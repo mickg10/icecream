@@ -28,6 +28,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -114,6 +116,96 @@ static MsgChannel *connect_tcp_bounded(int port, int timeout_msec)
         ::usleep(20000);
     }
     return nullptr;
+}
+
+static bool write_all(int fd, const void *data, size_t size)
+{
+    const char *position = static_cast<const char *>(data);
+    while (size != 0) {
+        const ssize_t written = ::send(fd, position, size, MSG_NOSIGNAL);
+        if (written > 0) {
+            position += written;
+            size -= static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+/* Queue a complete protocol-50 negotiation plus an ordinary CACHE_SESSION
+   frame while the daemon process is stopped.  The listener can then resume
+   with the entire burst already resident in its kernel accept queue, making
+   admission-versus-message-handling order deterministic rather than a client
+   scheduling race. */
+static int connect_preframed_cache_session(int port)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+
+    unsigned char wire[16]{};
+    wire[0] = static_cast<unsigned char>(PROTOCOL_VERSION);
+    wire[4] = static_cast<unsigned char>(PROTOCOL_VERSION);
+    const uint32_t frame_size = htonl(sizeof(uint32_t));
+    const uint32_t message = htonl(static_cast<uint32_t>(Msg::CACHE_SESSION));
+    std::memcpy(wire + 8, &frame_size, sizeof(frame_size));
+    std::memcpy(wire + 12, &message, sizeof(message));
+    if (!write_all(fd, wire, sizeof(wire))) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool wait_raw_eof(int fd, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    char buffer[64];
+    while (Clock::now() < deadline) {
+        pollfd descriptor{fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int remaining = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - Clock::now()).count());
+        int ready = -1;
+        do {
+            ready = ::poll(&descriptor, 1, remaining > 0 ? remaining : 0);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0) return false;
+        const ssize_t count = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (count == 0) return true;
+        if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+            return false;
+    }
+    return false;
+}
+
+static std::string read_file_suffix(const std::string& path, uintmax_t offset)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return {};
+    stream.seekg(static_cast<std::streamoff>(offset));
+    return std::string(std::istreambuf_iterator<char>(stream),
+                       std::istreambuf_iterator<char>());
+}
+
+static size_t count_text(const std::string& text, const std::string& needle)
+{
+    size_t count = 0;
+    size_t position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
 }
 
 static bool wait_eof(MsgChannel *channel, int timeout_msec)
@@ -323,6 +415,56 @@ int main(int argc, char **argv)
     REQUIRE(present(positive, static_cast<uint32_t>(daemon_port)),
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
+
+    // Stop only this private test daemon, queue a complete 36-connection burst
+    // (the S70 workload concurrency), and resume it.  Every connection already
+    // contains protocol negotiation and a deliberately unarmed CACHE_SESSION.
+    // An admission-only batch must log all accepts before the first ordinary
+    // message refusal; the predecessor handled one CACHE_SESSION between each
+    // pair of accepts and fails this exact ordering check.
+    constexpr size_t kAdmissionBurstCount = 36;
+    std::error_code size_error;
+    const uintmax_t admission_log_offset = std::filesystem::file_size(log, size_error);
+    const bool stop_sent = ::kill(daemon_pid, SIGSTOP) == 0;
+    int stop_status = 0;
+    const bool stopped = stop_sent &&
+        ::waitpid(daemon_pid, &stop_status, WUNTRACED) == daemon_pid &&
+        WIFSTOPPED(stop_status);
+    std::vector<int> admission_fds;
+    if (stopped) {
+        for (size_t index = 0; index != kAdmissionBurstCount; ++index) {
+            const int fd = connect_preframed_cache_session(daemon_port);
+            if (fd < 0) break;
+            admission_fds.push_back(fd);
+        }
+    }
+    const bool resumed = ::kill(daemon_pid, SIGCONT) == 0;
+    bool admission_eof = stopped && resumed &&
+        admission_fds.size() == kAdmissionBurstCount;
+    for (int fd : admission_fds) {
+        if (!wait_raw_eof(fd, 5000)) admission_eof = false;
+        ::close(fd);
+    }
+    const std::string admission_log = size_error
+        ? std::string() : read_file_suffix(log, admission_log_offset);
+    const std::string accepted_marker = "accepted ";
+    const std::string refused_marker =
+        "CACHE_SESSION refused: no authenticated cache sidecar";
+    const size_t accepted_count = count_text(admission_log, accepted_marker);
+    const size_t refused_count = count_text(admission_log, refused_marker);
+    const size_t last_accept = admission_log.rfind(accepted_marker);
+    const size_t first_refusal = admission_log.find(refused_marker);
+    const bool admission_ordered = admission_eof &&
+        accepted_count == kAdmissionBurstCount &&
+        refused_count == kAdmissionBurstCount &&
+        last_accept != std::string::npos && first_refusal != std::string::npos &&
+        last_accept < first_refusal;
+    REQUIRE(stopped && admission_fds.size() == kAdmissionBurstCount && resumed,
+            "full S70-concurrency protocol burst queued before daemon admission");
+    REQUIRE(admission_eof,
+            "all preframed burst clients are terminally handled after admission");
+    REQUIRE(admission_ordered,
+            "admission-only batch accepts the full burst before client activity");
 
     const int baseline_daemon_fds = process_fd_count(daemon_pid);
     REQUIRE(baseline_daemon_fds > 0,

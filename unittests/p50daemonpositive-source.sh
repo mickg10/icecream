@@ -31,6 +31,7 @@ contract() {
     require "$candidate" 'scheduler_cache_snapshot_valid = false' &&
     require "$candidate" 'client_accept_batch_limit' &&
     require "$candidate" 'accepted_count < client_accept_batch_limit' &&
+    require "$candidate" 'This phase is admission-only' &&
     require "$candidate" 'O_NONBLOCK' &&
     require "$candidate" 'Accept readiness never suppresses' &&
     require "$candidate" 'cache_sidecar_recovery_in_progress' &&
@@ -42,12 +43,29 @@ contract "$daemon" || {
     echo 'FAIL: production positive sidecar wiring contract is incomplete' >&2
     exit 1
 }
+
+# The bounded listener loop must only admit/authenticate/register channels.
+# Running the ordinary client state machine inside this region serializes
+# acceptance behind source/session/compile work and recreates the exact queue
+# starvation this batch is meant to prevent.  Existing real-daemon source-arm
+# and CacheSession coverage exercises the deferred path; this gate makes the
+# scheduling boundary deterministic, deletion-sensitive, and fails on the
+# predecessor's inline handler.
+accept_block=$(sed -n \
+    '/This phase is admission-only/,/Accept readiness never suppresses/p' \
+    "$daemon")
+if printf '%s\n' "$accept_block" | grep -F 'handle_activity(' >/dev/null; then
+    echo 'FAIL: bounded accept phase runs ordinary client activity inline' >&2
+    exit 1
+fi
 require "$makefile" 'libp50daemonsidecaradapter.a'
 require "$makefile" 'libp50sidecarlifecycle.a'
 require "$makefile" 'libp50readyadvertisement.a'
 require "$makefile" 'libp50sidecarsupervisor.a'
 require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/READY'
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
+require "$runtime_test" 'kAdmissionBurstCount = 36'
+require "$runtime_test" 'admission-only batch accepts the full burst before client activity'
 require "$runtime_test" 'source-arm owner is acknowledged before CACHE_SESSION'
 require "$runtime_test" 'authenticated one-shot handoff keeps the adopted session live'
 require "$runtime_test" 'kAuthoritativeSessionCount = 65'
@@ -107,6 +125,7 @@ for needle in \
     'scheduler_cache_snapshot_valid = false' \
     'client_accept_batch_limit' \
     'accepted_count < client_accept_batch_limit' \
+    'This phase is admission-only' \
     'O_NONBLOCK' \
     'Accept readiness never suppresses' \
     'cache_sidecar_recovery_in_progress' \

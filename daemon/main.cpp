@@ -10421,7 +10421,19 @@ void Daemon::answer_client_requests()
            transport deadline, so that queueing can destroy a valid assignment
            before application admission.  All ordinary listeners are
            nonblocking; drain a bounded batch, round-robin across listeners,
-           then always service the established-client poll snapshot below. */
+           then always service established clients/children below.
+
+           This phase is admission-only: protocol-negotiate, authenticate
+           provenance, and register each Client, but never handle an ordinary
+           client message between accepts.  In particular P50_SOURCE_ARM,
+           CACHE_SESSION, and COMPILE_FILE can all perform substantially more
+           work than admission.  Interleaving that work here turns the nominal
+           batch into one-at-a-time admission under load and can strand a
+           valid socket in the kernel queue past its caller's absolute
+           connection deadline.  A newly registered fd was not in this poll
+           snapshot; it is serviced through the established-client path on
+           the next outer turn (or from bytes already buffered by protocol
+           negotiation), under the same state and scheduler-loss checks. */
         bool listener_exhausted[3] = { false, false, false };
         size_t exhausted_count = 0;
         size_t accepted_count = 0;
@@ -10482,29 +10494,6 @@ void Daemon::answer_client_requests()
 
                     fd2client[c->fd] = client;
                     trace() << "accepted " << c->fd << " " << c->name << " as " << client->client_id << endl;
-
-                    while (!c->read_a_bit() || c->has_msg()) {
-                        const bool alive = handle_activity(client);
-                        /* G4 (16:47#2): a scheduler-bound message from this
-                           freshly-accepted client can close S.  Check the loss
-                           token before draining a second already-buffered
-                           message against a dead session; on loss, leave the
-                           turn (clear_children() tears down every client,
-                           including this one). */
-                        if (finish_scheduler_loss_if_needed()) {
-                            return;
-                        }
-                        if (!alive) {
-                            break;
-                        }
-
-                        if (client->status == Client::TOCOMPILE
-                                || client->status == Client::WAITP50INPUT
-                                || client->status == Client::WAITFORCHILD
-                                || client->status == Client::WAITINSTALL) {
-                            break;
-                        }
-                    }
                 }
             }
         }
