@@ -60,6 +60,12 @@ struct RuntimeConfig {
     size_t max_route_completed_requests = 4096;
     size_t max_route_relationships = 256;
     size_t max_route_endpoint_identities = 256;
+    // Connecting, negotiating, arming, and crossing CACHE_SESSION must never
+    // monopolize the process-wide route-owner gate for the full source
+    // operation deadline. F acknowledges an arm before doing source work;
+    // five seconds covers bounded connect retransmission and scheduling while
+    // leaving the unchanged outer deadline for queued and CacheWire work.
+    std::chrono::milliseconds source_open_arm_timeout{5000};
     P29InternerFaultInjection p29_interner_fault_injection =
         P29InternerFaultInjection::Disabled;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS

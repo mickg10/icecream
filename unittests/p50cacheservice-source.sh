@@ -32,6 +32,9 @@ for pair in \
     "$impl|kMaxControlWorkers = 64" \
     "$impl|kSourceTransferLockPoll" \
     "$impl|source_transfer_lock.try_lock_until" \
+    "$impl|open_arm_start + open_arm_timeout" \
+    "$impl|open_arm_budget_ms=%lld" \
+    "$impl|source_read_ns=%llu" \
     "$impl|#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS" \
     "$impl|endpoint_->request_cancel_for_test()" \
     "$impl|structured_launch.f_store_generation" \
@@ -45,13 +48,17 @@ for pair in \
     "$impl|kP29FingerprintReadyBudget" \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
+    "$header|source_open_arm_timeout{5000}" \
     "$header|std::timed_mutex source_transfer_mutex_" \
     "$header|seed_route_endpoint_identity_for_test" \
     "$header|seed_route_relationship_for_test" \
     "$test_file|legacy_store_identity_launches" \
     "$test_file|test_runtime_store_identity_is_explicit_and_role_tagged" \
+    "$test_file|test_source_open_arm_timeout_bounds" \
     "$test_file|test_route_endpoint_cap_refuses_before_f_open" \
     "$test_file|test_known_endpoint_relationship_cap_refuses_before_f_open" \
+    "$test_file|test_stalled_f_arm_is_bounded_before_healthy_transfer" \
+    "$test_file|healthy_result.code == local::SourceTransferResultCode::Committed" \
     "$test_file|test_route_poison_latches_before_successor_f_open" \
     "$test_file|first_observation.eof_without_cachewire" \
     "$test_file|authenticated_control_farm_accepts_twenty_and_stops" \

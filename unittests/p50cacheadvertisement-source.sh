@@ -328,6 +328,14 @@ require_count 1 'p50_cache_route_observation_kind(' daemon/main.cpp \
 # to that same selected hostname, commits ZSTD_TU before CompileFile, and binds
 # the resulting immutable selector.  The endpoint triple still may not leak
 # backwards into scheduler scoring or the generic compiler-input reader.
+require_count 1 'kP50CompilerConnectBudget = std::chrono::seconds(20)' client/remote.cpp \
+    'a P50 compiler connection has one explicit bounded deadline policy'
+require_count 1 'const bool cache_advertised_assignment =' client/remote.cpp \
+    'the ordinary compiler connection selects P50 policy from the exact UseCS'
+require_count 1 'Service::createChannelUntil(' client/remote.cpp \
+    'cache-advertised compiler connections use the deadline-aware connector'
+require_count 1 'Service::createChannel(hostname, port, 10)' client/remote.cpp \
+    'legacy compiler connections retain the historical ten-second connector'
 require_count 1 'p50_zstd_selected_profile(' client/remote.cpp \
     'the production client has one exact P50 profile selection/admission site'
 require_count 1 'assignment.cache_endpoint_port' client/remote.cpp \

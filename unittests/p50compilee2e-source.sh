@@ -75,6 +75,15 @@ contract() {
         return 1
     fi
     require_text "$root/client/remote.cpp" 'std::chrono::seconds(120)' || return 1
+    require_text "$root/client/remote.cpp" \
+        'kP50CompilerConnectBudget = std::chrono::seconds(20)' || return 1
+    require_text "$root/client/remote.cpp" \
+        'const bool cache_advertised_assignment =' || return 1
+    require_text "$root/client/remote.cpp" 'Service::createChannelUntil(' || return 1
+    require_text "$root/client/remote.cpp" \
+        'P50 compiler connection uses absolute 20-second deadline' || return 1
+    require_text "$root/client/remote.cpp" \
+        'Service::createChannel(hostname, port, 10)' || return 1
     # S7 may retain each successful preprocessor output only when the runner
     # opts in with a destination; the normal client path remains unchanged.
     require_text "$root/client/remote.cpp" 'ICECC_P50_PREPROCESSED_CAPTURE' || return 1

@@ -786,6 +786,12 @@ struct P50RemoteAttemptObservation {
     uint32_t profile_mask = 0;
 };
 
+// A cache-advertised assignment has one bounded strict retry instead of the
+// legacy local-fallback policy. Give its ordinary compiler connection enough
+// time to cross a transient SYN loss and protocol negotiation, while keeping
+// the historical ten-second behavior byte-for-byte for every legacy UseCS.
+constexpr auto kP50CompilerConnectBudget = std::chrono::seconds(20);
+
 static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_daemon,
                             const string &environment, const string &version_file,
                             const char *preproc_file, bool output,
@@ -981,7 +987,18 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     };
 
     try {
-        cserver = Service::createChannel(hostname, port, 10);
+        const bool cache_advertised_assignment =
+            usecs->hasCacheAdvertisement();
+        if (cache_advertised_assignment) {
+            trace() << "P50 compiler connection uses absolute 20-second deadline\n";
+            cserver = Service::createChannelUntil(
+                hostname, static_cast<unsigned short>(port),
+                std::chrono::steady_clock::now() +
+                    kP50CompilerConnectBudget);
+        } else {
+            trace() << "legacy compiler connection uses historical ten-second timeout\n";
+            cserver = Service::createChannel(hostname, port, 10);
+        }
 
         if (!cserver) {
             log_error() << "no server found behind given hostname " << hostname << ":"

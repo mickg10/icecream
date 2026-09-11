@@ -1254,6 +1254,8 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         config.max_route_completed_requests == 0 ||
         config.max_route_relationships == 0 ||
         config.max_route_endpoint_identities == 0 ||
+        config.source_open_arm_timeout <= std::chrono::milliseconds::zero() ||
+        config.source_open_arm_timeout > std::chrono::seconds(60) ||
         config.cancellation_grace <= std::chrono::milliseconds::zero())
         throw std::invalid_argument(
             "sidecar runtime bounds must be nonzero");
@@ -1523,10 +1525,25 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 local::SourceTransferErrorCode::RouteReplacementRequired));
         }
     }
+    const auto source_read_start = std::chrono::steady_clock::now();
     const auto source_bytes = read_source_fd(
         source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
-    if (!source_bytes.has_value())
+    const auto source_read_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - source_read_start)
+            .count();
+    const uint64_t source_read_ns =
+        source_read_elapsed > 0 ? static_cast<uint64_t>(source_read_elapsed) : 0;
+    if (!source_bytes.has_value()) {
+        std::fprintf(stderr,
+                     "P50_SOURCE_TRANSFER_REFUSED stage=source-read request=%llu "
+                     "f_host=%s f_cache_port=%u source_read_ns=%llu\n",
+                     static_cast<unsigned long long>(arm.source_request_id),
+                     arm.selected_f_host.c_str(), arm.selected_f_cache_port,
+                     static_cast<unsigned long long>(source_read_ns));
+        std::fflush(stderr);
         return source_transfer_error(3);
+    }
 
     const PrepareRequestKey route_request{arm.assignment_epoch,
                                           arm.assignment_nonce};
@@ -1535,17 +1552,42 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         int fd = -1;
         ~PendingFd() { if (fd >= 0) ::close(fd); }
     };
-    auto open_armed = [arm](std::chrono::steady_clock::time_point limit,
-                             FStoreGuid& remote_guid,
-                             uint64_t& remote_generation) {
-        const auto refused = [&arm](const char* stage, long long detail = 0) {
+    auto open_armed = [arm, source_read_ns,
+                       open_arm_timeout = config_.source_open_arm_timeout](
+                          std::chrono::steady_clock::time_point outer_limit,
+                          FStoreGuid& remote_guid,
+                          uint64_t& remote_generation) {
+        const auto open_arm_start = std::chrono::steady_clock::now();
+        const auto limit = std::min(
+            outer_limit, open_arm_start + open_arm_timeout);
+        auto stage_start = open_arm_start;
+        const auto refused = [&arm, source_read_ns, open_arm_start,
+                              &stage_start, open_arm_timeout](
+                                 const char* stage, long long detail = 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto open_arm_elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now - open_arm_start)
+                    .count();
+            const auto stage_elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now - stage_start)
+                    .count();
             std::fprintf(stderr,
                          "P50_SOURCE_TRANSFER_REFUSED stage=%s request=%llu "
-                         "f_host=%s f_cache_port=%u detail=%lld\n",
+                         "f_host=%s f_cache_port=%u detail=%lld "
+                         "source_read_ns=%llu open_arm_budget_ms=%lld "
+                         "open_arm_elapsed_ns=%llu stage_elapsed_ns=%llu\n",
                          stage,
                          static_cast<unsigned long long>(arm.source_request_id),
                          arm.selected_f_host.c_str(), arm.selected_f_cache_port,
-                         detail);
+                         detail,
+                         static_cast<unsigned long long>(source_read_ns),
+                         static_cast<long long>(open_arm_timeout.count()),
+                         static_cast<unsigned long long>(
+                             open_arm_elapsed > 0 ? open_arm_elapsed : 0),
+                         static_cast<unsigned long long>(
+                             stage_elapsed > 0 ? stage_elapsed : 0));
             std::fflush(stderr);
             return -1;
         };
@@ -1559,9 +1601,11 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 return refused("f-protocol", channel->protocol);
             if (std::chrono::steady_clock::now() >= limit)
                 return refused("f-connect-deadline");
+            stage_start = std::chrono::steady_clock::now();
             const P50SourceArmMsg request_message(arm);
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
                 return refused("f-arm-send");
+            stage_start = std::chrono::steady_clock::now();
             const auto remaining = limit - std::chrono::steady_clock::now();
             const auto timeout = std::chrono::duration_cast<std::chrono::seconds>(remaining).count();
             if (timeout <= 0 || timeout > INT_MAX)
@@ -1576,12 +1620,14 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 return refused("f-arm-mismatch");
             if (std::chrono::steady_clock::now() >= limit)
                 return refused("f-arm-deadline");
+            stage_start = std::chrono::steady_clock::now();
             remote_guid.bytes = acknowledgement->f_store_guid;
             remote_generation = acknowledgement->f_store_generation;
             if (remote_guid == FStoreGuid{} || remote_generation == 0)
                 return refused("f-store-identity");
             if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
                 return refused("f-cache-session-send");
+            stage_start = std::chrono::steady_clock::now();
             const int ready_fd = channel->release_fd_after_cache_session_ready(limit);
             return ready_fd >= 0 ? ready_fd : refused("f-cache-session-ready");
         } catch (...) {

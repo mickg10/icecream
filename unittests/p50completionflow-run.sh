@@ -372,6 +372,11 @@ run_remote_cell() {
         echo "FAIL: $cell has no positive P50 cache-path evidence" >&2
         return 1
     }
+    grep -F 'P50 compiler connection uses absolute 20-second deadline' \
+        "$client_log" >/dev/null || {
+        echo "FAIL: $cell did not exercise the deadline-aware P50 compiler connector" >&2
+        return 1
+    }
 }
 
 restart_cache_sidecar() {
@@ -1306,7 +1311,7 @@ test "$(grep -F -c \
 test "$(grep -F -c \
     "P50 retry exclusion forwarded endpoint=$worker_scheduler_host:$port_worker_strict3" \
     "$work/c.log")" -eq 1
-grep -F 'strict all-P50 run refuses local retry' \
+grep -F 'remote-only policy refuses local retry' \
     "$bounded_client_log" >/dev/null
 if grep -E 'requesting one fresh legacy|building myself, but telling localhost' \
     "$bounded_client_log" >/dev/null 2>&1; then

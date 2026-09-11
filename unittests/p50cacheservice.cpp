@@ -851,6 +851,25 @@ service::RuntimeConfig test_runtime_config() {
     return config;
 }
 
+void test_source_open_arm_timeout_bounds() {
+    for (const auto timeout : {
+             std::chrono::milliseconds::zero(),
+             std::chrono::milliseconds(60001)}) {
+        service::RuntimeConfig config = test_runtime_config();
+        config.source_open_arm_timeout = timeout;
+        bool rejected = false;
+        try {
+            service::SidecarRuntime runtime(std::move(config));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
+    service::RuntimeConfig maximum = test_runtime_config();
+    maximum.source_open_arm_timeout = std::chrono::seconds(60);
+    service::SidecarRuntime runtime(std::move(maximum));
+}
+
 void test_p29_fault_environment_is_exact() {
     P29InternerFaultInjection parsed = P29InternerFaultInjection::FailOnce;
     CHECK(service::parse_p29_interner_fault_injection(nullptr, parsed));
@@ -1484,7 +1503,43 @@ struct SourceArmServerObservation {
     bool cache_session_received = false;
     bool ready_sent = false;
     bool eof_without_cachewire = false;
+    bool transfer_completed = false;
 };
+
+void serve_stalled_source_arm(int listener,
+                              std::atomic<bool>& arm_received) noexcept {
+    try {
+        sockaddr_in peer{};
+        socklen_t peer_size = sizeof(peer);
+        const int accepted = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+        (void)::close(listener);
+        if (accepted < 0)
+            return;
+        std::unique_ptr<MsgChannel> channel(Service::createChannel(
+            accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+        if (!channel)
+            return;
+        std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+        const auto* arm = arm_message != nullptr
+                              ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                              : nullptr;
+        if (arm == nullptr || !arm->valid_payload())
+            return;
+        arm_received.store(true, std::memory_order_release);
+        pollfd descriptor{channel->fd, POLLIN | POLLHUP | POLLERR, 0};
+        int ready = -1;
+        do {
+            ready = ::poll(&descriptor, 1, 4000);
+        } while (ready < 0 && errno == EINTR);
+        if (ready > 0) {
+            uint8_t byte = 0;
+            (void)::recv(channel->fd, &byte, 1, 0);
+        }
+    } catch (...) {
+        (void)::close(listener);
+    }
+}
 
 void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
                           uint64_t f_store_generation,
@@ -1546,6 +1601,80 @@ void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
     }
 }
 
+void serve_one_source_transfer(int listener, FStoreGuid f_store_guid,
+                               uint64_t f_store_generation,
+                               SourceArmServerObservation& observation) noexcept {
+    try {
+        sockaddr_in peer{};
+        socklen_t peer_size = sizeof(peer);
+        const int accepted = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+        (void)::close(listener);
+        if (accepted < 0)
+            return;
+        observation.accepted = true;
+        std::unique_ptr<MsgChannel> channel(Service::createChannel(
+            accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+        if (!channel)
+            return;
+        observation.protocol_50 = channel->protocol == PROTOCOL_VERSION;
+        std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+        const auto* arm = arm_message != nullptr
+                              ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                              : nullptr;
+        if (arm == nullptr || !arm->valid_payload())
+            return;
+        observation.arm_received = true;
+        ClaimAttemptCapability128 capability_1;
+        ClaimAttemptCapability128 capability_2;
+        capability_1.bytes.fill(0xd1);
+        capability_2.bytes.fill(0xd2);
+        const P50SourceArmedMsg acknowledgement(
+            arm->arm, 101, 102, f_store_generation, f_store_guid.bytes,
+            kStoreIdentityDerivationVersion, 103, 2500,
+            capability_1, capability_2);
+        if (!channel->send_msg(acknowledgement))
+            return;
+        observation.armed_sent = true;
+        std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+        if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+            return;
+        observation.cache_session_received = true;
+        const int raw_fd = channel->release_fd_if_input_empty();
+        if (raw_fd < 0)
+            return;
+        observation.ready_sent = send_cache_session_ready(
+            raw_fd, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        if (!observation.ready_sent) {
+            (void)::close(raw_fd);
+            return;
+        }
+
+        namespace asio = boost::asio;
+        asio::io_context context;
+        boost::system::error_code error;
+        auto socket = P50ServerEndpoint::adopt_connected_fd(
+            context.get_executor(), raw_fd, error);
+        if (!socket.has_value())
+            return;
+        P50ServerEndpointConfig server_config;
+        server_config.input_job_state = [](
+            CStoreGuid, const TxBegin&, const TxCommit&,
+            std::span<const uint8_t>) { return InputJobState::Open; };
+        P50ServerEndpoint endpoint(f_store_guid, {}, nullptr, nullptr,
+                                   std::move(server_config));
+        auto result = asio::co_spawn(
+            context, endpoint.run_adopted(std::move(*socket)), asio::use_future);
+        context.run();
+        const ServerRunResult value = result.get();
+        observation.transfer_completed =
+            value.status == ServerRunStatus::Completed &&
+            value.committed_input.has_value();
+    } catch (...) {
+        (void)::close(listener);
+    }
+}
+
 local::P50SourceTransferRequest source_transfer_request(
     uint16_t port, uint64_t identity, uint32_t profile) {
     local::P50SourceTransferRequest request;
@@ -1568,6 +1697,100 @@ local::P50SourceTransferRequest source_transfer_request(
         request.source_mode = P50_SOURCE_MODE_ZSTD_TU;
     CHECK(request.valid());
     return request;
+}
+
+int source_file(std::string_view stem, std::span<const uint8_t> bytes) {
+    std::array<char, 128> path{};
+    const int length = std::snprintf(
+        path.data(), path.size(), "/tmp/%.*s-XXXXXX",
+        static_cast<int>(stem.size()), stem.data());
+    CHECK(length > 0 && static_cast<size_t>(length) < path.size());
+    const int fd = ::mkstemp(path.data());
+    CHECK(fd >= 0);
+    CHECK(write_all(fd, bytes));
+    CHECK(::unlink(path.data()) == 0);
+    return fd;
+}
+
+void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x61;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::milliseconds(1500);
+    service::SidecarRuntime runtime(std::move(config));
+
+    uint16_t stalled_port = 0;
+    const int stalled_listener = loopback_listener(stalled_port);
+    std::atomic<bool> stalled_arm_received{false};
+    std::thread stalled_server([&] {
+        serve_stalled_source_arm(stalled_listener, stalled_arm_received);
+    });
+    const std::array<uint8_t, 8> stalled_source{
+        's', 't', 'a', 'l', 'l', 'e', 'd', '\n'};
+    local::P50SourceTransferResult stalled_result;
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto stalled_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    std::thread stalled_transfer([&] {
+        stalled_result = runtime.transfer_source_on_owner(
+            source_transfer_request(stalled_port, 121, CACHE_PROFILE_ZSTD_TU),
+            stalled_deadline,
+            local::HandoffFd(source_file("p50-stalled-arm", stalled_source)));
+    });
+    const auto arm_wait_limit =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!stalled_arm_received.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < arm_wait_limit)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(stalled_arm_received.load(std::memory_order_acquire));
+
+    StoreIdentityRoot healthy_root{};
+    healthy_root.bytes[14] = 0x62;
+    const FStoreGuid healthy_guid = f_store_guid_for_root(healthy_root);
+    uint16_t healthy_port = 0;
+    const int healthy_listener = loopback_listener(healthy_port);
+    SourceArmServerObservation healthy_observation;
+    std::thread healthy_server([&] {
+        serve_one_source_transfer(healthy_listener, healthy_guid, 17,
+                                  healthy_observation);
+    });
+    const std::array<uint8_t, 9> healthy_source{
+        'h', 'e', 'a', 'l', 't', 'h', 'y', '!', '\n'};
+    const auto healthy_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    const auto healthy_started = std::chrono::steady_clock::now();
+    const local::P50SourceTransferResult healthy_result =
+        runtime.transfer_source_on_owner(
+            source_transfer_request(healthy_port, 131, CACHE_PROFILE_ZSTD_TU),
+            healthy_deadline,
+            local::HandoffFd(source_file("p50-healthy-arm", healthy_source)));
+    const auto healthy_elapsed =
+        std::chrono::steady_clock::now() - healthy_started;
+
+    stalled_transfer.join();
+    stalled_server.join();
+    healthy_server.join();
+    CHECK(stalled_result.code == local::SourceTransferResultCode::Error);
+    CHECK(stalled_result.error_code == 4 && stalled_result.attempts == 0);
+    CHECK(healthy_result.code == local::SourceTransferResultCode::Committed);
+    CHECK(healthy_result.attempts == 1);
+    CHECK(healthy_result.raw_bytes == healthy_source.size());
+    CHECK(healthy_result.raw_digest == icecc::digest128(healthy_source));
+    CHECK(healthy_observation.accepted && healthy_observation.protocol_50 &&
+          healthy_observation.arm_received && healthy_observation.armed_sent &&
+          healthy_observation.cache_session_received &&
+          healthy_observation.ready_sent &&
+          healthy_observation.transfer_completed);
+    CHECK(healthy_elapsed < std::chrono::seconds(3));
 }
 
 void test_route_poison_latches_before_successor_f_open() {
@@ -2206,8 +2429,10 @@ int main() {
         slowloris_deadline_is_total_and_listener_recovers();
         frame_header_and_payload_share_one_deadline();
         test_runtime_store_identity_is_explicit_and_role_tagged();
+        test_source_open_arm_timeout_bounds();
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
+        test_stalled_f_arm_is_bounded_before_healthy_transfer();
         test_route_poison_latches_before_successor_f_open();
         test_interner_fault_returns_permanent_profile_unavailable();
         test_p29_fault_environment_is_exact();
