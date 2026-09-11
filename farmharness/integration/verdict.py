@@ -81,6 +81,7 @@ SESSION_OUTCOMES = frozenset(("committed", "refused", "fallback", "none"))
 TERMINAL_KINDS = frozenset(
     ("completion", "fallback", "cancellation", "process-loss-recovery")
 )
+P50_RETRYABLE_TRANSPORT_ERRORS = frozenset((2, 6, 8, 9, 13, 14, 19, 20, 23, 107))
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
@@ -1119,6 +1120,112 @@ def _authenticated_strict_p50_retry_ids(
                 continue
             source_transfer_by_attempt[identity] = item
 
+    uncommitted_transports = observations.get("failed_p50_uncommitted_transports")
+    uncommitted_transport_raw = (
+        uncommitted_transports.get("records")
+        if isinstance(uncommitted_transports, Mapping)
+        else None
+    )
+    uncommitted_transport_by_attempt: dict[
+        tuple[str, int], Mapping[str, Any]
+    ] = {}
+    uncommitted_transport_duplicates: set[tuple[str, int]] = set()
+    invalid_uncommitted_transport = False
+    uncommitted_transport_fields = {
+        "assignment_epoch",
+        "assignment_identity_line",
+        "assignment_line",
+        "assignment_nonce",
+        "attempt_index",
+        "c_guid",
+        "compile_identity_present",
+        "failed_endpoint",
+        "normalized_error",
+        "normalized_line",
+        "original_error",
+        "profile_commit_present",
+        "retry_assignment_epoch",
+        "retry_assignment_identity_line",
+        "retry_assignment_line",
+        "retry_assignment_nonce",
+        "retry_c_guid",
+        "retry_endpoint",
+        "retry_line",
+        "retry_scheduler_job",
+        "retry_tu_seq",
+        "row_job_id",
+        "scheduler_job",
+        "source_result_present",
+        "tu_seq",
+        "worker",
+    }
+    if isinstance(uncommitted_transport_raw, list):
+        for item in uncommitted_transport_raw:
+            ordered_lines = (
+                "assignment_identity_line",
+                "assignment_line",
+                "normalized_line",
+                "retry_line",
+                "retry_assignment_identity_line",
+                "retry_assignment_line",
+            )
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != uncommitted_transport_fields
+                or not _is_int(item.get("assignment_epoch"), minimum=1)
+                or not _is_int(item.get("assignment_nonce"), minimum=1)
+                or item.get("attempt_index") != 0
+                or not _is_int(item.get("c_guid"), minimum=1)
+                or item.get("compile_identity_present") is not False
+                or not isinstance(item.get("failed_endpoint"), str)
+                or not item["failed_endpoint"]
+                or item.get("normalized_error") != 106
+                or item.get("original_error") not in P50_RETRYABLE_TRANSPORT_ERRORS
+                or item.get("profile_commit_present") is not False
+                or not _is_int(item.get("retry_assignment_epoch"), minimum=1)
+                or not _is_int(item.get("retry_assignment_nonce"), minimum=1)
+                or not _is_int(item.get("retry_c_guid"), minimum=1)
+                or item.get("retry_c_guid") != item.get("c_guid")
+                or not isinstance(item.get("retry_endpoint"), str)
+                or not item["retry_endpoint"]
+                or item.get("retry_endpoint") == item.get("failed_endpoint")
+                or not _is_int(item.get("retry_scheduler_job"), minimum=1)
+                or not _is_int(item.get("retry_tu_seq"))
+                or not isinstance(item.get("row_job_id"), str)
+                or not item["row_job_id"]
+                or not _is_int(item.get("scheduler_job"), minimum=1)
+                or item.get("source_result_present") is not False
+                or not _is_int(item.get("tu_seq"))
+                or not isinstance(item.get("worker"), str)
+                or not item["worker"]
+                or (
+                    item.get("retry_scheduler_job"),
+                    item.get("retry_assignment_epoch"),
+                    item.get("retry_assignment_nonce"),
+                )
+                == (
+                    item.get("scheduler_job"),
+                    item.get("assignment_epoch"),
+                    item.get("assignment_nonce"),
+                )
+                or not all(
+                    _is_int(item.get(name), minimum=1) for name in ordered_lines
+                )
+                or list(map(item.get, ordered_lines))
+                != sorted(map(item.get, ordered_lines))
+                or len(set(map(item.get, ordered_lines))) != len(ordered_lines)
+            ):
+                invalid_uncommitted_transport = True
+                continue
+            identity = (
+                _job_id(item.get("row_job_id"), "@failed-uncommitted-transport"),
+                item["attempt_index"],
+            )
+            if identity in uncommitted_transport_by_attempt:
+                uncommitted_transport_duplicates.add(identity)
+                continue
+            uncommitted_transport_by_attempt[identity] = item
+
     planned_worker_endpoints: dict[str, str] = {}
     plan = bundle.get("plan")
     topology = plan.get("topology") if isinstance(plan, Mapping) else None
@@ -1203,6 +1310,7 @@ def _authenticated_strict_p50_retry_ids(
         attempts = assignment.get("attempts") if isinstance(assignment, Mapping) else None
         missing = failed_by_attempt.get((job_id, 0))
         source_transfer = source_transfer_by_attempt.get((job_id, 0))
+        uncommitted_transport = uncommitted_transport_by_attempt.get((job_id, 0))
         reason = binding.get("failure_reason")
         expected_first_terminals = (
             {"process-loss-recovery"}
@@ -1218,7 +1326,7 @@ def _authenticated_strict_p50_retry_ids(
             )
             if reason == "result-stream-loss"
             else {"cancellation"}
-            if reason == "source-transfer-loss"
+            if reason in {"source-transfer-loss", "uncommitted-transport-loss"}
             else set()
         )
         first = attempts[0] if isinstance(attempts, list) and len(attempts) == 2 else None
@@ -1263,6 +1371,24 @@ def _authenticated_strict_p50_retry_ids(
             and source_transfer.get("retry_endpoint")
             == planned_worker_endpoints.get(binding.get("final_worker"))
         )
+        uncommitted_transport_valid = (
+            reason == "uncommitted-transport-loss"
+            and isinstance(uncommitted_transport, Mapping)
+            and missing is None
+            and source_transfer is None
+            and uncommitted_transport.get("attempt_index") == 0
+            and uncommitted_transport.get("row_job_id") == job_id
+            and uncommitted_transport.get("scheduler_job")
+            == binding.get("first_scheduler_job")
+            and uncommitted_transport.get("retry_scheduler_job")
+            == binding.get("final_scheduler_job")
+            and uncommitted_transport.get("worker") == binding.get("first_worker")
+            and binding.get("first_worker") != binding.get("final_worker")
+            and uncommitted_transport.get("failed_endpoint")
+            == planned_worker_endpoints.get(binding.get("first_worker"))
+            and uncommitted_transport.get("retry_endpoint")
+            == planned_worker_endpoints.get(binding.get("final_worker"))
+        )
         integers = (
             "final_dispatch_ms",
             "final_generation",
@@ -1273,6 +1399,24 @@ def _authenticated_strict_p50_retry_ids(
             "first_scheduler_job",
             "first_terminal_ms",
         )
+        integers_valid = all(
+            _is_int(binding.get(name), minimum=1) for name in integers
+        )
+        terminal_order_valid = (
+            integers_valid
+            and binding["first_dispatch_ms"] <= binding["first_terminal_ms"]
+            and binding["final_dispatch_ms"] <= binding["final_terminal_ms"]
+            and (
+                (
+                    binding["first_dispatch_ms"] <= binding["final_dispatch_ms"]
+                    and isinstance(lifecycle, Mapping)
+                    and _is_int(lifecycle.get("deadline_ms"), minimum=1)
+                    and binding["first_terminal_ms"] <= lifecycle["deadline_ms"]
+                )
+                if reason == "uncommitted-transport-loss"
+                else binding["first_terminal_ms"] <= binding["final_dispatch_ms"]
+            )
+        )
         valid = (
             job_id not in authenticated
             and isinstance(row, Mapping)
@@ -1281,16 +1425,20 @@ def _authenticated_strict_p50_retry_ids(
             and isinstance(lifecycle, Mapping)
             and (job_id, 0) not in failed_duplicates
             and (job_id, 0) not in source_transfer_duplicates
-            and (missing_valid or process_loss_valid or source_transfer_valid)
-            and all(_is_int(binding.get(name), minimum=1) for name in integers)
+            and (job_id, 0) not in uncommitted_transport_duplicates
+            and (
+                missing_valid
+                or process_loss_valid
+                or source_transfer_valid
+                or uncommitted_transport_valid
+            )
+            and integers_valid
             and isinstance(binding.get("first_worker"), str)
             and bool(binding["first_worker"])
             and isinstance(binding.get("final_worker"), str)
             and bool(binding["final_worker"])
             and binding.get("first_terminal") in expected_first_terminals
-            and binding["first_dispatch_ms"] <= binding["first_terminal_ms"]
-            and binding["first_terminal_ms"] <= binding["final_dispatch_ms"]
-            and binding["final_dispatch_ms"] <= binding["final_terminal_ms"]
+            and terminal_order_valid
             and row.get("retries") == 1
             and row.get("exact") is True
             and row.get("tail_present") is True
@@ -1340,6 +1488,16 @@ def _authenticated_strict_p50_retry_ids(
         )
     ):
         bad.add("@observations:failed_p50_source_transfers")
+    if invalid_uncommitted_transport or uncommitted_transport_duplicates or (
+        uncommitted_transports is not None
+        and (
+            not isinstance(uncommitted_transports, Mapping)
+            or not isinstance(uncommitted_transport_raw, list)
+            or uncommitted_transports.get("record_count")
+            != len(uncommitted_transport_raw)
+        )
+    ):
+        bad.add("@observations:failed_p50_uncommitted_transports")
     return authenticated, bad
 
 

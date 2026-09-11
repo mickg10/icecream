@@ -967,6 +967,7 @@ def _observations(
         "error106_job_ids": [],
         "failed_p50_result_identities": {"record_count": 0, "records": []},
         "failed_p50_source_transfers": {"record_count": 0, "records": []},
+        "failed_p50_uncommitted_transports": {"record_count": 0, "records": []},
         "incomplete_turns": [],
         "job_lifecycle": [
             {
@@ -2599,6 +2600,139 @@ def test_s70_b4_source_transfer_loss_is_recovered_by_exact_strict_retry() -> Non
     fixture = _s70_b4_worker_source_transfer_recovery_bundle()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+
+
+def _s70_b4_worker_uncommitted_transport_recovery_bundle() -> dict[str, object]:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    row = fixture["rows"][100]
+    fixture["observations"]["error106_job_ids"] = [row["job_id"]]
+    fixture["observations"]["failed_p50_source_transfers"] = {
+        "record_count": 0,
+        "records": [],
+    }
+    fixture["observations"]["failed_p50_uncommitted_transports"] = {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 11,
+                "assignment_identity_line": 6,
+                "assignment_line": 7,
+                "assignment_nonce": 21,
+                "attempt_index": 0,
+                "c_guid": 31,
+                "compile_identity_present": False,
+                "failed_endpoint": "10.0.27.101:23003",
+                "normalized_error": 106,
+                "normalized_line": 10,
+                "original_error": 2,
+                "profile_commit_present": False,
+                "retry_assignment_epoch": 11,
+                "retry_assignment_identity_line": 16,
+                "retry_assignment_line": 17,
+                "retry_assignment_nonce": 22,
+                "retry_c_guid": 31,
+                "retry_endpoint": "10.0.27.56:23004",
+                "retry_line": 11,
+                "retry_scheduler_job": 702,
+                "retry_tu_seq": 42,
+                "row_job_id": row["job_id"],
+                "scheduler_job": 701,
+                "source_result_present": False,
+                "tu_seq": 41,
+                "worker": "F1",
+            }
+        ],
+    }
+    fixture["observations"]["successful_strict_p50_retry_bindings"][0][
+        "failure_reason"
+    ] = "uncommitted-transport-loss"
+    return fixture
+
+
+def test_s70_b4_uncommitted_transport_loss_is_recovered_by_exact_strict_retry() -> None:
+    fixture = _s70_b4_worker_uncommitted_transport_recovery_bundle()
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+def test_uncommitted_transport_allows_late_scheduler_cancellation_settlement() -> None:
+    fixture = _s70_b4_worker_uncommitted_transport_recovery_bundle()
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    binding["first_terminal_ms"] = binding["final_terminal_ms"] + 1
+
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture,
+        fixture["observations"],
+        fixture["rows"],
+    )
+    assert authenticated == {binding["job_id"]}
+    assert bad == set()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-observation",
+        "wrong-first-job",
+        "wrong-retry-job",
+        "wrong-worker",
+        "wrong-failed-endpoint",
+        "wrong-retry-endpoint",
+        "same-endpoint",
+        "wrong-normalized-error",
+        "unsupported-error",
+        "profile-commit-present",
+        "source-result-present",
+        "compile-identity-present",
+        "bad-line-order",
+        "duplicate-observation",
+    ),
+)
+def test_s70_b4_uncommitted_transport_retry_binding_fails_closed(
+    mutation: str,
+) -> None:
+    fixture = _s70_b4_worker_uncommitted_transport_recovery_bundle()
+    evidence = fixture["observations"]["failed_p50_uncommitted_transports"]
+    record = evidence["records"][0]
+    if mutation == "missing-observation":
+        evidence["record_count"] = 0
+        evidence["records"] = []
+    elif mutation == "wrong-first-job":
+        record["scheduler_job"] = 799
+    elif mutation == "wrong-retry-job":
+        record["retry_scheduler_job"] = 799
+    elif mutation == "wrong-worker":
+        record["worker"] = "F2"
+    elif mutation == "wrong-failed-endpoint":
+        record["failed_endpoint"] = "10.0.27.99:23999"
+    elif mutation == "wrong-retry-endpoint":
+        record["retry_endpoint"] = "10.0.27.98:23998"
+    elif mutation == "same-endpoint":
+        record["retry_endpoint"] = record["failed_endpoint"]
+    elif mutation == "wrong-normalized-error":
+        record["normalized_error"] = 2
+    elif mutation == "unsupported-error":
+        record["original_error"] = 3
+    elif mutation == "profile-commit-present":
+        record["profile_commit_present"] = True
+    elif mutation == "source-result-present":
+        record["source_result_present"] = True
+    elif mutation == "compile-identity-present":
+        record["compile_identity_present"] = True
+    elif mutation == "bad-line-order":
+        record["retry_line"] = record["normalized_line"]
+    else:
+        evidence["records"].append(copy.deepcopy(record))
+        evidence["record_count"] = 2
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert failed & {
+        "engagement.expected",
+        "retry.strict-p50-bindings",
+        "s70.b4-worker-bounces",
+    }
 
 
 def test_source_transfer_marker_keeps_stronger_process_loss_reason() -> None:
