@@ -83,6 +83,12 @@ constexpr int kHandshakeMilliseconds = 500;
 // flock/hash wait before it can retire without publishing READY.
 constexpr auto kP29FingerprintReadyBudget = std::chrono::milliseconds(2000);
 constexpr int kMaxBacklog = 16;
+// The complete source open/arm phase remains bounded by RuntimeConfig's
+// five-second default.  A blackholed TCP/protocol four-tuple must not own that
+// whole budget: retry only before P50SourceArmMsg exists on the wire, against
+// the same selected numeric endpoint.  Any failure after channel creation is
+// potentially post-arm and remains fail-closed without replay.
+constexpr auto kSourceConnectAttemptBudget = std::chrono::seconds(1);
 // A bounded control farm keeps an authenticated idle dispatcher or an active
 // cache-wire handoff from consuming the only worker needed by compiler input.
 // This is a hard concurrent cap, not a per-connection unbounded thread fork.
@@ -1592,9 +1598,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             return -1;
         };
         try {
-            std::unique_ptr<MsgChannel> channel(Service::createChannelUntil(
+            std::unique_ptr<MsgChannel> channel(Service::createChannelRetryUntil(
                 arm.selected_f_host,
-                static_cast<unsigned short>(arm.selected_f_cache_port), limit));
+                static_cast<unsigned short>(arm.selected_f_cache_port), limit,
+                kSourceConnectAttemptBudget));
             if (!channel)
                 return refused("f-connect");
             if (channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT)

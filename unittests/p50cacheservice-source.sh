@@ -33,6 +33,8 @@ for pair in \
     "$impl|kSourceTransferLockPoll" \
     "$impl|source_transfer_lock.try_lock_until" \
     "$impl|open_arm_start + open_arm_timeout" \
+    "$impl|kSourceConnectAttemptBudget" \
+    "$impl|Service::createChannelRetryUntil(" \
     "$impl|open_arm_budget_ms=%lld" \
     "$impl|source_read_ns=%llu" \
     "$impl|#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS" \
@@ -57,6 +59,10 @@ for pair in \
     "$test_file|test_source_open_arm_timeout_bounds" \
     "$test_file|test_route_endpoint_cap_refuses_before_f_open" \
     "$test_file|test_known_endpoint_relationship_cap_refuses_before_f_open" \
+    "$test_file|test_source_connect_protocol_slice_retries_before_arm" \
+    "$test_file|observation.first_connection_bytes == protocol_only" \
+    "$test_file|test_source_connect_protocol_slices_share_one_outer_budget" \
+    "$test_file|attempts.size() >= 2 && attempts.size() <= 3" \
     "$test_file|test_stalled_f_arm_is_bounded_before_healthy_transfer" \
     "$test_file|healthy_result.code == local::SourceTransferResultCode::Committed" \
     "$test_file|test_route_poison_latches_before_successor_f_open" \

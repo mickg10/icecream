@@ -1529,8 +1529,12 @@ MsgChannel *Service::createChannelUntil(
     if (std::chrono::steady_clock::now() >= deadline ||
         (remote_fd = prepare_connect(hostname, p, remote_addr)) < 0)
         return nullptr;
-    if (std::chrono::steady_clock::now() >= deadline ||
-        !connect_until(remote_fd, reinterpret_cast<struct sockaddr *>(&remote_addr),
+    if (std::chrono::steady_clock::now() >= deadline) {
+        (void)close(remote_fd);
+        return nullptr;
+    }
+    if (!connect_until(remote_fd,
+                       reinterpret_cast<struct sockaddr *>(&remote_addr),
                        sizeof(remote_addr), deadline))
         return nullptr;
 
@@ -1564,8 +1568,18 @@ MsgChannel *Service::createChannelRetryUntil(
                           std::chrono::steady_clock::duration>(attempt_budget));
         ++attempt;
         if (MsgChannel *channel = createChannelUntil(
-                hostname, p, attempt_deadline))
+                hostname, p, attempt_deadline)) {
+            // createChannelUntil necessarily installs the attempt slice as
+            // TCP_USER_TIMEOUT.  A successful channel is owned by the outer
+            // operation, so restore that unchanged deadline before returning
+            // it; otherwise later application traffic would inherit the much
+            // shorter connection/protocol slice.
+            if (!set_tcp_user_timeout_past_deadline(channel->fd, deadline)) {
+                delete channel;
+                return nullptr;
+            }
             return channel;
+        }
 
         const auto finished = std::chrono::steady_clock::now();
         if (finished >= deadline)

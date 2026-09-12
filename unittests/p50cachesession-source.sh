@@ -48,11 +48,47 @@ require_count 1 'const bool armed = cache_session_send_release_armed;' services/
 require_count 1 'channel->release_fd_after_cache_session_ready(limit)' \
     cache/p50_cache_service.cpp \
     'production source transfer waits for sidecar ownership before CacheWire'
-require_count 1 'set_tcp_user_timeout_past_deadline(channel->fd, deadline)' \
-    services/comm.cpp \
-    'absolute-deadline channel prevents the ordinary TCP timeout from pre-empting its owner'
 require_count 2 'send_cache_session_ready(adopted.get(), deadline)' \
     cache/p50_cache_service.cpp 'production sidecar publishes READY on the adopted descriptor'
+
+create_until_slice=$(sed -n \
+    '/^MsgChannel \*Service::createChannelUntil(/,/^MsgChannel \*Service::createChannelRetryUntil(/p' \
+    "$src/services/comm.cpp")
+create_until_timeout_count=$(printf '%s\n' "$create_until_slice" \
+    | grep -F -c 'set_tcp_user_timeout_past_deadline(channel->fd, deadline)' || true)
+if [ "$create_until_timeout_count" -ne 1 ]; then
+    echo "FAIL: absolute-deadline channel must install its owner timeout exactly once (found $create_until_timeout_count)" >&2
+    exit 1
+fi
+echo 'ok - absolute-deadline channel prevents the ordinary TCP timeout from pre-empting its owner'
+
+create_until_close_count=$(printf '%s\n' "$create_until_slice" \
+    | grep -F -c '(void)close(remote_fd);' || true)
+if [ "$create_until_close_count" -ne 1 ]; then
+    echo "FAIL: post-prepare expired deadline must close its descriptor exactly once (found $create_until_close_count)" >&2
+    exit 1
+fi
+echo 'ok - post-prepare expired deadline closes its unowned descriptor'
+
+create_retry_slice=$(sed -n \
+    '/^MsgChannel \*Service::createChannelRetryUntil(/,/^MsgChannel \*Service::createChannel(const string &socket_path)/p' \
+    "$src/services/comm.cpp")
+create_retry_timeout_count=$(printf '%s\n' "$create_retry_slice" \
+    | grep -F -c 'set_tcp_user_timeout_past_deadline(channel->fd, deadline)' || true)
+if [ "$create_retry_timeout_count" -ne 1 ]; then
+    echo "FAIL: successful sliced retry must restore its outer TCP timeout exactly once (found $create_retry_timeout_count)" >&2
+    exit 1
+fi
+echo 'ok - successful sliced retry restores the unchanged outer TCP timeout'
+
+require_count 2 'test_same_endpoint_retry_after_complete_slice()' \
+    unittests/p50cachesession.cpp \
+    'real-TCP expired-slice retry regression remains registered'
+require_count 2 'test_same_endpoint_retry_immediate_success_owns_outer_timeout()' \
+    unittests/p50cachesession.cpp \
+    'real-TCP immediate-success outer-timeout regression remains registered'
+require_count 3 'timeout_msec > 15000' unittests/p50cachesession.cpp \
+    'absolute and both retry success shapes directly inspect the owned socket timeout'
 
 if sed -n '/class CacheSessionMsg : public Msg/,/^};/p' "$src/services/comm.h" \
         | grep -E 'C_GUID|[Pp]ayload' >/dev/null 2>&1; then

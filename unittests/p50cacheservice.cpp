@@ -1601,15 +1601,11 @@ void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
     }
 }
 
-void serve_one_source_transfer(int listener, FStoreGuid f_store_guid,
-                               uint64_t f_store_generation,
-                               SourceArmServerObservation& observation) noexcept {
+void serve_accepted_source_transfer(
+    int accepted, sockaddr_in peer, socklen_t peer_size,
+    FStoreGuid f_store_guid, uint64_t f_store_generation,
+    SourceArmServerObservation& observation) noexcept {
     try {
-        sockaddr_in peer{};
-        socklen_t peer_size = sizeof(peer);
-        const int accepted = ::accept(
-            listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
-        (void)::close(listener);
         if (accepted < 0)
             return;
         observation.accepted = true;
@@ -1670,9 +1666,112 @@ void serve_one_source_transfer(int listener, FStoreGuid f_store_guid,
         observation.transfer_completed =
             value.status == ServerRunStatus::Completed &&
             value.committed_input.has_value();
+    } catch (...) {}
+}
+
+void serve_one_source_transfer(int listener, FStoreGuid f_store_guid,
+                               uint64_t f_store_generation,
+                               SourceArmServerObservation& observation) noexcept {
+    sockaddr_in peer{};
+    socklen_t peer_size = sizeof(peer);
+    const int accepted = ::accept(
+        listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+    (void)::close(listener);
+    serve_accepted_source_transfer(accepted, peer, peer_size, f_store_guid,
+                                   f_store_generation, observation);
+}
+
+struct SourceConnectRetryObservation {
+    unsigned int accepted_connections = 0;
+    std::vector<uint8_t> first_connection_bytes;
+    SourceArmServerObservation successful;
+};
+
+std::vector<uint8_t> receive_after_protocol_slice(int fd) noexcept {
+    std::vector<uint8_t> result;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1150));
+    for (;;) {
+        std::array<uint8_t, 64> bytes{};
+        const ssize_t count = ::recv(fd, bytes.data(), bytes.size(),
+                                     MSG_DONTWAIT);
+        if (count > 0) {
+            result.insert(result.end(), bytes.begin(), bytes.begin() + count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    return result;
+}
+
+void serve_source_transfer_after_protocol_stall(
+    int listener, FStoreGuid f_store_guid, uint64_t f_store_generation,
+    SourceConnectRetryObservation& observation) noexcept {
+    try {
+        sockaddr_in first_peer{};
+        socklen_t first_peer_size = sizeof(first_peer);
+        const int stalled = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&first_peer),
+            &first_peer_size);
+        if (stalled < 0) {
+            (void)::close(listener);
+            return;
+        }
+        ++observation.accepted_connections;
+
+        // Hold protocol negotiation past the one-second connection slice.
+        // The client may send only its fixed four-byte protocol proposal;
+        // P50SourceArmMsg is composed only after a channel is returned.
+        observation.first_connection_bytes =
+            receive_after_protocol_slice(stalled);
+        (void)::close(stalled);
+
+        pollfd descriptor{listener, POLLIN, 0};
+        int ready = -1;
+        do {
+            ready = ::poll(&descriptor, 1, 2000);
+        } while (ready < 0 && errno == EINTR);
+        sockaddr_in retry_peer{};
+        socklen_t retry_peer_size = sizeof(retry_peer);
+        const int accepted = ready > 0
+                                 ? ::accept(
+                                       listener,
+                                       reinterpret_cast<sockaddr*>(&retry_peer),
+                                       &retry_peer_size)
+                                 : -1;
+        (void)::close(listener);
+        if (accepted >= 0)
+            ++observation.accepted_connections;
+        serve_accepted_source_transfer(
+            accepted, retry_peer, retry_peer_size, f_store_guid,
+            f_store_generation, observation.successful);
     } catch (...) {
         (void)::close(listener);
     }
+}
+
+void serve_only_protocol_stalls(
+    int listener, std::vector<std::vector<uint8_t>>& attempts) noexcept {
+    try {
+        // A 2.5-second source open/arm budget yields two complete one-second
+        // slices and one final partial slice.  Bound every accept so deleting
+        // the retry cannot strand this regression.
+        for (unsigned int index = 0; index != 3; ++index) {
+            pollfd descriptor{listener, POLLIN, 0};
+            int ready = -1;
+            do {
+                ready = ::poll(&descriptor, 1, 2000);
+            } while (ready < 0 && errno == EINTR);
+            const int accepted = ready > 0 ? ::accept(listener, nullptr, nullptr)
+                                           : -1;
+            if (accepted < 0)
+                break;
+            attempts.push_back(receive_after_protocol_slice(accepted));
+            (void)::close(accepted);
+        }
+    } catch (...) {}
+    (void)::close(listener);
 }
 
 local::P50SourceTransferRequest source_transfer_request(
@@ -1710,6 +1809,109 @@ int source_file(std::string_view stem, std::span<const uint8_t> bytes) {
     CHECK(write_all(fd, bytes));
     CHECK(::unlink(path.data()) == 0);
     return fd;
+}
+
+void test_source_connect_protocol_slice_retries_before_arm() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x63;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::milliseconds(3000);
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0x64;
+    const FStoreGuid remote_guid = f_store_guid_for_root(remote_root);
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    SourceConnectRetryObservation observation;
+    std::thread server([&] {
+        serve_source_transfer_after_protocol_stall(
+            listener, remote_guid, 19, observation);
+    });
+
+    const std::array<uint8_t, 13> source{
+        'r', 'e', 't', 'r', 'y', '-', 's', 'o', 'u', 'r', 'c', 'e', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    const auto started = std::chrono::steady_clock::now();
+    const local::P50SourceTransferResult result =
+        runtime.transfer_source_on_owner(
+            source_transfer_request(port, 141, CACHE_PROFILE_ZSTD_TU),
+            deadline,
+            local::HandoffFd(source_file("p50-connect-retry", source)));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    server.join();
+
+    const std::vector<uint8_t> protocol_only{
+        static_cast<uint8_t>(PROTOCOL_VERSION), 0, 0, 0};
+    CHECK(observation.accepted_connections == 2);
+    CHECK(observation.first_connection_bytes == protocol_only);
+    CHECK(result.code == local::SourceTransferResultCode::Committed);
+    CHECK(result.attempts == 1);
+    CHECK(result.raw_bytes == source.size());
+    CHECK(result.raw_digest == icecc::digest128(source));
+    CHECK(observation.successful.accepted &&
+          observation.successful.protocol_50 &&
+          observation.successful.arm_received &&
+          observation.successful.armed_sent &&
+          observation.successful.cache_session_received &&
+          observation.successful.ready_sent &&
+          observation.successful.transfer_completed);
+    CHECK(elapsed >= std::chrono::seconds(1) &&
+          elapsed < std::chrono::milliseconds(2800));
+}
+
+void test_source_connect_protocol_slices_share_one_outer_budget() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x65;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::milliseconds(2500);
+    service::SidecarRuntime runtime(std::move(config));
+
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    std::vector<std::vector<uint8_t>> attempts;
+    std::thread server([&] { serve_only_protocol_stalls(listener, attempts); });
+    const std::array<uint8_t, 12> source{
+        'a', 'l', 'l', '-', 's', 't', 'a', 'l', 'l', 'e', 'd', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    const auto started = std::chrono::steady_clock::now();
+    const local::P50SourceTransferResult result =
+        runtime.transfer_source_on_owner(
+            source_transfer_request(port, 151, CACHE_PROFILE_ZSTD_TU),
+            deadline,
+            local::HandoffFd(source_file("p50-connect-stalls", source)));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    server.join();
+
+    const std::vector<uint8_t> protocol_only{
+        static_cast<uint8_t>(PROTOCOL_VERSION), 0, 0, 0};
+    CHECK(result.code == local::SourceTransferResultCode::Error);
+    CHECK(result.error_code == 4 && result.attempts == 0);
+    CHECK(attempts.size() >= 2 && attempts.size() <= 3);
+    CHECK(std::all_of(attempts.begin(), attempts.end(),
+                      [&](const auto& bytes) {
+                          return bytes == protocol_only;
+                      }));
+    CHECK(elapsed >= std::chrono::milliseconds(2400) &&
+          elapsed < std::chrono::milliseconds(3200));
 }
 
 void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
@@ -2432,6 +2634,8 @@ int main() {
         test_source_open_arm_timeout_bounds();
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
+        test_source_connect_protocol_slice_retries_before_arm();
+        test_source_connect_protocol_slices_share_one_outer_budget();
         test_stalled_f_arm_is_bounded_before_healthy_transfer();
         test_route_poison_latches_before_successor_f_open();
         test_interner_fault_returns_permanent_profile_unavailable();
