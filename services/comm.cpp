@@ -1545,6 +1545,43 @@ MsgChannel *Service::createChannelUntil(
     return channel;
 }
 
+MsgChannel *Service::createChannelRetryUntil(
+    const string &hostname, unsigned short p,
+    std::chrono::steady_clock::time_point deadline,
+    std::chrono::milliseconds attempt_budget)
+{
+    if (attempt_budget <= std::chrono::milliseconds::zero())
+        return nullptr;
+
+    unsigned int attempt = 0;
+    for (;;) {
+        const auto started = std::chrono::steady_clock::now();
+        if (started >= deadline)
+            return nullptr;
+        const auto attempt_deadline = std::min(
+            deadline,
+            started + std::chrono::duration_cast<
+                          std::chrono::steady_clock::duration>(attempt_budget));
+        ++attempt;
+        if (MsgChannel *channel = createChannelUntil(
+                hostname, p, attempt_deadline))
+            return channel;
+
+        const auto finished = std::chrono::steady_clock::now();
+        if (finished >= deadline)
+            return nullptr;
+        // ECONNREFUSED, resolver failure, fd exhaustion, and other immediate
+        // terminal errors are authoritative.  Retry only the live-farm case
+        // where a single TCP/protocol attempt aged out while the endpoint
+        // remained healthy for other connections.
+        if (finished < attempt_deadline)
+            return nullptr;
+        trace() << "bounded channel attempt " << attempt
+                << " expired; retrying same endpoint " << hostname << ':'
+                << p << " inside the unchanged absolute deadline" << endl;
+    }
+}
+
 MsgChannel *Service::createChannel(const string &socket_path)
 {
     int remote_fd;

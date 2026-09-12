@@ -330,10 +330,12 @@ require_count 1 'p50_cache_route_observation_kind(' daemon/main.cpp \
 # backwards into scheduler scoring or the generic compiler-input reader.
 require_count 1 'kP50CompilerConnectBudget = std::chrono::seconds(20)' client/remote.cpp \
     'a P50 compiler connection has one explicit bounded deadline policy'
+require_count 1 'kP50CompilerConnectAttemptBudget = std::chrono::seconds(5)' client/remote.cpp \
+    'one blackholed compiler socket cannot consume the complete assignment deadline'
 require_count 1 'const bool cache_advertised_assignment =' client/remote.cpp \
     'the ordinary compiler connection selects P50 policy from the exact UseCS'
-require_count 1 'Service::createChannelUntil(' client/remote.cpp \
-    'cache-advertised compiler connections use the deadline-aware connector'
+require_count 1 'Service::createChannelRetryUntil(' client/remote.cpp \
+    'cache-advertised compiler connections retry only the same selected endpoint'
 require_count 1 'Service::createChannel(hostname, port, 10)' client/remote.cpp \
     'legacy compiler connections retain the historical ten-second connector'
 require_count 1 'p50_zstd_selected_profile(' client/remote.cpp \

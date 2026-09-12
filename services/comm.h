@@ -1310,6 +1310,14 @@ public:
     static MsgChannel *createChannelUntil(
         const std::string &host, unsigned short p,
         std::chrono::steady_clock::time_point deadline);
+    // Retry the same endpoint only when an individual connection/protocol
+    // attempt consumes its complete slice.  Immediate definitive failures
+    // remain immediate, and every attempt shares one unchanged outer
+    // deadline.  No application message is sent by this factory.
+    static MsgChannel *createChannelRetryUntil(
+        const std::string &host, unsigned short p,
+        std::chrono::steady_clock::time_point deadline,
+        std::chrono::milliseconds attempt_budget);
     static MsgChannel *createChannel(const std::string &domain_socket);
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
 };

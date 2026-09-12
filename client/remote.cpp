@@ -791,6 +791,11 @@ struct P50RemoteAttemptObservation {
 // time to cross a transient SYN loss and protocol negotiation, while keeping
 // the historical ten-second behavior byte-for-byte for every legacy UseCS.
 constexpr auto kP50CompilerConnectBudget = std::chrono::seconds(20);
+// One blackholed TCP four-tuple must not own the complete assignment budget.
+// A slice expiry may create a fresh socket to the same selected endpoint;
+// immediate definitive failures still enter the existing strict-assignment
+// retry path without delay.  No job/profile/source message has been sent yet.
+constexpr auto kP50CompilerConnectAttemptBudget = std::chrono::seconds(5);
 
 static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_daemon,
                             const string &environment, const string &version_file,
@@ -990,11 +995,13 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         const bool cache_advertised_assignment =
             usecs->hasCacheAdvertisement();
         if (cache_advertised_assignment) {
-            trace() << "P50 compiler connection uses absolute 20-second deadline\n";
-            cserver = Service::createChannelUntil(
+            trace() << "P50 compiler connection uses absolute 20-second deadline"
+                    << " with 5-second same-endpoint socket slices\n";
+            const auto compiler_connect_deadline =
+                std::chrono::steady_clock::now() + kP50CompilerConnectBudget;
+            cserver = Service::createChannelRetryUntil(
                 hostname, static_cast<unsigned short>(port),
-                std::chrono::steady_clock::now() +
-                    kP50CompilerConnectBudget);
+                compiler_connect_deadline, kP50CompilerConnectAttemptBudget);
         } else {
             trace() << "legacy compiler connection uses historical ten-second timeout\n";
             cserver = Service::createChannel(hostname, port, 10);

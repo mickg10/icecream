@@ -438,6 +438,87 @@ static void test_absolute_deadline_owns_tcp_user_timeout()
     peer.join();
 }
 
+static void test_same_endpoint_retry_after_complete_slice()
+{
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) std::exit(2);
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        listen(listener, 4) != 0)
+        std::exit(2);
+    socklen_t address_size = sizeof(address);
+    if (getsockname(listener, reinterpret_cast<sockaddr *>(&address),
+                    &address_size) != 0)
+        std::exit(2);
+
+    std::thread peer([listener] {
+        // The first TCP handshake completes, but ordinary protocol
+        // negotiation is blackholed past its per-socket slice.
+        const int stalled = accept(listener, nullptr, nullptr);
+        if (stalled >= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            close(stalled);
+        }
+
+        sockaddr_in remote{};
+        socklen_t remote_size = sizeof(remote);
+        const int accepted = accept(
+            listener, reinterpret_cast<sockaddr *>(&remote), &remote_size);
+        MsgChannel *channel = accepted >= 0
+                                  ? Service::createChannel(
+                                        accepted,
+                                        reinterpret_cast<sockaddr *>(&remote),
+                                        remote_size)
+                                  : nullptr;
+        delete channel;
+        close(listener);
+    });
+
+    const auto started = std::chrono::steady_clock::now();
+    MsgChannel *channel = Service::createChannelRetryUntil(
+        "127.0.0.1", ntohs(address.sin_port),
+        started + std::chrono::milliseconds(400),
+        std::chrono::milliseconds(80));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE(channel != nullptr && elapsed >= std::chrono::milliseconds(80) &&
+                elapsed < std::chrono::milliseconds(300),
+            "a slice-expired socket reconnects to the same endpoint inside one deadline");
+    delete channel;
+    peer.join();
+}
+
+static void test_same_endpoint_retry_preserves_immediate_failure()
+{
+    const int holder = socket(AF_INET, SOCK_STREAM, 0);
+    if (holder < 0) std::exit(2);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(holder, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
+        std::exit(2);
+    socklen_t address_size = sizeof(address);
+    if (getsockname(holder, reinterpret_cast<sockaddr *>(&address),
+                    &address_size) != 0)
+        std::exit(2);
+    close(holder);
+
+    const auto started = std::chrono::steady_clock::now();
+    MsgChannel *channel = Service::createChannelRetryUntil(
+        "127.0.0.1", ntohs(address.sin_port),
+        started + std::chrono::milliseconds(500),
+        std::chrono::milliseconds(80));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE(channel == nullptr && elapsed < std::chrono::milliseconds(200),
+            "an immediate definitive refusal does not spin until the outer deadline");
+    delete channel;
+}
+
 static void test_other_message_refusal_and_arm_clear()
 {
     Pair pair = make_pair(50);
@@ -657,6 +738,8 @@ int main()
     test_ready_wire_and_failure_boundaries();
     test_absolute_deadline_protocol_negotiation();
     test_absolute_deadline_owns_tcp_user_timeout();
+    test_same_endpoint_retry_after_complete_slice();
+    test_same_endpoint_retry_preserves_immediate_failure();
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();
     test_split_frame_reads();

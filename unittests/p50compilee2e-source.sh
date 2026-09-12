@@ -79,7 +79,9 @@ contract() {
         'kP50CompilerConnectBudget = std::chrono::seconds(20)' || return 1
     require_text "$root/client/remote.cpp" \
         'const bool cache_advertised_assignment =' || return 1
-    require_text "$root/client/remote.cpp" 'Service::createChannelUntil(' || return 1
+    require_text "$root/client/remote.cpp" 'Service::createChannelRetryUntil(' || return 1
+    require_text "$root/client/remote.cpp" \
+        'kP50CompilerConnectAttemptBudget = std::chrono::seconds(5)' || return 1
     require_text "$root/client/remote.cpp" \
         'P50 compiler connection uses absolute 20-second deadline' || return 1
     require_text "$root/client/remote.cpp" \
