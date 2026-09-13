@@ -160,6 +160,39 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert persisted == receipt
 
 
+def test_manifest_driver_exports_boundary_dependencies_to_compiler_children(
+    tmp_path: Path,
+) -> None:
+    variable_export_line = next(
+        line
+        for line in MANIFEST_DRIVER.splitlines()
+        if line.startswith("export gate_root ")
+    )
+    function_export_line = next(
+        line
+        for line in MANIFEST_DRIVER.splitlines()
+        if line.startswith("export -f ") and "compile_one" in line
+    )
+    completed = subprocess.run(
+        (
+            "/bin/bash",
+            "-c",
+            "read_boundary_release() { printf 'release:%s\\n' \"$1\"; }; "
+            "compile_one() { :; }; "
+            f"gate_root=$1; {function_export_line}; {variable_export_line}; "
+            "/bin/bash -c 'declare -F read_boundary_release >/dev/null && "
+            "read_boundary_release \"$gate_root\"'",
+            "icefarm-gate-root-probe",
+            str(tmp_path / "event-root"),
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout == f"release:{tmp_path / 'event-root'}\n"
+
+
 def test_s30_mutant_workload_enables_the_legacy_recovery_under_test(
     tmp_path: Path,
 ) -> None:

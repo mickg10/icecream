@@ -829,10 +829,10 @@ compile_one() {
     trap - EXIT
     return 0
 }
-export -f compile_one
+export -f read_boundary_release compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
-export gate_state gate_lock gate_active event_serial_through
+export gate_root gate_state gate_lock gate_active event_serial_through
 export resume_mode resume_indices
 
 set +e
