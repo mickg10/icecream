@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import ctypes
 import hashlib
 import http.server
 import inspect
@@ -8,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -27,6 +29,7 @@ from farmharness.integration.collect import (
 )
 from farmharness.integration.events import (
     ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
+    ACTIVE_COMPILER_BOUNDARY_SCRIPT,
     ACTIVE_COMPILER_COMMAND_GRACE_S,
     ACTIVE_COMPILER_OBSERVE_S,
     ACTIVE_COMPILER_RELEASE_SCRIPT,
@@ -376,12 +379,11 @@ def test_unsupported_actions_refuse_before_workload_and_deadline_is_bounded(tmp_
 
 
 def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
-    assert "len(daemons) != 1" not in ACTIVE_COMPILER_STOP_SCRIPT
-    assert "parents = {p[\"pid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert "parent[\"pid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "len(daemons) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "initial_parents = {p[\"pid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "initial_candidates = [" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'child["pid"] == child["pgid"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert '"--generation" not in child["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'os.readlink(root / "exe")' not in ACTIVE_COMPILER_STOP_SCRIPT
     assert '(root / "comm").read_text' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'line.startswith("Uid:")' in ACTIVE_COMPILER_STOP_SCRIPT
@@ -390,6 +392,8 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert 'item.get("exe") == "/opt/icecream/sbin/iceccd"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'not is_iceccd(before_daemon)' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'not is_iceccd(before)' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "PTRACE_O_TRACEFORK" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "os.getpgid(child) == child" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "socket.create_connection" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "while True:" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "size > 4 * 1024 * 1024" in ACTIVE_COMPILER_STOP_SCRIPT
@@ -408,16 +412,21 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert ACTIVE_COMPILER_OBSERVE_S == 240
     assert ACTIVE_COMPILER_COMMAND_GRACE_S == 30
     source = (INTEGRATION / "events.py").read_text(encoding="utf-8")
-    assert 'str(trigger - 1),' in source
+    assert 'str(trigger - 1),' not in source
+    assert '"0",' in inspect.getsource(EventProducer._prepare_active_compiler_capture)
     assert 'armed_path,' in source
     assert 'cancel_path,' in source
-    assert 'self._prepare_active_compiler_capture()' in source
+    assert 'events.prepare_active_compiler_boundary(turn)' in (
+        INTEGRATION / "workload.py"
+    ).read_text(encoding="utf-8")
     assert 'result, worker_before = self._take_active_compiler_capture(event, worker)' in source
     assert 'active-compiler capture cannot arm over a pre-existing compiler' in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'identity = (leader["pid"], leader["start_ticks"])' in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'if identity in seen:' in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'if skip:' in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'skip -= 1' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'message = ctypes.c_ulong()' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'child = int(message.value)' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'before = snap(child)' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'before["ppid"] != before_daemon["pid"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'before["pid"] != before["pgid"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert '"capture_mode": "ptrace-fork-v1"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'if cancel_path.exists():' in ACTIVE_COMPILER_STOP_SCRIPT
     assert "maximum=ACTIVE_COMPILER_OBSERVE_S + ACTIVE_COMPILER_COMMAND_GRACE_S" in source
     parent = _active_iceccd(10, 1, 10)
@@ -627,11 +636,15 @@ def test_release_script_resumes_only_the_exact_stopped_group() -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+    assert "PTRACE_SEIZE" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "PTRACE_O_TRACEFORK" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)" in (
+        ACTIVE_COMPILER_STOP_SCRIPT
+    )
     assert "same_identity(stopped, before)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "stop_deadline = time.monotonic() + 2" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert ACTIVE_COMPILER_STOP_SCRIPT.index(
-        'os.killpg(before["pgid"], signal.SIGSTOP)'
+        "ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)"
     ) < ACTIVE_COMPILER_STOP_SCRIPT.index(
         "listener = listener_probe(web_port, before_daemon)"
     )
@@ -648,6 +661,105 @@ def test_active_compiler_selector_rejects_sidecar_and_statewriter_shapes() -> No
     )
     compiler = _active_iceccd(13, 10, 13, argv=daemon["argv"])
     assert select_direct_compiler_pairs([daemon, statewriter, sidecar, compiler]) == [(daemon, compiler)]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ptrace fork events are Linux-only")
+def test_ptrace_fork_event_holds_a_short_lived_child_before_exit() -> None:
+    ptrace_seize = 0x4206
+    ptrace_detach = 17
+    ptrace_geteventmsg = 0x4201
+    ptrace_tracefork = 0x00000002
+    wait_wall = 0x40000000
+    read_fd, write_fd = os.pipe()
+    tracee = os.fork()
+    if tracee == 0:
+        try:
+            os.close(write_fd)
+            os.read(read_fd, 1)
+            child = os.fork()
+            if child == 0:
+                os._exit(0)
+            os.waitpid(child, 0)
+        finally:
+            os._exit(0)
+
+    os.close(read_fd)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.ptrace.restype = ctypes.c_long
+
+    def ptrace(request: int, pid: int, data: int = 0) -> None:
+        ctypes.set_errno(0)
+        result = libc.ptrace(
+            ctypes.c_uint(request),
+            ctypes.c_int(pid),
+            ctypes.c_void_p(0),
+            ctypes.c_void_p(data),
+        )
+        if result == -1:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+
+    forked = 0
+    try:
+        try:
+            ptrace(ptrace_seize, tracee, ptrace_tracefork)
+        except OSError as exc:
+            if exc.errno in {1, 13}:
+                pytest.skip(f"ptrace unavailable in test environment: {exc}")
+            raise
+        os.write(write_fd, b"x")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            waited, status = os.waitpid(tracee, os.WNOHANG | wait_wall)
+            if waited == tracee:
+                assert os.WIFSTOPPED(status)
+                assert status >> 16 == 1
+                break
+            time.sleep(0.002)
+        else:
+            pytest.fail("no ptrace fork event observed")
+        message = ctypes.c_ulong()
+        result = libc.ptrace(
+            ctypes.c_uint(ptrace_geteventmsg),
+            ctypes.c_int(tracee),
+            ctypes.c_void_p(0),
+            ctypes.byref(message),
+        )
+        assert result != -1
+        forked = int(message.value)
+        waited, child_status = os.waitpid(forked, wait_wall)
+        assert waited == forked and os.WIFSTOPPED(child_status)
+        time.sleep(0.1)
+        assert (Path("/proc") / str(forked)).exists()
+        raw_stat = (Path("/proc") / str(forked) / "stat").read_text(
+            encoding="ascii"
+        )
+        assert raw_stat.rsplit(") ", 1)[1].split()[0] in {"T", "t"}
+        ptrace(ptrace_detach, forked)
+        forked = 0
+        ptrace(ptrace_detach, tracee)
+        os.waitpid(tracee, 0)
+        tracee = 0
+    finally:
+        os.close(write_fd)
+        if forked:
+            try:
+                ptrace(ptrace_detach, forked)
+            except (OSError, ProcessLookupError):
+                pass
+        if tracee:
+            try:
+                ptrace(ptrace_detach, tracee)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                os.kill(tracee, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(tracee, 0)
+            except ChildProcessError:
+                pass
 
 
 def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Path) -> None:
@@ -671,10 +783,92 @@ def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Pat
         if command["phase"] == "up.start-f"
     )
     assert f"ICECC_WEB_HOSTPORT=127.0.0.1:{web_port}" in start["argv"]
+    ptrace_index = start["argv"].index("SYS_PTRACE")
+    assert start["argv"][ptrace_index - 1] == "--cap-add"
     assert all("ICECC_WEB_HOSTPORT" not in item.get("env", {}) for item in scenario.data["instances"])
+    ordinary = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S00-smoke.json", farm
+    )
+    ordinary_plan = farmtest.build_plan(
+        farm, ordinary, run_id="ordinary-no-ptrace-unit"
+    )
+    assert all(
+        "SYS_PTRACE" not in command["argv"]
+        for command in farmtest.fake_up(ordinary_plan)
+    )
 
 
-def test_active_scheduler_loss_capture_is_armed_before_workload_and_skips_one(
+def test_active_compiler_boundary_script_authenticates_and_releases_exact_marker(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workload" / "A"
+    gate = root / "event-gate"
+    active = gate / "active"
+    active.mkdir(parents=True)
+    (gate / "state.tsv").write_text("OPEN\t0\n", encoding="ascii")
+    (active / "job-2-77.tsv").write_text("2\t77\t0\t900\n", encoding="ascii")
+    (gate / "active-compiler-boundary-2.ready.tsv").write_text(
+        "icefarm-active-compiler-boundary-v1\t2\t77\t0\t1000\n",
+        encoding="ascii",
+    )
+
+    waited = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            ACTIVE_COMPILER_BOUNDARY_SCRIPT,
+            "wait",
+            str(root),
+            "2",
+            "1",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    assert json.loads(waited.stdout) == {
+        "action": "wait",
+        "index": 2,
+        "pid": 77,
+        "ready_ms": 1000,
+        "schema": "icefarm-active-compiler-boundary-control-v1",
+    }
+
+    released = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            ACTIVE_COMPILER_BOUNDARY_SCRIPT,
+            "release",
+            str(root),
+            "2",
+            "1",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    release_receipt = json.loads(released.stdout)
+    assert release_receipt | {"released_ms": 1} == {
+        "action": "release",
+        "index": 2,
+        "pid": 77,
+        "ready_ms": 1000,
+        "released_ms": 1,
+        "schema": "icefarm-active-compiler-boundary-control-v1",
+    }
+    control = gate / "active-compiler-boundary-2.control"
+    assert stat.S_IMODE(control.stat().st_mode) == 0o755
+    release_fields = (control / "release.tsv").read_text(
+        encoding="ascii"
+    ).strip().split("\t")
+    assert release_fields[:3] == ["icefarm-active-compiler-release-v1", "2", "77"]
+    assert int(release_fields[3]) >= 1000
+
+
+def test_active_scheduler_loss_capture_arms_zero_skip_after_boundary(
     tmp_path: Path,
 ) -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
@@ -702,11 +896,26 @@ def test_active_scheduler_loss_capture_is_armed_before_workload_and_skips_one(
 
         def invoke(self, command: PlannedCommand) -> CommandResult:
             self.commands.append(command)
+            if command.phase == "event.scheduler-loss-boundary-wait":
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "action": "wait",
+                            "index": 2,
+                            "pid": 77,
+                            "ready_ms": 1000,
+                            "schema": "icefarm-active-compiler-boundary-control-v1",
+                        }
+                    ),
+                    "",
+                )
             if command.phase == "event.scheduler-loss-prearm-compiler":
                 return CommandResult(
                     0,
                     json.dumps(
                         {
+                            "capture_mode": "ptrace-fork-v1",
                             "daemon": _active_iceccd(7, 1, 7),
                             "leader": {**stopped, "state": "S"},
                             "listener": {},
@@ -722,9 +931,27 @@ def test_active_scheduler_loss_capture_is_armed_before_workload_and_skips_one(
                     0,
                     json.dumps(
                         {
+                            "capture_mode": "ptrace-fork-v1",
+                            "daemon_pid": 7,
+                            "daemon_start_ticks": 100,
                             "pid": 99,
-                            "schema": "icefarm-compiler-capture-arm-v1",
-                            "skip": 1,
+                            "schema": "icefarm-compiler-capture-arm-v2",
+                            "skip": 0,
+                        }
+                    ),
+                    "",
+                )
+            if command.phase == "event.scheduler-loss-boundary-release":
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "action": "release",
+                            "index": 2,
+                            "pid": 77,
+                            "ready_ms": 1000,
+                            "released_ms": 1001,
+                            "schema": "icefarm-active-compiler-boundary-control-v1",
                         }
                     ),
                     "",
@@ -740,7 +967,8 @@ def test_active_scheduler_loss_capture_is_armed_before_workload_and_skips_one(
     )
     producer._inspect = lambda _name, **_kwargs: dict(worker_before)
     producer._preflight_container_image_id = lambda _worker: worker_before["image_id"]
-    producer._prepare_active_compiler_capture()
+    producer.signal_turn_start("A")
+    producer.prepare_active_compiler_boundary("A")
     result, captured_before = producer._take_active_compiler_capture(
         producer.events[0], worker
     )
@@ -748,11 +976,13 @@ def test_active_scheduler_loss_capture_is_armed_before_workload_and_skips_one(
     assert captured_before == worker_before
     phases = [item.phase for item in producer.recorder.commands]
     assert phases == [
+        "event.scheduler-loss-boundary-wait",
         "event.scheduler-loss-prearm-compiler",
         "event.scheduler-loss-prearm-ready",
+        "event.scheduler-loss-boundary-release",
     ]
-    capture_argv = producer.recorder.commands[0].argv
-    assert capture_argv[-3] == "1"
+    capture_argv = producer.recorder.commands[1].argv
+    assert capture_argv[-3] == "0"
     assert capture_argv[-2].endswith(".armed.json")
     assert capture_argv[-1].endswith(".cancel")
     producer._active_capture_claimed = True
@@ -799,9 +1029,12 @@ def test_unclaimed_active_scheduler_capture_is_cancelled_and_joined(
                     0,
                     json.dumps(
                         {
+                            "capture_mode": "ptrace-fork-v1",
+                            "daemon_pid": 7,
+                            "daemon_start_ticks": 100,
                             "pid": 99,
-                            "schema": "icefarm-compiler-capture-arm-v1",
-                            "skip": 1,
+                            "schema": "icefarm-compiler-capture-arm-v2",
+                            "skip": 0,
                         }
                     ),
                     "",
@@ -1301,6 +1534,80 @@ def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
             _validate_scheduler_active_loss_receipt(
                 tampered_v5,
                 current_event,
+                scenario,
+                0,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=tmp_path,
+            )
+
+    current_v6 = json.loads(json.dumps(current_v5))
+    current_v6["schema"] = "icefarm-scheduler-active-loss-v6"
+    current_v6["selection_last_dispatched_job"] = current_v6[
+        "lost_scheduler_job"
+    ]
+    current_v6["capture_boundary"] = {
+        "arm": {
+            "capture_mode": "ptrace-fork-v1",
+            "daemon_pid": current_v6["compiler"]["daemon"]["pid"],
+            "daemon_start_ticks": current_v6["compiler"]["daemon"][
+                "start_ticks"
+            ],
+            "pid": 99,
+            "schema": "icefarm-compiler-capture-arm-v2",
+            "skip": 0,
+        },
+        "client": "C1",
+        "event_epoch": 1,
+        "event_index": 0,
+        "release": {
+            "action": "release",
+            "index": 2,
+            "pid": 77,
+            "ready_ms": 100,
+            "released_ms": 101,
+            "schema": "icefarm-active-compiler-boundary-control-v1",
+        },
+        "run_id": plan["run_id"],
+        "schema": "icefarm-active-compiler-boundary-v1",
+        "serial_through": 2,
+        "turn": "A",
+        "wait": {
+            "action": "wait",
+            "index": 2,
+            "pid": 77,
+            "ready_ms": 100,
+            "schema": "icefarm-active-compiler-boundary-control-v1",
+        },
+    }
+    current_v6_event = json.loads(json.dumps(current_event))
+    current_v6_event["last_dispatched_job"] = current_v6["lost_scheduler_job"]
+    current_v6_event["workload_dispatch_count"] = 2
+    _validate_scheduler_active_loss_receipt(
+        current_v6,
+        current_v6_event,
+        scenario,
+        0,
+        farm=farm,
+        plan=plan,
+        preflight=preflight,
+        evidence=tmp_path,
+    )
+    for path, value in (
+        (("arm", "skip"), 1),
+        (("release", "pid"), 78),
+        (("serial_through",), 3),
+    ):
+        tampered_v6 = json.loads(json.dumps(current_v6))
+        cursor = tampered_v6["capture_boundary"]
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        with pytest.raises(CollectError, match="active compiler capture boundary"):
+            _validate_scheduler_active_loss_receipt(
+                tampered_v6,
+                current_v6_event,
                 scenario,
                 0,
                 farm=farm,

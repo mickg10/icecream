@@ -78,6 +78,38 @@ fault_job=$4
 checkpoint_path=${5:-"$result_root/checkpoint.json"}
 resume_mode=${6:-0}
 expected_checkpoint_sha=${7:-}
+
+read_boundary_release() {
+    python3 -c '
+import os, stat, sys
+root = sys.argv[1]
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    directory_stat = os.fstat(directory)
+    if (not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != 0
+            or stat.S_IMODE(directory_stat.st_mode) != 0o755):
+        raise SystemExit("unsafe active-compiler control directory")
+    release = os.open("release.tsv", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        release_stat = os.fstat(release)
+        if (not stat.S_ISREG(release_stat.st_mode)
+                or release_stat.st_uid != 0
+                or release_stat.st_nlink != 1
+                or stat.S_IMODE(release_stat.st_mode) != 0o644
+                or release_stat.st_size > 4096):
+            raise SystemExit("unsafe active-compiler release file")
+        payload = os.read(release, 4097)
+        if len(payload) != release_stat.st_size or len(payload) > 4096:
+            raise SystemExit("unstable active-compiler release file")
+    finally:
+        os.close(release)
+finally:
+    os.close(directory)
+sys.stdout.write(payload.decode("ascii"))
+' "$1"
+}
+
 test "$resume_mode" = 0 -o "$resume_mode" = 1
 if test "$resume_mode" -eq 1
 then
@@ -609,8 +641,68 @@ compile_one() {
             sleep 0.05
         fi
     done
-    mkdir "$job_dir"
     trap 'rm -f -- "$marker"' EXIT
+    if test "$event_serial_through" -gt 0 \
+        -a "$index" -eq "$event_serial_through"
+    then
+        # Hold the exact trigger job before icecc can request its scheduler
+        # assignment.  The event owner first authenticates this marker, then
+        # arms the F-local zero-skip compiler observer, and only then publishes
+        # the exact release receipt.  This removes observation-count timing
+        # from active-loss target selection.
+        boundary_ready="$gate_root/active-compiler-boundary-$index.ready.tsv"
+        boundary_control="$gate_root/active-compiler-boundary-$index.control"
+        boundary_release="$boundary_control/release.tsv"
+        test ! -e "$boundary_ready" -a ! -L "$boundary_ready"
+        test ! -e "$boundary_control" -a ! -L "$boundary_control"
+        set -o noclobber
+        printf 'icefarm-active-compiler-boundary-v1\t%s\t%s\t%s\t%s\n' \
+            "$index" "$BASHPID" "$gate_epoch" "$(date +%s%3N)" \
+            >"$boundary_ready"
+        set +o noclobber
+        boundary_deadline=$((SECONDS + per_job_timeout))
+        while true
+        do
+            if test -e "$boundary_release" -o -L "$boundary_release"
+            then
+                release_payload=$(read_boundary_release "$boundary_control")
+                IFS=$'\t' read -r release_schema release_index release_pid release_ms \
+                    <<<"$release_payload"
+                if test "$release_schema" != icefarm-active-compiler-release-v1 \
+                    -o "$release_index" != "$index" \
+                    -o "$release_pid" != "$BASHPID"
+                then
+                    echo "invalid active-compiler boundary release" >&2
+                    return 75
+                fi
+                case "$release_ms" in
+                    ''|*[!0-9]*|0) echo "invalid active-compiler boundary release time" >&2; return 75 ;;
+                esac
+                break
+            fi
+            if test -e "$boundary_release" -o -L "$boundary_release"
+            then
+                echo "unsafe active-compiler boundary release" >&2
+                return 75
+            fi
+            IFS=$'\t' read -r gate_mode gate_epoch <"$gate_state"
+            case "$gate_mode" in
+                OPEN) ;;
+                QUIESCE|ABORT)
+                    echo "event gate $gate_mode while awaiting active-compiler boundary release" >&2
+                    return 75
+                    ;;
+                *) echo "invalid event gate state while awaiting active-compiler boundary release" >&2; return 75 ;;
+            esac
+            if test "$SECONDS" -ge "$boundary_deadline"
+            then
+                echo "active-compiler boundary release wait expired" >&2
+                return 75
+            fi
+            sleep 0.05
+        done
+    fi
+    mkdir "$job_dir"
     started=$(date +%s%3N)
     strict=()
     job_compiler_args=()
@@ -1225,6 +1317,8 @@ def run_workload(
                 for command in commands:
                     futures.append(executor.submit(transport.invoke, command))
                 dispatch_ready.set()
+                if _active_loss_serial_through(scenario):
+                    events.prepare_active_compiler_boundary(turn)
                 results = [future.result() for future in futures]
             finally:
                 dispatch_ready.set()
@@ -1288,7 +1382,9 @@ def run_workload(
     if primary is not None:
         raise primary
     summaries = [totals[client["name"]] for client in clients]
-    commands = transport.commands[command_offset:]
+    commands = sorted(
+        transport.commands[command_offset:], key=lambda command: command.sequence
+    )
     receipt = {
         "clients": summaries,
         "commands": [command.as_dict() for command in commands],

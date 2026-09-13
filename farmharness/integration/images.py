@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Protocol
@@ -296,10 +297,23 @@ class RecordingTransport:
     def __init__(self, delegate: Recorder | None = None) -> None:
         self.delegate = delegate or SubprocessTransport()
         self.commands: list[PlannedCommand] = []
+        self._commands_lock = threading.Lock()
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
-        self.commands.append(command)
+        # Invocation may be deliberately concurrent with event control.  Keep
+        # the evidence list in the CommandFactory's immutable sequence order,
+        # rather than whichever thread happened to append first.
+        with self._commands_lock:
+            self.commands.append(command)
+            self.commands.sort(key=lambda item: item.sequence)
         return self.delegate.invoke(command)
+
+    def reserve(self, command: PlannedCommand) -> None:
+        """Record a blocking command before dispatching its delegate."""
+
+        with self._commands_lock:
+            self.commands.append(command)
+            self.commands.sort(key=lambda item: item.sequence)
 
 
 class CommandFactory:

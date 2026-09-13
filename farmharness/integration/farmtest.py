@@ -740,6 +740,11 @@ def _planned_commands(
                     f"nofile={F_NOFILE_SOFT}:{F_NOFILE_HARD}",
                 )
             )
+            if scenario.data.get("id") == "S70-b4-scheduler-active-loss":
+                # The active-loss harness latches the compile-worker fork in
+                # kernel ptrace state before the short-lived child can exit.
+                # No other cell receives this fault-observation capability.
+                args.extend(("--cap-add", "SYS_PTRACE"))
             if binding is not None:
                 args.extend(
                     (

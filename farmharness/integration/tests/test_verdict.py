@@ -725,6 +725,104 @@ def test_active_loss_v5_binds_serial_admission_release() -> None:
     )
 
 
+def test_active_loss_v6_binds_zero_skip_capture_to_held_trigger_job() -> None:
+    receipt, event, scenario, plan, farm, images = _active_loss_v3_fixture()
+    plan["run_id"] = "active-loss-v6"
+    event.update(
+        {
+            "event_index": 0,
+            "last_dispatched_job": 2,
+            "trigger": "job 2",
+            "workload_dispatch_count": 2,
+        }
+    )
+    receipt.update(
+        {
+            "schema": "icefarm-scheduler-active-loss-v6",
+            "selection_last_dispatched_job": 2,
+            "admission_release": {
+                "clients": {
+                    "C1": {
+                        "action": "resume",
+                        "active_after": 1,
+                        "active_before": 1,
+                        "client": "C1",
+                        "epoch": 1,
+                        "finished_ms": 201,
+                        "schema": "icefarm-event-gate-v1",
+                        "started_ms": 200,
+                        "status": "OPEN",
+                        "turn": "A",
+                    }
+                },
+                "schema": "icefarm-active-loss-admission-v1",
+                "serial_through": 2,
+            },
+            "capture_boundary": {
+                "arm": {
+                    "capture_mode": "ptrace-fork-v1",
+                    "daemon_pid": receipt["compiler"]["daemon"]["pid"],
+                    "daemon_start_ticks": receipt["compiler"]["daemon"][
+                        "start_ticks"
+                    ],
+                    "pid": 99,
+                    "schema": "icefarm-compiler-capture-arm-v2",
+                    "skip": 0,
+                },
+                "client": "C1",
+                "event_epoch": 1,
+                "event_index": 0,
+                "release": {
+                    "action": "release",
+                    "index": 2,
+                    "pid": 77,
+                    "ready_ms": 100,
+                    "released_ms": 101,
+                    "schema": "icefarm-active-compiler-boundary-control-v1",
+                },
+                "run_id": plan["run_id"],
+                "schema": "icefarm-active-compiler-boundary-v1",
+                "serial_through": 2,
+                "turn": "A",
+                "wait": {
+                    "action": "wait",
+                    "index": 2,
+                    "pid": 77,
+                    "ready_ms": 100,
+                    "schema": "icefarm-active-compiler-boundary-control-v1",
+                },
+            },
+        }
+    )
+    receipt["compiler"]["assignment"]["schema"] = (
+        "icefarm-compiler-assignment-v2"
+    )
+    kwargs = {
+        "readiness_v2": True,
+        "plan": plan,
+        "farm": farm,
+        "images": images,
+    }
+    assert not _scheduler_active_loss_receipt_errors(
+        receipt, event, scenario, **kwargs
+    )
+
+    for path, value in (
+        (("capture_boundary", "arm", "skip"), 1),
+        (("capture_boundary", "release", "pid"), 78),
+        (("capture_boundary", "serial_through"), 3),
+        (("selection_last_dispatched_job",), 3),
+    ):
+        tampered = copy.deepcopy(receipt)
+        cursor = tampered
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        assert _scheduler_active_loss_receipt_errors(
+            tampered, event, scenario, **kwargs
+        ), path
+
+
 def _client_transition_event() -> tuple[dict[str, object], dict[str, object]]:
     scenario = _scenario("S'CF", client_versions=(50,), worker_versions=(43,))
     scenario["timeline"] = [

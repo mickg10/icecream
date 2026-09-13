@@ -138,6 +138,14 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert 'active_count=$(find "$gate_active"' in MANIFEST_DRIVER
     assert 'serial_boundary_released=0' in MANIFEST_DRIVER
     assert 'event release wait expired for serial boundary job' in MANIFEST_DRIVER
+    assert 'active-compiler-boundary-$index.ready.tsv' in MANIFEST_DRIVER
+    assert 'active-compiler-boundary-$index.control' in MANIFEST_DRIVER
+    assert 'boundary_release="$boundary_control/release.tsv"' in MANIFEST_DRIVER
+    assert 'icefarm-active-compiler-boundary-v1' in MANIFEST_DRIVER
+    assert 'icefarm-active-compiler-release-v1' in MANIFEST_DRIVER
+    assert MANIFEST_DRIVER.index('>"$boundary_ready"') < MANIFEST_DRIVER.index(
+        'mkdir "$job_dir"'
+    )
     assert MANIFEST_DRIVER.index('serial_boundary_released=0') < MANIFEST_DRIVER.index(
         '>"$job_dir/result.tsv"'
     )
@@ -254,6 +262,42 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
         capture_output=True,
     )
     assert "scenario.data" not in MANIFEST_DRIVER
+
+
+def test_recording_transport_orders_delayed_concurrent_invocation_by_sequence() -> None:
+    class Delegate:
+        def invoke(self, _command: PlannedCommand) -> CommandResult:
+            return CommandResult(0, "", "")
+
+    transport = RecordingTransport(Delegate())
+    factory = CommandFactory()
+    low = factory.make(
+        phase="low",
+        host="hub",
+        transport="local",
+        timeout_s=1,
+        argv=("true",),
+    )
+    high = factory.make(
+        phase="high",
+        host="hub",
+        transport="local",
+        timeout_s=1,
+        argv=("true",),
+    )
+    release_low = threading.Event()
+
+    thread = threading.Thread(
+        target=lambda: (release_low.wait(timeout=2), transport.invoke(low)),
+        daemon=True,
+    )
+    thread.start()
+    transport.invoke(high)
+    release_low.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert [command.sequence for command in transport.commands] == [0, 1]
 
 
 def test_manifest_driver_relaunch_replaces_oracle_samples_atomically(

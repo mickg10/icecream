@@ -176,7 +176,7 @@ print(json.dumps({
 '''.strip()
 GATE_SCHEMA = "icefarm-event-gate-v1"
 SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v5"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v6"
 SCHEDULER_ACTIVE_LOSS_ADMISSION_SCHEMA = "icefarm-active-loss-admission-v1"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
@@ -192,10 +192,10 @@ CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 ACTIVE_COMPILER_OBSERVE_S = 240
 ACTIVE_COMPILER_COMMAND_GRACE_S = 30
-ACTIVE_COMPILER_ARM_SCHEMA = "icefarm-compiler-capture-arm-v1"
+ACTIVE_COMPILER_ARM_SCHEMA = "icefarm-compiler-capture-arm-v2"
 ACTIVE_COMPILER_CANCEL_SCHEMA = "icefarm-compiler-capture-cancel-v1"
 ACTIVE_COMPILER_STOP_SCRIPT = r'''
-import json, os, pathlib, signal, socket, sys, time
+import ctypes, json, os, pathlib, signal, socket, sys, time
 
 def snap(pid):
     root = pathlib.Path("/proc") / str(pid)
@@ -285,14 +285,12 @@ web_port = int(sys.argv[2])
 skip = int(sys.argv[3])
 armed_path = pathlib.Path(sys.argv[4])
 cancel_path = pathlib.Path(sys.argv[5])
-if skip < 0 or not armed_path.is_absolute() or not cancel_path.is_absolute():
+if skip != 0 or not armed_path.is_absolute() or not cancel_path.is_absolute():
     raise SystemExit("invalid active-compiler capture controls")
 if armed_path.exists() or armed_path.is_symlink() or cancel_path.is_symlink():
     raise SystemExit("active-compiler capture controls already exist or are symlinks")
-# Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
-# sidecars are excluded by: "--generation" not in p["argv"].  Process
-# identity uses readable kernel comm + cmdline + all four UIDs because the
-# privilege-dropped daemon deliberately makes /proc/<pid>/exe unreadable.
+# Process identity uses readable kernel comm + cmdline + all four UIDs because
+# the privilege-dropped daemon deliberately makes /proc/<pid>/exe unreadable.
 initial_items = processes()
 initial_parents = {p["pid"]: p for p in initial_items if is_iceccd(p)}
 initial_candidates = [
@@ -305,103 +303,217 @@ initial_candidates = [
 ]
 if initial_candidates:
     raise SystemExit("active-compiler capture cannot arm over a pre-existing compiler")
-armed = {"pid": os.getpid(), "schema": "icefarm-compiler-capture-arm-v1", "skip": skip}
-descriptor = os.open(armed_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+daemons = [
+    item for item in initial_items
+    if is_iceccd(item)
+    and item["state"] not in {"Z", "X"}
+    and "--generation" not in item["argv"]
+    and item["ppid"] not in initial_parents
+]
+if len(daemons) != 1:
+    raise SystemExit("active-compiler capture requires one authenticated daemon")
+daemon = snap(daemons[0]["pid"])
+if not same_identity(daemon, daemons[0]):
+    raise SystemExit("active-compiler daemon identity changed before arm")
+
+# Linux ptrace fork events stop the new compile worker in-kernel before it can
+# execute or exit.  The client-side boundary means the first authenticated
+# post-arm compile fork is the exact trigger job; no polling ordinal exists.
+PTRACE_CONT = 7
+PTRACE_DETACH = 17
+PTRACE_GETEVENTMSG = 0x4201
+PTRACE_SEIZE = 0x4206
+PTRACE_INTERRUPT = 0x4207
+PTRACE_O_TRACEFORK = 0x00000002
+PTRACE_O_TRACEVFORK = 0x00000004
+PTRACE_O_EXITKILL = 0x00100000
+PTRACE_EVENT_FORK = 1
+PTRACE_EVENT_VFORK = 2
+WAIT_WALL = 0x40000000
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+
+def ptrace(request, pid, address=0, data=0):
+    ctypes.set_errno(0)
+    result = libc.ptrace(
+        ctypes.c_uint(request), ctypes.c_int(pid), ctypes.c_void_p(address),
+        ctypes.c_void_p(data),
+    )
+    if result == -1:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return result
+
+def wait_stopped(pid, bound=2.0):
+    until = time.monotonic() + bound
+    while time.monotonic() < until:
+        waited, status = os.waitpid(pid, os.WNOHANG | WAIT_WALL)
+        if waited == pid:
+            if not os.WIFSTOPPED(status):
+                raise RuntimeError(f"ptrace tracee {pid} did not stop")
+            return status
+        time.sleep(0.002)
+    raise RuntimeError(f"ptrace tracee {pid} stop timed out")
+
+daemon_attached = False
+daemon_running = True
+child_attached = None
+stopped_owned = None
+
+def stop_and_detach_daemon():
+    global daemon_attached, daemon_running
+    if not daemon_attached:
+        return
+    if daemon_running:
+        ptrace(PTRACE_INTERRUPT, daemon["pid"])
+        wait_stopped(daemon["pid"])
+        daemon_running = False
+    ptrace(PTRACE_DETACH, daemon["pid"], 0, 0)
+    daemon_attached = False
+    daemon_running = True
+
 try:
-    os.write(descriptor, (json.dumps(armed, sort_keys=True, separators=(",", ":")) + "\n").encode())
-    os.fsync(descriptor)
-finally:
-    os.close(descriptor)
-seen = set()
-while time.monotonic() < deadline:
-    if cancel_path.exists():
-        print(json.dumps({"schema": "icefarm-compiler-capture-cancel-v1"},
-                         sort_keys=True, separators=(",", ":")), flush=True)
-        raise SystemExit(0)
-    items = processes()
-    parents = {p["pid"]: p for p in items if is_iceccd(p)}
-    candidates = [
-        (parent, child) for child in items
-        for parent in (parents.get(child["ppid"]),)
-        if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
-        and is_iceccd(child)
-        and child["state"] not in {"Z", "X"}
-        and "--generation" not in child["argv"]
-    ]
-    if len(candidates) != 1:
-        time.sleep(0.05)
-        continue
-    daemon, leader = candidates[0]
-    identity = (leader["pid"], leader["start_ticks"])
-    if identity in seen:
-        time.sleep(0.05)
-        continue
-    seen.add(identity)
-    if skip:
-        skip -= 1
-        time.sleep(0.05)
-        continue
-    before_daemon = snap(daemon["pid"])
-    before = snap(leader["pid"])
-    if (before_daemon != daemon or before != leader
-            or not is_iceccd(before_daemon)
-            or not is_iceccd(before)
-            or before["argv"] != before_daemon["argv"]
-            or before["ppid"] != before_daemon["pid"]
-            or before["pid"] != before["pgid"]):
-        time.sleep(0.05)
-        continue
-    os.killpg(before["pgid"], signal.SIGSTOP)
-    stopped_owned = True
+    ptrace(
+        PTRACE_SEIZE, daemon["pid"], 0,
+        PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_EXITKILL,
+    )
+    daemon_attached = True
+except OSError as exc:
+    raise SystemExit(f"active-compiler ptrace capability unavailable: {exc}") from exc
+
+armed = {
+    "capture_mode": "ptrace-fork-v1",
+    "daemon_pid": daemon["pid"],
+    "daemon_start_ticks": daemon["start_ticks"],
+    "pid": os.getpid(),
+    "schema": "icefarm-compiler-capture-arm-v2",
+    "skip": 0,
+}
+try:
+    descriptor = os.open(
+        armed_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
     try:
-        stopped_daemon = None
+        os.write(descriptor, (json.dumps(armed, sort_keys=True, separators=(",", ":")) + "\n").encode())
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+except BaseException as exc:
+    try:
+        stop_and_detach_daemon()
+    except BaseException as detach_exc:
+        raise SystemExit(f"{exc}; daemon detach failed: {detach_exc}") from detach_exc
+    raise
+try:
+    while time.monotonic() < deadline:
+        if cancel_path.exists():
+            stop_and_detach_daemon()
+            print(json.dumps({"schema": "icefarm-compiler-capture-cancel-v1"},
+                             sort_keys=True, separators=(",", ":")), flush=True)
+            raise SystemExit(0)
+        waited, status = os.waitpid(daemon["pid"], os.WNOHANG | WAIT_WALL)
+        if waited == 0:
+            time.sleep(0.002)
+            continue
+        if waited != daemon["pid"] or not os.WIFSTOPPED(status):
+            raise RuntimeError("active-compiler daemon left ptrace control")
+        daemon_running = False
+        event = status >> 16
+        if event not in {PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK}:
+            ptrace(PTRACE_CONT, daemon["pid"], 0, 0)
+            daemon_running = True
+            continue
+        message = ctypes.c_ulong()
+        ptrace(PTRACE_GETEVENTMSG, daemon["pid"], 0, ctypes.addressof(message))
+        child = int(message.value)
+        if child <= 0:
+            raise RuntimeError("ptrace fork event returned no child")
+        child_attached = child
+        wait_stopped(child)
+        ptrace(PTRACE_CONT, daemon["pid"], 0, 0)
+        daemon_running = True
+
+        # serve.cpp sets the compile child's PGID from the parent while the
+        # ptrace child remains stopped.  That transition is the durable,
+        # product-native discriminator from unrelated daemon forks.
+        group_deadline = time.monotonic() + 2
+        while time.monotonic() < group_deadline:
+            try:
+                if os.getpgid(child) == child:
+                    break
+            except ProcessLookupError as exc:
+                raise RuntimeError("ptrace compiler child vanished while held") from exc
+            time.sleep(0.002)
+        else:
+            ptrace(PTRACE_DETACH, child, 0, 0)
+            child_attached = None
+            continue
+
+        before_daemon = snap(daemon["pid"])
+        before = snap(child)
+        if (not same_identity(before_daemon, daemon)
+                or not is_iceccd(before_daemon)
+                or before_daemon["state"] in {"Z", "X"}
+                or not is_iceccd(before)
+                or before["state"] not in {"t", "T"}
+                or before["argv"] != before_daemon["argv"]
+                or before["ppid"] != before_daemon["pid"]
+                or before["pid"] != before["pgid"]
+                or "--generation" in before["argv"]):
+            raise RuntimeError("ptrace fork child failed compile-worker authentication")
+
+        # Detach the child into an ordinary group stop.  Existing event logic
+        # can now prove assignment/listener state and later SIGCONT/SIGKILL it.
+        ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)
+        child_attached = None
+        # Ownership changes at detach, not after a later snapshot.  Every
+        # failure from here must resume this exact ordinary stopped group.
+        stopped_owned = dict(before)
+        stop_and_detach_daemon()
         stopped = None
         stop_deadline = time.monotonic() + 2
         while time.monotonic() < stop_deadline:
-            stopped_daemon = snap(before_daemon["pid"])
             stopped = snap(before["pid"])
-            if (same_identity(stopped_daemon, before_daemon)
-                    and same_identity(stopped, before)
-                    and stopped["state"] in {"T", "t"}):
+            if same_identity(stopped, before) and stopped["state"] in {"T", "t"}:
                 break
-            time.sleep(0.02)
-        if (stopped_daemon is None or stopped is None
-                or not same_identity(stopped_daemon, before_daemon)
-                or not same_identity(stopped, before)
+            time.sleep(0.002)
+        if (stopped is None or not same_identity(stopped, before)
                 or stopped["state"] not in {"T", "t"}):
-            raise SystemExit("compiler group did not stop with its authenticated identity")
-        # Bind the listener/API witness after SIGSTOP.  The exact direct
-        # compiler can otherwise complete during this comparatively slow
-        # HTTP + kernel-socket probe.  Any probe failure remains inside the
-        # fail-safe block and resumes only the unchanged stopped group.
+            raise RuntimeError("compiler did not enter its authenticated group stop")
+        stopped_owned = dict(stopped)
         listener = listener_probe(web_port, before_daemon)
-        print(json.dumps({"daemon": before_daemon, "leader": before, "listener": listener,
-                          "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
-                          "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")),
-              flush=True)
-        stopped_owned = False
-    except BaseException as stop_exc:
+        print(json.dumps({
+            "capture_mode": "ptrace-fork-v1", "daemon": before_daemon,
+            "leader": before, "listener": listener,
+            "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
+            "stopped_ms": time.time_ns() // 1000000,
+        }, sort_keys=True, separators=(",", ":")), flush=True)
+        raise SystemExit(0)
+    raise RuntimeError("no authenticated compiler fork event occurred within bound")
+except SystemExit:
+    raise
+except BaseException as capture_exc:
+    cleanup_errors = []
+    if child_attached is not None:
         try:
-            current = snap(before["pid"])
-            if not same_identity(current, before) or current["state"] not in {"T", "t"}:
-                raise RuntimeError("compiler identity changed before fail-safe release")
-            os.killpg(before["pgid"], signal.SIGCONT)
-            release_deadline = time.monotonic() + 2
-            while time.monotonic() < release_deadline:
-                current = snap(before["pid"])
-                if same_identity(current, before) and current["state"] not in {"T", "t"}:
-                    stopped_owned = False
-                    break
-                time.sleep(0.02)
-            if stopped_owned:
-                raise RuntimeError("compiler group did not resume after fail-safe release")
-        except BaseException as release_exc:
-            raise SystemExit(
-                f"{stop_exc}; compiler group fail-safe release failed: {release_exc}"
-            ) from release_exc
-        raise
-    raise SystemExit(0)
-raise SystemExit("no unique direct compiler group leader became observable within bound")
+            ptrace(PTRACE_DETACH, child_attached, 0, 0)
+        except BaseException as exc:
+            cleanup_errors.append(f"child detach: {exc}")
+    try:
+        stop_and_detach_daemon()
+    except BaseException as exc:
+        cleanup_errors.append(f"daemon detach: {exc}")
+    if stopped_owned is not None:
+        try:
+            current = snap(stopped_owned["pid"])
+            if (not same_identity(current, stopped_owned)
+                    or current["state"] not in {"T", "t"}):
+                raise RuntimeError("held compiler identity changed before cleanup")
+            os.killpg(stopped_owned["pgid"], signal.SIGCONT)
+        except BaseException as exc:
+            cleanup_errors.append(f"held compiler release: {exc}")
+    suffix = "" if not cleanup_errors else "; cleanup failed: " + ", ".join(cleanup_errors)
+    raise SystemExit(f"{capture_exc}{suffix}") from capture_exc
 '''.strip()
 
 ACTIVE_COMPILER_ARM_WAIT_SCRIPT = r'''
@@ -416,14 +528,135 @@ while time.monotonic() < deadline:
         time.sleep(0.02)
         continue
     if (not isinstance(value, dict)
-            or set(value) != {"pid", "schema", "skip"}
-            or value.get("schema") != "icefarm-compiler-capture-arm-v1"
+            or set(value) != {"capture_mode", "daemon_pid", "daemon_start_ticks", "pid", "schema", "skip"}
+            or value.get("schema") != "icefarm-compiler-capture-arm-v2"
+            or value.get("capture_mode") != "ptrace-fork-v1"
+            or type(value.get("daemon_pid")) is not int or value["daemon_pid"] <= 0
+            or type(value.get("daemon_start_ticks")) is not int or value["daemon_start_ticks"] <= 0
             or type(value.get("pid")) is not int or value["pid"] <= 0
             or value.get("skip") != expected_skip):
         raise SystemExit("active-compiler capture arm receipt is invalid")
     print(json.dumps(value, sort_keys=True, separators=(",", ":")), flush=True)
     raise SystemExit(0)
 raise SystemExit("active-compiler capture did not arm within bound")
+'''.strip()
+
+ACTIVE_COMPILER_BOUNDARY_SCRIPT = r'''
+import json, os, pathlib, re, stat, sys, time
+
+action, root_arg, index_arg, timeout_arg = sys.argv[1:]
+root = pathlib.Path(root_arg)
+index = int(index_arg)
+timeout_s = float(timeout_arg)
+if action not in {"wait", "release"} or not root.is_absolute() or index < 1 or timeout_s <= 0:
+    raise SystemExit("invalid active-compiler boundary controls")
+gate = root / "event-gate"
+ready_path = gate / f"active-compiler-boundary-{index}.ready.tsv"
+control_path = gate / f"active-compiler-boundary-{index}.control"
+active_path = gate / "active"
+state_path = gate / "state.tsv"
+
+def read_regular(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        value = os.fstat(descriptor)
+        if (not stat.S_ISREG(value.st_mode) or value.st_nlink != 1
+                or value.st_size > 4096):
+            raise SystemExit(f"unsafe active-compiler boundary file: {path}")
+        payload = os.read(descriptor, 4097)
+        if len(payload) != value.st_size or len(payload) > 4096:
+            raise SystemExit(f"unstable active-compiler boundary file: {path}")
+        return payload.decode("ascii")
+    finally:
+        os.close(descriptor)
+
+def open_control_directory():
+    created = False
+    try:
+        os.mkdir(control_path, 0o755)
+        created = True
+    except FileExistsError:
+        pass
+    descriptor = os.open(
+        control_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        if created:
+            os.fchmod(descriptor, 0o755)
+        value = os.fstat(descriptor)
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != os.geteuid()
+                or stat.S_IMODE(value.st_mode) != 0o755):
+            raise SystemExit("unsafe active-compiler boundary control directory")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+def read_ready():
+    fields = read_regular(ready_path).strip().split("\t")
+    if (len(fields) != 5
+            or fields[0] != "icefarm-active-compiler-boundary-v1"
+            or fields[1] != str(index)
+            or re.fullmatch(r"[1-9][0-9]*", fields[2]) is None
+            or fields[3] != "0"
+            or re.fullmatch(r"[1-9][0-9]*", fields[4]) is None):
+        raise SystemExit("malformed active-compiler boundary receipt")
+    pid = int(fields[2])
+    marker = active_path / f"job-{index}-{pid}.tsv"
+    marker_fields = read_regular(marker).strip().split("\t")
+    if (len(marker_fields) != 4
+            or marker_fields[:3] != [str(index), str(pid), "0"]
+            or re.fullmatch(r"[1-9][0-9]*", marker_fields[3]) is None):
+        raise SystemExit("active-compiler boundary has no exact active marker")
+    if read_regular(state_path) != "OPEN\t0\n":
+        raise SystemExit("active-compiler boundary gate is not OPEN at epoch zero")
+    return pid, int(fields[4])
+
+deadline = time.monotonic() + timeout_s
+if action == "wait":
+    while True:
+        try:
+            pid, ready_ms = read_ready()
+            break
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise SystemExit("active-compiler boundary wait expired")
+            time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+    control_descriptor = open_control_directory()
+    os.close(control_descriptor)
+    document = {
+        "action": action, "index": index, "pid": pid, "ready_ms": ready_ms,
+        "schema": "icefarm-active-compiler-boundary-control-v1",
+    }
+else:
+    pid, ready_ms = read_ready()
+    control_descriptor = open_control_directory()
+    released_ms = time.time_ns() // 1_000_000
+    payload = (
+        f"icefarm-active-compiler-release-v1\t{index}\t{pid}\t{released_ms}\n"
+    ).encode("ascii")
+    try:
+        descriptor = os.open(
+            "release.tsv",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=control_descriptor,
+        )
+        try:
+            os.fchmod(descriptor, 0o644)
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(control_descriptor)
+    finally:
+        os.close(control_descriptor)
+    document = {
+        "action": action, "index": index, "pid": pid, "ready_ms": ready_ms,
+        "released_ms": released_ms,
+        "schema": "icefarm-active-compiler-boundary-control-v1",
+    }
+print(json.dumps(document, sort_keys=True, separators=(",", ":")))
 '''.strip()
 
 ACTIVE_COMPILER_CANCEL_SCRIPT = r'''
@@ -1418,6 +1651,7 @@ class EventProducer:
         self._active_capture_cancel_path: str | None = None
         self._active_capture_claimed = False
         self._active_capture_arm_receipt: dict[str, Any] | None = None
+        self._active_capture_boundary_receipts: dict[str, dict[str, Any]] = {}
         self._preflight_transition_targets()
 
     @property
@@ -1820,6 +2054,11 @@ class EventProducer:
             self._failure_evidence["compiler_capture_arm"] = {
                 "receipt": self._active_capture_arm_receipt,
                 "state": "ARMED",
+            }
+        if self._active_capture_boundary_receipts:
+            self._failure_evidence["compiler_capture_boundary"] = {
+                key: dict(value)
+                for key, value in self._active_capture_boundary_receipts.items()
             }
         self._current_phase = None
 
@@ -3254,6 +3493,137 @@ class EventProducer:
             "turn": turn,
         }
 
+    def _active_compiler_boundary_control(
+        self,
+        client: Mapping[str, Any],
+        *,
+        action: str,
+        turn: str,
+        trigger: int,
+    ) -> dict[str, Any]:
+        if action not in {"wait", "release"}:
+            raise EventError("invalid active compiler boundary action")
+        phase = f"event.scheduler-loss-boundary-{action}"
+        self._current_phase = phase
+        timeout_s = self._command_timeout(
+            maximum=int(self.scenario.data["timeouts"]["turn_s"])
+        )
+        container = f"icefarm-{self.plan['run_id']}-{client['name']}"
+        result = self._invoke(
+            self.factory.make(
+                phase=phase,
+                host=client["host"],
+                instance=client["name"],
+                transport=_docker_transport(self.farm, client["host"]),
+                timeout_s=timeout_s,
+                argv=docker_argv(
+                    self.farm,
+                    client["host"],
+                    (
+                        "exec",
+                        "--user",
+                        "0",
+                        container,
+                        "python3",
+                        "-c",
+                        ACTIVE_COMPILER_BOUNDARY_SCRIPT,
+                        action,
+                        f"/results/workload/{turn}",
+                        str(trigger),
+                        str(max(1, timeout_s - 1)),
+                    ),
+                ),
+            )
+        )
+        try:
+            receipt = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError(
+                f"active compiler boundary {action} returned malformed JSON"
+            ) from exc
+        expected = {"action", "index", "pid", "ready_ms", "schema"}
+        if action == "release":
+            expected.add("released_ms")
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != expected
+            or receipt.get("schema")
+            != "icefarm-active-compiler-boundary-control-v1"
+            or receipt.get("action") != action
+            or receipt.get("index") != trigger
+            or type(receipt.get("pid")) is not int
+            or receipt["pid"] <= 0
+            or type(receipt.get("ready_ms")) is not int
+            or receipt["ready_ms"] <= 0
+            or (
+                action == "release"
+                and (
+                    type(receipt.get("released_ms")) is not int
+                    or receipt["released_ms"] < receipt["ready_ms"]
+                )
+            )
+        ):
+            raise EventError(
+                f"active compiler boundary {action} returned an invalid receipt"
+            )
+        return dict(receipt)
+
+    def prepare_active_compiler_boundary(self, turn: str) -> None:
+        """Bind the active-loss observer to the held trigger job, then release it."""
+
+        active = [
+            event
+            for event in self.events
+            if event.action == "scheduler-loss-active"
+        ]
+        if not active:
+            return
+        if len(active) != 1 or active[0].trigger.kind != "job":
+            raise EventError("active scheduler loss boundary requires one job event")
+        with self._lock:
+            active_turn = self._active_turn
+        if active_turn != turn:
+            raise EventError("active scheduler loss boundary has no matching active turn")
+        trigger = int(active[0].trigger.value)
+        client_names = set(self.scenario.data["workload"]["clients"])
+        clients = [
+            item
+            for item in self.plan["topology"]["instances"]
+            if item["role"] == "C" and item["name"] in client_names
+        ]
+        if len(clients) != 1 or {clients[0]["name"]} != client_names:
+            raise EventError(
+                "active scheduler loss boundary requires exactly one workload client"
+            )
+        client = clients[0]
+        try:
+            waited = self._active_compiler_boundary_control(
+                client, action="wait", turn=turn, trigger=trigger
+            )
+            self._active_capture_boundary_receipts["wait"] = waited
+            self._prepare_active_compiler_capture()
+            released = self._active_compiler_boundary_control(
+                client, action="release", turn=turn, trigger=trigger
+            )
+            if released["pid"] != waited["pid"] or released["ready_ms"] != waited["ready_ms"]:
+                raise EventError("active compiler boundary identity changed before release")
+            self._active_capture_boundary_receipts["release"] = released
+        except BaseException as exc:
+            self._mark_failure(self._current_phase, exc)
+            try:
+                self._gate_control(
+                    client,
+                    action="abort",
+                    turn=turn,
+                    epoch=1,
+                    timeout_s=max(2, min(30, int(self.scenario.data["timeouts"]["turn_s"]))),
+                )
+            except BaseException as abort_exc:
+                raise EventError(
+                    f"{exc}; active compiler boundary abort failed: {abort_exc}"
+                ) from abort_exc
+            raise
+
     def _prepare_active_compiler_capture(self) -> None:
         active = [
             event
@@ -3321,7 +3691,7 @@ class EventProducer:
                     ACTIVE_COMPILER_STOP_SCRIPT,
                     str(ACTIVE_COMPILER_OBSERVE_S),
                     str(web_port),
-                    str(trigger - 1),
+                    "0",
                     armed_path,
                     cancel_path,
                 ),
@@ -3330,7 +3700,7 @@ class EventProducer:
         # Record before submitting so the immutable command list remains in
         # sequence order even though this one intentionally blocks while the
         # workload starts in another thread.
-        self.recorder.commands.append(capture)
+        self.recorder.reserve(capture)
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(self.recorder.delegate.invoke, capture)
         self._active_capture_executor = executor
@@ -3359,7 +3729,7 @@ class EventProducer:
                         "-c",
                         ACTIVE_COMPILER_ARM_WAIT_SCRIPT,
                         armed_path,
-                        str(trigger - 1),
+                        "0",
                         "8",
                     ),
                 ),
@@ -3371,11 +3741,24 @@ class EventProducer:
             raise EventError("active compiler capture returned malformed arm receipt") from exc
         if (
             not isinstance(receipt, dict)
-            or set(receipt) != {"pid", "schema", "skip"}
+            or set(receipt)
+            != {
+                "capture_mode",
+                "daemon_pid",
+                "daemon_start_ticks",
+                "pid",
+                "schema",
+                "skip",
+            }
             or receipt.get("schema") != ACTIVE_COMPILER_ARM_SCHEMA
+            or receipt.get("capture_mode") != "ptrace-fork-v1"
+            or type(receipt.get("daemon_pid")) is not int
+            or receipt["daemon_pid"] <= 0
+            or type(receipt.get("daemon_start_ticks")) is not int
+            or receipt["daemon_start_ticks"] <= 0
             or type(receipt.get("pid")) is not int
             or receipt["pid"] <= 0
-            or receipt.get("skip") != trigger - 1
+            or receipt.get("skip") != 0
         ):
             raise EventError("active compiler capture returned invalid arm receipt")
         self._active_capture_arm_receipt = dict(receipt)
@@ -3583,12 +3966,12 @@ class EventProducer:
             or not scheduler_before["started_at"]
         ):
             raise EventError("scheduler container identity changed before active loss")
-        # This selector was synchronously armed before the workload command was
-        # allowed to start.  It ignored exactly trigger-1 distinct workload
-        # compiler identities and stopped the trigger compiler locally inside
-        # F's PID namespace.  Taking that already-stopped result after the
-        # scheduler log exposes job N removes the impossible post-trigger SSH
-        # race without weakening the requirement for a real active compiler.
+        # The workload held its exact trigger wrapper before invoking icecc.
+        # After authenticating that boundary, the owner armed this zero-skip
+        # selector inside F and released only that wrapper.  Taking the
+        # already-stopped result after the scheduler log exposes job N removes
+        # both ordinal-observation and post-trigger SSH races without weakening
+        # the requirement for a real active compiler.
         result, worker_before = self._take_active_compiler_capture(event, worker)
         compiler: dict[str, Any] | None = None
         stopped_identity: dict[str, Any] | None = None
@@ -3609,6 +3992,7 @@ class EventProducer:
             if (
                 not isinstance(compiler, dict)
                 or compiler.get("schema") != "icefarm-compiler-group-stop-v1"
+                or compiler.get("capture_mode") != "ptrace-fork-v1"
             ):
                 raise EventError(
                     "compiler-group authentication did not return its exact schema"
@@ -3966,9 +4350,33 @@ class EventProducer:
         }
         if worker_identity != worker_after_identity:
             raise EventError("F authority changed across scheduler active loss")
+        boundary_wait = self._active_capture_boundary_receipts.get("wait")
+        boundary_release = self._active_capture_boundary_receipts.get("release")
+        boundary_arm = self._active_capture_arm_receipt
+        trigger = int(event.trigger.value)
+        if (
+            len(clients) != 1
+            or not isinstance(boundary_wait, Mapping)
+            or not isinstance(boundary_release, Mapping)
+            or not isinstance(boundary_arm, Mapping)
+        ):
+            raise EventError("scheduler active loss lacks its capture boundary authority")
+        capture_boundary = {
+            "arm": dict(boundary_arm),
+            "client": clients[0]["name"],
+            "event_epoch": epoch,
+            "event_index": event.index,
+            "release": dict(boundary_release),
+            "run_id": self.plan["run_id"],
+            "schema": "icefarm-active-compiler-boundary-v1",
+            "serial_through": trigger,
+            "turn": turn,
+            "wait": dict(boundary_wait),
+        }
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
             "before": {"container_id": scheduler_before["id"], "started_at": scheduler_before["started_at"]},
+            "capture_boundary": capture_boundary,
             "compiler": {
                 "container_id": worker_before["id"], "daemon": parent, "leader": leader,
                 "stopped": stopped, "group_gone": group_gone,
@@ -5592,7 +6000,6 @@ class EventProducer:
         ):
             reader = self.job_reader or self._remote_job_reader
             self._baseline_dispatches = parse_scheduler_dispatches(reader())
-        self._prepare_active_compiler_capture()
         self._thread = threading.Thread(target=self._run, name="icefarm-events")
         self._thread.start()
 

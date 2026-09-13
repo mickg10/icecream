@@ -132,7 +132,8 @@ SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V2 = "icefarm-scheduler-active-loss-v2"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V3 = "icefarm-scheduler-active-loss-v3"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V4 = "icefarm-scheduler-active-loss-v4"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v5"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V5 = "icefarm-scheduler-active-loss-v5"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v6"
 SCHEDULER_ACTIVE_LOSS_ADMISSION_SCHEMA = "icefarm-active-loss-admission-v1"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
@@ -2008,10 +2009,16 @@ def _validate_scheduler_active_loss_receipt(
         raise CollectError(f"{prefix} needs authenticated farm, plan, and evidence")
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
     schema = receipt.get("schema") if isinstance(receipt, Mapping) else None
-    if schema in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}:
+    if schema in {
+        SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
+        SCHEDULER_ACTIVE_LOSS_SCHEMA_V5,
+        SCHEDULER_ACTIVE_LOSS_SCHEMA,
+    }:
         required.add("selection_last_dispatched_job")
-    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+    if schema in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V5, SCHEDULER_ACTIVE_LOSS_SCHEMA}:
         required.add("admission_release")
+    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        required.add("capture_boundary")
     if (
         not isinstance(receipt, Mapping)
         or set(receipt) != required
@@ -2021,6 +2028,7 @@ def _validate_scheduler_active_loss_receipt(
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V2,
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V5,
             SCHEDULER_ACTIVE_LOSS_SCHEMA,
         }
     ):
@@ -2029,11 +2037,12 @@ def _validate_scheduler_active_loss_receipt(
     listener_v3 = receipt.get("schema") in {
         SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
         SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
+        SCHEDULER_ACTIVE_LOSS_SCHEMA_V5,
         SCHEDULER_ACTIVE_LOSS_SCHEMA,
     }
     if receipt.get("action") != event.get("action") or receipt.get("instance") != event.get("instance") or receipt.get("event_epoch") != event.get("event_epoch") or receipt.get("turn") not in scenario.data["workload"]["turns"]:
         raise CollectError(f"{prefix} is not bound to its timeline event")
-    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+    if schema in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V5, SCHEDULER_ACTIVE_LOSS_SCHEMA}:
         admission = receipt.get("admission_release")
         expected_clients = scenario.data["workload"].get("clients")
         trigger = re.fullmatch(r"job ([1-9][0-9]*)", str(event.get("trigger", "")))
@@ -2086,9 +2095,88 @@ def _validate_scheduler_active_loss_receipt(
                     break
         if not admission_valid:
             raise CollectError(f"{prefix} has no exact serialized admission release")
+    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        boundary = receipt.get("capture_boundary")
+        trigger = re.fullmatch(r"job ([1-9][0-9]*)", str(event.get("trigger", "")))
+        expected_clients = scenario.data["workload"].get("clients")
+        arm = boundary.get("arm") if isinstance(boundary, Mapping) else None
+        waited = boundary.get("wait") if isinstance(boundary, Mapping) else None
+        released = boundary.get("release") if isinstance(boundary, Mapping) else None
+        wait_fields = {"action", "index", "pid", "ready_ms", "schema"}
+        release_fields = wait_fields | {"released_ms"}
+        boundary_valid = (
+            isinstance(boundary, Mapping)
+            and set(boundary)
+            == {
+                "arm", "client", "event_epoch", "event_index", "release",
+                "run_id", "schema", "serial_through", "turn", "wait",
+            }
+            and boundary.get("schema") == "icefarm-active-compiler-boundary-v1"
+            and trigger is not None
+            and boundary.get("serial_through") == int(trigger.group(1))
+            and boundary.get("event_epoch") == event.get("event_epoch")
+            and boundary.get("event_index") == index
+            and boundary.get("run_id") == plan.get("run_id")
+            and boundary.get("turn") == receipt.get("turn")
+            and isinstance(expected_clients, list)
+            and len(expected_clients) == 1
+            and boundary.get("client") == expected_clients[0]
+            and isinstance(arm, Mapping)
+            and set(arm)
+            == {
+                "capture_mode", "daemon_pid", "daemon_start_ticks", "pid",
+                "schema", "skip",
+            }
+            and arm.get("schema") == "icefarm-compiler-capture-arm-v2"
+            and arm.get("capture_mode") == "ptrace-fork-v1"
+            and type(arm.get("daemon_pid")) is int
+            and arm["daemon_pid"] > 0
+            and type(arm.get("daemon_start_ticks")) is int
+            and arm["daemon_start_ticks"] > 0
+            and type(arm.get("pid")) is int
+            and arm["pid"] > 0
+            and arm.get("skip") == 0
+            and isinstance(waited, Mapping)
+            and set(waited) == wait_fields
+            and waited.get("schema")
+            == "icefarm-active-compiler-boundary-control-v1"
+            and waited.get("action") == "wait"
+            and waited.get("index") == boundary.get("serial_through")
+            and type(waited.get("pid")) is int
+            and waited["pid"] > 0
+            and type(waited.get("ready_ms")) is int
+            and waited["ready_ms"] > 0
+            and isinstance(released, Mapping)
+            and set(released) == release_fields
+            and released.get("schema")
+            == "icefarm-active-compiler-boundary-control-v1"
+            and released.get("action") == "release"
+            and released.get("index") == waited.get("index")
+            and released.get("pid") == waited.get("pid")
+            and released.get("ready_ms") == waited.get("ready_ms")
+            and type(released.get("released_ms")) is int
+            and released["released_ms"] >= waited["ready_ms"]
+            and event.get("workload_dispatch_count") == int(trigger.group(1))
+            and receipt.get("lost_scheduler_job") == event.get("last_dispatched_job")
+            and receipt.get("selection_last_dispatched_job")
+            == receipt.get("lost_scheduler_job")
+            and isinstance(receipt.get("compiler"), Mapping)
+            and isinstance(receipt["compiler"].get("daemon"), Mapping)
+            and arm.get("daemon_pid") == receipt["compiler"]["daemon"].get("pid")
+            and arm.get("daemon_start_ticks")
+            == receipt["compiler"]["daemon"].get("start_ticks")
+        )
+        if not boundary_valid:
+            raise CollectError(
+                f"{prefix} has no exact active compiler capture boundary"
+            )
     v4_boundary_valid = (
         receipt.get("schema")
-        in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}
+        in {
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V5,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA,
+        }
         and type(receipt.get("selection_last_dispatched_job")) is int
         and receipt["selection_last_dispatched_job"] > 0
         and receipt["selection_last_dispatched_job"]
@@ -2100,7 +2188,11 @@ def _validate_scheduler_active_loss_receipt(
     )
     legacy_boundary_valid = (
         receipt.get("schema")
-        not in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}
+        not in {
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V5,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA,
+        }
         and receipt.get("lost_scheduler_job") == event.get("last_dispatched_job")
     )
     if (type(receipt.get("lost_scheduler_generation")) is not int or receipt["lost_scheduler_generation"] <= 0
@@ -2275,7 +2367,11 @@ def _validate_scheduler_active_loss_receipt(
             != (
                 "icefarm-compiler-assignment-v2"
                 if receipt.get("schema")
-                in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}
+                in {
+                    SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
+                    SCHEDULER_ACTIVE_LOSS_SCHEMA_V5,
+                    SCHEDULER_ACTIVE_LOSS_SCHEMA,
+                }
                 else "icefarm-compiler-assignment-v1"
             )
             or assignment.get("child", {}).get("pid") != leader.get("pid")
