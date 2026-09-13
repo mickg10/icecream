@@ -1481,6 +1481,7 @@ def _s70_b5_bundle() -> dict[str, object]:
     scheduler["env"].pop("ICECC_P50_PROFILE")
     worker = next(item for item in scenario["instances"] if item["role"] == "F")
     worker["image"] = "new"
+    scenario["instances"].insert(2, _instance("F2", "F", 50))
 
     observed["action"] = "env_set"
     observed["trigger"] = "job 1"
@@ -1495,14 +1496,101 @@ def _s70_b5_bundle() -> dict[str, object]:
 
     rows = [
         _row(1),
-        _row(2, tail=False, outcome="none"),
-        _row(3, profile="ZSTD_TU"),
+        _row(2, worker="F2", profile="ZSTD_TU"),
+        _row(3, worker="F2", profile="ZSTD_TU"),
     ]
     rows[1]["event_epoch"] = 1
     rows[1]["retries"] = 1
     rows[2]["event_epoch"] = 1
     observations = _observations(rows)
-    observations["error106_job_ids"] = ["2"]
+    observations["error106_job_ids"] = []
+    observations["assignment_lifecycle"][1]["attempts"] = [
+        {
+            "generation": 1,
+            "scheduler_job": 20,
+            "terminal": "cancellation",
+            "worker": "F1",
+        },
+        {
+            "generation": 1,
+            "scheduler_job": 21,
+            "terminal": "completion",
+            "worker": "F2",
+        },
+    ]
+    observations["job_lifecycle"][1].update(
+        first_dispatch_ms=100,
+        final_dispatch_ms=101,
+    )
+    observations["f_init"] = {
+        "instances": [
+            {
+                "host": "h1",
+                "init": True,
+                "inspect_sha256": SHA_A,
+                "instance": "F1",
+            },
+            {
+                "host": "h2",
+                "init": True,
+                "inspect_sha256": SHA_A,
+                "instance": "F2",
+            },
+        ],
+        "schema": "icefarm-f-init-v1",
+    }
+    observations["failed_p50_source_transfers"] = {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 11,
+                "assignment_identity_line": 6,
+                "assignment_line": 7,
+                "assignment_nonce": 21,
+                "attempt_index": 0,
+                "c_guid": 31,
+                "compile_identity_present": False,
+                "error": 0x5001,
+                "failed_endpoint": "10.0.27.101:23003",
+                "failure_line": 11,
+                "profile": "P29V1",
+                "retry_assignment_epoch": 11,
+                "retry_assignment_identity_line": 16,
+                "retry_assignment_line": 17,
+                "retry_assignment_nonce": 22,
+                "retry_c_guid": 31,
+                "retry_endpoint": "10.0.27.56:23004",
+                "retry_line": 12,
+                "retry_scheduler_job": 21,
+                "retry_tu_seq": 42,
+                "row_job_id": "2",
+                "scheduler_job": 20,
+                "source_result_present": False,
+                "source_result_status": 3,
+                "status": 2,
+                "transfer_attempts": 0,
+                "tu_seq": 41,
+                "worker": "F1",
+            }
+        ],
+    }
+    observations["successful_strict_p50_retry_bindings"] = [
+        {
+            "failure_reason": "source-transfer-loss",
+            "final_dispatch_ms": 101,
+            "final_generation": 1,
+            "final_scheduler_job": 21,
+            "final_terminal_ms": 125,
+            "final_worker": "F2",
+            "first_dispatch_ms": 100,
+            "first_generation": 1,
+            "first_scheduler_job": 20,
+            "first_terminal": "cancellation",
+            "first_terminal_ms": 200,
+            "first_worker": "F1",
+            "job_id": "2",
+        }
+    ]
     observations["p29_interner_faults"] = [
         {
             "client_instance": "C1",
@@ -1512,6 +1600,27 @@ def _s70_b5_bundle() -> dict[str, object]:
         }
     ]
     bundle = _bundle(scenario, rows, observations)
+    bundle["launch_contract"] = "icefarm-f-init-launch-v1"
+    bundle["plan"] = {
+        "launch_contract": "icefarm-f-init-launch-v1",
+        "ports": {"instances": {"F1": 23003, "F2": 23004}},
+        "topology": {
+            "instances": [
+                {
+                    "address": "10.0.27.101",
+                    "host": "h1",
+                    "name": "F1",
+                    "role": "F",
+                },
+                {
+                    "address": "10.0.27.56",
+                    "host": "h2",
+                    "name": "F2",
+                    "role": "F",
+                },
+            ]
+        },
+    }
     bundle["event_log"] = [observed]
     return bundle
 
@@ -1529,7 +1638,14 @@ def test_s70_b5_interner_fault_downgrades_later_rows_to_zstd_tu() -> None:
         "duplicate_fault",
         "wrong_client",
         "p29_after",
-        "error_tail",
+        "controlled_no_tail",
+        "missing_source_transfer",
+        "duplicate_source_transfer",
+        "wrong_source_error",
+        "wrong_source_result_status",
+        "missing_retry_binding",
+        "extra_error106",
+        "extra_retry",
         "explicit_profile",
         "pause_not_active",
     ),
@@ -1547,11 +1663,33 @@ def test_s70_b5_fault_evidence_and_row_law_fail_closed(mutation: str) -> None:
     elif mutation == "p29_after":
         fixture["rows"][2]["tail_profile"] = "P29V1"
         fixture["rows"][2]["reuse"] = True
-    elif mutation == "error_tail":
-        fixture["rows"][1]["tail_present"] = True
-        fixture["rows"][1]["tail_profile"] = "P29V1"
-        fixture["rows"][1]["session_outcome"] = "committed"
-        fixture["rows"][1]["reuse"] = True
+    elif mutation == "controlled_no_tail":
+        fixture["rows"][1]["tail_present"] = False
+        fixture["rows"][1]["tail_profile"] = None
+        fixture["rows"][1]["session_outcome"] = "none"
+    elif mutation == "missing_source_transfer":
+        fixture["observations"]["failed_p50_source_transfers"] = {
+            "record_count": 0,
+            "records": [],
+        }
+    elif mutation == "duplicate_source_transfer":
+        source = fixture["observations"]["failed_p50_source_transfers"]
+        source["records"].append(copy.deepcopy(source["records"][0]))
+        source["record_count"] = 2
+    elif mutation == "wrong_source_error":
+        fixture["observations"]["failed_p50_source_transfers"]["records"][0][
+            "error"
+        ] = 4
+    elif mutation == "wrong_source_result_status":
+        fixture["observations"]["failed_p50_source_transfers"]["records"][0][
+            "source_result_status"
+        ] = 4
+    elif mutation == "missing_retry_binding":
+        fixture["observations"]["successful_strict_p50_retry_bindings"] = []
+    elif mutation == "extra_error106":
+        fixture["observations"]["error106_job_ids"] = ["2"]
+    elif mutation == "extra_retry":
+        fixture["rows"][1]["retries"] = 2
     elif mutation == "pause_not_active":
         fixture["event_log"][0]["receipt"]["coordination"]["clients"]["C1"][
             "active_before"
@@ -2600,6 +2738,20 @@ def test_s70_b4_source_transfer_loss_is_recovered_by_exact_strict_retry() -> Non
     fixture = _s70_b4_worker_source_transfer_recovery_bundle()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+
+
+def test_source_transfer_allows_late_scheduler_cancellation_settlement() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    binding["first_terminal_ms"] = binding["final_terminal_ms"] + 1
+
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture,
+        fixture["observations"],
+        fixture["rows"],
+    )
+    assert authenticated == {binding["job_id"]}
+    assert bad == set()
 
 
 def _s70_b4_worker_uncommitted_transport_recovery_bundle() -> dict[str, object]:

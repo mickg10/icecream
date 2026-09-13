@@ -28,7 +28,7 @@ try:
     from .remote import PlannedCommand, RemoteError, docker_argv
     from .scenario_spec import ScenarioSpec
     from .schema_validation import canonical_bytes
-    from .verdict import BUNDLE_SCHEMA, ROW_SCHEMA
+    from .verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
 except ImportError:  # Direct execution from this directory.
     from farm_spec import FarmSpec
     from images import CommandFactory, RecordingTransport
@@ -44,7 +44,7 @@ except ImportError:  # Direct execution from this directory.
     from remote import PlannedCommand, RemoteError, docker_argv
     from scenario_spec import ScenarioSpec
     from schema_validation import canonical_bytes
-    from verdict import BUNDLE_SCHEMA, ROW_SCHEMA
+    from verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
 
 
 SOURCE_RESULT_SCHEMA = "icecream-p50-source-result-v2"
@@ -801,6 +801,45 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
             raise CollectError(f"{path}: duplicate source result for assignment {key}")
         records[key] = item
     return records
+
+
+def _source_result_status(
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    identity: tuple[int, int, int],
+    *,
+    context: str,
+    expected_attempts: int | None = None,
+    expected_profile: str | None = None,
+    row_job_id: str,
+) -> int | None:
+    """Distinguish a committed result from a parsed failure diagnostic.
+
+    The product writes ``source-result`` records for both committed transfers
+    (status zero) and terminal noncommitted attempts (nonzero status).  The
+    latter is positive failure evidence and must not be mistaken for a source
+    commit.  Real records have already passed :func:`_source_results`; the
+    explicit type check keeps direct helper callers fail closed as well.
+    """
+
+    if identity not in source_results:
+        return None
+    result = source_results[identity]
+    status = result.get("status") if isinstance(result, Mapping) else None
+    if type(status) is not int or not 0 <= status <= 7:
+        raise CollectError(
+            f"{row_job_id}: {context} source-result status is malformed"
+        )
+    if status != 0 and (
+        expected_profile is not None
+        and result.get("profile") != expected_profile
+        or expected_attempts is not None
+        and result.get("attempts") != expected_attempts
+    ):
+        raise CollectError(
+            f"{row_job_id}: {context} source-result diagnostic disagrees with "
+            "the client failure marker"
+        )
+    return status
 
 
 def _source_candidates_for_assignment(
@@ -4667,6 +4706,14 @@ def _source_transfer_failure_observation(
         assignment_identity["assignment_nonce"],
     )
     worker = str(assignment.get("worker", ""))
+    source_result_status = _source_result_status(
+        source_results,
+        identity,
+        context="source-transfer loss",
+        expected_attempts=transfer_attempts,
+        expected_profile=failure.group(1),
+        row_job_id=row_job_id,
+    )
     if (
         assignment_identity["scheduler_job"] != assignment.get("scheduler_job")
         or retry_identity["scheduler_job"] != retry_assignment.get("scheduler_job")
@@ -4690,7 +4737,7 @@ def _source_transfer_failure_observation(
         or failed_endpoint != assignment.get("endpoint")
         or retry_assignment.get("endpoint") == failed_endpoint
         or not worker
-        or identity in source_results
+        or source_result_status == 0
         or identity in compile_identities
     ):
         raise CollectError(
@@ -4721,6 +4768,7 @@ def _source_transfer_failure_observation(
         "row_job_id": row_job_id,
         "scheduler_job": assignment["scheduler_job"],
         "source_result_present": False,
+        "source_result_status": source_result_status,
         "status": status,
         "transfer_attempts": transfer_attempts,
         "tu_seq": assignment_identity["tu_seq"],
@@ -4822,6 +4870,12 @@ def _uncommitted_transport_failure_observation(
         retry_identity["assignment_nonce"],
     )
     worker = str(assignment.get("worker", ""))
+    source_result_status = _source_result_status(
+        source_results,
+        identity,
+        context="transport loss",
+        row_job_id=row_job_id,
+    )
     if (
         assignment_identity["scheduler_job"] != assignment.get("scheduler_job")
         or retry_identity["scheduler_job"] != retry_assignment.get("scheduler_job")
@@ -4839,7 +4893,7 @@ def _uncommitted_transport_failure_observation(
         or failed_endpoint != assignment.get("endpoint")
         or retry_assignment.get("endpoint") == failed_endpoint
         or not worker
-        or identity in source_results
+        or source_result_status == 0
         or identity in compile_identities
         or any(PROFILE_RE.search(line) is not None for _, line in scoped_lines)
     ):
@@ -4872,6 +4926,7 @@ def _uncommitted_transport_failure_observation(
         "row_job_id": row_job_id,
         "scheduler_job": assignment["scheduler_job"],
         "source_result_present": False,
+        "source_result_status": source_result_status,
         "tu_seq": assignment_identity["tu_seq"],
         "worker": worker,
     }
@@ -7196,6 +7251,13 @@ def _observations(
             and first["terminal"] == "process-loss-recovery"
             else None
         )
+        b5_zstd_tu_retry = (
+            scenario.data.get("expect", {}).get("engagement")
+            == S70_B5_ENGAGEMENT
+            and retry_failure_reason == "source-transfer-loss"
+            and len(source_transfer_failures) == 1
+            and source_transfer_failures[0].get("error") == 0x5001
+        )
         if (
             raw["compile_rc"] == 0
             and raw["exact"] == 1
@@ -7204,7 +7266,8 @@ def _observations(
             and row["exact"] is True
             and row["retries"] == 1
             and row["tail_present"] is True
-            and row["tail_profile"] == "P29V1"
+            and row["tail_profile"]
+            == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
             and row["session_outcome"] == "committed"
             and len(records) == 2
             and final["terminal"] == "completion"

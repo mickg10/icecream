@@ -77,6 +77,7 @@ P29_FAULT_ENV = "ICECC_P50_FAULT_INJECTION"
 P29_FAULT_ENV_VALUE = "P29_INTERNER_FAIL_ONCE"
 P29_FAULT_SCHEMA = "icecream-p50-fault-v1"
 P29_FAULT_NAME = "p29-interner-fail-once"
+P29_PERMANENT_PROFILE_UNAVAILABLE = 0x5001
 SESSION_OUTCOMES = frozenset(("committed", "refused", "fallback", "none"))
 TERMINAL_KINDS = frozenset(
     ("completion", "fallback", "cancellation", "process-loss-recovery")
@@ -1051,6 +1052,7 @@ def _authenticated_strict_p50_retry_ids(
         "tu_seq",
         "worker",
     }
+    source_transfer_fields_v2 = source_transfer_fields | {"source_result_status"}
     if isinstance(source_transfer_raw, list):
         for item in source_transfer_raw:
             ordered_lines = (
@@ -1063,7 +1065,10 @@ def _authenticated_strict_p50_retry_ids(
             )
             if (
                 not isinstance(item, Mapping)
-                or set(item) != source_transfer_fields
+                or set(item) not in (
+                    source_transfer_fields,
+                    source_transfer_fields_v2,
+                )
                 or not _is_int(item.get("assignment_epoch"), minimum=1)
                 or not _is_int(item.get("assignment_nonce"), minimum=1)
                 or not _is_int(item.get("attempt_index"))
@@ -1097,6 +1102,14 @@ def _authenticated_strict_p50_retry_ids(
                 or not item["row_job_id"]
                 or not _is_int(item.get("scheduler_job"), minimum=1)
                 or item.get("source_result_present") is not False
+                or (
+                    "source_result_status" in item
+                    and item.get("source_result_status") is not None
+                    and (
+                        not _is_int(item.get("source_result_status"), minimum=1)
+                        or item["source_result_status"] > 7
+                    )
+                )
                 or not _is_int(item.get("status"), minimum=1)
                 or not _is_int(item.get("transfer_attempts"))
                 or not _is_int(item.get("tu_seq"))
@@ -1159,6 +1172,9 @@ def _authenticated_strict_p50_retry_ids(
         "tu_seq",
         "worker",
     }
+    uncommitted_transport_fields_v2 = uncommitted_transport_fields | {
+        "source_result_status"
+    }
     if isinstance(uncommitted_transport_raw, list):
         for item in uncommitted_transport_raw:
             ordered_lines = (
@@ -1171,7 +1187,10 @@ def _authenticated_strict_p50_retry_ids(
             )
             if (
                 not isinstance(item, Mapping)
-                or set(item) != uncommitted_transport_fields
+                or set(item) not in (
+                    uncommitted_transport_fields,
+                    uncommitted_transport_fields_v2,
+                )
                 or not _is_int(item.get("assignment_epoch"), minimum=1)
                 or not _is_int(item.get("assignment_nonce"), minimum=1)
                 or item.get("attempt_index") != 0
@@ -1195,6 +1214,14 @@ def _authenticated_strict_p50_retry_ids(
                 or not item["row_job_id"]
                 or not _is_int(item.get("scheduler_job"), minimum=1)
                 or item.get("source_result_present") is not False
+                or (
+                    "source_result_status" in item
+                    and item.get("source_result_status") is not None
+                    and (
+                        not _is_int(item.get("source_result_status"), minimum=1)
+                        or item["source_result_status"] > 7
+                    )
+                )
                 or not _is_int(item.get("tu_seq"))
                 or not isinstance(item.get("worker"), str)
                 or not item["worker"]
@@ -1413,9 +1440,21 @@ def _authenticated_strict_p50_retry_ids(
                     and _is_int(lifecycle.get("deadline_ms"), minimum=1)
                     and binding["first_terminal_ms"] <= lifecycle["deadline_ms"]
                 )
-                if reason == "uncommitted-transport-loss"
+                if reason in {
+                    "source-transfer-loss",
+                    "uncommitted-transport-loss",
+                }
                 else binding["first_terminal_ms"] <= binding["final_dispatch_ms"]
             )
+        )
+        scenario = bundle.get("scenario")
+        expect = scenario.get("expect") if isinstance(scenario, Mapping) else None
+        b5_zstd_tu_retry = (
+            isinstance(expect, Mapping)
+            and expect.get("engagement") == S70_B5_ENGAGEMENT
+            and reason == "source-transfer-loss"
+            and isinstance(source_transfer, Mapping)
+            and source_transfer.get("error") == P29_PERMANENT_PROFILE_UNAVAILABLE
         )
         valid = (
             job_id not in authenticated
@@ -1442,7 +1481,8 @@ def _authenticated_strict_p50_retry_ids(
             and row.get("retries") == 1
             and row.get("exact") is True
             and row.get("tail_present") is True
-            and row.get("tail_profile") == "P29V1"
+            and row.get("tail_profile")
+            == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
             and row.get("session_outcome") == "committed"
             and row.get("cs") == binding.get("final_worker")
             and first
@@ -5537,16 +5577,26 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     elif engagement_mode == S70_B5_ENGAGEMENT:
         pre_event = [row for row in valid_rows if row["event_epoch"] == 0]
         post_event = [row for row in valid_rows if row["event_epoch"] == 1]
-        error106_raw = observations.get("error106_job_ids")
-        error106_ids = (
-            {_job_id(item, "@error106") for item in error106_raw}
-            if isinstance(error106_raw, list)
-            else {"@observations:error106_job_ids"}
+        source_transfers = observations.get("failed_p50_source_transfers")
+        source_transfer_records = (
+            source_transfers.get("records")
+            if isinstance(source_transfers, Mapping)
+            else None
         )
+        error106_raw = observations.get("error106_job_ids")
+        controlled_ids = {
+            _job_id(item.get("row_job_id"), "@failed-source-transfer")
+            for item in source_transfer_records
+            if isinstance(item, Mapping)
+            and item.get("profile") == "P29V1"
+            and item.get("error") == P29_PERMANENT_PROFILE_UNAVAILABLE
+            and item.get("transfer_attempts") == 0
+            and item.get("source_result_status") == 3
+        } if isinstance(source_transfer_records, list) else set()
         controlled = [
             row
             for row in post_event
-            if _job_id(row["job_id"], "@row") in error106_ids
+            if _job_id(row["job_id"], "@row") in controlled_ids
         ]
         if not pre_event:
             engagement_bad.add("@rows:pre-event")
@@ -5562,19 +5612,29 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 engagement_bad.add(_job_id(row["job_id"], "@row"))
         if (
             not isinstance(error106_raw, list)
-            or len(error106_raw) != 1
-            or len(error106_ids) != 1
+            or error106_raw
+            or not isinstance(source_transfers, Mapping)
+            or not isinstance(source_transfer_records, list)
+            or source_transfers.get("record_count") != 1
+            or len(source_transfer_records) != 1
+            or len(controlled_ids) != 1
             or len(controlled) != 1
+            or strict_retry_bad
+            or strict_retry_ids != controlled_ids
         ):
-            engagement_bad.update(error106_ids or {"@observations:error106_job_ids"})
+            engagement_bad.update(
+                controlled_ids
+                or {"@observations:failed_p50_source_transfers"}
+            )
         else:
             failure = controlled[0]
             if (
-                failure["tail_present"] is not False
-                or failure["tail_profile"] is not None
-                or failure["session_outcome"] != "none"
+                failure["tail_present"] is not True
+                or failure["tail_profile"] != "ZSTD_TU"
+                or failure["session_outcome"] != "committed"
                 or failure["retries"] != 1
                 or failure["exact"] is not True
+                or failure["reuse"] is not None
             ):
                 engagement_bad.add(_job_id(failure["job_id"], "@row"))
         later = [

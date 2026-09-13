@@ -2166,7 +2166,19 @@ def _source_transfer_failure_kwargs(
         )
         for index, assignment in enumerate(assignments)
     ]
-    source_results = {(2, 1, 1): {}} if mutation == "source-result" else {}
+    source_results = (
+        {(2, 1, 1): {"status": 3, "attempts": 0, "profile": "P29V1"}}
+        if mutation == "noncommitted-source-result"
+        else {(2, 1, 1): {"status": 3, "attempts": 0, "profile": "ZSTD_TU"}}
+        if mutation == "noncommitted-source-wrong-profile"
+        else {(2, 1, 1): {"status": 3, "attempts": 1, "profile": "P29V1"}}
+        if mutation == "noncommitted-source-wrong-attempts"
+        else {(2, 1, 1): {"status": 0}}
+        if mutation == "committed-source-result"
+        else {(2, 1, 1): {}}
+        if mutation == "malformed-source-result"
+        else {}
+    )
     return {
         "assignment": assignments[0],
         "assignment_identity": identities[0],
@@ -2201,6 +2213,17 @@ def test_source_transfer_failure_binds_exact_uncommitted_retry_window() -> None:
     assert record["compile_identity_present"] is False
 
 
+def test_source_transfer_failure_accepts_noncommitted_source_result_diagnostic(
+) -> None:
+    record = _source_transfer_failure_observation(
+        **_source_transfer_failure_kwargs(mutation="noncommitted-source-result")
+    )
+
+    assert record is not None
+    assert record["source_result_present"] is False
+    assert record["source_result_status"] == 3
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -2212,7 +2235,10 @@ def test_source_transfer_failure_binds_exact_uncommitted_retry_window() -> None:
         "same-endpoint",
         "wrong-retry-identity",
         "duplicate-first-identity",
-        "source-result",
+        "committed-source-result",
+        "malformed-source-result",
+        "noncommitted-source-wrong-profile",
+        "noncommitted-source-wrong-attempts",
     ),
 )
 def test_source_transfer_failure_authentication_fails_closed(mutation: str) -> None:
@@ -2284,7 +2310,15 @@ def _uncommitted_transport_failure_kwargs(
         )
         for index, assignment in enumerate(assignments)
     ]
-    source_results = {(2, 1, 1): {}} if mutation == "source-result" else {}
+    source_results = (
+        {(2, 1, 1): {"status": 3}}
+        if mutation == "noncommitted-source-result"
+        else {(2, 1, 1): {"status": 0}}
+        if mutation == "committed-source-result"
+        else {(2, 1, 1): {}}
+        if mutation == "malformed-source-result"
+        else {}
+    )
     compile_identities = (
         {(2, 1, 1): {}} if mutation == "compile-identity" else {}
     )
@@ -2320,6 +2354,19 @@ def test_uncommitted_transport_failure_binds_exact_retry_window() -> None:
     assert record["compile_identity_present"] is False
 
 
+def test_uncommitted_transport_failure_accepts_noncommitted_source_diagnostic(
+) -> None:
+    record = _uncommitted_transport_failure_observation(
+        **_uncommitted_transport_failure_kwargs(
+            mutation="noncommitted-source-result"
+        )
+    )
+
+    assert record is not None
+    assert record["source_result_present"] is False
+    assert record["source_result_status"] == 3
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -2332,7 +2379,8 @@ def test_uncommitted_transport_failure_binds_exact_retry_window() -> None:
         "same-endpoint",
         "wrong-retry-identity",
         "duplicate-first-identity",
-        "source-result",
+        "committed-source-result",
+        "malformed-source-result",
         "compile-identity",
         "profile-commit",
     ),

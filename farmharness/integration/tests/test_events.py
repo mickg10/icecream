@@ -4720,14 +4720,54 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
 
     rows = [
         _b5_row(1, epoch=0, profile="P29V1"),
-        _b5_row(2, epoch=1, profile=None, retries=1),
+        _b5_row(2, worker="F2", epoch=1, profile="ZSTD_TU", retries=1),
         _b5_row(3, epoch=1, profile="ZSTD_TU"),
         _b5_row(4, worker="F2", epoch=1, profile="ZSTD_TU"),
     ]
     observations = {
         "cell_wall_ms": 2000,
         "compile_failure_job_ids": [],
-        "error106_job_ids": ["2"],
+        "error106_job_ids": [],
+        "failed_p50_result_identities": {"record_count": 0, "records": []},
+        "failed_p50_source_transfers": {
+            "record_count": 1,
+            "records": [
+                {
+                    "assignment_epoch": 11,
+                    "assignment_identity_line": 6,
+                    "assignment_line": 7,
+                    "assignment_nonce": 21,
+                    "attempt_index": 0,
+                    "c_guid": 31,
+                    "compile_identity_present": False,
+                    "error": 0x5001,
+                    "failed_endpoint": "10.0.27.101:23003",
+                    "failure_line": 11,
+                    "profile": "P29V1",
+                    "retry_assignment_epoch": 11,
+                    "retry_assignment_identity_line": 16,
+                    "retry_assignment_line": 17,
+                    "retry_assignment_nonce": 22,
+                    "retry_c_guid": 31,
+                    "retry_endpoint": "10.0.27.56:23004",
+                    "retry_line": 12,
+                    "retry_scheduler_job": 21,
+                    "retry_tu_seq": 42,
+                    "row_job_id": "2",
+                    "scheduler_job": 20,
+                    "source_result_present": False,
+                    "source_result_status": 3,
+                    "status": 2,
+                    "transfer_attempts": 0,
+                    "tu_seq": 41,
+                    "worker": "F1",
+                }
+            ],
+        },
+        "failed_p50_uncommitted_transports": {
+            "record_count": 0,
+            "records": [],
+        },
         "incomplete_turns": [],
         "job_lifecycle": [
             {
@@ -4739,6 +4779,20 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
                 "turn": "A",
             }
             for index, dispatch_ms in enumerate((0, 1100, 1200, 1300), start=1)
+        ],
+        "assignment_lifecycle": [
+            {
+                "attempts": [
+                    {
+                        "generation": 1,
+                        "scheduler_job": index * 10,
+                        "terminal": "completion",
+                        "worker": row["cs"],
+                    }
+                ],
+                "job_id": row["job_id"],
+            }
+            for index, row in enumerate(rows, start=1)
         ],
         "local_fallback_job_ids": [],
         "logins": [
@@ -4763,16 +4817,61 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
             "F1": {"cache_ports": [24000], "process_count": 1, "sessions": 2},
             "F2": {"cache_ports": [24001], "process_count": 1, "sessions": 1},
         },
+        "successful_strict_p50_retry_bindings": [
+            {
+                "failure_reason": "source-transfer-loss",
+                "final_dispatch_ms": 1101,
+                "final_generation": 1,
+                "final_scheduler_job": 21,
+                "final_terminal_ms": 1125,
+                "final_worker": "F2",
+                "first_dispatch_ms": 1100,
+                "first_generation": 1,
+                "first_scheduler_job": 20,
+                "first_terminal": "cancellation",
+                "first_terminal_ms": 1200,
+                "first_worker": "F1",
+                "job_id": "2",
+            }
+        ],
+        "successful_strict_p50_late_result_bindings": [],
         "wire_revisions": {"C1": 1, "F1": 1, "F2": 1},
     }
+    observations["assignment_lifecycle"][1]["attempts"] = [
+        {
+            "generation": 1,
+            "scheduler_job": 20,
+            "terminal": "cancellation",
+            "worker": "F1",
+        },
+        {
+            "generation": 1,
+            "scheduler_job": 21,
+            "terminal": "completion",
+            "worker": "F2",
+        },
+    ]
+    observations["job_lifecycle"][1].update(
+        first_dispatch_ms=1100,
+        final_dispatch_ms=1101,
+    )
     bundle = {
         "event_log": [event],
         "observations": observations,
+        "plan": {
+            "client_scheduler_readiness_contract": (
+                "icefarm-client-scheduler-readiness-v2"
+            ),
+            "commands": [],
+            "ports": {"instances": {"F1": 23003, "F2": 23004}},
+            "topology": plan["topology"],
+        },
         "rows": rows,
         "scenario": scenario.data,
         "schema": BUNDLE_SCHEMA,
     }
-    assert evaluate_bundle(bundle)["status"] == "PASS"
+    verdict = evaluate_bundle(bundle)
+    assert verdict["status"] == "PASS", verdict
     stale_replacement = json.loads(json.dumps(bundle))
     stale_witness = stale_replacement["event_log"][0]["receipt"][
         "client_readiness"
