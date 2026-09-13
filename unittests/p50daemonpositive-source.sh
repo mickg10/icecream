@@ -31,6 +31,13 @@ contract() {
     require "$candidate" 'scheduler_cache_snapshot_valid = false' &&
     require "$candidate" 'client_accept_batch_limit' &&
     require "$candidate" 'accepted_count < client_accept_batch_limit' &&
+    require "$candidate" 'pending_client_admission_limit' &&
+    require "$candidate" 'pending_remote_admission_limit' &&
+    require "$candidate" 'RLIMIT_NOFILE' &&
+    require "$candidate" 'Service::createChannelAccepted' &&
+    require "$candidate" 'service_pending_client_admissions(pollfds)' &&
+    require "$candidate" 'finish_protocol_admission()' &&
+    require "$candidate" 'ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC' &&
     require "$candidate" 'This phase is admission-only' &&
     require "$candidate" 'O_NONBLOCK' &&
     require "$candidate" 'Accept readiness never suppresses' &&
@@ -58,6 +65,10 @@ if printf '%s\n' "$accept_block" | grep -F 'handle_activity(' >/dev/null; then
     echo 'FAIL: bounded accept phase runs ordinary client activity inline' >&2
     exit 1
 fi
+if printf '%s\n' "$accept_block" | grep -F 'Service::createChannel(acc_fd' >/dev/null; then
+    echo 'FAIL: bounded accept phase synchronously waits for peer protocol' >&2
+    exit 1
+fi
 require "$makefile" 'libp50daemonsidecaradapter.a'
 require "$makefile" 'libp50sidecarlifecycle.a'
 require "$makefile" 'libp50readyadvertisement.a'
@@ -66,7 +77,11 @@ require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
 require "$runtime_test" 'kAdmissionBurstCount = 36'
 require "$runtime_test" 'admission-only batch accepts the full burst before client activity'
+require "$runtime_test" 'remote handshake saturation preserves prompt Unix-client admission'
 require "$runtime_test" 'source-arm owner is acknowledged before CACHE_SESSION'
+require "$runtime_test" 'source-arm acknowledgement bypasses a silent accepted handshake'
+require "$runtime_test" 'silent accepted handshake expires on the preserved bounded lifetime'
+require "$runtime_test" 'orderly shutdown closes a still-pending protocol admission'
 require "$runtime_test" 'authenticated one-shot handoff keeps the adopted session live'
 require "$runtime_test" 'kAuthoritativeSessionCount = 65'
 require "$runtime_test" 'more than 64 sequential authoritative CacheSessions remain accepted'
@@ -125,6 +140,13 @@ for needle in \
     'scheduler_cache_snapshot_valid = false' \
     'client_accept_batch_limit' \
     'accepted_count < client_accept_batch_limit' \
+    'pending_client_admission_limit' \
+    'pending_remote_admission_limit' \
+    'RLIMIT_NOFILE' \
+    'Service::createChannelAccepted' \
+    'service_pending_client_admissions(pollfds)' \
+    'finish_protocol_admission()' \
+    'ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC' \
     'This phase is admission-only' \
     'O_NONBLOCK' \
     'Accept readiness never suppresses' \

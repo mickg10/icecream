@@ -909,6 +909,10 @@ uint64_t icecream_monotonic_msec();
 // How long undelivered deferred output may wait before its peer is treated
 // as dead.  The same budget the historical blocking send granted.
 #define ICECC_DEFERRED_SEND_TIMEOUT_MSEC 30000
+// Historical accepted-channel protocol negotiation allowed one peer this much
+// time. Daemons preserve that per-peer budget without blocking their shared
+// event loop (see Service::createChannelAccepted()).
+#define ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC 15000
 
 // MsgChannel supports backpressure-tolerant sends (SendDeferrable,
 // has_pending_write(), flush_pending()).
@@ -917,6 +921,12 @@ uint64_t icecream_monotonic_msec();
 class MsgChannel
 {
 public:
+    enum class ProtocolAdmissionState : uint8_t {
+        Pending = 0,
+        Ready,
+        Failed,
+    };
+
     enum SendFlags {
         SendBlocking = 1 << 0,
         SendNonBlocking = 1 << 1,
@@ -1112,6 +1122,13 @@ public:
     // error state / at_eof() afterwards).
     bool flush_pending(void);
 
+    // Event-loop admission support. An accepted channel is not an ordinary
+    // client until the complete two-way protocol exchange, including queued
+    // handshake output, has finished. finish_protocol_admission() disables
+    // the handshake-only silent/nonblocking error path before promotion.
+    ProtocolAdmissionState protocol_admission_state(void) const noexcept;
+    bool finish_protocol_admission(void) noexcept;
+
     bool has_msg(void) const
     {
         return eof || instate == HAS_MSG;
@@ -1166,6 +1183,8 @@ public:
 
 protected:
     MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text = false);
+    MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text,
+               bool nonblocking_protocol_handshake);
 
     bool wait_for_protocol();
     bool wait_for_protocol_until(
@@ -1231,6 +1250,7 @@ protected:
     uint32_t inmsglen;
     bool eof;
     bool text_based;
+    bool nonblocking_protocol_handshake;
     // Armed only by a successfully decoded CACHE_SESSION.  It is cleared by
     // any subsequent decode or ordinary send attempt; there is no generic
     // clean-boundary escape.
@@ -1320,6 +1340,12 @@ public:
         std::chrono::milliseconds attempt_budget);
     static MsgChannel *createChannel(const std::string &domain_socket);
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
+    // Daemon accept-side factory: construct and emit the initial protocol
+    // bytes without waiting for the peer. The owning event loop must poll,
+    // progress, deadline, and call finish_protocol_admission() before exposing
+    // the channel to ordinary message handlers.
+    static MsgChannel *createChannelAccepted(
+        int remote_fd, struct sockaddr *, socklen_t);
 };
 
 class Broadcasts

@@ -797,6 +797,100 @@ static void test_eof_and_pending_output_barriers()
     }
 }
 
+static void test_nonblocking_accepted_protocol_admission()
+{
+    int sockets[2] = {-1, -1};
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+            "accepted-protocol socketpair is available");
+    if (sockets[0] < 0 || sockets[1] < 0)
+        return;
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const auto started = std::chrono::steady_clock::now();
+    MsgChannel *accepted = Service::createChannelAccepted(
+        sockets[0], reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    REQUIRE(accepted != nullptr && elapsed < 100,
+            "accepted factory returns without waiting for peer protocol bytes");
+    if (!accepted) {
+        close(sockets[1]);
+        return;
+    }
+    REQUIRE(accepted->protocol_admission_state() ==
+                MsgChannel::ProtocolAdmissionState::Pending,
+            "silent accepted peer remains pending rather than becoming a client");
+
+    std::array<unsigned char, 4> daemon_version{};
+    pollfd offer_poll{sockets[1], POLLIN, 0};
+    const bool offer_ready = poll(&offer_poll, 1, 100) == 1 &&
+        (offer_poll.revents & POLLIN) != 0;
+    const ssize_t version_count = offer_ready
+        ? recv(sockets[1], daemon_version.data(), daemon_version.size(), 0)
+        : -1;
+    REQUIRE(offer_ready &&
+                version_count == static_cast<ssize_t>(daemon_version.size()) &&
+                daemon_version[0] == PROTOCOL_VERSION,
+            "nonblocking accepted factory emits the ordinary protocol offer");
+
+    const std::array<unsigned char, 8> peer_protocol{
+        PROTOCOL_VERSION, 0, 0, 0, PROTOCOL_VERSION, 0, 0, 0};
+    REQUIRE(send(sockets[1], peer_protocol.data(), 2, MSG_NOSIGNAL) == 2,
+            "partial peer protocol prefix is sent");
+    REQUIRE(accepted->read_a_bit() &&
+                accepted->protocol_admission_state() ==
+                    MsgChannel::ProtocolAdmissionState::Pending,
+            "partial peer protocol remains pending after one nonblocking step");
+    REQUIRE(send(sockets[1], peer_protocol.data() + 2,
+                 peer_protocol.size() - 2, MSG_NOSIGNAL) ==
+                static_cast<ssize_t>(peer_protocol.size() - 2),
+            "remaining peer protocol bytes are sent");
+    REQUIRE(accepted->read_a_bit() &&
+                accepted->protocol_admission_state() ==
+                    MsgChannel::ProtocolAdmissionState::Ready,
+            "incremental protocol exchange becomes promotion-ready");
+    REQUIRE(accepted->finish_protocol_admission(),
+            "ready handshake explicitly crosses the client-admission boundary");
+
+    delete accepted;
+    close(sockets[1]);
+
+    int malformed_sockets[2] = {-1, -1};
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, malformed_sockets) == 0,
+            "malformed accepted-protocol socketpair is available");
+    if (malformed_sockets[0] < 0 || malformed_sockets[1] < 0)
+        return;
+    MsgChannel *malformed = Service::createChannelAccepted(
+        malformed_sockets[0], reinterpret_cast<sockaddr *>(&address),
+        sizeof(address));
+    std::array<unsigned char, 4> malformed_offer{};
+    pollfd malformed_poll{malformed_sockets[1], POLLIN, 0};
+    const bool malformed_offer_ready = malformed &&
+        poll(&malformed_poll, 1, 100) == 1 &&
+        (malformed_poll.revents & POLLIN) != 0;
+    if (malformed_offer_ready) {
+        (void)recv(malformed_sockets[1], malformed_offer.data(),
+                   malformed_offer.size(), 0);
+    }
+    const std::array<unsigned char, 4> invalid_protocol{1, 0, 0, 0};
+    const bool invalid_sent = send(
+        malformed_sockets[1], invalid_protocol.data(), invalid_protocol.size(),
+        MSG_NOSIGNAL) == static_cast<ssize_t>(invalid_protocol.size());
+    const auto malformed_started = std::chrono::steady_clock::now();
+    const bool malformed_read = malformed && malformed->read_a_bit();
+    const auto malformed_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - malformed_started).count();
+    REQUIRE(malformed_offer_ready && invalid_sent && !malformed_read &&
+                malformed_elapsed < 100 &&
+                malformed->protocol_admission_state() ==
+                    MsgChannel::ProtocolAdmissionState::Failed,
+            "malformed async protocol fails without entering a blocking error path");
+    delete malformed;
+    close(malformed_sockets[1]);
+}
+
 int main()
 {
     static_assert(Msg::CACHE_SESSION == UINT32_C(0x50f00000));
@@ -816,5 +910,6 @@ int main()
     test_split_frame_reads();
     test_read_ahead_barriers();
     test_eof_and_pending_output_barriers();
+    test_nonblocking_accepted_protocol_admission();
     return failures ? 1 : 0;
 }

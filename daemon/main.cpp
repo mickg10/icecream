@@ -1350,8 +1350,39 @@ static const size_t web_max_connections = 64;
 // Drain enough ordinary accepts to cover one fully occupied large worker,
 // while returning to already-established clients/children every turn.
 static const size_t client_accept_batch_limit = 64;
+// Accepted sockets negotiate independently in the main poll loop. Bound the
+// pre-client population to at most one quarter of the process fd limit (and a
+// hard ceiling), leaving descriptors for active clients, children, scheduler,
+// sidecar and telemetry. Remote TCP may not consume the protected local
+// quarter of this admission budget.
+static const size_t pending_client_admission_hard_limit = 256;
+static size_t pending_client_admission_limit() noexcept
+{
+    struct rlimit limit{};
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+        return 64;
+    if (limit.rlim_cur == RLIM_INFINITY)
+        return pending_client_admission_hard_limit;
+    const rlim_t scaled = std::max<rlim_t>(limit.rlim_cur / 4, 1);
+    return static_cast<size_t>(std::min<rlim_t>(
+        scaled, pending_client_admission_hard_limit));
+}
+
+static size_t pending_remote_admission_limit(size_t total_limit) noexcept
+{
+    const size_t local_reserve = std::min<size_t>(
+        64, std::max<size_t>(total_limit / 4, 1));
+    return total_limit > local_reserve ? total_limit - local_reserve : 0;
+}
 static const uint64_t web_idle_deadline_msec = 30 * 1000;
 static const uint64_t web_lifetime_deadline_msec = 300 * 1000;
+
+struct PendingClientAdmission {
+    std::unique_ptr<MsgChannel> channel;
+    ListenerKind listener_kind = ListenerKind::TcpRemote;
+    PeerCredentials peer_credentials{};
+    uint64_t deadline_msec = 0;
+};
 
 struct Daemon {
     Clients clients;
@@ -1380,6 +1411,7 @@ struct Daemon {
     bool custom_nodename;
     size_t cache_size;
     map<int, Client*> fd2client;
+    map<int, PendingClientAdmission> pending_client_admissions;
     int new_client_id;
     string remote_name;
     time_t next_scheduler_connect;
@@ -1549,6 +1581,10 @@ struct Daemon {
     void poll_cache_adapter() noexcept;
     void shutdown_cache_adapter() noexcept;
     void answer_client_requests();
+    bool expire_pending_client_admissions() noexcept;
+    uint64_t next_pending_client_admission_deadline_msec() const noexcept;
+    void service_pending_client_admissions(const vector<pollfd> &pollfds);
+    void clear_pending_client_admissions() noexcept;
     bool handle_transfer_env(Client *client, EnvTransferMsg *msg) __attribute_warn_unused_result__;
     bool handle_env_install_child_done(Client *client);
     bool finish_transfer_env(Client *client, bool cancel = false);
@@ -8890,6 +8926,11 @@ void Daemon::handle_end(Client *client, int exitcode)
 
 void Daemon::clear_children()
 {
+    // A channel still negotiating protocol has no Client/lease yet, but the
+    // predecessor would have dropped it before returning from its blocking
+    // accept factory. Preserve that teardown boundary across scheduler loss
+    // and orderly shutdown.
+    clear_pending_client_admissions();
     /* EXACT session quiescence (issue #4 corrections P0-C + D).  The
        registry snapshot happens BEFORE the Client objects vanish;
        environment children are exact-handled by handle_end ->
@@ -8933,6 +8974,7 @@ void Daemon::clear_children()
 
     // they should be all in clients too
     assert(fd2client.empty());
+    assert(pending_client_admissions.empty());
     assert(connection_leases.size() == 0);
 
     fd2client.clear();
@@ -9831,6 +9873,110 @@ bool Daemon::handle_activity(Client *client)
     return ret;
 }
 
+void Daemon::clear_pending_client_admissions() noexcept
+{
+    pending_client_admissions.clear();
+}
+
+uint64_t Daemon::next_pending_client_admission_deadline_msec() const noexcept
+{
+    uint64_t earliest = 0;
+    for (const auto &entry : pending_client_admissions) {
+        const uint64_t deadline = entry.second.deadline_msec;
+        if (deadline != 0 && (earliest == 0 || deadline < earliest))
+            earliest = deadline;
+    }
+    return earliest;
+}
+
+bool Daemon::expire_pending_client_admissions() noexcept
+{
+    const uint64_t now_msec = monotonic_msec();
+    bool changed = false;
+    for (auto it = pending_client_admissions.begin();
+         it != pending_client_admissions.end();) {
+        if (it->second.deadline_msec != 0 &&
+            now_msec >= it->second.deadline_msec) {
+            trace() << "protocol admission timeout on fd " << it->first << endl;
+            it = pending_client_admissions.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    return changed;
+}
+
+void Daemon::service_pending_client_admissions(
+    const vector<pollfd> &pollfds)
+{
+    for (auto it = pending_client_admissions.begin();
+         it != pending_client_admissions.end();) {
+        auto current = it++;
+        const int fd = current->first;
+        PendingClientAdmission &admission = current->second;
+        MsgChannel *channel = admission.channel.get();
+        short revents = 0;
+        for (const pollfd &descriptor : pollfds) {
+            if (descriptor.fd == fd) {
+                revents = descriptor.revents;
+                break;
+            }
+        }
+        if (revents == 0)
+            continue;
+
+        bool alive = (revents & POLLNVAL) == 0;
+        if (alive && (revents & POLLOUT) != 0 &&
+            channel->has_pending_write()) {
+            alive = channel->flush_pending();
+        }
+        if (alive &&
+            (revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+            alive = channel->read_a_bit();
+        }
+
+        MsgChannel::ProtocolAdmissionState state =
+            channel->protocol_admission_state();
+        if (!alive)
+            state = MsgChannel::ProtocolAdmissionState::Failed;
+        if (state == MsgChannel::ProtocolAdmissionState::Pending)
+            continue;
+        if (state == MsgChannel::ProtocolAdmissionState::Failed) {
+            trace() << "protocol admission failed on fd " << fd << endl;
+            pending_client_admissions.erase(current);
+            continue;
+        }
+
+        // Remove pending ownership before exposing the channel.  No ordinary
+        // handler can observe NEED_PROTO or a queued handshake reply.
+        PendingClientAdmission completed = std::move(current->second);
+        pending_client_admissions.erase(current);
+        channel = completed.channel.get();
+        if (!channel->finish_protocol_admission())
+            continue;
+
+        channel->set_p50_legacy_wire_role(P50LegacyWireRole::F);
+        Client *client = new Client;
+        client->client_id = ++new_client_id;
+        client->channel = completed.channel.release();
+        if (auto provenance = connection_leases.allocate(
+                completed.listener_kind, completed.peer_credentials)) {
+            client->connection_provenance = *provenance;
+            if (!connection_leases.bind(
+                    provenance->lease, client, client->channel)) {
+                connection_leases.cancel(provenance->lease);
+                client->connection_provenance = ConnectionProvenance{};
+            }
+        }
+        clients[client->channel] = client;
+        fd2client[client->channel->fd] = client;
+        trace() << "accepted " << client->channel->fd << " "
+                << client->channel->name << " as " << client->client_id
+                << endl;
+    }
+}
+
 void Daemon::answer_client_requests()
 {
 #ifdef ICECC_DEBUG
@@ -9847,6 +9993,8 @@ void Daemon::answer_client_requests()
     // Deadlines are owned by this event loop, not by fd readiness.  Sweep
     // before constructing pollfds so a silent peer is closed even when no
     // descriptor event is pending.
+    if (expire_pending_client_admissions())
+        return;
     if (expire_p50_source_waiters()) {
         return;
     }
@@ -9967,23 +10115,38 @@ void Daemon::answer_client_requests()
     }
 
     vector< pollfd > pollfds;
-    pollfds.reserve( fd2client.size() + 6 );
+    pollfds.reserve(fd2client.size() + pending_client_admissions.size() + 6);
     pollfd pfd; // tmp varible
 
-    if (tcp_listen_fd != -1) {
+    const size_t pending_admission_limit = pending_client_admission_limit();
+    const size_t pending_remote_limit =
+        pending_remote_admission_limit(pending_admission_limit);
+    size_t pending_remote_count = 0;
+    for (const auto &entry : pending_client_admissions) {
+        if (entry.second.listener_kind == ListenerKind::TcpRemote)
+            ++pending_remote_count;
+    }
+    const bool any_client_admission_capacity =
+        pending_client_admissions.size() < pending_admission_limit;
+    const bool remote_client_admission_capacity =
+        any_client_admission_capacity &&
+        pending_remote_count < pending_remote_limit;
+    if (remote_client_admission_capacity && tcp_listen_fd != -1) {
         pfd.fd = tcp_listen_fd;
         pfd.events = POLLIN;
         pollfds.push_back(pfd);
     }
-    if (tcp_listen_local_fd != -1) {
+    if (any_client_admission_capacity && tcp_listen_local_fd != -1) {
         pfd.fd = tcp_listen_local_fd;
         pfd.events = POLLIN;
         pollfds.push_back(pfd);
     }
 
-    pfd.fd = unix_listen_fd;
-    pfd.events = POLLIN;
-    pollfds.push_back(pfd);
+    if (any_client_admission_capacity && unix_listen_fd != -1) {
+        pfd.fd = unix_listen_fd;
+        pfd.events = POLLIN;
+        pollfds.push_back(pfd);
+    }
 
     if (web_listen_fd != -1
             && monotonic_msec() >= web_accept_backoff_until_msec) {
@@ -10017,6 +10180,14 @@ void Daemon::answer_client_requests()
         if (!pfd.events) {
             pfd.events = POLLOUT;   // 413 drain in flight; wake on writable
         }
+        pollfds.push_back(pfd);
+    }
+
+    for (const auto &it : pending_client_admissions) {
+        pfd.fd = it.first;
+        pfd.events = POLLIN | POLLHUP | POLLERR;
+        if (it.second.channel->has_pending_write())
+            pfd.events |= POLLOUT;
         pollfds.push_back(pfd);
     }
 
@@ -10163,6 +10334,23 @@ void Daemon::answer_client_requests()
         }
     }
 
+    // Pending protocol handshakes retain the historical 15-second per-peer
+    // lifetime, but the shared loop sleeps only until the earliest deadline.
+    const uint64_t protocol_deadline_msec =
+        next_pending_client_admission_deadline_msec();
+    if (protocol_deadline_msec != 0) {
+        const uint64_t now = monotonic_msec();
+        const int to_protocol_deadline = protocol_deadline_msec > now
+            ? static_cast<int>(std::min<uint64_t>(
+                  protocol_deadline_msec - now,
+                  std::numeric_limits<int>::max()))
+            : 0;
+        if (poll_timeout_msec < 0 ||
+            to_protocol_deadline < poll_timeout_msec) {
+            poll_timeout_msec = to_protocol_deadline;
+        }
+    }
+
     // A live source owner has one nonrenewable absolute deadline.  Cap poll
     // by the earliest such owner so traffic cannot make the loop sleep past
     // expiry; the explicit sweep above/after poll performs the actual close.
@@ -10215,6 +10403,8 @@ void Daemon::answer_client_requests()
         finish_scheduler_loss_if_needed();
         return;
     }
+    if (expire_pending_client_admissions())
+        return;
     // Poll may return zero for the capped deadline, or may return another fd
     // at the same instant.  Re-run the exact owner sweep before touching any
     // revents so an expired owner cannot consume a late frame.
@@ -10400,6 +10590,12 @@ void Daemon::answer_client_requests()
             }
         }
 
+        // Progress every previously accepted protocol peer before admitting
+        // another batch. This phase performs bounded nonblocking handshake IO
+        // and promotion only; ordinary messages remain below the listener
+        // phase, preserving admission-before-activity ordering.
+        service_pending_client_admissions(pollfds);
+
         int ready_listeners[3];
         size_t ready_listener_count = 0;
         if (tcp_listen_fd != -1 &&
@@ -10423,17 +10619,18 @@ void Daemon::answer_client_requests()
            nonblocking; drain a bounded batch, round-robin across listeners,
            then always service established clients/children below.
 
-           This phase is admission-only: protocol-negotiate, authenticate
-           provenance, and register each Client, but never handle an ordinary
-           client message between accepts.  In particular P50_SOURCE_ARM,
+           This phase is admission-only: capture immutable accept provenance
+           and register each socket for asynchronous protocol negotiation, but
+           never wait for a peer or handle an ordinary client message between
+           accepts. In particular P50_SOURCE_ARM,
            CACHE_SESSION, and COMPILE_FILE can all perform substantially more
            work than admission.  Interleaving that work here turns the nominal
            batch into one-at-a-time admission under load and can strand a
            valid socket in the kernel queue past its caller's absolute
-           connection deadline.  A newly registered fd was not in this poll
-           snapshot; it is serviced through the established-client path on
-           the next outer turn (or from bytes already buffered by protocol
-           negotiation), under the same state and scheduler-loss checks. */
+           connection deadline. A newly accepted fd was not in this poll
+           snapshot; its handshake starts on the next outer turn. Only after
+           the complete two-way protocol exchange is it promoted into
+           fd2client and exposed to the ordinary state machine. */
         bool listener_exhausted[3] = { false, false, false };
         size_t exhausted_count = 0;
         size_t accepted_count = 0;
@@ -10441,6 +10638,7 @@ void Daemon::answer_client_requests()
         while (ready_listener_count != 0 &&
                exhausted_count < ready_listener_count &&
                accepted_count < client_accept_batch_limit &&
+               pending_client_admissions.size() < pending_admission_limit &&
                accept_attempt_count <
                    client_accept_batch_limit + ready_listener_count) {
             const size_t listener_index =
@@ -10450,6 +10648,12 @@ void Daemon::answer_client_requests()
             if (listener_exhausted[listener_index])
                 continue;
             const int listen_fd = ready_listeners[listener_index];
+            if (listen_fd == tcp_listen_fd &&
+                pending_remote_count >= pending_remote_limit) {
+                listener_exhausted[listener_index] = true;
+                ++exhausted_count;
+                continue;
+            }
             struct sockaddr cli_addr;
             socklen_t cli_len = sizeof cli_addr;
             ++accept_attempt_count;
@@ -10472,28 +10676,22 @@ void Daemon::answer_client_requests()
                 // cache handoff.
                 const ListenerKind listener_kind = classify_listener(
                     listen_fd, unix_listen_fd, tcp_listen_local_fd, tcp_listen_fd);
+                if (listener_kind == ListenerKind::TcpRemote)
+                    ++pending_remote_count;
                 PeerCredentials peer_credentials;
                 if (listener_kind == ListenerKind::UnixLocal)
                     (void)capture_unix_peer_credentials(acc_fd, peer_credentials);
-                MsgChannel *c = Service::createChannel(acc_fd, &cli_addr, cli_len);
-
-                if (c) {
-                    c->set_p50_legacy_wire_role(P50LegacyWireRole::F);
-                    Client *client = new Client;
-                    client->client_id = ++new_client_id;
-                    client->channel = c;
-                    if (auto provenance = connection_leases.allocate(listener_kind,
-                                                                       peer_credentials)) {
-                        client->connection_provenance = *provenance;
-                        if (!connection_leases.bind(provenance->lease, client, c)) {
-                            connection_leases.cancel(provenance->lease);
-                            client->connection_provenance = ConnectionProvenance{};
-                        }
-                    }
-                    clients[c] = client;
-
-                    fd2client[c->fd] = client;
-                    trace() << "accepted " << c->fd << " " << c->name << " as " << client->client_id << endl;
+                MsgChannel *channel = Service::createChannelAccepted(
+                    acc_fd, &cli_addr, cli_len);
+                if (channel) {
+                    PendingClientAdmission admission;
+                    admission.channel.reset(channel);
+                    admission.listener_kind = listener_kind;
+                    admission.peer_credentials = peer_credentials;
+                    admission.deadline_msec = monotonic_msec() +
+                        ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC;
+                    pending_client_admissions.emplace(
+                        channel->fd, std::move(admission));
                 }
             }
         }

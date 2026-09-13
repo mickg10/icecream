@@ -620,7 +620,7 @@ bool MsgChannel::update_state()
 
                 if (remote_prot < MIN_PROTOCOL_VERSION || remote_prot > (1 << 20)) {
                     remote_prot = 0;
-                    set_error();
+                    set_error(nonblocking_protocol_handshake);
                     return false;
                 }
 
@@ -636,8 +636,10 @@ bool MsgChannel::update_state()
 
                 writefull(vers, 4);
 
-                if (!flush_writebuf(SendBlocking)) {
-                    set_error();
+                const int send_flags = nonblocking_protocol_handshake
+                    ? SendNonBlocking | SendDeferrable : SendBlocking;
+                if (!flush_writebuf(send_flags)) {
+                    set_error(nonblocking_protocol_handshake);
                     return false;
                 }
 
@@ -648,7 +650,7 @@ bool MsgChannel::update_state()
 
                 if ((int)remote_prot != protocol) {
                     protocol = 0;
-                    set_error();
+                    set_error(nonblocking_protocol_handshake);
                     return false;
                 }
 
@@ -657,7 +659,7 @@ bool MsgChannel::update_state()
                 break;
             } else {
                 trace() << "NEED_PROTO but protocol > 0" << endl;
-                set_error();
+                set_error(nonblocking_protocol_handshake);
                 return false;
             }
         }
@@ -945,7 +947,7 @@ bool MsgChannel::flush_writebuf(int send_flags)
     }
 
     if(error) {
-        set_error();
+        set_error(nonblocking_protocol_handshake);
         return false;
     }
     return true;
@@ -968,6 +970,26 @@ bool MsgChannel::flush_pending(void)
         p50_clear_outbound_claim();
     p50_promote_flushed_fd_request();
     return flushed;
+}
+
+MsgChannel::ProtocolAdmissionState
+MsgChannel::protocol_admission_state(void) const noexcept
+{
+    if (fd < 0 || protocol == 0 || instate == ERROR || eof)
+        return ProtocolAdmissionState::Failed;
+    if (instate == NEED_PROTO || has_pending_write())
+        return ProtocolAdmissionState::Pending;
+    return protocol >= MIN_PROTOCOL_VERSION
+        ? ProtocolAdmissionState::Ready
+        : ProtocolAdmissionState::Failed;
+}
+
+bool MsgChannel::finish_protocol_admission(void) noexcept
+{
+    if (protocol_admission_state() != ProtocolAdmissionState::Ready)
+        return false;
+    nonblocking_protocol_handshake = false;
+    return true;
 }
 
 MsgChannel &MsgChannel::operator>>(uint32_t &buf)
@@ -1660,7 +1682,25 @@ MsgChannel *Service::createChannel(int fd, struct sockaddr *_a, socklen_t _l)
     return c;
 }
 
+MsgChannel *Service::createChannelAccepted(
+    int fd, struct sockaddr *_a, socklen_t _l)
+{
+    MsgChannel *c = new MsgChannel(fd, _a, _l, false, true);
+    if (c->protocol_admission_state() ==
+            MsgChannel::ProtocolAdmissionState::Failed) {
+        delete c;
+        c = nullptr;
+    }
+    return c;
+}
+
 MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
+    : MsgChannel(_fd, _a, _l, text, false)
+{
+}
+
+MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text,
+                       bool async_protocol_handshake)
     : fd(_fd)
 {
     addr_len = (sizeof(struct sockaddr) > _l) ? sizeof(struct sockaddr) : _l;
@@ -1695,6 +1735,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     current_message_end = 0;
     eof = false;
     text_based = text;
+    nonblocking_protocol_handshake = async_protocol_handshake;
     cache_session_release_armed = false;
     cache_session_send_release_armed = false;
     p50_channel_generation = next_p50_nonzero(g_p50_channel_generation);
@@ -1773,9 +1814,11 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
         //writeuint32 ((uint32_t) PROTOCOL_VERSION);
         writefull(vers, 4);
 
-        if (!flush_writebuf(SendBlocking)) {
+        const int send_flags = nonblocking_protocol_handshake
+            ? SendNonBlocking | SendDeferrable : SendBlocking;
+        if (!flush_writebuf(send_flags)) {
             protocol = 0;    // unusable
-            set_error();
+            set_error(nonblocking_protocol_handshake);
         }
     }
 
@@ -1957,7 +2000,7 @@ bool MsgChannel::wait_for_protocol()
         pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLIN;
-        int ret = poll(&pfd, 1, 15 * 1000); // 15s
+        int ret = poll(&pfd, 1, ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC);
 
         if (ret < 0 && errno == EINTR) {
             continue;

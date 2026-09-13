@@ -118,6 +118,21 @@ static MsgChannel *connect_tcp_bounded(int port, int timeout_msec)
     return nullptr;
 }
 
+static int connect_raw_tcp(int port)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static bool write_all(int fd, const void *data, size_t size)
 {
     const char *position = static_cast<const char *>(data);
@@ -466,6 +481,43 @@ int main(int argc, char **argv)
     REQUIRE(admission_ordered,
             "admission-only batch accepts the full burst before client activity");
 
+    // Fill the remote share of the asynchronous handshake table with silent
+    // TCP peers. The protected local share must still admit Unix wrappers;
+    // a single global cap lets remote silence starve this path indefinitely.
+    const int pre_saturation_daemon_fds = process_fd_count(daemon_pid);
+    constexpr size_t kRemoteSaturationCount = 256;
+    std::vector<int> silent_remote_fds;
+    silent_remote_fds.reserve(kRemoteSaturationCount);
+    for (size_t index = 0; index != kRemoteSaturationCount; ++index) {
+        const int fd = connect_raw_tcp(daemon_port);
+        if (fd < 0) break;
+        silent_remote_fds.push_back(fd);
+    }
+    // Give the running daemon a deterministic chance to consume the public
+    // queue up to its remote sub-limit before presenting the local peer.
+    ::usleep(100 * 1000);
+    const auto local_admission_started = Clock::now();
+    MsgChannel *reserved_local = Service::createChannel(local_socket);
+    const auto local_admission_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - local_admission_started).count();
+    const bool local_admitted = reserved_local != nullptr &&
+        local_admission_elapsed < 4000;
+    const bool local_refused_normally = reserved_local != nullptr &&
+        reserved_local->send_msg(CacheSessionMsg()) &&
+        wait_eof(reserved_local, 4000);
+    delete reserved_local;
+    for (int fd : silent_remote_fds) ::close(fd);
+    REQUIRE(silent_remote_fds.size() == kRemoteSaturationCount,
+            "remote silent peers saturate more than the protected remote share");
+    REQUIRE(local_admitted && local_refused_normally,
+            "remote handshake saturation preserves prompt Unix-client admission");
+    const int post_saturation_daemon_fds = wait_for_fd_count_at_most(
+        daemon_pid, pre_saturation_daemon_fds + 2, 5000);
+    REQUIRE(post_saturation_daemon_fds >= 0 &&
+                post_saturation_daemon_fds <= pre_saturation_daemon_fds + 2,
+            "remote saturation teardown releases every pending descriptor");
+
     const int baseline_daemon_fds = process_fd_count(daemon_pid);
     REQUIRE(baseline_daemon_fds > 0,
             "real daemon descriptor baseline is observable");
@@ -483,6 +535,8 @@ int main(int argc, char **argv)
     bool first_connected = false;
     bool first_arm_sent = false;
     bool first_armed = false;
+    bool first_stalled_peer_opened = false;
+    bool first_arm_bypassed_stalled_peer = false;
     bool first_cache_session_sent = false;
     bool first_adopted_live = false;
     for (size_t index = 0; sequence_valid &&
@@ -508,9 +562,33 @@ int main(int argc, char **argv)
             break;
         }
 
+        int stalled_protocol_fd = -1;
+        Clock::time_point arm_admission_started{};
+        if (index == 0) {
+            const bool stop_sent = ::kill(daemon_pid, SIGSTOP) == 0;
+            int stop_status = 0;
+            const bool stopped = stop_sent &&
+                ::waitpid(daemon_pid, &stop_status, WUNTRACED) == daemon_pid &&
+                WIFSTOPPED(stop_status);
+            if (stopped)
+                stalled_protocol_fd = connect_raw_tcp(daemon_port);
+            first_stalled_peer_opened = stalled_protocol_fd >= 0;
+            const bool resumed = ::kill(daemon_pid, SIGCONT) == 0;
+            if (!stopped || !first_stalled_peer_opened || !resumed) {
+                if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
+                sequence_valid = false;
+                break;
+            }
+            arm_admission_started = Clock::now();
+            // Let the daemon accept the silent socket first. The predecessor
+            // then blocks its only event-loop thread in wait_for_protocol().
+            ::usleep(50 * 1000);
+        }
+
         MsgChannel *ordinary = connect_tcp_bounded(daemon_port, 5000);
         if (index == 0) first_connected = ordinary != nullptr;
         if (ordinary == nullptr) {
+            if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
             sequence_valid = false;
             break;
         }
@@ -520,6 +598,7 @@ int main(int argc, char **argv)
         const bool arm_sent = ordinary->send_msg(P50SourceArmMsg(arm));
         if (index == 0) first_arm_sent = arm_sent;
         if (!arm_sent) {
+            if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
             delete ordinary;
             sequence_valid = false;
             break;
@@ -528,8 +607,16 @@ int main(int argc, char **argv)
         auto *armed = dynamic_cast<P50SourceArmedMsg *>(armed_message);
         const bool armed_valid = armed != nullptr && armed->arm == arm &&
             armed->f_store_generation != 0;
-        if (index == 0) first_armed = armed_valid;
+        if (index == 0) {
+            first_armed = armed_valid;
+            const auto arm_admission_elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - arm_admission_started).count();
+            first_arm_bypassed_stalled_peer =
+                armed_valid && arm_admission_elapsed < 4000;
+        }
         delete armed_message;
+        if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
         if (!armed_valid) {
             delete ordinary;
             sequence_valid = false;
@@ -563,8 +650,12 @@ int main(int argc, char **argv)
     REQUIRE(first_connected,
             "ordinary Protocol-50 client reached the real public listener");
     REQUIRE(first_arm_sent, "exact source arm entered the production daemon path");
+    REQUIRE(first_stalled_peer_opened,
+            "silent protocol peer was admitted before the source-arm peer");
     REQUIRE(first_armed,
             "source-arm owner is acknowledged before CACHE_SESSION");
+    REQUIRE(first_arm_bypassed_stalled_peer,
+            "source-arm acknowledgement bypasses a silent accepted handshake");
     REQUIRE(first_cache_session_sent,
             "real CACHE_SESSION entered the production daemon path");
     REQUIRE(first_adopted_live,
@@ -572,6 +663,19 @@ int main(int argc, char **argv)
     REQUIRE(sequence_valid &&
                 authoritative_sessions == kAuthoritativeSessionCount,
             "more than 64 sequential authoritative CacheSessions remain accepted");
+
+    // The event-loop conversion preserves the historical 15-second peer
+    // budget: silence no longer blocks useful work, but it also cannot retain
+    // a pending descriptor indefinitely.
+    const int expiry_fd = connect_raw_tcp(daemon_port);
+    const auto expiry_started = Clock::now();
+    const bool expiry_eof = expiry_fd >= 0 && wait_raw_eof(expiry_fd, 17000);
+    const auto expiry_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - expiry_started).count();
+    if (expiry_fd >= 0) ::close(expiry_fd);
+    REQUIRE(expiry_eof && expiry_elapsed >= 14000 && expiry_elapsed < 17000,
+            "silent accepted handshake expires on the preserved bounded lifetime");
 
     const int settled_daemon_fds = wait_for_fd_count_at_most(
         daemon_pid, baseline_daemon_fds + 2, 5000);
@@ -583,11 +687,18 @@ int main(int argc, char **argv)
             "accepted handoff keeps the READY advertisement stable");
     delete spurious_login;
 
+    const int shutdown_pending_fd = connect_raw_tcp(daemon_port);
+    ::usleep(50 * 1000);
     ::kill(daemon_pid, SIGTERM);
     Msg *shutdown_message = wait_for_type(scheduler, Msg::LOGIN, 5000);
     LoginMsg *shutdown_login = dynamic_cast<LoginMsg *>(shutdown_message);
     REQUIRE(absent(shutdown_login), "orderly shutdown withdraws before scheduler teardown");
     delete shutdown_message;
+    const bool shutdown_pending_closed = shutdown_pending_fd >= 0 &&
+        wait_raw_eof(shutdown_pending_fd, 5000);
+    if (shutdown_pending_fd >= 0) ::close(shutdown_pending_fd);
+    REQUIRE(shutdown_pending_closed,
+            "orderly shutdown closes a still-pending protocol admission");
 
     int status = 0;
     bool reaped = wait_child(daemon_pid, 10000, &status);
