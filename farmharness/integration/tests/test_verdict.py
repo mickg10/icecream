@@ -2455,6 +2455,28 @@ def test_s70_b4_worker_action_lineage_does_not_require_same_tu_placement() -> No
     assert verdict["status"] == "PASS", verdict
 
 
+def test_s70_b4_worker_uses_f_transaction_order_not_scheduler_order() -> None:
+    fixture = _s70_b4_worker_action_lineage_bundle()
+    records = [
+        record
+        for record in fixture["observations"]["p29_action_lineage"]["records"]
+        if record["worker_instance"] == "F1"
+        and fixture["rows"][int(record["job_id"]) - 1]["event_epoch"] == 1
+    ]
+    scheduler_first = records[0]
+    sixth_f_transaction = next(
+        record for record in records if record["session_serial"] == 6
+    )
+    for field in ("previous_f_store_guid", "rel_seq", "session_serial"):
+        scheduler_first[field], sixth_f_transaction[field] = (
+            sixth_f_transaction[field],
+            scheduler_first[field],
+        )
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

@@ -6567,47 +6567,60 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
 
             cold_guids: set[str] = set()
             for epoch in (1, 2, 3):
-                candidates = ordered_target[epoch]
-                if not candidates:
+                epoch_lineages = [
+                    lineages_by_job.get(_job_id(row.get("job_id"), "@row"))
+                    for row in epoch_rows[epoch]
+                    if row.get("cs") == "F1"
+                    and row.get("session_outcome") == "committed"
+                ]
+                if not epoch_lineages or any(
+                    not isinstance(record, Mapping) for record in epoch_lineages
+                ):
                     b4_bad.add(f"@worker:F1:epoch-{epoch}")
                     continue
-                first_dispatch_ms, first_dispatch_line, first = min(
-                    candidates, key=lambda item: (item[0], item[1])
-                )
-                identifier = _job_id(first.get("job_id"), "@row")
-                first_lineage = lineages_by_job.get(identifier)
-                if first_lineage is None:
-                    b4_bad.add(identifier)
+                store_guids = {
+                    str(record["f_store_guid"]) for record in epoch_lineages
+                }
+                c_store_guids = {
+                    str(record["c_store_guid"]) for record in epoch_lineages
+                }
+                if len(store_guids) != 1 or len(c_store_guids) != 1:
+                    b4_bad.add(f"@worker:F1:epoch-{epoch}:store-relationship")
                     continue
-                cold_guids.add(str(first_lineage["f_store_guid"]))
-                later_lineages = [
-                    lineages_by_job.get(_job_id(row.get("job_id"), "@row"))
-                    for dispatch_ms, dispatch_line, row in candidates
-                    if (dispatch_ms, dispatch_line)
-                    > (first_dispatch_ms, first_dispatch_line)
+                store_guid = next(iter(store_guids))
+                c_store_guid = next(iter(c_store_guids))
+                cold = [
+                    record
+                    for record in epoch_lineages
+                    if record.get("session_serial") == 1
+                    and record.get("rel_seq") == 0
                 ]
-                progresses_warm = any(
-                    isinstance(record, Mapping)
-                    and record.get("worker_instance") == "F1"
-                    and record.get("c_store_guid")
-                    == first_lineage.get("c_store_guid")
-                    and record.get("f_store_guid")
-                    == first_lineage.get("f_store_guid")
-                    and record.get("history_nonce")
-                    == first_lineage.get("history_nonce")
-                    and record.get("session_serial") == 2
+                warm = [
+                    record
+                    for record in epoch_lineages
+                    if record.get("session_serial") == 2
                     and record.get("rel_seq") == 1
-                    for record in later_lineages
-                )
+                ]
+                cold_guids.add(store_guid)
                 if (
-                    first_lineage.get("worker_instance") != "F1"
-                    or first_lineage.get("previous_f_store_guid") != ZERO_GUID
-                    or first_lineage.get("session_serial") != 1
-                    or first_lineage.get("history_nonce") != 1
-                    or first_lineage.get("rel_seq") != 0
-                    or not progresses_warm
+                    len(cold) != 1
+                    or len(warm) != 1
+                    or cold[0].get("worker_instance") != "F1"
+                    or cold[0].get("c_store_guid") != c_store_guid
+                    or cold[0].get("f_store_guid") != store_guid
+                    or cold[0].get("previous_f_store_guid") != ZERO_GUID
+                    or cold[0].get("history_nonce") != 1
+                    or warm[0].get("worker_instance") != "F1"
+                    or warm[0].get("c_store_guid") != c_store_guid
+                    or warm[0].get("f_store_guid") != store_guid
+                    or warm[0].get("history_nonce")
+                    != cold[0].get("history_nonce")
                 ):
-                    b4_bad.add(identifier)
+                    b4_bad.add(
+                        _job_id(cold[0].get("job_id"), f"@worker:F1:epoch-{epoch}")
+                        if cold
+                        else f"@worker:F1:epoch-{epoch}"
+                    )
             if len(cold_guids) != 3:
                 b4_bad.add("@observations:s70-b4-worker-store-generations")
         else:
