@@ -4047,7 +4047,7 @@ class EventProducer:
                 or leader.get("pid") != stopped.get("pid")
                 or leader.get("pgid") != stopped.get("pgid")
                 or leader.get("start_ticks") != stopped.get("start_ticks")
-                or leader.get("state") in {"Z", "X"}
+                or leader.get("state") not in {"T", "t"}
                 or stopped.get("state") not in {"T", "t"}
             ):
                 raise EventError("compiler-group stop identity changed")

@@ -2373,6 +2373,12 @@ def _validate_scheduler_active_loss_receipt(
         )
 
     group_gone = compiler.get("group_gone") if isinstance(compiler, Mapping) else None
+    leader_state_valid = (
+        leader.get("state") in {"T", "t"}
+        if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA and isinstance(leader, Mapping)
+        else isinstance(leader, Mapping)
+        and leader.get("state") not in {"T", "t", "Z", "X"}
+    )
     strict_process_valid = (
         not strict
         or (
@@ -2383,7 +2389,7 @@ def _validate_scheduler_active_loss_receipt(
                 leader.get(field) == stopped.get(field)
                 for field in process_fields - {"state"}
             )
-            and leader.get("state") not in {"T", "t", "Z", "X"}
+            and leader_state_valid
             and stopped.get("state") in {"T", "t"}
             and isinstance(group_gone, Mapping)
             and set(group_gone) == {"gone", "leader", "members", "schema"}

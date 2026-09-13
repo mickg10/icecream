@@ -996,7 +996,7 @@ def test_active_scheduler_loss_capture_arms_zero_skip_after_boundary(
                         {
                             "capture_mode": "ptrace-fork-v1",
                             "daemon": _active_iceccd(7, 1, 7),
-                            "leader": {**stopped, "state": "S"},
+                            "leader": {**stopped, "state": "t"},
                             "listener": {},
                             "schema": "icefarm-compiler-group-stop-v1",
                             "stopped": stopped,
@@ -1534,6 +1534,48 @@ def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
         preflight=preflight,
         evidence=tmp_path,
     )
+    assert current["compiler"]["leader"]["state"] == "R"
+    assert current["compiler"]["stopped"]["state"] == "T"
+    legacy_ptrace_state = json.loads(json.dumps(current))
+    legacy_ptrace_state["compiler"]["leader"]["state"] = "t"
+    with pytest.raises(CollectError, match="stopped compiler-group identity"):
+        _validate_scheduler_active_loss_receipt(
+            legacy_ptrace_state,
+            current_event,
+            scenario,
+            0,
+            farm=farm,
+            plan=plan,
+            preflight=preflight,
+            evidence=tmp_path,
+        )
+    identity_mutations = {
+        "argv": ["/opt/icecream/sbin/iceccd", "--tampered"],
+        "comm": "tampered",
+        "exe": "/opt/icecream/sbin/tampered",
+        "exe_evidence": "tampered",
+        "pgid": 42,
+        "pid": 42,
+        "ppid": 11,
+        "start_ticks": 10,
+        "uids": [65534, 65534, 65534, 0],
+    }
+    for field, value in identity_mutations.items():
+        tampered_identity = json.loads(json.dumps(current))
+        tampered_identity["compiler"]["stopped"][field] = value
+        with pytest.raises(
+            CollectError, match="stopped compiler-group identity"
+        ):
+            _validate_scheduler_active_loss_receipt(
+                tampered_identity,
+                current_event,
+                scenario,
+                0,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=tmp_path,
+            )
     for field, value in (
         ("lost_scheduler_job", 6),
         ("selection_last_dispatched_job", 4),
@@ -1623,6 +1665,7 @@ def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
 
     current_v6 = json.loads(json.dumps(current_v5))
     current_v6["schema"] = "icefarm-scheduler-active-loss-v6"
+    current_v6["compiler"]["leader"]["state"] = "t"
     current_v6["selection_last_dispatched_job"] = current_v6[
         "lost_scheduler_job"
     ]
@@ -1673,6 +1716,33 @@ def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
         preflight=preflight,
         evidence=tmp_path,
     )
+    assert current_v6["compiler"]["leader"]["state"] == "t"
+    assert current_v6["compiler"]["stopped"]["state"] == "T"
+    for side, state in (
+        ("leader", "R"),
+        ("leader", "S"),
+        ("leader", "Z"),
+        ("leader", "X"),
+        ("stopped", "R"),
+        ("stopped", "S"),
+        ("stopped", "Z"),
+        ("stopped", "X"),
+    ):
+        tampered_state = json.loads(json.dumps(current_v6))
+        tampered_state["compiler"][side]["state"] = state
+        with pytest.raises(
+            CollectError, match="stopped compiler-group identity"
+        ):
+            _validate_scheduler_active_loss_receipt(
+                tampered_state,
+                current_v6_event,
+                scenario,
+                0,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=tmp_path,
+            )
     for path, value in (
         (("arm", "skip"), 1),
         (("release", "pid"), 78),

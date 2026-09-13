@@ -538,6 +538,30 @@ def test_active_loss_v3_binds_listener_worker_authority_and_readiness() -> None:
     assert not _scheduler_active_loss_receipt_errors(
         receipt, event, scenario, **kwargs
     )
+    assert receipt["compiler"]["leader"]["state"] == "R"
+    assert receipt["compiler"]["stopped"]["state"] == "T"
+    legacy_ptrace_state = copy.deepcopy(receipt)
+    legacy_ptrace_state["compiler"]["leader"]["state"] = "t"
+    assert _scheduler_active_loss_receipt_errors(
+        legacy_ptrace_state, event, scenario, **kwargs
+    )
+    identity_mutations = {
+        "argv": ["/opt/icecream/sbin/iceccd", "--tampered"],
+        "comm": "tampered",
+        "exe": "/opt/icecream/sbin/tampered",
+        "exe_evidence": "tampered",
+        "pgid": 42,
+        "pid": 42,
+        "ppid": 11,
+        "start_ticks": 10,
+        "uids": [65534, 65534, 65534, 0],
+    }
+    for field, value in identity_mutations.items():
+        tampered = copy.deepcopy(receipt)
+        tampered["compiler"]["stopped"][field] = value
+        assert _scheduler_active_loss_receipt_errors(
+            tampered, event, scenario, **kwargs
+        ), field
     paths = (
         ("compiler", "listener", "socket_inode"),
         ("compiler", "listener", "socket_uid"),
@@ -798,6 +822,7 @@ def test_active_loss_v6_binds_zero_skip_capture_to_held_trigger_job() -> None:
     receipt["compiler"]["assignment"]["schema"] = (
         "icefarm-compiler-assignment-v2"
     )
+    receipt["compiler"]["leader"]["state"] = "t"
     kwargs = {
         "readiness_v2": True,
         "plan": plan,
@@ -807,6 +832,23 @@ def test_active_loss_v6_binds_zero_skip_capture_to_held_trigger_job() -> None:
     assert not _scheduler_active_loss_receipt_errors(
         receipt, event, scenario, **kwargs
     )
+    assert receipt["compiler"]["leader"]["state"] == "t"
+    assert receipt["compiler"]["stopped"]["state"] == "T"
+    for side, state in (
+        ("leader", "R"),
+        ("leader", "S"),
+        ("leader", "Z"),
+        ("leader", "X"),
+        ("stopped", "R"),
+        ("stopped", "S"),
+        ("stopped", "Z"),
+        ("stopped", "X"),
+    ):
+        tampered = copy.deepcopy(receipt)
+        tampered["compiler"][side]["state"] = state
+        assert _scheduler_active_loss_receipt_errors(
+            tampered, event, scenario, **kwargs
+        ), (side, state)
 
     for path, value in (
         (("capture_boundary", "arm", "skip"), 1),
