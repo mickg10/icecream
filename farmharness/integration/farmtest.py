@@ -52,6 +52,8 @@ try:
         resolve_bindings,
     )
     from .lifecycle import (
+        F_NOFILE_HARD,
+        F_NOFILE_SOFT,
         LifecycleError,
         PreflightRefusal,
         bring_up,
@@ -130,6 +132,8 @@ except ImportError:  # Executed as ./farmtest.py.
         resolve_bindings,
     )
     from lifecycle import (
+        F_NOFILE_HARD,
+        F_NOFILE_SOFT,
         LifecycleError,
         PreflightRefusal,
         bring_up,
@@ -726,7 +730,16 @@ def _planned_commands(
                 f"instance {instance['name']!r} ICECC_TEST_SOCKET exceeds the 107-byte Unix limit"
             )
         if instance["role"] == "F":
-            args.extend(("--user", "0", "--cap-add", "SYS_CHROOT"))
+            args.extend(
+                (
+                    "--user",
+                    "0",
+                    "--cap-add",
+                    "SYS_CHROOT",
+                    "--ulimit",
+                    f"nofile={F_NOFILE_SOFT}:{F_NOFILE_HARD}",
+                )
+            )
             if binding is not None:
                 args.extend(
                     (

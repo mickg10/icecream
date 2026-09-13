@@ -380,6 +380,24 @@ def test_plan_commands_are_argv_only_and_label_scoped() -> None:
     assert all("icefarm.run=argv-check" in item["argv"] for item in starts)
 
 
+def test_only_f_starts_have_the_fixed_nofile_contract() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="nofile-check")
+    starts = [
+        item for item in plan["commands"] if item["phase"].startswith("up.start-")
+    ]
+
+    for command in starts:
+        argv = command["argv"]
+        if command["phase"] == "up.start-f":
+            index = argv.index("--ulimit")
+            assert argv[index + 1] == "nofile=65536:65536"
+            assert argv.count("--ulimit") == 1
+        else:
+            assert "--ulimit" not in argv
+
+
 def test_container_temporaries_use_the_instance_scratch_bind() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)

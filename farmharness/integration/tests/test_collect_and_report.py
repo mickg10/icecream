@@ -487,7 +487,12 @@ def _raw_collection(tmp_path: Path):
     )
     _write_json(
         diagnostics / worker["host"] / "F1.inspect",
-        {"HostConfig": {"Init": True}},
+        {
+            "HostConfig": {
+                "Init": True,
+                "Ulimits": [{"Name": "nofile", "Soft": 65536, "Hard": 65536}],
+            }
+        },
     )
 
     client_results = root / "C1.results"
@@ -749,8 +754,48 @@ def test_collection_refuses_false_or_missing_f_docker_init(
     if value is None:
         inspect.unlink()
     else:
-        _write_json(inspect, {"HostConfig": {"Init": value}})
-    with pytest.raises(CollectError, match="Init=true|F Init witnesses|cannot read"):
+        _write_json(
+            inspect,
+            {
+                "HostConfig": {
+                    "Init": value,
+                    "Ulimits": [{"Name": "nofile", "Soft": 65536, "Hard": 65536}],
+                }
+            },
+        )
+    with pytest.raises(CollectError, match="Init=true|nofile|F Init witnesses|cannot read"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
+@pytest.mark.parametrize(
+    "ulimits",
+    (
+        None,
+        [],
+        [{"Name": "nofile", "Soft": 1024, "Hard": 524288}],
+        [{"Name": "nofile", "Soft": 65536, "Hard": 524288}],
+        [
+            {"Name": "nofile", "Soft": 65536, "Hard": 65536},
+            {"Name": "nofile", "Soft": 65536, "Hard": 65536},
+        ],
+    ),
+)
+def test_collection_refuses_missing_or_divergent_f_nofile(
+    tmp_path: Path, ulimits: object
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    host = next(
+        item["host"]
+        for item in plan["topology"]["instances"]
+        if item["name"] == "F1"
+    )
+    inspect = root / "diagnostics" / host / "F1.inspect"
+    host_config = {"Init": True}
+    if ulimits is not None:
+        host_config["Ulimits"] = ulimits
+    _write_json(inspect, {"HostConfig": host_config})
+
+    with pytest.raises(CollectError, match="nofile=65536:65536"):
         collect_bundle(farm, scenario, plan, sync_remote=False)
 
 
@@ -3503,7 +3548,12 @@ class _LiveCollection:
                         },
                         "Id": self.ids[name],
                         "HostConfig": (
-                            {"Init": self.f_init}
+                            {
+                                "Init": self.f_init,
+                                "Ulimits": [
+                                    {"Name": "nofile", "Soft": 65536, "Hard": 65536}
+                                ],
+                            }
                             if name == "F1" and self.f_init is not None
                             else {}
                         ),
@@ -3529,7 +3579,12 @@ class _LiveCollection:
             name = self._name_from_argv(command)
             document = {
                 "HostConfig": (
-                    {"Init": self.f_init}
+                    {
+                        "Init": self.f_init,
+                        "Ulimits": [
+                            {"Name": "nofile", "Soft": 65536, "Hard": 65536}
+                        ],
+                    }
                     if name == "F1" and self.f_init is not None
                     else {}
                 )

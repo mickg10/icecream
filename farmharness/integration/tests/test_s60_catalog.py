@@ -71,6 +71,18 @@ def test_s60_edges_have_one_directional_instance_change_and_resolve() -> None:
         farm.data["hub"]["results_root"] = "/tmp/i/s60-catalog"
         plan = farmtest.build_plan(farm, scenario, run_id=f"s60-edge-{index}")
         assert plan["topology"]["topology_digest"]
+        starts = [
+            command
+            for command in plan["commands"]
+            if command["phase"].startswith("up.start-")
+        ]
+        assert sum(command["phase"] == "up.start-f" for command in starts) == 2
+        for command in starts:
+            if command["phase"] == "up.start-f":
+                ulimit = command["argv"].index("--ulimit")
+                assert command["argv"][ulimit + 1] == "nofile=65536:65536"
+            else:
+                assert "--ulimit" not in command["argv"]
 
 
 def test_s60_explicit_all_f_new_mixed_c_and_warm_pairs() -> None:

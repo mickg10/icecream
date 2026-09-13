@@ -16,7 +16,7 @@ from typing import Any
 try:
     from .farm_spec import FarmSpec
     from .images import CommandFactory, RecordingTransport
-    from .lifecycle import bundle_root, collect_diagnostics
+    from .lifecycle import bundle_root, collect_diagnostics, f_runtime_host_config_valid
     from .layout import instance_root, runtime_root
     from .mutant import (
         MUTANT_TRACE_PATH,
@@ -32,7 +32,7 @@ try:
 except ImportError:  # Direct execution from this directory.
     from farm_spec import FarmSpec
     from images import CommandFactory, RecordingTransport
-    from lifecycle import bundle_root, collect_diagnostics
+    from lifecycle import bundle_root, collect_diagnostics, f_runtime_host_config_valid
     from layout import instance_root, runtime_root
     from mutant import (
         MUTANT_TRACE_PATH,
@@ -265,7 +265,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _f_init_observation(plan: Mapping[str, Any], evidence: Path) -> dict[str, Any]:
-    """Bind every F to its retained Docker inspect Init=true witness."""
+    """Bind every F to its retained Docker init and nofile witness."""
 
     records: list[dict[str, Any]] = []
     topology = plan.get("topology", {}).get("instances", [])
@@ -281,8 +281,11 @@ def _f_init_observation(plan: Mapping[str, Any], evidence: Path) -> dict[str, An
         path = evidence / "diagnostics" / host / f"{name}.inspect"
         document = _read_json(path)
         host_config = document.get("HostConfig")
-        if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
-            raise CollectError(f"F container {host}:{name} lacks Docker Init=true")
+        if not f_runtime_host_config_valid(host_config):
+            raise CollectError(
+                f"F container {host}:{name} lacks Docker Init=true or exact "
+                "nofile=65536:65536"
+            )
         records.append(
             {
                 "host": host,
@@ -411,8 +414,11 @@ def _snapshot_live_evidence(
                 )
             if instance["role"] == "F":
                 host_config = document.get("HostConfig")
-                if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
-                    raise CollectError(f"F container {host}:{name} lacks Docker Init=true")
+                if not f_runtime_host_config_valid(host_config):
+                    raise CollectError(
+                        f"F container {host}:{name} lacks Docker Init=true or exact "
+                        "nofile=65536:65536"
+                    )
             container_ids[name] = container_id
             host_diagnostics = diagnostics / host
             host_diagnostics.mkdir(parents=True, exist_ok=True)

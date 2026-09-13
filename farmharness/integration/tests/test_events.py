@@ -4133,6 +4133,7 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     assert remove.timeout_s > 30
     assert start.timeout_s > 30
     assert start.argv[start.argv.index("--name") + 1] == "icefarm-event-unit-F1"
+    assert start.argv[start.argv.index("--ulimit") + 1] == "nofile=65536:65536"
     assert any(value.endswith("/runtimes/" + new_identity.closure_sha256 + "/root,dst=/opt/icecream,readonly") for value in start.argv)
     assert start.timeout_s >= 1
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan)[0]["receipt"]["preflight"]["role_sha256"] == receipt["preflight"]["role_sha256"]

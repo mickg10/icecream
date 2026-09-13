@@ -368,7 +368,19 @@ def test_h3_failure_collection_binds_dispatch_rejection_and_failed_workload(
     f_host = next(item["host"] for item in plan["topology"]["instances"] if item["name"] == "F1")
     f_inspect = tmp_path / "diagnostics" / f_host / "F1.inspect"
     f_inspect.parent.mkdir(parents=True, exist_ok=True)
-    f_inspect.write_text(json.dumps({"HostConfig": {"Init": True}}), encoding="utf-8")
+    f_inspect.write_text(
+        json.dumps(
+            {
+                "HostConfig": {
+                    "Init": True,
+                    "Ulimits": [
+                        {"Name": "nofile", "Soft": 65536, "Hard": 65536}
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     scheduler_result = tmp_path / "instances" / "S1" / "results"
     scheduler_result.mkdir(parents=True)
     (scheduler_result / "h3-mutant.jsonl").write_text(

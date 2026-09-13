@@ -89,11 +89,33 @@ MIN_FREE_BYTES = 25_000_000_000
 DISK_PROBE_BYTES = 1 << 30
 MIN_WRITE_BPS = 200_000_000
 POLL_INTERVAL_S = 1.0
+F_NOFILE_SOFT = 65_536
+F_NOFILE_HARD = 65_536
 ROLE_BINARY_PATHS = {
     "S": "/opt/icecream/sbin/icecc-scheduler",
     "C": "/opt/icecream/bin/icecc",
     "F": "/opt/icecream/sbin/iceccd",
 }
+
+
+def f_runtime_host_config_valid(host_config: object) -> bool:
+    """Return whether an F inspect proves init and the fixed nofile contract."""
+
+    if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
+        return False
+    ulimits = host_config.get("Ulimits")
+    if not isinstance(ulimits, list):
+        return False
+    nofile = [
+        item
+        for item in ulimits
+        if isinstance(item, Mapping) and item.get("Name") == "nofile"
+    ]
+    return (
+        len(nofile) == 1
+        and nofile[0].get("Soft") == F_NOFILE_SOFT
+        and nofile[0].get("Hard") == F_NOFILE_HARD
+    )
 
 
 HOST_PREFLIGHT_SCRIPT = r"""
@@ -3236,9 +3258,10 @@ def collect_diagnostics(
                         )
                     else:
                         host_config = document.get("HostConfig")
-                        if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
+                        if not f_runtime_host_config_valid(host_config):
                             problems.append(
-                                f"{host_name}:{instance['name']}:inspect lacks Docker Init=true"
+                                f"{host_name}:{instance['name']}:inspect lacks Docker Init=true "
+                                "or exact nofile=65536:65536"
                             )
                 (host_dir / f"{instance['name']}.{kind}").write_text(
                     result.stdout + result.stderr, encoding="utf-8"
