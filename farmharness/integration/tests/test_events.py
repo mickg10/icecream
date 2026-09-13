@@ -638,14 +638,22 @@ def test_release_script_resumes_only_the_exact_stopped_group() -> None:
             process.wait(timeout=5)
     assert "PTRACE_SEIZE" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "PTRACE_O_TRACEFORK" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert "ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)" in (
+    stop_index = ACTIVE_COMPILER_STOP_SCRIPT.index(
+        "os.killpg(child, signal.SIGSTOP)"
+    )
+    ownership_index = ACTIVE_COMPILER_STOP_SCRIPT.index(
+        "stopped_owned = dict(before)", stop_index
+    )
+    detach_index = ACTIVE_COMPILER_STOP_SCRIPT.index(
+        "ptrace(PTRACE_DETACH, child, 0, 0)", ownership_index
+    )
+    assert "ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)" not in (
         ACTIVE_COMPILER_STOP_SCRIPT
     )
     assert "same_identity(stopped, before)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "stop_deadline = time.monotonic() + 2" in ACTIVE_COMPILER_STOP_SCRIPT
-    assert ACTIVE_COMPILER_STOP_SCRIPT.index(
-        "ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)"
-    ) < ACTIVE_COMPILER_STOP_SCRIPT.index(
+    assert stop_index < ownership_index < detach_index
+    assert detach_index < ACTIVE_COMPILER_STOP_SCRIPT.index(
         "listener = listener_probe(web_port, before_daemon)"
     )
     assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT
@@ -668,6 +676,8 @@ def test_ptrace_fork_event_holds_a_short_lived_child_before_exit() -> None:
     ptrace_seize = 0x4206
     ptrace_detach = 17
     ptrace_geteventmsg = 0x4201
+    ptrace_cont = 7
+    ptrace_interrupt = 0x4207
     ptrace_tracefork = 0x00000002
     wait_wall = 0x40000000
     read_fd, write_fd = os.pipe()
@@ -679,6 +689,7 @@ def test_ptrace_fork_event_holds_a_short_lived_child_before_exit() -> None:
             child = os.fork()
             if child == 0:
                 os._exit(0)
+            os.setpgid(child, child)
             os.waitpid(child, 0)
         finally:
             os._exit(0)
@@ -700,6 +711,8 @@ def test_ptrace_fork_event_holds_a_short_lived_child_before_exit() -> None:
             raise OSError(code, os.strerror(code))
 
     forked = 0
+    held_child = 0
+    tracee_detached = 0
     try:
         try:
             ptrace(ptrace_seize, tracee, ptrace_tracefork)
@@ -729,19 +742,85 @@ def test_ptrace_fork_event_holds_a_short_lived_child_before_exit() -> None:
         forked = int(message.value)
         waited, child_status = os.waitpid(forked, wait_wall)
         assert waited == forked and os.WIFSTOPPED(child_status)
-        time.sleep(0.1)
-        assert (Path("/proc") / str(forked)).exists()
+
+        # Let the tracee parent establish the child's production-shaped PGID
+        # while the forked child remains stopped by ptrace.
+        ptrace(ptrace_cont, tracee)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if os.getpgid(forked) == forked:
+                break
+            time.sleep(0.002)
+        else:
+            pytest.fail("forked child did not become its own process group")
+
         raw_stat = (Path("/proc") / str(forked) / "stat").read_text(
             encoding="ascii"
         )
-        assert raw_stat.rsplit(") ", 1)[1].split()[0] in {"T", "t"}
+        fields = raw_stat.rsplit(") ", 1)[1].split()
+        start_ticks = int(fields[19])
+
+        # This is the production handoff: queue STOP while ptrace owns the
+        # exact group, then detach without signal injection.
+        os.killpg(forked, signal.SIGSTOP)
+        held_child = forked
         ptrace(ptrace_detach, forked)
         forked = 0
+
+        # Detach the blocked parent too; the child cannot exit while stopped.
+        ptrace(ptrace_interrupt, tracee)
+        waited, parent_status = os.waitpid(tracee, wait_wall)
+        assert waited == tracee and os.WIFSTOPPED(parent_status)
         ptrace(ptrace_detach, tracee)
-        os.waitpid(tracee, 0)
+        tracee_detached = tracee
         tracee = 0
+
+        deadline = time.monotonic() + 2
+        child_stat = None
+        while time.monotonic() < deadline:
+            raw_stat = (Path("/proc") / str(held_child) / "stat").read_text(
+                encoding="ascii"
+            )
+            child_stat = raw_stat.rsplit(") ", 1)[1].split()
+            if child_stat[0] in {"T", "t"}:
+                break
+            time.sleep(0.002)
+        assert child_stat is not None
+        assert int(child_stat[2]) == held_child
+        assert int(child_stat[19]) == start_ticks
+        assert child_stat[0] in {"T", "t"}
+        time.sleep(0.1)
+        held_stat = (Path("/proc") / str(held_child) / "stat").read_text(
+            encoding="ascii"
+        ).rsplit(") ", 1)[1].split()
+        assert int(held_stat[2]) == held_child
+        assert int(held_stat[19]) == start_ticks
+        assert held_stat[0] in {"T", "t"}
+
+        os.killpg(held_child, signal.SIGCONT)
+        os.waitpid(tracee_detached, 0)
+        held_child = 0
+        tracee_detached = 0
     finally:
         os.close(write_fd)
+        if held_child:
+            try:
+                os.killpg(held_child, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            try:
+                os.kill(held_child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if tracee_detached:
+            try:
+                os.kill(tracee_detached, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(tracee_detached, 0)
+            except ChildProcessError:
+                pass
         if forked:
             try:
                 ptrace(ptrace_detach, forked)

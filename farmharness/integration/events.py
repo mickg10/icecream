@@ -462,13 +462,17 @@ try:
                 or "--generation" in before["argv"]):
             raise RuntimeError("ptrace fork child failed compile-worker authentication")
 
-        # Detach the child into an ordinary group stop.  Existing event logic
-        # can now prove assignment/listener state and later SIGCONT/SIGKILL it.
-        ptrace(PTRACE_DETACH, child, 0, signal.SIGSTOP)
-        child_attached = None
-        # Ownership changes at detach, not after a later snapshot.  Every
-        # failure from here must resume this exact ordinary stopped group.
+        # Queue the ordinary group stop while ptrace still owns the exact,
+        # authenticated child.  Passing SIGSTOP to PTRACE_DETACH leaves a
+        # handoff window in which a short-lived child can exec or exit before
+        # the stop becomes durable.  A pending group signal followed by a
+        # signal-free detach closes that window without weakening identity.
+        os.killpg(child, signal.SIGSTOP)
+        # Release responsibility begins as soon as the exact group has a
+        # queued stop, including the fail-safe path if detach itself errors.
         stopped_owned = dict(before)
+        ptrace(PTRACE_DETACH, child, 0, 0)
+        child_attached = None
         stop_and_detach_daemon()
         stopped = None
         stop_deadline = time.monotonic() + 2
