@@ -1445,6 +1445,7 @@ def _authenticated_strict_p50_retry_ids(
                     and binding["first_terminal_ms"] <= lifecycle["deadline_ms"]
                 )
                 if reason in {
+                    "result-stream-loss",
                     "source-transfer-loss",
                     "uncommitted-transport-loss",
                 }
@@ -6235,7 +6236,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     or job_id in strict_bound_jobs
                     or binding.get("first_worker") != "F1"
                     or binding.get("final_worker") not in other_workers
-                    or matching_restart is None
+                    or (
+                        binding.get("failure_reason") != "result-stream-loss"
+                        and matching_restart is None
+                    )
                     or (
                         binding.get("failure_reason") == "result-stream-loss"
                         and job_id not in error106_ids

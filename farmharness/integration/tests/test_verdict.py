@@ -2878,6 +2878,19 @@ def test_s70_b4_result_stream_error106_is_recovered_by_exact_strict_retry() -> N
     assert verdict["status"] == "PASS", verdict
 
 
+def test_result_stream_allows_late_scheduler_cancellation_settlement() -> None:
+    fixture = _s70_b4_worker_result_stream_recovery_bundle()
+    binding = fixture["observations"][
+        "successful_strict_p50_retry_bindings"
+    ][0]
+    binding["first_terminal_ms"] = (
+        max(event["fired_ms"] for event in fixture["event_log"]) + 1
+    )
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
 def test_result_stream_retry_accepts_only_its_exact_active_scheduler_loss() -> None:
     fixture = _s70_b4_worker_result_stream_recovery_bundle()
     binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
@@ -3263,10 +3276,19 @@ def test_s70_b4_source_transfer_retry_binding_fails_closed(mutation: str) -> Non
     "mutation",
     (
         "missing-binding",
+        "wrong-first-job",
         "wrong-final-job",
+        "wrong-first-generation",
+        "wrong-final-generation",
+        "wrong-first-worker",
         "wrong-final-worker",
+        "wrong-row",
+        "missing-error106",
+        "unsupported-first-terminal",
+        "invalid-assignment-epoch",
+        "invalid-assignment-nonce",
         "missing-failed-identity",
-        "outside-restart-window",
+        "outside-lifecycle-deadline",
     ),
 )
 def test_s70_b4_strict_retry_binding_fails_closed(mutation: str) -> None:
@@ -3276,17 +3298,40 @@ def test_s70_b4_strict_retry_binding_fails_closed(mutation: str) -> None:
     ]
     if mutation == "missing-binding":
         bindings.clear()
+    elif mutation == "wrong-first-job":
+        bindings[0]["first_scheduler_job"] += 1
     elif mutation == "wrong-final-job":
         bindings[0]["final_scheduler_job"] += 1
+    elif mutation == "wrong-first-generation":
+        bindings[0]["first_generation"] += 1
+    elif mutation == "wrong-final-generation":
+        bindings[0]["final_generation"] += 1
+    elif mutation == "wrong-first-worker":
+        bindings[0]["first_worker"] = "F2"
     elif mutation == "wrong-final-worker":
         bindings[0]["final_worker"] = "F1"
+    elif mutation == "wrong-row":
+        bindings[0]["job_id"] = "missing"
+    elif mutation == "missing-error106":
+        fixture["observations"]["error106_job_ids"] = []
+    elif mutation == "unsupported-first-terminal":
+        bindings[0]["first_terminal"] = "process-loss-recovery"
+    elif mutation == "invalid-assignment-epoch":
+        fixture["observations"]["failed_p50_result_identities"]["records"][0][
+            "assignment_epoch"
+        ] = 0
+    elif mutation == "invalid-assignment-nonce":
+        fixture["observations"]["failed_p50_result_identities"]["records"][0][
+            "assignment_nonce"
+        ] = 0
     elif mutation == "missing-failed-identity":
         fixture["observations"]["failed_p50_result_identities"] = {
             "record_count": 0,
             "records": [],
         }
     else:
-        bindings[0]["first_terminal_ms"] = 30_001
+        lifecycle = fixture["observations"]["job_lifecycle"][100]
+        bindings[0]["first_terminal_ms"] = lifecycle["deadline_ms"] + 1
 
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "FAIL"
