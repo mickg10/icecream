@@ -26,6 +26,7 @@ from farmharness.integration.collect import (
     _legacy_wire_results,
     _missing_compile_result_identity_reason,
     _one_role_log,
+    _p29_action_lineages,
     _p29_interner_faults,
     _p50_assignment_identity_marker,
     _p50_assignment_identity_evidence,
@@ -60,12 +61,153 @@ from farmharness.integration.remote import (
 from farmharness.integration.report import ReportError, report_bundle, verify_bundle
 from farmharness.integration.scenario_spec import load_scenario_spec
 from farmharness.integration.schema_validation import canonical_bytes
-from farmharness.integration.verdict import _assignment_preference_errors
+from farmharness.integration.verdict import (
+    _assignment_preference_errors,
+    evaluate_bundle,
+)
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
 SHA = "a" * 64
 C_GUID = "1" * 32
+
+
+def _p29_action_lineage_record() -> dict[str, object]:
+    return {
+        "action": "TX_BEGIN",
+        "actor": "F",
+        "c_store_guid": C_GUID,
+        "f_store_guid": "2" * 32,
+        "history_nonce": 1,
+        "previous_f_store_guid": "0" * 32,
+        "profile": "p29_v1",
+        "raw_digest": "3" * 32,
+        "rel_seq": 0,
+        "session_serial": 1,
+        "tu_seq": 7,
+    }
+
+
+def test_p29_action_lineage_retains_exact_relationship_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "f-action.jsonl"
+    record = _p29_action_lineage_record()
+    _write_jsonl(path, [record])
+    assert _p29_action_lineages(path) == {
+        (C_GUID, 7): {
+            "c_store_guid": C_GUID,
+            "f_store_guid": "2" * 32,
+            "history_nonce": 1,
+            "previous_f_store_guid": "0" * 32,
+            "raw_digest": "3" * 32,
+            "rel_seq": 0,
+            "session_serial": 1,
+            "tu_seq": 7,
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("actor", "C"),
+        ("profile", "zstd_route"),
+        ("c_store_guid", "0" * 32),
+        ("f_store_guid", "0" * 32),
+        ("previous_f_store_guid", "bad"),
+        ("raw_digest", "bad"),
+        ("tu_seq", -1),
+        ("session_serial", 0),
+        ("history_nonce", 0),
+        ("rel_seq", -1),
+    ),
+)
+def test_p29_action_lineage_rejects_invalid_identity(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    path = tmp_path / "f-action.jsonl"
+    record = _p29_action_lineage_record()
+    record[field] = value
+    _write_jsonl(path, [record])
+    with pytest.raises(CollectError, match="P29 TX_BEGIN"):
+        _p29_action_lineages(path)
+
+
+def test_p29_action_lineage_rejects_duplicate_source_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "f-action.jsonl"
+    record = _p29_action_lineage_record()
+    _write_jsonl(path, [record, record])
+    with pytest.raises(CollectError, match="duplicate P29 TX_BEGIN"):
+        _p29_action_lineages(path)
+
+
+def test_worker_bounce_collection_emits_verdict_compatible_action_lineage(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    scenario.data["id"] = "S70-b4-worker-bounces"
+    scenario.data["expect"]["engagement"] = "s70-b4-worker-bounces"
+    scenario.data["expect"]["worker_cold_witness"] = "p29-action-lineage-v1"
+    plan = farmtest.build_plan(farm, scenario, run_id=plan["run_id"])
+    for leaf in ("preflight.json", "lifecycle.json", "workload.json"):
+        receipt_path = root / leaf
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        for field in (
+            "farm_digest",
+            "run_id",
+            "scenario_digest",
+            "topology_digest",
+        ):
+            receipt[field] = plan[field]
+        if leaf == "lifecycle.json":
+            receipt["plan"] = plan
+        _write_json(receipt_path, receipt)
+    lineage = _p29_action_lineage_record()
+    lineage["raw_digest"] = "2" * 32
+    lineage["tu_seq"] = 1
+    _write_jsonl(
+        root / "F1.results" / "f-action.jsonl",
+        [
+            lineage,
+            {"action": "INPUT_COMMITTED", "c_store_guid": C_GUID, "tu_seq": 1},
+        ],
+    )
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+    assert bundle["observations"]["p29_action_lineage"] == {
+        "record_count": 1,
+        "records": [
+            {
+                "c_store_guid": C_GUID,
+                "f_store_guid": "2" * 32,
+                "history_nonce": 1,
+                "job_id": "C1:A:1:2",
+                "previous_f_store_guid": "0" * 32,
+                "raw_digest": "2" * 32,
+                "rel_seq": 0,
+                "schema": "icefarm-p29-action-lineage-v1",
+                "session_serial": 1,
+                "tu_seq": 1,
+                "worker_instance": "F1",
+            }
+        ],
+        "schema": "icefarm-p29-action-lineage-v1",
+    }
+    verdict = evaluate_bundle(bundle)
+    worker_clause = next(
+        clause
+        for clause in verdict["clauses"]
+        if clause["id"] == "s70.b4-worker-bounces"
+    )
+    assert "@observations:s70-b4-worker-action-lineage" not in worker_clause[
+        "offending_job_ids"
+    ]
+    assert "@observations:s70-b4-worker-source-routes" not in worker_clause[
+        "offending_job_ids"
+    ]
 
 
 def _source_result_record() -> dict[str, object]:

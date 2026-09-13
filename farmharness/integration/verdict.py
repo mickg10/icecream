@@ -77,6 +77,9 @@ P29_FAULT_ENV = "ICECC_P50_FAULT_INJECTION"
 P29_FAULT_ENV_VALUE = "P29_INTERNER_FAIL_ONCE"
 P29_FAULT_SCHEMA = "icecream-p50-fault-v1"
 P29_FAULT_NAME = "p29-interner-fail-once"
+P29_ACTION_LINEAGE_SCHEMA = "icefarm-p29-action-lineage-v1"
+P29_ACTION_LINEAGE_CONTRACT = "p29-action-lineage-v1"
+ZERO_GUID = "0" * 32
 P29_PERMANENT_PROFILE_UNAVAILABLE = 0x5001
 SESSION_OUTCOMES = frozenset(("committed", "refused", "fallback", "none"))
 TERMINAL_KINDS = frozenset(
@@ -6066,6 +6069,12 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             if item.get("name") != "F1" and isinstance(item.get("name"), str)
         }
         workload = scenario.get("workload")
+        expect = scenario.get("expect")
+        cold_witness_contract = (
+            expect.get("worker_cold_witness")
+            if isinstance(expect, Mapping)
+            else None
+        )
         expected_timeline = [
             {"trigger": f"t+{seconds}", "action": "restart", "instance": "F1"}
             for seconds in (30, 60, 90)
@@ -6086,6 +6095,8 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 row.get("client_instance") != workload["clients"][0]
                 for row in valid_rows
             )
+            or cold_witness_contract
+            not in (None, P29_ACTION_LINEAGE_CONTRACT)
         ):
             b4_bad.add("@scenario:s70-b4-worker")
 
@@ -6401,38 +6412,239 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 ):
                     b4_bad.add(f"@worker:{worker}:epoch-{epoch}")
 
-        target_history: dict[
-            str, list[tuple[int, int, Mapping[str, Any]]]
-        ] = defaultdict(list)
-        for epoch in range(4):
-            for dispatch_ms, dispatch_line, row in ordered_target[epoch]:
-                target_history[str(row["tu"])].append(
-                    (dispatch_ms, dispatch_line, row)
-                )
-        for epoch in (1, 2, 3):
-            candidates = ordered_target[epoch]
-            if not candidates:
-                b4_bad.add(f"@worker:F1:epoch-{epoch}")
-                continue
-            first_dispatch_ms, first_dispatch_line, first = min(
-                candidates, key=lambda item: (item[0], item[1])
+        if cold_witness_contract == P29_ACTION_LINEAGE_CONTRACT:
+            expected_p29_rows = {
+                _job_id(row.get("job_id"), "@row"): row
+                for row in valid_rows
+                if row.get("tail_profile") == "P29V1"
+                and row.get("session_outcome") == "committed"
+            }
+            source_routes = observations.get("p50_source_routes")
+            source_records = (
+                source_routes.get("records")
+                if isinstance(source_routes, Mapping)
+                else None
             )
-            references = target_history.get(str(first["tu"]), [])
-            cold_bytes = (
-                max(row["c_to_f_bytes"] for _ms, _line, row in references),
-                max(row["f_to_c_bytes"] for _ms, _line, row in references),
+            routes_by_job: dict[str, Mapping[str, Any]] = {}
+            source_records_valid = (
+                isinstance(source_routes, Mapping)
+                and set(source_routes) == {"record_count", "records"}
+                and _is_int(source_routes.get("record_count"))
+                and isinstance(source_records, list)
+                and source_routes["record_count"] == len(source_records)
             )
-            later_warm = any(
-                (dispatch_ms, dispatch_line)
-                > (first_dispatch_ms, first_dispatch_line)
-                and row["c_to_f_bytes"] < first["c_to_f_bytes"]
-                for dispatch_ms, dispatch_line, row in references
-            )
+            if source_records_valid:
+                for record in source_records:
+                    identifier = (
+                        _job_id(record.get("job_id"), "@source-route")
+                        if isinstance(record, Mapping)
+                        else "@source-route"
+                    )
+                    row = expected_p29_rows.get(identifier)
+                    if (
+                        not isinstance(record, Mapping)
+                        or set(record)
+                        != {
+                            "c_store_guid",
+                            "c_to_f_bytes",
+                            "client_instance",
+                            "f_to_c_bytes",
+                            "job_id",
+                            "profile",
+                            "raw_bytes",
+                            "raw_digest",
+                            "schema",
+                            "tu_seq",
+                            "worker_instance",
+                        }
+                        or record.get("schema") != "icefarm-p50-source-route-v1"
+                        or record.get("profile") != "P29V1"
+                        or not isinstance(record.get("c_store_guid"), str)
+                        or re.fullmatch(r"[0-9a-f]{32}", record["c_store_guid"])
+                        is None
+                        or record["c_store_guid"] == ZERO_GUID
+                        or not isinstance(record.get("raw_digest"), str)
+                        or re.fullmatch(r"[0-9a-f]{32}", record["raw_digest"])
+                        is None
+                        or not _is_int(record.get("raw_bytes"), minimum=1)
+                        or not _is_int(record.get("tu_seq"))
+                        or not _is_int(record.get("c_to_f_bytes"))
+                        or not _is_int(record.get("f_to_c_bytes"))
+                        or row is None
+                        or record.get("client_instance")
+                        != row.get("client_instance")
+                        or record.get("worker_instance") != row.get("cs")
+                        or record.get("c_to_f_bytes") != row.get("c_to_f_bytes")
+                        or record.get("f_to_c_bytes") != row.get("f_to_c_bytes")
+                        or identifier in routes_by_job
+                    ):
+                        source_records_valid = False
+                        break
+                    routes_by_job[identifier] = record
             if (
-                cold_bytes != (first["c_to_f_bytes"], first["f_to_c_bytes"])
-                or not later_warm
+                not source_records_valid
+                or set(routes_by_job) != set(expected_p29_rows)
             ):
-                b4_bad.add(_job_id(first["job_id"], "@row"))
+                b4_bad.add("@observations:s70-b4-worker-source-routes")
+
+            lineage_observation = observations.get("p29_action_lineage")
+            lineage_records = (
+                lineage_observation.get("records")
+                if isinstance(lineage_observation, Mapping)
+                else None
+            )
+            lineages_by_job: dict[str, Mapping[str, Any]] = {}
+            lineage_records_valid = (
+                isinstance(lineage_observation, Mapping)
+                and set(lineage_observation) == {"record_count", "records", "schema"}
+                and lineage_observation.get("schema")
+                == P29_ACTION_LINEAGE_SCHEMA
+                and _is_int(lineage_observation.get("record_count"))
+                and isinstance(lineage_records, list)
+                and lineage_observation["record_count"] == len(lineage_records)
+            )
+            if lineage_records_valid:
+                for record in lineage_records:
+                    identifier = (
+                        _job_id(record.get("job_id"), "@p29-action-lineage")
+                        if isinstance(record, Mapping)
+                        else "@p29-action-lineage"
+                    )
+                    row = expected_p29_rows.get(identifier)
+                    source = routes_by_job.get(identifier)
+                    if (
+                        not isinstance(record, Mapping)
+                        or set(record)
+                        != {
+                            "c_store_guid",
+                            "f_store_guid",
+                            "history_nonce",
+                            "job_id",
+                            "previous_f_store_guid",
+                            "raw_digest",
+                            "rel_seq",
+                            "schema",
+                            "session_serial",
+                            "tu_seq",
+                            "worker_instance",
+                        }
+                        or record.get("schema") != P29_ACTION_LINEAGE_SCHEMA
+                        or any(
+                            not isinstance(record.get(field), str)
+                            or re.fullmatch(r"[0-9a-f]{32}", record[field]) is None
+                            for field in (
+                                "c_store_guid",
+                                "f_store_guid",
+                                "previous_f_store_guid",
+                                "raw_digest",
+                            )
+                        )
+                        or record.get("c_store_guid") == ZERO_GUID
+                        or record.get("f_store_guid") == ZERO_GUID
+                        or not _is_int(record.get("tu_seq"))
+                        or not _is_int(record.get("session_serial"), minimum=1)
+                        or not _is_int(record.get("history_nonce"), minimum=1)
+                        or not _is_int(record.get("rel_seq"))
+                        or row is None
+                        or source is None
+                        or record.get("worker_instance") != row.get("cs")
+                        or record.get("worker_instance")
+                        != source.get("worker_instance")
+                        or record.get("c_store_guid")
+                        != source.get("c_store_guid")
+                        or record.get("tu_seq") != source.get("tu_seq")
+                        or record.get("raw_digest") != source.get("raw_digest")
+                        or identifier in lineages_by_job
+                    ):
+                        lineage_records_valid = False
+                        break
+                    lineages_by_job[identifier] = record
+            if (
+                not lineage_records_valid
+                or set(lineages_by_job) != set(expected_p29_rows)
+            ):
+                b4_bad.add("@observations:s70-b4-worker-action-lineage")
+
+            cold_guids: set[str] = set()
+            for epoch in (1, 2, 3):
+                candidates = ordered_target[epoch]
+                if not candidates:
+                    b4_bad.add(f"@worker:F1:epoch-{epoch}")
+                    continue
+                first_dispatch_ms, first_dispatch_line, first = min(
+                    candidates, key=lambda item: (item[0], item[1])
+                )
+                identifier = _job_id(first.get("job_id"), "@row")
+                first_lineage = lineages_by_job.get(identifier)
+                if first_lineage is None:
+                    b4_bad.add(identifier)
+                    continue
+                cold_guids.add(str(first_lineage["f_store_guid"]))
+                later_lineages = [
+                    lineages_by_job.get(_job_id(row.get("job_id"), "@row"))
+                    for dispatch_ms, dispatch_line, row in candidates
+                    if (dispatch_ms, dispatch_line)
+                    > (first_dispatch_ms, first_dispatch_line)
+                ]
+                progresses_warm = any(
+                    isinstance(record, Mapping)
+                    and record.get("worker_instance") == "F1"
+                    and record.get("c_store_guid")
+                    == first_lineage.get("c_store_guid")
+                    and record.get("f_store_guid")
+                    == first_lineage.get("f_store_guid")
+                    and record.get("history_nonce")
+                    == first_lineage.get("history_nonce")
+                    and record.get("session_serial") == 2
+                    and record.get("rel_seq") == 1
+                    for record in later_lineages
+                )
+                if (
+                    first_lineage.get("worker_instance") != "F1"
+                    or first_lineage.get("previous_f_store_guid") != ZERO_GUID
+                    or first_lineage.get("session_serial") != 1
+                    or first_lineage.get("history_nonce") != 1
+                    or first_lineage.get("rel_seq") != 0
+                    or not progresses_warm
+                ):
+                    b4_bad.add(identifier)
+            if len(cold_guids) != 3:
+                b4_bad.add("@observations:s70-b4-worker-store-generations")
+        else:
+            # Retained bundles predate the deterministic action-lineage
+            # contract.  Preserve their original same-TU byte verdict exactly.
+            target_history: dict[
+                str, list[tuple[int, int, Mapping[str, Any]]]
+            ] = defaultdict(list)
+            for epoch in range(4):
+                for dispatch_ms, dispatch_line, row in ordered_target[epoch]:
+                    target_history[str(row["tu"])].append(
+                        (dispatch_ms, dispatch_line, row)
+                    )
+            for epoch in (1, 2, 3):
+                candidates = ordered_target[epoch]
+                if not candidates:
+                    b4_bad.add(f"@worker:F1:epoch-{epoch}")
+                    continue
+                first_dispatch_ms, first_dispatch_line, first = min(
+                    candidates, key=lambda item: (item[0], item[1])
+                )
+                references = target_history.get(str(first["tu"]), [])
+                cold_bytes = (
+                    max(row["c_to_f_bytes"] for _ms, _line, row in references),
+                    max(row["f_to_c_bytes"] for _ms, _line, row in references),
+                )
+                later_warm = any(
+                    (dispatch_ms, dispatch_line)
+                    > (first_dispatch_ms, first_dispatch_line)
+                    and row["c_to_f_bytes"] < first["c_to_f_bytes"]
+                    for dispatch_ms, dispatch_line, row in references
+                )
+                if (
+                    cold_bytes != (first["c_to_f_bytes"], first["f_to_c_bytes"])
+                    or not later_warm
+                ):
+                    b4_bad.add(_job_id(first["job_id"], "@row"))
         clauses.append(
             _clause(
                 "s70.b4-worker-bounces",

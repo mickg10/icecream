@@ -52,6 +52,9 @@ P29_INTERNER_FAULT_SCHEMA = "icecream-p50-fault-v1"
 P29_INTERNER_FAULT = "p29-interner-fail-once"
 P29_INTERNER_FAULT_OUTCOME = "fired"
 P29_INTERNER_FAULT_FIELDS = frozenset(("schema", "fault", "outcome"))
+P29_ACTION_LINEAGE_SCHEMA = "icefarm-p29-action-lineage-v1"
+P29_ACTION_LINEAGE_CONTRACT = "p29-action-lineage-v1"
+ZERO_GUID = "0" * 32
 LEGACY_WIRE_SCHEMA = "icecream-p50-legacy-wire-v1"
 LEGACY_WIRE_FIELDS = frozenset(
     {
@@ -1120,6 +1123,67 @@ def _action_commits(path: Path, actions: frozenset[str]) -> set[tuple[str, int]]
         if key in result:
             raise CollectError(f"{path}: duplicate terminal action for {key}")
         result.add(key)
+    return result
+
+
+def _p29_action_lineages(path: Path) -> dict[tuple[str, int], dict[str, Any]]:
+    """Retain the F-authored P29 relationship identity for each transaction.
+
+    B4 used to infer a fresh worker-side relationship from the chance that the
+    scheduler sent the same translation unit to the restarted worker twice.
+    The product trace already states the stronger fact directly: a new F store
+    starts at session/history/relationship sequence 1/1/0.  Preserve only the
+    fields needed to bind that fact to a full source-result identity.
+    """
+
+    result: dict[tuple[str, int], dict[str, Any]] = {}
+    for index, item in enumerate(_read_jsonl(path), start=1):
+        if item.get("action") != "TX_BEGIN":
+            continue
+        if item.get("actor") != "F" or item.get("profile") != "p29_v1":
+            raise CollectError(f"{path}:{index}: P29 TX_BEGIN role/profile is invalid")
+        c_store_guid = item.get("c_store_guid")
+        f_store_guid = item.get("f_store_guid")
+        previous_f_store_guid = item.get("previous_f_store_guid")
+        raw_digest = item.get("raw_digest")
+        tu_seq = item.get("tu_seq")
+        session_serial = item.get("session_serial")
+        history_nonce = item.get("history_nonce")
+        rel_seq = item.get("rel_seq")
+        if (
+            not isinstance(c_store_guid, str)
+            or re.fullmatch(r"[0-9a-f]{32}", c_store_guid) is None
+            or c_store_guid == ZERO_GUID
+            or not isinstance(f_store_guid, str)
+            or re.fullmatch(r"[0-9a-f]{32}", f_store_guid) is None
+            or f_store_guid == ZERO_GUID
+            or not isinstance(previous_f_store_guid, str)
+            or re.fullmatch(r"[0-9a-f]{32}", previous_f_store_guid) is None
+            or not isinstance(raw_digest, str)
+            or re.fullmatch(r"[0-9a-f]{32}", raw_digest) is None
+            or type(tu_seq) is not int
+            or tu_seq < 0
+            or type(session_serial) is not int
+            or session_serial < 1
+            or type(history_nonce) is not int
+            or history_nonce < 1
+            or type(rel_seq) is not int
+            or rel_seq < 0
+        ):
+            raise CollectError(f"{path}:{index}: P29 TX_BEGIN lineage is invalid")
+        key = (c_store_guid, tu_seq)
+        if key in result:
+            raise CollectError(f"{path}: duplicate P29 TX_BEGIN lineage for {key}")
+        result[key] = {
+            "c_store_guid": c_store_guid,
+            "f_store_guid": f_store_guid,
+            "history_nonce": history_nonce,
+            "previous_f_store_guid": previous_f_store_guid,
+            "raw_digest": raw_digest,
+            "rel_seq": rel_seq,
+            "session_serial": session_serial,
+            "tu_seq": tu_seq,
+        }
     return result
 
 
@@ -5449,6 +5513,23 @@ def _parse_rows(
         for item in topology
         if item["role"] == "F"
     }
+    cold_witness_contract = scenario.data.get("expect", {}).get(
+        "worker_cold_witness"
+    )
+    if cold_witness_contract is not None and (
+        scenario.data.get("id") != "S70-b4-worker-bounces"
+        or scenario.data.get("expect", {}).get("engagement")
+        != "s70-b4-worker-bounces"
+        or cold_witness_contract != P29_ACTION_LINEAGE_CONTRACT
+    ):
+        raise CollectError("worker cold-witness contract is invalid for this scenario")
+    f_action_lineages = {
+        item["name"]: _p29_action_lineages(
+            _instance_results(evidence, item["name"]) / "f-action.jsonl"
+        )
+        for item in topology
+        if item["role"] == "F" and cold_witness_contract is not None
+    }
     f_legacy_wires = {
         item["name"]: _legacy_wire_results(
             _instance_results(evidence, item["name"]) / "f-legacy-wire.jsonl", "F"
@@ -5464,6 +5545,7 @@ def _parse_rows(
     error106: list[str] = []
     source_mutex_records: list[dict[str, Any]] = []
     source_route_records: list[dict[str, Any]] = []
+    p29_action_lineage_records: list[dict[str, Any]] = []
     failed_result_identity_records: list[dict[str, Any]] = []
     failed_source_transfer_records: list[dict[str, Any]] = []
     failed_uncommitted_transport_records: list[dict[str, Any]] = []
@@ -5929,6 +6011,26 @@ def _parse_rows(
                         "worker_instance": worker["name"],
                     }
                 )
+                if cold_witness_contract is not None:
+                    if profile != "P29V1":
+                        raise CollectError(
+                            f"{job_id}: cold-witness scenario selected a non-P29 route"
+                        )
+                    lineage = f_action_lineages[worker["name"]].get(
+                        (source["c_store_guid"], source["tu_seq"])
+                    )
+                    if lineage is None or lineage["raw_digest"] != source["raw_digest"]:
+                        raise CollectError(
+                            f"{job_id}: P29 source route has no exact F action lineage"
+                        )
+                    p29_action_lineage_records.append(
+                        {
+                            **lineage,
+                            "job_id": job_id,
+                            "schema": P29_ACTION_LINEAGE_SCHEMA,
+                            "worker_instance": worker["name"],
+                        }
+                    )
             elif legacy_wire is not None:
                 f_wire = f_legacy_wires[worker["name"]].get(legacy_key)
                 if f_wire is None:
@@ -6143,6 +6245,13 @@ def _parse_rows(
         "p50_source_routes": {
             "record_count": len(source_route_records),
             "records": sorted(source_route_records, key=lambda item: item["job_id"]),
+        },
+        "p29_action_lineage": {
+            "record_count": len(p29_action_lineage_records),
+            "records": sorted(
+                p29_action_lineage_records, key=lambda item: item["job_id"]
+            ),
+            "schema": P29_ACTION_LINEAGE_SCHEMA,
         },
         "assignment_claims": assignment_claims,
         "raw_jobs": raw_jobs,

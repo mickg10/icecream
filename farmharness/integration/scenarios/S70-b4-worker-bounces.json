@@ -80,6 +80,7 @@
     "error106_max": 0,
     "tail_to_incapable": 0,
     "reuse": "none-when-legacy",
+    "worker_cold_witness": "p29-action-lineage-v1",
     "wall_s_max": null
   },
   "controls": [],

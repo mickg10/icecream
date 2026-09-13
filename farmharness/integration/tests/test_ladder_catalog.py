@@ -267,6 +267,9 @@ def test_s70_b4_worker_bounce_runs_three_30_second_flaps() -> None:
     assert scenario.data["workload"]["turns"] == ["A"]
     assert scenario.data["workload"]["repeat"] == 6
     assert scenario.data["expect"]["engagement"] == "s70-b4-worker-bounces"
+    assert scenario.data["expect"]["worker_cold_witness"] == (
+        "p29-action-lineage-v1"
+    )
     assert scenario.data["timeline"] == [
         {"action": "restart", "instance": "F1", "trigger": f"t+{seconds}"}
         for seconds in (30, 60, 90)

@@ -78,6 +78,7 @@
           "propertyNames": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"},
           "additionalProperties": {"type": "boolean"}
         },
+        "worker_cold_witness": {"enum": ["p29-action-lineage-v1"]},
         "wall_s_max": {"type": ["number", "null"], "exclusiveMinimum": 0}
       }
     },

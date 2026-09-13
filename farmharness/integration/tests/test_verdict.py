@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections import defaultdict
 
 import pytest
 
@@ -2375,10 +2376,178 @@ def _s70_b4_worker_bundle() -> dict[str, object]:
     return bundle
 
 
+def _s70_b4_worker_action_lineage_bundle() -> dict[str, object]:
+    fixture = _s70_b4_worker_bundle()
+    fixture["scenario"]["expect"]["worker_cold_witness"] = (
+        "p29-action-lineage-v1"
+    )
+    counters: dict[tuple[str, int], int] = defaultdict(int)
+    source_records: list[dict[str, object]] = []
+    lineage_records: list[dict[str, object]] = []
+    c_store_guid = "c" * 32
+    for row in fixture["rows"]:
+        worker = str(row["cs"])
+        epoch = int(row["event_epoch"])
+        relationship = (worker, epoch if worker == "F1" else 0)
+        counters[relationship] += 1
+        session_serial = counters[relationship]
+        guid_number = (epoch + 1) if worker == "F1" else 10
+        f_store_guid = f"{guid_number:032x}"
+        job_id = str(row["job_id"])
+        tu_seq = int(job_id)
+        raw_digest = hashlib.sha256(job_id.encode()).hexdigest()[:32]
+        source_records.append(
+            {
+                "c_store_guid": c_store_guid,
+                "c_to_f_bytes": row["c_to_f_bytes"],
+                "client_instance": row["client_instance"],
+                "f_to_c_bytes": row["f_to_c_bytes"],
+                "job_id": job_id,
+                "profile": "P29V1",
+                "raw_bytes": 4096,
+                "raw_digest": raw_digest,
+                "schema": "icefarm-p50-source-route-v1",
+                "tu_seq": tu_seq,
+                "worker_instance": worker,
+            }
+        )
+        lineage_records.append(
+            {
+                "c_store_guid": c_store_guid,
+                "f_store_guid": f_store_guid,
+                "history_nonce": 1,
+                "job_id": job_id,
+                "previous_f_store_guid": (
+                    "0" * 32 if session_serial == 1 else f_store_guid
+                ),
+                "raw_digest": raw_digest,
+                "rel_seq": session_serial - 1,
+                "schema": "icefarm-p29-action-lineage-v1",
+                "session_serial": session_serial,
+                "tu_seq": tu_seq,
+                "worker_instance": worker,
+            }
+        )
+        # The deterministic witness must not depend on a later dispatch of the
+        # same translation unit.
+        row["tu"] = f"files/unique-{job_id}.ii"
+    fixture["observations"]["p50_source_routes"] = {
+        "record_count": len(source_records),
+        "records": source_records,
+    }
+    fixture["observations"]["p29_action_lineage"] = {
+        "record_count": len(lineage_records),
+        "records": lineage_records,
+        "schema": "icefarm-p29-action-lineage-v1",
+    }
+    return fixture
+
+
 def test_s70_b4_worker_bounces_are_cold_while_other_worker_continues() -> None:
     fixture = _s70_b4_worker_bundle()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+
+
+def test_s70_b4_worker_action_lineage_does_not_require_same_tu_placement() -> None:
+    fixture = _s70_b4_worker_action_lineage_bundle()
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-observation",
+        "bad-count",
+        "missing-record",
+        "missing-source-record",
+        "extra-source-record",
+        "source-byte-mismatch",
+        "extra-field",
+        "c-guid-mismatch",
+        "raw-digest-mismatch",
+        "tu-seq-mismatch",
+        "worker-mismatch",
+        "cold-previous-guid",
+        "cold-session",
+        "cold-history",
+        "cold-rel-seq",
+        "reused-store-guid",
+        "missing-warm-progression",
+    ),
+)
+def test_s70_b4_worker_action_lineage_fails_closed(mutation: str) -> None:
+    fixture = _s70_b4_worker_action_lineage_bundle()
+    observation = fixture["observations"]["p29_action_lineage"]
+    records = observation["records"]
+    first_epoch_1 = next(
+        record
+        for record in records
+        if record["worker_instance"] == "F1"
+        and fixture["rows"][int(record["job_id"]) - 1]["event_epoch"] == 1
+    )
+    if mutation == "missing-observation":
+        del fixture["observations"]["p29_action_lineage"]
+    elif mutation == "bad-count":
+        observation["record_count"] -= 1
+    elif mutation == "missing-record":
+        records.pop()
+        observation["record_count"] -= 1
+    elif mutation == "missing-source-record":
+        fixture["observations"]["p50_source_routes"]["records"].pop()
+        fixture["observations"]["p50_source_routes"]["record_count"] -= 1
+    elif mutation == "extra-source-record":
+        forged = copy.deepcopy(
+            fixture["observations"]["p50_source_routes"]["records"][0]
+        )
+        forged["job_id"] = "forged"
+        fixture["observations"]["p50_source_routes"]["records"].append(forged)
+        fixture["observations"]["p50_source_routes"]["record_count"] += 1
+    elif mutation == "source-byte-mismatch":
+        fixture["observations"]["p50_source_routes"]["records"][100][
+            "c_to_f_bytes"
+        ] += 1
+    elif mutation == "extra-field":
+        first_epoch_1["forged"] = True
+    elif mutation == "c-guid-mismatch":
+        first_epoch_1["c_store_guid"] = "d" * 32
+    elif mutation == "raw-digest-mismatch":
+        first_epoch_1["raw_digest"] = "d" * 32
+    elif mutation == "tu-seq-mismatch":
+        first_epoch_1["tu_seq"] += 1
+    elif mutation == "worker-mismatch":
+        first_epoch_1["worker_instance"] = "F2"
+    elif mutation == "cold-previous-guid":
+        first_epoch_1["previous_f_store_guid"] = first_epoch_1["f_store_guid"]
+    elif mutation == "cold-session":
+        first_epoch_1["session_serial"] = 2
+    elif mutation == "cold-history":
+        first_epoch_1["history_nonce"] = 2
+    elif mutation == "cold-rel-seq":
+        first_epoch_1["rel_seq"] = 1
+    elif mutation == "reused-store-guid":
+        first_epoch_2 = next(
+            record
+            for record in records
+            if record["worker_instance"] == "F1"
+            and fixture["rows"][int(record["job_id"]) - 1]["event_epoch"] == 2
+        )
+        first_epoch_2["f_store_guid"] = first_epoch_1["f_store_guid"]
+    else:
+        second_epoch_1 = next(
+            record
+            for record in records
+            if record["worker_instance"] == "F1"
+            and record["f_store_guid"] == first_epoch_1["f_store_guid"]
+            and record["session_serial"] == 2
+        )
+        second_epoch_1["session_serial"] = 3
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert "s70.b4-worker-bounces" in failed
 
 
 @pytest.mark.parametrize(
