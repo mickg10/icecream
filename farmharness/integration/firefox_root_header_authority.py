@@ -143,7 +143,16 @@ def _preprocess_argv(candidate: Mapping[str, Any], input_path: Path) -> list[str
     position = candidate["input_position"]
     if argv[position] != candidate.get("input_operand", argv[position]):
         _fail("compile_command", "input operand changed")
-    argv[position] = str(input_path)
+    # Preserve the compile database's exact spelling when preprocessing its
+    # original input.  Clang writes that spelling into the leading linemarker,
+    # so normalizing a relative operand to an absolute path changes otherwise
+    # identical retained .ii bytes.  Substitution remains mandatory when the
+    # caller intentionally supplies a different input.
+    original = Path(candidate["actual_input"])
+    if os.path.realpath(input_path) == os.path.realpath(original):
+        argv[position] = candidate["input_operand"]
+    else:
+        argv[position] = str(input_path)
     argv[0] = candidate["compiler_path"]
     transformed: list[str] = []
     skip = False
@@ -627,9 +636,36 @@ COMPILE_BIND_FIELDS = frozenset({"path", "sha256", "turn_a_pass", "turn_b_pass"}
 
 
 def _first_diagnostic(stderr: bytes) -> str:
-    return next(
-        (line.strip()[:1000] for line in stderr.decode("utf-8", "replace").splitlines() if line.strip()),
-        "",
+    lines = [
+        line.strip()
+        for line in stderr.decode("utf-8", "replace").splitlines()
+        if line.strip()
+    ]
+    error = next(
+        (
+            line
+            for line in lines
+            if "fatal error:" in line.lower() or "error:" in line.lower()
+        ),
+        None,
+    )
+    return (error or next(iter(lines), ""))[:1000]
+
+
+def _difference_summary(retained: bytes, reproduced: bytes) -> str:
+    """Return bounded, deterministic evidence for unequal preprocessor output."""
+    common = min(len(retained), len(reproduced))
+    offset = next(
+        (index for index in range(common) if retained[index] != reproduced[index]),
+        common,
+    )
+    start = max(0, offset - 16)
+    end = offset + 17
+    return (
+        f"first_difference={offset};retained_bytes={len(retained)};"
+        f"reproduced_bytes={len(reproduced)};"
+        f"retained_hex={retained[start:end].hex()};"
+        f"reproduced_hex={reproduced[start:end].hex()}"
     )
 
 
@@ -1092,7 +1128,10 @@ def _retained_one(
         if not error:
             error = _first_diagnostic(stderr) or f"namespace exited {exit_code}"
     elif not equal:
-        error = "reproduced output does not equal retained B"
+        error = (
+            "reproduced output does not equal retained B: "
+            + _difference_summary(b_path.read_bytes(), stdout)
+        )
     if bind_evidence is None and not error:
         error = "missing bind identity evidence"
     bind_evidence = bind_evidence or {
@@ -1748,8 +1787,21 @@ def build_root_header_authority(
         raise RootHeaderAuthorityError(f"output already exists: {output_root}")
     output_root = output_root.absolute()
     published_root = (published_root or output_root).absolute()
-    if (count, expected_affected, expected_unaffected) != (1000, 761, 239):
-        _fail("count", "root-header authority requires exactly 1000 TUs with 761/239 body law")
+    if (
+        count != 1000
+        or not isinstance(expected_affected, int)
+        or isinstance(expected_affected, bool)
+        or not isinstance(expected_unaffected, int)
+        or isinstance(expected_unaffected, bool)
+        or expected_affected < 1
+        or expected_unaffected < 1
+        or expected_affected + expected_unaffected != count
+    ):
+        _fail(
+            "count",
+            "root-header authority requires exactly 1000 TUs and a declared "
+            "nonempty affected/unaffected body law",
+        )
     edit, selection, pair, validation_meta = _validate_inputs(
         source_root=source_root,
         source_commit=source_commit,
@@ -1901,8 +1953,11 @@ def validate_root_header_authority(authority_path: Path) -> dict[str, Any]:
         or affected + unaffected != count
     ):
         _fail("body_law", "counts are invalid")
-    if (count, affected, unaffected) != (1000, 761, 239):
-        _fail("body_law", "root-header authority requires literal 1000/761/239 law")
+    if count != 1000 or affected < 1 or unaffected < 1:
+        _fail(
+            "body_law",
+            "root-header authority requires 1000 TUs and nonempty affected/unaffected sets",
+        )
     root_edit = _mapping(authority["root_edit"], "root_edit")
     source = _mapping(authority["source"], "source")
     if set(root_edit) != ROOT_EDIT_FIELDS or set(source) != {"commit", "git", "header", "root"}:
@@ -2046,6 +2101,8 @@ def capture_root_header_authority(
     turn_a_manifest: Path,
     turn_b_manifest: Path,
     count: int = 1000,
+    expected_affected: int = 761,
+    expected_unaffected: int = 239,
     timeout_s: float = 120.0,
     jobs: int = 4,
     invoke: Callable[[list[str], float], subprocess.CompletedProcess[bytes]] | None = None,
@@ -2067,12 +2124,33 @@ def capture_root_header_authority(
     retained_receipt = staging / "retained-execution.json"
     preserve_failure = False
     try:
-        run_compile_validation(
+        compile_document = run_compile_validation(
             source_root=source_root, source_commit=source_commit, root_include=root_include,
             trace_path=trace_path, compile_commands_path=compile_commands_path,
             turn_a_manifest=turn_a_manifest, turn_b_manifest=turn_b_manifest,
             output_path=compile_receipt, count=count, timeout_s=timeout_s, jobs=jobs,
         )
+        failed_compile = (
+            next(
+                (
+                    row
+                    for row in compile_document["rows"]
+                    if row.get("exit_code") != 0
+                    or row.get("timed_out") is not False
+                    or row.get("error") != ""
+                    or row.get("output_sha256") is None
+                ),
+                None,
+            )
+            if isinstance(compile_document, Mapping)
+            else None
+        )
+        if failed_compile is not None:
+            _fail(
+                "compile_validation.rows"
+                f"[{failed_compile.get('index')},{failed_compile.get('turn')}]",
+                "not a definitive pass",
+            )
         run_retained_true_path_revalidation(
             source_root=source_root, source_commit=source_commit, root_include=root_include,
             header_after=header_after, trace_path=trace_path,
@@ -2101,8 +2179,9 @@ def capture_root_header_authority(
             header_after=header_after, edit_diff=edit_diff, trace_path=trace_path,
             compile_commands_path=compile_commands_path, turn_a_manifest=turn_a_manifest,
             turn_b_manifest=turn_b_manifest, compile_validation=compile_receipt,
-            provenance=provenance, count=count, expected_affected=761,
-            expected_unaffected=239,
+            provenance=provenance, count=count,
+            expected_affected=expected_affected,
+            expected_unaffected=expected_unaffected,
             published_root=output_root,
         )
         capture_receipt = {
@@ -2165,6 +2244,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--turn-b", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--count", type=int, default=1000)
+    parser.add_argument("--expected-affected", type=int, default=761)
+    parser.add_argument("--expected-unaffected", type=int, default=239)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--capture", action="store_true")
@@ -2187,6 +2268,8 @@ def main(argv: list[str] | None = None) -> int:
             turn_a_manifest=args.turn_a,
             turn_b_manifest=args.turn_b,
             count=args.count,
+            expected_affected=args.expected_affected,
+            expected_unaffected=args.expected_unaffected,
             timeout_s=args.timeout,
             jobs=args.jobs,
         )

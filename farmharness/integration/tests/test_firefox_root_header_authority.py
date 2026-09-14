@@ -34,7 +34,10 @@ from farmharness.integration.firefox_root_header_authority import (
     NAMESPACE_ARGV,
     NAMESPACE_TIMEOUT_ARGV,
     _compile_commands,
+    _difference_summary,
+    _first_diagnostic,
     _manifest,
+    _preprocess_argv,
     _trace,
 )
 from farmharness.integration.schema_validation import canonical_bytes, load_json
@@ -77,7 +80,9 @@ def _init_source(tmp_path: Path) -> tuple[Path, Path, str]:
     return root, header, commit
 
 
-def _make_inputs(tmp_path: Path) -> dict[str, Path | dict[str, object]]:
+def _make_inputs(
+    tmp_path: Path, *, affected: int = AFFECTED
+) -> dict[str, Path | dict[str, object]]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     source_root = tmp_path / "source"
     header_before = source_root / "memory" / "mozalloc.h"
@@ -120,7 +125,7 @@ def _make_inputs(tmp_path: Path) -> dict[str, Path | dict[str, object]]:
         b_path.parent.mkdir(parents=True, exist_ok=True)
         body = f"int body_{index};\n".encode()
         a_path.write_bytes(body)
-        b_path.write_bytes(body if index >= AFFECTED else b"X" + body)
+        b_path.write_bytes(body if index >= affected else b"X" + body)
         trace_rows.append(f"{index}\t{relative}\t{actual}\n")
         copy_script = (
             "import pathlib,sys; "
@@ -245,6 +250,28 @@ def _build(inputs: dict[str, Path | dict[str, object]]) -> dict[str, object]:
     )
 
 
+def _build_with_law(
+    inputs: dict[str, Path | dict[str, object]], affected: int
+) -> dict[str, object]:
+    return build_root_header_authority(
+        output_root=inputs["output"],  # type: ignore[arg-type]
+        source_root=inputs["source_root"],  # type: ignore[arg-type]
+        source_commit=inputs["source_commit"],  # type: ignore[arg-type]
+        root_include=str(inputs["header_before"]),
+        header_before=inputs["header_before"],  # type: ignore[arg-type]
+        header_after=inputs["header_after"],  # type: ignore[arg-type]
+        edit_diff=inputs["edit_diff"],  # type: ignore[arg-type]
+        trace_path=inputs["trace"],  # type: ignore[arg-type]
+        compile_commands_path=inputs["compile_commands"],  # type: ignore[arg-type]
+        turn_a_manifest=inputs["a_manifest"],  # type: ignore[arg-type]
+        turn_b_manifest=inputs["b_manifest"],  # type: ignore[arg-type]
+        compile_validation=inputs["compile_validation"],  # type: ignore[arg-type]
+        provenance=inputs["provenance"],  # type: ignore[arg-type]
+        expected_affected=affected,
+        expected_unaffected=COUNT - affected,
+    )
+
+
 def _promotion_corpus(
     inputs: dict[str, Path | dict[str, object]], authority: dict[str, object]
 ) -> dict[str, object]:
@@ -267,6 +294,7 @@ def _promotion_corpus(
         },
         "normalized_manifest_sha256": normalized,
         "pair_index_sha256": authority["pair_index"]["sha256"],  # type: ignore[index]
+        "root_header_body_law": authority["body_law"],
         "root": str(inputs["source_root"]),
         "turn_a_manifest": authority["turn_a_manifest"]["path"],  # type: ignore[index]
         "turn_b_manifest": authority["turn_b_manifest"]["path"],  # type: ignore[index]
@@ -288,6 +316,49 @@ def test_true_path_authority_proves_order_body_law_and_both_turns(tmp_path: Path
     assert selection["rows"][-1]["index"] == COUNT - 1
     assert selection["rows"][0]["ii_relative"] == "obj/file-0000.ii"
     assert validate_root_header_authority(inputs["output"] / "authority.json")["schema"] == AUTHORITY_SCHEMA  # type: ignore[operator]
+
+
+def test_alternative_body_law_is_explicitly_bound_end_to_end(tmp_path: Path) -> None:
+    inputs = _make_inputs(tmp_path, affected=617)
+    authority = _build_with_law(inputs, 617)
+    assert authority["body_law"] == {"affected": 617, "unaffected": 383}
+    validated = validate_root_header_authority(
+        inputs["output"] / "authority.json"  # type: ignore[operator]
+    )
+    assert validated["body_law"] == authority["body_law"]
+
+
+def test_preprocess_preserves_original_relative_input_spelling(tmp_path: Path) -> None:
+    actual = tmp_path / "obj" / "unit.cpp"
+    actual.parent.mkdir()
+    actual.write_text("int unit;\n", encoding="utf-8")
+    candidate = {
+        "actual_input": str(actual),
+        "argv": ["/bin/cc", "-c", "unit.cpp", "-o", "unit.o"],
+        "compiler_path": "/bin/cc",
+        "directory": str(actual.parent),
+        "input_operand": "unit.cpp",
+        "input_position": 2,
+    }
+
+    assert _preprocess_argv(candidate, actual) == ["/bin/cc", "unit.cpp", "-E"]
+    replacement = tmp_path / "replacement.ii"
+    assert _preprocess_argv(candidate, replacement) == [
+        "/bin/cc",
+        str(replacement),
+        "-E",
+    ]
+
+
+def test_failure_diagnostics_prefer_error_and_bound_first_difference() -> None:
+    stderr = b"clang: warning: unused option\nunit.cpp:7:3: error: broken token\n"
+    assert _first_diagnostic(stderr) == "unit.cpp:7:3: error: broken token"
+    summary = _difference_summary(b"0123456789abcdefLEFT", b"0123456789abcdefRIGHT")
+    assert summary.startswith(
+        "first_difference=16;retained_bytes=20;reproduced_bytes=21;"
+    )
+    assert "retained_hex=" in summary
+    assert "reproduced_hex=" in summary
 
 
 def test_revalidation_rejects_tampered_body_and_no_overwrite(tmp_path: Path) -> None:
@@ -412,6 +483,20 @@ def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) 
     assert promotion.mutation_kind == "single-insert"
     assert promotion.inserted_byte == ord("X")
     assert len(validate_and_verify_bodies(corpus).pair_rows) == COUNT
+    with pytest.raises(
+        FirefoxCorpusPromotionError,
+        match="corpus.root_header_body_law",
+    ):
+        validate_corpus_promotion(
+            {key: value for key, value in corpus.items() if key != "root_header_body_law"}
+        )
+    with pytest.raises(FirefoxCorpusPromotionError, match="authority.body_law"):
+        validate_corpus_promotion(
+            {
+                **corpus,
+                "root_header_body_law": {"affected": 760, "unaffected": 240},
+            }
+        )
     with pytest.raises(FirefoxCorpusPromotionError, match="normalized_manifest_sha256"):
         validate_corpus_promotion({**corpus, "normalized_manifest_sha256": "0" * 64})
 
@@ -636,11 +721,14 @@ def test_capture_cli_owns_producer_receipts_and_requires_capture_inputs(monkeypa
         "--compile-commands", "/tmp/compile_commands.json", "--turn-a", "/tmp/A.manifest",
         "--turn-b", "/tmp/B.manifest", "--output", output,
         "--capture-receipt", "/tmp/i/s80-capture.json",
+        "--expected-affected", "617", "--expected-unaffected", "383",
     ])
     assert rc == 0
     assert called["output_root"] == Path(output)
     assert "compile_validation" not in called
     assert called["capture_receipt_path"] == Path("/tmp/i/s80-capture.json")
+    assert called["expected_affected"] == 617
+    assert called["expected_unaffected"] == 383
 
 
 def test_capture_failure_retains_terminal_evidence_without_authority(
@@ -675,6 +763,61 @@ def test_capture_failure_retains_terminal_evidence_without_authority(
     assert failure["schema"] == CAPTURE_SCHEMA
     assert failure["status"] == "FAIL"
     assert Path(failure["failure_root"]).is_dir()
+
+
+def test_capture_stops_before_retained_phase_on_nonzero_compile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_compile(**kwargs: object) -> dict[str, object]:
+        Path(kwargs["output_path"]).write_bytes(b'{"stage":"compile"}')
+        return {
+            "rows": [
+                {
+                    "error": "",
+                    "exit_code": 1,
+                    "index": 17,
+                    "output_sha256": None,
+                    "timed_out": False,
+                    "turn": "B",
+                }
+            ]
+        }
+
+    def retained_must_not_run(**_kwargs: object) -> None:
+        pytest.fail("retained phase must not run after compile failure")
+
+    monkeypatch.setattr(
+        "farmharness.integration.firefox_root_header_authority.run_compile_validation",
+        failed_compile,
+    )
+    monkeypatch.setattr(
+        "farmharness.integration.firefox_root_header_authority.run_retained_true_path_revalidation",
+        retained_must_not_run,
+    )
+    output = tmp_path / "authority"
+    receipt = tmp_path / "capture.json"
+    with pytest.raises(
+        RootHeaderAuthorityError,
+        match=r"compile_validation.rows\[17,B\]: not a definitive pass",
+    ):
+        capture_root_header_authority(
+            output_root=output,
+            capture_receipt_path=receipt,
+            source_root=tmp_path,
+            source_commit="a" * 40,
+            root_include=tmp_path / "root.h",
+            header_before=tmp_path / "root.h",
+            header_after=tmp_path / "edited.h",
+            edit_diff=tmp_path / "root.diff",
+            trace_path=tmp_path / "trace.tsv",
+            compile_commands_path=tmp_path / "commands.json",
+            turn_a_manifest=tmp_path / "A.manifest",
+            turn_b_manifest=tmp_path / "B.manifest",
+        )
+    assert not output.exists()
+    failure = load_json(receipt)
+    assert failure["status"] == "FAIL"
+    assert Path(failure["failure_root"], "compile-validation.json").is_file()
 
 
 def test_capture_receipt_race_leaves_only_complete_internal_capture(
@@ -952,7 +1095,7 @@ def test_adversarial_authority_and_source_checks(tmp_path: Path) -> None:
 
     inputs = _make_inputs(tmp_path / "law")
     inputs["output"] = tmp_path / "law-authority"
-    with pytest.raises(RootHeaderAuthorityError, match="1000 TUs"):
+    with pytest.raises(RootHeaderAuthorityError, match="body_law"):
         build_root_header_authority(
             output_root=inputs["output"],  # type: ignore[arg-type]
             source_root=inputs["source_root"],  # type: ignore[arg-type]

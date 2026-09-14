@@ -314,8 +314,27 @@ def _validate_root_header_corpus_promotion(
     if tus != 1000 or authority.get("tus") != tus:
         _fail("authority.tus", "literal root-header promotion requires exactly 1000 TUs")
     body_law = _require_mapping(authority.get("body_law"), "authority.body_law")
-    if dict(body_law) != {"affected": 761, "unaffected": 239}:
-        _fail("authority.body_law", "requires exact 761 affected / 239 unchanged law")
+    declared_body_law = _require_mapping(
+        corpus.get("root_header_body_law"), "corpus.root_header_body_law"
+    )
+    if set(declared_body_law) != {"affected", "unaffected"}:
+        _fail("corpus.root_header_body_law", "fields are not exact")
+    affected_expected = declared_body_law.get("affected")
+    unaffected_expected = declared_body_law.get("unaffected")
+    if (
+        not isinstance(affected_expected, int)
+        or isinstance(affected_expected, bool)
+        or not isinstance(unaffected_expected, int)
+        or isinstance(unaffected_expected, bool)
+        or affected_expected < 1
+        or unaffected_expected < 1
+        or affected_expected + unaffected_expected != tus
+        or dict(body_law) != dict(declared_body_law)
+    ):
+        _fail(
+            "authority.body_law",
+            "does not match the corpus-bound 1000-TU affected/unaffected law",
+        )
 
     root_edit = _require_mapping(authority.get("root_edit"), "authority.root_edit")
     if set(root_edit) != ROOT_HEADER_ROOT_EDIT_FIELDS:
@@ -473,8 +492,11 @@ def _validate_root_header_corpus_promotion(
             _fail(f"pair_index.pairs[{expected}].affected", "must be boolean")
         affected += int(row["affected"])
         pair_rows.append(dict(row))
-    if affected != 761:
-        _fail("pair_index.pairs", "affected count does not reproduce the 761/239 law")
+    if affected != affected_expected:
+        _fail(
+            "pair_index.pairs",
+            "affected count does not reproduce the corpus-bound body law",
+        )
     normalized = hashlib.sha256(
         ("\n".join(str(row["path"]) for row in pair_rows) + "\n").encode()
     ).hexdigest()
