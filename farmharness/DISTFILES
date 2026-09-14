@@ -28,6 +28,7 @@ farmharness/integration/farm_spec.py
 farmharness/integration/farmtest.py
 farmharness/integration/firefox_corpus_authority.py
 farmharness/integration/firefox_corpus_promotion.py
+farmharness/integration/firefox_root_header_authority.py
 farmharness/integration/image_transport.py
 farmharness/integration/images.py
 farmharness/integration/layout.py
@@ -132,6 +133,7 @@ farmharness/integration/tests/test_events.py
 farmharness/integration/tests/test_farmtest_live_lock.py
 farmharness/integration/tests/test_firefox_corpus_authority.py
 farmharness/integration/tests/test_firefox_corpus_promotion.py
+farmharness/integration/tests/test_firefox_root_header_authority.py
 farmharness/integration/tests/test_formal_aggregate.py
 farmharness/integration/tests/test_image_transport.py
 farmharness/integration/tests/test_images.py
