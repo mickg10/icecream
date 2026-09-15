@@ -162,6 +162,15 @@
         "turn_b_manifest": {"type": "string", "pattern": "^/", "minLength": 2},
         "normalized_manifest_sha256": {"$ref": "#/$defs/sha256"},
         "pair_index_sha256": {"$ref": "#/$defs/sha256"},
+        "root_header_body_law": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["affected", "unaffected"],
+          "properties": {
+            "affected": {"type": "integer", "minimum": 1},
+            "unaffected": {"type": "integer", "minimum": 1}
+          }
+        },
         "authority_receipt": {"$ref": "#/$defs/corpus_authority_receipt"},
         "compression": {"$ref": "#/$defs/corpus_compression"},
         "archives": {

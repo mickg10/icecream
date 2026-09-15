@@ -72,6 +72,7 @@ def _s80_suite_tree(tmp_path: Path) -> Path:
         (INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json").read_text()
     )
     base["instances"] = [item for item in base["instances"] if item["name"] != "F2"]
+    base["workload"]["corpus"] = "firefox-root-header-1000"
     base["timeline"] = []
     base["expect"].pop("reuse_pairs")
     base["expect"]["reuse"] = "none-when-legacy"
@@ -970,6 +971,7 @@ def test_checked_in_twobuild_suite_authenticates_all_four_arms() -> None:
 
     for arm, scenario_id in suite.data["performance"]["arms"].items():
         scenario = load_scenario_spec(suite.scenario_path(scenario_id), farm)
+        assert scenario.data["workload"]["corpus"] == "firefox-root-header-1000"
         validate_s80_arm_scenario(arm, scenario.data)
 
 
@@ -1035,6 +1037,26 @@ def test_s80_refuses_noncomparable_arm_scenarios_before_running(
     )
 
     with pytest.raises(S80EvidenceError, match="differ outside profile/id/reuse"):
+        farmtest.run_suite(farm, suite)
+
+
+def test_fresh_s80_refuses_the_historical_non_root_header_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _s80_suite_tree(tmp_path)
+    for scenario_path in (path.parent.parent / "scenarios").glob("S80-*.json"):
+        scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
+        scenario["workload"]["corpus"] = "firefox-1000"
+        scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+    suite = load_suite_spec(path)
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    monkeypatch.setattr(
+        farmtest,
+        "run_scenario",
+        lambda *_args, **_kwargs: pytest.fail("must not run"),
+    )
+
+    with pytest.raises(S80EvidenceError, match="one Firefox A/B pair"):
         farmtest.run_suite(farm, suite)
 
 
@@ -1147,6 +1169,36 @@ def test_s80_runs_twelve_fresh_cells_and_retains_score(
     replayed = farmtest.replay_suite(output)
     assert replayed["performance"] == result["performance"]
     assert replayed["suite_status"] == "PASS"
+
+    historical = deepcopy(result)
+    for identity in historical["execution_manifest"]["cells"]:
+        run_id = identity["run_id"]
+        scenario, plan = planned[run_id]
+        old_scenario = deepcopy(scenario.data)
+        old_scenario["workload"]["corpus"] = "firefox-1000"
+        old_digest = hashlib.sha256(canonical_bytes(old_scenario)).hexdigest()
+        old_plan = deepcopy(plan)
+        old_plan["scenario_digest"] = old_digest
+        scenario_overrides[run_id] = old_scenario
+        plan_overrides[run_id] = old_plan
+        identity["scenario_digest"] = old_digest
+        identity["plan_digest"] = hashlib.sha256(
+            canonical_bytes(old_plan)
+        ).hexdigest()
+    historical["execution_digest"] = hashlib.sha256(
+        canonical_bytes(historical["execution_manifest"])
+    ).hexdigest()
+    (output / "suite.json").write_bytes(canonical_bytes(historical))
+    (output / "SUITE.md").write_text(
+        farmtest._render_suite(historical), encoding="utf-8"
+    )
+    assert farmtest.replay_suite(output)["suite_status"] == "PASS"
+    scenario_overrides.clear()
+    plan_overrides.clear()
+    (output / "suite.json").write_bytes(canonical_bytes(result))
+    (output / "SUITE.md").write_text(
+        farmtest._render_suite(result), encoding="utf-8"
+    )
 
     incomparable = deepcopy(result)
     for identity in incomparable["execution_manifest"]["cells"]:

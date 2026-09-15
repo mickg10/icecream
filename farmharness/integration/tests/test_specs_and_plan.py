@@ -13,6 +13,7 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
+from farmharness.integration import firefox_corpus_promotion
 from farmharness.integration.farm_spec import FarmSpecError, load_farm_spec
 from farmharness.integration.remote import (
     FakeRecorder,
@@ -69,6 +70,33 @@ def test_committed_examples_validate_and_plan_is_stable() -> None:
     assert "ICEFARM_INSTANCES" in first["icefarm_env"]
     assert "ICEFARM_IMAGE" not in first["icefarm_env"]
     assert "ICEFARM_S" not in first["icefarm_env"]
+
+
+def test_generic_farm_fixture_isolates_all_live_firefox_authorities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_real_root_header_resolution(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("generic farm fixture must not resolve a live root-header corpus")
+
+    monkeypatch.setattr(
+        firefox_corpus_promotion,
+        "_root_compile_commands",
+        reject_real_root_header_resolution,
+    )
+    monkeypatch.setattr(subprocess, "run", reject_real_root_header_resolution)
+    path = farm_fixture.example_farm_path()
+    document = json.loads(path.read_text(encoding="utf-8"))
+    for name in ("firefox-1000", "firefox-root-header-1000"):
+        corpus = document["corpora"][name]
+        receipt = Path(corpus["authority_receipt"]["path"])
+        assert receipt.parent == path.parent
+        assert corpus["tus"] == 1
+        serialized = json.dumps(corpus)
+        assert "/ictmp/experiments/icecream/integration/corpora/" not in serialized
+        assert "firefox-root-header-compile-valid-1000-20260914-a4" not in serialized
+
+    farm = load_farm_spec(path)
+    assert farm.data["corpora"]["firefox-root-header-1000"]["tus"] == 1
 
 
 def test_committed_s50_mixed_pool_resolves_every_pair_stably() -> None:

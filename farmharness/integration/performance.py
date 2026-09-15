@@ -14,6 +14,8 @@ CELL_SCHEMA = "icecream-s80-cell-v1"
 REPORT_SCHEMA = "icecream-s80-performance-v1"
 ARMS = ("P29V1", "ZSTD_TU", "ZSTD_ROUTE", "legacy")
 TURNS = ("A", "B")
+CURRENT_S80_CORPUS = "firefox-root-header-1000"
+REPLAY_COMPATIBLE_S80_CORPORA = frozenset(("firefox-1000", CURRENT_S80_CORPUS))
 HEADLINE_LINK_BPS = (1_000_000_000, 100_000_000)
 CONTEXT_LINK_BPS = (10_000_000_000, 25_000_000)
 REPETITIONS = 3
@@ -54,7 +56,12 @@ class S80EvidenceError(ValueError):
     """The performance evidence is incomplete, ambiguous, or not comparable."""
 
 
-def validate_s80_arm_scenario(arm: str, scenario: Mapping[str, Any]) -> None:
+def validate_s80_arm_scenario(
+    arm: str,
+    scenario: Mapping[str, Any],
+    *,
+    historical_replay: bool = False,
+) -> None:
     """Authenticate one fair, fresh S80 arm before any farm mutation."""
 
     if arm not in ARMS:
@@ -91,8 +98,13 @@ def validate_s80_arm_scenario(arm: str, scenario: Mapping[str, Any]) -> None:
         raise S80EvidenceError(f"{arm} scenario must use one sealed P50 product image")
     if scenario.get("shape") != "S'C'F'":
         raise S80EvidenceError(f"{arm} scenario must use the full-newgen shape")
+    accepted_corpora = (
+        REPLAY_COMPATIBLE_S80_CORPORA
+        if historical_replay
+        else frozenset((CURRENT_S80_CORPUS,))
+    )
     if (
-        workload.get("corpus") != "firefox-1000"
+        workload.get("corpus") not in accepted_corpora
         or workload.get("turns") != ["A", "B"]
         or workload.get("repeat") != 1
     ):
@@ -116,6 +128,8 @@ def validate_s80_arm_scenario(arm: str, scenario: Mapping[str, Any]) -> None:
 
 def validate_s80_matrix_scenarios(
     scenarios: Mapping[str, Mapping[str, Any]],
+    *,
+    historical_replay: bool = False,
 ) -> None:
     """Require one comparable scenario, varying only arm-owned fields."""
 
@@ -123,7 +137,9 @@ def validate_s80_matrix_scenarios(
         raise S80EvidenceError("S80 matrix must contain exactly the four arms")
     normalized: dict[str, dict[str, Any]] = {}
     for arm in ARMS:
-        validate_s80_arm_scenario(arm, scenarios[arm])
+        validate_s80_arm_scenario(
+            arm, scenarios[arm], historical_replay=historical_replay
+        )
         document = deepcopy(dict(scenarios[arm]))
         document["id"] = "S80-arm"
         scheduler = next(

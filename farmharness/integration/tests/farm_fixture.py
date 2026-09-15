@@ -9,6 +9,7 @@ with one tiny, fully hash-bound A/B pair under an owned temporary directory.
 from __future__ import annotations
 
 import atexit
+import copy
 import hashlib
 import json
 import os
@@ -245,7 +246,13 @@ def example_farm_path() -> Path:
     # capture.  Unit tests mutate authority entries, so their hermetic fixture
     # must remain an explicitly uncaptured document.
     document.pop("authority_capture", None)
-    document["corpora"]["firefox-1000"] = corpus
+    # Keep every generic-test Firefox name hermetic.  A newly catalogued live
+    # corpus must never survive here: load_farm_spec validates every paired
+    # corpus, even when the test scenario does not select it.  Dedicated
+    # authority tests exercise the literal root-header receipt; generic tests
+    # only need a valid, tiny A/B corpus under each catalog name.
+    for name in ("firefox-1000", "firefox-root-header-1000"):
+        document["corpora"][name] = copy.deepcopy(corpus)
     farm = root / "farm.json"
     farm.write_bytes(canonical_bytes(document))
     return farm

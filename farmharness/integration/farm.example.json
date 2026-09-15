@@ -141,6 +141,58 @@
           }
         }
       }
+    },
+    "firefox-root-header-1000": {
+      "kind": "tu-manifest",
+      "tus": 1000,
+      "turn_a_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-20260914-a4/turnA.manifest",
+      "turn_b_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-20260914-a4/turnB.manifest",
+      "normalized_manifest_sha256": "48aa7a25f750d455bf3a5ce7d32a1420f35dc5d5edc66b3994b47810789b5a70",
+      "pair_index_sha256": "77a3a65b6fa61e50ac0472b75f560b0a3f5fe7ec51059cb598e04da0e3a0d1be",
+      "root_header_body_law": {"affected": 617, "unaffected": 383},
+      "authority_receipt": {
+        "path": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-20260914-a4/authority.json",
+        "sha256": "8d6ba8cd2560987c1145bd0cd5ed3cc784d7a7a83876b8c394bfa643841784a8"
+      },
+      "root": "/tanksmall/scratch/ictmp/src3/gecko-dev",
+      "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+      "archives": {
+        "A": {
+          "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-archives-20260914T0600Z/firefox-root-header-1000-A-zstd19-long31-v1.tar.zst",
+          "archive_bytes": 12541493,
+          "archive_sha256": "cc7bcc50fcffb61b89ce88abab22d7ee6ca89649efa8ad1b7ee988ddf1f05321",
+          "authority_sha256": "e2b2f88843b378c9f5df7ad34f3bdcd3bb9c3419baa0a62487da7319bb422cad",
+          "files": 1000,
+          "manifest_sha256": "02f5e4b80c839224a6dbde4410e25d915ee142735daf7b3846e59225145a1503",
+          "unpacked_bytes": 4375268540
+        },
+        "B": {
+          "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-archives-20260914T0600Z/firefox-root-header-1000-B-zstd19-long31-v1.tar.zst",
+          "archive_bytes": 12543932,
+          "archive_sha256": "683a3b7fea29cc57e33147eda240e01fb37b5e56775b470ee367006c3b41554f",
+          "authority_sha256": "9d6a6b1e416674ad76efe659f6f0a5bc87946c294c23035fc76591962d766de2",
+          "files": 1000,
+          "manifest_sha256": "f8fe423442b85038256b059a8c10394eba673b2051f20fc0768783fdfc0e672e",
+          "unpacked_bytes": 4375269157
+        }
+      },
+      "compiler_recipes": {
+        "fedora-clang-libcxx": {
+          "executable": "/tanksmall/MICKG2/mickg/miniconda3/envs/clang21/bin/clang++",
+          "binary_sha256": "dd5bb93311545d121dae93e31b3958aba449e97415d02c35a3391c0e4662bf93",
+          "configuration_sha256": "72e2012f05218d8237ed2a6fe284d873feae7b69b1dfdc0c0b9d56d950a320bb",
+          "version": "clang version 21.1.8 (https://github.com/conda-forge/clangdev-feedstock 9a0c00c7abbcade892ea988cb6239816cc91d7fc)",
+          "arguments": ["-O2", "-fdiagnostics-color=never"],
+          "toolchain": {
+            "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/toolchains/clang21-conda-21.1.8-full-zstd19-long31-v1.tar.zst",
+            "archive_bytes": 264898201,
+            "archive_sha256": "f3f93d9b31d3df3f3261063ce9d9a80f1c2d9319904f5bd6f64fca011877cd1b",
+            "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+            "mount": "/tanksmall/MICKG2/mickg/miniconda3/envs/clang21",
+            "unpacked_bytes": 2718868255
+          }
+        }
+      }
     }
   },
   "runtime_image": {

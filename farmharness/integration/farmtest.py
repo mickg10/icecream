@@ -2380,7 +2380,9 @@ def _replay_suite_node(
             statuses.append(cell_status)
             retained_by_scenario[identity["scenario_id"]] = (cell, retained)
             if is_s80 and cell_status == "PASS":
-                validate_s80_arm_scenario(arm, retained_scenario)
+                validate_s80_arm_scenario(
+                    arm, retained_scenario, historical_replay=True
+                )
                 previous_scenario = s80_scenarios.setdefault(arm, retained_scenario)
                 if previous_scenario != retained_scenario:
                     raise ReportError(
@@ -2407,7 +2409,9 @@ def _replay_suite_node(
         replayed_result = {"cells": len(cells), "suite_status": reproduced_status}
 
         if is_s80 and complete and all(status == "PASS" for status in statuses):
-            validate_s80_matrix_scenarios(s80_scenarios)
+            validate_s80_matrix_scenarios(
+                s80_scenarios, historical_replay=True
+            )
             performance = score_s80_cells(reduced_s80)
             if result.get("performance") != performance:
                 raise ReportError("suite S80 performance result does not replay")
