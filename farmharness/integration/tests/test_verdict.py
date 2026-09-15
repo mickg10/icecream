@@ -257,6 +257,43 @@ def test_s60_worker_downgrade_keeps_untouched_new_worker_surface() -> None:
     assert clause["offending_job_ids"] == ["@instance:F1"]
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (None, "missing-capability", "unexpected-session", "missing-login"),
+)
+def test_full_newgen_legacy_off_requires_capabilities_and_zero_sessions(
+    mutation: str | None,
+) -> None:
+    scenario = _scenario("S'C'F'")
+    scheduler = next(
+        item for item in scenario["instances"] if item["role"] == "S"
+    )
+    scheduler["env"] = {"ICECC_P50_PROFILE": "OFF"}
+    scenario["expect"]["reuse"] = "none-when-legacy"
+    rows = [_row(1, tail=False, outcome="none")]
+    observations = _observations(rows)
+
+    if mutation == "missing-capability":
+        observations["logins"][0]["cache_profiles"].remove("ZSTD_ROUTE")
+    elif mutation == "unexpected-session":
+        observations["sidecars"]["F1"]["sessions"] = 1
+    elif mutation == "missing-login":
+        observations["logins"] = []
+
+    clause = next(
+        item
+        for item in _shape_clauses(
+            scenario, rows, observations, None, []
+        )
+        if item["id"] == "shape.full-newgen-engagement"
+    )
+    expected = "PASS" if mutation is None else "FAIL"
+    assert clause["status"] == expected
+    assert clause["offending_job_ids"] == (
+        [] if mutation is None else ["@instance:F1"]
+    )
+
+
 def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
     scenario = {"workload": {"turns": ["A"], "clients": ["C1"]}}
     event = {"action": "scheduler-loss-active", "instance": "S1", "last_dispatched_job": 2}

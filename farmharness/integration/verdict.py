@@ -4568,29 +4568,55 @@ def _shape_clauses(
             and authenticated_worker_transition[1] == "downgrade"
         ):
             new_workers.discard(authenticated_worker_transition[0])
+        legacy_off = selected_profile is None
         bad_workers = {
             str(worker)
             for worker in new_workers
             if not login_for(worker)
-            or any(
-                selected_profile not in (item.get("cache_profiles") or [])
-                for item in login_for(worker)
+            or (
+                legacy_off
+                and any(
+                    not isinstance(item.get("cache_profiles"), list)
+                    or any(
+                        profile not in item["cache_profiles"]
+                        for profile in PROFILES
+                    )
+                    for item in login_for(worker)
+                )
             )
             or (
-                worker in refusal_workers
+                legacy_off
                 and sidecar(worker).get("sessions") != 0
             )
             or (
-                worker not in refusal_workers
-                and not _is_int(sidecar(worker).get("sessions"), minimum=1)
+                not legacy_off
+                and any(
+                    selected_profile not in (item.get("cache_profiles") or [])
+                    for item in login_for(worker)
+                )
+            )
+            or (
+                not legacy_off
+                and (
+                    worker in refusal_workers
+                    and sidecar(worker).get("sessions") != 0
+                )
+            )
+            or (
+                not legacy_off
+                and worker not in refusal_workers
+                and not _is_int(
+                    sidecar(worker).get("sessions"), minimum=1
+                )
             )
         }
         clauses.append(
             _clause(
                 "shape.full-newgen-engagement",
                 bool(new_workers) and not bad_workers,
-                "every new worker advertises the selected profile; normal workers "
-                "record a session and S30 refusal workers record none",
+                "every new worker advertises the selected profile, or the complete "
+                "capability set when the scheduler selects OFF; profile-enabled "
+                "workers record a session while OFF and S30 refusal workers record none",
                 {f"@instance:{name}" for name in bad_workers}
                 or ({"@scenario:workers"} if not new_workers else set()),
             )
