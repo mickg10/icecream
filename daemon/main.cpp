@@ -112,6 +112,7 @@
 #include "getifaddrs.h"
 #include "p50_daemon_sidecar_adapter.h"
 #include "p50_completion_record.h"
+#include "p50_cache_recovery_policy.h"
 #include "p50_daemon_cache_dispatch.h"
 #include "p50_fsession_daemon_op.h"
 #include "p50_input_wait.h"
@@ -730,7 +731,7 @@ public:
     MsgChannel *channel;
     UseCSMsg *usecsmsg;
     GetCSMsg *deferred_getcs;   // G4: GetCS held during LOGIN_ATTEMPT, re-driven on ConfCS
-    bool deferred_getcs_waits_for_cache;  // strict remote request held only across a bounded in-progress sidecar replacement
+    bool deferred_getcs_waits_for_cache;  // cache-capable request held only across a bounded in-progress sidecar replacement
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
@@ -9032,10 +9033,17 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         }
     }
     const bool sidecar_ready = cache_client_sidecar_ready();
+    /* P50 strictness is intentionally not inferred from remote_required.
+       ICECC_P50_C1F1_REQUIRED is a wrapper policy and its one fresh strict
+       retry carries an explicit cache capability while remote_required stays
+       zero.  During an already-supervised replacement, publishing that
+       capability as canonical absence races the successor lease and produces
+       Error 105.  Hold every one-job cache-capable request across this finite
+       recovery; cache-absent/legacy requests remain immediately publishable. */
     const bool wait_for_cache_recovery =
-        umsg->remote_required == 1 &&
-        requested_cache_capability.profile_mask != 0 &&
-        !sidecar_ready && cache_sidecar_recovery_in_progress();
+        icecc::p50::daemon::should_defer_cache_capable_getcs(
+            umsg->count, requested_cache_capability.profile_mask,
+            sidecar_ready, cache_sidecar_recovery_in_progress());
     P50CacheClientCapability cache_capability =
         sidecar_ready ? requested_cache_capability
                       : P50CacheClientCapability{};
@@ -9079,7 +9087,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         client->deferred_getcs_waits_for_cache = true;
         client->set_status(
             Client::WAITFORCS,
-            "handle_get_cs: holding strict remote request for cache recovery");
+            "handle_get_cs: holding P50 cache-capable request for cache recovery");
         return true;
     }
 

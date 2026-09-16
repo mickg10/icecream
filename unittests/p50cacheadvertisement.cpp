@@ -4,6 +4,7 @@
 
 #include "comm.h"
 #include "cache/protocol50.h"
+#include "daemon/p50_cache_recovery_policy.h"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -1135,6 +1136,25 @@ static void test_revision_one_profile_registry()
     }
 }
 
+static void test_daemon_cache_recovery_deferral_policy()
+{
+    using icecc::p50::daemon::should_defer_cache_capable_getcs;
+
+    REQUIRE(should_defer_cache_capable_getcs(
+                1, CACHE_PROFILE_P29V1, false, true),
+            "strict P50 cache offer waits for an in-progress successor lease "
+            "without depending on the separate remote-required policy");
+    REQUIRE(!should_defer_cache_capable_getcs(
+                2, CACHE_PROFILE_P29V1, false, true) &&
+                !should_defer_cache_capable_getcs(1, 0, false, true) &&
+                !should_defer_cache_capable_getcs(
+                    1, CACHE_PROFILE_P29V1, true, true) &&
+                !should_defer_cache_capable_getcs(
+                    1, CACHE_PROFILE_P29V1, false, false),
+            "batch, cache-absent, already-ready, and terminal requests are "
+            "never retained by the successor-lease deferral policy");
+}
+
 int main()
 {
     test_legacy_bytes();
@@ -1147,6 +1167,7 @@ int main()
     test_cache_handoff_completion_binding();
     test_cache_advertisement_predicate_matches_projection_law();
     test_revision_one_profile_registry();
+    test_daemon_cache_recovery_deferral_policy();
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

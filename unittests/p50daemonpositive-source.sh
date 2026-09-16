@@ -43,7 +43,8 @@ contract() {
     require "$candidate" 'Accept readiness never suppresses' &&
     require "$candidate" 'cache_sidecar_recovery_in_progress' &&
     require "$candidate" 'deferred_getcs_waits_for_cache' &&
-    require "$candidate" 'holding strict remote request for cache recovery'
+    require "$candidate" 'Hold every one-job cache-capable request' &&
+    require "$candidate" 'holding P50 cache-capable request for cache recovery'
 }
 
 contract "$daemon" || {
@@ -63,6 +64,23 @@ accept_block=$(sed -n \
     "$daemon")
 if printf '%s\n' "$accept_block" | grep -F 'handle_activity(' >/dev/null; then
     echo 'FAIL: bounded accept phase runs ordinary client activity inline' >&2
+    exit 1
+fi
+
+# Strict P50 and remote-required are independent wrapper policies.  The farm's
+# strict S70 workload sets ICECC_P50_C1F1_REQUIRED without setting
+# ICECC_REMOTE_REQUIRED, so the bounded replacement hold must be gated by the
+# explicit cache capability rather than the unrelated remote_required bit.
+recovery_hold_block=$(sed -n \
+    '/const bool wait_for_cache_recovery =/,/sidecar_recovery_in_progress());/p' \
+    "$daemon")
+if ! printf '%s\n' "$recovery_hold_block" | \
+        grep -F 'should_defer_cache_capable_getcs' >/dev/null; then
+    echo 'FAIL: sidecar recovery hold is not gated by explicit P50 capability' >&2
+    exit 1
+fi
+if printf '%s\n' "$recovery_hold_block" | grep -F 'remote_required' >/dev/null; then
+    echo 'FAIL: strict P50 recovery hold incorrectly depends on remote_required' >&2
     exit 1
 fi
 if printf '%s\n' "$accept_block" | grep -F 'Service::createChannel(acc_fd' >/dev/null; then
@@ -152,7 +170,8 @@ for needle in \
     'Accept readiness never suppresses' \
     'cache_sidecar_recovery_in_progress' \
     'deferred_getcs_waits_for_cache' \
-    'holding strict remote request for cache recovery'; do
+    'Hold every one-job cache-capable request' \
+    'holding P50 cache-capable request for cache recovery'; do
     mutant="$mutant_dir/main.cpp"
     awk -v removed="$needle" 'index($0, removed) == 0' "$daemon" >"$mutant"
     if contract "$mutant"; then
