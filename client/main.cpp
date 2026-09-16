@@ -770,8 +770,28 @@ int main(int argc, char **argv)
                             << "P50 assignment failed; requesting one fresh legacy remote assignment"
                             << endl;
                     }
-                    (void)local_daemon->send_msg(EndMsg());
+                    /* The cache-route observation and this End share one
+                       ordered local socket.  Do not let the fresh retry race
+                       ahead on another connection: a replacement-required
+                       observation must be consumed by C before its successor
+                       GetCS can observe the sidecar lifecycle.  EOF is C's
+                       acknowledgement that it processed the exact proxy
+                       teardown (and every preceding frame).  Bound the wait
+                       and fail closed; never turn an unavailable C daemon
+                       into an uncoordinated second assignment. */
+                    const bool retry_end_sent =
+                        local_daemon->send_msg(EndMsg());
+                    Msg *retry_end_reply = retry_end_sent
+                        ? local_daemon->get_msg(30, true) : nullptr;
+                    const bool retry_proxy_closed = retry_end_sent &&
+                        retry_end_reply == nullptr && local_daemon->at_eof();
+                    delete retry_end_reply;
                     delete local_daemon;
+                    local_daemon = nullptr;
+                    if (!retry_proxy_closed)
+                        throw client_error(
+                            24,
+                            "Error 24 - local daemon did not settle P50 retry predecessor");
                     local_daemon = get_local_daemon();
                     if (!local_daemon)
                         throw client_error(
