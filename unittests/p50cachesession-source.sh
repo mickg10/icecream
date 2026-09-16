@@ -74,7 +74,7 @@ create_retry_slice=$(sed -n \
     '/^MsgChannel \*Service::createChannelRetryUntil(/,/^MsgChannel \*Service::createChannel(const string &socket_path)/p' \
     "$src/services/comm.cpp")
 create_retry_timeout_count=$(printf '%s\n' "$create_retry_slice" \
-    | grep -F -c 'set_tcp_user_timeout_past_deadline(channel->fd, deadline)' || true)
+    | grep -F -c 'channel->setTcpUserTimeoutUntil(deadline)' || true)
 if [ "$create_retry_timeout_count" -ne 1 ]; then
     echo "FAIL: successful sliced retry must restore its outer TCP timeout exactly once (found $create_retry_timeout_count)" >&2
     exit 1

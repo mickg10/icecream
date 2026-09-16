@@ -67,7 +67,11 @@ chmod 0711 "$work"
 : >"$work/scheduler.log"
 chmod 0666 "$work/scheduler.log"
 cleanup() {
+    if test -n "${delayed_compile_pgid:-}"; then
+        kill -s CONT "-$delayed_compile_pgid" 2>/dev/null || :
+    fi
     for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+        "${delayed_wrapper_pid:-}" \
         "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
         "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
         "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" \
@@ -77,6 +81,7 @@ cleanup() {
     for _ in $(seq 1 50); do
         live=0
         for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+            "${delayed_wrapper_pid:-}" \
             "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
             "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
             "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" \
@@ -89,6 +94,7 @@ cleanup() {
         sleep 0.1
     done
     for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+        "${delayed_wrapper_pid:-}" \
         "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
         "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
         "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" \
@@ -97,6 +103,7 @@ cleanup() {
     done
     wait "${bounded_wrapper_pid:-}" 2>/dev/null || :
     wait "${inflight_wrapper_pid:-}" 2>/dev/null || :
+    wait "${delayed_wrapper_pid:-}" 2>/dev/null || :
     wait "${inflight_replacement_worker_pid:-}" 2>/dev/null || :
     wait "${strict_retry_wrapper_pid:-}" 2>/dev/null || :
     wait "${retry_wrapper_pid:-}" 2>/dev/null || :
@@ -189,6 +196,19 @@ printf '%s\n' \
     'std::uint32_t p50_inflight_worker_loss_translation_unit(std::uint32_t value) {' \
     '    return P50WorkerLossSpin<3000>::run(value);' \
     '}' >"$work/src/inflight-worker-loss.cpp"
+printf '%s\n' \
+    '#include <cstdint>' \
+    'template<int N> struct P50DelayedResultSpin {' \
+    '    __attribute__((noinline)) static std::uint32_t run(std::uint32_t value) {' \
+    '        return P50DelayedResultSpin<N - 1>::run(value * UINT32_C(22695477) + N) ^ (value >> (N % 11));' \
+    '    }' \
+    '};' \
+    'template<> struct P50DelayedResultSpin<0> {' \
+    '    __attribute__((noinline)) static std::uint32_t run(std::uint32_t value) { return value; }' \
+    '};' \
+    'std::uint32_t p50_delayed_result_translation_unit(std::uint32_t value) {' \
+    '    return P50DelayedResultSpin<3000>::run(value);' \
+    '}' >"$work/src/delayed-result.cpp"
 
 (cd "$work/toolchain" && timeout "$timeout_s" \
     bash "$build/client/icecc-create-env" "$(command -v g++)" \
@@ -424,6 +444,90 @@ run_remote_cell accepted accepted
 wait_for_count 1 'action 2 status applied reason submitter accepted complete result' \
     "$work/f.log"
 
+# Exercise the shipped client's admitted-operation owner across a result wait
+# longer than the 30-second failure boundary observed in S80.  Stop only the
+# compile process group after the real compiler has started: iceccd and its
+# scheduler connection remain live, so this is a delayed result rather than a
+# worker-loss/retry cell.  The separate p50cachesession regression owns the
+# bounded-connect assertion; this cell owns the long admitted result wait.
+delayed_wait_seconds=35
+test "$timeout_s" -gt $((delayed_wait_seconds + 10)) || {
+    echo "SKIP: completion timeout must exceed the delayed-result window" >&2
+    exit 77
+}
+delayed_log_offset=$(stat -c %s "$work/f.log")
+delayed_remote_obj="$work/out/delayed-result-remote.o"
+delayed_local_obj="$work/out/delayed-result-local.o"
+delayed_client_log="$work/delayed-result-client.log"
+delayed_started_at=$(date +%s)
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+    ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_COMPILE_IDENTITY_TRACE="$work/compile-identity.jsonl" \
+    ICECC_PREFERRED_HOST=p50-f ICECC_CARET_WORKAROUND=0 \
+    ICECC_DEBUG=debug ICECC_LOGFILE="$delayed_client_log" \
+    timeout "$timeout_s" "$build/client/icecc" \
+    g++ -std=c++17 -O2 -Wall -ftemplate-depth=4096 -c \
+    "$work/src/delayed-result.cpp" -o "$delayed_remote_obj" &
+delayed_wrapper_pid=$!
+
+delayed_compile_pgid=
+for _ in $(seq 1 500); do
+    if tail -c +$((delayed_log_offset + 1)) "$work/f.log" | \
+        grep -F 'final arguments:' >/dev/null 2>&1; then
+        delayed_compile_pgid=$(ps -eo pid=,ppid=,pgid=,args= | \
+            awk -v parent="$worker_pid" -v sidecar="$service_pid" \
+                '$2 == parent && $1 == $3 && $1 != sidecar { print $1; exit }')
+        test -n "$delayed_compile_pgid" && break
+    fi
+    kill -0 "$delayed_wrapper_pid" 2>/dev/null || break
+    sleep 0.01
+done
+test -n "$delayed_compile_pgid" || {
+    echo "FAIL: delayed-result compile group was not observed after compiler start" >&2
+    exit 1
+}
+kill -STOP "-$delayed_compile_pgid"
+sleep "$delayed_wait_seconds"
+kill -0 "$delayed_wrapper_pid" 2>/dev/null || {
+    echo "FAIL: production client exited inside the delayed-result window" >&2
+    exit 1
+}
+kill -CONT "-$delayed_compile_pgid"
+delayed_compile_pgid=
+
+set +e
+wait "$delayed_wrapper_pid"
+delayed_rc=$?
+set -e
+delayed_wrapper_pid=
+test "$delayed_rc" -eq 0 || {
+    echo "FAIL: production delayed-result client exited $delayed_rc" >&2
+    exit 1
+}
+delayed_elapsed=$(( $(date +%s) - delayed_started_at ))
+test "$delayed_elapsed" -ge "$delayed_wait_seconds" || {
+    echo "FAIL: delayed-result cell did not cross its declared wait window" >&2
+    exit 1
+}
+test -s "$delayed_remote_obj" || {
+    echo "FAIL: production delayed-result cell produced no object" >&2
+    exit 1
+}
+g++ -std=c++17 -O2 -Wall -ftemplate-depth=4096 -c \
+    "$work/src/delayed-result.cpp" -o "$delayed_local_obj" \
+    2>"$work/delayed-result-local.err"
+cmp -s "$delayed_remote_obj" "$delayed_local_obj" || {
+    echo "FAIL: production delayed-result object differs from exact local reference" >&2
+    exit 1
+}
+grep -F 'P50 compiler connection uses absolute 20-second deadline' \
+    "$delayed_client_log" >/dev/null || {
+    echo "FAIL: delayed-result cell did not use the bounded P50 connector" >&2
+    exit 1
+}
+wait_for_count 2 'action 2 status applied reason submitter accepted complete result' \
+    "$work/f.log"
+
 run_remote_cell definitive definitive
 wait_for_count 1 'action 3 status applied reason submitter definitive cancellation' \
     "$work/f.log"
@@ -447,7 +551,7 @@ grep -F 'P50 terminal test disconnecting before disposition' \
     "$work/disconnect-client.log" >/dev/null
 restart_cache_sidecar
 
-wait_for_count 4 \
+wait_for_count 5 \
     'P50 terminal test post-settlement attach job .* fd invalid' "$work/f.log"
 if grep -E 'P50 terminal test post-settlement attach job .* status accepted|unexpectedly reattached consumed lease' \
     "$work/f.log" >/dev/null 2>&1; then
@@ -459,8 +563,8 @@ test -f "$work/lifecycle.trace" || {
     echo "FAIL: sidecar emitted no authoritative lifecycle trace" >&2
     exit 1
 }
-test "$(grep -c '^P50_LIFECYCLE ' "$work/lifecycle.trace")" -eq 4
-test "$(grep -E -c ' action=2 status=0 before_records=1 before_bytes=[1-9][0-9]* after_records=0 after_bytes=0$' "$work/lifecycle.trace")" -eq 1
+test "$(grep -c '^P50_LIFECYCLE ' "$work/lifecycle.trace")" -eq 5
+test "$(grep -E -c ' action=2 status=0 before_records=1 before_bytes=[1-9][0-9]* after_records=0 after_bytes=0$' "$work/lifecycle.trace")" -eq 2
 test "$(grep -E -c ' action=3 status=0 before_records=1 before_bytes=[1-9][0-9]* after_records=0 after_bytes=0$' "$work/lifecycle.trace")" -eq 1
 test "$(grep -E -c ' action=1 status=0 before_records=1 before_bytes=[1-9][0-9]* after_records=1 after_bytes=[1-9][0-9]*$' "$work/lifecycle.trace")" -eq 2
 
@@ -477,7 +581,7 @@ test "$attempt_only_attempts" -eq 2 || {
     exit 1
 }
 
-test "$(grep -E -c 'P50 input settlement job .* action 2 ' "$work/f.log")" -eq 1
+test "$(grep -E -c 'P50 input settlement job .* action 2 ' "$work/f.log")" -eq 2
 test "$(grep -E -c 'P50 input settlement job .* action 3 ' "$work/f.log")" -eq 1
 test "$(grep -E -c 'P50 input settlement job .* action 1 ' "$work/f.log")" -eq 2
 
@@ -502,8 +606,8 @@ statuses = {row["field"]: row["status"] for row in document["identity_status"]}
 if statuses != {"c_guid": "PASS", "tu_seq": "PASS"}:
     raise SystemExit(f"FAIL: compile identities are not PASS: {statuses}")
 identities = document["runtime"]["compile_identity"]
-if len(identities) != 4:
-    raise SystemExit(f"FAIL: expected four compile identity records, got {len(identities)}")
+if len(identities) != 5:
+    raise SystemExit(f"FAIL: expected five compile identity records, got {len(identities)}")
 verification = document["verification"]
 if verification.get("status") != "HOLD" or verification.get("issues") != [
         "statistics_document_missing"]:

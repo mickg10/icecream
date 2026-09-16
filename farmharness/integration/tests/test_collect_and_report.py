@@ -1223,6 +1223,27 @@ def test_reconciliation_records_exact_failed_request_dispatch(
     ]
 
 
+def test_reconciliation_allows_authenticated_predispatch_refusal(
+    tmp_path: Path,
+) -> None:
+    evidence, plan, claims, _scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    requests = [
+        {
+            "client_instance": "C1",
+            "request_finished_ms": 1_788_940_888_000,
+            "request_started_ms": 1_788_940_887_000,
+            "row_job_id": "C1:A:2:missing-2",
+        }
+    ]
+
+    result = _reconcile_scheduler_dispatches(
+        evidence, plan, claims, unclaimed_requests=requests
+    )
+
+    assert result.get("unclaimed_dispatches", []) == []
+    assert result["scheduler_dispatches"] == result["workload_dispatches"] == 1
+
+
 @pytest.mark.parametrize("mutation", ("wrong-client", "wrong-time", "duplicate"))
 def test_reconciliation_rejects_unbound_failed_request_dispatch(
     tmp_path: Path, mutation: str
@@ -2632,6 +2653,67 @@ def test_unassigned_p50_failure_binds_exact_remote_only_refusal() -> None:
     }
 
 
+def _unassigned_scheduler_stream_loss_kwargs(
+    *, mutation: str | None = None
+) -> dict[str, object]:
+    lines = [
+        "ICECC[1] asking for host to use",
+        "ICECC[1] got exception Error 1 - expected use_cs reply, but got "
+        "UNKNOWN instead (this should be an exception!)",
+        "ICECC[1] remote-only policy refuses client-error fallback",
+    ]
+    if mutation == "cache-overlap":
+        lines.insert(
+            2,
+            "ICECC[1] local build forced by remote exception: "
+            "Error 105 - strict all-P50 assignment has no cache handoff",
+        )
+    elif mutation == "wrong-error":
+        lines[1] = lines[1].replace("Error 1", "Error 2")
+    elif mutation == "missing-refusal":
+        lines.pop()
+    elif mutation == "reversed":
+        lines[1], lines[2] = lines[2], lines[1]
+    return {
+        "log_text": "\n".join(lines) + "\n",
+        "raw": {
+            "compile_rc": 100,
+            "exact": 0,
+            "finished": 1_789_524_585_252,
+            "index": 508,
+            "remote": 0,
+            "remote_sha": "0" * 64,
+            "retries": 0,
+            "scheduler_job": "missing-508",
+            "started": 1_789_524_576_201,
+            "turn": "A",
+            "worker": "UNKNOWN",
+        },
+        "row_job_id": "C1:A:508:missing-508",
+    }
+
+
+def test_unassigned_p50_failure_binds_scheduler_stream_loss() -> None:
+    record = _unassigned_p50_failure_observation(
+        **_unassigned_scheduler_stream_loss_kwargs()
+    )
+
+    assert record["failure_reason"] == "scheduler-stream-loss-before-usecs"
+    assert record["failure_line"] == 2
+    assert record["remote_only_refusal_line"] == 3
+    assert record["scheduler_job"] == "missing-508"
+
+
+@pytest.mark.parametrize(
+    "mutation", ("cache-overlap", "wrong-error", "missing-refusal", "reversed")
+)
+def test_unassigned_scheduler_stream_loss_fails_closed(mutation: str) -> None:
+    with pytest.raises(CollectError, match="missing assignment"):
+        _unassigned_p50_failure_observation(
+            **_unassigned_scheduler_stream_loss_kwargs(mutation=mutation)
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -2731,6 +2813,103 @@ def test_abandoned_p50_retry_binds_failed_request_without_usecs() -> None:
     assert record["transfer_error"] == 7
     assert record["request_started_ms"] == 10
     assert record["request_finished_ms"] == 20
+
+
+def _abandoned_p50_result_stream_retry_kwargs(
+    *, mutation: str | None = None
+) -> dict[str, object]:
+    endpoint = "10.0.27.101:23003"
+    log = (
+        "P50 assignment identity bound for job 427 epoch 1 nonce 2 "
+        "c_guid 1 tu_seq 426\n"
+        f"ICECC[1] 2026-09-16 02:09:28: Have to use host {endpoint} "
+        "- Job ID: 427 - env: x86_64\n"
+        "ZSTD_ROUTE source committed for P50 CompileFile: 5849401 exact bytes, "
+        "TU sequence 426\n"
+        "normalizing P50 client error 14 to Error 106 for a fresh assignment\n"
+        "P50 assignment failed; requesting one fresh strict-P50 remote "
+        f"assignment; avoiding failed endpoint {endpoint}\n"
+        "local build forced by remote exception: "
+        "Error 105 - strict all-P50 assignment has no cache handoff\n"
+        "remote-only policy refuses local retry\n"
+    )
+    if mutation == "missing-commit":
+        log = log.replace(
+            "ZSTD_ROUTE source committed for P50 CompileFile: 5849401 exact bytes, "
+            "TU sequence 426\n",
+            "",
+        )
+    elif mutation == "zero-tu":
+        log = log.replace("TU sequence 426", "TU sequence 0")
+    elif mutation == "wrong-error":
+        log = log.replace("client error 14", "client error 3")
+    elif mutation == "reordered":
+        normalized = (
+            "normalizing P50 client error 14 to Error 106 for a fresh assignment\n"
+        )
+        log = log.replace(normalized, "").replace(
+            "ZSTD_ROUTE source committed for P50 CompileFile: 5849401 exact bytes, "
+            "TU sequence 426\n",
+            normalized
+            + "ZSTD_ROUTE source committed for P50 CompileFile: 5849401 exact bytes, "
+            "TU sequence 426\n",
+        )
+    elif mutation == "transfer-overlap":
+        log = log.replace(
+            "normalizing P50 client error 14 to Error 106 for a fresh assignment\n",
+            "P29V1 cache source transfer failed closed "
+            "(status 2, error 7, attempts 0)\n"
+            "normalizing P50 client error 14 to Error 106 for a fresh assignment\n",
+        )
+    assignments = _client_assignments(log, "abandoned-result-stream-fixture")
+    assignments[0]["worker"] = "F1"
+    identity = _p50_assignment_identity_evidence(
+        log,
+        assignments[0]["scheduler_job"],
+        after_line=0,
+        before_line=assignments[0]["line"] + 1,
+    )
+    return {
+        "assignment": assignments[0],
+        "assignment_identity": identity,
+        "log_text": log,
+        "raw": {
+            "compile_rc": 100,
+            "exact": 0,
+            "finished": 1_789_524_598_309,
+            "remote": 1,
+            "remote_sha": "0" * 64,
+            "retries": 0,
+            "started": 1_789_524_568_146,
+        },
+        "row_job_id": "C1:A:426:427",
+    }
+
+
+def test_abandoned_p50_retry_binds_committed_result_stream_loss() -> None:
+    record = _abandoned_p50_retry_request_observation(
+        **_abandoned_p50_result_stream_retry_kwargs()
+    )
+
+    assert record is not None
+    assert record["failure_reason"] == "result-stream-loss"
+    assert record["normalized_error"] == 14
+    assert record["profile"] == "ZSTD_ROUTE"
+    assert record["raw_bytes"] == 5_849_401
+    assert record["tu_seq"] == 426
+    assert record["scheduler_job"] == 427
+    assert record["failed_endpoint"] == "10.0.27.101:23003"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-commit", "zero-tu", "wrong-error", "reordered", "transfer-overlap"),
+)
+def test_abandoned_p50_result_stream_retry_fails_closed(mutation: str) -> None:
+    with pytest.raises(CollectError, match="abandoned strict-P50 retry"):
+        _abandoned_p50_retry_request_observation(
+            **_abandoned_p50_result_stream_retry_kwargs(mutation=mutation)
+        )
 
 
 @pytest.mark.parametrize(

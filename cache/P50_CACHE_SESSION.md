@@ -50,10 +50,13 @@ I/O and poll under the caller's unchanged steady-clock deadline, rejects EOF,
 wrong/partial/late READY, and rejects any byte already queued behind READY.
 The TCP factory used by this path moves the kernel `TCP_USER_TIMEOUT` just
 past that same deadline before protocol negotiation; failure to install the
-bound closes the channel.  Thus the ordinary nine-second transport default
-cannot pre-empt an already-authoritative source-transfer deadline after F may
+bound closes the channel.  Thus the ordinary transport default cannot
+pre-empt an already-authoritative source-transfer deadline after F may
 have claimed the arm, while the application still closes at the original
-deadline and never replays an ambiguous arm.
+deadline and never replays an ambiguous arm.  The ordinary default is now 60
+seconds so it likewise cannot pre-empt the scheduler's 30-second deferred-send
+or 36-second ping/pong liveness owners; paths with a longer application-owned
+deadline still extend the socket option explicitly.
 Every call consumes the arm even on failure; failure retains the descriptor so
 normal channel teardown closes it, while success returns it and sets `fd = -1`.
 Thus a late token cannot resurrect a failed connection and the sender's retry

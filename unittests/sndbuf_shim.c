@@ -18,14 +18,13 @@
 
     ICECC_TEST_STRIP_USER_TIMEOUT=1
         Makes setsockopt(IPPROTO_TCP, TCP_USER_TIMEOUT) a no-op.  MsgChannel
-        arms a 9s TCP_USER_TIMEOUT on every TCP channel (a no-op on AF_UNIX);
-        with it in place the kernel declares a completely stalled
-        (zero-window, zero-progress) peer dead after ~9s, pre-empting the
-        30s application-level send timeout in flush_writebuf().  The
-        production failure is a SLOWLY-draining peer, whose ACKs keep
-        resetting the kernel timer so the application timeout governs; the
-        harness's full-stop stand-in would otherwise be killed by the kernel
-        first, so the option is stripped to reach the same application path.
+        arms a finite TCP_USER_TIMEOUT on every TCP channel (a no-op on
+        AF_UNIX).  The current default is 60s, beyond the 30s application
+        send owner; historical releases used 9s.  Strip the option here so
+        this differential test isolates the application path independently
+        of the candidate's transport default.  The production failure is a
+        SLOWLY-draining peer, whose ACKs keep resetting the kernel timer while
+        never freeing enough space within the application deadline.
 */
 
 #define _GNU_SOURCE

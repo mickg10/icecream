@@ -909,6 +909,11 @@ uint64_t icecream_monotonic_msec();
 // How long undelivered deferred output may wait before its peer is treated
 // as dead.  The same budget the historical blocking send granted.
 #define ICECC_DEFERRED_SEND_TIMEOUT_MSEC 30000
+// TCP transport failure must not pre-empt the scheduler's 30-second deferred
+// output bound or its 36-second ping/pong liveness owner.  Application paths
+// with longer exact deadlines (for example a remote compile result) extend
+// this per-channel value explicitly after connection admission.
+#define ICECC_TCP_USER_TIMEOUT_MSEC 60000
 // Historical accepted-channel protocol negotiation allowed one peer this much
 // time. Daemons preserve that per-peer budget without blocking their shared
 // event loop (see Service::createChannelAccepted()).
@@ -945,6 +950,13 @@ public:
     virtual ~MsgChannel();
 
     void setBulkTransfer();
+
+    // Move Linux TCP_USER_TIMEOUT just past an application-owned absolute
+    // deadline.  On platforms without that socket option, merely validate
+    // that the deadline is still live.  This changes no poll/get_msg bound;
+    // it only prevents the kernel transport timer from firing first.
+    bool setTcpUserTimeoutUntil(
+        std::chrono::steady_clock::time_point deadline) noexcept;
 
     std::string dump() const;
     // NULL  <--> channel closed or timeout

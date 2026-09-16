@@ -1490,13 +1490,14 @@ static bool set_tcp_user_timeout_past_deadline(
     if (remaining_msec == 0)
         return false;
 
-    // MsgChannel's ordinary nine-second transport bound is deliberately
-    // shorter than several legacy application waits.  It must not, however,
-    // pre-empt a caller that already owns one exact absolute deadline: doing
-    // so can tear down a P50 source arm after F has claimed the assignment but
-    // before C receives the acknowledgement.  Keep the application deadline
-    // authoritative and add only a scheduling guard; every wait and the
-    // eventual descriptor owner still closes at the original deadline.
+    // MsgChannel's ordinary transport bound is deliberately finite.  It must
+    // not, however, pre-empt a caller that already owns one exact longer
+    // absolute deadline: doing so can tear down a P50 source arm after F has
+    // claimed the assignment but before C receives the acknowledgement, or a
+    // compile channel before its bounded result wait completes.  Keep the
+    // application deadline authoritative and add only a scheduling guard;
+    // every wait and the eventual descriptor owner still closes at the
+    // original deadline.
     constexpr int deadline_guard_msec = 1000;
     const int timeout_msec =
         remaining_msec > std::numeric_limits<int>::max() - deadline_guard_msec
@@ -1509,6 +1510,12 @@ static bool set_tcp_user_timeout_past_deadline(
     (void)fd;
     return std::chrono::steady_clock::now() < deadline;
 #endif
+}
+
+bool MsgChannel::setTcpUserTimeoutUntil(
+    std::chrono::steady_clock::time_point deadline) noexcept
+{
+    return set_tcp_user_timeout_past_deadline(fd, deadline);
 }
 
 MsgChannel *Service::createChannel(const string &hostname, unsigned short p, int timeout)
@@ -1596,7 +1603,7 @@ MsgChannel *Service::createChannelRetryUntil(
             // operation, so restore that unchanged deadline before returning
             // it; otherwise later application traffic would inherit the much
             // shorter connection/protocol slice.
-            if (!set_tcp_user_timeout_past_deadline(channel->fd, deadline)) {
+            if (!channel->setTcpUserTimeoutUntil(deadline)) {
                 delete channel;
                 return nullptr;
             }
@@ -1787,7 +1794,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text,
 
 #ifdef TCP_USER_TIMEOUT
     if (is_tcp_channel) {
-        int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
+        int timeout = ICECC_TCP_USER_TIMEOUT_MSEC;
         setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
     }
 #endif

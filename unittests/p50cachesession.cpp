@@ -439,6 +439,74 @@ static void test_absolute_deadline_owns_tcp_user_timeout()
     peer.join();
 }
 
+static void test_ordinary_tcp_timeout_and_application_extension()
+{
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) std::exit(2);
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        listen(listener, 1) != 0)
+        std::exit(2);
+    socklen_t address_size = sizeof(address);
+    if (getsockname(listener, reinterpret_cast<sockaddr *>(&address),
+                    &address_size) != 0)
+        std::exit(2);
+
+    std::thread peer([listener] {
+        sockaddr_in remote{};
+        socklen_t remote_size = sizeof(remote);
+        const int accepted = accept(
+            listener, reinterpret_cast<sockaddr *>(&remote), &remote_size);
+        MsgChannel *channel = accepted >= 0
+                                  ? Service::createChannel(
+                                        accepted,
+                                        reinterpret_cast<sockaddr *>(&remote),
+                                        remote_size)
+                                  : nullptr;
+        delete channel;
+        close(listener);
+    });
+
+    MsgChannel *channel = Service::createChannel(
+        "127.0.0.1", ntohs(address.sin_port), 10);
+    REQUIRE(channel != nullptr, "ordinary TCP channel completes admission");
+#ifdef TCP_USER_TIMEOUT
+    int timeout_msec = 0;
+    socklen_t timeout_size = sizeof(timeout_msec);
+    REQUIRE(channel != nullptr &&
+                getsockopt(channel->fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                           &timeout_msec, &timeout_size) == 0 &&
+                timeout_msec == ICECC_TCP_USER_TIMEOUT_MSEC &&
+                timeout_msec > ICECC_DEFERRED_SEND_TIMEOUT_MSEC &&
+                timeout_msec > MAX_SCHEDULER_PING * 1000,
+            "ordinary TCP timeout cannot pre-empt scheduler liveness owners");
+
+    const auto application_deadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes(12);
+    REQUIRE(channel != nullptr &&
+                channel->setTcpUserTimeoutUntil(application_deadline),
+            "an admitted channel accepts the remote-operation deadline");
+    timeout_msec = 0;
+    timeout_size = sizeof(timeout_msec);
+    REQUIRE(channel != nullptr &&
+                getsockopt(channel->fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                           &timeout_msec, &timeout_size) == 0 &&
+                timeout_msec > 12 * 60 * 1000,
+            "remote-operation timeout remains beyond a 12-minute result wait");
+#else
+    REQUIRE(channel != nullptr && channel->setTcpUserTimeoutUntil(
+                std::chrono::steady_clock::now() + std::chrono::minutes(12)),
+            "application deadline remains valid without TCP_USER_TIMEOUT");
+#endif
+    delete channel;
+    peer.join();
+}
+
 static void test_same_endpoint_retry_after_complete_slice()
 {
     const int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -902,6 +970,7 @@ int main()
     test_ready_wire_and_failure_boundaries();
     test_absolute_deadline_protocol_negotiation();
     test_absolute_deadline_owns_tcp_user_timeout();
+    test_ordinary_tcp_timeout_and_application_extension();
     test_same_endpoint_retry_after_complete_slice();
     test_same_endpoint_retry_immediate_success_owns_outer_timeout();
     test_same_endpoint_retry_preserves_immediate_failure();

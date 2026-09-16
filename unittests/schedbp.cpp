@@ -18,17 +18,17 @@
         connection (with modern autotuned buffers, megabytes of kernel
         buffering would otherwise absorb everything).
 
-      - ICECC_TEST_STRIP_USER_TIMEOUT disables the 9s TCP_USER_TIMEOUT that
-        MsgChannel arms on every TCP channel (present in every release since
-        2020, including the issue report's 1.4.90).  The production failure
-        involves a SLOWLY-DRAINING submitter: it keeps ACKing and freeing
-        dribbles of buffer, which resets the kernel timer (TCP_USER_TIMEOUT
-        requires zero forward progress) while never freeing enough space
-        within 30s -- so the application timeout governs even with the
-        option armed.  This harness uses a full stop as a deterministic
-        stand-in for that slow drain, and a full stop WOULD trip the kernel
-        timer at ~9s on every variant alike, masking the application-level
-        behaviour under test; stripping the option isolates that behaviour.
+      - ICECC_TEST_STRIP_USER_TIMEOUT disables each candidate's finite
+        TCP_USER_TIMEOUT so the test isolates application behavior rather
+        than a transport-policy difference.  Historical releases, including
+        the issue report's 1.4.90, used 9s; the current default is 60s.  The
+        production failure involves a SLOWLY-DRAINING submitter: it keeps
+        ACKing and freeing dribbles of buffer, which resets the kernel timer
+        (TCP_USER_TIMEOUT requires zero forward progress) while never freeing
+        enough space within 30s -- so the application timeout governs even
+        with the option armed.  This harness uses a full stop as a
+        deterministic stand-in and strips the option to keep that behavior
+        identical across variants.
 
     Note the submitter's SO_RCVBUF is set to 64KiB, not smaller: on Linux
     loopback the MSS is ~64KiB, and a zero-window connection whose receive

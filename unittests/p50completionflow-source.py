@@ -37,6 +37,22 @@ def ordered(source: str, *tokens: str) -> None:
 
 def check_client(source: str, makefile: str) -> None:
     flow = section(source, "static int build_remote_int(", "static string\nmd5_for_file")
+    require("constexpr int kRemoteCompileResultWaitSeconds = 12 * 60;" in source and
+            "std::chrono::seconds(kRemoteCompileResultWaitSeconds)" in source,
+            "P50 compiler operation timeout is not tied to the result wait")
+    require(flow.count("cserver->setTcpUserTimeoutUntil(") == 2,
+            "P50 compiler channel does not extend both admitted-operation owners")
+    ordered(flow,
+            "cserver->set_p50_legacy_wire_role(P50LegacyWireRole::C);",
+            "if (cache_advertised_assignment &&",
+            "cserver->setTcpUserTimeoutUntil(",
+            "LegacyRemoteSink input_sink(cserver);")
+    result_wait = section(flow, 'log_block wait_cs("wait for cs");',
+                          "check_for_failure(msg, cserver);")
+    ordered(result_wait,
+            "if (p50_input &&",
+            "cserver->setTcpUserTimeoutUntil(",
+            "msg = cserver->get_msg(kRemoteCompileResultWaitSeconds);")
     require(flow.count("p50_disposition_attempted = true;") == 1,
             "submitter does not enforce one disposition attempt")
     require("p50_result_received &&\n            !p50_disposition_attempted" in flow,
@@ -568,6 +584,22 @@ def check_runtime_gate(source: str) -> None:
     require('timeout "$timeout_s" "$build/client/icecc"' not in injected_fault_launch,
             "malformed/disconnect fault injection still invokes the production wrapper")
 
+    delayed_result = section(
+        source,
+        "delayed_wait_seconds=35",
+        "run_remote_cell definitive definitive")
+    for token in (
+            'timeout "$timeout_s" "$build/client/icecc"',
+            'grep -F \'final arguments:\'',
+            'kill -STOP "-$delayed_compile_pgid"',
+            'sleep "$delayed_wait_seconds"',
+            'kill -0 "$delayed_wrapper_pid"',
+            'kill -CONT "-$delayed_compile_pgid"',
+            'production delayed-result object differs from exact local reference',
+            'P50 compiler connection uses absolute 20-second deadline'):
+        require(token in delayed_result,
+                f"actual-client delayed-result regression omits {token}")
+
     for token in ("run_remote_cell accepted accepted",
                   "run_remote_cell definitive definitive",
                   "run_remote_cell malformed malformed",
@@ -631,6 +663,11 @@ def check_runtime_gate(source: str) -> None:
                   'bounded strict retry minted ${bounded_new_count:-0} scheduler jobs'):
         require(token in source, f"real terminal/reclaim matrix omits {token}")
     ordered(source,
+            "run_remote_cell accepted accepted",
+            "delayed_wait_seconds=35",
+            'kill -STOP "-$delayed_compile_pgid"',
+            'sleep "$delayed_wait_seconds"',
+            'kill -CONT "-$delayed_compile_pgid"',
             "run_remote_cell malformed malformed",
             "restart_cache_sidecar",
             "run_remote_cell disconnect disconnect",
@@ -714,6 +751,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("client", "status == 0 && p50_result_received", "false"),
         ("client", "append_p50_fresh_legacy_local_trace(job, *usecs);", ""),
         ("client", "append_p50_compile_identity_trace(job, *crmsg);", ""),
+        ("client", "cserver->setTcpUserTimeoutUntil(", "timeout_extension_deleted("),
         ("serve", "write(out_fd, job_stat, sizeof(job_stat))", "write_deleted()"),
         ("serve", "rmsg.status = ret;", "status_binding_deleted();"),
         ("serve", "job_stat[JobStatistics::exit_code] = ret;", "stats_binding_deleted();"),
@@ -806,6 +844,9 @@ def deletion_mutants(files: dict[str, str]) -> None:
          'retry_marker="$work/fresh-retry.barrier"\nICECC_P50_C1F1_REQUIRED=1'),
         ("runtime_gate", "--identity-trace \"$work/compile-identity.jsonl\"", ""),
         ("runtime_gate", "run_remote_cell disconnect disconnect", "disconnect_deleted"),
+        ("runtime_gate", 'kill -STOP "-$delayed_compile_pgid"', "stop_deleted"),
+        ("runtime_gate", 'sleep "$delayed_wait_seconds"', "sleep_deleted"),
+        ("runtime_gate", 'kill -CONT "-$delayed_compile_pgid"', "continue_deleted"),
         ("runtime_gate", 'rm -f -- "$retry_remote_obj"', ""),
         ("runtime_gate", 'ICECC_P50_TEST_FRESH_STRICT_RETRY=1', ""),
         ("runtime_gate",

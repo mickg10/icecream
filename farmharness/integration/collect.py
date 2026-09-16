@@ -122,6 +122,12 @@ P50_NO_CACHE_HANDOFF_RE = re.compile(
     r"Error 105 - strict all-P50 assignment has no cache handoff\s*$"
 )
 REMOTE_ONLY_REFUSAL_RE = re.compile(r"\bremote-only policy refuses local retry\s*$")
+UNEXPECTED_USECS_ERROR_RE = re.compile(
+    r"\bgot exception Error 1 - expected use_cs reply, but got UNKNOWN instead\b"
+)
+REMOTE_ONLY_CLIENT_ERROR_REFUSAL_RE = re.compile(
+    r"\bremote-only policy refuses client-error fallback\s*$"
+)
 LOCAL_BUILD_MARKERS = ("<building_local>", "building myself, but telling localhost")
 LOG_TIMESTAMP_RE = re.compile(
     r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
@@ -5101,7 +5107,13 @@ def _uncommitted_transport_failure_observation(
 def _unassigned_p50_failure_observation(
     *, log_text: str, raw: Mapping[str, Any], row_job_id: str
 ) -> dict[str, Any]:
-    """Authenticate a remote-only P50 request rejected before assignment."""
+    """Authenticate a remote-only P50 request rejected before assignment.
+
+    An assignment can be absent because strict cache handoff was unavailable,
+    or because the scheduler channel vanished after request dispatch but
+    before UseCS reached the wrapper.  Both are compile failures, never
+    authenticated success.
+    """
 
     lines = list(enumerate(log_text.splitlines(), start=1))
     requests = [
@@ -5119,6 +5131,28 @@ def _unassigned_p50_failure_observation(
         for line_number, line in lines
         if REMOTE_ONLY_REFUSAL_RE.search(line) is not None
     ]
+    unexpected_usecs = [
+        line_number
+        for line_number, line in lines
+        if UNEXPECTED_USECS_ERROR_RE.search(line) is not None
+    ]
+    client_error_refusals = [
+        line_number
+        for line_number, line in lines
+        if REMOTE_ONLY_CLIENT_ERROR_REFUSAL_RE.search(line) is not None
+    ]
+    no_cache_handoff = (
+        len(failures) == 1
+        and len(refusals) == 1
+        and not unexpected_usecs
+        and not client_error_refusals
+    )
+    scheduler_stream_loss = (
+        not failures
+        and not refusals
+        and len(unexpected_usecs) == 1
+        and len(client_error_refusals) == 1
+    )
     expected_scheduler_job = f"missing-{raw.get('index')}"
     if (
         raw.get("scheduler_job") != expected_scheduler_job
@@ -5130,9 +5164,7 @@ def _unassigned_p50_failure_observation(
         or raw.get("retries") != 0
         or raw.get("remote_sha") != "0" * 64
         or len(requests) != 1
-        or len(failures) != 1
-        or len(refusals) != 1
-        or not requests[0] < failures[0] < refusals[0]
+        or no_cache_handoff == scheduler_stream_loss
         or CLIENT_ASSIGNMENT_RE.search(log_text) is not None
         or P50_ASSIGNMENT_IDENTITY_RE.search(log_text) is not None
         or PROFILE_RE.search(log_text) is not None
@@ -5145,12 +5177,22 @@ def _unassigned_p50_failure_observation(
             f"{row_job_id}: missing assignment is not one exact remote-only "
             "P50 cache-handoff refusal"
         )
-    return {
+    if no_cache_handoff and not requests[0] < failures[0] < refusals[0]:
+        raise CollectError(
+            f"{row_job_id}: missing assignment is not one exact remote-only "
+            "P50 cache-handoff refusal"
+        )
+    if scheduler_stream_loss and not (
+        requests[0] < unexpected_usecs[0] < client_error_refusals[0]
+    ):
+        raise CollectError(
+            f"{row_job_id}: missing assignment is not one exact remote-only "
+            "P50 cache-handoff refusal"
+        )
+    common = {
         "client_instance": row_job_id.split(":", 1)[0],
         "compile_rc": raw["compile_rc"],
-        "failure_line": failures[0],
         "index": raw["index"],
-        "remote_only_refusal_line": refusals[0],
         "request_line": requests[0],
         "request_finished_ms": raw["finished"],
         "request_started_ms": raw["started"],
@@ -5158,6 +5200,18 @@ def _unassigned_p50_failure_observation(
         "scheduler_job": raw["scheduler_job"],
         "turn": raw["turn"],
         "worker": raw["worker"],
+    }
+    if no_cache_handoff:
+        return {
+            **common,
+            "failure_line": failures[0],
+            "remote_only_refusal_line": refusals[0],
+        }
+    return {
+        **common,
+        "failure_line": unexpected_usecs[0],
+        "failure_reason": "scheduler-stream-loss-before-usecs",
+        "remote_only_refusal_line": client_error_refusals[0],
     }
 
 
@@ -5169,7 +5223,13 @@ def _abandoned_p50_retry_request_observation(
     assignment_identity: Mapping[str, int] | None,
     row_job_id: str,
 ) -> dict[str, Any] | None:
-    """Authenticate a strict retry request rejected before its UseCS arrived."""
+    """Authenticate a strict retry request rejected before its UseCS arrived.
+
+    The first assignment may have failed before source commit, or after an
+    exact source commit when its compile-result stream was lost.  These are
+    deliberately disjoint shapes.  This record only reconciles the otherwise
+    unclaimed retry dispatch; it never authenticates compile success.
+    """
 
     lines = list(enumerate(log_text.splitlines(), start=1))
     no_cache = [
@@ -5184,6 +5244,16 @@ def _abandoned_p50_retry_request_observation(
         for line_number, line in lines
         if (match := P50_SOURCE_TRANSFER_FAILED_RE.search(line)) is not None
     ]
+    committed_sources = [
+        (line_number, match)
+        for line_number, line in lines
+        if (match := PROFILE_RE.search(line)) is not None
+    ]
+    normalized_errors = [
+        (line_number, match)
+        for line_number, line in lines
+        if (match := P50_NORMALIZED_ERROR106_RE.search(line)) is not None
+    ]
     retries = [
         (line_number, match)
         for line_number, line in lines
@@ -5196,19 +5266,28 @@ def _abandoned_p50_retry_request_observation(
     ]
     assignments = list(CLIENT_ASSIGNMENT_RE.finditer(log_text))
     identities = list(P50_ASSIGNMENT_IDENTITY_RE.finditer(log_text))
+    source_transfer_failure = (
+        len(transfers) == 1
+        and not committed_sources
+        and not normalized_errors
+    )
+    result_stream_loss = (
+        not transfers
+        and len(committed_sources) == 1
+        and len(normalized_errors) == 1
+    )
     if (
         assignment_identity is None
         or len(assignments) != 1
         or len(identities) != 1
-        or len(transfers) != 1
         or len(retries) != 1
         or len(no_cache) != 1
         or len(refusals) != 1
+        or source_transfer_failure == result_stream_loss
     ):
         raise CollectError(
             f"{row_job_id}: abandoned strict-P50 retry markers are absent or ambiguous"
         )
-    transfer_line, transfer = transfers[0]
     retry_line, retry = retries[0]
     assignment_line = assignment.get("line")
     identity_line = assignment_identity.get("line")
@@ -5223,37 +5302,79 @@ def _abandoned_p50_retry_request_observation(
         or raw.get("remote") != 1
         or raw.get("retries") != 0
         or raw.get("remote_sha") != "0" * 64
-        or int(transfer.group(2)) < 1
-        or int(transfer.group(3)) < 1
-        or not (
-            identity_line
-            < assignment_line
-            < transfer_line
-            < retry_line
-            < no_cache[0]
-            < refusals[0]
-        )
-        or PROFILE_RE.search(log_text) is not None
-        or P50_NORMALIZED_ERROR106_RE.search(log_text) is not None
     ):
         raise CollectError(
             f"{row_job_id}: abandoned strict-P50 retry is not an exact failed request"
         )
-    return {
+    common = {
         "client_instance": row_job_id.split(":", 1)[0],
         "compile_rc": raw["compile_rc"],
         "failed_endpoint": retry.group(1),
-        "failure_line": transfer_line,
-        "profile": transfer.group(1),
         "request_finished_ms": raw["finished"],
         "request_started_ms": raw["started"],
         "retry_line": retry_line,
         "row_job_id": row_job_id,
         "scheduler_job": assignment["scheduler_job"],
-        "status": int(transfer.group(2)),
-        "transfer_error": int(transfer.group(3)),
-        "transfer_attempts": int(transfer.group(4)),
         "worker": assignment["worker"],
+    }
+    if source_transfer_failure:
+        transfer_line, transfer = transfers[0]
+        if (
+            int(transfer.group(2)) < 1
+            or int(transfer.group(3)) < 1
+            or not (
+                identity_line
+                < assignment_line
+                < transfer_line
+                < retry_line
+                < no_cache[0]
+                < refusals[0]
+            )
+        ):
+            raise CollectError(
+                f"{row_job_id}: abandoned strict-P50 retry is not an exact failed request"
+            )
+        return {
+            **common,
+            "failure_line": transfer_line,
+            "failure_reason": "source-transfer-failure",
+            "profile": transfer.group(1),
+            "status": int(transfer.group(2)),
+            "transfer_error": int(transfer.group(3)),
+            "transfer_attempts": int(transfer.group(4)),
+        }
+
+    commit_line, commit = committed_sources[0]
+    normalized_line, normalized = normalized_errors[0]
+    normalized_error = int(normalized.group(1))
+    if (
+        int(commit.group(2)) < 1
+        # Source TU sequence is session-local and may differ from the
+        # scheduler assignment's client TU sequence under concurrency.  The
+        # later source-result join binds it to the full assignment identity.
+        or int(commit.group(3)) < 1
+        or normalized_error not in P50_RETRYABLE_TRANSPORT_ERRORS
+        or not (
+            identity_line
+            < assignment_line
+            < commit_line
+            < normalized_line
+            < retry_line
+            < no_cache[0]
+            < refusals[0]
+        )
+    ):
+        raise CollectError(
+            f"{row_job_id}: abandoned strict-P50 retry is not an exact failed request"
+        )
+    return {
+        **common,
+        "failure_line": normalized_line,
+        "failure_reason": "result-stream-loss",
+        "normalized_error": normalized_error,
+        "profile": commit.group(1),
+        "raw_bytes": int(commit.group(2)),
+        "tu_seq": int(commit.group(3)),
     }
 
 
@@ -6380,15 +6501,21 @@ def _reconcile_scheduler_dispatches(
         raise CollectError(
             f"scheduler dispatch/assignment keys differ missing={missing!r} extra={extra!r}"
         )
-    if unclaimed_dispatches or requests:
+    if unclaimed_dispatches:
         request_clients = Counter(item.get("client_instance") for item in requests)
         dispatch_clients = Counter(item.get("client") for item in unclaimed_dispatches)
         request_rows = [item.get("row_job_id") for item in requests]
         if (
-            not unclaimed_dispatches
-            or not requests
-            or len(unclaimed_dispatches) != len(requests)
-            or request_clients != dispatch_clients
+            not requests
+            # A failed request can be rejected before any scheduler dispatch
+            # (for example strict-P50 no-handoff).  Such authenticated rows
+            # remain compile failures but do not participate in the
+            # dispatch/claim bijection.  Every actual extra dispatch must
+            # still have a client/time-compatible failed request witness.
+            or any(
+                dispatch_clients[client] > request_clients[client]
+                for client in dispatch_clients
+            )
             or any(not isinstance(item, str) or not item for item in request_rows)
             or len(set(request_rows)) != len(request_rows)
             or any(
@@ -7366,6 +7493,23 @@ def _observations(
             and missing["reason"] == "result-stream-loss"
             for missing in missing_result_identities
         )
+        if (
+            not failed_result_stream_completion
+            and isinstance(raw.get("abandoned_p50_retry_request"), Mapping)
+            and raw["abandoned_p50_retry_request"].get("failure_reason")
+            == "result-stream-loss"
+            and raw["compile_rc"] != 0
+            and raw["remote"] == 1
+            and not raw["local_build"]
+            and final["terminal"] == "completion"
+        ):
+            # CompileResult may be authenticated while the following object
+            # stream is lost (for example Error 19).  The source/result
+            # identities and scheduler completion remain real, but the row
+            # is still a compile/exactness failure.  Its exact normalized
+            # Error106 + strict retry/no-handoff record was authenticated
+            # before lifecycle reconciliation.
+            failed_result_stream_completion = True
         strict_p50_late_result_binding = (
             _successful_strict_p50_late_result_binding(
                 scenario, row, raw, records, events

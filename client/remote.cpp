@@ -796,6 +796,12 @@ constexpr auto kP50CompilerConnectBudget = std::chrono::seconds(20);
 // immediate definitive failures still enter the existing strict-assignment
 // retry path without delay.  No job/profile/source message has been sent yet.
 constexpr auto kP50CompilerConnectAttemptBudget = std::chrono::seconds(5);
+constexpr int kRemoteCompileResultWaitSeconds = 12 * 60;
+// Once connection/protocol admission succeeds, the short connect deadline no
+// longer owns the channel.  Source preparation and the ordinary remote result
+// wait each receive the same 12-minute budget already enforced by get_msg().
+constexpr auto kP50CompilerOperationBudget =
+    std::chrono::seconds(kRemoteCompileResultWaitSeconds);
 
 static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_daemon,
                             const string &environment, const string &version_file,
@@ -1013,6 +1019,14 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             throw client_error(2, "Error 2 - no server found at " + hostname);
         }
         cserver->set_p50_legacy_wire_role(P50LegacyWireRole::C);
+        if (cache_advertised_assignment &&
+            !cserver->setTcpUserTimeoutUntil(
+                std::chrono::steady_clock::now() +
+                kP50CompilerOperationBudget)) {
+            throw client_error(
+                14,
+                "Error 14 - unable to arm P50 compiler operation timeout");
+        }
 
         // Environment transfer always stays on the ordinary legacy stream.
         // Source selection happens only after this phase and then remains one
@@ -1297,7 +1311,15 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         Msg *msg;
         {
             log_block wait_cs("wait for cs");
-            msg = cserver->get_msg(12 * 60);
+            if (p50_input &&
+                !cserver->setTcpUserTimeoutUntil(
+                    std::chrono::steady_clock::now() +
+                    kP50CompilerOperationBudget)) {
+                throw client_error(
+                    14,
+                    "Error 14 - unable to arm P50 compile-result timeout");
+            }
+            msg = cserver->get_msg(kRemoteCompileResultWaitSeconds);
 
             if (!msg) {
                 throw client_error(14, "Error 14 - error reading message from remote");
