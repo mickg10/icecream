@@ -2534,6 +2534,92 @@ def test_s70_b4_worker_action_lineage_does_not_require_same_tu_placement() -> No
     assert verdict["status"] == "PASS", verdict
 
 
+def _roll_s70_c_store_in_epoch_three(
+    fixture: dict[str, object], *, records: int
+) -> None:
+    rows = {row["job_id"]: row for row in fixture["rows"]}
+    lineages = [
+        record
+        for record in fixture["observations"]["p29_action_lineage"]["records"]
+        if record["worker_instance"] == "F1"
+        and rows[record["job_id"]]["event_epoch"] == 3
+    ]
+    selected = sorted(lineages, key=lambda record: record["session_serial"])[
+        -records:
+    ]
+    selected_ids = {record["job_id"] for record in selected}
+    new_c_store_guid = "d" * 32
+    for rel_seq, record in enumerate(selected):
+        record["c_store_guid"] = new_c_store_guid
+        record["history_nonce"] = 1
+        record["previous_f_store_guid"] = "0" * 32
+        record["rel_seq"] = rel_seq
+    for record in fixture["observations"]["p50_source_routes"]["records"]:
+        if record["job_id"] in selected_ids:
+            record["c_store_guid"] = new_c_store_guid
+
+
+def _s70_capacity_replacement_lineage_bundle() -> dict[str, object]:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    lineage_fixture = _s70_b4_worker_action_lineage_bundle()
+    fixture["scenario"]["expect"]["worker_cold_witness"] = (
+        "p29-action-lineage-v1"
+    )
+    for field in ("p50_source_routes", "p29_action_lineage"):
+        fixture["observations"][field] = copy.deepcopy(
+            lineage_fixture["observations"][field]
+        )
+
+    retry_job = fixture["rows"][100]["job_id"]
+    for record in fixture["observations"]["p50_source_routes"]["records"]:
+        if record["job_id"] == retry_job:
+            record["worker_instance"] = "F2"
+    for record in fixture["observations"]["p29_action_lineage"]["records"]:
+        row = fixture["rows"][int(record["job_id"]) - 1]
+        if record["job_id"] == retry_job:
+            record["worker_instance"] = "F2"
+            record["f_store_guid"] = f"{10:032x}"
+        elif record["worker_instance"] == "F1" and row["event_epoch"] == 1:
+            record["session_serial"] -= 1
+            record["rel_seq"] -= 1
+            if record["session_serial"] == 1:
+                record["previous_f_store_guid"] = "0" * 32
+
+    source_failure = fixture["observations"]["failed_p50_source_transfers"]
+    source_failure["records"][0]["error"] = 0x5002
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    binding["first_terminal_ms"] = 40_000
+    return fixture
+
+
+def test_s70_b4_worker_accepts_authenticated_c_store_capacity_rollover() -> None:
+    fixture = _s70_capacity_replacement_lineage_bundle()
+    _roll_s70_c_store_in_epoch_three(fixture, records=10)
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+def test_s70_b4_worker_rejects_c_store_rollover_without_warm_lineage() -> None:
+    fixture = _s70_capacity_replacement_lineage_bundle()
+    _roll_s70_c_store_in_epoch_three(fixture, records=1)
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert "s70.b4-worker-bounces" in failed
+
+
+def test_s70_b4_worker_rejects_unauthenticated_c_store_rollover() -> None:
+    fixture = _s70_b4_worker_action_lineage_bundle()
+    _roll_s70_c_store_in_epoch_three(fixture, records=10)
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert "s70.b4-worker-bounces" in failed
+
+
 def test_s70_b4_worker_uses_f_transaction_order_not_scheduler_order() -> None:
     fixture = _s70_b4_worker_action_lineage_bundle()
     records = [
@@ -3133,6 +3219,49 @@ def test_source_transfer_allows_late_scheduler_cancellation_settlement() -> None
     )
     assert authenticated == {binding["job_id"]}
     assert bad == set()
+
+
+def test_s70_b4_accepts_capacity_rollover_retry_after_restart_windows() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    fixture["observations"]["failed_p50_source_transfers"]["records"][0][
+        "error"
+    ] = 0x5002
+    binding["first_terminal_ms"] = (
+        max(event["fired_ms"] for event in fixture["event_log"]) + 1
+    )
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+def test_s70_b4_rejects_unrelated_source_retry_after_restart_windows() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    binding["first_terminal_ms"] = (
+        max(event["fired_ms"] for event in fixture["event_log"]) + 1
+    )
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert "s70.b4-worker-bounces" in failed
+
+
+def test_s70_b4_rejects_forged_capacity_rollover_retry_endpoint() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    record = fixture["observations"]["failed_p50_source_transfers"]["records"][0]
+    record["error"] = 0x5002
+    record["failed_endpoint"] = "10.0.27.99:23999"
+    binding["first_terminal_ms"] = (
+        max(event["fired_ms"] for event in fixture["event_log"]) + 1
+    )
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert failed & {"retry.strict-p50-bindings", "s70.b4-worker-bounces"}
 
 
 def _s70_b4_worker_uncommitted_transport_recovery_bundle() -> dict[str, object]:

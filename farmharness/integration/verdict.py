@@ -81,6 +81,7 @@ P29_ACTION_LINEAGE_SCHEMA = "icefarm-p29-action-lineage-v1"
 P29_ACTION_LINEAGE_CONTRACT = "p29-action-lineage-v1"
 ZERO_GUID = "0" * 32
 P29_PERMANENT_PROFILE_UNAVAILABLE = 0x5001
+P29_ROUTE_REPLACEMENT_REQUIRED = 0x5002
 SESSION_OUTCOMES = frozenset(("committed", "refused", "fallback", "none"))
 TERMINAL_KINDS = frozenset(
     ("completion", "fallback", "cancellation", "process-loss-recovery")
@@ -6234,6 +6235,20 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         strict_bindings = observations.get(
             "successful_strict_p50_retry_bindings"
         )
+        source_transfer_observation = observations.get(
+            "failed_p50_source_transfers"
+        )
+        source_transfer_records = (
+            source_transfer_observation.get("records")
+            if isinstance(source_transfer_observation, Mapping)
+            else None
+        )
+        route_replacement_retry_ids = {
+            _job_id(record.get("row_job_id"), "@route-replacement")
+            for record in source_transfer_records
+            if isinstance(record, Mapping)
+            and record.get("error") == P29_ROUTE_REPLACEMENT_REQUIRED
+        } if isinstance(source_transfer_records, list) else set()
         strict_bound_jobs: set[str] = set()
         error106_raw = observations.get("error106_job_ids")
         error106_ids = (
@@ -6269,8 +6284,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     or binding.get("first_worker") != "F1"
                     or binding.get("final_worker") not in other_workers
                     or (
-                        binding.get("failure_reason") != "result-stream-loss"
+                        binding.get("failure_reason")
+                        not in {"result-stream-loss", "source-transfer-loss"}
                         and matching_restart is None
+                    )
+                    or (
+                        binding.get("failure_reason") == "source-transfer-loss"
+                        and matching_restart is None
+                        and job_id not in route_replacement_retry_ids
                     )
                     or (
                         binding.get("failure_reason") == "result-stream-loss"
@@ -6617,46 +6638,79 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 store_guids = {
                     str(record["f_store_guid"]) for record in epoch_lineages
                 }
-                c_store_guids = {
-                    str(record["c_store_guid"]) for record in epoch_lineages
-                }
-                if len(store_guids) != 1 or len(c_store_guids) != 1:
+                if len(store_guids) != 1:
                     b4_bad.add(f"@worker:F1:epoch-{epoch}:store-relationship")
                     continue
                 store_guid = next(iter(store_guids))
-                c_store_guid = next(iter(c_store_guids))
-                cold = [
+                cold_guids.add(store_guid)
+                epoch_cold = [
                     record
                     for record in epoch_lineages
                     if record.get("session_serial") == 1
                     and record.get("rel_seq") == 0
                 ]
-                warm = [
+                epoch_warm = [
                     record
                     for record in epoch_lineages
                     if record.get("session_serial") == 2
                     and record.get("rel_seq") == 1
                 ]
-                cold_guids.add(store_guid)
                 if (
-                    len(cold) != 1
-                    or len(warm) != 1
-                    or cold[0].get("worker_instance") != "F1"
-                    or cold[0].get("c_store_guid") != c_store_guid
-                    or cold[0].get("f_store_guid") != store_guid
-                    or cold[0].get("previous_f_store_guid") != ZERO_GUID
-                    or cold[0].get("history_nonce") != 1
-                    or warm[0].get("worker_instance") != "F1"
-                    or warm[0].get("c_store_guid") != c_store_guid
-                    or warm[0].get("f_store_guid") != store_guid
-                    or warm[0].get("history_nonce")
-                    != cold[0].get("history_nonce")
+                    len(epoch_cold) != 1
+                    or len(epoch_warm) != 1
+                    or epoch_cold[0].get("c_store_guid")
+                    != epoch_warm[0].get("c_store_guid")
                 ):
                     b4_bad.add(
-                        _job_id(cold[0].get("job_id"), f"@worker:F1:epoch-{epoch}")
-                        if cold
+                        _job_id(
+                            epoch_cold[0].get("job_id"),
+                            f"@worker:F1:epoch-{epoch}",
+                        )
+                        if epoch_cold
                         else f"@worker:F1:epoch-{epoch}"
                     )
+                relationships: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+                for record in epoch_lineages:
+                    relationships[str(record["c_store_guid"])].append(record)
+                if len(relationships) > 1 and (
+                    len(relationships) != 2 or not route_replacement_retry_ids
+                ):
+                    b4_bad.add(f"@worker:F1:epoch-{epoch}:store-relationship")
+                for c_store_guid, relationship in relationships.items():
+                    cold = [
+                        record
+                        for record in relationship
+                        if record.get("rel_seq") == 0
+                    ]
+                    warm = [
+                        record
+                        for record in relationship
+                        if record.get("rel_seq") == 1
+                    ]
+                    if (
+                        len(cold) != 1
+                        or len(warm) != 1
+                        or cold[0].get("worker_instance") != "F1"
+                        or cold[0].get("c_store_guid") != c_store_guid
+                        or cold[0].get("f_store_guid") != store_guid
+                        or cold[0].get("previous_f_store_guid") != ZERO_GUID
+                        or cold[0].get("history_nonce") != 1
+                        or warm[0].get("worker_instance") != "F1"
+                        or warm[0].get("c_store_guid") != c_store_guid
+                        or warm[0].get("f_store_guid") != store_guid
+                        or warm[0].get("history_nonce")
+                        != cold[0].get("history_nonce")
+                        or warm[0].get("session_serial", 0)
+                        <= cold[0].get("session_serial", 0)
+                    ):
+                        b4_bad.add(
+                            _job_id(
+                                cold[0].get("job_id"),
+                                f"@worker:F1:epoch-{epoch}:store-relationship",
+                            )
+                            if cold
+                            else f"@worker:F1:epoch-{epoch}:store-relationship"
+                        )
             if len(cold_guids) != 3:
                 b4_bad.add("@observations:s70-b4-worker-store-generations")
         else:
