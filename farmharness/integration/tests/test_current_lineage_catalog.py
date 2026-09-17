@@ -60,3 +60,24 @@ def test_final_product_role_store_uses_measured_current_binaries() -> None:
         for role, binding in farm["authority"]["role_stores"]["50"].items()
     }
     assert observed == FINAL_ROLE_HASHES
+
+
+def test_direct_builder_catalog_is_f_only_and_deletion_sensitive() -> None:
+    farm = json.loads((INTEGRATION / "farm.example.json").read_text(encoding="utf-8"))
+    hosts = {host["name"]: host for host in farm["hosts"]}
+    builders = {name: hosts[name] for name in ("tt-quietbox4", "tt-quietbox5")}
+
+    assert all(host["roles_allowed"] == ["F"] for host in builders.values())
+    assert {host["docker_context"] for host in builders.values()} == {"q4", "q5"}
+    assert {host["lan_ip"] for host in builders.values()} == {
+        "10.0.27.125",
+        "10.0.27.150",
+    }
+    assert "research7" not in hosts
+    assert {
+        name: farm["authority"]["hosts"][name]
+        for name in builders
+    } == {
+        "tt-quietbox4": {"class": "worker", "address": "10.0.27.125"},
+        "tt-quietbox5": {"class": "worker", "address": "10.0.27.150"},
+    }

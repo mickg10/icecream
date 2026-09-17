@@ -47,6 +47,34 @@
       "shared_lan": "10.0.27.0/24"
     },
     {
+      "name": "tt-quietbox4",
+      "ssh": "mickg10@tt-quietbox4",
+      "docker_context": "q4",
+      "lan_ip": "10.0.27.125",
+      "arch": "x86_64",
+      "cores": 16,
+      "mem_gb": 240,
+      "scratch_root": "/home/mickg10/farm-scratch",
+      "roles_allowed": ["F"],
+      "sudo": true,
+      "netem": false,
+      "shared_lan": "10.0.27.0/24"
+    },
+    {
+      "name": "tt-quietbox5",
+      "ssh": "mickg10@tt-quietbox5",
+      "docker_context": "q5",
+      "lan_ip": "10.0.27.150",
+      "arch": "x86_64",
+      "cores": 32,
+      "mem_gb": 240,
+      "scratch_root": "/home/mickg10/farm-scratch",
+      "roles_allowed": ["F"],
+      "sudo": true,
+      "netem": false,
+      "shared_lan": "10.0.27.0/24"
+    },
+    {
       "name": "research6",
       "ssh": "mickg@research6",
       "docker_context": "r6",
@@ -259,6 +287,8 @@
     "hosts": {
       "tt-quietbox3": {"class": "submission", "address": "10.0.27.101"},
       "tt-quietbox2": {"class": "worker", "address": "10.0.27.212"},
+      "tt-quietbox4": {"class": "worker", "address": "10.0.27.125"},
+      "tt-quietbox5": {"class": "worker", "address": "10.0.27.150"},
       "research6": {"class": "orchestration", "address": "10.0.27.56"}
     },
     "role_stores": {
