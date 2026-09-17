@@ -17,6 +17,7 @@ FINAL_ROLE_HASHES = {
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
+BUILDER_HOSTS = {"tt-quietbox4", "tt-quietbox5"}
 
 
 def test_requalified_catalog_uses_the_final_product_lineage() -> None:
@@ -80,4 +81,77 @@ def test_direct_builder_catalog_is_f_only_and_deletion_sensitive() -> None:
     } == {
         "tt-quietbox4": {"class": "worker", "address": "10.0.27.125"},
         "tt-quietbox5": {"class": "worker", "address": "10.0.27.150"},
+    }
+
+
+def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None:
+    """Keep fast-builder placement tied to installed image/topology authority."""
+
+    s60 = sorted(SCENARIOS.glob("S60-*.json"))
+    assert len(s60) == 14
+    for path in s60:
+        instances = json.loads(path.read_text(encoding="utf-8"))["instances"]
+        workers = {item["name"]: item for item in instances if item["role"] == "F"}
+        assert {name: item["host"] for name, item in workers.items()} == {
+            "F1": "tt-quietbox5",
+            "F2": "tt-quietbox4",
+        }, path.name
+        assert {item["role"] for item in instances if item["host"] in BUILDER_HOSTS} == {"F"}
+
+    for path in sorted(SCENARIOS.glob("S70-*.json")):
+        instances = json.loads(path.read_text(encoding="utf-8"))["instances"]
+        workers = {item["name"]: item for item in instances if item["role"] == "F"}
+        assert workers["F1"]["host"] == "tt-quietbox5", path.name
+        if len(workers) == 2 and path.name in {
+            "S70-b4-worker-bounces.json",
+            "S70-b5-interner-failure.json",
+        }:
+            assert workers["F2"]["host"] == "tt-quietbox4", path.name
+        elif len(workers) == 2:
+            assert workers["F2"]["host"] == "research6", path.name
+
+    s80_expected = {
+        "S80-legacy.json": "tt-quietbox5",
+        "S80-p29v1.json": "tt-quietbox5",
+        "S80-zstd-route.json": "tt-quietbox5",
+        "S80-zstd-tu.json": "tt-quietbox5",
+        # q3 is the sole netem-authorized host; preserve the shaped arm.
+        "S80-p29v1-shaped-100m.json": "tt-quietbox3",
+    }
+    for name, expected_host in s80_expected.items():
+        scenario = json.loads((SCENARIOS / name).read_text(encoding="utf-8"))
+        worker = next(item for item in scenario["instances"] if item["name"] == "F1")
+        assert worker["host"] == expected_host, name
+        if name.endswith("shaped-100m.json"):
+            assert scenario["network"]["shaping"] == [
+                {"instance": "F1", "rate": "100mbit", "delay_ms": 2}
+            ]
+
+    skew = json.loads((SCENARIOS / "S90-revision-skew.json").read_text(encoding="utf-8"))
+    skew_workers = {item["name"]: item for item in skew["instances"] if item["role"] == "F"}
+    assert {name: item["host"] for name, item in skew_workers.items()} == {
+        "F1": "tt-quietbox5",
+        # The r2 mutant is not installed on q4/q5; retain its authorized q3 host.
+        "F2": "tt-quietbox3",
+    }
+    refusal = json.loads(
+        (SCENARIOS / "S90-revision-refusal-retry.json").read_text(encoding="utf-8")
+    )
+    refusal_worker = next(item for item in refusal["instances"] if item["role"] == "F")
+    assert refusal_worker["host"] == "tt-quietbox2"
+
+    s95 = json.loads((SCENARIOS / "S95-cache-disk-full.json").read_text(encoding="utf-8"))
+    s95_workers = {item["name"]: item for item in s95["instances"] if item["role"] == "F"}
+    assert {name: item["host"] for name, item in s95_workers.items()} == {
+        "F1": "tt-quietbox5",
+        "F2": "tt-quietbox4",
+    }
+
+    # H5 deliberately remains on its stale 57a1 image until that exact image
+    # is installed and independently sealed on the new builders.
+    h5 = json.loads((SCENARIOS / "H5-worker-kill.json").read_text(encoding="utf-8"))
+    h5_workers = {item["name"]: item for item in h5["instances"] if item["role"] == "F"}
+    assert {name: item["host"] for name, item in h5_workers.items()} == {
+        "F1": "tt-quietbox3",
+        "F2": "research6",
     }

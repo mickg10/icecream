@@ -18,14 +18,14 @@
     {
       "name": "F1",
       "role": "F",
-      "host": "tt-quietbox3",
+      "host": "tt-quietbox5",
       "image": "new",
       "slots": 24
     },
     {
       "name": "F2",
       "role": "F",
-      "host": "research6",
+      "host": "tt-quietbox4",
       "image": "new",
       "slots": 12
     },

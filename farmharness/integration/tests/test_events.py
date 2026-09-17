@@ -1329,7 +1329,12 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
     # plans use the stronger incarnation-bound readiness receipt below.
     plan.pop("client_scheduler_readiness_contract")
     plan["ports"].pop("web")
-    log = tmp_path / "diagnostics" / "tt-quietbox3" / "F1.log" / "iceccd.log"
+    worker = next(
+        item
+        for item in plan["topology"]["instances"]
+        if item["name"] == "F1"
+    )
+    log = tmp_path / "diagnostics" / worker["host"] / "F1.log" / "iceccd.log"
     log.parent.mkdir(parents=True)
     log.write_text(
         "session quiescence TERM compiler pid=41 pgid=41 generation=7\n"
@@ -5180,6 +5185,12 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
         _b5_row(3, epoch=1, profile="ZSTD_TU"),
         _b5_row(4, worker="F2", epoch=1, profile="ZSTD_TU"),
     ]
+    workers = {
+        item["name"]: item
+        for item in plan["topology"]["instances"]
+        if item["role"] == "F"
+    }
+    ports = plan["ports"]["instances"]
     observations = {
         "cell_wall_ms": 2000,
         "compile_failure_job_ids": [],
@@ -5197,7 +5208,9 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
                     "c_guid": 31,
                     "compile_identity_present": False,
                     "error": 0x5001,
-                    "failed_endpoint": "10.0.27.101:23003",
+                    "failed_endpoint": (
+                        f"{workers['F1']['address']}:{ports['F1']}"
+                    ),
                     "failure_line": 11,
                     "profile": "P29V1",
                     "retry_assignment_epoch": 11,
@@ -5205,7 +5218,9 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
                     "retry_assignment_line": 17,
                     "retry_assignment_nonce": 22,
                     "retry_c_guid": 31,
-                    "retry_endpoint": "10.0.27.56:23004",
+                    "retry_endpoint": (
+                        f"{workers['F2']['address']}:{ports['F2']}"
+                    ),
                     "retry_line": 12,
                     "retry_scheduler_job": 21,
                     "retry_tu_seq": 42,
