@@ -831,6 +831,41 @@ struct P50CacheControlIdentity
     auto operator<=>(const P50CacheControlIdentity &) const = default;
 };
 
+/* Move-only authority for one delayed daemon -> wrapper descriptor reply.
+   The ordinary event loop probes a drained client socket once after every
+   decoded frame; that empty nonblocking read is not a protocol mutation and
+   must not destroy a reply that is waiting for supervised sidecar recovery.
+   The ticket instead binds the exact channel incarnation, decoded frame,
+   outbound frame boundary, and request.  Any real later frame, ordinary send,
+   EOF/error, buffered byte, or non-idle socket still makes consumption fail. */
+class P50CacheFdReplyTicket
+{
+public:
+    P50CacheFdReplyTicket() = default;
+    P50CacheFdReplyTicket(const P50CacheFdReplyTicket &) = delete;
+    P50CacheFdReplyTicket &operator=(const P50CacheFdReplyTicket &) = delete;
+    P50CacheFdReplyTicket(P50CacheFdReplyTicket &&other) noexcept;
+    P50CacheFdReplyTicket &operator=(P50CacheFdReplyTicket &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return channel_generation_ != 0 && request_.valid();
+    }
+
+private:
+    friend class MsgChannel;
+    P50CacheFdReplyTicket(
+        uint64_t channel_generation, uint64_t decoded_frame_sequence,
+        uint64_t outbound_frame_sequence,
+        P50CacheSessionFdRequestFields request) noexcept;
+    void invalidate() noexcept;
+
+    uint64_t channel_generation_ = 0;
+    uint64_t decoded_frame_sequence_ = 0;
+    uint64_t outbound_frame_sequence_ = 0;
+    P50CacheSessionFdRequestFields request_{};
+};
+
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
    LoginMsg may advertise a runnable capability set.  A UseCS assignment is
    narrower: cache_assignment_is_valid_present additionally requires the one
@@ -1029,6 +1064,14 @@ public:
        fixed lease plus one descriptor.  Every call consumes transfer_fd
        (success and failure); the receiver owns the returned descriptor on
        success. */
+    P50CacheFdReplyTicket take_p50_cache_fd_reply_ticket(
+        const P50CacheSessionFdRequestMsg &request) noexcept;
+    bool send_p50_cache_fd_reply(
+        P50CacheFdReplyTicket &&ticket,
+        P50CacheControlIdentity control_identity, int transfer_fd,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    /* Immediate compatibility helper: mint and consume the ticket in the same
+       call.  Delayed owners must retain the explicit move-only ticket. */
     bool send_p50_cache_fd_reply(
         const P50CacheSessionFdRequestMsg &request,
         P50CacheControlIdentity control_identity, int transfer_fd,

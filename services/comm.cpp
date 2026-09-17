@@ -432,6 +432,50 @@ void P50ClientAdoptedReleaseTicket::invalidate() noexcept
     f_store_guid_.fill(0);
 }
 
+P50CacheFdReplyTicket::P50CacheFdReplyTicket(
+    uint64_t channel_generation, uint64_t decoded_frame_sequence,
+    uint64_t outbound_frame_sequence,
+    P50CacheSessionFdRequestFields request) noexcept
+    : channel_generation_(channel_generation),
+      decoded_frame_sequence_(decoded_frame_sequence),
+      outbound_frame_sequence_(outbound_frame_sequence), request_(request)
+{
+}
+
+P50CacheFdReplyTicket::P50CacheFdReplyTicket(
+    P50CacheFdReplyTicket &&other) noexcept
+    : channel_generation_(std::exchange(other.channel_generation_, 0)),
+      decoded_frame_sequence_(
+          std::exchange(other.decoded_frame_sequence_, 0)),
+      outbound_frame_sequence_(
+          std::exchange(other.outbound_frame_sequence_, 0)),
+      request_(std::exchange(other.request_, {}))
+{
+}
+
+P50CacheFdReplyTicket &P50CacheFdReplyTicket::operator=(
+    P50CacheFdReplyTicket &&other) noexcept
+{
+    if (this != &other) {
+        invalidate();
+        channel_generation_ = std::exchange(other.channel_generation_, 0);
+        decoded_frame_sequence_ =
+            std::exchange(other.decoded_frame_sequence_, 0);
+        outbound_frame_sequence_ =
+            std::exchange(other.outbound_frame_sequence_, 0);
+        request_ = std::exchange(other.request_, {});
+    }
+    return *this;
+}
+
+void P50CacheFdReplyTicket::invalidate() noexcept
+{
+    channel_generation_ = 0;
+    decoded_frame_sequence_ = 0;
+    outbound_frame_sequence_ = 0;
+    request_ = {};
+}
+
 // Prefer least amount of CPU use
 #undef ZSTD_CLEVEL_DEFAULT
 #define ZSTD_CLEVEL_DEFAULT 1
@@ -4084,19 +4128,41 @@ bool p50_fd_wait(int socket, short events,
 
 } // namespace
 
+P50CacheFdReplyTicket MsgChannel::take_p50_cache_fd_reply_ticket(
+    const P50CacheSessionFdRequestMsg &request) noexcept
+{
+    const bool ready = !p50_fd_reply_arm_consumed &&
+        p50_fd_request_ready && protocol == PROTOCOL_VERSION &&
+        !eof && instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
+        pending_frame_ends.empty() && framesFlushed() == framesQueued() &&
+        request.valid_payload() && request.request == p50_last_fd_request;
+    p50_fd_reply_arm_consumed = true;
+    if (!ready || !p50_fd_socket_idle(fd))
+        return {};
+
+    P50CacheFdReplyTicket ticket(
+        p50_channel_generation, p50_decoded_frame_sequence, framesQueued(),
+        request.request);
+    p50_fd_request_ready = false;
+    p50_last_fd_request = {};
+    return ticket;
+}
+
 bool MsgChannel::send_p50_cache_fd_reply(
-    const P50CacheSessionFdRequestMsg &request,
+    P50CacheFdReplyTicket &&ticket,
     P50CacheControlIdentity control_identity, int transfer_fd,
     std::chrono::steady_clock::time_point deadline) noexcept
 {
-    const bool ready = !p50_fd_reply_arm_consumed &&
-        p50_fd_request_ready && transfer_fd >= 0 && transfer_fd != fd &&
-        protocol == PROTOCOL_VERSION &&
-        !eof && instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
-        pending_frame_ends.empty() && framesFlushed() == framesQueued() &&
-        request.valid_payload() && request.request == p50_last_fd_request &&
+    const P50CacheSessionFdRequestFields request = ticket.request_;
+    const bool ready = ticket.valid() && transfer_fd >= 0 && transfer_fd != fd &&
+        ticket.channel_generation_ == p50_channel_generation &&
+        ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
+        ticket.outbound_frame_sequence_ == framesQueued() &&
+        ticket.outbound_frame_sequence_ == framesFlushed() &&
+        protocol == PROTOCOL_VERSION && !eof && instate == NEED_LEN &&
+        inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
         control_identity.valid();
-    p50_fd_reply_arm_consumed = true;
+    ticket.invalidate();
     if (!ready || !p50_fd_socket_idle(fd)) {
         if (transfer_fd >= 0)
             ::close(transfer_fd);
@@ -4104,7 +4170,7 @@ bool MsgChannel::send_p50_cache_fd_reply(
         return false;
     }
 
-    const auto wire = p50_fd_lease_wire(request.request, control_identity);
+    const auto wire = p50_fd_lease_wire(request, control_identity);
     alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int))> control{};
     size_t offset = 0;
     bool rights_sent = false;
@@ -4158,6 +4224,16 @@ bool MsgChannel::send_p50_cache_fd_reply(
     complete = offset == wire.size() && rights_sent;
     p50_note_channel_mutation();
     return complete;
+}
+
+bool MsgChannel::send_p50_cache_fd_reply(
+    const P50CacheSessionFdRequestMsg &request,
+    P50CacheControlIdentity control_identity, int transfer_fd,
+    std::chrono::steady_clock::time_point deadline) noexcept
+{
+    P50CacheFdReplyTicket ticket = take_p50_cache_fd_reply_ticket(request);
+    return send_p50_cache_fd_reply(
+        std::move(ticket), control_identity, transfer_fd, deadline);
 }
 
 int MsgChannel::receive_p50_cache_fd_reply(

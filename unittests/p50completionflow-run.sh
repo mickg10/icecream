@@ -57,9 +57,19 @@ then
 fi
 
 # The sidecar appends an identity-rich attempt leaf below this directory.
-# Keep the socket namespace below sockaddr_un.sun_path even when the caller's
-# TMPDIR is a long out-of-tree build path.
-work=$(mktemp -d /tmp/p5c.XXXXXX)
+# Keep the socket namespace below sockaddr_un.sun_path.  Operators may point
+# ICEFARM_TMPDIR (preferred) or TMPDIR at a short symlink backed by the large
+# scratch filesystem; never force this multi-process gate onto root /tmp.
+temp_root=${ICEFARM_TMPDIR:-${TMPDIR:-/tmp}}
+case "$temp_root" in
+/*) ;;
+*) echo "FAIL: completion-flow temp root must be absolute: $temp_root" >&2; exit 1 ;;
+esac
+test -d "$temp_root" && test -w "$temp_root" || {
+    echo "FAIL: completion-flow temp root is not a writable directory: $temp_root" >&2
+    exit 1
+}
+work=$(mktemp -d "$temp_root/p5c.XXXXXX")
 # A root scheduler changes to its service account before opening the requested
 # log.  Keep only the private root traversable and pre-create that log as
 # writable; HOME and cache runtime directories below remain mode 0700.

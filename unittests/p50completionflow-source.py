@@ -374,6 +374,78 @@ def check_parent(source: str) -> None:
             "set_p50_legacy_wire_identity(identity)")
 
 
+def check_cache_fd_replacement(main_source: str, comm_header: str,
+                               comm_source: str) -> None:
+    require("class P50CacheFdReplyTicket" in comm_header and
+            "P50CacheFdReplyTicket(const P50CacheFdReplyTicket &) = delete;" in
+                comm_header and
+            "P50CacheFdReplyTicket &operator=(const P50CacheFdReplyTicket &) = delete;" in
+                comm_header,
+            "deferred descriptor reply authority is not move-only")
+
+    take = section(
+        comm_source,
+        "P50CacheFdReplyTicket MsgChannel::take_p50_cache_fd_reply_ticket(",
+        "bool MsgChannel::send_p50_cache_fd_reply(\n    P50CacheFdReplyTicket &&ticket")
+    ordered(take,
+            "!p50_fd_reply_arm_consumed",
+            "p50_fd_request_ready",
+            "p50_fd_socket_idle(fd)",
+            "p50_channel_generation, p50_decoded_frame_sequence, framesQueued()",
+            "p50_fd_request_ready = false;",
+            "p50_last_fd_request = {};")
+
+    send = section(
+        comm_source,
+        "bool MsgChannel::send_p50_cache_fd_reply(\n    P50CacheFdReplyTicket &&ticket",
+        "bool MsgChannel::send_p50_cache_fd_reply(\n    const P50CacheSessionFdRequestMsg &request")
+    for token in (
+            "ticket.channel_generation_ == p50_channel_generation",
+            "ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence",
+            "ticket.outbound_frame_sequence_ == framesQueued()",
+            "ticket.outbound_frame_sequence_ == framesFlushed()",
+            "!eof && instate == NEED_LEN",
+            "pending_frame_ends.empty()",
+            "ticket.invalidate();",
+            "p50_fd_socket_idle(fd)"):
+        require(token in send,
+                f"deferred descriptor ticket consumption omits {token}")
+
+    resume = section(
+        main_source,
+        "void Daemon::resume_deferred_p50_cache_fd_requests() noexcept",
+        "void Daemon::shutdown_cache_adapter() noexcept")
+    ordered(resume,
+            "if (!service_ready && cache_sidecar_recovery_in_progress())",
+            "std::vector<MsgChannel *> deferred;",
+            "deferred.push_back(entry.first);",
+            "const auto found = clients.find(channel);",
+            "std::move(*client->deferred_p50_cache_fd_request)",
+            "client->deferred_p50_cache_fd_request.reset();",
+            "handle_p50_cache_session_fd_request(")
+    require(main_source.count("resume_deferred_p50_cache_fd_requests();") == 1,
+            "sidecar poll does not resume deferred descriptor requests exactly once")
+
+    handler = section(
+        main_source,
+        "bool Daemon::handle_p50_cache_session_fd_request(",
+        "bool Daemon::handle_cache_session(")
+    ordered(handler,
+            "take_p50_cache_fd_reply_ticket(*msg)",
+            "scheduler_owns_getcs_assignment(client)",
+            "assignment_rebind_eligible && cache_sidecar_recovery_in_progress()",
+            "client->deferred_p50_cache_fd_request.emplace(",
+            "if (cache_adapter == nullptr || !cache_adapter->authenticated())",
+            "if (!assignment_rebind_eligible)",
+            "handoff.readyLease = *ready_lease;",
+            "handoff.routeStateGeneration = cache_route_state_generation;",
+            "std::move(reply_ticket), control_identity, transfer_fd, deadline")
+    require("handoff.cachePort =" not in handler and
+            "handoff.assignmentEpoch =" not in handler and
+            "handoff.assignmentNonce =" not in handler,
+            "C-side replacement mutates immutable F endpoint or assignment identity")
+
+
 def check_compiler_quiescence(source: str, helper: str, test_source: str,
                               workit: str, workit_header: str,
                               makefile: str, daemon_makefile: str) -> None:
@@ -537,6 +609,9 @@ def check_cache_service(source: str) -> None:
 
 
 def check_runtime_gate(source: str) -> None:
+    require('temp_root=${ICEFARM_TMPDIR:-${TMPDIR:-/tmp}}' in source and
+            'work=$(mktemp -d "$temp_root/p5c.XXXXXX")' in source,
+            "completion-flow work is not redirectable away from root /tmp")
     worker_launch = section(
         source,
         'ICECC_TEST_SOCKET="$work/worker.sock"',
@@ -763,6 +838,8 @@ def check_all(files: dict[str, str]) -> None:
     check_wrapper_retry(files["client_main"], files["client"], files["client_h"])
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
+    check_cache_fd_replacement(files["main"], files["comm_h"],
+                               files["comm_cpp"])
     check_compiler_quiescence(files["main"], files["compiler_signal"],
                               files["compiler_test"], files["workit"],
                               files["workit_h"], files["unit_make"],
@@ -834,6 +911,27 @@ def deletion_mutants(files: dict[str, str]) -> None:
          '"orphaned compiler cleanup deleted pid="'),
         ("main", "release_slot_once(rec.slot)", "release_slot_deleted(rec.slot)"),
         ("main", "workit_daemon_shutdown_signal = whichsig;", ""),
+        ("main",
+         "const bool assignment_rebind_eligible =\n"
+         "        scheduler_owns_getcs_assignment(client) &&",
+         "const bool assignment_rebind_eligible =\n        true &&"),
+        ("main",
+         "assignment_rebind_eligible && cache_sidecar_recovery_in_progress()",
+         "assignment_rebind_eligible"),
+        ("main", "handoff.readyLease = *ready_lease;", ""),
+        ("main", "resume_deferred_p50_cache_fd_requests();", ""),
+        ("comm_cpp",
+         "const bool ready = ticket.valid() && transfer_fd >= 0 && transfer_fd != fd &&\n"
+         "        ticket.channel_generation_ == p50_channel_generation &&",
+         "const bool ready = ticket.valid() && transfer_fd >= 0 && transfer_fd != fd &&\n"
+         "        true &&"),
+        ("comm_cpp",
+         "ticket.channel_generation_ == p50_channel_generation &&\n"
+         "        ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence",
+         "ticket.channel_generation_ == p50_channel_generation &&\n"
+         "        true"),
+        ("comm_cpp", "ticket.outbound_frame_sequence_ == framesQueued()",
+         "true"),
         ("client_main",
          'getenv("ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER")',
          'getenv("ICECC_P50_TEST_STRICT_RETRY_BARRIER_DELETED")'),
@@ -876,6 +974,9 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
          "if (mutated && decision.collect_record)\n                    collect_deleted();"),
         ("runtime_gate", "kill -9 \"$old_pid\"", "kill_deleted"),
+        ("runtime_gate",
+         'work=$(mktemp -d "$temp_root/p5c.XXXXXX")',
+         'work=$(mktemp -d /tmp/p5c.XXXXXX)'),
         ("runtime_gate",
          'ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1',
          'ICECC_TEST_SOCKET="$work/worker.sock"'),
@@ -943,6 +1044,8 @@ def main() -> int:
         "client_make": (ROOT / "client/Makefile.am").read_text(),
         "serve": (ROOT / "daemon/serve.cpp").read_text(),
         "main": (ROOT / "daemon/main.cpp").read_text(),
+        "comm_h": (ROOT / "services/comm.h").read_text(),
+        "comm_cpp": (ROOT / "services/comm.cpp").read_text(),
         "compiler_signal": (ROOT / "daemon/compiler_group_signal.h").read_text(),
         "compiler_test": (ROOT / "unittests/p50_compiler_quiescence_test.cpp").read_text(),
         "workit": (ROOT / "daemon/workit.cpp").read_text(),

@@ -557,6 +557,11 @@ public:
         std::optional<icecc::p50::sidecar::ReadyLease> readyLease;
     };
 
+    struct DeferredP50CacheFdRequest {
+        P50CacheSessionFdRequestFields request;
+        P50CacheFdReplyTicket replyTicket;
+    };
+
     enum class P50InputLeaseState : uint8_t {
         None = 0,
         Active,
@@ -594,6 +599,7 @@ public:
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
         deferred_getcs_waits_for_cache = false;
+        deferred_p50_cache_fd_request.reset();
         getcs_published = false;
         getcs_outstanding = false;
         getcs_generation = 0;
@@ -732,6 +738,13 @@ public:
     UseCSMsg *usecsmsg;
     GetCSMsg *deferred_getcs;   // G4: GetCS held during LOGIN_ATTEMPT, re-driven on ConfCS
     bool deferred_getcs_waits_for_cache;  // cache-capable request held only across a bounded in-progress sidecar replacement
+    // A wrapper can receive UseCS immediately before the supervised C sidecar
+    // reaches its bounded process-lifetime limit.  Keep that exact
+    // assignment's one descriptor request private while the replacement
+    // lifecycle advances; the successor READY lease services it without
+    // closing the ordinary submitter proxy or minting another scheduler job.
+    std::optional<DeferredP50CacheFdRequest>
+        deferred_p50_cache_fd_request;
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
@@ -1578,6 +1591,7 @@ struct Daemon {
     bool cache_client_sidecar_ready() noexcept;
     bool cache_client_service_ready() noexcept;
     bool cache_sidecar_recovery_in_progress() noexcept;
+    void resume_deferred_p50_cache_fd_requests() noexcept;
     bool configure_cache_adapter() noexcept;
     void poll_cache_adapter() noexcept;
     void shutdown_cache_adapter() noexcept;
@@ -1620,7 +1634,8 @@ struct Daemon {
     bool handle_job_timing(Client *client, JobTimingMsg *m) __attribute_warn_unused_result__;
     bool handle_cache_session(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool handle_p50_cache_session_fd_request(
-        Client *client, P50CacheSessionFdRequestMsg *msg)
+        Client *client, P50CacheSessionFdRequestMsg *msg,
+        P50CacheFdReplyTicket reply_ticket = {})
         __attribute_warn_unused_result__;
     bool handle_compile_done(Client *client) __attribute_warn_unused_result__;
     bool handle_verify_env(Client *client, VerifyEnvMsg *msg) __attribute_warn_unused_result__;
@@ -5517,6 +5532,52 @@ void Daemon::poll_cache_adapter() noexcept
         }
     }
     reconcile_cache_route_state();
+    resume_deferred_p50_cache_fd_requests();
+}
+
+void Daemon::resume_deferred_p50_cache_fd_requests() noexcept
+{
+    const bool service_ready = cache_client_service_ready();
+    if (!service_ready && cache_sidecar_recovery_in_progress())
+        return;
+
+    /* handle_p50_cache_session_fd_request() may close and erase a client on
+       revalidation failure, so snapshot channel keys and re-lookup each Client
+       before re-entering it.  A failure for one request may erase another
+       Client, making a raw-pointer snapshot unsafe.  Each deferred request
+       belongs to a different live AF_UNIX connection. */
+    std::vector<MsgChannel *> deferred;
+    for (const auto& entry : clients) {
+        if (entry.second != nullptr &&
+            entry.second->deferred_p50_cache_fd_request.has_value()) {
+            deferred.push_back(entry.first);
+        }
+    }
+
+    for (MsgChannel *channel : deferred) {
+        const auto found = clients.find(channel);
+        if (found == clients.end() || found->second == nullptr)
+            continue;
+        Client *const client = found->second;
+        if (client->channel != channel ||
+            !client->deferred_p50_cache_fd_request.has_value()) {
+            continue;
+        }
+        Client::DeferredP50CacheFdRequest deferred_request =
+            std::move(*client->deferred_p50_cache_fd_request);
+        client->deferred_p50_cache_fd_request.reset();
+        trace() << "resuming deferred P50 C-cache control request for assignment "
+                << deferred_request.request.wire_job_id << endl;
+        P50CacheSessionFdRequestMsg message(deferred_request.request);
+        const bool resumed =
+            handle_p50_cache_session_fd_request(
+                client, &message, std::move(deferred_request.replyTicket));
+        if (!resumed && service_ready) {
+            log_warning()
+                << "deferred P50 C-cache control request failed revalidation for assignment "
+                << deferred_request.request.wire_job_id << endl;
+        }
+    }
 }
 
 void Daemon::shutdown_cache_adapter() noexcept
@@ -9428,7 +9489,8 @@ bool Daemon::handle_job_timing(Client *client, JobTimingMsg *m)
 }
 
 bool Daemon::handle_p50_cache_session_fd_request(
-    Client *client, P50CacheSessionFdRequestMsg *msg)
+    Client *client, P50CacheSessionFdRequestMsg *msg,
+    P50CacheFdReplyTicket reply_ticket)
 {
     auto refuse = [&](const char *reason) {
         log_warning() << "P50 C-cache control request refused: " << reason << endl;
@@ -9446,7 +9508,7 @@ bool Daemon::handle_p50_cache_session_fd_request(
     const P50CacheSessionFdRequestFields& request = msg->request;
     const ConnectionProvenance& provenance = client->connection_provenance;
     const UseCSMsg *const assignment = client->usecsmsg;
-    const Client::CacheHandoff& handoff = client->cacheHandoff;
+    Client::CacheHandoff& handoff = client->cacheHandoff;
     const bool assignment_owner_status =
         client->status == Client::WAITCOMPILE ||
         client->status == Client::CLIENTWORK;
@@ -9467,15 +9529,57 @@ bool Daemon::handle_p50_cache_session_fd_request(
         (request.profile & handoff.cacheProfileMask) != request.profile)
         return refuse("request does not match the retained UseCS handoff");
 
+    if (!reply_ticket.valid()) {
+        reply_ticket =
+            client->channel->take_p50_cache_fd_reply_ticket(*msg);
+    }
+    if (!reply_ticket.valid())
+        return refuse("cache-control reply authority is unavailable");
+
+    const P50CacheClientCapability current_capability =
+        p50_cache_client_capability_from_env(
+            client->channel != nullptr ? client->channel->protocol : 0);
+    const bool assignment_rebind_eligible =
+        scheduler_owns_getcs_assignment(client) &&
+        handoff.readyLease.has_value() && handoff.readyLease->valid() &&
+        current_capability.protocol == handoff.cacheProtocol &&
+        (request.profile & current_capability.profile_mask) == request.profile &&
+        (request.profile & cache_unavailable_profile_mask) == 0;
+
+    if ((cache_adapter == nullptr || !cache_adapter->authenticated() ||
+         !cache_adapter->outer_current_ready_lease().has_value()) &&
+        assignment_rebind_eligible && cache_sidecar_recovery_in_progress()) {
+        if (client->deferred_p50_cache_fd_request.has_value())
+            return refuse("duplicate cache-control request during supervised replacement");
+        client->deferred_p50_cache_fd_request.emplace(
+            Client::DeferredP50CacheFdRequest{
+                request, std::move(reply_ticket)});
+        trace() << "deferred P50 C-cache control request across supervised replacement for assignment "
+                << request.wire_job_id << endl;
+        return true;
+    }
+
     if (cache_adapter == nullptr || !cache_adapter->authenticated())
         return refuse("supervised cache service is unavailable");
     const auto ready_lease = cache_adapter->outer_current_ready_lease();
     if (!ready_lease.has_value() || !ready_lease->valid())
         return refuse("supervised cache service has no current READY lease");
-    if (!handoff.readyLease.has_value() ||
-        !icecc::p50::daemon::p50_ready_lease_observation_equal(
-            *handoff.readyLease, *ready_lease))
-        return refuse("retained UseCS belongs to another READY lease");
+    if (!handoff.readyLease.has_value())
+        return refuse("retained UseCS has no READY lease");
+    if (!icecc::p50::daemon::p50_ready_lease_observation_equal(
+            *handoff.readyLease, *ready_lease)) {
+        if (!assignment_rebind_eligible)
+            return refuse("retained UseCS belongs to another READY lease");
+        /* No source operation began under the retired C lease: the wrapper is
+           still blocked waiting for this descriptor.  Rebind only the C-local
+           lease/generation of the exact live scheduler assignment.  Its F
+           endpoint, assignment identity, profile, and retry budget are
+           unchanged. */
+        handoff.readyLease = *ready_lease;
+        handoff.routeStateGeneration = cache_route_state_generation;
+        trace() << "rebound retained P50 assignment " << request.wire_job_id
+                << " to successor C-cache READY lease" << endl;
+    }
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
@@ -9523,7 +9627,7 @@ bool Daemon::handle_p50_cache_session_fd_request(
         static_cast<uint64_t>(::geteuid()),
         static_cast<uint64_t>(::getegid())};
     if (!client->channel->send_p50_cache_fd_reply(
-            *msg, control_identity, transfer_fd, deadline))
+            std::move(reply_ticket), control_identity, transfer_fd, deadline))
         return refuse("cannot deliver cache-service control descriptor");
 
     trace() << "P50 C-cache control descriptor delivered for assignment "

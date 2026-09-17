@@ -297,6 +297,30 @@ static bool wait_file_contains(const std::string &path,
     return false;
 }
 
+static bool wait_path_exists(const std::string &path, int timeout_msec)
+{
+    const Clock::time_point deadline = Clock::now()
+        + std::chrono::milliseconds(timeout_msec);
+    while (Clock::now() < deadline) {
+        if (access(path.c_str(), F_OK) == 0)
+            return true;
+        usleep(20 * 1000);
+    }
+    return false;
+}
+
+static size_t count_occurrences(const std::string &text,
+                                const std::string &needle)
+{
+    size_t count = 0;
+    size_t offset = 0;
+    while ((offset = text.find(needle, offset)) != std::string::npos) {
+        ++count;
+        offset += needle.size();
+    }
+    return count;
+}
+
 static std::string read_file_contents(const std::string &path)
 {
     std::ifstream input(path);
@@ -349,8 +373,32 @@ int main(int argc, char **argv)
     const std::string socket_path = work + "/iceccd.sock";
     const std::string daemon_log = work + "/iceccd.log";
     const std::string ready_trace = work + "/ready.trace";
+    const std::string service_wrapper = work + "/cache-service-wrapper.sh";
+    const std::string service_launch_count = work + "/cache-service-launch-count";
+    const std::string replacement_waiting = work + "/replacement-waiting";
+    const std::string replacement_release = work + "/replacement-release";
     mkdir(envdir.c_str(), 0700);
     mkdir(runtime.c_str(), 0700);
+    {
+        std::ofstream wrapper(service_wrapper);
+        wrapper
+            << "#!/bin/sh\n"
+            << "set -eu\n"
+            << "count=0\n"
+            << "if test -f \"$ICECC_TEST_CACHE_WRAPPER_COUNT\"; then "
+               "IFS= read -r count < \"$ICECC_TEST_CACHE_WRAPPER_COUNT\"; fi\n"
+            << "count=$((count + 1))\n"
+            << "printf '%s\\n' \"$count\" > \"$ICECC_TEST_CACHE_WRAPPER_COUNT\"\n"
+            << "if test \"$count\" -eq 2; then\n"
+            << "  : > \"$ICECC_TEST_CACHE_REPLACEMENT_WAITING\"\n"
+            << "  while test ! -e \"$ICECC_TEST_CACHE_REPLACEMENT_RELEASE\"; do sleep 0.01; done\n"
+            << "  rm -f \"$ICECC_TEST_CACHE_REPLACEMENT_WAITING\" "
+               "\"$ICECC_TEST_CACHE_REPLACEMENT_RELEASE\"\n"
+            << "fi\n"
+            << "exec \"$ICECC_TEST_REAL_CACHE_SERVICE\" \"$@\"\n";
+    }
+    REQUIRE(chmod(service_wrapper.c_str(), 0700) == 0,
+            "cache-service replacement rendezvous wrapper is executable");
     fprintf(stderr, "retained work directory: %s\n", work.c_str());
 
     const int scheduler_port = reserve_port();
@@ -375,6 +423,10 @@ int main(int argc, char **argv)
         setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
         setenv("ICECC_P50_MODE", "on", 1);
         setenv("ICECC_P50_TEST_READY_TRACE", ready_trace.c_str(), 1);
+        setenv("ICECC_TEST_REAL_CACHE_SERVICE", argv[2], 1);
+        setenv("ICECC_TEST_CACHE_WRAPPER_COUNT", service_launch_count.c_str(), 1);
+        setenv("ICECC_TEST_CACHE_REPLACEMENT_WAITING", replacement_waiting.c_str(), 1);
+        setenv("ICECC_TEST_CACHE_REPLACEMENT_RELEASE", replacement_release.c_str(), 1);
         /* S2 Gap 3 (BigOracle d23d9c5d HOLD): arms the NoCS-site poison/
            record hook (see test_poison_cache_handoff_if_armed's own
            comment in daemon/main.cpp) for Client D below.  Client A/B/C
@@ -391,7 +443,8 @@ int main(int argc, char **argv)
         execl(argv[1], argv[1], "-m", "2", "-p", daemon_port_text,
               "-s", scheduler_spec, "-n", "s2-relay-gate", "-N", "s2-relay-daemon",
               "-b", envdir.c_str(), "-l", daemon_log.c_str(),
-              "--cache-service", argv[2], "--cache-runtime-dir", runtime.c_str(),
+              "--cache-service", service_wrapper.c_str(),
+              "--cache-runtime-dir", runtime.c_str(),
               "-v", "-v", "-v", static_cast<char *>(nullptr));
         perror("execl iceccd");
         _exit(127);
@@ -431,7 +484,7 @@ int main(int argc, char **argv)
             "authenticated local cache sidecar reached READY before C capability publication");
     REQUIRE(wait_file_contains(ready_trace, "READY v2 ", 5000),
             "C sidecar emitted its exact READY-lease witness");
-    const std::string initial_ready_witness = read_file_contents(ready_trace);
+    std::string stable_ready_witness = read_file_contents(ready_trace);
 
     /* S2 (BigOracle, 5th gap): consume client_id=1 with a throwaway
        connection before Client A, so Client A's own (daemon-assigned,
@@ -549,6 +602,156 @@ int main(int argc, char **argv)
     REQUIRE(client && client->send_msg(successful_done),
             "client A reports the local-only successful cache-route observation");
 
+    /* A UseCS may be delivered immediately before the supervised C sidecar
+       retires at its bounded process-lifetime limit.  The wrapper has not
+       started a source operation while it is waiting for the private control
+       descriptor, so the daemon must retain that exact scheduler assignment,
+       wait for the successor READY lease, and service the original request on
+       the still-live ordinary client connection.  The executable wrapper used
+       by this test gates only launch #2, making the otherwise tiny replacement
+       window deterministic without adding a production test hook. */
+    MsgChannel *client_rebind = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_rebind != nullptr,
+            "replacement-race client connected before sidecar retirement");
+    GetCSMsg request_rebind(
+        Environments(), "replacement-race.cpp", CompileJob::Lang_CXX,
+        1, "x86_64", 0, std::string(), 0, 0, 0);
+    request_rebind.cache_protocol = CACHE_WIRE_REVISION;
+    request_rebind.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    REQUIRE(client_rebind && client_rebind->send_msg(request_rebind),
+            "replacement-race client requested one cache assignment");
+
+    Msg *forwarded_rebind_wire = scheduler
+        ? wait_for_type(scheduler, Msg::GET_CS, 5000) : nullptr;
+    GetCSMsg *forwarded_rebind = forwarded_rebind_wire
+        ? dynamic_cast<GetCSMsg *>(forwarded_rebind_wire) : nullptr;
+    REQUIRE(forwarded_rebind != nullptr &&
+                forwarded_rebind->cache_protocol == CACHE_WIRE_REVISION &&
+                forwarded_rebind->cache_profile_mask ==
+                    CACHE_ADVERTISABLE_PROFILE_MASK,
+            "replacement-race GetCS retained the current C capability");
+
+    const uint32_t rebind_wire_job_id = UINT32_C(0x00005210);
+    const uint64_t rebind_assignment_epoch =
+        UINT64_C(0x5200000000000010);
+    const uint64_t rebind_assignment_nonce =
+        UINT64_C(0x1020304050607080);
+    const uint64_t rebind_c_guid = UINT64_C(0x52000000000000d0);
+    const uint64_t rebind_tu_seq = UINT64_C(48);
+    const std::string rebind_f_host = "192.0.2.110";
+    const uint32_t rebind_f_port = UINT32_C(54310);
+    const uint32_t rebind_cache_port = UINT32_C(0x0000fed0);
+    UseCSMsg reply_rebind(
+        "x86_64", rebind_f_host, rebind_f_port, rebind_wire_job_id, true,
+        forwarded_rebind ? forwarded_rebind->client_id : 0,
+        UINT32_C(0x00000048), rebind_assignment_epoch,
+        rebind_assignment_nonce, rebind_cache_port, CACHE_WIRE_REVISION,
+        CACHE_PROFILE_P29V1);
+    reply_rebind.setCompileIdentity(rebind_c_guid, rebind_tu_seq);
+    if (scheduler && forwarded_rebind) {
+        REQUIRE(scheduler->send_msg(reply_rebind),
+                "fake scheduler delivered the replacement-race UseCS");
+    }
+    delete forwarded_rebind_wire;
+
+    Msg *client_rebind_wire = client_rebind
+        ? wait_for_type(client_rebind, Msg::USE_CS, 5000) : nullptr;
+    UseCSMsg *client_rebind_use = client_rebind_wire
+        ? dynamic_cast<UseCSMsg *>(client_rebind_wire) : nullptr;
+    REQUIRE(client_rebind_use != nullptr &&
+                client_rebind_use->job_id == rebind_wire_job_id &&
+                client_rebind_use->assignmentEpoch() ==
+                    rebind_assignment_epoch &&
+                client_rebind_use->assignmentNonce() ==
+                    rebind_assignment_nonce &&
+                client_rebind_use->cGuid() == rebind_c_guid &&
+                client_rebind_use->tuSeq() == rebind_tu_seq &&
+                client_rebind_use->cache_profile_mask == CACHE_PROFILE_P29V1,
+            "replacement-race client retained the exact live assignment");
+    delete client_rebind_wire;
+
+    const pid_t retired_sidecar = find_child_with_command(daemon_pid, argv[2]);
+    REQUIRE(retired_sidecar > 0,
+            "replacement-race test identified the authenticated sidecar PID");
+    REQUIRE(retired_sidecar > 0 && kill(retired_sidecar, SIGKILL) == 0,
+            "replacement-race test retired the exact sidecar incarnation");
+    REQUIRE(wait_path_exists(replacement_waiting, 10000),
+            "successor sidecar launch is held before READY");
+
+    const P50CacheSessionFdRequestFields descriptor_request{
+        rebind_wire_job_id, rebind_assignment_epoch,
+        rebind_assignment_nonce, CACHE_PROFILE_P29V1};
+    REQUIRE(client_rebind && client_rebind->send_msg(
+                P50CacheSessionFdRequestMsg(descriptor_request)),
+            "wrapper requested its exact cache-control descriptor during replacement");
+    REQUIRE(wait_file_contains(
+                daemon_log,
+                "deferred P50 C-cache control request across supervised replacement",
+                5000),
+            "daemon retained the descriptor request during supervised replacement");
+
+    {
+        std::ofstream release(replacement_release);
+        release << "release\n";
+    }
+    P50CacheControlIdentity replacement_identity;
+    const int replacement_control_fd = client_rebind
+        ? client_rebind->receive_p50_cache_fd_reply(
+              descriptor_request, replacement_identity,
+              Clock::now() + std::chrono::seconds(15))
+        : -1;
+    REQUIRE(replacement_control_fd >= 0 && replacement_identity.valid(),
+            "original wrapper received a valid successor control descriptor");
+    if (replacement_control_fd >= 0)
+        close(replacement_control_fd);
+    REQUIRE(wait_file_contains(
+                daemon_log,
+                "rebound retained P50 assignment 21008 to successor C-cache READY lease",
+                5000),
+            "daemon rebound only the retained assignment's C-local READY lease");
+    REQUIRE(wait_file_contains(
+                daemon_log,
+                "P50 C-cache control descriptor delivered for assignment 21008",
+                5000),
+            "daemon completed the deferred descriptor handoff");
+
+    stable_ready_witness = read_file_contents(ready_trace);
+    const std::string replacement_ready_identity =
+        "READY v2 generation=" +
+        std::to_string(replacement_identity.generation) + " attempt=" +
+        std::to_string(replacement_identity.attempt) + " ";
+    REQUIRE(count_occurrences(stable_ready_witness, "READY v2 ") == 2 &&
+                stable_ready_witness.find(replacement_ready_identity) !=
+                    std::string::npos,
+            "returned descriptor identity names the one recorded successor READY lease");
+
+    JobDoneMsg rebind_success(
+        rebind_wire_job_id, 0,
+        static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+            static_cast<uint32_t>(JobDoneMsg::P50CacheRouteObservation), 0,
+        rebind_assignment_epoch, rebind_assignment_nonce,
+        rebind_c_guid, rebind_tu_seq);
+    REQUIRE(client_rebind && client_rebind->send_msg(rebind_success),
+            "replacement-race wrapper reports success on its original assignment");
+    REQUIRE(client_rebind &&
+                !request_internals(client_rebind, 5000).empty(),
+            "same-channel status orders the post-replacement observation");
+    delete client_rebind;
+    client_rebind = nullptr;
+
+    Msg *rebind_done_wire = scheduler
+        ? wait_for_type(scheduler, Msg::JOB_DONE, 5000) : nullptr;
+    JobDoneMsg *rebind_done = rebind_done_wire
+        ? dynamic_cast<JobDoneMsg *>(rebind_done_wire) : nullptr;
+    REQUIRE(rebind_done != nullptr &&
+                rebind_done->job_id == rebind_wire_job_id &&
+                rebind_done->assignmentEpoch() == rebind_assignment_epoch &&
+                rebind_done->assignmentNonce() == rebind_assignment_nonce &&
+                rebind_done->cGuid() == rebind_c_guid &&
+                rebind_done->tuSeq() == rebind_tu_seq,
+            "replacement-race assignment settles once with its original identity");
+    delete rebind_done_wire;
+
     /* Client C: the scheduler selects a REMOTE host as F -- hostname/port
        matching neither this daemon's own remote-observed identity nor
        127.0.0.1, so msg->hostname == remote_name && msg->port ==
@@ -576,23 +779,18 @@ int main(int argc, char **argv)
         ? dynamic_cast<GetCSMsg *>(forwarded_c_wire) : nullptr;
     REQUIRE(forwarded_c != nullptr,
             "fake scheduler received client C's forwarded GetCS");
-    const bool self_endpoint_is_schedulable = observed_daemon_port != 0;
     REQUIRE(forwarded_c &&
                 forwarded_c->cache_protocol == CACHE_WIRE_REVISION &&
                 forwarded_c->cache_profile_mask ==
                     CACHE_ADVERTISABLE_PROFILE_MASK &&
                 forwarded_c->cache_retry_avoid_port == 0 &&
                 forwarded_c->cache_retry_avoid_host.empty() &&
-                (self_endpoint_is_schedulable
-                     ? forwarded_c->cache_affinity_profile_mask ==
-                           CACHE_PROFILE_ZSTD_TU &&
-                           forwarded_c->cache_affinity_port ==
-                               observed_daemon_port &&
-                           forwarded_c->cache_affinity_host == "127.0.0.1"
-                     : forwarded_c->cache_affinity_profile_mask == 0 &&
-                           forwarded_c->cache_affinity_port == 0 &&
-                           forwarded_c->cache_affinity_host.empty()),
-            "next GetCS carries an exact host/ordinary-port/profile warm hint only for a schedulable endpoint");
+                forwarded_c->cache_affinity_profile_mask ==
+                    CACHE_PROFILE_P29V1 &&
+                forwarded_c->cache_affinity_port == rebind_f_port &&
+                forwarded_c->cache_affinity_host == rebind_f_host,
+            "next GetCS carries the exact post-replacement successful "
+            "host/ordinary-port/profile warm hint");
 
     const std::string remote_f_host = "192.0.2.77";
     const uint32_t remote_f_port = UINT32_C(54321);
@@ -831,7 +1029,7 @@ int main(int argc, char **argv)
             "same READY lease preserves capability and the exact retry "
             "exclusion across deferred scheduler reconnect without reviving "
             "the lower-priority warm hint");
-    REQUIRE(read_file_contents(ready_trace) == initial_ready_witness,
+    REQUIRE(read_file_contents(ready_trace) == stable_ready_witness,
             "S bounce preserved the exact sidecar PID, ReadyLease, and C/F store identities");
 
     if (scheduler && forwarded_bounce) {

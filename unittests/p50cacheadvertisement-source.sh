@@ -236,8 +236,8 @@ require_count 1 'if (wrapper_cache_eligible && usecs_cache_handoff_admissible(*m
     'scheduler_use_cs retains the cache handoff only via that helper'
 require_count 1 'bool Daemon::cache_client_service_ready() noexcept' daemon/main.cpp \
     'daemon has one authenticated C-side cache readiness predicate'
-require_count 4 'cache_client_service_ready()' daemon/main.cpp \
-    'one declaration/definition and both wire boundaries use current C-side readiness'
+require_count 5 'cache_client_service_ready()' daemon/main.cpp \
+    'one declaration/definition, both wire boundaries, and deferred descriptor resumption use current C-side readiness'
 require_count 1 'bool Daemon::cache_client_sidecar_ready() noexcept' daemon/main.cpp \
     'daemon separates C-sidecar lease health from scheduler publication readiness'
 require_count 5 'cache_client_sidecar_ready()' daemon/main.cpp \

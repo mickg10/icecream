@@ -379,6 +379,52 @@ void test_sender_deadline_consumes_fd()
     delete decoded;
 }
 
+void test_deferred_reply_ticket_survives_only_empty_probe()
+{
+    ChannelPair pair = make_pair();
+    const auto expected = request();
+    P50CacheSessionFdRequestMsg outbound(expected);
+    CHECK(pair.left->send_msg(outbound));
+    Msg *decoded = pair.right->get_msg(2, true);
+    auto *typed = dynamic_cast<P50CacheSessionFdRequestMsg *>(decoded);
+    CHECK(typed != nullptr);
+    P50CacheFdReplyTicket ticket =
+        pair.right->take_p50_cache_fd_reply_ticket(*typed);
+    CHECK(ticket.valid());
+    delete decoded;
+
+    /* iceccd's ordinary drain loop performs this exact no-byte probe after
+       every handled frame.  It must not revoke an explicitly retained ticket. */
+    CHECK(pair.right->read_a_bit());
+    const int source = ::open("/dev/null", O_RDONLY);
+    CHECK(source >= 0);
+    CHECK(pair.right->send_p50_cache_fd_reply(
+        std::move(ticket), control_identity(), source, deadline()));
+    P50CacheControlIdentity observed;
+    const int received = pair.left->receive_p50_cache_fd_reply(
+        expected, observed, deadline());
+    CHECK(received >= 0 && observed == control_identity());
+    ::close(received);
+
+    ChannelPair dirty_pair = make_pair();
+    P50CacheSessionFdRequestMsg dirty_outbound(expected);
+    CHECK(dirty_pair.left->send_msg(dirty_outbound));
+    Msg *dirty_decoded = dirty_pair.right->get_msg(2, true);
+    auto *dirty_typed =
+        dynamic_cast<P50CacheSessionFdRequestMsg *>(dirty_decoded);
+    CHECK(dirty_typed != nullptr);
+    P50CacheFdReplyTicket dirty_ticket =
+        dirty_pair.right->take_p50_cache_fd_reply_ticket(*dirty_typed);
+    CHECK(dirty_ticket.valid());
+    delete dirty_decoded;
+    CHECK(dirty_pair.left->send_msg(PingMsg()));
+    const int dirty_source = ::open("/dev/null", O_RDONLY);
+    CHECK(dirty_source >= 0);
+    CHECK(!dirty_pair.right->send_p50_cache_fd_reply(
+        std::move(dirty_ticket), control_identity(), dirty_source, deadline()));
+    CHECK(::fcntl(dirty_source, F_GETFD) == -1 && errno == EBADF);
+}
+
 void test_ordinary_mutation_clears_receive_arm()
 {
     ChannelPair pair = make_pair();
@@ -406,6 +452,7 @@ int main()
         test_chunked_reply_and_receive_deadline();
         test_receive_eagain_consumes_arm();
         test_sender_deadline_consumes_fd();
+        test_deferred_reply_ticket_survives_only_empty_probe();
         test_ordinary_mutation_clears_receive_arm();
     } catch (const std::exception &error) {
         std::fprintf(stderr, "p50 cache fd seam test failed: %s\n", error.what());
