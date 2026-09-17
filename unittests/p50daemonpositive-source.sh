@@ -36,6 +36,8 @@ contract() {
     require "$candidate" 'RLIMIT_NOFILE' &&
     require "$candidate" 'Service::createChannelAccepted' &&
     require "$candidate" 'service_pending_client_admissions(pollfds)' &&
+    require "$candidate" 'service_pending_client_admissions_now()' &&
+    require "$candidate" 'current_remote_client_admission_capacity' &&
     require "$candidate" 'finish_protocol_admission()' &&
     require "$candidate" 'ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC' &&
     require "$candidate" 'This phase is admission-only' &&
@@ -93,8 +95,8 @@ require "$makefile" 'libp50readyadvertisement.a'
 require "$makefile" 'libp50sidecarsupervisor.a'
 require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/READY'
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
-require "$runtime_test" 'kAdmissionBurstCount = 36'
-require "$runtime_test" 'admission-only batch accepts the full burst before client activity'
+require "$runtime_test" 'kAdmissionBurstCount = 65'
+require "$runtime_test" 'turn-boundary admission waits behind at most one client activity'
 require "$runtime_test" 'remote handshake saturation preserves prompt Unix-client admission'
 require "$runtime_test" 'source-arm owner is acknowledged before CACHE_SESSION'
 require "$runtime_test" 'source-arm acknowledgement bypasses a silent accepted handshake'
@@ -163,6 +165,8 @@ for needle in \
     'RLIMIT_NOFILE' \
     'Service::createChannelAccepted' \
     'service_pending_client_admissions(pollfds)' \
+    'service_pending_client_admissions_now()' \
+    'current_remote_client_admission_capacity' \
     'finish_protocol_admission()' \
     'ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC' \
     'This phase is admission-only' \

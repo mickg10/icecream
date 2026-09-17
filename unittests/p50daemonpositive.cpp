@@ -431,13 +431,14 @@ int main(int argc, char **argv)
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
 
-    // Stop only this private test daemon, queue a complete 36-connection burst
-    // (the S70 workload concurrency), and resume it.  Every connection already
+    // Stop only this private test daemon, queue one more connection than the
+    // 64-socket accept quantum, and resume it.  Every connection already
     // contains protocol negotiation and a deliberately unarmed CACHE_SESSION.
-    // An admission-only batch must log all accepts before the first ordinary
-    // message refusal; the predecessor handled one CACHE_SESSION between each
-    // pair of accepts and fails this exact ordering check.
-    constexpr size_t kAdmissionBurstCount = 36;
+    // The 65th socket crosses the accept quantum and was absent from the
+    // original poll snapshot. Admission must progress between ordinary client
+    // activities; otherwise a busy compile turn can strand its protocol
+    // greeting past a legacy client's fixed deadline.
+    constexpr size_t kAdmissionBurstCount = 65;
     std::error_code size_error;
     const uintmax_t admission_log_offset = std::filesystem::file_size(log, size_error);
     const bool stop_sent = ::kill(daemon_pid, SIGSTOP) == 0;
@@ -469,17 +470,26 @@ int main(int argc, char **argv)
     const size_t refused_count = count_text(admission_log, refused_marker);
     const size_t last_accept = admission_log.rfind(accepted_marker);
     const size_t first_refusal = admission_log.find(refused_marker);
+    size_t refusals_before_last_accept = 0;
+    if (last_accept != std::string::npos) {
+        size_t offset = admission_log.find(refused_marker);
+        while (offset != std::string::npos && offset < last_accept) {
+            ++refusals_before_last_accept;
+            offset = admission_log.find(refused_marker,
+                                        offset + refused_marker.size());
+        }
+    }
     const bool admission_ordered = admission_eof &&
         accepted_count == kAdmissionBurstCount &&
         refused_count == kAdmissionBurstCount &&
         last_accept != std::string::npos && first_refusal != std::string::npos &&
-        last_accept < first_refusal;
+        refusals_before_last_accept <= 1;
     REQUIRE(stopped && admission_fds.size() == kAdmissionBurstCount && resumed,
-            "full S70-concurrency protocol burst queued before daemon admission");
+            "burst beyond the accept quantum queued before daemon admission");
     REQUIRE(admission_eof,
             "all preframed burst clients are terminally handled after admission");
     REQUIRE(admission_ordered,
-            "admission-only batch accepts the full burst before client activity");
+            "turn-boundary admission waits behind at most one client activity");
 
     // Fill the remote share of the asynchronous handshake table with silent
     // TCP peers. The protected local share must still admit Unix wrappers;

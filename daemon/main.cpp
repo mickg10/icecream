@@ -1599,6 +1599,7 @@ struct Daemon {
     bool expire_pending_client_admissions() noexcept;
     uint64_t next_pending_client_admission_deadline_msec() const noexcept;
     void service_pending_client_admissions(const vector<pollfd> &pollfds);
+    void service_pending_client_admissions_now();
     void clear_pending_client_admissions() noexcept;
     bool handle_transfer_env(Client *client, EnvTransferMsg *msg) __attribute_warn_unused_result__;
     bool handle_env_install_child_done(Client *client);
@@ -10089,6 +10090,32 @@ void Daemon::service_pending_client_admissions(
     }
 }
 
+void Daemon::service_pending_client_admissions_now()
+{
+    if (pending_client_admissions.empty())
+        return;
+
+    vector<pollfd> pollfds;
+    pollfds.reserve(pending_client_admissions.size());
+    for (const auto &entry : pending_client_admissions) {
+        pollfd pfd{};
+        pfd.fd = entry.first;
+        pfd.events = POLLIN | POLLHUP | POLLERR;
+        if (entry.second.channel->has_pending_write())
+            pfd.events |= POLLOUT;
+        pollfds.push_back(pfd);
+    }
+
+    const int result = poll(pollfds.data(), pollfds.size(), 0);
+    if (result < 0) {
+        if (errno != EINTR)
+            log_perror("poll pending client admissions");
+        return;
+    }
+    if (result != 0)
+        service_pending_client_admissions(pollfds);
+}
+
 void Daemon::answer_client_requests()
 {
 #ifdef ICECC_DEBUG
@@ -10708,110 +10735,148 @@ void Daemon::answer_client_requests()
         // phase, preserving admission-before-activity ordering.
         service_pending_client_admissions(pollfds);
 
-        int ready_listeners[3];
-        size_t ready_listener_count = 0;
-        if (tcp_listen_fd != -1 &&
-            pollfd_is_set(pollfds, tcp_listen_fd, POLLIN)) {
-            ready_listeners[ready_listener_count++] = tcp_listen_fd;
-        }
-        if (tcp_listen_local_fd != -1 &&
-            pollfd_is_set(pollfds, tcp_listen_local_fd, POLLIN)) {
-            ready_listeners[ready_listener_count++] = tcp_listen_local_fd;
-        }
-        if (unix_listen_fd != -1 &&
-            pollfd_is_set(pollfds, unix_listen_fd, POLLIN)) {
-            ready_listeners[ready_listener_count++] = unix_listen_fd;
-        }
-
-        /* One accept per outer turn lets a full compile burst spend seconds
-           in the kernel listen queue while this same thread performs input
-           settlement.  CacheWire source arms inherit the ordinary socket's
-           transport deadline, so that queueing can destroy a valid assignment
-           before application admission.  All ordinary listeners are
-           nonblocking; drain a bounded batch, round-robin across listeners,
-           then always service established clients/children below.
-
-           This phase is admission-only: capture immutable accept provenance
-           and register each socket for asynchronous protocol negotiation, but
-           never wait for a peer or handle an ordinary client message between
-           accepts. In particular P50_SOURCE_ARM,
-           CACHE_SESSION, and COMPILE_FILE can all perform substantially more
-           work than admission.  Interleaving that work here turns the nominal
-           batch into one-at-a-time admission under load and can strand a
-           valid socket in the kernel queue past its caller's absolute
-           connection deadline. A newly accepted fd was not in this poll
-           snapshot; its handshake starts on the next outer turn. Only after
-           the complete two-way protocol exchange is it promoted into
-           fd2client and exposed to the ordinary state machine. */
-        bool listener_exhausted[3] = { false, false, false };
-        size_t exhausted_count = 0;
-        size_t accepted_count = 0;
-        size_t accept_attempt_count = 0;
-        while (ready_listener_count != 0 &&
-               exhausted_count < ready_listener_count &&
-               accepted_count < client_accept_batch_limit &&
-               pending_client_admissions.size() < pending_admission_limit &&
-               accept_attempt_count <
-                   client_accept_batch_limit + ready_listener_count) {
-            const size_t listener_index =
-                client_accept_cursor % ready_listener_count;
-            client_accept_cursor =
-                (client_accept_cursor + 1) % ready_listener_count;
-            if (listener_exhausted[listener_index])
-                continue;
-            const int listen_fd = ready_listeners[listener_index];
-            if (listen_fd == tcp_listen_fd &&
-                pending_remote_count >= pending_remote_limit) {
-                listener_exhausted[listener_index] = true;
-                ++exhausted_count;
-                continue;
-            }
-            struct sockaddr cli_addr;
-            socklen_t cli_len = sizeof cli_addr;
-            ++accept_attempt_count;
-            int acc_fd = accept(listen_fd, &cli_addr, &cli_len);
-
-            if (acc_fd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    listener_exhausted[listener_index] = true;
-                    ++exhausted_count;
-                } else if (errno != EINTR) {
-                    note_accept_error("client", errno);
-                    listener_exhausted[listener_index] = true;
-                    ++exhausted_count;
-                }
-            } else {
-                ++accepted_count;
-                // Capture AF_UNIX credentials before any wrapper/channel
-                // setup can run.  TCP and a credential failure remain valid
-                // legacy clients; their provenance simply cannot authorize a
-                // cache handoff.
-                const ListenerKind listener_kind = classify_listener(
-                    listen_fd, unix_listen_fd, tcp_listen_local_fd, tcp_listen_fd);
-                if (listener_kind == ListenerKind::TcpRemote)
+        auto accept_client_admissions_now = [&]() {
+            /* Pending handshakes above can free admission capacity after the outer
+               poll snapshot was built.  A connection beyond the prior accept
+               quantum may already be waiting in the kernel queue even though that
+               snapshot did not arm or report its listener.  The ordinary
+               listeners are nonblocking, so probe every currently admissible
+               listener once; EAGAIN is the bounded no-work result. */
+            pending_remote_count = 0;
+            for (const auto &entry : pending_client_admissions) {
+                if (entry.second.listener_kind == ListenerKind::TcpRemote)
                     ++pending_remote_count;
-                PeerCredentials peer_credentials;
-                if (listener_kind == ListenerKind::UnixLocal)
-                    (void)capture_unix_peer_credentials(acc_fd, peer_credentials);
-                MsgChannel *channel = Service::createChannelAccepted(
-                    acc_fd, &cli_addr, cli_len);
-                if (channel) {
-                    PendingClientAdmission admission;
-                    admission.channel.reset(channel);
-                    admission.listener_kind = listener_kind;
-                    admission.peer_credentials = peer_credentials;
-                    admission.deadline_msec = monotonic_msec() +
-                        ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC;
-                    pending_client_admissions.emplace(
-                        channel->fd, std::move(admission));
+            }
+            const bool current_any_client_admission_capacity =
+                pending_client_admissions.size() < pending_admission_limit;
+            const bool current_remote_client_admission_capacity =
+                current_any_client_admission_capacity &&
+                pending_remote_count < pending_remote_limit;
+
+            int ready_listeners[3];
+            size_t ready_listener_count = 0;
+            if (tcp_listen_fd != -1 &&
+                current_remote_client_admission_capacity) {
+                ready_listeners[ready_listener_count++] = tcp_listen_fd;
+            }
+            if (tcp_listen_local_fd != -1 &&
+                current_any_client_admission_capacity) {
+                ready_listeners[ready_listener_count++] = tcp_listen_local_fd;
+            }
+            if (unix_listen_fd != -1 &&
+                current_any_client_admission_capacity) {
+                ready_listeners[ready_listener_count++] = unix_listen_fd;
+            }
+
+            /* One accept per outer turn lets a full compile burst spend seconds
+               in the kernel listen queue while this same thread performs input
+               settlement.  CacheWire source arms inherit the ordinary socket's
+               transport deadline, so that queueing can destroy a valid assignment
+               before application admission.  All ordinary listeners are
+               nonblocking; drain a bounded batch, round-robin across listeners,
+               then always service established clients/children below.
+
+               This phase is admission-only: capture immutable accept provenance
+               and register each socket for asynchronous protocol negotiation, but
+               never wait for a peer or handle an ordinary client message between
+               accepts. In particular P50_SOURCE_ARM,
+               CACHE_SESSION, and COMPILE_FILE can all perform substantially more
+               work than admission.  Interleaving that work here turns the nominal
+               batch into one-at-a-time admission under load and can strand a
+               valid socket in the kernel queue past its caller's absolute
+               connection deadline. A newly accepted fd was not in this poll
+               snapshot, so the dedicated zero-time admission pass below services
+               any already-queued greeting before ordinary activity. Only after the
+               complete two-way protocol exchange is it promoted into fd2client and
+               exposed to the ordinary state machine. */
+            bool listener_exhausted[3] = { false, false, false };
+            size_t exhausted_count = 0;
+            size_t accepted_count = 0;
+            size_t accept_attempt_count = 0;
+            while (ready_listener_count != 0 &&
+                   exhausted_count < ready_listener_count &&
+                   accepted_count < client_accept_batch_limit &&
+                   pending_client_admissions.size() < pending_admission_limit &&
+                   accept_attempt_count <
+                       client_accept_batch_limit + ready_listener_count) {
+                const size_t listener_index =
+                    client_accept_cursor % ready_listener_count;
+                client_accept_cursor =
+                    (client_accept_cursor + 1) % ready_listener_count;
+                if (listener_exhausted[listener_index])
+                    continue;
+                const int listen_fd = ready_listeners[listener_index];
+                if (listen_fd == tcp_listen_fd &&
+                    pending_remote_count >= pending_remote_limit) {
+                    listener_exhausted[listener_index] = true;
+                    ++exhausted_count;
+                    continue;
+                }
+                struct sockaddr cli_addr;
+                socklen_t cli_len = sizeof cli_addr;
+                ++accept_attempt_count;
+                int acc_fd = accept(listen_fd, &cli_addr, &cli_len);
+
+                if (acc_fd < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        listener_exhausted[listener_index] = true;
+                        ++exhausted_count;
+                    } else if (errno != EINTR) {
+                        note_accept_error("client", errno);
+                        listener_exhausted[listener_index] = true;
+                        ++exhausted_count;
+                    }
+                } else {
+                    ++accepted_count;
+                    // Capture AF_UNIX credentials before any wrapper/channel
+                    // setup can run.  TCP and a credential failure remain valid
+                    // legacy clients; their provenance simply cannot authorize a
+                    // cache handoff.
+                    const ListenerKind listener_kind = classify_listener(
+                        listen_fd, unix_listen_fd, tcp_listen_local_fd, tcp_listen_fd);
+                    if (listener_kind == ListenerKind::TcpRemote)
+                        ++pending_remote_count;
+                    PeerCredentials peer_credentials;
+                    if (listener_kind == ListenerKind::UnixLocal)
+                        (void)capture_unix_peer_credentials(acc_fd, peer_credentials);
+                    MsgChannel *channel = Service::createChannelAccepted(
+                        acc_fd, &cli_addr, cli_len);
+                    if (channel) {
+                        PendingClientAdmission admission;
+                        admission.channel.reset(channel);
+                        admission.listener_kind = listener_kind;
+                        admission.peer_credentials = peer_credentials;
+                        admission.deadline_msec = monotonic_msec() +
+                            ICECC_PROTOCOL_HANDSHAKE_TIMEOUT_MSEC;
+                        pending_client_admissions.emplace(
+                            channel->fd, std::move(admission));
+                    }
                 }
             }
-        }
+
+            /* A socket accepted above was absent from the outer poll snapshot.
+               Its peer may already have queued the complete protocol greeting,
+               especially when this batch crossed client_accept_batch_limit.  Give
+               those admission-only channels one zero-time readiness pass before
+               established client activity.  Otherwise the first socket in the
+               next accept quantum can spend a whole busy turn behind ordinary
+               compile settlement and exceed a legacy peer's handshake deadline. */
+            // A previously accepted peer may finish its greeting while ordinary
+            // work runs. Progress it even when this probe accepted no new socket.
+            service_pending_client_admissions_now();
+        };
+
+        accept_client_admissions_now();
 
         /* Accept readiness never suppresses already-established client or
            child readiness from the same poll snapshot. */
         {
             for (auto it = fd2client.begin(); it != fd2client.end();)  {
+                /* A connection can cross into the nonblocking listen queue
+                   after the stale outer snapshot.  Re-probe between ordinary
+                   clients so no full ready set can postpone its protocol
+                   greeting behind an unbounded number of settlements. */
+                accept_client_admissions_now();
                 int i = it->first;
                 Client *client = it->second;
                 MsgChannel *c = client->channel;
