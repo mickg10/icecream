@@ -67,10 +67,17 @@ chmod 0711 "$work"
 : >"$work/scheduler.log"
 chmod 0666 "$work/scheduler.log"
 cleanup() {
+    if test -n "${scheduler_loss_worker_stopped:-}"; then
+        kill -s CONT "${worker_pid:-}" 2>/dev/null || :
+    fi
+    if test -n "${scheduler_loss_compile_pgid:-}"; then
+        kill -s CONT "-$scheduler_loss_compile_pgid" 2>/dev/null || :
+    fi
     if test -n "${delayed_compile_pgid:-}"; then
         kill -s CONT "-$delayed_compile_pgid" 2>/dev/null || :
     fi
-    for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+    for pid in "${scheduler_loss_wrapper_pid:-}" \
+        "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
         "${delayed_wrapper_pid:-}" \
         "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
         "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
@@ -80,7 +87,8 @@ cleanup() {
     done
     for _ in $(seq 1 50); do
         live=0
-        for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+        for pid in "${scheduler_loss_wrapper_pid:-}" \
+            "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
             "${delayed_wrapper_pid:-}" \
             "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
             "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
@@ -93,7 +101,8 @@ cleanup() {
         test "$live" -eq 0 && break
         sleep 0.1
     done
-    for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+    for pid in "${scheduler_loss_wrapper_pid:-}" \
+        "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
         "${delayed_wrapper_pid:-}" \
         "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
         "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
@@ -101,6 +110,7 @@ cleanup() {
         "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
     done
+    wait "${scheduler_loss_wrapper_pid:-}" 2>/dev/null || :
     wait "${bounded_wrapper_pid:-}" 2>/dev/null || :
     wait "${inflight_wrapper_pid:-}" 2>/dev/null || :
     wait "${delayed_wrapper_pid:-}" 2>/dev/null || :
@@ -122,9 +132,9 @@ trap cleanup EXIT HUP INT TERM
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" \
     "$work/out" "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home" \
     "$work/evidence" "$work/bin" "$work/envs-f-strict1" \
-    "$work/envs-f-strict2" "$work/envs-f-strict3" \
+    "$work/envs-f-strict2" "$work/envs-f-strict3" "$work/envs-f-loss" \
     "$work/cache-runtime-f-strict1" "$work/cache-runtime-f-strict2" \
-    "$work/cache-runtime-f-strict3"
+    "$work/cache-runtime-f-strict3" "$work/cache-runtime-f-loss"
 ln -s "$build/client/icecc-p50-completion-test" "$work/bin/icecc"
 test "$(readlink -f "$work/bin/icecc")" = \
     "$(readlink -f "$build/client/icecc-p50-completion-test")" || {
@@ -132,10 +142,10 @@ test "$(readlink -f "$work/bin/icecc")" = \
     exit 1
 }
 chmod 1777 "$work/envs-f" "$work/envs-c" "$work/envs-f-strict1" \
-    "$work/envs-f-strict2" "$work/envs-f-strict3"
+    "$work/envs-f-strict2" "$work/envs-f-strict3" "$work/envs-f-loss"
 chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home" \
     "$work/cache-runtime-f-strict1" "$work/cache-runtime-f-strict2" \
-    "$work/cache-runtime-f-strict3"
+    "$work/cache-runtime-f-strict3" "$work/cache-runtime-f-loss"
 HOME="$work/home"
 export HOME
 port_sched=$((24000 + ($$ % 1000)))
@@ -143,6 +153,7 @@ port_worker=$((25000 + ($$ % 1000)))
 port_worker_strict1=$((26000 + ($$ % 1000)))
 port_worker_strict2=$((27000 + ($$ % 1000)))
 port_worker_strict3=$((28000 + ($$ % 1000)))
+port_worker_loss=$((29000 + ($$ % 1000)))
 network="p50completion-$$"
 experiment_id=${ICECC_P50_EXPERIMENT_ID:-p50completionflow}
 
@@ -183,6 +194,19 @@ printf '%s\n' \
     'int p50_bounded_strict_retry_translation_unit() {' \
     '    return static_cast<int>(UINT32_C(56));' \
     '}' >"$work/src/bounded-strict-retry.cpp"
+printf '%s\n' \
+    '#include <cstdint>' \
+    'template<int N> struct P50SchedulerLossSpin {' \
+    '    __attribute__((noinline)) static std::uint32_t run(std::uint32_t value) {' \
+    '        return P50SchedulerLossSpin<N - 1>::run(value * UINT32_C(1103515245) + N) ^ (value >> (N % 13));' \
+    '    }' \
+    '};' \
+    'template<> struct P50SchedulerLossSpin<0> {' \
+    '    __attribute__((noinline)) static std::uint32_t run(std::uint32_t value) { return value; }' \
+    '};' \
+    'std::uint32_t p50_scheduler_loss_retry_translation_unit(std::uint32_t value) {' \
+    '    return P50SchedulerLossSpin<3000>::run(value);' \
+    '}' >"$work/src/scheduler-loss-retry.cpp"
 printf '%s\n' \
     '#include <cstdint>' \
     'template<int N> struct P50WorkerLossSpin {' \
@@ -1452,6 +1476,211 @@ if retry_route:
         "FAIL: sole-worker same-endpoint retry was treated as if an alternative existed")
 PY
 
+# Reproduce the S70 active-scheduler-loss ordering with real production
+# processes.  Stop F and its active compiler only after CompileFile admission,
+# then remove S.  C must consume scheduler EOF and clear the old wrapper proxy
+# before F can expose the result-stream loss.  The non-strict, remote-required
+# wrapper then has exactly one legal recovery: accept the already-closed proxy
+# as settled, reconnect to C, wait for the replacement scheduler session, and
+# issue one canonical-absent legacy GetCS.  Strict P50 keeps the stronger
+# observation-plus-End ordering and is deliberately not exercised here.
+# Earlier strict-retry cells intentionally launch F with the check-only
+# ICECC_P50_C1F1_REQUIRED policy.  Replace that fixture before this cell: S70
+# puts strictness only on wrappers, and its F must accept the canonical legacy
+# retry while continuing to advertise a cache-capable first assignment.
+scheduler_loss_ready_before=$(grep -E -c \
+    'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+    "$work/scheduler.log" 2>/dev/null || true)
+kill -TERM "$worker_pid" 2>/dev/null || :
+for _ in $(seq 1 100); do
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "$worker_pid" 2>/dev/null; then
+    kill -KILL "$worker_pid" 2>/dev/null || :
+fi
+wait "$worker_pid" 2>/dev/null || :
+worker_pid=
+service_pid=
+
+ICECC_TEST_SOCKET="$work/worker-loss.sock" \
+    ICECC_P50_TEST_LIFECYCLE_TRACE="$work/lifecycle-loss.trace" \
+    ICECC_P50_TEST_READY_TRACE="$work/ready-loss.trace" \
+    "$build/daemon/iceccd" "$@" -p "$port_worker_loss" -m 1 \
+    -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
+    -b "$work/envs-f-loss" -l "$work/f-loss.log" -vvv \
+    --cache-service "$build/cache/icecc-cache-service" \
+    --cache-runtime-dir "$work/cache-runtime-f-loss" &
+worker_pid=$!
+
+scheduler_loss_ready=0
+for _ in $(seq 1 300); do
+    scheduler_loss_ready_now=$(grep -E -c \
+        'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" 2>/dev/null || true)
+    if test "${scheduler_loss_ready_now:-0}" -gt \
+        "${scheduler_loss_ready_before:-0}"; then
+        scheduler_loss_ready=1
+        break
+    fi
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$scheduler_loss_ready" -eq 1 || {
+    echo "FAIL: normal scheduler-loss worker did not advertise READY" >&2
+    exit 1
+}
+service_pid=
+for _ in $(seq 1 300); do
+    service_pid=$(find_service_pid)
+    test -n "$service_pid" && break
+    sleep 0.1
+done
+test -n "$service_pid" || {
+    echo "FAIL: normal scheduler-loss worker has no cache sidecar" >&2
+    exit 1
+}
+
+scheduler_loss_log_offset=$(stat -c %s "$work/f-loss.log")
+scheduler_loss_clears_before=$(grep -F -c 'cleared children' \
+    "$work/c.log" 2>/dev/null || true)
+scheduler_loss_client_log="$work/scheduler-loss-retry-client.log"
+scheduler_loss_remote_obj="$work/out/scheduler-loss-retry-remote.o"
+scheduler_loss_local_obj="$work/out/scheduler-loss-retry-local.o"
+
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+    ICECC_REMOTE_REQUIRED=1 ICECC_VERSION="$envtar" \
+    ICECC_PREFERRED_HOST=p50-f ICECC_CARET_WORKAROUND=0 \
+    ICECC_DEBUG=debug ICECC_LOGFILE="$scheduler_loss_client_log" \
+    timeout "$timeout_s" "$build/client/icecc" \
+    g++ -std=c++17 -O2 -Wall -ftemplate-depth=4096 -c \
+    "$work/src/scheduler-loss-retry.cpp" \
+    -o "$scheduler_loss_remote_obj" >"$work/scheduler-loss-retry.out" 2>&1 &
+scheduler_loss_wrapper_pid=$!
+
+scheduler_loss_compile_pgid=
+for _ in $(seq 1 500); do
+    if tail -c +$((scheduler_loss_log_offset + 1)) "$work/f-loss.log" | \
+        grep -F 'final arguments:' >/dev/null 2>&1; then
+        scheduler_loss_compile_pgid=$(ps -eo pid=,ppid=,pgid=,args= | \
+            awk -v parent="$worker_pid" -v sidecar="$service_pid" \
+                '$2 == parent && $1 == $3 && $1 != sidecar { print $1; exit }')
+        test -n "$scheduler_loss_compile_pgid" && break
+    fi
+    kill -0 "$scheduler_loss_wrapper_pid" 2>/dev/null || break
+    sleep 0.01
+done
+test -n "$scheduler_loss_compile_pgid" || {
+    echo "FAIL: scheduler-loss compiler was not active before S removal" >&2
+    exit 1
+}
+kill -STOP "-$scheduler_loss_compile_pgid"
+kill -STOP "$worker_pid"
+scheduler_loss_worker_stopped=1
+
+kill -TERM "$sched_pid"
+wait "$sched_pid" 2>/dev/null || :
+sched_pid=
+
+scheduler_loss_cleared=0
+for _ in $(seq 1 600); do
+    scheduler_loss_clears_now=$(grep -F -c 'cleared children' \
+        "$work/c.log" 2>/dev/null || true)
+    if test "${scheduler_loss_clears_now:-0}" -gt \
+        "${scheduler_loss_clears_before:-0}"; then
+        scheduler_loss_cleared=1
+        break
+    fi
+    kill -0 "$scheduler_loss_wrapper_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$scheduler_loss_cleared" -eq 1 || {
+    echo "FAIL: C did not clear the active submitter proxy after scheduler loss" >&2
+    exit 1
+}
+
+kill -CONT "$worker_pid"
+scheduler_loss_worker_stopped=
+
+scheduler_loss_preclosed=0
+for _ in $(seq 1 600); do
+    if grep -F \
+        'P50 legacy retry predecessor proxy was already settled by local daemon; reconnecting' \
+        "$scheduler_loss_client_log" >/dev/null 2>&1; then
+        scheduler_loss_preclosed=1
+        break
+    fi
+    kill -0 "$scheduler_loss_wrapper_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$scheduler_loss_preclosed" -eq 1 || {
+    echo "FAIL: scheduler loss did not enter the preclosed legacy retry branch" >&2
+    exit 1
+}
+for _ in $(seq 1 100); do
+    kill -0 "-$scheduler_loss_compile_pgid" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "-$scheduler_loss_compile_pgid" 2>/dev/null; then
+    echo "FAIL: scheduler loss left the stopped compiler group alive" >&2
+    exit 1
+fi
+scheduler_loss_compile_pgid=
+
+"$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
+    --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv &
+sched_pid=$!
+sleep 1
+kill -0 "$sched_pid" 2>/dev/null || {
+    echo "FAIL: replacement scheduler exited during startup" >&2
+    exit 1
+}
+
+set +e
+wait "$scheduler_loss_wrapper_pid"
+scheduler_loss_rc=$?
+set -e
+scheduler_loss_wrapper_pid=
+test "$scheduler_loss_rc" -eq 0 || {
+    echo "FAIL: scheduler-loss legacy retry exited $scheduler_loss_rc" >&2
+    exit 1
+}
+test -s "$scheduler_loss_remote_obj" || {
+    echo "FAIL: scheduler-loss legacy retry produced no object" >&2
+    exit 1
+}
+g++ -std=c++17 -O2 -Wall -ftemplate-depth=4096 -c \
+    "$work/src/scheduler-loss-retry.cpp" -o "$scheduler_loss_local_obj" \
+    2>"$work/scheduler-loss-retry-local.err"
+cmp -s "$scheduler_loss_remote_obj" "$scheduler_loss_local_obj" || {
+    echo "FAIL: scheduler-loss legacy retry differs from exact local reference" >&2
+    exit 1
+}
+test "$(grep -F -c \
+    'P50 assignment failed; requesting one fresh legacy remote assignment' \
+    "$scheduler_loss_client_log")" -eq 1
+test "$(grep -F -c \
+    'P50 legacy retry predecessor proxy was already settled by local daemon; reconnecting' \
+    "$scheduler_loss_client_log")" -eq 1
+test "$(grep -F -c 'asking for host to use' \
+    "$scheduler_loss_client_log")" -eq 2
+test "$(grep -F -c 'P50 assignment identity bound for job' \
+    "$scheduler_loss_client_log")" -eq 2
+test "$(grep -F -c 'P29V1 source committed for P50 CompileFile' \
+    "$scheduler_loss_client_log")" -eq 1
+test "$(grep -F -c 'legacy wire identity bound for job' \
+    "$scheduler_loss_client_log")" -eq 1
+if grep -F 'Error 24 - local daemon did not settle P50 retry predecessor' \
+    "$scheduler_loss_client_log" >/dev/null 2>&1; then
+    echo "FAIL: scheduler-loss retry retained the preclosed-proxy Error 24" >&2
+    exit 1
+fi
+if grep -E 'building myself, but telling localhost|requesting one fresh strict-P50' \
+    "$scheduler_loss_client_log" >/dev/null 2>&1; then
+    echo "FAIL: scheduler-loss retry crossed a local or strict-P50 path" >&2
+    exit 1
+fi
+
 # The fault/barrier seams remain absent from the shipped wrapper.
 for selector in \
     ICECC_P50_TEST_FRESH_STRICT_RETRY \
@@ -1473,4 +1702,4 @@ do
     }
 done
 
-echo "PASS: real P50 terminal lifecycle plus worker-loss and bounded retries"
+echo "PASS: real P50 terminal lifecycle plus worker/scheduler loss and bounded retries"

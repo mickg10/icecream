@@ -151,6 +151,8 @@ def check_wrapper_retry(main_source: str, remote_source: str,
         retry,
         'const bool strict_p50 =',
         'getenv("ICECC_P50_C1F1_REQUIRED") != nullptr',
+        'const bool remote_required_retry =',
+        'getenv("ICECC_REMOTE_REQUIRED") != nullptr',
         "bool p50_retry_attempted = false;",
         "string p50_retry_avoid_host;",
         "uint32_t p50_retry_avoid_port = 0;",
@@ -162,9 +164,14 @@ def check_wrapper_retry(main_source: str, remote_source: str,
         "strict_p50 && !error.hasRetryAvoidEndpoint()",
         '"P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint "',
         '"P50 assignment failed; requesting one fresh legacy remote assignment"',
+        "const bool retry_proxy_preclosed =",
+        "local_daemon->at_eof()",
+        "const bool retry_end_sent = !retry_proxy_preclosed &&",
         "local_daemon->send_msg(EndMsg())",
         "local_daemon->get_msg(30, true)",
-        "local_daemon->at_eof()",
+        "(!strict_p50 && remote_required_retry &&",
+        "retry_proxy_preclosed)",
+        "retry_end_sent && retry_end_reply == nullptr",
         "delete local_daemon;",
         '"Error 24 - local daemon did not settle P50 retry predecessor"',
         "local_daemon = get_local_daemon();",
@@ -173,6 +180,12 @@ def check_wrapper_retry(main_source: str, remote_source: str,
         "p50_retry_attempted = true;")
     require(retry.count("p50_retry_attempted = true;") == 1,
             "wrapper does not bound P50 reassignment to one attempt")
+    require(
+        '"P50 legacy retry predecessor proxy was already settled by local daemon; reconnecting"'
+        in retry,
+        "wrapper does not expose the authenticated scheduler-loss retry branch")
+    require(retry.count("!strict_p50 && remote_required_retry &&") == 2,
+            "preclosed proxy recovery is not confined to remote-required legacy retry")
     require("p50_legacy_retry" not in retry,
             "wrapper retained the strict-refusing legacy-only retry state")
     require("p50_completion_test_wait_before_retry_getcs(" in main_source and
@@ -567,6 +580,17 @@ def check_runtime_gate(source: str) -> None:
             "twice-failed strict wrapper does not exercise the bounded policy")
     require('test "${bounded_new_count:-0}" -eq 2' in source,
             "twice-failed strict wrapper does not reject a third assignment")
+    scheduler_loss_worker = section(
+        source,
+        "scheduler_loss_ready_before=",
+        'scheduler_loss_log_offset=$(stat -c %s "$work/f-loss.log")')
+    require("ICECC_P50_C1F1_REQUIRED" not in scheduler_loss_worker and
+            'ICECC_TEST_SOCKET="$work/worker-loss.sock"' in
+                scheduler_loss_worker and
+            'port_worker_loss' in scheduler_loss_worker and
+            "normal scheduler-loss worker did not advertise READY" in
+                scheduler_loss_worker,
+            "scheduler-loss regression does not replace strict F with a normal cache-capable worker")
     inflight_launch = section(
         source,
         'inflight_identity="$work/inflight-worker-loss-compile-identity.jsonl"',
@@ -663,7 +687,18 @@ def check_runtime_gate(source: str) -> None:
                   "len(job_ids) != 2",
                   "production in-flight strict retry differs from exact local reference",
                   'twice-failed strict retry exited $bounded_rc instead of 100',
-                  'bounded strict retry minted ${bounded_new_count:-0} scheduler jobs'):
+                  'bounded strict retry minted ${bounded_new_count:-0} scheduler jobs',
+                  'scheduler_loss_clears_before=',
+                  'ICECC_REMOTE_REQUIRED=1 ICECC_VERSION="$envtar"',
+                  'kill -STOP "$worker_pid"',
+                  'kill -TERM "$sched_pid"',
+                  'scheduler loss did not enter the preclosed legacy retry branch',
+                  'P50 legacy retry predecessor proxy was already settled by local daemon; reconnecting',
+                  'replacement scheduler exited during startup',
+                  'scheduler-loss legacy retry differs from exact local reference',
+                  'P29V1 source committed for P50 CompileFile',
+                  'legacy wire identity bound for job',
+                  'scheduler-loss retry crossed a local or strict-P50 path'):
         require(token in source, f"real terminal/reclaim matrix omits {token}")
     ordered(source,
             "run_remote_cell accepted accepted",
@@ -693,7 +728,15 @@ def check_runtime_gate(source: str) -> None:
             'bounded_marker="$work/bounded-strict-retry.barrier"',
             'ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1',
             ': >"$bounded_release"',
-            "PASS: real P50 terminal lifecycle plus worker-loss and bounded retries")
+            'scheduler_loss_log_offset=',
+            'kill -STOP "$worker_pid"',
+            'kill -TERM "$sched_pid"',
+            'scheduler_loss_cleared=1',
+            'kill -CONT "$worker_pid"',
+            'scheduler_loss_preclosed=1',
+            '"$build/scheduler/icecc-scheduler"',
+            'wait "$scheduler_loss_wrapper_pid"',
+            "PASS: real P50 terminal lifecycle plus worker/scheduler loss and bounded retries")
 
 
 def check_record(header: str, source: str) -> None:

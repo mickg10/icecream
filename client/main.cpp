@@ -724,6 +724,8 @@ int main(int argc, char **argv)
             invocation_timing_mark_enqueue("remote");
             const bool strict_p50 =
                 getenv("ICECC_P50_C1F1_REQUIRED") != nullptr;
+            const bool remote_required_retry =
+                getenv("ICECC_REMOTE_REQUIRED") != nullptr;
             bool p50_retry_attempted = false;
             string p50_retry_avoid_host;
             uint32_t p50_retry_avoid_port = 0;
@@ -776,15 +778,44 @@ int main(int argc, char **argv)
                        observation must be consumed by C before its successor
                        GetCS can observe the sidecar lifecycle.  EOF is C's
                        acknowledgement that it processed the exact proxy
-                       teardown (and every preceding frame).  Bound the wait
-                       and fail closed; never turn an unavailable C daemon
-                       into an uncoordinated second assignment. */
-                    const bool retry_end_sent =
+                       teardown (and every preceding frame).  Bound the wait;
+                       a still-live predecessor must prove this ordering before
+                       another assignment.  The already-closed cache-absent
+                       case is handled separately below. */
+                    /* An established scheduler loss makes C settle and close
+                       every old-session wrapper proxy before this wrapper can
+                       observe its worker result-stream EOF.  In that one
+                       ordering, the failed cache-route observation above has
+                       already discovered a dead local channel, so sending End
+                       cannot create a second acknowledgement.  Only an
+                       explicitly remote-required ordinary retry may reconnect:
+                       it is deliberately cache-absent, cannot fall back
+                       locally, and C cannot publish its fresh GetCS until a
+                       successor scheduler session is active.  Thus EOF proves
+                       only that the predecessor proxy is gone; successor
+                       admission proves the new scheduler generation.
+
+                       A strict-P50 retry is different.  It can depend on the
+                       observation ordering to retire/replace local cache
+                       state, so pre-existing EOF is not enough and remains a
+                       fail-closed Error 24. */
+                    const bool retry_proxy_preclosed =
+                        local_daemon->at_eof();
+                    const bool retry_end_sent = !retry_proxy_preclosed &&
                         local_daemon->send_msg(EndMsg());
                     Msg *retry_end_reply = retry_end_sent
                         ? local_daemon->get_msg(30, true) : nullptr;
-                    const bool retry_proxy_closed = retry_end_sent &&
-                        retry_end_reply == nullptr && local_daemon->at_eof();
+                    const bool retry_proxy_closed =
+                        (!strict_p50 && remote_required_retry &&
+                         retry_proxy_preclosed) ||
+                        (retry_end_sent && retry_end_reply == nullptr &&
+                         local_daemon->at_eof());
+                    if (!strict_p50 && remote_required_retry &&
+                        retry_proxy_preclosed) {
+                        log_warning()
+                            << "P50 legacy retry predecessor proxy was already settled by local daemon; reconnecting"
+                            << endl;
+                    }
                     delete retry_end_reply;
                     delete local_daemon;
                     local_daemon = nullptr;
