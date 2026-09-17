@@ -5,7 +5,7 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-59868aa4"
+FINAL_PRODUCT = "p50s4-01cbd11b"
 FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
@@ -13,7 +13,7 @@ FINAL_MUTANTS = {
 FINAL_ROLE_HASHES = {
     "scheduler": "5297fd92b1ac80101b90ed0d8f3eb2b4fabe7323af55ac6a8b7fafd8088629f9",
     "client": "d0371be430e29431eba1a88cdcd00785de2522c11f771e3545a7d96e37625910",
-    "daemon": "5644b04ac7f79b710e38e4965b066ebd628862f985398f881f070afd2e3f1235",
+    "daemon": "648cb05e12b38d4d6587e1a47b7ca5e4453beadc10cc2bab5a2d08aaa7d38a93",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
