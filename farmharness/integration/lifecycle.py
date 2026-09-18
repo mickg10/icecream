@@ -3185,6 +3185,8 @@ def collect_diagnostics(
     destination: Path,
     *,
     container_ids: Mapping[str, str] | None = None,
+    live_only: bool = False,
+    include_live: bool = True,
 ) -> list[str]:
     """Best-effort diagnostic capture that never replaces the original error."""
 
@@ -3216,7 +3218,9 @@ def collect_diagnostics(
             ),
             ("logs", ("container", "logs", container_target)),
         ]
-        if instance["name"] in shaped_names:
+        if live_only:
+            diagnostics = []
+        if include_live and instance["name"] in shaped_names:
             diagnostics.append(
                 (
                     "tc",
@@ -3268,6 +3272,8 @@ def collect_diagnostics(
                 )
             except (RemoteError, OSError) as exc:
                 problems.append(f"{host_name}:{instance['name']}:{kind}:{exc}")
+        if live_only:
+            continue
         remote_log = (
             PurePosixPath(farm.hosts[host_name]["scratch_root"])
             / "icefarm"

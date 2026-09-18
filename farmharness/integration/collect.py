@@ -489,6 +489,14 @@ def _snapshot_live_evidence(
         except RemoteError as exc:
             raise CollectError(f"cannot collect {host}:{name}: {exc}") from exc
 
+    # Network namespace diagnostics require a live authenticated container.
+    problems = collect_diagnostics(
+        farm, plan, recorder, factory, diagnostics,
+        container_ids=container_ids, live_only=True,
+    )
+    if problems:
+        raise CollectError("live diagnostic collection failed: " + "; ".join(problems))
+
     # Freeze all writers before copying their logs and result trees.  The
     # authenticated container IDs close the name-replacement gap and the C/F/S
     # order prevents new work from entering while workers and the scheduler
@@ -531,6 +539,7 @@ def _snapshot_live_evidence(
         factory,
         diagnostics,
         container_ids=container_ids,
+        include_live=False,
     )
     if problems:
         raise CollectError("diagnostic collection failed: " + "; ".join(problems))

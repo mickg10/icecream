@@ -4043,6 +4043,34 @@ class _LiveCollection:
         raise AssertionError(f"unexpected collection command: {command.phase}")
 
 
+def test_live_network_diagnostics_precede_stop(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from farmharness.integration import lifecycle
+
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    monkeypatch.setattr(lifecycle, "_netem_bindings", lambda _: (SimpleNamespace(instance="F1"),))
+
+    class ShapedCollection(_LiveCollection):
+        def invoke(self, command):
+            if command.phase == "diagnostics.tc":
+                assert self._name_from_argv(command) == "F1"
+                assert "F1" not in self.stopped, "tc cannot exec after worker stop"
+                return CommandResult(0, "qdisc netem 100mbit delay 2ms\n", "")
+            result = super().invoke(command)
+            if command.phase == "collect.stop":
+                self.stopped = self.stopped | {self._name_from_argv(command)}
+            return result
+
+    recorder = RecordingTransport(ShapedCollection(plan, root))
+    _snapshot_live_evidence(farm, plan, tmp_path / "snapshot", recorder)
+    phases = [command.phase for command in recorder.commands]
+    assert phases.count("diagnostics.tc") == 1
+    assert phases.index("diagnostics.tc") < phases.index("collect.stop")
+    assert phases.index("diagnostics.sync-log") > max(
+        i for i, phase in enumerate(phases) if phase == "collect.stop"
+    )
+
+
 def test_live_collection_authenticates_samples_then_freezes_before_copy(
     tmp_path: Path,
 ) -> None:
