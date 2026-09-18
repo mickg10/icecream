@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import farmharness.integration.events as events_module
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
@@ -4278,7 +4279,11 @@ def test_s_f_transition_pauses_rejoins_and_resumes_with_strict_receipt(tmp_path:
     assert record.fired_ms == record.receipt["coordination"]["ready_ms"]
     phases = [command.phase for command in recorder.commands]
     assert phases.index("event.pause-drain") < phases.index("event.upgrade.stop")
-    assert phases.index("event.upgrade.stop") < phases.index("event.upgrade.remove") < phases.index("event.upgrade.start")
+    assert phases.index("event.upgrade.stop") < phases.index("event.upgrade.logs") < phases.index("event.upgrade.remove") < phases.index("event.upgrade.start")
+    stop = next(command for command in recorder.commands if command.phase == "event.upgrade.stop")
+    logs = next(command for command in recorder.commands if command.phase == "event.upgrade.logs")
+    remove = next(command for command in recorder.commands if command.phase == "event.upgrade.remove")
+    assert stop.argv[-1] == logs.argv[-1] == remove.argv[-1]
     assert phases.index("event.scheduler-worker-rejoin") < phases.index("event.resume")
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan)[0]["receipt"] == record.receipt
     path = tmp_path / "events" / "events.json"
@@ -4332,6 +4337,11 @@ def test_scheduler_transition_requires_fresh_workers_and_all_clients(tmp_path: P
     assert set(receipt["coordination"]["client_readiness"]) == {"C1"}
     phases = [command.phase for command in recorder.commands]
     assert phases.index("event.pause-drain") < phases.index("event.upgrade.stop")
+    assert phases.index("event.upgrade.stop") < phases.index("event.upgrade.logs") < phases.index("event.upgrade.remove")
+    stop = next(command for command in recorder.commands if command.phase == "event.upgrade.stop")
+    logs = next(command for command in recorder.commands if command.phase == "event.upgrade.logs")
+    remove = next(command for command in recorder.commands if command.phase == "event.upgrade.remove")
+    assert stop.argv[-1] == logs.argv[-1] == remove.argv[-1]
     assert phases.index("event.client-scheduler-ready") < phases.index("event.resume")
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan)[0]["receipt"] == receipt
 
@@ -4545,6 +4555,13 @@ def test_daemon_transition_aborts_paused_clients_on_missing_rejoin(tmp_path: Pat
 
 
 def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(tmp_path: Path) -> None:
+    class LogsRecorder(TransitionRecorder):
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            result = super().invoke(command)
+            if command.phase.endswith(".logs"):
+                return CommandResult(0, "old stdout\n", "old stderr\n")
+            return result
+
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
@@ -4559,7 +4576,7 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     farm.data["authority"]["images"]["p43-1.4.0"]["closure_sha256"] = old_identity.closure_sha256
     farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = new_identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
-    recorder = TransitionRecorder(farm, plan)
+    recorder = LogsRecorder(farm, plan)
     records = run_events(
         farm,
         scenario,
@@ -4577,8 +4594,9 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     phases = [command.phase for command in recorder.commands]
     assert phases[:3] == ["preflight.image", "preflight.runtime-mkdir", "preflight.runtime-materialize"]
     assert "preflight.role-hashes" in phases
-    assert phases[-5:] == [
+    assert phases[-6:] == [
         "event.downgrade.stop",
+        "event.downgrade.logs",
         "event.downgrade.remove",
         "event.downgrade.start",
         "event.authenticate",
@@ -4586,9 +4604,18 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     ]
     assert "event.readiness-baseline" in phases
     stop = next(command for command in recorder.commands if command.phase == "event.upgrade.stop")
+    logs = next(command for command in recorder.commands if command.phase == "event.upgrade.logs")
     remove = next(command for command in recorder.commands if command.phase == "event.upgrade.remove")
     start = next(command for command in recorder.commands if command.phase == "event.upgrade.start")
     assert stop.argv[-1] == remove.argv[-1] == "1" * 64
+    assert logs.argv[-1] == stop.argv[-1]
+    assert phases.index("event.upgrade.stop") < phases.index("event.upgrade.logs") < phases.index("event.upgrade.remove")
+    retained = tmp_path / "events" / "container-logs" / f"0000-{'1' * 64}.log"
+    assert json.loads(retained.read_text(encoding="utf-8")) == {
+        "container_id": "1" * 64,
+        "stderr": "old stderr\n",
+        "stdout": "old stdout\n",
+    }
     assert stop.argv[-5:-1] == ("container", "stop", "--time", "10")
     assert stop.timeout_s > 30
     assert remove.timeout_s > 30
@@ -4604,6 +4631,69 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     event_path.write_text(json.dumps(persisted), encoding="utf-8")
     with pytest.raises(CollectError):
         _event_log(tmp_path, scenario)
+
+
+def test_transition_log_capture_failure_prevents_container_removal(tmp_path: Path) -> None:
+    class FailingLogsRecorder(TransitionRecorder):
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            result = super().invoke(command)
+            if command.phase == "event.upgrade.logs":
+                return CommandResult(1, "partial stdout", "docker logs failed")
+            return result
+
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
+    scenario.data["timeline"] = [
+        {"trigger": "t+0", "action": "upgrade", "instance": "F1", "image": "new"}
+    ]
+    old_document = _transition_image_document(farm, "p43-1.4.0")
+    new_document = _transition_image_document(farm, "p50s4-57a1e336")
+    farm.data["authority"]["images"]["p43-1.4.0"]["closure_sha256"] = _image_identity(
+        CommandResult(0, json.dumps(old_document), ""), "old"
+    ).closure_sha256
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = _image_identity(
+        CommandResult(0, json.dumps(new_document), ""), "new"
+    ).closure_sha256
+    plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
+    recorder = FailingLogsRecorder(farm, plan)
+    with pytest.raises(EventError, match="event.upgrade.logs"):
+        run_events(
+            farm,
+            scenario,
+            plan,
+            recorder=RecordingTransport(recorder),
+            event_path=tmp_path / "events" / "events.json",
+            deadline_s=300,
+        )
+    phases = [command.phase for command in recorder.commands]
+    assert phases.index("event.upgrade.stop") < phases.index("event.upgrade.logs")
+    assert "event.upgrade.remove" not in phases
+    assert not (tmp_path / "events" / "container-logs").exists()
+
+
+def test_transition_log_write_failure_is_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(EventRecorder()),
+        event_path=tmp_path / "events" / "events.json",
+    )
+    event = TimelineEvent.from_dict(
+        0, {"trigger": "t+0", "action": "upgrade", "instance": "F1", "image": "new"}
+    )
+    instance = next(item for item in plan["topology"]["instances"] if item["name"] == "F1")
+
+    def fail_logs(path: Path, value: bytes) -> None:
+        if path.parent.name == "container-logs":
+            raise OSError("read-only evidence tree")
+        raise AssertionError(f"unexpected write: {path}")
+
+    monkeypatch.setattr(events_module, "_atomic_write", fail_logs)
+    with pytest.raises(EventError, match="cannot persist stopped container logs"):
+        producer._retain_stopped_container_logs(event, instance, "1" * 64)
 
 
 def test_env_set_is_limited_to_authorized_setting_and_receipts_are_immutable(tmp_path: Path) -> None:
@@ -5113,6 +5203,15 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     assert callback_calls == ["quiesce:A", "relaunch:A"]
     assert len(producer.records) == 1
     event = producer.records[0].as_dict()
+    phases = [command.phase for command in recorder.commands]
+    prefix = f"event.{event['action']}"
+    assert phases.index(prefix + ".stop") < phases.index(prefix + ".logs") < phases.index(prefix + ".remove")
+    stopped = next(command for command in recorder.commands if command.phase == prefix + ".stop")
+    captured = next(command for command in recorder.commands if command.phase == prefix + ".logs")
+    removed = next(command for command in recorder.commands if command.phase == prefix + ".remove")
+    assert stopped.argv[-1] == captured.argv[-1] == removed.argv[-1]
+    retained_log = tmp_path / "events" / "container-logs" / f"0000-{stopped.argv[-1]}.log"
+    assert json.loads(retained_log.read_text())["container_id"] == stopped.argv[-1]
     assert event["receipt"]["schema"] == CLIENT_TRANSITION_SCHEMA
     assert event["receipt"]["coordination"]["ready_ms"] == 1000
     assert event["receipt"]["after"]["env"] == {
@@ -5174,6 +5273,7 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
         / "result.tsv"
     )
     assert staged_checkpoint.read_bytes() == checkpoint_payload
+    assert (evidence / "events" / "container-logs" / retained_log.name).read_bytes() == retained_log.read_bytes()
     assert _event_log(evidence, scenario, farm=farm, plan=plan) == [event]
     staged_checkpoint.unlink()
     with pytest.raises(CollectError, match="invalid transition coordination"):

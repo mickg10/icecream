@@ -2030,6 +2030,51 @@ class EventProducer:
             )
         return result
 
+    def _retain_stopped_container_logs(
+        self,
+        event: TimelineEvent,
+        instance: Mapping[str, Any],
+        container_id: str,
+    ) -> Path:
+        """Persist the stopped container's complete Docker output before removal.
+
+        ``docker container rm`` destroys the container's stdout/stderr stream.
+        The ID was authenticated by ``_inspect`` immediately before the stop,
+        so use that exact ID and a transition-specific filename.  A failed
+        command or write raises before the caller is allowed to remove the
+        container.
+        """
+        if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise EventError("cannot retain logs for an invalid authenticated container id")
+        command = self.factory.make(
+            phase=f"event.{event.action}.logs",
+            host=instance["host"],
+            instance=event.instance,
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(
+                self.farm,
+                instance["host"],
+                ("container", "logs", "--timestamps", container_id),
+            ),
+        )
+        result = self._invoke(command)
+        payload = canonical_bytes(
+            {
+                "container_id": container_id,
+                "stderr": result.stderr,
+                "stdout": result.stdout,
+            }
+        )
+        path = self.event_path.parent / "container-logs" / (
+            f"{event.index:04d}-{container_id}.log"
+        )
+        try:
+            _atomic_write(path, payload)
+        except (OSError, ValueError) as exc:
+            raise EventError(f"cannot persist stopped container logs at {path}") from exc
+        return path
+
     def _mark_failure(self, phase: str | None, exc: BaseException) -> None:
         if phase:
             self._failure_evidence.setdefault("root_phase", phase)
@@ -3038,11 +3083,7 @@ class EventProducer:
                 self._readiness_baseline(scheduler) if instance["role"] == "F" else None
             )
             for operation, args in (
-                (
-                    "stop",
-                    ("container", "stop", "--time", "10", before_id),
-                ),
-                ("remove", ("container", "rm", "--force", before_id)),
+                ("stop", ("container", "stop", "--time", "10", before_id)),
             ):
                 self._invoke(
                     self.factory.make(
@@ -3054,6 +3095,21 @@ class EventProducer:
                         argv=docker_argv(self.farm, instance["host"], args),
                     )
                 )
+            self._retain_stopped_container_logs(event, instance, before_id)
+            self._invoke(
+                self.factory.make(
+                    phase=f"event.{event.action}.remove",
+                    host=instance["host"],
+                    instance=event.instance,
+                    transport=_docker_transport(self.farm, instance["host"]),
+                    timeout_s=self._command_timeout(),
+                    argv=docker_argv(
+                        self.farm,
+                        instance["host"],
+                        ("container", "rm", "--force", before_id),
+                    ),
+                )
+            )
             self._invoke(
                 self.factory.make(
                     phase=f"event.{event.action}.start",
@@ -3363,20 +3419,35 @@ class EventProducer:
                 route_before = self._client_route_state_from_inspect(
                     current_client, before
                 )
-            for operation, args in (
-                ("stop", ("container", "stop", "--time", "10", before_id)),
-                ("remove", ("container", "rm", "--force", before_id)),
-            ):
-                self._invoke(
-                    self.factory.make(
-                        phase=f"event.{event.action}.{operation}",
-                        host=instance["host"],
-                        instance=event.instance,
-                        transport=_docker_transport(self.farm, instance["host"]),
-                        timeout_s=self._command_timeout(),
-                        argv=docker_argv(self.farm, instance["host"], args),
-                    )
+            self._invoke(
+                self.factory.make(
+                    phase=f"event.{event.action}.stop",
+                    host=instance["host"],
+                    instance=event.instance,
+                    transport=_docker_transport(self.farm, instance["host"]),
+                    timeout_s=self._command_timeout(),
+                    argv=docker_argv(
+                        self.farm,
+                        instance["host"],
+                        ("container", "stop", "--time", "10", before_id),
+                    ),
                 )
+            )
+            self._retain_stopped_container_logs(event, instance, before_id)
+            self._invoke(
+                self.factory.make(
+                    phase=f"event.{event.action}.remove",
+                    host=instance["host"],
+                    instance=event.instance,
+                    transport=_docker_transport(self.farm, instance["host"]),
+                    timeout_s=self._command_timeout(),
+                    argv=docker_argv(
+                        self.farm,
+                        instance["host"],
+                        ("container", "rm", "--force", before_id),
+                    ),
+                )
+            )
             self._invoke(
                 self.factory.make(
                     phase=f"event.{event.action}.start",
@@ -5762,6 +5833,7 @@ class EventProducer:
                 ),
             )
         )
+        self._retain_stopped_container_logs(event, instance, before_id)
         self._invoke(
             self.factory.make(
                 phase=f"event.{event.action}.remove",
