@@ -5,10 +5,10 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-ea153fc5"
-FINAL_COMMIT = "ea153fc56ec182e9ab86e52f17c9958b946e4a12"
-FINAL_SOURCE_ARCHIVE = "8f7be40b5d182d815aead62025a484b2d607282ac66baea4b974e91094028c70"
-FINAL_CLOSURE = "e165e8abf5e4627d12f9ab68f4f8d779edb324c903a07b870cb1d232411a5303"
+FINAL_PRODUCT = "p50s4-fff328e2"
+FINAL_COMMIT = "fff328e25a5983197e41905246a880853511e791"
+FINAL_SOURCE_ARCHIVE = "2e7a7b9062d19d266363d3428001860291a169d8d0fdcb1325cc8d4c57ab76bf"
+FINAL_CLOSURE = "e5dda2b8a834047b7e6c53d8ba5b09684dd02529b76e8cd1e172f94e9fbf2637"
 FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
@@ -16,7 +16,7 @@ FINAL_MUTANTS = {
 FINAL_ROLE_HASHES = {
     "scheduler": "3f376f1c7b5086db58a3cf5e25826f4a1ef538d6a8045dd6ff5fd6986c4e35e6",
     "client": "f661d93315b027faa4cdfa34961450a6393b4c715ddf687641f7263532384bf9",
-    "daemon": "4996e952d29ed60ec1bf1104b7d7defe8657d42b2497a6a34ee09ec1879f2f07",
+    "daemon": "ca06985cefc260006f3eb673d467718eb02c42901d2b65b49edc391d126b0a3f",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
@@ -72,7 +72,7 @@ def test_final_product_binding_matches_verified_source_and_runtime() -> None:
     assert binding["commit"] == FINAL_COMMIT
     assert binding["archive_sha256"] == FINAL_SOURCE_ARCHIVE
     assert binding["closure_sha256"] == FINAL_CLOSURE
-    assert binding["id"] == "sha256:2dd22a3e895caa972d90d068b2474d6dbfc32129140af2788290b52a1a286c61"
+    assert binding["id"] == "sha256:2882264273abef6ebb3e70299ef04e88744d49fb4efcec9fffe402c71dceb65e"
 
 
 def test_direct_builder_catalog_is_f_only_and_deletion_sensitive() -> None:

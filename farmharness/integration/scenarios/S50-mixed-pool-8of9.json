@@ -2,7 +2,7 @@
   "schema": "icefarm-scenario-v1",
   "id": "S50-mixed-pool-8of9",
   "shape": "S'[FF'][CC']",
-  "images": {"old": "p43-1.4.0", "new": "p50s4-ea153fc5"},
+  "images": {"old": "p43-1.4.0", "new": "p50s4-fff328e2"},
   "instances": [
     {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "P29V1"}},
     {"name": "F1", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 4},
