@@ -660,13 +660,16 @@ static void test_same_endpoint_retry_preserves_immediate_failure()
     delete channel;
 }
 
-static void test_adaptive_connection_budget()
+static void test_adaptive_connection_budget(bool hedged = true)
 {
     using namespace std::chrono_literals;
     using Clock = std::chrono::steady_clock;
     // Independently serviced sockets: a slow greeting on every connection,
-    // a blackholed first connection, all blackholed, and immediate success.
-    for (int mode = 0; mode != 4; ++mode) {
+    // a blackholed first connection, all blackholed, immediate success, and
+    // a viable first greeting that arrives after the retry's remaining budget.
+    // The last case must preserve progress: restarting at 750ms cannot finish
+    // another 1500ms handshake inside the original 2000ms deadline.
+    for (int mode = 0; mode != (hedged ? 8 : 4); ++mode) {
         const int listener = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -679,6 +682,7 @@ static void test_adaptive_connection_budget()
             std::exit(2);
         std::atomic<bool> stop{false};
         std::atomic<unsigned> accepts{0};
+        std::atomic<unsigned> stalled_closed{0};
         std::thread peer([&] {
             std::vector<std::thread> workers;
             while (!stop.load()) {
@@ -693,13 +697,45 @@ static void test_adaptive_connection_budget()
                     continue;
                 const unsigned index = ++accepts;
                 workers.emplace_back([&, fd, remote, remote_size, index]() mutable {
-                    if (mode == 2 || (mode == 1 && index == 1)) {
-                        while (!stop.load())
-                            std::this_thread::sleep_for(5ms);
+                    if ((mode == 5 && index == 1) || mode == 6 ||
+                        (mode == 7 && index == 1)) {
+                        std::this_thread::sleep_for(150ms);
+                        unsigned char proposal[4];
+                        // Drain the proposal so this is clean EOF, not RST
+                        // caused by closing with unread application input.
+                        const ssize_t received = recv(fd, proposal, sizeof(proposal),
+                                                      MSG_DONTWAIT);
+                        (void)received;
+                        if (mode == 7) {
+                            const unsigned char invalid_version[4]{};
+                            (void)send(fd, invalid_version, sizeof(invalid_version), 0);
+                            std::this_thread::sleep_for(50ms);
+                        }
                         close(fd);
                         return;
                     }
-                    std::this_thread::sleep_for(mode == 0 ? 250ms : 10ms);
+                    if (mode == 2 || (mode == 1 && index == 1)) {
+                        // Observe client cleanup rather than closing the peer
+                        // when the test ends, which would conceal leaked losers.
+                        const auto close_deadline = Clock::now() + 2s;
+                        while (Clock::now() < close_deadline) {
+                            unsigned char greeting[16];
+                            const ssize_t count = recv(fd, greeting, sizeof(greeting),
+                                                       MSG_DONTWAIT);
+                            if (count == 0) {
+                                ++stalled_closed;
+                                break;
+                            }
+                            if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                                errno != EINTR)
+                                break;
+                            std::this_thread::sleep_for(5ms);
+                        }
+                        close(fd);
+                        return;
+                    }
+                    std::this_thread::sleep_for(
+                        mode == 4 ? 1500ms : (mode == 0 || mode >= 5) ? 250ms : 10ms);
                     delete Service::createChannel(fd,
                         reinterpret_cast<sockaddr *>(&remote), remote_size);
                 });
@@ -708,14 +744,17 @@ static void test_adaptive_connection_budget()
                 worker.join();
         });
         const auto started = Clock::now();
-        const auto deadline = started + 1s;
+        const auto deadline = started + (mode == 4 ? 2s : 1s);
         MsgChannel *channel = Service::createChannelRetryUntil(
-            "127.0.0.1", ntohs(address.sin_port), deadline, 100ms,
-            Service::ChannelRetryPolicy::RemainingAfterFirst);
+            "127.0.0.1", ntohs(address.sin_port), deadline,
+            mode == 4 ? 750ms : 100ms,
+            hedged ? Service::ChannelRetryPolicy::HedgeAfterFirst
+                   : Service::ChannelRetryPolicy::RemainingAfterFirst);
         const auto elapsed = Clock::now() - started;
-        REQUIRE((channel != nullptr) == (mode != 2),
+        REQUIRE((channel != nullptr) == (mode != 2 && mode != 6 && mode != 7),
                 "adaptive factory admits slow/live peers and refuses all-stalled peers");
-        REQUIRE(mode == 2 ? elapsed >= 900ms && elapsed < 1400ms
+        REQUIRE(mode == 4 ? elapsed >= 1400ms && elapsed < 1900ms
+                         : mode == 2 ? elapsed >= 900ms && elapsed < 1400ms
                           : elapsed < 900ms,
                 "adaptive factory preserves the unchanged absolute deadline");
 #ifdef TCP_USER_TIMEOUT
@@ -736,6 +775,9 @@ static void test_adaptive_connection_budget()
         close(listener);
         REQUIRE(accepts == (mode == 3 ? 1U : 2U),
                 "adaptive factory uses at most one fresh same-endpoint connection");
+        if (mode == 1 || mode == 2)
+            REQUIRE(stalled_closed == (mode == 1 ? 1U : 2U),
+                    "factory closes stalled loser and every deadline-expired socket");
     }
 
     // Keep a non-listening port reserved, avoiding an ephemeral-port reuse race.
@@ -750,7 +792,7 @@ static void test_adaptive_connection_budget()
     const auto started = Clock::now();
     MsgChannel *channel = Service::createChannelRetryUntil(
         "127.0.0.1", ntohs(address.sin_port), started + 1s, 100ms,
-        Service::ChannelRetryPolicy::RemainingAfterFirst);
+        Service::ChannelRetryPolicy::HedgeAfterFirst);
     REQUIRE(!channel && Clock::now() - started < 500ms,
             "adaptive immediate refusal does not consume or renew the budget");
     delete channel;
@@ -1174,6 +1216,7 @@ int main()
     test_same_endpoint_retry_immediate_success_owns_outer_timeout();
     test_same_endpoint_retry_preserves_immediate_failure();
     test_adaptive_connection_budget();
+    test_adaptive_connection_budget(false);
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();
     test_split_frame_reads();

@@ -1602,7 +1602,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 arm.selected_f_host,
                 static_cast<unsigned short>(arm.selected_f_cache_port), limit,
                 kSourceConnectAttemptBudget,
-                Service::ChannelRetryPolicy::RemainingAfterFirst));
+                Service::ChannelRetryPolicy::HedgeAfterFirst));
             if (!channel)
                 return refused("f-connect");
             if (channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT)

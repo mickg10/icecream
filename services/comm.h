@@ -1396,7 +1396,10 @@ public:
     // deadline.  No application message is sent by this factory.
     // RemainingAfterFirst permits one fresh connection after a stalled first
     // slice, then lets a consistently slow peer use the remaining budget.
-    enum class ChannelRetryPolicy { FixedSlices, RemainingAfterFirst };
+    // HedgeAfterFirst retains the first live handshake while starting at most
+    // one additional connection to the same resolved endpoint. Both share the
+    // original deadline; only the selected winner may carry application data.
+    enum class ChannelRetryPolicy { FixedSlices, RemainingAfterFirst, HedgeAfterFirst };
     static MsgChannel *createChannelRetryUntil(
         const std::string &host, unsigned short p,
         std::chrono::steady_clock::time_point deadline,

@@ -2577,14 +2577,15 @@ void ready_reader_close_after_bind_is_fail_closed() {
     ReapOnFailure cleanup{pid, {&ready[0], &ready[1], &gate[0], &gate[1],
                                &acknowledgement[0]}};
 
-    // The preload gate holds the child immediately before write(READY).  The
-    // visible socket therefore proves bind/listen completed, while the close
-    // below deterministically makes the subsequent write fail with EPIPE.
-    CHECK(wait_for_socket_node(socket, 2000));
+    // Wait for the explicit pre-READY gate using the same startup allowance
+    // as the other subprocess tests, rather than timing process startup with
+    // a filesystem poll. The gate holds the child after bind/listen and before
+    // write(READY); closing the reader below deterministically produces EPIPE.
     struct pollfd gate_seen{acknowledgement[0], POLLIN | POLLHUP, 0};
-    CHECK(::poll(&gate_seen, 1, 2000) > 0);
+    CHECK(::poll(&gate_seen, 1, kStartupReadyTimeoutMilliseconds) > 0);
     char gate_ack = 0;
     CHECK(::read(acknowledgement[0], &gate_ack, 1) == 1 && gate_ack == 1);
+    CHECK(wait_for_socket_node(socket, 2000));
     CHECK(::close(acknowledgement[0]) == 0);
     acknowledgement[0] = -1;
     CHECK(::close(ready[0]) == 0);

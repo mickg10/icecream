@@ -1622,6 +1622,135 @@ MsgChannel *Service::createChannelUntil(
     return channel;
 }
 
+static MsgChannel *create_channel_hedged_until(
+    const string &hostname, unsigned short port,
+    std::chrono::steady_clock::time_point deadline,
+    std::chrono::milliseconds first_budget)
+{
+    using Clock = std::chrono::steady_clock;
+    struct Attempt {
+        int connecting_fd = -1;
+        std::unique_ptr<MsgChannel> channel;
+        ~Attempt() { if (connecting_fd >= 0) close(connecting_fd); }
+    } attempts[2];
+    sockaddr_in address{};
+    const auto hedge_at = std::min(deadline, Clock::now() + first_budget);
+    if (Clock::now() >= deadline)
+        return nullptr;
+    const int first_fd = prepare_connect(hostname, port, address);
+    if (first_fd < 0)
+        return nullptr;
+
+    auto promote = [&](Attempt &attempt) {
+        const int fd = std::exchange(attempt.connecting_fd, -1);
+        attempt.channel.reset(Service::createChannelAccepted(
+            fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)));
+        return attempt.channel && attempt.channel->setTcpUserTimeoutUntil(deadline);
+    };
+    auto start = [&](Attempt &attempt, int fd) {
+        if (fd < 0)
+            return false;
+        attempt.connecting_fd = fd;
+        const int flags = fcntl(fd, F_GETFL);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+            !set_tcp_user_timeout_past_deadline(fd, deadline))
+            return false;
+        const int result = connect(fd, reinterpret_cast<sockaddr *>(&address),
+                                   sizeof(address));
+        if (result == 0)
+            return promote(attempt);
+        return errno == EINPROGRESS || errno == EAGAIN;
+    };
+    if (!start(attempts[0], first_fd))
+        return nullptr;
+    unsigned count = 1;
+    for (;;) {
+        if (Clock::now() >= deadline)
+            return nullptr;
+        for (unsigned i = 0; i != count; ++i) {
+            auto &channel = attempts[i].channel;
+            if (!channel)
+                continue;
+            const auto state = channel->protocol_admission_state();
+            if (state == MsgChannel::ProtocolAdmissionState::Failed) {
+                // After the hedge, a clean EOF on one peer is not evidence
+                // that the surviving peer failed. Retire only that socket;
+                // read_a_bit()/flush_pending() failures below remain
+                // terminal, preserving malformed-protocol rejection.
+                if (count == 2 && channel->at_eof()) {
+                    channel.reset();
+                    continue;
+                }
+                return nullptr;
+            }
+            if (state == MsgChannel::ProtocolAdmissionState::Ready) {
+                if (!channel->finish_protocol_admission() || Clock::now() >= deadline)
+                    return nullptr;
+                return channel.release(); // Other attempt is closed by RAII.
+            }
+        }
+        bool attempt_live = false;
+        for (unsigned i = 0; i != count; ++i) {
+            if (attempts[i].channel || attempts[i].connecting_fd >= 0) {
+                attempt_live = true;
+                break;
+            }
+        }
+        if (!attempt_live)
+            return nullptr;
+        if (count == 1 && Clock::now() >= hedge_at) {
+            // Reuse the resolved address, not a second DNS selection. Never
+            // block on the hedge: the first handshake must keep progressing.
+            const int fd = socket(PF_INET, SOCK_STREAM, 0);
+            if (fd >= 0) {
+                const int enabled = 1;
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+            }
+            if (!start(attempts[1], fd))
+                return nullptr;
+            count = 2;
+        }
+        pollfd descriptors[2]{};
+        for (unsigned i = 0; i != count; ++i) {
+            const auto &attempt = attempts[i];
+            descriptors[i].fd = attempt.channel ? attempt.channel->fd
+                                                : attempt.connecting_fd;
+            descriptors[i].events = attempt.channel ? POLLIN : POLLOUT;
+            if (attempt.channel && attempt.channel->has_pending_write())
+                descriptors[i].events |= POLLOUT;
+        }
+        const int ready = poll(descriptors, count, poll_milliseconds_until(
+            count == 1 ? hedge_at : deadline));
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return nullptr;
+        }
+        for (unsigned i = 0; i != count; ++i) {
+            const short events = descriptors[i].revents;
+            if (!events)
+                continue;
+            auto &attempt = attempts[i];
+            if (events & POLLNVAL)
+                return nullptr;
+            if (!attempt.channel) {
+                int error = 0;
+                socklen_t size = sizeof(error);
+                if (getsockopt(attempt.connecting_fd, SOL_SOCKET, SO_ERROR,
+                               &error, &size) < 0 || error != 0 || !promote(attempt))
+                    return nullptr;
+                continue;
+            }
+            if ((events & POLLOUT) && attempt.channel->has_pending_write() &&
+                !attempt.channel->flush_pending())
+                return nullptr;
+            if ((events & (POLLIN | POLLHUP | POLLERR)) &&
+                !attempt.channel->read_a_bit())
+                return nullptr;
+        }
+    }
+}
+
 MsgChannel *Service::createChannelRetryUntil(
     const string &hostname, unsigned short p,
     std::chrono::steady_clock::time_point deadline,
@@ -1638,6 +1767,8 @@ MsgChannel *Service::createChannelRetryUntil(
 {
     if (attempt_budget <= std::chrono::milliseconds::zero())
         return nullptr;
+    if (policy == ChannelRetryPolicy::HedgeAfterFirst)
+        return create_channel_hedged_until(hostname, p, deadline, attempt_budget);
 
     unsigned int attempt = 0;
     for (;;) {
@@ -1645,8 +1776,9 @@ MsgChannel *Service::createChannelRetryUntil(
         if (started >= deadline)
             return nullptr;
         // Repeating a short slice can starve a reachable peer whose protocol
-        // greeting consistently arrives later than that slice. Source ingress
-        // opts into one short attempt followed by the entire remaining budget.
+        // greeting consistently arrives later than that slice. The retained
+        // RemainingAfterFirst policy gives its second attempt the remainder;
+        // source ingress now uses the progress-preserving hedge above.
         const auto attempt_deadline =
             attempt > 0 && policy == ChannelRetryPolicy::RemainingAfterFirst
                 ? deadline

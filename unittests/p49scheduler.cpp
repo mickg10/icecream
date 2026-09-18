@@ -410,6 +410,8 @@ static pid_t start_cache_routing_scheduler(const std::string &binary, int port,
 
 static bool stop_scheduler(pid_t child)
 {
+    if (child <= 0)
+        return false;
     kill(child, SIGTERM);
     const auto deadline = Clock::now() + std::chrono::seconds(5);
     int status = 0;
@@ -595,6 +597,64 @@ static bool wait_file_contains(const std::string &path,
         usleep(20 * 1000);
     }
     return file_contains(path, needle);
+}
+
+/* Reservation sockets must be released before exec: the production scheduler
+   does not accept inherited listeners. Retry only a confirmed startup bind
+   collision, never a scenario failure or an unexplained readiness timeout. */
+static pid_t start_cache_routing_scheduler_retry(
+    const std::string &binary, const std::string &directory,
+    int *selected_port, std::string *selected_log)
+{
+    const auto deadline = Clock::now() + std::chrono::seconds(8);
+    for (unsigned attempt = 0; attempt != 4 && Clock::now() < deadline; ++attempt) {
+        const int port = reserve_port_pair();
+        if (port == 0) return -1;
+        const std::string suffix = attempt == 0 ? std::string()
+            : ".attempt" + std::to_string(attempt + 1);
+        const std::string log = directory + "/pre-exposure-worker-loss" + suffix + ".log";
+        int injected = -1;
+        if (attempt == 0 && std::getenv("ICECC_TEST_P49_OCCUPY_RESERVED_PORT")) {
+            int ignored = 0;
+            injected = bind_scheduler_port(SOCK_STREAM, port, &ignored);
+            if (injected >= 0 && listen(injected, 1) != 0) {
+                close(injected);
+                injected = -1;
+            }
+            if (injected < 0)
+                return -1;
+        }
+        const pid_t child = start_cache_routing_scheduler(binary, port, log, "strict-nonce");
+        if (child <= 0) {
+            if (injected >= 0) close(injected);
+            return -1;
+        }
+        bool collision = false;
+        bool ready = false;
+        while (Clock::now() < deadline) {
+            collision = file_contains(log, "bind()(Error: Address already in use)");
+            if (collision) break;
+            if (file_contains(log, "scheduler ready, algorithm:")) {
+                ready = true;
+                break;
+            }
+            usleep(20 * 1000);
+        }
+        if (injected >= 0) close(injected);
+        if (collision) {
+            if (!stop_scheduler(child))
+                return -1;
+            continue;
+        }
+        if (!ready) {
+            stop_scheduler(child);
+            return -1;
+        }
+        *selected_port = port;
+        *selected_log = log;
+        return child;
+    }
+    return -1;
 }
 
 static JobDoneMsg job_done_for(const UseCSMsg &use, int exitcode,
@@ -1492,12 +1552,13 @@ static void run_strict_nonce(const std::string &binary,
 static void run_pre_exposure_worker_loss_redispatch(
     const std::string &binary, const std::string &directory)
 {
-    const int port = reserve_port_pair();
-    const std::string log = directory + "/pre-exposure-worker-loss.log";
-    pid_t scheduler = start_cache_routing_scheduler(
-        binary, port, log, "strict-nonce");
+    int port = 0;
+    std::string log;
+    pid_t scheduler = start_cache_routing_scheduler_retry(binary, directory, &port, &log);
     REQUIRE(port != 0 && scheduler > 0,
             "pre-exposure worker-loss scheduler launched");
+    if (port == 0 || scheduler <= 0)
+        return;
 
     int worker_a_port = 0;
     int worker_a_listener = bind_port(0, &worker_a_port);

@@ -12,6 +12,7 @@
 #include "../cache/p50_incarnation_identity.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pwd.h>
@@ -124,13 +125,40 @@ static int connect_raw_tcp(int port)
 {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ::close(fd);
+        return -1;
+    }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(static_cast<uint16_t>(port));
-    if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+    const int connected = ::connect(
+        fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    if (connected < 0 && errno != EINPROGRESS) {
         ::close(fd);
         return -1;
+    }
+    if (connected < 0) {
+        pollfd waiter{fd, POLLOUT, 0};
+        const auto connect_deadline = Clock::now() + std::chrono::milliseconds(250);
+        int ready = -1;
+        while (true) {
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(connect_deadline - Clock::now()).count();
+            if (remaining <= 0) break;
+            ready = ::poll(&waiter, 1, static_cast<int>(remaining));
+            if (ready >= 0 || errno != EINTR) break;
+        }
+        int socket_error = 0;
+        socklen_t socket_error_size = sizeof(socket_error);
+        if (ready <= 0 || ::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                                       &socket_error, &socket_error_size) < 0 ||
+            socket_error != 0) {
+            ::close(fd);
+            return -1;
+        }
     }
     return fd;
 }
@@ -579,6 +607,60 @@ int main(int argc, char **argv)
         wait_attachment_log(log, attach_log_offset, attach_begin_marker, 3000);
     REQUIRE(attach_begin_seen, "attachment handler begins exact authenticated attach");
 
+    // While the authenticated CompileFile remains active, keep a bounded
+    // remote admission burst outstanding and prove that a fresh source-arm
+    // still receives its ACK within the existing four-second budget.  This
+    // uses the real attachment path above as ordinary daemon work; it does
+    // not substitute Ping traffic or assert compile success.
+    constexpr size_t kCompileAdmissionBurstCount = 64;
+    std::vector<int> compile_admission_fds;
+    compile_admission_fds.reserve(kCompileAdmissionBurstCount);
+    for (size_t peer = 0; peer != kCompileAdmissionBurstCount; ++peer) {
+        const int fd = connect_raw_tcp(daemon_port);
+        if (fd < 0) break;
+        compile_admission_fds.push_back(fd);
+    }
+    const uint32_t concurrent_wire_id = attach_wire_id + 1;
+    const uint64_t concurrent_nonce = attach_nonce + 1;
+    const P50SourceArmFields concurrent_arm = source_arm(
+        concurrent_wire_id, attach_epoch, concurrent_nonce,
+        static_cast<uint32_t>(daemon_port), static_cast<uint32_t>(daemon_port));
+    const bool concurrent_prepare = scheduler && scheduler->send_msg(
+        AssignPrepareMsg(attach_epoch, concurrent_wire_id, concurrent_nonce, 1));
+    Msg *concurrent_ready_message = concurrent_prepare
+        ? wait_for_type(scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
+    auto *concurrent_ready = dynamic_cast<AssignReadyMsg *>(concurrent_ready_message);
+    const bool concurrent_ready_valid = concurrent_ready != nullptr &&
+        concurrent_ready->wire_id == concurrent_wire_id &&
+        concurrent_ready->epoch() == attach_epoch &&
+        concurrent_ready->nonce() == concurrent_nonce;
+    delete concurrent_ready_message;
+    MsgChannel *concurrent_source = concurrent_ready_valid
+        ? connect_tcp_bounded(daemon_port, 5000) : nullptr;
+    const auto concurrent_arm_started = Clock::now();
+    const bool concurrent_arm_sent = concurrent_source &&
+        concurrent_source->send_msg(P50SourceArmMsg(concurrent_arm));
+    Msg *concurrent_armed_message = concurrent_arm_sent
+        ? wait_for_type(concurrent_source, Msg::P50_SOURCE_ARMED, 5000) : nullptr;
+    auto *concurrent_armed = dynamic_cast<P50SourceArmedMsg *>(concurrent_armed_message);
+    const auto concurrent_arm_elapsed = std::chrono::duration_cast<
+        std::chrono::milliseconds>(Clock::now() - concurrent_arm_started).count();
+    const bool concurrent_arm_ack = concurrent_armed != nullptr &&
+        concurrent_armed->arm == concurrent_arm && concurrent_arm_elapsed < 4000;
+    delete concurrent_armed_message;
+    delete concurrent_source;
+    for (int fd : compile_admission_fds) ::close(fd);
+    REQUIRE(compile_admission_fds.size() == kCompileAdmissionBurstCount,
+            "remote admission burst remains active during an ordinary CompileFile");
+    REQUIRE(concurrent_prepare && concurrent_ready_valid && concurrent_arm_sent &&
+                concurrent_arm_ack,
+            "source-arm ACK stays within budget during ordinary work and admissions");
+    const bool attachment_still_pending =
+        read_file_suffix(log, attach_log_offset).find(attach_end_marker) ==
+        std::string::npos;
+    REQUIRE(attachment_still_pending,
+            "ordinary CompileFile remains pending during concurrent source admission");
+
     bool attach_resumed = false;
     if (disconnect_pending) {
         delete attach_compile_client;
@@ -739,6 +821,7 @@ int main(int argc, char **argv)
     bool first_arm_sent = false;
     bool first_armed = false;
     bool first_stalled_peer_opened = false;
+    bool first_concurrent_stalled_peers_opened = false;
     bool first_arm_bypassed_stalled_peer = false;
     bool first_cache_session_sent = false;
     bool first_adopted_live = false;
@@ -766,6 +849,7 @@ int main(int argc, char **argv)
         }
 
         int stalled_protocol_fd = -1;
+        std::vector<int> concurrent_stalled_fds;
         Clock::time_point arm_admission_started{};
         if (index == 0) {
             const bool stop_sent = ::kill(daemon_pid, SIGSTOP) == 0;
@@ -773,12 +857,25 @@ int main(int argc, char **argv)
             const bool stopped = stop_sent &&
                 ::waitpid(daemon_pid, &stop_status, WUNTRACED) == daemon_pid &&
                 WIFSTOPPED(stop_status);
+            constexpr size_t kConcurrentStalledPeerCount = 64;
             if (stopped)
                 stalled_protocol_fd = connect_raw_tcp(daemon_port);
+            if (stalled_protocol_fd >= 0) {
+                concurrent_stalled_fds.reserve(kConcurrentStalledPeerCount);
+                for (size_t peer = 0; peer != kConcurrentStalledPeerCount; ++peer) {
+                    const int fd = connect_raw_tcp(daemon_port);
+                    if (fd < 0) break;
+                    concurrent_stalled_fds.push_back(fd);
+                }
+            }
             first_stalled_peer_opened = stalled_protocol_fd >= 0;
+            first_concurrent_stalled_peers_opened =
+                concurrent_stalled_fds.size() == kConcurrentStalledPeerCount;
             const bool resumed = ::kill(daemon_pid, SIGCONT) == 0;
-            if (!stopped || !first_stalled_peer_opened || !resumed) {
+            if (!stopped || !first_stalled_peer_opened ||
+                !first_concurrent_stalled_peers_opened || !resumed) {
                 if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
+                for (int fd : concurrent_stalled_fds) ::close(fd);
                 sequence_valid = false;
                 break;
             }
@@ -792,6 +889,7 @@ int main(int argc, char **argv)
         if (index == 0) first_connected = ordinary != nullptr;
         if (ordinary == nullptr) {
             if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
+            for (int fd : concurrent_stalled_fds) ::close(fd);
             sequence_valid = false;
             break;
         }
@@ -802,6 +900,7 @@ int main(int argc, char **argv)
         if (index == 0) first_arm_sent = arm_sent;
         if (!arm_sent) {
             if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
+            for (int fd : concurrent_stalled_fds) ::close(fd);
             delete ordinary;
             sequence_valid = false;
             break;
@@ -820,6 +919,7 @@ int main(int argc, char **argv)
         }
         delete armed_message;
         if (stalled_protocol_fd >= 0) ::close(stalled_protocol_fd);
+        for (int fd : concurrent_stalled_fds) ::close(fd);
         if (!armed_valid) {
             delete ordinary;
             sequence_valid = false;
@@ -855,6 +955,8 @@ int main(int argc, char **argv)
     REQUIRE(first_arm_sent, "exact source arm entered the production daemon path");
     REQUIRE(first_stalled_peer_opened,
             "silent protocol peer was admitted before the source-arm peer");
+    REQUIRE(first_concurrent_stalled_peers_opened,
+            "concurrent silent protocol peers were queued before the source-arm peer");
     REQUIRE(first_armed,
             "source-arm owner is acknowledged before CACHE_SESSION");
     REQUIRE(first_arm_bypassed_stalled_peer,
