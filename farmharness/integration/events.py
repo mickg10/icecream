@@ -1761,9 +1761,8 @@ class EventProducer:
                     None,
                 )
                 expected_mount = (
-                    "type=tmpfs,"
-                    f"dst={CACHE_DISK_FAULT_PATH},"
-                    f"tmpfs-size={CACHE_DISK_FAULT_BYTES},tmpfs-mode=0700"
+                    f"{CACHE_DISK_FAULT_PATH}:rw,exec,nosuid,nodev,"
+                    f"size={CACHE_DISK_FAULT_BYTES},mode=0700"
                 )
                 if not isinstance(start, Mapping) or expected_mount not in start.get("argv", []):
                     raise UnsupportedEvent(
@@ -2235,6 +2234,26 @@ class EventProducer:
             if isinstance(configured_cache_mount, dict)
             else None
         )
+        # Docker --mount tmpfs defaults to noexec, which prevents environment
+        # verification and compiler execution. New plans explicitly use --tmpfs
+        # exec; authenticate its exact bounded options, not merely a tmpfs type.
+        start = next(
+            (item for item in self.plan["commands"]
+             if item.get("instance") == name
+             and str(item.get("phase", "")).startswith("up.start-")),
+            {},
+        )
+        if "--tmpfs" in start.get("argv", []):
+            configured_tmpfs = document.get("HostConfig", {}).get("Tmpfs", {})
+            expected_options = (
+                f"rw,exec,nosuid,nodev,size={CACHE_DISK_FAULT_BYTES},mode=0700"
+            )
+            tmpfs_options = (
+                {"SizeBytes": CACHE_DISK_FAULT_BYTES, "Mode": 0o700}
+                if isinstance(configured_tmpfs, dict)
+                and configured_tmpfs.get(CACHE_DISK_FAULT_PATH) == expected_options
+                else None
+            )
         cache_fault_mount = (
             {
                 "destination": CACHE_DISK_FAULT_PATH,

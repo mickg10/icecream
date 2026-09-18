@@ -1920,6 +1920,10 @@ class DiskFillRecorder(EventRecorder):
                             }
                         ],
                         "HostConfig": {
+                            "Tmpfs": {
+                                CACHE_DISK_FAULT_PATH:
+                                f"rw,exec,nosuid,nodev,size={CACHE_DISK_FAULT_BYTES},mode=0700"
+                            },
                             "Mounts": [
                                 {
                                     "Target": CACHE_DISK_FAULT_PATH,
@@ -1945,6 +1949,48 @@ class DiskFillRecorder(EventRecorder):
         if command.phase == "event.disk-fill":
             return CommandResult(0, json.dumps(_disk_fill_operation()), "")
         return CommandResult(0, "", "")
+
+
+@pytest.mark.parametrize("mutation", ("noexec", "missing", "size", "mode"))
+def test_disk_fill_rejects_nonexecuting_or_unbounded_tmpfs(
+    tmp_path: Path, mutation: str,
+) -> None:
+    farm, scenario, _plan = _fixture(tmp_path)
+    scenario.data["timeline"] = [
+        {"trigger": "t+0", "action": "disk_fill", "instance": "F1"}
+    ]
+    plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
+
+    class TamperedMount(DiskFillRecorder):
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            result = super().invoke(command)
+            if command.phase != "event.authenticate":
+                return result
+            document = json.loads(result.stdout)
+            mounts = document["HostConfig"]["Tmpfs"]
+            options = mounts[CACHE_DISK_FAULT_PATH]
+            if mutation == "missing":
+                del mounts[CACHE_DISK_FAULT_PATH]
+            else:
+                before, after = {
+                    "noexec": ("exec", "noexec"),
+                    "size": (str(CACHE_DISK_FAULT_BYTES), "268435456"),
+                    "mode": ("0700", "0777"),
+                }[mutation]
+                mounts[CACHE_DISK_FAULT_PATH] = options.replace(before, after)
+            return CommandResult(0, json.dumps(document), "")
+
+    recorder = TamperedMount()
+    producer = EventProducer(
+        farm, scenario, plan, recorder=RecordingTransport(recorder),
+        event_path=tmp_path / "events.json", deadline_s=2, poll_interval_s=0.01,
+    )
+    producer.start()
+    with pytest.raises(EventError, match="authenticated bounded cache tmpfs"):
+        producer.wait()
+    with pytest.raises(EventError, match="authenticated bounded cache tmpfs"):
+        producer.stop()
+    assert not any(c.phase == "event.disk-fill" for c in recorder.commands)
 
 
 def test_disk_fill_uses_only_the_fixed_bounded_cache_tmpfs_and_records_enospc(
@@ -1992,9 +2038,8 @@ def test_disk_fill_uses_only_the_fixed_bounded_cache_tmpfs_and_records_enospc(
         if item["phase"] == "up.start-f" and item["instance"] == "F1"
     )
     assert (
-        "type=tmpfs,"
-        f"dst={CACHE_DISK_FAULT_PATH},"
-        f"tmpfs-size={CACHE_DISK_FAULT_BYTES},tmpfs-mode=0700"
+        f"{CACHE_DISK_FAULT_PATH}:rw,exec,nosuid,nodev,"
+        f"size={CACHE_DISK_FAULT_BYTES},mode=0700"
     ) in start["argv"]
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan) == [
         producer.records[0].as_dict()

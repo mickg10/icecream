@@ -765,10 +765,9 @@ def _planned_commands(
             if target == CACHE_DISK_FAULT_PATH and instance["name"] in disk_fill_targets:
                 args.extend(
                     (
-                        "--mount",
-                        "type=tmpfs,"
-                        f"dst={CACHE_DISK_FAULT_PATH},"
-                        f"tmpfs-size={CACHE_DISK_FAULT_BYTES},tmpfs-mode=0700",
+                        "--tmpfs",
+                        f"{CACHE_DISK_FAULT_PATH}:rw,exec,nosuid,nodev,"
+                        f"size={CACHE_DISK_FAULT_BYTES},mode=0700",
                     )
                 )
             else:

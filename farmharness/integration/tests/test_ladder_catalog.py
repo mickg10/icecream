@@ -435,8 +435,8 @@ def test_s95_disk_fill_mount_is_bounded_and_only_replaces_the_target_cache() -> 
         if item["phase"] == "up.start-f"
     }
     bounded = (
-        "type=tmpfs,dst=/var/cache/icecream,"
-        "tmpfs-size=134217728,tmpfs-mode=0700"
+        "/var/cache/icecream:rw,exec,nosuid,nodev,"
+        "size=134217728,mode=0700"
     )
     assert bounded in starts["F1"]
     assert bounded not in starts["F2"]
