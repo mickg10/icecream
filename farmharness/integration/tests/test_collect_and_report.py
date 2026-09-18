@@ -4048,6 +4048,7 @@ def test_live_network_diagnostics_precede_stop(tmp_path: Path, monkeypatch) -> N
     from farmharness.integration import lifecycle
 
     farm, scenario, plan, root = _raw_collection(tmp_path)
+    plan["worker_endpoint_contract"] = "icefarm-live-bridge-endpoint-v1"
     monkeypatch.setattr(lifecycle, "_netem_bindings", lambda _: (SimpleNamespace(instance="F1"),))
 
     class ShapedCollection(_LiveCollection):
@@ -4063,6 +4064,9 @@ def test_live_network_diagnostics_precede_stop(tmp_path: Path, monkeypatch) -> N
 
     recorder = RecordingTransport(ShapedCollection(plan, root))
     _snapshot_live_evidence(farm, plan, tmp_path / "snapshot", recorder)
+    host = next(item["host"] for item in plan["topology"]["instances"] if item["name"] == "F1")
+    live = json.loads((tmp_path / "snapshot" / "diagnostics" / host / "F1.live-inspect").read_text())
+    assert live["State"]["Running"] is True
     phases = [command.phase for command in recorder.commands]
     assert phases.count("diagnostics.tc") == 1
     assert phases.index("diagnostics.tc") < phases.index("collect.stop")

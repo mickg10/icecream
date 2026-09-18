@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -444,6 +445,8 @@ def _snapshot_live_evidence(
             container_ids[name] = container_id
             host_diagnostics = diagnostics / host
             host_diagnostics.mkdir(parents=True, exist_ok=True)
+            if plan.get("worker_endpoint_contract") == "icefarm-live-bridge-endpoint-v1":
+                _atomic_json(host_diagnostics / f"{name}.live-inspect", document)
             running = document.get("State", {}).get("Running")
             if name in stopped_instances:
                 if running is not False:
@@ -5741,7 +5744,10 @@ def _legacy_wire_binding_marker(
     return next(iter(unique)) if unique else None
 
 
-def _endpoint_workers(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _endpoint_workers(
+    plan: dict[str, Any], scenario: ScenarioSpec | None = None,
+    evidence: Path | None = None,
+) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for instance in plan["topology"]["instances"]:
         if instance["role"] != "F":
@@ -5752,6 +5758,47 @@ def _endpoint_workers(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if endpoint in result:
             raise CollectError(f"duplicate worker endpoint {endpoint}")
         result[endpoint] = instance
+    if plan.get("worker_endpoint_contract") == "icefarm-live-bridge-endpoint-v1":
+        if scenario is None or evidence is None:
+            raise CollectError("bridge endpoints require retained authenticated evidence")
+        shaping = _network_shaping_observation(scenario, plan, evidence)
+        if shaping is None:
+            raise CollectError("bridge endpoint contract requires shaping")
+        by_name = {item["name"]: item for item in plan["topology"]["instances"]}
+        for record in shaping["bindings"]:
+            instance = by_name[record["instance"]]
+            request = record["request"]
+            directory = evidence / "diagnostics" / instance["host"]
+            live = _read_json(directory / f"{instance['name']}.live-inspect")
+            stopped = _read_json(directory / f"{instance['name']}.inspect")
+            labels = live.get("Config", {}).get("Labels", {})
+            networks = live.get("NetworkSettings", {}).get("Networks", {})
+            network = networks.get(request["bridge"], {})
+            container_id = live.get("Id")
+            if (
+                instance["role"] != "F"
+                or not isinstance(container_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+                or stopped.get("Id") != container_id
+                or labels.get("icefarm.run") != plan["run_id"]
+                or labels.get("icefarm.instance") != instance["name"]
+                or live.get("State", {}).get("Running") is not True
+                or live.get("HostConfig", {}).get("NetworkMode") != request["bridge"]
+                or set(networks) != {request["bridge"]}
+                or network.get("NetworkID") != record["bridge"]["network_id"]
+                or request["container_port"] != plan["ports"]["instances"][instance["name"]]
+            ):
+                raise CollectError("bridge endpoint container/network identity mismatch")
+            try:
+                address = ipaddress.IPv4Address(network.get("IPAddress", ""))
+            except ipaddress.AddressValueError as exc:
+                raise CollectError("bridge endpoint has no valid live IPv4 address") from exc
+            if address.is_unspecified or address.is_loopback or address.is_multicast:
+                raise CollectError("bridge endpoint address is not unicast")
+            endpoint = f"{address}:{request['container_port']}"
+            if endpoint in result and result[endpoint] is not instance:
+                raise CollectError(f"duplicate worker endpoint {endpoint}")
+            result[endpoint] = instance
     return result
 
 
@@ -5862,7 +5909,7 @@ def _parse_rows(
     topology = plan["topology"]["instances"]
     retry_decisions = _scheduler_retry_decisions(evidence, plan)
     by_name = {item["name"]: item for item in topology}
-    workers = _endpoint_workers(plan)
+    workers = _endpoint_workers(plan, scenario, evidence)
     attachments = _worker_attachments(evidence, topology)
     f_commits = {
         item["name"]: _action_commits(
@@ -6638,7 +6685,7 @@ def _canary_assignment_claims(
 ) -> list[dict[str, Any]]:
     """Authenticate the readiness dispatches which precede every workload."""
 
-    workers = _endpoint_workers(plan)
+    workers = _endpoint_workers(plan, scenario, evidence)
     claims: list[dict[str, Any]] = []
     worker_instances = sorted(
         (item for item in plan["topology"]["instances"] if item["role"] == "F"),
@@ -8677,4 +8724,11 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
         raise CollectError("bundle derived values differ from immutable evidence")
     if bundle.get("event_log") != events:
         raise CollectError("bundle event log differs from immutable evidence")
+    if plan.get("worker_endpoint_contract") == "icefarm-live-bridge-endpoint-v1":
+        scenario = ScenarioSpec(
+            path=path / "evidence" / "specs" / "scenario.json", data=bundle["scenario"]
+        )
+        reparsed, _facts = _parse_rows(scenario, plan, path / "evidence", events)
+        if reparsed != rows:
+            raise CollectError("bridge endpoint rows differ from retained raw evidence")
     return bundle

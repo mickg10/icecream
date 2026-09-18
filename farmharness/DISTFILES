@@ -144,6 +144,7 @@ farmharness/integration/tests/test_live_lock.py
 farmharness/integration/tests/test_make_surface.py
 farmharness/integration/tests/test_mutant.py
 farmharness/integration/tests/test_netem.py
+farmharness/integration/tests/test_node_netem_dependency.py
 farmharness/integration/tests/test_orchestration.py
 farmharness/integration/tests/test_performance.py
 farmharness/integration/tests/test_resolver_v2.py

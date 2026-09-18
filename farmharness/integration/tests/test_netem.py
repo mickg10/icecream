@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from farmharness.integration import farmtest, lifecycle
-from farmharness.integration.collect import _network_shaping_observation
+from farmharness.integration.collect import (
+    CollectError, _endpoint_workers, _network_shaping_observation,
+)
 from farmharness.integration.images import CommandFactory
 from farmharness.integration.lifecycle import LifecycleError, bring_up
 from farmharness.integration.lifecycle import _netem_up_receipt
@@ -69,6 +71,69 @@ def _applied_receipt(scenario, plan):
         [command("up.netem-apply")],
         [command("up.netem-observe")],
     )
+
+
+@pytest.mark.parametrize("mutation", [
+    None, "missing-live", "container", "run", "instance", "stopped", "mode",
+    "network", "extra-network", "empty-ip", "loopback", "collision",
+])
+def test_bridge_endpoint_requires_live_bound_identity(tmp_path: Path, mutation) -> None:
+    _farm, scenario, plan = _shaped_plan(tmp_path)
+    receipt = _applied_receipt(scenario, plan)
+    binding = receipt["bindings"][0]
+    worker = next(item for item in plan["topology"]["instances"] if item["name"] == "F1")
+    root = tmp_path / "evidence"
+    directory = root / "diagnostics" / worker["host"]
+    directory.mkdir(parents=True)
+    (root / "receipts").mkdir()
+    (root / "receipts" / "lifecycle.json").write_text(json.dumps({"network_shaping": receipt}))
+    bridge = binding["request"]["bridge"]
+    live = {
+        "Id": "b" * 64,
+        "Config": {"Labels": {"icefarm.run": plan["run_id"], "icefarm.instance": "F1"}},
+        "State": {"Running": True},
+        "HostConfig": {"NetworkMode": bridge},
+        "NetworkSettings": {"Networks": {bridge: {
+            "NetworkID": "a" * 64, "IPAddress": "172.18.0.2",
+        }}},
+    }
+    stopped = {"Id": "b" * 64}
+    if mutation == "container":
+        stopped["Id"] = "c" * 64
+    if mutation in {"run", "instance"}:
+        live["Config"]["Labels"]["icefarm." + mutation] = "wrong"
+    if mutation == "stopped":
+        live["State"]["Running"] = False
+    if mutation == "mode":
+        live["HostConfig"]["NetworkMode"] = "host"
+    if mutation == "network":
+        live["NetworkSettings"]["Networks"][bridge]["NetworkID"] = "c" * 64
+    if mutation == "extra-network":
+        live["NetworkSettings"]["Networks"]["unexpected"] = {}
+    if mutation in {"empty-ip", "loopback"}:
+        live["NetworkSettings"]["Networks"][bridge]["IPAddress"] = (
+            "" if mutation == "empty-ip" else "127.0.0.1"
+        )
+    if mutation == "collision":
+        other = copy.deepcopy(worker)
+        other.update(name="F99", address="172.18.0.2")
+        plan["topology"]["instances"].append(other)
+        plan["ports"]["instances"]["F99"] = plan["ports"]["instances"]["F1"]
+    if mutation != "missing-live":
+        (directory / "F1.live-inspect").write_text(json.dumps(live))
+    (directory / "F1.inspect").write_text(json.dumps(stopped))
+    if mutation is not None:
+        with pytest.raises(CollectError):
+            _endpoint_workers(plan, scenario, root)
+    else:
+        workers = _endpoint_workers(plan, scenario, root)
+        port = plan["ports"]["instances"]["F1"]
+        assert workers[f"172.18.0.2:{port}"] is worker
+        assert workers[f"{worker['address']}:{port}"] is worker
+        assert f"172.18.0.99:{port}" not in workers
+        # Historical plans do not acquire aliases from untrusted extra evidence.
+        del plan["worker_endpoint_contract"]
+        assert f"172.18.0.2:{port}" not in _endpoint_workers(plan, scenario, root)
 
 
 def test_shaped_worker_uses_private_bridge_and_container_tc_only(tmp_path: Path) -> None:
