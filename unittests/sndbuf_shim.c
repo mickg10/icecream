@@ -36,6 +36,8 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static int env_int(const char *name)
 {
@@ -60,6 +62,9 @@ static int shrink(int fd)
                         "backpressure scenario will not engage\n");
             }
         }
+        bytes = env_int("ICECC_TEST_CONNECT_SNDBUF");
+        if (bytes > 0)
+            (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
     }
     errno = saved_errno;
     return fd;
@@ -102,6 +107,9 @@ int socket(int domain, int type, int protocol)
         int bytes = env_int("ICECC_TEST_RCVBUF");
         if (bytes > 0)
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+        bytes = env_int("ICECC_TEST_CONNECT_SNDBUF");
+        if (bytes > 0)
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
     }
     errno = saved_errno;
     return fd;
@@ -118,4 +126,34 @@ int setsockopt(int fd, int level, int optname, const void *optval, socklen_t opt
         return 0;
 #endif
     return real_setsockopt(fd, level, optname, optval, optlen);
+}
+
+/* Optional evidence hook for the real-daemon scheduler backpressure test.
+   It is disabled unless the test supplies a marker path. */
+ssize_t send(int fd, const void *buf, size_t len, int flags)
+{
+    static ssize_t (*real_send)(int, const void *, size_t, int);
+    if (!real_send)
+        real_send = must_dlsym("send");
+    const ssize_t result = real_send(fd, buf, len, flags);
+    const int saved_errno = errno;
+    if (result < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
+        const char *marker = getenv("ICECC_TEST_SEND_EAGAIN_MARKER");
+        const int scheduler_port = env_int("ICECC_TEST_BACKPRESSURE_SCHED_PORT");
+        struct sockaddr_in peer;
+        socklen_t peer_size = sizeof(peer);
+        const int scheduler_socket = scheduler_port > 0 &&
+            getpeername(fd, (struct sockaddr *)&peer, &peer_size) == 0 &&
+            peer.sin_family == AF_INET && ntohs(peer.sin_port) == scheduler_port;
+        if (marker && *marker && scheduler_socket) {
+            const int marker_fd = open(marker, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            if (marker_fd >= 0) {
+                const char line = '1';
+                (void)write(marker_fd, &line, 1);
+                close(marker_fd);
+            }
+        }
+    }
+    errno = saved_errno;
+    return result;
 }

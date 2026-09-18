@@ -59,6 +59,12 @@ static int listen_ephemeral(int *port)
         ::close(fd);
         return -1;
     }
+    if (const char *bytes = ::getenv("ICECC_TEST_SCHEDULER_RCVBUF");
+        bytes != nullptr && *bytes != '\0') {
+        const int value = std::atoi(bytes);
+        if (value > 0)
+            (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value));
+    }
     socklen_t size = sizeof(address);
     if (::getsockname(fd, reinterpret_cast<sockaddr *>(&address), &size) != 0) {
         ::close(fd);
@@ -462,6 +468,10 @@ int main(int argc, char **argv)
     const std::string runtime = work + "/runtime";
     const std::string local_socket = work + "/iceccd.sock";
     const std::string log = work + "/iceccd.log";
+    if (::getenv("ICECC_TEST_SCHEDULER_BACKPRESSURE") != nullptr) {
+        const std::string marker = work + "/scheduler-send-eagain";
+        ::setenv("ICECC_TEST_SEND_EAGAIN_MARKER", marker.c_str(), 1);
+    }
     REQUIRE(::chown(work.c_str(), icecc->pw_uid, icecc->pw_gid) == 0
                 && ::chmod(work.c_str(), 0700) == 0,
             "temporary root belongs only to the daemon identity");
@@ -488,6 +498,12 @@ int main(int argc, char **argv)
         std::snprintf(public_port, sizeof(public_port), "%d", daemon_port);
         ::setenv("ICECC_TESTS", "1", 1);
         ::setenv("ICECC_TEST_SOCKET", local_socket.c_str(), 1);
+        char scheduler_port_text[16];
+        std::snprintf(scheduler_port_text, sizeof(scheduler_port_text), "%d", scheduler_port);
+        ::setenv("ICECC_TEST_BACKPRESSURE_SCHED_PORT", scheduler_port_text, 1);
+        if (const char *shim = ::getenv("ICECC_TEST_SNDBUF_SHIM");
+            shim != nullptr && *shim != '\0')
+            ::setenv("LD_PRELOAD", shim, 1);
         ::execl(argv[1], argv[1], "-p", public_port, "-m", "1",
                 "-s", scheduler, "-n", "p50-daemon-positive", "-N", "p50-f",
                 "-b", envdir.c_str(), "-l", log.c_str(),
@@ -991,6 +1007,102 @@ int main(int argc, char **argv)
     REQUIRE(spurious_login == nullptr,
             "accepted handoff keeps the READY advertisement stable");
     delete spurious_login;
+
+    if (std::getenv("ICECC_TEST_SCHEDULER_BACKPRESSURE") != nullptr) {
+        /*
+         * This is deliberately opt-in: the fake scheduler stops reading its
+         * established socket while the daemon processes authenticated
+         * AssignPrepare requests.  AssignReady is emitted through the real
+         * Daemon::send_scheduler() path, so a full scheduler receive window
+         * exercises the same blocking flush as compile completion.  A fresh
+         * protocol peer must still receive the daemon's greeting within the
+         * existing five-second admission budget.
+         *
+         * The test is expected to fail against a daemon that blocks in
+         * flush_writebuf(); the isolated daemon is terminated after the
+         * bounded probe so the flood thread cannot outlive this test.
+         */
+        constexpr size_t kFloodCount = 20000;
+        std::atomic<size_t> flood_sent{0};
+        std::atomic<bool> flood_started{false};
+        std::thread flood([&] {
+            flood_started.store(true);
+            for (size_t index = 0; index != kFloodCount; ++index) {
+                const uint32_t wire_id = static_cast<uint32_t>(0x7f000000u + index);
+                const uint64_t nonce = UINT64_C(0x7f00000000000001) + index;
+                if (!scheduler || !scheduler->send_msg(
+                        AssignPrepareMsg(epoch, wire_id, nonce, 1)))
+                    break;
+                ++flood_sent;
+            }
+        });
+        while (!flood_started.load()) ::usleep(1000);
+        const char *eagain_marker = std::getenv("ICECC_TEST_SEND_EAGAIN_MARKER");
+        const auto eagain_deadline = Clock::now() + std::chrono::milliseconds(5000);
+        while (eagain_marker && *eagain_marker && Clock::now() < eagain_deadline) {
+            std::error_code marker_error;
+            if (std::filesystem::file_size(eagain_marker, marker_error) > 0 &&
+                !marker_error)
+                break;
+            ::usleep(10000);
+        }
+        std::error_code eagain_error;
+        const uintmax_t eagain_count = eagain_marker && *eagain_marker
+            ? std::filesystem::file_size(eagain_marker, eagain_error) : 0;
+        const bool observed_backpressure = !eagain_error && eagain_count > 0;
+        MsgChannel *probe = observed_backpressure ? Service::createChannelUntil(
+            "127.0.0.1", static_cast<unsigned short>(daemon_port),
+            Clock::now() + std::chrono::milliseconds(5000)) : nullptr;
+        const bool greeting_valid = probe != nullptr;
+        delete probe;
+        REQUIRE(flood_sent.load() > 0,
+                "scheduler backpressure flood entered the real daemon path");
+        REQUIRE(observed_backpressure,
+                "child daemon observed send-side EAGAIN under scheduler backpressure");
+        REQUIRE(greeting_valid,
+                "fresh protocol admission completes within five seconds after confirmed scheduler backpressure");
+        if (greeting_valid && observed_backpressure) {
+            flood.join();
+            REQUIRE(flood_sent.load() == kFloodCount,
+                    "finite scheduler input flood completed without loss");
+            if (::getenv("ICECC_TEST_SCHEDULER_BACKPRESSURE_EXPIRE") != nullptr) {
+                REQUIRE(wait_attachment_log(log, 0,
+                            "scheduler deferred output deadline expired", 33000),
+                        "silent scheduler backlog expires on its existing deadline");
+            } else {
+                size_t replies = 0;
+                bool intact = true;
+                const auto drain_deadline = Clock::now() + std::chrono::seconds(25);
+                while (replies < kFloodCount && Clock::now() < drain_deadline) {
+                    Msg *reply = scheduler->get_msg(1, true);
+                    if (!reply) {
+                        if (scheduler->at_eof()) break;
+                        continue;
+                    }
+                    if (*reply == Msg::ASSIGN_READY) {
+                        const auto *ready = dynamic_cast<const AssignReadyMsg *>(reply);
+                        intact = intact && ready && ready->epoch() == epoch &&
+                            ready->wire_id == static_cast<uint32_t>(0x7f000000u + replies) &&
+                            ready->nonce() == UINT64_C(0x7f00000000000001) + replies;
+                        ++replies;
+                    }
+                    delete reply;
+                }
+                REQUIRE(intact && replies == kFloodCount,
+                        "all deferred scheduler replies drain intact in FIFO order");
+            }
+        }
+        ::kill(daemon_pid, SIGKILL);
+        int backpressure_status = 0;
+        (void)::waitpid(daemon_pid, &backpressure_status, 0);
+        if (flood.joinable()) flood.join();
+        delete scheduler;
+        ::close(scheduler_listener);
+        std::fprintf(stderr, "retained backpressure work directory: %s; marker=%s; count=%ju; sent=%zu\n",
+                     work.c_str(), eagain_marker ? eagain_marker : "missing",
+                     eagain_count, flood_sent.load());
+        return failures ? 1 : 0;
+    }
 
     const int shutdown_pending_fd = connect_raw_tcp(daemon_port);
     ::usleep(50 * 1000);

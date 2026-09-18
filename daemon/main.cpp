@@ -1656,6 +1656,7 @@ struct Daemon {
     void determine_supported_features();
     bool maybe_stats(bool force_check = false);
     bool send_scheduler(const Msg &msg) __attribute_warn_unused_result__;
+    bool expire_scheduler_output();
     void record_waitforcs_latency(bool use_cs, uint64_t latency_msec);
     void close_scheduler(bool orderly_shutdown = false);
     bool finish_scheduler_loss_if_needed();
@@ -4497,12 +4498,41 @@ bool Daemon::send_scheduler(const Msg& msg)
         return false;
     }
 
-    if (!scheduler->send_msg(msg)) {
+    // A scheduler that stops reading must not hold the shared daemon loop
+    // inside a blocking send (and starve public protocol admission). Success
+    // means committed to this session's FIFO, not acknowledged by S. All
+    // subsequent lifecycle/advertisement frames use this same queue; loss
+    // discards the queue with the existing generation cleanup.
+    // Bound retained backlog at 4 MiB. Serialization can transiently add
+    // one protocol-bounded frame before the post-send overflow check closes
+    // the channel; this is not an unbounded producer queue.
+    constexpr size_t pending_limit = 4 * 1024 * 1024;
+    if ((scheduler->deferred_output_armed() &&
+         monotonic_msec() >= scheduler->deferred_output_deadline_msec()) ||
+        scheduler->pending_bytes() >= pending_limit) {
+        log_warning() << "scheduler output backlog exhausted" << endl;
+        close_scheduler();
+        return false;
+    }
+    if (!scheduler->send_msg(msg, MsgChannel::SendNonBlocking |
+                                  MsgChannel::SendDeferrable) ||
+        scheduler->pending_bytes() > pending_limit) {
         log_error() << "sending message to scheduler failed.." << endl;
         close_scheduler();
         return false;
     }
 
+    return true;
+}
+
+bool Daemon::expire_scheduler_output()
+{
+    if (!scheduler || !scheduler->deferred_output_armed() ||
+        monotonic_msec() < scheduler->deferred_output_deadline_msec())
+        return false;
+    log_warning() << "scheduler deferred output deadline expired" << endl;
+    close_scheduler();
+    (void)finish_scheduler_loss_if_needed();
     return true;
 }
 
@@ -10196,6 +10226,8 @@ void Daemon::service_pending_client_admissions_now()
 
 void Daemon::answer_client_requests()
 {
+    if (expire_scheduler_output())
+        return;
 #ifdef ICECC_DEBUG
 
     if (clients.size() + current_kids) {
@@ -10481,6 +10513,8 @@ void Daemon::answer_client_requests()
     if (scheduler) {
         pfd.fd = scheduler->fd;
         pfd.events = POLLIN;
+        if (scheduler->has_pending_write())
+            pfd.events |= POLLOUT;
         pollfds.push_back(pfd);
     } else if (discover && discover->listen_fd() >= 0) {
         /* We don't explicitely check for discover->get_fd() being in
@@ -10507,6 +10541,15 @@ void Daemon::answer_client_requests()
         cache_adapter->outer_append_pollfds(pollfds);
 
     int poll_timeout_msec = max_scheduler_pong * 1000;
+    if (scheduler && scheduler->deferred_output_armed()) {
+        const uint64_t now = monotonic_msec();
+        const uint64_t deadline = scheduler->deferred_output_deadline_msec();
+        const int remaining = deadline > now
+            ? static_cast<int>(std::min<uint64_t>(deadline - now,
+                  std::numeric_limits<int>::max())) : 0;
+        if (poll_timeout_msec < 0 || remaining < poll_timeout_msec)
+            poll_timeout_msec = remaining;
+    }
     for (const auto& entry : clients) {
         const auto& attachment = entry.second->p50_attachment;
         if (!attachment) continue;
@@ -10626,6 +10669,8 @@ void Daemon::answer_client_requests()
 
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
+    if (expire_scheduler_output())
+        return;
     if (ret < 0 && errno != EINTR) {
         log_perror("poll");
         close_scheduler();
@@ -10733,6 +10778,12 @@ void Daemon::answer_client_requests()
     }
 
     if (ret > 0) {
+        if (scheduler && pollfd_is_set(pollfds, scheduler->fd, POLLOUT) &&
+            !scheduler->flush_pending()) {
+            close_scheduler();
+            (void)finish_scheduler_loss_if_needed();
+            return;
+        }
         if (scheduler && pollfd_is_set(pollfds, scheduler->fd, POLLIN)) {
             /* A handler in this loop (e.g. scheduler_use_cs -> handle_end ->
                a failed compensating send_scheduler) can call close_scheduler()
