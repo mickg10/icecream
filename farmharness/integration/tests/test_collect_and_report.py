@@ -2095,8 +2095,13 @@ def test_failed_transport_without_result_identity_collects_as_fail(
     assert verify_bundle(root)["status"] == "FAIL"
 
 
+@pytest.mark.parametrize("interval", (
+    False, True, "missing", "wrong-id", "wrong-host", "wrong-instance",
+    "wrong-name", "wrong-signal", "wrong-schema", "reversed", "boolean-time",
+    "after-event", "no-overlap", "retained-id", "retained-label",
+))
 def test_killed_worker_result_stream_loss_collects_without_inventing_success(
-    tmp_path: Path,
+    tmp_path: Path, interval: bool | str,
 ) -> None:
     """A real scheduler STOP and client EOF are compatible loss witnesses."""
     farm, scenario, old_plan, root = _raw_collection(tmp_path)
@@ -2105,6 +2110,16 @@ def test_killed_worker_result_stream_loss_collects_without_inventing_success(
         {"action": "kill -9", "instance": "F1", "trigger": "job 2"}
     ]
     plan = farmtest.build_plan(farm, scenario, run_id=old_plan["run_id"])
+    if not interval:
+        plan.pop("kill_timing_contract")  # Retained pre-interval plan semantics.
+    worker = next(i for i in plan["topology"]["instances"] if i["name"] == "F1")
+    inspect = json.loads((root / "diagnostics" / worker["host"] / "F1.inspect").read_text())
+    if interval:
+        inspect.update(Id="3" * 64, Name=f"/icefarm-{plan['run_id']}-F1")
+        inspect.setdefault("Config", {})["Labels"] = {
+            "icefarm.run": plan["run_id"], "icefarm.instance": "F1",
+        }
+        _write_json(root / "diagnostics" / worker["host"] / "F1.inspect", inspect)
     for name in ("preflight", "lifecycle", "workload"):
         path = root / f"{name}.json"
         receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -2118,8 +2133,16 @@ def test_killed_worker_result_stream_loss_collects_without_inventing_success(
         {"events": [{
             "action": "kill -9", "instance": "F1", "trigger": "job 2",
             "event_epoch": 1, "event_index": 0,
-            "fired_ms": 1_788_570_005_500, "last_dispatched_job": 2,
+            "fired_ms": 1_788_570_006_500 if interval else 1_788_570_005_500,
+            "last_dispatched_job": 2,
             "workload_dispatch_count": 1,
+            **({"receipt": {
+                "schema": "icefarm-kill-interval-v1", "instance": "F1",
+                "host": worker["host"], "container_id": inspect["Id"],
+                "container_name": inspect["Name"], "signal": "KILL",
+                "started_ms": 1_788_570_005_500,
+                "completed_ms": 1_788_570_006_500,
+            }} if interval else {}),
         }]},
     )
     scheduler = next(i for i in plan["topology"]["instances"] if i["role"] == "S")
@@ -2129,8 +2152,41 @@ def test_killed_worker_result_stream_loss_collects_without_inventing_success(
     ), encoding="utf-8")
     result = root / "C1.results" / "workload" / "jobs" / "000001" / "result.tsv"
     fields = result.read_text(encoding="utf-8").rstrip("\n").split("\t")
-    fields[7] = "1788570006000"
+    fields[7] = "1788570007000"
     result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+
+    if isinstance(interval, str):
+        event_path = root / "events" / "events.json"
+        document = json.loads(event_path.read_text())
+        event = document["events"][0]
+        changes = {
+            "wrong-id": ("container_id", "4" * 64),
+            "wrong-host": ("host", "unplanned-host"),
+            "wrong-instance": ("instance", "F2"),
+            "wrong-name": ("container_name", "/wrong-container"),
+            "wrong-signal": ("signal", "TERM"),
+            "wrong-schema": ("schema", "unknown"),
+            "reversed": ("started_ms", 1_788_570_006_501),
+            "boolean-time": ("started_ms", True),
+            "after-event": ("completed_ms", 1_788_570_006_501),
+            "no-overlap": ("started_ms", 1_788_570_006_000),
+        }
+        if interval == "missing":
+            del event["receipt"]
+        elif interval in changes:
+            key, value = changes[interval]
+            event["receipt"][key] = value
+        else:
+            if interval == "retained-id":
+                inspect["Id"] = "4" * 64
+            else:
+                inspect["Config"]["Labels"]["icefarm.run"] = "another-run"
+            _write_json(root / "diagnostics" / worker["host"] / "F1.inspect", inspect)
+        _write_json(event_path, document)
+        with pytest.raises(CollectError):
+            collect_bundle(farm, scenario, plan, sync_remote=False)
+        assert not (root / "bundle.json").exists()
+        return
 
     bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
 
@@ -3174,6 +3230,21 @@ def _orphan_recovery_job() -> dict[str, object]:
         "row_job_id": "C1:A:1:3",
         "started": 1_000,
     }
+
+
+@pytest.mark.parametrize("start,end,accepted", ((1500, 2500, True), (2100, 2500, False)))
+def test_orphan_kill_interval_overlaps_assignment(start: int, end: int, accepted: bool) -> None:
+    raw = _orphan_recovery_job()
+    raw["assignment_claims"][0]["scheduler_record"].update(
+        worker="F1", dispatch_ms=1000, terminal_ms=1000,
+    )
+    events = [{"action": "kill -9", "instance": "F1", "fired_ms": end,
+               "receipt": {"started_ms": start, "completed_ms": end}}]
+    if accepted:
+        _validate_orphan_recovery_markers([raw], events)
+    else:
+        with pytest.raises(CollectError, match="authenticated killed-assignment retry"):
+            _validate_orphan_recovery_markers([raw], events)
 
 
 def test_orphan_marker_is_admitted_only_for_authenticated_killed_retry() -> None:

@@ -5714,6 +5714,11 @@ class EventProducer:
             operation = ("container", "restart", "--time", "10", identifier)
         else:  # guarded by _validate_events
             raise UnsupportedEvent(f"timeline action {event.action!r} is unsupported")
+        kill_interval = (
+            event.action == "kill -9"
+            and self.plan.get("kill_timing_contract") == "icefarm-kill-interval-v1"
+        )
+        started_ms = int(self.wall_ms()) if kill_interval else None
         self._invoke(
             self.factory.make(
                 phase=f"event.{event.action.replace(' ', '-')}",
@@ -5724,6 +5729,20 @@ class EventProducer:
                 argv=docker_argv(self.farm, instance["host"], operation),
             )
         )
+        if kill_interval:
+            completed_ms = int(self.wall_ms())
+            if completed_ms < started_ms:
+                raise EventError("kill operation clock moved backwards")
+            return {
+                "schema": "icefarm-kill-interval-v1",
+                "instance": event.instance,
+                "host": instance["host"],
+                "container_id": identifier,
+                "container_name": before["name"],
+                "started_ms": started_ms,
+                "completed_ms": completed_ms,
+                "signal": "KILL",
+            }
         return None
 
     def _start_argv(self, event: TimelineEvent, target: dict[str, Any]) -> tuple[str, ...]:

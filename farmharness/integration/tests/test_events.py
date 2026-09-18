@@ -321,6 +321,28 @@ class EventRecorder:
         return CommandResult(0, "", "")
 
 
+def test_kill_receipt_brackets_command_completion_across_second(tmp_path: Path) -> None:
+    farm, scenario, _plan = _fixture(tmp_path)
+    scenario.data["timeline"] = [
+        {"trigger": "t+0", "action": "kill -9", "instance": "F1"}
+    ]
+    plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
+    clock = iter((5500, 6500))
+    recorder = EventRecorder()
+    producer = EventProducer(
+        farm, scenario, plan, recorder=RecordingTransport(recorder),
+        wall_ms=lambda: next(clock),
+    )
+    receipt = producer._dispatch(producer.events[0])
+    assert receipt == {
+        "schema": "icefarm-kill-interval-v1", "instance": "F1",
+        "host": next(i["host"] for i in plan["topology"]["instances"] if i["name"] == "F1"),
+        "container_id": "3" * 64, "container_name": "/icefarm-event-unit-F1",
+        "signal": "KILL", "started_ms": 5500, "completed_ms": 6500,
+    }
+    assert next(c for c in recorder.commands if c.phase == "event.kill--9").argv[-1] == "3" * 64
+
+
 def test_trigger_order_epochs_and_exact_authenticated_argv(tmp_path: Path) -> None:
     farm, scenario, plan = _fixture(tmp_path)
     scenario.data["timeline"] = [

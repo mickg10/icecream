@@ -2105,6 +2105,11 @@ def _event_log(
         transition = event.get("action") in {"upgrade", "downgrade", "env_set"}
         header_edit = event.get("action") == "header_edit"
         disk_fill = event.get("action") == "disk_fill"
+        kill_interval = (
+            event.get("action") == "kill -9"
+            and plan is not None
+            and plan.get("kill_timing_contract") == "icefarm-kill-interval-v1"
+        )
         scheduler_restart = False
         scheduler_active_loss = False
         client_route_restart = False
@@ -2162,6 +2167,7 @@ def _event_log(
             if transition
             or header_edit
             or disk_fill
+            or kill_interval
             or scheduler_restart
             or scheduler_active_loss
             or client_route_restart
@@ -2214,6 +2220,10 @@ def _event_log(
         elif header_edit:
             _validate_header_edit_receipt(
                 event["receipt"], event, scenario, index, farm=farm, plan=plan
+            )
+        elif kill_interval:
+            _validate_kill_interval(
+                event, plan, evidence if validate_client_evidence else None
             )
         elif disk_fill:
             _validate_disk_fill_receipt(
@@ -7464,6 +7474,57 @@ def _nearest_rank(values: list[int], percentile: int) -> int:
     return ordered[index]
 
 
+def _validate_kill_interval(
+    event: Mapping[str, Any], plan: Mapping[str, Any], evidence: Path | None,
+) -> None:
+    receipt = event.get("receipt")
+    target = next((item for item in plan["topology"]["instances"]
+                   if item["name"] == event["instance"]), None)
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != {"schema", "instance", "host", "container_id",
+                            "container_name", "started_ms", "completed_ms", "signal"}
+        or target is None
+        or receipt.get("schema") != "icefarm-kill-interval-v1"
+        or receipt.get("instance") != event["instance"]
+        or receipt.get("host") != target["host"]
+        or receipt.get("container_name") != f"/icefarm-{plan['run_id']}-{event['instance']}"
+        or not isinstance(receipt.get("container_id"), str)
+        or SHA256_RE.fullmatch(receipt["container_id"]) is None
+        or receipt.get("signal") != "KILL"
+        or type(receipt.get("started_ms")) is not int
+        or type(receipt.get("completed_ms")) is not int
+        or not 0 <= receipt["started_ms"] <= receipt["completed_ms"] <= event["fired_ms"]
+    ):
+        raise CollectError("invalid authenticated kill operation interval")
+    if evidence is not None:
+        document = _read_json(
+            evidence / "diagnostics" / target["host"] / f"{event['instance']}.inspect"
+        )
+        if (
+            document.get("Id") != receipt["container_id"]
+            or document.get("Name") != receipt["container_name"]
+            or document.get("Config", {}).get("Labels", {}).get("icefarm.run") != plan["run_id"]
+            or document.get("Config", {}).get("Labels", {}).get("icefarm.instance") != event["instance"]
+        ):
+            raise CollectError("kill interval disagrees with retained container identity")
+
+
+def _kill_overlaps_assignment(
+    event: Mapping[str, Any], raw: Mapping[str, Any], record: Mapping[str, Any],
+) -> bool:
+    if event.get("action") != "kill -9" or event.get("instance") != record["worker"]:
+        return False
+    receipt = event.get("receipt", {})
+    start = receipt.get("started_ms", event["fired_ms"])
+    end = receipt.get("completed_ms", event["fired_ms"])
+    # The receipt was validated against the plan and retained container before
+    # this join. Scheduler timestamps have only whole-second precision.
+    return max(start, raw["started"], record["dispatch_ms"]) <= min(
+        end, raw["finished"], record["terminal_ms"] + 999
+    )
+
+
 def _result_stream_kill_loss(
     missing: Mapping[str, Any],
     raw: Mapping[str, Any],
@@ -7485,15 +7546,7 @@ def _result_stream_kill_loss(
         or record.get("terminal") != "process-loss-recovery"
     ):
         return False
-    matches = [
-        event
-        for event in events
-        if event.get("action") == "kill -9"
-        and event.get("instance") == record["worker"]
-        and raw["started"] <= event["fired_ms"] <= raw["finished"]
-        and record["dispatch_ms"] <= event["fired_ms"]
-        <= record["terminal_ms"] + 999
-    ]
+    matches = [event for event in events if _kill_overlaps_assignment(event, raw, record)]
     return len(matches) == 1
 
 
@@ -7543,7 +7596,11 @@ def _validate_orphan_recovery_markers(
             [
                 event
                 for event in kill_events.get(owner["worker"], [])
-                if raw["started"] <= event["fired_ms"] <= raw["finished"]
+                if (
+                    _kill_overlaps_assignment(event, raw, owner["scheduler_record"])
+                    if "receipt" in event
+                    else raw["started"] <= event["fired_ms"] <= raw["finished"]
+                )
             ]
             if owner is not None
             else []

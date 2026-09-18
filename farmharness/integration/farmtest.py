@@ -934,6 +934,9 @@ def build_plan(
         "farm_digest": farm.digest,
         "icefarm_env": _resolver_environment(farm, scenario),
         "launch_contract": F_INIT_LAUNCH_CONTRACT,
+        **({"kill_timing_contract": "icefarm-kill-interval-v1"}
+           if any(event["action"] == "kill -9"
+                  for event in scenario.data["timeline"]) else {}),
         **({"s90_refusal_contract": "icefarm-s90-typed-refusal-v1"}
            if scenario.data["id"] == "S90-revision-refusal-retry" else {}),
         **({"worker_endpoint_contract": "icefarm-live-bridge-endpoint-v1"}
