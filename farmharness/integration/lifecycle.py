@@ -3326,9 +3326,12 @@ def collect_diagnostics(
                         argv=(
                             "rsync",
                             "--archive",
+                            "--no-owner",
+                            "--no-group",
+                            "--omit-dir-times",
                             "--protect-args",
-                            f"{farm.hosts[host_name]['ssh']}:{remote_output}/",
-                            str(local_output) + "/",
+                            f"{farm.hosts[host_name]['ssh']}:{remote_output}/canary/",
+                            str(local_output / "canary") + "/",
                         ),
                     )
                 )
