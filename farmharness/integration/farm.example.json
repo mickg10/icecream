@@ -298,9 +298,9 @@
         "daemon": {"sha256": "d784931378fbba8464541a11fd4557aa47fff528159482350b4b5e27be3741ab"}
       },
       "50": {
-        "scheduler": {"sha256": "5297fd92b1ac80101b90ed0d8f3eb2b4fabe7323af55ac6a8b7fafd8088629f9"},
-        "client": {"sha256": "d0371be430e29431eba1a88cdcd00785de2522c11f771e3545a7d96e37625910"},
-        "daemon": {"sha256": "648cb05e12b38d4d6587e1a47b7ca5e4453beadc10cc2bab5a2d08aaa7d38a93"}
+        "scheduler": {"sha256": "30a0588e08e02e25967d46f5a00c3a188db49dcddfd9ff2212dee61ddbf7ca7d"},
+        "client": {"sha256": "f17a8e2b8dec443f4cfc2ce8e9322fbb1246bde91b0d8034afed2cd4cce23b94"},
+        "daemon": {"sha256": "8feb405c098fcd64ff3c822bea281bc7d54d1992138d51b61532b8de0dc1c23c"}
       }
     },
     "images": {
@@ -465,6 +465,12 @@
         "closure_sha256": "fea67593697c99948858dbafff18f836f7fc18af3c46e2c003dd20539b0383fd",
         "commit": "5062490849d836fff46d3555b4b642290807afa0",
         "id": "sha256:cbc7488a6d1424401aad2a289032ede0460648e0168d7f384a39b9f830fc2b95"
+      },
+      "p50s4-3e73c6e7": {
+        "archive_sha256": "18cfe65083c0b79c1c81379937640250cee0b2ca106ae97ce3072bfb61fa59aa",
+        "closure_sha256": "e192f377ea93e91d2477fc7100ac983767cf8ade805ba297409f36daeea44683",
+        "commit": "3e73c6e75b0710b3d81a0833525cf77bf9bdae75",
+        "id": "sha256:94f2e00cf10b477312ef1efa48891478fc4ed3ef57a4f3902f8b31579bace2a2"
       },
       "p50s4-01cbd11b": {
         "archive_sha256": "60beacde4a2013d7c835643432fdde0f705b89283d36079002ce509cfe4baff0",

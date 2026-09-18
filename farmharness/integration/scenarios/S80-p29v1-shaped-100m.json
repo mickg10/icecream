@@ -2,7 +2,7 @@
   "schema": "icefarm-scenario-v1",
   "id": "S80-p29v1-shaped-100m",
   "shape": "S'C'F'",
-  "images": {"new": "p50s4-01cbd11b"},
+  "images": {"new": "p50s4-3e73c6e7"},
   "instances": [
     {
       "name": "S1",
