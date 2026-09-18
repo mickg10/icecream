@@ -1010,13 +1010,42 @@ bool handle_connection(local::Connection connection, const Options& options,
                                                      ? local::HandoffRequest{}
                                                      : local::HandoffRequest{
                                                            options.identity,
-                                                           operation.request_id},
+                                                         operation.request_id},
                                          deadline);
-            if (handoff.status != local::FdHandoffStatus::Accepted)
+            if (handoff.status != local::FdHandoffStatus::Accepted) {
+                std::fprintf(
+                    stderr,
+                    "P50_CACHE_SESSION_REFUSED stage=fd-handoff request=%llu "
+                    "status=%s state=%u\n",
+                    static_cast<unsigned long long>(operation.request_id),
+                    local::fd_handoff_status_name(handoff.status),
+                    static_cast<unsigned>(handoff.sender_state));
+                std::fflush(stderr);
                 return true;
+            }
             local::HandoffFd adopted = receiver.take_adopted_fd();
-            if (!adopted.valid() || !send_cache_session_ready(adopted.get(), deadline))
+            if (!adopted.valid()) {
+                std::fprintf(
+                    stderr,
+                    "P50_CACHE_SESSION_REFUSED stage=adopt request=%llu\n",
+                    static_cast<unsigned long long>(operation.request_id));
+                std::fflush(stderr);
                 return true;
+            }
+            errno = 0;
+            if (!send_cache_session_ready(adopted.get(), deadline)) {
+                std::fprintf(
+                    stderr,
+                    "P50_CACHE_SESSION_REFUSED stage=ready request=%llu "
+                    "errno=%d\n",
+                    static_cast<unsigned long long>(operation.request_id), errno);
+                std::fflush(stderr);
+                return true;
+            }
+            std::fprintf(
+                stderr, "P50_CACHE_SESSION_READY request=%llu\n",
+                static_cast<unsigned long long>(operation.request_id));
+            std::fflush(stderr);
             runtime.start_adopted_endpoint(adopted.release());
             return true;
         }

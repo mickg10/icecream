@@ -8832,7 +8832,12 @@ bool Daemon::handle_blacklist_host_env(Client *client, Msg *msg)
 
 void Daemon::handle_end(Client *client, int exitcode)
 {
-    trace() << "handle_end " << client->client_id << " " << client->channel->name << endl;
+    trace() << "handle_end " << client->client_id << " " << client->channel->name
+            << " exitcode=" << exitcode
+            << " status=" << Client::status_str(client->status)
+            << " fd=" << client->channel->fd
+            << " detached=" << (client->p50_cache_session_detached ? 1 : 0)
+            << endl;
 #ifdef ICECC_DEBUG
     trace() << "handle_end " << client->dump() << endl;
     trace() << dump_internals() << endl;
