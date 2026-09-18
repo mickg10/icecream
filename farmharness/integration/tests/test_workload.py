@@ -294,6 +294,142 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
         check=True,
         capture_output=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("epoch", "index", "boundary", "expected"),
+    [(0, 24, 24, 1), (0, 25, 24, 0), (0, 100, 24, 0),
+     (1, 25, 24, 1), (1, 100, 24, 1), (0, 100, 0, 1)],
+)
+def test_s60_admission_reserves_suffix_even_when_controller_is_delayed(
+    epoch: int, index: int, boundary: int, expected: int,
+) -> None:
+    # Execute the actual admission decision, not a Python copy. The controller
+    # may remain at epoch zero indefinitely: finishing the prefix must not
+    # admit the suffix until its authenticated resume opens epoch one.
+    start = MANIFEST_DRIVER.index("                admit_now=0\n")
+    end = MANIFEST_DRIVER.index('                if test "$admit_now" -eq 1', start)
+    program = (
+        'event_serial_through=0; gate_epoch=$1; index=$2; s60_admit_through=$3;\n'
+        + MANIFEST_DRIVER[start:end]
+        + '\nprintf "%s\\n" "$admit_now"\n'
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-eu", "-c", program, "admission-probe",
+         str(epoch), str(index), str(boundary)],
+        text=True, capture_output=True, check=True,
+    )
+    assert int(result.stdout) == expected
+
+
+@pytest.mark.parametrize("path", sorted((INTEGRATION / "scenarios").glob("S60-*.json")))
+def test_s60_driver_binds_admission_limit_for_initial_and_resumed_clients(
+    tmp_path: Path, path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(path, farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="s60-admission-unit")
+    for client in plan["topology"]["instances"]:
+        if client["role"] != "C":
+            continue
+        for resume in (False, True):
+            command = _driver_command(
+                farm, scenario, plan, client, "A", CommandFactory(),
+                resume=resume, checkpoint_sha256="a" * 64 if resume else None,
+            )
+            assert "ICEFARM_S60_ADMIT_THROUGH=24" in command.argv
+            assert not any(arg.startswith("ICEFARM_EVENT_SERIAL_THROUGH=")
+                           for arg in command.argv)
+    corpus = farm.data["corpora"][scenario.data["workload"]["corpus"]]
+    scenario.data["timeline"][0]["trigger"] = "job 1000000"
+    with pytest.raises(WorkloadError, match="preserve a client suffix"):
+        workload_module._s60_admit_through(scenario, corpus)
+
+
+@pytest.mark.parametrize("release", ["OPEN", "ABORT", "QUIESCE"])
+def test_s60_suffix_waits_at_real_gate_then_resumes_or_aborts(
+    tmp_path: Path, release: str,
+) -> None:
+    active = tmp_path / "active"
+    active.mkdir()
+    state = tmp_path / "state.tsv"
+    state.write_text("OPEN\t0\n")
+    start = MANIFEST_DRIVER.index("    gate_deadline=$((SECONDS + per_job_timeout))")
+    end = MANIFEST_DRIVER.index("    trap 'rm -f", start)
+    program = (
+        'gate_active=$1/active; gate_state=$1/state.tsv; gate_lock=$1/lock; '
+        'marker=$gate_active/probe.tsv; index=25; per_job_timeout=5; '
+        'event_serial_through=0; s60_admit_through=24; '
+        'probe() {\n' + MANIFEST_DRIVER[start:end] + '\n}; probe\n'
+    )
+    process = subprocess.Popen(
+        ["/bin/bash", "-eu", "-c", program, "gate-probe", str(tmp_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        time.sleep(0.15)
+        assert process.poll() is None, "suffix escaped before transition resume"
+        assert not list(active.iterdir())
+        # Publish using the same lock/atomic-state discipline as the controller.
+        subprocess.run(
+            ["/bin/bash", "-eu", "-c",
+             'exec 8>"$1/lock"; flock -x 8; printf "%s\\t1\\n" "$2" >"$1/next"; '
+             'mv "$1/next" "$1/state.tsv"', "release", str(tmp_path), release],
+            check=True,
+        )
+        _, stderr = process.communicate(timeout=6)
+        assert process.returncode == (0 if release == "OPEN" else 75), stderr
+        assert bool(list(active.iterdir())) is (release == "OPEN")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+
+@pytest.mark.parametrize("action", ["pause", "quiesce"])
+def test_s60_completed_boundary_survives_delayed_controller_and_drains(
+    tmp_path: Path, action: str,
+) -> None:
+    from farmharness.integration.events import GATE_CONTROL_SCRIPT
+
+    gate = tmp_path / "event-gate"
+    active = gate / "active"
+    active.mkdir(parents=True)
+    (gate / "state.tsv").write_text("OPEN\t0\n")
+    (gate / "state.lock").touch()
+    marker = active / "job-24-99.tsv"
+    marker.write_text("24\t99\t0\t1\n")
+    start = MANIFEST_DRIVER.index("    # Keep a completed prefix boundary visible")
+    end = MANIFEST_DRIVER.index('    rm -f -- "$remote_object"', start)
+    program = (
+        'gate_lock=$1/event-gate/state.lock; gate_state=$1/event-gate/state.tsv; '
+        's60_admit_through=24; index=24; gate_epoch=0; per_job_timeout=5; '
+        'finish() {\n' + MANIFEST_DRIVER[start:end]
+        + '\n}; finish; rm "$1/event-gate/active/job-24-99.tsv"\n'
+    )
+    boundary = subprocess.Popen(
+        ["/bin/bash", "-eu", "-c", program, "boundary", str(tmp_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        time.sleep(0.15)
+        assert boundary.poll() is None
+        assert marker.exists()
+        result = subprocess.run(
+            ["python3", "-c", GATE_CONTROL_SCRIPT, action, str(tmp_path),
+             "C1", "A", "1", "3"],
+            text=True, capture_output=True, timeout=5, check=True,
+        )
+        receipt = json.loads(result.stdout)
+        assert receipt["active_before"] == 1
+        assert receipt["active_after"] == 0
+        _, stderr = boundary.communicate(timeout=2)
+        assert boundary.returncode == 0, stderr
+    finally:
+        if boundary.poll() is None:
+            boundary.kill()
+            boundary.communicate()
     assert "scenario.data" not in MANIFEST_DRIVER
 
 

@@ -134,6 +134,10 @@ test "$per_job_timeout" -ge 1
 test "$layout" = single -o "$layout" = paired
 test "$strict_p50" = 0 -o "$strict_p50" = 1
 event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}
+s60_admit_through=${ICEFARM_S60_ADMIT_THROUGH:-0}
+case "$s60_admit_through" in
+    ''|*[!0-9]*) echo "invalid S60 admission boundary" >&2; exit 65 ;;
+esac
 case "$event_serial_through" in
     ''|*[!0-9]*) echo "invalid event serial boundary" >&2; exit 65 ;;
 esac
@@ -599,6 +603,15 @@ compile_one() {
                         admit_now=1
                     fi
                 fi
+                # Reserve a suffix on every S60 client until the existing
+                # authenticated transition resumes epoch one. Remote polling
+                # and pause preparation may otherwise outlast the workload.
+                if test "$s60_admit_through" -gt 0 \
+                    -a "$gate_epoch" -eq 0 \
+                    -a "$index" -gt "$s60_admit_through"
+                then
+                    admit_now=0
+                fi
                 if test "$admit_now" -eq 1
                 then
                     temporary_marker="$gate_active/.job-$index-$BASHPID.tmp"
@@ -824,6 +837,39 @@ compile_one() {
         "$started" "$finished" "$compile_rc" "$remote_sha" "$local_sha" "$exact" "$remote" \
         "$retries" \
         >"$job_dir/result.tsv"
+    # Keep a completed prefix boundary visible until the controller closes
+    # admission. It requires a positive marker even if every compile finished
+    # before polling. Release on PAUSE/QUIESCE, not resume: pause drains these
+    # markers before it can publish epoch one. The result is already durable
+    # for a C-transition checkpoint before its marker disappears.
+    if test "$s60_admit_through" -gt 0 \
+        -a "$index" -eq "$s60_admit_through" -a "$gate_epoch" -eq 0
+    then
+        s60_boundary_deadline=$((SECONDS + per_job_timeout))
+        while :
+        do
+            exec 8>"$gate_lock"
+            flock -x 8
+            IFS=$'\t' read -r boundary_mode boundary_epoch <"$gate_state"
+            flock -u 8
+            exec 8>&-
+            case "$boundary_mode" in
+                PAUSE|QUIESCE)
+                    test "$boundary_epoch" -eq 1 || return 75
+                    break ;;
+                OPEN)
+                    if test "$boundary_epoch" -eq 1; then break; fi
+                    test "$boundary_epoch" -eq 0 || return 75 ;;
+                *) return 75 ;;
+            esac
+            if test "$SECONDS" -ge "$s60_boundary_deadline"
+            then
+                echo "S60 boundary pause wait expired for job $index" >&2
+                return 75
+            fi
+            sleep 0.05
+        done
+    fi
     rm -f -- "$remote_object"
     rm -f -- "$marker"
     trap - EXIT
@@ -832,7 +878,7 @@ compile_one() {
 export -f read_boundary_release compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
-export gate_root gate_state gate_lock gate_active event_serial_through
+export gate_root gate_state gate_lock gate_active event_serial_through s60_admit_through
 export resume_mode resume_indices
 
 set +e
@@ -1017,6 +1063,23 @@ def _active_loss_serial_through(scenario: ScenarioSpec) -> int:
     return int(match.group(1))
 
 
+def _s60_admit_through(scenario: ScenarioSpec, corpus: dict[str, Any]) -> int:
+    """Bound each S60 client's parallel prefix, preserving a post-event suffix."""
+    if not scenario.data.get("id", "").startswith("S60-"):
+        return 0
+    events = scenario.data.get("timeline", [])
+    if len(events) != 1 or events[0].get("action") not in {"upgrade", "downgrade"}:
+        raise WorkloadError("S60 admission needs one upgrade/downgrade event")
+    match = re.fullmatch(r"job ([1-9][0-9]*)", events[0].get("trigger", ""))
+    if match is None:
+        raise WorkloadError("S60 admission needs a positive job boundary")
+    boundary = int(match.group(1))
+    total = corpus["tus"] * corpus.get("repeat", 1) * scenario.data["workload"]["repeat"]
+    if boundary >= total:
+        raise WorkloadError("S60 admission boundary must preserve a client suffix")
+    return boundary
+
+
 def _driver_command(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -1034,6 +1097,7 @@ def _driver_command(
     corpus_repeat = corpus.get("repeat", 1)
     strict_p50 = int(_strict_p50_required(scenario, plan))
     active_loss_serial_through = _active_loss_serial_through(scenario)
+    s60_admit_through = _s60_admit_through(scenario, corpus)
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300
@@ -1044,6 +1108,10 @@ def _driver_command(
             "exec",
             "--user",
             "65534:65534",
+            *(
+                ("--env", f"ICEFARM_S60_ADMIT_THROUGH={s60_admit_through}")
+                if s60_admit_through else ()
+            ),
             *(
                 (
                     "--env",
