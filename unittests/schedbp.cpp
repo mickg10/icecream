@@ -124,7 +124,6 @@ static int failures = 0;
 
 static const char *kPlatform = "x86_64";
 static const char *kEnv = "testenv";
-static const unsigned int kCsPort = 10245;
 
 static pid_t start_scheduler(const std::string &binary, const std::string &shim,
                              int port, const std::string &logfile,
@@ -790,6 +789,35 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "# port=%d jobs=%d clog=%ds\n", port, njobs, clog_s);
 
+    // Reserve every advertised endpoint before login. Fixed ports silently
+    // borrowed another parallel fixture's listener when bind failed.
+    int probe_fds[4];
+    unsigned int probe_ports[4];
+    for (int i = 0; i < 4; ++i) {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t size = sizeof(address);
+        if (fd < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+            bind(fd, reinterpret_cast<sockaddr *>(&address), size) != 0 ||
+            listen(fd, 16) != 0 ||
+            getsockname(fd, reinterpret_cast<sockaddr *>(&address), &size) != 0) {
+            perror("reserve fixture probe listener");
+            kill(sched, SIGTERM);
+            waitpid(sched, nullptr, 0);
+            std::exit(2);
+        }
+        probe_fds[i] = fd;
+        probe_ports[i] = ntohs(address.sin_port);
+    }
+    const unsigned int kCsPort = probe_ports[0];
+    const unsigned int altPort = probe_ports[1];
+    const unsigned int armPort = probe_ports[2];
+    const unsigned int cPort = probe_ports[3];
+    fprintf(stderr, "# owned probe ports: %u %u %u %u\n",
+            kCsPort, altPort, armPort, cPort);
+
     // ---- fake compile server ----------------------------------------------
     MsgChannel *cs = connect_daemon(port, 0);
     if (!cs) {
@@ -897,21 +925,7 @@ int main(int argc, char **argv)
        the ports its fake workers advertise: the suite only stayed green
        through that product bug.  With the probe honest, the fake workers
        must be genuinely reachable -- accept and immediately close.  */
-    auto probe_acceptor = [&](int port) {
-        const int lfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (lfd < 0) { return; }
-        int one = 1;
-        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        struct sockaddr_in la;
-        memset(&la, 0, sizeof(la));
-        la.sin_family = AF_INET;
-        la.sin_addr.s_addr = htonl(INADDR_ANY);
-        la.sin_port = htons((uint16_t)port);
-        if (bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0
-                || listen(lfd, 16) != 0) {
-            close(lfd);
-            return;
-        }
+    auto probe_acceptor = [&](int lfd) {
         while (!shutdown) {
             struct pollfd pf = { lfd, POLLIN, 0 };
             if (poll(&pf, 1, 200) > 0) {
@@ -923,8 +937,8 @@ int main(int argc, char **argv)
     };
     /* One acceptor per port any fake worker in this harness advertises
        (fakecs, the teardown alt worker, fakecsB/aarch64, fakecsC).  */
-    for (const int accept_port : { (int)kCsPort, 10250, 10261, 10262 }) {
-        std::thread t([&, accept_port] { probe_acceptor(accept_port); });
+    for (const int probe_fd : probe_fds) {
+        std::thread t([&, probe_fd] { probe_acceptor(probe_fd); });
         t.detach();
     }
 
@@ -2540,7 +2554,7 @@ int main(int argc, char **argv)
         std::atomic<bool> csB_alive{true};
         std::thread csB_thread([&] {
             if (!csB) { return; }
-            LoginMsg login(10261, "fakecsB", "aarch64", 0);
+            LoginMsg login(armPort, "fakecsB", "aarch64", 0);
             login.envs.push_back(std::make_pair(std::string("aarch64"), std::string(kEnv)));
             login.max_kids = 4;
             login.noremote = false;
@@ -2652,7 +2666,7 @@ int main(int argc, char **argv)
                 "a compatible request behind an unservable head is dispatched (SCH-3 circular walk)");
         /* The hostname field carries the address; the advertised remote
            port is what distinguishes the two local fake hosts.  */
-        REQUIRE(arm_port == 10261, "it went to the aarch64 host");
+        REQUIRE(arm_port == armPort, "it went to the aarch64 host");
         REQUIRE(head_replies == 0, "the unservable head stayed queued, not bounced");
         if (arm_jid) {
             std::lock_guard<std::mutex> lock(bconfirm_mutex);
@@ -2711,7 +2725,7 @@ int main(int argc, char **argv)
                         const unsigned jid = u->job_id;
                         const unsigned cport = u->port;
                         delete m;
-                        if (cport == 10261) {
+                        if (cport == armPort) {
                             std::lock_guard<std::mutex> lock(bconfirm_mutex);
                             b_to_confirm.push_back(jid);   // begins+dones with real=0
                         } else {
@@ -2746,7 +2760,7 @@ int main(int argc, char **argv)
                     delete m;
                 }
             }
-            REQUIRE(occ3 != 0 && occ3port != 10261, "occupier 3 parked on the x86 host");
+            REQUIRE(occ3 != 0 && occ3port != armPort, "occupier 3 parked on the x86 host");
             begin_job(occ3);
 
             /* BOTH hosts must be fully held while both jobs enqueue, or
@@ -2843,7 +2857,7 @@ int main(int argc, char **argv)
                     arm2_jid ? "yes" : "NO", arm2_port);
             REQUIRE(arm2_jid != 0,
                     "a servable job BEFORE the scored winner is reached (true circular wrap)");
-            REQUIRE(arm2_port == 10261, "it went to the aarch64 host");
+            REQUIRE(arm2_port == armPort, "it went to the aarch64 host");
             if (arm2_jid) {
                 std::lock_guard<std::mutex> lock(bconfirm_mutex);
                 b_to_confirm.push_back(arm2_jid);
@@ -4152,7 +4166,7 @@ int main(int argc, char **argv)
             unsigned int jid2 = 0;
             MsgChannel *subU = nullptr;
             if (cs2) {
-                LoginMsg login(10250, kAltPlat, kAltPlat, 0);
+                LoginMsg login(altPort, kAltPlat, kAltPlat, 0);
                 login.envs.push_back(std::make_pair(kAltPlat, kAltEnv));
                 login.max_kids = 2;
                 login.chroot_possible = true;
@@ -4371,7 +4385,7 @@ int main(int argc, char **argv)
         std::atomic<bool> csC_alive{true};
         std::thread csC_thread([&] {
             if (!csC) { return; }
-            LoginMsg login(10262, "fakecsC", kPlatform, 0);
+            LoginMsg login(cPort, "fakecsC", kPlatform, 0);
             login.envs.push_back(std::make_pair(std::string(kPlatform), std::string(kEnv)));
             login.max_kids = 8;
             login.noremote = false;
@@ -4447,10 +4461,10 @@ int main(int argc, char **argv)
             return false;
         };
         auto begin_on = [&](unsigned jid, unsigned csport) {
-            if (csport == 10262) { beginC(jid); } else { begin_job(jid); }
+            if (csport == cPort) { beginC(jid); } else { begin_job(jid); }
         };
         auto done_on = [&](unsigned jid, unsigned csport) {
-            if (csport == 10262) { doneC(jid); } else { finish_job(jid, 100); }
+            if (csport == cPort) { doneC(jid); } else { finish_job(jid, 100); }
         };
 
         /* The second host must be REGISTERED before any fill is submitted,
@@ -4485,7 +4499,7 @@ int main(int argc, char **argv)
         }
         int on_a = 0, on_c = 0;
         for (const Held &h : held) {
-            if (h.port == 10262) { ++on_c; } else { ++on_a; }
+            if (h.port == cPort) { ++on_c; } else { ++on_a; }
         }
         fprintf(stderr, "# leastbusy: fill spread a=%d c=%d (2-slot vs 8-slot)\n", on_a, on_c);
         REQUIRE(on_a == 1 && on_c == 3,
@@ -4498,8 +4512,8 @@ int main(int argc, char **argv)
             unsigned jid = 0, csport = 0;
             REQUIRE(send_one(9150, "unequal.cpp"), "unequal-denominator probe submitted");
             REQUIRE(await_use(9150, 15, &jid, &csport), "unequal probe assigned");
-            fprintf(stderr, "# leastbusy: 3/8-vs-1/2 probe went to port=%u (want 10262)\n", csport);
-            REQUIRE(csport == 10262,
+            fprintf(stderr, "# leastbusy: 3/8-vs-1/2 probe went to port=%u (want %u)\n", csport, cPort);
+            REQUIRE(csport == cPort,
                     "the lower FRACTION wins although it holds more jobs (cross multiplication)");
             begin_on(jid, csport);
             held.push_back(Held{jid, csport});
@@ -4541,7 +4555,7 @@ int main(int argc, char **argv)
                the earlier probes took.  */
             int cur_a = 0, cur_c = 0;
             for (const Held &h : held) {
-                if (h.port == 10262) { ++cur_c; } else { ++cur_a; }
+                if (h.port == cPort) { ++cur_c; } else { ++cur_a; }
             }
             const int need_total = (2 - cur_a) + (8 - cur_c);
             for (int i = 0; i < need_total; ++i) {
@@ -4569,17 +4583,17 @@ int main(int argc, char **argv)
         /* Phase 5 -- empty host C completely, leave host A full.  The next
            job must land on C (0/8 beats 2/2 exactly).  */
         for (const Held &h : held) {
-            if (h.port == 10262) { done_on(h.jid, h.port); }
+            if (h.port == cPort) { done_on(h.jid, h.port); }
         }
         usleep(500 * 1000);   // let the ENDs land
         unsigned qjid = 0, qport = 0;
         REQUIRE(send_one(9300, "emptier.cpp"), "occupancy probe submitted");
         REQUIRE(await_use(9300, 15, &qjid, &qport), "occupancy probe assigned");
-        fprintf(stderr, "# leastbusy: occupancy probe went to port=%u (want 10262)\n", qport);
-        REQUIRE(qport == 10262, "the emptier host wins the occupancy comparison");
+        fprintf(stderr, "# leastbusy: occupancy probe went to port=%u (want %u)\n", qport, cPort);
+        REQUIRE(qport == cPort, "the emptier host wins the occupancy comparison");
         if (qjid) { begin_on(qjid, qport); done_on(qjid, qport); }
         for (const Held &h : held) {
-            if (h.port != 10262) { done_on(h.jid, h.port); }
+            if (h.port != cPort) { done_on(h.jid, h.port); }
         }
                 REQUIRE(worst_reply.load() < 5.0, "scheduler stayed responsive");
 

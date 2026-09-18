@@ -3207,6 +3207,36 @@ def test_s70_b4_source_transfer_loss_is_recovered_by_exact_strict_retry() -> Non
     assert verdict["status"] == "PASS", verdict
 
 
+@pytest.mark.parametrize("mode", ["legacy", "unknown"])
+def test_legacy_source_failure_cannot_authenticate_strict_retry(mode: str) -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    record = fixture["observations"]["failed_p50_source_transfers"]["records"][0]
+    record["source_result_status"] = None
+    record["retry_mode"] = mode
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture, fixture["observations"], fixture["rows"]
+    )
+    assert not authenticated
+    assert bad
+
+
+def test_legacy_source_failure_is_visible_without_strict_success() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    observations = fixture["observations"]
+    record = observations["failed_p50_source_transfers"]["records"][0]
+    record["source_result_status"] = None
+    record["retry_mode"] = "legacy"
+    observations["successful_strict_p50_retry_bindings"] = []
+    row = next(r for r in fixture["rows"] if r["job_id"] == record["row_job_id"])
+    row.update(tail_present=False, tail_profile=None, session_outcome="none")
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture, observations, fixture["rows"]
+    )
+    assert not authenticated
+    assert not bad
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+
+
 def test_source_transfer_allows_late_scheduler_cancellation_settlement() -> None:
     fixture = _s70_b4_worker_source_transfer_recovery_bundle()
     binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]

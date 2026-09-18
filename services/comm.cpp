@@ -1337,7 +1337,7 @@ void MsgChannel::set_error(bool silent)
         return;
     }
     const int saved_errno = errno;
-    if( !silent && !set_error_recursion ) {
+    if( !silent && !set_error_recursion && !deadline_receive_active ) {
         trace() << "setting error state for channel " << dump() << endl;
         // After the state is set to error, get_msg() will not return anything anymore,
         // so try to fetch last status from the other side, if available.
@@ -1627,6 +1627,15 @@ MsgChannel *Service::createChannelRetryUntil(
     std::chrono::steady_clock::time_point deadline,
     std::chrono::milliseconds attempt_budget)
 {
+    return createChannelRetryUntil(hostname, p, deadline, attempt_budget,
+                                   ChannelRetryPolicy::FixedSlices);
+}
+
+MsgChannel *Service::createChannelRetryUntil(
+    const string &hostname, unsigned short p,
+    std::chrono::steady_clock::time_point deadline,
+    std::chrono::milliseconds attempt_budget, ChannelRetryPolicy policy)
+{
     if (attempt_budget <= std::chrono::milliseconds::zero())
         return nullptr;
 
@@ -1635,10 +1644,14 @@ MsgChannel *Service::createChannelRetryUntil(
         const auto started = std::chrono::steady_clock::now();
         if (started >= deadline)
             return nullptr;
-        const auto attempt_deadline = std::min(
-            deadline,
-            started + std::chrono::duration_cast<
-                          std::chrono::steady_clock::duration>(attempt_budget));
+        // Repeating a short slice can starve a reachable peer whose protocol
+        // greeting consistently arrives later than that slice. Source ingress
+        // opts into one short attempt followed by the entire remaining budget.
+        const auto attempt_deadline =
+            attempt > 0 && policy == ChannelRetryPolicy::RemainingAfterFirst
+                ? deadline
+                : std::min(deadline, started + std::chrono::duration_cast<
+                      std::chrono::steady_clock::duration>(attempt_budget));
         ++attempt;
         if (MsgChannel *channel = createChannelUntil(
                 hostname, p, attempt_deadline)) {
@@ -2286,29 +2299,61 @@ void MsgChannel::write_message_payload(std::span<const uint8_t> payload)
         writefull(payload.data(), payload.size());
 }
 
-Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
+void MsgChannel::begin_receive() noexcept
 {
-    Msg *m = nullptr;
-    Msg::Value type;
-
+    // An attempted receive invalidates handoff authority even when its budget
+    // has already expired, just like the ordinary get_msg entry point.
     p50_note_channel_mutation();
-
     p50_fd_request_pending = false;
     p50_fd_pending_request_frame = 0;
     p50_pending_fd_request = {};
-
-    /* A release is tied to the immediately preceding CACHE_SESSION decode;
-       attempting another receive is itself the next parser use. */
     cache_session_release_armed = false;
     cache_session_send_release_armed = false;
-    // set_error() probes one optional STATUS_TEXT frame by recursively
-    // calling get_msg(). Keep a malformed arm's exact triple across that
-    // internal probe; a later external decode starts a fresh identity slot.
     if (!set_error_recursion) {
         invalid_p50_source_arm_wire_id = 0;
         invalid_p50_source_arm_epoch = 0;
         invalid_p50_source_arm_nonce = 0;
     }
+}
+
+Msg *MsgChannel::get_msg_until(
+    std::chrono::steady_clock::time_point deadline, bool eofAllowed)
+{
+    struct DeadlineReceiveScope {
+        bool &active;
+        bool previous;
+        explicit DeadlineReceiveScope(bool &value)
+            : active(value), previous(value) { active = true; }
+        ~DeadlineReceiveScope() { active = previous; }
+    } scope(deadline_receive_active);
+    begin_receive();
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (instate == ERROR)
+            return nullptr;
+        if (has_msg())
+            return get_msg(0, eofAllowed);
+        const int timeout = poll_milliseconds_until(deadline);
+        if (timeout == 0)
+            return nullptr;
+        pollfd descriptor{fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 ||
+            (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0)
+            return nullptr;
+        if (!read_a_bit())
+            return nullptr;
+    }
+    return nullptr;
+}
+
+Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
+{
+    Msg *m = nullptr;
+    Msg::Value type;
+
+    begin_receive();
 
     if (!wait_for_msg(timeout)) {
         // trace() << "!wait_for_msg()\n";

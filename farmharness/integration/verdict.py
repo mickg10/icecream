@@ -1085,7 +1085,9 @@ def _authenticated_strict_p50_retry_ids(
                     source_transfer_fields,
                     source_transfer_fields_v2,
                     source_transfer_fields_v2 | {"same_endpoint_decision"},
+                    source_transfer_fields_v2 | {"retry_mode"},
                 )
+                or ("retry_mode" in item and item["retry_mode"] != "legacy")
                 or not _is_int(item.get("assignment_epoch"), minimum=1)
                 or not _is_int(item.get("assignment_nonce"), minimum=1)
                 or not _is_int(item.get("attempt_index"))
@@ -1103,7 +1105,8 @@ def _authenticated_strict_p50_retry_ids(
                 or not isinstance(item.get("retry_endpoint"), str)
                 or not item["retry_endpoint"]
                 or (
-                    (
+                    item.get("retry_mode") != "legacy"
+                    and (
                         "same_endpoint_decision" in item
                         or item.get("retry_endpoint") == item.get("failed_endpoint")
                     )
@@ -1153,6 +1156,16 @@ def _authenticated_strict_p50_retry_ids(
                 source_transfer_duplicates.add(identity)
                 continue
             source_transfer_by_attempt[identity] = item
+            if item.get("retry_mode") == "legacy":
+                legacy_row = row_by_id.get(item["row_job_id"])
+                if (
+                    not isinstance(legacy_row, Mapping)
+                    or legacy_row.get("tail_present") is not False
+                    or legacy_row.get("tail_profile") is not None
+                    or legacy_row.get("session_outcome") != "none"
+                    or legacy_row.get("retries") != 1
+                ):
+                    invalid_source_transfer = True
 
     uncommitted_transports = observations.get("failed_p50_uncommitted_transports")
     uncommitted_transport_raw = (
@@ -1421,6 +1434,7 @@ def _authenticated_strict_p50_retry_ids(
         source_transfer_valid = (
             reason == "source-transfer-loss"
             and isinstance(source_transfer, Mapping)
+            and source_transfer.get("retry_mode") != "legacy"
             and missing is None
             and source_transfer.get("attempt_index") == 0
             and source_transfer.get("row_job_id") == job_id

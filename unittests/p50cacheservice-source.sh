@@ -62,7 +62,7 @@ for pair in \
     "$test_file|test_source_connect_protocol_slice_retries_before_arm" \
     "$test_file|observation.first_connection_bytes == protocol_only" \
     "$test_file|test_source_connect_protocol_slices_share_one_outer_budget" \
-    "$test_file|attempts.size() >= 2 && attempts.size() <= 3" \
+    "$test_file|attempts.size() == 2" \
     "$test_file|test_stalled_f_arm_is_bounded_before_healthy_transfer" \
     "$test_file|healthy_result.code == local::SourceTransferResultCode::Committed" \
     "$test_file|test_route_poison_latches_before_successor_f_open" \

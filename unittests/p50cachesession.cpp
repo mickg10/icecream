@@ -5,11 +5,14 @@
 #include <errno.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -657,6 +660,103 @@ static void test_same_endpoint_retry_preserves_immediate_failure()
     delete channel;
 }
 
+static void test_adaptive_connection_budget()
+{
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    // Independently serviced sockets: a slow greeting on every connection,
+    // a blackholed first connection, all blackholed, and immediate success.
+    for (int mode = 0; mode != 4; ++mode) {
+        const int listener = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t size = sizeof(address);
+        if (listener < 0 ||
+            bind(listener, reinterpret_cast<sockaddr *>(&address), size) ||
+            listen(listener, 16) ||
+            getsockname(listener, reinterpret_cast<sockaddr *>(&address), &size))
+            std::exit(2);
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> accepts{0};
+        std::thread peer([&] {
+            std::vector<std::thread> workers;
+            while (!stop.load()) {
+                pollfd descriptor{listener, POLLIN, 0};
+                if (poll(&descriptor, 1, 10) <= 0)
+                    continue;
+                sockaddr_in remote{};
+                socklen_t remote_size = sizeof(remote);
+                const int fd = accept(listener,
+                    reinterpret_cast<sockaddr *>(&remote), &remote_size);
+                if (fd < 0)
+                    continue;
+                const unsigned index = ++accepts;
+                workers.emplace_back([&, fd, remote, remote_size, index]() mutable {
+                    if (mode == 2 || (mode == 1 && index == 1)) {
+                        while (!stop.load())
+                            std::this_thread::sleep_for(5ms);
+                        close(fd);
+                        return;
+                    }
+                    std::this_thread::sleep_for(mode == 0 ? 250ms : 10ms);
+                    delete Service::createChannel(fd,
+                        reinterpret_cast<sockaddr *>(&remote), remote_size);
+                });
+            }
+            for (auto &worker : workers)
+                worker.join();
+        });
+        const auto started = Clock::now();
+        const auto deadline = started + 1s;
+        MsgChannel *channel = Service::createChannelRetryUntil(
+            "127.0.0.1", ntohs(address.sin_port), deadline, 100ms,
+            Service::ChannelRetryPolicy::RemainingAfterFirst);
+        const auto elapsed = Clock::now() - started;
+        REQUIRE((channel != nullptr) == (mode != 2),
+                "adaptive factory admits slow/live peers and refuses all-stalled peers");
+        REQUIRE(mode == 2 ? elapsed >= 900ms && elapsed < 1400ms
+                          : elapsed < 900ms,
+                "adaptive factory preserves the unchanged absolute deadline");
+#ifdef TCP_USER_TIMEOUT
+        if (channel) {
+            int timeout_msec = 0;
+            socklen_t timeout_size = sizeof(timeout_msec);
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - Clock::now()).count();
+            REQUIRE(getsockopt(channel->fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                               &timeout_msec, &timeout_size) == 0 &&
+                        timeout_msec > remaining + 900,
+                    "adaptive success restores the outer socket timeout");
+        }
+#endif
+        delete channel;
+        stop = true;
+        peer.join();
+        close(listener);
+        REQUIRE(accepts == (mode == 3 ? 1U : 2U),
+                "adaptive factory uses at most one fresh same-endpoint connection");
+    }
+
+    // Keep a non-listening port reserved, avoiding an ephemeral-port reuse race.
+    const int holder = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t size = sizeof(address);
+    if (holder < 0 || bind(holder, reinterpret_cast<sockaddr *>(&address), size) ||
+        getsockname(holder, reinterpret_cast<sockaddr *>(&address), &size))
+        std::exit(2);
+    const auto started = Clock::now();
+    MsgChannel *channel = Service::createChannelRetryUntil(
+        "127.0.0.1", ntohs(address.sin_port), started + 1s, 100ms,
+        Service::ChannelRetryPolicy::RemainingAfterFirst);
+    REQUIRE(!channel && Clock::now() - started < 500ms,
+            "adaptive immediate refusal does not consume or renew the budget");
+    delete channel;
+    close(holder);
+}
+
 static void test_other_message_refusal_and_arm_clear()
 {
     Pair pair = make_pair(50);
@@ -959,6 +1059,105 @@ static void test_nonblocking_accepted_protocol_admission()
     close(malformed_sockets[1]);
 }
 
+static volatile sig_atomic_t deadline_interruptions = 0;
+static void interrupt_deadline_wait(int)
+{
+    deadline_interruptions = 1;
+}
+
+static void test_absolute_message_deadline()
+{
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    {
+        Pair pair = make_pair(50);
+        Bytes malformed(sizeof(uint32_t));
+        const uint32_t oversized = htonl(2 * 1024 * 1024);
+        std::memcpy(malformed.data(), &oversized, sizeof(oversized));
+        (void)send(pair.left->fd, malformed.data(), malformed.size(), MSG_NOSIGNAL);
+        const auto start = Clock::now();
+        Msg *message = pair.right->get_msg_until(start + 100ms);
+        REQUIRE(!message && Clock::now() - start < 200ms,
+                "malformed deadline reply cannot start an ordinary status wait");
+        delete message;
+    }
+    {
+        Pair pair = make_pair(50);
+        std::thread sender([&] {
+            std::this_thread::sleep_for(30ms);
+            (void)pair.left->send_msg(PingMsg());
+        });
+        Msg *message = pair.right->get_msg_until(Clock::now() + 500ms);
+        REQUIRE(dynamic_cast<PingMsg *>(message) != nullptr,
+                "absolute receive uses a positive subsecond budget");
+        delete message;
+        sender.join();
+    }
+    {
+        Pair pair = make_pair(50);
+        std::thread sender([&] {
+            for (unsigned char byte : kPingFixture) {
+                std::this_thread::sleep_for(30ms);
+                (void)send(pair.left->fd, &byte, 1, MSG_NOSIGNAL);
+            }
+        });
+        const auto start = Clock::now();
+        Msg *message = pair.right->get_msg_until(start + 100ms);
+        const auto elapsed = Clock::now() - start;
+        REQUIRE(!message && elapsed >= 90ms && elapsed < 200ms,
+                "partial frames cannot renew the absolute receive deadline");
+        delete message;
+        sender.join();
+        message = pair.right->get_msg_until(Clock::now() + 100ms);
+        REQUIRE(dynamic_cast<PingMsg *>(message) != nullptr,
+                "timed out receive preserves partial input for its owner");
+        delete message;
+    }
+    {
+        Pair pair = make_pair(50);
+        (void)pair.left->send_msg(PingMsg());
+        Msg *message = pair.right->get_msg_until(Clock::now() - 1ms);
+        REQUIRE(!message, "expired deadline refuses even a queued reply");
+        delete message;
+    }
+    {
+        Pair pair = make_pair(50);
+        delete decode_cache_session(pair);
+        const int owned = pair.right->fd;
+        delete pair.right->get_msg_until(Clock::now() - 1ms);
+        REQUIRE(pair.right->release_fd_if_input_empty() == -1 &&
+                    pair.right->fd == owned,
+                "expired receive invalidates prior cache-session handoff authority");
+    }
+    {
+        Pair pair = make_pair(50);
+        struct sigaction action{}, previous{};
+        action.sa_handler = interrupt_deadline_wait;
+        sigemptyset(&action.sa_mask);
+        const bool installed = sigaction(SIGUSR1, &action, &previous) == 0;
+        REQUIRE(installed, "deadline interruption handler installs");
+        if (!installed)
+            return;
+        const pthread_t receiver = pthread_self();
+        deadline_interruptions = 0;
+        std::thread interrupter([receiver] {
+            for (int i = 0; i < 6; ++i) {
+                std::this_thread::sleep_for(20ms);
+                (void)pthread_kill(receiver, SIGUSR1);
+            }
+        });
+        const auto start = Clock::now();
+        Msg *message = pair.right->get_msg_until(start + 100ms);
+        const auto elapsed = Clock::now() - start;
+        REQUIRE(!message && deadline_interruptions &&
+                    elapsed >= 90ms && elapsed < 180ms,
+                "interrupted waits do not renew the absolute deadline");
+        delete message;
+        interrupter.join();
+        (void)sigaction(SIGUSR1, &previous, nullptr);
+    }
+}
+
 int main()
 {
     static_assert(Msg::CACHE_SESSION == UINT32_C(0x50f00000));
@@ -974,11 +1173,13 @@ int main()
     test_same_endpoint_retry_after_complete_slice();
     test_same_endpoint_retry_immediate_success_owns_outer_timeout();
     test_same_endpoint_retry_preserves_immediate_failure();
+    test_adaptive_connection_budget();
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();
     test_split_frame_reads();
     test_read_ahead_barriers();
     test_eof_and_pending_output_barriers();
     test_nonblocking_accepted_protocol_admission();
+    test_absolute_message_deadline();
     return failures ? 1 : 0;
 }

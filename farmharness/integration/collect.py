@@ -119,6 +119,9 @@ P50_STRICT_RETRY_REQUEST_RE = re.compile(
     r"\bP50 assignment failed; requesting one fresh strict-P50 remote "
     r"assignment; avoiding failed endpoint ([^ ]+)\s*$"
 )
+P50_LEGACY_RETRY_REQUEST_RE = re.compile(
+    r"\bP50 assignment failed; requesting one fresh legacy remote assignment\s*$"
+)
 P50_NO_CACHE_HANDOFF_RE = re.compile(
     r"\blocal build forced by remote exception: "
     r"Error 105 - strict all-P50 assignment has no cache handoff\s*$"
@@ -4994,12 +4997,15 @@ def _source_transfer_failure_observation(
     attempt_index: int,
     retry_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Authenticate a strict retry caused before a P50 source result exists.
+    """Authenticate a retry caused before a P50 source result exists.
 
     The producer's fail-closed transfer line and wrapper retry request must be
     unique and ordered inside one exact assignment window.  The failed
     identity must have produced no source-result or compile-result evidence,
-    and the retry must avoid the failed endpoint.  Cache action commits are
+    and a strict retry must authenticate endpoint selection. Normal legacy
+    retries retain their distinct mode and require a final legacy wire witness
+    at the caller; they never qualify as successful strict retries.
+    Cache action commits are
     deliberately not constrained: a lost acknowledgement can fail the client
     closed after the remote cache has already committed the input.
     """
@@ -5023,6 +5029,13 @@ def _source_transfer_failure_observation(
         for line_number, line in scoped_lines
         if (match := P50_STRICT_RETRY_REQUEST_RE.search(line)) is not None
     ]
+    legacy_retries = [
+        (line_number, match)
+        for line_number, line in scoped_lines
+        if (match := P50_LEGACY_RETRY_REQUEST_RE.search(line)) is not None
+    ]
+    legacy_retry = bool(legacy_retries)
+    retries += legacy_retries
     has_failure_claim = any(
         "cache source transfer failed closed" in line for _, line in scoped_lines
     )
@@ -5032,7 +5045,11 @@ def _source_transfer_failure_observation(
     )
     if not has_failure_claim and not has_retry_claim:
         return None
-    if len(failures) != 1 or len(retries) != 1:
+    retry_claims = sum(
+        line.count("P50 assignment failed; requesting one fresh")
+        for _, line in scoped_lines
+    )
+    if len(failures) != 1 or len(retries) != 1 or retry_claims != 1:
         raise CollectError(
             f"{row_job_id}: source-transfer loss markers are absent, malformed, or ambiguous"
         )
@@ -5069,7 +5086,7 @@ def _source_transfer_failure_observation(
     status = int(failure.group(2))
     error = int(failure.group(3))
     transfer_attempts = int(failure.group(4))
-    failed_endpoint = retry.group(1)
+    failed_endpoint = assignment.get("endpoint") if legacy_retry else retry.group(1)
     identity = (
         assignment_identity["scheduler_job"],
         assignment_identity["assignment_epoch"],
@@ -5111,7 +5128,7 @@ def _source_transfer_failure_observation(
     ):
         raise CollectError(
             f"{row_job_id}: source-transfer loss does not bind one uncommitted "
-            "failed assignment to a distinct strict retry"
+            "failed assignment to a distinct retry"
         )
     record = {
         "assignment_epoch": assignment_identity["assignment_epoch"],
@@ -5143,6 +5160,9 @@ def _source_transfer_failure_observation(
         "tu_seq": assignment_identity["tu_seq"],
         "worker": worker,
     }
+    if legacy_retry:
+        record["retry_mode"] = "legacy"
+        return record
     return _bind_same_endpoint_decision(
         record, retry_decisions or [], "source-transfer loss"
     )
@@ -6262,6 +6282,20 @@ def _parse_rows(
             legacy_key, legacy_wire = (
                 legacy_candidates[0] if legacy_candidates else (None, None)
             )
+            if any(
+                failure.get("retry_mode") == "legacy"
+                for failure in source_transfer_failures
+            ) and (
+                len(assignments) != 2
+                or raw["retries"] != 1
+                or marker is not None
+                or source is not None
+                or legacy_marker is None
+                or legacy_wire is None
+            ):
+                raise CollectError(
+                    f"{job_id}: source-transfer legacy retry lacks one exact legacy result"
+                )
             if legacy_marker is not None and legacy_wire is None:
                 raise CollectError(
                     f"{job_id}: legacy-wire binding marker has no exact result witness"
@@ -7823,6 +7857,10 @@ def _observations(
             and len(records) == 2
             and final["terminal"] == "completion"
             and retry_failure_reason is not None
+            and not any(
+                failure.get("retry_mode") == "legacy"
+                for failure in source_transfer_failures
+            )
             and (
                 retry_failure_reason
                 not in {"source-transfer-loss", "uncommitted-transport-loss"}

@@ -1754,10 +1754,10 @@ void serve_source_transfer_after_protocol_stall(
 void serve_only_protocol_stalls(
     int listener, std::vector<std::vector<uint8_t>>& attempts) noexcept {
     try {
-        // A 2.5-second source open/arm budget yields two complete one-second
-        // slices and one final partial slice.  Bound every accept so deleting
-        // the retry cannot strand this regression.
-        for (unsigned int index = 0; index != 3; ++index) {
+        // Keep both sockets stalled until the client closes them: the first
+        // at its short slice, the second at the unchanged outer deadline.
+        // Closing on a fixture timer would test definitive refusal instead.
+        for (unsigned int index = 0; index != 2; ++index) {
             pollfd descriptor{listener, POLLIN, 0};
             int ready = -1;
             do {
@@ -1767,7 +1767,28 @@ void serve_only_protocol_stalls(
                                            : -1;
             if (accepted < 0)
                 break;
-            attempts.push_back(receive_after_protocol_slice(accepted));
+            std::vector<uint8_t> bytes;
+            const auto limit = std::chrono::steady_clock::now() +
+                               std::chrono::seconds(4);
+            while (std::chrono::steady_clock::now() < limit) {
+                pollfd peer{accepted, POLLIN, 0};
+                const int readable = ::poll(&peer, 1, 50);
+                if (readable < 0 && errno == EINTR)
+                    continue;
+                if (readable < 0)
+                    break;
+                if (readable == 0)
+                    continue;
+                std::array<uint8_t, 64> chunk{};
+                const ssize_t count = ::recv(accepted, chunk.data(),
+                                             chunk.size(), MSG_DONTWAIT);
+                if (count > 0)
+                    bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + count);
+                else if (count == 0 || (errno != EINTR && errno != EAGAIN &&
+                                        errno != EWOULDBLOCK))
+                    break;
+            }
+            attempts.push_back(std::move(bytes));
             (void)::close(accepted);
         }
     } catch (...) {}
@@ -1905,7 +1926,7 @@ void test_source_connect_protocol_slices_share_one_outer_budget() {
         static_cast<uint8_t>(PROTOCOL_VERSION), 0, 0, 0};
     CHECK(result.code == local::SourceTransferResultCode::Error);
     CHECK(result.error_code == 4 && result.attempts == 0);
-    CHECK(attempts.size() >= 2 && attempts.size() <= 3);
+    CHECK(attempts.size() == 2);
     CHECK(std::all_of(attempts.begin(), attempts.end(),
                       [&](const auto& bytes) {
                           return bytes == protocol_only;

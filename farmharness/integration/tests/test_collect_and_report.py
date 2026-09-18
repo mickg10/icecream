@@ -2355,6 +2355,25 @@ def _source_transfer_failure_kwargs(
     }
 
 
+@pytest.mark.parametrize("same_endpoint", [False, True])
+def test_source_transfer_failure_preserves_normal_legacy_retry(same_endpoint: bool) -> None:
+    kwargs = _source_transfer_failure_kwargs(
+        mutation="same-endpoint" if same_endpoint else None
+    )
+    kwargs["log_text"] = kwargs["log_text"].replace(
+        "requesting one fresh strict-P50 remote assignment; avoiding failed endpoint "
+        + kwargs["assignment"]["endpoint"],
+        "requesting one fresh legacy remote assignment",
+    )
+    record = _source_transfer_failure_observation(**kwargs)
+    assert record is not None
+    assert record["retry_mode"] == "legacy"
+    assert record["scheduler_job"] == 2
+    assert record["retry_scheduler_job"] == 3
+    assert record["status"] == 2
+    assert record["compile_identity_present"] is False
+
+
 def test_source_transfer_failure_binds_exact_uncommitted_retry_window() -> None:
     record = _source_transfer_failure_observation(
         **_source_transfer_failure_kwargs()
@@ -2374,6 +2393,37 @@ def test_source_transfer_failure_binds_exact_uncommitted_retry_window() -> None:
     assert record["transfer_attempts"] == 0
     assert record["source_result_present"] is False
     assert record["compile_identity_present"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "status-zero", "duplicate-failure", "wrong-retry-identity",
+        "duplicate-first-identity", "committed-source-result",
+        "malformed-source-result", "noncommitted-source-wrong-profile",
+        "noncommitted-source-wrong-attempts",
+    ],
+)
+def test_legacy_source_transfer_retry_keeps_identity_guards(mutation: str) -> None:
+    kwargs = _source_transfer_failure_kwargs(mutation=mutation)
+    kwargs["log_text"] = kwargs["log_text"].replace(
+        "requesting one fresh strict-P50 remote assignment; avoiding failed endpoint "
+        + kwargs["assignment"]["endpoint"],
+        "requesting one fresh legacy remote assignment",
+    )
+    with pytest.raises(CollectError, match="source-transfer loss"):
+        _source_transfer_failure_observation(**kwargs)
+
+
+def test_source_transfer_retry_rejects_mixed_retry_claims() -> None:
+    kwargs = _source_transfer_failure_kwargs()
+    kwargs["log_text"] = kwargs["log_text"].replace(
+        "P50 assignment failed; requesting one fresh strict-P50 remote assignment;",
+        "P50 assignment failed; requesting one fresh legacy remote assignment "
+        "P50 assignment failed; requesting one fresh strict-P50 remote assignment;",
+    )
+    with pytest.raises(CollectError, match="source-transfer loss"):
+        _source_transfer_failure_observation(**kwargs)
 
 
 def test_source_transfer_failure_accepts_noncommitted_source_result_diagnostic(

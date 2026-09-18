@@ -997,6 +997,9 @@ public:
     // NULL  <--> channel closed or timeout
     // Will warn in log if EOF and !eofAllowed.
     Msg *get_msg(int timeout = 10, bool eofAllowed = false);
+    // Partial frames and EINTR consume the same absolute receive budget.
+    Msg *get_msg_until(std::chrono::steady_clock::time_point deadline,
+                       bool eofAllowed = false);
 
     // A malformed P50_SOURCE_ARM is never returned as a message, but its
     // first exact assignment triple is retained long enough for the daemon's
@@ -1358,9 +1361,11 @@ private:
     struct sockaddr *addr;
     socklen_t addr_len;
     bool set_error_recursion;
+    bool deadline_receive_active = false;
     std::optional<std::string> error_status;
 
     void p50_note_channel_mutation() noexcept;
+    void begin_receive() noexcept;
     void p50_clear_decoded_stamp() noexcept;
     void p50_clear_outbound_claim() noexcept;
     void p50_promote_flushed_claim() noexcept;
@@ -1389,10 +1394,18 @@ public:
     // attempt consumes its complete slice.  Immediate definitive failures
     // remain immediate, and every attempt shares one unchanged outer
     // deadline.  No application message is sent by this factory.
+    // RemainingAfterFirst permits one fresh connection after a stalled first
+    // slice, then lets a consistently slow peer use the remaining budget.
+    enum class ChannelRetryPolicy { FixedSlices, RemainingAfterFirst };
     static MsgChannel *createChannelRetryUntil(
         const std::string &host, unsigned short p,
         std::chrono::steady_clock::time_point deadline,
         std::chrono::milliseconds attempt_budget);
+    static MsgChannel *createChannelRetryUntil(
+        const std::string &host, unsigned short p,
+        std::chrono::steady_clock::time_point deadline,
+        std::chrono::milliseconds attempt_budget,
+        ChannelRetryPolicy policy);
     static MsgChannel *createChannel(const std::string &domain_socket);
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
     // Daemon accept-side factory: construct and emit the initial protocol

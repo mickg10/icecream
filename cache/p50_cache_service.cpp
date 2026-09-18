@@ -1601,7 +1601,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             std::unique_ptr<MsgChannel> channel(Service::createChannelRetryUntil(
                 arm.selected_f_host,
                 static_cast<unsigned short>(arm.selected_f_cache_port), limit,
-                kSourceConnectAttemptBudget));
+                kSourceConnectAttemptBudget,
+                Service::ChannelRetryPolicy::RemainingAfterFirst));
             if (!channel)
                 return refused("f-connect");
             if (channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
@@ -1613,11 +1614,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
                 return refused("f-arm-send");
             stage_start = std::chrono::steady_clock::now();
-            const auto remaining = limit - std::chrono::steady_clock::now();
-            const auto timeout = std::chrono::duration_cast<std::chrono::seconds>(remaining).count();
-            if (timeout <= 0 || timeout > INT_MAX)
-                return refused("f-arm-budget", timeout);
-            std::unique_ptr<Msg> response(channel->get_msg(static_cast<int>(timeout)));
+            std::unique_ptr<Msg> response(channel->get_msg_until(limit));
             const auto* acknowledgement = response != nullptr
                                               ? dynamic_cast<P50SourceArmedMsg*>(response.get())
                                               : nullptr;
