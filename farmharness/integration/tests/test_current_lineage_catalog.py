@@ -159,9 +159,9 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
         "F2": "tt-quietbox4",
     }
 
-    # H5 deliberately remains on its stale 57a1 image until that exact image
-    # is installed and independently sealed on the new builders.
+    # H5 qualifies current-product recovery on its authorized original hosts.
     h5 = json.loads((SCENARIOS / "H5-worker-kill.json").read_text(encoding="utf-8"))
+    assert h5["images"] == {"new": FINAL_PRODUCT}
     h5_workers = {item["name"]: item for item in h5["instances"] if item["role"] == "F"}
     assert {name: item["host"] for name, item in h5_workers.items()} == {
         "F1": "tt-quietbox3",

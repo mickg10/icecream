@@ -30,7 +30,7 @@
   ],
   "workload": {
     "driver": "tu-manifest",
-    "corpus": "firefox-1000",
+    "corpus": "firefox-root-header-1000",
     "turns": ["A", "B"],
     "jobs": 24,
     "clients": ["C1"],

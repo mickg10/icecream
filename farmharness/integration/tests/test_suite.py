@@ -689,6 +689,7 @@ def test_checked_in_shaped_s80_is_a_separate_same_host_p29v1_pair() -> None:
     plan = farmtest.build_plan(farm, scenario, run_id="shaped-checked-in")
 
     assert suite.expanded_scenario_ids() == (("S80-p29v1-shaped-100m", 1),)
+    assert scenario.data["workload"]["corpus"] == "firefox-root-header-1000"
     assert scenario.data["workload"]["turns"] == ["A", "B"]
     assert {
         item["host"] for item in plan["topology"]["instances"]
