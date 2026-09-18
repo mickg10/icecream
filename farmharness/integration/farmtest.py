@@ -935,6 +935,8 @@ def build_plan(
         "farm_digest": farm.digest,
         "icefarm_env": _resolver_environment(farm, scenario),
         "launch_contract": F_INIT_LAUNCH_CONTRACT,
+        **({"s90_refusal_contract": "icefarm-s90-typed-refusal-v1"}
+           if scenario.data["id"] == "S90-revision-refusal-retry" else {}),
         **({"worker_endpoint_contract": "icefarm-live-bridge-endpoint-v1"}
            if netem_bindings else {}),
         "ports": ports,

@@ -949,6 +949,64 @@ def _lifecycle_final_dispatch_ms(item: Mapping[str, Any]) -> Any:
     return item.get("final_dispatch_ms", item.get("dispatch_ms"))
 
 
+def _s90_typed_refusal_ids(bundle: Mapping[str, Any]) -> set[str] | None:
+    """Bind typed source refusal to its exact failed and legacy assignments."""
+    plan = bundle.get("plan")
+    if not isinstance(plan, Mapping) or plan.get("s90_refusal_contract") != "icefarm-s90-typed-refusal-v1":
+        return None
+    if bundle.get("scenario", {}).get("id") != "S90-revision-refusal-retry":
+        return set()
+    observations = bundle.get("observations", {})
+    revisions, errors = _authoritative_endpoint_revisions(bundle, 0)
+    if revisions is None:  # Pure-verdict fixtures have no launch authority.
+        revisions = observations.get("wire_revisions", {})
+    if errors or revisions.get("C1") != 1:
+        return set()
+    mismatches = observations.get("wire_revision_mismatches")
+    transfers = observations.get("failed_p50_source_transfers", {})
+    records = transfers.get("records") if isinstance(transfers, Mapping) else None
+    if (
+        not isinstance(mismatches, list) or not mismatches
+        or not isinstance(records, list)
+        or transfers.get("record_count") != len(records)
+        or len(records) != len(mismatches)
+    ):
+        return set()
+    result: set[str] = set()
+    for mismatch in mismatches:
+        if not isinstance(mismatch, Mapping):
+            return set()
+        identifier = mismatch.get("row_job_id")
+        matching = [r for r in records if isinstance(r, Mapping) and r.get("row_job_id") == identifier]
+        if not isinstance(identifier, str) or identifier in result or len(matching) != 1:
+            return set()
+        record = matching[0]
+        first = {key: record.get(key) for key in ("scheduler_job", "assignment_epoch", "assignment_nonce")}
+        retry = {key: record.get("retry_" + key) for key in first}
+        if (
+            mismatch.get("error") != "WIRE_REVISION_MISMATCH"
+            or mismatch.get("error_code") != 4
+            or mismatch.get("client_instance") != "C1"
+            or mismatch.get("client_wire_revision") != 1
+            or mismatch.get("advertised_worker_wire_revision") != 1
+            or mismatch.get("endpoint_wire_revision") != 2
+            or mismatch.get("worker_instance") != record.get("worker")
+            or first != mismatch.get("first_assignment")
+            or retry != mismatch.get("retry_assignment")
+            or first == retry
+            or record.get("error") != 0x5002  # RouteReplacementRequired
+            or record.get("status") != 2
+            or record.get("source_result_status") != 4
+            or record.get("transfer_attempts") != 1
+            or record.get("retry_mode") != "legacy"
+            or record.get("compile_identity_present") is not False
+            or record.get("source_result_present") is not False
+        ):
+            return set()
+        result.add(identifier)
+    return result
+
+
 def _authenticated_strict_p50_retry_ids(
     bundle: Mapping[str, Any],
     observations: Mapping[str, Any],
@@ -957,6 +1015,7 @@ def _authenticated_strict_p50_retry_ids(
     """Validate successful strict-P50 retries against independent witnesses."""
 
     field = "successful_strict_p50_retry_bindings"
+    typed_refusal_ids = _s90_typed_refusal_ids(bundle) or set()
     raw = observations.get(field)
     if not isinstance(raw, list):
         return set(), {f"@observations:{field}"}
@@ -1162,7 +1221,9 @@ def _authenticated_strict_p50_retry_ids(
                     not isinstance(legacy_row, Mapping)
                     or legacy_row.get("tail_present") is not False
                     or legacy_row.get("tail_profile") is not None
-                    or legacy_row.get("session_outcome") != "none"
+                    or legacy_row.get("session_outcome") != (
+                        "fallback" if item["row_job_id"] in typed_refusal_ids else "none"
+                    )
                     or legacy_row.get("retries") != 1
                 ):
                     invalid_source_transfer = True
@@ -4326,6 +4387,7 @@ def _shape_clauses(
     topology: Any = None,
     run_id: Any = None,
     readiness_v2: bool = False,
+    typed_refusal_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     shape = scenario.get("shape")
     clauses: list[dict[str, Any]] = []
@@ -4996,7 +5058,7 @@ def _shape_clauses(
             or selected_profile not in (f_logins[0].get("cache_profiles") or [])
             or not isinstance(revisions, Mapping)
             or revisions.get("F1") != 1
-            or revisions.get("C1") != 1
+            or (typed_refusal_ids is None and revisions.get("C1") != 1)
             or sidecar("F1").get("sessions") != 0
         ):
             bad.add("@instance:F1")
@@ -5086,7 +5148,10 @@ def _shape_clauses(
         if (
             not isinstance(error106_raw, list)
             or len(error106_ids) != len(error106_raw)
-            or error106_ids != mismatch_ids
+            or (
+                error106_ids != mismatch_ids if typed_refusal_ids is None
+                else typed_refusal_ids != mismatch_ids or not error106_ids <= mismatch_ids
+            )
         ):
             bad.add("@observations:error106_job_ids")
         if local_raw != []:
@@ -6072,6 +6137,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 or {"@observations:s95-fallback-bound"}
             )
     elif engagement_mode == S90_REVISION_REFUSAL_ENGAGEMENT:
+        typed_refusal_ids = _s90_typed_refusal_ids(bundle)
         mismatch_raw = observations.get("wire_revision_mismatches")
         mismatch_ids = {
             _job_id(item.get("row_job_id"), "@revision-mismatch")
@@ -6102,7 +6168,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if (
             not isinstance(error106_raw, list)
             or len(error106_ids) != len(error106_raw)
-            or error106_ids != mismatch_ids
+            or (
+                error106_ids != mismatch_ids if typed_refusal_ids is None
+                else typed_refusal_ids != mismatch_ids or not error106_ids <= mismatch_ids
+            )
         ):
             engagement_bad.add("@observations:error106_job_ids")
         if observations.get("local_fallback_job_ids") != []:
@@ -8228,6 +8297,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             bundle.get("topology"),
             bundle.get("run_id"),
             readiness_v2=readiness_v2,
+            typed_refusal_ids=_s90_typed_refusal_ids(bundle),
         )
     )
     return _finish(clauses)

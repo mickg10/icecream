@@ -4835,6 +4835,81 @@ def test_s90_named_revision_refusal_and_fresh_remote_retry_passes() -> None:
     assert verdict["status"] == "PASS", verdict
 
 
+def _s90_typed_refusal_bundle():
+    bundle = _s90_refusal_bundle()
+    bundle["plan"] = {"s90_refusal_contract": "icefarm-s90-typed-refusal-v1", "commands": []}
+    observations = bundle["observations"]
+    observations["error106_job_ids"] = []
+    observations["failed_p50_source_transfers"] = {"record_count": 1, "records": [{
+        "row_job_id": "1", "worker": "F1", "attempt_index": 0,
+        "assignment_epoch": 7, "assignment_nonce": 11, "scheduler_job": 41,
+        "c_guid": 7, "tu_seq": 2, "failed_endpoint": "10.0.0.2:23003",
+        "assignment_identity_line": 6, "assignment_line": 7, "failure_line": 11,
+        "retry_line": 12, "retry_assignment_identity_line": 16, "retry_assignment_line": 17,
+        "retry_assignment_epoch": 7, "retry_assignment_nonce": 12, "retry_scheduler_job": 42,
+        "retry_c_guid": 7, "retry_tu_seq": 3, "retry_endpoint": "10.0.0.2:23003",
+        "retry_mode": "legacy", "profile": "P29V1", "error": 0x5002,
+        "status": 2, "source_result_status": 4, "transfer_attempts": 1,
+        "compile_identity_present": False, "source_result_present": False,
+    }]}
+    return bundle
+
+
+def test_s90_typed_refusal_binds_legacy_retry_without_literal_error106():
+    bundle = _s90_typed_refusal_bundle()
+    verdict = evaluate_bundle(bundle)
+    assert verdict["status"] == "PASS", verdict
+    del bundle["plan"]["s90_refusal_contract"]
+    assert evaluate_bundle(bundle)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("mutation", [
+    "source_error", "source_status", "terminal_status", "attempt_count",
+    "missing_source", "duplicate_source", "wrong_first", "wrong_retry",
+    "wrong_client_revision", "wrong_name", "wrong_wire_error", "wrong_endpoint_revision",
+    "unrelated_error106", "unknown_row", "missing_mismatch", "local_fallback",
+])
+def test_s90_typed_refusal_fails_closed(mutation):
+    bundle = _s90_typed_refusal_bundle()
+    observations = bundle["observations"]
+    source = observations["failed_p50_source_transfers"]["records"][0]
+    mismatch = observations["wire_revision_mismatches"][0]
+    if mutation == "source_error":
+        source["error"] = 4
+    elif mutation == "source_status":
+        source["status"] = 1
+    elif mutation == "terminal_status":
+        source["source_result_status"] = 3
+    elif mutation == "attempt_count":
+        source["transfer_attempts"] = 2
+    elif mutation == "missing_source":
+        observations["failed_p50_source_transfers"] = {"record_count": 0, "records": []}
+    elif mutation == "duplicate_source":
+        observations["failed_p50_source_transfers"]["records"].append(dict(source))
+        observations["failed_p50_source_transfers"]["record_count"] = 2
+    elif mutation == "wrong_first":
+        source["assignment_nonce"] += 1
+    elif mutation == "wrong_retry":
+        source["retry_assignment_nonce"] += 1
+    elif mutation == "wrong_client_revision":
+        observations["wire_revisions"]["C1"] = 2
+    elif mutation == "wrong_name":
+        mismatch["error"] = "UNKNOWN"
+    elif mutation == "wrong_wire_error":
+        mismatch["error_code"] = 3
+    elif mutation == "wrong_endpoint_revision":
+        mismatch["endpoint_wire_revision"] = 1
+    elif mutation == "unrelated_error106":
+        observations["error106_job_ids"] = ["2"]
+    elif mutation == "unknown_row":
+        source["row_job_id"] = "2"
+    elif mutation == "missing_mismatch":
+        observations["wire_revision_mismatches"] = []
+    elif mutation == "local_fallback":
+        observations["local_fallback_job_ids"] = ["1"]
+    assert evaluate_bundle(bundle)["status"] == "FAIL"
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
