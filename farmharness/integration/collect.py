@@ -7464,6 +7464,39 @@ def _nearest_rank(values: list[int], percentile: int) -> int:
     return ordered[index]
 
 
+def _result_stream_kill_loss(
+    missing: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    record: Mapping[str, Any],
+    events: list[dict[str, Any]],
+) -> bool:
+    """Join an already-authenticated EOF to this assignment's declared kill.
+
+    Scheduler STOP timestamps have whole-second precision. Only that final
+    fractional second is admitted; the exact wrapper interval still bounds
+    the kill. This collects a loss, never supplies a successful result identity.
+    """
+    if (
+        missing.get("reason") != "result-stream-loss"
+        or missing.get("result_identity_present") is not False
+        or missing.get("row_job_id") != raw.get("row_job_id")
+        or missing.get("scheduler_job") != record.get("scheduler_job")
+        or missing.get("worker") != record.get("worker")
+        or record.get("terminal") != "process-loss-recovery"
+    ):
+        return False
+    matches = [
+        event
+        for event in events
+        if event.get("action") == "kill -9"
+        and event.get("instance") == record["worker"]
+        and raw["started"] <= event["fired_ms"] <= raw["finished"]
+        and record["dispatch_ms"] <= event["fired_ms"]
+        <= record["terminal_ms"] + 999
+    ]
+    return len(matches) == 1
+
+
 def _validate_orphan_recovery_markers(
     raw_jobs: list[dict[str, Any]], events: list[dict[str, Any]]
 ) -> None:
@@ -7732,7 +7765,14 @@ def _observations(
                 and record.get("scheduler_job") in active_loss_jobs
                 and record.get("generation") in active_loss_generations
             )
-            if terminal not in expected_terminals and not exact_active_scheduler_loss:
+            exact_killed_worker_loss = _result_stream_kill_loss(
+                missing, raw, record, events
+            )
+            if (
+                terminal not in expected_terminals
+                and not exact_active_scheduler_loss
+                and not exact_killed_worker_loss
+            ):
                 raise CollectError(
                     f"{row['job_id']}: missing result identity loss witness "
                     "disagrees with scheduler terminal"

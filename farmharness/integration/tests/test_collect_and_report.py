@@ -32,6 +32,7 @@ from farmharness.integration.collect import (
     _p50_assignment_identity_evidence,
     _retained_log_witness,
     _retained_log_witness_exact,
+    _result_stream_kill_loss,
     _parse_logins,
     _reconcile_scheduler_dispatches,
     _scheduler_jobs,
@@ -2092,6 +2093,113 @@ def test_failed_transport_without_result_identity_collects_as_fail(
         ],
     }
     assert verify_bundle(root)["status"] == "FAIL"
+
+
+def test_killed_worker_result_stream_loss_collects_without_inventing_success(
+    tmp_path: Path,
+) -> None:
+    """A real scheduler STOP and client EOF are compatible loss witnesses."""
+    farm, scenario, old_plan, root = _raw_collection(tmp_path)
+    _make_failed_p50_transport_fixture(root)
+    scenario.data["timeline"] = [
+        {"action": "kill -9", "instance": "F1", "trigger": "job 2"}
+    ]
+    plan = farmtest.build_plan(farm, scenario, run_id=old_plan["run_id"])
+    for name in ("preflight", "lifecycle", "workload"):
+        path = root / f"{name}.json"
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("farm_digest", "scenario_digest", "topology_digest"):
+            receipt[key] = plan[key]
+        if name == "lifecycle":
+            receipt["plan"] = plan
+        _write_json(path, receipt)
+    _write_json(
+        root / "events" / "events.json",
+        {"events": [{
+            "action": "kill -9", "instance": "F1", "trigger": "job 2",
+            "event_epoch": 1, "event_index": 0,
+            "fired_ms": 1_788_570_005_500, "last_dispatched_job": 2,
+            "workload_dispatch_count": 1,
+        }]},
+    )
+    scheduler = next(i for i in plan["topology"]["instances"] if i["role"] == "S")
+    log = root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
+    log.write_text(log.read_text(encoding="utf-8").replace(
+        "END 2 status=0 server=F1", "STOP (DAEMON2) FOR 2"
+    ), encoding="utf-8")
+    result = root / "C1.results" / "workload" / "jobs" / "000001" / "result.tsv"
+    fields = result.read_text(encoding="utf-8").rstrip("\n").split("\t")
+    fields[7] = "1788570006000"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+
+    assert bundle["observations"]["failed_p50_result_identities"]["records"][0][
+        "reason"
+    ] == "result-stream-loss"
+    assert bundle["observations"]["assignment_lifecycle"][0]["attempts"][0][
+        "terminal"
+    ] == "process-loss-recovery"
+    assert bundle["rows"][0]["exact"] is False
+    assert verify_bundle(root)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        None, "last-millisecond", "wrong-row", "wrong-job", "wrong-worker",
+        "wrong-terminal", "wrong-reason", "result-present", "no-kill",
+        "other-action", "other-worker", "before-start", "after-finish",
+        "before-dispatch", "after-terminal-second", "duplicate-kill",
+    ),
+)
+def test_result_stream_kill_loss_requires_exact_assignment_and_interval(
+    mutation: str | None,
+) -> None:
+    missing = {
+        "reason": "result-stream-loss", "result_identity_present": False,
+        "row_job_id": "C1:A:24:28", "scheduler_job": 25, "worker": "F1",
+    }
+    raw = {"row_job_id": "C1:A:24:28", "started": 1000, "finished": 10000}
+    record = {
+        "scheduler_job": 25, "worker": "F1", "terminal": "process-loss-recovery",
+        "dispatch_ms": 2000, "terminal_ms": 5000,
+    }
+    events = [{"action": "kill -9", "instance": "F1", "fired_ms": 5500}]
+    if mutation == "last-millisecond":
+        events[0]["fired_ms"] = 5999
+    elif mutation == "wrong-row":
+        missing["row_job_id"] = "C1:A:25:28"
+    elif mutation == "wrong-job":
+        missing["scheduler_job"] = 26
+    elif mutation == "wrong-worker":
+        missing["worker"] = "F2"
+    elif mutation == "wrong-terminal":
+        record["terminal"] = "cancellation"
+    elif mutation == "wrong-reason":
+        missing["reason"] = "worker-restart-loss"
+    elif mutation == "result-present":
+        missing["result_identity_present"] = True
+    elif mutation == "no-kill":
+        events = []
+    elif mutation == "other-action":
+        events[0]["action"] = "restart"
+    elif mutation == "other-worker":
+        events[0]["instance"] = "F2"
+    elif mutation == "before-start":
+        raw["started"] = 6000
+    elif mutation == "after-finish":
+        raw["finished"] = 5000
+    elif mutation == "before-dispatch":
+        record["dispatch_ms"] = 6000
+    elif mutation == "after-terminal-second":
+        events[0]["fired_ms"] = 6000
+    elif mutation == "duplicate-kill":
+        events.append(dict(events[0]))
+
+    assert _result_stream_kill_loss(missing, raw, record, events) is (
+        mutation in (None, "last-millisecond")
+    )
 
 
 @pytest.mark.parametrize(
