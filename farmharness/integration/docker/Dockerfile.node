@@ -17,6 +17,7 @@ RUN apt-get update \
         file \
         g++-11 \
         gcc-11 \
+        iproute2 \
         libarchive-dev \
         libboost-dev \
         libcap-ng-dev \
@@ -31,6 +32,7 @@ RUN apt-get update \
         tar \
         xz-utils \
         zstd \
+    && /usr/sbin/tc -V \
     && test "$(gcc-11 -dumpfullversion -dumpversion)" = "11.4.0" \
     && grep -q '^#define BOOST_LIB_VERSION "1_74"' /usr/include/boost/version.hpp \
     && rm -rf /var/lib/apt/lists/*
