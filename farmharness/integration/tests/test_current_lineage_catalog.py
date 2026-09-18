@@ -5,15 +5,18 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-1d8169d0"
+FINAL_PRODUCT = "p50s4-ea153fc5"
+FINAL_COMMIT = "ea153fc56ec182e9ab86e52f17c9958b946e4a12"
+FINAL_SOURCE_ARCHIVE = "8f7be40b5d182d815aead62025a484b2d607282ac66baea4b974e91094028c70"
+FINAL_CLOSURE = "e165e8abf5e4627d12f9ab68f4f8d779edb324c903a07b870cb1d232411a5303"
 FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
 }
 FINAL_ROLE_HASHES = {
-    "scheduler": "a372f48a1ef26c93f0f86244218b752b2440cbbb87640a179d06cce2353d12ec",
-    "client": "902086dc8931a38986882ff9f82b893bbf23f3781ec70bfaa7ac92784e5f96a2",
-    "daemon": "edce31e32e710b2dae25c6e6add9e42d034b47d0318517057d9ee97b21767536",
+    "scheduler": "3f376f1c7b5086db58a3cf5e25826f4a1ef538d6a8045dd6ff5fd6986c4e35e6",
+    "client": "f661d93315b027faa4cdfa34961450a6393b4c715ddf687641f7263532384bf9",
+    "daemon": "4996e952d29ed60ec1bf1104b7d7defe8657d42b2497a6a34ee09ec1879f2f07",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
@@ -61,6 +64,15 @@ def test_final_product_role_store_uses_measured_current_binaries() -> None:
         for role, binding in farm["authority"]["role_stores"]["50"].items()
     }
     assert observed == FINAL_ROLE_HASHES
+
+
+def test_final_product_binding_matches_verified_source_and_runtime() -> None:
+    farm = json.loads((INTEGRATION / "farm.example.json").read_text(encoding="utf-8"))
+    binding = farm["authority"]["images"][FINAL_PRODUCT]
+    assert binding["commit"] == FINAL_COMMIT
+    assert binding["archive_sha256"] == FINAL_SOURCE_ARCHIVE
+    assert binding["closure_sha256"] == FINAL_CLOSURE
+    assert binding["id"] == "sha256:2dd22a3e895caa972d90d068b2474d6dbfc32129140af2788290b52a1a286c61"
 
 
 def test_direct_builder_catalog_is_f_only_and_deletion_sensitive() -> None:

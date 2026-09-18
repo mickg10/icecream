@@ -2,7 +2,7 @@
   "schema": "icefarm-scenario-v1",
   "id": "S70-b4-scheduler-active-loss",
   "shape": "S'C'F'",
-  "images": {"new": "p50s4-1d8169d0"},
+  "images": {"new": "p50s4-ea153fc5"},
   "instances": [
     {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "P29V1"}},
     {"name": "F1", "role": "F", "host": "tt-quietbox5", "image": "new", "slots": 1},
