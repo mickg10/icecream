@@ -20,6 +20,20 @@ from farmharness.integration.suite_spec import (
 INTEGRATION = Path(__file__).resolve().parents[1]
 
 
+def test_s95_plan_preserves_client_canary_output_for_failure_diagnostics() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S95-cache-disk-full.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="s95-diagnostic-capture")
+
+    assert plan["diagnostic_capture_client_output"] is True
+
+    smoke = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
+    smoke_plan = farmtest.build_plan(farm, smoke, run_id="s00-no-diagnostic-capture")
+    assert "diagnostic_capture_client_output" not in smoke_plan
+
+
 def test_checked_in_harness_gate_suites_are_exact_and_complete() -> None:
     controls = load_suite_spec(INTEGRATION / "suites" / "controls.json")
     smoke = load_suite_spec(INTEGRATION / "suites" / "smoke.json")

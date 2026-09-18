@@ -3302,6 +3302,40 @@ def collect_diagnostics(
             )
         except RemoteError as exc:
             problems.append(f"{host_name}:{instance['name']}:sync-log:{exc}")
+        if (
+            instance.get("role") == "C"
+            and plan.get("diagnostic_capture_client_output") is True
+        ):
+            remote_output = (
+                PurePosixPath(farm.hosts[host_name]["scratch_root"])
+                / "icefarm"
+                / plan["run_id"]
+                / instance["name"]
+                / "output"
+            )
+            local_output = host_dir / f"{instance['name']}.output"
+            local_output.mkdir(parents=True, exist_ok=True)
+            try:
+                recorder.invoke(
+                    _command(
+                        factory,
+                        phase="diagnostics.sync-output",
+                        host=host_name,
+                        transport="rsync-ssh",
+                        timeout_s=60,
+                        argv=(
+                            "rsync",
+                            "--archive",
+                            "--protect-args",
+                            f"{farm.hosts[host_name]['ssh']}:{remote_output}/",
+                            str(local_output) + "/",
+                        ),
+                    )
+                )
+            except RemoteError as exc:
+                problems.append(
+                    f"{host_name}:{instance['name']}:sync-output:{exc}"
+                )
     return problems
 
 
