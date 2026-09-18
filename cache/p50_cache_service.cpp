@@ -1854,6 +1854,10 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
         std::optional<asio::ip::tcp::socket> socket =
             P50ServerEndpoint::adopt_connected_fd(executor, fd_for_adoption, adoption_error);
         if (!socket) {
+            std::fprintf(stderr,
+                         "P50_CACHE_SESSION_ENDPOINT_REFUSED stage=adopt errno=%d\n",
+                         adoption_error.value());
+            std::fflush(stderr);
             owner_result.status = RuntimeStatus::AdoptionFailed;
             completion.set_value(std::move(owner_result));
             co_return;
@@ -1876,8 +1880,17 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
                     config_.owner_failure_after_live();
             });
         }
+        std::fprintf(stderr, "P50_CACHE_SESSION_ENDPOINT_START\n");
+        std::fflush(stderr);
         const ServerRunResult endpoint_result =
             co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
+        std::fprintf(stderr,
+                     "P50_CACHE_SESSION_ENDPOINT_DONE status=%u completed=%u "
+                     "committed=%u\n",
+                     static_cast<unsigned>(endpoint_result.status),
+                     endpoint_result.completed_input.has_value() ? 1u : 0u,
+                     endpoint_result.committed_input.has_value() ? 1u : 0u);
+        std::fflush(stderr);
         if (endpoint_result.candidate_input.has_value() &&
             !endpoint_result.completed_input.has_value())
             input_lifecycle_.abort_route_commit(*endpoint_result.candidate_input);
@@ -1902,6 +1915,8 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
                                   : RuntimeStatus::Completed;
         completion.set_value(std::move(owner_result));
     } catch (...) {
+        std::fprintf(stderr, "P50_CACHE_SESSION_ENDPOINT_EXCEPTION\n");
+        std::fflush(stderr);
         if (owned_fd >= 0)
             (void)::close(owned_fd);
         release_endpoint_run();
