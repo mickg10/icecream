@@ -587,6 +587,101 @@ Status Connection::receive(Frame& frame) noexcept {
     return fd_ < 0 ? status_ : read_frame(fd_, frame);
 }
 
+FrameOperation::FrameOperation(
+    Connection& connection, std::chrono::steady_clock::time_point deadline) noexcept
+    : connection_(connection), deadline_(deadline) {
+    try {
+        bytes_.resize(kFrameHeaderSize);
+    } catch (...) {
+        finish(Status::IoError);
+    }
+    if (!connection.valid()) finish(Status::InvalidArgument);
+}
+
+FrameOperation::FrameOperation(
+    Connection& connection, const Frame& frame,
+    std::chrono::steady_clock::time_point deadline) noexcept
+    : connection_(connection), deadline_(deadline), sending_(true) {
+    if (!connection.valid()) { finish(Status::InvalidArgument); return; }
+    if (connection_.writing_.test_and_set(std::memory_order_acquire)) {
+        finish(Status::Busy);
+        return;
+    }
+    writer_locked_ = true;
+    try {
+        Status encoded;
+        bytes_ = encode_frame(frame, &encoded);
+        if (encoded != Status::Ok) finish(encoded);
+    } catch (...) {
+        finish(Status::IoError);
+    }
+}
+
+FrameOperation::~FrameOperation() { cancel(); }
+
+void FrameOperation::finish(Status status) noexcept {
+    status_ = status;
+    done_ = true;
+    // A partial frame may never be reused as a new relationship boundary.
+    if (status != Status::Ok && status != Status::Busy)
+        connection_.close();
+    if (writer_locked_) {
+        connection_.writing_.clear(std::memory_order_release);
+        writer_locked_ = false;
+    }
+}
+
+void FrameOperation::cancel() noexcept {
+    if (!done_) finish(Status::IoError);
+}
+
+void FrameOperation::advance() noexcept {
+    if (done_) return;
+    if (std::chrono::steady_clock::now() >= deadline_) {
+        finish(Status::Timeout);
+        return;
+    }
+    // One nonblocking syscall per turn; even repeated EINTR yields to owner.
+    int send_flags = MSG_DONTWAIT;
+#if defined(MSG_NOSIGNAL)
+    send_flags |= MSG_NOSIGNAL;
+#endif
+    const ssize_t count = sending_
+        ? ::send(connection_.fd_, bytes_.data() + offset_, bytes_.size() - offset_,
+                 send_flags)
+        : ::recv(connection_.fd_, bytes_.data() + offset_, bytes_.size() - offset_,
+                 MSG_DONTWAIT);
+    if (count < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            finish(Status::IoError);
+        return;
+    }
+    if (count == 0) {
+        finish(!sending_ && offset_ == 0 ? Status::CleanEof : Status::Truncated);
+        return;
+    }
+    offset_ += static_cast<size_t>(count);
+    if (std::chrono::steady_clock::now() >= deadline_) {
+        finish(Status::Timeout);
+        return;
+    }
+    if (offset_ != bytes_.size()) return;
+    if (sending_) { finish(Status::Ok); return; }
+    try {
+        if (!header_read_) {
+            uint32_t length = 0;
+            const Status status = validate_header(bytes_.data(), bytes_.size(), &length);
+            if (status != Status::Ok) { finish(status); return; }
+            header_read_ = true;
+            bytes_.resize(kFrameHeaderSize + length);
+            if (length != 0) return;
+        }
+        finish(decode_frame(bytes_, frame_));
+    } catch (...) {
+        finish(Status::IoError);
+    }
+}
+
 Frame make_hello(PeerRole role, Identity identity) {
     return Frame{kProtocolVersion, MessageType::Hello, identity,
                  {static_cast<uint8_t>(role)}};
@@ -750,6 +845,69 @@ Connection connect_unix(const std::string& path, Status* status) noexcept {
     }
     set_status(Status::Ok, status);
     return connection;
+}
+
+void UnixConnectOperation::finish(Status status) noexcept {
+    status_ = status;
+    done_ = true;
+    if (status != Status::Ok && fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+
+void UnixConnectOperation::cancel() noexcept {
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (!done_) finish(Status::IoError);
+}
+
+Connection UnixConnectOperation::take_connection() noexcept {
+    if (!done_ || status_ != Status::Ok) return Connection(-1);
+    const int fd = std::exchange(fd_, -1);
+    return Connection(fd);
+}
+
+void UnixConnectOperation::advance(short revents) noexcept {
+    if (done_) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline_) { finish(Status::Timeout); return; }
+    if (fd_ < 0) {
+        if (now < retry_at_) return;
+        if (++attempts_ > 4096) { finish(Status::IoError); return; }
+        sockaddr_un address{};
+        if (!fill_address(path_, address) || !private_parent(path_) ||
+            !private_socket_node(path_)) { finish(Status::InvalidPath); return; }
+        fd_ = socket_nonblocking_cloexec();
+        if (fd_ < 0) { finish(Status::IoError); return; }
+        const int result = connect_once(fd_, reinterpret_cast<sockaddr*>(&address),
+            static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path_.size() + 1));
+        if (result < 0) {
+            if (errno == EINPROGRESS) return;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                ::close(fd_);
+                fd_ = -1;
+                retry_at_ = now + std::chrono::milliseconds(1);
+                return;
+            }
+            finish(Status::IoError);
+            return;
+        }
+    } else if ((revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) == 0) {
+        return;
+    }
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
+        finish(Status::IoError);
+        return;
+    }
+    if (std::chrono::steady_clock::now() >= deadline_) { finish(Status::Timeout); return; }
+    const int flags = ::fcntl(fd_, F_GETFL);
+    if (flags < 0 || ::fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+        finish(Status::IoError);
+        return;
+    }
+    finish(Status::Ok);
 }
 
 Connection connect_unix_until(const std::string& path,

@@ -284,6 +284,12 @@ public:
         InputRecordKey key, InputLeaseOwner owner,
         uint64_t request_id) noexcept;
 
+    // The caller retains the observed ReadyLease and must reject completion
+    // after replacement. This operation never accesses mutable adapter state.
+    [[nodiscard]] std::unique_ptr<InputFdAttachmentOperation> begin_attach_input(
+        InputRecordKey key, InputLeaseOwner owner,
+        uint64_t request_id) noexcept;
+
     // Attempt teardown and terminal logical-job settlement are deliberately
     // distinct.  A failed operation is retained in the adapter's bounded retry
     // queue; replacement of the named sidecar incarnation reclaims it without

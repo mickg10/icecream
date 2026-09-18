@@ -2445,9 +2445,11 @@ static CompileServer *pick_server_fastest(Job *job, list<CompileServer *> &eligi
 
 static CompileServer *pick_server(Job *job,
                                   SchedulerAlgorithmName schedulerAlgorithm,
-                                  bool &cache_retry_wait)
+                                  bool &cache_retry_wait,
+                                  bool &retry_alternative_exists)
 {
     cache_retry_wait = false;
+    retry_alternative_exists = false;
 #if DEBUG_SCHEDULER > 0
     /* consistency checking for now */
     for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
@@ -2473,7 +2475,7 @@ static CompileServer *pick_server(Job *job,
 
     const P50CacheProfileRequest cache_request =
         p50_cache_profile_request_from_env();
-    const bool retry_alternative_exists =
+    retry_alternative_exists =
         assignment_mode_prepares() &&
         cache_retry_has_compatible_alternative(job, cache_request);
 
@@ -2820,10 +2822,12 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 
     CompileServer *use_cs = nullptr;
     Job* job = jobPosition.job;
+    bool retry_alternative_exists = false;
 
     while (true) {
         bool cache_retry_wait = false;
-        use_cs = pick_server(job, schedulerAlgorithm, cache_retry_wait);
+        use_cs = pick_server(job, schedulerAlgorithm, cache_retry_wait,
+                             retry_alternative_exists);
 
         if (use_cs) {
             break;
@@ -3016,6 +3020,24 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         /* Admission is the accepted PREPARE enqueue, not later READY or
            client exposure.  Charge exactly here for both prepared modes. */
         debit_dispatch_credit(job);
+        // Record the same selection-time compatibility fact that enforced
+        // retry exclusion. Busy alternatives still count; a withdrawn one
+        // does not. Bind to this freshly minted assignment, never just job ID
+        // (an unexposed redispatch can reuse that ID with a different nonce).
+        const uint32_t retry_profile = selected_cache_profile(
+            job, use_cs, p50_cache_profile_request_from_env());
+        if (retry_profile != 0 && p50_cache_retry_avoid_is_present(
+                job->cacheRetryAvoidPort(), job->cacheRetryAvoidHost())) {
+            trace() << "P50_RETRY_DECISION job=" << job->id()
+                    << " epoch=" << job->assignmentEpoch()
+                    << " nonce=" << job->assignmentNonce()
+                    << " failed=" << job->cacheRetryAvoidHost() << ":"
+                    << job->cacheRetryAvoidPort()
+                    << " selected=" << use_cs->name << ":" << use_cs->remotePort()
+                    << " profile=" << retry_profile
+                    << " compatible_alternative=" << (retry_alternative_exists ? 1 : 0)
+                    << endl;
+        }
     } else {
         job->setAssignmentPolicy(Job::ASSIGNMENT_LEGACY);
         job->setAssignmentPhase(Job::ASSIGNMENT_NONE);

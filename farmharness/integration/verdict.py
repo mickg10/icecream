@@ -18,8 +18,10 @@ from typing import Any
 
 try:
     from .netem import NetemPlanError, validate_receipt as validate_netem_receipt
+    from .retry_decision import same_endpoint_decision_valid
 except ImportError:  # Direct execution from this directory.
     from netem import NetemPlanError, validate_receipt as validate_netem_receipt
+    from retry_decision import same_endpoint_decision_valid
 
 
 BUNDLE_SCHEMA = "icefarm-bundle-v1"
@@ -964,17 +966,25 @@ def _authenticated_strict_p50_retry_ids(
         if isinstance(row, Mapping)
     }
     assignment_raw = observations.get("assignment_lifecycle")
-    assignments = {
-        _job_id(item.get("job_id"), "@assignment-lifecycle"): item
-        for item in assignment_raw
-        if isinstance(item, Mapping)
-    } if isinstance(assignment_raw, list) else {}
+    assignments = (
+        {
+            _job_id(item.get("job_id"), "@assignment-lifecycle"): item
+            for item in assignment_raw
+            if isinstance(item, Mapping)
+        }
+        if isinstance(assignment_raw, list)
+        else {}
+    )
     lifecycle_raw = observations.get("job_lifecycle")
-    lifecycles = {
-        _job_id(item.get("job_id"), "@lifecycle"): item
-        for item in lifecycle_raw
-        if isinstance(item, Mapping)
-    } if isinstance(lifecycle_raw, list) else {}
+    lifecycles = (
+        {
+            _job_id(item.get("job_id"), "@lifecycle"): item
+            for item in lifecycle_raw
+            if isinstance(item, Mapping)
+        }
+        if isinstance(lifecycle_raw, list)
+        else {}
+    )
     failed = observations.get("failed_p50_result_identities")
     failed_raw = failed.get("records") if isinstance(failed, Mapping) else None
     failed_by_attempt: dict[tuple[str, int], Mapping[str, Any]] = {}
@@ -1070,9 +1080,11 @@ def _authenticated_strict_p50_retry_ids(
             )
             if (
                 not isinstance(item, Mapping)
-                or set(item) not in (
+                or set(item)
+                not in (
                     source_transfer_fields,
                     source_transfer_fields_v2,
+                    source_transfer_fields_v2 | {"same_endpoint_decision"},
                 )
                 or not _is_int(item.get("assignment_epoch"), minimum=1)
                 or not _is_int(item.get("assignment_nonce"), minimum=1)
@@ -1090,7 +1102,13 @@ def _authenticated_strict_p50_retry_ids(
                 or item.get("retry_c_guid") != item.get("c_guid")
                 or not isinstance(item.get("retry_endpoint"), str)
                 or not item["retry_endpoint"]
-                or item.get("retry_endpoint") == item.get("failed_endpoint")
+                or (
+                    (
+                        "same_endpoint_decision" in item
+                        or item.get("retry_endpoint") == item.get("failed_endpoint")
+                    )
+                    and not same_endpoint_decision_valid(item)
+                )
                 or not _is_int(item.get("retry_scheduler_job"), minimum=1)
                 or not _is_int(item.get("retry_tu_seq"))
                 or (
@@ -1120,9 +1138,7 @@ def _authenticated_strict_p50_retry_ids(
                 or not _is_int(item.get("tu_seq"))
                 or not isinstance(item.get("worker"), str)
                 or not item["worker"]
-                or not all(
-                    _is_int(item.get(name), minimum=1) for name in ordered_lines
-                )
+                or not all(_is_int(item.get(name), minimum=1) for name in ordered_lines)
                 or list(map(item.get, ordered_lines))
                 != sorted(map(item.get, ordered_lines))
                 or len(set(map(item.get, ordered_lines))) != len(ordered_lines)
@@ -1144,9 +1160,7 @@ def _authenticated_strict_p50_retry_ids(
         if isinstance(uncommitted_transports, Mapping)
         else None
     )
-    uncommitted_transport_by_attempt: dict[
-        tuple[str, int], Mapping[str, Any]
-    ] = {}
+    uncommitted_transport_by_attempt: dict[tuple[str, int], Mapping[str, Any]] = {}
     uncommitted_transport_duplicates: set[tuple[str, int]] = set()
     invalid_uncommitted_transport = False
     uncommitted_transport_fields = {
@@ -1192,9 +1206,11 @@ def _authenticated_strict_p50_retry_ids(
             )
             if (
                 not isinstance(item, Mapping)
-                or set(item) not in (
+                or set(item)
+                not in (
                     uncommitted_transport_fields,
                     uncommitted_transport_fields_v2,
+                    uncommitted_transport_fields_v2 | {"same_endpoint_decision"},
                 )
                 or not _is_int(item.get("assignment_epoch"), minimum=1)
                 or not _is_int(item.get("assignment_nonce"), minimum=1)
@@ -1212,7 +1228,13 @@ def _authenticated_strict_p50_retry_ids(
                 or item.get("retry_c_guid") != item.get("c_guid")
                 or not isinstance(item.get("retry_endpoint"), str)
                 or not item["retry_endpoint"]
-                or item.get("retry_endpoint") == item.get("failed_endpoint")
+                or (
+                    (
+                        "same_endpoint_decision" in item
+                        or item.get("retry_endpoint") == item.get("failed_endpoint")
+                    )
+                    and not same_endpoint_decision_valid(item)
+                )
                 or not _is_int(item.get("retry_scheduler_job"), minimum=1)
                 or not _is_int(item.get("retry_tu_seq"))
                 or not isinstance(item.get("row_job_id"), str)
@@ -1240,9 +1262,7 @@ def _authenticated_strict_p50_retry_ids(
                     item.get("assignment_epoch"),
                     item.get("assignment_nonce"),
                 )
-                or not all(
-                    _is_int(item.get(name), minimum=1) for name in ordered_lines
-                )
+                or not all(_is_int(item.get(name), minimum=1) for name in ordered_lines)
                 or list(map(item.get, ordered_lines))
                 != sorted(map(item.get, ordered_lines))
                 or len(set(map(item.get, ordered_lines))) != len(ordered_lines)
@@ -1287,8 +1307,7 @@ def _authenticated_strict_p50_retry_ids(
         for item in process_raw:
             if (
                 isinstance(item, Mapping)
-                and set(item)
-                == {"attempt_index", "job_id", "scheduler_job", "worker"}
+                and set(item) == {"attempt_index", "job_id", "scheduler_job", "worker"}
                 and _is_int(item.get("attempt_index"))
                 and _is_int(item.get("scheduler_job"), minimum=1)
                 and isinstance(item.get("worker"), str)
@@ -1303,15 +1322,22 @@ def _authenticated_strict_p50_retry_ids(
                     )
                 )
 
-    active_loss_boundaries = {
-        (receipt.get("lost_scheduler_job"), receipt.get("lost_scheduler_generation"))
-        for event in bundle.get("event_log", [])
-        if isinstance(event, Mapping)
-        and event.get("action") == "scheduler-loss-active"
-        and isinstance((receipt := event.get("receipt")), Mapping)
-        and _is_int(receipt.get("lost_scheduler_job"), minimum=1)
-        and _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
-    } if isinstance(bundle.get("event_log"), list) else set()
+    active_loss_boundaries = (
+        {
+            (
+                receipt.get("lost_scheduler_job"),
+                receipt.get("lost_scheduler_generation"),
+            )
+            for event in bundle.get("event_log", [])
+            if isinstance(event, Mapping)
+            and event.get("action") == "scheduler-loss-active"
+            and isinstance((receipt := event.get("receipt")), Mapping)
+            and _is_int(receipt.get("lost_scheduler_job"), minimum=1)
+            and _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
+        }
+        if isinstance(bundle.get("event_log"), list)
+        else set()
+    )
 
     fields = {
         "failure_reason",
@@ -1339,7 +1365,9 @@ def _authenticated_strict_p50_retry_ids(
         row = row_by_id.get(job_id)
         assignment = assignments.get(job_id)
         lifecycle = lifecycles.get(job_id)
-        attempts = assignment.get("attempts") if isinstance(assignment, Mapping) else None
+        attempts = (
+            assignment.get("attempts") if isinstance(assignment, Mapping) else None
+        )
         missing = failed_by_attempt.get((job_id, 0))
         source_transfer = source_transfer_by_attempt.get((job_id, 0))
         uncommitted_transport = uncommitted_transport_by_attempt.get((job_id, 0))
@@ -1361,8 +1389,12 @@ def _authenticated_strict_p50_retry_ids(
             if reason in {"source-transfer-loss", "uncommitted-transport-loss"}
             else set()
         )
-        first = attempts[0] if isinstance(attempts, list) and len(attempts) == 2 else None
-        final = attempts[1] if isinstance(attempts, list) and len(attempts) == 2 else None
+        first = (
+            attempts[0] if isinstance(attempts, list) and len(attempts) == 2 else None
+        )
+        final = (
+            attempts[1] if isinstance(attempts, list) and len(attempts) == 2 else None
+        )
         missing_valid = (
             isinstance(missing, Mapping)
             and missing.get("attempt_index") == 0
@@ -1397,7 +1429,10 @@ def _authenticated_strict_p50_retry_ids(
             and source_transfer.get("retry_scheduler_job")
             == binding.get("final_scheduler_job")
             and source_transfer.get("worker") == binding.get("first_worker")
-            and binding.get("first_worker") != binding.get("final_worker")
+            and (
+                binding.get("first_worker") != binding.get("final_worker")
+                or same_endpoint_decision_valid(source_transfer, binding)
+            )
             and source_transfer.get("failed_endpoint")
             == planned_worker_endpoints.get(binding.get("first_worker"))
             and source_transfer.get("retry_endpoint")
@@ -1415,7 +1450,10 @@ def _authenticated_strict_p50_retry_ids(
             and uncommitted_transport.get("retry_scheduler_job")
             == binding.get("final_scheduler_job")
             and uncommitted_transport.get("worker") == binding.get("first_worker")
-            and binding.get("first_worker") != binding.get("final_worker")
+            and (
+                binding.get("first_worker") != binding.get("final_worker")
+                or same_endpoint_decision_valid(uncommitted_transport, binding)
+            )
             and uncommitted_transport.get("failed_endpoint")
             == planned_worker_endpoints.get(binding.get("first_worker"))
             and uncommitted_transport.get("retry_endpoint")
@@ -1431,9 +1469,7 @@ def _authenticated_strict_p50_retry_ids(
             "first_scheduler_job",
             "first_terminal_ms",
         )
-        integers_valid = all(
-            _is_int(binding.get(name), minimum=1) for name in integers
-        )
+        integers_valid = all(_is_int(binding.get(name), minimum=1) for name in integers)
         terminal_order_valid = (
             integers_valid
             and binding["first_dispatch_ms"] <= binding["first_terminal_ms"]
@@ -1445,7 +1481,8 @@ def _authenticated_strict_p50_retry_ids(
                     and _is_int(lifecycle.get("deadline_ms"), minimum=1)
                     and binding["first_terminal_ms"] <= lifecycle["deadline_ms"]
                 )
-                if reason in {
+                if reason
+                in {
                     "result-stream-loss",
                     "source-transfer-loss",
                     "uncommitted-transport-loss",
@@ -1487,8 +1524,7 @@ def _authenticated_strict_p50_retry_ids(
             and row.get("retries") == 1
             and row.get("exact") is True
             and row.get("tail_present") is True
-            and row.get("tail_profile")
-            == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
+            and row.get("tail_profile") == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
             and row.get("session_outcome") == "committed"
             and row.get("cs") == binding.get("final_worker")
             and first
@@ -1525,22 +1561,30 @@ def _authenticated_strict_p50_retry_ids(
         )
     ):
         bad.add("@observations:failed_p50_result_identities")
-    if invalid_source_transfer or source_transfer_duplicates or (
-        source_transfers is not None
-        and (
-            not isinstance(source_transfers, Mapping)
-            or not isinstance(source_transfer_raw, list)
-            or source_transfers.get("record_count") != len(source_transfer_raw)
+    if (
+        invalid_source_transfer
+        or source_transfer_duplicates
+        or (
+            source_transfers is not None
+            and (
+                not isinstance(source_transfers, Mapping)
+                or not isinstance(source_transfer_raw, list)
+                or source_transfers.get("record_count") != len(source_transfer_raw)
+            )
         )
     ):
         bad.add("@observations:failed_p50_source_transfers")
-    if invalid_uncommitted_transport or uncommitted_transport_duplicates or (
-        uncommitted_transports is not None
-        and (
-            not isinstance(uncommitted_transports, Mapping)
-            or not isinstance(uncommitted_transport_raw, list)
-            or uncommitted_transports.get("record_count")
-            != len(uncommitted_transport_raw)
+    if (
+        invalid_uncommitted_transport
+        or uncommitted_transport_duplicates
+        or (
+            uncommitted_transports is not None
+            and (
+                not isinstance(uncommitted_transports, Mapping)
+                or not isinstance(uncommitted_transport_raw, list)
+                or uncommitted_transports.get("record_count")
+                != len(uncommitted_transport_raw)
+            )
         )
     ):
         bad.add("@observations:failed_p50_uncommitted_transports")
@@ -6250,6 +6294,19 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             and record.get("error") == P29_ROUTE_REPLACEMENT_REQUIRED
         } if isinstance(source_transfer_records, list) else set()
         strict_bound_jobs: set[str] = set()
+        same_endpoint_retry_records = (
+            list(source_transfer_records)
+            if isinstance(source_transfer_records, list)
+            else []
+        )
+        transport_observation = observations.get("failed_p50_uncommitted_transports")
+        transport_records = (
+            transport_observation.get("records")
+            if isinstance(transport_observation, Mapping)
+            else None
+        )
+        if isinstance(transport_records, list):
+            same_endpoint_retry_records.extend(transport_records)
         error106_raw = observations.get("error106_job_ids")
         error106_ids = (
             {_job_id(item, "@error106") for item in error106_raw}
@@ -6282,7 +6339,18 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     job_id not in strict_retry_ids
                     or job_id in strict_bound_jobs
                     or binding.get("first_worker") != "F1"
-                    or binding.get("final_worker") not in other_workers
+                    or (
+                        binding.get("final_worker") not in other_workers
+                        and not (
+                            job_id in strict_retry_ids
+                            and any(
+                                isinstance(record, Mapping)
+                                and record.get("row_job_id") == job_id
+                                and same_endpoint_decision_valid(record, binding)
+                                for record in same_endpoint_retry_records
+                            )
+                        )
+                    )
                     or (
                         binding.get("failure_reason")
                         not in {"result-stream-loss", "source-transfer-loss"}

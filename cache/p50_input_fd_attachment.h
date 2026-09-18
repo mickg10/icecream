@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <compare>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -140,6 +141,50 @@ public:
         const std::string& socket_path, InputFdRequest request,
         const local::CredentialExpectation& expected_peer,
         std::chrono::steady_clock::time_point deadline) noexcept;
+};
+
+// Nonblocking client-side equivalent of InputFdAttachmentClient::attach().
+// The caller owns scheduling: advance() performs one bounded progress step
+// and never waits internally.  The absolute deadline covers every phase.
+class InputFdAttachmentOperation {
+public:
+    InputFdAttachmentOperation(
+        std::string socket_path, InputFdRequest request,
+        local::CredentialExpectation expected_peer,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    ~InputFdAttachmentOperation() noexcept;
+    InputFdAttachmentOperation(const InputFdAttachmentOperation&) = delete;
+    InputFdAttachmentOperation& operator=(const InputFdAttachmentOperation&) = delete;
+
+    void advance(short revents = 0) noexcept;
+    void cancel() noexcept;
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] InputFdAttachmentStatus status() const noexcept { return result_.status; }
+    [[nodiscard]] int poll_fd() const noexcept;
+    [[nodiscard]] short poll_events() const noexcept;
+    [[nodiscard]] std::chrono::steady_clock::time_point next_wakeup() const noexcept;
+    [[nodiscard]] std::optional<InputFdAttachmentResult> take_result() noexcept;
+    [[nodiscard]] const InputFdRequest& request() const noexcept { return request_; }
+
+private:
+    enum class Phase : uint8_t { Connect, Verify, SendHello, ReceiveHelloAck,
+                                 SendRequest, ReceiveResult, Handoff, Done };
+    void fail(InputFdAttachmentStatus status) noexcept;
+    void finish_result(InputFdAttachmentResult result) noexcept;
+    void advance_frame() noexcept;
+
+    std::string socket_path_;
+    InputFdRequest request_{};
+    local::CredentialExpectation expected_peer_{};
+    std::chrono::steady_clock::time_point deadline_{};
+    Phase phase_ = Phase::Connect;
+    bool done_ = false;
+    bool result_taken_ = false;
+    InputFdAttachmentResult result_{};
+    local::UnixConnectOperation connect_;
+    std::optional<local::Connection> connection_;
+    std::unique_ptr<local::FrameOperation> frame_;
+    std::unique_ptr<local::AsyncFdHandoffReceiver> handoff_;
 };
 
 #if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)

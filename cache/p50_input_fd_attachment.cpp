@@ -662,6 +662,283 @@ InputFdAttachmentResult InputFdAttachmentClient::attach(
     return result;
 }
 
+InputFdAttachmentOperation::InputFdAttachmentOperation(
+    std::string socket_path, InputFdRequest request,
+    local::CredentialExpectation expected_peer,
+    std::chrono::steady_clock::time_point deadline) noexcept
+    : socket_path_(std::move(socket_path)), request_(std::move(request)),
+      expected_peer_(std::move(expected_peer)), deadline_(deadline),
+      connect_(socket_path_, deadline_) {
+    if (request_.identity.generation == 0 || request_.identity.attempt == 0 ||
+        request_.key.c_store_guid == CStoreGuid{} ||
+        !input_lease_owner_valid(request_.owner) || request_.request_id == 0 ||
+        !expected_peer_.specified() ||
+        deadline_ <= std::chrono::steady_clock::now()) {
+        fail(InputFdAttachmentStatus::InvalidArgument);
+    }
+}
+
+InputFdAttachmentOperation::~InputFdAttachmentOperation() noexcept { cancel(); }
+
+void InputFdAttachmentOperation::fail(InputFdAttachmentStatus status) noexcept {
+    if (done_)
+        return;
+    if (frame_)
+        frame_->cancel();
+    frame_.reset();
+    if (handoff_)
+        handoff_->cancel(status == InputFdAttachmentStatus::Timeout
+                             ? local::FdHandoffStatus::Timeout
+                             : local::FdHandoffStatus::Disconnected);
+    handoff_.reset();
+    connect_.cancel();
+    connection_.reset();
+    result_ = rejected(status);
+    done_ = true;
+    phase_ = Phase::Done;
+}
+
+void InputFdAttachmentOperation::finish_result(
+    InputFdAttachmentResult result) noexcept {
+    if (done_)
+        return;
+    result_ = std::move(result);
+    done_ = true;
+    phase_ = Phase::Done;
+}
+
+void InputFdAttachmentOperation::advance_frame() noexcept {
+    if (!frame_)
+        return fail(InputFdAttachmentStatus::HandshakeFailed);
+    frame_->advance();
+    if (!frame_->done())
+        return;
+    if (frame_->status() != local::Status::Ok) {
+        fail(status_for_local(frame_->status()));
+        return;
+    }
+    local::Frame received;
+    try {
+        received = frame_->frame();
+    } catch (...) {
+        fail(InputFdAttachmentStatus::HandshakeFailed);
+        return;
+    }
+    frame_.reset();
+    if (phase_ == Phase::SendHello) {
+        phase_ = Phase::ReceiveHelloAck;
+        try {
+            frame_ = std::make_unique<local::FrameOperation>(
+                *connection_, deadline_);
+        } catch (...) {
+            fail(InputFdAttachmentStatus::HandshakeFailed);
+        }
+        return;
+    }
+    if (phase_ == Phase::ReceiveHelloAck) {
+        if (local::validate_handshake(
+                received, local::MessageType::HelloAck,
+                local::PeerRole::Sidecar, request_.identity) != local::Status::Ok) {
+            fail(InputFdAttachmentStatus::HandshakeFailed);
+            return;
+        }
+        phase_ = Phase::SendRequest;
+        try {
+            const auto payload = encode_request(request_);
+            if (payload.empty()) {
+                fail(InputFdAttachmentStatus::InvalidArgument);
+                return;
+            }
+            frame_ = std::make_unique<local::FrameOperation>(
+                *connection_,
+                local::Frame{local::kProtocolVersion, local::MessageType::Data,
+                             request_.identity, payload},
+                deadline_);
+        } catch (...) {
+            fail(InputFdAttachmentStatus::HandshakeFailed);
+        }
+        return;
+    }
+    if (phase_ == Phase::SendRequest) {
+        phase_ = Phase::ReceiveResult;
+        try {
+            frame_ = std::make_unique<local::FrameOperation>(
+                *connection_, deadline_);
+        } catch (...) {
+            fail(InputFdAttachmentStatus::HandshakeFailed);
+        }
+        return;
+    }
+    if (phase_ != Phase::ReceiveResult) {
+        fail(InputFdAttachmentStatus::HandshakeFailed);
+        return;
+    }
+    InputFdAttachmentStatus attachment_status =
+        InputFdAttachmentStatus::MalformedRequest;
+    const local::Status identity_status =
+        local::validate_identity(received, request_.identity);
+    if (received.type != local::MessageType::Data ||
+        identity_status != local::Status::Ok ||
+        !decode_attachment_result(received.payload, request_.request_id,
+                                   attachment_status)) {
+        fail(identity_status == local::Status::StaleGeneration ||
+                     identity_status == local::Status::IdentityMismatch
+                 ? InputFdAttachmentStatus::StaleIdentity
+                 : InputFdAttachmentStatus::MalformedRequest);
+        return;
+    }
+    if (attachment_status != InputFdAttachmentStatus::Accepted) {
+        fail(attachment_status);
+        return;
+    }
+    try {
+        handoff_ = std::make_unique<local::AsyncFdHandoffReceiver>();
+    } catch (...) {
+        fail(InputFdAttachmentStatus::HandoffFailed);
+        return;
+    }
+    const local::HandoffRequest expected{request_.identity, request_.request_id};
+    if (!handoff_->start(*connection_, expected, deadline_)) {
+        fail(InputFdAttachmentStatus::HandoffFailed);
+        return;
+    }
+    phase_ = Phase::Handoff;
+}
+
+void InputFdAttachmentOperation::advance(short revents) noexcept {
+    if (done_)
+        return;
+    if (std::chrono::steady_clock::now() >= deadline_) {
+        fail(InputFdAttachmentStatus::Timeout);
+        return;
+    }
+    try {
+        switch (phase_) {
+        case Phase::Connect:
+            connect_.advance(revents);
+            if (!connect_.done())
+                return;
+            if (connect_.status() != local::Status::Ok) {
+                fail(status_for_local(connect_.status()));
+                return;
+            }
+            connection_.emplace(connect_.take_connection());
+            phase_ = Phase::Verify;
+            return;
+        case Phase::Verify:
+            if (!connection_ ||
+                connection_->verify_peer_credentials(expected_peer_) != local::Status::Ok) {
+                fail(InputFdAttachmentStatus::PeerUnauthenticated);
+                return;
+            }
+            phase_ = Phase::SendHello;
+            frame_ = std::make_unique<local::FrameOperation>(
+                *connection_, local::make_hello(local::PeerRole::Daemon,
+                                                request_.identity), deadline_);
+            return;
+        case Phase::SendHello:
+        case Phase::ReceiveHelloAck:
+        case Phase::SendRequest:
+        case Phase::ReceiveResult:
+            advance_frame();
+            return;
+        case Phase::Handoff:
+            if (!handoff_ || !connection_) {
+                fail(InputFdAttachmentStatus::HandoffFailed);
+                return;
+            }
+            handoff_->advance(revents);
+            if (!handoff_->done())
+                return;
+            {
+                const local::FdHandoffResult handoff_result = handoff_->result();
+                result_.handoff = handoff_result;
+                if (handoff_result.status != local::FdHandoffStatus::Accepted) {
+                    fail(status_for_handoff(handoff_result.status));
+                    return;
+                }
+                local::HandoffFd fd = handoff_->take_fd();
+                if (!fd.valid()) {
+                    fail(InputFdAttachmentStatus::HandoffFailed);
+                    return;
+                }
+                const int raw_fd = fd.release();
+                InputFd input(raw_fd);
+                const int status_flags = ::fcntl(raw_fd, F_GETFL);
+                const int descriptor_flags = ::fcntl(raw_fd, F_GETFD);
+                struct stat info{};
+                if (status_flags < 0 || (status_flags & O_ACCMODE) != O_RDONLY ||
+                    descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0 ||
+                    ::fstat(raw_fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+                    ::lseek(raw_fd, 0, SEEK_SET) != 0) {
+                    fail(InputFdAttachmentStatus::HandoffFailed);
+                    return;
+                }
+                if (std::chrono::steady_clock::now() >= deadline_) {
+                    fail(InputFdAttachmentStatus::Timeout);
+                    return;
+                }
+                result_.status = InputFdAttachmentStatus::Accepted;
+                result_.fd = std::move(input);
+                result_.lease = request_;
+                done_ = true;
+                phase_ = Phase::Done;
+            }
+            return;
+        case Phase::Done:
+            return;
+        }
+    } catch (...) {
+        fail(InputFdAttachmentStatus::HandshakeFailed);
+    }
+}
+
+void InputFdAttachmentOperation::cancel() noexcept {
+    if (!done_)
+        fail(InputFdAttachmentStatus::Disconnected);
+}
+
+int InputFdAttachmentOperation::poll_fd() const noexcept {
+    if (done_)
+        return -1;
+    if (phase_ == Phase::Connect)
+        return connect_.poll_fd();
+    if (phase_ == Phase::Handoff)
+        return handoff_ ? handoff_->poll_fd() : -1;
+    return connection_ ? connection_->native_handle() : -1;
+}
+
+short InputFdAttachmentOperation::poll_events() const noexcept {
+    if (done_)
+        return 0;
+    if (phase_ == Phase::Connect)
+        return connect_.poll_events();
+    if (phase_ == Phase::Handoff)
+        return handoff_ ? handoff_->poll_events() : 0;
+    return frame_ ? frame_->poll_events() : 0;
+}
+
+std::chrono::steady_clock::time_point
+InputFdAttachmentOperation::next_wakeup() const noexcept {
+    if (done_)
+        return std::chrono::steady_clock::time_point::max();
+    if (phase_ == Phase::Connect)
+        return connect_.next_wakeup();
+    if (phase_ == Phase::Handoff)
+        return deadline_;
+    if (phase_ == Phase::Verify || !frame_)
+        return std::chrono::steady_clock::now();
+    return deadline_;
+}
+
+std::optional<InputFdAttachmentResult>
+InputFdAttachmentOperation::take_result() noexcept {
+    if (!done_ || result_taken_)
+        return std::nullopt;
+    result_taken_ = true;
+    return std::move(result_);
+}
+
 #if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
 void test_set_input_materialization_progress_hook(
     InputMaterializationProgressTestHook hook) noexcept {

@@ -547,6 +547,18 @@ static bool set_worker_load(MsgChannel *worker, uint32_t load)
     return worker && worker->send_msg(stats);
 }
 
+static std::string retry_decision_record(const UseCSMsg &use, int failed_port,
+                                          bool alternative)
+{
+    return "P50_RETRY_DECISION job=" + std::to_string(use.job_id) +
+        " epoch=" + std::to_string(use.assignmentEpoch()) +
+        " nonce=" + std::to_string(use.assignmentNonce()) +
+        " failed=127.0.0.1:" + std::to_string(failed_port) +
+        " selected=" + use.hostname + ":" + std::to_string(use.port) +
+        " profile=" + std::to_string(use.cache_profile_mask) +
+        " compatible_alternative=" + (alternative ? "1" : "0");
+}
+
 static bool file_contains(const std::string &path, const std::string &needle)
 {
     std::ifstream input(path);
@@ -2164,6 +2176,9 @@ static void run_cache_routing_preference(const std::string &binary,
     REQUIRE(retry_b_prepare && retry_b_use &&
                 retry_b_use->port == static_cast<uint32_t>(worker_b_port),
             "queued retry selects B immediately after alternative capacity frees");
+    REQUIRE(retry_b_use && wait_file_contains(log,
+                retry_decision_record(*retry_b_use, worker_a_port, true), 3000),
+            "busy-alternative retry decision is bound to the exact new assignment");
     if (retry_b_use) {
         worker_b->send_msg(JobBeginMsg(retry_b_use->job_id, 0));
         worker_b->send_msg(job_done_for(
@@ -2524,6 +2539,9 @@ static void run_cache_retry_pressure_and_preferred(
     REQUIRE(same_a_prepare && same_a &&
                 same_a->port == static_cast<uint32_t>(worker_a_port),
             "capability disappearance restores lawful same-endpoint recovery");
+    REQUIRE(same_a && wait_file_contains(log,
+                retry_decision_record(*same_a, worker_a_port, false), 3000),
+            "withdrawn-alternative decision authenticates the exact same-endpoint retry");
     if (same_a) {
         worker_a->send_msg(JobBeginMsg(same_a->job_id, 0));
         worker_a->send_msg(job_done_for(
@@ -2605,6 +2623,9 @@ static void run_cache_retry_single_worker(const std::string &binary,
     REQUIRE(prepare && use &&
                 use->port == static_cast<uint32_t>(worker_port),
             "no compatible alternative permits same-endpoint replacement recovery");
+    REQUIRE(use && wait_file_contains(log,
+                retry_decision_record(*use, worker_port, false), 3000),
+            "single-worker retry emits exact zero-alternative decision evidence");
     REQUIRE(!file_contains(log, "P50_RETRY_AVOID_WAIT job=") &&
                 !file_contains(log, "P50_RETRY_AVOID_APPLIED job="),
             "single-worker fallback is not mislabeled as exclusion waiting");

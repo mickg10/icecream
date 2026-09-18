@@ -126,6 +126,11 @@ p50localtransport_SOURCES = p50_local_transport_test.cpp ../cache/p50_local_tran
 p50localtransport_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS
 p50localtransport_CXXFLAGS = -pthread
 p50localtransport_LDFLAGS = -pthread
+
+TESTS += p50frameasync
+p50frameasync_SOURCES = p50frameasync.cpp ../cache/p50_local_transport.cpp
+p50frameasync_CXXFLAGS = -pthread
+p50frameasync_LDFLAGS = -pthread
 p50sidecarsupervisor_SOURCES = p50_sidecar_supervisor_test.cpp
 p50sidecarsupervisor_CXXFLAGS = -pthread
 p50sidecarsupervisor_LDFLAGS = -pthread
@@ -259,6 +264,15 @@ p50inputfd_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS
 p50inputfd_CXXFLAGS = -pthread
 p50inputfd_LDFLAGS = -pthread
 p50inputfd_LDADD = ../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
+check_PROGRAMS += p50inputattachasync
+TESTS += p50inputattachasync
+p50inputattachasync_SOURCES = p50inputattachasync.cpp \
+    ../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
+    ../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
+    ../cache/protocol50.cpp
+p50inputattachasync_CXXFLAGS = -pthread
+p50inputattachasync_LDFLAGS = -pthread
+p50inputattachasync_LDADD = ../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50inputlifecycle_SOURCES = p50_input_lifecycle_test.cpp
 p50forkfdhygiene_SOURCES = p50_fork_fd_hygiene_test.cpp \
 	../daemon/p50_fork_fd_hygiene.cpp
@@ -465,6 +479,13 @@ p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
 	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp
+check_PROGRAMS += p50frameasync
+check_PROGRAMS += p50fdhandoffasync
+TESTS += p50fdhandoffasync
+p50fdhandoffasync_SOURCES = p50fdhandoffasync.cpp ../cache/p50_fd_handoff.cpp \
+    ../cache/p50_local_transport.cpp
+p50fdhandoffasync_CXXFLAGS = -pthread
+p50fdhandoffasync_LDFLAGS = -pthread
 p50fdhandoff_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_FD_HANDOFF_TEST_HOOKS
 p50fdhandoff_CXXFLAGS = -pthread
 p50fdhandoff_LDFLAGS = -pthread

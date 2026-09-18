@@ -484,6 +484,29 @@ InputFdAttachmentResult DaemonSidecarAdapter::attach_input(
         expected, deadline);
 }
 
+std::unique_ptr<InputFdAttachmentOperation> DaemonSidecarAdapter::begin_attach_input(
+    InputRecordKey key, InputLeaseOwner owner, uint64_t request_id) noexcept
+{
+    if (key.c_store_guid == CStoreGuid{} || !input_lease_owner_valid(owner) ||
+        request_id == 0 || outer_lifecycle_ == nullptr ||
+        outer_lifecycle_->state() != sidecar::LifecycleState::Ready ||
+        !outer_authenticated_ || !outer_ready_lease_.has_value() ||
+        !outer_ready_lease_->valid() || !runtime_nodes_valid())
+        return nullptr;
+    const local::Identity identity{config_.generation,
+                                   outer_ready_lease_->identity.attempt};
+    const local::CredentialExpectation expected{
+        config_.expected_service_uid, config_.expected_service_gid,
+        static_cast<uint64_t>(::getpid())};
+    try {
+        return std::make_unique<InputFdAttachmentOperation>(
+            socket_path_, InputFdRequest{identity, key, owner, request_id}, expected,
+            std::chrono::steady_clock::now() + config_.input_attachment_timeout);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 bool DaemonSidecarAdapter::next_input_lifecycle_operation(
     uint64_t& operation_id) noexcept
 {

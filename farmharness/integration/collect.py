@@ -26,6 +26,7 @@ try:
     )
     from .netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from .remote import PlannedCommand, RemoteError, docker_argv
+    from .retry_decision import same_endpoint_decision_valid
     from .scenario_spec import ScenarioSpec
     from .schema_validation import canonical_bytes
     from .verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
@@ -42,6 +43,7 @@ except ImportError:  # Direct execution from this directory.
     )
     from netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from remote import PlannedCommand, RemoteError, docker_argv
+    from retry_decision import same_endpoint_decision_valid
     from scenario_spec import ScenarioSpec
     from schema_validation import canonical_bytes
     from verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
@@ -158,6 +160,13 @@ SCHEDULER_PREEXPOSURE_REDISPATCH_RE = re.compile(
     r"^redispatch unexposed assignment ([0-9]+) after worker loss "
     r"([A-Za-z0-9][A-Za-z0-9._-]*)$"
 )
+SCHEDULER_RETRY_DECISION_RE = re.compile(
+    r"^P50_RETRY_DECISION job=([0-9]+) epoch=([0-9]+) nonce=([0-9]+) "
+    r"failed=([A-Za-z0-9][A-Za-z0-9._-]*):([0-9]+) "
+    r"selected=([A-Za-z0-9][A-Za-z0-9._-]*):([0-9]+) profile=([0-9]+) "
+    r"compatible_alternative=([01])$"
+)
+SCHEDULER_RETRY_DECISION_PROFILES = frozenset((1, 2, 4))
 SCHEDULER_BEGIN_RE = re.compile(r"^BEGIN: ([0-9]+)\b")
 SCHEDULER_END_RE = re.compile(r"^END ([0-9]+) status=(-?[0-9]+)\b")
 SCHEDULER_STOP_RE = re.compile(r"^STOP \((WAITFORCS|DAEMON|DAEMON2)\) FOR ([0-9]+)\b")
@@ -1572,6 +1581,167 @@ def _client_assignments(text: str, source: str) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def _scheduler_retry_decisions(
+    evidence: Path, plan: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Parse producer-authenticated P50 retry selection decisions.
+
+    This is deliberately an optional witness for historical bundles: bundles
+    without the marker continue through the existing collector.  When present,
+    however, every marker is strict, framed, tied to a known scheduler NEW
+    record, and ordered before that incarnation's put record.
+    """
+
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    path = _one_role_log(evidence, scheduler)
+    if path is None:
+        raise CollectError("scheduler lifecycle log is absent")
+    generation = 0
+    jobs: dict[tuple[int, int], dict[str, Any]] = {}
+    decisions: list[dict[str, Any]] = []
+    marker = "P50_RETRY_DECISION"
+    for line_number, line in enumerate(_text(path).splitlines(), start=1):
+        framed = SCHEDULER_LINE_RE.fullmatch(line)
+        if framed is None:
+            if marker in line:
+                raise CollectError(
+                    f"scheduler retry decision line {line_number} lacks exact timestamp frame"
+                )
+            continue
+        timestamp_ms = _timestamp_ms(framed.group(1), f"{path}:{line_number}")
+        message = framed.group(2)
+        if SCHEDULER_START_RE.fullmatch(message):
+            generation += 1
+            continue
+        new = SCHEDULER_NEW_RE.match(message)
+        if new is not None:
+            if generation == 0:
+                raise CollectError(
+                    "scheduler retry decision job appears before startup"
+                )
+            key = (generation, int(new.group(1)))
+            if key in jobs:
+                raise CollectError(f"duplicate scheduler NEW record for {key}")
+            jobs[key] = {
+                "new_line": line_number,
+                "incarnation_start_ms": timestamp_ms,
+                "dispatch_line": None,
+                "pending": False,
+                "pending_decision": None,
+                "decision_tuples": set(),
+            }
+            continue
+        redispatch = SCHEDULER_PREEXPOSURE_REDISPATCH_RE.match(message)
+        if redispatch is not None:
+            key = (generation, int(redispatch.group(1)))
+            state = jobs.get(key)
+            if state is None or state["dispatch_line"] is None or state["pending"]:
+                raise CollectError(
+                    f"invalid pre-exposure redispatch before retry decision at line {line_number}"
+                )
+            state["pending"] = True
+            state["incarnation_start_ms"] = timestamp_ms
+            continue
+        if marker in message:
+            parsed = SCHEDULER_RETRY_DECISION_RE.fullmatch(message)
+            if parsed is None:
+                raise CollectError(
+                    f"malformed scheduler retry decision at line {line_number}"
+                )
+            if generation == 0:
+                raise CollectError("scheduler retry decision appears before startup")
+            job_id, epoch, nonce = (int(parsed.group(i)) for i in (1, 2, 3))
+            failed_port, selected_port, profile = (
+                int(parsed.group(i)) for i in (5, 7, 8)
+            )
+            if (
+                (
+                    job_id > 0xFFFFFFFF
+                    or epoch > 0xFFFFFFFFFFFFFFFF
+                    or nonce > 0xFFFFFFFFFFFFFFFF
+                    or min(job_id, epoch, nonce) <= 0
+                    or not (1 <= failed_port <= 65535)
+                )
+                or not (1 <= selected_port <= 65535)
+                or profile not in SCHEDULER_RETRY_DECISION_PROFILES
+            ):
+                raise CollectError(
+                    f"invalid scheduler retry decision values at line {line_number}"
+                )
+            key = (generation, job_id)
+            state = jobs.get(key)
+            if state is None:
+                raise CollectError(
+                    f"scheduler retry decision has no NEW record for {key}"
+                )
+            if state["dispatch_line"] is not None and not state["pending"]:
+                raise CollectError(f"scheduler retry decision follows put for {key}")
+            if state["pending_decision"] is not None:
+                raise CollectError(
+                    f"multiple scheduler retry decisions before put for {key}"
+                )
+            if timestamp_ms < state["incarnation_start_ms"]:
+                raise CollectError(
+                    f"scheduler retry decision precedes its current incarnation for {key}"
+                )
+            decision_tuple = (epoch, nonce)
+            if decision_tuple in state["decision_tuples"]:
+                raise CollectError(f"duplicate scheduler retry decision for {key}")
+            state["decision_tuples"].add(decision_tuple)
+            decision = {
+                "generation": generation,
+                "job": job_id,
+                "epoch": epoch,
+                "nonce": nonce,
+                "failed_host": parsed.group(4),
+                "failed_port": failed_port,
+                "selected_host": parsed.group(6),
+                "selected_port": selected_port,
+                "profile": profile,
+                "compatible_alternative": int(parsed.group(9)),
+                "line": line_number,
+                "source_path": str(path.relative_to(evidence)),
+                "timestamp_ms": timestamp_ms,
+                "new_line": state["new_line"],
+            }
+            state["pending_decision"] = decision
+            decisions.append(decision)
+            continue
+        put = SCHEDULER_DISPATCH_RE.match(message)
+        if put is not None:
+            key = (generation, int(put.group(1)))
+            state = jobs.get(key)
+            if state is None:
+                raise CollectError(f"scheduler put has no NEW record for {key}")
+            if state["dispatch_line"] is not None and not state["pending"]:
+                raise CollectError(f"duplicate scheduler put for {key}")
+            pending_decision = state["pending_decision"]
+            if pending_decision is not None:
+                if timestamp_ms < pending_decision["timestamp_ms"]:
+                    raise CollectError(
+                        f"scheduler put precedes retry decision for {key}"
+                    )
+                pending_decision.update(
+                    {
+                        "put_line": line_number,
+                        "put_ms": timestamp_ms,
+                        "worker": put.group(2),
+                    }
+                )
+                state["pending_decision"] = None
+            state["dispatch_line"] = line_number
+            state["pending"] = False
+            continue
+    if generation == 0:
+        raise CollectError("scheduler log has no startup generation")
+    for state in jobs.values():
+        if state["pending_decision"] is not None:
+            raise CollectError("scheduler retry decision has no corresponding put")
+    return decisions
 
 
 def _scheduler_jobs(
@@ -4784,6 +4954,33 @@ def _profile_markers_by_assignment(
     return [items[0] if items else None for items in bound]
 
 
+def _bind_same_endpoint_decision(
+    record: dict[str, Any], decisions: list[dict[str, Any]], kind: str
+) -> dict[str, Any]:
+    if record["failed_endpoint"] != record["retry_endpoint"]:
+        return record
+    matches = [
+        decision
+        for decision in decisions
+        if (decision["job"], decision["epoch"], decision["nonce"])
+        == (
+            record["retry_scheduler_job"],
+            record["retry_assignment_epoch"],
+            record["retry_assignment_nonce"],
+        )
+    ]
+    if len(matches) != 1:
+        raise CollectError(
+            f"{record['row_job_id']}: {kind} lacks one exact same-endpoint decision"
+        )
+    record["same_endpoint_decision"] = matches[0]
+    if not same_endpoint_decision_valid(record):
+        raise CollectError(
+            f"{record['row_job_id']}: {kind} has invalid same-endpoint decision"
+        )
+    return record
+
+
 def _source_transfer_failure_observation(
     *,
     log_text: str,
@@ -4795,6 +4992,7 @@ def _source_transfer_failure_observation(
     compile_identities: Mapping[tuple[int, int, int], Mapping[str, Any]],
     row_job_id: str,
     attempt_index: int,
+    retry_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Authenticate a strict retry caused before a P50 source result exists.
 
@@ -4907,7 +5105,6 @@ def _source_transfer_failure_observation(
             < retry_assignment_line
         )
         or failed_endpoint != assignment.get("endpoint")
-        or retry_assignment.get("endpoint") == failed_endpoint
         or not worker
         or source_result_status == 0
         or identity in compile_identities
@@ -4916,7 +5113,7 @@ def _source_transfer_failure_observation(
             f"{row_job_id}: source-transfer loss does not bind one uncommitted "
             "failed assignment to a distinct strict retry"
         )
-    return {
+    record = {
         "assignment_epoch": assignment_identity["assignment_epoch"],
         "assignment_identity_line": identity_line,
         "assignment_line": assignment_line,
@@ -4946,6 +5143,9 @@ def _source_transfer_failure_observation(
         "tu_seq": assignment_identity["tu_seq"],
         "worker": worker,
     }
+    return _bind_same_endpoint_decision(
+        record, retry_decisions or [], "source-transfer loss"
+    )
 
 
 def _uncommitted_transport_failure_observation(
@@ -4959,6 +5159,7 @@ def _uncommitted_transport_failure_observation(
     compile_identities: Mapping[tuple[int, int, int], Mapping[str, Any]],
     row_job_id: str,
     attempt_index: int,
+    retry_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Authenticate a strict retry after a pre-commit P50 transport loss.
 
@@ -4979,8 +5180,7 @@ def _uncommitted_transport_failure_observation(
         if assignment_line < line_number < retry_assignment_line
     ]
     has_normalized_claim = any(
-        "normalizing P50 client error" in line
-        and "for a fresh assignment" in line
+        "normalizing P50 client error" in line and "for a fresh assignment" in line
         for _, line in scoped_lines
     )
     if not has_normalized_claim:
@@ -5063,7 +5263,6 @@ def _uncommitted_transport_failure_observation(
             < retry_assignment_line
         )
         or failed_endpoint != assignment.get("endpoint")
-        or retry_assignment.get("endpoint") == failed_endpoint
         or not worker
         or source_result_status == 0
         or identity in compile_identities
@@ -5073,7 +5272,7 @@ def _uncommitted_transport_failure_observation(
             f"{row_job_id}: uncommitted transport loss does not bind one exact "
             "failed assignment to a distinct strict retry"
         )
-    return {
+    record = {
         "assignment_epoch": assignment_identity["assignment_epoch"],
         "assignment_identity_line": identity_line,
         "assignment_line": assignment_line,
@@ -5102,6 +5301,9 @@ def _uncommitted_transport_failure_observation(
         "tu_seq": assignment_identity["tu_seq"],
         "worker": worker,
     }
+    return _bind_same_endpoint_decision(
+        record, retry_decisions or [], "uncommitted transport loss"
+    )
 
 
 def _unassigned_p50_failure_observation(
@@ -5629,6 +5831,7 @@ def _parse_rows(
     events: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     topology = plan["topology"]["instances"]
+    retry_decisions = _scheduler_retry_decisions(evidence, plan)
     by_name = {item["name"]: item for item in topology}
     workers = _endpoint_workers(plan)
     attachments = _worker_attachments(evidence, topology)
@@ -5640,13 +5843,10 @@ def _parse_rows(
         for item in topology
         if item["role"] == "F"
     }
-    cold_witness_contract = scenario.data.get("expect", {}).get(
-        "worker_cold_witness"
-    )
+    cold_witness_contract = scenario.data.get("expect", {}).get("worker_cold_witness")
     if cold_witness_contract is not None and (
         scenario.data.get("id") != "S70-b4-worker-bounces"
-        or scenario.data.get("expect", {}).get("engagement")
-        != "s70-b4-worker-bounces"
+        or scenario.data.get("expect", {}).get("engagement") != "s70-b4-worker-bounces"
         or cold_witness_contract != P29_ACTION_LINEAGE_CONTRACT
     ):
         raise CollectError("worker cold-witness contract is invalid for this scenario")
@@ -5687,8 +5887,7 @@ def _parse_rows(
             if item["role"] == "F" and item["image"].get("kind") == "daemon-mutant":
                 s30_refusals.extend(
                     _s30_mutant_refusals(
-                        _instance_results(evidence, item["name"])
-                        / "s30-mutant-f.jsonl"
+                        _instance_results(evidence, item["name"]) / "s30-mutant-f.jsonl"
                     )
                 )
                 s30_canary_refusals.extend(
@@ -5735,8 +5934,7 @@ def _parse_rows(
             )
             if not raw["scheduler_job"].isdigit():
                 job_id = (
-                    f"{client_name}:{raw['turn']}:{raw['index']}:"
-                    f"{raw['scheduler_job']}"
+                    f"{client_name}:{raw['turn']}:{raw['index']}:{raw['scheduler_job']}"
                 )
                 observation = _unassigned_p50_failure_observation(
                     log_text=log_text, raw=raw, row_job_id=job_id
@@ -5877,9 +6075,7 @@ def _parse_rows(
             if abandoned_retry_request is not None:
                 raw_job["abandoned_p50_retry_request"] = abandoned_retry_request
                 abandoned_retry_request_records.append(abandoned_retry_request)
-            scheduler = next(
-                item for item in topology if item["role"] == "S"
-            )
+            scheduler = next(item for item in topology if item["role"] == "S")
 
             missing_result_identities: list[dict[str, Any]] = []
             source_transfer_failures: list[dict[str, Any]] = []
@@ -5899,6 +6095,7 @@ def _parse_rows(
             ):
                 if attempt_marker is None:
                     transport_failure = _uncommitted_transport_failure_observation(
+                        retry_decisions=retry_decisions,
                         log_text=log_text,
                         assignment=assignment,
                         retry_assignment=assignments[attempt_index + 1],
@@ -5913,6 +6110,7 @@ def _parse_rows(
                         uncommitted_transport_failures.append(transport_failure)
                         continue
                     failure = _source_transfer_failure_observation(
+                        retry_decisions=retry_decisions,
                         log_text=log_text,
                         assignment=assignment,
                         retry_assignment=assignments[attempt_index + 1],
@@ -5929,9 +6127,7 @@ def _parse_rows(
                 attempt_candidates = _source_candidates_for_assignment(
                     source_results,
                     assignment["scheduler_job"],
-                    _instance_version_at(
-                        scheduler, events, assignment["observed_ms"]
-                    ),
+                    _instance_version_at(scheduler, events, assignment["observed_ms"]),
                     attempt_identity,
                 )
                 matching = [
@@ -6043,9 +6239,7 @@ def _parse_rows(
                             }
                         )
             if missing_result_identities:
-                raw_job["missing_compile_result_identities"] = (
-                    missing_result_identities
-                )
+                raw_job["missing_compile_result_identities"] = missing_result_identities
                 failed_result_identity_records.extend(missing_result_identities)
             if source_transfer_failures:
                 raw_job["failed_p50_source_transfers"] = source_transfer_failures
@@ -6240,8 +6434,7 @@ def _parse_rows(
                         or refused.get("terminal_error_name")
                         != "WIRE_REVISION_MISMATCH"
                         or first_worker.get("cache_wire_revision") != 1
-                        or first_worker.get("image", {}).get("kind")
-                        != "daemon-mutant"
+                        or first_worker.get("image", {}).get("kind") != "daemon-mutant"
                         or endpoint_revision != "2"
                         or by_name[client_name].get("cache_wire_revision") != 1
                     ):
@@ -7355,24 +7548,35 @@ def _observations(
             raise CollectError("active scheduler loss has multiple lost-job boundaries")
         lost_job = next(iter(active_loss_jobs))
         affected = [
-            raw for raw in raw_jobs
+            raw
+            for raw in raw_jobs
             if raw["assignment_claims"]
             and raw["assignment_claims"][0]["scheduler_job"] == lost_job
-            and raw["assignment_claims"][0].get("scheduler_record", {}).get("generation")
+            and raw["assignment_claims"][0]
+            .get("scheduler_record", {})
+            .get("generation")
             == next(iter(active_loss_generations), None)
         ]
         if len(affected) != 1 or affected[0]["retries"] != 1:
-            raise CollectError("active scheduler loss does not bind exactly one fresh retry")
+            raise CollectError(
+                "active scheduler loss does not bind exactly one fresh retry"
+            )
         first = affected[0]["assignment_claims"][0]
         first_record = first.get("scheduler_record", {})
         active_event = next(
             event for event in events if event.get("action") == "scheduler-loss-active"
         )
         active_receipt = active_event["receipt"]
-        if (first_record.get("terminal") != "scheduler-loss"
-                or first_record.get("generation") != active_receipt.get("lost_scheduler_generation")
-                or first_record.get("scheduler_job") != active_receipt.get("lost_scheduler_job")):
-            raise CollectError("active scheduler loss lacks its explicit scheduler boundary")
+        if (
+            first_record.get("terminal") != "scheduler-loss"
+            or first_record.get("generation")
+            != active_receipt.get("lost_scheduler_generation")
+            or first_record.get("scheduler_job")
+            != active_receipt.get("lost_scheduler_job")
+        ):
+            raise CollectError(
+                "active scheduler loss lacks its explicit scheduler boundary"
+            )
         if any(raw["retries"] != 0 for raw in raw_jobs if raw is not affected[0]):
             raise CollectError("active scheduler loss permits more than one retry")
     assignment_preference = _assignment_preference(
@@ -7411,14 +7615,10 @@ def _observations(
                     "turn": raw["turn"],
                 }
             )
-            assignment_lifecycle.append(
-                {"attempts": [], "job_id": row["job_id"]}
-            )
+            assignment_lifecycle.append({"attempts": [], "job_id": row["job_id"]})
             continue
         records = [item["scheduler_record"] for item in attempts]
-        missing_result_identities = raw.get(
-            "missing_compile_result_identities", []
-        )
+        missing_result_identities = raw.get("missing_compile_result_identities", [])
         source_transfer_failures = raw.get("failed_p50_source_transfers", [])
         uncommitted_transport_failures = raw.get(
             "failed_p50_uncommitted_transports", []
@@ -7510,10 +7710,8 @@ def _observations(
             # Error106 + strict retry/no-handoff record was authenticated
             # before lifecycle reconciliation.
             failed_result_stream_completion = True
-        strict_p50_late_result_binding = (
-            _successful_strict_p50_late_result_binding(
-                scenario, row, raw, records, events
-            )
+        strict_p50_late_result_binding = _successful_strict_p50_late_result_binding(
+            scenario, row, raw, records, events
         )
         if (
             (raw["compile_rc"] == 0) != (final["terminal"] == "completion")
@@ -7607,8 +7805,7 @@ def _observations(
             else None
         )
         b5_zstd_tu_retry = (
-            scenario.data.get("expect", {}).get("engagement")
-            == S70_B5_ENGAGEMENT
+            scenario.data.get("expect", {}).get("engagement") == S70_B5_ENGAGEMENT
             and retry_failure_reason == "source-transfer-loss"
             and len(source_transfer_failures) == 1
             and source_transfer_failures[0].get("error") == 0x5001
@@ -7621,8 +7818,7 @@ def _observations(
             and row["exact"] is True
             and row["retries"] == 1
             and row["tail_present"] is True
-            and row["tail_profile"]
-            == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
+            and row["tail_profile"] == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
             and row["session_outcome"] == "committed"
             and len(records) == 2
             and final["terminal"] == "completion"
@@ -7631,6 +7827,19 @@ def _observations(
                 retry_failure_reason
                 not in {"source-transfer-loss", "uncommitted-transport-loss"}
                 or first["worker"] != final["worker"]
+                or (
+                    len(source_transfer_failures + uncommitted_transport_failures) == 1
+                    and same_endpoint_decision_valid(
+                        (source_transfer_failures + uncommitted_transport_failures)[0],
+                        {
+                            "final_generation": final["generation"],
+                            "final_scheduler_job": final["scheduler_job"],
+                            "final_dispatch_ms": final["dispatch_ms"],
+                            "first_worker": first["worker"],
+                            "final_worker": final["worker"],
+                        },
+                    )
+                )
             )
         ):
             successful_strict_p50_retry_bindings.append(
@@ -7659,7 +7868,9 @@ def _observations(
         refusal = row_facts.get("s30_mutant_f")
         fallback_rows = [row for row in rows if row["session_outcome"] == "fallback"]
         direct_legacy_rows = [row for row in rows if row["session_outcome"] == "none"]
-        refusal_count = refusal.get("refusal_count") if isinstance(refusal, Mapping) else None
+        refusal_count = (
+            refusal.get("refusal_count") if isinstance(refusal, Mapping) else None
+        )
         if (
             not fallback_rows
             or not isinstance(refusal_count, int)
@@ -7694,7 +7905,9 @@ def _observations(
                     )
                 first, final = attempts
                 if first["scheduler_record"].get("terminal") == "completion":
-                    raise CollectError("S30 first P50 assignment has no refusal terminal")
+                    raise CollectError(
+                        "S30 first P50 assignment has no refusal terminal"
+                    )
                 if final["scheduler_record"].get("terminal") != "completion":
                     raise CollectError(
                         "S30 fresh legacy assignment lacks a completion terminal"
@@ -7748,9 +7961,7 @@ def _observations(
         client_turn_observations[turn] = {}
         for client in scenario.data["workload"]["clients"]:
             client_lifecycle = [
-                item
-                for item in turn_lifecycle
-                if item["client_instance"] == client
+                item for item in turn_lifecycle if item["client_instance"] == client
             ]
             client_raw = [item for item in turn_raw if item["client"] == client]
             if not client_lifecycle or len(client_lifecycle) != len(client_raw):
@@ -7759,8 +7970,7 @@ def _observations(
                 )
             client_turn_observations[turn][client] = {
                 "exact_objects": sum(
-                    row_by_identity[item["row_job_id"]]["exact"]
-                    for item in client_raw
+                    row_by_identity[item["row_job_id"]]["exact"] for item in client_raw
                 ),
                 "jobs": len(client_raw),
                 "wall_ms": max(item["terminal_ms"] for item in client_lifecycle)
@@ -7782,11 +7992,7 @@ def _observations(
         "f_init": f_init,
         "job_lifecycle": lifecycle,
         "logins": logins,
-        **(
-            {"network_shaping": network_shaping}
-            if network_shaping is not None
-            else {}
-        ),
+        **({"network_shaping": network_shaping} if network_shaping is not None else {}),
         "oracle": _oracle(evidence, scenario),
         "p29_interner_faults": p29_interner_faults,
         "protected_before": {

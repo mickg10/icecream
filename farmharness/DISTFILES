@@ -43,6 +43,7 @@ farmharness/integration/netem.py
 farmharness/integration/performance.py
 farmharness/integration/remote.py
 farmharness/integration/report.py
+farmharness/integration/retry_decision.py
 farmharness/integration/s50_fairness.py
 farmharness/integration/scenario_spec.py
 farmharness/integration/scenarios/H1-role-hash-refusal.json
@@ -150,6 +151,8 @@ farmharness/integration/tests/test_s30_mutant_catalog.py
 farmharness/integration/tests/test_s50_catalog.py
 farmharness/integration/tests/test_s50_fairness.py
 farmharness/integration/tests/test_s60_catalog.py
+farmharness/integration/tests/test_same_endpoint_retry_proof.py
+farmharness/integration/tests/test_scheduler_retry_decisions.py
 farmharness/integration/tests/test_specs_and_plan.py
 farmharness/integration/tests/test_suite.py
 farmharness/integration/tests/test_system_source_authority.py

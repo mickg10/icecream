@@ -836,6 +836,11 @@ public:
     ConnectionProvenance p50_source_arm_provenance;
     uint64_t p50_source_deadline_msec = 0;
     bool p50_source_compile_pending = false;
+    std::unique_ptr<icecc::p50::InputFdAttachmentOperation> p50_attachment;
+    std::unique_ptr<CompileJob> p50_attachment_job;
+    std::optional<icecc::p50::InputFdAttachmentResult> p50_attachment_result;
+    std::optional<icecc::p50::InputFdRequest> p50_attachment_lease;
+    uint64_t p50_attachment_started_msec = 0;
     // CACHE_SESSION transfers this wrapper's public descriptor to the sidecar
     // but its source-arm assignment remains live until the ordinary compile
     // connection (or its deadline) settles it. Such a wrapper has no fd to
@@ -1611,6 +1616,7 @@ struct Daemon {
         P50CacheClientCapability capability);
     void handle_old_request();
     bool handle_compile_file(Client *client, Msg *msg) __attribute_warn_unused_result__;
+    bool advance_p50_attachments(const std::vector<pollfd>& pollfds);
     bool handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         __attribute_warn_unused_result__;
     bool handle_activity(Client *client) __attribute_warn_unused_result__;
@@ -6832,20 +6838,21 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         p50_cache_client_capability_from_env(
             c->channel != nullptr ? c->channel->protocol : 0);
     const bool cache_service_ready = cache_client_service_ready();
-    const auto *const current_ready_lease = cache_adapter != nullptr
-        ? &cache_adapter->outer_current_ready_lease() : nullptr;
-    const bool exact_offer_current =
+    // This offer was published before the scheduler chose an assignment.
+    // A supervised C-sidecar replacement while that decision is in flight
+    // does not revoke the scheduler's exact assignment or widen its offer.
+    // Keep the original lease here: descriptor delivery below independently
+    // waits/rebinds to authenticated READY before any source operation starts.
+    const bool exact_offer_owned =
         c->cache_offer_generation == c->getcs_generation &&
         c->cache_offer_generation == scheduler_session_generation &&
         c->cache_offer.protocol != 0 && c->cache_offer.profile_mask != 0 &&
         c->cache_offer_lease.has_value() &&
-        current_ready_lease != nullptr && current_ready_lease->has_value() &&
-        (*current_ready_lease)->valid() &&
-        icecc::p50::daemon::p50_ready_lease_observation_equal(
-            *c->cache_offer_lease, **current_ready_lease);
+        c->cache_offer_lease->valid();
     const bool wrapper_cache_eligible =
         c->connection_provenance.cache_eligible() &&
-        cache_service_ready && exact_offer_current &&
+        exact_offer_owned &&
+        (cache_service_ready || cache_sidecar_recovery_in_progress()) &&
         c->cache_offer.protocol == msg->cache_protocol &&
         (msg->cache_profile_mask & ~c->cache_offer.profile_mask) == 0 &&
         current_client_cache_capability.protocol == msg->cache_protocol &&
@@ -8277,6 +8284,35 @@ static int p50_attachment_failure_exit_code(
     return 152;
 }
 
+bool Daemon::advance_p50_attachments(const std::vector<pollfd>& pollfds)
+{
+    for (const auto& entry : clients) {
+        Client *client = entry.second;
+        if (!client->p50_attachment) continue;
+        short revents = 0;
+        for (const auto& descriptor : pollfds)
+            if (descriptor.fd == client->p50_attachment->poll_fd())
+                revents |= descriptor.revents;
+        client->p50_attachment->advance(revents);
+        if (!client->p50_attachment->done()) continue;
+        client->p50_attachment_result = client->p50_attachment->take_result();
+        client->p50_attachment.reset();
+        if (!client->p50_attachment_result || !client->p50_attachment_job) {
+            handle_end(client, 146);
+            return true;
+        }
+        CompileFileMsg resume(client->p50_attachment_job.release(), true);
+        // Re-enter the exact ownership/ReadyLease checks before publishing
+        // the returned descriptor. The message owns the job until takeJob().
+        const bool alive = handle_compile_file(client, &resume);
+        (void)alive;
+        // Completion may erase a client or settle the scheduler; rebuild the
+        // poll snapshot rather than reusing references from this turn.
+        return true;
+    }
+    return false;
+}
+
 bool Daemon::handle_compile_file(Client *client, Msg *msg)
 {
     CompileJob *job = dynamic_cast<CompileFileMsg *>(msg)->takeJob();
@@ -8402,7 +8438,7 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             authorize_assignment_claim(
                 *job, static_cast<uint32_t>(client->client_id),
                 client->channel != nullptr ? client->channel->protocol : 0);
-        if (!exact_claim || client->job != nullptr ||
+        if (!exact_claim || client->job != nullptr || client->p50_attachment ||
             client->p50_source_compile_pending) {
             log_warning() << "P50 CompileFile did not match one live source owner for job "
                           << job->jobID() << endl;
@@ -8418,8 +8454,32 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             icecc::p50::TuSeq{input.tu_seq}};
         const icecc::p50::InputLeaseOwner input_owner{
             job->jobID(), job->assignmentEpoch(), job->assignmentNonce()};
-        auto attached = cache_adapter->attach_input(
-            input_key, input_owner, input.request_id);
+        if (!client->p50_attachment_result.has_value()) {
+            client->p50_attachment = cache_adapter->begin_attach_input(
+                input_key, input_owner, input.request_id);
+            if (!client->p50_attachment) {
+                delete job;
+                (void)client->channel->send_msg(EndMsg());
+                handle_end(client, 146);
+                return false;
+            }
+            client->p50_attachment_lease = client->p50_attachment->request();
+            client->p50_attachment_job.reset(job);
+            client->p50_attachment_started_msec = monotonic_msec();
+            trace() << "P50_INPUT_ATTACH_BEGIN job=" << job->jobID()
+                    << " epoch=" << job->assignmentEpoch()
+                    << " nonce=" << job->assignmentNonce()
+                    << " request=" << input.request_id << endl;
+            return true;
+        }
+        auto attached = std::move(*client->p50_attachment_result);
+        client->p50_attachment_result.reset();
+        trace() << "P50_INPUT_ATTACH_END job=" << job->jobID()
+                << " epoch=" << job->assignmentEpoch()
+                << " nonce=" << job->assignmentNonce()
+                << " request=" << input.request_id
+                << " elapsed_ms=" << monotonic_msec() - client->p50_attachment_started_msec
+                << " status=" << static_cast<unsigned>(attached.status) << endl;
         if (attached.status != icecc::p50::InputFdAttachmentStatus::Accepted ||
             !attached.fd.valid() || !attached.lease.has_value()) {
             log_warning() << "P50 compiler input attachment failed for job "
@@ -8473,6 +8533,7 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         (void)attached.fd.release();
         client->p50_input_lease = attached.lease;
         client->p50_input_lease_state = Client::P50InputLeaseState::Active;
+        client->p50_attachment_lease.reset();
         client->job = job;
         client->p50_source_compile_pending = true;
         if (client->command_line.empty()) {
@@ -8759,6 +8820,20 @@ void Daemon::handle_end(Client *client, int exitcode)
     // A normal disconnect, worker failure, scheduler loss, or retry says only
     // that this assignment attempt is over.  It must not terminally close the
     // logical job; an explicit result disposition does that before handle_end.
+    // Attachment reserves the owner before ACK and before the validated FD
+    // becomes Active. Close its transport first, then revoke that exact
+    // pending incarnation even when completion never published an active lease.
+    client->p50_attachment.reset();
+    if (client->p50_attachment_lease.has_value()) {
+        const auto lease = *client->p50_attachment_lease;
+        client->p50_attachment_lease.reset();
+        if (cache_adapter != nullptr) {
+            const auto result = cache_adapter->apply_input_lifecycle(
+                lease, icecc::p50::InputLifecycleAction::CancelAttempt);
+            if (result.status != icecc::p50::InputLifecycleStatus::Disconnected)
+                complete_p50_input_lifecycle(result, "pending attachment teardown");
+        }
+    }
     settle_p50_input(client, icecc::p50::InputLifecycleAction::CancelAttempt,
                      "handle_end");
     remember_finished_job(client, exitcode);
@@ -8780,6 +8855,9 @@ void Daemon::handle_end(Client *client, int exitcode)
         client->p50_input_wait.close();
     }
     client->p50_source_arm_fields.reset();
+    client->p50_attachment.reset();
+    client->p50_attachment_job.reset();
+    client->p50_attachment_result.reset();
     client->p50_source_f_lease.reset();
     client->p50_source_armed_ack.reset();
     client->p50_source_f_store_generation = 0;
@@ -10429,6 +10507,18 @@ void Daemon::answer_client_requests()
         cache_adapter->outer_append_pollfds(pollfds);
 
     int poll_timeout_msec = max_scheduler_pong * 1000;
+    for (const auto& entry : clients) {
+        const auto& attachment = entry.second->p50_attachment;
+        if (!attachment) continue;
+        if (attachment->poll_fd() >= 0)
+            pollfds.push_back(pollfd{attachment->poll_fd(), attachment->poll_events(), 0});
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            attachment->next_wakeup() - std::chrono::steady_clock::now()).count();
+        const int timeout = static_cast<int>(std::clamp<int64_t>(
+            remaining, 0, std::numeric_limits<int>::max()));
+        if (poll_timeout_msec < 0 || timeout < poll_timeout_msec)
+            poll_timeout_msec = timeout;
+    }
     if (state_dump_interval_s && (!state_jsonl_path.empty() || state_dump_log)) {
         const uint64_t now = monotonic_msec();
         if (!next_state_dump_msec) {
@@ -10595,6 +10685,10 @@ void Daemon::answer_client_requests()
         if (invalidate_p50_source_waiters_for_lease())
             return;
         reconcile_cache_route_state();
+    }
+    if (advance_p50_attachments(pollfds)) {
+        finish_scheduler_loss_if_needed();
+        return;
     }
     // Keep exact child status delivery after the lifecycle turn.  The central
     // registry remains the only wait-status consumer; this ordering prevents

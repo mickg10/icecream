@@ -7,6 +7,7 @@
 // accidentally create a second framed writer for the same relationship.
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <atomic>
 #include <cerrno>
@@ -208,6 +209,7 @@ public:
     Status receive(Frame& frame) noexcept;
 
 private:
+    friend class FrameOperation;
     friend class FdHandoffSender;
     friend class FdHandoffReceiver;
     void close() noexcept;
@@ -215,6 +217,40 @@ private:
     Status status_ = Status::InvalidArgument;
     std::atomic_flag writing_ = ATOMIC_FLAG_INIT;
     mutable bool peer_credentials_verified_ = false;
+};
+
+// One exact frame, advanced without waiting. The connection must outlive the
+// operation and must not be moved or read by another owner while it is pending.
+// Writes retain Connection's one-writer gate until completion or destruction.
+class FrameOperation {
+public:
+    FrameOperation(Connection& connection,
+                   std::chrono::steady_clock::time_point deadline) noexcept;
+    FrameOperation(Connection& connection, const Frame& frame,
+                   std::chrono::steady_clock::time_point deadline) noexcept;
+    ~FrameOperation();
+    FrameOperation(const FrameOperation&) = delete;
+    FrameOperation& operator=(const FrameOperation&) = delete;
+    void advance() noexcept;
+    void cancel() noexcept;
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] Status status() const noexcept { return status_; }
+    [[nodiscard]] short poll_events() const noexcept {
+        return done_ ? 0 : (sending_ ? POLLOUT : POLLIN);
+    }
+    [[nodiscard]] const Frame& frame() const noexcept { return frame_; }
+private:
+    void finish(Status status) noexcept;
+    Connection& connection_;
+    std::chrono::steady_clock::time_point deadline_;
+    std::vector<uint8_t> bytes_;
+    size_t offset_ = 0;
+    bool sending_ = false;
+    bool writer_locked_ = false;
+    bool header_read_ = false;
+    bool done_ = false;
+    Status status_ = Status::Busy;
+    Frame frame_;
 };
 
 Frame make_hello(PeerRole role, Identity identity);
@@ -274,6 +310,37 @@ Connection connect_unix_until(
     const std::string& path, std::chrono::steady_clock::time_point deadline,
     Status* status = nullptr) noexcept;
 Connection accept_unix(int listener_fd, Status* status = nullptr) noexcept;
+
+// Event-loop equivalent of connect_unix_until. Backlog retries yield until
+// next_wakeup(); EINPROGRESS waits for POLLOUT. No advance() waits internally.
+class UnixConnectOperation {
+public:
+    UnixConnectOperation(std::string path,
+                         std::chrono::steady_clock::time_point deadline) noexcept
+        : path_(std::move(path)), deadline_(deadline) {}
+    ~UnixConnectOperation() { cancel(); }
+    UnixConnectOperation(const UnixConnectOperation&) = delete;
+    UnixConnectOperation& operator=(const UnixConnectOperation&) = delete;
+    void advance(short revents = 0) noexcept;
+    void cancel() noexcept;
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] Status status() const noexcept { return status_; }
+    [[nodiscard]] int poll_fd() const noexcept { return done_ ? -1 : fd_; }
+    [[nodiscard]] short poll_events() const noexcept { return fd_ >= 0 && !done_ ? POLLOUT : 0; }
+    [[nodiscard]] std::chrono::steady_clock::time_point next_wakeup() const noexcept {
+        return fd_ >= 0 ? deadline_ : std::min(deadline_, retry_at_);
+    }
+    Connection take_connection() noexcept;
+private:
+    void finish(Status status) noexcept;
+    std::string path_;
+    std::chrono::steady_clock::time_point deadline_;
+    std::chrono::steady_clock::time_point retry_at_{};
+    int fd_ = -1;
+    unsigned attempts_ = 0;
+    bool done_ = false;
+    Status status_ = Status::Busy;
+};
 
 #if defined(ICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS)
 // Compile-time-only test seam.  The production library does not declare or

@@ -670,6 +670,42 @@ int main(int argc, char **argv)
             "replacement-race client retained the exact live assignment");
     delete client_rebind_wire;
 
+    // Publish a second request under the old READY lease, but withhold its
+    // scheduler decision until replacement completes. This is distinct from
+    // the already-delivered assignment's descriptor race above.
+    MsgChannel *client_inflight = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_inflight && client_inflight->send_msg(request_rebind),
+            "inflight GetCS submitted before C-sidecar replacement");
+    Msg *inflight_wire = scheduler
+        ? wait_for_type(scheduler, Msg::GET_CS, 5000) : nullptr;
+    GetCSMsg *inflight_getcs = inflight_wire
+        ? dynamic_cast<GetCSMsg *>(inflight_wire) : nullptr;
+    REQUIRE(inflight_getcs &&
+                inflight_getcs->cache_protocol == CACHE_WIRE_REVISION &&
+                inflight_getcs->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK,
+            "inflight GetCS published old-lease P50 capability to scheduler");
+    UseCSMsg inflight_reply(
+        "x86_64", rebind_f_host, rebind_f_port, UINT32_C(0x5211), true,
+        inflight_getcs ? inflight_getcs->client_id : 0, 0,
+        rebind_assignment_epoch, rebind_assignment_nonce + 1,
+        rebind_cache_port, CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    inflight_reply.setCompileIdentity(rebind_c_guid, rebind_tu_seq + 1);
+    delete inflight_wire;
+
+    MsgChannel *client_recovering = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_recovering && client_recovering->send_msg(request_rebind),
+            "recovery-window GetCS submitted under original lease");
+    Msg *recovering_wire = scheduler
+        ? wait_for_type(scheduler, Msg::GET_CS, 5000) : nullptr;
+    GetCSMsg *recovering_getcs = recovering_wire
+        ? dynamic_cast<GetCSMsg *>(recovering_wire) : nullptr;
+    REQUIRE(recovering_getcs && recovering_getcs->cache_protocol == CACHE_WIRE_REVISION,
+            "recovery-window GetCS published before retirement");
+    UseCSMsg recovering_reply(inflight_reply);
+    recovering_reply.job_id = UINT32_C(0x5212);
+    recovering_reply.client_id = recovering_getcs ? recovering_getcs->client_id : 0;
+    delete recovering_wire;
+
     const pid_t retired_sidecar = find_child_with_command(daemon_pid, argv[2]);
     REQUIRE(retired_sidecar > 0,
             "replacement-race test identified the authenticated sidecar PID");
@@ -677,6 +713,29 @@ int main(int argc, char **argv)
             "replacement-race test retired the exact sidecar incarnation");
     REQUIRE(wait_path_exists(replacement_waiting, 10000),
             "successor sidecar launch is held before READY");
+
+    REQUIRE(scheduler && scheduler->send_msg(recovering_reply),
+            "scheduler decision arrives while successor READY is gated");
+    Msg *recovering_use_wire = client_recovering
+        ? wait_for_type(client_recovering, Msg::USE_CS, 5000) : nullptr;
+    UseCSMsg *recovering_use = recovering_use_wire
+        ? dynamic_cast<UseCSMsg *>(recovering_use_wire) : nullptr;
+    REQUIRE(recovering_use &&
+                usecs_matches_except_host_and_cache(recovering_reply, *recovering_use) &&
+                recovering_use->cache_endpoint_port == rebind_cache_port &&
+                recovering_use->cache_protocol == CACHE_WIRE_REVISION &&
+                recovering_use->cache_profile_mask == CACHE_PROFILE_P29V1,
+            "recovery-window decision preserves the exact P50 handoff");
+    delete recovering_use_wire;
+    const P50CacheSessionFdRequestFields recovering_descriptor{
+        recovering_reply.job_id, recovering_reply.assignmentEpoch(),
+        recovering_reply.assignmentNonce(), CACHE_PROFILE_P29V1};
+    REQUIRE(client_recovering && client_recovering->send_msg(
+                P50CacheSessionFdRequestMsg(recovering_descriptor)),
+            "recovery-window assignment requests descriptor before READY");
+    REQUIRE(wait_file_contains(daemon_log,
+                "deferred P50 C-cache control request across supervised replacement for assignment 21010",
+                5000), "recovery-window descriptor waits for authenticated READY");
 
     const P50CacheSessionFdRequestFields descriptor_request{
         rebind_wire_job_id, rebind_assignment_epoch,
@@ -751,6 +810,63 @@ int main(int argc, char **argv)
                 rebind_done->tuSeq() == rebind_tu_seq,
             "replacement-race assignment settles once with its original identity");
     delete rebind_done_wire;
+
+    P50CacheControlIdentity recovering_identity;
+    const int recovering_fd = client_recovering
+        ? client_recovering->receive_p50_cache_fd_reply(
+              recovering_descriptor, recovering_identity,
+              Clock::now() + std::chrono::seconds(5)) : -1;
+    REQUIRE(recovering_fd >= 0 && recovering_identity.valid() &&
+                recovering_identity.generation == replacement_identity.generation &&
+                recovering_identity.attempt == replacement_identity.attempt,
+            "recovery-window assignment receives only the successor descriptor");
+    if (recovering_fd >= 0)
+        close(recovering_fd);
+    delete client_recovering;
+    Msg *recovering_done = scheduler
+        ? wait_for_type(scheduler, Msg::JOB_DONE, 5000) : nullptr;
+    REQUIRE(recovering_done != nullptr,
+            "recovery-window assignment settles after descriptor delivery");
+    delete recovering_done;
+
+    REQUIRE(scheduler && scheduler->send_msg(inflight_reply),
+            "scheduler resolves old-lease GetCS after successor READY");
+    Msg *inflight_use_wire = client_inflight
+        ? wait_for_type(client_inflight, Msg::USE_CS, 5000) : nullptr;
+    UseCSMsg *inflight_use = inflight_use_wire
+        ? dynamic_cast<UseCSMsg *>(inflight_use_wire) : nullptr;
+    REQUIRE(inflight_use &&
+                usecs_matches_except_host_and_cache(inflight_reply, *inflight_use) &&
+                inflight_use->hostname == inflight_reply.hostname &&
+                inflight_use->port == inflight_reply.port &&
+                inflight_use->cache_endpoint_port == rebind_cache_port &&
+                inflight_use->cache_protocol == CACHE_WIRE_REVISION &&
+                inflight_use->cache_profile_mask == CACHE_PROFILE_P29V1,
+            "inflight GetCS preserves exact assignment and P50 handoff across C replacement");
+    delete inflight_use_wire;
+    const P50CacheSessionFdRequestFields inflight_descriptor{
+        inflight_reply.job_id, inflight_reply.assignmentEpoch(),
+        inflight_reply.assignmentNonce(), CACHE_PROFILE_P29V1};
+    REQUIRE(client_inflight && client_inflight->send_msg(
+                P50CacheSessionFdRequestMsg(inflight_descriptor)),
+            "inflight assignment requests descriptor after successor READY");
+    P50CacheControlIdentity inflight_identity;
+    const int inflight_fd = client_inflight
+        ? client_inflight->receive_p50_cache_fd_reply(
+              inflight_descriptor, inflight_identity,
+              Clock::now() + std::chrono::seconds(5)) : -1;
+    REQUIRE(inflight_fd >= 0 && inflight_identity.valid() &&
+                inflight_identity.generation == replacement_identity.generation &&
+                inflight_identity.attempt == replacement_identity.attempt,
+            "inflight old-lease offer obtains only the authenticated successor descriptor");
+    if (inflight_fd >= 0)
+        close(inflight_fd);
+    delete client_inflight;
+    Msg *inflight_done = scheduler
+        ? wait_for_type(scheduler, Msg::JOB_DONE, 5000) : nullptr;
+    REQUIRE(inflight_done != nullptr,
+            "inflight replacement regression settles its assignment");
+    delete inflight_done;
 
     /* Client C: the scheduler selects a REMOTE host as F -- hostname/port
        matching neither this daemon's own remote-observed identity nor

@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
@@ -327,6 +329,70 @@ static P50SourceArmFields source_arm(uint32_t wire_id, uint64_t epoch,
     arm.c_control_attempt = nonce;
     return arm;
 }
+
+static pid_t find_attachment_sidecar(pid_t daemon_pid, const char *service_path)
+{
+    const std::string wanted = service_path ? service_path : "";
+    std::error_code error;
+    for (const auto &entry : std::filesystem::directory_iterator("/proc", error)) {
+        if (error) break;
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        std::ifstream stat(entry.path() / "stat");
+        pid_t pid = -1, ppid = -1;
+        char comm[256]{}, state = 0;
+        if (!(stat >> pid >> comm >> state >> ppid) || ppid != daemon_pid) continue;
+        std::ifstream cmd(entry.path() / "cmdline", std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(cmd)),
+                                std::istreambuf_iterator<char>());
+        if (!wanted.empty() && bytes.find(wanted) != std::string::npos) return pid;
+    }
+    return -1;
+}
+
+static bool wait_attachment_log(const std::string &path, uintmax_t offset,
+                                const std::string &marker, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    while (Clock::now() < deadline) {
+        std::ifstream stream(path, std::ios::binary);
+        stream.seekg(static_cast<std::streamoff>(offset));
+        const std::string suffix((std::istreambuf_iterator<char>(stream)),
+                                 std::istreambuf_iterator<char>());
+        if (suffix.find(marker) != std::string::npos) return true;
+        ::usleep(10000);
+    }
+    return false;
+}
+
+static CompileJob attachment_compile_job(uint32_t wire_id, uint64_t epoch,
+                                         uint64_t nonce,
+                                         const P50SourceArmFields &arm)
+{
+    CompileJob job;
+    job.setLanguage(CompileJob::Lang_CXX);
+    job.setJobID(wire_id);
+    job.setAssignmentIdentity(epoch, nonce);
+    job.setCompileIdentity(31, 42);
+    job.setEnvironmentVersion("env");
+    job.setTargetPlatform("x86_64");
+    job.setCompilerName("g++");
+    job.setInputFile("in.ii");
+    job.setWorkingDirectory("/tmp");
+    job.setOutputFile("out.o");
+    job.appendFlag("-O2", Arg_Remote);
+    CompileInputIdentity input;
+    input.profile = CompileInputIdentity::ZstdTuProfile;
+    input.c_store_guid = arm.c_store_guid;
+    input.tu_seq = 0;
+    input.raw_bytes = 1;
+    input.raw_digest.fill(0xa5);
+    input.attempt_id = arm.compiler_attempt;
+    input.request_id = arm.source_request_id;
+    job.setCompileInputIdentity(input);
+    return job;
+}
 #endif
 
 int main(int argc, char **argv)
@@ -431,6 +497,133 @@ int main(int argc, char **argv)
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
 
+    // Diagnostic regression: a synchronous compiler-input attachment must not
+    // prevent a fresh ordinary peer from completing admission.  The sidecar
+    // is test-owned and always resumed after a successful stop.
+    MsgChannel *attach_healthy_peer = connect_tcp_bounded(daemon_port, 5000);
+    const bool attach_healthy_greeting = attach_healthy_peer &&
+        attach_healthy_peer->send_msg(CacheSessionMsg());
+    delete attach_healthy_peer;
+    REQUIRE(attach_healthy_greeting,
+            "attachment diagnostic healthy-sidecar peer greeting succeeds");
+
+    const bool disconnect_pending = std::getenv("ICECC_TEST_PENDING_DISCONNECT") != nullptr;
+    const uint32_t attach_wire_id = 0x7a710101 + unsigned(disconnect_pending);
+    // Assignment epochs are scheduler-session scoped; keep the active epoch
+    // and mint a distinct wire/nonce pair for this diagnostic.
+    const uint64_t attach_epoch = epoch;
+    const uint64_t attach_nonce = UINT64_C(0x7a71010100000001) + unsigned(disconnect_pending);
+    const P50SourceArmFields attach_arm = source_arm(
+        attach_wire_id, attach_epoch, attach_nonce,
+        static_cast<uint32_t>(daemon_port), static_cast<uint32_t>(daemon_port));
+    REQUIRE(scheduler && scheduler->send_msg(
+                AssignPrepareMsg(attach_epoch, attach_wire_id, attach_nonce, 1)),
+            "attachment diagnostic PREPARE reaches the daemon");
+    Msg *attach_ready_message = wait_for_type(scheduler, Msg::ASSIGN_READY, 5000);
+    auto *attach_ready = dynamic_cast<AssignReadyMsg *>(attach_ready_message);
+    REQUIRE(attach_ready != nullptr && attach_ready->wire_id == attach_wire_id &&
+                attach_ready->epoch() == attach_epoch && attach_ready->nonce() == attach_nonce,
+            "attachment diagnostic assignment is authenticated");
+    delete attach_ready_message;
+
+    MsgChannel *attach_wrapper = connect_tcp_bounded(daemon_port, 5000);
+    REQUIRE(attach_wrapper && attach_wrapper->send_msg(P50SourceArmMsg(attach_arm)),
+            "attachment diagnostic source arm is sent");
+    Msg *attach_armed_message = wait_for_type(attach_wrapper, Msg::P50_SOURCE_ARMED, 5000);
+    auto *attach_armed = dynamic_cast<P50SourceArmedMsg *>(attach_armed_message);
+    REQUIRE(attach_armed != nullptr && attach_armed->arm == attach_arm,
+            "attachment diagnostic source arm is acknowledged");
+    delete attach_armed_message;
+    REQUIRE(attach_wrapper && attach_wrapper->send_msg(CacheSessionMsg()),
+            "attachment diagnostic wrapper enters CACHE_SESSION");
+    ::usleep(100 * 1000);
+
+    const pid_t attach_sidecar_pid = find_attachment_sidecar(daemon_pid, argv[2]);
+    const bool attach_stop_sent = attach_sidecar_pid > 1 &&
+        ::kill(attach_sidecar_pid, SIGSTOP) == 0;
+    bool attach_stopped = false;
+    if (attach_stop_sent) {
+        const auto stop_deadline = Clock::now() + std::chrono::milliseconds(2000);
+        while (Clock::now() < stop_deadline) {
+            std::ifstream status(std::string("/proc/") +
+                                 std::to_string(attach_sidecar_pid) + "/status");
+            std::string line;
+            while (std::getline(status, line))
+                if (line.rfind("State:", 0) == 0 && line.find('T') != std::string::npos)
+                    attach_stopped = true;
+            if (attach_stopped) break;
+            ::usleep(10000);
+        }
+    }
+    REQUIRE(attach_stopped, "attachment diagnostic stops only its test-owned sidecar");
+
+    std::error_code attach_log_error;
+    const uintmax_t attach_log_offset = std::filesystem::file_size(log, attach_log_error);
+    MsgChannel *attach_compile_client = connect_tcp_bounded(daemon_port, 5000);
+    CompileJob attach_job = attachment_compile_job(
+        attach_wire_id, attach_epoch, attach_nonce, attach_arm);
+    const bool attach_compile_sent = attach_compile_client &&
+        attach_compile_client->send_msg(CompileFileMsg(&attach_job));
+    REQUIRE(attach_compile_sent, "attachment diagnostic valid CompileFile is sent");
+    const std::string attach_begin_marker =
+        "P50_INPUT_ATTACH_BEGIN job=" + std::to_string(attach_wire_id) +
+        " epoch=" + std::to_string(attach_epoch) +
+        " nonce=" + std::to_string(attach_nonce) +
+        " request=" + std::to_string(attach_arm.source_request_id);
+    const std::string attach_end_marker =
+        "P50_INPUT_ATTACH_END job=" + std::to_string(attach_wire_id) +
+        " epoch=" + std::to_string(attach_epoch) +
+        " nonce=" + std::to_string(attach_nonce) +
+        " request=" + std::to_string(attach_arm.source_request_id);
+    const bool attach_begin_seen = attach_compile_sent && !attach_log_error &&
+        wait_attachment_log(log, attach_log_offset, attach_begin_marker, 3000);
+    REQUIRE(attach_begin_seen, "attachment handler begins exact authenticated attach");
+
+    bool attach_resumed = false;
+    if (disconnect_pending) {
+        delete attach_compile_client;
+        attach_compile_client = nullptr;
+        attach_resumed = attach_stop_sent && ::kill(attach_sidecar_pid, SIGCONT) == 0;
+    }
+
+    std::atomic<bool> attach_peer_connected{false};
+    std::atomic<bool> attach_peer_greeting{false};
+    std::thread attach_peer([&] {
+        MsgChannel *peer = connect_tcp_bounded(daemon_port, 5000);
+        attach_peer_connected.store(peer != nullptr);
+        const bool sent = peer && peer->send_msg(CacheSessionMsg());
+        attach_peer_greeting.store(sent);
+        delete peer;
+    });
+    ::usleep(1200 * 1000);
+    REQUIRE(attach_begin_seen && attach_peer_connected.load() && attach_peer_greeting.load() &&
+                read_file_suffix(log, attach_log_offset).find(attach_end_marker) == std::string::npos,
+            "peer handshake completes while exact attachment remains pending");
+    if (!disconnect_pending)
+        attach_resumed = attach_stop_sent && ::kill(attach_sidecar_pid, SIGCONT) == 0;
+    REQUIRE(attach_resumed, "attachment diagnostic resumes its stopped sidecar");
+    attach_peer.join();
+    const bool attach_compile_bounded = disconnect_pending ||
+        (attach_compile_client && wait_eof(attach_compile_client, 8000));
+    delete attach_compile_client;
+    delete attach_wrapper;
+    REQUIRE(attach_peer_connected.load() && attach_peer_greeting.load(),
+            "peer admission resumes after attachment sidecar continuation");
+    REQUIRE(attach_compile_bounded, "attachment diagnostic CompileFile terminates boundedly");
+    if (disconnect_pending) {
+        // No input was committed in this fixture: unknown-record proves the
+        // exact pending cancellation reached the sidecar, not lease revocation.
+        const std::string cancelled = "P50 input settlement job " +
+            std::to_string(attach_wire_id) + " action 1 status unknown-record";
+        REQUIRE(wait_attachment_log(log, attach_log_offset, cancelled, 3000),
+                "pending disconnect delivers CancelAttempt to the sidecar");
+        REQUIRE(read_file_suffix(log, attach_log_offset).find(attach_end_marker) ==
+                    std::string::npos,
+                "disconnected attachment is not resumed or published");
+    } else {
+        REQUIRE(wait_attachment_log(log, attach_log_offset, attach_end_marker, 2000),
+                "attachment handler emits exact END after sidecar continuation");
+    }
     // Stop only this private test daemon, queue one more connection than the
     // 64-socket accept quantum, and resume it.  Every connection already
     // contains protocol negotiation and a deliberately unarmed CACHE_SESSION.

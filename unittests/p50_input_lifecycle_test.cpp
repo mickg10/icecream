@@ -361,6 +361,8 @@ void replacement_cycle_and_bounds() {
 }
 
 void cancellation_racing_attachment_finalization_revokes_exact_owner() {
+    for (const bool begin_before_cancel : {false, true}) {
+    for (const bool acknowledged : {false, true}) {
     InputLifecycleRegistry registry(4, 8);
     const local::Identity identity{9, 10};
     const InputRecordKey input = key(7);
@@ -369,9 +371,11 @@ void cancellation_racing_attachment_finalization_revokes_exact_owner() {
 
     require(registry.prepare_route_commit(input) ==
                 InputLifecycleCommitDecision::Open &&
-                registry.observe_route_commit(input, true) &&
-                registry.begin_attachment(input, first, 1),
+                registry.observe_route_commit(input, true),
             "attachment/cancellation race setup failed");
+    if (begin_before_cancel)
+        require(registry.begin_attachment(input, first, 1),
+                "initial attachment reservation failed");
 
     const InputLifecycleRequest cancel = request(
         identity, input, first, 1, InputLifecycleAction::CancelAttempt);
@@ -380,14 +384,16 @@ void cancellation_racing_attachment_finalization_revokes_exact_owner() {
             "pending attachment attempt cancellation failed");
     (void)registry.finish_apply(cancel, true);
 
-    // A lost/negative descriptor ACK may finalize after cancellation.  It
-    // must not clear the revocation and permit the same owner to attach again.
-    registry.finish_attachment(input, first, 1, false);
+    // Neither positive nor negative late ACK may resurrect a cancelled owner.
+    // Cancellation before the first reservation must fence that owner too.
+    registry.finish_attachment(input, first, 1, acknowledged);
     require(!registry.begin_attachment(input, first, 2),
             "cancelled exact owner reattached after lost descriptor ACK");
     require(registry.begin_attachment(input, replacement, 2),
             "fresh replacement owner was rejected after raced cancellation");
     registry.finish_attachment(input, replacement, 2, true);
+    }
+    }
 }
 
 InputLifecycleOperationLease refinement_lease(local::Identity identity,

@@ -6,9 +6,11 @@
 // session codec, and it never creates a listener or advertises an endpoint.
 
 #include <chrono>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <poll.h>
 
 #include "p50_local_transport.h"
 
@@ -137,6 +139,54 @@ private:
     bool consumed_ = false;
     std::optional<HandoffRequest> seen_request_;
     HandoffFd adopted_;
+};
+
+// Event-loop form of FdHandoffReceiver.  The caller owns the authenticated
+// Connection and invokes advance() only after poll(2) reports the events from
+// poll_events().  advance() never waits and performs a bounded amount of
+// nonblocking I/O.  The absolute deadline is fixed at start().
+class AsyncFdHandoffReceiver {
+public:
+    AsyncFdHandoffReceiver() noexcept = default;
+    ~AsyncFdHandoffReceiver() noexcept;
+    AsyncFdHandoffReceiver(const AsyncFdHandoffReceiver&) = delete;
+    AsyncFdHandoffReceiver& operator=(const AsyncFdHandoffReceiver&) = delete;
+
+    // The Connection is borrowed and remains owned by the caller on every
+    // terminal result; the caller must close/recycle it after completion.
+    bool start(Connection& connection, const HandoffRequest& expected,
+               std::chrono::steady_clock::time_point deadline) noexcept;
+    void advance(short revents = POLLIN) noexcept;
+    [[nodiscard]] int poll_fd() const noexcept { return connection_fd_; }
+    [[nodiscard]] short poll_events() const noexcept;
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] FdHandoffResult result() const noexcept { return result_; }
+    [[nodiscard]] HandoffFd take_fd() noexcept;
+    void cancel(FdHandoffStatus status = FdHandoffStatus::Disconnected) noexcept;
+
+private:
+    enum class State : uint8_t { Idle, Receiving, SendingAck, Done };
+    void fail(FdHandoffStatus status) noexcept;
+    void receive_once() noexcept;
+    void finish_receive() noexcept;
+    void send_ack_once() noexcept;
+
+    int connection_fd_ = -1;
+    HandoffRequest expected_{};
+    std::chrono::steady_clock::time_point deadline_{};
+    State state_ = State::Idle;
+    bool done_ = false;
+    bool consumed_ = false;
+    std::array<uint8_t, 40> wire_{};
+    size_t offset_ = 0;
+    int received_fd_ = -1;
+    size_t fd_count_ = 0;
+    bool has_rights_ = false;
+    std::array<uint8_t, 40> ack_wire_{};
+    size_t ack_offset_ = 0;
+    HandoffFd adopted_{};
+    FdHandoffStatus ack_status_ = FdHandoffStatus::Accepted;
+    FdHandoffResult result_{};
 };
 
 #if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)

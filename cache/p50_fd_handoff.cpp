@@ -630,6 +630,200 @@ FdHandoffResult FdHandoffReceiver::receive_and_ack(
 
 HandoffFd FdHandoffReceiver::take_adopted_fd() noexcept { return std::move(adopted_); }
 
+AsyncFdHandoffReceiver::~AsyncFdHandoffReceiver() noexcept { cancel(); }
+
+bool AsyncFdHandoffReceiver::start(
+    Connection& connection, const HandoffRequest& expected,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (state_ != State::Idle) return false;
+    if (!connection.valid() || !connection.peer_credentials_verified()) {
+        result_ = FdHandoffResult{connection.valid()
+                                      ? FdHandoffStatus::NotAuthenticated
+                                      : FdHandoffStatus::InvalidArgument,
+                                  FdHandoffSenderState::Rejected};
+        done_ = true;
+        state_ = State::Done;
+        return false;
+    }
+    if (!valid_request(expected)) {
+        result_ = FdHandoffResult{FdHandoffStatus::InvalidArgument,
+                                  FdHandoffSenderState::Rejected};
+        done_ = true;
+        state_ = State::Done;
+        return false;
+    }
+    connection_fd_ = connection.native_handle();
+    expected_ = expected;
+    deadline_ = deadline;
+    state_ = State::Receiving;
+    done_ = false;
+    consumed_ = false;
+    ack_status_ = FdHandoffStatus::Accepted;
+    result_ = {};
+    return true;
+}
+
+short AsyncFdHandoffReceiver::poll_events() const noexcept {
+    if (done_ || state_ == State::Idle) return 0;
+    return state_ == State::SendingAck ? POLLOUT : POLLIN;
+}
+
+void AsyncFdHandoffReceiver::fail(FdHandoffStatus status) noexcept {
+    if (received_fd_ >= 0) {
+        ::close(received_fd_);
+        received_fd_ = -1;
+    }
+    adopted_.reset();
+    result_ = FdHandoffResult{status, status == FdHandoffStatus::Timeout
+                                      ? FdHandoffSenderState::TimedOut
+                                      : FdHandoffSenderState::Rejected};
+    done_ = true;
+    state_ = State::Done;
+}
+
+void AsyncFdHandoffReceiver::cancel(FdHandoffStatus status) noexcept {
+    if (done_ && state_ == State::Done) return;
+    fail(status);
+}
+
+void AsyncFdHandoffReceiver::advance(short revents) noexcept {
+    if (done_ || state_ == State::Idle) return;
+    if (std::chrono::steady_clock::now() >= deadline_) {
+        fail(FdHandoffStatus::Timeout);
+        return;
+    }
+    if ((revents & (POLLERR | POLLNVAL)) != 0) {
+        fail(FdHandoffStatus::Disconnected);
+        return;
+    }
+    if (state_ == State::Receiving) {
+        if ((revents & (POLLIN | POLLHUP)) == 0) return;
+        receive_once();
+    }
+    if (state_ == State::SendingAck) {
+        if ((revents & (POLLOUT | POLLHUP)) == 0) return;
+        send_ack_once();
+    }
+}
+
+void AsyncFdHandoffReceiver::receive_once() noexcept {
+    alignas(struct cmsghdr) std::array<uint8_t, kControlBufferSize> control{};
+    struct iovec iov{wire_.data() + offset_, wire_.size() - offset_};
+    struct msghdr message{};
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    int flags = MSG_DONTWAIT;
+#if defined(MSG_CMSG_CLOEXEC)
+    flags |= MSG_CMSG_CLOEXEC;
+#endif
+    const ssize_t count = ::recvmsg(connection_fd_, &message, flags);
+    if (count == 0) {
+        fail(offset_ == 0 ? FdHandoffStatus::Disconnected : FdHandoffStatus::Truncated);
+        return;
+    }
+    if (count < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
+        fail(FdHandoffStatus::IoError);
+        return;
+    }
+    Received received;
+    received.status = FdHandoffStatus::Accepted;
+    received.fd = received_fd_;
+    received.fd_count = fd_count_;
+    received.has_rights = has_rights_;
+    record_control(received, message);
+    received_fd_ = received.fd;
+    fd_count_ = received.fd_count;
+    has_rights_ = received.has_rights;
+    const size_t remaining = wire_.size() - offset_;
+    if (static_cast<size_t>(count) > remaining) {
+        fail(FdHandoffStatus::MessageTruncated);
+        return;
+    }
+    offset_ += static_cast<size_t>(count);
+    if (received.status != FdHandoffStatus::Accepted) {
+        fail(received.status);
+        return;
+    }
+    if (offset_ == wire_.size()) finish_receive();
+}
+
+void AsyncFdHandoffReceiver::finish_receive() noexcept {
+    if (std::chrono::steady_clock::now() >= deadline_) {
+        fail(FdHandoffStatus::Timeout);
+        return;
+    }
+    uint8_t byte = 0;
+    const ssize_t trailing = ::recv(connection_fd_, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+    if (trailing > 0) { fail(FdHandoffStatus::TrailingData); return; }
+    if (trailing < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        fail(FdHandoffStatus::IoError); return;
+    }
+    HandoffRequest actual{};
+    uint32_t code = 0;
+    if (!decode_wire(wire_, kRequestType, actual, code)) {
+        fail(FdHandoffStatus::Malformed); return;
+    }
+    FdHandoffStatus status = actual == expected_ ? FdHandoffStatus::Accepted
+                                                 : rejection_for(actual, expected_);
+    if (fd_count_ == 0 || !has_rights_) status = FdHandoffStatus::MissingFd;
+    if (fd_count_ > 1) status = FdHandoffStatus::ExtraFd;
+    if (status != FdHandoffStatus::Accepted) {
+        if (received_fd_ >= 0) { ::close(received_fd_); received_fd_ = -1; }
+        ack_wire_ = encode_wire(kNackType, actual, nack_code(status));
+        ack_status_ = status;
+        ack_offset_ = 0;
+        state_ = State::SendingAck;
+        return;
+    }
+    adopted_ = HandoffFd(received_fd_);
+    received_fd_ = -1;
+    if (!adopted_.valid() || !adopted_.cloexec()) {
+        fail(FdHandoffStatus::AdoptionFailed); return;
+    }
+    consumed_ = true;
+    ack_wire_ = encode_wire(kAckType, actual, kCodeAck);
+    ack_status_ = FdHandoffStatus::Accepted;
+    ack_offset_ = 0;
+    state_ = State::SendingAck;
+}
+
+void AsyncFdHandoffReceiver::send_ack_once() noexcept {
+    const size_t remaining = ack_wire_.size() - ack_offset_;
+    int flags = MSG_DONTWAIT;
+#if defined(MSG_NOSIGNAL)
+    flags |= MSG_NOSIGNAL;
+#endif
+    const ssize_t count = ::send(connection_fd_, ack_wire_.data() + ack_offset_, remaining,
+                                  flags);
+    if (count < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
+        fail(FdHandoffStatus::Disconnected); return;
+    }
+    if (count == 0) { fail(FdHandoffStatus::Disconnected); return; }
+    ack_offset_ += static_cast<size_t>(count);
+    if (ack_offset_ == ack_wire_.size()) {
+        if (std::chrono::steady_clock::now() >= deadline_) {
+            fail(FdHandoffStatus::Timeout);
+            return;
+        }
+        result_ = FdHandoffResult{
+            ack_status_, ack_status_ == FdHandoffStatus::Accepted
+                              ? FdHandoffSenderState::Acked
+                              : FdHandoffSenderState::Nacked};
+        done_ = true;
+        state_ = State::Done;
+    }
+}
+
+HandoffFd AsyncFdHandoffReceiver::take_fd() noexcept {
+    if (!done_ || result_.status != FdHandoffStatus::Accepted)
+        return {};
+    return std::move(adopted_);
+}
+
 #if defined(ICECC_P50_FD_HANDOFF_TEST_HOOKS)
 void fd_handoff_test_set_max_send_chunk(size_t bytes) noexcept {
     g_test_max_send_chunk.store(bytes, std::memory_order_relaxed);
