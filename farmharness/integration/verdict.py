@@ -2401,7 +2401,7 @@ def _disk_fill_receipt_errors(
     receipt: Any, event: Mapping[str, Any], topology: Any = None, run_id: Any = None
 ) -> set[str]:
     marker = "@event:disk-fill"
-    if not isinstance(receipt, Mapping) or set(receipt) != {
+    if not isinstance(receipt, Mapping) or set(receipt) not in ({
         "action",
         "after",
         "before",
@@ -2409,7 +2409,27 @@ def _disk_fill_receipt_errors(
         "fill",
         "instance",
         "schema",
-    }:
+    }, {
+        "action",
+        "after",
+        "before",
+        "event_epoch",
+        "fill",
+        "instance",
+        "schema",
+        "admission_boundary",
+    }):
+        return {marker}
+    boundary = receipt.get("admission_boundary")
+    if boundary is not None and (
+        not isinstance(boundary, Mapping)
+        or set(boundary) != {"epoch", "pause", "resume", "schema", "turn"}
+        or boundary.get("schema") != "icefarm-disk-fill-admission-boundary-v1"
+        or not isinstance(boundary.get("epoch"), int)
+        or not isinstance(boundary.get("turn"), str)
+        or not isinstance(boundary.get("pause"), Mapping)
+        or not isinstance(boundary.get("resume"), Mapping)
+    ):
         return {marker}
     if (
         receipt.get("schema") != DISK_FILL_SCHEMA

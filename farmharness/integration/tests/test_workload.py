@@ -222,7 +222,7 @@ def test_s30_mutant_workload_enables_the_legacy_recovery_under_test(
         ("S80-p29v1", True),
         ("S70-b6-kill-switch", False),
         ("S70-b5-interner-failure", True),
-        ("S95-cache-disk-full", False),
+        ("S95-cache-disk-full", True),
         ("S40-full-newgen-engagement", True),
         ("S60-11-warm-f2-down", False),
         ("S60-13-warm-s-down", False),

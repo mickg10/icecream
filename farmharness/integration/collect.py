@@ -2895,7 +2895,7 @@ def _validate_disk_fill_receipt(
         "trigger": event.get("trigger"),
     }:
         raise CollectError(f"{prefix} is not the exact declared fault")
-    if not isinstance(receipt, Mapping) or set(receipt) != {
+    if not isinstance(receipt, Mapping) or set(receipt) not in ({
         "action",
         "after",
         "before",
@@ -2903,8 +2903,29 @@ def _validate_disk_fill_receipt(
         "fill",
         "instance",
         "schema",
-    }:
+    }, {
+        "action",
+        "after",
+        "before",
+        "event_epoch",
+        "fill",
+        "instance",
+        "schema",
+        "admission_boundary",
+    }):
         raise CollectError(f"{prefix} has invalid receipt fields")
+    boundary = receipt.get("admission_boundary")
+    if boundary is not None:
+        if (
+            not isinstance(boundary, Mapping)
+            or set(boundary) != {"epoch", "pause", "resume", "schema", "turn"}
+            or boundary.get("schema") != "icefarm-disk-fill-admission-boundary-v1"
+            or not isinstance(boundary.get("epoch"), int)
+            or not isinstance(boundary.get("turn"), str)
+            or not isinstance(boundary.get("pause"), Mapping)
+            or not isinstance(boundary.get("resume"), Mapping)
+        ):
+            raise CollectError(f"{prefix} has malformed admission boundary")
     if (
         receipt.get("schema") != DISK_FILL_SCHEMA
         or receipt.get("action") != "disk_fill"

@@ -1773,6 +1773,21 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
             const bool p50_assignment = usecs->hasCacheAdvertisement();
             const string failed_host = usecs->hostname;
             const uint32_t failed_port = usecs->port;
+            /* A P50 worker can report a bounded resource failure through
+               CompileResultMsg::was_out_of_memory.  For a strict cache
+               assignment (notably the authenticated S95 disk-fill probe),
+               this is an assignment loss, not permission for the outer
+               client to compile locally.  Normalize it to the existing
+               one-shot retry class while preserving the failed endpoint. */
+            if (p50_assignment && error.errorCode == 101 &&
+                getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+                publish_p50_observation();
+                delete usecs;
+                throw remote_error(
+                    106,
+                    "Error 106 - P50 worker resource failure before exact completion",
+                    failed_host, failed_port);
+            }
             publish_p50_observation();
             delete usecs;
             if (error.errorCode == 106 && p50_assignment &&
