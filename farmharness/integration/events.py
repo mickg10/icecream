@@ -1647,6 +1647,7 @@ class EventProducer:
         # This keeps the event boundary between completed workload units and
         # post-event work without changing the declared trigger or verifier.
         self._disk_fill_terminal_ceiling: int | None = None
+        self._disk_fill_eligible_since: float | None = None
         self._workload_time_origin: float | None = None
         self._next_workload_time_origin_poll = 0.0
         self._anchor_time_to_workload = (
@@ -6070,6 +6071,15 @@ class EventProducer:
                     # reader may observe more assignments while we wait; they
                     # are post-boundary work and must not postpone the fault.
                     self._disk_fill_terminal_ceiling = dispatches[required - 1]
+                    self._disk_fill_eligible_since = self.monotonic()
+                # Give the workload a bounded drain window after the trigger
+                # becomes visible.  This avoids racing a just-dispatched
+                # compiler whose terminal record is still being flushed.
+                if (
+                    self._disk_fill_eligible_since is not None
+                    and self.monotonic() - self._disk_fill_eligible_since < 15.0
+                ):
+                    return False
                 terminals = parse_scheduler_terminals(self.job_reader())
                 active = parse_scheduler_active(self.job_reader())
                 return all(
