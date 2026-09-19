@@ -8074,16 +8074,24 @@ void Daemon::handle_old_request()
         /* we don't want to handle TOCOMPILE jobs as long as our load
            is too high */
         if (current_load >= 1000) {
+            bool exact_p50_ready = false;
             for (const auto &entry : clients) {
-                if (entry.second->status == Client::TOCOMPILE) {
-                    trace() << "P50 TOCOMPILE held: client="
-                            << entry.second->client_id
-                            << " current_load=" << current_load
-                            << " active=" << clients.active_processes
-                            << " capacity=" << compile_limit << endl;
+                const Client *candidate = entry.second;
+                if (candidate->status == Client::TOCOMPILE &&
+                    candidate->job != nullptr &&
+                    candidate->job->usesP50Input() &&
+                    candidate->p50_input_lease_state ==
+                        Client::P50InputLeaseState::Active) {
+                    exact_p50_ready = true;
+                    break;
                 }
             }
-            break;
+            // A scheduler-assigned P50 job with an authenticated, exact input
+            // lease already owns a compiler slot.  Do not deadlock it behind
+            // the coarse load sentinel (1000); retain load shedding for all
+            // unassigned/local work.
+            if (!exact_p50_ready)
+                break;
         }
 
         client = clients.get_earliest_client(Client::TOCOMPILE);
