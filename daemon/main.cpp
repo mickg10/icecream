@@ -8074,6 +8074,15 @@ void Daemon::handle_old_request()
         /* we don't want to handle TOCOMPILE jobs as long as our load
            is too high */
         if (current_load >= 1000) {
+            for (const auto &entry : clients) {
+                if (entry.second->status == Client::TOCOMPILE) {
+                    trace() << "P50 TOCOMPILE held: client="
+                            << entry.second->client_id
+                            << " current_load=" << current_load
+                            << " active=" << clients.active_processes
+                            << " capacity=" << compile_limit << endl;
+                }
+            }
             break;
         }
 
