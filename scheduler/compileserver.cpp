@@ -230,6 +230,7 @@ bool CompileServer::is_eligible_now(const Job *job) const
 bool CompileServer::cacheCompatible(const Job *job) const
 {
     if (job == nullptr || job->submitter() == this ||
+        cacheLoadProbeUsed() ||
         /* A retry already carries an explicit failed-endpoint exclusion.
            Preserve the scheduler's wait semantics until a genuinely
            selectable alternative exists; only the initial P50 attempt gets
@@ -309,6 +310,8 @@ unsigned int CompileServer::load() const
 void CompileServer::setLoad(unsigned int load)
 {
     m_load = load;
+    if (load < 1000)
+        m_cacheLoadProbeUsed = false;
 }
 
 int CompileServer::maxJobs() const

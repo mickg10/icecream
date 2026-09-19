@@ -2890,6 +2890,14 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         }
     }
 
+    /* A worker that has crossed the absolute load sentinel gets exactly one
+       cache-compatible P50 probe. If that probe fails, the client's bounded
+       retry excludes this endpoint; independent later jobs must not keep
+       bypassing the worker's load-shedding boundary. The latch is cleared
+       only when the worker reports load below the sentinel. */
+    if (use_cs->load() >= 1000 && use_cs->cacheCompatible(job))
+        use_cs->markCacheLoadProbe();
+
     remove_job_request( jobPosition );
 
     if (job->preExposureRedispatch()) {

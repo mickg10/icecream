@@ -163,6 +163,8 @@ public:
        return the bounded transport/fallback outcome and the client can
        exclude that endpoint on retry. */
     bool cacheCompatible(const Job *job) const;
+    bool cacheLoadProbeUsed() const { return m_cacheLoadProbeUsed; }
+    void markCacheLoadProbe() { m_cacheLoadProbeUsed = true; }
     void setCacheAdvertisement(uint32_t endpoint_port, uint32_t protocol,
                                uint32_t profiles)
     {
@@ -280,6 +282,7 @@ private:
     uint32_t m_cacheEndpointPort;
     uint32_t m_cacheProtocol;
     uint32_t m_cacheProfileMask;
+    bool m_cacheLoadProbeUsed = false;
     int m_clientCount; // number of client connections the daemon has
     int m_submittedJobsCount;
     uint64_t m_admittedJobsTotal = 0;
