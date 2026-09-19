@@ -2207,17 +2207,6 @@ class EventProducer:
         ) if isinstance(mounts, list) else None
         if expected_runtime is not None and runtime_mount != expected_runtime:
             raise EventError(f"container {name!r} has no authenticated target runtime mount")
-        runtime_cache_mount = next(
-            (
-                mount
-                for mount in mounts
-                if isinstance(mount, dict)
-                and mount.get("Type") == "tmpfs"
-                and mount.get("Destination") == CACHE_DISK_FAULT_PATH
-                and mount.get("RW") is True
-            ),
-            None,
-        ) if isinstance(mounts, list) else None
         configured_mounts = document.get("HostConfig", {}).get("Mounts")
         configured_cache_mount = next(
             (
@@ -2260,8 +2249,12 @@ class EventProducer:
                 "size_bytes": tmpfs_options.get("SizeBytes"),
                 "type": "tmpfs",
             }
-            if isinstance(runtime_cache_mount, dict)
-            and isinstance(tmpfs_options, dict)
+            # Docker's inspect API normally omits --tmpfs entries from the
+            # top-level Mounts array, while retaining the authenticated
+            # options in HostConfig.Tmpfs.  The planner already requires the
+            # exact --tmpfs argv; accept that canonical inspect shape instead
+            # of treating a correctly mounted fault target as unbounded.
+            if isinstance(tmpfs_options, dict)
             else None
         )
         config_env = document.get("Config", {}).get("Env")

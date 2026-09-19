@@ -2015,6 +2015,43 @@ def test_disk_fill_rejects_nonexecuting_or_unbounded_tmpfs(
     assert not any(c.phase == "event.disk-fill" for c in recorder.commands)
 
 
+def test_disk_fill_accepts_docker_inspect_tmpfs_without_top_level_mount_entry(
+    tmp_path: Path,
+) -> None:
+    """Docker inspect reports --tmpfs in HostConfig.Tmpfs, not Mounts."""
+    farm, scenario, _plan = _fixture(tmp_path)
+    scenario.data["timeline"] = [
+        {"trigger": "t+0", "action": "disk_fill", "instance": "F1"}
+    ]
+    plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
+
+    class DockerInspectShape(DiskFillRecorder):
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            result = super().invoke(command)
+            if command.phase != "event.authenticate":
+                return result
+            document = json.loads(result.stdout)
+            document["Mounts"] = [
+                mount
+                for mount in document["Mounts"]
+                if mount.get("Destination") != CACHE_DISK_FAULT_PATH
+            ]
+            return CommandResult(0, json.dumps(document), "")
+
+    recorder = DockerInspectShape()
+    producer = EventProducer(
+        farm, scenario, plan, recorder=RecordingTransport(recorder),
+        event_path=tmp_path / "events.json", deadline_s=2, poll_interval_s=0.01,
+    )
+    producer.start()
+    producer.wait()
+    assert len(producer.records) == 1
+    receipt = producer.records[0].receipt
+    assert receipt is not None
+    assert receipt["action"] == "disk_fill"
+    assert any(c.phase == "event.disk-fill" for c in recorder.commands)
+
+
 def test_disk_fill_uses_only_the_fixed_bounded_cache_tmpfs_and_records_enospc(
     tmp_path: Path,
 ) -> None:
