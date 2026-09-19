@@ -2253,6 +2253,44 @@ def test_s70_b4_client_route_restart_makes_next_tu_cold() -> None:
     assert verdict["status"] == "PASS", verdict
 
 
+def _precise_client_epoch_bundle():
+    fixture = _s70_b4_client_bundle()
+    fixture.setdefault("plan", {})["client_route_epoch_contract"] = "icefarm-client-route-wrapper-epoch-v1"
+    fixture["plan"].setdefault("commands", [])
+    for item in fixture["observations"]["job_lifecycle"]:
+        item["wrapper_started_ms"] = item["dispatch_ms"]
+        item["wrapper_finished_ms"] = item["terminal_ms"]
+        item["dispatch_ms"] = item["dispatch_ms"] // 1000 * 1000
+        item["terminal_ms"] = item["terminal_ms"] // 1000 * 1000
+    return fixture
+
+
+def test_client_epoch_precision_preserves_cold_restart_checks():
+    fixture = _precise_client_epoch_bundle()
+    assert evaluate_bundle(fixture)["status"] == "PASS"
+    del fixture["plan"]["client_route_epoch_contract"]
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("mutation", ["missing_time", "early_start", "wrong_epoch", "stale_store", "no_sequence_reset", "wrong_contract"])
+def test_client_epoch_precision_negative_evidence(mutation):
+    fixture = _precise_client_epoch_bundle()
+    timing = fixture["observations"]["job_lifecycle"][75]
+    if mutation == "missing_time":
+        del timing["wrapper_started_ms"]
+    elif mutation == "early_start":
+        timing["wrapper_started_ms"] = 7470
+    elif mutation == "wrong_epoch":
+        fixture["rows"][75]["event_epoch"] = 0
+    elif mutation == "stale_store":
+        fixture["observations"]["p50_source_routes"]["records"][75]["c_store_guid"] = "1" * 32
+    elif mutation == "no_sequence_reset":
+        fixture["observations"]["p50_source_routes"]["records"][75]["tu_seq"] = 76
+    else:
+        fixture["plan"]["client_route_epoch_contract"] = "unknown"
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

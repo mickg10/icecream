@@ -7,6 +7,7 @@ farmharness/S8_METHOD_MATRIX_REPORT.md
 farmharness/S8_REFERENCE_WITNESS.md
 farmharness/integration/__init__.py
 farmharness/integration/authority.py
+farmharness/integration/client_epoch.py
 farmharness/integration/collect.py
 farmharness/integration/corpus_archive.py
 farmharness/integration/daemon_mutant_promotion.py
@@ -125,6 +126,7 @@ farmharness/integration/tests/farm_fixture.py
 farmharness/integration/tests/fixtures/newgen-v1-authority.json
 farmharness/integration/tests/fixtures/test-compiler.sh
 farmharness/integration/tests/test_authority_capture.py
+farmharness/integration/tests/test_client_epoch.py
 farmharness/integration/tests/test_collect_and_report.py
 farmharness/integration/tests/test_corpus_archive.py
 farmharness/integration/tests/test_current_lineage_catalog.py

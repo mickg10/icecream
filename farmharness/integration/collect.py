@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:
+    from .client_epoch import CLIENT_ROUTE_EPOCH_CONTRACT, client_route_epoch
     from .farm_spec import FarmSpec
     from .images import CommandFactory, RecordingTransport
     from .lifecycle import bundle_root, collect_diagnostics, f_runtime_host_config_valid
@@ -32,6 +33,7 @@ try:
     from .schema_validation import canonical_bytes
     from .verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
 except ImportError:  # Direct execution from this directory.
+    from client_epoch import CLIENT_ROUTE_EPOCH_CONTRACT, client_route_epoch
     from farm_spec import FarmSpec
     from images import CommandFactory, RecordingTransport
     from lifecycle import bundle_root, collect_diagnostics, f_runtime_host_config_valid
@@ -7856,6 +7858,16 @@ def _observations(
         if worker_epoch_contract != WORKER_REJOIN_EPOCH_CONTRACT:
             raise CollectError("plan has an unknown worker rejoin epoch contract")
         worker_boundaries = _worker_rejoin_boundaries(farm, scenario, plan, evidence, events)
+    client_epoch_contract = plan.get("client_route_epoch_contract")
+    if client_epoch_contract is not None:
+        if (client_epoch_contract != CLIENT_ROUTE_EPOCH_CONTRACT
+                or scenario.data.get("expect", {}).get("engagement") != "s70-b4-client-route-restart"
+                or len(events) != 1):
+            raise CollectError("invalid client route epoch contract or timeline")
+        _validate_client_route_restart_receipt(
+            events[0].get("receipt"), events[0], scenario, 0,
+            farm=farm, plan=plan, evidence=evidence,
+        )
     p29_interner_faults = _p29_interner_faults(evidence, topology)
     for row in rows:
         if row["tail_present"]:
@@ -8135,6 +8147,14 @@ def _observations(
                 boundary["scheduler_rejoin_line"] < final["dispatch_line"]
                 for boundary in worker_boundaries
             )
+        if client_epoch_contract is not None:
+            try:
+                event_epoch = client_route_epoch(
+                    events[0], row["client_instance"], raw["started"],
+                    raw["finished"], final["dispatch_ms"],
+                )
+            except ValueError as exc:
+                raise CollectError(f"{row['job_id']}: {exc}") from exc
         row["event_epoch"] = event_epoch
         if epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT:
             row["client_version"] = _planned_instance_version_at_epoch(
@@ -8158,6 +8178,9 @@ def _observations(
                 "dispatch_ms": first["dispatch_ms"],
                 "final_dispatch_ms": final["dispatch_ms"],
                 "first_dispatch_ms": first["dispatch_ms"],
+                **({"wrapper_started_ms": raw["started"],
+                    "wrapper_finished_ms": raw["finished"]}
+                   if client_epoch_contract is not None else {}),
                 "job_id": row["job_id"],
                 "scheduler_dispatch_line": final["dispatch_line"],
                 "scheduler_generation": final["generation"],

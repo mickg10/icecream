@@ -929,6 +929,9 @@ def build_plan(
         "assignment_fence_mode": assignment_fence_mode,
         "client_scheduler_readiness_contract": CLIENT_SCHEDULER_READINESS_CONTRACT,
         "scheduler_dispatch_epoch_contract": SCHEDULER_DISPATCH_EPOCH_CONTRACT,
+        **({"client_route_epoch_contract": "icefarm-client-route-wrapper-epoch-v1"}
+           if scenario.data.get("expect", {}).get("engagement") == "s70-b4-client-route-restart"
+           else {}),
         **({"worker_rejoin_epoch_contract": "icefarm-worker-rejoin-log-order-v1"}
            if scenario.data.get("expect", {}).get("engagement") == "s70-b4-worker-bounces"
            else {}),

@@ -17,9 +17,11 @@ from datetime import datetime
 from typing import Any
 
 try:
+    from .client_epoch import CLIENT_ROUTE_EPOCH_CONTRACT, client_route_epoch
     from .netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from .retry_decision import same_endpoint_decision_valid
 except ImportError:  # Direct execution from this directory.
+    from client_epoch import CLIENT_ROUTE_EPOCH_CONTRACT, client_route_epoch
     from netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from retry_decision import same_endpoint_decision_valid
 
@@ -5403,6 +5405,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         or epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT
     )
     generation_epoch = epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT
+    client_contract = plan.get("client_route_epoch_contract") if isinstance(plan, Mapping) else None
+    if client_contract is not None:
+        clauses.append(_clause(
+            "client-route-epoch.contract",
+            client_contract == CLIENT_ROUTE_EPOCH_CONTRACT
+            and scenario.get("expect", {}).get("engagement") == S70_B4_CLIENT_ENGAGEMENT,
+            "precise client epochs require the versioned client restart contract",
+        ))
     worker_contract = plan.get("worker_rejoin_epoch_contract") if isinstance(plan, Mapping) else None
     if worker_contract is not None:
         valid_worker_contract = (
@@ -7395,10 +7405,30 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 if isinstance(item, Mapping)
             } if isinstance(lifecycle, list) else {}
             fired_ms = observed_event.get("fired_ms")
+            lifecycle_by_job = {
+                item.get("job_id"): item for item in lifecycle
+                if isinstance(item, Mapping)
+            } if isinstance(lifecycle, list) else {}
             ordered_rows: list[tuple[int, Mapping[str, Any]]] = []
             for row in valid_rows:
                 identifier = _job_id(row["job_id"], "@row")
                 dispatch_ms = dispatch_by_job.get(identifier)
+                if client_contract is not None:
+                    timing = lifecycle_by_job.get(identifier, {})
+                    try:
+                        expected_epoch = client_route_epoch(
+                            observed_event, row["client_instance"],
+                            timing.get("wrapper_started_ms"),
+                            timing.get("wrapper_finished_ms"), dispatch_ms,
+                        )
+                    except ValueError:
+                        b4_bad.add(identifier)
+                        continue
+                    if row["event_epoch"] != expected_epoch:
+                        b4_bad.add(identifier)
+                    elif expected_epoch == 1:
+                        ordered_rows.append((timing["wrapper_started_ms"], row))
+                    continue
                 if not (
                     _is_int(fired_ms)
                     and _is_int(dispatch_ms)
