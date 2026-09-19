@@ -2546,6 +2546,58 @@ static void run_cache_retry_pressure_and_preferred(
     delete retry_b;
     delete retry_b_prepare;
 
+    /* A saturated cache-compatible worker gets one initial P50 probe so the
+       production S95 engagement path can observe its bounded failure.  The
+       per-worker latch must then reject a second independent preferred job
+       until the worker reports recovered load. */
+    REQUIRE(set_worker_load(worker_b, 1000),
+            "B re-enters the saturated state for the one-shot probe test");
+    usleep(100 * 1000);
+    REQUIRE(request_job_preferring(
+                submitter, 6209, "retry-pressure-b"),
+            "initial saturated P50 probe is requested");
+    AssignPrepareMsg *probe_prepare = wait_prepare(worker_b);
+    UseCSMsg *probe_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(probe_prepare && probe_use &&
+                probe_use->port == static_cast<uint32_t>(worker_b_port),
+            "one-shot saturated P50 probe reaches B");
+    if (probe_use) {
+        worker_b->send_msg(JobBeginMsg(probe_use->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *probe_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete probe_use;
+    delete probe_prepare;
+
+    REQUIRE(request_job_preferring(
+                submitter, 6210, "retry-pressure-b"),
+            "second independent saturated P50 probe is requested");
+    AssignPrepareMsg *blocked_probe = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_b, Msg::ASSIGN_PREPARE, 300));
+    UseCSMsg *blocked_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 300));
+    REQUIRE(!blocked_probe && !blocked_use,
+            "one-shot latch blocks repeated saturated P50 probe");
+    delete blocked_use;
+    delete blocked_probe;
+
+    REQUIRE(set_worker_load(worker_b, 0),
+            "B load recovery reopens the latched P50 path");
+    AssignPrepareMsg *recovered_probe = wait_prepare(worker_b);
+    UseCSMsg *recovered_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(recovered_probe && recovered_use &&
+                recovered_use->port == static_cast<uint32_t>(worker_b_port),
+            "latched P50 probe releases after load recovery");
+    if (recovered_use) {
+        worker_b->send_msg(JobBeginMsg(recovered_use->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *recovered_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete recovered_use;
+    delete recovered_probe;
+
     REQUIRE(request_job_preferring(
                 submitter, 6206, "retry-pressure-a", "127.0.0.1",
                 static_cast<uint32_t>(worker_a_port)),
