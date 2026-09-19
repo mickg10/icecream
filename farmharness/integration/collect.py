@@ -112,6 +112,10 @@ P50_NORMALIZED_ERROR106_RE = re.compile(
     r"\bnormalizing P50 client error ([0-9]+) to Error 106 for a fresh assignment\b"
 )
 P50_RETRYABLE_TRANSPORT_ERRORS = frozenset((2, 6, 8, 9, 13, 14, 19, 20, 23, 107))
+P50_RESOURCE_FAILURE_RE = re.compile(
+    r"\bP50 worker resource failure normalized to Error 106 for job ([0-9]+) "
+    r"epoch ([0-9]+) nonce ([0-9]+) c_guid ([0-9]+) tu_seq ([0-9]+)$"
+)
 P50_SOURCE_TRANSFER_FAILED_RE = re.compile(
     r"\b(P29V1|ZSTD_TU|ZSTD_ROUTE) cache source transfer failed closed "
     r"\(status ([0-9]+), error ([0-9]+), attempts ([0-9]+)\)\s*$"
@@ -5211,6 +5215,71 @@ def _source_transfer_failure_observation(
     )
 
 
+def _resource_failure_observation(
+    log_text: str,
+    assignments: list[dict[str, Any]],
+    identities: list[Mapping[str, int] | None],
+    compile_identities: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    row_job_id: str,
+) -> dict[str, Any] | None:
+    """Bind resource-loss diagnostics to received results and a fresh remote retry."""
+    lines = log_text.splitlines()
+    claims = [(n, line) for n, line in enumerate(lines, 1)
+              if "P50 worker resource failure normalized" in line]
+    if not claims:
+        return None
+    if len(claims) != 1 or len(assignments) != 2 or len(identities) != 2:
+        raise CollectError(f"{row_job_id}: resource failure requires one fresh retry")
+    failure_line, line = claims[0]
+    match = P50_RESOURCE_FAILURE_RE.search(line)
+    first, final = identities
+    if match is None or first is None or final is None:
+        raise CollectError(f"{row_job_id}: resource failure lacks exact identities")
+    fields = ("scheduler_job", "assignment_epoch", "assignment_nonce", "c_guid", "tu_seq")
+    first_key = tuple(first[field] for field in fields)
+    final_key = tuple(final[field] for field in fields)
+    retries = [(n, m) for n, line in enumerate(lines, 1)
+               if (m := P50_STRICT_RETRY_REQUEST_RE.search(line)) is not None]
+    if (
+        tuple(map(int, match.groups())) != first_key
+        or len(retries) != 1
+        or first_key[:3] == final_key[:3]
+        or first_key[3] != final_key[3]
+        or first_key[0] != assignments[0]["scheduler_job"]
+        or final_key[0] != assignments[1]["scheduler_job"]
+        or assignments[0]["worker"] == assignments[1]["worker"]
+        or assignments[0]["endpoint"] == assignments[1]["endpoint"]
+        or retries[0][1].group(1) != assignments[0]["endpoint"]
+        or not (first["line"] < assignments[0]["line"] < failure_line
+                < retries[0][0] < final["line"] < assignments[1]["line"])
+    ):
+        raise CollectError(f"{row_job_id}: resource failure retry identity/order mismatch")
+    for key in (first_key, final_key):
+        result = compile_identities.get(key[:3], {})
+        if tuple(result.get(field) for field in
+                 ("job_id", "assignment_epoch", "assignment_nonce", "c_guid", "tu_seq")) != key:
+            raise CollectError(f"{row_job_id}: resource failure lacks matching CompileResult")
+        occurrences = sum(
+            tuple(map(int, marker.groups())) == key
+            for marker in P50_ASSIGNMENT_IDENTITY_RE.finditer(log_text)
+        )
+        if occurrences != 1:
+            raise CollectError(f"{row_job_id}: resource failure identity is ambiguous")
+    return {
+        "row_job_id": row_job_id,
+        "first_identity": dict(zip(fields, first_key)),
+        "final_identity": dict(zip(fields, final_key)),
+        "first_worker": assignments[0]["worker"],
+        "final_worker": assignments[1]["worker"],
+        "failed_endpoint": assignments[0]["endpoint"],
+        "retry_endpoint": assignments[1]["endpoint"],
+        "failure_line": failure_line,
+        "retry_line": retries[0][0],
+        "normalized_error": 106,
+        "compile_results_present": True,
+    }
+
+
 def _uncommitted_transport_failure_observation(
     *,
     log_text: str,
@@ -5983,6 +6052,7 @@ def _parse_rows(
     failed_result_identity_records: list[dict[str, Any]] = []
     failed_source_transfer_records: list[dict[str, Any]] = []
     failed_uncommitted_transport_records: list[dict[str, Any]] = []
+    resource_failure_records: list[dict[str, Any]] = []
     failed_unassigned_request_records: list[dict[str, Any]] = []
     abandoned_retry_request_records: list[dict[str, Any]] = []
     legacy_wire_records: list[dict[str, Any]] = []
@@ -6156,6 +6226,13 @@ def _parse_rows(
                 else None
                 for evidence in attempt_identity_evidence
             ]
+            resource_failure = _resource_failure_observation(
+                log_text, assignments, attempt_identity_evidence,
+                compile_identities, job_id,
+            )
+            if resource_failure is not None:
+                resource_failure_records.append(resource_failure)
+                raw_job["resource_failure"] = resource_failure
             log_lines = log_text.splitlines()
             attempt_log_texts = [
                 "\n".join(
@@ -6632,6 +6709,7 @@ def _parse_rows(
     return rows, {
         "compile_failure_job_ids": sorted(compile_failures),
         "error106_job_ids": sorted(error106),
+        "p50_resource_failures": resource_failure_records,
         "failed_p50_result_identities": {
             "record_count": len(failed_result_identity_records),
             "records": sorted(
@@ -7890,6 +7968,34 @@ def _observations(
             raise CollectError(f"{row['job_id']}: retry dispatch order is inconsistent")
         first = records[0]
         final = records[-1]
+        resource_failure = raw.get("resource_failure")
+        if resource_failure is not None:
+            if (
+                len(records) != 2
+                or first["terminal"] != "cancellation"
+                or final["terminal"] != "completion"
+                or first["worker"] != resource_failure["first_worker"]
+                or final["worker"] != resource_failure["final_worker"]
+                or first["scheduler_job"] != resource_failure["first_identity"]["scheduler_job"]
+                or final["scheduler_job"] != resource_failure["final_identity"]["scheduler_job"]
+                or first["terminal_ms"] > final["dispatch_ms"]
+                or raw["compile_rc"] != 0
+                or raw["remote"] != 1
+                or raw["local_build"]
+                or row["exact"] is not True
+                or row["retries"] != 1
+                or row["session_outcome"] != "committed"
+                or row["tail_profile"] != "P29V1"
+            ):
+                raise CollectError(f"{row['job_id']}: resource retry lifecycle is inconsistent")
+            resource_failure.update(
+                first_generation=first["generation"],
+                final_generation=final["generation"],
+                first_dispatch_ms=first["dispatch_ms"],
+                first_terminal_ms=first["terminal_ms"],
+                final_dispatch_ms=final["dispatch_ms"],
+                final_terminal_ms=final["terminal_ms"],
+            )
         local_fallback_completion = (
             raw["compile_rc"] == 0
             and raw["remote"] == 0

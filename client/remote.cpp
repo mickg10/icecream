@@ -1348,7 +1348,11 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         if (status && crmsg->was_out_of_memory) {
             (void)send_p50_disposition(ResultDispositionMsg::DefinitiveCancel);
             delete crmsg;
-            log_warning() << "the server ran out of memory, recompiling locally" << endl;
+            if (p50_input && getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+                log_warning() << "P50 server reported a resource failure" << endl;
+            } else {
+                log_warning() << "the server ran out of memory, recompiling locally" << endl;
+            }
             throw remote_error(101, "Error 101 - the server ran out of memory, recompiling locally");
         }
 
@@ -1781,6 +1785,12 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                one-shot retry class while preserving the failed endpoint. */
             if (p50_assignment && error.errorCode == 101 &&
                 getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+                log_warning() << "P50 worker resource failure normalized to Error 106"
+                              << " for job " << job.jobID()
+                              << " epoch " << job.assignmentEpoch()
+                              << " nonce " << job.assignmentNonce()
+                              << " c_guid " << job.cGuid()
+                              << " tu_seq " << job.tuSeq() << endl;
                 publish_p50_observation();
                 delete usecs;
                 throw remote_error(

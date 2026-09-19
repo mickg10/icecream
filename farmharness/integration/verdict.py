@@ -6040,6 +6040,96 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(error106_raw, list) or error106_raw:
             engagement_bad.add("@observations:error106_job_ids")
     elif engagement_mode == S95_DISK_FILL_ENGAGEMENT:
+        resource_ids: set[str] = set()
+        affected_resource_ids: set[str] = set()
+        resource_records = observations.get("p50_resource_failures", [])
+        resource_seen: set[str] = set()
+        resource_fields = {
+            "row_job_id", "first_identity", "final_identity", "first_worker",
+            "final_worker", "failed_endpoint", "retry_endpoint", "failure_line",
+            "retry_line", "normalized_error", "compile_results_present",
+            "first_generation", "final_generation", "first_dispatch_ms",
+            "first_terminal_ms", "final_dispatch_ms", "final_terminal_ms",
+        }
+        resource_rows = {row["job_id"]: row for row in valid_rows}
+        resource_lifecycles = {
+            item.get("job_id"): item for item in observations.get("job_lifecycle", [])
+            if isinstance(item, Mapping)
+        }
+        resource_assignments = {
+            item.get("job_id"): item for item in observations.get("assignment_lifecycle", [])
+            if isinstance(item, Mapping)
+        }
+        if not isinstance(resource_records, list):
+            engagement_bad.add("@observations:p50_resource_failures")
+            resource_records = []
+        for record in resource_records:
+            if not isinstance(record, Mapping) or set(record) != resource_fields:
+                engagement_bad.add("@observations:p50_resource_failures")
+                continue
+            identifier = record["row_job_id"]
+            if not isinstance(identifier, str) or identifier in resource_seen:
+                engagement_bad.add("@observations:p50_resource_failures")
+                continue
+            resource_seen.add(identifier)
+            row = resource_rows.get(identifier, {})
+            lifecycle = resource_lifecycles.get(identifier, {})
+            identity_fields = {"scheduler_job", "assignment_epoch", "assignment_nonce", "c_guid", "tu_seq"}
+            identities = [record["first_identity"], record["final_identity"]]
+            if any(
+                not isinstance(identity, Mapping) or set(identity) != identity_fields
+                or any(not _is_int(identity.get(key), minimum=0 if key == "tu_seq" else 1)
+                       for key in identity_fields)
+                for identity in identities
+            ):
+                engagement_bad.add(identifier)
+                continue
+            first_identity, final_identity = identities
+            expected_attempts = [
+                {"generation": record["first_generation"], "scheduler_job": first_identity["scheduler_job"],
+                 "terminal": "cancellation", "worker": record["first_worker"]},
+                {"generation": record["final_generation"], "scheduler_job": final_identity["scheduler_job"],
+                 "terminal": "completion", "worker": record["final_worker"]},
+            ]
+            if (
+                any(not _is_int(record[key], minimum=1) for key in
+                    ("first_generation", "final_generation", "first_dispatch_ms", "first_terminal_ms",
+                     "final_dispatch_ms", "final_terminal_ms", "failure_line", "retry_line"))
+                or not (record["first_dispatch_ms"] <= record["first_terminal_ms"]
+                        <= record["final_dispatch_ms"] <= record["final_terminal_ms"])
+                or record["failure_line"] >= record["retry_line"]
+                or record["normalized_error"] != 106
+                or record["compile_results_present"] is not True
+                or first_identity["c_guid"] != final_identity["c_guid"]
+                or all(first_identity[k] == final_identity[k] for k in
+                       ("scheduler_job", "assignment_epoch", "assignment_nonce"))
+                or record["first_worker"] == record["final_worker"]
+                or any(not isinstance(record[k], str) or not record[k] for k in
+                       ("first_worker", "final_worker", "failed_endpoint", "retry_endpoint"))
+                or record["failed_endpoint"] == record["retry_endpoint"]
+                or resource_assignments.get(identifier, {}).get("attempts") != expected_attempts
+                or lifecycle.get("first_dispatch_ms") != record["first_dispatch_ms"]
+                or lifecycle.get("final_dispatch_ms") != record["final_dispatch_ms"]
+                or lifecycle.get("terminal_ms") != record["final_terminal_ms"]
+                or lifecycle.get("scheduler_generation") != record["final_generation"]
+                or lifecycle.get("terminal") != "completion"
+                or row.get("cs") != record["final_worker"]
+                or row.get("exact") is not True or row.get("retries") != 1
+                or row.get("tail_present") is not True or row.get("tail_profile") != "P29V1"
+                or row.get("session_outcome") != "committed"
+                or identifier not in observations.get("error106_job_ids", [])
+            ):
+                engagement_bad.add(identifier)
+                continue
+            resource_ids.add(identifier)
+            if any(
+                isinstance(event, Mapping) and event.get("action") == "disk_fill"
+                and event.get("instance") == record["first_worker"]
+                and _is_int(event.get("fired_ms"), minimum=1)
+                and record["first_dispatch_ms"] >= event["fired_ms"]
+                for event in bundle.get("event_log", [])
+            ):
+                affected_resource_ids.add(identifier)
         pre_event = [row for row in valid_rows if row["event_epoch"] == 0]
         post_event = [row for row in valid_rows if row["event_epoch"] == 1]
         if not pre_event:
@@ -6080,9 +6170,9 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             )
             if fallback:
                 fallback_ids.add(identifier)
-            if not (committed or fallback):
+            if not (committed or fallback or identifier in resource_ids):
                 engagement_bad.add(identifier)
-        if not affected_post:
+        if not affected_post and not affected_resource_ids:
             engagement_bad.add("@rows:s95-affected-worker-post-event")
         error106_raw = observations.get("error106_job_ids")
         error106_ids = (
@@ -6144,7 +6234,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if (
             not isinstance(error106_raw, list)
             or len(error106_ids) != len(error106_raw)
-            or error106_ids != fallback_ids
+            or error106_ids != fallback_ids | resource_ids
             or len(fallback_ids) > len(post_event)
             or len(assignment_by_job) != len(assignment_raw or [])
             or set(assignment_by_job) != row_job_ids
