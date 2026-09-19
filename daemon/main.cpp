@@ -8578,6 +8578,12 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                         : "ZSTD_TU"))
                 << " input for job "
                 << job->jobID() << endl;
+        // The exact input attachment is the admission boundary, not the
+        // terminal state.  Queue the now-complete P50 CompileFile through the
+        // ordinary bounded compiler scheduler; leaving this owner in
+        // WAITP50INPUT strands it forever while the client waits for a result.
+        client->set_status(Client::TOCOMPILE,
+                           "P50 CompileFile attached: queued for compile");
         return true;
     }
 
