@@ -157,6 +157,12 @@ public:
     uint32_t cacheEndpointPort() const { return m_cacheEndpointPort; }
     uint32_t cacheProtocol() const { return m_cacheProtocol; }
     uint32_t cacheProfileMask() const { return m_cacheProfileMask; }
+    /* A full cache filesystem is normally a hard admission stop.  The
+       authenticated P50 route is different: one exact cache-compatible
+       assignment must be allowed to reach the worker so the worker can
+       return the bounded transport/fallback outcome and the client can
+       exclude that endpoint on retry. */
+    bool cacheCompatible(const Job *job) const;
     void setCacheAdvertisement(uint32_t endpoint_port, uint32_t protocol,
                                uint32_t profiles)
     {

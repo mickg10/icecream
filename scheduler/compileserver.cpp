@@ -213,16 +213,37 @@ bool CompileServer::is_eligible_now(const Job *job) const
     // busy with local jobs (that may possibly take long)
     if( m_maxJobs > 0 && jobs_now < m_maxJobs + maxPreloadCount() && local_jobs_now < m_maxJobs)
         jobs_okay = true;
-    bool load_okay = m_load < 1000;
+    const bool cache_compatible = cacheCompatible(job);
+    bool load_okay = m_load < 1000 || cache_compatible;
     bool eligible = jobs_okay
                     && load_okay
                     && can_install(job, false).size();
 #if DEBUG_SCHEDULER > 2
     trace() << nodeName() << " is_eligible_now: " << eligible << " (remote jobs " << m_jobList.size()
         << ", local jobs " << (currentJobCount() - m_jobList.size()) << ", jobs_okay " << jobs_okay
-        << ", load_okay " << load_okay << ")" << endl;
+        << ", load_okay " << load_okay
+        << ", cache_compatible " << cache_compatible << ")" << endl;
 #endif
     return eligible;
+}
+
+bool CompileServer::cacheCompatible(const Job *job) const
+{
+    if (job == nullptr || job->submitter() == this ||
+        /* A retry already carries an explicit failed-endpoint exclusion.
+           Preserve the scheduler's wait semantics until a genuinely
+           selectable alternative exists; only the initial P50 attempt gets
+           the one-shot admission needed for S95 engagement. */
+        p50_cache_retry_avoid_is_present(
+            job->cacheRetryAvoidPort(), job->cacheRetryAvoidHost()) ||
+        !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, this) ||
+        !cache_advertisement_is_valid_present(
+            cacheEndpointPort(), cacheProtocol(), cacheProfileMask()))
+        return false;
+    return p50_select_pair_cache_profile(
+        job->cacheProtocol(), job->cacheProfileMask(),
+        cacheProtocol(), cacheProfileMask(),
+        p50_cache_profile_request_from_env()) != 0;
 }
 
 unsigned int CompileServer::remotePort() const
