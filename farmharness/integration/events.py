@@ -57,6 +57,7 @@ TRIGGER_TIME = re.compile(r"^t\+([0-9]+(?:\.[0-9]+)?)$")
 TRIGGER_JOB = re.compile(r"^job ([1-9][0-9]*)$")
 TRIGGER_TURN = re.compile(r"^after turn ([A-Za-z0-9][A-Za-z0-9._-]*)$")
 DISPATCH_RE = re.compile(r"\bput\s+([0-9]+)\s+in joblist of\b", re.IGNORECASE)
+TERMINAL_RE = re.compile(r"\bEND\s+([0-9]+)\s+status=", re.IGNORECASE)
 JOB_PATTERNS = (
     DISPATCH_RE,
     re.compile(r"\bJob ID:\s*([0-9]+)\b", re.IGNORECASE),
@@ -1539,6 +1540,20 @@ def parse_scheduler_dispatches(value: int | str | Iterable[str] | None) -> tuple
     return tuple(result)
 
 
+def parse_scheduler_terminals(value: int | str | Iterable[str] | None) -> frozenset[int]:
+    """Return scheduler job ids with a terminal END record.
+
+    Live timeline faults must not fire while an already-dispatched job is still
+    executing: doing so converts a pre-event result into a synthetic withdrawal
+    and makes the event boundary ambiguous.  Integer readers are deterministic
+    test counters and intentionally have no terminal-log representation.
+    """
+    if value is None or isinstance(value, int):
+        return frozenset()
+    text = value if isinstance(value, str) else "\n".join(str(item) for item in value)
+    return frozenset(int(match.group(1)) for match in TERMINAL_RE.finditer(text))
+
+
 def _atomic_write(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{threading.get_ident()}")
@@ -1609,6 +1624,11 @@ class EventProducer:
         self._baseline_dispatches: tuple[int, ...] = ()
         self._dispatch_count = 0
         self._job_trigger_floor = 0
+        # For bounded disk-fill faults, remember the dispatch ceiling that
+        # crossed the trigger and wait for those pre-event jobs to terminate.
+        # This keeps the event boundary between completed workload units and
+        # post-event work without changing the declared trigger or verifier.
+        self._disk_fill_terminal_ceiling: int | None = None
         self._workload_time_origin: float | None = None
         self._next_workload_time_origin_poll = 0.0
         self._anchor_time_to_workload = (
@@ -6019,12 +6039,26 @@ class EventProducer:
             self._workload_dispatches()
             return True
         if event.trigger.kind == "job":
-            self._workload_dispatches()
+            dispatches = self._workload_dispatches()
             required = max(
                 int(event.trigger.value),
                 self._job_trigger_floor + 1,
             )
-            return self._dispatch_count >= required
+            if self._dispatch_count < required:
+                return False
+            if event.action == "disk_fill" and self.job_reader is not None:
+                if self._disk_fill_terminal_ceiling is None:
+                    # Snapshot the first trigger-crossing dispatch set.  The
+                    # reader may observe more assignments while we wait; they
+                    # are post-boundary work and must not postpone the fault.
+                    self._disk_fill_terminal_ceiling = dispatches[required - 1]
+                terminals = parse_scheduler_terminals(self.job_reader())
+                return all(
+                    job_id in terminals
+                    for job_id in dispatches
+                    if job_id <= self._disk_fill_terminal_ceiling
+                )
+            return True
         return str(event.trigger.value) in self._turns
 
     def _run(self) -> None:
