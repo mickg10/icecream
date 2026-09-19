@@ -13,6 +13,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration import farmtest, report
 from farmharness.integration.collect import (
     CollectError,
+    _authenticated_rejoin_line,
     _abandoned_p50_retry_request_observation,
     _client_assignments,
     _canary_assignment_claims,
@@ -145,14 +146,20 @@ def test_p29_action_lineage_rejects_duplicate_source_identity(
         _p29_action_lineages(path)
 
 
+@pytest.mark.parametrize("current_contract", [False, True])
 def test_worker_bounce_collection_emits_verdict_compatible_action_lineage(
-    tmp_path: Path,
+    tmp_path: Path, current_contract: bool,
 ) -> None:
     farm, scenario, plan, root = _raw_collection(tmp_path)
     scenario.data["id"] = "S70-b4-worker-bounces"
     scenario.data["expect"]["engagement"] = "s70-b4-worker-bounces"
     scenario.data["expect"]["worker_cold_witness"] = "p29-action-lineage-v1"
     plan = farmtest.build_plan(farm, scenario, run_id=plan["run_id"])
+    assert plan["worker_rejoin_epoch_contract"] == "icefarm-worker-rejoin-log-order-v1"
+    if not current_contract:
+        # Historical single-row extraction fixture has no restart timeline.
+        # Keep its old behavior covered, separately from fail-closed v1 evidence.
+        plan.pop("worker_rejoin_epoch_contract")
     for leaf in ("preflight.json", "lifecycle.json", "workload.json"):
         receipt_path = root / leaf
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -177,6 +184,10 @@ def test_worker_bounce_collection_emits_verdict_compatible_action_lineage(
         ],
     )
 
+    if current_contract:
+        with pytest.raises(CollectError, match="complete bounce timeline"):
+            collect_bundle(farm, scenario, plan, sync_remote=False)
+        return
     bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
     assert bundle["observations"]["p29_action_lineage"] == {
         "record_count": 1,
@@ -4349,3 +4360,82 @@ def test_live_collection_accepts_only_event_authenticated_stopped_instance(
     assert json.loads(
         (destination / "diagnostics" / f1["host"] / "F1.stats").read_text()
     ) == {"container_running": False, "reason": "authenticated-kill-event"}
+
+
+def test_authenticated_rejoin_line_uses_exact_window():
+    window = b"login F1\nRELOGIN F1\nassignment\n"
+    prefix = b"RELOGIN F1\nold assignment\n"
+    receipt = {"offset": len(prefix), "bytes": len(window),
+               "sha256": hashlib.sha256(window).hexdigest(),
+               "cache_line": "RELOGIN F1"}
+    assert _authenticated_rejoin_line(prefix + window, receipt) == 4
+
+
+@pytest.mark.parametrize("fault", [None, "reordered", "worker", "generation", "receipt"])
+def test_worker_rejoin_boundaries_bind_order_and_receipts(tmp_path, monkeypatch, fault):
+    from types import SimpleNamespace
+    from farmharness.integration import collect
+
+    raw = b"ICECREAM scheduler 1 starting up, port 1\n"
+    events = []
+    for index in range(3):
+        window = f"login F1 {index}\nRELOGIN F1 {index}\n".encode()
+        rejoin = {"offset": len(raw), "bytes": len(window),
+                  "sha256": hashlib.sha256(window).hexdigest(),
+                  "cache_line": f"RELOGIN F1 {index}"}
+        raw += window
+        events.append({"action": "restart", "instance": "F1", "event_epoch": index + 1,
+                       "receipt": {"after": {"container_id": "a" * 64, "started_at": str(index)},
+                                   "coordination": {"scheduler_rejoin": rejoin}}})
+    if fault == "reordered":
+        events[1]["receipt"]["coordination"] = events[0]["receipt"]["coordination"]
+    elif fault == "worker":
+        events[1]["instance"] = "F2"
+    elif fault == "generation":
+        raw += b"ICECREAM scheduler 1 starting up, port 1\n"
+    path = tmp_path / "scheduler.log"
+    path.write_bytes(raw)
+    monkeypatch.setattr(collect, "_one_role_log", lambda *_: path)
+    validated = []
+
+    def validate(receipt, event, scenario, index, **kwargs):
+        if fault == "receipt":
+            raise CollectError("invalid restart receipt")
+        validated.append(index)
+
+    monkeypatch.setattr(collect, "_validate_worker_restart_receipt", validate)
+    scenario = SimpleNamespace(data={"expect": {"engagement": "s70-b4-worker-bounces"}})
+    plan = {"topology": {"instances": [{"name": "S1", "role": "S"}]}}
+    if fault:
+        with pytest.raises(CollectError):
+            collect._worker_rejoin_boundaries(None, scenario, plan, tmp_path, events)
+    else:
+        result = collect._worker_rejoin_boundaries(None, scenario, plan, tmp_path, events)
+        assert validated == [0, 1, 2]
+        assert [r["scheduler_rejoin_line"] for r in result] == [3, 5, 7]
+        assert [r["event_epoch"] for r in result] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("fault", ["hash", "offset", "size", "missing", "duplicate", "partial", "bool"])
+def test_authenticated_rejoin_line_rejects_invalid_boundary(fault):
+    window = b"login F1\nRELOGIN F1\n"
+    prefix = b"old\n"
+    if fault == "duplicate":
+        window += b"RELOGIN F1\n"
+    if fault == "partial":
+        window = window[:-1]
+    receipt = {"offset": len(prefix), "bytes": len(window),
+               "sha256": hashlib.sha256(window).hexdigest(),
+               "cache_line": "RELOGIN F1"}
+    if fault == "hash":
+        receipt["sha256"] = "0" * 64
+    elif fault == "offset":
+        receipt["offset"] = 2
+    elif fault == "size":
+        receipt["bytes"] += 1
+    elif fault == "missing":
+        receipt["cache_line"] = "RELOGIN F2"
+    elif fault == "bool":
+        receipt["offset"] = True
+    with pytest.raises(CollectError):
+        _authenticated_rejoin_line(prefix + window, receipt)

@@ -57,6 +57,7 @@ P29_INTERNER_FAULT_OUTCOME = "fired"
 P29_INTERNER_FAULT_FIELDS = frozenset(("schema", "fault", "outcome"))
 P29_ACTION_LINEAGE_SCHEMA = "icefarm-p29-action-lineage-v1"
 P29_ACTION_LINEAGE_CONTRACT = "p29-action-lineage-v1"
+WORKER_REJOIN_EPOCH_CONTRACT = "icefarm-worker-rejoin-log-order-v1"
 ZERO_GUID = "0" * 32
 LEGACY_WIRE_SCHEMA = "icecream-p50-legacy-wire-v1"
 LEGACY_WIRE_FIELDS = frozenset(
@@ -4750,6 +4751,77 @@ def _validate_transition_receipt(
     continuity[event["instance"]] = after
 
 
+def _authenticated_rejoin_line(raw: bytes, rejoin: Mapping[str, Any]) -> int:
+    """Locate a unique cache rejoin in its checksum-bound, complete log window.
+
+    Role/container/worker identity must already have passed restart receipt
+    validation. Never select a matching line outside the captured window.
+    Returned positions use the scheduler lifecycle parser's 1-based lines.
+    """
+    offset, size = rejoin.get("offset"), rejoin.get("bytes")
+    needle = rejoin.get("cache_line")
+    digest = rejoin.get("sha256")
+    if (
+        type(offset) is not int or offset < 0
+        or type(size) is not int or size < 1
+        or offset + size > len(raw)
+        or (offset and raw[offset - 1:offset] != b"\n")
+        or not isinstance(needle, str) or not needle
+        or "\n" in needle or "\r" in needle
+        or not isinstance(digest, str)
+    ):
+        raise CollectError("worker rejoin has invalid log window")
+    window = raw[offset:offset + size]
+    if not window.endswith(b"\n") or hashlib.sha256(window).hexdigest() != digest:
+        raise CollectError("worker rejoin log window is incomplete or unauthenticated")
+    matches = [index for index, line in enumerate(window.splitlines(), start=1)
+               if line == needle.encode("utf-8")]
+    if len(matches) != 1:
+        raise CollectError("worker rejoin log boundary is missing or ambiguous")
+    return len(raw[:offset].splitlines()) + matches[0]
+
+
+def _worker_rejoin_boundaries(
+    farm: FarmSpec, scenario: ScenarioSpec, plan: dict[str, Any],
+    evidence: Path, events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Authenticate S70's three worker incarnations independently of store GUIDs."""
+    if (scenario.data.get("expect", {}).get("engagement") != "s70-b4-worker-bounces"
+            or len(events) != 3):
+        raise CollectError("worker rejoin boundaries require the complete bounce timeline")
+    scheduler = next(item for item in plan["topology"]["instances"] if item["role"] == "S")
+    path = _one_role_log(evidence, scheduler)
+    if path is None:
+        raise CollectError("worker rejoin scheduler log is absent")
+    raw = path.read_bytes()
+    # This contract is deliberately limited to a stable scheduler incarnation.
+    if sum("ICECREAM scheduler" in line for line in raw.decode("utf-8").splitlines()) != 1:
+        raise CollectError("worker rejoin requires exactly one scheduler incarnation")
+    boundaries: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        if (event.get("action") != "restart" or event.get("instance") != "F1"
+                or event.get("event_epoch") != index + 1):
+            raise CollectError("worker rejoin timeline identity is invalid")
+        receipt = event["receipt"]
+        _validate_worker_restart_receipt(
+            receipt, event, scenario, index, farm=farm, plan=plan, evidence=evidence,
+        )
+        rejoin = receipt["coordination"]["scheduler_rejoin"]
+        line = _authenticated_rejoin_line(raw, rejoin)
+        if boundaries and line <= boundaries[-1]["scheduler_rejoin_line"]:
+            raise CollectError("worker rejoin boundaries are not strictly ordered")
+        boundaries.append({
+            "event_epoch": index + 1,
+            "worker_instance": event["instance"],
+            "scheduler_generation": 1,
+            "scheduler_rejoin_line": line,
+            "container_id": receipt["after"]["container_id"],
+            "started_at": receipt["after"]["started_at"],
+            "rejoin_sha256": rejoin["sha256"],
+        })
+    return boundaries
+
+
 def _epoch_at(events: list[dict[str, Any]], dispatch_ms: int) -> int:
     return sum(event["fired_ms"] <= dispatch_ms for event in events)
 
@@ -7778,6 +7850,12 @@ def _observations(
         and epoch_contract != SCHEDULER_DISPATCH_EPOCH_CONTRACT
     ):
         raise CollectError("plan has an unknown scheduler dispatch epoch contract")
+    worker_epoch_contract = plan.get("worker_rejoin_epoch_contract")
+    worker_boundaries = None
+    if worker_epoch_contract is not None:
+        if worker_epoch_contract != WORKER_REJOIN_EPOCH_CONTRACT:
+            raise CollectError("plan has an unknown worker rejoin epoch contract")
+        worker_boundaries = _worker_rejoin_boundaries(farm, scenario, plan, evidence, events)
     p29_interner_faults = _p29_interner_faults(evidence, topology)
     for row in rows:
         if row["tail_present"]:
@@ -8050,6 +8128,13 @@ def _observations(
             event_epoch = final["generation"] - 1
         else:
             event_epoch = _epoch_at(events, final["dispatch_ms"])
+        if worker_boundaries is not None and row["cs"] == "F1":
+            if final["generation"] != 1 or type(final["dispatch_line"]) is not int:
+                raise CollectError("worker rejoin dispatch has invalid scheduler identity")
+            event_epoch = sum(
+                boundary["scheduler_rejoin_line"] < final["dispatch_line"]
+                for boundary in worker_boundaries
+            )
         row["event_epoch"] = event_epoch
         if epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT:
             row["client_version"] = _planned_instance_version_at_epoch(
@@ -8309,6 +8394,8 @@ def _observations(
         "incomplete_turns": _turn_completeness(scenario, plan, evidence, raw_jobs),
         "f_init": f_init,
         "job_lifecycle": lifecycle,
+        **({"worker_rejoin_boundaries": worker_boundaries}
+           if worker_boundaries is not None else {}),
         "logins": logins,
         **({"network_shaping": network_shaping} if network_shaping is not None else {}),
         "oracle": _oracle(evidence, scenario),

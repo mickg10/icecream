@@ -2534,6 +2534,63 @@ def test_s70_b4_worker_action_lineage_does_not_require_same_tu_placement() -> No
     assert verdict["status"] == "PASS", verdict
 
 
+@pytest.mark.parametrize("fault", ["unknown", "wrong_engagement", "missing_lineage", "missing_boundaries"])
+def test_worker_rejoin_contract_fails_closed(fault):
+    fixture = _s70_b4_worker_action_lineage_bundle()
+    fixture.setdefault("plan", {})["worker_rejoin_epoch_contract"] = "icefarm-worker-rejoin-log-order-v1"
+    if fault == "unknown":
+        fixture["plan"]["worker_rejoin_epoch_contract"] = "unknown"
+    elif fault == "wrong_engagement":
+        fixture["scenario"]["expect"]["engagement"] = "all"
+    elif fault == "missing_lineage":
+        fixture["scenario"]["expect"].pop("worker_cold_witness")
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    if fault != "missing_boundaries":
+        assert any(c["id"] == "worker-rejoin.contract" and c["status"] == "FAIL"
+                   for c in verdict["clauses"])
+
+
+def _s70_worker_rejoin_bundle():
+    fixture = _s70_b4_worker_action_lineage_bundle()
+    fixture.setdefault("plan", {})["worker_rejoin_epoch_contract"] = "icefarm-worker-rejoin-log-order-v1"
+    fixture["plan"]["commands"] = []
+    fixture["observations"]["worker_rejoin_boundaries"] = [
+        {"event_epoch": i + 1, "worker_instance": "F1", "scheduler_generation": 1,
+         "scheduler_rejoin_line": (i + 1) * 100,
+         "container_id": event["receipt"]["after"]["container_id"],
+         "started_at": event["receipt"]["after"]["started_at"],
+         "rejoin_sha256": event["receipt"]["coordination"]["scheduler_rejoin"]["sha256"]}
+        for i, event in enumerate(fixture["event_log"])
+    ]
+    for job in (101, 201, 301):
+        lifecycle = fixture["observations"]["job_lifecycle"][job - 1]
+        lifecycle["dispatch_ms"] -= 1
+    return fixture
+
+
+def test_worker_rejoin_pre_ready_cold_witness_passes_only_new_contract():
+    fixture = _s70_worker_rejoin_bundle()
+    assert evaluate_bundle(fixture)["status"] == "PASS"
+    fixture["plan"].pop("worker_rejoin_epoch_contract")
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("container_id", "0" * 64), ("started_at", "wrong"),
+    ("rejoin_sha256", "0" * 64), ("scheduler_generation", 2),
+    ("scheduler_rejoin_line", True), ("worker_instance", "F2"),
+    ("event_epoch", 3),
+])
+def test_worker_rejoin_boundary_mutations_fail(field, value):
+    fixture = _s70_worker_rejoin_bundle()
+    fixture["observations"]["worker_rejoin_boundaries"][0][field] = value
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    assert any("@observations:worker-rejoin-boundaries" in c["offending_job_ids"]
+               for c in verdict["clauses"])
+
+
 def _roll_s70_c_store_in_epoch_three(
     fixture: dict[str, object], *, records: int
 ) -> None:

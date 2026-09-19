@@ -5403,6 +5403,18 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         or epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT
     )
     generation_epoch = epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT
+    worker_contract = plan.get("worker_rejoin_epoch_contract") if isinstance(plan, Mapping) else None
+    if worker_contract is not None:
+        valid_worker_contract = (
+            worker_contract == "icefarm-worker-rejoin-log-order-v1"
+            and scenario.get("expect", {}).get("engagement") == S70_B4_WORKER_ENGAGEMENT
+            and scenario.get("expect", {}).get("worker_cold_witness") == P29_ACTION_LINEAGE_CONTRACT
+        )
+        clauses.append(_clause(
+            "worker-rejoin.contract", valid_worker_contract,
+            "worker rejoin epochs require the versioned S70 action-lineage contract",
+            () if valid_worker_contract else {"@plan:worker_rejoin_epoch_contract"},
+        ))
     if readiness_contract is not None:
         clauses.append(
             _clause(
@@ -6413,6 +6425,49 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             if len(fired) == 3 and not (fired[0] < fired[1] < fired[2]):
                 b4_bad.add("@event:s70-b4-worker-order")
 
+        worker_boundary_lines = None
+        worker_contract = plan.get("worker_rejoin_epoch_contract") if isinstance(plan, Mapping) else None
+        if worker_contract is not None:
+            boundaries = observations.get("worker_rejoin_boundaries")
+            boundary_fields = {
+                "event_epoch", "worker_instance", "scheduler_generation",
+                "scheduler_rejoin_line", "container_id", "started_at", "rejoin_sha256",
+            }
+            valid_boundaries = (
+                worker_contract == "icefarm-worker-rejoin-log-order-v1"
+                and isinstance(boundaries, list) and len(boundaries) == 3
+                and isinstance(event_log, list) and len(event_log) == 3
+            )
+            lines = []
+            if valid_boundaries:
+                for index, boundary in enumerate(boundaries):
+                    event = event_log[index]
+                    receipt = event.get("receipt", {}) if isinstance(event, Mapping) else {}
+                    after = receipt.get("after", {}) if isinstance(receipt, Mapping) else {}
+                    coordination = receipt.get("coordination", {}) if isinstance(receipt, Mapping) else {}
+                    rejoin = coordination.get("scheduler_rejoin", {}) if isinstance(coordination, Mapping) else {}
+                    if (
+                        not isinstance(boundary, Mapping) or set(boundary) != boundary_fields
+                        or type(boundary.get("event_epoch")) is not int
+                        or boundary.get("event_epoch") != index + 1
+                        or boundary.get("worker_instance") != "F1"
+                        or type(boundary.get("scheduler_generation")) is not int
+                        or boundary["scheduler_generation"] != 1
+                        or not _is_int(boundary.get("scheduler_rejoin_line"), minimum=1)
+                        or not isinstance(after, Mapping) or not isinstance(rejoin, Mapping)
+                        or boundary.get("container_id") != after.get("container_id")
+                        or boundary.get("started_at") != after.get("started_at")
+                        or boundary.get("rejoin_sha256") != rejoin.get("sha256")
+                        or (lines and boundary["scheduler_rejoin_line"] <= lines[-1])
+                    ):
+                        valid_boundaries = False
+                        break
+                    lines.append(boundary["scheduler_rejoin_line"])
+            if valid_boundaries:
+                worker_boundary_lines = lines
+            else:
+                b4_bad.add("@observations:worker-rejoin-boundaries")
+
         lifecycle = observations.get("job_lifecycle")
         dispatch_by_job = {
             _job_id(item.get("job_id"), "@lifecycle"): _lifecycle_final_dispatch_ms(item)
@@ -6705,6 +6760,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     if _is_int(dispatch_ms)
                     else None
                 )
+                if worker_boundary_lines is not None and row["cs"] == "F1":
+                    if (not isinstance(job_lifecycle, Mapping)
+                            or type(job_lifecycle.get("scheduler_generation")) is not int
+                            or job_lifecycle.get("scheduler_generation") != 1
+                            or not _is_int(dispatch_line, minimum=1)):
+                        b4_bad.add(identifier)
+                        continue
+                    expected_epoch = sum(line < dispatch_line for line in worker_boundary_lines)
                 if expected_epoch != epoch:
                     b4_bad.add(identifier)
                     continue
