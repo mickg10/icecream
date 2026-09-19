@@ -58,6 +58,7 @@ TRIGGER_JOB = re.compile(r"^job ([1-9][0-9]*)$")
 TRIGGER_TURN = re.compile(r"^after turn ([A-Za-z0-9][A-Za-z0-9._-]*)$")
 DISPATCH_RE = re.compile(r"\bput\s+([0-9]+)\s+in joblist of\b", re.IGNORECASE)
 TERMINAL_RE = re.compile(r"\bEND\s+([0-9]+)\s+status=", re.IGNORECASE)
+BEGIN_RE = re.compile(r"\bBEGIN:\s*([0-9]+)\b", re.IGNORECASE)
 JOB_PATTERNS = (
     DISPATCH_RE,
     re.compile(r"\bJob ID:\s*([0-9]+)\b", re.IGNORECASE),
@@ -1552,6 +1553,23 @@ def parse_scheduler_terminals(value: int | str | Iterable[str] | None) -> frozen
         return frozenset()
     text = value if isinstance(value, str) else "\n".join(str(item) for item in value)
     return frozenset(int(match.group(1)) for match in TERMINAL_RE.finditer(text))
+
+
+def parse_scheduler_active(value: int | str | Iterable[str] | None) -> frozenset[int]:
+    """Return jobs whose latest scheduler lifecycle record is BEGIN."""
+    if value is None or isinstance(value, int):
+        return frozenset()
+    text = value if isinstance(value, str) else "\n".join(str(item) for item in value)
+    active: set[int] = set()
+    for line in text.splitlines():
+        begin = BEGIN_RE.search(line)
+        if begin is not None:
+            active.add(int(begin.group(1)))
+            continue
+        terminal = TERMINAL_RE.search(line)
+        if terminal is not None:
+            active.discard(int(terminal.group(1)))
+    return frozenset(active)
 
 
 def _atomic_write(path: Path, value: bytes) -> None:
@@ -6053,10 +6071,13 @@ class EventProducer:
                     # are post-boundary work and must not postpone the fault.
                     self._disk_fill_terminal_ceiling = dispatches[required - 1]
                 terminals = parse_scheduler_terminals(self.job_reader())
+                active = parse_scheduler_active(self.job_reader())
                 return all(
                     job_id in terminals
                     for job_id in dispatches
                     if job_id <= self._disk_fill_terminal_ceiling
+                ) and not any(
+                    job_id <= self._disk_fill_terminal_ceiling for job_id in active
                 )
             return True
         return str(event.trigger.value) in self._turns
