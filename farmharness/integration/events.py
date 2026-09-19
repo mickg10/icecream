@@ -5733,7 +5733,51 @@ class EventProducer:
         elif event.action == "disk_fill":
             if instance["role"] != "F":
                 raise UnsupportedEvent("disk_fill is only safe for an F instance")
-            return self._authenticated_disk_fill(event, instance, before)
+            with self._lock:
+                turn = self._active_turn
+                epoch = len(self._records) + 1
+            clients = sorted(
+                (
+                    item
+                    for item in self.plan["topology"]["instances"]
+                    if item["role"] == "C"
+                    and item["name"] in set(self.scenario.data["workload"]["clients"])
+                ),
+                key=lambda item: item["name"],
+            )
+            # Unit-level event authentication tests dispatch without a live
+            # workload turn; retain the direct bounded-operation path there.
+            if turn is None:
+                return self._authenticated_disk_fill(event, instance, before)
+            paused: dict[str, dict[str, Any]] = {}
+            resumed: dict[str, dict[str, Any]] = {}
+            self._gate_controls(
+                clients,
+                action="pause",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=self._command_timeout(),
+                receipts=paused,
+            )
+            try:
+                receipt = self._authenticated_disk_fill(event, instance, before)
+            finally:
+                self._gate_controls(
+                    clients,
+                    action="resume",
+                    turn=turn,
+                    epoch=epoch,
+                    timeout_s=self._command_timeout(),
+                    receipts=resumed,
+                )
+            receipt["admission_boundary"] = {
+                "epoch": epoch,
+                "pause": paused,
+                "resume": resumed,
+                "schema": "icefarm-disk-fill-admission-boundary-v1",
+                "turn": turn,
+            }
+            return receipt
         elif event.action == "header_edit":
             if instance["role"] != "F":
                 raise UnsupportedEvent("header_edit is only safe for an F instance")
