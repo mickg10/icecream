@@ -3,7 +3,7 @@
   "id": "S20-scheduler-first-smoke",
   "shape": "S'CF",
   "images": {
-    "new": "p50s4-diag-5675fc1d",
+    "new": "p50s4-diag-b269fad9",
     "old": "p43-1.4.0"
   },
   "instances": [

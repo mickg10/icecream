@@ -24,7 +24,7 @@ def test_s30_mutant_f_refusal_is_a_checked_in_single_cell() -> None:
         )
     )
     assert scenario["shape"] == "S'C'F'"
-    assert scenario["images"]["new"] == "p50s4-diag-5675fc1d"
+    assert scenario["images"]["new"] == "p50s4-diag-b269fad9"
     assert scenario["images"]["mutant"] == "p50s30-f-refusal-57a1e336"
     assert scenario["expect"]["exact"] == "all"
     assert scenario["expect"]["error106_max"] == 100
