@@ -726,9 +726,15 @@ def test_down_removes_containers_before_reporting_protected_count_change(
         sync_corpora=False,
     )
     scripted.protected_count = 2
+    teardown = RecordingTransport(scripted)
     with pytest.raises(LifecycleError, match="protected-count-changed"):
-        down_from_state(farm, plan, recorder=RecordingTransport(scripted))
+        down_from_state(farm, plan, recorder=teardown)
     assert scripted.containers == {}
+    cleanups = [command for command in teardown.commands if command.phase == "down.remove-scratch"]
+    assert len(cleanups) == len(plan["topology"]["instances"])
+    for command in cleanups:
+        assert "/cleanup/system-source" in command.argv[-1]
+        assert "system-source-snapshots" not in " ".join(command.argv)
 
 
 def test_ports_are_unique_and_every_daemon_gets_an_explicit_port(

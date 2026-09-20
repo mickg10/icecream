@@ -16,6 +16,7 @@
     {
       "name": "F1",
       "role": "F",
+      "system_source_snapshot": "stable-f-source",
       "host": "tt-quietbox3",
       "image": "new",
       "slots": 24
@@ -23,6 +24,7 @@
     {
       "name": "F2",
       "role": "F",
+      "system_source_snapshot": "stable-f-source",
       "host": "research6",
       "image": "new",
       "slots": 12

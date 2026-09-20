@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -32,6 +33,24 @@ def derived_root(scratch_root: str | Path, manifest_sha256: str) -> PurePosixPat
 def derived_mounts(scratch_root: str | Path, manifest_sha256: str) -> dict[str, str]:
     root = derived_root(scratch_root, manifest_sha256)
     return {destination: str(root / destination.lstrip("/")) for destination in ROOTS}
+
+
+def private_root(
+    scratch_root: str | Path, manifest_sha256: str, run_id: str, instance: str
+) -> PurePosixPath:
+    """A writable source tree must belong to exactly one run and instance."""
+    # Reuse digest/root validation, but never return the shared snapshot path.
+    derived_root(scratch_root, manifest_sha256)
+    for label, value in (("run", run_id), ("instance", instance)):
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", value) is None
+        ):
+            raise SystemSourceSnapshotError(f"private snapshot {label} is invalid")
+    return (
+        PurePosixPath(str(scratch_root)) / "icefarm" / run_id / instance
+        / "system-source" / manifest_sha256
+    )
 
 
 def validate_snapshot_authority(snapshot: Mapping[str, Any]) -> None:

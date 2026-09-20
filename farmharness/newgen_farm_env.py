@@ -519,8 +519,8 @@ def _parse_v2_instances(text: str) -> list[dict[str, Any]]:
             _refuse(f"{field}.client_environment is valid only for C")
         system_source_snapshot = raw.get("system_source_snapshot")
         if system_source_snapshot is not None:
-            if role != "C":
-                _refuse(f"{field}.system_source_snapshot is valid only for C")
+            if role not in ("C", "F"):
+                _refuse(f"{field}.system_source_snapshot is valid only for C or F")
             system_source_snapshot = _safe_name(
                 system_source_snapshot, f"{field}.system_source_snapshot"
             )

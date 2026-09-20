@@ -1342,6 +1342,19 @@ before_sha = hashlib.sha256(before).hexdigest()
 addition = ("\n/* icefarm S40 header_edit " + marker + " */\n").encode("ascii")
 if addition in before:
     raise SystemExit("header edit marker already exists")
+if cache_dir.is_symlink() or not cache_dir.is_dir():
+    raise SystemExit("managed P29 runtime cache directory is unsafe")
+before_cache = []
+for name in cache_names:
+    item = cache_dir / name
+    if not item.exists() or item.is_symlink():
+        raise SystemExit("managed P29 cache entry is absent or symlink: " + name)
+    value = item.lstat()
+    if not stat.S_ISREG(value.st_mode):
+        raise SystemExit("managed P29 cache entry is unsafe")
+    before_cache.append(name)
+if before_cache != list(cache_names):
+    raise SystemExit("managed P29 cache set is incomplete")
 with header.open("ab") as handle:
     handle.write(addition)
     handle.flush()
@@ -1350,19 +1363,6 @@ after = header.read_bytes()
 after_sha = hashlib.sha256(after).hexdigest()
 if before_sha == after_sha:
     raise SystemExit("header fingerprint did not change")
-if cache_dir.is_symlink() or not cache_dir.is_dir():
-    raise SystemExit("managed P29 runtime cache directory is unsafe")
-before_cache = []
-for name in cache_names:
-    item = cache_dir / name
-    if not item.exists() or item.is_symlink():
-        raise SystemExit("managed P29 cache entry is absent")
-    value = item.lstat()
-    if not stat.S_ISREG(value.st_mode):
-        raise SystemExit("managed P29 cache entry is unsafe")
-    before_cache.append(name)
-if before_cache != list(cache_names):
-    raise SystemExit("managed P29 cache set is incomplete")
 for name in before_cache:
     (cache_dir / name).unlink()
 after_cache = [

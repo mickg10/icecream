@@ -47,6 +47,7 @@ try:
         SystemSourceSnapshotError,
         verify_local_archive,
         verified_materialization,
+        private_root,
     )
 except ImportError:  # Direct execution from this directory.
     from farm_spec import FarmSpec
@@ -82,6 +83,7 @@ except ImportError:  # Direct execution from this directory.
         SystemSourceSnapshotError,
         verify_local_archive,
         verified_materialization,
+        private_root,
     )
 
 
@@ -1771,6 +1773,9 @@ def _materialize_system_source_snapshot(
     scratch = PurePosixPath(farm.hosts[host_name]["scratch_root"]) / "icefarm"
     archive_parent = scratch / "system-source-archives"
     materialized_parent = scratch / "system-source-snapshots"
+    private = instance["role"] == "F"
+    if private:
+        materialized_parent = private_root(farm.hosts[host_name]["scratch_root"], key, run_id, instance["name"]).parent
     remote_archive = archive_parent / f"{archive_key}.tar.zst"
     recorder.invoke(_command(factory, phase="preflight.system-source-mkdir", host=host_name, transport="ssh", timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("install", "-d", "-m", "0755", "--", str(archive_parent), str(materialized_parent)))))
     first = recorder.invoke(_command(factory, phase="preflight.system-source-verify", host=host_name, transport="ssh", timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("python3", "-c", SYSTEM_SOURCE_VERIFY_SCRIPT, str(remote_archive), str(snapshot["archive"]["archive_bytes"]), archive_key))))
@@ -1815,7 +1820,7 @@ def _materialize_system_source_snapshot(
         host_name,
         (
             "run", "--rm", "--pull=never", "--name",
-            f"icefarm-{run_id}-system-source-{key[:12]}",
+            f"icefarm-{run_id}-system-source-{instance['name']}-{key[:12]}",
             "--label", f"icefarm.run={run_id}", "--user", "0",
             "--mount", f"type=bind,src={archive_parent},dst=/icefarm-system-source-archives,readonly",
             "--mount", f"type=bind,src={materialized_parent},dst=/icefarm-system-source",
@@ -1849,6 +1854,12 @@ def _materialize_system_source_snapshot(
         ):
             raise ValueError("malformed materialization receipt")
         verified = verified_materialization(snapshot, farm.hosts[host_name]["scratch_root"], observed["manifest_sha256"], observed["file_count"])
+        if private:
+            root = materialized_parent / key
+            verified["root"] = str(root)
+            verified["mounts"] = {destination: str(root / destination.lstrip("/")) for destination in verified["mounts"]}
+            verified["instance"] = instance["name"]
+            verified["scope"] = "run-instance"
     except (ValueError, KeyError, TypeError, SystemSourceSnapshotError) as exc:
         raise PreflightRefusal(f"system-source materialization failed: {exc}", reason_code="system-source-manifest") from exc
     return {"archive_sha256": archive_key, "archive_bytes": snapshot["archive"]["archive_bytes"], "host": host_name, **verified}
@@ -2295,10 +2306,13 @@ def preflight(
                 factory,
                 timeout_s,
             )
-    verified_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
+    verified_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
     for instance in topology["instances"]:
         snapshot = instance.get("system_source_snapshot")
-        if snapshot is None or (snapshot["name"], instance["host"]) in verified_snapshots:
+        if snapshot is None:
+            continue
+        snapshot_key = (snapshot["name"], instance["host"], instance["name"] if instance["role"] == "F" else "")
+        if snapshot_key in verified_snapshots:
             continue
         authority_snapshot = farm.data.get("system_source_snapshots", {}).get(snapshot["name"])
         if not isinstance(authority_snapshot, Mapping):
@@ -2306,7 +2320,7 @@ def preflight(
                 f"system-source snapshot {snapshot['name']!r} is absent from authority",
                 reason_code="system-source-authority",
             )
-        verified_snapshots[(snapshot["name"], instance["host"])] = _materialize_system_source_snapshot(
+        verified_snapshots[snapshot_key] = _materialize_system_source_snapshot(
             farm, instance, authority_snapshot, plan["run_id"], recorder, factory, timeout_s
         )
     reaped = _refuse_or_reap_stale(
@@ -3647,7 +3661,7 @@ def tear_down(
                             reference,
                             "-c",
                             "rm -rf -- /cleanup/cache /cleanup/tmp /cleanup/log "
-                            "/cleanup/input /cleanup/output",
+                            "/cleanup/input /cleanup/output /cleanup/system-source",
                         ),
                     ),
                 )

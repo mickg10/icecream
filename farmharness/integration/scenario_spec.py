@@ -254,9 +254,9 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
             )
         snapshot_name = instance.get("system_source_snapshot")
         if snapshot_name is not None:
-            if instance["role"] != "C":
+            if instance["role"] not in ("C", "F"):
                 raise ScenarioSpecError(
-                    f"$.instances[{index}].system_source_snapshot: valid only for C instances"
+                    f"$.instances[{index}].system_source_snapshot: valid only for C or F instances"
                 )
             snapshots = farm.data.get("system_source_snapshots", {})
             snapshot = snapshots.get(snapshot_name)
@@ -264,7 +264,7 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
                 raise ScenarioSpecError(
                     f"$.instances[{index}].system_source_snapshot: absent from farm authority"
                 )
-            if client_environment != "fedora-clang-libcxx":
+            if instance["role"] == "C" and client_environment != "fedora-clang-libcxx":
                 raise ScenarioSpecError(
                     f"$.instances[{index}].system_source_snapshot: requires fedora-clang-libcxx C foundation"
                 )

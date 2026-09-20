@@ -80,7 +80,7 @@ try:
     )
     from .scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from .schema_validation import ValidationError, canonical_bytes, load_json, validate
-    from .system_source_snapshot import derived_mounts, derived_root
+    from .system_source_snapshot import derived_mounts, derived_root, private_root
     from .system_source_authority import (
         SystemSourceAuthorityError,
         capture_system_source_from_runtime,
@@ -161,7 +161,7 @@ except ImportError:  # Executed as ./farmtest.py.
     )
     from scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from schema_validation import ValidationError, canonical_bytes, load_json, validate
-    from system_source_snapshot import derived_mounts, derived_root
+    from system_source_snapshot import derived_mounts, derived_root, private_root
     from system_source_authority import (
         SystemSourceAuthorityError,
         capture_system_source_from_runtime,
@@ -360,7 +360,7 @@ def resolve_topology(farm: FarmSpec, scenario: ScenarioSpec) -> dict[str, Any]:
 
 
 def _bind_system_source_snapshots(
-    farm: FarmSpec, scenario_data: dict[str, Any], topology: dict[str, Any]
+    farm: FarmSpec, scenario_data: dict[str, Any], topology: dict[str, Any], run_id: str | None = None
 ) -> dict[str, Any]:
     snapshots = farm.data.get("system_source_snapshots", {})
     requested = {item["name"]: item for item in scenario_data["instances"]}
@@ -382,6 +382,13 @@ def _bind_system_source_snapshots(
             "source_runtime_closure_sha256": snapshot["source_runtime_closure_sha256"],
             "source_runtime_id": snapshot["source_runtime_id"],
         }
+        if resolved["role"] == "F":
+            bound = resolved["system_source_snapshot"]
+            bound["scope"] = "run-instance"
+            if run_id is not None:
+                root = private_root(host_scratch, snapshot["manifest_sha256"], run_id, resolved["name"])
+                bound["root"] = str(root)
+                bound["mounts"] = {destination: str(root / destination.lstrip("/")) for destination in bound["mounts"]}
     topology_body = dict(topology)
     topology_body.pop("topology_digest", None)
     topology["topology_digest"] = hashlib.sha256(
@@ -824,6 +831,21 @@ def _planned_commands(
                             f"type=bind,src={source},dst={destination},readonly",
                         )
                     )
+        if instance["role"] == "F" and instance.get("system_source_snapshot") is not None:
+            snapshot = instance["system_source_snapshot"]
+            expected = private_root(farm.hosts[instance["host"]]["scratch_root"], snapshot["manifest_sha256"], run_id, instance["name"])
+            expected_mounts = {
+                destination: str(expected / destination.lstrip("/"))
+                for destination in ("/usr/include", "/usr/lib/gcc", "/usr/local/include")
+            }
+            if (
+                snapshot.get("scope") != "run-instance"
+                or snapshot["root"] != str(expected)
+                or snapshot.get("mounts") != expected_mounts
+            ):
+                raise PlanError("worker snapshot is not run-private")
+            for destination, source in sorted(snapshot["mounts"].items()):
+                args.extend(("--mount", f"type=bind,src={source},dst={destination}"))
         args.extend(_env_args(environment))
         entrypoint = {
             "S": "/opt/icecream/entry-scheduler.sh",
@@ -919,6 +941,7 @@ def build_plan(
     selected_run_id = run_id or f"plan-{topology['topology_digest'][:12]}"
     if RUN_ID_RE.fullmatch(selected_run_id) is None or selected_run_id in (".", ".."):
         raise PlanError("run id must be 1-80 safe, non-dot filename/label characters")
+    topology = _bind_system_source_snapshots(farm, scenario.data, topology, selected_run_id)
     try:
         netem_bindings = resolve_bindings(
             farm, scenario.data, topology, ports, selected_run_id
@@ -1968,7 +1991,7 @@ def replay_bundle(
                 client_environments=farm_data.get("client_environments"),
             )
             reproduced_topology = _bind_system_source_snapshots(
-                farm, scenario_data, reproduced_topology
+                farm, scenario_data, reproduced_topology, retained["plan"]["run_id"]
             )
         except (KeyError, TypeError, newgen_farm_env.ResolutionError) as exc:
             raise ReportError(

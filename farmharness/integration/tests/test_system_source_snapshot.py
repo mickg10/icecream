@@ -20,6 +20,7 @@ from farmharness.integration.scenario_spec import ScenarioSpec, load_scenario_sp
 from farmharness.integration.system_source_snapshot import (
     SystemSourceSnapshotError,
     verify_local_archive,
+    private_root,
 )
 from farmharness.integration.lifecycle import (
     PreflightRefusal,
@@ -32,6 +33,29 @@ from farmharness.integration.remote import CommandResult
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
+
+
+def test_private_snapshot_paths_isolate_runs_workers_and_shared_source() -> None:
+    from farmharness.integration.system_source_snapshot import derived_root
+
+    digest = "a" * 64
+    roots = {
+        private_root("/scratch", digest, run, worker)
+        for run in ("run-a", "run-b") for worker in ("F1", "F2")
+    }
+    assert len(roots) == 4
+    assert derived_root("/scratch", digest) not in roots
+    assert str(private_root("/scratch", digest, "run-a", "F2")) == (
+        "/scratch/icefarm/run-a/F2/system-source/" + digest
+    )
+
+
+@pytest.mark.parametrize("unsafe", ["", ".", "..", "a/b", "../escape", "/absolute", "a\n", "a" * 81])
+def test_private_snapshot_rejects_unsafe_ownership(unsafe: str) -> None:
+    with pytest.raises(SystemSourceSnapshotError):
+        private_root("/scratch", "a" * 64, unsafe, "F2")
+    with pytest.raises(SystemSourceSnapshotError):
+        private_root("/scratch", "a" * 64, "run-a", unsafe)
 
 
 def _snapshot_farm() -> FarmSpec:
@@ -106,6 +130,37 @@ def test_snapshot_is_authority_bound_and_mounts_are_in_topology_digest() -> None
     assert altered_plan["topology_digest"] != plan["topology_digest"]
 
 
+def test_worker_snapshot_plan_is_private_writable_and_replay_derivable() -> None:
+    farm = _snapshot_farm()
+    original = load_scenario_spec(INTEGRATION / "scenarios/S40-full-newgen-engagement.json", farm)
+    assert all(item.get("system_source_snapshot") == "stable-f-source" for item in original.data["instances"] if item["role"] == "F")
+    data = copy.deepcopy(original.data)
+    for instance in data["instances"]:
+        if instance["role"] == "F":
+            instance["system_source_snapshot"] = "stable-f-source"
+    scenario = ScenarioSpec(path=original.path, data=data)
+    plan = farmtest.build_plan(farm, scenario, run_id="private-s40")
+    next_plan = farmtest.build_plan(farm, scenario, run_id="private-s40-next")
+    assert plan["topology_digest"] != next_plan["topology_digest"]
+    workers = [item for item in plan["topology"]["instances"] if item["role"] == "F"]
+    assert len({item["system_source_snapshot"]["root"] for item in workers}) == len(workers)
+    for worker in workers:
+        snapshot = worker["system_source_snapshot"]
+        assert snapshot["scope"] == "run-instance"
+        commands = [item for item in plan["commands"] if item["phase"] == "up.start-f" and item["instance"] == worker["name"]]
+        assert len(commands) == 1
+        for destination, source in snapshot["mounts"].items():
+            assert f"type=bind,src={source},dst={destination}" in commands[0]["argv"]
+            assert f"/private-s40/{worker['name']}/system-source/" in source
+    rebound = farmtest._bind_system_source_snapshots(farm, data, farmtest.resolve_topology(farm, scenario), "private-s40")
+    assert rebound == plan["topology"]
+    tampered = copy.deepcopy(plan["topology"])
+    target = next(item for item in tampered["instances"] if item["role"] == "F")
+    target["system_source_snapshot"]["mounts"]["/usr/include"] = "/shared/usr/include"
+    with pytest.raises(farmtest.PlanError, match="not run-private"):
+        farmtest._planned_commands(farm, scenario, tampered, plan["ports"], "private-s40")
+
+
 def test_snapshot_refuses_bad_enumeration_and_extra_archive_fields() -> None:
     farm = _snapshot_farm()
     farm.data["system_source_snapshots"]["stable-f-source"]["enumeration"]["roots"] = ["/etc"]
@@ -176,11 +231,14 @@ class _SnapshotRecorder:
         return CommandResult(0, "", "")
 
 
-def test_snapshot_preflight_syncs_and_materializes_from_derived_paths(tmp_path: Path) -> None:
+@pytest.mark.parametrize("role", ["C", "F"])
+def test_snapshot_preflight_syncs_and_materializes_from_derived_paths(tmp_path: Path, role: str) -> None:
     farm = _snapshot_farm()
     scenario = _snapshot_scenario(farm)
     plan = farmtest.build_plan(farm, scenario, run_id="snapshot-preflight")
     instance = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
+    instance = copy.deepcopy(instance)
+    instance["role"] = role
     snapshot = farm.data["system_source_snapshots"]["stable-f-source"]
     archive = tmp_path / "source.tar.zst"
     archive.write_bytes(b"archive")
@@ -194,6 +252,13 @@ def test_snapshot_preflight_syncs_and_materializes_from_derived_paths(tmp_path: 
     )
     assert receipt["manifest_sha256"] == snapshot["manifest_sha256"]
     assert receipt["root"].endswith(snapshot["manifest_sha256"])
+    if role == "F":
+        expected = private_root(farm.hosts[instance["host"]]["scratch_root"], snapshot["manifest_sha256"], "snapshot-preflight", instance["name"])
+        assert receipt["root"] == str(expected)
+        assert receipt["scope"] == "run-instance"
+        assert receipt["instance"] == instance["name"]
+        assert all(str(expected) in path for path in receipt["mounts"].values())
+        assert f"src={expected.parent},dst=/icefarm-system-source" in " ".join(recorder.commands[-1].argv)
     phases = [command.phase for command in recorder.commands]
     assert phases == [
         "preflight.system-source-mkdir",
@@ -292,6 +357,24 @@ def _run_local_materializer(tmp_path: Path, archive: Path, archive_sha: str, man
         capture_output=True,
         env={**os.environ, "ICEFARM_TMPDIR": str(tmp_path)},
     ), snapshot_parent / manifest
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required for executable archive tests")
+def test_independent_extractions_do_not_share_header_inodes(tmp_path: Path) -> None:
+    archive, archive_sha, manifest = _make_system_source_archive(tmp_path)
+    headers = []
+    for owner in ("shared", "run-a-F1", "run-a-F2", "run-b-F2"):
+        directory = tmp_path / owner
+        directory.mkdir()
+        result, target = _run_local_materializer(directory, archive, archive_sha, manifest)
+        assert result.returncode == 0, result.stderr
+        headers.append(target / "usr/include/a.h")
+    assert len({(path.stat().st_dev, path.stat().st_ino) for path in headers}) == 4
+    headers[2].chmod(0o600)
+    headers[2].write_bytes(b"alpha\n/* S40 header edit */\n")
+    for index in (0, 1, 3):
+        assert headers[index].read_bytes() == b"alpha\n"
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == archive_sha
 
 
 @pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required for executable archive tests")

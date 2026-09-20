@@ -2269,6 +2269,32 @@ class HeaderEditRecorder(EventRecorder):
         return CommandResult(0, "", "")
 
 
+@pytest.mark.parametrize("missing", ["cache", "lock"])
+def test_header_edit_missing_cache_does_not_mutate_header(tmp_path: Path, missing: str) -> None:
+    header = tmp_path / "stdio.h"
+    header.write_bytes(b"/* original header */\n")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for suffix in ("cache", "lock"):
+        if suffix != missing:
+            (cache / f"p29-system-source-fingerprint-v1.{suffix}").write_bytes(b"retained")
+    # Redirect only filesystem locations; execute the production event script.
+    script = events_module.HEADER_EDIT_SCRIPT.replace(
+        'pathlib.PurePosixPath(sys.argv[1])', f'pathlib.PurePosixPath({str(header)!r})'
+    ).replace('"/usr/include/"', repr(str(tmp_path) + "/")).replace(
+        '"/var/cache/icecream/p50-runtime"', repr(str(cache))
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, "/usr/include/stdio.h", "event-1"],
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode != 0
+    assert f"p29-system-source-fingerprint-v1.{missing}" in result.stderr
+    assert header.read_bytes() == b"/* original header */\n"
+    assert len(list(cache.iterdir())) == 1
+    assert next(cache.iterdir()).read_bytes() == b"retained"
+
+
 def test_header_edit_is_scoped_drained_and_rejoined_with_fingerprint_receipt(
     tmp_path: Path,
 ) -> None:
