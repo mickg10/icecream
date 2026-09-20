@@ -25,7 +25,7 @@
       "name": "F2",
       "role": "F",
       "system_source_snapshot": "stable-f-source",
-      "host": "research6",
+      "host": "tt-quietbox5",
       "image": "new",
       "slots": 12
     },

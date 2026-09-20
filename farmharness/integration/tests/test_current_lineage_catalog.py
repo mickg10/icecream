@@ -120,7 +120,7 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
         workers = {item["name"]: item for item in instances if item["role"] == "F"}
         assert {name: item["host"] for name, item in workers.items()} == {
             "F1": "tt-quietbox5",
-            "F2": "research6",
+            "F2": "tt-quietbox5",
         }, path.name
         assert {item["role"] for item in instances if item["host"] in BUILDER_HOSTS} == {"F"}
 
@@ -132,9 +132,9 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
             "S70-b4-worker-bounces.json",
             "S70-b5-interner-failure.json",
         }:
-            assert workers["F2"]["host"] == "research6", path.name
+            assert workers["F2"]["host"] == "tt-quietbox5", path.name
         elif len(workers) == 2:
-            assert workers["F2"]["host"] == "research6", path.name
+            assert workers["F2"]["host"] == "tt-quietbox5", path.name
 
     s80_expected = {
         "S80-legacy.json": "tt-quietbox5",
@@ -169,7 +169,7 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
     s95 = json.loads((SCENARIOS / "S95-cache-disk-full.json").read_text(encoding="utf-8"))
     s95_workers = {item["name"]: item for item in s95["instances"] if item["role"] == "F"}
     assert {name: item["host"] for name, item in s95_workers.items()} == {
-        "F1": "research6",
+        "F1": "tt-quietbox5",
         "F2": "tt-quietbox5",
     }
 
@@ -179,5 +179,5 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
     h5_workers = {item["name"]: item for item in h5["instances"] if item["role"] == "F"}
     assert {name: item["host"] for name, item in h5_workers.items()} == {
         "F1": "tt-quietbox3",
-        "F2": "research6",
+        "F2": "tt-quietbox5",
     }

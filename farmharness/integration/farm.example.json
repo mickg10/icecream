@@ -71,23 +71,6 @@
       "sudo": true,
       "netem": false,
       "shared_lan": "10.0.27.0/24"
-    },
-    {
-      "name": "research6",
-      "ssh": "mickg@research6",
-      "docker_context": "r6",
-      "lan_ip": "10.0.27.56",
-      "arch": "x86_64",
-      "cores": 20,
-      "mem_gb": 128,
-      "scratch_root": "/home/mickg/farm-scratch",
-      "roles_allowed": [
-        "F",
-        "C"
-      ],
-      "sudo": false,
-      "netem": false,
-      "shared_lan": "10.0.27.0/24"
     }
   ],
   "corpora": {
