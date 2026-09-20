@@ -3,7 +3,7 @@
   "id": "S30-old-f-firefox",
   "shape": "S'FC'",
   "images": {
-    "new": "p50s4-57a1e336",
+    "new": "p50s4-diag-5675fc1d",
     "old": "p43-1.4.0"
   },
   "instances": [

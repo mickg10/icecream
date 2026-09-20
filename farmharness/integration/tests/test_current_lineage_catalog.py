@@ -23,6 +23,20 @@ REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
 BUILDER_HOSTS = {"tt-quietbox5"}
 
 
+def test_all_ordinary_p50_roles_use_current_product() -> None:
+    """A shared v50 role store cannot authenticate unoverridden historical bits."""
+    farm = json.loads((INTEGRATION / "farm.example.json").read_text())
+    for path in sorted(SCENARIOS.glob("*.json")):
+        scenario = json.loads(path.read_text())
+        for label in scenario["images"].values():
+            if not label.startswith("p50s4-"):
+                continue
+            binding = farm["authority"]["images"][label]
+            if binding.get("kind", "").endswith("-mutant"):
+                continue
+            assert label == FINAL_PRODUCT, (path.name, label)
+
+
 def test_requalified_catalog_uses_the_final_product_lineage() -> None:
     for path in sorted(SCENARIOS.glob("*.json")):
         scenario = json.loads(path.read_text(encoding="utf-8"))
@@ -40,7 +54,7 @@ def test_mutant_scenarios_use_the_final_product_lineage() -> None:
     expected = {
         "H3-mutant-scheduler.json": {
             "mutant": "p50s4-h3-tail-57a1e336",
-            "new": HISTORICAL_PRODUCT,
+            "new": FINAL_PRODUCT,
             "old": "p43-1.4.0",
         },
         "S90-revision-skew.json": {
