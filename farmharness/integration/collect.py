@@ -5211,6 +5211,22 @@ def _source_transfer_failure_observation(
     status = int(failure.group(2))
     error = int(failure.group(3))
     transfer_attempts = int(failure.group(4))
+    control_endings = [
+        (number, line)
+        for number, line in scoped_lines
+        if "P50 cache control operation ended" in line
+    ]
+    control_reply_lost = bool(control_endings)
+    if control_reply_lost and not (
+        len(control_endings) == 1
+        and control_endings[0][1].count("P50 cache control operation ended") == 1
+        and control_endings[0][1].endswith(
+            "P50 cache control operation ended disconnected"
+        )
+        and assignment_line < control_endings[0][0] < failure_line
+        and (status, error, transfer_attempts) == (2, 7, 0)
+    ):
+        raise CollectError(f"{row_job_id}: source-transfer loss control disconnect is ambiguous")
     failed_endpoint = assignment.get("endpoint") if legacy_retry else retry.group(1)
     identity = (
         assignment_identity["scheduler_job"],
@@ -5222,7 +5238,9 @@ def _source_transfer_failure_observation(
         source_results,
         identity,
         context="source-transfer loss",
-        expected_attempts=transfer_attempts,
+        # The local error-7 fallback carries no daemon attempt knowledge.
+        # A received reply still requires exact agreement between observers.
+        expected_attempts=None if control_reply_lost else transfer_attempts,
         expected_profile=failure.group(1),
         row_job_id=row_job_id,
     )
@@ -5285,6 +5303,15 @@ def _source_transfer_failure_observation(
         "tu_seq": assignment_identity["tu_seq"],
         "worker": worker,
     }
+    if control_reply_lost:
+        observed_attempts = source_results.get(identity, {}).get("attempts")
+        if identity in source_results and (
+            type(observed_attempts) is not int or not 0 <= observed_attempts <= 2
+        ):
+            raise CollectError(f"{row_job_id}: source-transfer loss daemon attempts are malformed")
+        record["control_result_received"] = False
+        record["control_disconnect_line"] = control_endings[0][0]
+        record["source_result_attempts"] = observed_attempts
     if legacy_retry:
         record["retry_mode"] = "legacy"
         return record
@@ -9111,5 +9138,27 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
         reparsed, _facts = _parse_rows(scenario, plan, path / "evidence", events)
         if reparsed != rows:
             raise CollectError("bridge endpoint rows differ from retained raw evidence")
+    source_failures = observations.get("failed_p50_source_transfers", {})
+    failure_records = source_failures.get("records", [])
+    raw_disconnect = any(
+        "P50 cache control operation ended disconnected" in log.read_text(encoding="utf-8")
+        for log in (path / "evidence" / "instances").glob(
+            "*/results/workload/**/client-debug.log"
+        )
+    )
+    if (
+        raw_disconnect
+        and plan.get("source_failure_observation_contract")
+        == "icefarm-source-failure-observers-v2"
+    ) or any(
+        isinstance(item, Mapping) and "control_result_received" in item
+        for item in failure_records
+    ):
+        scenario = ScenarioSpec(
+            path=path / "evidence" / "specs" / "scenario.json", data=bundle["scenario"]
+        )
+        raw_rows, raw_facts = _parse_rows(scenario, plan, path / "evidence", events)
+        if raw_rows != rows or raw_facts["failed_p50_source_transfers"] != source_failures:
+            raise CollectError("lost control reply observations differ from retained raw evidence")
     _verify_h3_raw_replay(bundle, path / "evidence", receipt_bindings)
     return bundle

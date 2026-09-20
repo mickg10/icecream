@@ -3302,6 +3302,41 @@ def test_s70_b4_source_transfer_loss_is_recovered_by_exact_strict_retry() -> Non
     assert verdict["status"] == "PASS", verdict
 
 
+@pytest.mark.parametrize("mutation", [
+    None, "received", "line", "bool-line", "attempts", "bool-attempts",
+    "missing-status", "committed", "error", "client-attempts", "missing-field",
+])
+def test_lost_source_reply_verdict_guards(mutation: str | None) -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    record = fixture["observations"]["failed_p50_source_transfers"]["records"][0]
+    record.update(
+        error=7, source_result_status=4, source_result_attempts=1,
+        control_result_received=False, control_disconnect_line=9,
+    )
+    if mutation == "received":
+        record["control_result_received"] = True
+    elif mutation == "line":
+        record["control_disconnect_line"] = record["failure_line"]
+    elif mutation == "bool-line":
+        record["control_disconnect_line"] = True
+    elif mutation == "attempts":
+        record["source_result_attempts"] = 3
+    elif mutation == "bool-attempts":
+        record["source_result_attempts"] = True
+    elif mutation == "missing-status":
+        record["source_result_status"] = None
+    elif mutation == "committed":
+        record["source_result_status"] = 0
+    elif mutation == "error":
+        record["error"] = 4
+    elif mutation == "client-attempts":
+        record["transfer_attempts"] = 1
+    elif mutation == "missing-field":
+        del record["control_disconnect_line"]
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == ("PASS" if mutation is None else "FAIL"), verdict
+
+
 @pytest.mark.parametrize("mode", ["legacy", "unknown"])
 def test_legacy_source_failure_cannot_authenticate_strict_retry(mode: str) -> None:
     fixture = _s70_b4_worker_source_transfer_recovery_bundle()
@@ -5475,6 +5510,23 @@ def test_s30_mutant_requires_one_refusal_and_one_fresh_legacy_retry() -> None:
     fixture = _s30_fixture()
     fixture["observations"]["sidecars"]["F1"]["sessions"] = 1
     assert evaluate_bundle(fixture)["status"] == "FAIL"
+
+
+def test_s30_source_failure_records_allow_only_refusal_fallback() -> None:
+    fixture = _s30_fixture()
+    record = _s70_b4_worker_source_transfer_recovery_bundle()["observations"][
+        "failed_p50_source_transfers"
+    ]["records"][0]
+    record.update(row_job_id="1", retry_mode="legacy", source_result_status=4)
+    fixture["observations"]["failed_p50_source_transfers"] = {
+        "record_count": 1, "records": [record],
+    }
+    assert evaluate_bundle(fixture)["status"] == "PASS"
+    fixture["observations"]["s30_mutant_f"]["records"] = []
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+
+
+def test_s30_mutant_rejects_missing_or_inconsistent_refusal_evidence() -> None:
     fixture = _s30_fixture()
     fixture["observations"]["logins"][0]["cache_profiles"] = []
     assert evaluate_bundle(fixture)["status"] == "FAIL"

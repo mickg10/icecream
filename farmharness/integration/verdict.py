@@ -1129,6 +1129,9 @@ def _authenticated_strict_p50_retry_ids(
         "worker",
     }
     source_transfer_fields_v2 = source_transfer_fields | {"source_result_status"}
+    lost_reply_fields = {
+        "control_result_received", "control_disconnect_line", "source_result_attempts"
+    }
     if isinstance(source_transfer_raw, list):
         for item in source_transfer_raw:
             ordered_lines = (
@@ -1147,6 +1150,33 @@ def _authenticated_strict_p50_retry_ids(
                     source_transfer_fields_v2,
                     source_transfer_fields_v2 | {"same_endpoint_decision"},
                     source_transfer_fields_v2 | {"retry_mode"},
+                    source_transfer_fields_v2 | lost_reply_fields,
+                    source_transfer_fields_v2 | lost_reply_fields | {"retry_mode"},
+                    source_transfer_fields_v2 | lost_reply_fields | {"same_endpoint_decision"},
+                )
+                or (
+                    "control_result_received" in item
+                    and (
+                        item.get("control_result_received") is not False
+                        or item.get("status") != 2
+                        or item.get("error") != 7
+                        or item.get("transfer_attempts") != 0
+                        or not _is_int(item.get("control_disconnect_line"), minimum=1)
+                        or not _is_int(item.get("assignment_line"), minimum=1)
+                        or not _is_int(item.get("failure_line"), minimum=1)
+                        or not item["assignment_line"] < item["control_disconnect_line"] < item["failure_line"]
+                        or (
+                            item.get("source_result_status") is None
+                            and item.get("source_result_attempts") is not None
+                        )
+                        or (
+                            item.get("source_result_status") is not None
+                            and (
+                                not _is_int(item.get("source_result_attempts"))
+                                or item["source_result_attempts"] > 2
+                            )
+                        )
+                    )
                 )
                 or ("retry_mode" in item and item["retry_mode"] != "legacy")
                 or not _is_int(item.get("assignment_epoch"), minimum=1)
@@ -1224,7 +1254,10 @@ def _authenticated_strict_p50_retry_ids(
                     or legacy_row.get("tail_present") is not False
                     or legacy_row.get("tail_profile") is not None
                     or legacy_row.get("session_outcome") != (
-                        "fallback" if item["row_job_id"] in typed_refusal_ids else "none"
+                        "fallback" if (
+                            item["row_job_id"] in typed_refusal_ids
+                            or bundle.get("scenario", {}).get("id") == "S30-mutant-f-refusal"
+                        ) else "none"
                     )
                     or legacy_row.get("retries") != 1
                 ):

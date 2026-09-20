@@ -753,6 +753,38 @@ def _raw_collection(tmp_path: Path):
     return farm, scenario, plan, root
 
 
+@pytest.mark.parametrize("raw_trigger", [False, True])
+def test_replay_rejects_rehashed_invented_lost_reply(tmp_path: Path, raw_trigger: bool) -> None:
+    from farmharness.integration.collect import _evidence_artifacts, _write_checksums
+
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+    assert plan["source_failure_observation_contract"] == "icefarm-source-failure-observers-v2"
+    invented = {"record_count": 1, "records": [{"control_result_received": False}]}
+    if raw_trigger:
+        # Remove the derived trigger; the retained raw diagnostic must still
+        # force comparison, even after the caller recomputes every checksum.
+        invented["records"] = [{}]
+        debug = next((root / "evidence/instances").glob(
+            "*/results/workload/**/client-debug.log"
+        ))
+        debug.write_text(
+            debug.read_text() + "\nP50 cache control operation ended disconnected\n",
+            encoding="utf-8",
+        )
+    bundle["observations"]["failed_p50_source_transfers"] = invented
+    (root / "evidence/derived/observations.json").write_text(
+        json.dumps(bundle["observations"]), encoding="utf-8"
+    )
+    bundle["artifacts"] = _evidence_artifacts(root)
+    bundle["checksum_policy"]["sha256sums_sha256"] = _write_checksums(
+        root, bundle["artifacts"]
+    )
+    (root / "bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
+    with pytest.raises(CollectError, match="lost control reply observations"):
+        load_verified_bundle(root)
+
+
 def test_collection_verdict_report_and_replay_are_reproducible(tmp_path: Path) -> None:
     farm, scenario, plan, root = _raw_collection(tmp_path)
     bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
@@ -2451,7 +2483,7 @@ def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
 
 
 def _source_transfer_failure_kwargs(
-    *, mutation: str | None = None
+    *, mutation: str | None = None, disconnected: bool = False
 ) -> dict[str, object]:
     first_endpoint = "10.0.27.101:23003"
     retry_endpoint = (
@@ -2460,6 +2492,11 @@ def _source_transfer_failure_kwargs(
     failure = (
         "P29V1 cache source transfer failed closed (status 2, error 4, attempts 0)"
     )
+    if disconnected:
+        failure = (
+            "P50 cache control operation ended disconnected\n"
+            "P29V1 cache source transfer failed closed (status 2, error 7, attempts 0)"
+        )
     retry = (
         "P50 assignment failed; requesting one fresh strict-P50 remote assignment; "
         f"avoiding failed endpoint {first_endpoint}"
@@ -2586,6 +2623,60 @@ def test_legacy_source_transfer_retry_keeps_identity_guards(mutation: str) -> No
         + kwargs["assignment"]["endpoint"],
         "requesting one fresh legacy remote assignment",
     )
+    with pytest.raises(CollectError, match="source-transfer loss"):
+        _source_transfer_failure_observation(**kwargs)
+
+
+def test_source_transfer_disconnect_preserves_daemon_attempt_observation() -> None:
+    # A lost local control reply is not a claim that the daemon attempted no
+    # transfer. Reproduce the two observer views retained in full A3/n026.
+    kwargs = _source_transfer_failure_kwargs(
+        mutation="noncommitted-source-wrong-attempts", disconnected=True
+    )
+    kwargs["log_text"] = kwargs["log_text"].replace(
+        "requesting one fresh strict-P50 remote assignment; avoiding failed endpoint "
+        + kwargs["assignment"]["endpoint"],
+        "requesting one fresh legacy remote assignment",
+    )
+    record = _source_transfer_failure_observation(**kwargs)
+    assert record is not None
+    assert record["transfer_attempts"] == 0
+    assert record["source_result_attempts"] == 1
+    assert record["source_result_status"] == 3
+    assert record["control_result_received"] is False
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing", "duplicate", "wrong-status", "wrong-error", "wrong-attempts",
+    "wrong-profile", "committed", "bool-attempts", "large-attempts",
+])
+def test_source_transfer_disconnect_rejects_invalid_evidence(mutation: str) -> None:
+    kwargs = _source_transfer_failure_kwargs(
+        mutation="noncommitted-source-wrong-attempts", disconnected=True
+    )
+    log = kwargs["log_text"]
+    marker = "P50 cache control operation ended disconnected"
+    if mutation == "missing":
+        log = log.replace(marker, "no control observation")
+    elif mutation == "duplicate":
+        log = log.replace(marker, marker + " " + marker)
+    elif mutation == "wrong-status":
+        log = log.replace("status 2", "status 1")
+    elif mutation == "wrong-error":
+        log = log.replace("error 7", "error 4")
+    elif mutation == "wrong-attempts":
+        log = log.replace("attempts 0", "attempts 1")
+    else:
+        result = kwargs["source_results"][(2, 1, 1)]
+        if mutation == "wrong-profile":
+            result["profile"] = "ZSTD_TU"
+        elif mutation == "committed":
+            result["status"] = 0
+        elif mutation == "bool-attempts":
+            result["attempts"] = True
+        else:
+            result["attempts"] = 3
+    kwargs["log_text"] = log
     with pytest.raises(CollectError, match="source-transfer loss"):
         _source_transfer_failure_observation(**kwargs)
 

@@ -939,6 +939,7 @@ def build_plan(
                ) for item in topology["instances"]
            ) else {}),
         "client_scheduler_readiness_contract": CLIENT_SCHEDULER_READINESS_CONTRACT,
+        "source_failure_observation_contract": "icefarm-source-failure-observers-v2",
         "scheduler_dispatch_epoch_contract": SCHEDULER_DISPATCH_EPOCH_CONTRACT,
         **({"client_route_epoch_contract": "icefarm-client-route-wrapper-epoch-v1"}
            if scenario.data.get("expect", {}).get("engagement") == "s70-b4-client-route-restart"
