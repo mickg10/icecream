@@ -21,6 +21,7 @@ try:
     )
     from .images import CommandFactory, ImageError, RecordingTransport, _image_identity
     from .layout import instance_root, runtime_root, toolchain_root
+    from .mutant import MUTANT_ARM_PATH, MUTANT_ARM_CONTRACT
     from .netem import (
         NETEM_RECEIPT_SCHEMA,
         NetemBinding,
@@ -55,6 +56,7 @@ except ImportError:  # Direct execution from this directory.
     )
     from images import CommandFactory, ImageError, RecordingTransport, _image_identity
     from layout import instance_root, runtime_root, toolchain_root
+    from mutant import MUTANT_ARM_PATH, MUTANT_ARM_CONTRACT
     from netem import (
         NETEM_RECEIPT_SCHEMA,
         NetemBinding,
@@ -3062,6 +3064,60 @@ def _run_canaries(
     return results
 
 
+H3_ARM_SCRIPT = r"""
+import hashlib, json, os, pathlib, sys
+marker = pathlib.Path(sys.argv[1])
+run_id, scheduler, contract = sys.argv[2:5]
+if marker.exists() or marker.is_symlink():
+    raise SystemExit("H3 already armed or stale marker")
+trace = marker.parent / "h3-mutant.jsonl"
+if trace.exists() or trace.is_symlink():
+    raise SystemExit("H3 emitted a trace before arming")
+log = pathlib.Path("/var/log/icecream/scheduler.log")
+if log.is_symlink():
+    raise SystemExit("H3 scheduler log is a symlink")
+prefix = log.read_bytes()
+if not prefix or not prefix.endswith(b"\n"):
+    raise SystemExit("H3 boundary requires complete scheduler log lines")
+receipt = {"schema": contract, "run_id": run_id, "scheduler": scheduler,
+           "scheduler_log_bytes": len(prefix),
+           "scheduler_log_lines": prefix.count(b"\n"),
+           "scheduler_log_sha256": hashlib.sha256(prefix).hexdigest()}
+payload = json.dumps(receipt, sort_keys=True).encode() + b"\n"
+temporary = marker.with_suffix(".pending")
+with temporary.open("xb") as handle:
+    handle.write(payload)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.link(temporary, marker)
+temporary.unlink()
+print(payload.decode(), end="")
+""".strip()
+
+
+def _arm_h3_mutant(farm, plan, recorder, factory, *, timeout_s):
+    contract = plan.get("h3_arm_contract")
+    if contract is None:
+        return None
+    if contract != MUTANT_ARM_CONTRACT:
+        raise LifecycleError("unknown H3 arming contract")
+    scheduler = next(item for item in plan["topology"]["instances"] if item["role"] == "S")
+    result = recorder.invoke(_command(
+        factory, phase="readiness.h3-arm", host=scheduler["host"],
+        transport=_docker_transport(farm, scheduler["host"]), timeout_s=timeout_s,
+        argv=docker_argv(farm, scheduler["host"], (
+            "exec", f"icefarm-{plan['run_id']}-{scheduler['name']}",
+            "python3", "-c", H3_ARM_SCRIPT, MUTANT_ARM_PATH,
+            plan["run_id"], scheduler["name"], contract,
+        )),
+    ))
+    receipt = _json_result(result, "H3 arming")
+    if (receipt.get("schema") != contract or receipt.get("run_id") != plan["run_id"]
+            or receipt.get("scheduler") != scheduler["name"]):
+        raise LifecycleError("H3 arming receipt identity mismatch")
+    return receipt
+
+
 def _rotate_s30_canary_traces(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -3790,6 +3846,10 @@ def bring_up(
         )
         receipt = {
             "canaries": canaries,
+            **({"h3_arm": _arm_h3_mutant(
+                farm, plan, transport, factory,
+                timeout_s=_timeout_left(deadline, monotonic),
+            )} if plan.get("h3_arm_contract") else {}),
             "client_cache_readiness": clients,
             "commands": _recorded_commands(transport),
             "environment_readiness": environments,

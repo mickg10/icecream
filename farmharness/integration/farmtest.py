@@ -41,7 +41,8 @@ try:
     )
     from .layout import instance_root, oracle_root, runtime_root, toolchain_root
     from .live_lock import LiveRunLockError, live_run_lock
-    from .mutant import MUTANT_TRACE_PATH
+    from .mutant import (MUTANT_TRACE_PATH, MUTANT_ARM_PATH, MUTANT_ARM_CONTRACT,
+                         scheduler_mutant_requires_arming)
     from .netem import (
         NETEM_PLAN_SCHEMA,
         NetemBinding,
@@ -121,7 +122,8 @@ except ImportError:  # Executed as ./farmtest.py.
     )
     from layout import instance_root, oracle_root, runtime_root, toolchain_root
     from live_lock import LiveRunLockError, live_run_lock
-    from mutant import MUTANT_TRACE_PATH
+    from mutant import (MUTANT_TRACE_PATH, MUTANT_ARM_PATH, MUTANT_ARM_CONTRACT,
+                        scheduler_mutant_requires_arming)
     from netem import (
         NETEM_PLAN_SCHEMA,
         NetemBinding,
@@ -695,6 +697,9 @@ def _planned_commands(
                 )
             environment["ICECC_WEB_HOSTPORT"] = f"127.0.0.1:{web_port}"
         if "H3" in scenario.data["controls"] and instance["role"] == "S":
+            authority = farm.data["authority"]["images"][instance["image"]["label"]]
+            if scheduler_mutant_requires_arming(authority):
+                environment["ICECC_P50_H3_ARM_FILE"] = MUTANT_ARM_PATH
             environment.update(
                 {
                     "ICECC_P50_H3_MUTANT": "1",
@@ -927,6 +932,12 @@ def build_plan(
     )
     return {
         "assignment_fence_mode": assignment_fence_mode,
+        **({"h3_arm_contract": MUTANT_ARM_CONTRACT}
+           if scenario.data["controls"] == ["H3"] and any(
+               item["role"] == "S" and scheduler_mutant_requires_arming(
+                   farm.data["authority"]["images"][item["image"]["label"]]
+               ) for item in topology["instances"]
+           ) else {}),
         "client_scheduler_readiness_contract": CLIENT_SCHEDULER_READINESS_CONTRACT,
         "scheduler_dispatch_epoch_contract": SCHEDULER_DISPATCH_EPOCH_CONTRACT,
         **({"client_route_epoch_contract": "icefarm-client-route-wrapper-epoch-v1"}

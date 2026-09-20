@@ -22,6 +22,8 @@ try:
     from .layout import instance_root, runtime_root
     from .mutant import (
         MUTANT_TRACE_PATH,
+        MUTANT_ARM_PATH, MUTANT_ARM_CONTRACT, h3_workload_dispatches,
+        scheduler_mutant_requires_arming,
         MutantError,
         parse_h3_client_rejections,
         validate_h3_trace,
@@ -40,6 +42,8 @@ except ImportError:  # Direct execution from this directory.
     from layout import instance_root, runtime_root
     from mutant import (
         MUTANT_TRACE_PATH,
+        MUTANT_ARM_PATH, MUTANT_ARM_CONTRACT, h3_workload_dispatches,
+        scheduler_mutant_requires_arming,
         MutantError,
         parse_h3_client_rejections,
         validate_h3_trace,
@@ -8732,6 +8736,25 @@ def _h3_control_failure_observations(
     ).relative_to("/results")
     trace_records = _read_jsonl(trace_path, required=True)
     scheduler_jobs = _scheduler_jobs(evidence, plan)
+    requires_arm = scheduler_mutant_requires_arming(authority_image)
+    if requires_arm or "h3_arm_contract" in plan:
+        if not requires_arm or plan.get("h3_arm_contract") != MUTANT_ARM_CONTRACT:
+            raise CollectError("H3 arming contract is not bound to successor recipe")
+        marker_path = _instance_results(evidence, scheduler["name"]) / Path(
+            MUTANT_ARM_PATH
+        ).name
+        log_path = _one_role_log(evidence, scheduler)
+        if marker_path.is_symlink() or not marker_path.is_file() or log_path is None:
+            raise CollectError("H3 retained arming evidence is missing")
+        try:
+            scheduler_jobs = h3_workload_dispatches(
+                _read_json(marker_path), receipts.get("lifecycle", {}).get("h3_arm"),
+                log_path.read_bytes(), scheduler_jobs,
+                _canary_assignment_claims(scenario, plan, evidence),
+                run_id=plan["run_id"], scheduler=scheduler["name"],
+            )
+        except (MutantError, KeyError, TypeError, ValueError) as exc:
+            raise CollectError(f"invalid H3 arming boundary: {exc}") from exc
     if any(
         job["client"] not in selected_clients or job["worker"] not in selected_workers
         for job in scheduler_jobs
@@ -8937,6 +8960,29 @@ def _manifest(path: Path) -> dict[str, str]:
     return result
 
 
+def _verify_h3_raw_replay(bundle, evidence, receipts):
+    """Recompute new H3 controls from raw evidence even if derived hashes match."""
+    plan = bundle["plan"]
+    authority = bundle["farm"].get("authority", {}).get("images", {})
+    armed = any(
+        item.get("role") == "S" and scheduler_mutant_requires_arming(
+            authority.get(item.get("image", {}).get("label"), {})
+        ) for item in plan["topology"]["instances"]
+    )
+    if not armed and "h3_arm_contract" not in plan:
+        return
+    if (bundle.get("mode") != CONTROL_FAILURE_MODE
+            or bundle["scenario"].get("controls") != ["H3"]):
+        raise CollectError("armed H3 replay lacks control-failure binding")
+    farm = FarmSpec(path=evidence / "specs/farm.json", data=bundle["farm"])
+    scenario = ScenarioSpec(path=evidence / "specs/scenario.json", data=bundle["scenario"])
+    observed = _h3_control_failure_observations(
+        farm, scenario, plan, evidence, receipts, bundle["event_log"],
+    )
+    if observed != bundle["observations"]:
+        raise CollectError("H3 observations differ from retained raw evidence")
+
+
 def load_verified_bundle(root: Path | str) -> dict[str, Any]:
     """Verify immutable bytes and their derived bundle bindings before use."""
 
@@ -9065,4 +9111,5 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
         reparsed, _facts = _parse_rows(scenario, plan, path / "evidence", events)
         if reparsed != rows:
             raise CollectError("bridge endpoint rows differ from retained raw evidence")
+    _verify_h3_raw_replay(bundle, path / "evidence", receipt_bindings)
     return bundle

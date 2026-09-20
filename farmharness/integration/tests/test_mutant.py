@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,7 +10,10 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
-from farmharness.integration.collect import _h3_control_failure_observations
+from farmharness.integration.collect import (
+    _h3_control_failure_observations, CollectError, _verify_h3_raw_replay,
+    CONTROL_FAILURE_MODE,
+)
 from farmharness.integration.farm_spec import FarmSpecError, load_farm_spec
 from farmharness.integration.images import image_bindings
 from farmharness.integration.mutant import (
@@ -20,6 +24,7 @@ from farmharness.integration.mutant import (
     derive_scheduler_mutant,
     parse_h3_client_rejections,
     validate_h3_trace,
+    ARMED_MUTANT_PATCH, MUTANT_ARM_CONTRACT,
 )
 from farmharness.integration.scenario_spec import load_scenario_spec
 from farmharness import newgen_farm_env
@@ -337,13 +342,24 @@ def test_mutant_build_authenticates_patch_inside_docker() -> None:
     assert "git apply /tmp/scheduler-tail.patch" in dockerfile
 
 
+@pytest.mark.parametrize("armed", [None, "valid", "missing-marker", "changed-prefix", "missing-contract"])
 def test_h3_failure_collection_binds_dispatch_rejection_and_failed_workload(
     tmp_path: Path,
+    armed,
 ) -> None:
     farm = _farm()
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H3-mutant-scheduler.json", farm
     )
+    if armed:
+        label = scenario.data["images"]["mutant"]
+        image = farm.data["authority"]["images"][label]
+        farm.data["authority"]["images"][label] = {
+            **image, **derive_scheduler_mutant(
+                image["base_image"], farm.data["authority"]["images"][image["base_image"]],
+                ARMED_MUTANT_PATCH, label=label,
+            ),
+        }
     plan = farmtest.build_plan(farm, scenario, run_id="h3-failure")
     scheduler_log = tmp_path / "diagnostics" / "tt-quietbox3" / "S1.log"
     scheduler_log.mkdir(parents=True)
@@ -398,12 +414,45 @@ def test_h3_failure_collection_binds_dispatch_rejection_and_failed_workload(
         + "\t0\t0\t0\n",
         encoding="ascii",
     )
+    receipts = {"workload": {"status": "COMPLETE_WITH_JOB_FAILURES", "clients": [{"jobs": 1, "failures": 1}]}}
+    if armed:
+        log_path = scheduler_log / "scheduler.log"
+        original = log_path.read_text().splitlines()
+        prefix = ("\n".join([
+            original[0],
+            "[S1] 2026-09-05 00:00:00: NEW 2 client=C1",
+            "[S1] 2026-09-05 00:00:00: put 2 in joblist of F1",
+            "[S1] 2026-09-05 00:00:00: BEGIN: 2",
+            "[S1] 2026-09-05 00:00:00: END 2 status=0",
+        ]) + "\n").encode()
+        log_path.write_bytes(prefix + "\n".join(original[1:]).encode())
+        marker = {"schema": MUTANT_ARM_CONTRACT, "run_id": plan["run_id"], "scheduler": "S1",
+                  "scheduler_log_bytes": len(prefix), "scheduler_log_lines": 5,
+                  "scheduler_log_sha256": hashlib.sha256(prefix).hexdigest()}
+        receipts["lifecycle"] = {"h3_arm": marker}
+        if armed != "missing-marker":
+            (scheduler_result / "h3-armed.json").write_text(json.dumps(marker))
+        if armed == "changed-prefix":
+            log_path.write_bytes(log_path.read_bytes().replace(b"test starting", b"TEST starting"))
+        if armed == "missing-contract":
+            del plan["h3_arm_contract"]
+        canary = tmp_path / "instances/C1/results/canary"
+        canary.mkdir(parents=True)
+        worker = next(item for item in plan["topology"]["instances"] if item["name"] == "F1")
+        port = plan["ports"]["instances"]["F1"]
+        (canary / "F1.client.log").write_text(
+            f"[C1] 2026-09-05 00:00:00: Have to use host {worker['address']}:{port} - Job ID: 2\n"
+        )
+    if armed not in (None, "valid"):
+        with pytest.raises(CollectError):
+            _h3_control_failure_observations(farm, scenario, plan, tmp_path, receipts, [])
+        return
     observations = _h3_control_failure_observations(
         farm,
         scenario,
         plan,
         tmp_path,
-        {"workload": {"status": "COMPLETE_WITH_JOB_FAILURES", "clients": [{"jobs": 1, "failures": 1}]}},
+        receipts,
         [],
     )
     failure = observations["h3_control_failure"]
@@ -411,6 +460,18 @@ def test_h3_failure_collection_binds_dispatch_rejection_and_failed_workload(
     assert failure["successful_product_rows"] == 0
     assert len(failure["emission"]["records"]) == 1
     assert len(failure["rejections"]) == 1
+    if armed == "valid":
+        bundle = {"plan": plan, "farm": farm.data, "scenario": scenario.data,
+                  "mode": CONTROL_FAILURE_MODE, "event_log": [],
+                  "observations": observations}
+        _verify_h3_raw_replay(bundle, tmp_path, receipts)
+        forged = copy.deepcopy(bundle)
+        forged["observations"]["h3_control_failure"]["scheduler_dispatch_count"] = 99
+        with pytest.raises(CollectError, match="retained raw evidence"):
+            _verify_h3_raw_replay(forged, tmp_path, receipts)
+        (scheduler_result / "h3-armed.json").unlink()
+        with pytest.raises(CollectError, match="arming evidence is missing"):
+            _verify_h3_raw_replay(bundle, tmp_path, receipts)
 
 
 def test_h3_scenario_loads_and_plan_injects_runner_trace() -> None:

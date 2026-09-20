@@ -27,6 +27,9 @@ DAEMON_MUTANT_RECIPE_SCHEMA = "icefarm-daemon-mutant-recipe-v1"
 MUTANT_TRACE_SCHEMA = "icefarm-scheduler-mutant-trace-v1"
 MUTANT_TRACE_PATH = "/results/h3-mutant.jsonl"
 MUTANT_PATCH = Path(__file__).with_name("mutants") / "scheduler-tail.patch"
+ARMED_MUTANT_PATCH = Path(__file__).with_name("mutants") / "scheduler-tail-armed.patch"
+MUTANT_ARM_PATH = "/results/h3-armed.json"
+MUTANT_ARM_CONTRACT = "icefarm-h3-post-readiness-arm-v1"
 DAEMON_MUTANT_PATCH = (
     Path(__file__).with_name("mutants") / "daemon-session-refuse.patch"
 )
@@ -37,6 +40,53 @@ LABEL_RE = re.compile(r"^p50s[0-9]+-h3-[a-z0-9][a-z0-9._-]*$")
 
 class MutantError(ValueError):
     """A scheduler-mutant recipe or trace is not authenticated."""
+
+
+def scheduler_mutant_requires_arming(image: Mapping[str, Any]) -> bool:
+    """Select the new lifecycle by authenticated recipe, never label spelling."""
+    return (
+        image.get("kind") == MUTANT_KIND
+        and image.get("patch_sha256") == file_sha256(ARMED_MUTANT_PATCH)
+    )
+
+
+def h3_workload_dispatches(marker, lifecycle_marker, log_bytes, dispatches,
+                          canary_claims, *, run_id, scheduler):
+    """Authenticate the retained readiness prefix without deleting log events."""
+    if not isinstance(marker, dict) or marker != lifecycle_marker:
+        raise MutantError("H3 arming marker differs from lifecycle receipt")
+    expected_fields = {"schema", "run_id", "scheduler", "scheduler_log_bytes",
+                       "scheduler_log_lines", "scheduler_log_sha256"}
+    if (set(marker) != expected_fields or marker["schema"] != MUTANT_ARM_CONTRACT
+            or marker["run_id"] != run_id or marker["scheduler"] != scheduler):
+        raise MutantError("H3 arming identity mismatch")
+    size, lines = marker["scheduler_log_bytes"], marker["scheduler_log_lines"]
+    if (type(size) is not int or not 0 < size <= len(log_bytes)
+            or type(lines) is not int or lines <= 0):
+        raise MutantError("H3 arming boundary is invalid")
+    prefix = log_bytes[:size]
+    if (not prefix.endswith(b"\n") or prefix.count(b"\n") != lines
+            or hashlib.sha256(prefix).hexdigest() != marker["scheduler_log_sha256"]):
+        raise MutantError("H3 arming log prefix does not authenticate")
+    readiness, workload = [], []
+    for job in dispatches:
+        if job["line"] <= lines:
+            if (job["terminal_line"] > lines or job["terminal"] != "completion"
+                    or job["status"] != 0):
+                raise MutantError("H3 readiness dispatch did not finish before arming")
+            readiness.append(job)
+        else:
+            workload.append(job)
+    def key(job):
+        return (int(job["scheduler_job"]), job["client"], job["worker"])
+    observed = [key(job) for job in readiness]
+    claimed = [key(job) for job in canary_claims]
+    if (not observed or len(set(observed)) != len(observed)
+            or len(set(claimed)) != len(claimed) or set(observed) != set(claimed)):
+        raise MutantError("H3 readiness dispatches do not match remote canaries")
+    if not workload:
+        raise MutantError("H3 has no post-arming workload dispatch")
+    return workload
 
 
 def file_sha256(path: Path) -> str:

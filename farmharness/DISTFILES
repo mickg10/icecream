@@ -39,6 +39,7 @@ farmharness/integration/mutant.py
 farmharness/integration/mutants/daemon-hidden-wire-skew.patch
 farmharness/integration/mutants/daemon-session-refuse.patch
 farmharness/integration/mutants/daemon-wire-revision-2.patch
+farmharness/integration/mutants/scheduler-tail-armed.patch
 farmharness/integration/mutants/scheduler-tail.patch
 farmharness/integration/netem.py
 farmharness/integration/performance.py
@@ -138,6 +139,7 @@ farmharness/integration/tests/test_firefox_corpus_authority.py
 farmharness/integration/tests/test_firefox_corpus_promotion.py
 farmharness/integration/tests/test_firefox_root_header_authority.py
 farmharness/integration/tests/test_formal_aggregate.py
+farmharness/integration/tests/test_h3_armed_recipe.py
 farmharness/integration/tests/test_image_transport.py
 farmharness/integration/tests/test_images.py
 farmharness/integration/tests/test_ladder_catalog.py

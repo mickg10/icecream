@@ -1,0 +1,90 @@
+diff --git a/scheduler/scheduler.cpp b/scheduler/scheduler.cpp
+--- a/scheduler/scheduler.cpp
++++ b/scheduler/scheduler.cpp
+@@ -1448,16 +1448,64 @@ static bool send_remote_dispatch_reply(Job *job)
+ static bool send_remote_dispatch_reply(Job *job)
+ {
+     assert(job);
+     assert(job->submitter());
+     assert(job->server());
+     uint32_t cache_port = 0, cache_protocol = 0, cache_mask = 0;
+     project_cache_handoff(job, cache_port, cache_protocol, cache_mask);
++    const bool mutant = (getenv("ICECC_P50_H3_MUTANT") != nullptr && getenv("ICECC_P50_H3_ARM_FILE") != nullptr && access(getenv("ICECC_P50_H3_ARM_FILE"), F_OK) == 0);
++    uint64_t reply_epoch = job->assignmentEpoch();
++    uint64_t reply_nonce = job->assignmentNonce();
++    if (mutant) {
++        const CompileServer *const cs = job->server();
++        const uint32_t selected_mask = p50_select_cache_profile(
++            cs->cacheProfileMask(), p50_cache_profile_request_from_env());
++        if (scheduler_assignment_epoch == 0 ||
++            !cache_advertisement_is_valid_present(
++                cs->cacheEndpointPort(), cs->cacheProtocol(),
++                cs->cacheProfileMask()) ||
++            selected_mask == 0)
++            return false;
++        cache_port = cs->cacheEndpointPort();
++        cache_protocol = cs->cacheProtocol();
++        cache_mask = selected_mask;
++        reply_epoch = scheduler_assignment_epoch;
++        reply_nonce = fresh_assignment_nonce();
++    }
+-    UseCSMsg reply(job->dispatchPlatform(), job->server()->name,
+-                   job->server()->remotePort(), job->id(),
+-                   job->dispatchGotEnv(), job->localClientId(),
+-                   job->dispatchMatchedJobId(), job->assignmentEpoch(),
+-                   job->assignmentNonce(), cache_port, cache_protocol, cache_mask);
++    UseCSMsg reply(job->dispatchPlatform(), job->server()->name,
++                   job->server()->remotePort(), job->id(),
++                   job->dispatchGotEnv(), job->localClientId(),
++                   job->dispatchMatchedJobId(), reply_epoch,
++                   reply_nonce, cache_port, cache_protocol, cache_mask);
+     reply.setCompileIdentity(job->cGuid(), job->tuSeq());
+-    return job->submitter()->send_msg(
+-        reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
++    const bool sent = job->submitter()->send_msg(
++        reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
++    if (!sent)
++        return false;
++    if (mutant) {
++        const char *trace_path = getenv("ICECC_P50_H3_TRACE");
++        const char *scheduler_name = getenv("ICECC_P50_H3_SCHEDULER_INSTANCE");
++        if (trace_path == nullptr || *trace_path == '\0' ||
++            scheduler_name == nullptr || *scheduler_name == '\0')
++            return false;
++        char tail_hex[25];
++        snprintf(tail_hex, sizeof(tail_hex), "%08x%08x%08x",
++                 cache_port, cache_protocol, cache_mask);
++        std::ofstream trace_file(trace_path, std::ios::app);
++        if (!trace_file)
++            return false;
++        trace_file << "{\"assignment_epoch\":" << reply_epoch
++                   << ",\"assignment_nonce\":" << reply_nonce
++                   << ",\"cache_port\":" << cache_port
++                   << ",\"cache_profile_mask\":" << cache_mask
++                   << ",\"cache_protocol\":" << cache_protocol
++                   << ",\"client_instance\":\"" << job->submitter()->nodeName()
++                   << "\",\"worker_instance\":\"" << job->server()->nodeName()
++                   << "\",\"emission\":\"protocol-50-tail-sent\""
++                   << ",\"schema\":\"icefarm-scheduler-mutant-trace-v1\""
++                   << ",\"scheduler_instance\":\"" << scheduler_name
++                   << "\",\"scheduler_job\":" << job->id()
++                   << ",\"tail_bytes\":12,\"tail_hex\":\"" << tail_hex
++                   << "\"}\n";
++    }
++    return true;
+ }
+diff --git a/services/comm.cpp b/services/comm.cpp
+--- a/services/comm.cpp
++++ b/services/comm.cpp
+@@ -4392,6 +4392,9 @@ void UseCSMsg::send_to_channel(MsgChannel *c) const
+     }
+-    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
++    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)
++        || (getenv("ICECC_P50_H3_MUTANT") != nullptr && getenv("ICECC_P50_H3_ARM_FILE") != nullptr && access(getenv("ICECC_P50_H3_ARM_FILE"), F_OK) == 0)) {
++        /* H3 appends the exact projected three-word (12-byte) tail to a
++           legacy channel; the old client must reject its unread payload. */
+         *c << cache_endpoint_port;
+         *c << cache_protocol;
+         *c << cache_profile_mask;
+     }
+ }
