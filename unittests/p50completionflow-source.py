@@ -554,12 +554,15 @@ def check_compiler_quiescence(source: str, helper: str, test_source: str,
 
 
 def check_cache_service(source: str) -> None:
+    trace_writer = section(source, "void append_test_trace(",
+                           "void append_ready_test_trace(")
+    for token in ("::getenv(environment)", "O_APPEND", "O_CLOEXEC", "::write(fd"):
+        require(token in trace_writer, f"sidecar trace writer omits {token}")
     ready_trace = section(source, "void append_ready_test_trace(",
-                          "void append_terminal_lifecycle_test_trace(")
-    for token in ("ICECC_P50_TEST_READY_TRACE", "O_APPEND", "O_CLOEXEC",
-                  "::write(fd"):
-        require(token in ready_trace, f"sidecar READY evidence omits {token}")
-    require("ICECC_P50_C1F1_REQUIRED" not in ready_trace,
+                          "void append_fingerprint_test_trace(")
+    require('append_test_trace("ICECC_P50_TEST_READY_TRACE", message);' in ready_trace,
+            "sidecar READY evidence must use its dedicated trace path")
+    require("ICECC_P50_C1F1_REQUIRED" not in ready_trace + trace_writer,
             "READY evidence must be opted in by its path, not workload strictness")
     ready = section(source, "bool write_ready_lease(",
                     "bool capture_listener_identity(")

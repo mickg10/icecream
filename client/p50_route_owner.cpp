@@ -118,7 +118,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     // ledger; TU identity is allocated by the shared C authority.
     ZstdSourceTransferResult result =
         co_await sender->transfer_route(remote, request, deadline, source);
-    if (result.replacement_required)
+    if (result.replacement_required && !result.route_local_failure)
         replacement_required_ = true;
     co_return result;
 }
@@ -146,7 +146,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     }
     ZstdSourceTransferResult result = co_await sender->transfer_route(
         std::move(connection), request, deadline, source);
-    if (result.replacement_required)
+    if (result.replacement_required && !result.route_local_failure)
         replacement_required_ = true;
     co_return result;
 }

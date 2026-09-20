@@ -156,6 +156,15 @@ struct P50ZstdSourceSender::Impl {
         return result;
     }
 
+    void quarantine_transport(ZstdSourceTransferResult& result,
+                              bool persistent_route) noexcept {
+        require_replacement(result, persistent_route);
+        if (persistent_route) {
+            route_transport_quarantined = true;
+            result.route_local_failure = true;
+        }
+    }
+
     ZstdSourceTransferResult committed_from_witness(
         const ClientRunResult& run, uint64_t raw_bytes, Digest128 raw_digest,
         uint8_t attempts) const {
@@ -248,6 +257,7 @@ struct P50ZstdSourceSender::Impl {
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
     bool route_replacement_required = false;
+    bool route_transport_quarantined = false;
 };
 
 P50ZstdSourceSender::P50ZstdSourceSender(CStoreGuid c_store_guid,
@@ -406,9 +416,12 @@ P50ZstdSourceSender::transfer_bytes(
        ledger reaches its ceiling.  A distinct request cannot be admitted:
        make that capacity boundary a sticky cold-replacement request rather
        than silently disabling P50 for the remainder of the process. */
-    if (explicit_route && impl_->route_replacement_required)
-        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
-                                     explicit_route);
+    if (explicit_route && impl_->route_replacement_required) {
+        auto result = impl_->replacement(ZstdSourceTransferStatus::Unavailable,
+                                         explicit_route);
+        result.route_local_failure = impl_->route_transport_quarantined;
+        co_return result;
+    }
     if (impl_->completed.size() >= impl_->config.max_completed_requests)
         co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
                                      explicit_route);
@@ -447,7 +460,7 @@ P50ZstdSourceSender::transfer_bytes(
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
             result.attempts = static_cast<uint8_t>(attempt - 1);
-            impl_->require_replacement(result, explicit_route);
+            impl_->quarantine_transport(result, explicit_route);
             co_return result;
         }
         ClientRunResult run;
@@ -536,7 +549,7 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
             result.attempts = attempt;
             impl_->bind_wire_evidence(result);
-            impl_->require_replacement(result, explicit_route);
+            impl_->quarantine_transport(result, explicit_route);
             co_return result;
         }
         if (run.status == ClientRunStatus::TerminalError) {
@@ -553,7 +566,7 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
             result.attempts = attempt;
             impl_->bind_wire_evidence(result);
-            impl_->require_replacement(result, explicit_route);
+            impl_->quarantine_transport(result, explicit_route);
             co_return result;
         }
     }

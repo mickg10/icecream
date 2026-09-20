@@ -446,10 +446,11 @@ void test_long_lived_relationship_owner() {
         asio::use_future);
     context.run();
     const auto poisoned_result = poisoned.get();
-    CHECK(poisoned_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(poisoned_result.status == ZstdSourceTransferStatus::RetryExhausted);
     CHECK(poisoned_result.replacement_required);
-    CHECK(poisoned_connections == 0);
-    CHECK(failed_owner.owner_count() == 1 && !failed_owner.owns(other_failed_route));
+    CHECK(poisoned_result.route_local_failure);
+    CHECK(poisoned_connections == 2);
+    CHECK(failed_owner.owner_count() == 2 && failed_owner.owns(other_failed_route));
     context.restart();
     auto sticky = asio::co_spawn(
         context,
@@ -464,7 +465,7 @@ void test_long_lived_relationship_owner() {
         asio::use_future);
     context.run();
     CHECK(sticky.get().replacement_required);
-    CHECK(poisoned_connections == 0);
+    CHECK(poisoned_connections == 2);
     CHECK(!failed_owner.reset_f_store_exact(Id128::from_u64(211), 1));
 
     // The healthy relationship is independent and advances normally to TU3.
@@ -692,6 +693,61 @@ void test_relationship_table_cap_requests_replacement() {
     CHECK(owner.owner_count() == 1 && owner.owns(first_route));
 }
 
+void test_transport_loss_does_not_reject_another_worker() {
+    // H5: two workers share one C owner. A transport loss on F1 must not
+    // reject F2 before even attempting its connection. Keep the failed route
+    // retained; this is not permission to reset poisoned preparation state.
+    P50CRouteOwner owner(config(ProfileId::P29V1));
+    asio::io_context context;
+    const std::vector<uint8_t> source{'h', '5'};
+    const auto failed_route = relationship(191, 291, 1, ProfileId::P29V1);
+    unsigned failed_connections = 0;
+    auto first = asio::co_spawn(
+        context, owner.transfer(failed_route, {7701, 1},
+            ConnectedFdFactory{[&](auto) { ++failed_connections; return -1; }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    CHECK(first.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_connections == 2);
+    CHECK(owner.owns(failed_route));
+
+    context.restart();
+    unsigned other_connections = 0;
+    auto other = asio::co_spawn(
+        context, owner.transfer(relationship(191, 292, 1, ProfileId::P29V1),
+            {7702, 1}, ConnectedFdFactory{[&](auto) {
+                ++other_connections;
+                return -1; // Count admission without a blocking test server.
+            }}, std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    const auto result = other.get();
+    CHECK(other_connections == 2);
+    CHECK(result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(owner.owns(failed_route));
+
+    // A third relationship can actually commit after both retained failures,
+    // without rewinding the C-wide TU allocator or dropping failed state.
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.supported_profiles = kOperationalProfileMask;
+    P50ServerEndpoint server(Id128::from_u64(293), caps, nullptr, nullptr,
+        P50ServerEndpointConfig{
+            .input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                  std::span<const uint8_t>) {
+                return InputJobState::Open;
+            }});
+    const auto healthy = relationship(191, 293, 1, ProfileId::P29V1);
+    const auto committed = route_call(context, owner, server, acceptor, healthy,
+                                      {7703, 1}, source);
+    CHECK(committed.status == ZstdSourceTransferStatus::Committed);
+    CHECK(committed.committed_input.has_value());
+    CHECK(committed.committed_input->tu_seq.value == 2);
+    CHECK(owner.owns(failed_route));
+}
+
 void test_typed_poison_catch_is_owner_wide() {
     P50RouteOwnerConfig injected = config(ProfileId::P29V1);
     unsigned injections = 0;
@@ -842,6 +898,7 @@ int main() {
     test_p29v1_retry_and_reset_owner();
     test_p29v1_relationship_owner();
     test_relationship_table_cap_requests_replacement();
+    test_transport_loss_does_not_reject_another_worker();
     test_typed_poison_catch_is_owner_wide();
     test_interner_fault_is_sticky_only_for_p29v1();
 }

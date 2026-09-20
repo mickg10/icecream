@@ -272,6 +272,7 @@ void fingerprint_stop_before_ready_is_bounded() {
     CHECK(::mkdir(lease.c_str(), 0700) == 0);
     const std::string socket = lease + "/cache.sock";
     const std::string lock_path = root + "/p29-system-source-fingerprint-v1.lock";
+    const std::string fingerprint_trace = root + "/fingerprint.trace";
     const int held_lock = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     CHECK(held_lock >= 0 && ::flock(held_lock, LOCK_EX) == 0);
 
@@ -290,6 +291,7 @@ void fingerprint_stop_before_ready_is_bounded() {
         CHECK(pid >= 0);
         if (pid == 0) {
             clear_structured_launch_environment();
+            (void)::setenv("ICECC_P50_TEST_FINGERPRINT_TRACE", fingerprint_trace.c_str(), 1);
             const std::string ready_fd = std::to_string(ready_write);
             const std::string listener_fd = std::to_string(listener);
             (void)::setenv("ICECC_CACHE_SERVICE_READY_FD", ready_fd.c_str(), 1);
@@ -347,6 +349,11 @@ void fingerprint_stop_before_ready_is_bounded() {
 
     CHECK(::flock(held_lock, LOCK_UN) == 0);
     CHECK(::close(held_lock) == 0);
+    // The first child is reaped. Preserve its outcome separately so a slow
+    // cancellation cannot be confused with the second startup's outcome.
+    const std::string first_trace = root + "/fingerprint-first.trace";
+    if (::rename(fingerprint_trace.c_str(), first_trace.c_str()) != 0)
+        CHECK(errno == ENOENT);
     const auto second = launch_attempt();
     expect_structured_ready(second.second);
     CHECK(::close(second.second) == 0);
@@ -354,11 +361,31 @@ void fingerprint_stop_before_ready_is_bounded() {
     int second_status = 0;
     CHECK(::waitpid(second.first, &second_status, 0) == second.first);
     CHECK(WIFEXITED(second_status) && WEXITSTATUS(second_status) == 0);
+    const int trace_fd = ::open(fingerprint_trace.c_str(), O_RDONLY | O_CLOEXEC);
+    CHECK(trace_fd >= 0);
+    std::array<char, 4096> trace{};
+    const ssize_t trace_size = ::read(trace_fd, trace.data(), trace.size() - 1);
+    CHECK(trace_size > 0 && trace_size < static_cast<ssize_t>(trace.size() - 1));
+    CHECK(::close(trace_fd) == 0);
+    const bool completed = std::strstr(trace.data(), "fingerprint completed\n") != nullptr;
+    const bool timed_out = std::strstr(trace.data(), "fingerprint timed-out\n") != nullptr;
+    CHECK(completed != timed_out);
+    CHECK(std::strstr(trace.data(), "fingerprint unavailable\n") == nullptr);
     struct stat cache_info{};
-    CHECK(::stat((root + "/p29-system-source-fingerprint-v1.cache").c_str(),
-                 &cache_info) == 0 && cache_info.st_size > 0);
+    const std::string cache_path = root + "/p29-system-source-fingerprint-v1.cache";
+    const int cache_status = ::stat(cache_path.c_str(), &cache_info);
+    // READY permits a bounded timeout with reuse disabled. Only an explicitly
+    // completed fingerprint promises a cache; never infer completion from READY.
+    if (completed)
+        CHECK(cache_status == 0 && cache_info.st_size > 0);
+    else
+        CHECK(cache_status == 0 || errno == ENOENT);
     CHECK(::unlink(socket.c_str()) == 0);
-    CHECK(::unlink((root + "/p29-system-source-fingerprint-v1.cache").c_str()) == 0);
+    if (cache_status == 0)
+        CHECK(::unlink(cache_path.c_str()) == 0);
+    CHECK(::unlink(fingerprint_trace.c_str()) == 0);
+    if (::unlink(first_trace.c_str()) != 0)
+        CHECK(errno == ENOENT);
     CHECK(::unlink(lock_path.c_str()) == 0);
     CHECK(::rmdir(lease.c_str()) == 0);
     CHECK(::rmdir(root.c_str()) == 0);
@@ -1604,7 +1631,8 @@ void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
 void serve_accepted_source_transfer(
     int accepted, sockaddr_in peer, socklen_t peer_size,
     FStoreGuid f_store_guid, uint64_t f_store_generation,
-    SourceArmServerObservation& observation) noexcept {
+    SourceArmServerObservation& observation,
+    bool disconnect_after_ready = false) noexcept {
     try {
         if (accepted < 0)
             return;
@@ -1646,6 +1674,10 @@ void serve_accepted_source_transfer(
             return;
         }
 
+        if (disconnect_after_ready) {
+            (void)::close(raw_fd);
+            return;
+        }
         namespace asio = boost::asio;
         asio::io_context context;
         boost::system::error_code error;
@@ -2014,6 +2046,77 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
           healthy_observation.ready_sent &&
           healthy_observation.transfer_completed);
     CHECK(healthy_elapsed < std::chrono::seconds(3));
+}
+
+void test_transport_loss_preserves_other_worker_service() {
+    StoreIdentityRoot root{};
+    root.bytes[15] = 0x73;
+    const auto launch = test_sidecar_launch(root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::milliseconds(500);
+    service::SidecarRuntime runtime(std::move(config));
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    auto deadline = [&] {
+        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(4),
+            clock.clock_domain_id, clock.time_namespace_id);
+    };
+    const std::array<uint8_t, 4> source{'h', '5', '!', '\n'};
+    StoreIdentityRoot failed_root{};
+    failed_root.bytes[14] = 0x74;
+    StoreIdentityRoot healthy_root{};
+    healthy_root.bytes[14] = 0x75;
+    uint16_t failed_port = 0;
+    const int failed_listener = loopback_listener(failed_port);
+    SourceArmServerObservation failed_observation;
+    std::thread failed_server([&] {
+        pollfd ready{failed_listener, POLLIN, 0};
+        if (::poll(&ready, 1, 5000) <= 0) {
+            (void)::close(failed_listener);
+            return;
+        }
+        sockaddr_in peer{};
+        socklen_t size = sizeof(peer);
+        const int fd = ::accept(failed_listener,
+            reinterpret_cast<sockaddr*>(&peer), &size);
+        (void)::close(failed_listener);
+        serve_accepted_source_transfer(fd, peer, size, f_store_guid_for_root(failed_root),
+            1, failed_observation, true);
+    });
+    const auto failed = runtime.transfer_source_on_owner(
+        source_transfer_request(failed_port, 191, CACHE_PROFILE_P29V1),
+        deadline(), local::HandoffFd(source_file("h5-failed", source)));
+    failed_server.join();
+    CHECK(failed_observation.ready_sent);
+    CHECK(failed.code == local::SourceTransferResultCode::Error);
+    CHECK(failed.attempts == 2);
+    CHECK(failed.error_code != static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired));
+
+    uint16_t healthy_port = 0;
+    const int healthy_listener = loopback_listener(healthy_port);
+    SourceArmServerObservation healthy_observation;
+    std::thread healthy_server([&] {
+        pollfd ready{healthy_listener, POLLIN, 0};
+        if (::poll(&ready, 1, 5000) <= 0) {
+            (void)::close(healthy_listener);
+            return;
+        }
+        serve_one_source_transfer(healthy_listener, f_store_guid_for_root(healthy_root),
+                                  1, healthy_observation);
+    });
+    const auto healthy = runtime.transfer_source_on_owner(
+        source_transfer_request(healthy_port, 201, CACHE_PROFILE_P29V1),
+        deadline(), local::HandoffFd(source_file("h5-healthy", source)));
+    healthy_server.join();
+    CHECK(healthy.code == local::SourceTransferResultCode::Committed);
+    CHECK(healthy.raw_digest == icecc::digest128(source));
+    CHECK(healthy.raw_bytes == source.size());
+    CHECK(healthy_observation.transfer_completed);
 }
 
 void test_route_poison_latches_before_successor_f_open() {
@@ -2638,8 +2741,16 @@ void ready_requires_bind_and_replacement_is_preserved() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--transport-isolation") == 0) {
+            test_transport_loss_preserves_other_worker_service();
+            test_route_poison_latches_before_successor_f_open();
+            test_route_endpoint_cap_refuses_before_f_open();
+            test_known_endpoint_relationship_cap_refuses_before_f_open();
+            return 0;
+        }
+        CHECK(argc == 1);
         exercise_root_contract_then_drop_test_process();
         fingerprint_stop_before_ready_is_bounded();
         legacy_store_identity_launches();
@@ -2660,6 +2771,7 @@ int main() {
         test_source_connect_protocol_slices_share_one_outer_budget();
         test_stalled_f_arm_is_bounded_before_healthy_transfer();
         test_route_poison_latches_before_successor_f_open();
+        test_transport_loss_preserves_other_worker_service();
         test_interner_fault_returns_permanent_profile_unavailable();
         test_p29_fault_environment_is_exact();
         structured_launch_is_complete_and_fail_closed();

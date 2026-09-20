@@ -69,9 +69,14 @@ struct ZstdSourceTransferResult {
     std::optional<bool> system_source_reuse;
     // A long-lived sender sets this after any post-prepare outcome whose C/F
     // commit state is ambiguous, or when its bounded replay ledger is full.
-    // It is sticky for the route: the supervised C sidecar must be replaced
-    // before another distinct request may open F.
+    // It is sticky for the route: another distinct request may not open F.
+    // Unless route_local_failure is set, the supervised C sidecar must be
+    // replaced before any relationship accepts a new request.
     bool replacement_required = false;
+    // Transport exhaustion retains/quarantines only this relationship. It
+    // must not retire the shared C owner or reject other F relationships.
+    // Never set for typed preparation poison or uncertain local state.
+    bool route_local_failure = false;
 };
 
 struct ZstdSourceTransferConfig {

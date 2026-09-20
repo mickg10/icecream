@@ -111,8 +111,8 @@ std::string daemon_cache_directory_from_socket(
                : std::string(attempt_directory.substr(0, root_separator));
 }
 
-void append_ready_test_trace(std::string_view message) noexcept {
-    const char* path = ::getenv("ICECC_P50_TEST_READY_TRACE");
+void append_test_trace(const char* environment, std::string_view message) noexcept {
+    const char* path = ::getenv(environment);
     /* Supplying a private trace path is itself the opt-in.  Readiness is an
        infrastructure witness needed before canaries and must not depend on a
        workload's later strict-C1F1 policy knob. */
@@ -134,6 +134,14 @@ void append_ready_test_trace(std::string_view message) noexcept {
         break;
     }
     (void)::close(fd);
+}
+
+void append_ready_test_trace(std::string_view message) noexcept {
+    append_test_trace("ICECC_P50_TEST_READY_TRACE", message);
+}
+
+void append_fingerprint_test_trace(std::string_view message) noexcept {
+    append_test_trace("ICECC_P50_TEST_FINGERPRINT_TRACE", message);
 }
 
 void append_source_result_trace(
@@ -1312,7 +1320,7 @@ local::P50SourceTransferResult source_transfer_error(uint16_t code,
 
 local::P50SourceTransferResult source_transfer_result(
     const ZstdSourceTransferResult& transfer, CStoreGuid expected_c_guid) noexcept {
-    if (transfer.replacement_required) {
+    if (transfer.replacement_required && !transfer.route_local_failure) {
         return source_transfer_error(static_cast<uint16_t>(
             local::SourceTransferErrorCode::RouteReplacementRequired),
             transfer.attempts);
@@ -1728,7 +1736,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                             transfer_deadline,
                             std::span<const uint8_t>(*source_bytes));
                     }
-                    if (observed.replacement_required)
+                    if (observed.replacement_required && !observed.route_local_failure)
                         route_replacement_required_.store(
                             true, std::memory_order_release);
                     value = source_transfer_result(observed, expected_c_guid);
@@ -2821,10 +2829,16 @@ int run(const Options& options) noexcept {
         wait_p29_system_source_fingerprint_for(kP29FingerprintReadyBudget);
     switch (fingerprint_outcome) {
     case P29FingerprintOutcome::Completed:
+        append_fingerprint_test_trace("fingerprint completed\n");
+        break;
     case P29FingerprintOutcome::Unavailable:
+        append_fingerprint_test_trace("fingerprint unavailable\n");
+        break;
     case P29FingerprintOutcome::TimedOut:
+        append_fingerprint_test_trace("fingerprint timed-out\n");
         break;
     case P29FingerprintOutcome::Cancelled:
+        append_fingerprint_test_trace("fingerprint cancelled\n");
         return 2;
     }
     if (g_stop_requested != 0) {
