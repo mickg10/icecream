@@ -5,22 +5,22 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-fff328e2"
-FINAL_COMMIT = "fff328e25a5983197e41905246a880853511e791"
-FINAL_SOURCE_ARCHIVE = "2e7a7b9062d19d266363d3428001860291a169d8d0fdcb1325cc8d4c57ab76bf"
-FINAL_CLOSURE = "e5dda2b8a834047b7e6c53d8ba5b09684dd02529b76e8cd1e172f94e9fbf2637"
+FINAL_PRODUCT = "p50s4-diag-5675fc1d"
+FINAL_COMMIT = "5675fc1d58a7254638e77ce0cd55f0cb6a0f2f3f"
+FINAL_SOURCE_ARCHIVE = "d8928ad08c73772a9f4fb19071932d32021528dd88c973c80ddb26b068abf14c"
+FINAL_CLOSURE = "4aa20b6a99523b14aa04d2ad2f12123ee2c52074eb3a50c569def91793bae3dd"
 FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
 }
 FINAL_ROLE_HASHES = {
-    "scheduler": "3f376f1c7b5086db58a3cf5e25826f4a1ef538d6a8045dd6ff5fd6986c4e35e6",
-    "client": "f661d93315b027faa4cdfa34961450a6393b4c715ddf687641f7263532384bf9",
-    "daemon": "ca06985cefc260006f3eb673d467718eb02c42901d2b65b49edc391d126b0a3f",
+    "scheduler": "e6714d8daff6cde398c68c9df9611d3672daeb2df55d9f51e57af1dfb2e3bc38",
+    "client": "7ff9ef9bd79709cd3f10c0f024afe471f52874628e63f49cd8282f2c2e3c29d3",
+    "daemon": "bf6ff4477da9f97e58b05c503099bb054dbfd70a4aa8769d47d2115d4cdfa966",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
-BUILDER_HOSTS = {"tt-quietbox4", "tt-quietbox5"}
+BUILDER_HOSTS = {"tt-quietbox5"}
 
 
 def test_requalified_catalog_uses_the_final_product_lineage() -> None:
@@ -72,26 +72,26 @@ def test_final_product_binding_matches_verified_source_and_runtime() -> None:
     assert binding["commit"] == FINAL_COMMIT
     assert binding["archive_sha256"] == FINAL_SOURCE_ARCHIVE
     assert binding["closure_sha256"] == FINAL_CLOSURE
-    assert binding["id"] == "sha256:2882264273abef6ebb3e70299ef04e88744d49fb4efcec9fffe402c71dceb65e"
+    assert binding["id"] == "sha256:1df19cb5d11950075c70b379665908c779236e0c7d0671aec3277d7b0df16bac"
 
 
 def test_direct_builder_catalog_is_f_only_and_deletion_sensitive() -> None:
     farm = json.loads((INTEGRATION / "farm.example.json").read_text(encoding="utf-8"))
     hosts = {host["name"]: host for host in farm["hosts"]}
-    builders = {name: hosts[name] for name in ("tt-quietbox4", "tt-quietbox5")}
+    builders = {name: hosts[name] for name in ("tt-quietbox5",)}
 
     assert all(host["roles_allowed"] == ["F"] for host in builders.values())
-    assert {host["docker_context"] for host in builders.values()} == {"q4", "q5"}
+    assert {host["docker_context"] for host in builders.values()} == {"q5"}
     assert {host["lan_ip"] for host in builders.values()} == {
-        "10.0.27.125",
         "10.0.27.150",
     }
     assert "research7" not in hosts
+    assert "tt-quietbox4" not in hosts
+    assert "tt-quietbox4" not in farm["authority"]["hosts"]
     assert {
         name: farm["authority"]["hosts"][name]
         for name in builders
     } == {
-        "tt-quietbox4": {"class": "worker", "address": "10.0.27.125"},
         "tt-quietbox5": {"class": "worker", "address": "10.0.27.150"},
     }
 
@@ -106,7 +106,7 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
         workers = {item["name"]: item for item in instances if item["role"] == "F"}
         assert {name: item["host"] for name, item in workers.items()} == {
             "F1": "tt-quietbox5",
-            "F2": "tt-quietbox4",
+            "F2": "research6",
         }, path.name
         assert {item["role"] for item in instances if item["host"] in BUILDER_HOSTS} == {"F"}
 
@@ -118,7 +118,7 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
             "S70-b4-worker-bounces.json",
             "S70-b5-interner-failure.json",
         }:
-            assert workers["F2"]["host"] == "tt-quietbox4", path.name
+            assert workers["F2"]["host"] == "research6", path.name
         elif len(workers) == 2:
             assert workers["F2"]["host"] == "research6", path.name
 
@@ -155,8 +155,8 @@ def test_expanded_builder_placement_is_explicit_and_deletion_sensitive() -> None
     s95 = json.loads((SCENARIOS / "S95-cache-disk-full.json").read_text(encoding="utf-8"))
     s95_workers = {item["name"]: item for item in s95["instances"] if item["role"] == "F"}
     assert {name: item["host"] for name, item in s95_workers.items()} == {
-        "F1": "tt-quietbox5",
-        "F2": "tt-quietbox4",
+        "F1": "research6",
+        "F2": "tt-quietbox5",
     }
 
     # H5 qualifies current-product recovery on its authorized original hosts.

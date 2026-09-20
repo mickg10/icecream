@@ -16,7 +16,10 @@
     "checksum": true
   },
   "netname_prefix": "icefarm",
-  "port_range": [23000, 23999],
+  "port_range": [
+    23000,
+    23999
+  ],
   "hosts": [
     {
       "name": "tt-quietbox3",
@@ -27,7 +30,11 @@
       "cores": 32,
       "mem_gb": 256,
       "scratch_root": "/home/mickg10/farm-scratch",
-      "roles_allowed": ["S", "F", "C"],
+      "roles_allowed": [
+        "S",
+        "F",
+        "C"
+      ],
       "sudo": true,
       "netem": true,
       "shared_lan": "10.0.27.0/24"
@@ -41,21 +48,10 @@
       "cores": 32,
       "mem_gb": 256,
       "scratch_root": "/home/mickg10/farm-scratch",
-      "roles_allowed": ["F", "C"],
-      "sudo": true,
-      "netem": false,
-      "shared_lan": "10.0.27.0/24"
-    },
-    {
-      "name": "tt-quietbox4",
-      "ssh": "mickg10@tt-quietbox4",
-      "docker_context": "q4",
-      "lan_ip": "10.0.27.125",
-      "arch": "x86_64",
-      "cores": 16,
-      "mem_gb": 240,
-      "scratch_root": "/home/mickg10/farm-scratch",
-      "roles_allowed": ["F"],
+      "roles_allowed": [
+        "F",
+        "C"
+      ],
       "sudo": true,
       "netem": false,
       "shared_lan": "10.0.27.0/24"
@@ -69,7 +65,9 @@
       "cores": 32,
       "mem_gb": 240,
       "scratch_root": "/home/mickg10/farm-scratch",
-      "roles_allowed": ["F"],
+      "roles_allowed": [
+        "F"
+      ],
       "sudo": true,
       "netem": false,
       "shared_lan": "10.0.27.0/24"
@@ -83,7 +81,10 @@
       "cores": 20,
       "mem_gb": 128,
       "scratch_root": "/home/mickg/farm-scratch",
-      "roles_allowed": ["F", "C"],
+      "roles_allowed": [
+        "F",
+        "C"
+      ],
       "sudo": false,
       "netem": false,
       "shared_lan": "10.0.27.0/24"
@@ -97,7 +98,13 @@
       "manifest": "/tanksmall/scratch/ictmp/corpus7/manifest.txt",
       "manifest_sha256": "c362761c3a7e45af984ffd561c772783ab4f27efda7eb6f24afd84223e8233d0",
       "root": "/tanksmall/scratch/ictmp/corpus7/CMakeFiles",
-      "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+      "compression": {
+        "codec": "zstd",
+        "level": 19,
+        "long": 31,
+        "threads": 8,
+        "checksum": true
+      },
       "archives": {
         "files": {
           "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/fmt-100-files-zstd19-long31-v1.tar.zst",
@@ -115,7 +122,10 @@
           "binary_sha256": "dd91977c184e327710578363ad93ebb175c3a457b6236b874fd3911b7c055c65",
           "configuration_sha256": "30d282954b70763ea287fcefdd07dae11ebe12b056d56605f8d59fa732d40991",
           "version": "g++ (Debian 12.2.0-14+deb12u1) 12.2.0",
-          "arguments": ["-O2", "-fdiagnostics-color=never"]
+          "arguments": [
+            "-O2",
+            "-fdiagnostics-color=never"
+          ]
         }
       }
     },
@@ -131,7 +141,13 @@
         "sha256": "b43b5e72bcc23f744fd881dcc64cd71e7d10721af9e1b32fdcb1764f8fed2f0d"
       },
       "root": "/tanksmall/scratch/ictmp/src3/gecko-dev",
-      "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+      "compression": {
+        "codec": "zstd",
+        "level": 19,
+        "long": 31,
+        "threads": 8,
+        "checksum": true
+      },
       "archives": {
         "A": {
           "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-archives-20260905T1025Z/firefox-1000-A-zstd19-long31-v1.tar.zst",
@@ -158,12 +174,21 @@
           "binary_sha256": "dd5bb93311545d121dae93e31b3958aba449e97415d02c35a3391c0e4662bf93",
           "configuration_sha256": "72e2012f05218d8237ed2a6fe284d873feae7b69b1dfdc0c0b9d56d950a320bb",
           "version": "clang version 21.1.8 (https://github.com/conda-forge/clangdev-feedstock 9a0c00c7abbcade892ea988cb6239816cc91d7fc)",
-          "arguments": ["-O2", "-fdiagnostics-color=never"],
+          "arguments": [
+            "-O2",
+            "-fdiagnostics-color=never"
+          ],
           "toolchain": {
             "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/toolchains/clang21-conda-21.1.8-full-zstd19-long31-v1.tar.zst",
             "archive_bytes": 264898201,
             "archive_sha256": "f3f93d9b31d3df3f3261063ce9d9a80f1c2d9319904f5bd6f64fca011877cd1b",
-            "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+            "compression": {
+              "codec": "zstd",
+              "level": 19,
+              "long": 31,
+              "threads": 8,
+              "checksum": true
+            },
             "mount": "/tanksmall/MICKG2/mickg/miniconda3/envs/clang21",
             "unpacked_bytes": 2718868255
           }
@@ -177,13 +202,22 @@
       "turn_b_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-20260914-a4/turnB.manifest",
       "normalized_manifest_sha256": "48aa7a25f750d455bf3a5ce7d32a1420f35dc5d5edc66b3994b47810789b5a70",
       "pair_index_sha256": "77a3a65b6fa61e50ac0472b75f560b0a3f5fe7ec51059cb598e04da0e3a0d1be",
-      "root_header_body_law": {"affected": 617, "unaffected": 383},
+      "root_header_body_law": {
+        "affected": 617,
+        "unaffected": 383
+      },
       "authority_receipt": {
         "path": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-20260914-a4/authority.json",
         "sha256": "8d6ba8cd2560987c1145bd0cd5ed3cc784d7a7a83876b8c394bfa643841784a8"
       },
       "root": "/tanksmall/scratch/ictmp/src3/gecko-dev",
-      "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+      "compression": {
+        "codec": "zstd",
+        "level": 19,
+        "long": 31,
+        "threads": 8,
+        "checksum": true
+      },
       "archives": {
         "A": {
           "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-root-header-compile-valid-1000-archives-20260914T0600Z/firefox-root-header-1000-A-zstd19-long31-v1.tar.zst",
@@ -210,12 +244,21 @@
           "binary_sha256": "dd5bb93311545d121dae93e31b3958aba449e97415d02c35a3391c0e4662bf93",
           "configuration_sha256": "72e2012f05218d8237ed2a6fe284d873feae7b69b1dfdc0c0b9d56d950a320bb",
           "version": "clang version 21.1.8 (https://github.com/conda-forge/clangdev-feedstock 9a0c00c7abbcade892ea988cb6239816cc91d7fc)",
-          "arguments": ["-O2", "-fdiagnostics-color=never"],
+          "arguments": [
+            "-O2",
+            "-fdiagnostics-color=never"
+          ],
           "toolchain": {
             "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/toolchains/clang21-conda-21.1.8-full-zstd19-long31-v1.tar.zst",
             "archive_bytes": 264898201,
             "archive_sha256": "f3f93d9b31d3df3f3261063ce9d9a80f1c2d9319904f5bd6f64fca011877cd1b",
-            "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+            "compression": {
+              "codec": "zstd",
+              "level": 19,
+              "long": 31,
+              "threads": 8,
+              "checksum": true
+            },
             "mount": "/tanksmall/MICKG2/mickg/miniconda3/envs/clang21",
             "unpacked_bytes": 2718868255
           }
@@ -240,7 +283,11 @@
       "file_count": 16819,
       "enumeration": {
         "schema": "icefarm-system-source-manifest-v1",
-        "roots": ["/usr/include", "/usr/lib/gcc", "/usr/local/include"],
+        "roots": [
+          "/usr/include",
+          "/usr/lib/gcc",
+          "/usr/local/include"
+        ],
         "symlink_policy": "no-directory-follow;regular-file-symlinks-regularized"
       },
       "archive": {
@@ -248,7 +295,13 @@
         "sha256": "ee52009cded8fcbe9ca9490dc50942b00fc43c786f2113001de5f1c62094a5f6",
         "archive_bytes": 42426888,
         "unpacked_bytes": 277530174,
-        "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true}
+        "compression": {
+          "codec": "zstd",
+          "level": 19,
+          "long": 31,
+          "threads": 8,
+          "checksum": true
+        }
       }
     }
   },
@@ -279,28 +332,53 @@
     }
   },
   "protected": {
-    "process_patterns": ["bigfarm"],
+    "process_patterns": [
+      "bigfarm"
+    ],
     "never_touch_labels_other_than": "icefarm.*"
   },
   "authority": {
     "schema": "icecream-newgen-farm-authority-v1",
     "hosts": {
-      "tt-quietbox3": {"class": "submission", "address": "10.0.27.101"},
-      "tt-quietbox2": {"class": "worker", "address": "10.0.27.212"},
-      "tt-quietbox4": {"class": "worker", "address": "10.0.27.125"},
-      "tt-quietbox5": {"class": "worker", "address": "10.0.27.150"},
-      "research6": {"class": "orchestration", "address": "10.0.27.56"}
+      "tt-quietbox3": {
+        "class": "submission",
+        "address": "10.0.27.101"
+      },
+      "tt-quietbox2": {
+        "class": "worker",
+        "address": "10.0.27.212"
+      },
+      "tt-quietbox5": {
+        "class": "worker",
+        "address": "10.0.27.150"
+      },
+      "research6": {
+        "class": "orchestration",
+        "address": "10.0.27.56"
+      }
     },
     "role_stores": {
       "43": {
-        "scheduler": {"sha256": "5e85c16a12e33cc27900dab351a997fa49f801b89612272ffae9710e26372fb7"},
-        "client": {"sha256": "02b66cc29cd9431b410b443e1f5c1650d93f9ac7407e52cdd399c7c4e5bd34b3"},
-        "daemon": {"sha256": "d784931378fbba8464541a11fd4557aa47fff528159482350b4b5e27be3741ab"}
+        "scheduler": {
+          "sha256": "5e85c16a12e33cc27900dab351a997fa49f801b89612272ffae9710e26372fb7"
+        },
+        "client": {
+          "sha256": "02b66cc29cd9431b410b443e1f5c1650d93f9ac7407e52cdd399c7c4e5bd34b3"
+        },
+        "daemon": {
+          "sha256": "d784931378fbba8464541a11fd4557aa47fff528159482350b4b5e27be3741ab"
+        }
       },
       "50": {
-        "scheduler": {"sha256": "3f376f1c7b5086db58a3cf5e25826f4a1ef538d6a8045dd6ff5fd6986c4e35e6"},
-        "client": {"sha256": "f661d93315b027faa4cdfa34961450a6393b4c715ddf687641f7263532384bf9"},
-        "daemon": {"sha256": "ca06985cefc260006f3eb673d467718eb02c42901d2b65b49edc391d126b0a3f"}
+        "client": {
+          "sha256": "7ff9ef9bd79709cd3f10c0f024afe471f52874628e63f49cd8282f2c2e3c29d3"
+        },
+        "daemon": {
+          "sha256": "bf6ff4477da9f97e58b05c503099bb054dbfd70a4aa8769d47d2115d4cdfa966"
+        },
+        "scheduler": {
+          "sha256": "e6714d8daff6cde398c68c9df9611d3672daeb2df55d9f51e57af1dfb2e3bc38"
+        }
       }
     },
     "images": {
@@ -732,13 +810,31 @@
             "sha256": "fb40971b2be536a4e4bfd23825534879816526a014f8ea1a94b753d1d7e3ae50"
           }
         }
+      },
+      "p50s4-diag-5675fc1d": {
+        "archive_sha256": "d8928ad08c73772a9f4fb19071932d32021528dd88c973c80ddb26b068abf14c",
+        "closure_sha256": "4aa20b6a99523b14aa04d2ad2f12123ee2c52074eb3a50c569def91793bae3dd",
+        "commit": "5675fc1d58a7254638e77ce0cd55f0cb6a0f2f3f",
+        "id": "sha256:1df19cb5d11950075c70b379665908c779236e0c7d0671aec3277d7b0df16bac"
       }
     },
     "topologies": {
-      "C1F1": {"f_relationships": 1, "slots_per_f": 24},
-      "C1F2": {"f_relationships": 2, "slots_per_f": 24},
-      "C2F2": {"f_relationships": 2, "slots_per_f": 24},
-      "C2F9": {"f_relationships": 9, "slots_per_f": 4}
+      "C1F1": {
+        "f_relationships": 1,
+        "slots_per_f": 24
+      },
+      "C1F2": {
+        "f_relationships": 2,
+        "slots_per_f": 24
+      },
+      "C2F2": {
+        "f_relationships": 2,
+        "slots_per_f": 24
+      },
+      "C2F9": {
+        "f_relationships": 9,
+        "slots_per_f": 4
+      }
     }
   }
 }

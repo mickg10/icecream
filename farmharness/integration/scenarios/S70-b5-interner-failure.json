@@ -3,7 +3,7 @@
   "id": "S70-b5-interner-failure",
   "shape": "S'C'F'",
   "images": {
-    "new": "p50s4-fff328e2"
+    "new": "p50s4-diag-5675fc1d"
   },
   "instances": [
     {
@@ -23,7 +23,7 @@
     {
       "name": "F2",
       "role": "F",
-      "host": "tt-quietbox4",
+      "host": "research6",
       "image": "new",
       "slots": 12
     },

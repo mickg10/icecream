@@ -1,73 +1,83 @@
 {
-  "schema": "icefarm-scenario-v1",
+  "controls": [],
+  "expect": {
+    "engagement": "s95-cache-disk-full",
+    "error106_max": 200,
+    "exact": "all",
+    "reuse": "all-false-when-p29v1",
+    "tail_to_incapable": 0,
+    "wall_s_max": null,
+    "wedges": 0
+  },
   "id": "S95-cache-disk-full",
-  "shape": "S'C'F'",
   "images": {
-    "new": "p50s4-fff328e2"
+    "new": "p50s4-diag-5675fc1d"
   },
   "instances": [
     {
-      "name": "S1",
-      "role": "S",
+      "env": {
+        "ICECC_P50_PROFILE": "P29V1"
+      },
       "host": "tt-quietbox3",
       "image": "new",
-      "env": {"ICECC_P50_PROFILE": "P29V1"}
+      "name": "S1",
+      "role": "S"
     },
     {
+      "host": "research6",
+      "image": "new",
       "name": "F1",
       "role": "F",
+      "slots": 1
+    },
+    {
       "host": "tt-quietbox5",
       "image": "new",
-      "slots": 1
-    },
-    {
       "name": "F2",
       "role": "F",
-      "host": "tt-quietbox4",
-      "image": "new",
       "slots": 1
     },
     {
-      "name": "C1",
-      "role": "C",
+      "client_environment": "debian-gcc",
+      "env": {
+        "ICECC_P50_MODE": "on"
+      },
       "host": "tt-quietbox2",
       "image": "new",
-      "client_environment": "debian-gcc",
-      "env": {"ICECC_P50_MODE": "on"}
+      "name": "C1",
+      "role": "C"
     }
   ],
-  "workload": {
-    "driver": "tu-manifest",
-    "corpus": "fmt-100",
-    "turns": ["A"],
-    "jobs": 2,
-    "clients": ["C1"],
-    "repeat": 2,
-    "oracle": "local-sha"
+  "network": {
+    "shaping": []
   },
-  "network": {"shaping": []},
+  "schema": "icefarm-scenario-v1",
+  "shape": "S'C'F'",
   "timeline": [
     {
-      "trigger": "job 12",
       "action": "disk_fill",
-      "instance": "F1"
+      "instance": "F1",
+      "trigger": "job 12"
     }
   ],
-  "expect": {
-    "exact": "all",
-    "engagement": "s95-cache-disk-full",
-    "wedges": 0,
-    "error106_max": 200,
-    "tail_to_incapable": 0,
-    "reuse": "all-false-when-p29v1",
-    "wall_s_max": null
-  },
-  "controls": [],
   "timeouts": {
-    "images_s": 1800,
-    "up_s": 300,
-    "turn_s": 1800,
     "collect_s": 600,
-    "down_s": 300
+    "down_s": 300,
+    "images_s": 1800,
+    "turn_s": 1800,
+    "up_s": 300
+  },
+  "workload": {
+    "clients": [
+      "C1"
+    ],
+    "corpus": "fmt-100",
+    "driver": "tu-manifest",
+    "jobs": 2,
+    "oracle": "local-sha",
+    "repeat": 2,
+    "turns": [
+      "A"
+    ]
   }
 }
