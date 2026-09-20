@@ -773,6 +773,25 @@
           }
         }
       },
+      "p50s4-h3-armed-57a1e336": {
+        "archive_sha256": "bce76c1e718a79e4e083d605e3980720452730f115c5e2dc381a1d56d753147b",
+        "base_archive_sha256": "41e543b313171d0a9684fa772e976489bccc07925326511885dcf2aaec5edcd7",
+        "base_commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "base_image": "p50s4-57a1e336",
+        "closure_sha256": "401bf4e1905a5861225b8cf3e0a7c173c1ed8aede8d75e4b7cb03b15f77334f9",
+        "commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "id": "sha256:dcd2bee7366b035a4c8fa6185e72a0ac7bfbc50205216f5e863cbd8dec834102",
+        "kind": "scheduler-mutant",
+        "patch_path": "mutants/scheduler-tail-armed.patch",
+        "patch_sha256": "e256217c5c1836de4b2031f9032f2f7009516ef1af7406de7e7c98e4420a6ccb",
+        "recipe_schema": "icefarm-scheduler-mutant-recipe-v1",
+        "recipe_sha256": "bce76c1e718a79e4e083d605e3980720452730f115c5e2dc381a1d56d753147b",
+        "role_overrides": {
+          "scheduler": {
+            "sha256": "38e5fc948a6edc25aaf550eb1a9afa9d2020be6850e86069050623d81bec024a"
+          }
+        }
+      },
       "p50s4-h3-tail-mutant": {
         "kind": "scheduler-mutant",
         "base_image": "p50s4-89917385",

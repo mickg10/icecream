@@ -53,7 +53,7 @@ def test_requalified_catalog_uses_the_final_product_lineage() -> None:
 def test_mutant_scenarios_use_the_final_product_lineage() -> None:
     expected = {
         "H3-mutant-scheduler.json": {
-            "mutant": "p50s4-h3-tail-57a1e336",
+            "mutant": "p50s4-h3-armed-57a1e336",
             "new": FINAL_PRODUCT,
             "old": "p43-1.4.0",
         },

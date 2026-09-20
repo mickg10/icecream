@@ -31,6 +31,7 @@ PATCH = ROOT / "mutants/scheduler-tail-armed.patch"
 def test_new_recipe_plan_selects_arming_and_old_plan_does_not():
     farm = _farm()
     scenario = load_scenario_spec(ROOT / "scenarios/H3-mutant-scheduler.json", farm)
+    scenario.data["images"]["mutant"] = "p50s4-h3-tail-57a1e336"
     old = farmtest.build_plan(farm, scenario, run_id="h3-old")
     assert "h3_arm_contract" not in old
     label = scenario.data["images"]["mutant"]

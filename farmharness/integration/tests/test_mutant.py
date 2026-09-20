@@ -351,6 +351,7 @@ def test_h3_failure_collection_binds_dispatch_rejection_and_failed_workload(
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H3-mutant-scheduler.json", farm
     )
+    scenario.data["images"]["mutant"] = "p50s4-h3-tail-57a1e336"
     if armed:
         label = scenario.data["images"]["mutant"]
         image = farm.data["authority"]["images"][label]

@@ -3,7 +3,7 @@
   "id": "H3-mutant-scheduler",
   "shape": "mixed",
   "images": {
-    "mutant": "p50s4-h3-tail-57a1e336",
+    "mutant": "p50s4-h3-armed-57a1e336",
     "new": "p50s4-diag-5675fc1d",
     "old": "p43-1.4.0"
   },
