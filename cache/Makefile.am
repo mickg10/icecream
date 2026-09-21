@@ -97,6 +97,7 @@ EXTRA_DIST = \
 	codec/FORMAT.md \
 	codec/README.md \
 	codec/p29_intern.h \
+	codec/p29_online_s1.h \
 	codec/p29_wire.h \
 	codec/provider.h \
 	codec/tuples.h \
@@ -246,12 +247,11 @@ EXTRA_DIST = \
 	P50_PREBOUND_TWO_ROLE.md \
 	p50_adopted_outcome_writer.cpp \
 	p50_adopted_outcome_writer.h \
-	../vendor/libbsc/PROVENANCE \
-	../vendor/libbsc/SOURCE-MANIFEST.sha256 \
-	../vendor/libbsc/LICENSE \
-	../vendor/grouprlz/grz2.cpp \
-	../vendor/grouprlz/grz2g.cpp \
 	formal/README.md
+
+# Historical GRZ/libbsc generators stay under research/ in Git, not the product
+# source distribution. The codec tuple API and frozen test vectors stay above
+# and in unittests; none of them builds or links a GRZ/libbsc implementation.
 
 # The historical explicit list above remains compatible, while this reviewed
 # manifest closes omissions as new formal lanes and mutant configs are added.

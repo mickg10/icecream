@@ -17,7 +17,7 @@ pending ownership or the endpoint reducer.
 This is an internal production seam: it introduces no wire fields, changes no
 digest or identity law, and does not alter the existing ZSTD_TU exception or
 publication behavior. The P29V1 adapter uses the reviewed
-`capability/grouprlz/p29_online_s1.h` provider and carries its framed inner
+`cache/codec/p29_online_s1.h` provider and carries its framed inner
 stream through BODY, NEED, and FILL; it is not a ZSTD codec alias. Unsupported,
 undeclared, or unnegotiated profiles fail closed at the factory. A lost
 terminal is replayed by the existing endpoint route: the committed

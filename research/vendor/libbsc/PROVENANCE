@@ -1,0 +1,39 @@
+Historical GRZ_RESIDUAL libbsc input contract (research archive only)
+==================================================================
+
+GRZ and the --with-libbsc configure/link surface were removed from the
+revision-1 product in stage 2 (624702e9). These sources are retained only as
+frozen research/golden provenance; they are not built or shipped by the
+product source distribution. The historical contract below is not a current
+build instruction. Current profile ID 3 is ZSTD_ROUTE, not GRZ.
+
+Before that removal, GRZ was enabled by configure --with-libbsc[=PREFIX].
+The reviewed GROUP-RLZ residual implementation is imported from:
+  capability/grouprlz/residual_group_codec.h
+  review ref: origin/implementer/issue16-capability
+  review commit: 0b70be88b57e5162442b04fd6e795d06bbc61034
+  source md5: a5bd5811f6163a7f223ec69d0f27389b
+  source sha256: 9f4d721e1495987bc1d5f207e23d31a76fab9b780d5610832927df8f398895f9
+The reviewed GROUP-RLZ stream references remain pinned for follow-up library
+extraction (the live endpoint uses only the reviewed residual frame state):
+  grz2g.cpp blob: 7f57775694b8962d3d92f38ce7e3213842139bc2
+  grz2.cpp blob: fa63c7b8ce40a1366b6ba4dc65a59839bfaa7419
+  closure provenance blob: 3aed5ec4fa42b211d0bbefceb147a6ed83b14332
+  corrected source SHA256: 57ef6970cc15625f569f1d4ee5a2365620b1bd62aaee970c3c53b20af2286599
+  canonical source package copies (not standalone product binaries):
+    vendor/grouprlz/grz2.cpp  blob fa63c7b8ce40a1366b6ba4dc65a59839bfaa7419
+    vendor/grouprlz/grz2g.cpp blob 7f57775694b8962d3d92f38ce7e3213842139bc2
+
+libbsc is pinned to upstream revision:
+  baffa62c70b6ebbecc9af14ce550e965ea247680
+  source checkout: /tanksmall/scratch/ictmp/libbsc-issue16
+  reproducible git-archive tar SHA256 (prefix libbsc-baffa62...): 39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf
+  license: Apache-2.0, SHA256 cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+  local patches: none (clean revision; build directories are ignored)
+  source membership: vendor/libbsc/SOURCE-MANIFEST.sha256
+
+The historical build accepted a source prefix or explicit
+LIBBSC_CFLAGS/LIBBSC_LIBS. A requested but unavailable dependency was a
+configure error; its default build had no ICECC_P50_WITH_LIBBSC definition
+and excluded GRZ from operational and advertised masks. That old registry
+reserved ID 3 for GRZ; it does not describe the current revision-1 registry.

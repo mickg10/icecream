@@ -1,5 +1,9 @@
 # P48 to Protocol-50 product convergence
 
+Historical paths in this record name the original commits. In the current
+tree, `p29_online_s1.h` lives under `cache/codec/`, and the two measurement
+TSVs live under `research/measurements/`; their bytes are unchanged.
+
 This branch is the standalone Protocol-50 endpoint/core convergence substep onto the accepted
 P48 product. It does not complete Epoch 2 / M2.5 and does not attach the endpoint to scheduler,
 daemon, wrapper, or compiler-pipe paths. The P48 and R2 source histories have no Git merge

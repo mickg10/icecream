@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -10,6 +12,48 @@ from farmharness.integration import farmtest
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def _catalog_image_labels() -> set[str]:
+    return {
+        label
+        for path in (ROOT / "farmharness/integration/scenarios").glob("*.json")
+        for label in json.loads(path.read_text(encoding="utf-8"))["images"].values()
+    }
+
+
+def _command_labels(command: str) -> list[str]:
+    labels = re.findall(r'--labels "([^"]+)"', command)
+    assert len(labels) == 1
+    return labels[0].split(",")
+
+
+def test_image_defaults_match_current_catalog_in_both_makefiles() -> None:
+    expected = _catalog_image_labels()
+    # The old-generation image and H1's deliberately wrong image are both
+    # necessary; "old" is not the same thing as "unused".
+    assert {"p43-1.4.0", "p50s2-5b2e5801"} <= expected
+    for name in ("GNUmakefile", "Makefile.am"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        labels = re.search(r"^ICEFARM_SEALED_LABELS = (.+)$", text, re.MULTILINE)
+        assert labels is not None
+        actual = labels[1].split(",")
+        assert len(actual) == len(set(actual))
+        assert set(actual) == expected, name
+        assert "ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)\n" in text
+
+
+@pytest.mark.parametrize("target", ["integration_images", "integration_source_archives"])
+def test_historical_image_work_requires_but_still_accepts_explicit_labels(target: str) -> None:
+    result = subprocess.run(
+        (
+            "make", "--no-print-directory", "-n", target,
+            "LABELS=p50s4-89917385",
+            "ICEFARM_SOURCE_ARCHIVE_DIR=/tanksmall/scratch/ictmp/source-inventory",
+        ),
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    assert _command_labels(result.stdout) == ["p50s4-89917385"]
 
 
 def test_one_farm_temp_variable_routes_all_standard_temp_variables(
@@ -73,20 +117,7 @@ def test_image_make_target_is_scratch_routed() -> None:
         assert f'{variable}="/tmp/i"' in result.stdout
     assert result.stdout.count("farmharness.integration.farmtest images") == 2
     assert result.stdout.count("--foundations") == 1
-    assert (
-        '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
-        'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
-        'p50s4-57a1e336,p50s4-h3-tail-57a1e336,p50s4-a82d72d8,'
-        'p50s90-f-revision-2-a82d72d8,p50s90-f-hidden-skew-a82d72d8,'
-        'p50s4-f9648cc1,p50s90-f-revision-2-f9648cc1,'
-        'p50s90-f-hidden-skew-f9648cc1"'
-    ) in result.stdout
-    assert "p50s30-f-refusal-mutant-candidate" not in result.stdout
-    assert "p50s30-f-refusal-0c820e79" not in result.stdout
-    assert "p50s30-f-refusal-2deb91d6" not in result.stdout
-    assert "p50s30-f-refusal-57a1e336" not in result.stdout
-    assert "p50s90-f-revision-2-candidate" not in result.stdout
-    assert "p50s90-f-revision-2-57a1e336" not in result.stdout
+    assert set(_command_labels(result.stdout)) == _catalog_image_labels()
     assert '--repo "' in result.stdout
 
     retained = subprocess.run(
@@ -144,20 +175,7 @@ def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
     assert 'ICEFARM_TMPDIR="/tmp/i"' in result.stdout
     assert "farmharness.integration.farmtest source-archives" in result.stdout
     assert '--output-dir "/tanksmall/scratch/ictmp/source-inventory"' in result.stdout
-    assert (
-        '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
-        'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
-        'p50s4-57a1e336,p50s4-h3-tail-57a1e336,p50s4-a82d72d8,'
-        'p50s90-f-revision-2-a82d72d8,p50s90-f-hidden-skew-a82d72d8,'
-        'p50s4-f9648cc1,p50s90-f-revision-2-f9648cc1,'
-        'p50s90-f-hidden-skew-f9648cc1,'
-        'p50s30-f-refusal-mutant-candidate,'
-        'p50s30-f-refusal-0c820e79,'
-        'p50s30-f-refusal-2deb91d6,'
-        'p50s30-f-refusal-57a1e336,'
-        'p50s90-f-revision-2-candidate,'
-        'p50s90-f-revision-2-57a1e336"'
-    ) in result.stdout
+    assert set(_command_labels(result.stdout)) == _catalog_image_labels()
 
 
 def test_autotools_source_exposes_the_same_required_targets() -> None:

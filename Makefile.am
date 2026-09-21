@@ -3,29 +3,35 @@
 # explicit entries `make dist` silently produced a tarball missing the very
 # tests and tools the reports describe.
 EXTRA_DIST = README.md \
-	AUDIT-ISSUE-1.md \
-	DEPLOYMENT-MATRIX.md \
-	PERF-REPORT.md \
-	WEBGUI-REVIEW.md \
+	PROJECT_STATE.md \
+	research/README.md \
+	research/reports/AUDIT-ISSUE-1.md \
+	research/reports/BENCH \
+	research/reports/DEPLOYMENT-MATRIX.md \
+	research/reports/P50_RESULT_DISPOSITION_WIRE_AUDIT.md \
+	research/reports/PERF-REPORT.md \
+	research/reports/WEBGUI-REVIEW.md \
 	GNUmakefile \
 	log_extractor \
 	package_builder \
 	tests/compose \
 	tests/stress \
 	tests/webgui \
-	capability/grouprlz/p29_online_s1.h \
-	capability/grouprlz/alpha_line_codec.h \
-	capability/grouprlz/runway-census.tsv \
-	capability/distribution/firefox-corrected.compile-trace.tsv \
+	research/measurements/runway-census.tsv \
+	research/measurements/firefox-corrected.compile-trace.tsv \
+	research/distribution/S5-STATISTICS-CONTRACT.md \
+	research/distribution/s5-statistics.schema.json \
+	research/distribution/s5_statistics.py \
+	research/distribution/verify_s5_statistics.py \
 	distro_installed_identity.sh \
 	distro_installed_identity_gates.sh \
 	s1b_validate_installed_facts.py \
 	distro_probe.sh \
 	S1B_EXIT_MANIFEST.md
 
-# Keep the farm tooling distributable without recursively copying private or
-# generated files from the working tree.  The reviewed manifest contains only
-# tracked paths; its test rejects farm.local.json, results, caches and symlinks.
+# Keep the active farm tooling and relocated research replay tooling
+# distributable without recursively copying private or generated files.
+# The explicit manifest rejects farm.local.json, results, caches and symlinks.
 ICEFARM_DIST_MANIFEST = $(srcdir)/farmharness/DISTFILES
 ICEFARM_DIST_FILES = $(shell sed -e '/^[[:space:]]*$$/d' "$(ICEFARM_DIST_MANIFEST)")
 EXTRA_DIST += farmharness/DISTFILES $(ICEFARM_DIST_FILES)
@@ -39,8 +45,10 @@ ICEFARM_TMPDIR ?= /tmp/i
 ICEFARM_TMP_ENV = env ICEFARM_TMPDIR="$(ICEFARM_TMPDIR)" \
 	TMPDIR="$(ICEFARM_TMPDIR)" TMP="$(ICEFARM_TMPDIR)" \
 	TEMP="$(ICEFARM_TMPDIR)" TEMPDIR="$(ICEFARM_TMPDIR)"
-ICEFARM_SEALED_LABELS = p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,p50s4-57a1e336,p50s4-h3-tail-57a1e336,p50s4-a82d72d8,p50s90-f-revision-2-a82d72d8,p50s90-f-hidden-skew-a82d72d8,p50s4-f9648cc1,p50s90-f-revision-2-f9648cc1,p50s90-f-hidden-skew-f9648cc1
-ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS),p50s30-f-refusal-mutant-candidate,p50s30-f-refusal-0c820e79,p50s30-f-refusal-2deb91d6,p50s30-f-refusal-57a1e336,p50s90-f-revision-2-candidate,p50s90-f-revision-2-57a1e336
+# Exactly the current scenario catalogue, including legacy and fault controls.
+# Historical experiments remain available through an explicit LABELS= override.
+ICEFARM_SEALED_LABELS = p43-1.4.0,p50s2-5b2e5801,p50s30-f-refusal-57a1e336,p50s4-diag-b269fad9,p50s4-h3-armed-57a1e336,p50s90-f-hidden-skew-f9648cc1,p50s90-f-revision-2-f9648cc1
+ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
 

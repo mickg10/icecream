@@ -129,7 +129,7 @@ BODY header.
 The residual-group frame is one u32le selector/length word followed by its
 payload.  Bits 31..29 select `0=zstd-3`, `1=libbsc BWT+QLFC`, or `2=zstd-10`;
 bits 28..0 are the exact payload length.  This is defined in
-`capability/grouprlz/residual_group_codec.h:1-14`.
+`research/codecs/residual_group_codec.h:1-14`.
 
 ## ZSTD product v0
 

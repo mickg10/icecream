@@ -1,6 +1,6 @@
 # Real-machine stress drivers
 
-Used for the results in DEPLOYMENT-MATRIX.md section 7.  These are
+Used for the results in [DEPLOYMENT-MATRIX.md](../../research/reports/DEPLOYMENT-MATRIX.md) section 7. These are
 environment-specific harnesses, parameterized via:
 
 - `STRESS_SCHED_IP`   LAN IP of the host running the scheduler(s) + c-role

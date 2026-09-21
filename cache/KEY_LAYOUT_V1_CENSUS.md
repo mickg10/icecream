@@ -7,8 +7,8 @@ objects are much coarser and repeated content reuses an earlier key.
 
 | checked-in input | builds/TUs | raw bytes |
 |---|---:|---:|
-| `capability/grouprlz/runway-census.tsv` | 19 corpora / 9,616 TUs | 29,012,306,127 |
-| `capability/distribution/firefox-corrected.compile-trace.tsv` | 1 build / 2,498 TUs | 15,240,876,398 |
+| `research/measurements/runway-census.tsv` | 19 corpora / 9,616 TUs | 29,012,306,127 |
+| `research/measurements/firefox-corrected.compile-trace.tsv` | 1 build / 2,498 TUs | 15,240,876,398 |
 | combined conservative charge | 12,114 TUs | 44,253,182,525 |
 
 KeyLayoutV1 is derived in `protocol50.h`: 5 type bits, 10 generation bits, and 49 ordinal

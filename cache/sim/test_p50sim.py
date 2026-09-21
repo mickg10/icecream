@@ -33,7 +33,7 @@ def write_role_traces(artifacts: Path, rows: list[dict[str, object]]) -> None:
 
 def invoke_explicit_runner(artifacts: Path, cell: str, output: Path) -> subprocess.CompletedProcess[str]:
     root = HERE.parents[1]
-    command = [str(root / "farmharness/s7_warm_replay.py"), "--cell", cell, "--out", str(output)]
+    command = [str(root / "research/farmharness/s7_warm_replay.py"), "--cell", cell, "--out", str(output)]
     if cell.endswith("/warm"):
         command += [
             "--prewarm-input", str(artifacts / "preprocessed.ii"),

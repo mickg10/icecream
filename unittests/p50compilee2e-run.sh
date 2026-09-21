@@ -634,7 +634,7 @@ if test -n "$reference_witness"; then
         echo "FAIL: reference reuse requires external batch, plan, authority, and image identity" >&2
         exit 1
     }
-    python3 "$src/farmharness/s8_reference_witness.py" verify \
+    python3 "$src/research/farmharness/s8_reference_witness.py" verify \
         --package "$reference_witness" --batch-manifest "$batch_manifest" \
         --predictive-plan "$predictive_plan" --authority "$reference_authority" \
         --image-id "$ICECC_P50_REFERENCE_IMAGE_ID" \

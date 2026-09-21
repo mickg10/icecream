@@ -1,6 +1,6 @@
 #include "cache/codec/p29_intern.h"
 #include "cache/p50_slice0.h"
-#include "capability/grouprlz/p29_online_s1.h"
+#include "cache/codec/p29_online_s1.h"
 
 #include <zstd.h>
 

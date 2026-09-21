@@ -10,6 +10,10 @@ dynamically schedules the compile jobs to the fastest free server. This
 advantage pays off mostly for shared computers, if you're the only user
 on x machines, you have full control over them.
 
+For this branch's qualification status, retained compression modes, and cleanup
+boundaries, see [PROJECT_STATE.md](PROJECT_STATE.md).
+Experimental code and historical reports live under [research/](research/README.md).
+
 Table of Contents
 
 -   [Installation](#installation)

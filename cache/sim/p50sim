@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 try:
-    from farmharness.s8_schema import CORPORA, PROFILES, REGIMES
+    from research.farmharness.s8_schema import CORPORA, PROFILES, REGIMES
 except ImportError as error:  # A missing immutable contract must fail closed.
     raise RuntimeError("p50sim cannot load the shared S8 cell contract") from error
 

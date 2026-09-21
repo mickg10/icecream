@@ -1,6 +1,6 @@
 #pragma once
 
-#include "capability/grouprlz/p29_online_s1.h"
+#include "p29_online_s1.h"
 #include "services/digest128.h"
 
 #include <zstd.h>

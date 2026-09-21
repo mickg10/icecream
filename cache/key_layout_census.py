@@ -17,8 +17,8 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
 
 
 def render(root: Path) -> str:
-    runway_path = root / "capability/grouprlz/runway-census.tsv"
-    firefox_path = root / "capability/distribution/firefox-corrected.compile-trace.tsv"
+    runway_path = root / "research/measurements/runway-census.tsv"
+    firefox_path = root / "research/measurements/firefox-corrected.compile-trace.tsv"
     runway = read_tsv(runway_path)
     firefox = read_tsv(firefox_path)
     runway_tus = sum(int(row["total_tus"]) for row in runway)
@@ -36,8 +36,8 @@ objects are much coarser and repeated content reuses an earlier key.
 
 | checked-in input | builds/TUs | raw bytes |
 |---|---:|---:|
-| `capability/grouprlz/runway-census.tsv` | {len(runway)} corpora / {runway_tus:,} TUs | {runway_raw:,} |
-| `capability/distribution/firefox-corrected.compile-trace.tsv` | 1 build / {len(firefox):,} TUs | {firefox_raw:,} |
+| `research/measurements/runway-census.tsv` | {len(runway)} corpora / {runway_tus:,} TUs | {runway_raw:,} |
+| `research/measurements/firefox-corrected.compile-trace.tsv` | 1 build / {len(firefox):,} TUs | {firefox_raw:,} |
 | combined conservative charge | {runway_tus + len(firefox):,} TUs | {total_raw:,} |
 
 KeyLayoutV1 is derived in `protocol50.h`: 5 type bits, 10 generation bits, and 49 ordinal

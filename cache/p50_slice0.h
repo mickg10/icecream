@@ -2,7 +2,7 @@
 
 #include "p50_actions.h"
 #include "protocol50.h"
-#include "capability/grouprlz/p29_online_s1.h"
+#include "codec/p29_online_s1.h"
 
 #include <array>
 #include <chrono>

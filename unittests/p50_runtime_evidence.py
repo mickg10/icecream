@@ -249,12 +249,12 @@ def verify_runtime_artifact(document: Mapping[str, Any]) -> dict[str, Any]:
             else:
                 try:
                     try:
-                        from capability.distribution.s5_statistics import verify_preregistered
+                        from research.distribution.s5_statistics import verify_preregistered
                     except ImportError:
                         root = str(Path(__file__).resolve().parents[1])
                         if root not in sys.path:
                             sys.path.insert(0, root)
-                        from capability.distribution.s5_statistics import verify_preregistered
+                        from research.distribution.s5_statistics import verify_preregistered
                     verifier_result = verify_preregistered(
                         preregistration, evidence,
                         expected_digest=expected_digest,
