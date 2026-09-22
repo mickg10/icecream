@@ -135,12 +135,23 @@ test "$layout" = single -o "$layout" = paired
 test "$strict_p50" = 0 -o "$strict_p50" = 1
 event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}
 s60_admit_through=${ICEFARM_S60_ADMIT_THROUGH:-0}
+disk_fill_worker=${ICEFARM_DISK_FILL_WORKER:-}
+disk_fill_trigger=${ICEFARM_DISK_FILL_TRIGGER:-0}
 case "$s60_admit_through" in
     ''|*[!0-9]*) echo "invalid S60 admission boundary" >&2; exit 65 ;;
 esac
 case "$event_serial_through" in
     ''|*[!0-9]*) echo "invalid event serial boundary" >&2; exit 65 ;;
 esac
+case "$disk_fill_trigger" in
+    ''|*[!0-9]*) echo "invalid disk-fill trigger" >&2; exit 65 ;;
+esac
+if test "$disk_fill_trigger" -gt 0
+then
+    printf '%s' "$disk_fill_worker" | grep -Eq '^F[1-9][0-9]*$'
+else
+    test -z "$disk_fill_worker"
+fi
 test "$compiler_arg_count" -ge 1
 test -x "$compiler"
 test "$(sha256sum "$compiler" | awk '{print $1}')" = "$expected_compiler_digest"
@@ -718,6 +729,7 @@ compile_one() {
     mkdir "$job_dir"
     started=$(date +%s%3N)
     strict=()
+    preferred=()
     job_compiler_args=()
     compiler_arg_index=0
     while test "$compiler_arg_index" -lt "$compiler_arg_count"
@@ -727,6 +739,10 @@ compile_one() {
         compiler_arg_index=$((compiler_arg_index + 1))
     done
     test "$strict_p50" -eq 0 || strict=(ICECC_P50_C1F1_REQUIRED=1)
+    if test "$disk_fill_trigger" -gt 0 -a "$index" -eq "$disk_fill_trigger"
+    then
+        preferred=(ICECC_PREFERRED_HOST="$disk_fill_worker")
+    fi
     set +e
     env \
         ICECC_DEBUG=debug \
@@ -734,6 +750,7 @@ compile_one() {
         ICECC_TEST_REMOTEBUILD=1 \
         ICECC_VERSION="$environment" \
         "${strict[@]}" \
+        "${preferred[@]}" \
         timeout "$per_job_timeout" \
         /opt/icecream/bin/icecc "$compiler" "${job_compiler_args[@]}" \
             -c "$source" -o "$remote_object" >"$output_log" 2>&1
@@ -879,6 +896,7 @@ export -f read_boundary_release compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
 export gate_root gate_state gate_lock gate_active event_serial_through s60_admit_through
+export disk_fill_worker disk_fill_trigger
 export resume_mode resume_indices
 
 set +e
@@ -1097,6 +1115,23 @@ def _driver_command(
     strict_p50 = int(_strict_p50_required(scenario, plan))
     active_loss_serial_through = _active_loss_serial_through(scenario)
     s60_admit_through = _s60_admit_through(scenario, corpus)
+    timeline = scenario.data.get("timeline", [])
+    preferred_worker = (
+        timeline[0].get("instance")
+        if scenario.data.get("expect", {}).get("engagement")
+        == "s95-cache-disk-full"
+        and isinstance(timeline, list)
+        and len(timeline) == 1
+        and isinstance(timeline[0], dict)
+        and timeline[0].get("action") == "disk_fill"
+        else None
+    )
+    disk_fill_trigger = 0
+    if preferred_worker is not None:
+        match = re.fullmatch(r"job ([1-9][0-9]*)", timeline[0].get("trigger", ""))
+        if match is None:
+            raise WorkloadError("S95 disk fill needs a positive job trigger")
+        disk_fill_trigger = int(match.group(1))
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300
@@ -1107,6 +1142,14 @@ def _driver_command(
             "exec",
             "--user",
             "65534:65534",
+            *(
+                (
+                    "--env", f"ICEFARM_DISK_FILL_WORKER={preferred_worker}",
+                    "--env", f"ICEFARM_DISK_FILL_TRIGGER={disk_fill_trigger}",
+                )
+                if isinstance(preferred_worker, str) and preferred_worker
+                else ()
+            ),
             *(
                 ("--env", f"ICEFARM_S60_ADMIT_THROUGH={s60_admit_through}")
                 if s60_admit_through else ()

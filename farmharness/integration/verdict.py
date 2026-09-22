@@ -34,7 +34,7 @@ HEADER_EDIT_SCHEMA = "icefarm-header-edit-v1"
 DISK_FILL_SCHEMA = "icefarm-disk-fill-v1"
 CACHE_DISK_FAULT_PATH = "/var/cache/icecream"
 CACHE_DISK_FAULT_FILE = "/var/cache/icecream/.icefarm-disk-fill"
-CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
+CACHE_DISK_FAULT_BYTES = 512 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 STALL_LIMIT_MS = 120_000
@@ -4822,9 +4822,22 @@ def _shape_clauses(
                 for item in instances
                 if isinstance(item, Mapping) and isinstance(item.get("name"), str)
             }
+            timeline = scenario.get("timeline")
+            filled_worker = (
+                timeline[0].get("instance")
+                if isinstance(timeline, list) and len(timeline) == 1
+                and isinstance(timeline[0], Mapping)
+                and timeline[0].get("action") == "disk_fill"
+                else None
+            )
+            target_workers = {
+                item.get("name")
+                for item in instances
+                if isinstance(item, Mapping) and item.get("role") == "F"
+            }
             expected_event = {
                 "action": "disk_fill",
-                "instance": "F1",
+                "instance": filled_worker,
                 "trigger": "job 12",
             }
             if (
@@ -4832,6 +4845,7 @@ def _shape_clauses(
                 or workers != {"F1", "F2"}
                 or clients != {"C1"}
                 or set(named) != {"S1", "F1", "F2", "C1"}
+                or filled_worker not in target_workers
                 or any(named[name].get("slots") != 1 for name in ("F1", "F2"))
                 or scenario.get("timeline") != [expected_event]
                 or not isinstance(workload, Mapping)
@@ -4851,7 +4865,7 @@ def _shape_clauses(
             if (
                 not isinstance(observed_event, Mapping)
                 or observed_event.get("action") != "disk_fill"
-                or observed_event.get("instance") != "F1"
+                or observed_event.get("instance") != filled_worker
                 or observed_event.get("trigger") != "job 12"
                 or observed_event.get("event_index") != 0
                 or observed_event.get("event_epoch") != 1
@@ -6095,6 +6109,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(error106_raw, list) or error106_raw:
             engagement_bad.add("@observations:error106_job_ids")
     elif engagement_mode == S95_DISK_FILL_ENGAGEMENT:
+        timeline = scenario.get("timeline")
+        filled_worker = (
+            timeline[0].get("instance")
+            if isinstance(timeline, list) and len(timeline) == 1
+            and isinstance(timeline[0], Mapping)
+            and timeline[0].get("action") == "disk_fill"
+            else None
+        )
         resource_ids: set[str] = set()
         affected_resource_ids: set[str] = set()
         resource_records = observations.get("p50_resource_failures", [])
@@ -6181,7 +6203,8 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 isinstance(event, Mapping) and event.get("action") == "disk_fill"
                 and event.get("instance") == record["first_worker"]
                 and _is_int(event.get("fired_ms"), minimum=1)
-                and record["first_dispatch_ms"] >= event["fired_ms"]
+                and record["first_dispatch_ms"] <= event["fired_ms"]
+                <= record["first_terminal_ms"]
                 for event in bundle.get("event_log", [])
             ):
                 affected_resource_ids.add(identifier)
@@ -6208,7 +6231,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         fallback_ids: set[str] = set()
         for row in post_event:
             identifier = _job_id(row["job_id"], "@row")
-            if row["cs"] == "F1":
+            if row["cs"] == filled_worker:
                 affected_post.append(row)
             committed = (
                 row["tail_present"] is True

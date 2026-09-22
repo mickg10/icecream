@@ -1,5 +1,5 @@
 #!/bin/sh
-# Deletion-sensitive scope gate for the development release identity (S1b).
+# Deletion-sensitive scope gate for the release identity (S1b).
 # Source-only -- see releaseidentity-artifact.sh for the built icecc
 # --version identity gate, kept as a separate test per the
 # bigoracle/local-oracle HOLD on 97ef314f (both findings below).
@@ -17,7 +17,7 @@
 # for each macro NAME at all, independent of value -- exactly one, or fail;
 # (2) only then extract that one definition's numeric value, with a strict
 # 'm4_define([name],[N])' shape check, and require the composed
-# major.minor.micro to equal exactly 1.5.90. A second active definition of
+# major.minor.micro to equal exactly 1.5.0. A second active definition of
 # any value fails step 1 before step 2 ever runs.
 set -eu
 
@@ -91,10 +91,10 @@ micro=$(extract_value icecream_version_micro) || {
 echo "ok - extracted major.minor.micro = $major.$minor.$micro"
 
 composed="$major.$minor.$micro"
-if [ "$composed" != "1.5.90" ]; then
-    echo "FAIL: configure.ac composes to $composed, expected exactly 1.5.90" >&2
+if [ "$composed" != "1.5.0" ]; then
+    echo "FAIL: configure.ac composes to $composed, expected exactly 1.5.0" >&2
     exit 1
 fi
-echo "ok - configure.ac composes to exactly 1.5.90"
+echo "ok - configure.ac composes to exactly 1.5.0"
 
-echo 'PASS: development release identity is 1.5.90 (source only)'
+echo 'PASS: release identity is 1.5.0 (source only)'

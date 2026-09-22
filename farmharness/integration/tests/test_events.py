@@ -3613,6 +3613,34 @@ def test_worker_bounce_time_origin_waits_for_first_workload_dispatch(
     assert producer._dispatch_count == 2
 
 
+def test_s95_disk_fill_waits_for_the_trigger_compile_to_be_active(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S95-cache-disk-full.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="s95-active-trigger-unit")
+    dispatches = "".join(
+        f"put {job} in joblist of F2\n" for job in range(1, 13)
+    )
+    sample = [dispatches]
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(EventRecorder()),
+        job_reader=lambda: sample[0],
+        event_path=tmp_path / "events" / "events.json",
+    )
+    event = producer.events[0]
+
+    assert producer._eligible(event, 1.0) is False
+    sample[0] += "BEGIN: 12\n"
+    assert producer._eligible(event, 2.0) is True
+
+
 def test_job_trigger_excludes_late_environment_canary(tmp_path: Path) -> None:
     farm, scenario, plan = _fixture(tmp_path)
     scenario.data["timeline"] = [

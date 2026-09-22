@@ -77,7 +77,10 @@ def test_farm_temp_variable_must_be_absolute(monkeypatch: pytest.MonkeyPatch) ->
         farmtest._configure_host_temp_environment()
 
 
-def test_required_integration_make_targets_are_scratch_routed() -> None:
+def test_required_integration_make_targets_are_scratch_routed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ICEFARM_TMPDIR", raising=False)
     suites = {
         "integration_smoke": "smoke.json",
         "integration_controls": "controls.json",
@@ -104,7 +107,8 @@ def test_required_integration_make_targets_are_scratch_routed() -> None:
         )
 
 
-def test_image_make_target_is_scratch_routed() -> None:
+def test_image_make_target_is_scratch_routed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ICEFARM_TMPDIR", raising=False)
     result = subprocess.run(
         ("make", "--no-print-directory", "-n", "integration_images"),
         cwd=ROOT,
@@ -158,7 +162,10 @@ def test_image_make_target_is_scratch_routed() -> None:
     )
 
 
-def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
+def test_source_archive_make_target_is_explicit_and_scratch_routed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ICEFARM_TMPDIR", raising=False)
     result = subprocess.run(
         (
             "make",
@@ -176,6 +183,34 @@ def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
     assert "farmharness.integration.farmtest source-archives" in result.stdout
     assert '--output-dir "/tanksmall/scratch/ictmp/source-inventory"' in result.stdout
     assert set(_command_labels(result.stdout)) == _catalog_image_labels()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "integration_smoke",
+        "integration_controls",
+        "integration_ladder",
+        "integration_twobuild",
+        "integration_full",
+        "integration_images",
+        "integration_source_archives",
+    ],
+)
+def test_make_targets_preserve_operator_temp_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str,
+) -> None:
+    routed = str(tmp_path / "scratch temp")
+    monkeypatch.setenv("ICEFARM_TMPDIR", routed)
+    command = subprocess.run(
+        (
+            "make", "--no-print-directory", "-n", target,
+            f"ICEFARM_SOURCE_ARCHIVE_DIR={tmp_path / 'source-inventory'}",
+        ),
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout
+    for variable in ("ICEFARM_TMPDIR", "TMPDIR", "TMP", "TEMP", "TEMPDIR"):
+        assert f'{variable}="{routed}"' in command
 
 
 def test_autotools_source_exposes_the_same_required_targets() -> None:

@@ -1,4 +1,4 @@
-# S1b 1.5.90 exit contract
+# S1b 1.5.0 exit contract
 
 This file is the committed S1b contract.  It deliberately contains no
 historical hashes from an older source tree.  Exact run evidence is emitted by
@@ -15,14 +15,14 @@ record.
 
 ## Release authority
 
-- Source version: exactly `1.5.90` in `configure.ac`.
-- Client identity: exactly `ICECC 1.5.90`.
+- Source version: exactly `1.5.0` in `configure.ac`.
+- Client identity: exactly `ICECC 1.5.0`.
 - Daemon identity set: exactly one line, exactly
-  `ICECREAM daemon 1.5.90`.
+  `ICECREAM daemon 1.5.0`.
 - Scheduler identity set: exactly one line, exactly
-  `ICECREAM scheduler 1.5.90`.
+  `ICECREAM scheduler 1.5.0`.
 - pkg-config identity set: exactly one `Version:` field, exactly
-  `Version: 1.5.90`.
+  `Version: 1.5.0`.
 
 The committed image authorities are:
 

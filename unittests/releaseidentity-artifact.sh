@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fail-closed built-artifact identity gate for the development release
+# Fail-closed built-artifact identity gate for the release
 # identity (S1b), split out from releaseidentity-source.sh per the
 # bigoracle/local-oracle HOLD on 97ef314f.
 #
@@ -15,7 +15,7 @@
 # wired by unittests/Makefile.am's AM_TESTS_ENVIRONMENT to
 # $(abs_top_builddir)/client/icecc -- i.e. `make -C services && make -C
 # cache && make -C client icecc` must already have run), and its
-# `--version` output must equal the literal string "ICECC 1.5.90", not
+# `--version` output must equal the literal string "ICECC 1.5.0", not
 # merely contain it. Missing, non-executable, or wrong output is RED; there
 # is no skip path.
 set -eu
@@ -33,10 +33,10 @@ fi
 echo "ok - $ICECC_RELEASE_IDENTITY_BIN exists and is executable"
 
 out=$("$ICECC_RELEASE_IDENTITY_BIN" --version)
-if [ "$out" != "ICECC 1.5.90" ]; then
-    echo "FAIL: $ICECC_RELEASE_IDENTITY_BIN --version printed '$out', expected exactly 'ICECC 1.5.90'" >&2
+if [ "$out" != "ICECC 1.5.0" ]; then
+    echo "FAIL: $ICECC_RELEASE_IDENTITY_BIN --version printed '$out', expected exactly 'ICECC 1.5.0'" >&2
     exit 1
 fi
-echo "ok - $ICECC_RELEASE_IDENTITY_BIN --version is exactly 'ICECC 1.5.90'"
+echo "ok - $ICECC_RELEASE_IDENTITY_BIN --version is exactly 'ICECC 1.5.0'"
 
-echo 'PASS: built release identity artifact is exactly ICECC 1.5.90'
+echo 'PASS: built release identity artifact is exactly ICECC 1.5.0'

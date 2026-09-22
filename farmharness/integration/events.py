@@ -189,7 +189,7 @@ DISK_FILL_SCHEMA = "icefarm-disk-fill-v1"
 CLIENT_TRANSITION_SCHEMA = "icefarm-client-transition-v1"
 CACHE_DISK_FAULT_PATH = "/var/cache/icecream"
 CACHE_DISK_FAULT_FILE = "/var/cache/icecream/.icefarm-disk-fill"
-CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
+CACHE_DISK_FAULT_BYTES = 512 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 ACTIVE_COMPILER_OBSERVE_S = 240
@@ -809,7 +809,7 @@ watchdog_s = int(sys.argv[4])
 minimum_headroom = int(sys.argv[5])
 if str(root) != "/var/cache/icecream" or str(filler) != "/var/cache/icecream/.icefarm-disk-fill":
     raise SystemExit("disk-fill path contract mismatch")
-if limit != 128 * 1024 * 1024 or watchdog_s != 30 or minimum_headroom != 8 * 1024 * 1024:
+if limit != 512 * 1024 * 1024 or watchdog_s != 30 or minimum_headroom != 8 * 1024 * 1024:
     raise SystemExit("disk-fill bound contract mismatch")
 
 def watchdog(_signum, _frame):
@@ -5751,25 +5751,40 @@ class EventProducer:
                 return self._authenticated_disk_fill(event, instance, before)
             paused: dict[str, dict[str, Any]] = {}
             resumed: dict[str, dict[str, Any]] = {}
-            self._gate_controls(
-                clients,
-                action="pause",
-                turn=turn,
-                epoch=epoch,
-                timeout_s=self._command_timeout(),
-                receipts=paused,
-            )
-            try:
+            if (
+                self.scenario.data.get("expect", {}).get("engagement")
+                == "s95-cache-disk-full"
+            ):
+                # Eligibility proved that the trigger compile is active on
+                # the preferred target. Inject ENOSPC before draining admission
+                # so the product sees an actual in-flight resource failure.
                 receipt = self._authenticated_disk_fill(event, instance, before)
-            finally:
                 self._gate_controls(
                     clients,
-                    action="resume",
+                    action="pause",
                     turn=turn,
                     epoch=epoch,
                     timeout_s=self._command_timeout(),
-                    receipts=resumed,
+                    receipts=paused,
                 )
+            else:
+                self._gate_controls(
+                    clients,
+                    action="pause",
+                    turn=turn,
+                    epoch=epoch,
+                    timeout_s=self._command_timeout(),
+                    receipts=paused,
+                )
+                receipt = self._authenticated_disk_fill(event, instance, before)
+            self._gate_controls(
+                clients,
+                action="resume",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=self._command_timeout(),
+                receipts=resumed,
+            )
             receipt["admission_boundary"] = {
                 "epoch": epoch,
                 "pause": paused,
@@ -6110,6 +6125,16 @@ class EventProducer:
             if self._dispatch_count < required:
                 return False
             if event.action == "disk_fill" and self.job_reader is not None:
+                if (
+                    self.scenario.data.get("expect", {}).get("engagement")
+                    == "s95-cache-disk-full"
+                ):
+                    # S95 must fill the cache while the selected trigger compile
+                    # is active on the preferred target.  Draining it first lets
+                    # the daemon publish load 1000, after which no resource
+                    # failure/retry can ever be exercised.
+                    trigger_job = dispatches[required - 1]
+                    return trigger_job in parse_scheduler_active(self.job_reader())
                 if self._disk_fill_terminal_ceiling is None:
                     # Snapshot the first trigger-crossing dispatch set.  The
                     # reader may observe more assignments while we wait; they
@@ -6151,13 +6176,18 @@ class EventProducer:
                     # an earlier completed event.
                     self._reset_failure_evidence()
                     if self._eligible(event, now):
+                        triggered_ms = (
+                            int(self.wall_ms()) if event.action == "disk_fill" else None
+                        )
                         receipt = (
                             self._transition(event)
                             if event.action in TRANSITION_ACTIONS
                             else self._dispatch(event)
                         )
                         fired_ms = (
-                            int(receipt["coordination"]["ready_ms"])
+                            int(triggered_ms)
+                            if event.action == "disk_fill"
+                            else int(receipt["coordination"]["ready_ms"])
                             if isinstance(receipt, dict)
                             and receipt.get("schema")
                             in {

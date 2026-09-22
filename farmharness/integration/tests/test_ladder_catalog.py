@@ -441,7 +441,7 @@ def test_s95_disk_fill_mount_is_bounded_and_only_replaces_the_target_cache() -> 
     plan = farmtest.build_plan(farm, scenario, run_id="s95-dry-plan")
 
     assert scenario.data["timeline"] == [
-        {"action": "disk_fill", "instance": "F1", "trigger": "job 12"}
+        {"action": "disk_fill", "instance": "F2", "trigger": "job 12"}
     ]
     starts = {
         item["instance"]: item["argv"]
@@ -450,17 +450,17 @@ def test_s95_disk_fill_mount_is_bounded_and_only_replaces_the_target_cache() -> 
     }
     bounded = (
         "/var/cache/icecream:rw,exec,nosuid,nodev,"
-        "size=134217728,mode=0700"
+        "size=536870912,mode=0700"
     )
-    assert bounded in starts["F1"]
-    assert bounded not in starts["F2"]
+    assert bounded in starts["F2"]
+    assert bounded not in starts["F1"]
     assert not any(
         item.startswith("type=bind,") and item.endswith("dst=/var/cache/icecream")
-        for item in starts["F1"]
+        for item in starts["F2"]
     )
     assert any(
         item.startswith("type=bind,") and item.endswith("dst=/var/cache/icecream")
-        for item in starts["F2"]
+        for item in starts["F1"]
     )
     assert load_suite_spec(
         INTEGRATION / "suites" / "s95-disk-full.json"

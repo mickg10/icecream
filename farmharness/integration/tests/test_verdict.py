@@ -5131,7 +5131,7 @@ def _s95_disk_fill_bundle() -> dict[str, object]:
     ] = "cancellation"
     mount = {
         "destination": "/var/cache/icecream",
-        "size_bytes": 128 * 1024 * 1024,
+        "size_bytes": 512 * 1024 * 1024,
         "type": "tmpfs",
     }
     snapshot = {
@@ -5162,15 +5162,15 @@ def _s95_disk_fill_bundle() -> dict[str, object]:
             "event_epoch": 1,
             "fill": {
                 "available_after": 0,
-                "available_before": 128 * 1024 * 1024,
+                "available_before": 512 * 1024 * 1024,
                 "directory_gid": 65534,
                 "directory_mode": 0o700,
                 "directory_uid": 65534,
                 "elapsed_ms": 10,
                 "errno": 28,
-                "filler_bytes": 128 * 1024 * 1024 - 4096,
+                "filler_bytes": 512 * 1024 * 1024 - 4096,
                 "filler_path": "/var/cache/icecream/.icefarm-disk-fill",
-                "limit_bytes": 128 * 1024 * 1024,
+                "limit_bytes": 512 * 1024 * 1024,
                 "minimum_headroom_bytes": 8 * 1024 * 1024,
                 "schema": "icefarm-disk-fill-operation-v1",
                 "watchdog_s": 30,
@@ -5191,6 +5191,22 @@ def test_s95_disk_fill_accepts_one_bounded_remote_fallback() -> None:
     assert next(
         item for item in verdict["clauses"] if item["id"] == "s95.cache-disk-full"
     )["status"] == "PASS"
+
+
+def test_s95_disk_fill_target_is_derived_from_declared_worker() -> None:
+    fixture = _s95_disk_fill_bundle()
+    fixture["scenario"]["timeline"][0]["instance"] = "F2"
+    event = fixture["event_log"][0]
+    event["instance"] = "F2"
+    event["receipt"]["instance"] = "F2"
+    before = event["receipt"]["before"]
+    before["container_name"] = "/icefarm-test-run-F2"
+    before["labels"]["icefarm.instance"] = "F2"
+    event["receipt"]["after"] = copy.deepcopy(before)
+    fixture["rows"][2]["cs"] = "F2"
+    for attempt in fixture["observations"]["assignment_lifecycle"][2]["attempts"]:
+        attempt["worker"] = "F2"
+    assert evaluate_bundle(fixture)["status"] == "PASS"
 
 
 @pytest.mark.parametrize(

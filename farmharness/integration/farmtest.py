@@ -180,7 +180,7 @@ SCHEDULER_DISPATCH_EPOCH_CONTRACT = "icefarm-scheduler-generation-epoch-v1"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 CONTAINER_TEMP_ROOT = "/tmp/icefarm"
 CACHE_DISK_FAULT_PATH = "/var/cache/icecream"
-CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
+CACHE_DISK_FAULT_BYTES = 512 * 1024 * 1024
 
 
 PREPARE_INSTANCE_SCRIPT = r"""

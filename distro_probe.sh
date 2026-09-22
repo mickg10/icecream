@@ -2,7 +2,7 @@
 # distro_probe.sh -- S1b exit-roster distro probes (2026-08-23 run).
 #
 # Reproduces the three distro-probe rows in S1B_EXIT_MANIFEST.md: install
-# build deps for a distro, configure the icecc-1.5.90 dist tarball
+# build deps for a distro, configure the icecc-1.5.0 dist tarball
 # out-of-tree, build services+cache+client, run both release-identity
 # tests. Run on a host with docker and the extracted dist tarball
 # available; pass the extracted source dir as $1 and a scratch work dir as

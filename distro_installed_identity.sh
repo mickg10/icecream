@@ -17,7 +17,7 @@
 #   distro_installed_identity.sh SRC_DIR WORK_DIR DISTRO \
 #       [--stale-control | --sentinel-control | --corrupt-control=ARTIFACT]
 #
-# SRC_DIR    the extracted icecc-1.5.90 dist tree (read-only bind; reusing
+# SRC_DIR    the extracted icecc-1.5.0 dist tree (read-only bind; reusing
 #            the SOURCE across runs is fine, only build/DESTDIR must be
 #            fresh -- the HOLD is about build-output freshness).
 # WORK_DIR   per-distro scratch root; build/ and destdir/ live under it.
@@ -29,7 +29,7 @@
 #            clean-step scenario), plants a wrong-version fake icecc at
 #            the exact installed path, runs ONLY the identity probe (no
 #            configure/build/install), and requires the exact
-#            "ICECC 1.5.90" check to FAIL. This alone does NOT prove the
+#            "ICECC 1.5.0" check to FAIL. This alone does NOT prove the
 #            clean step (a rebuild can overwrite the stale client without
 #            the clean step ever running) -- see --sentinel-control.
 # --sentinel-control
@@ -789,7 +789,7 @@ elif [ "$MODE" = corrupt-control ]; then
                 chmod 755 /destdir/usr/local/sbin/icecc-scheduler
                 ;;
             icecc-scheduler-competing)
-                printf '%s\n' '#!/bin/sh' 'echo ICECREAM scheduler 1.5.90' 'echo ICECREAM scheduler 1.5.89' > /destdir/usr/local/sbin/icecc-scheduler
+                printf '%s\n' '#!/bin/sh' 'echo ICECREAM scheduler 1.5.0' 'echo ICECREAM scheduler 1.5.89' > /destdir/usr/local/sbin/icecc-scheduler
                 chmod 755 /destdir/usr/local/sbin/icecc-scheduler
                 ;;
             libicecc.a)
@@ -827,7 +827,7 @@ elif [ "$MODE" = corrupt-control ]; then
     ICECC_OUT=$(read_or "$BUILD/corrupt-icecc-version-output.txt" MISSING)
     fact installed_icecc_version_output "$ICECC_OUT"
     record_artifact installed_icecc "$DESTDIR/usr/local/bin/icecc" file "$ICECC_OUT" >/dev/null
-    require_exact installed_icecc_version_output "$ICECC_OUT" "ICECC 1.5.90"
+    require_exact installed_icecc_version_output "$ICECC_OUT" "ICECC 1.5.0"
 
     record_artifact installed_icecc_create_env "$DESTDIR/usr/local/bin/icecc-create-env" file "(script, no version marker)" >/dev/null
     [ -x "$DESTDIR/usr/local/bin/icecc-create-env" ] || { echo "FAIL: $DISTRO installed_icecc_create_env not executable" >&2; exit 1; }
@@ -838,7 +838,7 @@ elif [ "$MODE" = corrupt-control ]; then
     fact installed_iceccd_identity_total_count "$ICECCD_TOTAL"
     require_count1 installed_iceccd_identity_total_count "$ICECCD_TOTAL" "daemon identity line of any version"
     fact installed_iceccd_identity_line "$ICECCD_MATCHES"
-    require_exact installed_iceccd_identity_line "$ICECCD_MATCHES" "ICECREAM daemon 1.5.90"
+    require_exact installed_iceccd_identity_line "$ICECCD_MATCHES" "ICECREAM daemon 1.5.0"
 
     SCHED_MATCHES=$(read_or "$BUILD/corrupt-scheduler-version-matches.txt" "")
     record_artifact installed_scheduler "$DESTDIR/usr/local/sbin/icecc-scheduler" file "$(printf '%s' "$SCHED_MATCHES" | tr '\n' ';')" >/dev/null
@@ -846,7 +846,7 @@ elif [ "$MODE" = corrupt-control ]; then
     fact installed_scheduler_identity_total_count "$SCHED_TOTAL"
     require_count1 installed_scheduler_identity_total_count "$SCHED_TOTAL" "scheduler identity line of any version"
     fact installed_scheduler_identity_line "$SCHED_MATCHES"
-    require_exact installed_scheduler_identity_line "$SCHED_MATCHES" "ICECREAM scheduler 1.5.90"
+    require_exact installed_scheduler_identity_line "$SCHED_MATCHES" "ICECREAM scheduler 1.5.0"
 
     record_artifact installed_libicecc_a "$DESTDIR/usr/local/lib/libicecc.a" file "(static archive)" >/dev/null
 
@@ -856,7 +856,7 @@ elif [ "$MODE" = corrupt-control ]; then
     fact installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL"
     require_count1 installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL" "pkg-config Version field of any value"
     fact installed_icecc_pc_version_line "$PC_VERSION_LINES"
-    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINES" "Version: 1.5.90"
+    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINES" "Version: 1.5.0"
 
     record_artifact package_inventory "$BUILD/package-inventory.txt" file "" >/dev/null
     PKG_LINES=$(wc -l < "$BUILD/package-inventory.txt" | tr -d ' ')
@@ -897,16 +897,16 @@ fi
 fact installed_icecc_version_output "$ICECC_OUT"
 record_artifact installed_icecc "$DESTDIR/usr/local/bin/icecc" file "$ICECC_OUT" >/dev/null
 
-if [ "$ICECC_OUT" = "ICECC 1.5.90" ]; then
+if [ "$ICECC_OUT" = "ICECC 1.5.0" ]; then
     fact installed_icecc_identity_check "PASS"
 else
-    fact installed_icecc_identity_check "FAIL (expected exactly 'ICECC 1.5.90', got '$ICECC_OUT')"
+    fact installed_icecc_identity_check "FAIL (expected exactly 'ICECC 1.5.0', got '$ICECC_OUT')"
 fi
 
 if [ "$MODE" = normal ]; then
     # -- the rest of the installed-identity evidence (normal mode only).
     # Every one of these is a GATE, not merely a recorded observation.
-    require_exact installed_icecc_version_output "$ICECC_OUT" "ICECC 1.5.90"
+    require_exact installed_icecc_version_output "$ICECC_OUT" "ICECC 1.5.0"
 
     record_artifact installed_icecc_create_env "$DESTDIR/usr/local/bin/icecc-create-env" file "(script, no version marker)" >/dev/null
     [ -x "$DESTDIR/usr/local/bin/icecc-create-env" ] || { echo "FAIL: $DISTRO installed_icecc_create_env not executable" >&2; exit 1; }
@@ -917,7 +917,7 @@ if [ "$MODE" = normal ]; then
     fact installed_iceccd_identity_total_count "$ICECCD_TOTAL"
     require_count1 installed_iceccd_identity_total_count "$ICECCD_TOTAL" "daemon identity line of any version"
     fact installed_iceccd_identity_line "$ICECCD_MATCHES"
-    require_exact installed_iceccd_identity_line "$ICECCD_MATCHES" "ICECREAM daemon 1.5.90"
+    require_exact installed_iceccd_identity_line "$ICECCD_MATCHES" "ICECREAM daemon 1.5.0"
 
     SCHED_MATCHES=$(read_or "$BUILD/scheduler-version-matches.txt" "")
     record_artifact installed_scheduler "$DESTDIR/usr/local/sbin/icecc-scheduler" file "$(printf '%s' "$SCHED_MATCHES" | tr '\n' ';')" >/dev/null
@@ -925,7 +925,7 @@ if [ "$MODE" = normal ]; then
     fact installed_scheduler_identity_total_count "$SCHED_TOTAL"
     require_count1 installed_scheduler_identity_total_count "$SCHED_TOTAL" "scheduler identity line of any version"
     fact installed_scheduler_identity_line "$SCHED_MATCHES"
-    require_exact installed_scheduler_identity_line "$SCHED_MATCHES" "ICECREAM scheduler 1.5.90"
+    require_exact installed_scheduler_identity_line "$SCHED_MATCHES" "ICECREAM scheduler 1.5.0"
 
     record_artifact installed_libicecc_a "$DESTDIR/usr/local/lib/libicecc.a" file "(static archive)" >/dev/null
 
@@ -935,7 +935,7 @@ if [ "$MODE" = normal ]; then
     fact installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL"
     require_count1 installed_icecc_pc_version_total_count "$PC_VERSION_TOTAL" "pkg-config Version field of any value"
     fact installed_icecc_pc_version_line "$PC_VERSION_LINES"
-    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINES" "Version: 1.5.90"
+    require_exact installed_icecc_pc_version_line "$PC_VERSION_LINES" "Version: 1.5.0"
 
     record_artifact package_inventory "$BUILD/package-inventory.txt" file "" >/dev/null
     PKG_LINES=$(wc -l < "$BUILD/package-inventory.txt" | tr -d ' ')

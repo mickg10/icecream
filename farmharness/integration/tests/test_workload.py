@@ -286,6 +286,38 @@ def test_active_loss_serializes_exact_trigger_prefix_and_requires_remote(
     assert _active_loss_serial_through(ordinary) == 0
 
 
+def test_s95_disk_full_prefers_the_declared_filled_worker() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S95-cache-disk-full.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="s95-preferred-worker-unit")
+    client = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "C"
+    )
+
+    command = _driver_command(
+        farm, scenario, plan, client, "A", CommandFactory()
+    )
+    assert "ICEFARM_DISK_FILL_WORKER=F2" in command.argv
+    assert "ICEFARM_DISK_FILL_TRIGGER=12" in command.argv
+    assert "ICECC_PREFERRED_HOST=F2" not in command.argv
+    assert 'preferred=(ICECC_PREFERRED_HOST="$disk_fill_worker")' in MANIFEST_DRIVER
+
+    ordinary = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S00-smoke.json", farm
+    )
+    ordinary_plan = farmtest.build_plan(
+        farm, ordinary, run_id="ordinary-no-preferred-worker-unit"
+    )
+    ordinary_command = _driver_command(
+        farm, ordinary, ordinary_plan, client, "A", CommandFactory()
+    )
+    assert not any(
+        item.startswith("ICEFARM_DISK_FILL_") for item in ordinary_command.argv
+    )
+
+
 def test_manifest_driver_shell_is_syntactically_valid() -> None:
     subprocess.run(
         ["/bin/bash", "-n"],

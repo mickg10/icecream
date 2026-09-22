@@ -79,12 +79,12 @@ def resource_bundle():
                session_outcome="committed", reuse=False)
     obs = bundle["observations"]
     obs["assignment_lifecycle"][2]["attempts"][1]["worker"] = "F2"
-    obs["job_lifecycle"][2].update(dispatch_ms=1100, first_dispatch_ms=1100,
+    obs["job_lifecycle"][2].update(dispatch_ms=900, first_dispatch_ms=900,
         final_dispatch_ms=1200, terminal_ms=1225, scheduler_generation=1,
         scheduler_dispatch_line=10)
     record = _resource_failure_observation(**evidence())
     record.update(row_job_id="3", first_generation=1, final_generation=1,
-        first_dispatch_ms=1100, first_terminal_ms=1150,
+        first_dispatch_ms=900, first_terminal_ms=1150,
         final_dispatch_ms=1200, final_terminal_ms=1225)
     record["first_identity"]["scheduler_job"] = 30
     record["final_identity"]["scheduler_job"] = 31
@@ -92,23 +92,27 @@ def resource_bundle():
     return bundle
 
 
-def test_s95_accepts_authenticated_post_fault_resource_retry():
+def test_s95_accepts_authenticated_inflight_resource_retry():
     from farmharness.integration.verdict import evaluate_bundle
     verdict = evaluate_bundle(resource_bundle())
     assert verdict["status"] == "PASS", verdict
 
 
-@pytest.mark.parametrize("mutation", ["pre_event", "no_error106", "wrong_worker",
+@pytest.mark.parametrize("mutation", ["completed_before_fault", "started_after_fault",
+    "no_error106", "wrong_worker",
     "wrong_job", "no_cancellation", "duplicate", "no_witness", "bad_timing"])
 def test_s95_resource_retry_fails_closed(mutation):
     from farmharness.integration.verdict import evaluate_bundle
     bundle = resource_bundle()
     obs = bundle["observations"]
     record = obs["p50_resource_failures"][0]
-    if mutation == "pre_event":
-        record["first_dispatch_ms"] = 900
-        obs["job_lifecycle"][2]["first_dispatch_ms"] = 900
-        obs["job_lifecycle"][2]["dispatch_ms"] = 900
+    if mutation == "completed_before_fault":
+        record["first_terminal_ms"] = bundle["event_log"][0]["fired_ms"] - 1
+    elif mutation == "started_after_fault":
+        started = bundle["event_log"][0]["fired_ms"] + 1
+        record["first_dispatch_ms"] = started
+        obs["job_lifecycle"][2]["first_dispatch_ms"] = started
+        obs["job_lifecycle"][2]["dispatch_ms"] = started
     elif mutation == "no_error106":
         obs["error106_job_ids"] = []
     elif mutation == "wrong_worker":

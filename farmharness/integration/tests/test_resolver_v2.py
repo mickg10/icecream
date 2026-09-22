@@ -28,7 +28,7 @@ def _inputs():
         {
             "name": "C1",
             "role": "C",
-            "host": "research6",
+            "host": "tt-quietbox2",
             "image": "p50s2-624702e9",
             "client_environment": "fedora-clang-libcxx",
             "env": {"ICECC_P50_MODE": "on"},
@@ -43,7 +43,7 @@ def _inputs():
         {
             "name": "F2",
             "role": "F",
-            "host": "research6",
+            "host": "tt-quietbox2",
             "image": "p50s2-624702e9",
             "slots": 12,
         },
@@ -226,7 +226,7 @@ def test_v2_canonicalizes_instance_json_order_and_formatting() -> None:
 def test_unused_host_role_policy_does_not_change_digest() -> None:
     farm, environment = _inputs()
     baseline = _resolve(farm, environment)["topology_digest"]
-    farm.hosts["tt-quietbox2"]["roles_allowed"].append("S")
+    farm.hosts["tt-quietbox5"]["roles_allowed"].append("S")
     assert _resolve(farm, environment)["topology_digest"] == baseline
 
 
@@ -246,7 +246,7 @@ def test_unused_host_role_policy_does_not_change_digest() -> None:
             "no sha256",
         ),
         (
-            lambda farm, env: farm.hosts["research6"].update(roles_allowed=["C"]),
+            lambda farm, env: farm.hosts["tt-quietbox2"].update(roles_allowed=["C"]),
             "does not allow role F",
         ),
         (

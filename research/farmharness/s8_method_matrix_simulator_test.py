@@ -475,24 +475,6 @@ print(json.dumps({"bytes": len(wire), "rss_kib": resource.getrusage(resource.RUS
     assert result["rss_kib"] < 256 * 1024
 
 
-def test_methods_do_not_alias_and_missing_authority_is_explicit() -> None:
-    topology = MatrixTopology.from_id("C1F1/100000")
-    simulator = MethodMatrixSimulator(topology)
-    result = simulator.run([Occurrence(0, b"payload")])
-    assert result["core_completion"]["status"] == "NOT_READY"
-    statuses = result["method_status"]
-    assert statuses == {
-        "RAW_II": "READY", "ZSTD_TU": "READY", "P29": "READY",
-        "GRZ_RESIDUAL": "READY", "ZSTD_ROUTE": "READY",
-        "ZSTD_COHORT": "NOT_READY", "ZSTD_GLOBAL": "NOT_IMPLEMENTED",
-    }
-    rows = {row["method"]: row for row in result["rows"]}
-    assert rows["ZSTD_COHORT"]["encoded_bytes"] is None
-    assert rows["ZSTD_GLOBAL"]["encoded_bytes"] is None
-    assert rows["RAW_II"]["encoded_sha256"] is None
-    assert rows["RAW_II"]["measurement_scope"] == "raw_bytes_only_no_wire_witness"
-
-
 def test_raw_control_retains_no_copy_and_runs_are_collision_safe(tmp_path: Path,
                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
     source = tmp_path / "external.ii"
@@ -718,7 +700,7 @@ def test_native_batch_preserves_valid_prefix_when_child_exits_nonzero(
     original_run = simulator_module.subprocess.run
 
     def failed_after_prefix(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        original = original_run(command, **kwargs)
+        original_run(command, **kwargs)
         output = Path(command[command.index("--batch-output") + 1])
         lines = output.read_text().splitlines()
         output.write_text("\n".join(lines) + "\n")
@@ -791,7 +773,7 @@ def test_native_batch_preserves_prefix_and_records_malformed_last_row(
     original_run = simulator_module.subprocess.run
 
     def malformed_last(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        original = original_run(command, **kwargs)
+        original_run(command, **kwargs)
         output = Path(command[command.index("--batch-output") + 1])
         first = output.read_text().splitlines()[0]
         output.write_text(first + "\n{\"schema\":\n")

@@ -239,7 +239,7 @@ HEADER_EDIT_SCHEMA = "icefarm-header-edit-v1"
 DISK_FILL_SCHEMA = "icefarm-disk-fill-v1"
 CACHE_DISK_FAULT_PATH = "/var/cache/icecream"
 CACHE_DISK_FAULT_FILE = "/var/cache/icecream/.icefarm-disk-fill"
-CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
+CACHE_DISK_FAULT_BYTES = 512 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 
