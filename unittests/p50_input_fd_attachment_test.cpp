@@ -101,15 +101,14 @@ void delay_readonly_reopen() noexcept {
 }  // namespace
 
 int main() {
-    const std::filesystem::path runtime =
-        std::filesystem::path("/tanksmall/scratch/ictmp/build-luna") /
-        ("p50-input-fd-runtime-" + std::to_string(static_cast<long long>(::getpid())));
+    std::string runtime_template =
+        (std::filesystem::temp_directory_path() / "p50-input-fd-runtime-XXXXXX").string();
+    std::vector<char> runtime_buffer(runtime_template.begin(), runtime_template.end());
+    runtime_buffer.push_back('\0');
+    char* created_runtime = ::mkdtemp(runtime_buffer.data());
+    require(created_runtime != nullptr, "private runtime directory creation failed");
+    const std::filesystem::path runtime(created_runtime);
     std::error_code error;
-    std::filesystem::remove_all(runtime, error);
-    require(std::filesystem::create_directory(runtime, error) && !error,
-            "private runtime directory creation failed");
-    require(::chmod(runtime.c_str(), S_IRWXU) == 0,
-            "private runtime directory mode failed");
     const std::string socket_path = (runtime / "attach.sock").string();
 
     const CStoreGuid guid = Id128::from_u64(0xabc);

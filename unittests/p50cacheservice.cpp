@@ -21,6 +21,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include <chrono>
 #include <atomic>
@@ -523,6 +526,12 @@ void exercise_root_contract_then_drop_test_process() {
     CHECK(::setgroups(0, nullptr) == 0);
     CHECK(::setgid(drop_gid) == 0);
     CHECK(::setuid(drop_uid) == 0);
+#if defined(__linux__)
+    // setuid resets this flag; restore it for this test process so the leak
+    // checker can inspect its threads at exit. The installed service's own
+    // identity transition above remains unchanged.
+    CHECK(::prctl(PR_SET_DUMPABLE, 1L) == 0);
+#endif
     CHECK(::getuid() == drop_uid && ::geteuid() == drop_uid &&
           ::getgid() == drop_gid && ::getegid() == drop_gid);
 }

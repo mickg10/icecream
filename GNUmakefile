@@ -1,5 +1,7 @@
 .DEFAULT_GOAL := all
 
+# Keep historical integration defaults; the developer commands use root farm.json.
+ICEFARM_USER_FARM := $(FARM)
 FARM ?= $(CURDIR)/farmharness/integration/farm.local.json
 ICEFARM_PYTHON ?= python3
 ICEFARM_TMPDIR ?=
@@ -14,6 +16,13 @@ ICEFARM_SEALED_LABELS = p43-1.4.0,p50s2-5b2e5801,p50s30-f-refusal-57a1e336,p50s4
 ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
+
+.PHONY: dev-bootstrap qa
+dev-bootstrap qa:
+	@$(ICEFARM_SCRATCH_GUARD)
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B dev/bootstrap.py \
+		$(if $(filter qa,$@),qa,bootstrap) \
+		--farm "$(if $(ICEFARM_USER_FARM),$(FARM),$(CURDIR)/farm.json)"
 
 .PHONY: integration_source_archives integration_images integration_smoke integration_controls \
 	integration_ladder integration_twobuild integration_full test-harness-fast \

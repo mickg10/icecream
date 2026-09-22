@@ -3,6 +3,13 @@
 # explicit entries `make dist` silently produced a tarball missing the very
 # tests and tools the reports describe.
 EXTRA_DIST = README.md \
+	farm.json \
+	dev/bootstrap.py \
+	dev/Dockerfile \
+	dev/Dockerfile.runtime \
+	dev/run-qa.sh \
+	dev/mixed.py \
+	dev/README.md \
 	PROJECT_STATE.md \
 	research/README.md \
 	pytest.ini \
@@ -40,6 +47,7 @@ EXTRA_DIST += farmharness/DISTFILES $(ICEFARM_DIST_FILES)
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
 
+ICEFARM_USER_FARM := $(FARM)
 FARM ?= $(abs_top_srcdir)/farmharness/integration/farm.local.json
 ICEFARM_PYTHON ?= python3
 ICEFARM_TMPDIR ?=
@@ -54,6 +62,13 @@ ICEFARM_SEALED_LABELS = p43-1.4.0,p50s2-5b2e5801,p50s30-f-refusal-57a1e336,p50s4
 ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
+
+.PHONY: dev-bootstrap qa
+dev-bootstrap qa:
+	$(ICEFARM_SCRATCH_GUARD)
+	$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B "$(abs_top_srcdir)/dev/bootstrap.py" \
+		$(if $(filter qa,$@),qa,bootstrap) \
+		--farm "$(if $(ICEFARM_USER_FARM),$(FARM),$(abs_top_srcdir)/farm.json)"
 
 .PHONY: integration_source_archives integration_images integration_smoke integration_controls \
 	integration_ladder integration_twobuild integration_full

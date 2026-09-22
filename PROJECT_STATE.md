@@ -3,6 +3,91 @@
 Updated 2026-09-22 UTC. This is the current operational checkpoint; older
 progress reports are history, not evidence that the current product passed.
 
+## Docker developer bootstrap — 2026-09-22, q4 end-to-end PASS
+
+Added `make dev-bootstrap` and `make qa`, using the root `farm.json` (override
+with `FARM=...`) and mandatory `ICEFARM_TMPDIR`. The SDK supplies native build
+dependencies, Python/pytest and Java. Current/P43 scheduler, client and worker
+roles share product images; P43 is rebuilt from the pinned real 1.4.0 commit.
+This does not replace the qualified-image identities or external farm below.
+
+q4 passed the complete `make qa` command with Ubuntu 24.04, four jobs and a
+16 GiB limit, using the SDK built locally on nas642. Build/install, real P43
+build, runtime-image packaging and all five mixed cases passed. Native:
+169 passed, six skipped; separate root cache-service checks: two passed.
+Python: 1,486 passed, seven skipped in 54.43 seconds. Total about 11m37s,
+excluding SDK preparation/transfer. Tested source snapshot:
+`3ce12ffb4c2e619537e5c3dbc78cb6e2c5038ee59da4e30d26d748ec759a8ead`.
+Remote result:
+`/home/mickg10/scratch/icecream/bootstrap-trial.3Ih5my/icecream-qa-5cxfzjy1/result.json`.
+Local copy, native/Python logs and mixed evidence:
+`/tanksmall/scratch/tmp/icecream-q4-final-5cxfzjy1/`.
+
+Verified on nas642: SDK build; current build/install (177 s with two jobs);
+P43 build/install; five mixed-version/profile remote-compilation cases;
+real repository A/B selection and missing-repository refusal; SDK save/load.
+The last frozen full NAS run (`icecream-qa-orefyqq0`) remains FAIL: 168 native
+passed, six skipped, one endpoint-script failure; Python 1,486 passed, seven
+skipped in 236.82 seconds. The endpoint failure was an auxiliary `git diff`
+check in a gitless source snapshot, after runtime checks passed. Its correction
+passed separately on NAS (`icecream-targeted.K4ePDp`) and in the full q4 run.
+Do not relabel that older NAS result as a full-command PASS.
+The subsequent NAS root cache-service and sanitizer subset also passed (two
+passed, zero skipped) with the runner's shared short temporary-path mount and
+Make-provided environment. An earlier ad hoc direct-binary reproduction used
+different setup and failed; it was not evidence of a product regression.
+That targeted Make rerun reused the NAS build tree, replacing its two
+cache-service test records; the original aggregate logs/result remain FAIL.
+Output ownership was restored to the invoking host user afterward. The
+`p49daemon` failed-fork check also returned the expected exit 2 without any
+kill/wait calls (`/tanksmall/scratch/tmp/p49-fork-guard.1/`).
+
+The SDK now runs ordinary build/tests as `nobody`, with a separate required
+root cache-service/leak-check gate. Root-running the entire suite was incorrect
+for tests modeling ordinary P50 users. Fresh Ubuntu also exposed a GCC 13
+test-header macro issue and several root fixture/startup-error bugs; fixes are
+test-only. Runtime logs, source hashes and stage statuses are retained under
+the selected scratch directory. Normal exits restore output ownership.
+
+Earlier isolated runs exposed private fmt corpus paths, missing Java,
+long Unix socket names, test-only machine-specific scratch paths, and Docker
+blocking the descriptor-identity operation. These were corrected. The unchanged descriptor test
+passes with `SYS_PTRACE` in a private-PID QA container. Both compressed-golden
+checks now pass using per-frame decoded equality across zstd versions;
+same-build byte checks and historical vectors are unchanged. The runner aliases the same
+explicit scratch mount at `/tmp` and verifies its identity, avoiding fallback
+storage while keeping socket paths short.
+Native skips cover optional live/remote probes; the required five-case mixed
+Docker gate runs independently. Python skips cover unavailable user/PID namespaces,
+one retained production corpus and five Git-history checks in the gitless
+snapshot. All five history-dependent tests subsequently passed in the actual
+NAS Git checkout (3.40 seconds; scratch `icecream-history-tests.eYBq6c`).
+The remaining skips are explicit limits, not tests silently counted as PASS.
+The older failed diagnostic logs remain retained, not rewritten as green gates.
+NAS mixed proof (three explicit strict P50 profiles plus both P43 roles):
+`/tanksmall/scratch/tmp/mixed-p50-profiles-1790097199/summary.json`, five PASS.
+Focused codec proof:
+`/tanksmall/scratch/tmp/icecream-codec-runtime2.LR7d7U/run.log`.
+Repository-switching proof:
+`/tanksmall/scratch/tmp/icecream-registry-switch.iPijec/registry-result.json`.
+
+q4 is reachable through its actual configured account,
+`mickg10@tt-quietbox4`; the earlier `mickg` check used the wrong account.
+It has 32 CPUs, about 249 GiB RAM, and one 3.6 TiB root filesystem with
+3.2 TiB free; DockerRootDir is `/var/lib/docker` on that same filesystem.
+An explicit `/home/mickg10/scratch/icecream/bootstrap-trial.3Ih5my` directory
+was used on that large disk; no mount or Docker configuration changed.
+SDK save/load succeeded across nas642's ZFS and q4's containerd/overlayfs.
+The archive SHA-256 is
+`3716f7ec66cfe71079e5ec259f2de8efcf8cac7adb35c82825857b233f1e162b`.
+Those stores report different image IDs (config versus manifest digest), both
+present in the same archive; filesystem layer digests match. GitHub access
+there lacks working credentials. The verified Git-bundle checkout is
+`/home/mickg10/src/icecream-bootstrap-3Ih5my`; the edited snapshot is transferred
+separately. This offline checkout trial is not a direct GitHub clone.
+The q4 QA pass above uses that offline checkout and exact source snapshot.
+This does not prove direct GitHub access there or Ubuntu 22.04 coverage.
+
 ## Cleanup implementation — 2026-09-22
 
 Owner approved the readability/correctness cleanup and requested Luna agents

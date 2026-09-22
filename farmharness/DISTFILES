@@ -129,6 +129,9 @@ farmharness/integration/tests/test_collect_and_report.py
 farmharness/integration/tests/test_corpus_archive.py
 farmharness/integration/tests/test_current_lineage_catalog.py
 farmharness/integration/tests/test_daemon_mutant_promotion.py
+farmharness/integration/tests/test_dev_bootstrap.py
+farmharness/integration/tests/test_dev_mixed.py
+farmharness/integration/tests/test_dev_runner.py
 farmharness/integration/tests/test_disk_fill_cleanup.py
 farmharness/integration/tests/test_distribution_manifest.py
 farmharness/integration/tests/test_events.py

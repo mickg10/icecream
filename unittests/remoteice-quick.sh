@@ -128,9 +128,8 @@ trap cleanup EXIT
 
 command -v gcc >/dev/null || skip "gcc not available"
 
-# As root (containers, rpm %check) iceccd refuses -u root and instead picks
-# its own unprivileged compile user (icecc, else nobody) -- the production
-# path.  Unprivileged runs keep -u so the daemon accepts the invoking user.
+# Root runs select a real account explicitly so the daemon and fixture agree
+# on both UID and GID (the fallback numeric group is not portable).
 USERFLAG=""
 if [ "$(id -u)" != 0 ]; then
     USERFLAG="-u $(whoami)"
@@ -151,7 +150,9 @@ if [ "$(id -u)" = 0 ]; then
     chmod 1777 "$work" "$sockdir"
     ICEUSER=nobody
     id -u icecc >/dev/null 2>&1 && ICEUSER=icecc
-    chown "$ICEUSER" "$work/envs-remote" "$work/envs-local"
+    USERFLAG="-u $ICEUSER"
+    ICEGROUP=$(id -g "$ICEUSER")
+    chown "$ICEUSER:$ICEGROUP" "$work/envs-remote" "$work/envs-local"
 fi
 
 # STRICT_NONCE is the all-P50 row: the scheduler intentionally withholds a
@@ -166,7 +167,7 @@ if [ "$ASSIGNMENT_FENCE_MODE" = strict-nonce ]; then
     mkdir -p "$sockdir/cache-remote" "$sockdir/cache-local"
     chmod 0700 "$sockdir/cache-remote" "$sockdir/cache-local"
     if [ "$(id -u)" = 0 ]; then
-        chown "$ICEUSER" "$sockdir/cache-remote" "$sockdir/cache-local"
+        chown "$ICEUSER:$ICEGROUP" "$sockdir/cache-remote" "$sockdir/cache-local"
     fi
     REMOTE_CACHE_ARGS=(--cache-service "$CACHE_SERVICE"
                        --cache-runtime-dir "$sockdir/cache-remote")

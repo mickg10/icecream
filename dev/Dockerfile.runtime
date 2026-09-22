@@ -1,0 +1,8 @@
+ARG SDK_IMAGE
+FROM ${SDK_IMAGE}
+COPY . /opt/icecream/
+# Preserve the configured prefix used by libtool and icecc-create-env links.
+RUN mkdir -p /work && ln -s /opt/icecream /work/install
+ENV PATH=/opt/icecream/bin:/opt/icecream/sbin:$PATH
+WORKDIR /work
+ENTRYPOINT []

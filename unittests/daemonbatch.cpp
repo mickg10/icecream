@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -298,7 +299,24 @@ int main(int argc, char **argv)
     const std::string envdir = work + "/envs";
     const std::string socket_path = work + "/iceccd.sock";
     const std::string daemon_log = work + "/iceccd.log";
-    mkdir(envdir.c_str(), 0700);
+    if (mkdir(envdir.c_str(), 0700) != 0) {
+        perror("mkdir daemon environment directory");
+        return 2;
+    }
+    std::string daemon_user;
+    if (getuid() == 0) {
+        struct passwd *nobody = getpwnam("nobody");
+        if (!nobody || nobody->pw_uid == 0 || nobody->pw_gid == 0) {
+            fprintf(stderr, "daemonbatch: a non-root nobody account is required when run as root\n");
+            return 2;
+        }
+        if (chown(work.c_str(), nobody->pw_uid, nobody->pw_gid) != 0
+                || chown(envdir.c_str(), nobody->pw_uid, nobody->pw_gid) != 0) {
+            perror("chown daemon fixture to nobody");
+            return 2;
+        }
+        daemon_user = "nobody";
+    }
     fprintf(stderr, "retained work directory: %s\n", work.c_str());
 
     const int scheduler_port = reserve_port();
@@ -328,11 +346,22 @@ int main(int argc, char **argv)
            this fabricates that precondition immediately before each
            accepted batch decision's real, unmodified clear runs. */
         setenv("ICECC_TEST_POISON_CACHE_HANDOFF_SITE", "batch", 1);
-        execl(argv[1], argv[1], "--no-remote", "-m", "1", "-p", "10245",
-              "-s", scheduler_spec, "-n", "g4-batch-gate", "-N", "g4-daemon",
-              "-b", envdir.c_str(), "-l", daemon_log.c_str(),
-              "-v", "-v", "-v", static_cast<char *>(nullptr));
-        perror("execl iceccd");
+        std::vector<std::string> arguments {
+            argv[1], "--no-remote", "-m", "1", "-p", "10245", "-s",
+            scheduler_spec, "-n", "g4-batch-gate", "-N", "g4-daemon", "-b",
+            envdir, "-l", daemon_log, "-v", "-v", "-v"
+        };
+        if (!daemon_user.empty()) {
+            arguments.insert(arguments.begin() + 2, {"-u", daemon_user});
+        }
+        std::vector<char *> argument_pointers;
+        argument_pointers.reserve(arguments.size() + 1);
+        for (std::string &argument : arguments) {
+            argument_pointers.push_back(const_cast<char *>(argument.c_str()));
+        }
+        argument_pointers.push_back(nullptr);
+        execv(argv[1], argument_pointers.data());
+        perror("execv iceccd");
         _exit(127);
     }
     REQUIRE(daemon_pid > 0, "iceccd process started");
@@ -345,6 +374,18 @@ int main(int argc, char **argv)
     MsgChannel *sched = accept_login_channel(listener, 20000, &login);
     REQUIRE(sched != nullptr, "scheduler accepted the daemon Login");
     REQUIRE(login != nullptr, "scheduler received Login");
+    if (!sched || !login) {
+        delete login;
+        delete sched;
+        close(listener);
+        kill(daemon_pid, SIGTERM);
+        int status = 0;
+        if (!wait_child(daemon_pid, 5000, &status)) {
+            kill(daemon_pid, SIGKILL);
+            waitpid(daemon_pid, &status, 0);
+        }
+        return 1;
+    }
     delete login;
     REQUIRE(sched && sched->send_msg(
                 ConfCSMsg(UINT64_C(0x4700000000000002), ConfCSMsg::Legacy)),

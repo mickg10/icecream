@@ -1,6 +1,7 @@
 #include "cache/codec/p29_intern.h"
 #include "cache/p50_slice0.h"
 #include "cache/codec/p29_online_s1.h"
+#include "codec_golden_compare.h"
 
 #include <zstd.h>
 
@@ -428,27 +429,6 @@ void append_root_frames(std::span<const std::uint32_t> occurrences,
     }
 }
 
-[[nodiscard]] std::vector<std::uint8_t>
-frames_of_kind(std::span<const std::uint8_t> wire, std::uint8_t wanted) {
-    std::vector<std::uint8_t> result;
-    std::size_t position = 0;
-    while (position < wire.size()) {
-        require(wire.size() - position >= 5, "wire stream has truncated header");
-        const std::size_t frame_begin = position;
-        const std::uint8_t kind = wire[position++];
-        std::uint32_t length = 0;
-        for (unsigned byte = 0; byte != 4; ++byte)
-            length |= std::uint32_t(wire[position++]) << (8 * byte);
-        require(length <= wire.size() - position,
-                "wire stream has truncated payload");
-        position += length;
-        if (kind == wanted)
-            result.insert(result.end(), wire.begin() + frame_begin,
-                          wire.begin() + position);
-    }
-    return result;
-}
-
 void write_file(const fs::path &path, std::span<const std::uint8_t> bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output)
@@ -622,8 +602,9 @@ int main(int argc, char **argv) {
         if (!config.root_reference.empty()) {
             const std::vector<std::uint8_t> reference =
                 read_file(config.root_reference);
-            require(frames_of_kind(roots, 1) == frames_of_kind(reference, 1),
-                    "ROOT frames differ from retained research stream");
+            require(icecc::codec::test_golden::equivalent(
+                        roots, reference, icecc::codec::P29WireKind::Root),
+                    "ROOT decoded frames differ from retained research stream");
         }
         if (!config.root_output.empty())
             write_file(config.root_output, roots);

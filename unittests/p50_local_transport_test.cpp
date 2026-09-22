@@ -1,3 +1,8 @@
+// Load standard-library internals before the test's private-member access
+// macro: GCC 13's <chrono> includes <sstream>, whose access labels must remain
+// unchanged. The macro is intended only for our transport class.
+#include <chrono>
+
 #define private public
 #include "cache/p50_local_transport.h"
 #undef private
@@ -15,7 +20,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <chrono>
 #include <atomic>
 #include <fcntl.h>
 #include <pthread.h>

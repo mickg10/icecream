@@ -12,6 +12,7 @@
 #include <vector>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <pwd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
@@ -89,7 +90,15 @@ int main(int argc, char **argv)
     const std::string socket_path = work + "/iceccd.sock";
     const std::string envdir = work + "/envs";
     const std::string log_path = work + "/iceccd.log";
-    ::mkdir(envdir.c_str(), 0700);
+    if (::mkdir(envdir.c_str(), 0700) != 0) return 2;
+    std::string daemon_user;
+    if (::getuid() == 0) {
+        const passwd *account = ::getpwnam("nobody");
+        if (!account || account->pw_uid == 0 || account->pw_gid == 0) return 2;
+        if (::chown(work.c_str(), account->pw_uid, account->pw_gid) != 0 ||
+            ::chown(envdir.c_str(), account->pw_uid, account->pw_gid) != 0) return 2;
+        daemon_user = "nobody";
+    }
     const int scheduler_port = reserve_port();
     REQUIRE(scheduler_port > 0, "real daemon scheduler retry port reserved");
 
@@ -99,9 +108,16 @@ int main(int argc, char **argv)
         std::snprintf(scheduler, sizeof(scheduler), "127.0.0.1:%d", scheduler_port);
         ::setenv("ICECC_TESTS", "1", 1);
         ::setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
-        ::execl(argv[1], argv[1], "--no-remote", "-m", "0", "-p", "10245",
-                "-s", scheduler, "-n", "s2-cache-dispatch", "-N", "s2-cache-daemon",
-                "-b", envdir.c_str(), "-l", log_path.c_str(), static_cast<char *>(nullptr));
+        std::vector<std::string> arguments {
+            argv[1], "--no-remote", "-m", "0", "-p", "10245", "-s", scheduler,
+            "-n", "s2-cache-dispatch", "-N", "s2-cache-daemon", "-b", envdir,
+            "-l", log_path
+        };
+        if (!daemon_user.empty()) arguments.insert(arguments.end(), {"-u", daemon_user});
+        std::vector<char *> pointers;
+        for (auto &argument : arguments) pointers.push_back(argument.data());
+        pointers.push_back(nullptr);
+        ::execv(argv[1], pointers.data());
         ::_exit(127);
     }
     REQUIRE(child > 0, "real iceccd process started");

@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using Clock = std::chrono::steady_clock;
 static int failures = 0;
@@ -280,7 +282,24 @@ int main(int argc, char **argv)
     const std::string envdir = work + "/envs";
     const std::string logfile = work + "/iceccd.log";
     const std::string socket_path = work + "/iceccd.sock";
-    mkdir(envdir.c_str(), 0700);
+    if (mkdir(envdir.c_str(), 0700) != 0) {
+        std::perror("mkdir daemon environment directory");
+        return 2;
+    }
+    std::string daemon_user;
+    if (getuid() == 0) {
+        struct passwd *nobody = getpwnam("nobody");
+        if (!nobody || nobody->pw_uid == 0 || nobody->pw_gid == 0) {
+            std::fprintf(stderr, "p49daemon: a non-root nobody account is required when run as root\n");
+            return 2;
+        }
+        if (chown(work.c_str(), nobody->pw_uid, nobody->pw_gid) != 0
+                || chown(envdir.c_str(), nobody->pw_uid, nobody->pw_gid) != 0) {
+            std::perror("chown daemon fixture to nobody");
+            return 2;
+        }
+        daemon_user = "nobody";
+    }
     std::fprintf(stderr, "retained work directory: %s\n", work.c_str());
 
     int scheduler_port = 0;
@@ -296,17 +315,43 @@ int main(int argc, char **argv)
         setenv("ICECC_TESTS", "1", 1);
         setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
         setenv("ICECC_TEST_ASSIGNMENT_TABLE_LIMIT", "8", 1);
-        execl(argv[1], argv[1], "--no-remote", "-m", "1", "-p", "10245",
-              "-s", scheduler_spec, "-n", "p49-worker", "-N", "p49-daemon",
-              "-b", envdir.c_str(), "-l", logfile.c_str(), "-v", "-v", "-v",
-              static_cast<char *>(nullptr));
+        std::vector<std::string> arguments {
+            argv[1], "--no-remote", "-m", "1", "-p", "10245", "-s",
+            scheduler_spec, "-n", "p49-worker", "-N", "p49-daemon", "-b",
+            envdir, "-l", logfile, "-v", "-v", "-v"
+        };
+        if (!daemon_user.empty()) {
+            arguments.insert(arguments.begin() + 2, {"-u", daemon_user});
+        }
+        std::vector<char *> argument_pointers;
+        argument_pointers.reserve(arguments.size() + 1);
+        for (std::string &argument : arguments) {
+            argument_pointers.push_back(const_cast<char *>(argument.c_str()));
+        }
+        argument_pointers.push_back(nullptr);
+        execv(argv[1], argument_pointers.data());
         _exit(127);
     }
     REQUIRE(daemon_pid > 0, "real iceccd started");
+    if (daemon_pid < 0) {
+        close(listener);
+        return 2;
+    }
 
     MsgChannel *scheduler = accept_channel(listener, 8000);
     Msg *login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon logged in through the real protocol");
+    if (!scheduler || !login) {
+        delete login;
+        delete scheduler;
+        close(listener);
+        kill(daemon_pid, SIGTERM);
+        if (!wait_child(daemon_pid, 5000)) {
+            kill(daemon_pid, SIGKILL);
+            waitpid(daemon_pid, nullptr, 0);
+        }
+        return 1;
+    }
     LoginMsg *typed_login = dynamic_cast<LoginMsg *>(login);
     REQUIRE(typed_login && !typed_login->hasCacheAdvertisement()
                 && typed_login->cache_protocol == 0

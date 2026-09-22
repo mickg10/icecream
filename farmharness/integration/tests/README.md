@@ -28,6 +28,9 @@ namespace revalidation test took 450.915 seconds; time varies with the machine.
 Some retained-corpus probes depend on local external data and skip when those
 files are unavailable; they do not make the rest of the test suite dependent
 on a farm or Docker.
+The historical H3 patch-application probe also skips in gitless source
+snapshots when its exact base commit is absent; in a full Git checkout it
+continues to verify that the patch applies to the unchanged historical files.
 
 Bare pytest behavior is unchanged: `python3 -m pytest
 farmharness/integration/tests` still runs the entire directory. Both make

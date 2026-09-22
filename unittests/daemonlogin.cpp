@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -35,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using Clock = std::chrono::steady_clock;
 
@@ -258,7 +260,24 @@ int main(int argc, char **argv)
     const std::string envdir = work + "/envs";
     const std::string socket_path = work + "/iceccd.sock";
     const std::string daemon_log = work + "/iceccd.log";
-    mkdir(envdir.c_str(), 0700);
+    if (mkdir(envdir.c_str(), 0700) != 0) {
+        perror("mkdir daemon environment directory");
+        return 2;
+    }
+    std::string daemon_user;
+    if (getuid() == 0) {
+        struct passwd *nobody = getpwnam("nobody");
+        if (!nobody || nobody->pw_uid == 0 || nobody->pw_gid == 0) {
+            fprintf(stderr, "daemonlogin: a non-root nobody account is required when run as root\n");
+            return 2;
+        }
+        if (chown(work.c_str(), nobody->pw_uid, nobody->pw_gid) != 0
+                || chown(envdir.c_str(), nobody->pw_uid, nobody->pw_gid) != 0) {
+            perror("chown daemon fixture to nobody");
+            return 2;
+        }
+        daemon_user = "nobody";
+    }
     fprintf(stderr, "retained work directory: %s\n", work.c_str());
 
     const int scheduler_port = reserve_port();
@@ -285,11 +304,22 @@ int main(int argc, char **argv)
            before the next one can. */
         setenv("ICECC_TEST_POISON_CACHE_HANDOFF_SITE",
                "get_cs_no_scheduler,old_request_stranded", 1);
-        execl(argv[1], argv[1], "--no-remote", "-m", "1", "-p", "10245",
-              "-s", scheduler_spec, "-n", "g4-login-gate", "-N", "g4-daemon",
-              "-b", envdir.c_str(), "-l", daemon_log.c_str(),
-              "-v", "-v", "-v", static_cast<char *>(nullptr));
-        perror("execl iceccd");
+        std::vector<std::string> arguments {
+            argv[1], "--no-remote", "-m", "1", "-p", "10245", "-s",
+            scheduler_spec, "-n", "g4-login-gate", "-N", "g4-daemon", "-b",
+            envdir, "-l", daemon_log, "-v", "-v", "-v"
+        };
+        if (!daemon_user.empty()) {
+            arguments.insert(arguments.begin() + 2, {"-u", daemon_user});
+        }
+        std::vector<char *> argument_pointers;
+        argument_pointers.reserve(arguments.size() + 1);
+        for (std::string &argument : arguments) {
+            argument_pointers.push_back(const_cast<char *>(argument.c_str()));
+        }
+        argument_pointers.push_back(nullptr);
+        execv(argv[1], argument_pointers.data());
+        perror("execv iceccd");
         _exit(127);
     }
     REQUIRE(daemon_pid > 0, "iceccd process started without a scheduler");
@@ -299,6 +329,15 @@ int main(int argc, char **argv)
 
     MsgChannel *client_a = connect_unix_bounded(socket_path, 5000);
     REQUIRE(client_a != nullptr, "local client A connected while disconnected");
+    if (!client_a) {
+        kill(daemon_pid, SIGTERM);
+        int status = 0;
+        if (!wait_child(daemon_pid, 5000, &status)) {
+            kill(daemon_pid, SIGKILL);
+            waitpid(daemon_pid, &status, 0);
+        }
+        return 1;
+    }
     GetCSMsg local_request(Environments(), "local-a.cpp", CompileJob::Lang_CXX,
                            1, "x86_64", 0, std::string(), 0, 0, 0);
     REQUIRE(client_a && client_a->send_msg(local_request),

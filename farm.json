@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "profile": "ubuntu24.04",
+  "image_repository": "",
+  "jobs": 2,
+  "memory_gb": 8
+}

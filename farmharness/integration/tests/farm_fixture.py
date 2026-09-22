@@ -1,9 +1,10 @@
 """Hermetic farm document for integration unit tests.
 
 The committed example intentionally names retained operator artifacts.  Unit
-tests must not require those host-specific paths, so this module preserves the
-example's topology and authority while replacing its Firefox corpus authority
-with one tiny, fully hash-bound A/B pair under an owned temporary directory.
+tests must not require those host-specific paths, so this module preserves its
+topology while replacing fmt-100 with a scratch-local archive and its Firefox
+corpora with tiny, fully hash-bound A/B pairs under an owned temporary
+directory.
 """
 
 from __future__ import annotations
@@ -11,10 +12,13 @@ from __future__ import annotations
 import atexit
 import copy
 import hashlib
+import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
+import tarfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -51,6 +55,58 @@ def _archive_authority(corpus: dict[str, object], group: str, manifest: Path) ->
             }
         )
     ).hexdigest()
+
+
+def _local_single_manifest_corpus(
+    original: dict[str, object], fixture_root: Path
+) -> dict[str, object]:
+    """Keep the catalogued TU count while relocating fmt inputs into test scratch."""
+    corpus = copy.deepcopy(original)
+    root = fixture_root / "fmt-100"
+    source_root = root / "CMakeFiles"
+    source_root.mkdir(parents=True)
+    paths: list[Path] = []
+    for index in range(int(corpus["tus"])):
+        path = source_root / f"unit-{index:04d}.cpp"
+        path.write_text(f"int fmt_unit_{index}() {{ return {index}; }}\n", encoding="utf-8")
+        paths.append(path)
+    manifest = root / "manifest.txt"
+    manifest.write_text("".join(f"{path}\n" for path in paths), encoding="utf-8")
+    archive_path = root / "fmt-100-files.tar.zst"
+    tar_stream = io.BytesIO()
+    with tarfile.open(fileobj=tar_stream, mode="w", format=tarfile.USTAR_FORMAT) as bundle:
+        for path in paths:
+            payload = path.read_bytes()
+            member = tarfile.TarInfo(path.relative_to(source_root).as_posix())
+            member.size = len(payload)
+            member.mode = 0o644
+            member.uid = member.gid = 0
+            member.uname = member.gname = ""
+            member.mtime = 0
+            bundle.addfile(member, io.BytesIO(payload))
+    compressed = subprocess.run(
+        ["zstd", "-q", "-19", "--long=31", "--check", "-c"],
+        input=tar_stream.getvalue(),
+        check=True,
+        capture_output=True,
+    ).stdout
+    archive_path.write_bytes(compressed)
+
+    corpus["root"] = str(source_root)
+    corpus["manifest"] = str(manifest)
+    corpus["manifest_sha256"] = _sha(manifest)
+    archive = copy.deepcopy(corpus["archives"]["files"])
+    archive.update(
+        archive=str(archive_path),
+        archive_bytes=archive_path.stat().st_size,
+        archive_sha256=_sha(archive_path),
+        authority_sha256=_archive_authority(corpus, "files", manifest),
+        files=int(corpus["tus"]),
+        manifest_sha256=_sha(manifest),
+        unpacked_bytes=sum(path.stat().st_size for path in paths),
+    )
+    corpus["archives"] = {"files": archive}
+    return corpus
 
 
 @lru_cache(maxsize=1)
@@ -241,6 +297,9 @@ def example_farm_path() -> Path:
 
     document = json.loads(
         (INTEGRATION / "farm.example.json").read_text(encoding="utf-8")
+    )
+    document["corpora"]["fmt-100"] = _local_single_manifest_corpus(
+        document["corpora"]["fmt-100"], root
     )
     # The committed operator example may carry a live, immutable authority
     # capture.  Unit tests mutate authority entries, so their hermetic fixture

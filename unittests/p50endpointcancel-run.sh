@@ -5,7 +5,7 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 build=${ICECC_TEST_BUILDDIR:-${TMPDIR:-/tmp}/icecream-endpoint-cancel-build}
 mkdir -p "$build"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-evidence=${ICECC_ENDPOINT_CANCEL_EVIDENCE_DIR:-/tanksmall/scratch/ictmp/experiments/icecream/p50-endpoint-run-cancel/$stamp}
+evidence=${ICECC_ENDPOINT_CANCEL_EVIDENCE_DIR:-${TMPDIR:-/tmp}/icecream-endpoint-run-cancel/$stamp}
 mkdir -p "$evidence"
 printf '%s\n' '{"test":"p50endpointcancel","source":"typed-registry","status":"started"}' >"$evidence/manifest.jsonl"
 
@@ -72,6 +72,13 @@ else
     printf '%s\n' '{"test":"real-endpoint-rows","status":"not-built"}' >>"$evidence/results.jsonl"
 fi
 
-git -C "$src" diff --check
-printf '%s\n' '{"test":"git-diff-check","status":"pass"}' >>"$evidence/results.jsonl"
+# Git metadata is absent from release archives and Docker source snapshots.
+# This auxiliary whitespace check must not prevent the runtime checks above
+# from being used in those builds, or inspect an unrelated parent repository.
+if [ -e "$src/.git" ]; then
+    git -C "$src" diff --check
+    printf '%s\n' '{"test":"git-diff-check","status":"pass"}' >>"$evidence/results.jsonl"
+else
+    printf '%s\n' '{"test":"git-diff-check","status":"not-applicable-source-snapshot"}' >>"$evidence/results.jsonl"
+fi
 printf 'PASS: endpoint run cancellation normal/sanitizer/source census (%s)\n' "$evidence"

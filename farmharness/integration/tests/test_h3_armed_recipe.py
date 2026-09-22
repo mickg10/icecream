@@ -85,6 +85,13 @@ def test_armed_recipe_is_distinct_and_preserves_historical_recipe():
 
 def test_successor_patch_applies_to_exact_historical_base(tmp_path):
     repository = ROOT.parents[1]
+    available = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "-e",
+         "57a1e33624d324e52c1d17481fcc43046eaa3139^{commit}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    if available.returncode:
+        pytest.skip("requires Git history containing the exact historical base commit")
     for name in ("scheduler/scheduler.cpp", "services/comm.cpp"):
         original = subprocess.run(
             ["git", "show", f"57a1e33624d324e52c1d17481fcc43046eaa3139:{name}"],

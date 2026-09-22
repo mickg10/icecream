@@ -13,6 +13,20 @@ on x machines, you have full control over them.
 For this branch's qualification status, retained compression modes, and cleanup
 boundaries, see [PROJECT_STATE.md](PROJECT_STATE.md).
 Experimental code and historical reports live under [research/](research/README.md).
+For Docker-based development, install Docker, Git, Make and Python 3.10+ on a
+Linux host, choose an existing scratch directory, then run:
+
+```sh
+ICEFARM_TMPDIR=/data/icecream make qa
+```
+
+The default [farm.json](farm.json) selects Ubuntu 24.04, two build jobs and
+8 GiB memory. Override it with `FARM=/path/to/farm.json`. This builds the edited
+checkout, runs local tests and a small P43/P50 Docker interoperability test;
+it does not run the external qualification farm. `make dev-bootstrap` builds
+without the test suites. See [the development guide](dev/README.md) for image
+repositories, offline transfer, prerequisites and retained results.
+
 For local harness checks, use `make test-harness-fast` or
 `make test-harness-thorough`; see the [test guide](farmharness/integration/tests/README.md)
 for prerequisites, scratch paths, and the distinction from farm qualification.

@@ -99,6 +99,23 @@ def test_generic_farm_fixture_isolates_all_live_firefox_authorities(
     assert farm.data["corpora"]["firefox-root-header-1000"]["tus"] == 1
 
 
+def test_generic_farm_fixture_relocates_fmt_corpus_under_test_scratch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ICEFARM_TMPDIR", str(tmp_path))
+    farm_fixture.example_farm_path.cache_clear()
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    corpus = farm.data["corpora"]["fmt-100"]
+    manifest = Path(corpus["manifest"])
+    paths = [Path(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+
+    assert manifest.is_relative_to(tmp_path)
+    assert Path(corpus["root"]).is_relative_to(tmp_path)
+    assert len(paths) == corpus["tus"] == 50
+    assert all(path.is_file() and path.is_relative_to(tmp_path) for path in paths)
+    assert not any("/tanksmall/scratch/ictmp/corpus7/" in str(path) for path in paths)
+
+
 def test_committed_s50_mixed_pool_resolves_every_pair_stably() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(

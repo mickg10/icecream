@@ -57,6 +57,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -71,6 +72,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using Clock = std::chrono::steady_clock;
 
@@ -399,6 +401,17 @@ int main(int argc, char **argv)
     }
     REQUIRE(chmod(service_wrapper.c_str(), 0700) == 0,
             "cache-service replacement rendezvous wrapper is executable");
+    std::string daemon_user;
+    if (getuid() == 0) {
+        const passwd *account = getpwnam("nobody");
+        if (!account || account->pw_uid == 0 || account->pw_gid == 0) return 2;
+        // The daemon and its child must own both the directories and wrapper
+        // after switching away from the root test runner.
+        for (const auto &path : {work, envdir, runtime, service_wrapper}) {
+            if (chown(path.c_str(), account->pw_uid, account->pw_gid) != 0) return 2;
+        }
+        daemon_user = "nobody";
+    }
     fprintf(stderr, "retained work directory: %s\n", work.c_str());
 
     const int scheduler_port = reserve_port();
@@ -440,12 +453,17 @@ int main(int argc, char **argv)
            silently route every test through the remote-worker branch
            instead of the self-selected-F (127.0.0.1 rewrite) branch this
            test exists to exercise. */
-        execl(argv[1], argv[1], "-m", "2", "-p", daemon_port_text,
-              "-s", scheduler_spec, "-n", "s2-relay-gate", "-N", "s2-relay-daemon",
-              "-b", envdir.c_str(), "-l", daemon_log.c_str(),
-              "--cache-service", service_wrapper.c_str(),
-              "--cache-runtime-dir", runtime.c_str(),
-              "-v", "-v", "-v", static_cast<char *>(nullptr));
+        std::vector<std::string> arguments {
+            argv[1], "-m", "2", "-p", daemon_port_text, "-s", scheduler_spec,
+            "-n", "s2-relay-gate", "-N", "s2-relay-daemon", "-b", envdir,
+            "-l", daemon_log, "--cache-service", service_wrapper,
+            "--cache-runtime-dir", runtime, "-v", "-v", "-v"
+        };
+        if (!daemon_user.empty()) arguments.insert(arguments.end(), {"-u", daemon_user});
+        std::vector<char *> pointers;
+        for (auto &argument : arguments) pointers.push_back(argument.data());
+        pointers.push_back(nullptr);
+        execv(argv[1], pointers.data());
         perror("execl iceccd");
         _exit(127);
     }

@@ -1,6 +1,7 @@
 #include "cache/codec/p29_intern.h"
 #include "cache/codec/p29_wire.h"
 #include "cache/p50_slice0.h"
+#include "codec_golden_compare.h"
 
 #include <algorithm>
 #include <array>
@@ -1143,6 +1144,81 @@ void run_wire_controls(const Corpus &corpus,
   }
 }
 
+void run_golden_comparison_controls() {
+  wire::MessageCodec messages;
+  wire::ContinuingEncoder control;
+  const std::array<std::uint8_t, 3> root_raw{1, 2, 3};
+  const std::array<std::uint8_t, 2> control_first{4, 5};
+  const std::array<std::uint8_t, 2> control_last{6, 7};
+  std::vector<std::uint8_t> original;
+  wire::append_frame(original, P29WireKind::Root, messages.encode(root_raw));
+  wire::append_frame(original, P29WireKind::FillControl,
+                     control.encode(control_first, false));
+  wire::append_frame(original, P29WireKind::FillControl,
+                     control.encode(control_last, true));
+  wire::append_frame(original, P29WireKind::TuEnd, {});
+  require(icecc::codec::test_golden::equivalent(original, original),
+          "golden semantic comparison rejected identical frames");
+
+  auto rebuild = [](const std::vector<wire::FrameView> &frames) {
+    std::vector<std::uint8_t> bytes;
+    for (const wire::FrameView &frame : frames)
+      wire::append_frame(bytes, frame.kind, frame.payload);
+    return bytes;
+  };
+  const auto frames = wire::parse_frames(original);
+  {
+    std::vector<wire::FrameView> changed = frames;
+    changed[0].kind = P29WireKind::BlockDefinition;
+    require(!icecc::codec::test_golden::equivalent(original, rebuild(changed)),
+            "golden semantic comparison accepted altered frame kind");
+  }
+  {
+    std::vector<wire::FrameView> changed = frames;
+    std::swap(changed[0], changed[1]);
+    require(!icecc::codec::test_golden::equivalent(original, rebuild(changed)),
+            "golden semantic comparison accepted reordered frames");
+  }
+  {
+    std::vector<std::uint8_t> changed;
+    auto raw = messages.decode(frames[0].payload);
+    raw[0] ^= 0xff;
+    wire::append_frame(changed, P29WireKind::Root, messages.encode(raw));
+    for (std::size_t i = 1; i < frames.size(); ++i)
+      wire::append_frame(changed, frames[i].kind, frames[i].payload);
+    require(!icecc::codec::test_golden::equivalent(original, changed),
+            "golden semantic comparison accepted changed decoded byte");
+  }
+  {
+    std::vector<std::uint8_t> changed;
+    wire::append_frame(changed, P29WireKind::Root, frames[0].payload);
+    std::vector<std::uint8_t> merged(frames[1].payload.begin(),
+                                     frames[1].payload.end());
+    merged.insert(merged.end(), frames[2].payload.begin(), frames[2].payload.end());
+    wire::append_frame(changed, P29WireKind::FillControl, merged);
+    wire::append_frame(changed, P29WireKind::TuEnd, {});
+    require(!icecc::codec::test_golden::equivalent(original, changed),
+            "golden semantic comparison accepted changed frame boundaries");
+  }
+  {
+    std::vector<std::uint8_t> truncated = original;
+    truncated.pop_back();
+    require(!icecc::codec::test_golden::equivalent(original, truncated),
+            "golden semantic comparison accepted truncation");
+  }
+  {
+    std::vector<std::uint8_t> changed;
+    std::vector<std::uint8_t> trailing(frames[0].payload.begin(),
+                                       frames[0].payload.end());
+    trailing.push_back(0);
+    wire::append_frame(changed, P29WireKind::Root, trailing);
+    for (std::size_t i = 1; i < frames.size(); ++i)
+      wire::append_frame(changed, frames[i].kind, frames[i].payload);
+    require(!icecc::codec::test_golden::equivalent(original, changed),
+            "golden semantic comparison accepted trailing compressed data");
+  }
+}
+
 struct Options {
   std::vector<fs::path> inputs = phase0_inputs();
   P29InternLayout layout = P29InternLayout::probe();
@@ -1232,6 +1308,7 @@ int main(int argc, char **argv) {
     require(interner.distinct_lines() == config.expected_lines,
             "wire distinct Line count differs");
     run_wire_controls(corpus, interner);
+    run_golden_comparison_controls();
 
     const auto total_start = Clock::now();
     auto research =
@@ -1239,11 +1316,13 @@ int main(int argc, char **argv) {
     const double research_wall =
         std::chrono::duration<double>(Clock::now() - total_start).count();
     if (!config.cf_reference.empty())
-      require(research.cf == read_file(config.cf_reference),
-              "C-to-F stream differs from retained research golden");
+      require(icecc::codec::test_golden::equivalent(
+                  research.cf, read_file(config.cf_reference)),
+              "C-to-F decoded frames differ from retained research golden");
     if (!config.fc_reference.empty())
-      require(research.fc == read_file(config.fc_reference),
-              "F-to-C stream differs from retained research golden");
+      require(icecc::codec::test_golden::equivalent(
+                  research.fc, read_file(config.fc_reference)),
+              "F-to-C decoded frames differ from retained research golden");
     if (!config.cf_output.empty())
       write_file(config.cf_output, research.cf);
     if (!config.fc_output.empty())

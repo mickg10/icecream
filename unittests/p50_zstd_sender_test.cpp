@@ -6,7 +6,9 @@
 #include <boost/asio/use_future.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <future>
 #include <netinet/in.h>
@@ -28,6 +30,22 @@ void check(bool value, const char* expression) {
 }
 
 #define CHECK(expression) check((expression), #expression)
+
+struct TemporaryFile {
+    std::string path;
+    int fd = -1;
+};
+
+TemporaryFile create_temporary_file(const char* name) {
+    const char* configured = std::getenv("TMPDIR");
+    const std::filesystem::path directory =
+        configured != nullptr && configured[0] != '\0' ? configured : "/tmp";
+    std::string pattern = (directory / (std::string(name) + "-XXXXXX")).string();
+    std::vector<char> writable(pattern.begin(), pattern.end());
+    writable.push_back('\0');
+    const int fd = ::mkstemp(writable.data());
+    return {fd < 0 ? std::string{} : std::string(writable.data()), fd};
+}
 
 ZstdSourceTransferConfig config() {
     ZstdSourceTransferConfig result;
@@ -98,15 +116,15 @@ void test_exact_network_transfer() {
 }
 
 void test_owned_fd_and_fail_closed_validation() {
-    char path[] = "/tanksmall/scratch/ictmp/p50-zstd-sender-test-XXXXXX";
-    const int write_fd = ::mkstemp(path);
+    const TemporaryFile temporary = create_temporary_file("p50-zstd-sender-test");
+    const int write_fd = temporary.fd;
     CHECK(write_fd >= 0);
     CHECK(::fchmod(write_fd, 0600) == 0);
     const std::string source = "#define owned_fd 1\n";
     CHECK(::write(write_fd, source.data(), source.size()) ==
           static_cast<ssize_t>(source.size()));
     CHECK(::close(write_fd) == 0);
-    const int read_fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    const int read_fd = ::open(temporary.path.c_str(), O_RDONLY | O_CLOEXEC);
     CHECK(read_fd >= 0);
 
     asio::io_context context;
@@ -117,14 +135,14 @@ void test_owned_fd_and_fail_closed_validation() {
         asio::use_future);
     context.run();
     CHECK(result.get().status == ZstdSourceTransferStatus::InvalidRequest);
-    CHECK(::unlink(path) == 0);
+    CHECK(::unlink(temporary.path.c_str()) == 0);
 }
 
 void test_owned_fd_release_transfers_single_ownership() {
-    char path[] = "/tanksmall/scratch/ictmp/p50-owned-source-release-XXXXXX";
-    const int fd = ::mkstemp(path);
+    const TemporaryFile temporary = create_temporary_file("p50-owned-source-release");
+    const int fd = temporary.fd;
     CHECK(fd >= 0);
-    CHECK(::unlink(path) == 0);
+    CHECK(::unlink(temporary.path.c_str()) == 0);
     {
         OwnedSourceFd source(fd);
         CHECK(source.get() == fd);
