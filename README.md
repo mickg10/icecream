@@ -13,6 +13,9 @@ on x machines, you have full control over them.
 For this branch's qualification status, retained compression modes, and cleanup
 boundaries, see [PROJECT_STATE.md](PROJECT_STATE.md).
 Experimental code and historical reports live under [research/](research/README.md).
+For local harness checks, use `make test-harness-fast` or
+`make test-harness-thorough`; see the [test guide](farmharness/integration/tests/README.md)
+for prerequisites, scratch paths, and the distinction from farm qualification.
 
 Table of Contents
 

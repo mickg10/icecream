@@ -422,6 +422,7 @@ def test_refuses_non_single_header_edit(tmp_path: Path) -> None:
         _build(inputs)
 
 
+@pytest.mark.thorough
 def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) -> None:
     inputs = _make_inputs(tmp_path)
     b_paths = [Path(line) for line in inputs["b_manifest"].read_text(encoding="utf-8").splitlines()]  # type: ignore[union-attr]

@@ -1,6 +1,9 @@
 # S8 expanded campaign planner
 
-`farmharness/s8_campaign_planner.py` creates an authenticated declarative
+> Historical research guide retained for reproducibility. This S8 campaign
+> workflow is not a current product qualification recipe.
+
+`research/farmharness/s8_campaign_planner.py` creates an authenticated declarative
 index and `descriptors.jsonl`. It does not emit Docker, simulator, or farm
 commands. A later native/live runner binds descriptors whose status is `READY`
 to `icecream.s8.native-live-runner-v1`.
@@ -33,7 +36,7 @@ Methods are distinct: `RAW_II`, `ZSTD_TU`, `ZSTD_ROUTE`, `P29`,
 explicit whole-legacy control arm, not a fifth compressed profile and not an
 alias for `P29`. Its descriptor retains the required
 `raw_ii_legacy_wire_witness` and `raw_ii_engine_template` inputs. The dedicated
-`farmharness/s8_raw_ii_predictive_producer.py` consumes those inputs: the
+`research/farmharness/s8_raw_ii_predictive_producer.py` consumes those inputs: the
 witness binds C-to-F as `CompileFile + FileChunk + End`, while the separately
 scoped `raw_ii_control_engine` binds F-to-C and one elapsed service duration
 per occurrence. It never reads P29 predictions. The four compressed methods
@@ -67,7 +70,7 @@ curve, and comparison identities remain `RAW_II`.
 Example declarative invocation (the timestamp is caller-owned and immutable):
 
 ```sh
-python3 farmharness/s8_campaign_planner.py \
+python3 research/farmharness/s8_campaign_planner.py \
   --corpus-inventory /tanksmall/scratch/ictmp/experiments/icecream/s8-image-authority-inventory/20260829T101006Z/inventory.json \
   --image-recovery-report /tanksmall/scratch/ictmp/s8-image-authority-recovery-luna/20260829T110547Z/recovery.json \
   --image-recovery-sha256 a2eafa4b1c01ca7c21e9f52b72700582a563c52fd2cea075b36260ad7f110bf5 \

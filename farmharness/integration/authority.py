@@ -9,7 +9,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -231,7 +231,7 @@ def _parse_host_capture(
     captured_at = value["captured_at"]
     if not isinstance(captured_at, str) or ISO_UTC_RE.fullmatch(captured_at) is None:
         raise AuthorityCaptureError(f"host {host_name} has invalid capture time")
-    captured = datetime.strptime(captured_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    captured = datetime.strptime(captured_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     age = (now - captured).total_seconds()
     if age < -30 or age > 300:
         raise AuthorityCaptureError(f"host {host_name} capture is stale")
@@ -334,7 +334,7 @@ def capture_authority(
         raise AuthorityCaptureError("authority descriptor directory already exists")
     steps = _capture_steps(farm, timeout_s)
     transport = recorder or SubprocessTransport()
-    observed_at = now or datetime.now(UTC)
+    observed_at = now or datetime.now(timezone.utc)
     hosts: dict[str, dict[str, Any]] = {}
     for step in steps:
         result = transport.invoke(step.command)

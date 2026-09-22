@@ -23,6 +23,13 @@ From the repo root:
 
 Artifacts go under `tests/compose/out/<run-id>/` by default (override with `ICECC_OUT_DIR`).
 
+The image build uses at most two make jobs by default (`BUILD_JOBS=2`). To
+override that limit when building the compose images manually, run
+`docker compose build --build-arg BUILD_JOBS=4` from `tests/compose` (choose a
+value appropriate for the machine). This only bounds compilation while the
+image is built; it does not bound the runtime resources used by the seven
+containers or their worker builds.
+
 ## Tunables
 
 Environment variables:

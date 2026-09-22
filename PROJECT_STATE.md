@@ -3,11 +3,69 @@
 Updated 2026-09-22 UTC. This is the current operational checkpoint; older
 progress reports are history, not evidence that the current product passed.
 
+## Cleanup implementation — 2026-09-22
+
+Owner approved the readability/correctness cleanup and requested Luna agents
+for testing with minimal foreground work. The owner subsequently authorized
+committing the verified cleanup and publishing `sorbet_v1.5` to GitHub for a
+fresh-checkout trial on research6. Verify the remote branch identity separately
+from the test results below; authorization alone is not a successful push.
+The larger plan remains open in
+`CLEANUP_PLAN.md`; do not mistake this batch for completion of all 15 items.
+
+- Failed disk-fill coordination now attempts abort/release for every client,
+  including partial pause/resume failures; both primary and cleanup errors are
+  retained. Normal S95 fill-before-pause ordering is unchanged.
+- Supported package aggregates omit Fedora 28; its explicit refusal checks stay.
+  Compose now bootstraps Autotools, includes Boost/xxhash dependencies, and
+  defaults image builds to two jobs. No Docker build was executed for this batch.
+- The 887-line manifest worker is an editable packaged shell file, byte-identical
+  to its previous Python literal. Existing command identity is preserved.
+- Added `make test-harness-fast` and `make test-harness-thorough`. Ordinary pytest
+  still includes all tests. Only the expensive synthetic 1,000-row namespace
+  revalidation test is excluded by the fast entrypoint.
+- Moved the historical S8 guide from `doc/` to `research/farmharness/docs/`,
+  updated runnable paths and distribution metadata. No historical content was
+  discarded. Other research files retain replay/test consumers.
+
+Luna verification: **1,455 passed, 1 deselected in 89.52 s** for the final fast
+selection; JUnit: `/tanksmall/scratch/tmp/sorbet-cleanup-fast.xml`.
+The separately selected thorough test passed: **1 passed, 1,455 deselected in
+445.29 s**; JUnit: `/tanksmall/scratch/tmp/sorbet-cleanup-thorough.xml`.
+Focused event, workload and distribution checks also pass; Bash syntax and Ruff
+pass for the agent-owned changes. No farm deployment, new qualification run or
+image relabeling occurred. The previously qualified image/campaign below
+remains the authority.
+
+Next: enforce explicit scratch storage at Make entrypoints, publish the branch,
+and test the fresh checkout on research6. That separate remote build/test trial
+is now owner-authorized; it is not a rerun of the existing qualification farm.
+Selected-artifact validation and owned-process cancellation remain pending.
+
+Research6 inspection: `~/src` and DockerRootDir are on the large data filesystem
+(about 4.1 TiB free), not the root filesystem. Isolated trial directory:
+`/home/mickg/src/icecream-checkout-test.1WHUxU`, with private `logs/` and `tmp/`.
+The host reports 20 logical CPUs, about 378 GiB RAM and Docker 29.8.0.
+GitHub HTTPS access there currently cannot obtain credentials; SSH to GitHub
+on ports 22 and 443 timed out. No credentials were copied or host packages
+installed. Source publication and remote download access are separate gates.
+
+Make integration, local-harness and formal entrypoints now require an explicit
+`ICEFARM_TMPDIR`: existing, absolute, writable, and not the filesystem root
+(including aliases). There is no `/tmp/i` default for these targets. Child
+temporary-directory settings inherit the chosen path; native object files still
+require an out-of-tree build directory, and Docker storage is checked separately.
+The research6 Python 3.10 probe also confirmed that `datetime.UTC` was unavailable;
+active harness code and its test now use `timezone.utc`, matching the documented
+Python 3.10 baseline. Native build dependencies and pytest are absent on that
+host; those are additional fresh-machine prerequisites, not hidden installations.
+
 ## Release branch — sorbet_v1.5
 
 The owner requested a local commit of the complete Icecream work on
 `sorbet_v1.5`, with package version **1.5.0**. This replaces the earlier
-proposed branch name `sorbet_v1.50`. No push or tag is authorized or claimed.
+proposed branch name `sorbet_v1.50`. The owner has now authorized a branch push
+for fresh-checkout testing; no release tag is authorized or claimed.
 The source version, source/binary release tests, installed-identity checks and
 release manifest now agree on 1.5.0. P50 protocol/profile IDs and pinned P43
 image versions are unchanged.

@@ -97,9 +97,10 @@ def test_required_integration_make_targets_are_scratch_routed(
             text=True,
         )
         command = result.stdout
-        assert 'ICEFARM_TMPDIR="/tmp/i"' in command
+        assert "check_scratch.sh" in command
         for variable in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
-            assert f'{variable}="/tmp/i"' in command
+            assert f'{variable}="$ICEFARM_TMPDIR"' in command
+        assert "PYTHONDONTWRITEBYTECODE=1" in command
         assert "farmharness.integration.farmtest suite" in command
         assert f"farmharness/integration/suites/{suite}" in command
         assert ("--stop-on-fail" in command) is (
@@ -116,9 +117,9 @@ def test_image_make_target_is_scratch_routed(monkeypatch: pytest.MonkeyPatch) ->
         capture_output=True,
         text=True,
     )
-    assert 'ICEFARM_TMPDIR="/tmp/i"' in result.stdout
+    assert "check_scratch.sh" in result.stdout
     for variable in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
-        assert f'{variable}="/tmp/i"' in result.stdout
+        assert f'{variable}="$ICEFARM_TMPDIR"' in result.stdout
     assert result.stdout.count("farmharness.integration.farmtest images") == 2
     assert result.stdout.count("--foundations") == 1
     assert set(_command_labels(result.stdout)) == _catalog_image_labels()
@@ -179,7 +180,7 @@ def test_source_archive_make_target_is_explicit_and_scratch_routed(
         capture_output=True,
         text=True,
     )
-    assert 'ICEFARM_TMPDIR="/tmp/i"' in result.stdout
+    assert "check_scratch.sh" in result.stdout
     assert "farmharness.integration.farmtest source-archives" in result.stdout
     assert '--output-dir "/tanksmall/scratch/ictmp/source-inventory"' in result.stdout
     assert set(_command_labels(result.stdout)) == _catalog_image_labels()
@@ -209,8 +210,8 @@ def test_make_targets_preserve_operator_temp_override(
         ),
         cwd=ROOT, check=True, capture_output=True, text=True,
     ).stdout
-    for variable in ("ICEFARM_TMPDIR", "TMPDIR", "TMP", "TEMP", "TEMPDIR"):
-        assert f'{variable}="{routed}"' in command
+    for variable in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
+        assert f'{variable}="$ICEFARM_TMPDIR"' in command
 
 
 def test_autotools_source_exposes_the_same_required_targets() -> None:
@@ -225,10 +226,11 @@ def test_autotools_source_exposes_the_same_required_targets() -> None:
         "integration_full",
     ):
         assert f"{target}:" in text
-    assert "ICEFARM_TMPDIR ?= /tmp/i" in text
-    assert 'ICEFARM_TMPDIR="$(ICEFARM_TMPDIR)"' in text
+    assert "ICEFARM_TMPDIR ?= /tmp/i" not in text
+    assert "check_scratch.sh" in text
+    assert "ICEFARM_TMPDIR ?=" in text
     for variable in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
-        assert f'{variable}="$(ICEFARM_TMPDIR)"' in text
+        assert f'{variable}="$$ICEFARM_TMPDIR"' in text
     image_target = text.split("integration_images:", 1)[1].split(
         "integration_smoke:", 1
     )[0]
@@ -242,3 +244,61 @@ def test_autotools_source_exposes_the_same_required_targets() -> None:
     assert "p50s90-f-revision-2-candidate" not in image_target
     assert "foundations.json" in image_target
     assert "sealed-products.json" in image_target
+
+
+def test_make_entrypoints_require_real_scratch_before_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = tmp_path / "fake-python"
+    marker = tmp_path / "python-ran"
+    python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$ICEFARM_TMPDIR|$TMPDIR|$TMP|$TEMP|$TEMPDIR|$PYTHONDONTWRITEBYTECODE\" > \"$ICEFARM_TEST_MARKER\"\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    monkeypatch.setenv("ICEFARM_TEST_MARKER", str(marker))
+    for variable in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
+        monkeypatch.delenv(variable, raising=False)
+
+    invalid_values = (
+        None, "relative/path", str(tmp_path / "missing"), str(python), "/", "/tmp/..",
+    )
+    for value in invalid_values:
+        monkeypatch.delenv("ICEFARM_TMPDIR", raising=False)
+        if value is not None:
+            monkeypatch.setenv("ICEFARM_TMPDIR", value)
+        result = subprocess.run(
+            ("make", "--no-print-directory", "integration_smoke", f"ICEFARM_PYTHON={python}"),
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "ICEFARM_TMPDIR" in result.stderr
+        assert not marker.exists()
+
+    fake_bin = tmp_path / "unwritable-bin"
+    fake_bin.mkdir()
+    mktemp = fake_bin / "mktemp"
+    mktemp.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    mktemp.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    scratch = tmp_path / "valid scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("ICEFARM_TMPDIR", str(scratch))
+    result = subprocess.run(
+        ("make", "--no-print-directory", "integration_smoke", f"ICEFARM_PYTHON={python}"),
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "ICEFARM_TMPDIR is not writable" in result.stderr
+    assert not marker.exists()
+
+    monkeypatch.setenv("PATH", os.environ["PATH"].removeprefix(f"{fake_bin}:"))
+    monkeypatch.setenv("ICEFARM_TMPDIR", str(scratch))
+    result = subprocess.run(
+        ("make", "--no-print-directory", "integration_smoke", f"ICEFARM_PYTHON={python}"),
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8").strip() == "|".join(
+        (str(scratch),) * 5 + ("1",)
+    )

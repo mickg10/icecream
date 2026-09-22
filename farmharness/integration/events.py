@@ -5751,14 +5751,15 @@ class EventProducer:
                 return self._authenticated_disk_fill(event, instance, before)
             paused: dict[str, dict[str, Any]] = {}
             resumed: dict[str, dict[str, Any]] = {}
-            if (
-                self.scenario.data.get("expect", {}).get("engagement")
-                == "s95-cache-disk-full"
-            ):
-                # Eligibility proved that the trigger compile is active on
-                # the preferred target. Inject ENOSPC before draining admission
-                # so the product sees an actual in-flight resource failure.
-                receipt = self._authenticated_disk_fill(event, instance, before)
+            try:
+                in_flight = (
+                    self.scenario.data.get("expect", {}).get("engagement")
+                    == "s95-cache-disk-full"
+                )
+                if in_flight:
+                    # Fill while the trigger compile is active, before draining
+                    # admission. Preserve the qualified S95 event ordering.
+                    receipt = self._authenticated_disk_fill(event, instance, before)
                 self._gate_controls(
                     clients,
                     action="pause",
@@ -5767,24 +5768,35 @@ class EventProducer:
                     timeout_s=self._command_timeout(),
                     receipts=paused,
                 )
-            else:
+                if not in_flight:
+                    receipt = self._authenticated_disk_fill(event, instance, before)
                 self._gate_controls(
                     clients,
-                    action="pause",
+                    action="resume",
                     turn=turn,
                     epoch=epoch,
                     timeout_s=self._command_timeout(),
-                    receipts=paused,
+                    receipts=resumed,
                 )
-                receipt = self._authenticated_disk_fill(event, instance, before)
-            self._gate_controls(
-                clients,
-                action="resume",
-                turn=turn,
-                epoch=epoch,
-                timeout_s=self._command_timeout(),
-                receipts=resumed,
-            )
+            except BaseException as primary:
+                # Pause and resume can each fail after changing only some
+                # clients. Always release every client, not just those whose
+                # receipts arrived, and retain both errors if cleanup fails.
+                aborted: dict[str, dict[str, Any]] = {}
+                try:
+                    self._gate_controls(
+                        clients,
+                        action="abort",
+                        turn=turn,
+                        epoch=epoch,
+                        timeout_s=self._command_timeout(),
+                        receipts=aborted,
+                    )
+                except BaseException as abort_exc:
+                    raise EventError(
+                        f"{primary}; disk-fill admission abort failed: {abort_exc}"
+                    ) from primary
+                raise
             receipt["admission_boundary"] = {
                 "epoch": epoch,
                 "pause": paused,

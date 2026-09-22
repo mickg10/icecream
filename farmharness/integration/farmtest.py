@@ -12,7 +12,7 @@ import re
 import secrets
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -1030,7 +1030,7 @@ def fake_up(plan: dict[str, Any]) -> list[dict[str, Any]]:
 def new_run_id() -> str:
     """Return the normative collision-resistant UTC run identifier."""
 
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{secrets.token_hex(3)}"
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -32,6 +33,15 @@ from farmharness.integration.workload import (
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
+
+
+def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
+    driver_path = INTEGRATION / "workers" / "manifest_driver.sh"
+
+    assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
+    assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
+        "9d4c72674c3957109ec383c94d5e384b1846975ef199d0c4a0e887239bf2bf40"
+    )
 
 
 def _farm_scenario_plan(tmp_path: Path):

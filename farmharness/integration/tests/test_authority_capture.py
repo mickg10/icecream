@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,7 +16,7 @@ from farmharness.integration.schema_validation import canonical_bytes
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
-NOW = datetime(2026, 9, 4, 20, 0, 0, tzinfo=UTC)
+NOW = datetime(2026, 9, 4, 20, 0, 0, tzinfo=timezone.utc)
 DOCKER_INFO = {
     "Architecture": "amd64",
     "DockerRootDir": "/var/lib/docker",
