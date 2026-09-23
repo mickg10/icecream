@@ -147,6 +147,12 @@ if ! icecc_run_make -C "$icecc_test_build" -j2 V=1 all \
     cat "$icecc_test_root/build.log" >&2
     exit 1
 fi
+# The endpoint hooks are check-only, so the product build above omits them.
+if ! icecc_run_make -C "$icecc_test_build/cache" -j2 V=1 libp50endpointtesthooks.a \
+        >> "$icecc_test_root/build.log" 2>&1; then
+    cat "$icecc_test_root/build.log" >&2
+    exit 1
+fi
 if ! icecc_run_make -C "$icecc_test_build/unittests" -j2 V=1 p50endpoint \
         >> "$icecc_test_root/build.log" 2>&1; then
     cat "$icecc_test_root/build.log" >&2

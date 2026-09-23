@@ -8,7 +8,7 @@
 // FSessionOperationId.  No endpoint can manufacture authority from a socket
 // descriptor, descriptor number, or object address.
 
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 #include "services/p50_cache_session_wire.h"
 #include "protocol50.h"
 

@@ -1,3 +1,4 @@
+// Test-only reference component; not part of the live P50 implementation.
 #pragma once
 
 // Bounded reverse (F -> C) sealed-input delivery.  This is deliberately a
@@ -5,8 +6,8 @@
 // call CompileFile.  The endpoint owner stages one immutable master memfd;
 // each attempt duplicates that master and passes the duplicate over the wire.
 
-#include "p50_fd_handoff.h"
-#include "p50_source_identity.h"
+#include "cache/p50_fd_handoff.h"
+#include "cache/p50_source_identity.h"
 
 #include <chrono>
 #include <cstddef>

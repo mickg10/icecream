@@ -1,6 +1,6 @@
 #include "../cache/p50_phase_open.h"
-#include "../cache/p50_reverse_fd_retry.h"
-#include "../cache/p50_sidecar_supervisor.h"
+#include "../unittests/support/p50_reverse_fd_retry.h"
+#include "support/p50_sidecar_supervisor.h"
 #include "../services/comm.h"
 
 #include <chrono>

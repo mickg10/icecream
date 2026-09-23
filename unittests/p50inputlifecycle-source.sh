@@ -6,6 +6,7 @@ root=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 lifecycle_h=$root/cache/p50_input_lifecycle.h
 lifecycle_cpp=$root/cache/p50_input_lifecycle.cpp
 control=$root/cache/p50_control_operation.h
+control_cpp=$root/cache/p50_control_operation.cpp
 service=$root/cache/p50_cache_service.cpp
 adapter=$root/cache/p50_daemon_sidecar_adapter.cpp
 daemon=$root/daemon/main.cpp
@@ -36,7 +37,7 @@ grep -Fq 'kControlOperationVersionV1 = 1' "$control"
 grep -Fq 'kControlOperationVersionV2 = 2' "$control"
 grep -Fq 'kLegacyInputFdAttachmentOperationBytes = 56' "$control"
 grep -Fq 'kInputLifecycleOperationBytes = 88' "$control"
-grep -Fq 'wire.begin() + 84' "$control"
+grep -Fq 'wire.begin() + 84' "$control_cpp"
 grep -Fq 'input_lifecycle_.prepare_route_commit' "$service"
 grep -Fq 'owner_limits.max_retained_input_records' "$service"
 grep -Fq 'input_lifecycle_.observe_route_commit' "$service"

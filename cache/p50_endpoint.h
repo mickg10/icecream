@@ -3,7 +3,7 @@
 #include "p50_actions.h"
 #include "p50_input_record.h"
 #include "p50_profile.h"
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 #include "p50_zstd.h"
 #include "p50_slice0.h"
 #include "p50_endpoint_run_cancel.h"

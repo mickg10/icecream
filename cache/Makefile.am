@@ -1,7 +1,7 @@
-noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50endpointtesthooks.a libp50localtransport.a \
-	libp50sidecarsupervisor.a libp50sidecarlifecycle.a libp50readyadvertisement.a libp50roleowner.a \
-	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
-	libp50sessionjoin.a libp50adoptedoutcomewriter.a
+noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
+	libp50sidecar.a libp50daemonsidecaradapter.a libp50input.a \
+	libp50adoptedoutcomewriter.a
+check_LIBRARIES = libp50endpointtesthooks.a
 
 sbin_PROGRAMS = icecc-cache-service
 
@@ -9,8 +9,8 @@ icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h \
 	../client/p50_route_owner.cpp ../client/p50_route_owner.h \
 	../client/p50_zstd_sender.cpp ../client/p50_zstd_sender.h
 icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
-	libp50inputfd.a \
-	libp50inputlifecycle.a libprotocol50.a \
+	libp50input.a \
+	libprotocol50.a \
 	libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
@@ -32,12 +32,8 @@ libprotocol50_a_SOURCES = \
 	p50_zstd.h \
 	p50_input_record.cpp \
 	p50_input_record.h \
-	p50_input_attachment.cpp \
-	p50_input_attachment.h \
 	p50_source_identity.cpp \
 	p50_source_identity.h \
-	p50_source_ingress.cpp \
-	p50_source_ingress.h \
 	p50_phase_open.cpp \
 	p50_phase_open.h \
 	p50_input_wait.cpp \
@@ -71,26 +67,19 @@ libp50endpointtesthooks_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
 	p50_fd_handoff.cpp p50_fd_handoff.h \
 	p50_daemon_control.cpp p50_daemon_control.h \
-	p50_reverse_fd_retry.cpp p50_reverse_fd_retry.h
-libp50inputfd_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h
-libp50inputfd_a_CPPFLAGS = $(AM_CPPFLAGS)
-libp50inputlifecycle_a_SOURCES = p50_input_lifecycle.cpp p50_input_lifecycle.h
-libp50inputlifecycle_a_CPPFLAGS = $(AM_CPPFLAGS)
-libp50sidecarsupervisor_a_SOURCES = p50_sidecar_supervisor.cpp p50_sidecar_supervisor.h
-libp50sidecarlifecycle_a_SOURCES = p50_sidecar_lifecycle.cpp p50_sidecar_lifecycle.h
-libp50sidecarlifecycle_a_CPPFLAGS = $(AM_CPPFLAGS)
-libp50readyadvertisement_a_SOURCES = p50_ready_advertisement.cpp \
-	p50_ready_advertisement.h
+	p50_control_operation.cpp p50_control_operation.h
+libp50input_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h \
+	p50_input_lifecycle.cpp p50_input_lifecycle.h
+libp50input_a_CPPFLAGS = $(AM_CPPFLAGS)
+libp50sidecar_a_SOURCES = p50_sidecar_identity.cpp p50_sidecar_identity.h \
+	p50_sidecar_lifecycle.cpp p50_sidecar_lifecycle.h \
+	p50_ready_advertisement.cpp p50_ready_advertisement.h
+libp50sidecar_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
 	p50_daemon_sidecar_adapter.h
 libp50daemonsidecaradapter_a_CPPFLAGS = $(AM_CPPFLAGS)
-libp50roleowner_a_SOURCES = p50_role_owner.cpp p50_role_owner.h
-libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp \
-	p50_cache_session_join.h
-libp50sessionjoin_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50adoptedoutcomewriter_a_SOURCES = p50_adopted_outcome_writer.cpp \
-	p50_adopted_outcome_writer.h p50_adopted_socket_lease.cpp \
-	p50_adopted_socket_lease.h
+	p50_adopted_outcome_writer.h
 libp50adoptedoutcomewriter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
@@ -225,7 +214,6 @@ EXTRA_DIST = \
 	formal/run_global_trace_gate.sh \
 	formal/run_global_tlc.sh \
 	formal/run_global_formal_gate.sh \
-	p50_sidecar_supervisor.h \
 	p50_daemon_cache_dispatch.h \
 	p50_adopted_outcome_writer.cpp \
 	p50_adopted_outcome_writer.h \

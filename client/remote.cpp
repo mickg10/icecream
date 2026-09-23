@@ -58,7 +58,7 @@
 #include "p50_compile_binding.h"
 #include "cache/p50_control_operation.h"
 #include "cache/p50_daemon_control.h"
-#include "cache/p50_sidecar_supervisor.h"
+#include "cache/p50_sidecar_identity.h"
 #include "services/digest128.h"
 #include "services/util.h"
 #include "pipes.h"

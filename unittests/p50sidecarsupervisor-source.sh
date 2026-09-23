@@ -3,16 +3,20 @@
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
-impl="$src/cache/p50_sidecar_supervisor.cpp"
-header="$src/cache/p50_sidecar_supervisor.h"
+impl="$src/unittests/support/p50_sidecar_supervisor.cpp"
+header="$src/unittests/support/p50_sidecar_supervisor.h"
+identity_impl="$src/cache/p50_sidecar_identity.cpp"
+identity_header="$src/cache/p50_sidecar_identity.h"
 
 lease_gate() {
     candidate_impl=$1
     candidate_header=$2
-    grep -F 'class LaunchIdentityAllocator' "$candidate_header" >/dev/null &&
+    candidate_identity_impl=$3
+    candidate_identity_header=$4
+    grep -F 'class LaunchIdentityAllocator' "$candidate_identity_header" >/dev/null &&
         grep -F 'std::shared_ptr<LaunchIdentityAllocator> launch_identities' \
             "$candidate_header" >/dev/null &&
-        grep -F 'LaunchIdentityAllocator::allocate()' "$candidate_impl" >/dev/null &&
+        grep -F 'LaunchIdentityAllocator::allocate()' "$candidate_identity_impl" >/dev/null &&
         grep -F 'config_.launch_identities->allocate()' "$candidate_impl" >/dev/null &&
         grep -F 'std::string_view(ready).substr(0, prefix_bytes)' \
             "$candidate_impl" >/dev/null &&
@@ -64,7 +68,7 @@ lease_gate() {
             "$candidate_impl" >/dev/null
 }
 
-lease_gate "$impl" "$header"
+lease_gate "$impl" "$header" "$identity_impl" "$identity_header"
 
 grep -F 'kReadyFdEnvironment' "$impl" >/dev/null
 grep -F 'READY\n' "$impl" >/dev/null
@@ -104,13 +108,13 @@ grep -F 'increment_saturating' "$impl" >/dev/null
 grep -F 'max_attempts_per_recovery' "$impl" "$header" >/dev/null
 grep -F 'mkdtemp' "$impl" >/dev/null
 grep -F 'parse_ready_lease' "$impl" >/dev/null
-grep -F 'F_STORE_GUID' "$impl" "$header" >/dev/null
-grep -F 'store_generation' "$impl" "$header" >/dev/null
+grep -F 'F_STORE_GUID' "$impl" "$header" "$identity_header" >/dev/null
+grep -F 'store_generation' "$impl" "$header" "$identity_header" >/dev/null
 grep -F 'F_STORE_GENERATION' "$impl" >/dev/null
-grep -F 'listener_device' "$impl" "$header" >/dev/null
+grep -F 'listener_device' "$impl" "$header" "$identity_header" >/dev/null
 grep -F 'pathname_info' "$impl" >/dev/null
 grep -F 'lstat(lease.socket_path.c_str()' "$impl" >/dev/null
-grep -F 'socket_path_digest' "$impl" "$header" >/dev/null
+grep -F 'socket_path_digest' "$impl" "$header" "$identity_header" >/dev/null
 grep -F 'cleanup_lease' "$impl" >/dev/null
 grep -F 'rmdir' "$impl" >/dev/null
 grep -F 'SYS_renameat2' "$impl" >/dev/null
@@ -118,9 +122,9 @@ grep -F 'RENAME_NOREPLACE' "$impl" >/dev/null
 grep -F 'fstatat' "$impl" >/dev/null
 grep -F 'AT_SYMLINK_NOFOLLOW' "$impl" >/dev/null
 grep -F 'capture_and_remove_at' "$impl" >/dev/null
-grep -F 'canonical_absolute_lease_path' "$header" "$impl" >/dev/null
-grep -F 'directory_device == 0' "$header" >/dev/null
-grep -F 'socket_path_digest != digest128(socket_path)' "$header" >/dev/null
+grep -F 'canonical_absolute_lease_path' "$identity_header" "$impl" >/dev/null
+grep -F 'directory_device == 0' "$identity_header" >/dev/null
+grep -F 'socket_path_digest != digest128(socket_path)' "$identity_header" >/dev/null
 grep -F 'cleanup_never_deletes_replaced_socket' \
     "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
 grep -F 'cleanup_never_deletes_replaced_directory' \
@@ -183,7 +187,6 @@ fi
 # Every new incarnation/lease fence is load-bearing. Deleting any one exact
 # source anchor must make the focused source gate red.
 for pattern in \
-    'LaunchIdentityAllocator::allocate()' \
     'config_.launch_identities->allocate()' \
     'std::string_view(ready).substr(0, prefix_bytes)' \
     'prefix.substr(0, prefix_bytes)' \
@@ -213,11 +216,23 @@ for pattern in \
     'return direct_dead && group_dead;'; do
     lease_mutant="$mutant_dir/impl.cpp"
     awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$lease_mutant"
-    if lease_gate "$lease_mutant" "$header"; then
+    if lease_gate "$lease_mutant" "$header" "$identity_impl" "$identity_header"; then
         echo "FAIL: supervisor lease deletion mutant survived: $pattern" >&2
         exit 1
     fi
 done
+
+identity_gate() {
+    grep -F 'LaunchIdentityAllocator::allocate()' "$1" >/dev/null
+}
+identity_gate "$identity_impl"
+identity_mutant="$mutant_dir/identity.cpp"
+awk -v needle='LaunchIdentityAllocator::allocate()' \
+    'index($0, needle) == 0' "$identity_impl" >"$identity_mutant"
+if identity_gate "$identity_mutant"; then
+    echo 'FAIL: launch allocator deletion mutant survived' >&2
+    exit 1
+fi
 
 # Deletion-sensitive source mutants must not remove the atomic capture fence.
 for pattern in \
@@ -227,7 +242,7 @@ for pattern in \
     'capture_and_remove_at'; do
     atomic_mutant="$mutant_dir/atomic-${pattern##*/}.cpp"
     grep -vF "$pattern" "$impl" >"$atomic_mutant"
-    if lease_gate "$atomic_mutant" "$header"; then
+    if lease_gate "$atomic_mutant" "$header" "$identity_impl" "$identity_header"; then
         echo "FAIL: atomic lease deletion mutant survived: $pattern" >&2
         exit 1
     fi
@@ -237,7 +252,7 @@ for pattern in \
     'directory_device == 0' \
     'socket_path_digest != digest128(socket_path)'; do
     atomic_header_mutant="$mutant_dir/atomic-${pattern##*/}.h"
-    grep -vF "$pattern" "$header" >"$atomic_header_mutant"
+    grep -vF "$pattern" "$identity_header" >"$atomic_header_mutant"
     if grep -F "$pattern" "$atomic_header_mutant" >/dev/null; then
         echo "FAIL: canonical lease deletion mutant was not formed: $pattern" >&2
         exit 1
@@ -245,14 +260,25 @@ for pattern in \
 done
 
 for pattern in \
-    'class LaunchIdentityAllocator' \
     'std::shared_ptr<LaunchIdentityAllocator> launch_identities' \
     'int child_pidfd_ = -1;'; do
     lease_mutant="$mutant_dir/header.h"
     awk -v needle="$pattern" 'index($0, needle) == 0' "$header" >"$lease_mutant"
-    if lease_gate "$impl" "$lease_mutant"; then
+    if lease_gate "$impl" "$lease_mutant" "$identity_impl" "$identity_header"; then
         echo "FAIL: supervisor allocator deletion mutant survived: $pattern" >&2
         exit 1
     fi
 done
+identity_header_mutant="$mutant_dir/identity.h"
+awk -v needle='class LaunchIdentityAllocator' \
+    'index($0, needle) == 0' "$identity_header" >"$identity_header_mutant"
+if grep -F 'class LaunchIdentityAllocator' "$identity_header_mutant" >/dev/null; then
+    echo 'FAIL: launch allocator declaration mutant was not formed' >&2
+    exit 1
+fi
+if grep -F 'class LaunchIdentityAllocator' "$identity_header" >/dev/null &&
+   grep -F 'class LaunchIdentityAllocator' "$identity_header_mutant" >/dev/null; then
+    echo 'FAIL: launch allocator declaration deletion mutant survived' >&2
+    exit 1
+fi
 echo 'ok - sidecar supervisor source gates hold'

@@ -60,6 +60,16 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 TESTS += codec_parity codec_provider codec_intern codec_wire
 TESTS += daemonqueue
 # Native executables and shell/Python helpers inherit the same locked Python.
+# Reference reducers are exercised here, never linked into shipped programs.
+check_LIBRARIES = libp50reference.a
+libp50reference_a_SOURCES = \
+	support/p50_role_owner.cpp support/p50_role_owner.h \
+	support/p50_cache_session_join.cpp support/p50_cache_session_join.h \
+	support/p50_input_attachment.cpp support/p50_input_attachment.h \
+	support/p50_source_ingress.cpp support/p50_source_ingress.h \
+	support/p50_reverse_fd_retry.cpp support/p50_reverse_fd_retry.h \
+	support/p50_adopted_socket_lease.cpp support/p50_adopted_socket_lease.h \
+	support/p50_sidecar_supervisor.cpp support/p50_sidecar_supervisor.h
 LOG_COMPILER = sh "$(abs_top_srcdir)/dev/python.sh" --exec
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -115,10 +125,10 @@ p50inputrecordlate_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(XXHASH_LIBS)
 p50inputrecordreopen_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(XXHASH_LIBS)
-p50inputattachment_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50inputattachment_LDADD = libp50reference.a ../cache/libprotocol50.a ../services/libicecc.la
 p50endpoint_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_ENDPOINT_TEST_HOOKS
 p50endpoint_LDFLAGS = $(BOOST_LDFLAGS)
-p50endpoint_LDADD = ../cache/libp50endpointtesthooks.a \
+p50endpoint_LDADD = libp50reference.a ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
@@ -136,21 +146,22 @@ p50frameasync_LDFLAGS = -pthread
 p50sidecarsupervisor_SOURCES = p50_sidecar_supervisor_test.cpp
 p50sidecarsupervisor_CXXFLAGS = -pthread
 p50sidecarsupervisor_LDFLAGS = -pthread
-p50sidecarsupervisor_LDADD = ../cache/libp50sidecarsupervisor.a \
+p50sidecarsupervisor_LDADD = libp50reference.a ../cache/libp50sidecar.a \
 	../cache/libp50localtransport.a ../services/libicecc.la
 p50sidecarlifecycle_SOURCES = p50_sidecar_lifecycle_test.cpp
 p50sidecarlifecycle_CXXFLAGS = -pthread
 p50sidecarlifecycle_LDFLAGS = -pthread
-p50sidecarlifecycle_LDADD = ../cache/libp50sidecarlifecycle.a \
-	../cache/libp50sidecarsupervisor.a ../cache/libp50localtransport.a \
+p50sidecarlifecycle_LDADD = ../cache/libp50sidecar.a \
+	../cache/libp50localtransport.a \
 	../services/libicecc.la
-p50roleowner_SOURCES = p50_role_owner_test.cpp ../cache/p50_role_owner.cpp
+p50roleowner_SOURCES = p50_role_owner_test.cpp
+p50roleowner_LDADD = libp50reference.a
 p50roleowner_CXXFLAGS = -pthread
 p50roleowner_LDFLAGS = -pthread
 p50sessionjoin_SOURCES = p50_cache_session_join_test.cpp \
 	../daemon/connection_provenance.cpp
 p50sessionjoin_CPPFLAGS = $(AM_CPPFLAGS)
-p50sessionjoin_LDADD = ../cache/libp50sessionjoin.a \
+p50sessionjoin_LDADD = libp50reference.a \
 	../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50cachesessionwire_SOURCES = p50_cache_session_wire_test.cpp
@@ -165,7 +176,7 @@ p50cachefdseam_SOURCES = p50_cache_fd_seam_test.cpp
 p50cachefdseam_CXXFLAGS = -pthread
 p50cachefdseam_LDFLAGS = -pthread
 p50cachefdseam_LDADD = ../services/libicecc.la
-p50readyadvertisement_LDADD = ../cache/libp50readyadvertisement.a
+p50readyadvertisement_LDADD = ../cache/libp50sidecar.a
 digest128bench_LDADD = ../services/libicecc.la
 
 check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
@@ -234,7 +245,7 @@ p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp
 p50sourceingress_CXXFLAGS = -pthread
 p50sourceingress_LDFLAGS = -pthread
-p50sourceingress_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50sourceingress_LDADD = libp50reference.a ../cache/libprotocol50.a ../services/libicecc.la
 p50storeidentitywire_SOURCES = p50_store_identity_wire_test.cpp
 p50slice0_SOURCES = \
 	p50_slice0_test.cpp
@@ -258,7 +269,7 @@ p50inputrecord_SOURCES = p50_input_record_test.cpp
 p50inputrecordlate_SOURCES = p50_input_record_late_commit_test.cpp
 p50inputrecordreopen_SOURCES = p50_input_record_closed_reopen_test.cpp
 p50inputattachment_SOURCES = p50_input_attachment_test.cpp
-p50inputfd_SOURCES = p50_input_fd_attachment_test.cpp \
+p50inputfd_SOURCES = p50_input_fd_attachment_test.cpp ../cache/p50_control_operation.cpp \
 	../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
 	../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/protocol50.cpp
@@ -268,7 +279,7 @@ p50inputfd_LDFLAGS = -pthread
 p50inputfd_LDADD = ../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
 check_PROGRAMS += p50inputattachasync
 TESTS += p50inputattachasync
-p50inputattachasync_SOURCES = p50inputattachasync.cpp \
+p50inputattachasync_SOURCES = p50inputattachasync.cpp ../cache/p50_control_operation.cpp \
     ../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
     ../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
     ../cache/protocol50.cpp
@@ -282,7 +293,7 @@ p50forkfdhygiene_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOK
 p50compilerquiescence_SOURCES = p50_compiler_quiescence_test.cpp
 p50inputlifecycle_CXXFLAGS = -pthread
 p50inputlifecycle_LDFLAGS = -pthread
-p50inputlifecycle_LDADD = ../cache/libp50inputlifecycle.a \
+p50inputlifecycle_LDADD = ../cache/libp50input.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50endpoint_SOURCES = p50_endpoint_test.cpp
@@ -309,7 +320,8 @@ p50routeowner_SOURCES = p50_route_owner_test.cpp
 p50routeowner_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50routeowner_CXXFLAGS = -pthread
 p50routeowner_LDFLAGS = $(BOOST_LDFLAGS) -pthread
-p50routeowner_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
+p50routeowner_LDADD = ../cache/libp50localtransport.a \
+	../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50resultdisposition_SOURCES = p50_result_disposition_test.cpp
@@ -324,18 +336,16 @@ p50daemonsidecaradapter_CPPFLAGS = $(AM_CPPFLAGS) \
 p50daemonsidecaradapter_CXXFLAGS = -pthread
 p50daemonsidecaradapter_LDFLAGS = -pthread
 p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
-	../cache/libp50sidecarlifecycle.a \
-	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a \
+	../cache/libp50sidecar.a \
+	../cache/libp50input.a \
 	../cache/libprotocol50.a \
-	../cache/libp50readyadvertisement.a ../cache/libp50sidecarsupervisor.a \
 	../cache/libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50daemonsidecaradapter_DEPENDENCIES = \
-	../cache/libp50daemonsidecaradapter.a ../cache/libp50inputfd.a \
-	../cache/libp50sidecarlifecycle.a \
-	../cache/libp50inputlifecycle.a \
-	../cache/libprotocol50.a ../cache/libp50readyadvertisement.a \
-	../cache/libp50sidecarsupervisor.a ../cache/libp50localtransport.a \
+	../cache/libp50daemonsidecaradapter.a ../cache/libp50input.a \
+	../cache/libp50sidecar.a \
+	../cache/libprotocol50.a \
+	../cache/libp50localtransport.a \
 	../services/libicecc.la ../cache/icecc-cache-service
 p50daemonpositive_SOURCES = p50daemonpositive.cpp
 p50daemonpositive_LDADD = ../services/libicecc.la
@@ -417,7 +427,7 @@ p50cachesession_SOURCES = p50cachesession.cpp
 p50cachesession_CXXFLAGS = -pthread
 p50cachesession_LDFLAGS = -pthread
 p50cachesession_LDADD = ../services/libicecc.la
-p50daemoncachedispatch_SOURCES = p50_daemon_cache_dispatch_test.cpp \
+p50daemoncachedispatch_SOURCES = p50_daemon_cache_dispatch_test.cpp ../cache/p50_control_operation.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp \
 	../cache/p50_fd_handoff.cpp ../cache/p50_local_transport.cpp
 p50daemoncachedispatch_CPPFLAGS = $(AM_CPPFLAGS)
@@ -455,13 +465,13 @@ p50reversefdretry_SOURCES = p50_reverse_fd_retry_test.cpp
 p50reversefdretry_CPPFLAGS = $(AM_CPPFLAGS)
 p50reversefdretry_CXXFLAGS = -pthread
 p50reversefdretry_LDFLAGS = -pthread
-p50reversefdretry_LDADD = ../cache/libp50localtransport.a ../cache/libprotocol50.a \
+p50reversefdretry_LDADD = libp50reference.a ../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la
 p50s2restartreplay_SOURCES = p50_s2_restart_replay_test.cpp
 p50s2restartreplay_CPPFLAGS = $(AM_CPPFLAGS)
 p50s2restartreplay_CXXFLAGS = -pthread
 p50s2restartreplay_LDFLAGS = -pthread
-p50s2restartreplay_LDADD = ../cache/libp50sidecarsupervisor.a \
+p50s2restartreplay_LDADD = libp50reference.a ../cache/libp50sidecar.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp \
@@ -472,13 +482,12 @@ p50cacheservice_CXXFLAGS = -pthread
 p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a ../cache/libp50inputfd.a \
-	../cache/libp50inputlifecycle.a \
+	../cache/libp50adoptedoutcomewriter.a ../cache/libp50input.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
 	../cache/libp50endpointtesthooks.a \
-	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a readyclose_shim.so
+	../cache/libp50input.a  readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp
 check_PROGRAMS += p50frameasync

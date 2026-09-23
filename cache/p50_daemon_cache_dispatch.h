@@ -17,7 +17,6 @@
 
 #include "p50_fd_handoff.h"
 #include "p50_incarnation_identity.h"
-#include "p50_phase_open.h"
 #include "protocol50.h"
 
 class MsgChannel;
@@ -98,16 +97,6 @@ public:
     CacheDispatchOutcome dispatch(MsgChannel& channel, int negotiated_protocol,
                                   uint32_t decoded_type) noexcept;
 
-    // Build the exact phase-open envelope only after the one-shot descriptor
-    // handoff has been ACKed and the ordinary stream's trailing-byte barrier
-    // was proven.  The current CACHE_SESSION wire intentionally carries no
-    // P50SourceArm, so callers must supply the complete arm from a later
-    // CompileFile/source-arm message; absent that message this remains a
-    // fail-closed HOLD rather than synthesizing identity fields.
-    std::optional<std::vector<uint8_t>> emit_attachment_phase_open(
-        const CacheDispatchOutcome& outcome,
-        const icecc::p50::P50SourceArm& source_arm) noexcept;
-
 private:
     static bool valid_identity(local::Identity identity) noexcept;
     CacheDispatchOutcome fail_after_detach(local::FdHandoffStatus status,
@@ -117,7 +106,6 @@ private:
     uint64_t next_request_id_ = 1;
     std::chrono::milliseconds handoff_timeout_;
     std::optional<OnDemandEndpoint> on_demand_;
-    icecc::p50::P50HandoffAuthority phase_authority_;
 };
 
 } // namespace icecc::p50::daemon

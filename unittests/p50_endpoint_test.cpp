@@ -1,6 +1,6 @@
 #include "cache/p50_endpoint.h"
 #include "cache/p50_adopted_outcome_writer.h"
-#include "cache/p50_adopted_socket_lease.h"
+#include "unittests/support/p50_adopted_socket_lease.h"
 #include "cache/p50_slice0.h"
 
 #include <zstd.h>

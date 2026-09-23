@@ -90,9 +90,7 @@ if printf '%s\n' "$accept_block" | grep -F 'Service::createChannel(acc_fd' >/dev
     exit 1
 fi
 require "$makefile" 'libp50daemonsidecaradapter.a'
-require "$makefile" 'libp50sidecarlifecycle.a'
-require "$makefile" 'libp50readyadvertisement.a'
-require "$makefile" 'libp50sidecarsupervisor.a'
+require "$makefile" 'libp50sidecar.a'
 require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/READY'
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
 require "$runtime_test" 'kAdmissionBurstCount = 65'

@@ -18,7 +18,8 @@ libs=${ICECC_TEST_LIBS:-${LIBS:-}}
 protocol_lib="$top_build_dir/cache/libprotocol50.a"
 transport_lib="$top_build_dir/cache/libp50localtransport.a"
 services_lib="$top_build_dir/services/.libs/libicecc.a"
-if test ! -f "$protocol_lib" || test ! -f "$transport_lib" || test ! -f "$services_lib"; then
+if test ! -f "$protocol_lib" || test ! -f "$transport_lib" || \
+        test ! -f "$services_lib"; then
     echo 'skip - sanitizer requires a configured libicecc build'
     exit 0
 fi
@@ -34,7 +35,8 @@ trap 'exit 1' HUP INT TERM
     -fsanitize=address,undefined,leak -fno-omit-frame-pointer \
     -I"$test_srcdir/.." -I"$test_srcdir/../cache" -I"$test_srcdir/../services" \
     "$test_srcdir/p50_sidecar_supervisor_test.cpp" \
-    "$test_srcdir/../cache/p50_sidecar_supervisor.cpp" \
+    "$test_srcdir/support/p50_sidecar_supervisor.cpp" \
+    "$test_srcdir/../cache/p50_sidecar_identity.cpp" \
     $ldflags "$transport_lib" "$protocol_lib" "$services_lib" \
     /lib/x86_64-linux-gnu/libxxhash.so.0 -lzstd -ldl $libs -o "$binary"
 # The test intentionally exercises fail-closed lease leaks and uses fork/exec

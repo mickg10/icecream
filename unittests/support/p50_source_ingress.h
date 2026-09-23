@@ -1,10 +1,11 @@
+// Test-only reference component; not part of the live P50 implementation.
 #pragma once
 
 // Event-loop-owned C source ingress/finalization reducer.  This is a bounded
 // integration seam: production CompileFile/private transport callsites remain
 // deliberately unbound until they can supply the exact witnesses below.
 
-#include "p50_input_record.h"
+#include "cache/p50_input_record.h"
 #include "services/comm.h"
 #include "services/digest128.h"
 

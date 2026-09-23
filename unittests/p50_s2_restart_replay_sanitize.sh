@@ -41,8 +41,9 @@ trap cleanup EXIT HUP INT TERM
     -pthread $sanitize_flags -fno-omit-frame-pointer \
     -I"$test_srcdir/.." -I"$test_srcdir/../cache" -I"$test_srcdir/../services" \
     "$test_srcdir/p50_s2_restart_replay_test.cpp" \
-    "$test_srcdir/../cache/p50_sidecar_supervisor.cpp" \
-    "$test_srcdir/../cache/p50_reverse_fd_retry.cpp" \
+    "$test_srcdir/support/p50_sidecar_supervisor.cpp" \
+    "$test_srcdir/../cache/p50_sidecar_identity.cpp" \
+    "$test_srcdir/../unittests/support/p50_reverse_fd_retry.cpp" \
     "$test_srcdir/../cache/p50_fd_handoff.cpp" \
     "$test_srcdir/../cache/p50_local_transport.cpp" \
     "$test_srcdir/../cache/p50_phase_open.cpp" \

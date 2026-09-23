@@ -2,10 +2,10 @@
 # Deletion-sensitive source gate for the bounded pre-bound listener/two-role slice.
 set -eu
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
-supervisor="$src/cache/p50_sidecar_supervisor.cpp"
+supervisor="$src/unittests/support/p50_sidecar_supervisor.cpp"
 service="$src/cache/p50_cache_service.cpp"
-roles="$src/cache/p50_role_owner.cpp"
-header="$src/cache/p50_role_owner.h"
+roles="$src/unittests/support/p50_role_owner.cpp"
+header="$src/unittests/support/p50_role_owner.h"
 
 for pattern in \
     'kListenerFdEnvironment' 'local::listen_unix(lease.socket_path' \

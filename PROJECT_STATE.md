@@ -12,6 +12,48 @@ retained artifact directories.
 
 ## Developer QA
 
+### P50 implementation cleanup
+
+The local cleanup separates seven test-only reference components from live
+code, removes retired adapter/dispatcher APIs and unused daemon state, and
+moves control-operation encoding out of the header without changing its
+wire format. Always-built cache archives decrease from 13 to 7. P50 C++
+files in the production directories decrease from 89 to 78; reference code
+remains under `unittests/support/` and is built only for tests.
+
+The clean offline Ubuntu 24.04 SDK build/install passed on nas642 with four
+jobs and a 16 GiB limit. Ordinary native checks passed **169 tests with 6
+optional skips**; the separate root cache-service checks passed **2/2**.
+The source snapshot digest was
+`f7cf4d99249d8b550bd7b2ec3a5ec6ebcea7580006d6598cba717e2b05a37d6f`.
+Evidence root:
+`/tanksmall/scratch/tmp/icecream-deslop-final.dh5IUo/icecream-qa-8uj642kz/`.
+
+That complete `make qa` attempt remains **FAIL**: Python reported 1,499
+passes, 7 skips and one failure in its real-uv stale-lock negative test.
+The negative fixture depended on registry metadata absent from the offline
+SDK cache. It now uses a dependency-free project and an initially empty
+cache, still requires the real stale-lock diagnostic, and verifies that
+`--locked` leaves the lockfile unchanged. A separate fixture's scratch setup
+is now independent of whether its helper created the directory first.
+
+After those test-only corrections, the full offline SDK Python suite passed
+**1,505 tests with 2 skips in 567.92s**, using Python 3.12.12. Evidence:
+`/tanksmall/scratch/tmp/icecream-sdk-python-final/full.log` and
+`/tanksmall/scratch/tmp/icecream-sdk-python-final/work/artifacts/pytest-full-final.xml`.
+The corrected test files in that run matched the checkout. Native and mixed
+results below use the unchanged product source from the clean build; these
+complementary passes do not turn the original `make qa` receipt into a pass.
+
+Separately, all five mixed Docker cases passed using the clean installed
+product: P50 P29V1, ZSTD_TU, ZSTD_ROUTE, P43 worker and P43 client. Their
+evidence is `mixed-recovered-all5/summary.json` under the evidence root above;
+run ID `023e6f9d99de4f5092d30dd302a7397f`. Five Git-history tests also passed in
+the real checkout; source-only snapshots skip those checks. Earlier failed
+build/diagnostic runs were retained, not relabeled as passing.
+
+### Earlier uv and portability evidence
+
 The local uv conversion pins Python 3.12.12, pytest 8.4.2 and uv 0.9.21.
 On nas642, its full integration-harness run passed **1,504 tests in 612.61s**
 with `UV_OFFLINE=1`; the log is
@@ -19,9 +61,9 @@ with `UV_OFFLINE=1`; the log is
 The rebuilt Ubuntu 24.04 SDK completed offline, non-root native
 build/install in 187.05s. Its result is
 `/tanksmall/scratch/tmp/icecream-uv-real2.2JNKOK/icecream-qa-eg2lg4aa/result.json`.
-The current Compose image also built successfully and ran the managed Python
-and pytest offline as both root and `nobody`. These checks do not replace a
-full native/mixed QA run of the uv conversion or a new q4 portability trial.
+The Compose image also built successfully and ran the managed Python
+and pytest offline as both root and `nobody`. Those earlier checks did not
+include full native/mixed QA or a new q4 portability trial.
 
 The following complete QA result predates the uv conversion:
 

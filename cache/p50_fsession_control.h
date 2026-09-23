@@ -22,7 +22,7 @@
 #define ICECC_CACHE_P50_FSESSION_CONTROL_H
 
 #include "protocol50.h"                    // Id128 (CStoreGuid/FStoreGuid)
-#include "p50_sidecar_supervisor.h"        // AbsoluteMonotonicDeadline
+#include "p50_sidecar_identity.h"          // AbsoluteMonotonicDeadline
 
 #include "services/p50_cache_session_wire.h" // P50FSessionOperationId, P50WireLaunchIdentity
 

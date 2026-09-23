@@ -50,7 +50,7 @@ require 'READY current lease advertises while no transient TU relationship exist
 require 'same-counter READY recovery at saturation remains failed closed' "$test" \
     'behavioral suite covers the saturated same-counter crash ambiguity'
 
-require 'libp50readyadvertisement.a' "$src/cache/Makefile.am" \
+require 'libp50sidecar.a' "$src/cache/Makefile.am" \
     'controller library is registered in the cache build'
 require 'P50_PROTOCOL.md' "$src/cache/Makefile.am" \
     'policy contract is distributed'

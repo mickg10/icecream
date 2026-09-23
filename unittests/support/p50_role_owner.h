@@ -1,3 +1,4 @@
+// Test-only reference component; not part of the live P50 implementation.
 #pragma once
 
 // Typed, bounded ownership skeleton for the two BigOracle roles.  This is a
@@ -11,7 +12,7 @@
 #include <memory>
 #include <utility>
 
-#include "protocol50.h"
+#include "cache/protocol50.h"
 
 namespace icecc::p50::role {
 

@@ -10,10 +10,6 @@ iceccd_SOURCES = \
 	compiler_input.cpp \
 	workit.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp \
-	../cache/p50_source_identity.cpp \
-	../cache/p50_phase_open.cpp \
-	../cache/p50_input_wait.cpp \
-	../cache/p50_reverse_fd_retry.cpp \
 	environment.cpp \
 	load.cpp \
 	file_util.cpp \
@@ -21,11 +17,8 @@ iceccd_SOURCES = \
 
 iceccd_LDADD = \
 	../cache/libp50daemonsidecaradapter.a \
-	../cache/libp50sidecarlifecycle.a \
-	../cache/libp50inputfd.a \
-	../cache/libp50inputlifecycle.a \
-	../cache/libp50readyadvertisement.a \
-	../cache/libp50sidecarsupervisor.a \
+	../cache/libp50sidecar.a \
+	../cache/libp50input.a \
 	../cache/libprotocol50.a \
 	../cache/libp50localtransport.a \
 	../services/libicecc.la \

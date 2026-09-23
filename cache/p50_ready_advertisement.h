@@ -8,7 +8,7 @@
 // projection pure makes the fail-closed advertisement policy independently
 // testable before production lifecycle wiring lands.
 
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 
 #include <array>
 #include <cstddef>

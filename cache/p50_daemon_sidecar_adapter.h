@@ -13,7 +13,7 @@
 #include "p50_local_transport.h"
 #include "p50_ready_advertisement.h"
 #include "p50_sidecar_lifecycle.h"
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 
 #include <chrono>
 #include <cstdint>
@@ -45,7 +45,6 @@ enum class AdapterError : uint8_t {
     AttemptOverflow,
     StalePath,
     RuntimeNodeFailure,
-    StartupFailure,
     AuthenticationFailure,
     ListenerFailure,
     ShutdownFailure,
@@ -145,12 +144,6 @@ public:
 
     static bool valid_config(const Config& config) noexcept;
 
-    // Starts/recoveries are bounded by max_attempts_per_recovery and the
-    // adapter-owned rolling restart budget.  `update`, when supplied, is
-    // filled with ordered advertisement transitions from this call.  The
-    // boolean is true exactly when the resulting advertisement is present.
-    bool start(advertisement::Update* update = nullptr) noexcept;
-    bool poll(advertisement::Update* update = nullptr) noexcept;
     void shutdown(advertisement::Update* update = nullptr) noexcept;
 
     // The daemon supplies an observation of its already-bound public socket.
@@ -173,13 +166,6 @@ public:
     [[nodiscard]] const CacheSessionDispatcher* dispatcher() const noexcept {
         return dispatcher_.get();
     }
-    // Historical source compatibility only.  The synchronous Supervisor is
-    // no longer instantiated by this adapter; callers must use outer_*().
-    [[nodiscard]] sidecar::Supervisor* supervisor() noexcept { return nullptr; }
-    [[nodiscard]] const sidecar::Supervisor* supervisor() const noexcept {
-        return nullptr;
-    }
-
     // Outer-loop lifecycle seam.  These methods are the only production
     // entry points used by iceccd.  Each call performs at most one reducer
     // turn and at most one launch/TERM/KILL/cleanup/connect/send/receive
@@ -376,10 +362,8 @@ private:
     bool outer_input_failure_ = false;
     advertisement::Update pending_advertisement_update_{};
 
-    // The compatibility Supervisor above is retained only for the historical
-    // unit API; the daemon's outer loop never calls start/poll/shutdown.  The live
-    // production path below owns exactly one incremental reducer and no local
-    // waitpid/reap loop.
+    // The live production path below owns exactly one incremental reducer and
+    // no local waitpid/reap loop.
     std::shared_ptr<sidecar::KillDomainVerifier> outer_kill_domain_;
     std::shared_ptr<sidecar::AttemptLeafAuthority> outer_attempt_leaf_authority_;
     std::unique_ptr<sidecar::SidecarLifecycle> outer_lifecycle_;

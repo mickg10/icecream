@@ -9,7 +9,7 @@ trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
     -I"$root" -I"$root/cache" -I"$root/services" \
     "$root/unittests/p50_sidecar_lifecycle_test.cpp" \
     "$root/cache/p50_sidecar_lifecycle.cpp" \
-    "$build/../cache/libp50sidecarsupervisor.a" "$build/../cache/libp50localtransport.a" \
+    "$build/../cache/libp50sidecar.a" "$build/../cache/libp50localtransport.a" \
     "$build/../services/.libs/libicecc.a" \
     -L"${P50_R2_DEPS:-/tanksmall/MICKG2/mickg/src/mickg10/icecream-worktrees/.p50-r2-deps/root/usr/lib/x86_64-linux-gnu}" \
     -lxxhash ${ICECC_TEST_LIBS:-} -o "$tmp/test" >/dev/null 2>&1 || {

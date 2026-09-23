@@ -1,7 +1,8 @@
+// Test-only reference component; not part of the live P50 implementation.
 #pragma once
 
-#include "p50_adopted_outcome_writer.h"
-#include "p50_fd_handoff.h"
+#include "cache/p50_adopted_outcome_writer.h"
+#include "cache/p50_fd_handoff.h"
 
 namespace icecc::p50::sidecar {
 

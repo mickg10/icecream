@@ -17,23 +17,23 @@ count() {
     echo "ok - $label"
 }
 
-count 1 'std::unordered_map<InputRecordKey, Lifecycle' cache/p50_input_attachment.h \
+count 1 'std::unordered_map<InputRecordKey, Lifecycle' unittests/support/p50_input_attachment.h \
     'canonical lifecycle is keyed by cache identity, never ATTEMPT_ID'
-count 1 'request.attempt.store_generation' cache/p50_input_attachment.cpp \
+count 1 'request.attempt.store_generation' unittests/support/p50_input_attachment.cpp \
     'request identity carries the store generation fence'
 count 1 'return pending_ready_count() < max_pending_ready_;' \
-    cache/p50_input_attachment.cpp 'pending ready table has a hard admission bound'
+    unittests/support/p50_input_attachment.cpp 'pending ready table has a hard admission bound'
 count 2 'state.ready_pending = false;' \
-    cache/p50_input_attachment.cpp 'ACK retires the one ready event'
+    unittests/support/p50_input_attachment.cpp 'ACK retires the one ready event'
 count 1 'state.current_attempt = new_owner.attempt_id;' \
-    cache/p50_input_attachment.cpp 'replacement changes ownership only'
+    unittests/support/p50_input_attachment.cpp 'replacement changes ownership only'
 count 1 'InputCursor cursor = records_.attach(request.key);' \
-    cache/p50_input_attachment.cpp 'attachment delegates exact bytes to InputRecordStore'
+    unittests/support/p50_input_attachment.cpp 'attachment delegates exact bytes to InputRecordStore'
 count 2 'Lifecycle& state = existing_owner_for(key, owner);' \
-    cache/p50_input_attachment.cpp \
+    unittests/support/p50_input_attachment.cpp \
     'closed observation and release validate without inserting owners'
 count 1 'position.second.reply.event_id == reply.event_id' \
-    cache/p50_input_attachment.cpp \
+    unittests/support/p50_input_attachment.cpp \
     'one event ACK retires every replay observation for that event'
 count 1 'entry.begin != begin || entry.commit != commit' \
     cache/p50_input_record.cpp \

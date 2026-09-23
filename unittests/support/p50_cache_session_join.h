@@ -1,3 +1,4 @@
+// Test-only reference component; not part of the live P50 implementation.
 #pragma once
 
 // Event-loop-owned Protocol-50 join between an exact F WAITP50INPUT owner and
@@ -5,9 +6,9 @@
 // P50_SOURCE_ARM; a network claim can reserve an existing registration but can
 // never manufacture one.
 
-#include "../daemon/connection_provenance.h"
-#include "p50_local_transport.h"
-#include "p50_source_identity.h"
+#include "daemon/connection_provenance.h"
+#include "cache/p50_local_transport.h"
+#include "cache/p50_source_identity.h"
 #include "services/comm.h"
 #include "services/p50_cache_session_wire.h"
 #include "services/p50_store_identity_wire.h"

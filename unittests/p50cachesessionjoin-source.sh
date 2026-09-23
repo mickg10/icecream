@@ -2,8 +2,8 @@
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
-header="$src/cache/p50_cache_session_join.h"
-impl="$src/cache/p50_cache_session_join.cpp"
+header="$src/unittests/support/p50_cache_session_join.h"
+impl="$src/unittests/support/p50_cache_session_join.cpp"
 test_file="$src/unittests/p50_cache_session_join_test.cpp"
 wire_header="$src/services/p50_cache_session_wire.h"
 wire_file="$src/services/p50_cache_session_wire.cpp"
@@ -22,8 +22,12 @@ done
 grep -F 'p50sessionjoin_SOURCES = p50_cache_session_join_test.cpp' \
     "$unittest_makefile" >/dev/null
 grep -F '../daemon/connection_provenance.cpp' "$unittest_makefile" >/dev/null
-grep -F 'libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp' \
-    "$cache_makefile" >/dev/null
+grep -F 'support/p50_cache_session_join.cpp support/p50_cache_session_join.h' \
+    "$unittest_makefile" >/dev/null
+if grep -F 'p50_cache_session_join' "$cache_makefile" >/dev/null; then
+    echo 'FAIL: reference join reducer returned to the product build' >&2
+    exit 1
+fi
 grep -F 'P50_PROTOCOL.md' "$cache_makefile" >/dev/null
 
 wire_block=$(sed -n '/struct P50CacheSessionWireClaim {/,/^};/p' "$wire_header")

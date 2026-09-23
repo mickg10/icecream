@@ -153,18 +153,44 @@ def test_real_uv_locked_sync_rejects_stale_isolated_copy(tmp_path: Path) -> None
         pytest.skip("uv executable is unavailable")
     project = tmp_path / "stale-project"
     project.mkdir()
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    pyproject = pyproject.replace('name = "icecream-dev-tools"',
-                                  'name = "icecream-dev-tools-stale"')
-    (project / "pyproject.toml").write_text(pyproject, encoding="utf-8")
-    (project / "uv.lock").write_bytes((ROOT / "uv.lock").read_bytes())
+    # A stale project is resolved before uv reports the lock mismatch. Keep
+    # this fixture dependency-free so even an empty offline cache suffices.
+    pyproject_path = project / "pyproject.toml"
+    pyproject_path.write_text(
+        '[project]\n'
+        'name = "icecream-dev-tools"\n'
+        'version = "0.0.0"\n'
+        'requires-python = ">=3.8"\n'
+        'dependencies = []\n'
+        '\n'
+        '[tool.uv]\n'
+        'package = false\n',
+        encoding="utf-8",
+    )
     env = {
         **os.environ,
+        "UV_CACHE_DIR": str(tmp_path / "empty-uv-cache"),
         "UV_PROJECT_ENVIRONMENT": str(tmp_path / "isolated-env"),
         "UV_OFFLINE": "1",
         "UV_PYTHON_DOWNLOADS": "never",
     }
     env.pop("VIRTUAL_ENV", None)
+    locked = subprocess.run(
+        [uv, "lock", "--offline", "--python", sys.executable,
+         "--project", str(project)],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert locked.returncode == 0, locked.stderr
+    lock_path = project / "uv.lock"
+    original_lock = lock_path.read_bytes()
+
+    pyproject_path.write_text(
+        pyproject_path.read_text(encoding="utf-8").replace(
+            'name = "icecream-dev-tools"',
+            'name = "icecream-dev-tools-stale"',
+        ),
+        encoding="utf-8",
+    )
     result = subprocess.run(
         [uv, "sync", "--locked", "--offline", "--python", sys.executable,
          "--project", str(project)],
@@ -173,6 +199,7 @@ def test_real_uv_locked_sync_rejects_stale_isolated_copy(tmp_path: Path) -> None
     assert result.returncode != 0
     assert "lockfile" in result.stderr.lower(), result.stderr
     assert "needs to be updated" in result.stderr.lower(), result.stderr
+    assert lock_path.read_bytes() == original_lock
 
 
 def test_python_wrapper_and_shell_compiler_routes_are_distributed() -> None:

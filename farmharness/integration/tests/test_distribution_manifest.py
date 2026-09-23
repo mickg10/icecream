@@ -153,6 +153,33 @@ def test_production_headers_do_not_depend_on_research_tree() -> None:
                 assert not forbidden.search(path.read_text(encoding="utf-8")), path
 
 
+def test_p50_reference_components_are_not_product_dependencies() -> None:
+    references = (
+        "p50_role_owner", "p50_cache_session_join", "p50_input_attachment",
+        "p50_source_ingress", "p50_reverse_fd_retry",
+        "p50_adopted_socket_lease", "p50_sidecar_supervisor",
+    )
+    tests = (ROOT / "unittests/Makefile.am").read_text()
+    assert "check_LIBRARIES = libp50reference.a" in tests
+    for stem in references:
+        for suffix in (".h", ".cpp"):
+            name = stem + suffix
+            assert not (ROOT / "cache" / name).exists()
+            assert (ROOT / "unittests/support" / name).is_file()
+            assert f"support/{name}" in tests
+    for directory in ("cache", "client", "daemon", "services", "scheduler"):
+        makefile = (ROOT / directory / "Makefile.am").read_text()
+        assert "libp50reference" not in makefile
+        assert "unittests/support" not in makefile
+        for path in (ROOT / directory).glob("*"):
+            if path.suffix not in {".h", ".cpp"}:
+                continue
+            for include in re.findall(r'^\s*#\s*include\s*[<"]([^">]+)',
+                                      path.read_text(), re.MULTILINE):
+                assert "unittests/" not in include, path
+                assert Path(include).stem not in references, path
+
+
 def test_historical_reports_are_nested_and_packaged_by_explicit_path() -> None:
     top = (ROOT / "Makefile.am").read_text(encoding="utf-8")
     for name in ("BENCH", "P50_RESULT_DISPOSITION_WIRE_AUDIT.md"):

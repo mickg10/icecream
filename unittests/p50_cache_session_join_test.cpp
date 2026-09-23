@@ -1,4 +1,4 @@
-#include "../cache/p50_cache_session_join.h"
+#include "../unittests/support/p50_cache_session_join.h"
 #include "../cache/p50_incarnation_identity.h"
 
 #include <chrono>

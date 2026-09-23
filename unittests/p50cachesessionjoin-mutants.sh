@@ -42,7 +42,7 @@ compile_wire_mutant() {
         ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
         -I"$src" -I"$src/cache" -I"$src/services" -I"$top_build" \
         "$src/unittests/p50_cache_session_join_test.cpp" \
-        "$src/cache/p50_cache_session_join.cpp" "$mutant" \
+        "$src/unittests/support/p50_cache_session_join.cpp" "$mutant" \
         "$src/daemon/connection_provenance.cpp" \
         "$top_build/cache/libprotocol50.a" \
         "$top_build/services/libicecc.la" \
@@ -55,8 +55,8 @@ compile_and_require_red() {
     name=$1
     expression=$2
     mutant="$build/$name.cpp"
-    sed "$expression" "$src/cache/p50_cache_session_join.cpp" >"$mutant"
-    if cmp -s "$src/cache/p50_cache_session_join.cpp" "$mutant"; then
+    sed "$expression" "$src/unittests/support/p50_cache_session_join.cpp" >"$mutant"
+    if cmp -s "$src/unittests/support/p50_cache_session_join.cpp" "$mutant"; then
         echo "FAIL: $name mutation did not apply" >&2
         exit 1
     fi

@@ -26,7 +26,7 @@ grep -Fq 'std::chrono::steady_clock::now() >= deadline' "$source"
 grep -Fq 'materialization ignored its absolute deadline' \
     "$root/unittests/p50_input_fd_attachment_test.cpp"
 grep -Fq 'lseek(fd.get(), 0, SEEK_SET)' "$source"
-grep -Fq 'libp50inputfd.a' "$makefile"
+grep -Fq 'libp50input.a' "$makefile"
 
 if grep -E -n 'FileChunkMsg|FileChunk' "$header" "$source" >/dev/null; then
     echo 'FAIL: input FD attachment acquired a FileChunk path' >&2

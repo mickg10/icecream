@@ -1,6 +1,11 @@
-# Protocol 50 M3 input attachment core
+# Protocol 50 input attachment reference
 
-This slice is a pure C++ ownership and observation core. It composes the
+This test-only ownership and observation core lives in
+`unittests/support/p50_input_attachment.h`. It is not linked into the daemon
+or cache service. The live input path is described in
+[P50_PROTOCOL.md](../cache/P50_PROTOCOL.md).
+
+The reference composes the
 existing `InputRecordStore`/`InputCursor` implementation and does not change
 the endpoint, cache service, adopted-endpoint, FD-handoff, or compiler-input
 transport seams.
@@ -48,7 +53,7 @@ transport seams.
 The API returns status replies for unknown and stale request observations and
 throws on malformed local identities or illegal owner transitions. Networking,
 compiler process lifetime, wire serialization, and scheduler policy remain
-outside this module for a later integration slice.
+outside this reference module.
 
 ## Focused gates
 

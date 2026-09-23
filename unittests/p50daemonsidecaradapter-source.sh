@@ -26,7 +26,7 @@ grep -F 'socket_info.st_dev == socket_device_' "$src" >/dev/null
 grep -F 'socket_info.st_ino == socket_inode_' "$src" >/dev/null
 grep -F 'directory_info.st_ino != attempt_directory_inode_' "$src" >/dev/null
 grep -F 'controller_.observe(observation)' "$src" >/dev/null
-grep -F 'max_restarts = 0' "$src" >/dev/null
+grep -F 'executable_file(config.executable)' "$src" >/dev/null
 grep -F 'observe_public_listener' "$header" >/dev/null
 grep -F 'outer_begin_turn' "$header" >/dev/null
 grep -F 'outer_advance_turn' "$header" >/dev/null
@@ -121,9 +121,7 @@ link_binary() {
     "$cxx" "$standard" -pthread ${ICECC_TEST_LDFLAGS:-} \
         "$test_object" "$dispatch_object" "$handoff_object" \
         "$attachment_object" "$lifecycle_object" "$adapter_object" \
-        "$top_build/cache/libp50readyadvertisement.a" \
-        "$top_build/cache/libp50sidecarlifecycle.a" \
-        "$top_build/cache/libp50sidecarsupervisor.a" \
+        "$top_build/cache/libp50sidecar.a" \
         "$top_build/cache/libp50localtransport.a" \
         "$top_build/cache/libprotocol50.a" \
         "$top_build/services/.libs/libicecc.a" \

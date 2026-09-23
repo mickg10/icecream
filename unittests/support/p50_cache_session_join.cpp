@@ -1,4 +1,4 @@
-#include "p50_cache_session_join.h"
+#include "unittests/support/p50_cache_session_join.h"
 
 #include <algorithm>
 #include <stdexcept>

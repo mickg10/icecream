@@ -40,6 +40,7 @@ run_true_mutant() {
     "$cxx" "$standard" -pthread -I"$src" -I"$src/cache" \
         "$src/unittests/p50_daemon_control_test.cpp" "$mutant" \
         "$src/cache/p50_local_transport.cpp" "$src/cache/p50_fd_handoff.cpp" \
+        "$src/cache/p50_control_operation.cpp" \
         -o "$binary"
     if timeout 30 "$binary" >/dev/null 2>&1; then
         echo "FAIL: $label survived runtime" >&2

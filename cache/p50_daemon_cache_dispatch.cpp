@@ -210,36 +210,4 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
                                 true, true};
 }
 
-std::optional<std::vector<uint8_t>> CacheSessionDispatcher::emit_attachment_phase_open(
-    const CacheDispatchOutcome& outcome,
-    const icecc::p50::P50SourceArm& source_arm) noexcept {
-    // The empty CACHE_SESSION discriminator cannot carry a source arm.  Do
-    // not derive one from the handoff identity: C_STORE_GUID, logical job,
-    // attempt, and source mode are independent fields and are not present on
-    // this wire.  The caller must provide the exact later arm, and this gate
-    // still requires both ownership proofs from this very dispatch result.
-    if (outcome.result != CacheDispatchResult::Accepted ||
-        !outcome.detached || !outcome.handoff_acknowledged ||
-        !outcome.trailing_byte_barrier || !source_arm.valid() ||
-        source_arm.source_request_id != outcome.request.request_id)
-        return std::nullopt;
-
-    const icecc::p50::HandoffOffer offer{
-        outcome.request.request_id, source_arm.cache_profile, source_arm};
-    const auto offer_decision = phase_authority_.offer(offer);
-    if (offer_decision != icecc::p50::OfferDecision::Accepted &&
-        offer_decision != icecc::p50::OfferDecision::ExactReplay)
-        return std::nullopt;
-    const icecc::p50::AttachmentPhaseOpen open{
-        outcome.request.request_id, source_arm};
-    const auto open_decision = phase_authority_.phase_open(open);
-    if (open_decision != icecc::p50::OfferDecision::Accepted &&
-        open_decision != icecc::p50::OfferDecision::ExactReplay)
-        return std::nullopt;
-    const auto wire = icecc::p50::encode_attachment_phase_open(open);
-    if (wire.empty())
-        return std::nullopt;
-    return wire;
-}
-
 } // namespace icecc::p50::daemon

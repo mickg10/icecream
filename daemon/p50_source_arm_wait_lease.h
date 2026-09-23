@@ -1,6 +1,6 @@
 #pragma once
 
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 
 namespace icecc::p50::daemon {
 

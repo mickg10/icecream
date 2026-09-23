@@ -127,7 +127,7 @@ contract() {
     # The service and exact bounded codec are part of the executable topology,
     # rather than a fake socket peer supplied by this test.
     require_text "$root/cache/Makefile.am" 'icecc-cache-service' || return 1
-    require_text "$root/cache/Makefile.am" 'libp50inputfd.a' || return 1
+    require_text "$root/cache/Makefile.am" 'libp50input.a' || return 1
     require_text "$root/cache/p50_cache_service.cpp" \
         'std::make_unique<P50ServerEndpoint>' || return 1
     # The live C1F1 runner must provision the submitter-side adapter as well
@@ -210,7 +210,7 @@ for pair in \
     "research/farmharness/s8_external_farm_executor.py|S2_KILL before_pid=" \
     "research/farmharness/s8_external_farm_executor.py|external-s2-process-loss.json" \
     "client/Makefile.am|libp50zstdsender.a" \
-    "cache/Makefile.am|libp50inputfd.a" \
+    "cache/Makefile.am|libp50input.a" \
     "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \
     "client/Makefile.am|libprotocol50.a"; do
     file=${pair%%|*}

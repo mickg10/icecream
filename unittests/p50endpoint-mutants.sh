@@ -9,6 +9,7 @@ standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++23}
 libtool=${ICECC_TEST_LIBTOOL:-$top_build/libtool}
 test_object=${ICECC_TEST_ENDPOINT_TEST_OBJECT:-$top_build/unittests/p50endpoint-p50_endpoint_test.o}
 baseline=${ICECC_TEST_ENDPOINT_BINARY:-$top_build/unittests/p50endpoint}
+reference_archive=${ICECC_TEST_REFERENCE_ARCHIVE:-$top_build/unittests/libp50reference.a}
 adopted_archive=${ICECC_TEST_ADOPTED_WRITER_ARCHIVE:-$top_build/cache/libp50adoptedoutcomewriter.a}
 local_archive=${ICECC_TEST_LOCAL_TRANSPORT_ARCHIVE:-$top_build/cache/libp50localtransport.a}
 protocol_archive=${ICECC_TEST_PROTOCOL50_ARCHIVE:-$top_build/cache/libprotocol50.a}
@@ -18,7 +19,8 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/p50-endpoint-mutants.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 run_cancel_object="$work/p50_endpoint_run_cancel.o"
 
-for required in "$libtool" "$test_object" "$baseline" "$adopted_archive" \
+for required in "$libtool" "$test_object" "$baseline" "$reference_archive" \
+    "$adopted_archive" \
     "$local_archive" "$protocol_archive" "$services_la"; do
     test -f "$required"
 done
@@ -134,7 +136,8 @@ compile_mutant() {
     "$libtool" --tag=CXX --mode=link "$cxx" "$standard" -O0 -g \
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_BOOST_LDFLAGS:-} \
         -pthread -o "$output" "$test_object" "$object" \
-        "$run_cancel_object" $input_record_object "$adopted_archive" "$local_archive" \
+        "$run_cancel_object" $input_record_object "$reference_archive" \
+        "$adopted_archive" "$local_archive" \
         "$protocol_archive" "$services_la" \
         ${ICECC_TEST_LIBZSTD_LIBS:-} \
         ${ICECC_TEST_XXHASH_LIBS:-} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \

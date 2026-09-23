@@ -137,6 +137,15 @@ bool has_nul(const std::string& value) noexcept
     return value.find('\0') != std::string::npos;
 }
 
+bool executable_file(const std::string& path) noexcept
+{
+    if (path.empty() || path.front() != '/' || has_nul(path))
+        return false;
+    struct stat info{};
+    return ::stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) &&
+           ::access(path.c_str(), X_OK) == 0;
+}
+
 bool private_directory(const Config& config) noexcept
 {
     struct stat info{};
@@ -387,15 +396,7 @@ DaemonSidecarAdapter::~DaemonSidecarAdapter()
 
 bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
 {
-    sidecar::Config supervisor_config;
-    supervisor_config.executable = config.executable;
-    supervisor_config.readiness_timeout = config.readiness_timeout;
-    supervisor_config.shutdown_timeout = config.shutdown_timeout;
-    supervisor_config.restart_window = config.restart_window;
-    supervisor_config.max_restarts = 0;
-    supervisor_config.max_attempts_per_recovery = 1;
-    if (!sidecar::Supervisor::valid_config(supervisor_config) ||
-        config.executable.empty() || config.executable.front() != '/' ||
+    if (!executable_file(config.executable) ||
         config.runtime_directory.empty() ||
         config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
         config.runtime_directory.size() >= 180 ||
@@ -857,31 +858,6 @@ void DaemonSidecarAdapter::append_pending_advertisement_update(
 {
     append_update(destination, pending_advertisement_update_);
     pending_advertisement_update_ = advertisement::Update{};
-}
-
-bool DaemonSidecarAdapter::start(advertisement::Update* result) noexcept
-{
-    advertisement::Update update;
-    append_pending_advertisement_update(update);
-    // The synchronous Supervisor entry point is retired.  Keeping this ABI
-    // as a fail-closed stub prevents an old caller from becoming a second
-    // lifecycle/reaper authority; production iceccd calls outer_begin_turn().
-    fail(AdapterError::StartupFailure);
-    if (result != nullptr)
-        *result = update;
-    return false;
-}
-
-bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
-{
-    advertisement::Update update;
-    append_pending_advertisement_update(update);
-    // No caller may advance a live lifecycle through this historical method;
-    // doing so would bypass the daemon's single poll inventory and central
-    // exact-pidfd reaper.  The outer owner supplies the only positive route.
-    if (result != nullptr)
-        *result = update;
-    return false;
 }
 
 void DaemonSidecarAdapter::fail(AdapterError error) noexcept

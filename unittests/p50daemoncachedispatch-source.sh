@@ -62,15 +62,11 @@ grep -F 'cache_adapter->outer_request_shutdown(&update)' "$daemon" >/dev/null
 grep -F 'connection_leases.revalidate' "$daemon" >/dev/null
 grep -F 'handoff_acknowledged' "$impl" "$header" >/dev/null
 grep -F 'trailing_byte_barrier' "$impl" "$header" >/dev/null
-grep -F 'emit_attachment_phase_open' "$impl" "$header" "$test" >/dev/null
-grep -F 'p50_phase_open.cpp' "$makefile" >/dev/null
-grep -F 'p50_reverse_fd_retry.cpp' "$makefile" >/dev/null
 grep -F 'P50_PROTOCOL.md' "$src/cache/Makefile.am" >/dev/null
 grep -F 'Additional tested components' "$src/cache/P50_PROTOCOL.md" >/dev/null
 grep -F 'p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
 grep -F 'libp50daemonsidecaradapter.a' "$makefile" >/dev/null
-grep -F 'libp50readyadvertisement.a' "$makefile" >/dev/null
-grep -F 'libp50sidecarsupervisor.a' "$makefile" >/dev/null
+grep -F 'libp50sidecar.a' "$makefile" >/dev/null
 grep -F 'p50daemoncachedispatch' "$src/unittests/Makefile.am" >/dev/null
 grep -F 'p50daemoncachedispatch-sanitize.sh' "$src/unittests/Makefile.am" >/dev/null
 grep -F '../cache/p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null

@@ -20,7 +20,7 @@ done
     ${ICECC_TEST_CPPFLAGS:-} -I"$src" -I"$src/cache" \
     -I"$src/services" -I"$top_build" \
     "$src/unittests/p50_cache_session_join_test.cpp" \
-    "$src/cache/p50_cache_session_join.cpp" \
+    "$src/unittests/support/p50_cache_session_join.cpp" \
     "$src/daemon/connection_provenance.cpp" \
     "$top_build/cache/libprotocol50.a" "$top_build/services/libicecc.la" \
     ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:-} \

@@ -12,7 +12,7 @@ ldflags=${ICECC_TEST_LDFLAGS:-}
     -fsanitize=address,undefined,leak -Wall -Wextra -Wpedantic -Werror \
     $cppflags -I"$root" -I"$root/cache" -I"$root/services" \
     "$root/unittests/p50_reverse_fd_retry_test.cpp" \
-    "$root/cache/p50_reverse_fd_retry.cpp" \
+    "$root/unittests/support/p50_reverse_fd_retry.cpp" \
     "$root/cache/p50_fd_handoff.cpp" "$root/cache/p50_local_transport.cpp" \
     "$root/cache/p50_source_identity.cpp" $ldflags -pthread -o "$build/test"
 ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1} \

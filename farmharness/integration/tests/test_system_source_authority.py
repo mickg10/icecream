@@ -60,7 +60,7 @@ def test_capture_is_pinned_deterministic_and_streamed(tmp_path: Path, monkeypatc
     monkeypatch.setenv("ICEFARM_TMPDIR", str(tmp_path / "tmp"))
     source = _source(tmp_path)
     output_root = tmp_path / "tmp"
-    output_root.mkdir()
+    output_root.mkdir(exist_ok=True)
     first = capture_system_source_snapshot(
         _farm(), source_root=source, output=output_root / "one.json", archive_dir=output_root / "archives1"
     )

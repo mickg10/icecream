@@ -9,6 +9,7 @@ standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++23}
     -fsanitize=address,undefined,leak -I"$root" \
     "$root/unittests/p50_daemon_control_test.cpp" \
     "$root/cache/p50_daemon_control.cpp" "$root/cache/p50_local_transport.cpp" \
+    "$root/cache/p50_control_operation.cpp" \
     "$root/cache/p50_fd_handoff.cpp" \
     -o "$build/p50daemoncontrol"
 ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1} \

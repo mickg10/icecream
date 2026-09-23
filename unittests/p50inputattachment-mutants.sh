@@ -14,7 +14,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/p50-attachment-mutants.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 reset_sources() {
-    cp "$root/cache/p50_input_attachment.cpp" "$work/p50_input_attachment.cpp"
+    cp "$root/unittests/support/p50_input_attachment.cpp" "$work/p50_input_attachment.cpp"
     cp "$root/cache/p50_input_record.cpp" "$work/p50_input_record.cpp"
 }
 

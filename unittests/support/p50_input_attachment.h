@@ -1,6 +1,7 @@
+// Test-only reference component; not part of the live P50 implementation.
 #pragma once
 
-#include "p50_input_record.h"
+#include "cache/p50_input_record.h"
 
 #include <cstddef>
 #include <cstdint>

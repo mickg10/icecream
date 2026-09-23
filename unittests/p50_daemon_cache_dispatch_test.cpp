@@ -338,40 +338,6 @@ int main() {
         adopted.reset();
         CHECK(dispatcher.available(), "endpoint lease remains after successful TU");
 
-        // Phase-open is a separate, exact projection.  It is not derivable
-        // from CACHE_SESSION: the complete source arm must arrive later, and
-        // the dispatcher refuses to emit it unless both the handoff ACK and
-        // the ordinary trailing-byte barrier are present.
-        P50SourceArm arm;
-        arm.wire_job_id = 1;
-        arm.assignment_epoch = 2;
-        arm.assignment_nonce = 3;
-        arm.selected_f_host = "127.0.0.1";
-        arm.selected_f_ordinary_port = 10245;
-        arm.selected_f_cache_port = 10246;
-        arm.cache_protocol = CACHE_WIRE_REVISION;
-        arm.cache_profile = CACHE_PROFILE_P29V1;
-        arm.logical_job = 1;
-        arm.attempt_id = 1;
-        arm.c_store_generation = 1;
-        arm.c_store_guid = icecc::p50::CStoreGuid::from_u64(1);
-        arm.source_request_id = outcome.request.request_id;
-        arm.source_mode = P50_SOURCE_MODE_P29V1;
-        const auto phase_wire = dispatcher.emit_attachment_phase_open(outcome, arm);
-        CHECK(phase_wire.has_value(),
-              "phase-open projection requires ACK plus trailing-byte barrier");
-        const auto decoded_phase = phase_wire.has_value()
-                                       ? icecc::p50::decode_attachment_phase_open(*phase_wire)
-                                       : std::nullopt;
-        CHECK(decoded_phase.has_value() && decoded_phase->source_arm == arm,
-              "phase-open projection carries the complete exact source arm");
-        const auto replay = dispatcher.emit_attachment_phase_open(outcome, arm);
-        CHECK(replay.has_value() && replay == phase_wire,
-              "exact phase-open replay is idempotent");
-        auto no_barrier = outcome;
-        no_barrier.trailing_byte_barrier = false;
-        CHECK(!dispatcher.emit_attachment_phase_open(no_barrier, arm).has_value(),
-              "phase-open is refused when the trailing-byte proof is removed");
     }
 
     // The production supervisor pre-binds the private listener in the daemon

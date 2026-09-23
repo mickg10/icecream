@@ -29,5 +29,12 @@ not add deployable profiles.
 - [key-layout census](KEY_LAYOUT_V1_CENSUS.md): generated, checked measurement
   summary; not a protocol specification.
 
+The build groups live code into wire/profile, endpoint, local transport,
+input, sidecar lifecycle, daemon adapter and outcome-writer libraries.
+Reference reducers and the retired synchronous supervisor live under
+`unittests/support/` in a check-only library. They are not alternate product
+paths. Shared launch/clock types live in `p50_sidecar_identity.h`; local
+operation encoding is implemented in `p50_control_operation.cpp`.
+
 For build and QA commands, use the [project README](../README.md) and
 [test entrypoints](../farmharness/integration/tests/README.md).

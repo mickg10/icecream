@@ -114,7 +114,6 @@
 #include "p50_completion_record.h"
 #include "p50_cache_recovery_policy.h"
 #include "p50_daemon_cache_dispatch.h"
-#include "p50_fsession_daemon_op.h"
 #include "p50_input_wait.h"
 #include "connection_provenance.h"
 #include "p50_source_arm_wait_lease.h"
@@ -700,10 +699,6 @@ public:
     }
 
     ~Client() {
-        if (fsession_control_fd >= 0) {
-            (void)::close(fsession_control_fd);
-            fsession_control_fd = -1;
-        }
         status = (Status) - 1;
         delete channel;
         channel = nullptr;
@@ -820,11 +815,6 @@ public:
     // projection above is only a state gate; these values are the authority
     // used for later CompileFile matching and teardown settlement.
     std::optional<P50SourceArmFields> p50_source_arm_fields;
-    /* S2: the daemon half of the distributed F-session operation for this
-       client's CACHE_SESSION, plus its dedicated authenticated control
-       relationship to the exact sidecar incarnation. */
-    std::unique_ptr<icecc::p50::fsession::DaemonFSessionOperation> fsession_op;
-    int fsession_control_fd = -1;
     std::optional<icecc::p50::sidecar::ReadyLease> p50_source_f_lease;
     // Retain the complete ACK, not just a compact lease projection.  The
     // later cache-session join must be derivable from the canonical arm plus

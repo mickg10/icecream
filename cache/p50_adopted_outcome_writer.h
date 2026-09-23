@@ -7,7 +7,7 @@
 // move-only lease below, and only P50ServerEndpoint may perform its final
 // descriptor release while consuming the complete authority bundle.
 
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 #include "../services/p50_cache_session_wire.h"
 
 #include <cstddef>

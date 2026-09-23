@@ -14,6 +14,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
     ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
     "$root/unittests/p50_input_lifecycle_test.cpp" \
     "$root/cache/p50_input_lifecycle.cpp" \
+    "$root/cache/p50_control_operation.cpp" \
     "$root/cache/p50_local_transport.cpp" \
     "$build/cache/libprotocol50.a" \
     "$build/services/.libs/libicecc.a" -llzo2 \

@@ -47,7 +47,7 @@ session limits are negotiated later, not duplicated in Login.
 
 `iceccd` owns the public TCP listener. The sidecar adopts cache sockets from
 that listener, rather than opening another public port. Advertisement requires
-the bound listener, a Ready supervisor and its exact current READY lease.
+the bound listener, a Ready lifecycle and its exact current READY lease.
 Idle time between one-shot private connections does not withdraw presence.
 Listener loss, sidecar failure, stale lease or shutdown withdraws it.
 The adapter retains a cumulative post-READY exit count across supervisor
@@ -353,8 +353,8 @@ sent handoff. This raw exchange is not interleaved with framed control.
 
 ## Sidecar process and lease ownership
 
-The daemon adapter owns integration; the synchronous Supervisor owns the
-child and structured private lease. The supervisor pre-binds the private
+The daemon adapter drives SidecarLifecycle from the daemon poll loop and
+uses CentralChildReaperRegistry for child-exit ownership. The adapter pre-binds the private
 listener before fork; the service adopts it and never binds or unlinks that
 structured pathname. Paths use a fresh 0700 per-attempt directory and a 0600
 socket, owned by the daemon's effective nonzero UID/GID. Replaced nodes are
@@ -363,7 +363,7 @@ never removed.
 Each launch consumes a fresh control attempt, F-store generation and random
 StoreIdentity root. Its C/F GUIDs are role-tagged projections of that root,
 not hashes of generation/attempt counters. The shared allocator outlives
-Supervisor recreation and rejects exhaustion.
+controller replacement and rejects exhaustion.
 
 The structured launch supplies nine all-or-none identity environment fields:
 READY_FORMAT, EXPECTED_GENERATION, EXPECTED_ATTEMPT,
@@ -391,7 +391,7 @@ then establishes a private session/process group. Only required launch
 descriptors survive exec. Readiness and restart budgets are bounded; failure
 never publishes a nonzero endpoint.
 
-Shutdown withdraws dispatch first. The supervisor uses the exact pidfd to
+Shutdown withdraws dispatch first. The adapter and lifecycle use the exact pidfd to
 stop and observe a live leader before signaling its anchored process group;
 TERM grace, KILL, reap and cleanup are bounded. If exact child/group death
 cannot be established, it leaves the unique lease for external recovery and
@@ -426,8 +426,11 @@ must settle its exact operation before uncertain retained work can be replaced.
 
 ## Additional tested components
 
-These modules have focused tests but must not be confused with the live
-source-arm / socket-handoff / InputFdAttachment path described above:
+The reference implementations in `unittests/support/` have focused tests but
+are compiled only by `make check`, never into shipped programs. They must not
+be confused with the live source-arm / socket-handoff / InputFdAttachment
+path described above. Their tests preserve requirements and do not establish
+that equivalent behavior is wired into the live path.
 
 | Component | Contract and scope |
 |---|---|
@@ -435,9 +438,14 @@ source-arm / socket-handoff / InputFdAttachment path described above:
 | SourceIngress / SourceFinalize | Separately latches wrapper EOF and exact-child completion; a revocable finalization token and F ACK gate transfer. This reducer is not the current CompileFile bridge. |
 | PhaseOpen / HandoffAuthority | Exact request/arm echo and replay high-water mark with nonrenewable establishment/source deadlines. Linking these helpers does not send their frames in production. |
 | ReverseFdOwner / ReceiverLedger | Sealed master plus fresh CLOEXEC duplicate per retry; unchanged delivery token/deadline, remaining-duration wire field, accept-before-ACK and duplicate suppression. Not the live attachment transport. |
-| SidecarLifecycle / CentralChildReaperRegistry | Nonblocking action reducer with one reap owner and bounded event delivery; not the synchronous Supervisor used by the daemon. Replacement needs an external non-reusable process-domain proof; the default verifier refuses it. |
+| Synchronous Supervisor | Retained test implementation only. The live daemon uses SidecarLifecycle and CentralChildReaperRegistry through its adapter; the adapter supplies the process-domain observations used for replacement. |
 | ClientRoleOwner / ServerRoleOwner | Typed pre-adoption role owners; not complete C/F CompileFile wiring. |
+| InputAttachmentCore | Reference ready/ACK/replay reducer; the live path uses InputFdAttachment and InputLifecycleRegistry. |
 | Typed P5coEndpointHandoff overload | Consumes an exact retained socket lease and operation deadline; the service uses the socket overload instead. |
+
+PhaseOpen helpers and the typed endpoint overload remain separately tested
+interfaces, not additional live protocol exchanges. The concrete retained
+socket used by the typed-overload tests lives in test support.
 
 The service validates OP_CANCEL shape and bounds, but its zero binding
 placeholder does not provide a complete session claim. Daemon OP_CANCEL and

@@ -8,7 +8,7 @@
 // or signals.  The daemon supplies observations and performs at most the one
 // action returned by each call.
 
-#include "p50_sidecar_supervisor.h"
+#include "p50_sidecar_identity.h"
 
 #include <chrono>
 #include <cstdint>

@@ -2,7 +2,7 @@
 set -eu
 src=${ICECC_TEST_TOP_SRCDIR:?ICECC_TEST_TOP_SRCDIR is required}
 build=${ICECC_TEST_TOP_BUILDDIR:?ICECC_TEST_TOP_BUILDDIR is required}
-impl="$src/cache/p50_source_ingress.cpp"
+impl="$src/unittests/support/p50_source_ingress.cpp"
 test="$src/unittests/p50_source_ingress_test.cpp"
 comm="$src/services/comm.cpp"
 comm_header="$src/services/comm.h"
@@ -18,7 +18,7 @@ grep -F 'store_identity_file_guid_matches_client' "$identity" "$comm_header" >/d
 grep -F 'reported_pid != lease_.cpp_pid' "$impl" >/dev/null
 grep -F 'CacheWireState::CommitSent' "$impl" >/dev/null
 grep -F 'witness_matches' "$impl" >/dev/null
-grep -F 'FinalizeControl' "$impl" "$src/cache/p50_source_ingress.h" >/dev/null
+grep -F 'FinalizeControl' "$impl" "$src/unittests/support/p50_source_ingress.h" >/dev/null
 
 cxx=${CXX:-g++}
 flags="-std=c++23 -Wall -Wextra ${ICECC_TEST_CPPFLAGS:-} -I$src -I$src/cache -I$src/services -I$build"

@@ -6,6 +6,7 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 impl="$src/cache/p50_cache_service.cpp"
 header="$src/cache/p50_cache_service.h"
 control="$src/cache/p50_control_operation.h"
+control_cpp="$src/cache/p50_control_operation.cpp"
 identity="$src/cache/p50_incarnation_identity.h"
 wire="$src/services/p50_store_identity_wire.h"
 doc="$src/cache/P50_PROTOCOL.md"
@@ -191,6 +192,9 @@ for pair in \
     "$control|ControlCancelTargetRole::CSource" \
     "$control|ControlCancelTargetRole::FSession" \
     "$control|ControlOperationRole::Sidecar" \
+    "$control_cpp|encode_control_operation(" \
+    "$control_cpp|decode_control_operation(" \
+    "$control_cpp|wire.begin() + 40" \
     "$test_file|test_operation_cancel_prebyte_mid_dialogue_eof_deadline" \
     "$test_file|test_runtime_cancel_fail_stop_subprocess" \
     "$test_file|test_runtime_owner_failure_fail_stop_subprocess" \

@@ -18,7 +18,7 @@ zstd_libs=${ICECC_TEST_LIBZSTD_LIBS:--lzstd}
     -fsanitize=address,undefined,leak -DP50_ATTACHMENT_TEST_SEAMS \
     $cppflags $xxhash_cflags -I"$root" -I"$root/services" \
     "$root/unittests/p50_input_attachment_test.cpp" \
-    "$root/cache/p50_input_attachment.cpp" \
+    "$root/unittests/support/p50_input_attachment.cpp" \
     "$root/cache/p50_input_record.cpp" \
     "$root/cache/protocol50.cpp" "$root/services/digest128.cpp" \
     $ldflags -o "$build/p50_input_attachment_test" $zstd_libs $xxhash_libs
