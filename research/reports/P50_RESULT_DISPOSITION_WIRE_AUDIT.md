@@ -1,4 +1,8 @@
-# Protocol-50 ResultDispositionMsg wire audit
+# Protocol-50 result-disposition wire contract
+
+This is a maintained description of `services/comm` and the result/lifecycle
+bridge, not a TLA+ model or evidence of a new farm run. See also
+[committed-input lifecycle](../../cache/P50_PROTOCOL.md#compiler-input-and-result-lifecycle).
 
 `ResultDispositionMsg` is an ordinary framed `services/comm` message and is
 admitted only when the negotiated protocol is exactly 50.  The message value

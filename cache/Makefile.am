@@ -95,6 +95,8 @@ libp50adoptedoutcomewriter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
 	codec/FORMAT.md \
+	codec/P29V1_FORMAT.md \
+	codec/ZSTD_FORMATS.md \
 	codec/README.md \
 	codec/p29_intern.h \
 	codec/p29_online_s1.h \
@@ -105,7 +107,7 @@ EXTRA_DIST = \
 	p50_daemon_control.h \
 	p50_daemon_control.cpp \
 	README.md \
-	P48_P50_CONVERGENCE.md \
+	P50_PROTOCOL.md \
 	KEY_LAYOUT_V1_CENSUS.md \
 	key_layout_census.py \
 	formal/Protocol50.tla \
@@ -223,28 +225,8 @@ EXTRA_DIST = \
 	formal/run_global_trace_gate.sh \
 	formal/run_global_tlc.sh \
 	formal/run_global_formal_gate.sh \
-	P50_ENDPOINT.md \
-	P50_PROFILE_INTERFACE.md \
-	P50_LOCAL_TRANSPORT.md \
-	P50_CACHE_SESSION.md \
-	P50_SIDECAR_SUPERVISOR.md \
 	p50_sidecar_supervisor.h \
-	P50_SIDECAR_LIFECYCLE.md \
-	P50_READY_ADVERTISEMENT.md \
-	P50_CACHE_SERVICE.md \
-	P50_FD_HANDOFF.md \
-	P50_REVERSE_FD_RETRY.md \
-	P50_DAEMON_CACHE_DISPATCH.md \
 	p50_daemon_cache_dispatch.h \
-	P50_DAEMON_SIDECAR_ADAPTER.md \
-	P50_INPUT_FD_ATTACHMENT.md \
-	P50_INPUT_LIFECYCLE.md \
-	P50_DAEMON_PHASE_REVERSE_WIRING.md \
-	P50_S2_RESTART_REPLAY.md \
-	P50_SOURCE_ARM.md \
-	P50_CACHE_SESSION_JOIN.md \
-	P50_SOURCE_INGRESS.md \
-	P50_PREBOUND_TWO_ROLE.md \
 	p50_adopted_outcome_writer.cpp \
 	p50_adopted_outcome_writer.h \
 	formal/README.md
@@ -260,5 +242,5 @@ P50_FORMAL_DIST_FILES = $(shell sed -e '/^[[:space:]]*$$/d' "$(P50_FORMAL_DIST_M
 EXTRA_DIST += formal/DISTFILES $(P50_FORMAL_DIST_FILES)
 
 check-local:
-	python3 $(srcdir)/key_layout_census.py \
+	sh "$(top_srcdir)/dev/python.sh" "$(srcdir)/key_layout_census.py" \
 		--root $(top_srcdir) --check $(srcdir)/KEY_LAYOUT_V1_CENSUS.md

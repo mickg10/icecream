@@ -187,7 +187,7 @@ grep -F 'p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-muta
     "$src/unittests/Makefile.am" >/dev/null
 grep -F 'post-hello C cancellation silently authorized an abort' \
     "$src/unittests/p50_endpoint_test.cpp" >/dev/null
-grep -F 'CLOEXEC' "$src/cache/P50_ENDPOINT.md" >/dev/null
-grep -F 'Operation-scoped C cancellation' "$src/cache/P50_ENDPOINT.md" >/dev/null
-grep -F '`0/0/0`' "$src/cache/P50_ENDPOINT.md" >/dev/null
+grep -F 'CLOEXEC' "$src/cache/P50_PROTOCOL.md" >/dev/null
+grep -F 'Endpoint execution and cancellation' "$src/cache/P50_PROTOCOL.md" >/dev/null
+grep -F '(0, 0, 0)' "$src/cache/P50_PROTOCOL.md" >/dev/null
 echo 'PASS: adopted endpoint and operation-scoped cancellation source gates hold'

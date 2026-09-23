@@ -4,7 +4,7 @@ set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 test_file="$src/unittests/p50_s2_restart_replay_test.cpp"
-doc="$src/cache/P50_S2_RESTART_REPLAY.md"
+doc="$src/cache/P50_PROTOCOL.md"
 
 gate() {
     candidate=$1
@@ -55,9 +55,9 @@ if grep -F 'int structured_listener(' "$test_file" >/dev/null; then
 fi
 grep -F 'p50s2restartreplay' "$src/unittests/Makefile.am" >/dev/null
 grep -F 'p50_s2_restart_replay_sanitize.sh' "$src/unittests/Makefile.am" >/dev/null
-grep -F 'P50_S2_RESTART_REPLAY.md' "$src/cache/Makefile.am" >/dev/null
-grep -F 'CompileFile wiring' "$doc" >/dev/null
-grep -F 'product C/F' "$doc" >/dev/null
+grep -F 'P50_PROTOCOL.md' "$src/cache/Makefile.am" >/dev/null
+grep -F 'Routes, commit and restart behavior' "$doc" >/dev/null
+grep -F 'Compiler input and result lifecycle' "$doc" >/dev/null
 
 mutant_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50s2restartreplay-mutants.XXXXXX")
 trap 'rm -rf "$mutant_dir"' EXIT HUP INT TERM

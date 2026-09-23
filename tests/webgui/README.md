@@ -14,6 +14,10 @@ Then it uses Playwright to verify:
 - API endpoints return valid JSON
 - job history endpoint reports `capacity=20000`
 
+It requires Node.js/npm, Playwright (Chromium is installed by the runner), a
+configured native build, and a writable temporary directory. It is a local
+opt-in test and does not contact a farm.
+
 ## Run
 
 From repo root:

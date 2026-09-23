@@ -10,7 +10,7 @@ V6 takes two immutable inputs: an independently retained canonical
 preregistration and an evidence document.  Invoke it as:
 
 ```text
-python verify_s5_statistics.py --preregistration preregistration.json \
+python research/distribution/verify_s5_statistics.py --preregistration preregistration.json \
   --preregistration-sha256 <suite-supplied-digest> \
   --evidence-root evidence-root evidence.json -o result.json
 ```

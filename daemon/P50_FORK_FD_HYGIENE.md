@@ -44,14 +44,14 @@ unrelated control/listener descriptors and the child keeps the ordinary client
 channel, so an ordinary client OP_CANCEL/EOF remains observable while the
 worker is alive.
 
-## ControlOperation boundary (HOLD)
+## Production attachment boundary
 
-The completed local cache `ControlOperation` is consumed inside the cache
-adapter and is not retained in `Client`. The daemon carries only the raw
-candidate observation today; it cannot mint a `ForkSourceLease` from a number
-alone. The `TOCOMPILE` edge therefore has a fail-closed precondition: a future
-positive delivery bridge must erase a completed operation before this edge and
-before fork, then mint the lease at the delivery owner. Live production
-minting is explicitly HOLD; this slice makes no production daemon-to-sidecar
-bridge claim and does not move synchronous transport/FD helpers into
+The completed local cache operation is consumed by the cache adapter and is
+not retained as numeric authority in `Client`. At the `TOCOMPILE` boundary the
+daemon verifies the complete attachment key/owner/request binding, then mints
+the lease from the accepted descriptor and request ID
+(`daemon/main.cpp:8113-8129`). `handle_connection` receives that move-only
+lease (`daemon/serve.cpp:202-207`) and the fork hygiene sweep remains the
+fail-closed child boundary. This document does not claim that a bare delivery
+ID can mint a lease or that unrelated synchronous transport helpers moved into
 `iceccd`.

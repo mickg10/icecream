@@ -1,8 +1,18 @@
 # Research and historical material
 
+For local execution, use the shared locked Python environment from the
+repository root: `sh dev/python.sh SCRIPT.py ...`, or
+`sh dev/python.sh --exec bash` for a shell covering the commands below.
+Set `ICEFARM_TMPDIR` to an existing writable scratch directory first.
+There is no separate research pip environment; historical remote commands
+and retained execution records keep their original interpreter paths.
+
 Experimental codecs, statistical research tools, retained measurements and
 historical reports belong here, not in the project root or production codec
 directories. New experiments should use this tree from the start.
+Everything under `research/` is historical/replay-only unless a current test
+or tool names it explicitly; these documents are not TLA+/TLC models and do
+not by themselves establish current product qualification.
 
 | Directory | Contents | Production use |
 |---|---|---|
@@ -31,8 +41,10 @@ updated. No product C++ source may include `research/` or `capability/`.
 
 ## Path changes
 
-- Root `AUDIT-ISSUE-1.md`, `BENCH`, `DEPLOYMENT-MATRIX.md`, `PERF-REPORT.md`,
-  `WEBGUI-REVIEW.md` and `P50_RESULT_DISPOSITION_WIRE_AUDIT.md` → `reports/`.
+- Root historical reports were reviewed separately; obsolete audit/performance/
+  deployment/web-GUI reports are removed from this release tree. The retained
+  `P50_RESULT_DISPOSITION_WIRE_AUDIT.md` remains under `reports/` because its
+  protocol field/order assertions are still useful to current tests.
 - `vendor/` → `research/vendor/` (archived sources, no compatibility symlinks).
 - Unused `capability/grouprlz/` codec headers → `codecs/`.
 - `capability/distribution/` statistical tools → `distribution/`.

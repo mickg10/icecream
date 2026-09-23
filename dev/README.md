@@ -1,7 +1,7 @@
 # Local build and QA SDK
 
 From a normal Git checkout on a Linux Docker host, with Git, Make and
-Python 3.10+ installed:
+uv 0.9.21 installed (a host Python installation is not required):
 
 ```sh
 ICEFARM_TMPDIR=/data/icecream make qa
@@ -32,7 +32,9 @@ Override [farm.json](../farm.json) with `FARM=/path/to/farm.json`:
 ```
 
 `jobs` accepts 1–8 and cannot exceed Docker's reported CPU count; memory cannot
-exceed Docker's reported total. Ubuntu 22.04 is separately selectable. This
+exceed Docker's reported total. Memory limits are per container, not a reserved
+budget for the whole host; the mixed gate runs several role containers.
+Ubuntu 22.04 is separately selectable. This
 small developer spec does not replace the existing multi-host qualification
 spec or its Make targets.
 
@@ -41,7 +43,8 @@ spec or its Make targets.
 Set `image_repository` to a prepared SDK repository, or override it with
 `make qa IMAGE_REPO=registry.example:5000/team/icecream`. It pulls the tag
 `sdk-ubuntu24.04` (or the selected profile) and checks the SDK recipe label.
-The image must have been built from this checkout's Dockerfile and runner.
+The image must have been built from this checkout's Dockerfile, runner and
+Python metadata (`pyproject.toml`, `uv.lock`, `.python-version`).
 It never silently falls back to another repository or a local build. With an
 empty repository, `base_image` selects a mirrored Ubuntu base image and
 `http_proxy` specifies a separate HTTP(S) package-download proxy. Registry
@@ -51,11 +54,17 @@ For a prepared host, use `docker image save -o /data/icecream/sdk.tar IMAGE`
 with the SDK tag from the build log. Transfer that archive and the checkout;
 set `"image_bundle": "/data/icecream/sdk.tar", "offline": true` in `farm.json`.
 Loading restores image tags; the selected SDK tag must have the matching
-recipe. Offline mode will not pull or install packages. An explicitly selected
+recipe. Offline mode will not pull images or download packages. The SDK
+creates each run's Python environment from its baked package cache, offline.
+An explicitly selected
 repository still determines the required tag in offline mode. Build containers
 have no network. A normal clone must include the pinned P43 commit
 `cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`; shallow clones may need that history
 fetched before going offline.
+The host also needs uv and a prepared locked Python environment/cache:
+run `ICEFARM_TMPDIR=/data/icecream make python-sync` while online, then set
+`UV_OFFLINE=1` for offline commands. A Docker image bundle does not include
+the host's uv installation or cache.
 Run the command on the machine hosting Docker, including when reached over
 SSH; a remote Docker context is not a substitute for transferring the checkout
 and scratch files. Docker Desktop's separate VM is not validated by this gate.
@@ -83,13 +92,15 @@ same-build repeatability and cross-provider checks still compare exact bytes.
 
 `dev/Dockerfile` builds a source-free Ubuntu 24.04 development toolchain image.
 It is separate from the Compose worker/product image and farm compiler
-environments. The container does not start a farm, contact workers, or need a
-Docker socket. It installs native C++ dependencies, Autotools, Git, shell
-utilities, Python 3/pytest, and tools used by local tests.
+environments. Build/test containers do not contact an external farm or need a
+Docker socket; the host wrapper launches the later mixed-role containers.
+The SDK installs native C++ dependencies, Autotools, Git, shell
+utilities, uv and tools used by local tests. Python 3.12.12 and pytest are
+prepared by `uv sync --locked`, not installed as distro pytest packages.
 
 The host wrapper owns image selection and scratch provisioning. Its profile is
 `ubuntu24.04` by default. With an empty `image_repository`, it builds this SDK
-from the configured `BASE_IMAGE` (default `ubuntu:24.04`). With a non-empty
+from the JSON `base_image` (default `ubuntu:24.04`). With a non-empty
 `image_repository`, it must pull that prepared SDK and fail if unavailable;
 there is no local-build fallback. Docker build args `BASE_IMAGE`, `DEV_PROFILE`,
 and `RECIPE_REVISION` select an approved base mirror and stamp the image. The
@@ -107,6 +118,10 @@ copies the snapshot into `/work/source`, configures/builds out of tree in
 logs, JUnit XML, and `summary.json` under `/work/artifacts`. Reuse the same
 `/work` for `bootstrap` followed by `qa`; use fresh scratch for another source
 snapshot.
+Python uses `/work/python-env` and `/work/uv-cache`, with its readable managed
+interpreter under `/opt/uv-python`. The runner checks source Python metadata
+against the SDK's baked copies before offline sync; a changed lock or Python
+pin requires rebuilding the SDK rather than silently reusing old dependencies.
 
 Examples (the host wrapper should add the mounts and selected image):
 
@@ -131,16 +146,41 @@ Bootstrap-only containers do not need this addition. Direct `docker run`
 invocations of the QA runner must include `--cap-add SYS_PTRACE` too.
 Python tests still run if native compilation/check fails; the runner records
 stage exit statuses and logs and returns nonzero if any required stage fails.
-The Ubuntu 24.04 gate passed on q4 (containerd/overlayfs), using the SDK built
-on nas642 (ZFS) and transferred with Docker save/load: 169 native checks plus
-two root-only checks, 1,486 Python checks, and all five mixed cases. Six native
-and seven Python checks skipped. With four jobs and a 16 GiB limit, the complete
-command took about 11 minutes 37 seconds; Python accounted for 54 seconds.
-This timing excludes preparing/transferring the SDK. Ubuntu 22.04 remains an
-untested selection. Local
+See [recorded validation](../PROJECT_STATE.md#developer-qa) for exact tested
+source identities, counts, resource settings and timings. Ubuntu 22.04 remains
+an untested selection. Local
 namespace-dependent cases can skip when the container/host disallows those
 namespaces; optional retained-corpus probes can skip when their external corpus
 is absent. This is local build/test evidence, not farm qualification.
 The native suite also compiles many separate checking binaries; its time is
 additional to the Python suite. Inspect per-stage logs rather than treating
 the Python-only timing as a budget for all of `make qa`.
+
+## Python tools
+
+All local tools share `pyproject.toml` and `uv.lock`; this is a non-packaged
+tooling project, not a Python build of Icecream. `make python-sync` performs
+exact locked setup. `sh dev/python.sh SCRIPT.py ...` runs a Python script;
+`sh dev/python.sh --exec COMMAND ...` also sets PATH for shell/native helpers
+and their `#!/usr/bin/env python3` children. For example, from the repository:
+
+```sh
+ICEFARM_TMPDIR=/data/icecream sh dev/python.sh -m pytest cache/sim/test_p50sim.py
+ICEFARM_TMPDIR=/data/icecream sh dev/python.sh --exec bash
+```
+
+Storage defaults to `$ICEFARM_TMPDIR/icecream-uv-<uid>/`: a shared download
+cache and managed Python installation, plus one environment per checkout.
+Explicit `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` and `UV_PROJECT_ENVIRONMENT`
+overrides must be absolute paths. Do not share one project environment between
+simultaneously running checkouts with different locks. The uv version is
+required by `pyproject.toml`; the interpreter patch version is selected by
+`.python-version`. Updating either is a deliberate change that also rebuilds
+the SDK. For package updates, use `uv lock` with those same storage variables,
+review the lock diff, and rerun QA; normal commands use `--locked`.
+
+Remote OS probes still execute the remote machine/image's `python3`; a
+controller virtualenv path is not valid over SSH. Those probes use only the
+standard library. Frozen farm images and historical execution records are not
+rewritten by this environment conversion. Run historical local tools from the
+managed shell above rather than adding per-script dependency installers.

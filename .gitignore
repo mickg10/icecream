@@ -1,6 +1,8 @@
 # out-of-tree build
 compile
 build/
+.venv/
+.uv-cache/
 # autoconf
 m4/libtool.m4
 m4/ltoptions.m4

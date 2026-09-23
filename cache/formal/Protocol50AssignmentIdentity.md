@@ -148,6 +148,8 @@ violates the admission invariants.
 Run with a pinned TLA+ tools jar:
 
 ```sh
+ICEFARM_TMPDIR=/absolute/path/to/scratch \
+TLC_STATE_ROOT=/absolute/path/to/scratch/assignment-identity-tlc \
 TLA2TOOLS_JAR=/absolute/path/to/tla2tools.jar \
 TLC_WORKERS=1 \
 sh cache/formal/run_assignment_identity_tlc.sh

@@ -7,7 +7,7 @@ build=${ICECC_TEST_BUILDDIR:?}
 
 rows='magic version size delivery token duration seals cloexec fresh deadline highwater arm conflict preack replay close stale terminal'
 for row in $rows; do
-    echo "ok - mutant row $row is covered by P50_REVERSE_FD_RETRY.md"
+    echo "checking reverse-FD invariant: $row"
 done
 
 test -x "$build/p50reversefdretry"

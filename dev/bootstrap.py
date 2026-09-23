@@ -151,9 +151,13 @@ class Run:
 
 
 def sdk_image(run: Run, spec: dict) -> str:
-    recipe = hashlib.sha256((ROOT / "dev/Dockerfile").read_bytes()
-                            + (ROOT / "dev/run-qa.sh").read_bytes()
-                            + spec["base_image"].encode()
+    metadata = ["pyproject.toml", "uv.lock", ".python-version"]
+    missing = [name for name in metadata if not (ROOT / name).is_file()]
+    if missing:
+        raise BootstrapError("SDK Python metadata is missing: " + ", ".join(missing))
+    recipe_input = b"".join((ROOT / name).read_bytes() for name in
+                             ["dev/Dockerfile", "dev/run-qa.sh", *metadata])
+    recipe = hashlib.sha256(recipe_input + spec["base_image"].encode()
                             + spec["profile"].encode()).hexdigest()
     repository = spec["image_repository"]
     reference = (f"{repository}:sdk-{spec['profile']}" if repository else
@@ -165,16 +169,23 @@ def sdk_image(run: Run, spec: dict) -> str:
         run.command("pull-sdk", ["docker", "image", "pull", reference], timeout=300)
     observed = run.inspect(reference)
     if observed is None and not repository and not spec["offline"]:
+        context = run.root / "sdk-context"
+        context.mkdir()
+        for name in ("pyproject.toml", "uv.lock", ".python-version"):
+            shutil.copy2(ROOT / name, context / name)
+        shutil.copy2(ROOT / "dev/Dockerfile", context / "Dockerfile")
+        shutil.copy2(ROOT / "dev/run-qa.sh", context / "run-qa.sh")
         argv = ["docker", "build", "--progress=plain", "--build-arg",
                 f"BASE_IMAGE={spec['base_image']}", "--build-arg",
-                f"DEV_PROFILE={spec['profile']}", "--build-arg", f"RECIPE_REVISION={recipe}",
-                "--tag", reference, "--file", str(ROOT / "dev/Dockerfile")]
+                f"DEV_PROFILE={spec['profile']}", "--build-arg",
+                f"RECIPE_REVISION={recipe}", "--tag", reference,
+                "--file", str(context / "Dockerfile")]
         env = os.environ.copy()
         if spec.get("http_proxy"):
             # Values stay in the child environment, not persisted command logs.
             env.update(HTTP_PROXY=spec["http_proxy"], HTTPS_PROXY=spec["http_proxy"])
             argv += ["--build-arg", "HTTP_PROXY", "--build-arg", "HTTPS_PROXY"]
-        argv.append(str(ROOT / "dev"))
+        argv.append(str(context))
         previous = {key: os.environ.get(key) for key in ("HTTP_PROXY", "HTTPS_PROXY")}
         try:
             for key in previous:

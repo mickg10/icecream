@@ -138,6 +138,7 @@ other's state.
 ## Run
 
 ```sh
+ICEFARM_TMPDIR=/absolute/path/to/scratch \
 TLA2TOOLS_JAR=/path/to/tla2tools.jar make protocol50-formal
 ```
 

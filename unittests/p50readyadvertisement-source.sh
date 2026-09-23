@@ -52,7 +52,7 @@ require 'same-counter READY recovery at saturation remains failed closed' "$test
 
 require 'libp50readyadvertisement.a' "$src/cache/Makefile.am" \
     'controller library is registered in the cache build'
-require 'P50_READY_ADVERTISEMENT.md' "$src/cache/Makefile.am" \
+require 'P50_PROTOCOL.md' "$src/cache/Makefile.am" \
     'policy contract is distributed'
 require 'p50readyadvertisement-source.sh' "$src/unittests/Makefile.am" \
     'source gate is registered and distributed'

@@ -8,7 +8,7 @@ header="$src/cache/p50_cache_service.h"
 control="$src/cache/p50_control_operation.h"
 identity="$src/cache/p50_incarnation_identity.h"
 wire="$src/services/p50_store_identity_wire.h"
-doc="$src/cache/P50_CACHE_SERVICE.md"
+doc="$src/cache/P50_PROTOCOL.md"
 test_file="$src/unittests/p50cacheservice.cpp"
 test_makefile="$src/unittests/Makefile.am"
 product_makefile="$src/cache/Makefile.am"
@@ -76,7 +76,7 @@ for pair in \
     "$test_makefile|p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service" \
     "$test_makefile|-DICECC_P50_CACHE_SERVICE_NO_MAIN -DICECC_P50_ENDPOINT_TEST_HOOKS" \
     "$test_file|READY v2 generation=91 attempt=7 F_STORE_GENERATION=191 DERIVATION_VERSION=1" \
-    "$doc|CSPRNG"; do
+    "$doc|Sidecar process and lease ownership"; do
     file=${pair%%|*}; pattern=${pair#*|}
     require "$file" "$pattern"
 done

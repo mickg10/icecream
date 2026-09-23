@@ -19,11 +19,13 @@ services:
       - NO_PROXY
       - ICECREAM_BUILDER_INSECURE
       - RELEASE_TARBALL
+      - ICEFARM_TMPDIR=/scratch
     volumes:
       - ../..:/src:ro
       - ./out:/out
+      - ${ICEFARM_TMPDIR:?set ICEFARM_TMPDIR to existing scratch}:/scratch
     working_dir: /work
-    command: ["/usr/local/bin/build_deb.sh"]
+    command: ["sh", "/src/dev/python.sh", "--exec", "/usr/local/bin/build_deb.sh"]
   verify:
     build:
       context: .
@@ -44,8 +46,10 @@ services:
       - NO_PROXY
       - ICECREAM_BUILDER_INSECURE
       - RELEASE_TARBALL
+      - ICEFARM_TMPDIR=/scratch
     volumes:
       - ../..:/src:ro
       - ./out:/out
+      - ${ICEFARM_TMPDIR:?set ICEFARM_TMPDIR to existing scratch}:/scratch
     working_dir: /work
-    command: ["/usr/local/bin/verify_deb.sh"]
+    command: ["sh", "/src/dev/python.sh", "--exec", "/usr/local/bin/verify_deb.sh"]

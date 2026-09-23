@@ -3,7 +3,7 @@
 # Keep historical integration defaults; the developer commands use root farm.json.
 ICEFARM_USER_FARM := $(FARM)
 FARM ?= $(CURDIR)/farmharness/integration/farm.local.json
-ICEFARM_PYTHON ?= python3
+ICEFARM_PYTHON ?= sh "$(CURDIR)/dev/python.sh"
 ICEFARM_TMPDIR ?=
 export ICEFARM_TMPDIR
 ICEFARM_SCRATCH_GUARD = sh "$(CURDIR)/farmharness/integration/check_scratch.sh"
@@ -17,7 +17,15 @@ ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
 
-.PHONY: dev-bootstrap qa
+.PHONY: python-sync dev-bootstrap qa
+python-sync:
+	@sh "$(CURDIR)/dev/python.sh" --sync
+
+check:
+	@sh "$(CURDIR)/dev/python.sh" --exec $(MAKE) -f Makefile check
+
+.PHONY: check
+
 dev-bootstrap qa:
 	@$(ICEFARM_SCRATCH_GUARD)
 	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B dev/bootstrap.py \

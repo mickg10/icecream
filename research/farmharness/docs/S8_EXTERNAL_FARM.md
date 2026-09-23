@@ -7,9 +7,10 @@ overlap metrics, and finalization remain the contracts of
 `s8_real_c1f1_live_runner` and `p50compilee2e-run.sh`.
 
 The authenticated placement keeps scheduler and submission C on q3 and puts
-every currently executable F relationship on q2 or research7.  Research6 is
-captured in the four-host authority but remains HOLD and is rejected as an F
-target.  Physical host digests must be unique, q3 can never appear in the F
+every default F relationship on q2 or research7. Research6 is captured in the
+four-host authority but excluded from default placement. Using it as an F
+requires `--include-research6` and fresh passing authority. Physical host digests
+must be unique, q3 can never appear in the F
 map, and fresh load is limited to 0.50.  Profiles are passed through as P29,
 ZSTD_TU, ZSTD_ROUTE, GRZ_RESIDUAL, or RAW_II; RAW has no cache sidecar.
 

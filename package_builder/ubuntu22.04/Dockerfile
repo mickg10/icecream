@@ -1,5 +1,7 @@
 FROM ubuntu:22.04
 
+COPY --from=ghcr.io/astral-sh/uv:0.9.21 /uv /usr/local/bin/uv
+
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy

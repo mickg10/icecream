@@ -1,8 +1,20 @@
 # Protocol-50 formal lane
 
+Use `make protocol50-formal` from the repository root with `ICEFARM_TMPDIR`
+set. It uses the shared `uv sync --locked` environment. For direct commands
+below, enter it with `sh dev/python.sh --exec bash` from the repository root;
+Java and the pinned TLC jar remain separate prerequisites.
+
 This directory is the canonical formal home for Protocol 50 because it lives beside the product identities, executable state machine, action trace, and trace checker.
 
-There are five small models with different ownership boundaries:
+The retained [S6 transplant record](S6_V6_TRANSPLANT_AUTHORITY.md) is historical
+evidence, not a current completion claim. Its table's 40-hex blob identifiers
+are Git SHA-1 object IDs despite the original `SHA-256` column label. Historical
+authority records are preserved byte-for-byte; current execution scope is below.
+
+The core cache lane has five small models with different ownership boundaries;
+the aggregate runner additionally includes assignment, global-trace, and
+portable ZSTD_ROUTE/FInput lanes described below:
 
 ```text
 Protocol50.tla
@@ -163,7 +175,7 @@ The job model includes:
 - late losing results observable but unable to win;
 - exactly one accepted result for the logical job.
 
-“Authorized” is now an executable invariant, not only prose. It means the compiler owns an independent, complete, immutable input source. A compiler still waiting for bytes through a sidecar-owned pipe is not restart-independent. A direct mutant authorizes without ownership and must violate `AuthorizedCompilerOwnsIndependentInput`.
+“Authorized” is now an executable invariant, not only prose. It means the compiler owns an independent, complete, immutable input source. A compiler still waiting for bytes through a sidecar-owned pipe is not restart-independent. A direct mutant authorizes without ownership and must violate `AuthorizedAttemptOwnsIndependentInput`.
 
 A valid compiler restart therefore remains simple:
 
@@ -234,7 +246,10 @@ Local Prepare must be idempotent across a lost local reply. A producer-session/r
 
 ## Implementation correspondence
 
-Current M1 traces cover the implemented subset. Future mutating boundaries should use these names or an explicitly documented one-to-one mapping:
+The current action traces cover the implemented subset and provide names for
+correspondence checks; they are not a claim of full implementation refinement.
+Future mutating boundaries should use these names or an explicitly documented
+one-to-one mapping:
 
 ```text
 SESSION_OPENED
@@ -308,6 +323,7 @@ Use the pinned TLA+ tools artifact whose SHA-256 is declared in
 command is:
 
 ```sh
+ICEFARM_TMPDIR=/absolute/path/to/scratch \
 TLA2TOOLS_JAR=/path/to/tla2tools.jar \
 make protocol50-formal
 ```

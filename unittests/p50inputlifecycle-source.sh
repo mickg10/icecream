@@ -10,7 +10,7 @@ service=$root/cache/p50_cache_service.cpp
 adapter=$root/cache/p50_daemon_sidecar_adapter.cpp
 daemon=$root/daemon/main.cpp
 test_file=$root/unittests/p50_input_lifecycle_test.cpp
-doc=$root/cache/P50_INPUT_LIFECYCLE.md
+doc=$root/cache/P50_PROTOCOL.md
 
 gate() {
     grep -Fq 'InputLeaseOwner' "$lifecycle_h" &&

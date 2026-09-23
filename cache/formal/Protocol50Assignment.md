@@ -1,7 +1,7 @@
 # P49/P50 assignment ownership model
 
-`Protocol50Assignment.tla` is the bounded formal gate for the next product
-slice after the accepted P48 endpoint/core convergence.  It does not replace
+`Protocol50Assignment.tla` is the bounded formal gate for assignment ownership
+and delivery. It does not replace
 `Protocol50.tla` or `Protocol50JobLifecycle.tla`; it composes the scheduler
 assignment with the already-modeled compiler-attempt lifecycle.
 

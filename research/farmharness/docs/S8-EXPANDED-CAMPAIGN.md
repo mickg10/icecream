@@ -70,13 +70,13 @@ curve, and comparison identities remain `RAW_II`.
 Example declarative invocation (the timestamp is caller-owned and immutable):
 
 ```sh
-python3 research/farmharness/s8_campaign_planner.py \
-  --corpus-inventory /tanksmall/scratch/ictmp/experiments/icecream/s8-image-authority-inventory/20260829T101006Z/inventory.json \
-  --image-recovery-report /tanksmall/scratch/ictmp/s8-image-authority-recovery-luna/20260829T110547Z/recovery.json \
+python3 -m research.farmharness.s8_campaign_planner \
+  --corpus-inventory /path/to/authority/inventory.json \
+  --image-recovery-report /path/to/recovery/report.json \
   --image-recovery-sha256 a2eafa4b1c01ca7c21e9f52b72700582a563c52fd2cea075b36260ad7f110bf5 \
-  --matrix-audit /tanksmall/scratch/ictmp/experiments/icecream/s8-matrix-audit/20260829T083511Z/summary.json \
+  --matrix-audit /path/to/matrix-audit/summary.json \
   --matrix-audit-sha256 f8c8e308256ece6da7d0f0d7cdba235bd55e083d2ce02895cd127c23b7137e62 \
-  --output-root /tanksmall/scratch/ictmp/experiments/icecream/s8-expanded-campaign/20260829T120000Z \
+  --output-root /path/to/output/s8-expanded-campaign/20260829T120000Z \
   --timestamp 20260829T120000Z
 ```
 

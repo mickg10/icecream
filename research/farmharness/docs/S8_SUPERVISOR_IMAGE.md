@@ -1,6 +1,7 @@
 # S8 supervisor image
 
-`research/farmharness/docker/s8-supervisor.Dockerfile` is a small production supervisor image. It
+`research/farmharness/docker/s8-supervisor.Dockerfile` builds the historical
+S8 campaign supervisor image, not the current developer SDK. It
 adds only `python3`, `git`, and the Ubuntu Docker CLI package (`docker.io`);
 the checkout and campaign artifacts are mounted by
 `s8_protected_launcher.py` at execution time.
@@ -23,7 +24,9 @@ test "$(docker image inspect "$BASE" --format '{{.Id}}')" = "$BASE_ID"
 docker image inspect "$BASE" > /absolute/path/s8-supervisor-base.inspect.json
 ```
 
-The exact offline build command is then:
+The build command is below. The Dockerfile installs packages with `apt`, so
+an uncached build needs package-repository access. `--pull=false` alone does
+not make the build offline:
 
 ```sh
 docker build --pull=false --platform=linux/amd64 \

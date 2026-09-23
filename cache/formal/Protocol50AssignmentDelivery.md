@@ -125,6 +125,8 @@ they do not abbreviate or rewrite the control message.
 Run:
 
 ```sh
+ICEFARM_TMPDIR=/absolute/path/to/scratch \
+TLC_STATE_ROOT=/absolute/path/to/scratch/assignment-delivery-tlc \
 TLA2TOOLS_JAR=/path/to/tla2tools.jar \
   sh cache/formal/run_assignment_delivery_tlc.sh
 ```

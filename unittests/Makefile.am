@@ -59,6 +59,8 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 	p50endpoint-sanitize.sh
 TESTS += codec_parity codec_provider codec_intern codec_wire
 TESTS += daemonqueue
+# Native executables and shell/Python helpers inherit the same locked Python.
+LOG_COMPILER = sh "$(abs_top_srcdir)/dev/python.sh" --exec
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)'; export ICECC_TEST_TOP_BUILDDIR; \
@@ -92,7 +94,7 @@ AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_XXHASH_CFLAGS='$(XXHASH_CFLAGS)'; export ICECC_TEST_XXHASH_CFLAGS; \
 	ICECC_TEST_XXHASH_LIBS='$(XXHASH_LIBS)'; export ICECC_TEST_XXHASH_LIBS;
 TEST_EXTENSIONS = .sh
-SH_LOG_COMPILER = $(SHELL)
+SH_LOG_COMPILER = $(LOG_COMPILER) $(SHELL)
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
 	$(LIBZSTD_CFLAGS)

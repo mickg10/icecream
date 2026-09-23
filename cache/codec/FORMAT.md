@@ -1,9 +1,17 @@
-# Codec byte formats, version 0
+# Historical codec formats
 
 This file freezes the formats that existed at product commit
 `db9870d903be76694b01158303cf9e438f802120` and the named research formats at
-`56fff4e40f7ba67befa983772a29e2813233fcf2`.  It is descriptive in Phase 0:
-no product source includes `cache/codec/`, and no byte producer is changed.
+`56fff4e40f7ba67befa983772a29e2813233fcf2`. The v0 sections below describe
+historical fixtures, not the current CacheWire revision-1 transport. Paths and
+line numbers in those sections refer to the named revisions, including files
+since removed or relocated. Use [the current CacheWire overview](../README.md)
+for the production outer wire and supported profile IDs.
+
+Current profiles are specified in [P29V1_FORMAT.md](P29V1_FORMAT.md) and
+[ZSTD_FORMATS.md](ZSTD_FORMATS.md). This file is only the retained format
+catalogue needed to interpret frozen fixtures; it is not a current protocol
+or performance specification.
 
 Every integer below is unsigned.  `u16be`, `u32be`, and `u64be` are fixed-width
 big-endian integers; `u32le` and `u64le` are fixed-width little-endian
@@ -11,7 +19,7 @@ integers.  A digest is its 16 stored bytes without another length prefix.
 Offsets begin at zero.  The committed files and hashes in
 `unittests/codec_golden/MANIFEST.json` are the executable witnesses.
 
-## Protocol-50 carriage shared by product codecs
+## Historical v0 Protocol-50 carriage
 
 The outer frame header is four bytes: message type in byte 0 and payload
 length as a 24-bit big-endian integer in bytes 1..3, followed by exactly that
@@ -150,7 +158,7 @@ ROUTE tuple semantics are interchangeable.
 
 ## GRZ product v0
 
-The current group container is emitted by `group_pack` at
+The retained v0 group container was emitted by `group_pack` at
 `cache/p50_grz.cpp:216`.  All integers in this container are little-endian:
 
 | Offset | Bytes | Field |
@@ -207,124 +215,3 @@ then the four encoded streams in the declared order.  Source:
 
 The final frame is `GEND` u32le followed by total raw bytes, group count,
 match count, and stream digest as four u64le values (`grz2g.cpp:541-545`).
-
-## P29 wire v1 core (Phase 3b)
-
-The research sink frame is type u8, payload length u32le, then exact payload
-bytes (`codec50-sink.cpp:315-387` at `56fff4e4`).  General frame kinds are:
-
-| Kind | Name | Kind | Name |
-| ---: | --- | ---: | --- |
-| 1 | ROOT | 2 | BLOCKDEF |
-| 3 | NEED | 4 | ASSOCIATION |
-| 5 | PATHDEF | 6 | LINEDEF |
-| 7 | REGIONDEF | 8 | FILL_CTRL |
-| 9 | FILL_LIT | 10 | FILL_ARRAY_CTRL |
-| 11 | FILL_ARRAY_VALUES | 12 | FILL_SOURCE_CTRL |
-| 13 | FILL_SOURCE_FILES | 20 | SELECTOR |
-| 21 | BLOB | 22 | BLOB_PATCH |
-| 23 | LITERAL_GROUP | 30 | FALLBACK_REQUEST |
-| 31 | FALLBACK_REPLY | 0xfd | ACK |
-| 0xfe | TU_END | 0xff | BUILD_CLOSE |
-
-Phase 3b implements this inner stream in `cache/codec/p29_wire.h` without a
-Protocol-50 call site or advertised profile.  It consumes the Phase-3a
-`P29Interner` and uses `OnlineS1{min_match=3,max_chain=1024,hash_bits=22}`.
-No `Key64` appears in the inner wire.  Product carriage, peer negotiation,
-resource-model accounting, and a `kP29WireV1` capability remain later landing
-work.
-
-Every inner frame is kind u8, payload length u32le, then the exact payload.
-ROOT and TU_END are unconditional.  BLOCKDEF, NEED, FILL_CTRL, FILL_LIT, and
-PATHDEF are present only when nonempty.  A committed TU therefore has these
-ordered streams (brackets mean conditional):
-
-- C BODY: `ROOT [BLOCKDEF]`
-- F NEED: `[NEED]`
-- C FILL: `[FILL_CTRL] [FILL_LIT] [PATHDEF] TU_END`
-- F close: `TU_END`
-
-ROOT, BLOCKDEF, NEED, and PATHDEF payloads are independent zstd-3 messages.
-FILL_CTRL and FILL_LIT are two separate continuing zstd-3 streams with the
-content-size field disabled.  Each nonempty TU ends in `ZSTD_e_flush`; an
-explicit final close adds `ZSTD_e_end`.  FILL's TU_END has one payload byte:
-bit 0 records a FILL_CTRL segment and bit 1 a FILL_LIT segment.  F's closing
-TU_END has an empty payload.  Opcode 3 and every general research frame kind
-outside this core are forbidden.
-
-### ROOT and BLOCKDEF raw payloads
-
-ROOT is a sequence of minimal unsigned LEB128 typed tags.  Region `r` is
-`2*r`; Block `b` is `2*b+1`.
-
-BLOCKDEF begins with definition count.  Each definition is Block id, kind,
-then one of:
-
-- kind 0: child count followed by that many Region ids;
-- kind 1: source occurrence offset and Region count, copying a preceding
-  contiguous range of F's committed occurrence stream.
-
-Definitions occur in first-use order.  A Block already known by F may not be
-redefined.  Every Root Region and every Block child must be known already or
-defined by the matching FILL before TU_END.
-
-### NEED raw payload
-
-NEED is missing-Region count, those Region ids in first-use closure order,
-then a zero terminator.  BLOCKDEF presence makes NEED present even when the
-missing-Region count is zero.  C validates the complete list and rejects any
-unsolicited, reordered, extra, or absent request.
-
-### FILL_CTRL and FILL_LIT raw payloads
-
-FILL_CTRL starts with the requested-Region count.  For each Region, it stores
-the exact raw byte length followed by operations until exactly that length is
-materialized.  FILL_LIT is the shared literal-byte stream consumed by
-operations 0 and 6.  The allowed operation program is:
-
-| Opcode | Operands | Meaning |
-| ---: | --- | --- |
-| 0 | literal length | Copy that many bytes from FILL_LIT. |
-| 1 | source-Region zigzag delta, offset, length | Copy a verified Line view and publish it as the next public Line. |
-| 2 | public-Line id | Copy a previously published Line view. |
-| 4 | Path id, line number, flag count, flag bytes | Reconstruct a preprocessor line marker. |
-| 5 | Path id, source-Line id | Copy that exact Line from an allowed system source. |
-| 6 | Path id, source-Line id, prefix, suffix, middle length | Copy source prefix and suffix around middle bytes from FILL_LIT. |
-
-Opcode 1's delta is `source_region-current_region`.  Public-Line zero is a
-sentinel and never appears on the wire.  Opcode 5 or 6 is legal only for an
-exact Path under `/usr/include/`, `/usr/lib/gcc/`, or `/usr/local/include/`.
-The provider supplies immutable source bytes and complete line offsets;
-missing, malformed, or out-of-range source views fail the TU.  Valid but
-different host source bytes are detected by the outer transaction's raw
-digest/materialization check and the TU is abandoned.
-
-PATHDEF is a sequence of path-byte-length followed by exact path bytes.  Its
-frame is physically after the continuing streams, but F stages and validates
-it before interpreting marker/source operations.
-
-### State and transaction law
-
-All persistent route state belongs to the provider.  C owns Path ids,
-per-Line mixed state, the next public-Line id, and its mirrors of F-known
-Regions and Blocks.  F owns Paths, immutable per-committed-TU Region byte
-segments and Region views, public-Line views, Blocks, and the occurrence
-stream.  The serializer/deserializer allow exactly one pending TU.
-
-BODY, NEED, decoded definitions, and materialization remain staged.  Commit
-first verifies the captured provider-state base, pre-reserves every append,
-publishes immutable Regions/Blocks through the provider, then applies the
-redo.  Abandon discards the redo and resets both continuing zstd contexts, so
-a resend starts fresh segments.  Committing every TU without abandon is byte
-identical to research revision `56fff4e40f7ba67befa983772a29e2813233fcf2`.
-
-`P29WireLimits` bounds Region/Block/Path/public-Line ordinals, Region and TU
-bytes, Block children, occurrence count, decompressed messages, and continuing
-stream output.  Frame order, minimal closure, requested identities, lengths,
-source bounds, and trailing bytes are all checked before provider state moves.
-
-The retained `v1core-*.bin` witnesses contain 120 C-to-F and 40 F-to-C frames
-for 20 TUs.  The additional warm, fmt, edited-turn, 2,498-TU Firefox, and
-1,000+1,000 Firefox-turn witnesses bind full streams in both directions.
-Those byte vectors establish identity; any G3/effectiveness verdict still
-requires at least 1,000 TUs.

@@ -21,8 +21,10 @@ def _spec(tmp_path: Path, **fields: object) -> Path:
 
 def _recipe(spec: dict) -> str:
     return hashlib.sha256(
-        (bootstrap.ROOT / "dev/Dockerfile").read_bytes()
-        + (bootstrap.ROOT / "dev/run-qa.sh").read_bytes()
+        b"".join((bootstrap.ROOT / name).read_bytes() for name in (
+            "dev/Dockerfile", "dev/run-qa.sh", "pyproject.toml", "uv.lock",
+            ".python-version",
+        ))
         + spec["base_image"].encode()
         + spec["profile"].encode()
     ).hexdigest()
@@ -147,8 +149,12 @@ def test_local_sdk_build_uses_profile_base_recipe_args_and_repo_context(
     assert "BASE_IMAGE=mirror.example/ubuntu:24.04" in argv
     assert "DEV_PROFILE=ubuntu24.04" in argv
     assert f"RECIPE_REVISION={_recipe(spec)}" in argv
-    assert argv[-1] == str(bootstrap.ROOT / "dev")
-    assert argv[argv.index("--file") + 1] == str(bootstrap.ROOT / "dev/Dockerfile")
+    context = Path(argv[-1])
+    assert context.name == "sdk-context"
+    assert argv[argv.index("--file") + 1] == str(context / "Dockerfile")
+    assert {path.name for path in context.iterdir()} == {
+        "Dockerfile", "run-qa.sh", "pyproject.toml", "uv.lock", ".python-version"
+    }
 
 
 def _git(source: Path, *args: str) -> None:

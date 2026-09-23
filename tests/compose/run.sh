@@ -2,6 +2,9 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python_runner="$script_dir/../../dev/python.sh"
+# Fail before starting containers if the locked Python setup is unavailable.
+sh "$python_runner" --sync
 
 run_id="${ICECC_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 out_root="${ICECC_OUT_DIR:-${script_dir}/out/${run_id}}"
@@ -67,7 +70,7 @@ echo "== shutdown"
 docker compose down -v --remove-orphans || true
 
 echo "== verify"
-python3 "${script_dir}/verify.py" "${out_root}"
+sh "$python_runner" "${script_dir}/verify.py" "${out_root}"
 
 if [[ "${rc1}" -ne 0 || "${rc2}" -ne 0 ]]; then
   echo "ERROR: worker exit codes: worker1=${rc1} worker2=${rc2}" >&2

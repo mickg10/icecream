@@ -15,7 +15,7 @@ predecessor-continuity marker and relationship state in the source experiment.
 Usage:
 
 ```text
-PYTHONPATH=research/farmharness python research/farmharness/s8_method_matrix_report.py \
+PYTHONPATH=. python3 -m research.farmharness.s8_method_matrix_report \
   --output-root experiments/matrix \
   experiments/run-a experiments/run-b
 ```

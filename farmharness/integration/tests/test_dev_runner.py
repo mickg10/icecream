@@ -27,10 +27,17 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     source_mount.mkdir()
     work_root.mkdir()
     fake_bin.mkdir()
+    sdk_metadata = tmp_path / "sdk-metadata"
+    sdk_metadata.mkdir()
+    for name in ("pyproject.toml", "uv.lock", ".python-version"):
+        (source_mount / name).write_text("metadata\n", encoding="utf-8")
+        (sdk_metadata / name).write_text("metadata\n", encoding="utf-8")
 
     runner_text = RUNNER.read_text(encoding="utf-8")
     runner_text = runner_text.replace("SOURCE_MOUNT=/source", f"SOURCE_MOUNT={source_mount}")
     runner_text = runner_text.replace("WORK_ROOT=/work", f"WORK_ROOT={work_root}")
+    runner_text = runner_text.replace("SDK_METADATA_ROOT=/opt/icecream-python-src",
+                                      f"SDK_METADATA_ROOT={sdk_metadata}")
     runner = tmp_path / "run-qa.sh"
     _executable(runner, runner_text)
 
@@ -84,9 +91,16 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "exit 0\n",
     )
     _executable(
+        fake_bin / "uv",
+        "#!/bin/sh\n"
+        'printf "%s|%s|%s|%s\\n" "$*" "$UV_OFFLINE" "$UV_CACHE_DIR" "$UV_PROJECT_ENVIRONMENT" >> "$UV_LOG"\n'
+        "exit 0\n",
+    )
+    _executable(
         fake_bin / "python3",
         "#!/bin/sh\n"
         'printf "%s\\n" "$*" > "$PYTEST_LOG"\n'
+        'printf "%s|%s|%s\\n" "$VIRTUAL_ENV" "$UV_OFFLINE" "$UV_PYTHON_DOWNLOADS" >> "$PYTEST_LOG"\n'
         "exit 0\n",
     )
 
@@ -101,6 +115,7 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "PYTEST_LOG": str(tmp_path / "pytest.log"),
         "CHOWN_LOG": str(tmp_path / "chown.log"),
         "TMP_LOG": str(tmp_path / "tmp.log"),
+        "UV_LOG": str(tmp_path / "uv.log"),
         "ICEFARM_TMPDIR": str(work_root / "tmp"),
         "ICEFARM_OUTPUT_UID": "1234",
         "ICEFARM_OUTPUT_GID": "5678",
@@ -129,7 +144,7 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
             " check TESTS=p50cacheservice p50cacheservice-sanitize.sh"
         )
     user_stages = (tmp_path / "runuser.log").read_text().splitlines()
-    assert len(user_stages) == 6
+    assert len(user_stages) == 7
     assert all(line.startswith("-u nobody -- ") for line in user_stages)
     assert not any("native-root-check" in line for line in user_stages)
     assert (tmp_path / "tmp.log").read_text().splitlines() == [
@@ -141,13 +156,19 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     chown_calls = (tmp_path / "chown.log").read_text().splitlines()
     assert chown_calls == [
         f"-R --no-dereference 65534:65534 {work_root}/source {work_root}/build "
-        f"{work_root}/install /tmp {work_root}/artifacts",
+        f"{work_root}/install /tmp {work_root}/artifacts {work_root}/uv-cache "
+        f"{work_root}/python-env",
         f"-R --no-dereference 1234:5678 {work_root}",
     ]
 
     pytest_args = (tmp_path / "pytest.log").read_text()
     assert "-m pytest" in pytest_args
     assert str(work_root / "artifacts" / "pytest.xml") in pytest_args
+    assert f"{work_root}/python-env|1|never" in pytest_args
+    assert (tmp_path / "uv.log").read_text().startswith(
+        f"sync --locked --offline --managed-python --python metadata|1|"
+        f"{work_root}/uv-cache|{work_root}/python-env"
+    )
     summary = json.loads((work_root / "artifacts" / "summary.json").read_text())
     assert summary == {
         "mode": "qa",
@@ -156,6 +177,7 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "configure_exit": 0,
         "build_exit": 0,
         "install_exit": 0,
+        "python_sync_exit": 0,
         "native_check_exit": native_status,
         "native_root_check_exit": None if native_status else 0,
         "pytest_exit": 0,

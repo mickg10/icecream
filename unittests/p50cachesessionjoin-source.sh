@@ -24,7 +24,7 @@ grep -F 'p50sessionjoin_SOURCES = p50_cache_session_join_test.cpp' \
 grep -F '../daemon/connection_provenance.cpp' "$unittest_makefile" >/dev/null
 grep -F 'libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp' \
     "$cache_makefile" >/dev/null
-grep -F 'P50_CACHE_SESSION_JOIN.md' "$cache_makefile" >/dev/null
+grep -F 'P50_PROTOCOL.md' "$cache_makefile" >/dev/null
 
 wire_block=$(sed -n '/struct P50CacheSessionWireClaim {/,/^};/p' "$wire_header")
 if printf '%s\n' "$wire_block" | grep -E 'ConnectionLease|client_id|OwnerContext' >/dev/null; then

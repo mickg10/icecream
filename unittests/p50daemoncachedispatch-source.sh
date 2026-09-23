@@ -65,8 +65,8 @@ grep -F 'trailing_byte_barrier' "$impl" "$header" >/dev/null
 grep -F 'emit_attachment_phase_open' "$impl" "$header" "$test" >/dev/null
 grep -F 'p50_phase_open.cpp' "$makefile" >/dev/null
 grep -F 'p50_reverse_fd_retry.cpp' "$makefile" >/dev/null
-grep -F 'P50_DAEMON_PHASE_REVERSE_WIRING.md' "$src/cache/Makefile.am" >/dev/null
-grep -F 'Deliberate HOLDs' "$src/cache/P50_DAEMON_PHASE_REVERSE_WIRING.md" >/dev/null
+grep -F 'P50_PROTOCOL.md' "$src/cache/Makefile.am" >/dev/null
+grep -F 'Additional tested components' "$src/cache/P50_PROTOCOL.md" >/dev/null
 grep -F 'p50_daemon_cache_dispatch.cpp' "$makefile" >/dev/null
 grep -F 'libp50daemonsidecaradapter.a' "$makefile" >/dev/null
 grep -F 'libp50readyadvertisement.a' "$makefile" >/dev/null

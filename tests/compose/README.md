@@ -18,8 +18,14 @@ The workers generate a project with many translation units and compile them with
 From the repo root:
 
 ```bash
-./tests/compose/run.sh
+ICEFARM_TMPDIR=/path/to/existing/scratch ./tests/compose/run.sh
 ```
+
+Prerequisites are uv 0.9.21, Docker Compose v2, a Linux host with enough scratch space
+for seven containers, and the compose context from this checkout. This is a
+local benchmark/debug workload, not the bounded `make qa` gate.
+The image prepares its Python environment from the same `uv.lock` during
+build; worker runs do not download Python packages.
 
 Artifacts go under `tests/compose/out/<run-id>/` by default (override with `ICECC_OUT_DIR`).
 

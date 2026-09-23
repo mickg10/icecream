@@ -3,6 +3,10 @@
 # explicit entries `make dist` silently produced a tarball missing the very
 # tests and tools the reports describe.
 EXTRA_DIST = README.md \
+	pyproject.toml \
+	uv.lock \
+	.python-version \
+	dev/python.sh \
 	farm.json \
 	dev/bootstrap.py \
 	dev/Dockerfile \
@@ -13,12 +17,8 @@ EXTRA_DIST = README.md \
 	PROJECT_STATE.md \
 	research/README.md \
 	pytest.ini \
-	research/reports/AUDIT-ISSUE-1.md \
 	research/reports/BENCH \
-	research/reports/DEPLOYMENT-MATRIX.md \
 	research/reports/P50_RESULT_DISPOSITION_WIRE_AUDIT.md \
-	research/reports/PERF-REPORT.md \
-	research/reports/WEBGUI-REVIEW.md \
 	GNUmakefile \
 	log_extractor \
 	package_builder \
@@ -49,7 +49,7 @@ AM_LIBTOOLFLAGS = --silent
 
 ICEFARM_USER_FARM := $(FARM)
 FARM ?= $(abs_top_srcdir)/farmharness/integration/farm.local.json
-ICEFARM_PYTHON ?= python3
+ICEFARM_PYTHON ?= sh "$(abs_top_srcdir)/dev/python.sh"
 ICEFARM_TMPDIR ?=
 export ICEFARM_TMPDIR
 ICEFARM_SCRATCH_GUARD = sh "$(abs_top_srcdir)/farmharness/integration/check_scratch.sh"
@@ -63,7 +63,10 @@ ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
 
-.PHONY: dev-bootstrap qa
+.PHONY: python-sync dev-bootstrap qa
+python-sync:
+	sh "$(abs_top_srcdir)/dev/python.sh" --sync
+
 dev-bootstrap qa:
 	$(ICEFARM_SCRATCH_GUARD)
 	$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B "$(abs_top_srcdir)/dev/bootstrap.py" \

@@ -1,7 +1,9 @@
 # Real-machine stress drivers
 
-Used for the results in [DEPLOYMENT-MATRIX.md](../../research/reports/DEPLOYMENT-MATRIX.md) section 7. These are
-environment-specific harnesses, parameterized via:
+Historical/manual stress drivers used for mixed-version and backpressure
+experiments. They are not part of `make check` or the portable `make qa` gate,
+and require an explicitly provisioned two-host LAN environment. The retired
+deployment report is not a required input. Parameters are:
 
 - `STRESS_SCHED_IP`   LAN IP of the host running the scheduler(s) + c-role
 - `STRESS_FARM_SSH`   `user@host` of the second farm machine (needs

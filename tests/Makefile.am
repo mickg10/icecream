@@ -26,8 +26,9 @@ test-full: test-prepare
 	$(MAKE) test-run
 
 test-run: test-setup.sh
-	results=`realpath -s ${builddir}/results` && builddir2=`realpath -s ${builddir}` && cd ${srcdir} && /bin/bash test.sh ${prefix} $$results --builddir=$$builddir2 --strict=$(STRICT) --valgrind=$(VALGRIND) --sudo=$(SUDO)
+	results=`realpath -s ${builddir}/results` && builddir2=`realpath -s ${builddir}` && cd ${srcdir} && sh "$(abs_top_srcdir)/dev/python.sh" --exec /bin/bash test.sh ${prefix} $$results --builddir=$$builddir2 --strict=$(STRICT) --valgrind=$(VALGRIND) --sudo=$(SUDO)
 
+LOG_COMPILER = sh "$(abs_top_srcdir)/dev/python.sh" --exec
 check_SCRIPTS = test.sh test-setup.sh
 
 EXTRA_DIST = $(check_SCRIPTS)
