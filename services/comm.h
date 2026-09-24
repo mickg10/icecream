@@ -71,6 +71,7 @@
    UseCSMsg::fill_from_channel and valid_payload; Login's own decode was
    already strict this way and needed no change. */
 #define PROTOCOL_VERSION_CACHE_ADVERTISEMENT 50
+#define PROTOCOL_VERSION_CACHE_R2_NEGOTIATION 51
 
 /* CacheWire R1 and its ordinary CACHE_SESSION/source-arm bridge are pinned
    to the exact protocol-50 draft. Keep these gates independent from
@@ -79,6 +80,24 @@
    negotiated R2 path is implemented. */
 #define PROTOCOL_VERSION_P50_SOURCE_ARM_R1 50
 #define PROTOCOL_VERSION_P50_CACHE_SESSION_R1 50
+#define PROTOCOL_VERSION_SUPPORTED_MAX 51
+
+inline constexpr bool protocol_supports_p50_r1_bridge(int protocol) noexcept
+{
+    return protocol >= PROTOCOL_VERSION_P50_CACHE_SESSION_R1 &&
+           protocol <= PROTOCOL_VERSION_SUPPORTED_MAX;
+}
+
+inline constexpr bool protocol_supports_result_disposition(int protocol) noexcept
+{
+    return protocol >= PROTOCOL_VERSION_RESULT_DISPOSITION &&
+           protocol <= PROTOCOL_VERSION_SUPPORTED_MAX;
+}
+
+inline constexpr bool protocol_supports_cache_r2(int protocol) noexcept
+{
+    return protocol == PROTOCOL_VERSION_CACHE_R2_NEGOTIATION;
+}
 
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
@@ -92,6 +111,7 @@
 class MsgChannel;
 class P50CacheSessionOutcomeMsg;
 class P50CacheSessionFdRequestMsg;
+class P51SourceLeaseRequestMsg;
 
 enum class P50LegacyWireRole : uint8_t { C, F };
 
@@ -233,7 +253,14 @@ public:
         // Protocol-50 private ordinary request for the already-authenticated
         // C-cache control descriptor.  The raw SCM_RIGHTS reply is a separate
         // clean-boundary exchange and is never interpreted as a Msg.
-        P50_CACHE_SESSION_FD_REQUEST = 0x50f00014
+        P50_CACHE_SESSION_FD_REQUEST = 0x50f00014,
+
+        // Protocol-51 source-control and persistent-link setup. These are
+        // distinct records; no Protocol-50 payload is reinterpreted.
+        P51_SOURCE_LEASE_REQUEST = 0x51f00000,
+        P51_SOURCE_ARM = 0x51f00010,
+        P51_SOURCE_ARMED = 0x51f00011,
+        P51_CACHE_LINK_SESSION = 0x51f00012
     };
 
     Msg() = default;
@@ -347,6 +374,14 @@ public:
                 return "P50_CACHE_SESSION_OUTCOME";
             case P50_CACHE_SESSION_FD_REQUEST:
                 return "P50_CACHE_SESSION_FD_REQUEST";
+            case P51_SOURCE_LEASE_REQUEST:
+                return "P51_SOURCE_LEASE_REQUEST";
+            case P51_SOURCE_ARM:
+                return "P51_SOURCE_ARM";
+            case P51_SOURCE_ARMED:
+                return "P51_SOURCE_ARMED";
+            case P51_CACHE_LINK_SESSION:
+                return "P51_CACHE_LINK_SESSION";
         }
         return "UNKNOWN";
     }
@@ -589,8 +624,13 @@ inline constexpr uint32_t CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001);
    and the exact sidecar peer uid/gid observed by the daemon, all in network
    byte order. */
 inline constexpr uint32_t P50_CACHE_FD_LEASE_MAGIC = UINT32_C(0x5035464c);
-inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 3;
-inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 64;
+inline constexpr uint32_t P50_CACHE_FD_LEASE_V3_VERSION = 3;
+inline constexpr size_t P50_CACHE_FD_LEASE_V3_BYTES = 64;
+inline constexpr uint32_t P51_CACHE_FD_LEASE_V4_VERSION = 4;
+inline constexpr size_t P51_CACHE_FD_LEASE_V4_BYTES = 96;
+inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION =
+    P50_CACHE_FD_LEASE_V3_VERSION;
+inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = P50_CACHE_FD_LEASE_V3_BYTES;
 
 /* Send the exact network-order CACHE_SESSION_READY_MAGIC under one absolute
    steady-clock deadline.  The caller retains descriptor ownership. */
@@ -820,6 +860,32 @@ struct P50CacheSessionFdRequestFields
     auto operator<=>(const P50CacheSessionFdRequestFields &) const = default;
 };
 
+struct P51SourceLeaseRequestFields
+{
+    uint32_t wire_job_id = 0;
+    uint64_t assignment_epoch = 0;
+    uint64_t assignment_nonce = 0;
+    uint32_t profile = 0;
+    uint32_t requested_cache_revision = 0;
+    uint32_t requested_window = 0;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return wire_job_id != 0 && assignment_epoch != 0 &&
+               assignment_nonce != 0 &&
+               p50_source_profile_selection_valid(profile) &&
+               requested_cache_revision == 2 &&
+               requested_window != 0 && requested_window <= 30;
+    }
+
+    [[nodiscard]] P50CacheSessionFdRequestFields base() const noexcept
+    {
+        return {wire_job_id, assignment_epoch, assignment_nonce, profile};
+    }
+
+    auto operator<=>(const P51SourceLeaseRequestFields &) const = default;
+};
+
 /* Identity of the supervised cache-service incarnation whose HELLO/ACK was
    already completed by the local daemon before it passed the descriptor.
    The wrapper uses this exact value on the first post-handshake control frame;
@@ -838,6 +904,29 @@ struct P50CacheControlIdentity
     }
 
     auto operator<=>(const P50CacheControlIdentity &) const = default;
+};
+
+struct P51CacheControlIdentity
+{
+    uint64_t control_generation = 0;
+    uint64_t control_attempt = 0;
+    uint64_t peer_uid = UINT64_MAX;
+    uint64_t peer_gid = UINT64_MAX;
+    uint64_t c_store_generation = 0;
+    uint64_t derivation_version = 0;
+    std::array<uint8_t, 16> c_store_guid{};
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return control_generation != 0 && control_attempt != 0 &&
+               peer_uid <= UINT32_MAX && peer_gid <= UINT32_MAX &&
+               c_store_generation != 0 &&
+               derivation_version == icecc::p50::kStoreIdentityDerivationVersion &&
+               icecc::p50::store_identity_guid_valid_for_role(
+                   c_store_guid, icecc::p50::kStoreIdentityClientRole);
+    }
+
+    auto operator<=>(const P51CacheControlIdentity &) const = default;
 };
 
 /* Move-only authority for one delayed daemon -> wrapper descriptor reply.
@@ -873,6 +962,33 @@ private:
     uint64_t decoded_frame_sequence_ = 0;
     uint64_t outbound_frame_sequence_ = 0;
     P50CacheSessionFdRequestFields request_{};
+};
+class P51CacheFdReplyTicket
+{
+public:
+    P51CacheFdReplyTicket() = default;
+    P51CacheFdReplyTicket(const P51CacheFdReplyTicket &) = delete;
+    P51CacheFdReplyTicket &operator=(const P51CacheFdReplyTicket &) = delete;
+    P51CacheFdReplyTicket(P51CacheFdReplyTicket &&other) noexcept;
+    P51CacheFdReplyTicket &operator=(P51CacheFdReplyTicket &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return channel_generation_ != 0 && request_.valid();
+    }
+
+private:
+    friend class MsgChannel;
+    P51CacheFdReplyTicket(
+        uint64_t channel_generation, uint64_t decoded_frame_sequence,
+        uint64_t outbound_frame_sequence,
+        P51SourceLeaseRequestFields request) noexcept;
+    void invalidate() noexcept;
+
+    uint64_t channel_generation_ = 0;
+    uint64_t decoded_frame_sequence_ = 0;
+    uint64_t outbound_frame_sequence_ = 0;
+    P51SourceLeaseRequestFields request_{};
 };
 
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
@@ -1091,6 +1207,16 @@ public:
     int receive_p50_cache_fd_reply(
         const P50CacheSessionFdRequestFields &expected,
         P50CacheControlIdentity &control_identity,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    P51CacheFdReplyTicket take_p51_cache_fd_reply_ticket(
+        const P51SourceLeaseRequestMsg &request) noexcept;
+    bool send_p51_cache_fd_reply(
+        P51CacheFdReplyTicket &&ticket,
+        P51CacheControlIdentity control_identity, int transfer_fd,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    int receive_p51_cache_fd_reply(
+        const P51SourceLeaseRequestFields &expected,
+        P51CacheControlIdentity &control_identity,
         std::chrono::steady_clock::time_point deadline) noexcept;
 
     /* Bytes which remain inside the frame currently being decoded.  This is
@@ -1349,6 +1475,16 @@ protected:
     bool p50_fd_request_pending = false;
     uint64_t p50_fd_pending_request_frame = 0;
     P50CacheSessionFdRequestFields p50_pending_fd_request{};
+    bool p51_fd_request_ready = false;
+    uint64_t p51_fd_request_frame_sequence = 0;
+    bool p51_fd_reply_arm_consumed = false;
+    bool p51_fd_receive_arm = false;
+    uint64_t p51_fd_receive_frame_sequence = 0;
+    P51SourceLeaseRequestFields p51_armed_fd_request{};
+    P51SourceLeaseRequestFields p51_last_fd_request{};
+    bool p51_fd_request_pending = false;
+    uint64_t p51_fd_pending_request_frame = 0;
+    P51SourceLeaseRequestFields p51_pending_fd_request{};
 
     // One exact outbound claim may await one first outcome on this fresh
     // connection. A queued claim is promoted only after its frame fully
@@ -1379,6 +1515,7 @@ private:
     void p50_clear_outbound_claim() noexcept;
     void p50_promote_flushed_claim() noexcept;
     void p50_promote_flushed_fd_request() noexcept;
+    void p51_promote_flushed_fd_request() noexcept;
     void p50_legacy_note_received(Msg::Value type, size_t frame_bytes) noexcept;
     void p50_legacy_note_frame_queued(Msg::Value type,
                                       uint64_t begin, uint64_t end) noexcept;
@@ -1557,7 +1694,7 @@ public:
 
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
+        return protocol_supports_p50_r1_bridge(negotiated_protocol);
     }
 };
 
@@ -1576,7 +1713,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
+        return protocol_supports_p50_r1_bridge(negotiated_protocol);
     }
 
     std::vector<uint8_t> wire;
@@ -1600,7 +1737,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
+        return protocol_supports_p50_r1_bridge(negotiated_protocol);
     }
 
     std::vector<uint8_t> wire;
@@ -1634,7 +1771,7 @@ struct P50SourceArmFields {
     uint64_t c_control_generation = 0;
     uint64_t c_control_attempt = 0;
 
-    [[nodiscard]] bool valid() const noexcept
+    [[nodiscard]] bool valid_for_cache_revision(uint32_t revision) const noexcept
     {
         return wire_job_id != 0 && assignment_epoch != 0 &&
                assignment_nonce != 0 && !selected_f_host.empty() &&
@@ -1644,7 +1781,7 @@ struct P50SourceArmFields {
                selected_f_ordinary_port <= UINT16_MAX &&
                selected_f_cache_port != 0 &&
                selected_f_cache_port <= UINT16_MAX &&
-               cache_protocol == CACHE_WIRE_REVISION_R1 &&
+               cache_protocol == revision &&
                p50_source_profile_mode_valid(cache_profile, source_mode) &&
                logical_job != 0 &&
                compiler_attempt != 0 && c_store_generation != 0 &&
@@ -1654,6 +1791,10 @@ struct P50SourceArmFields {
                    c_store_guid, icecc::p50::kStoreIdentityClientRole) &&
                source_request_id != 0 &&
                c_control_generation != 0 && c_control_attempt != 0;
+    }
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return valid_for_cache_revision(CACHE_WIRE_REVISION_R1);
     }
     auto operator<=>(const P50SourceArmFields&) const = default;
 };
@@ -1673,7 +1814,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1;
+        return protocol_supports_p50_r1_bridge(negotiated_protocol);
     }
 
     P50SourceArmFields arm;
@@ -1700,10 +1841,67 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
+        return protocol_supports_p50_r1_bridge(negotiated_protocol);
     }
 
     P50CacheSessionFdRequestFields request;
+
+private:
+    bool wire_payload_valid = true;
+};
+
+class P51SourceLeaseRequestMsg : public Msg
+{
+public:
+    static constexpr size_t PayloadBytes = 32;
+
+    P51SourceLeaseRequestMsg()
+        : Msg(Msg::P51_SOURCE_LEASE_REQUEST) {}
+    explicit P51SourceLeaseRequestMsg(P51SourceLeaseRequestFields fields)
+        : Msg(Msg::P51_SOURCE_LEASE_REQUEST), request(std::move(fields)) {}
+
+    void fill_from_channel(MsgChannel *channel) override;
+    void send_to_channel(MsgChannel *channel) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return protocol_supports_cache_r2(negotiated_protocol);
+    }
+
+    P51SourceLeaseRequestFields request{};
+
+private:
+    bool wire_payload_valid = true;
+};
+
+struct P51SourceArmFields
+{
+    P50SourceArmFields source{};
+    uint32_t requested_window = 0;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return source.valid_for_cache_revision(2) &&
+               requested_window != 0 && requested_window <= 30;
+    }
+    auto operator<=>(const P51SourceArmFields &) const = default;
+};
+
+class P51SourceArmMsg : public Msg
+{
+public:
+    static constexpr size_t MaxPayloadBytes = 516;
+    P51SourceArmMsg() : Msg(Msg::P51_SOURCE_ARM) {}
+    explicit P51SourceArmMsg(P51SourceArmFields fields)
+        : Msg(Msg::P51_SOURCE_ARM), arm(std::move(fields)) {}
+    void fill_from_channel(MsgChannel *channel) override;
+    void send_to_channel(MsgChannel *channel) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return protocol_supports_cache_r2(negotiated_protocol);
+    }
+    P51SourceArmFields arm{};
 
 private:
     bool wire_payload_valid = true;
@@ -1779,7 +1977,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1;
+        return protocol_supports_p50_r1_bridge(negotiated_protocol);
     }
 
     [[nodiscard]] bool acknowledges(const P50SourceArmMsg &request) const noexcept
@@ -1789,6 +1987,56 @@ public:
 
 private:
     bool wire_payload_valid = true;
+};
+
+struct P51SourceArmedFields
+{
+    P51SourceArmFields arm{};
+    uint64_t f_control_generation = 0;
+    uint64_t f_control_attempt = 0;
+    uint64_t f_store_generation = 0;
+    std::array<uint8_t, 16> f_store_guid{};
+    uint64_t f_store_derivation_version = 0;
+    uint64_t arm_observation_id = 0;
+    uint32_t source_budget_msec = 0;
+    ClaimAttemptCapability128 attempt_capability_1{};
+    ClaimAttemptCapability128 attempt_capability_2{};
+    std::array<uint8_t, 16> reservation_id{};
+    std::array<uint8_t, 16> logical_relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint32_t selected_revision = 0;
+    uint32_t selected_window = 0;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] bool acknowledges(const P51SourceArmMsg &request) const noexcept;
+    auto operator<=>(const P51SourceArmedFields &) const = default;
+};
+
+class P51SourceArmedMsg : public Msg, public P51SourceArmedFields
+{
+public:
+    static constexpr size_t MaxPayloadBytes = 1280;
+    P51SourceArmedMsg() : Msg(Msg::P51_SOURCE_ARMED) {}
+    explicit P51SourceArmedMsg(P51SourceArmedFields fields)
+        : Msg(Msg::P51_SOURCE_ARMED),
+          P51SourceArmedFields(std::move(fields)) {}
+    void fill_from_channel(MsgChannel *channel) override;
+    void send_to_channel(MsgChannel *channel) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return protocol_supports_cache_r2(negotiated_protocol);
+    }
+};
+
+class P51CacheLinkSessionMsg : public Msg
+{
+public:
+    P51CacheLinkSessionMsg() : Msg(Msg::P51_CACHE_LINK_SESSION) {}
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return protocol_supports_cache_r2(negotiated_protocol);
+    }
 };
 
 class GetCSMsg : public Msg
@@ -2288,7 +2536,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION_RESULT_DISPOSITION;
+        return protocol_supports_result_disposition(negotiated_protocol);
     }
 
     uint64_t assignmentEpoch() const

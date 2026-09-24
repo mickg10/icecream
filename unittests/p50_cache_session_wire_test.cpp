@@ -752,32 +752,56 @@ void exact_protocol_gate() {
   const P50CacheSessionClaimMsg claim_message(wire);
   const P50CacheSessionOutcomeMsg outcome_message(outcome_wire);
   CHECK(claim_message.valid_for_protocol(50) &&
+            claim_message.valid_for_protocol(51) &&
             !claim_message.valid_for_protocol(49) &&
-            !claim_message.valid_for_protocol(51),
-        "claim message is valid for exactly Protocol 50");
+            !claim_message.valid_for_protocol(52),
+        "R1 claim message is valid on Protocol 50 and 51 only");
   CHECK(outcome_message.valid_for_protocol(50) &&
+            outcome_message.valid_for_protocol(51) &&
             !outcome_message.valid_for_protocol(49) &&
-            !outcome_message.valid_for_protocol(51),
-        "outcome message is valid for exactly Protocol 50");
+            !outcome_message.valid_for_protocol(52),
+        "R1 outcome message is valid on Protocol 50 and 51 only");
   {
     Pair pair = make_pair();
     const int owned = pair.left->fd;
     CHECK(!pair.left->send_msg(outcome_message) && pair.left->fd == owned,
           "unissued P5CO cannot send on a clean Protocol-50 channel");
   }
-  for (int protocol : {49, 51}) {
+  {
+    Pair pair = make_pair(51);
+    CHECK(pair.left->send_msg(claim_message),
+          "selected R1 claim remains sendable on Protocol 51");
+    std::unique_ptr<Msg> received(pair.right->get_msg(2, true));
+    CHECK(dynamic_cast<P50CacheSessionClaimMsg *>(received.get()) != nullptr,
+          "Protocol-51 decoder receives the unchanged R1 claim frame");
+    const auto claim = exact_claim();
+    auto stamp = pair.right->take_p50_decoded_claim_stamp();
+    auto server_ticket = pair.right->issue_p50_server_claim_release_ticket(
+        std::move(stamp), 2501, claim.attempt.selected_capability);
+    const auto outcome = adopted(wire, 502);
+    CHECK(server_ticket.valid() &&
+              pair.right->send_p50_cache_session_outcome(
+                  server_ticket, P50CacheSessionOutcomeMsg(
+                                     encode_cache_session_outcome(outcome))),
+          "selected R1 outcome remains sendable on Protocol 51");
+    std::unique_ptr<Msg> received_outcome(pair.left->get_msg(2, true));
+    CHECK(dynamic_cast<P50CacheSessionOutcomeMsg *>(
+              received_outcome.get()) != nullptr,
+          "Protocol-51 decoder receives the unchanged R1 outcome frame");
+  }
+  for (int protocol : {49, 52}) {
     Pair pair = make_pair(protocol);
     const int owned = pair.left->fd;
     CHECK(!pair.left->send_msg(P50CacheSessionClaimMsg(wire)) &&
               pair.left->fd == owned && pair.left->send_msg(PingMsg()),
-          "claim refuses every protocol except exactly 50 before framing");
+          "claim refuses protocols outside the R1 bridge range before framing");
     Pair outcome_pair = make_pair(protocol);
     const int outcome_owned = outcome_pair.left->fd;
     CHECK(!outcome_pair.left->send_msg(
               P50CacheSessionOutcomeMsg(outcome_wire)) &&
               outcome_pair.left->fd == outcome_owned &&
               outcome_pair.left->send_msg(PingMsg()),
-          "outcome refuses every protocol except exactly 50 before framing");
+          "outcome refuses protocols outside the R1 bridge range before framing");
   }
 }
 

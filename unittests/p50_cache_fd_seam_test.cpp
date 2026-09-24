@@ -33,7 +33,7 @@ struct ChannelPair {
     }
 };
 
-ChannelPair make_pair()
+ChannelPair make_pair(int protocol = PROTOCOL_VERSION_P50_CACHE_SESSION_R1)
 {
     int sockets[2] = {-1, -1};
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -51,7 +51,7 @@ ChannelPair make_pair()
     left.join();
     right.join();
     CHECK(pair.left != nullptr && pair.right != nullptr);
-    pair.left->protocol = pair.right->protocol = PROTOCOL_VERSION;
+    pair.left->protocol = pair.right->protocol = protocol;
     return pair;
 }
 
@@ -75,8 +75,8 @@ std::chrono::steady_clock::time_point deadline()
     return std::chrono::steady_clock::now() + std::chrono::seconds(2);
 }
 
-void put32(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
-           size_t offset, uint32_t value)
+template <size_t N>
+void put32(std::array<uint8_t, N> &wire, size_t offset, uint32_t value)
 {
     wire[offset] = static_cast<uint8_t>(value >> 24);
     wire[offset + 1] = static_cast<uint8_t>(value >> 16);
@@ -84,8 +84,8 @@ void put32(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
     wire[offset + 3] = static_cast<uint8_t>(value);
 }
 
-void put64(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
-           size_t offset, uint64_t value)
+template <size_t N>
+void put64(std::array<uint8_t, N> &wire, size_t offset, uint64_t value)
 {
     for (size_t i = 0; i != 8; ++i)
         wire[offset + i] = static_cast<uint8_t>(value >> (56 - i * 8));
@@ -107,6 +107,169 @@ std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> lease_wire(
     put64(wire, 48, identity.peer_uid);
     put64(wire, 56, identity.peer_gid);
     return wire;
+}
+
+P51SourceLeaseRequestFields request_v4()
+{
+    return {0x12345678, UINT64_C(0x1020304050607080),
+            UINT64_C(0x8877665544332211), CACHE_PROFILE_ZSTD_TU, 2, 4};
+}
+
+P51CacheControlIdentity control_identity_v4()
+{
+    P51CacheControlIdentity identity;
+    identity.control_generation = UINT64_C(0x1112131415161718);
+    identity.control_attempt = UINT64_C(0x2122232425262728);
+    identity.peer_uid = 4103;
+    identity.peer_gid = 3513;
+    identity.c_store_generation = UINT64_C(0x3132333435363738);
+    identity.derivation_version =
+        icecc::p50::kStoreIdentityDerivationVersion;
+    for (size_t i = 0; i != identity.c_store_guid.size(); ++i)
+        identity.c_store_guid[i] = static_cast<uint8_t>(0x90 + i);
+    identity.c_store_guid[icecc::p50::kStoreIdentityRoleByte] &=
+        static_cast<uint8_t>(~icecc::p50::kStoreIdentityRoleMask);
+    identity.c_store_guid[icecc::p50::kStoreIdentityRoleByte] |=
+        icecc::p50::kStoreIdentityClientRole;
+    return identity;
+}
+
+std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES> lease_wire_v4(
+    const P51SourceLeaseRequestFields &value,
+    const P51CacheControlIdentity &identity = control_identity_v4())
+{
+    std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES> wire{};
+    put32(wire, 0, P50_CACHE_FD_LEASE_MAGIC);
+    put32(wire, 4, P51_CACHE_FD_LEASE_V4_VERSION);
+    put32(wire, 8, value.wire_job_id);
+    put64(wire, 12, value.assignment_epoch);
+    put64(wire, 20, value.assignment_nonce);
+    put32(wire, 28, value.profile);
+    put64(wire, 32, identity.control_generation);
+    put64(wire, 40, identity.control_attempt);
+    put64(wire, 48, identity.peer_uid);
+    put64(wire, 56, identity.peer_gid);
+    put64(wire, 64, identity.c_store_generation);
+    put64(wire, 72, identity.derivation_version);
+    std::copy(identity.c_store_guid.begin(), identity.c_store_guid.end(),
+              wire.begin() + 80);
+    return wire;
+}
+
+int receive_raw_with_fd(int socket, uint8_t *bytes, size_t size)
+{
+    iovec iov{bytes, size};
+    alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int) * 4)> control{};
+    msghdr message{};
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    const ssize_t received = ::recvmsg(socket, &message, MSG_WAITALL);
+    int transferred = -1;
+    size_t fd_count = 0;
+    for (cmsghdr *cmsg = CMSG_FIRSTHDR(&message); cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(&message, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+            cmsg->cmsg_len < CMSG_LEN(sizeof(int)))
+            continue;
+        const size_t count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        const int *fds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+        for (size_t i = 0; i != count; ++i) {
+            if (fd_count++ == 0)
+                transferred = fds[i];
+            else
+                ::close(fds[i]);
+        }
+    }
+    if (received != static_cast<ssize_t>(size) || fd_count != 1 ||
+        (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+        if (transferred >= 0)
+            ::close(transferred);
+        return -1;
+    }
+    return transferred;
+}
+
+void test_legacy_v3_lease_fixture_is_byte_exact()
+{
+    /* Pin the deployable v3/64-byte reply before adding the separately
+       versioned P51/v4 lease.  The future extension must not silently rewrite
+       this R1 local record: its only v4-prefix difference is the version word. */
+    constexpr std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> expected{
+        0x50, 0x35, 0x46, 0x4c, 0x00, 0x00, 0x00, 0x03,
+        0x12, 0x34, 0x56, 0x78,
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x00, 0x00, 0x00, 0x02,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x07,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0xb9};
+    CHECK(P50_CACHE_FD_LEASE_VERSION == 3);
+    CHECK(lease_wire(request()) == expected);
+}
+
+void test_v4_lease_fixture_and_scm_rights_roundtrip()
+{
+    static_assert(P50_CACHE_FD_LEASE_V3_VERSION == 3);
+    static_assert(P50_CACHE_FD_LEASE_V3_BYTES == 64);
+    static_assert(P51_CACHE_FD_LEASE_V4_VERSION == 4);
+    static_assert(P51_CACHE_FD_LEASE_V4_BYTES == 96);
+    const auto expected = lease_wire_v4(request_v4());
+    const std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES> golden{
+        0x50, 0x35, 0x46, 0x4c, 0x00, 0x00, 0x00, 0x04,
+        0x12, 0x34, 0x56, 0x78,
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x00, 0x00, 0x00, 0x02,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x07,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0xb9,
+        0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x10, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f};
+    CHECK(expected == golden);
+
+    ChannelPair pair = make_pair(51);
+    const auto request_fields = request_v4();
+    P51SourceLeaseRequestMsg outbound(request_fields);
+    CHECK(pair.left->send_msg(outbound));
+    Msg *decoded = pair.right->get_msg(2, true);
+    auto *typed = dynamic_cast<P51SourceLeaseRequestMsg *>(decoded);
+    CHECK(typed != nullptr && typed->request == request_fields);
+    P51CacheFdReplyTicket ticket = typed == nullptr
+        ? P51CacheFdReplyTicket{}
+        : pair.right->take_p51_cache_fd_reply_ticket(*typed);
+    CHECK(ticket.valid());
+
+    char path[] = "/tmp/icecc-p51-fd-XXXXXX";
+    const int source = ::mkstemp(path);
+    CHECK(source >= 0);
+    const char contents[] = "v4 lease descriptor survives unlink";
+    CHECK(::write(source, contents, sizeof(contents)) ==
+          static_cast<ssize_t>(sizeof(contents)));
+    CHECK(::unlink(path) == 0);
+    CHECK(pair.right->send_p51_cache_fd_reply(
+        std::move(ticket), control_identity_v4(), source, deadline()));
+    delete decoded;
+
+    std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES> received_wire{};
+    const int received = receive_raw_with_fd(
+        pair.left->fd, received_wire.data(), received_wire.size());
+    CHECK(received_wire == golden);
+    CHECK(received >= 0);
+    if (received >= 0) {
+        CHECK(::lseek(received, 0, SEEK_SET) == 0);
+        char readback[sizeof(contents)]{};
+        CHECK(::read(received, readback, sizeof(readback)) ==
+              static_cast<ssize_t>(sizeof(readback)));
+        CHECK(std::memcmp(readback, contents, sizeof(contents)) == 0);
+        ::close(received);
+    }
+    CHECK(::fcntl(source, F_GETFD) == -1 && errno == EBADF);
 }
 
 void send_raw(int socket, const uint8_t *bytes, size_t size,
@@ -139,6 +302,138 @@ void send_plain(int socket, const uint8_t *bytes, size_t size)
         CHECK(sent > 0);
         offset += static_cast<size_t>(sent);
     }
+}
+
+void test_v4_lease_receiver_binds_full_request_and_exact_shape()
+{
+    const auto request_fields = request_v4();
+    const auto valid_wire = lease_wire_v4(request_fields);
+    const auto probe = [&](const P51SourceLeaseRequestFields &expected,
+                           const uint8_t *bytes, size_t size) {
+        ChannelPair pair = make_pair(51);
+        CHECK(pair.left->send_msg(P51SourceLeaseRequestMsg(request_fields)));
+        Msg *decoded = pair.right->get_msg(2, true);
+        CHECK(dynamic_cast<P51SourceLeaseRequestMsg *>(decoded) != nullptr);
+        const int source = ::open("/dev/null", O_RDONLY);
+        CHECK(source >= 0);
+        send_raw(pair.right->fd, bytes, size, &source, 1);
+        P51CacheControlIdentity observed;
+        const int received = pair.left->receive_p51_cache_fd_reply(
+            expected, observed, deadline());
+        ::close(source);
+        delete decoded;
+        return std::pair<int, P51CacheControlIdentity>{received, observed};
+    };
+
+    auto [received, identity] =
+        probe(request_fields, valid_wire.data(), valid_wire.size());
+    CHECK(received >= 0 && identity == control_identity_v4());
+    if (received >= 0)
+        ::close(received);
+
+    auto wrong_window = request_fields;
+    ++wrong_window.requested_window;
+    auto [wrong_fd, wrong_identity] =
+        probe(wrong_window, valid_wire.data(), valid_wire.size());
+    CHECK(wrong_fd == -1 && !wrong_identity.valid());
+
+    const auto legacy_v3 = lease_wire(request());
+    auto [legacy_fd, legacy_identity] =
+        probe(request_fields, legacy_v3.data(), legacy_v3.size());
+    CHECK(legacy_fd == -1 && !legacy_identity.valid());
+
+    auto wrong_version = valid_wire;
+    wrong_version[7] = static_cast<uint8_t>(P50_CACHE_FD_LEASE_V3_VERSION);
+    auto [wrong_version_fd, wrong_version_identity] =
+        probe(request_fields, wrong_version.data(), wrong_version.size());
+    CHECK(wrong_version_fd == -1 && !wrong_version_identity.valid());
+
+    auto [short_fd, short_identity] = probe(
+        request_fields, valid_wire.data(), valid_wire.size() - 1);
+    CHECK(short_fd == -1 && !short_identity.valid());
+
+    std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES + 1> overlong{};
+    std::copy(valid_wire.begin(), valid_wire.end(), overlong.begin());
+    auto [long_fd, long_identity] =
+        probe(request_fields, overlong.data(), overlong.size());
+    CHECK(long_fd == -1 && !long_identity.valid());
+}
+
+void test_v4_reply_backpressure_is_bounded_and_consumes_fd()
+{
+    ChannelPair pair = make_pair(51);
+    const auto request_fields = request_v4();
+    CHECK(pair.left->send_msg(P51SourceLeaseRequestMsg(request_fields)));
+    Msg *decoded = pair.right->get_msg(2, true);
+    auto *typed = dynamic_cast<P51SourceLeaseRequestMsg *>(decoded);
+    CHECK(typed != nullptr);
+    P51CacheFdReplyTicket ticket = typed == nullptr
+        ? P51CacheFdReplyTicket{}
+        : pair.right->take_p51_cache_fd_reply_ticket(*typed);
+    CHECK(ticket.valid());
+
+    int send_buffer = 1024;
+    CHECK(::setsockopt(pair.right->fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) == 0);
+    const std::array<uint8_t, 1024> filler{};
+    size_t filled = 0;
+    for (;;) {
+        const ssize_t count = ::send(pair.right->fd, filler.data(),
+                                     filler.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (count > 0) {
+            filled += static_cast<size_t>(count);
+            continue;
+        }
+        CHECK(count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        break;
+    }
+    CHECK(filled != 0);
+
+    const int source = ::open("/dev/null", O_RDONLY);
+    CHECK(source >= 0);
+    const auto started = std::chrono::steady_clock::now();
+    const bool sent = pair.right->send_p51_cache_fd_reply(
+        std::move(ticket), control_identity_v4(), source, deadline());
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(!sent);
+    CHECK(elapsed < std::chrono::milliseconds(100));
+    CHECK(!ticket.valid());
+    CHECK(::fcntl(source, F_GETFD) == -1 && errno == EBADF);
+    delete decoded;
+}
+
+void test_v4_partial_reply_invalidates_receive_ticket()
+{
+    ChannelPair pair = make_pair(51);
+    const auto request_fields = request_v4();
+    CHECK(pair.left->send_msg(P51SourceLeaseRequestMsg(request_fields)));
+    Msg *decoded = pair.right->get_msg(2, true);
+    auto *typed = dynamic_cast<P51SourceLeaseRequestMsg *>(decoded);
+    CHECK(typed != nullptr);
+    P51CacheFdReplyTicket ticket = typed == nullptr
+        ? P51CacheFdReplyTicket{}
+        : pair.right->take_p51_cache_fd_reply_ticket(*typed);
+    CHECK(ticket.valid());
+
+    const auto wire = lease_wire_v4(request_fields);
+    const int source = ::open("/dev/null", O_RDONLY);
+    CHECK(source >= 0);
+    send_raw(pair.right->fd, wire.data(), wire.size() / 2, &source, 1);
+    const auto short_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(20);
+    P51CacheControlIdentity observed;
+    CHECK(pair.left->receive_p51_cache_fd_reply(
+              request_fields, observed, short_deadline) == -1);
+    CHECK(!observed.valid());
+    send_plain(pair.right->fd, wire.data() + wire.size() / 2,
+               wire.size() - wire.size() / 2);
+    const auto retry_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(1);
+    CHECK(pair.left->receive_p51_cache_fd_reply(
+              request_fields, observed, retry_deadline) == -1);
+    CHECK(!observed.valid());
+    ::close(source);
+    delete decoded;
 }
 
 void test_request_and_deleted_source()
@@ -443,6 +738,11 @@ void test_ordinary_mutation_clears_receive_arm()
 int main()
 {
     try {
+        test_legacy_v3_lease_fixture_is_byte_exact();
+        test_v4_lease_fixture_and_scm_rights_roundtrip();
+        test_v4_lease_receiver_binds_full_request_and_exact_shape();
+        test_v4_reply_backpressure_is_bounded_and_consumes_fd();
+        test_v4_partial_reply_invalidates_receive_ticket();
         test_request_and_deleted_source();
         test_wrong_echo_consumes_reply_arm();
         test_control_identity_is_required();

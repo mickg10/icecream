@@ -252,14 +252,22 @@ static void test_rejections_and_protocol_gates()
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(partial_assignment),
             "partial assignment identity is refused before framing");
 
-    for (const int protocol : {43, 48, 49, 51}) {
+    for (const int protocol : {43, 48, 49, 52}) {
         Pair pair = make_pair(protocol);
         REQUIRE(!pair.left->send_msg(present_message()),
-                "ResultDispositionMsg is refused outside exact protocol 50");
+                "ResultDispositionMsg is refused outside the 50-51 bridge range");
         unsigned char byte = 0;
         REQUIRE(recv(pair.right->fd, &byte, sizeof(byte), MSG_DONTWAIT) < 0
                     && (errno == EAGAIN || errno == EWOULDBLOCK),
                 "pre-P50/non-P50 refusal emits no frame bytes");
+    }
+    {
+        Pair pair = make_pair(51);
+        REQUIRE(pair.left->send_msg(present_message()),
+                "Protocol-50 result disposition remains selectable on 51");
+        std::unique_ptr<Msg> received(pair.right->get_msg(2, true));
+        REQUIRE(dynamic_cast<ResultDispositionMsg *>(received.get()) != nullptr,
+                "Protocol-51 decoder receives unchanged result disposition");
     }
 }
 

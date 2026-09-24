@@ -25,8 +25,8 @@ persistent W1 path. Original-compiler-socket ARM cannot be enabled while the
 sidecar still depends on re-arming its separate R1 connection: job binding and
 the persistent endpoint therefore share one feature-enable gate. Keep current
 R1 behavior and withhold R2 advertisement until that vertical path works.
-Recovery precedes W2–W30. No new C/D passing evidence exists yet; the Stage A
-results below do not qualify these changes. No Chromium build/download has
+Recovery precedes W2–W30. No persistent-link runtime passing evidence exists
+yet; the Stage A results below do not qualify these changes. No Chromium build/download has
 been started for this implementation step.
 
 The first version-gate audit preserves ordinary maximum 50 and existing R1
@@ -54,6 +54,36 @@ model, or a runtime W30 test. Full epoch/digest validation, lost-confirmation
 recovery and product correspondence remain runtime/model follow-up gates;
 see [formal scope](cache/formal/README.md). Product C1–C3 and P29 speculative
 preparation are being implemented in parallel; neither is qualified yet.
+
+The dormant P51 ordinary codecs and version-4 local descriptor exchange have
+passed a focused component gate. Normal negotiation still has maximum 50;
+the tests explicitly construct protocol-51 channels. R1 source-arm,
+cache-session and result-disposition records remain selectable there, while
+P51-specific records reject protocol 50 and unsupported versions. Version-3
+descriptor bytes are retained; version 4 adds the exact C store identity and
+tests one-shot request binding, malformed replies and nonblocking send failure
+under backpressure. These are component tests, not a working R2 data link.
+
+Evidence under `/tanksmall/scratch/tmp/p50-stageA-C0C1-20260924.ZJvsRb/tmp/`:
+
+| Log | Result and scope | SHA256 |
+| --- | --- | --- |
+| `c1-wire-runtime-r9.log` | source-arm, fd seam, result disposition and source guard passed; 43.29s including Docker wrapper | `5127a19b8df5eb9598a2d1e208abae2617e3760adcc4e3bdb8411fb40221579b` |
+| `c1-sessionwire-r2.log` | cache-session compatibility passed; 4.44s | `dc97d312ac6a216b7351d922d4b357cdd0bf822fa198ceab8c16498d2f37a7d3` |
+| `c1-advertisement-r1.log` | advertisement fixtures passed; 64.08s | `df65edff3ac274ca5c6bfda594196fa9d1c099840254687e82a5d4141de4a218` |
+
+The tested communication source hashes are `comm.h`
+`7381bce245c7f0429d99110606caa4e298859da3405c4058b568f9fdfb5206e0`
+and `comm.cpp`
+`0d02256a91d58e55405ce01355e3b6a6a96deb3cc57923cdc92788bbf1b89357`.
+Advertisement linked the retained pre-D1 cache library
+`0d15cb87e814ae5c86aeaa10049d2dff7ea72d46109199452dfa2b06956c51d0`;
+it does not qualify concurrent P29 speculative-preparation edits. Earlier
+attempts hit read-only Automake regeneration, a misspelled build target, and
+test fixtures requiring updates for explicit 51 coexistence; those attempts
+remain failed, not rewritten as a clean full-suite run. The draft asynchronous
+daemon integration compiled separately but has no runtime qualification yet
+and is not included in this codec checkpoint.
 
 ### Independent-link pipeline candidate
 

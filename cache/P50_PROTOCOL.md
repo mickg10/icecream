@@ -19,19 +19,51 @@ These version numbers are independent. The old codec v0 fixtures are not
 deployable CacheWire revision-1 profiles. Ordinary legacy FileChunk compression
 also remains separate from the cache profiles.
 
-The implemented ordinary bridge is pinned to protocol 50 by named
-`PROTOCOL_VERSION_P50_SOURCE_ARM_R1` and
-`PROTOCOL_VERSION_P50_CACHE_SESSION_R1` gates. In particular, CACHE_SESSION
-release/READY and the one-TU socket transition are exact-50 operations, not
-`>= 50` features: raising the ordinary protocol maximum alone must never make
-an R1 endpoint accept a persistent successor. By contrast, assignment identity
-is a version-50 feature threshold and remains valid on later ordinary versions.
+Normal ordinary negotiation remains capped at protocol 50. Named R1 gates
+and `protocol_supports_p50_r1_bridge` also permit unchanged R1 records on an
+explicitly selected protocol-51 fixture channel, preparing legacy coexistence
+when 51 is enabled. This does not convert CACHE_SESSION release/READY or its
+one-TU EOF contract into a persistent session. Versions outside the explicitly
+supported range are rejected. Assignment identity remains a version-50 feature
+threshold independent of the ordinary maximum.
 The cache-advertisement fields described below are the existing v50 prefix;
 they do not advertise a later CacheWire revision or persistent-link support.
 
 C means the submitting cache role and F the fulfilling cache role; S is the
 scheduler. A TU is one exact preprocessed translation unit. A compiler attempt
 is not a cache transaction: one committed TU may support a replacement attempt.
+
+## Dormant protocol-51 source-control codecs
+
+These ordinary-message and descriptor codecs are preparation for the
+[persistent-link implementation](../doc/p50-transfer-concurrency.md#7-persistent-links-and-w30-implementation-specification),
+not an enabled R2 endpoint. Normal negotiation cannot select 51 yet; scheduler
+advertisement and CacheWire remain R1. Codec tests select 51 explicitly.
+
+All integers below use network byte order, with no struct padding.
+
+| Message | Discriminator | Payload |
+| --- | --- | --- |
+| P51_SOURCE_LEASE_REQUEST | `0x51f00000` | Exactly 32 bytes: job u32, assignment epoch u64, assignment nonce u64, profile u32, requested cache revision u32, requested window u32 |
+| P51_SOURCE_ARM | `0x51f00010` | Existing source-arm field ordering with cache revision 2, followed by requested window u32; separate validation from R1 |
+| P51_SOURCE_ARMED | `0x51f00011` | Exact P51 ARM echo, existing F identity/observation/budget/two-attempt-value fields, then reservation ID 16 bytes, logical relationship ID 16 bytes, relationship epoch u64, selected revision u32 and selected window u32 |
+| P51_CACHE_LINK_SESSION | `0x51f00012` | Reserved ordinary link-setup discriminator; no functioning persistent transition is provided by this codec checkpoint |
+
+Requested revision is 2; requested window is 1–30. ARMED must select revision
+2 and a nonzero window no larger than requested. Reservation and relationship
+IDs must be nonzero. A valid ARMED record echoes the complete request; it does
+not by itself establish live daemon/sidecar job ownership.
+
+The P51 local descriptor reply is a distinct fixed 96-byte version-4 record.
+Its first 64 bytes retain the version-3 layout, except the version word is 4;
+offsets 64 and 72 contain C store generation and derivation version (u64 each),
+and offset 80 contains the 16-byte C store GUID. The legacy version-3 reply
+remains exactly 64 bytes. Each reply transfers exactly one descriptor and is
+consumed once under a bounded deadline. The version-4 ticket retains the full
+32-byte request, including revision/window, even though those two fields are
+not repeated in the raw descriptor reply. Ordinary traffic, changed request
+identity, malformed descriptor data or a non-clean boundary invalidates the
+exchange. End-to-end asynchronous daemon integration remains a separate gate.
 
 ## Selection and advertisement
 

@@ -476,6 +476,50 @@ void P50CacheFdReplyTicket::invalidate() noexcept
     request_ = {};
 }
 
+P51CacheFdReplyTicket::P51CacheFdReplyTicket(
+    uint64_t channel_generation, uint64_t decoded_frame_sequence,
+    uint64_t outbound_frame_sequence,
+    P51SourceLeaseRequestFields request) noexcept
+    : channel_generation_(channel_generation),
+      decoded_frame_sequence_(decoded_frame_sequence),
+      outbound_frame_sequence_(outbound_frame_sequence), request_(request)
+{
+}
+
+P51CacheFdReplyTicket::P51CacheFdReplyTicket(
+    P51CacheFdReplyTicket &&other) noexcept
+    : channel_generation_(std::exchange(other.channel_generation_, 0)),
+      decoded_frame_sequence_(
+          std::exchange(other.decoded_frame_sequence_, 0)),
+      outbound_frame_sequence_(
+          std::exchange(other.outbound_frame_sequence_, 0)),
+      request_(std::exchange(other.request_, {}))
+{
+}
+
+P51CacheFdReplyTicket &P51CacheFdReplyTicket::operator=(
+    P51CacheFdReplyTicket &&other) noexcept
+{
+    if (this != &other) {
+        invalidate();
+        channel_generation_ = std::exchange(other.channel_generation_, 0);
+        decoded_frame_sequence_ =
+            std::exchange(other.decoded_frame_sequence_, 0);
+        outbound_frame_sequence_ =
+            std::exchange(other.outbound_frame_sequence_, 0);
+        request_ = std::exchange(other.request_, {});
+    }
+    return *this;
+}
+
+void P51CacheFdReplyTicket::invalidate() noexcept
+{
+    channel_generation_ = 0;
+    decoded_frame_sequence_ = 0;
+    outbound_frame_sequence_ = 0;
+    request_ = {};
+}
+
 // Prefer least amount of CPU use
 #undef ZSTD_CLEVEL_DEFAULT
 #define ZSTD_CLEVEL_DEFAULT 1
@@ -2355,6 +2399,13 @@ void MsgChannel::p50_note_channel_mutation() noexcept
     p50_fd_receive_arm = false;
     p50_fd_receive_frame_sequence = 0;
     p50_armed_fd_request = {};
+    p51_fd_request_ready = false;
+    p51_fd_request_frame_sequence = 0;
+    p51_fd_receive_arm = false;
+    p51_fd_receive_frame_sequence = 0;
+    p51_armed_fd_request = {};
+    p51_fd_reply_arm_consumed = false;
+    p51_last_fd_request = {};
     p50_active_server_release_nonce = 0;
     p50_active_server_claim_stamp_nonce = 0;
     p50_active_client_release_nonce = 0;
@@ -2386,10 +2437,23 @@ void MsgChannel::p50_promote_flushed_fd_request() noexcept
     p50_pending_fd_request = {};
 }
 
+void MsgChannel::p51_promote_flushed_fd_request() noexcept
+{
+    if (!p51_fd_request_pending || p51_fd_pending_request_frame == 0 ||
+        framesFlushed() < p51_fd_pending_request_frame)
+        return;
+    p51_fd_request_pending = false;
+    p51_fd_receive_arm = true;
+    p51_fd_receive_frame_sequence = p51_fd_pending_request_frame;
+    p51_armed_fd_request = p51_pending_fd_request;
+    p51_fd_pending_request_frame = 0;
+    p51_pending_fd_request = {};
+}
+
 bool MsgChannel::p50_clean_release_boundary() const noexcept
 {
     return fd >= 0 &&
-           protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 && !eof &&
+           protocol_supports_p50_r1_bridge(protocol) && !eof &&
            instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
            pending_frame_ends.empty();
 }
@@ -2451,6 +2515,13 @@ void MsgChannel::begin_receive() noexcept
     p50_fd_request_pending = false;
     p50_fd_pending_request_frame = 0;
     p50_pending_fd_request = {};
+    p51_fd_request_pending = false;
+    p51_fd_pending_request_frame = 0;
+    p51_pending_fd_request = {};
+    p51_fd_receive_arm = false;
+    p51_fd_receive_frame_sequence = 0;
+    p51_armed_fd_request = {};
+    p51_fd_reply_arm_consumed = false;
     cache_session_release_armed = false;
     cache_session_send_release_armed = false;
     if (!set_error_recursion) {
@@ -2645,39 +2716,55 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
         }
         break;
     case Msg::CACHE_SESSION:
-        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
+        if (protocol_supports_p50_r1_bridge(protocol)) {
             m = new CacheSessionMsg;
         }
         break;
     case Msg::RESULT_DISPOSITION:
-        if (protocol == PROTOCOL_VERSION_RESULT_DISPOSITION) {
+        if (protocol_supports_result_disposition(protocol)) {
             m = new ResultDispositionMsg;
         }
         break;
     case Msg::P50_SOURCE_ARM:
-        if (protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1) {
+        if (protocol_supports_p50_r1_bridge(protocol)) {
             m = new P50SourceArmMsg;
         }
         break;
     case Msg::P50_SOURCE_ARMED:
-        if (protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1) {
+        if (protocol_supports_p50_r1_bridge(protocol)) {
             m = new P50SourceArmedMsg;
         }
         break;
     case Msg::P50_CACHE_SESSION_CLAIM:
-        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
+        if (protocol_supports_p50_r1_bridge(protocol)) {
             m = new P50CacheSessionClaimMsg;
         }
         break;
     case Msg::P50_CACHE_SESSION_OUTCOME:
-        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
+        if (protocol_supports_p50_r1_bridge(protocol)) {
             m = new P50CacheSessionOutcomeMsg;
         }
         break;
     case Msg::P50_CACHE_SESSION_FD_REQUEST:
-        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
+        if (protocol_supports_p50_r1_bridge(protocol)) {
             m = new P50CacheSessionFdRequestMsg;
         }
+        break;
+    case Msg::P51_SOURCE_LEASE_REQUEST:
+        if (protocol_supports_cache_r2(protocol))
+            m = new P51SourceLeaseRequestMsg;
+        break;
+    case Msg::P51_SOURCE_ARM:
+        if (protocol_supports_cache_r2(protocol))
+            m = new P51SourceArmMsg;
+        break;
+    case Msg::P51_SOURCE_ARMED:
+        if (protocol_supports_cache_r2(protocol))
+            m = new P51SourceArmedMsg;
+        break;
+    case Msg::P51_CACHE_LINK_SESSION:
+        if (protocol_supports_cache_r2(protocol))
+            m = new P51CacheLinkSessionMsg;
         break;
     case Msg::VERIFY_ENV:
         m = new VerifyEnvMsg;
@@ -2788,6 +2875,14 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
                 throw std::bad_cast();
             p50_last_fd_request = request->request;
             p50_fd_request_ready = true;
+        } else if (type == Msg::P51_SOURCE_LEASE_REQUEST) {
+            const auto *request =
+                dynamic_cast<const P51SourceLeaseRequestMsg *>(m);
+            if (request == nullptr)
+                throw std::bad_cast();
+            p51_last_fd_request = request->request;
+            p51_fd_request_ready = true;
+            p51_fd_request_frame_sequence = p50_decoded_frame_sequence;
         }
     } catch (...) {
         delete m;
@@ -3079,7 +3174,7 @@ int MsgChannel::release_fd_if_input_empty()
        byte, or a partial/complete ordinary frame, exactly where the legacy
        parser left it. */
     if (!cache_session_release_armed || fd < 0 ||
-        protocol != PROTOCOL_VERSION_P50_CACHE_SESSION_R1
+        !protocol_supports_p50_r1_bridge(protocol)
         || eof || instate == ERROR || instate != NEED_LEN
         || inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty()) {
         return -1;
@@ -3210,7 +3305,7 @@ int MsgChannel::release_fd_after_cache_session_ready(
     const bool armed = cache_session_send_release_armed;
     cache_session_send_release_armed = false;
     if (!armed || fd < 0 ||
-        protocol != PROTOCOL_VERSION_P50_CACHE_SESSION_R1 || eof ||
+        !protocol_supports_p50_r1_bridge(protocol) || eof ||
         instate == ERROR || instate != NEED_LEN || inofs != intogo ||
         msgtogo != 0 || !pending_frame_ends.empty() ||
         !receive_cache_session_ready(fd, deadline))
@@ -3241,6 +3336,11 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         p50_fd_request_pending = false;
         p50_fd_pending_request_frame = 0;
         p50_pending_fd_request = {};
+    }
+    if (m != Msg::P51_SOURCE_LEASE_REQUEST) {
+        p51_fd_request_pending = false;
+        p51_fd_pending_request_frame = 0;
+        p51_pending_fd_request = {};
     }
 
     /* Protocol-specific refusal occurs before composing even the four-byte
@@ -3365,6 +3465,19 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
             p50_pending_fd_request = request->request;
         }
     }
+    if (m == Msg::P51_SOURCE_LEASE_REQUEST) {
+        const auto *request =
+            dynamic_cast<const P51SourceLeaseRequestMsg *>(&m);
+        if (request == nullptr) {
+            p51_fd_request_pending = false;
+            p51_fd_pending_request_frame = 0;
+            p51_pending_fd_request = {};
+        } else {
+            p51_fd_request_pending = true;
+            p51_fd_pending_request_frame = frames_queued_seq;
+            p51_pending_fd_request = request->request;
+        }
+    }
 
     if ((flags & SendBulkOnly) && msgtogo < 4096) {
         return true;
@@ -3384,7 +3497,13 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         p50_fd_pending_request_frame = 0;
         p50_pending_fd_request = {};
     }
+    if (!flushed && m == Msg::P51_SOURCE_LEASE_REQUEST) {
+        p51_fd_request_pending = false;
+        p51_fd_pending_request_frame = 0;
+        p51_pending_fd_request = {};
+    }
     p50_promote_flushed_fd_request();
+    p51_promote_flushed_fd_request();
     return flushed;
 }
 
@@ -4238,10 +4357,184 @@ void P50CacheSessionFdRequestMsg::send_to_channel(MsgChannel *channel) const
     }
 }
 
+bool P51SourceLeaseRequestMsg::valid_payload() const
+{
+    return wire_payload_valid && request.valid();
+}
+
+void P51SourceLeaseRequestMsg::fill_from_channel(MsgChannel *channel)
+{
+    wire_payload_valid = channel != nullptr &&
+        channel->current_message_bytes_remaining() == PayloadBytes;
+    if (!wire_payload_valid)
+        return;
+    *channel >> request.wire_job_id;
+    if (!p50_read_u64(channel, request.assignment_epoch) ||
+        !p50_read_u64(channel, request.assignment_nonce)) {
+        wire_payload_valid = false;
+        return;
+    }
+    *channel >> request.profile;
+    *channel >> request.requested_cache_revision;
+    *channel >> request.requested_window;
+    wire_payload_valid = channel->current_message_bytes_remaining() == 0 &&
+                         request.valid();
+}
+
+void P51SourceLeaseRequestMsg::send_to_channel(MsgChannel *channel) const
+{
+    if (channel == nullptr || !valid_payload())
+        return;
+    Msg::send_to_channel(channel);
+    *channel << request.wire_job_id;
+    p50_write_u64(channel, request.assignment_epoch);
+    p50_write_u64(channel, request.assignment_nonce);
+    *channel << request.profile;
+    *channel << request.requested_cache_revision;
+    *channel << request.requested_window;
+}
+
+bool P51SourceArmMsg::valid_payload() const
+{
+    return wire_payload_valid && arm.valid();
+}
+
+void P51SourceArmMsg::fill_from_channel(MsgChannel *channel)
+{
+    wire_payload_valid = channel != nullptr;
+    if (!wire_payload_valid)
+        return;
+    const size_t remaining = channel->current_message_bytes_remaining();
+    if (remaining < kP50SourceArmMinimumBytes + sizeof(uint32_t) ||
+        remaining > MaxPayloadBytes || !p50_read_arm(channel, arm.source)) {
+        wire_payload_valid = false;
+        return;
+    }
+    *channel >> arm.requested_window;
+    wire_payload_valid = channel->current_message_bytes_remaining() == 0 &&
+                         arm.valid();
+}
+
+void P51SourceArmMsg::send_to_channel(MsgChannel *channel) const
+{
+    if (channel == nullptr || !valid_payload())
+        return;
+    Msg::send_to_channel(channel);
+    p50_write_arm(channel, arm.source);
+    *channel << arm.requested_window;
+}
+
+bool P51SourceArmedFields::valid() const noexcept
+{
+    const bool reservation_nonzero = std::any_of(
+        reservation_id.begin(), reservation_id.end(),
+        [](uint8_t byte) { return byte != 0; });
+    const bool relationship_nonzero = std::any_of(
+        logical_relationship_id.begin(), logical_relationship_id.end(),
+        [](uint8_t byte) { return byte != 0; });
+    return arm.valid() && f_control_generation != 0 &&
+           f_control_attempt != 0 && f_store_generation != 0 &&
+           icecc::p50::store_identity_guid_valid_for_role(
+               f_store_guid, icecc::p50::kStoreIdentityFileRole) &&
+           f_store_derivation_version ==
+               icecc::p50::kStoreIdentityDerivationVersion &&
+           arm_observation_id != 0 && source_budget_msec != 0 &&
+           source_budget_msec <= P50SourceArmedFields::MaxSourceBudgetMsec &&
+           attempt_capability_1.valid() && attempt_capability_2.valid() &&
+           attempt_capability_1 != attempt_capability_2 &&
+           !icecc::p50::store_identity_file_guid_matches_client(
+               arm.source.c_store_guid, f_store_guid) && reservation_nonzero &&
+           relationship_nonzero && relationship_epoch != 0 &&
+           selected_revision == 2 && selected_window != 0 &&
+           selected_window <= arm.requested_window;
+}
+
+bool P51SourceArmedFields::acknowledges(
+    const P51SourceArmMsg &request) const noexcept
+{
+    return valid() && request.valid_payload() && arm == request.arm;
+}
+
+bool P51SourceArmedMsg::valid_payload() const
+{
+    return valid();
+}
+
+void P51SourceArmedMsg::fill_from_channel(MsgChannel *channel)
+{
+    if (channel == nullptr) {
+        arm = {};
+        return;
+    }
+    const size_t remaining = channel->current_message_bytes_remaining();
+    if (remaining < kP50SourceArmedMinimumBytes + 4 + 48 ||
+        remaining > MaxPayloadBytes || !p50_read_arm(channel, arm.source)) {
+        arm = {};
+        std::vector<uint8_t> discard;
+        (void)channel->read_current_message_payload(discard, 0, MaxPayloadBytes);
+        return;
+    }
+    *channel >> arm.requested_window;
+    if (!p50_read_u64(channel, f_control_generation) ||
+        !p50_read_u64(channel, f_control_attempt) ||
+        !p50_read_u64(channel, f_store_generation) ||
+        !p50_read_id(channel, f_store_guid) ||
+        !p50_read_u64(channel, f_store_derivation_version) ||
+        !p50_read_u64(channel, arm_observation_id) ||
+        channel->current_message_bytes_remaining() < 4 + 2 * 16 + 48) {
+        arm = {};
+        std::vector<uint8_t> discard;
+        (void)channel->read_current_message_payload(discard, 0, MaxPayloadBytes);
+        return;
+    }
+    *channel >> source_budget_msec;
+    if (!p50_read_id(channel, attempt_capability_1.bytes) ||
+        !p50_read_id(channel, attempt_capability_2.bytes) ||
+        !p50_read_id(channel, reservation_id) ||
+        !p50_read_id(channel, logical_relationship_id) ||
+        !p50_read_u64(channel, relationship_epoch)) {
+        arm = {};
+        std::vector<uint8_t> discard;
+        (void)channel->read_current_message_payload(discard, 0, MaxPayloadBytes);
+        return;
+    }
+    *channel >> selected_revision;
+    *channel >> selected_window;
+    if (channel->current_message_bytes_remaining() != 0) {
+        arm = {};
+        std::vector<uint8_t> discard;
+        (void)channel->read_current_message_payload(discard, 0, MaxPayloadBytes);
+    }
+}
+
+void P51SourceArmedMsg::send_to_channel(MsgChannel *channel) const
+{
+    if (channel == nullptr || !valid_payload())
+        return;
+    Msg::send_to_channel(channel);
+    p50_write_arm(channel, arm.source);
+    *channel << arm.requested_window;
+    p50_write_u64(channel, f_control_generation);
+    p50_write_u64(channel, f_control_attempt);
+    p50_write_u64(channel, f_store_generation);
+    p50_write_id(channel, f_store_guid);
+    p50_write_u64(channel, f_store_derivation_version);
+    p50_write_u64(channel, arm_observation_id);
+    *channel << source_budget_msec;
+    p50_write_id(channel, attempt_capability_1.bytes);
+    p50_write_id(channel, attempt_capability_2.bytes);
+    p50_write_id(channel, reservation_id);
+    p50_write_id(channel, logical_relationship_id);
+    p50_write_u64(channel, relationship_epoch);
+    *channel << selected_revision;
+    *channel << selected_window;
+}
+
 namespace {
 
-void p50_fd_put_u32(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
-                    size_t offset, uint32_t value) noexcept
+template <size_t N>
+void p50_fd_put_u32(std::array<uint8_t, N> &wire, size_t offset,
+                    uint32_t value) noexcept
 {
     wire[offset] = static_cast<uint8_t>(value >> 24);
     wire[offset + 1] = static_cast<uint8_t>(value >> 16);
@@ -4249,16 +4542,17 @@ void p50_fd_put_u32(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
     wire[offset + 3] = static_cast<uint8_t>(value);
 }
 
-void p50_fd_put_u64(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
-                    size_t offset, uint64_t value) noexcept
+template <size_t N>
+void p50_fd_put_u64(std::array<uint8_t, N> &wire, size_t offset,
+                    uint64_t value) noexcept
 {
     for (size_t i = 0; i != 8; ++i)
         wire[offset + i] = static_cast<uint8_t>(value >> (56 - i * 8));
 }
 
-uint64_t p50_fd_get_u64(
-    const std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
-    size_t offset) noexcept
+template <size_t N>
+uint64_t p50_fd_get_u64(const std::array<uint8_t, N> &wire,
+                        size_t offset) noexcept
 {
     uint64_t value = 0;
     for (size_t i = 0; i != 8; ++i)
@@ -4281,6 +4575,28 @@ p50_fd_lease_wire(const P50CacheSessionFdRequestFields &request,
     p50_fd_put_u64(wire, 40, control_identity.attempt);
     p50_fd_put_u64(wire, 48, control_identity.peer_uid);
     p50_fd_put_u64(wire, 56, control_identity.peer_gid);
+    return wire;
+}
+
+std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES>
+p51_fd_lease_wire(const P51SourceLeaseRequestFields &request,
+                  P51CacheControlIdentity control_identity) noexcept
+{
+    std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES> wire{};
+    p50_fd_put_u32(wire, 0, P50_CACHE_FD_LEASE_MAGIC);
+    p50_fd_put_u32(wire, 4, P51_CACHE_FD_LEASE_V4_VERSION);
+    p50_fd_put_u32(wire, 8, request.wire_job_id);
+    p50_fd_put_u64(wire, 12, request.assignment_epoch);
+    p50_fd_put_u64(wire, 20, request.assignment_nonce);
+    p50_fd_put_u32(wire, 28, request.profile);
+    p50_fd_put_u64(wire, 32, control_identity.control_generation);
+    p50_fd_put_u64(wire, 40, control_identity.control_attempt);
+    p50_fd_put_u64(wire, 48, control_identity.peer_uid);
+    p50_fd_put_u64(wire, 56, control_identity.peer_gid);
+    p50_fd_put_u64(wire, 64, control_identity.c_store_generation);
+    p50_fd_put_u64(wire, 72, control_identity.derivation_version);
+    std::copy(control_identity.c_store_guid.begin(),
+              control_identity.c_store_guid.end(), wire.begin() + 80);
     return wire;
 }
 
@@ -4325,7 +4641,7 @@ P50CacheFdReplyTicket MsgChannel::take_p50_cache_fd_reply_ticket(
 {
     const bool ready = !p50_fd_reply_arm_consumed &&
         p50_fd_request_ready &&
-        protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 &&
+        protocol_supports_p50_r1_bridge(protocol) &&
         !eof && instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
         pending_frame_ends.empty() && framesFlushed() == framesQueued() &&
         request.valid_payload() && request.request == p50_last_fd_request;
@@ -4352,7 +4668,7 @@ bool MsgChannel::send_p50_cache_fd_reply(
         ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
         ticket.outbound_frame_sequence_ == framesQueued() &&
         ticket.outbound_frame_sequence_ == framesFlushed() &&
-        protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 && !eof &&
+        protocol_supports_p50_r1_bridge(protocol) && !eof &&
         instate == NEED_LEN &&
         inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
         control_identity.valid();
@@ -4442,7 +4758,7 @@ int MsgChannel::receive_p50_cache_fd_reply(
         p50_fd_receive_frame_sequence != 0 &&
         p50_fd_receive_frame_sequence == framesFlushed() &&
         p50_armed_fd_request == expected && fd >= 0 &&
-        protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 && !eof &&
+        protocol_supports_p50_r1_bridge(protocol) && !eof &&
         instate == NEED_LEN &&
         inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
         expected.valid();
@@ -4571,6 +4887,230 @@ int MsgChannel::receive_p50_cache_fd_reply(
     const int result = received_fds[0];
     received_fds[0] = -1;
     control_identity = observed_identity;
+    p50_note_channel_mutation();
+    return result;
+}
+
+P51CacheFdReplyTicket MsgChannel::take_p51_cache_fd_reply_ticket(
+    const P51SourceLeaseRequestMsg &request) noexcept
+{
+    const bool ready = !p51_fd_reply_arm_consumed && p51_fd_request_ready &&
+        protocol_supports_cache_r2(protocol) && !eof &&
+        instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
+        pending_frame_ends.empty() && framesFlushed() == framesQueued() &&
+        request.valid_payload() && request.request == p51_last_fd_request &&
+        p51_fd_request_frame_sequence == p50_decoded_frame_sequence;
+    p51_fd_reply_arm_consumed = true;
+    if (!ready || !p50_fd_socket_idle(fd))
+        return {};
+    P51CacheFdReplyTicket ticket(
+        p50_channel_generation, p50_decoded_frame_sequence, framesQueued(),
+        request.request);
+    p51_fd_request_ready = false;
+    p51_last_fd_request = {};
+    return ticket;
+}
+
+bool MsgChannel::send_p51_cache_fd_reply(
+    P51CacheFdReplyTicket &&ticket,
+    P51CacheControlIdentity control_identity, int transfer_fd,
+    std::chrono::steady_clock::time_point deadline) noexcept
+{
+    const P51SourceLeaseRequestFields request = ticket.request_;
+    const bool ready = ticket.valid() && transfer_fd >= 0 && transfer_fd != fd &&
+        ticket.channel_generation_ == p50_channel_generation &&
+        ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
+        ticket.outbound_frame_sequence_ == framesQueued() &&
+        ticket.outbound_frame_sequence_ == framesFlushed() &&
+        protocol_supports_cache_r2(protocol) && !eof && instate == NEED_LEN &&
+        inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
+        control_identity.valid();
+    ticket.invalidate();
+    if (!ready || !p50_fd_socket_idle(fd)) {
+        if (transfer_fd >= 0)
+            ::close(transfer_fd);
+        p50_note_channel_mutation();
+        return false;
+    }
+
+    const auto wire = p51_fd_lease_wire(request, control_identity);
+    alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int))> control{};
+    size_t offset = 0;
+    bool rights_sent = false;
+    int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    while (offset != wire.size()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+        ssize_t sent = -1;
+        if (!rights_sent) {
+            iovec iov{const_cast<uint8_t *>(wire.data() + offset),
+                      wire.size() - offset};
+            msghdr message{};
+            message.msg_iov = &iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.data();
+            message.msg_controllen = control.size();
+            auto *cmsg = reinterpret_cast<cmsghdr *>(control.data());
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(cmsg), &transfer_fd, sizeof(transfer_fd));
+            sent = ::sendmsg(fd, &message, flags);
+        } else {
+            sent = ::send(fd, wire.data() + offset, wire.size() - offset,
+                          flags);
+        }
+        if (sent > 0) {
+            offset += static_cast<size_t>(sent);
+            if (!rights_sent) {
+                rights_sent = true;
+                ::close(transfer_fd);
+                transfer_fd = -1;
+            }
+            continue;
+        }
+        if (sent == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            break;
+        // The v4 reply is issued from the daemon's main poll owner after an
+        // asynchronous HELLO exchange. Never turn the final SCM_RIGHTS write
+        // into a blocking wait on that owner; a full peer socket consumes the
+        // one-shot ticket and fails closed below.
+        break;
+    }
+    if (transfer_fd >= 0)
+        ::close(transfer_fd);
+    const bool complete = offset == wire.size() && rights_sent;
+    if (!complete && (offset != 0 || rights_sent))
+        set_error(); // partial raw lease bytes cannot be retried on this stream
+    p50_note_channel_mutation();
+    return complete;
+}
+
+int MsgChannel::receive_p51_cache_fd_reply(
+    const P51SourceLeaseRequestFields &expected,
+    P51CacheControlIdentity &control_identity,
+    std::chrono::steady_clock::time_point deadline) noexcept
+{
+    control_identity = {};
+    if (!p51_fd_receive_arm)
+        return -1;
+    const bool ready = p51_fd_receive_frame_sequence != 0 &&
+        p51_fd_receive_frame_sequence == framesFlushed() &&
+        p51_armed_fd_request == expected && fd >= 0 &&
+        protocol_supports_cache_r2(protocol) && !eof && instate == NEED_LEN &&
+        inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
+        expected.valid();
+    if (!ready) {
+        p50_note_channel_mutation();
+        return -1;
+    }
+    std::array<uint8_t, P51_CACHE_FD_LEASE_V4_BYTES> wire{};
+    alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int) * 16)> control{};
+    msghdr message{};
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    std::array<int, 16> received_fds{};
+    size_t fd_count = 0;
+    size_t offset = 0;
+    bool first_read = true;
+    bool malformed_control = false;
+    ssize_t received = -1;
+    int flags = MSG_DONTWAIT;
+#ifdef MSG_CMSG_CLOEXEC
+    flags |= MSG_CMSG_CLOEXEC;
+#endif
+    while (offset != wire.size()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+        iovec iov{wire.data() + offset, wire.size() - offset};
+        message.msg_iov = &iov;
+        message.msg_iovlen = 1;
+        message.msg_control = first_read ? control.data() : nullptr;
+        message.msg_controllen = first_read ? control.size() : 0;
+        received = first_read ? ::recvmsg(fd, &message, flags)
+                              : ::recv(fd, wire.data() + offset,
+                                       wire.size() - offset, MSG_DONTWAIT);
+        if (received > 0) {
+            offset += static_cast<size_t>(received);
+            if (first_read) {
+                first_read = false;
+                for (cmsghdr *cmsg = CMSG_FIRSTHDR(&message); cmsg != nullptr;
+                     cmsg = CMSG_NXTHDR(&message, cmsg)) {
+                    if (cmsg->cmsg_level != SOL_SOCKET ||
+                        cmsg->cmsg_type != SCM_RIGHTS ||
+                        cmsg->cmsg_len < CMSG_LEN(0)) {
+                        malformed_control = true;
+                        continue;
+                    }
+                    const size_t bytes = cmsg->cmsg_len - CMSG_LEN(0);
+                    if (bytes == 0 || bytes % sizeof(int) != 0) {
+                        malformed_control = true;
+                        continue;
+                    }
+                    const size_t count = bytes / sizeof(int);
+                    const auto *fds = reinterpret_cast<const int *>(
+                        CMSG_DATA(cmsg));
+                    for (size_t i = 0; i < count; ++i) {
+                        if (fd_count < received_fds.size())
+                            received_fds[fd_count++] = fds[i];
+                        else
+                            ::close(fds[i]);
+                    }
+                }
+                malformed_control |=
+                    (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0;
+            }
+            continue;
+        }
+        if (received == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            break;
+        if (!p50_fd_wait(fd, POLLIN, deadline))
+            break;
+    }
+    const auto close_received = [&]() noexcept {
+        for (size_t i = 0; i < fd_count; ++i)
+            if (received_fds[i] >= 0)
+                ::close(received_fds[i]);
+    };
+    P51CacheControlIdentity observed;
+    if (offset == wire.size()) {
+        observed.control_generation = p50_fd_get_u64(wire, 32);
+        observed.control_attempt = p50_fd_get_u64(wire, 40);
+        observed.peer_uid = p50_fd_get_u64(wire, 48);
+        observed.peer_gid = p50_fd_get_u64(wire, 56);
+        observed.c_store_generation = p50_fd_get_u64(wire, 64);
+        observed.derivation_version = p50_fd_get_u64(wire, 72);
+        std::copy(wire.begin() + 80, wire.end(), observed.c_store_guid.begin());
+    }
+    const bool exact_payload = offset == wire.size() && observed.valid() &&
+        wire == p51_fd_lease_wire(expected, observed);
+    if (!exact_payload || malformed_control || fd_count != 1) {
+        close_received();
+        p50_note_channel_mutation();
+        return -1;
+    }
+    unsigned char trailing = 0;
+    const ssize_t peek = ::recv(fd, &trailing, sizeof(trailing),
+                                MSG_PEEK | MSG_DONTWAIT);
+    if (peek >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        close_received();
+        p50_note_channel_mutation();
+        return -1;
+    }
+    const int result = received_fds[0];
+    received_fds[0] = -1;
+    control_identity = observed;
     p50_note_channel_mutation();
     return result;
 }

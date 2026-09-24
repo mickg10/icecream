@@ -142,6 +142,43 @@ P50SourceArmedMsg armed(const P50SourceArmFields &source_arm)
                              capability_1, capability_2);
 }
 
+P51SourceLeaseRequestFields p51_lease_request()
+{
+    return {7, UINT64_C(0x0102030405060708),
+            UINT64_C(0x1112131415161718), CACHE_PROFILE_ZSTD_TU, 2, 4};
+}
+
+P51SourceArmFields p51_arm()
+{
+    P50SourceArmFields base = arm();
+    base.cache_protocol = 2;
+    return {base, 4};
+}
+
+P51SourceArmedFields p51_armed(const P51SourceArmFields &source_arm)
+{
+    const P50SourceArmedMsg base = armed(source_arm.source);
+    P51SourceArmedFields fields;
+    fields.arm = source_arm;
+    fields.f_control_generation = base.f_control_generation;
+    fields.f_control_attempt = base.f_control_attempt;
+    fields.f_store_generation = base.f_store_generation;
+    fields.f_store_guid = base.f_store_guid;
+    fields.f_store_derivation_version = base.f_store_derivation_version;
+    fields.arm_observation_id = base.arm_observation_id;
+    fields.source_budget_msec = base.source_budget_msec;
+    fields.attempt_capability_1 = base.attempt_capability_1;
+    fields.attempt_capability_2 = base.attempt_capability_2;
+    for (size_t i = 0; i != fields.reservation_id.size(); ++i) {
+        fields.reservation_id[i] = static_cast<uint8_t>(0xc0 + i);
+        fields.logical_relationship_id[i] = static_cast<uint8_t>(0xe0 + i);
+    }
+    fields.relationship_epoch = UINT64_C(0xb1b2b3b4b5b6b7b8);
+    fields.selected_revision = 2;
+    fields.selected_window = 4;
+    return fields;
+}
+
 Bytes encode_frame(const Msg &message, int protocol = PROTOCOL_VERSION)
 {
     Pair pair = make_pair(protocol);
@@ -392,53 +429,134 @@ void test_rejects_malformed_and_legacy()
                 P50SourceArmMsg(zero_c_root)),
             "C StoreIdentity with a zero root is refused");
 
-    REQUIRE(!make_pair(PROTOCOL_VERSION - 1).left->send_msg(request),
+    REQUIRE(!make_pair(PROTOCOL_VERSION_P50_SOURCE_ARM_R1 - 1)
+                 .left->send_msg(request),
             "source-arm is refused on legacy Protocol 49");
-    REQUIRE(!make_pair(PROTOCOL_VERSION - 1).left->send_msg(armed(request.arm)),
+    REQUIRE(!make_pair(PROTOCOL_VERSION_P50_SOURCE_ARM_R1 - 1)
+                 .left->send_msg(armed(request.arm)),
             "armed ACK is refused on legacy Protocol 49");
 }
 
-void test_r1_private_messages_do_not_extend_to_protocol_51()
+void test_r1_private_messages_keep_exact_bytes_on_protocol_51()
 {
     static_assert(PROTOCOL_VERSION == 50,
-                  "R2 negotiation is not part of the C0 protocol-version bump");
+                  "the codec checkpoint must not enable protocol 51");
     static_assert(PROTOCOL_VERSION_P50_SOURCE_ARM_R1 == 50);
     static_assert(PROTOCOL_VERSION_P50_CACHE_SESSION_R1 == 50);
     const P50SourceArmMsg request(arm());
-    const auto request_wire = encode_frame(request, PROTOCOL_VERSION);
-    const auto reply_wire = encode_frame(armed(request.arm), PROTOCOL_VERSION);
+    const auto request_wire = encode_frame(request, PROTOCOL_VERSION_P50_SOURCE_ARM_R1);
+    const auto reply_wire = encode_frame(armed(request.arm),
+                                         PROTOCOL_VERSION_P50_SOURCE_ARM_R1);
+    const auto request_wire_51 = encode_frame(request, 51);
+    const auto reply_wire_51 = encode_frame(armed(request.arm), 51);
     REQUIRE(!request_wire.empty() && !reply_wire.empty(),
             "Protocol-50 R1 ARM and ARMED fixtures remain available");
+    REQUIRE(request_wire_51 == request_wire && reply_wire_51 == reply_wire,
+            "selected R1 mode keeps byte-identical ARM and ARMED on protocol 51");
+    Msg *r1_request_51 = decode_frame(request_wire, 51);
+    REQUIRE(dynamic_cast<P50SourceArmMsg *>(r1_request_51) != nullptr,
+            "protocol-51 decoder accepts the explicitly selected R1 SOURCE_ARM");
+    delete r1_request_51;
+    Msg *r1_reply_51 = decode_frame(reply_wire, 51);
+    REQUIRE(dynamic_cast<P50SourceArmedMsg *>(r1_reply_51) != nullptr,
+            "protocol-51 decoder accepts the explicitly selected R1 SOURCE_ARMED");
+    delete r1_reply_51;
 
-    Pair future_request_pair = make_pair(PROTOCOL_VERSION + 1);
-    REQUIRE(!future_request_pair.left->send_msg(request),
-            "R1 SOURCE_ARM is not enabled by a manually selected Protocol 51 channel");
+    Pair legacy_request_pair = make_pair(PROTOCOL_VERSION_P50_SOURCE_ARM_R1);
+    REQUIRE(legacy_request_pair.left->send_msg(request),
+            "R1 SOURCE_ARM remains selectable on protocol 50");
+    Pair legacy_reply_pair = make_pair(PROTOCOL_VERSION_P50_SOURCE_ARM_R1);
+    REQUIRE(legacy_reply_pair.left->send_msg(armed(request.arm)),
+            "R1 SOURCE_ARMED remains selectable on protocol 50");
+}
+
+void test_p51_lease_and_source_arm_exact_frames_and_gates()
+{
+    static_assert(Msg::P51_SOURCE_LEASE_REQUEST == UINT32_C(0x51f00000));
+    static_assert(Msg::P51_SOURCE_ARM == UINT32_C(0x51f00010));
+    static_assert(Msg::P51_SOURCE_ARMED == UINT32_C(0x51f00011));
+    static_assert(P51SourceLeaseRequestMsg::PayloadBytes == 32);
+    static_assert(PROTOCOL_VERSION_CACHE_R2_NEGOTIATION == 51);
+
+    const P51SourceLeaseRequestMsg lease_request(p51_lease_request());
+    const Bytes lease_wire = encode_frame(lease_request, 51);
+    REQUIRE(lease_wire == hex_fixture(
+                "0000002451f000000000000701020304050607081112131415161718"
+                "000000020000000200000004"),
+            "P51 lease request is the exact 32-byte revision/window fixture");
+    Msg *lease_base = decode_frame(lease_wire, 51);
+    const auto *decoded_lease =
+        dynamic_cast<P51SourceLeaseRequestMsg *>(lease_base);
+    REQUIRE(decoded_lease && decoded_lease->request == p51_lease_request(),
+            "P51 lease request round-trips all assignment/profile/window fields");
+    delete lease_base;
+
+    Pair legacy_lease_pair = make_pair(50);
+    REQUIRE(!legacy_lease_pair.left->send_msg(lease_request),
+            "P51 lease request cannot be sent on R1 protocol 50");
     unsigned char unexpected = 0;
     errno = 0;
-    const ssize_t request_bytes = ::recv(future_request_pair.right->fd,
-                                         &unexpected, sizeof(unexpected),
-                                         MSG_DONTWAIT);
-    REQUIRE(request_bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
-            "Protocol-51 SOURCE_ARM rejection emits no frame bytes");
+    ssize_t sent = ::recv(legacy_lease_pair.right->fd, &unexpected,
+                          sizeof(unexpected), MSG_DONTWAIT);
+    REQUIRE(sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
+            "rejected P51 lease request emits no protocol-50 bytes");
+    Pair later_lease_pair = make_pair(52);
+    REQUIRE(!later_lease_pair.left->send_msg(lease_request),
+            "P51-only lease request rejects unknown higher protocol 52");
 
-    Pair future_reply_pair = make_pair(PROTOCOL_VERSION + 1);
-    REQUIRE(!future_reply_pair.left->send_msg(armed(request.arm)),
-            "R1 SOURCE_ARMED is not enabled by a manually selected Protocol 51 channel");
-    errno = 0;
-    const ssize_t reply_bytes = ::recv(future_reply_pair.right->fd,
-                                       &unexpected, sizeof(unexpected),
-                                       MSG_DONTWAIT);
-    REQUIRE(reply_bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
-            "Protocol-51 SOURCE_ARMED rejection emits no frame bytes");
+    const P51SourceArmFields source_arm = p51_arm();
+    const P51SourceArmMsg arm_message(source_arm);
+    const Bytes arm_wire = encode_frame(arm_message, 51);
+    REQUIRE(arm_wire == hex_fixture(
+                "0000008b51f000100000000701020304050607081112131415161718"
+                "0000000f776f726b65722e6578616d706c650000002805000028060000"
+                "000200000002000000000000001321222324252627283132333435363738"
+                "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
+                "5758000000026162636465666768717273747576777800000004"),
+            "P51 ARM is a distinct exact frame with CacheWire revision 2/window");
+    Msg *arm_base = decode_frame(arm_wire, 51);
+    const auto *decoded_arm = dynamic_cast<P51SourceArmMsg *>(arm_base);
+    REQUIRE(decoded_arm && decoded_arm->arm == source_arm,
+            "P51 ARM round-trips source identity and requested window");
+    delete arm_base;
+    Pair old_arm_pair = make_pair(50);
+    REQUIRE(!old_arm_pair.left->send_msg(arm_message),
+            "P51 ARM cannot reinterpret an R1 protocol-50 source request");
+    Pair future_arm_pair = make_pair(52);
+    REQUIRE(!future_arm_pair.left->send_msg(arm_message),
+            "P51 ARM rejects unknown higher protocol 52");
 
-    Msg *future_request = decode_frame(request_wire, PROTOCOL_VERSION + 1);
-    REQUIRE(future_request == nullptr,
-            "Protocol-51 decoder does not accept a Protocol-50 R1 SOURCE_ARM");
-    delete future_request;
-    Msg *future_reply = decode_frame(reply_wire, PROTOCOL_VERSION + 1);
-    REQUIRE(future_reply == nullptr,
-            "Protocol-51 decoder does not accept a Protocol-50 R1 SOURCE_ARMED");
-    delete future_reply;
+    const P51SourceArmedFields armed_fields = p51_armed(source_arm);
+    const P51SourceArmedMsg armed_message(armed_fields);
+    const Bytes armed_wire = encode_frame(armed_message, 51);
+    REQUIRE(armed_wire == hex_fixture(
+                "0000011751f000110000000701020304050607081112131415161718"
+                "0000000f776f726b65722e6578616d706c650000002805000028060000"
+                "000200000002000000000000001321222324252627283132333435363738"
+                "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
+                "5758000000026162636465666768717273747576777800000004"
+                "81828384858687889192939495969798999a9b9c9d9e9fa0"
+                "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf0000000000000001"
+                "a1a2a3a4a5a6a7a8000009c4"
+                "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+                "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+                "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+                "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+                "b1b2b3b4b5b6b7b80000000200000004"),
+            "P51 ARMED exact echo includes reservation, relationship and window");
+    Msg *armed_base = decode_frame(armed_wire, 51);
+    const auto *decoded_armed = dynamic_cast<P51SourceArmedMsg *>(armed_base);
+    REQUIRE(decoded_armed &&
+                static_cast<const P51SourceArmedFields &>(*decoded_armed) ==
+                    armed_fields,
+            "P51 ARMED round-trips every lease and relationship field");
+    REQUIRE(decoded_armed && decoded_armed->acknowledges(arm_message),
+            "P51 ARMED authorizes only the exact requested arm/window");
+    delete armed_base;
+    Msg *wrong_protocol = decode_frame(armed_wire, 50);
+    REQUIRE(wrong_protocol == nullptr,
+            "protocol-50 decoder never interprets P51 ARMED");
+    delete wrong_protocol;
 }
 
 void test_ack_conflict()
@@ -515,7 +633,8 @@ int main()
 {
     test_roundtrip_and_exact_echo();
     test_rejects_malformed_and_legacy();
-    test_r1_private_messages_do_not_extend_to_protocol_51();
+    test_r1_private_messages_keep_exact_bytes_on_protocol_51();
+    test_p51_lease_and_source_arm_exact_frames_and_gates();
     test_ack_conflict();
     return failures == 0 ? 0 : 1;
 }
