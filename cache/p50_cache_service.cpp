@@ -1965,7 +1965,7 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
             // Post outside this guarded coroutine: the injected exception must
             // escape the owner executor while run_adopted is suspended on the
             // live session, not be converted into an ordinary endpoint result.
-            context_.post([this] {
+            asio::post(context_, [this] {
                 if (config_.owner_failure_after_live)
                     config_.owner_failure_after_live();
             });
@@ -2675,7 +2675,7 @@ void SidecarRuntime::cancel_endpoint_run() noexcept {
             permit = endpoint_cancel_permit_;
         }
         if (permit) {
-            context_.post([this, permit = std::move(*permit)] {
+            asio::post(context_, [this, permit = std::move(*permit)] {
                 (void)endpoint_->request_cancel(permit);
             });
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -2683,7 +2683,7 @@ void SidecarRuntime::cancel_endpoint_run() noexcept {
             // Historical raw-fd fixtures do not carry a P5CO operation and
             // therefore cannot mint a production cancellation permit.  Keep
             // their owner-wakeup coverage inside the test-hooks build only.
-            context_.post([this] { endpoint_->request_cancel_for_test(); });
+            asio::post(context_, [this] { endpoint_->request_cancel_for_test(); });
 #endif
         }
     } catch (...) {
@@ -2697,7 +2697,7 @@ void SidecarRuntime::cancel_endpoint_incarnation() noexcept {
     if (!config_.sidecar_launch)
         return;
     try {
-        context_.post([this, incarnation = *config_.sidecar_launch] {
+        asio::post(context_, [this, incarnation = *config_.sidecar_launch] {
             (void)endpoint_->cancel_all_for_incarnation(incarnation);
         });
     } catch (...) {

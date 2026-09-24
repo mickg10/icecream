@@ -261,6 +261,14 @@ void close_now(tcp::socket& socket) {
     socket.close(ignored);
 }
 
+// Boost 1.87 dropped the error_code overload of the timer's cancel().
+void cancel_quietly(asio::steady_timer& timer) noexcept {
+    try {
+        timer.cancel();
+    } catch (...) {
+    }
+}
+
 // The timer owns the socket through this shared state.  Consequently a
 // canceled/late timer completion can never dereference the run coroutine's
 // stack, and no callback captures the endpoint (whose owner may be gone).
@@ -3544,8 +3552,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             result.observation = ClientRunObservation::Disconnected;
             result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
             close_now(socket);
-            boost::system::error_code timer_error;
-            io->timer.cancel(timer_error);
+            cancel_quietly(io->timer);
             impl_->active_session = 0;
             co_return result;
         }
@@ -3591,8 +3598,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             result.status = ClientRunStatus::Committed;
             result.reconnect = EndpointReconnectOutcome::LostFinalAcknowledgement;
             close_now(socket);
-            boost::system::error_code timer_error;
-            io->timer.cancel(timer_error);
+            cancel_quietly(io->timer);
             impl_->active_session = 0;
             co_return result;
         }
@@ -3796,8 +3802,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         close_now(socket);
         if (impl_->active_session == serial)
             impl_->active_session = 0;
-        boost::system::error_code timer_error;
-        io->timer.cancel(timer_error);
+        cancel_quietly(io->timer);
         throw;
     } catch (const std::exception& error) {
         close_now(socket);
@@ -3806,8 +3811,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         close_now(socket);
         if (impl_->active_session == serial)
             impl_->active_session = 0;
-        boost::system::error_code timer_error;
-        io->timer.cancel(timer_error);
+        cancel_quietly(io->timer);
         throw;
     }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -3834,8 +3838,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         (result.status == ClientRunStatus::Disconnected ||
          result.status == ClientRunStatus::DeadlineExceeded))
         impl_->active->p29v1_transport_retry = true;
-    boost::system::error_code timer_error;
-    io->timer.cancel(timer_error);
+    cancel_quietly(io->timer);
     if (impl_->active_session == serial)
         impl_->active_session = 0;
     co_return result;

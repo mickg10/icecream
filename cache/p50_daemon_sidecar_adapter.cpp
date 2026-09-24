@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
