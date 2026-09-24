@@ -111,6 +111,10 @@ window. Focused request/reply round trips pass for offer 30 with selections
 the encoder. Evidence:
 `/tanksmall/scratch/tmp/p51-service-own.ntIYnn/codec-r3.log`
 (SHA256 `36fa0b4edd65ca7554ec1e323b4019176eec77ce4eab0aa15569fea4512a9979`).
+Additional codec cases reject mutated reply windows 0/31 and revision 3 at
+decode time, and round-trip a committed empty TU. Evidence:
+`/tanksmall/scratch/tmp/p51-service-own.ntIYnn/tmp/p50daemoncontrol-codec.log`
+(SHA256 `7224f20d8c478b7d52c38a684f8f4f0d8d7dbd46e99202317b8ac6fa48ef6c34`).
 
 The annotated tag `sorbet_1.5_pipeline_plan` freezes the detailed C/D plan at
 `6dfd606de89bd60abb9315b398b53df37c878640`; the tag is pushed and its remote
@@ -140,13 +144,19 @@ against the committed sender/endpoint. Added cases cover local reply deadline
 and peer closure, slot reuse, the global 120-reservation limit, cancellation
 and idle expiry, publication/reset lifecycle, and shutdown while an accepted
 connection stalls before ordinary protocol admission completes. That last
-case verifies both operation and raw-byte credits return to zero. The optional
-cancellation-aware handshake polls do not extend the original deadline.
-This does not yet prove cancellation after R2 HELLO or 120 active transfers.
-Evidence: `/tanksmall/scratch/tmp/p51-service-own.ntIYnn/build/unittests/p50cacheservice.log`
-(SHA256 `cb0abf2f093f03a5ac669b764c037478cc0a501860ab2d2e31b477beac20c9dd`);
+case verifies both operation and raw-byte credits return to zero. A second
+case completes ordinary protocol admission, observes the link-session request,
+then withholds its reply; shutdown also returns both credits in that phase.
+The optional cancellation-aware handshake polls do not extend the original deadline.
+A third case observes R2 LINK_HELLO and withholds LINK_STATE. Whole-runtime
+shutdown retires the C sender on its owner executor and returns both credits.
+These tests do not yet prove cancellation during body/recovery or 120 active
+transfers. This service snapshot still uses the earlier committed sender and
+endpoint, so combined qualification with the latest recovery changes remains open.
+Evidence: `/tanksmall/scratch/tmp/p51-service-own.ntIYnn/service-posthello-pass-r3.log`
+(SHA256 `5904a3ee47fb2f57d1d79a31a65ab2240072f2771bb824b4a6991b4575b3c930`);
 test binary SHA256
-`fbd07ab0b3504eef5e3cf0b75a52d6e07420fee6f61f8f9ed82686ea5e07b15b`.
+`56222f849e95f7b78a7c88770dae3b2ee0b78919d51b37c8fc04ef7c8f661cf1`.
 
 The focused `run_adopted_r2` receiver fixture passed two sequential ZSTD_TU
 jobs on one TCP link: one W1 HELLO, distinct one-shot reservations, two

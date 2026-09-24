@@ -1,5 +1,6 @@
 #include "../cache/p50_daemon_control.h"
 #include "../cache/p50_fd_handoff.h"
+#include "../services/digest128.h"
 
 #include <array>
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdexcept>
+#include <span>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -489,6 +491,40 @@ void test_p51_source_transfer_downselected_window_v7_codec() {
         CHECK(decode_control_operation(reply_wire, decoded_reply));
         CHECK(decoded_reply.p51_source_transfer == request);
         CHECK(decoded_reply.p51_source_transfer_result == error);
+
+        P50SourceTransferResult committed_empty;
+        committed_empty.code = SourceTransferResultCode::Committed;
+        committed_empty.attempts = 1;
+        committed_empty.tu_seq = 0;
+        committed_empty.raw_bytes = 0;
+        committed_empty.raw_digest = icecc::digest128(
+            std::span<const uint8_t>{});
+        committed_empty.c_store_guid.bytes = arm.source.c_store_guid;
+        CHECK(committed_empty.valid());
+        const auto committed_reply = make_p51_source_transfer_reply_operation(
+            operation, committed_empty);
+        const auto committed_wire = encode_control_operation(committed_reply);
+        ControlOperation decoded_committed;
+        CHECK(decode_control_operation(committed_wire, decoded_committed));
+        CHECK(decoded_committed.p51_source_transfer_result == committed_empty);
+
+        auto store_u32 = [](std::vector<uint8_t>& bytes, size_t offset,
+                            uint32_t value) {
+            bytes[offset] = static_cast<uint8_t>(value >> 24);
+            bytes[offset + 1] = static_cast<uint8_t>(value >> 16);
+            bytes[offset + 2] = static_cast<uint8_t>(value >> 8);
+            bytes[offset + 3] = static_cast<uint8_t>(value);
+        };
+        constexpr size_t kP51ReplyOffset = 456;
+        for (const auto& [offset, invalid_value] : {
+                 std::pair<size_t, uint32_t>{kP51ReplyOffset + 136, 0},
+                 std::pair<size_t, uint32_t>{kP51ReplyOffset + 136, 31},
+                 std::pair<size_t, uint32_t>{kP51ReplyOffset + 132, 3}}) {
+            auto malformed = reply_wire;
+            store_u32(malformed, offset, invalid_value);
+            ControlOperation rejected;
+            CHECK(!decode_control_operation(malformed, rejected));
+        }
     }
 
     P51SourceTransferRequest invalid;
