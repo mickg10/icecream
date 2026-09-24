@@ -52,8 +52,8 @@ accounting projection. Evidence:
 The model is not a production receiver-validation proof, a complete restart
 model, or a runtime W30 test. Full epoch/digest validation, lost-confirmation
 recovery and product correspondence remain runtime/model follow-up gates;
-see [formal scope](cache/formal/README.md). Product C1–C3 and P29 speculative
-preparation are being implemented in parallel; neither is qualified yet.
+see [formal scope](cache/formal/README.md). Persistent runtime integration
+remains unqualified; the narrower component gates below do not establish it.
 
 The dormant P51 ordinary codecs and version-4 local descriptor exchange have
 passed a focused component gate. Normal negotiation still has maximum 50;
@@ -84,6 +84,28 @@ test fixtures requiring updates for explicit 51 coexistence; those attempts
 remain failed, not rewritten as a clean full-suite run. The draft asynchronous
 daemon integration compiled separately but has no runtime qualification yet
 and is not included in this codec checkpoint.
+
+### Reservation-service snapshot gate
+
+The isolated development snapshot passed the complete `p50cacheservice` run
+with v7 reservation tests: exact duplicate at capacity, fixed relationship
+window/profile, C-incarnation mismatch, and expiry freeing bounded capacity.
+The first reservation fixture incorrectly used a paired local C/F identity;
+it was corrected to use an independent remote C. A later run exposed an
+existing stop-opening fixture race: it launched the queued contender before
+observing the first operation's ARM barrier. The corrected ordering preserves
+the same timeout and refusal assertions.
+
+Passing log:
+`/tanksmall/scratch/tmp/p50-r2-codec-snapshot-20260924/tmp/c1-r2-service-run-r3.log`
+(SHA256 `d48bc2d76f24e343213c241244dcfa3467fabaa90a00a838ab7b82071f461a79`).
+Test source SHA256:
+`7bd472199565f0d1723eb975850fe95b69e183ab72cf7a3d9b5014dd7d188473`;
+binary SHA256:
+`2cda98e3e59a88ff6b4c9a4eeb1bad575df4aa9c4d8d76a4f9908fd784f13e6b`.
+This snapshot gate excludes newer link lookup/consumption callbacks, the
+persistent receive loop, C sender/wrapper integration and recovery. Those
+development changes remain unqualified and are not covered by this pass.
 
 ### CacheWire R2 record component
 

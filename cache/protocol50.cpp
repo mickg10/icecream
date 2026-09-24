@@ -34,7 +34,8 @@ bool known_object_type(ObjectType type) {
 bool known_message_type(MessageType type) {
     const uint8_t value = static_cast<uint8_t>(type);
     return value >= static_cast<uint8_t>(MessageType::SESSION_HELLO) &&
-           value <= static_cast<uint8_t>(MessageType::COMMIT_ACK);
+           (value <= static_cast<uint8_t>(MessageType::COMMIT_ACK) ||
+            type == MessageType::CLOSE);
 }
 
 bool known_profile(ProfileId profile) {
@@ -537,6 +538,7 @@ MessageType message_type(const Message& message) {
         if constexpr (std::is_same_v<T, R2FillMessage>) return MessageType::R2_FILL;
         if constexpr (std::is_same_v<T, TuEnd>) return MessageType::TU_END;
         if constexpr (std::is_same_v<T, R2TxCommit>) return MessageType::R2_TX_COMMIT;
+        if constexpr (std::is_same_v<T, CloseMessage>) return MessageType::CLOSE;
         return MessageType::COMMIT_ACK;
     }, message);
 }
@@ -687,6 +689,8 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.u64(value.relationship_epoch);
             out.u64(value.physical_link_generation);
             out.u64(value.contiguous_verified_ordinal);
+        } else if constexpr (std::is_same_v<T, CloseMessage>) {
+            // CLOSE has an exact empty payload.
         }
     }, message);
     return out.take();
@@ -891,6 +895,9 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         validate_commit_ack(value);
         return value;
     }
+    case MessageType::CLOSE:
+        in.exact_end();
+        return CloseMessage{};
     }
     throw std::invalid_argument("unknown message type");
 }

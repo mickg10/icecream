@@ -80,13 +80,14 @@ void test_revision_one_registry() {
     static_assert(kKnownProfileMask == 7);
     static_assert(CACHE_ADVERTISABLE_PROFILE_MASK == 7);
     static_assert(kMandatoryControlFramePayload == 116);
-    static_assert(std::variant_size_v<Message> == 18);
+    static_assert(std::variant_size_v<Message> == 19);
     static_assert(static_cast<uint8_t>(MessageType::BODY) == 6);
     static_assert(static_cast<uint8_t>(MessageType::FILL) == 8);
     static_assert(static_cast<uint8_t>(MessageType::LINK_HELLO) == 10);
     static_assert(static_cast<uint8_t>(MessageType::R2_BODY) == 14);
     static_assert(static_cast<uint8_t>(MessageType::R2_FILL) == 15);
     static_assert(static_cast<uint8_t>(MessageType::COMMIT_ACK) == 18);
+    static_assert(static_cast<uint8_t>(MessageType::CLOSE) == 24);
 
     require(profile_name(ProfileId::P29V1) == "p29_v1" &&
                 profile_name(ProfileId::ZSTD_TU) == "zstd_tu" &&
@@ -166,6 +167,19 @@ Digest128 independent_r2_transaction_digest(
 }
 
 void test_r2_fixed_wire_shapes_and_negative_cases() {
+    const Message close_message{CloseMessage{}};
+    require(encode_payload(close_message).empty(),
+            "CLOSE payload is not the exact empty payload");
+    require(message_type(close_message) == MessageType::CLOSE &&
+                decode_payload(MessageType::CLOSE, {}) == close_message,
+            "empty CLOSE message did not round-trip");
+    const std::array<uint8_t, 1> nonempty_close_payload{0};
+    require_throws<std::exception>(
+        [&] {
+            (void)decode_payload(MessageType::CLOSE, nonempty_close_payload);
+        },
+        "CLOSE accepted a non-empty payload");
+
     LinkHello hello;
     hello.profile = ProfileId::ZSTD_ROUTE;
     hello.window = 4;
@@ -393,7 +407,7 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
         [&] { (void)encode_payload(Message{LinkHello{.revision = 1}}); },
         "R2 LINK_HELLO accepted revision 1");
     require_throws<std::exception>(
-        [&] { (void)decode_payload(static_cast<MessageType>(19), {}); },
+        [&] { (void)decode_payload(static_cast<MessageType>(25), {}); },
         "unknown post-R2 frame type was accepted");
 
     const Digest128 base_digest = compute_r2_transaction_digest(
@@ -664,5 +678,6 @@ int main() {
     test_need_and_fill_streams();
     test_p29v1_outer_streams_have_no_flags();
     test_body_only_transaction_closure();
+    std::puts("p50wire: R1/R2 golden and negative checks passed");
     return 0;
 }

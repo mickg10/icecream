@@ -73,9 +73,8 @@ fixed records are codec groundwork for W1; R1 records and bytes remain
 unchanged. The outer frame remains `type:u8, payload_length:u24, payload`,
 all record integers are big-endian, and GUIDs/digests/reservation IDs are 16
 raw bytes. Revisions and profiles are u16; windows and frame caps are u32.
-Payloads have no padding or reserved extensibility bytes. Types 19–25 are
-reserved for recovery/close records and are not implemented by this codec
-snapshot.
+Payloads have no padding or reserved extensibility bytes. Types 19–23 and 25
+remain reserved for recovery/error records.
 
 | Type | Record | Exact payload fields / byte offsets | Bytes |
 |---:|---|---|---:|
@@ -88,6 +87,7 @@ snapshot.
 | 16 | TU_END | relationship ordinal u64@0; binding digest@8; outer transaction digest@24 | 40 |
 | 17 | R2_TX_COMMIT | relationship ordinal u64@0; binding digest@8; outer transaction digest@24; exact 72-byte R1 TX_COMMIT payload@40 | 112 |
 | 18 | COMMIT_ACK | relationship ID@0; relationship epoch u64@16; physical generation u64@24; contiguous verified ordinal u64@32 | 40 |
+| 24 | CLOSE | empty payload; closes only an idle bound link and settles no receipt | 0 |
 
 LINK_HELLO starts revision 2 and pins one profile/window to a physical link.
 R1 transaction bytes are nested at TU_BEGIN and R2_TX_COMMIT but do not by
@@ -109,9 +109,10 @@ TU_END is excluded from its own digest. F independently derives the expected
 P29 NEED and validates FILL; there is no R2 NEED frame. F validates job,
 physical generation, ordinal, inner TX_BEGIN identity and both digests before
 publishing. COMMIT_ACK advances only a contiguous ordinal and is checked
-against F's committed prefix K. These codecs do not yet implement session
-adoption, the persistent two-job loop, receipt recovery/reset, or an R2
-advertisement/selection gate.
+against F's committed prefix K. This codec checkpoint does not qualify the
+development persistent receive loop, receipt recovery/reset, or ordinary
+daemon selection/adoption. These records are not a production end-to-end
+capability and no R2 advertisement is made.
 
 ## Selection and advertisement
 

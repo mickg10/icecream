@@ -136,6 +136,7 @@ enum class MessageType : uint8_t {
     TU_END = 16,
     R2_TX_COMMIT = 17,
     COMMIT_ACK = 18,
+    CLOSE = 24,
 };
 
 enum class LinkStartMode : uint8_t { Initial = 0, Reconnect = 1 };
@@ -355,6 +356,10 @@ struct CommitAck {
     auto operator<=>(const CommitAck&) const = default;
 };
 
+struct CloseMessage {
+    auto operator<=>(const CloseMessage&) const = default;
+};
+
 // Client receive gate for a SESSION_STATE negotiated from the original offer.
 void validate_session_state(const SessionHello& hello,
                             const SessionState& received_state);
@@ -394,7 +399,7 @@ using Message = std::variant<SessionHello, SessionState, HistoryReset, ErrorMess
                              TxBegin, BodyMessage, NeedMessage, FillMessage,
                              TxCommit, LinkHello, LinkState, JobBind, TuBegin,
                              R2TxCommit, CommitAck, TuEnd,
-                             R2BodyMessage, R2FillMessage>;
+                             R2BodyMessage, R2FillMessage, CloseMessage>;
 
 struct Frame {
     MessageType type = MessageType::ERROR;
