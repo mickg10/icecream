@@ -147,7 +147,8 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     P50RouteRelationship relationship, PrepareRequestKey request,
     ConnectedFdFactory connection,
     std::chrono::steady_clock::time_point deadline,
-    std::shared_ptr<const std::vector<uint8_t>> source) {
+    std::shared_ptr<const std::vector<uint8_t>> source,
+    std::optional<Digest128> raw_digest) {
     if (!relationship.valid() ||
         request.producer_session == 0 ||
         request.request_token == 0 || !connection)
@@ -165,7 +166,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
         co_return replacement();
     }
     ZstdSourceTransferResult result = co_await sender->transfer_route(
-        std::move(connection), request, deadline, source);
+        std::move(connection), request, deadline, source, raw_digest);
     if (result.replacement_required && !result.route_local_failure)
         replacement_required_ = true;
     co_return result;

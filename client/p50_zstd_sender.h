@@ -157,10 +157,12 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    // raw_digest, when known, is digest128(*source).
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
         ConnectedFdFactory connection, PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
-        std::shared_ptr<const std::vector<uint8_t>> source);
+        std::shared_ptr<const std::vector<uint8_t>> source,
+        std::optional<Digest128> raw_digest = std::nullopt);
 
 private:
     using ConnectionTarget =
@@ -171,7 +173,8 @@ private:
         PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
         bool explicit_route,
-        std::shared_ptr<const std::vector<uint8_t>> source);
+        std::shared_ptr<const std::vector<uint8_t>> source,
+        std::optional<Digest128> raw_digest = std::nullopt);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

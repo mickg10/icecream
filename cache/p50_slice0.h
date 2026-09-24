@@ -340,6 +340,11 @@ public:
     void pin_v1_system_source_reuse(bool reuse);
     std::span<const uint8_t> build_fill_v1(
         std::span<const uint8_t> inner_need);
+    // FILL for a pipelined TX_BEGIN, before NEED: nullopt when NEED could list
+    // more than max_need_regions.  confirm_need_v1() must check NEED later.
+    std::optional<std::span<const uint8_t>> fill_v1_before_need(
+        size_t max_need_regions);
+    void confirm_need_v1(std::span<const uint8_t> inner_need);
     void restart_v1_for_transport_retry();
     void reset_v1_route(FStoreGuid f_store_guid,
                         HistoryNonce history_nonce);
@@ -359,6 +364,7 @@ public:
 private:
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);
     void record(ActionType action, const CActiveTx& active);
+    void poison_v1() noexcept;
 
     CAuthority& authority_;
     FStoreGuid f_store_guid_{};

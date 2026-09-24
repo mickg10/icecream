@@ -403,11 +403,12 @@ boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                                     PrepareRequestKey request,
                                     Clock::time_point deadline,
-                                    std::shared_ptr<const std::vector<uint8_t>> source) {
+                                    std::shared_ptr<const std::vector<uint8_t>> source,
+                                    std::optional<Digest128> raw_digest) {
     if (source && source->size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
         source.reset();
     return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
-                          deadline, true, std::move(source));
+                          deadline, true, std::move(source), raw_digest);
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -416,7 +417,8 @@ P50ZstdSourceSender::transfer_bytes(
     PrepareRequestKey request,
     Clock::time_point deadline,
     bool explicit_route,
-    std::shared_ptr<const std::vector<uint8_t>> source) {
+    std::shared_ptr<const std::vector<uint8_t>> source,
+    std::optional<Digest128> known_digest) {
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||
@@ -433,7 +435,7 @@ P50ZstdSourceSender::transfer_bytes(
     if (!source)
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
 
-    const Digest128 raw_digest = digest128(*source);
+    const Digest128 raw_digest = known_digest ? *known_digest : digest128(*source);
     try {
         if (const auto completed = impl_->completed_for(request, *source, raw_digest))
             co_return *completed;

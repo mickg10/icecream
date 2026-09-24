@@ -986,9 +986,9 @@ void test_p29v1_pipelined_begin() {
             ++writes_before_read.back().second;
     }
     require(writes_before_read.size() == 3 && writes_before_read[0].second < 3 &&
-                writes_before_read[1].second >= 3 &&
-                writes_before_read[2].second >= 3,
-            "retained P29V1 route did not send TX_BEGIN and BODY before STATE");
+                writes_before_read[1].second >= 4 &&
+                writes_before_read[2].second >= 4,
+            "retained P29V1 route did not send TX_BEGIN, BODY and FILL before STATE");
 
     // Another F incarnation behind the same address must fail closed.
     const P5coStoreGuids other = p5co_store_guids(234);

@@ -70,12 +70,14 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
-    // Shares the caller's buffer instead of copying it.
+    // Shares the caller's buffer instead of copying it; raw_digest, when
+    // known, is digest128(*source).
     boost::asio::awaitable<ZstdSourceTransferResult> transfer(
         P50RouteRelationship relationship, PrepareRequestKey request,
         ConnectedFdFactory connection,
         std::chrono::steady_clock::time_point deadline,
-        std::shared_ptr<const std::vector<uint8_t>> source);
+        std::shared_ptr<const std::vector<uint8_t>> source,
+        std::optional<Digest128> raw_digest = std::nullopt);
 
     // The shared C preparation authority, created on first use.
     [[nodiscard]] std::shared_ptr<P50PreparationAuthority> authority(

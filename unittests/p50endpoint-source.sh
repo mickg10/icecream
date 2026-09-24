@@ -190,4 +190,6 @@ grep -F 'post-hello C cancellation silently authorized an abort' \
 grep -F 'CLOEXEC' "$src/cache/P50_PROTOCOL.md" >/dev/null
 grep -F 'Endpoint execution and cancellation' "$src/cache/P50_PROTOCOL.md" >/dev/null
 grep -F '(0, 0, 0)' "$src/cache/P50_PROTOCOL.md" >/dev/null
+# A FILL sent before NEED is still checked against that NEED.
+grep -F 'impl_->preparation->confirm_p29v1_need(' "$endpoint" >/dev/null
 echo 'PASS: adopted endpoint and operation-scoped cancellation source gates hold'

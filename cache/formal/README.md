@@ -326,8 +326,18 @@ C then records `TX_ABORTED` (F has nothing pending), requeues the TU and
 reports a disconnect; the retry reads `SESSION_STATE` first and takes the
 ordinary `HISTORY_RESET` row, e.g. after F dropped only its P29V1 codec on input
 eviction. Any other mismatch (another F, fingerprint or limit drift) is a
-terminal error before `FILL`, and P29V1 cannot close an installed begin without
-`FILL`, so nothing commits.
+terminal error, and F never installed that begin, so nothing commits: on a
+route that `SESSION_STATE` shows exactly, its fingerprint and limits are the
+route's own, fixed when the route was established.
+
+The same client writes `FILL` right after `BODY`. C builds `FILL` from its own
+record of what the route holds and never reads `NEED` to do so. It still reads
+`NEED` and checks it against that record before accepting `TX_COMMIT`, and
+poisons the route if they differ. F reads frames in order and writes `NEED`
+before reading `FILL`, so F's steps and trace are those of an ordinary run, and
+the model has no C step for `FILL`. C reads nothing until `FILL` is written,
+so it sends `FILL` early only when F's `SESSION_STATE` and `NEED` fit in its
+receive buffer: at most 4096 missing Regions, about 20 KiB of `NEED`.
 
 ## P50 assignment identity through the client
 

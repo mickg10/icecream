@@ -760,6 +760,11 @@ public:
     return pending_.plan->root.size();
   }
 
+  [[nodiscard]] std::size_t pending_missing_regions() const {
+    require_pending();
+    return pending_.missing_regions.size();
+  }
+
   // Project the logical committed route state while the TU is still
   // tentative. Callers enforce their hard route budget before exposing FILL,
   // so a peer can never commit a successor that C later rejects for size.
@@ -852,6 +857,24 @@ public:
       // The caller may still abandon; logical provider state has not moved.
       throw;
     }
+  }
+
+  // FILL is built from this route's own state and never reads NEED, so it
+  // can be sent before NEED arrives; confirm_need() then checks the NEED.
+  [[nodiscard]] const std::vector<std::uint8_t> &fill_before_need() {
+    require_pending();
+    if (pending_.fill_ready)
+      fail("P29 serializer answered NEED twice");
+    build_fill(false);
+    pending_.fill_ready = true;
+    return pending_.fill;
+  }
+
+  void confirm_need(std::span<const std::uint8_t> need_frames) {
+    require_pending();
+    if (!pending_.fill_ready)
+      fail("P29 serializer confirms NEED before FILL");
+    validate_need(need_frames);
   }
 
   void commit() {

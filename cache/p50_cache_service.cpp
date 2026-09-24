@@ -1719,11 +1719,12 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // transfer itself to report.
     const PrepareRequestKey route_request{arm.assignment_epoch,
                                           arm.assignment_nonce};
+    const Digest128 source_digest = digest128(**source_bytes);
     std::shared_ptr<const P50PreparationAuthority::PreparedSource> prepared_source;
     if (profile == ProfileId::P29V1 && source_authority_) {
         try {
             prepared_source = source_authority_->prepare_source(
-                route_request, *source_bytes, digest128(**source_bytes));
+                route_request, *source_bytes, source_digest);
         } catch (...) {
         }
     }
@@ -1782,7 +1783,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         asio::co_spawn(
             context_,
             [this, relationship, request, connection, transfer_deadline,
-             source_bytes = *source_bytes, completion, route_request, prepared_source,
+             source_bytes = *source_bytes, source_digest, completion, route_request,
+             prepared_source,
              expected_c_guid = config_.c_store_guid, source_mutex_wait_ns,
              source_mutex_service_start]() mutable
                 -> asio::awaitable<void> {
@@ -1805,7 +1807,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     } else {
                         observed = co_await route_owner_->transfer(
                             relationship, route_request, connection,
-                            transfer_deadline, source_bytes);
+                            transfer_deadline, source_bytes, source_digest);
                     }
                     if (observed.replacement_required && !observed.route_local_failure)
                         route_replacement_required_.store(

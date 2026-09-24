@@ -29,6 +29,7 @@
 
 namespace icecc::p50 {
 
+class CRoute;
 class GlobalResourceTrace;
 
 /* A C-side P29V1 authority failed while reserving/initializing its permanent
@@ -275,6 +276,12 @@ public:
     void release_source(PrepareRequestKey request) noexcept;
     std::span<const uint8_t> answer_p29v1_need(
         PreparedTuHandle handle, std::span<const uint8_t> inner_need);
+    // FILL for a pipelined TX_BEGIN, sent before NEED; nullopt when NEED could
+    // outgrow a socket buffer.  confirm_p29v1_need() must check NEED later.
+    std::optional<std::span<const uint8_t>> fill_p29v1_before_need(
+        PreparedTuHandle handle);
+    void confirm_p29v1_need(PreparedTuHandle handle,
+                            std::span<const uint8_t> inner_need);
     [[nodiscard]] Digest128 p29v1_system_source_fingerprint(
         PreparedTuHandle handle) const;
     [[nodiscard]] std::optional<bool> p29v1_system_source_reuse(
@@ -317,6 +324,7 @@ public:
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
     void validate_begin(const TxBegin& begin) const;
+    CRoute& p29v1_successor(PreparedTuHandle handle);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

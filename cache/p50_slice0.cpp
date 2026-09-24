@@ -1934,18 +1934,22 @@ void CRoute::pin_v1_system_source_reuse(bool reuse) {
     p29v1_->provider.sender_route().system_source_reuse = reuse;
 }
 
+static void require_need_tu_end(std::span<const uint8_t> inner_need) {
+    if (inner_need.size() < 5 ||
+        inner_need[inner_need.size() - 5] !=
+            static_cast<uint8_t>(codec::P29WireKind::TuEnd) ||
+        std::any_of(inner_need.end() - 4, inner_need.end(),
+                    [](uint8_t value) { return value != 0; }))
+        throw std::invalid_argument("P29V1 NEED has no exact TU_END");
+}
+
 std::span<const uint8_t> CRoute::build_fill_v1(
     std::span<const uint8_t> inner_need) {
     if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal)
         throw std::logic_error("C route has no runnable P29V1 ACTIVE_TX");
     try {
-        if (inner_need.size() < 5 ||
-            inner_need[inner_need.size() - 5] !=
-                static_cast<uint8_t>(codec::P29WireKind::TuEnd) ||
-            std::any_of(inner_need.end() - 4, inner_need.end(),
-                        [](uint8_t value) { return value != 0; }))
-            throw std::invalid_argument("P29V1 NEED has no exact TU_END");
+        require_need_tu_end(inner_need);
         if (!p29v1_->fixed_system_source_reuse)
             throw std::logic_error(
                 "P29V1 system-source reuse was not pinned at HISTORY_RESET");
@@ -1968,16 +1972,59 @@ std::span<const uint8_t> CRoute::build_fill_v1(
             throw std::length_error("P29V1 route state exceeds its budget");
         return fill;
     } catch (...) {
-        if (p29v1_->serializer.has_pending()) {
-            try {
-                p29v1_->serializer.abandon();
-            } catch (...) {
-            }
-        }
-        p29v1_->terminal = true;
-        active_.reset();
+        poison_v1();
         throw;
     }
+}
+
+std::optional<std::span<const uint8_t>> CRoute::fill_v1_before_need(
+    size_t max_need_regions) {
+    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal || p29v1_->fill_answered)
+        throw std::logic_error("C route has no fresh P29V1 ACTIVE_TX");
+    if (p29v1_->serializer.pending_missing_regions() > max_need_regions)
+        return std::nullopt;
+    try {
+        if (!p29v1_->fixed_system_source_reuse)
+            throw std::logic_error(
+                "P29V1 system-source reuse was not pinned at HISTORY_RESET");
+        const std::vector<uint8_t>& fill =
+            p29v1_->serializer.fill_before_need();
+        p29v1_->fill_answered = true;
+        if (p29v1_->serializer.pending_route_state_bytes() >
+            p29v1_->max_route_state_bytes)
+            throw std::length_error("P29V1 route state exceeds its budget");
+        return std::span<const uint8_t>(fill);
+    } catch (...) {
+        poison_v1();
+        throw;
+    }
+}
+
+void CRoute::confirm_need_v1(std::span<const uint8_t> inner_need) {
+    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal || !p29v1_->fill_answered ||
+        !p29v1_->answered_need.empty())
+        throw std::logic_error("C route has no early P29V1 FILL to confirm");
+    try {
+        require_need_tu_end(inner_need);
+        p29v1_->serializer.confirm_need(inner_need.first(inner_need.size() - 5));
+        p29v1_->answered_need.assign(inner_need.begin(), inner_need.end());
+    } catch (...) {
+        poison_v1();
+        throw;
+    }
+}
+
+void CRoute::poison_v1() noexcept {
+    if (p29v1_->serializer.has_pending()) {
+        try {
+            p29v1_->serializer.abandon();
+        } catch (...) {
+        }
+    }
+    p29v1_->terminal = true;
+    active_.reset();
 }
 
 void CRoute::restart_v1_for_transport_retry() {

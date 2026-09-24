@@ -1142,6 +1142,42 @@ void run_wire_controls(const Corpus &corpus,
     deserializer.abandon();
     serializer.abandon();
   }
+
+  // A FILL built before NEED is the FILL that answering NEED builds, and the
+  // NEED it is later confirmed against must still match exactly.
+  {
+    ResearchProvider early_sender;
+    ResearchProvider early_receiver;
+    ResearchProvider answered_sender;
+    ResearchProvider answered_receiver;
+    P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>> early(
+        early_sender, interner);
+    P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>> answered(
+        answered_sender, interner);
+    P29Deserializer<ResearchProvider> early_f(early_receiver);
+    P29Deserializer<ResearchProvider> answered_f(answered_receiver);
+    const std::vector<std::uint8_t> early_need =
+        early_f.receive_body(early.begin_tu(one_region));
+    const std::vector<std::uint8_t> answered_need =
+        answered_f.receive_body(answered.begin_tu(one_region));
+    const std::vector<std::uint8_t> early_fill = early.fill_before_need();
+    require(!early_need.empty() &&
+                early_fill == answered.answer_need(answered_need, false),
+            "FILL built before NEED differs from the answered FILL");
+    bool rejected = false;
+    try {
+      early.confirm_need({});
+    } catch (const std::exception &) {
+      rejected = true;
+    }
+    require(rejected, "sender confirmed a NEED that differs from its own");
+    early.confirm_need(early_need);
+    (void)early_f.receive_fill(early_fill, false);
+    early_f.commit();
+    early.commit();
+    answered_f.abandon();
+    answered.abandon();
+  }
 }
 
 void run_golden_comparison_controls() {

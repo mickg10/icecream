@@ -1064,7 +1064,6 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         throw std::invalid_argument("PrepareRequestKey zero fields are reserved");
     if (exact_input.size() > impl_->zstd_limits.max_raw_bytes)
         throw std::length_error("P50 raw input exceeds the local cap");
-    const Digest128 raw_digest = digest128(exact_input);
     std::shared_ptr<Impl::Shared> shared;
     std::optional<TuSeq> reserved_tu_seq;
     if (const auto request_position = impl_->requests.find(request);
@@ -1100,6 +1099,7 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
 
     std::unique_lock source_lock(impl_->source_mutex, std::defer_lock);
     if (!shared) {
+        const Digest128 raw_digest = digest128(exact_input);
         source_lock.lock();
         shared = std::make_shared<Impl::Shared>();
         shared->request = request;
@@ -1262,8 +1262,7 @@ void P50PreparationAuthority::release_source(PrepareRequestKey request) noexcept
         impl_->requests.erase(position);
 }
 
-std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
-    PreparedTuHandle handle, std::span<const uint8_t> inner_need) {
+CRoute& P50PreparationAuthority::p29v1_successor(PreparedTuHandle handle) {
     impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
         throw std::invalid_argument(
@@ -1278,7 +1277,26 @@ std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
     if (!route.p29_route ||
         route.uncommitted_route_entry != handle.entry_id_)
         throw std::logic_error("P29V1 NEED does not identify the route successor");
-    return route.p29_route->build_fill_v1(inner_need);
+    return *route.p29_route;
+}
+
+std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
+    PreparedTuHandle handle, std::span<const uint8_t> inner_need) {
+    return p29v1_successor(handle).build_fill_v1(inner_need);
+}
+
+std::optional<std::span<const uint8_t>>
+P50PreparationAuthority::fill_p29v1_before_need(PreparedTuHandle handle) {
+    // C reads nothing until FILL is written, so F's STATE and NEED must fit
+    // in C's receive buffer: a NEED inner stream is at most 20 + 5 bytes per
+    // missing Region, i.e. about 20 KiB here.
+    constexpr size_t kMaxEarlyNeedRegions = 4096;
+    return p29v1_successor(handle).fill_v1_before_need(kMaxEarlyNeedRegions);
+}
+
+void P50PreparationAuthority::confirm_p29v1_need(
+    PreparedTuHandle handle, std::span<const uint8_t> inner_need) {
+    p29v1_successor(handle).confirm_need_v1(inner_need);
 }
 
 Digest128 P50PreparationAuthority::p29v1_system_source_fingerprint(
@@ -3446,6 +3464,10 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             impl_->pipelined_begin && impl_->caps.profile == ProfileId::P29V1 &&
             !impl_->active && impl_->queued && impl_->route_known &&
             impl_->f_guid && impl_->route_f_fingerprint && !impl_->run_identity_seed;
+        codec::P29WireLimits wire_limits;
+        wire_limits.max_tu_bytes = static_cast<size_t>(impl_->caps.zstd.max_raw_bytes);
+        wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+        bool fill_sent = false;
         if (pipelined) {
             impl_->preparation->pin_p29v1_system_source_reuse(
                 impl_->queued_handle, *impl_->route_f_fingerprint);
@@ -3460,6 +3482,19 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 socket, impl_->active->prepared->body, impl_->route_limits.max_frame_payload,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment),
                 impl_->completions, control, verify);
+            // FILL never depends on NEED's bytes, so send it now too; NEED is
+            // still read and checked before TX_COMMIT is accepted.
+            if (const auto inner_fill = impl_->preparation->fill_p29v1_before_need(
+                    impl_->active->handle)) {
+                for (const FillMessage& fill : encode_p29v1_fill_messages(
+                         *inner_fill, impl_->route_limits.max_frame_payload,
+                         codec::p29v1_fill_inner_bound(wire_limits)))
+                    co_await async_write_message(
+                        socket, fill, impl_->route_limits.max_frame_payload,
+                        impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                        impl_->completions, control, verify);
+                fill_sent = true;
+            }
         }
 
         Frame state_frame = co_await async_read_frame(
@@ -3691,10 +3726,6 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         }
 
         if (sent_profile == ProfileId::P29V1) {
-            codec::P29WireLimits wire_limits;
-            wire_limits.max_tu_bytes = static_cast<size_t>(
-                impl_->caps.zstd.max_raw_bytes);
-            wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
             P29V1NeedStreamDecoder need_decoder(
                 codec::p29v1_need_inner_bound(wire_limits));
             for (;;) {
@@ -3712,18 +3743,23 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 if (need_decoder.complete())
                     break;
             }
-            const std::span<const uint8_t> inner_fill =
-                impl_->preparation->answer_p29v1_need(
+            if (fill_sent) {
+                impl_->preparation->confirm_p29v1_need(
                     impl_->active->handle, need_decoder.inner_frames());
-            const std::vector<FillMessage> fills =
-                encode_p29v1_fill_messages(
-                    inner_fill, frame_cap,
-                    codec::p29v1_fill_inner_bound(wire_limits));
-            for (const FillMessage& fill : fills)
-                co_await async_write_message(
-                    socket, fill, frame_cap,
-                    impl_->stamp(session, AsyncOperationKind::WriteFragment),
-                    impl_->completions, control, verify);
+            } else {
+                const std::span<const uint8_t> inner_fill =
+                    impl_->preparation->answer_p29v1_need(
+                        impl_->active->handle, need_decoder.inner_frames());
+                const std::vector<FillMessage> fills =
+                    encode_p29v1_fill_messages(
+                        inner_fill, frame_cap,
+                        codec::p29v1_fill_inner_bound(wire_limits));
+                for (const FillMessage& fill : fills)
+                    co_await async_write_message(
+                        socket, fill, frame_cap,
+                        impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                        impl_->completions, control, verify);
+            }
         }
         Frame commit_frame = co_await async_read_frame(
             socket, frame_cap, impl_->stamp(session, AsyncOperationKind::ReadHeader),
