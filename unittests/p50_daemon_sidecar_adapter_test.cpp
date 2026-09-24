@@ -236,6 +236,78 @@ int main()
     if (!hold_after_ready())
         return 27;
 
+    // CancelAttempt for an input that was never committed is an authenticated
+    // exact no-op.  The sidecar records the operation replay, but the adapter
+    // must not tear down a healthy READY relationship for this expected
+    // UnknownRecord response.
+    const auto ready_for_cancel = adapter.outer_current_ready_lease();
+    if (!ready_for_cancel || !ready_for_cancel->valid())
+        return 28;
+    const auto make_absent_cancel = [&](uint64_t operation_id,
+                                        uint64_t logical_job,
+                                        uint64_t tu_seq) {
+        icecc::p50::InputLifecycleRequest request;
+        request.identity = ready_for_cancel->identity;
+        request.key = icecc::p50::InputRecordKey{
+            ready_for_cancel->c_store_guid, icecc::p50::TuSeq{tu_seq}};
+        request.owner = icecc::p50::InputLeaseOwner{
+            logical_job, UINT64_C(0x901), UINT64_C(0x902) + logical_job};
+        request.operation_id = operation_id;
+        request.action = icecc::p50::InputLifecycleAction::CancelAttempt;
+        request.deadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(2);
+        return request;
+    };
+    const auto settle_next_input_lifecycle = [&](std::chrono::milliseconds budget) {
+        std::optional<icecc::p50::InputLifecycleResult> result;
+        const bool settled = drive_until(adapter, reaper, update, budget, [&] {
+            result = adapter.take_outer_input_lifecycle_result();
+            return result.has_value();
+        });
+        return settled ? result
+                       : std::optional<icecc::p50::InputLifecycleResult>{};
+    };
+    auto absent_cancel = make_absent_cancel(0x901, 0x911, 0x921);
+    const auto cancel_queued = adapter.test_queue_input_lifecycle(absent_cancel);
+    if (cancel_queued.status != icecc::p50::InputLifecycleStatus::Disconnected)
+        return 29;
+    const auto cancel_result = settle_next_input_lifecycle(
+        std::chrono::seconds(3));
+    std::fprintf(stderr,
+        "cancel result present=%d status=%u action=%u request_match=%d authenticated=%d advertised=%d pending=%zu error=%u\n",
+        int(cancel_result.has_value()),
+        cancel_result ? unsigned(cancel_result->status) : 255u,
+        cancel_result ? unsigned(cancel_result->request.action) : 255u,
+        int(cancel_result && cancel_result->request == absent_cancel),
+        int(adapter.authenticated()),
+        int(adapter.advertisement_snapshot().present()),
+        adapter.pending_input_lifecycle_count(),
+        unsigned(adapter.last_error()));
+    if (!cancel_result ||
+        cancel_result->status != icecc::p50::InputLifecycleStatus::UnknownRecord ||
+        cancel_result->request != absent_cancel || !adapter.authenticated() ||
+        !adapter.advertisement_snapshot().present() ||
+        adapter.pending_input_lifecycle_count() != 0)
+        return 30;
+    const auto exact_replay = adapter.test_queue_input_lifecycle(absent_cancel);
+    if (exact_replay.status != icecc::p50::InputLifecycleStatus::AlreadyApplied ||
+        exact_replay.request != absent_cancel || !adapter.authenticated() ||
+        !adapter.advertisement_snapshot().present())
+        return 31;
+    auto next_absent_cancel = make_absent_cancel(0x902, 0x912, 0x922);
+    const auto next_queued = adapter.test_queue_input_lifecycle(next_absent_cancel);
+    if (next_queued.status != icecc::p50::InputLifecycleStatus::Disconnected)
+        return 32;
+    const auto next_result = settle_next_input_lifecycle(
+        std::chrono::seconds(3));
+    if (!next_result ||
+        next_result->status != icecc::p50::InputLifecycleStatus::UnknownRecord ||
+        next_result->request != next_absent_cancel || !adapter.authenticated() ||
+        !adapter.advertisement_snapshot().present() ||
+        adapter.pending_input_lifecycle_count() != 0)
+        return 33;
+    std::puts("absent CancelAttempt is replayed as a no-op without READY withdrawal");
+
     const pid_t first_pid = adapter.outer_child_pid();
     const std::string first_path = adapter.socket_path();
     const std::string first_directory =
@@ -334,6 +406,71 @@ int main()
         return 23;
     if (!drive_shutdown(parked_adapter, reaper, parked_update))
         return 24;
+
+    // UnknownRecord is benign only for an idempotent attempt cancellation.
+    // A typed terminal CLOSE against a missing record still retires this
+    // relationship, proving the exception does not bless other operations.
+    DaemonSidecarAdapter other_lifecycle_adapter(config);
+    other_lifecycle_adapter.observe_public_listener(
+        true, config.public_listener_port);
+    other_lifecycle_adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update other_update;
+    if (!drive_until(other_lifecycle_adapter, reaper, other_update,
+                     std::chrono::seconds(5), [&] {
+                         return other_lifecycle_adapter.authenticated() &&
+                                other_lifecycle_adapter.advertisement_snapshot().present();
+                     }))
+        return 34;
+    const auto other_ready = other_lifecycle_adapter.outer_current_ready_lease();
+    if (!other_ready || !other_ready->valid())
+        return 35;
+    icecc::p50::RemoteInputLeaseBinding absent_close;
+    absent_close.identity = other_ready->identity;
+    absent_close.key = icecc::p50::InputRecordKey{
+        other_ready->c_store_guid, icecc::p50::TuSeq{0x933}};
+    absent_close.owner = icecc::p50::InputLeaseOwner{
+        UINT64_C(0x934), UINT64_C(0x935), UINT64_C(0x936)};
+    absent_close.operation_id = UINT64_C(0x937);
+    absent_close.f_store_generation = other_ready->store_generation;
+    absent_close.f_store_guid = other_ready->f_store_guid;
+    absent_close.immutable_digest.bytes[0] = 1;
+    absent_close.retirement_id = UINT64_C(0x938);
+    const auto close_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(2);
+    const auto clock_identity = other_lifecycle_adapter.monotonic_clock_identity();
+    const auto absent_close_deadline =
+        icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            close_deadline, clock_identity.clock_domain_id,
+            clock_identity.time_namespace_id);
+    if (!absent_close.valid())
+        return 36;
+    const auto close_queued = other_lifecycle_adapter.outer_close_logical_input_lease(
+        absent_close, absent_close_deadline);
+    if (close_queued.status != icecc::p50::InputLifecycleStatus::Disconnected)
+        return 37;
+    other_lifecycle_adapter.outer_set_scheduler_owner(false);
+    std::optional<icecc::p50::InputLifecycleResult> close_result;
+    if (!drive_until(other_lifecycle_adapter, reaper, other_update,
+                     std::chrono::seconds(3), [&] {
+                         close_result =
+                             other_lifecycle_adapter.take_outer_input_lifecycle_result();
+                         return close_result.has_value();
+                     }) ||
+        close_result->status != icecc::p50::InputLifecycleStatus::UnknownRecord ||
+        close_result->request.action !=
+            icecc::p50::InputLifecycleAction::CloseLogicalInputLease)
+        return 38;
+    if (!drive_until(other_lifecycle_adapter, reaper, other_update,
+                     std::chrono::seconds(5), [&] {
+                         return !other_lifecycle_adapter.authenticated() &&
+                                other_lifecycle_adapter.advertisement_snapshot().absent() &&
+                                other_lifecycle_adapter.outer_lifecycle_state() ==
+                                    icecc::p50::sidecar::LifecycleState::RetryEligible;
+                     }))
+        return 39;
+    std::puts("absent CloseLogicalInputLease remains fail-closed");
+    if (!drive_shutdown(other_lifecycle_adapter, reaper, other_update))
+        return 40;
 
     if (!remove_p29_fingerprint_cache(root) || ::rmdir(directory) != 0)
         return 25;

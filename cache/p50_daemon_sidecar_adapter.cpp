@@ -2777,9 +2777,16 @@ bool DaemonSidecarAdapter::outer_immediate_turn_required() const noexcept
           !outer_lifecycle_->term_sent()) ||
          (lifecycle_state == sidecar::LifecycleState::TerminatingKill &&
           !outer_lifecycle_->kill_sent()));
+    const bool input_request_ready =
+        // A queued operation becomes actionable once this exact sidecar lease
+        // is authenticated.  Start it on a zero-timeout turn instead of
+        // depending on unrelated fd traffic to wake a quiet READY daemon.
+        outer_input_operation_ == nullptr && !pending_input_lifecycle_.empty() &&
+        outer_authenticated_ && outer_ready_lease_.has_value() &&
+        outer_ready_lease_->valid() && runtime_nodes_valid();
     return outer_launch_phase_ != 0 || cleanup_step_ready ||
            path_observation_ready || retry_ready || reducer_request_ready ||
-           signal_step_ready ||
+           signal_step_ready || input_request_ready ||
            outer_pending_action_.has_value() || outer_reap_event_pending_ ||
            outer_shutdown_input_close_pending_ ||
            outer_replacement_input_close_pending_ ||
@@ -2953,9 +2960,14 @@ bool DaemonSidecarAdapter::outer_advance_input(
         }
     }
     outer_last_input_lifecycle_result_ = InputLifecycleResult{result_status, request};
+    // The F owner records an exact replay even when CancelAttempt names no
+    // committed input.  Treat that specific UnknownRecord as a completed
+    // no-op; UnknownRecord for every other action remains fail-closed below.
     const bool success =
         result_status == InputLifecycleStatus::Applied ||
         result_status == InputLifecycleStatus::AlreadyApplied ||
+        (request.action == InputLifecycleAction::CancelAttempt &&
+         result_status == InputLifecycleStatus::UnknownRecord) ||
         result_status == InputLifecycleStatus::AttemptQuiescedRecordRetained ||
         result_status == InputLifecycleStatus::ReplacementInstalledRecordRetained ||
         result_status == InputLifecycleStatus::JobClosedRecordRetained ||

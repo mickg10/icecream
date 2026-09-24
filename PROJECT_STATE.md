@@ -222,9 +222,31 @@ the later source-arm ACK and dependent CACHE_SESSION checks fail. Evidence:
 `run-daemon-standard-r1.log` under the same root (exit 1, SHA256
 `454cf61e8a85f6d2642a1e2a554420a6848d800dec04952cba8f4953e9f4e6a4`).
 The runner stops there, before P51 cancellation/replacement and vertical modes.
-The daemon rejects the next source ARM with `advertisement=0`; whether this
-is a readiness-fixture error or a product regression remains under investigation.
-This is not a passing full runner.
+The daemon rejects the next source ARM with `advertisement=0`. The cause was
+adapter retirement after an expected `UnknownRecord` response to cancelling
+an input that never arrived. The adapter now completes that exact CancelAttempt
+as a replayable no-op; other missing-record lifecycle operations still retire
+the relationship. A second defect delayed queued lifecycle work until its
+deadline on an otherwise idle connection; queued actionable work now requests
+an immediate outer-loop turn.
+
+Both behavior changes pass all four standard-daemon invocations in
+`run-daemon-standard-r3.log` (exit 0, SHA256
+`69f42f1be793d512a748f51ab8ce5f66a61bda856360149cac899b58f78ea645`).
+That run used daemon SHA256
+`3ac8a459c3e253564acc26545431cfb75ddea915f92b0a29dbb43c466738e130`.
+The final source adds explanatory comments and passes the adapter unit suite:
+quiet-connection cancellation, exact replay, a second cancellation, and
+missing-record CloseLogicalInputLease still withdrawing the relationship.
+Evidence: `build-adapter-cancel-final-r1.log` under the same logs root (exit 0,
+SHA256 `d33099d66f79c6e7327f4e3f429f0b2ef794a462b7bbf4142e66cb849ba67a6e`).
+Its daemon SHA256 is
+`4e7c38fe58dd8a701686dab316383bef5e89d6f1614f4afb5243eccd1a0b4414`;
+the final-source standard-daemon rerun also passes all four invocations:
+`run-daemon-standard-r4.log` (inner and container exit 0, SHA256
+`9745f9ecd05391c8e76b14deac41102fda73add12d59ca09482f3b5f4877b86b`).
+These four invocations
+include a one-job vertical transfer, not the separate 30-job receipt gate.
 
 Continuation handoff: the three Luna agents temporarily stopped with
 usage-limit errors, then resumed on retry. Actual-wrapper success is not

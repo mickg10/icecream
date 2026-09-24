@@ -308,6 +308,11 @@ public:
     // Compile-time-only fault injection for otherwise unreachable uint64_t
     // boundaries.  Production objects are built without this macro.
     void test_force_attempt(uint64_t value) noexcept { attempt_ = value; }
+    // Exact replay probe routed through the same bounded queue validation.
+    [[nodiscard]] InputLifecycleResult test_queue_input_lifecycle(
+        InputLifecycleRequest request) noexcept {
+        return queue_outer_input_request(request);
+    }
     void test_force_counter_state(uint64_t cumulative, uint64_t prior,
                                   bool prior_observed) noexcept {
         cumulative_post_ready_exits_ = cumulative;
