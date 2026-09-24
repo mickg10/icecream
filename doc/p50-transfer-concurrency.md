@@ -581,7 +581,8 @@ not APIs already available in the checkout.
    replacement Client with the same numeric descriptor or request slot.
 5. The wrapper passes the actual full ARMED reply and source fd to C's
    sidecar. The sidecar validates its own store/launch identity and selected
-   F incarnation. It creates or reuses the one R2 data link for this logical
+   F incarnation, validates source size and reserves count/raw bytes before
+   reading or initiating HELLO/JOB_BIND. It creates or reuses the one R2 data link for this logical
    relationship. First HELLO uses the reservation as an exact creation bind;
    F resolves it to its already-installed row rather than creating a job.
 6. Each JOB_BIND names the reservation, current physical-link generation,
@@ -624,6 +625,7 @@ wire numbers in a design document.
 | COMMIT_ACK | C's contiguous verified receipt floor, relationship/recovery epoch; no gaps or acknowledgement beyond F's committed prefix |
 | RECOVER / RECEIPTS | C's verified floor and retained suffix identity; F's complete bounded receipt interval, not only last commit |
 | RESET / RESET_ACK | Idempotent recovery operation ID, settled prefix, old epoch, fresh history nonce and new epoch; no input-record deletion |
+| RESET_CONFIRM | Exact recovery operation ID and new epoch; C confirms receipt of RESET_ACK before new TU bundles |
 | CLOSE / ERROR | Typed reason and relevant epoch/TU; no successful settlement inferred from EOF |
 
 Use the existing bounded outer-frame shape only if it remains sufficient;
@@ -694,6 +696,16 @@ transition, before sending TX_COMMIT. Store all not-yet-acknowledged receipts;
 the R1 single `last_commit` is insufficient. Receipt eviction follows only
 an exact COMMIT_ACK or completed retirement policy, never an idle timeout
 while an in-flight C can still legitimately recover the epoch.
+Enforce this as flow control, not only an assertion: before refilling the
+window, the writer emits its latest COMMIT_ACK in full at the next bundle
+boundary, ahead of any bundle that would exceed the previous receipt budget.
+Track the transmitted ACK floor separately from Q, which advances when F
+processes it. F processes these control records in stream order before the
+following bundle and never publishes beyond its receipt capacity. On link
+loss, the transmitted floor is not proof that F processed it; recovery uses
+actual retained receipts and confirmed floors. Both sides must still read
+control traffic when payload admission is paused, preventing a full ledger
+from blocking the very ACK that frees it.
 
 ### 7.6 Interruption, recovery and reset
 
@@ -713,6 +725,11 @@ while an in-flight C can still legitimately recover the epoch.
    Retain the recovery operation/result until C confirms the new epoch.
    If RESET_ACK is lost, repeating RESET returns that same result instead of
    creating another nonce or forgetting the receipt interval.
+   C sends RESET_CONFIRM before new bundles. F deduplicates RESET by operation
+   ID before checking old-nonce staleness; a duplicate confirmation is harmless.
+   Keep one bounded last-reset result per live relationship through the next
+   confirmed reset or relationship retirement, so loss of a confirmation does
+   not require an unbounded chain of tombstones or erase an ambiguous result.
 6. Reset codec/entropy state on both ends without deleting immutable input
    records. Rebuild only the uncommitted suffix from retained raw input in
    order; preserve TU/job identity, use the new nonce and fresh route-relative
