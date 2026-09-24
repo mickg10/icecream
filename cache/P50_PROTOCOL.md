@@ -82,16 +82,16 @@ original compiler connection, and JOB_BIND consumes its exact reservation on
 the persistent link. These are implementation requirements, not a claim that
 the production transition has passed its integration gate.
 
-### Dormant CacheWire R2 W1 record codecs
+### Dormant CacheWire R2 record codecs
 
 Normal negotiation remains capped at protocol 50 and these CacheWire records
 are not advertised or accepted by the production endpoint. The following
-fixed records are codec groundwork for W1; R1 records and bytes remain
+fixed records are codec groundwork; R1 records and bytes remain
 unchanged. The outer frame remains `type:u8, payload_length:u24, payload`,
 all record integers are big-endian, and GUIDs/digests/reservation IDs are 16
 raw bytes. Revisions and profiles are u16; windows and frame caps are u32.
-Payloads have no padding or reserved extensibility bytes. Types 19–23 and 25
-remain reserved for recovery/error records.
+Payloads have no padding or reserved extensibility bytes. Type 25 remains
+reserved for error records.
 
 | Type | Record | Exact payload fields / byte offsets | Bytes |
 |---:|---|---|---:|
@@ -104,6 +104,14 @@ remain reserved for recovery/error records.
 | 16 | TU_END | relationship ordinal u64@0; binding digest@8; outer transaction digest@24 | 40 |
 | 17 | R2_TX_COMMIT | relationship ordinal u64@0; binding digest@8; outer transaction digest@24; exact 72-byte R1 TX_COMMIT payload@40 | 112 |
 | 18 | COMMIT_ACK | relationship ID@0; relationship epoch u64@16; physical generation u64@24; contiguous verified ordinal u64@32 | 40 |
+| 19 | RECOVER Begin | relationship ID@0; relationship epoch u64@16; new physical generation u64@24; recovery operation ID@32; kind u8@48=`0`; floor A u64@49; prepared prefix P u64@57; witness count u32@65 | 69 |
+| 19 | RECOVER Witness | same common identity through @47; kind u8@48=`1`; ordinal u64@49; binding digest@57; transaction digest@73; exact 116-byte TX_BEGIN@89 | 205 |
+| 19 | RECOVER End | same common identity through @47; kind u8@48=`2`; witness count u32@49; transcript digest@53 | 69 |
+| 20 | RECEIPTS Row | relationship ID@0; relationship epoch u64@16; physical generation u64@24; recovery operation ID@32; kind u8@48=`0`; ordinal u64@49; binding digest@57; transaction digest@73; exact 72-byte TX_COMMIT@89 | 161 |
+| 20 | RECEIPTS End | same common identity through @47; kind u8@48=`1`; floor A u64@49; committed prefix K u64@57; acknowledged prefix Q u64@65; receipt count u32@73 | 77 |
+| 21 | RESET | relationship ID@0; old/new relationship epochs u64@16/@24; physical generation u64@32; operation ID@40; settled prefix K u64@56; old/new history nonces u64@64/@72 | 80 |
+| 22 | RESET_ACK | exact RESET payload@0..79; fresh initial state digest@80; next REL_SEQ u64@96 | 104 |
+| 23 | RESET_CONFIRM | relationship ID@0; new relationship epoch u64@16; physical generation u64@24; operation ID@32; new history nonce u64@48; settled prefix K u64@56 | 64 |
 | 24 | CLOSE | empty payload; closes only an idle bound link and settles no receipt | 0 |
 
 LINK_HELLO starts revision 2 and pins one profile/window to a physical link.
@@ -130,6 +138,31 @@ against F's committed prefix K. This codec checkpoint does not qualify the
 development persistent receive loop, receipt recovery/reset, or ordinary
 daemon selection/adoption. These records are not a production end-to-end
 capability and no R2 advertisement is made.
+
+RECOVER is a three-part request stream: Begin, exactly `P-A` contiguous
+Witness records for ordinals `A+1..P` (`P-A <= W`), then End. Its transcript
+digest is XXH3-128 over ASCII `R2-recover-v1` (no NUL), followed by the exact
+Begin and Witness frame records in order; each contributes type u8, payload
+length u64, and payload bytes. End is excluded. F verifies the complete
+request before returning any receipts. RECEIPTS returns one exact retained
+R2_TX_COMMIT witness for every ordinal in `(A,K]`, then an explicit End with
+K, Q, and count. C validates the entire interval before advancing its
+verified floor. F refuses `A < Q` or `A > K` and fences older physical-link
+generations before processing recovery.
+
+RESET is idempotently keyed by operation ID, advances the relationship epoch
+by exactly one, names the reconciled prefix K, and replaces the codec history
+nonce. RESET_ACK echoes the logical request fields and the new initial state;
+RESET_CONFIRM names the same operation, new epoch, nonce, and K. F accepts a
+duplicate RESET before checking stale old-epoch state and returns the cached
+logical reset result, including after physical reconnection. A confirmed reset keeps its last
+logical reset outcome until a later confirmed reset or relationship retirement.
+On a new physical connection a duplicate RESET carries that connection's
+current generation; the echoed RESET_ACK envelope uses that generation while
+the operation ID, epochs, prefix, nonces, and reset state remain identical.
+RESET may settle a reconciled prefix even when the previous COMMIT_ACK was lost; it does
+not delete immutable committed input records. These recovery codecs remain
+dormant until the F and C recovery lifecycles pass their runtime gates.
 
 ## Selection and advertisement
 

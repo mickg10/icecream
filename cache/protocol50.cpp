@@ -34,7 +34,7 @@ bool known_object_type(ObjectType type) {
 bool known_message_type(MessageType type) {
     const uint8_t value = static_cast<uint8_t>(type);
     return value >= static_cast<uint8_t>(MessageType::SESSION_HELLO) &&
-           (value <= static_cast<uint8_t>(MessageType::COMMIT_ACK) ||
+           (value <= static_cast<uint8_t>(MessageType::RESET_CONFIRM) ||
             type == MessageType::CLOSE);
 }
 
@@ -226,6 +226,96 @@ void validate_commit_ack(const CommitAck& value) {
         throw std::invalid_argument("COMMIT_ACK fields are invalid");
 }
 
+bool valid_recovery_identity(const Id128& relationship_id,
+                             uint64_t relationship_epoch,
+                             uint64_t physical_link_generation,
+                             const Id128& operation_id) {
+    return nonzero_id(relationship_id.bytes) && relationship_epoch != 0 &&
+           physical_link_generation != 0 && nonzero_id(operation_id.bytes);
+}
+
+void validate_recover_begin(const RecoverBegin& value) {
+    if (!valid_recovery_identity(value.relationship_id,
+                                 value.relationship_epoch,
+                                 value.physical_link_generation,
+                                 value.operation_id) ||
+        value.verified_floor_a > value.prepared_prefix_p ||
+        value.prepared_prefix_p - value.verified_floor_a > 30 ||
+        value.witness_count != value.prepared_prefix_p - value.verified_floor_a)
+        throw std::invalid_argument("RECOVER begin fields are invalid");
+}
+
+void validate_recover_witness(const RecoverWitness& value) {
+    if (!valid_recovery_identity(value.relationship_id,
+                                 value.relationship_epoch,
+                                 value.physical_link_generation,
+                                 value.operation_id) ||
+        value.relationship_ordinal == 0 ||
+        value.binding_digest == Digest128{} ||
+        value.transaction_digest == Digest128{})
+        throw std::invalid_argument("RECOVER witness fields are invalid");
+    validate_tx_begin_intrinsic(value.inner);
+}
+
+void validate_recover_end(const RecoverEnd& value) {
+    if (!valid_recovery_identity(value.relationship_id,
+                                 value.relationship_epoch,
+                                 value.physical_link_generation,
+                                 value.operation_id) ||
+        value.witness_count > 30 || value.transcript_digest == Digest128{})
+        throw std::invalid_argument("RECOVER end fields are invalid");
+}
+
+void validate_receipt_row(const ReceiptRow& value) {
+    if (!valid_recovery_identity(value.relationship_id,
+                                 value.relationship_epoch,
+                                 value.physical_link_generation,
+                                 value.operation_id))
+        throw std::invalid_argument("RECEIPTS row identity is invalid");
+    validate_r2_commit(value.receipt);
+}
+
+void validate_receipts_end(const ReceiptsEnd& value) {
+    if (!valid_recovery_identity(value.relationship_id,
+                                 value.relationship_epoch,
+                                 value.physical_link_generation,
+                                 value.operation_id) ||
+        value.acknowledged_prefix_q > value.committed_prefix_k ||
+        value.verified_floor_a > value.committed_prefix_k ||
+        value.committed_prefix_k - value.verified_floor_a > 30 ||
+        value.receipt_count != value.committed_prefix_k - value.verified_floor_a)
+        throw std::invalid_argument("RECEIPTS interval end fields are invalid");
+}
+
+void validate_reset_request(const ResetRequest& value) {
+    if (!nonzero_id(value.relationship_id.bytes) ||
+        value.old_relationship_epoch == 0 || value.new_relationship_epoch == 0 ||
+        value.old_relationship_epoch == UINT64_MAX ||
+        value.new_relationship_epoch != value.old_relationship_epoch + 1 ||
+        value.physical_link_generation == 0 ||
+        !nonzero_id(value.operation_id.bytes) ||
+        value.old_history_nonce.value == 0 ||
+        value.new_history_nonce.value == 0 ||
+        value.new_history_nonce == value.old_history_nonce)
+        throw std::invalid_argument("RESET fields are invalid");
+}
+
+void validate_reset_ack(const ResetAck& value) {
+    validate_reset_request(value.request);
+    if (value.initial_state_digest == Digest128{} ||
+        value.next_rel_seq.value != 0)
+        throw std::invalid_argument("RESET_ACK fields are invalid");
+}
+
+void validate_reset_confirm(const ResetConfirm& value) {
+    if (!nonzero_id(value.relationship_id.bytes) ||
+        value.new_relationship_epoch == 0 ||
+        value.physical_link_generation == 0 ||
+        !nonzero_id(value.operation_id.bytes) ||
+        value.new_history_nonce.value == 0)
+        throw std::invalid_argument("RESET_CONFIRM fields are invalid");
+}
+
 class Encoder {
 public:
     void u8(uint8_t value) { bytes_.push_back(value); }
@@ -342,6 +432,34 @@ ComponentDescriptor decode_descriptor(Decoder& in) {
     result.decoded_bytes = in.u64();
     result.digest = in.digest();
     return result;
+}
+
+void encode_tx_begin(Encoder& out, const TxBegin& value) {
+    validate_tx_begin_intrinsic(value);
+    out.u64(value.history_nonce.value);
+    out.u64(value.rel_seq.value);
+    out.u64(value.tu_seq.value);
+    out.u16(static_cast<uint16_t>(value.profile));
+    out.digest(value.pre_state_digest);
+    encode_descriptor(out, value.body);
+    out.u64(value.raw_bytes);
+    out.digest(value.raw_digest);
+    out.digest(value.transaction_digest);
+}
+
+TxBegin decode_tx_begin(Decoder& in) {
+    TxBegin value;
+    value.history_nonce.value = in.u64();
+    value.rel_seq.value = in.u64();
+    value.tu_seq.value = in.u64();
+    value.profile = static_cast<ProfileId>(in.u16());
+    value.pre_state_digest = in.digest();
+    value.body = decode_descriptor(in);
+    value.raw_bytes = in.u64();
+    value.raw_digest = in.digest();
+    value.transaction_digest = in.digest();
+    validate_tx_begin_intrinsic(value);
+    return value;
 }
 
 void encode_commit(Encoder& out, const TxCommit& commit) {
@@ -538,6 +656,14 @@ MessageType message_type(const Message& message) {
         if constexpr (std::is_same_v<T, R2FillMessage>) return MessageType::R2_FILL;
         if constexpr (std::is_same_v<T, TuEnd>) return MessageType::TU_END;
         if constexpr (std::is_same_v<T, R2TxCommit>) return MessageType::R2_TX_COMMIT;
+        if constexpr (std::is_same_v<T, RecoverBegin> ||
+                      std::is_same_v<T, RecoverWitness> ||
+                      std::is_same_v<T, RecoverEnd>) return MessageType::RECOVER;
+        if constexpr (std::is_same_v<T, ReceiptRow> ||
+                      std::is_same_v<T, ReceiptsEnd>) return MessageType::RECEIPTS;
+        if constexpr (std::is_same_v<T, ResetRequest>) return MessageType::RESET;
+        if constexpr (std::is_same_v<T, ResetAck>) return MessageType::RESET_ACK;
+        if constexpr (std::is_same_v<T, ResetConfirm>) return MessageType::RESET_CONFIRM;
         if constexpr (std::is_same_v<T, CloseMessage>) return MessageType::CLOSE;
         return MessageType::COMMIT_ACK;
     }, message);
@@ -689,6 +815,89 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.u64(value.relationship_epoch);
             out.u64(value.physical_link_generation);
             out.u64(value.contiguous_verified_ordinal);
+        } else if constexpr (std::is_same_v<T, RecoverBegin>) {
+            validate_recover_begin(value);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u8(0);
+            out.u64(value.verified_floor_a);
+            out.u64(value.prepared_prefix_p);
+            out.u32(value.witness_count);
+        } else if constexpr (std::is_same_v<T, RecoverWitness>) {
+            validate_recover_witness(value);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u8(1);
+            out.u64(value.relationship_ordinal);
+            out.digest(value.binding_digest);
+            out.digest(value.transaction_digest);
+            encode_tx_begin(out, value.inner);
+        } else if constexpr (std::is_same_v<T, RecoverEnd>) {
+            validate_recover_end(value);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u8(2);
+            out.u32(value.witness_count);
+            out.digest(value.transcript_digest);
+        } else if constexpr (std::is_same_v<T, ReceiptRow>) {
+            validate_receipt_row(value);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u8(0);
+            out.u64(value.receipt.relationship_ordinal);
+            out.digest(value.receipt.binding_digest);
+            out.digest(value.receipt.transaction_digest);
+            encode_commit(out, value.receipt.inner);
+        } else if constexpr (std::is_same_v<T, ReceiptsEnd>) {
+            validate_receipts_end(value);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u8(1);
+            out.u64(value.verified_floor_a);
+            out.u64(value.committed_prefix_k);
+            out.u64(value.acknowledged_prefix_q);
+            out.u32(value.receipt_count);
+        } else if constexpr (std::is_same_v<T, ResetRequest>) {
+            validate_reset_request(value);
+            out.id(value.relationship_id);
+            out.u64(value.old_relationship_epoch);
+            out.u64(value.new_relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u64(value.settled_prefix_k);
+            out.u64(value.old_history_nonce.value);
+            out.u64(value.new_history_nonce.value);
+        } else if constexpr (std::is_same_v<T, ResetAck>) {
+            validate_reset_ack(value);
+            const ResetRequest& request = value.request;
+            out.id(request.relationship_id);
+            out.u64(request.old_relationship_epoch);
+            out.u64(request.new_relationship_epoch);
+            out.u64(request.physical_link_generation);
+            out.id(request.operation_id);
+            out.u64(request.settled_prefix_k);
+            out.u64(request.old_history_nonce.value);
+            out.u64(request.new_history_nonce.value);
+            out.digest(value.initial_state_digest);
+            out.u64(value.next_rel_seq.value);
+        } else if constexpr (std::is_same_v<T, ResetConfirm>) {
+            validate_reset_confirm(value);
+            out.id(value.relationship_id);
+            out.u64(value.new_relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.operation_id);
+            out.u64(value.new_history_nonce.value);
+            out.u64(value.settled_prefix_k);
         } else if constexpr (std::is_same_v<T, CloseMessage>) {
             // CLOSE has an exact empty payload.
         }
@@ -895,6 +1104,131 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         validate_commit_ack(value);
         return value;
     }
+    case MessageType::RECOVER: {
+        const Id128 relationship_id = in.id();
+        const uint64_t relationship_epoch = in.u64();
+        const uint64_t physical_link_generation = in.u64();
+        const Id128 operation_id = in.id();
+        const uint8_t kind = in.u8();
+        if (kind == 0) {
+            RecoverBegin value;
+            value.relationship_id = relationship_id;
+            value.relationship_epoch = relationship_epoch;
+            value.physical_link_generation = physical_link_generation;
+            value.operation_id = operation_id;
+            value.verified_floor_a = in.u64();
+            value.prepared_prefix_p = in.u64();
+            value.witness_count = in.u32();
+            in.exact_end();
+            validate_recover_begin(value);
+            return value;
+        }
+        if (kind == 1) {
+            RecoverWitness value;
+            value.relationship_id = relationship_id;
+            value.relationship_epoch = relationship_epoch;
+            value.physical_link_generation = physical_link_generation;
+            value.operation_id = operation_id;
+            value.relationship_ordinal = in.u64();
+            value.binding_digest = in.digest();
+            value.transaction_digest = in.digest();
+            value.inner = decode_tx_begin(in);
+            in.exact_end();
+            validate_recover_witness(value);
+            return value;
+        }
+        if (kind == 2) {
+            RecoverEnd value;
+            value.relationship_id = relationship_id;
+            value.relationship_epoch = relationship_epoch;
+            value.physical_link_generation = physical_link_generation;
+            value.operation_id = operation_id;
+            value.witness_count = in.u32();
+            value.transcript_digest = in.digest();
+            in.exact_end();
+            validate_recover_end(value);
+            return value;
+        }
+        throw std::invalid_argument("RECOVER subrecord kind is invalid");
+    }
+    case MessageType::RECEIPTS: {
+        const Id128 relationship_id = in.id();
+        const uint64_t relationship_epoch = in.u64();
+        const uint64_t physical_link_generation = in.u64();
+        const Id128 operation_id = in.id();
+        const uint8_t kind = in.u8();
+        if (kind == 0) {
+            ReceiptRow value;
+            value.relationship_id = relationship_id;
+            value.relationship_epoch = relationship_epoch;
+            value.physical_link_generation = physical_link_generation;
+            value.operation_id = operation_id;
+            value.receipt.relationship_ordinal = in.u64();
+            value.receipt.binding_digest = in.digest();
+            value.receipt.transaction_digest = in.digest();
+            value.receipt.inner = decode_commit(in);
+            in.exact_end();
+            validate_receipt_row(value);
+            return value;
+        }
+        if (kind == 1) {
+            ReceiptsEnd value;
+            value.relationship_id = relationship_id;
+            value.relationship_epoch = relationship_epoch;
+            value.physical_link_generation = physical_link_generation;
+            value.operation_id = operation_id;
+            value.verified_floor_a = in.u64();
+            value.committed_prefix_k = in.u64();
+            value.acknowledged_prefix_q = in.u64();
+            value.receipt_count = in.u32();
+            in.exact_end();
+            validate_receipts_end(value);
+            return value;
+        }
+        throw std::invalid_argument("RECEIPTS subrecord kind is invalid");
+    }
+    case MessageType::RESET: {
+        ResetRequest value;
+        value.relationship_id = in.id();
+        value.old_relationship_epoch = in.u64();
+        value.new_relationship_epoch = in.u64();
+        value.physical_link_generation = in.u64();
+        value.operation_id = in.id();
+        value.settled_prefix_k = in.u64();
+        value.old_history_nonce.value = in.u64();
+        value.new_history_nonce.value = in.u64();
+        in.exact_end();
+        validate_reset_request(value);
+        return value;
+    }
+    case MessageType::RESET_ACK: {
+        ResetAck value;
+        value.request.relationship_id = in.id();
+        value.request.old_relationship_epoch = in.u64();
+        value.request.new_relationship_epoch = in.u64();
+        value.request.physical_link_generation = in.u64();
+        value.request.operation_id = in.id();
+        value.request.settled_prefix_k = in.u64();
+        value.request.old_history_nonce.value = in.u64();
+        value.request.new_history_nonce.value = in.u64();
+        value.initial_state_digest = in.digest();
+        value.next_rel_seq.value = in.u64();
+        in.exact_end();
+        validate_reset_ack(value);
+        return value;
+    }
+    case MessageType::RESET_CONFIRM: {
+        ResetConfirm value;
+        value.relationship_id = in.id();
+        value.new_relationship_epoch = in.u64();
+        value.physical_link_generation = in.u64();
+        value.operation_id = in.id();
+        value.new_history_nonce.value = in.u64();
+        value.settled_prefix_k = in.u64();
+        in.exact_end();
+        validate_reset_confirm(value);
+        return value;
+    }
     case MessageType::CLOSE:
         in.exact_end();
         return CloseMessage{};
@@ -940,6 +1274,42 @@ Digest128 compute_r2_transaction_digest(
     for (const R2FillMessage& fill : fills)
         append_frame(MessageType::R2_FILL,
                      std::span<const uint8_t>(fill.bytes));
+    return digest.finish();
+}
+
+Digest128 compute_r2_recovery_transcript_digest(
+    const RecoverBegin& begin, std::span<const RecoverWitness> witnesses) {
+    validate_recover_begin(begin);
+    if (witnesses.size() != begin.witness_count)
+        throw std::invalid_argument("RECOVER witness count differs from begin");
+    icecc::Digest128Builder digest;
+    digest.append("R2-recover-v1");
+    auto append_record = [&digest](MessageType type,
+                                   const std::vector<uint8_t>& payload) {
+        digest.append_u8(static_cast<uint8_t>(type));
+        digest.append_u64(static_cast<uint64_t>(payload.size()));
+        digest.append(payload);
+    };
+    append_record(MessageType::RECOVER, encode_payload(Message{begin}));
+    uint64_t ordinal = begin.verified_floor_a;
+    for (const RecoverWitness& witness : witnesses) {
+        if (ordinal == UINT64_MAX)
+            throw std::overflow_error("RECOVER witness ordinal exhausted");
+        ++ordinal;
+        validate_recover_witness(witness);
+        if (witness.relationship_id != begin.relationship_id ||
+            witness.relationship_epoch != begin.relationship_epoch ||
+            witness.physical_link_generation !=
+                begin.physical_link_generation ||
+            witness.operation_id != begin.operation_id ||
+            witness.relationship_ordinal != ordinal)
+            throw std::invalid_argument(
+                "RECOVER witnesses are not the exact contiguous identity interval");
+        append_record(MessageType::RECOVER,
+                      encode_payload(Message{witness}));
+    }
+    if (ordinal != begin.prepared_prefix_p)
+        throw std::invalid_argument("RECOVER witness interval is incomplete");
     return digest.finish();
 }
 

@@ -14,6 +14,15 @@ retained artifact directories.
 
 ### Persistent-link implementation in progress
 
+The dormant recovery record codecs now pass the focused `p50wire` gate:
+exact payload sizes and round trips, truncation/trailing-byte rejection,
+invalid subkinds/ordinals/intervals/epochs, and transcript sensitivity to
+changed witness bytes. Evidence:
+`/tanksmall/scratch/tmp/p50-recovery-closure.avtx9r/logs/p50wire-recovery-r1.log`
+(SHA256 `e52b1bd8ba96eb0b174bb3b3a7d708581b3f4107ecf52f886a8f2b686d7782a1`).
+This proves record encoding/decoding only, not reconnect/reset execution,
+production sender W30, or restart correctness. Those runtime gates remain open.
+
 The annotated tag `sorbet_1.5_pipeline_plan` freezes the detailed C/D plan at
 `6dfd606de89bd60abb9315b398b53df37c878640`; the tag is pushed and its remote
 target was verified. It is a plan checkpoint, not a W30 release.

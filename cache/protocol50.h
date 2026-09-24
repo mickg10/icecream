@@ -113,6 +113,14 @@ constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
 constexpr uint32_t kMandatoryControlFramePayload = 116;
 constexpr uint32_t kR2LinkHelloPayloadBytes = 181;
 constexpr uint32_t kR2LinkStatePayloadBytes = 212;
+constexpr uint32_t kR2RecoverBeginPayloadBytes = 69;
+constexpr uint32_t kR2RecoverWitnessPayloadBytes = 205;
+constexpr uint32_t kR2RecoverEndPayloadBytes = 69;
+constexpr uint32_t kR2ReceiptRowPayloadBytes = 161;
+constexpr uint32_t kR2ReceiptsEndPayloadBytes = 77;
+constexpr uint32_t kR2ResetPayloadBytes = 80;
+constexpr uint32_t kR2ResetAckPayloadBytes = 104;
+constexpr uint32_t kR2ResetConfirmPayloadBytes = 64;
 constexpr uint32_t kR2MandatoryControlFramePayload =
     kR2LinkStatePayloadBytes;
 constexpr uint64_t kInitialMaxFillRecordBytes = uint64_t{1} << 32;
@@ -136,6 +144,11 @@ enum class MessageType : uint8_t {
     TU_END = 16,
     R2_TX_COMMIT = 17,
     COMMIT_ACK = 18,
+    RECOVER = 19,
+    RECEIPTS = 20,
+    RESET = 21,
+    RESET_ACK = 22,
+    RESET_CONFIRM = 23,
     CLOSE = 24,
 };
 
@@ -360,6 +373,92 @@ struct CloseMessage {
     auto operator<=>(const CloseMessage&) const = default;
 };
 
+// R2 recovery is a bounded subrecord stream. Every subrecord repeats the
+// relationship, physical-link, and operation identity so a partial stream
+// cannot be attached to a later recovery attempt.
+struct RecoverBegin {
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    uint64_t verified_floor_a = 0;
+    uint64_t prepared_prefix_p = 0;
+    uint32_t witness_count = 0;
+    auto operator<=>(const RecoverBegin&) const = default;
+};
+
+struct RecoverWitness {
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    uint64_t relationship_ordinal = 0;
+    Digest128 binding_digest{};
+    Digest128 transaction_digest{};
+    TxBegin inner{};
+    auto operator<=>(const RecoverWitness&) const = default;
+};
+
+struct RecoverEnd {
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    uint32_t witness_count = 0;
+    Digest128 transcript_digest{};
+    auto operator<=>(const RecoverEnd&) const = default;
+};
+
+struct ReceiptRow {
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    R2TxCommit receipt{};
+    auto operator<=>(const ReceiptRow&) const = default;
+};
+
+struct ReceiptsEnd {
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    uint64_t verified_floor_a = 0;
+    uint64_t committed_prefix_k = 0;
+    uint64_t acknowledged_prefix_q = 0;
+    uint32_t receipt_count = 0;
+    auto operator<=>(const ReceiptsEnd&) const = default;
+};
+
+struct ResetRequest {
+    Id128 relationship_id{};
+    uint64_t old_relationship_epoch = 0;
+    uint64_t new_relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    uint64_t settled_prefix_k = 0;
+    HistoryNonce old_history_nonce{};
+    HistoryNonce new_history_nonce{};
+    auto operator<=>(const ResetRequest&) const = default;
+};
+
+struct ResetAck {
+    ResetRequest request{};
+    Digest128 initial_state_digest{};
+    RelSeq next_rel_seq{};
+    auto operator<=>(const ResetAck&) const = default;
+};
+
+struct ResetConfirm {
+    Id128 relationship_id{};
+    uint64_t new_relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    Id128 operation_id{};
+    HistoryNonce new_history_nonce{};
+    uint64_t settled_prefix_k = 0;
+    auto operator<=>(const ResetConfirm&) const = default;
+};
+
 // Client receive gate for a SESSION_STATE negotiated from the original offer.
 void validate_session_state(const SessionHello& hello,
                             const SessionState& received_state);
@@ -399,7 +498,10 @@ using Message = std::variant<SessionHello, SessionState, HistoryReset, ErrorMess
                              TxBegin, BodyMessage, NeedMessage, FillMessage,
                              TxCommit, LinkHello, LinkState, JobBind, TuBegin,
                              R2TxCommit, CommitAck, TuEnd,
-                             R2BodyMessage, R2FillMessage, CloseMessage>;
+                             R2BodyMessage, R2FillMessage, CloseMessage,
+                             RecoverBegin, RecoverWitness, RecoverEnd,
+                             ReceiptRow, ReceiptsEnd, ResetRequest, ResetAck,
+                             ResetConfirm>;
 
 struct Frame {
     MessageType type = MessageType::ERROR;
@@ -421,6 +523,8 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload);
     const JobBind& binding, const TuBegin& begin,
     std::span<const R2BodyMessage> bodies,
     std::span<const R2FillMessage> fills);
+[[nodiscard]] Digest128 compute_r2_recovery_transcript_digest(
+    const RecoverBegin& begin, std::span<const RecoverWitness> witnesses);
 std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_bytes);
 FrameHeader decode_frame_header(std::span<const uint8_t> header,
                                 uint32_t max_payload = kInitialMaxFramePayload);

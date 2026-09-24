@@ -80,13 +80,18 @@ void test_revision_one_registry() {
     static_assert(kKnownProfileMask == 7);
     static_assert(CACHE_ADVERTISABLE_PROFILE_MASK == 7);
     static_assert(kMandatoryControlFramePayload == 116);
-    static_assert(std::variant_size_v<Message> == 19);
+    static_assert(std::variant_size_v<Message> == 27);
     static_assert(static_cast<uint8_t>(MessageType::BODY) == 6);
     static_assert(static_cast<uint8_t>(MessageType::FILL) == 8);
     static_assert(static_cast<uint8_t>(MessageType::LINK_HELLO) == 10);
     static_assert(static_cast<uint8_t>(MessageType::R2_BODY) == 14);
     static_assert(static_cast<uint8_t>(MessageType::R2_FILL) == 15);
     static_assert(static_cast<uint8_t>(MessageType::COMMIT_ACK) == 18);
+    static_assert(static_cast<uint8_t>(MessageType::RECOVER) == 19);
+    static_assert(static_cast<uint8_t>(MessageType::RECEIPTS) == 20);
+    static_assert(static_cast<uint8_t>(MessageType::RESET) == 21);
+    static_assert(static_cast<uint8_t>(MessageType::RESET_ACK) == 22);
+    static_assert(static_cast<uint8_t>(MessageType::RESET_CONFIRM) == 23);
     static_assert(static_cast<uint8_t>(MessageType::CLOSE) == 24);
 
     require(profile_name(ProfileId::P29V1) == "p29_v1" &&
@@ -448,6 +453,116 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
                 compute_r2_transaction_digest(binding, begin, {},
                                               same_payload_as_fill),
             "R2 transaction digest omitted BODY/FILL frame type");
+
+    const Id128 recovery_operation = Id128::from_u64(0xe1);
+    RecoverBegin recover_begin{hello.relationship_id,
+                               hello.relationship_epoch,
+                               hello.physical_link_generation,
+                               recovery_operation, 0, 1, 1};
+    RecoverWitness witness{hello.relationship_id,
+                           hello.relationship_epoch,
+                           hello.physical_link_generation,
+                           recovery_operation,
+                           1,
+                           binding_digest,
+                           transaction_digest,
+                           begin.inner};
+    const std::array<RecoverWitness, 1> witnesses{witness};
+    const Digest128 recovery_transcript =
+        compute_r2_recovery_transcript_digest(recover_begin, witnesses);
+    RecoverEnd recover_end{hello.relationship_id,
+                           hello.relationship_epoch,
+                           hello.physical_link_generation,
+                           recovery_operation,
+                           1,
+                           recovery_transcript};
+    ReceiptRow receipt_row{hello.relationship_id,
+                           hello.relationship_epoch,
+                           hello.physical_link_generation,
+                           recovery_operation,
+                           commit};
+    ReceiptsEnd receipts_end{hello.relationship_id,
+                             hello.relationship_epoch,
+                             hello.physical_link_generation,
+                             recovery_operation,
+                             0,
+                             1,
+                             0,
+                             1};
+    ResetRequest reset_request{hello.relationship_id,
+                               hello.relationship_epoch,
+                               hello.relationship_epoch + 1,
+                               hello.physical_link_generation,
+                               recovery_operation,
+                               1,
+                               hello.history_nonce,
+                               HistoryNonce{hello.history_nonce.value + 1}};
+    ResetAck reset_ack{reset_request, digest("reset-initial-state"), RelSeq{0}};
+    ResetConfirm reset_confirm{hello.relationship_id,
+                               reset_request.new_relationship_epoch,
+                               hello.physical_link_generation,
+                               recovery_operation,
+                               reset_request.new_history_nonce,
+                               reset_request.settled_prefix_k};
+    const std::array<Message, 8> recovery_messages{
+        Message{recover_begin}, Message{witness}, Message{recover_end},
+        Message{receipt_row}, Message{receipts_end}, Message{reset_request},
+        Message{reset_ack}, Message{reset_confirm}};
+    const std::array<size_t, 8> recovery_sizes{
+        kR2RecoverBeginPayloadBytes, kR2RecoverWitnessPayloadBytes,
+        kR2RecoverEndPayloadBytes, kR2ReceiptRowPayloadBytes,
+        kR2ReceiptsEndPayloadBytes, kR2ResetPayloadBytes,
+        kR2ResetAckPayloadBytes, kR2ResetConfirmPayloadBytes};
+    for (size_t index = 0; index != recovery_messages.size(); ++index) {
+        const Message& message = recovery_messages[index];
+        const auto payload = encode_payload(message);
+        require(payload.size() == recovery_sizes[index],
+                "R2 recovery payload size changed");
+        require(decode_payload(message_type(message), payload) == message,
+                "R2 recovery payload did not round-trip exactly");
+        require_throws<std::exception>(
+            [&] { (void)decode_payload(message_type(message),
+                                       std::span<const uint8_t>(payload).first(
+                                           payload.size() - 1)); },
+            "truncated R2 recovery payload was accepted");
+        std::vector<uint8_t> with_trailing = payload;
+        with_trailing.push_back(0);
+        require_throws<std::exception>(
+            [&] { (void)decode_payload(message_type(message), with_trailing); },
+            "R2 recovery payload with trailing bytes was accepted");
+    }
+    auto bad_recover_subkind = encode_payload(Message{witness});
+    bad_recover_subkind[48] = 0xff;
+    require_throws<std::exception>(
+        [&] { (void)decode_payload(MessageType::RECOVER, bad_recover_subkind); },
+        "RECOVER accepted an unknown subkind");
+    auto bad_receipt_subkind = encode_payload(Message{receipt_row});
+    bad_receipt_subkind[48] = 0xff;
+    require_throws<std::exception>(
+        [&] { (void)decode_payload(MessageType::RECEIPTS, bad_receipt_subkind); },
+        "RECEIPTS accepted an unknown subkind");
+    auto bad_recover_ordinal = encode_payload(Message{witness});
+    std::fill(bad_recover_ordinal.begin() + 49,
+              bad_recover_ordinal.begin() + 57, 0);
+    require_throws<std::exception>(
+        [&] { (void)decode_payload(MessageType::RECOVER, bad_recover_ordinal); },
+        "RECOVER accepted ordinal zero");
+    auto bad_receipt_interval = encode_payload(Message{receipts_end});
+    bad_receipt_interval.back() = 2;
+    require_throws<std::exception>(
+        [&] { (void)decode_payload(MessageType::RECEIPTS, bad_receipt_interval); },
+        "RECEIPTS accepted a count inconsistent with its interval");
+    auto bad_reset_epoch = encode_payload(Message{reset_request});
+    std::fill(bad_reset_epoch.begin() + 24, bad_reset_epoch.begin() + 32, 0);
+    require_throws<std::exception>(
+        [&] { (void)decode_payload(MessageType::RESET, bad_reset_epoch); },
+        "RESET accepted a non-successor relationship epoch");
+    auto changed_witnesses = witnesses;
+    changed_witnesses[0].binding_digest.bytes[0] ^= 1;
+    require(compute_r2_recovery_transcript_digest(recover_begin, witnesses) !=
+                compute_r2_recovery_transcript_digest(recover_begin,
+                                                     changed_witnesses),
+            "R2 recovery transcript omitted witness identity bytes");
 }
 
 void test_key_layout() {
