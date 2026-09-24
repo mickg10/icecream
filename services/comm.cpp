@@ -2388,7 +2388,8 @@ void MsgChannel::p50_promote_flushed_fd_request() noexcept
 
 bool MsgChannel::p50_clean_release_boundary() const noexcept
 {
-    return fd >= 0 && protocol == PROTOCOL_VERSION && !eof &&
+    return fd >= 0 &&
+           protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 && !eof &&
            instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
            pending_frame_ends.empty();
 }
@@ -2644,7 +2645,7 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
         }
         break;
     case Msg::CACHE_SESSION:
-        if (protocol == PROTOCOL_VERSION) {
+        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
             m = new CacheSessionMsg;
         }
         break;
@@ -2654,27 +2655,27 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
         }
         break;
     case Msg::P50_SOURCE_ARM:
-        if (protocol == PROTOCOL_VERSION) {
+        if (protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1) {
             m = new P50SourceArmMsg;
         }
         break;
     case Msg::P50_SOURCE_ARMED:
-        if (protocol == PROTOCOL_VERSION) {
+        if (protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1) {
             m = new P50SourceArmedMsg;
         }
         break;
     case Msg::P50_CACHE_SESSION_CLAIM:
-        if (protocol == PROTOCOL_VERSION) {
+        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
             m = new P50CacheSessionClaimMsg;
         }
         break;
     case Msg::P50_CACHE_SESSION_OUTCOME:
-        if (protocol == PROTOCOL_VERSION) {
+        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
             m = new P50CacheSessionOutcomeMsg;
         }
         break;
     case Msg::P50_CACHE_SESSION_FD_REQUEST:
-        if (protocol == PROTOCOL_VERSION) {
+        if (protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1) {
             m = new P50CacheSessionFdRequestMsg;
         }
         break;
@@ -2733,7 +2734,8 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
        after this return, so retain that one frame until the binding occurs. */
     const uint64_t frame_bytes =
         inmsglen + (text_based ? 0 : sizeof(uint32_t));
-    if (type == Msg::COMPILE_FILE && protocol >= PROTOCOL_VERSION &&
+    if (type == Msg::COMPILE_FILE &&
+        protocol >= PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
         p50_legacy_wire_role == P50LegacyWireRole::F) {
         P50LegacyWireIdentity identity;
         const auto *compile = dynamic_cast<const CompileFileMsg *>(m);
@@ -3076,7 +3078,8 @@ int MsgChannel::release_fd_if_input_empty()
        do not call read_a_bit(): a failed handoff must leave an early CacheWire
        byte, or a partial/complete ordinary frame, exactly where the legacy
        parser left it. */
-    if (!cache_session_release_armed || fd < 0 || protocol != PROTOCOL_VERSION
+    if (!cache_session_release_armed || fd < 0 ||
+        protocol != PROTOCOL_VERSION_P50_CACHE_SESSION_R1
         || eof || instate == ERROR || instate != NEED_LEN
         || inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty()) {
         return -1;
@@ -3206,7 +3209,8 @@ int MsgChannel::release_fd_after_cache_session_ready(
        closes it, but it can never reinterpret later bytes as a fresh READY. */
     const bool armed = cache_session_send_release_armed;
     cache_session_send_release_armed = false;
-    if (!armed || fd < 0 || protocol != PROTOCOL_VERSION || eof ||
+    if (!armed || fd < 0 ||
+        protocol != PROTOCOL_VERSION_P50_CACHE_SESSION_R1 || eof ||
         instate == ERROR || instate != NEED_LEN || inofs != intogo ||
         msgtogo != 0 || !pending_frame_ends.empty() ||
         !receive_cache_session_ready(fd, deadline))
@@ -4320,7 +4324,8 @@ P50CacheFdReplyTicket MsgChannel::take_p50_cache_fd_reply_ticket(
     const P50CacheSessionFdRequestMsg &request) noexcept
 {
     const bool ready = !p50_fd_reply_arm_consumed &&
-        p50_fd_request_ready && protocol == PROTOCOL_VERSION &&
+        p50_fd_request_ready &&
+        protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 &&
         !eof && instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
         pending_frame_ends.empty() && framesFlushed() == framesQueued() &&
         request.valid_payload() && request.request == p50_last_fd_request;
@@ -4347,7 +4352,8 @@ bool MsgChannel::send_p50_cache_fd_reply(
         ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
         ticket.outbound_frame_sequence_ == framesQueued() &&
         ticket.outbound_frame_sequence_ == framesFlushed() &&
-        protocol == PROTOCOL_VERSION && !eof && instate == NEED_LEN &&
+        protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 && !eof &&
+        instate == NEED_LEN &&
         inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
         control_identity.valid();
     ticket.invalidate();
@@ -4436,7 +4442,8 @@ int MsgChannel::receive_p50_cache_fd_reply(
         p50_fd_receive_frame_sequence != 0 &&
         p50_fd_receive_frame_sequence == framesFlushed() &&
         p50_armed_fd_request == expected && fd >= 0 &&
-        protocol == PROTOCOL_VERSION && !eof && instate == NEED_LEN &&
+        protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1 && !eof &&
+        instate == NEED_LEN &&
         inofs == intogo && msgtogo == 0 && pending_frame_ends.empty() &&
         expected.valid();
     if (!ready) {

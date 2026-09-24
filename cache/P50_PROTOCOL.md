@@ -19,6 +19,16 @@ These version numbers are independent. The old codec v0 fixtures are not
 deployable CacheWire revision-1 profiles. Ordinary legacy FileChunk compression
 also remains separate from the cache profiles.
 
+The implemented ordinary bridge is pinned to protocol 50 by named
+`PROTOCOL_VERSION_P50_SOURCE_ARM_R1` and
+`PROTOCOL_VERSION_P50_CACHE_SESSION_R1` gates. In particular, CACHE_SESSION
+release/READY and the one-TU socket transition are exact-50 operations, not
+`>= 50` features: raising the ordinary protocol maximum alone must never make
+an R1 endpoint accept a persistent successor. By contrast, assignment identity
+is a version-50 feature threshold and remains valid on later ordinary versions.
+The cache-advertisement fields described below are the existing v50 prefix;
+they do not advertise a later CacheWire revision or persistent-link support.
+
 C means the submitting cache role and F the fulfilling cache role; S is the
 scheduler. A TU is one exact preprocessed translation unit. A compiler attempt
 is not a cache transaction: one committed TU may support a replacement attempt.

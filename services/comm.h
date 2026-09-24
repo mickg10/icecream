@@ -72,6 +72,14 @@
    already strict this way and needed no change. */
 #define PROTOCOL_VERSION_CACHE_ADVERTISEMENT 50
 
+/* CacheWire R1 and its ordinary CACHE_SESSION/source-arm bridge are pinned
+   to the exact protocol-50 draft. Keep these gates independent from
+   PROTOCOL_VERSION: protocol 51 must not silently reinterpret a one-TU R1
+   socket as persistent. These aliases are intentionally 50 until a fully
+   negotiated R2 path is implemented. */
+#define PROTOCOL_VERSION_P50_SOURCE_ARM_R1 50
+#define PROTOCOL_VERSION_P50_CACHE_SESSION_R1 50
+
 #define MAX_SCHEDULER_PONG 3
 // MAX_SCHEDULER_PING must be multiple of MAX_SCHEDULER_PONG
 #define MAX_SCHEDULER_PING 12 * MAX_SCHEDULER_PONG
@@ -567,7 +575,8 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 /* CacheWire has a revision space independent of the ordinary Icecream link.
    Revision 1 is the first deployable shape; ordinary peers still negotiate
    Icecream protocol 50 before these fields are present. */
-inline constexpr uint32_t CACHE_WIRE_REVISION = 1;
+inline constexpr uint32_t CACHE_WIRE_REVISION_R1 = 1;
+inline constexpr uint32_t CACHE_WIRE_REVISION = CACHE_WIRE_REVISION_R1;
 
 /* Raw four-byte transition witness sent by the F sidecar only after it has
    accepted ownership of the detached ordinary socket.  This is not an
@@ -588,7 +597,7 @@ inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 64;
 bool send_cache_session_ready(
     int fd, std::chrono::steady_clock::time_point deadline) noexcept;
 
-/* Registry values are scoped to CACHE_WIRE_REVISION. */
+/* Registry values are scoped to a CacheWire revision. */
 inline constexpr uint32_t CACHE_PROFILE_P29V1 = (UINT32_C(1) << 0);
 inline constexpr uint32_t CACHE_PROFILE_ZSTD_TU = (UINT32_C(1) << 1);
 inline constexpr uint32_t CACHE_PROFILE_ZSTD_ROUTE = (UINT32_C(1) << 2);
@@ -651,7 +660,7 @@ inline bool p50_cache_client_request_is_valid(
             protocol, profile_mask, affinity_profile_mask, affinity_port,
             affinity_host))
         return true;
-    if (protocol != CACHE_WIRE_REVISION || profile_mask == 0 ||
+    if (protocol != CACHE_WIRE_REVISION_R1 || profile_mask == 0 ||
         (profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0 ||
         (affinity_profile_mask & ~profile_mask) != 0 ||
         affinity_port > UINT16_MAX ||
@@ -674,7 +683,7 @@ inline P50CacheClientCapability p50_cache_client_capability_from_mode(
         return {};
     if (mode != nullptr && std::string_view(mode) != "on")
         return {};
-    return {CACHE_WIRE_REVISION, CACHE_ADVERTISABLE_PROFILE_MASK};
+    return {CACHE_WIRE_REVISION_R1, CACHE_ADVERTISABLE_PROFILE_MASK};
 }
 
 inline P50CacheClientCapability p50_cache_client_capability_from_env(
@@ -756,8 +765,8 @@ inline constexpr uint32_t p50_select_pair_cache_profile(
     uint32_t server_protocol, uint32_t server_profiles,
     P50CacheProfileRequest request) noexcept
 {
-    if (client_protocol != CACHE_WIRE_REVISION ||
-        server_protocol != CACHE_WIRE_REVISION ||
+    if (client_protocol != CACHE_WIRE_REVISION_R1 ||
+        server_protocol != CACHE_WIRE_REVISION_R1 ||
         client_profiles == 0 || server_profiles == 0 ||
         (client_profiles & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0 ||
         (server_profiles & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0)
@@ -889,7 +898,7 @@ inline bool cache_advertisement_is_valid_present(uint32_t port,
 {
     return cache_advertisement_is_well_formed_present(port, protocol,
                                                        profile_mask)
-        && protocol == CACHE_WIRE_REVISION;
+        && protocol == CACHE_WIRE_REVISION_R1;
 }
 
 inline bool cache_assignment_is_valid_present(uint32_t port,
@@ -1548,7 +1557,7 @@ public:
 
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION;
+        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
     }
 };
 
@@ -1567,7 +1576,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION;
+        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
     }
 
     std::vector<uint8_t> wire;
@@ -1591,7 +1600,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION;
+        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
     }
 
     std::vector<uint8_t> wire;
@@ -1635,7 +1644,7 @@ struct P50SourceArmFields {
                selected_f_ordinary_port <= UINT16_MAX &&
                selected_f_cache_port != 0 &&
                selected_f_cache_port <= UINT16_MAX &&
-               cache_protocol == CACHE_WIRE_REVISION &&
+               cache_protocol == CACHE_WIRE_REVISION_R1 &&
                p50_source_profile_mode_valid(cache_profile, source_mode) &&
                logical_job != 0 &&
                compiler_attempt != 0 && c_store_generation != 0 &&
@@ -1664,7 +1673,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION;
+        return negotiated_protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1;
     }
 
     P50SourceArmFields arm;
@@ -1691,7 +1700,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION;
+        return negotiated_protocol == PROTOCOL_VERSION_P50_CACHE_SESSION_R1;
     }
 
     P50CacheSessionFdRequestFields request;
@@ -1770,7 +1779,7 @@ public:
     bool valid_payload() const override;
     bool valid_for_protocol(int negotiated_protocol) const override
     {
-        return negotiated_protocol == PROTOCOL_VERSION;
+        return negotiated_protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1;
     }
 
     [[nodiscard]] bool acknowledges(const P50SourceArmMsg &request) const noexcept

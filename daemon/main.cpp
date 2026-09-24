@@ -8661,7 +8661,8 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     }
 
     client->job = job;
-    if (!job->usesP50Input() && client->channel->protocol >= PROTOCOL_VERSION) {
+    if (!job->usesP50Input() &&
+        client->channel->protocol >= PROTOCOL_VERSION_ASSIGNMENT_IDENTITY) {
         trace() << "legacy CompileFile admitted canonical input for job "
                 << job->jobID() << " epoch " << job->assignmentEpoch()
                 << " nonce " << job->assignmentNonce() << " c_guid "

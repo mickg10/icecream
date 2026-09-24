@@ -22,6 +22,7 @@
 #include <sys/un.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -397,6 +398,49 @@ void test_rejects_malformed_and_legacy()
             "armed ACK is refused on legacy Protocol 49");
 }
 
+void test_r1_private_messages_do_not_extend_to_protocol_51()
+{
+    static_assert(PROTOCOL_VERSION == 50,
+                  "R2 negotiation is not part of the C0 protocol-version bump");
+    static_assert(PROTOCOL_VERSION_P50_SOURCE_ARM_R1 == 50);
+    static_assert(PROTOCOL_VERSION_P50_CACHE_SESSION_R1 == 50);
+    const P50SourceArmMsg request(arm());
+    const auto request_wire = encode_frame(request, PROTOCOL_VERSION);
+    const auto reply_wire = encode_frame(armed(request.arm), PROTOCOL_VERSION);
+    REQUIRE(!request_wire.empty() && !reply_wire.empty(),
+            "Protocol-50 R1 ARM and ARMED fixtures remain available");
+
+    Pair future_request_pair = make_pair(PROTOCOL_VERSION + 1);
+    REQUIRE(!future_request_pair.left->send_msg(request),
+            "R1 SOURCE_ARM is not enabled by a manually selected Protocol 51 channel");
+    unsigned char unexpected = 0;
+    errno = 0;
+    const ssize_t request_bytes = ::recv(future_request_pair.right->fd,
+                                         &unexpected, sizeof(unexpected),
+                                         MSG_DONTWAIT);
+    REQUIRE(request_bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
+            "Protocol-51 SOURCE_ARM rejection emits no frame bytes");
+
+    Pair future_reply_pair = make_pair(PROTOCOL_VERSION + 1);
+    REQUIRE(!future_reply_pair.left->send_msg(armed(request.arm)),
+            "R1 SOURCE_ARMED is not enabled by a manually selected Protocol 51 channel");
+    errno = 0;
+    const ssize_t reply_bytes = ::recv(future_reply_pair.right->fd,
+                                       &unexpected, sizeof(unexpected),
+                                       MSG_DONTWAIT);
+    REQUIRE(reply_bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
+            "Protocol-51 SOURCE_ARMED rejection emits no frame bytes");
+
+    Msg *future_request = decode_frame(request_wire, PROTOCOL_VERSION + 1);
+    REQUIRE(future_request == nullptr,
+            "Protocol-51 decoder does not accept a Protocol-50 R1 SOURCE_ARM");
+    delete future_request;
+    Msg *future_reply = decode_frame(reply_wire, PROTOCOL_VERSION + 1);
+    REQUIRE(future_reply == nullptr,
+            "Protocol-51 decoder does not accept a Protocol-50 R1 SOURCE_ARMED");
+    delete future_reply;
+}
+
 void test_ack_conflict()
 {
     const P50SourceArmMsg request(arm());
@@ -471,6 +515,7 @@ int main()
 {
     test_roundtrip_and_exact_echo();
     test_rejects_malformed_and_legacy();
+    test_r1_private_messages_do_not_extend_to_protocol_51();
     test_ack_conflict();
     return failures == 0 ? 0 : 1;
 }

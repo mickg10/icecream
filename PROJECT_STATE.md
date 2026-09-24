@@ -12,6 +12,36 @@ retained artifact directories.
 
 ## Developer QA
 
+### Persistent-link implementation in progress
+
+The annotated tag `sorbet_1.5_pipeline_plan` freezes the detailed C/D plan at
+`6dfd606de89bd60abb9315b398b53df37c878640`; the tag is pushed and its remote
+target was verified. It is a plan checkpoint, not a W30 release.
+
+Luna lanes are implementing product changes, focused tests and the bounded
+recovery model; primary owns architecture and review. First comes the named
+version-gate audit and minimal wire definitions, followed by a complete opt-in
+persistent W1 path. Original-compiler-socket ARM cannot be enabled while the
+sidecar still depends on re-arming its separate R1 connection: job binding and
+the persistent endpoint therefore share one feature-enable gate. Keep current
+R1 behavior and withhold R2 advertisement until that vertical path works.
+Recovery precedes W2–W30. No new C/D passing evidence exists yet; the Stage A
+results below do not qualify these changes. No Chromium build/download has
+been started for this implementation step.
+
+The first version-gate audit preserves ordinary maximum 50 and existing R1
+bytes. Focused `p50sourcearmwire`, `p50cachesessionwire`,
+`p50cacheadvertisement` and the source-arm source guard passed in 92.50s;
+the affected communication library and linked tests were rebuilt. Evidence:
+`/tanksmall/scratch/tmp/p50-stageA-C0C1-20260924.ZJvsRb/tmp/c0-replay.log`
+(SHA256 `9babd192070d127c64e4190567875e019354acfd6478839ad224def699a8f3b4`).
+This is a focused compatibility gate, not a daemon/client build, full QA or
+persistent-link test. An earlier make-check attempt failed because read-only
+source staging tried to regenerate build files; direct targets and the source
+guard subsequently passed. On actual protocol-51 enablement, legacy R1 must
+remain explicitly selectable; interim exact-50 guards are not a permanent
+prohibition against the planned new-peer legacy path.
+
 ### Independent-link pipeline candidate
 
 `sorbet_1.5_pipeline` is a candidate, not a release or a new S* farm

@@ -1206,7 +1206,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                         << identity->tu_seq << endl;
             } else {
                 job.clearCompileInputIdentity();
-                if (cserver->protocol >= PROTOCOL_VERSION) {
+                if (cserver->protocol >= PROTOCOL_VERSION_ASSIGNMENT_IDENTITY) {
                     bool local_legacy_wire_identity = false;
                     if (!job.hasCompileIdentity()) {
                         local_legacy_wire_identity =
@@ -1412,7 +1412,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             }
         }
 
-        if (!p50_input && cserver->protocol >= PROTOCOL_VERSION &&
+        if (!p50_input &&
+            cserver->protocol >= PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
             !cserver->p50_legacy_wire_complete()) {
             throw client_error(
                 108, "Error 108 - legacy wire witness did not reach completion");

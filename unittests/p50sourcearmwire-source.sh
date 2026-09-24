@@ -12,6 +12,10 @@ for file in "$header" "$impl" "$identity" "$makefile" "$test"; do
 done
 
 for needle in \
+    '#define PROTOCOL_VERSION 50' \
+    'inline constexpr uint32_t CACHE_WIRE_REVISION_R1 = 1;' \
+    '#define PROTOCOL_VERSION_P50_SOURCE_ARM_R1 50' \
+    '#define PROTOCOL_VERSION_P50_CACHE_SESSION_R1 50' \
     'P50_SOURCE_ARM = 0x50f00010' \
     'P50_SOURCE_ARMED = 0x50f00011' \
     'wire_job_id' 'assignment_epoch' 'assignment_nonce' \
@@ -33,7 +37,7 @@ for needle in \
     'kStoreIdentityFileRole' 'store_identity_guid_valid_for_role' \
     'store_identity_file_guid_matches_client' \
     'read_bounded_string' 'current_message_bytes_remaining() != 0' \
-    'negotiated_protocol == PROTOCOL_VERSION' \
+    'negotiated_protocol == PROTOCOL_VERSION_P50_SOURCE_ARM_R1' \
     'if (!valid_payload())'; do
     grep -F "$needle" "$header" "$impl" "$identity" >/dev/null
 done
@@ -45,6 +49,8 @@ grep -F 'truncated capability tail' "$test" >/dev/null
 grep -F 'zero attempt capability is refused before framing' "$test" >/dev/null
 grep -F 'equal attempt capabilities are refused before framing' "$test" >/dev/null
 grep -F 'Protocol 49' "$test" >/dev/null
+grep -F 'Protocol 51' "$test" >/dev/null
+grep -F 'Protocol-51 decoder' "$test" >/dev/null
 grep -F 'WIRE-AUDIT three-bucket classification' "$test" >/dev/null
 grep -F 'stable Protocol-50 fixture bytes' "$test" >/dev/null
 grep -F 'independent F sidecar StoreIdentity root is accepted' "$test" >/dev/null
