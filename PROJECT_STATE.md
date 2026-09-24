@@ -104,6 +104,27 @@ in the subsequent full runs; its cause remains unresolved and bounded failure
 diagnostics are retained. This does not qualify repeated shared-link failures,
 service integration, cancellation/expiry, or process restart behavior.
 
+The sender also passes the full suite with repeated shared-link
+loss for 2 and 30 callers across all three profiles: the original COMMIT
+reply and then RESET_ACK are lost; a third connection replays the exact reset
+and finishes the retained suffix. Each input is published once and cumulative
+ACK reaches the final ordinal. This is not a second failure after a fully
+confirmed reset. Retirement checks cover stopping recovery without another
+connection and preserving an already validated positive commit, including
+exact replay and rejection of conflicting input.
+Evidence: `/tanksmall/scratch/tmp/p51-retire-final-freeze-GuhC4u/logs/build-and-full-sender3.log`
+(SHA256 `2496323fdb73f2fec83a8642f1b805433acfacc5e0dc84d6ed5266f05b59cd29`),
+exit 0 in 94.33 seconds; freshly linked binary SHA256
+`40a70201ded065de7cff6e2d795ded27c0055d468e0a3c009e21abdc9e6f992d`.
+The build records matching source hashes before and after execution. Earlier
+attempts with unretained test source or failed builds followed by execution
+of a copied binary are not qualification evidence for these changes.
+The preceding diagnostic run timed out (exit 124). The recovery fixture now
+posts retirement to the sender owner and waits for server completion before
+stopping its event loop; previously it could wait forever on a future whose
+executor had already stopped. This does not resolve the separately recorded
+first-bundle timeout or qualify process restarts and real-daemon integration.
+
 The P51 source-control codec now restores the ARM identity before validating
 ARMED metadata and accepts a selected window from 1 through the offered
 window. Focused request/reply round trips pass for offer 30 with selections

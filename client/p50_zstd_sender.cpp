@@ -701,6 +701,16 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                 }
             }
         }
+        if (receipt_validated &&
+            impl_->config.after_r2_receipt_validated_for_test) {
+            try {
+                impl_->config.after_r2_receipt_validated_for_test(
+                    pending->sent.binding.relationship_ordinal);
+            } catch (...) {
+                // A test observation must not rewrite an already validated
+                // positive receipt into a transport failure.
+            }
+        }
         pending->notification.expires_at(Clock::now());
         for (const auto& timer : wake_window) {
             boost::system::error_code ignored;
@@ -720,7 +730,6 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
         }
     }
 }
-
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
 #pragma GCC diagnostic pop
 #endif
@@ -770,7 +779,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
             const uint64_t confirmed_floor =
                 impl_->endpoint->r2_confirmed_prefix();
             std::lock_guard lock(impl_->r2_transfer_mutex);
-            if (impl_->r2_physical_link_generation == physical_link_generation &&
+            if (!impl_->route_replacement_required &&
+                impl_->r2_physical_link_generation == physical_link_generation &&
                 impl_->r2_ack_pump_generation == physical_link_generation) {
                 impl_->r2_recovery_required = true;
                 impl_->r2_failed_physical_generation =
@@ -814,7 +824,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
 boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     AsyncConnectedFdFactory connection, uint64_t requested_generation,
     Clock::time_point deadline) {
-    if (!impl_->r2_recovery_required || !impl_->r2_hello || !connection ||
+    if (impl_->route_replacement_required ||
+        !impl_->r2_recovery_required || !impl_->r2_hello || !connection ||
         deadline <= Clock::now())
         throw std::logic_error("R2 recovery has no retained link context");
     if (impl_->r2_reader_running || impl_->r2_ack_pump_running)
@@ -881,6 +892,10 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     const int fd = co_await await_connected_fd(connection, deadline);
     if (fd < 0)
         throw std::runtime_error("R2 recovery connector failed");
+    if (impl_->route_replacement_required) {
+        (void)::close(fd);
+        throw boost::system::system_error(boost::asio::error::operation_aborted);
+    }
     const auto executor = co_await boost::asio::this_coro::executor;
     boost::system::error_code socket_error;
     auto socket = P50ClientEndpoint::adopt_connected_fd(
@@ -1168,6 +1183,13 @@ P50ZstdSourceSender::transfer_p51_route(
         armed.arm.source.assignment_epoch != request.producer_session ||
         armed.arm.source.assignment_nonce != request.request_token)
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    const Digest128 raw_digest = digest128(source);
+    try {
+        if (const auto completed = impl_->completed_for(request, source, raw_digest))
+            co_return *completed;
+    } catch (...) {
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    }
     {
         std::lock_guard lock(impl_->r2_transfer_mutex);
         // A request key can have only one live owner. In particular, do not
@@ -1241,13 +1263,6 @@ P50ZstdSourceSender::transfer_p51_route(
         if (Clock::now() >= deadline)
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     }
-    const Digest128 raw_digest = digest128(source);
-    try {
-        if (const auto completed = impl_->completed_for(request, source, raw_digest))
-            co_return *completed;
-    } catch (...) {
-        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
-    }
     if (impl_->route_replacement_required)
         co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
     if (impl_->completed.size() >= impl_->config.max_completed_requests)
@@ -1306,6 +1321,7 @@ P50ZstdSourceSender::transfer_p51_route(
     std::shared_ptr<Impl::PendingReceipt> pending;
     bool bundle_complete = false;
     bool recovery_needed = false;
+    bool exact_commit_preserved = false;
     uint64_t observed_failure_generation = 0;
     try {
         if (impl_->route_replacement_required)
@@ -1451,22 +1467,26 @@ P50ZstdSourceSender::transfer_p51_route(
               // Exact TX_COMMIT was already validated and accepted. Failure
               // to return flow-control credit quarantines this link until the
               // same retained relationship is reconciled by RESET.
-              impl_->r2_recovery_required = true;
-              impl_->r2_failed_physical_generation =
-                  impl_->r2_physical_link_generation;
-              impl_->r2_recovery_floor =
-                  impl_->endpoint->r2_confirmed_prefix();
-              impl_->route_transport_quarantined = true;
-              if (impl_->r2_socket) {
-                  boost::system::error_code ignored;
-                  impl_->r2_socket->close(ignored);
+              if (!impl_->route_replacement_required) {
+                  impl_->r2_recovery_required = true;
+                  impl_->r2_failed_physical_generation =
+                      impl_->r2_physical_link_generation;
+                  impl_->r2_recovery_floor =
+                      impl_->endpoint->r2_confirmed_prefix();
+                  impl_->route_transport_quarantined = true;
+                  if (impl_->r2_socket) {
+                      boost::system::error_code ignored;
+                      impl_->r2_socket->close(ignored);
+                  }
               }
           }
       }
       if (impl_->r2_recovery_required && Clock::now() < deadline &&
+          !impl_->route_replacement_required &&
           co_await acquire_r2_writer(deadline)) {
           Impl::R2TransferGuard recovery_guard(impl_.get());
-          while (impl_->r2_recovery_required && Clock::now() < deadline) {
+          while (impl_->r2_recovery_required && Clock::now() < deadline &&
+                 !impl_->route_replacement_required) {
               bool recovered = false;
               try {
                   co_await recover_r2_link(connection,
@@ -1503,6 +1523,14 @@ P50ZstdSourceSender::transfer_p51_route(
         co_return result;
     } catch (...) {
         const std::exception_ptr transfer_failure = std::current_exception();
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            exact_commit_preserved = pending && pending->done &&
+                !pending->failure &&
+                pending->client_result.status == ClientRunStatus::Committed &&
+                pending->client_result.committed_commit.has_value();
+        }
+        if (!exact_commit_preserved) {
         const uint64_t error_generation = observed_failure_generation != 0
             ? observed_failure_generation
             : (pending && pending->sent.binding.physical_link_generation != 0
@@ -1583,6 +1611,21 @@ P50ZstdSourceSender::transfer_p51_route(
         recovery_needed = pending && has_staged_witness &&
             impl_->r2_physical_link_generation == error_generation;
         }
+        }
+    }
+
+    if (exact_commit_preserved) {
+        ZstdSourceTransferResult result;
+        result.status = ZstdSourceTransferStatus::Committed;
+        result.profile = pending->sent.binding.profile;
+        result.committed_input = pending->client_result.committed_input;
+        result.raw_bytes = pending->sent.binding.raw_bytes;
+        result.raw_digest = pending->sent.binding.raw_digest;
+        result.attempts = 1;
+        result.system_source_reuse = pending->system_source_reuse;
+        if (!pending->replayed_after_reset)
+            impl_->remember_completed(request, source, raw_digest, result);
+        co_return result;
     }
 
     if (recovery_needed) {
@@ -1618,6 +1661,8 @@ P50ZstdSourceSender::transfer_p51_route(
                     pending->ready = false;
                 }
             }
+            if (impl_->route_replacement_required)
+                break;
             if (Clock::now() >= deadline)
                 break;
 
@@ -1627,6 +1672,8 @@ P50ZstdSourceSender::transfer_p51_route(
                 recovery_required = impl_->r2_recovery_required;
             }
             if (recovery_required) {
+                if (impl_->route_replacement_required)
+                    break;
                 if (!co_await acquire_r2_writer(deadline))
                     break;
                 writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
@@ -1637,6 +1684,10 @@ P50ZstdSourceSender::transfer_p51_route(
                 if (!recovery_required) {
                     writer_guard.reset();
                     continue;
+                }
+                if (impl_->route_replacement_required) {
+                    writer_guard.reset();
+                    break;
                 }
                 bool recovered = false;
                 try {
@@ -1653,14 +1704,16 @@ P50ZstdSourceSender::transfer_p51_route(
                             pending->client_result.status ==
                                 ClientRunStatus::Committed &&
                             pending->client_result.committed_commit.has_value();
-                        if (!positive_commit) {
+                        if (!positive_commit &&
+                            !impl_->route_replacement_required) {
                             impl_->r2_recovery_required = true;
                             impl_->r2_failed_physical_generation =
                                 impl_->r2_physical_link_generation;
                             impl_->route_transport_quarantined = true;
                         }
                     }
-                    if (!positive_commit && impl_->r2_socket) {
+                    if (!positive_commit && !impl_->route_replacement_required &&
+                        impl_->r2_socket) {
                         boost::system::error_code ignored;
                         impl_->r2_socket->close(ignored);
                     }
@@ -1670,6 +1723,8 @@ P50ZstdSourceSender::transfer_p51_route(
                 // physical failure.
                 writer_guard.reset();
                 if (!recovered && Clock::now() < deadline) {
+                    if (impl_->route_replacement_required)
+                        break;
                     boost::asio::steady_timer retry_pause(executor);
                     retry_pause.expires_at(std::min(
                         deadline, Clock::now() + std::chrono::milliseconds(5)));

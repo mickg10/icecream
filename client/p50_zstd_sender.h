@@ -98,6 +98,9 @@ struct ZstdSourceTransferConfig {
     // Test-only observation after the complete R2 TU bundle is on the socket;
     // it does not participate in admission or receipt handling.
     std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
+    // Test-only observation after the independent reader validated the exact
+    // cumulative receipt, before waking callers or starting ACK output.
+    std::function<void(uint64_t)> after_r2_receipt_validated_for_test;
     // Deterministic fault seam: after a complete bundle is on the wire, the
     // callback may request a transport close before the independent receipt
     // reader begins. Product callers leave this empty.

@@ -630,13 +630,16 @@ sender_r2_accept_shared_failure(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
     std::atomic<unsigned>& bundles_sent,
     size_t bundles_required, std::mutex& gate_mutex,
-    std::condition_variable& gate_cv) {
-    std::vector<ServerRunResult> results(2);
+    std::condition_variable& gate_cv, bool repeat_recovery_loss,
+    bool retire_after_positive_receipt) {
+    const size_t connection_count = repeat_recovery_loss ? 3
+        : retire_after_positive_receipt ? 1 : 2;
+    std::vector<ServerRunResult> results(connection_count);
     for (size_t index = 0; index != results.size(); ++index) {
         tcp::socket socket(co_await acceptor.async_accept(asio::use_awaitable));
         socket.set_option(tcp::socket::receive_buffer_size(4096));
         EndpointIoControl control;
-        if (index == 0) {
+        if (index == 0 && !retire_after_positive_receipt) {
             control.close_before_write = MessageType::R2_TX_COMMIT;
             control.before_materialize_on_worker = [&] {
                 std::unique_lock lock(gate_mutex);
@@ -647,6 +650,8 @@ sender_r2_accept_shared_failure(
                     throw std::runtime_error(
                         "second caller did not send before first receipt loss");
             };
+        } else if (index == 1 && repeat_recovery_loss) {
+            control.close_before_write = MessageType::RESET_ACK;
         }
         results[index] = co_await endpoint.run_adopted_r2(
             std::move(socket), std::move(control));
@@ -825,6 +830,7 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
         authority, route, PrepareRequestKey{3, 100}, sender_config);
 
     asio::io_context c_context;
+    auto c_work = asio::make_work_guard(c_context);
     const tcp::endpoint remote = acceptor.local_endpoint();
     std::atomic<unsigned> connector_calls{0};
     AsyncConnectedFdFactory connector = [&](auto, auto completion) {
@@ -952,7 +958,17 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     }
     CHECK(acknowledged.load(std::memory_order_acquire) == kJobs);
     CHECK(connector_calls.load(std::memory_order_relaxed) == 1);
-    sender->retire_for_replacement();
+    std::promise<void> retirement_posted;
+    auto retirement_done = retirement_posted.get_future();
+    asio::post(c_context, [&sender, &retirement_posted] {
+        sender->retire_for_replacement();
+        retirement_posted.set_value();
+    });
+    CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
+    CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
+    c_work.reset();
     c_context.stop();
     c_thread.join();
     const ServerRunResult server_result = server_future.get();
@@ -963,7 +979,8 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     }
 }
 
-void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
+void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
+                                  bool retire_during_recovery = false) {
     const auto [c_guid, f_guid] = sender_r2_store_guids();
     const Id128 relationship_id = Id128::from_u64(0x5102);
     P51SourceArmFields source_arm = sender_r2_arm(
@@ -990,6 +1007,10 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
     std::atomic<unsigned> consumed{0};
     std::atomic<unsigned> resets{0};
     std::atomic<unsigned> input_selectors{0};
+    std::mutex recovery_gate_mutex;
+    std::condition_variable recovery_gate_cv;
+    bool recovery_waiting = false;
+    bool release_recovery = false;
     std::optional<ResetRequest> retained_reset;
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
@@ -1104,6 +1125,12 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
             (committed_before_recovery && !commit) ||
             (!committed_before_recovery && commit.has_value()))
             return std::nullopt;
+        if (retire_during_recovery) {
+            std::unique_lock lock(recovery_gate_mutex);
+            recovery_waiting = true;
+            recovery_gate_cv.notify_all();
+            recovery_gate_cv.wait(lock, [&] { return release_recovery; });
+        }
         P51RecoveryReceiptInterval interval;
         const uint64_t committed_prefix = committed_before_recovery ? 1 : 0;
         if (commit) {
@@ -1179,10 +1206,24 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
     auto server_future = asio::co_spawn(
         f_context,
         sender_r2_accept_recovery_with_lost_reset_ack(
-            acceptor, server, repeat_interrupted_materialization ? 4 : 3,
+            acceptor, server,
+            retire_during_recovery ? 2 :
+                (repeat_interrupted_materialization ? 4 : 3),
             repeat_interrupted_materialization ? 2 : 0),
         asio::use_future);
     std::thread f_thread([&] { f_context.run(); });
+    struct RecoveryThreadCleanup {
+        asio::io_context& c_context;
+        asio::io_context& f_context;
+        std::thread& c_thread;
+        std::thread& f_thread;
+        ~RecoveryThreadCleanup() {
+            c_context.stop();
+            f_context.stop();
+            if (c_thread.joinable()) c_thread.join();
+            if (f_thread.joinable()) f_thread.join();
+        }
+    };
 
     PreparationAuthorityLimits limits;
     limits.max_speculative_tus = 2;
@@ -1229,6 +1270,8 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
         completion(connect_fd(remote));
     };
     std::thread c_thread([&] { c_context.run(); });
+    RecoveryThreadCleanup thread_cleanup{
+        c_context, f_context, c_thread, f_thread};
     const auto source_deadline = sender_config.deadline;
     const auto invoke = [&] {
         return asio::co_spawn(c_context,
@@ -1236,7 +1279,55 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
                 PrepareRequestKey{3, 901}, source_deadline, source),
             asio::use_future);
     };
-    const ZstdSourceTransferResult recovered = invoke().get();
+    std::future<ZstdSourceTransferResult> transfer = invoke();
+    if (retire_during_recovery) {
+        {
+            std::unique_lock lock(recovery_gate_mutex);
+            CHECK(recovery_gate_cv.wait_for(lock, std::chrono::seconds(10), [&] {
+                return recovery_waiting;
+            }));
+        }
+        std::promise<void> retirement_posted;
+        auto retirement_done = retirement_posted.get_future();
+        asio::post(c_context, [&sender, &retirement_posted] {
+            sender->retire_for_replacement();
+            retirement_posted.set_value();
+        });
+        CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        {
+            std::lock_guard lock(recovery_gate_mutex);
+            release_recovery = true;
+        }
+        recovery_gate_cv.notify_all();
+    }
+    std::cerr << "P51_RECOVERY_TRANSFER_WAIT repeated_abort="
+              << repeat_interrupted_materialization
+              << " retire=" << retire_during_recovery << "\n";
+    const ZstdSourceTransferResult recovered = transfer.get();
+    std::cerr << "P51_RECOVERY_TRANSFER_DONE status="
+              << static_cast<unsigned>(recovered.status)
+              << " connectors=" << connector_calls.load()
+              << " repeated_abort=" << repeat_interrupted_materialization
+              << " retire=" << retire_during_recovery << "\n";
+    if (retire_during_recovery) {
+        CHECK(recovered.status == ZstdSourceTransferStatus::Unavailable);
+        CHECK(connector_calls.load() == 3);
+        CHECK(resets.load() <= 1);
+        CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        c_work.reset();
+        c_context.stop();
+        c_thread.join();
+        f_context.stop();
+        f_thread.join();
+        const auto server_runs = server_future.get();
+        CHECK(server_runs.size() == 2);
+        CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
+        CHECK(server_runs[1].status == ServerRunStatus::Disconnected);
+        std::cerr << "P51_SENDER_RETIRE_DURING_RECOVERY PASS\n";
+        return;
+    }
     if (recovered.status != ZstdSourceTransferStatus::Committed)
         throw std::runtime_error(std::string("recovery status=") +
             std::to_string(static_cast<unsigned>(recovered.status)) +
@@ -1259,7 +1350,18 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization) {
           (repeat_interrupted_materialization ? 3U : 1U));
     CHECK(resets.load() == (repeat_interrupted_materialization ? 2U : 1U));
 
-    sender->retire_for_replacement();
+    std::promise<void> retirement_posted;
+    auto retirement_done = retirement_posted.get_future();
+    asio::post(c_context, [&sender, &retirement_posted] {
+        sender->retire_for_replacement();
+        retirement_posted.set_value();
+    });
+    CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
+    std::cerr << "P51_RECOVERY_SERVER_WAIT repeated_abort="
+              << repeat_interrupted_materialization << "\n";
+    CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
     c_work.reset();
     c_context.stop();
     c_thread.join();
@@ -1277,8 +1379,10 @@ void test_p51_sender_recovers_lost_commit_reply_after_connector_failure() {
     run_p51_sender_recovery_case(true);
 }
 
-void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
-    CHECK(kJobs >= 2 && kJobs <= 30);
+void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
+                                        bool repeat_recovery_loss = false,
+                                        bool retire_after_positive_receipt = false) {
+    CHECK(kJobs >= 1 && kJobs <= 30);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
                                     : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
@@ -1382,11 +1486,18 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
         }
         P51SourceLinkLease lease;
         lease.initial_armed = armed[0];
-        lease.initial_armed.relationship_epoch = hello.relationship_epoch;
         lease.absolute_deadline = deadline;
         lease.reconnect = hello.start_mode == LinkStartMode::Reconnect;
-        lease.relationship_epoch = hello.relationship_epoch;
-        lease.history_nonce = hello.history_nonce;
+        // A lost RESET_ACK leaves the next physical HELLO at the original
+        // epoch/nonce, while F's active codec history already reflects RESET.
+        // Return that authoritative active state for the exact replay.
+        lease.relationship_epoch = retained_reset
+            ? retained_reset->new_relationship_epoch
+            : hello.relationship_epoch;
+        lease.initial_armed.relationship_epoch = lease.relationship_epoch;
+        lease.history_nonce = retained_reset
+            ? retained_reset->new_history_nonce
+            : hello.history_nonce;
         if (lease.reconnect) {
             lease.committed_prefix_k = 1;
             lease.acknowledged_prefix_q = 0;
@@ -1553,6 +1664,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
 
     P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
                              std::move(server_config));
+    std::shared_ptr<P50ZstdSourceSender> sender;
     asio::io_context f_context;
     tcp::acceptor acceptor(f_context, {asio::ip::address_v4::loopback(), 0});
     asio::io_context c_context;
@@ -1572,7 +1684,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
     } cleanup{c_context, f_context, c_thread, f_thread};
     auto server_future = asio::co_spawn(
         f_context, sender_r2_accept_shared_failure(
-            acceptor, server, bundles_sent, kJobs, gate_mutex, gate_cv),
+            acceptor, server, bundles_sent, kJobs, gate_mutex, gate_cv,
+            repeat_recovery_loss, retire_after_positive_receipt),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -1598,7 +1711,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
         bundles_sent.fetch_add(1, std::memory_order_release);
         gate_cv.notify_all();
     };
-    auto sender = std::make_shared<P50ZstdSourceSender>(
+    if (retire_after_positive_receipt) {
+        sender_config.after_r2_receipt_validated_for_test =
+            [&sender](uint64_t ordinal) {
+                if (ordinal == 1)
+                    sender->retire_for_replacement();
+            };
+    }
+    sender = std::make_shared<P50ZstdSourceSender>(
         authority, route, PrepareRequestKey{3, 921}, sender_config);
 
     const tcp::endpoint remote = acceptor.local_endpoint();
@@ -1633,6 +1753,24 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
                InputRecordKey{c_guid, TuSeq{index}}));
         CHECK(outcomes[index].raw_digest == icecc::digest128(input[index]));
     }
+    if (retire_after_positive_receipt) {
+        auto duplicate = asio::co_spawn(c_context,
+            sender->transfer_p51_route(
+                armed[0], 41, connector, PrepareRequestKey{3, 921},
+                deadline.as_steady_time_point(), input[0]),
+            asio::use_future).get();
+        CHECK(duplicate.status == ZstdSourceTransferStatus::Committed);
+        CHECK(duplicate.raw_digest == icecc::digest128(input[0]));
+        std::vector<uint8_t> conflicting = input[0];
+        conflicting.push_back(0x7f);
+        auto rejected = asio::co_spawn(c_context,
+            sender->transfer_p51_route(
+                armed[0], 41, connector, PrepareRequestKey{3, 921},
+                deadline.as_steady_time_point(), std::move(conflicting)),
+            asio::use_future).get();
+        CHECK(rejected.status == ZstdSourceTransferStatus::InvalidRequest);
+        CHECK(connector_calls.load() == 1);
+    }
     CHECK(bundles_sent.load() == kJobs); // all original callers were in flight
     std::cerr << "P51_SENDER_SHARED_FAILURE_COUNTS sent=" << bundles_sent.load()
               << " selected=" << input_selections.load()
@@ -1643,7 +1781,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
               << " commits=" << commits[0].load() << ".."
               << commits[kJobs - 1].load()
               << " ack=" << acknowledged.load()
-              << " connectors=" << connector_calls.load() << "\n";
+              << " connectors=" << connector_calls.load()
+              << " repeated_loss=" << repeat_recovery_loss << "\n";
     CHECK(input_selections.load() == kJobs);
     CHECK(input_mismatches.load() == 0);
     CHECK(materialized.load() == kJobs);
@@ -1656,8 +1795,10 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
                std::chrono::steady_clock::now() < deadline.as_steady_time_point())
             ack_cv.wait_until(lock, deadline.as_steady_time_point());
     }
-    CHECK(acknowledged.load() == kJobs);
-    CHECK(connector_calls.load() == 2); // one shared reconnect, no late reconnect
+    CHECK(acknowledged.load() == (retire_after_positive_receipt ? 0U
+                                                                  : kJobs));
+    CHECK(connector_calls.load() == (retire_after_positive_receipt ? 1U
+        : repeat_recovery_loss ? 3U : 2U));
     CHECK(binds[0].load() == 1);
     for (size_t index = 1; index != kJobs; ++index)
         CHECK(binds[index].load() == 1); // uncommitted suffix binds after reset
@@ -1681,13 +1822,18 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
     f_context.stop();
     c_thread.join();
     f_thread.join();
-    CHECK(server_runs.size() == 2);
+    CHECK(server_runs.size() == (repeat_recovery_loss ? 3U
+        : retire_after_positive_receipt ? 1U : 2U));
     CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
-    CHECK(server_runs[1].status == ServerRunStatus::Disconnected);
+    if (server_runs.size() > 1)
+        CHECK(server_runs[1].status == ServerRunStatus::Disconnected);
+    if (server_runs.size() > 2)
+        CHECK(server_runs[2].status == ServerRunStatus::Disconnected);
     std::cerr << "P51_SENDER_SHARED_FAILURE profile=" << profile_name
               << " callers=" << kJobs
               << " initial_sent=" << kJobs
               << " replayed_suffix=" << (kJobs - 1)
+              << " repeated_loss=" << repeat_recovery_loss
               << " recovered_prefix=1 PASS\n";
 }
 
@@ -1697,6 +1843,20 @@ void test_p51_sender_shared_failure_recovers_pending_callers() {
         run_p51_sender_shared_failure_case(2, profile);
         run_p51_sender_shared_failure_case(30, profile);
     }
+}
+
+void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        run_p51_sender_shared_failure_case(2, profile, true);
+        run_p51_sender_shared_failure_case(30, profile, true);
+    }
+}
+
+void test_p51_sender_retirement_during_recovery() {
+    run_p51_sender_recovery_case(false, true);
+    run_p51_sender_shared_failure_case(
+        1, ProfileId::ZSTD_TU, false, true);
 }
 
 void test_route_failure_requires_cold_replacement() {
@@ -2076,21 +2236,40 @@ int main(int argc, char** argv) {
         std::cerr << "P51_SENDER_SHARED_FAILURE_ROUTE30_SELECTOR PASS\n";
         return 0;
     }
-    test_exact_network_transfer();
-    test_route_sender_reuses_relationship_for_two_transfers();
-    test_route_completed_ledger_releases_live_entry();
-    test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
-    test_p51_sender_recovers_lost_commit_reply_after_connector_failure();
-    test_p51_sender_shared_failure_recovers_pending_callers();
-    test_route_failure_requires_cold_replacement();
-    test_explicit_route_operations_bind_request_and_deadline();
-    test_explicit_route_retry_is_bounded_then_replaced();
-    test_owned_fd_and_fail_closed_validation();
-    test_owned_fd_release_transfers_single_ownership();
-    test_adopted_fd_factory_exact_transfer();
-    test_async_fd_factory_exact_transfer();
-    test_async_fd_factory_late_and_throwing_completion_close_fds();
-    test_absolute_deadline_is_required();
-    test_disconnected_retry_is_bounded_and_exactly_once();
-    test_factory_cannot_extend_absolute_deadline();
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--repeated-shared-failure") {
+        test_p51_sender_repeated_shared_failure_recovers_pending_callers();
+        std::cerr << "P51_SENDER_REPEATED_SHARED_FAILURE_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--retire-during-recovery") {
+        test_p51_sender_retirement_during_recovery();
+        std::cerr << "P51_SENDER_RETIRE_DURING_RECOVERY_SELECTOR PASS\n";
+        return 0;
+    }
+    const auto run = [](const char* name, auto test) {
+        std::cerr << "P51_TEST_BEGIN " << name << "\n";
+        test();
+        std::cerr << "P51_TEST_END " << name << "\n";
+    };
+    run("exact_network", test_exact_network_transfer);
+    run("route_reuse", test_route_sender_reuses_relationship_for_two_transfers);
+    run("route_ledger", test_route_completed_ledger_releases_live_entry);
+    run("w30_profiles", test_p51_sender_w30_concurrent_callers_refill_and_duplicate);
+    run("lost_commit_recovery", test_p51_sender_recovers_lost_commit_reply_after_connector_failure);
+    run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
+    run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
+    run("retirement", test_p51_sender_retirement_during_recovery);
+    run("cold_replacement", test_route_failure_requires_cold_replacement);
+    run("explicit_route", test_explicit_route_operations_bind_request_and_deadline);
+    run("explicit_retry", test_explicit_route_retry_is_bounded_then_replaced);
+    run("owned_fd", test_owned_fd_and_fail_closed_validation);
+    run("owned_fd_release", test_owned_fd_release_transfers_single_ownership);
+    run("adopted_fd", test_adopted_fd_factory_exact_transfer);
+    run("async_fd", test_async_fd_factory_exact_transfer);
+    run("async_fd_late", test_async_fd_factory_late_and_throwing_completion_close_fds);
+    run("deadline_required", test_absolute_deadline_is_required);
+    run("disconnected_retry", test_disconnected_retry_is_bounded_and_exactly_once);
+    run("deadline_not_extended", test_factory_cannot_extend_absolute_deadline);
 }
