@@ -203,9 +203,32 @@ The standard daemon runner also passes default, pending-disconnect, P51
 cancellation/replacement and one-job vertical modes:
 `logs/run-daemon-standard-direct-r1.log`
 (SHA256 `d43259eed25ae938a10663e598df5480420a0ff275ba95cf51da025f6a06b9e2`).
-These runs retain the pinned pre-retirement sender core described above;
-combined qualification with the newer sender remains required. Allocation
-failure in orphaned-ARM retention was reviewed but not directly injected.
+These runs retain the pinned pre-retirement sender core described above.
+Allocation failure in orphaned-ARM retention was reviewed but not directly
+injected.
+
+A fresh Git archive of combined commit `b1790ab1` subsequently passes the
+full sender suite, service suite, and explicit three-profile real-daemon W30
+target. Its generated build helpers were recreated with `autogen.sh` before
+the successful build. Evidence under
+`/tanksmall/scratch/tmp/p51-b1790-qa.1w2Xvi/logs/`:
+`run-sender-service-r1.log`
+(SHA256 `1bdee288b20d6c9bb0cbecf0663010098d435082dc9ab156638eb97c4a31be38`)
+and `run-w30-target-r1.log`
+(SHA256 `001c3bd76ae1bf1e3d32721f24ea16cd847a9c5561cd14c527f408ece4c4865b`),
+both exit 0. The standard daemon runner has not yet been rerun on that exact
+combined commit.
+
+Continuation handoff: the three Luna agents stopped with usage-limit errors.
+No task test container remained running at the final check. Uncommitted work
+is limited to `unittests/p51wrappercompile-run.sh` and
+`unittests/p50compilee2e-source.sh`; actual-wrapper success is not established.
+The wrapper scratch roots start with `/tanksmall/scratch/tmp/p51-wrapper-w31`.
+Real C/F process-restart coverage was identified as missing but no restart
+test patch was completed. Next: finish actual-wrapper 31-job object comparison,
+standard daemon rerun on the combined commit, real C/F/S restart gates, and
+mixed-version qualification. Do not count same-process socket recovery as a
+process-restart test.
 
 A separate coherent integration snapshot passes 55 native P50 targets,
 including ordinary 43/49/50/51, R1/R2 and profile-selection boundary tests:
