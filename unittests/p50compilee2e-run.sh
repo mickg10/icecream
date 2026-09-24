@@ -455,7 +455,11 @@ for row in rows:
                 compile_source != source or not isinstance(compile_output, str) or
                 not os.path.isabs(compile_output)):
             raise SystemExit("batch compile source/output binding invalid")
-    print("\t".join((tu, source, source_relative, actual, predictive["path"], predictive["source_relative"], payload_sha, str(payload_bytes), db, db_sha, compile_source, compile_output)))
+    # `read` below treats tab as IFS whitespace, which collapses adjacent
+    # delimiters.  Keep optional columns nonempty so an absent compile-database
+    # binding cannot shift the source path into the database field.
+    compile_binding = (db, db_sha, compile_source, compile_output) if db else ("-", "-", "-", "-")
+    print("\t".join((tu, source, source_relative, actual, predictive["path"], predictive["source_relative"], payload_sha, str(payload_bytes), *compile_binding)))
     seen.add(tu)
 PY
     batch_expected_count=${ICECC_P50_C1F1_EXPECTED_COUNT:-}
@@ -1650,6 +1654,20 @@ if test -n "$batch_manifest"; then
         job_pids=""
         batch_job_pids=""
         while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_db_sha item_source item_output; do
+            if test "$item_db" = "-"; then
+                test "$item_db_sha" = "-" && test "$item_source" = "-" && \
+                    test "$item_output" = "-" || {
+                    echo "FAIL: batch compile binding has partial empty-column sentinels ($run_label-$ordinal)" >&2
+                    exit 1
+                }
+                item_db= item_db_sha= item_source= item_output=
+            else
+                test "$item_db_sha" != "-" && test "$item_source" != "-" && \
+                    test "$item_output" != "-" || {
+                    echo "FAIL: batch compile binding has a partial sentinel row ($run_label-$ordinal)" >&2
+                    exit 1
+                }
+            fi
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3

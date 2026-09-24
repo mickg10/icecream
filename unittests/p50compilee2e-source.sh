@@ -54,11 +54,17 @@ contract() {
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_TIMEOUT' || return 1
     require_text "$root/daemon/workit.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/client/remote.cpp" 'job.setCompileInputIdentity(*identity)' || return 1
-    # The real C production caller leases the already authenticated sidecar
-    # descriptor from the live local daemon relationship, then starts exactly
-    # one source-transfer control operation without a second HELLO.
+    # Both deployed cache revisions stay wired through the actual wrapper:
+    # R1 retains its one-shot FD request; opt-in R2 performs the P51 lease and
+    # ARM on the original compiler channel before its bounded kind-8 transfer.
     require_text "$root/client/remote.cpp" 'P50CacheSessionFdRequestMsg(fd_request)' || return 1
     require_text "$root/client/remote.cpp" 'receive_p50_cache_fd_reply' || return 1
+    require_text "$root/client/remote.cpp" 'P51SourceLeaseRequestMsg(lease_request)' || return 1
+    require_text "$root/client/remote.cpp" 'receive_p51_cache_fd_reply' || return 1
+    require_text "$root/client/remote.cpp" 'P51SourceArmMsg arm_message' || return 1
+    require_text "$root/client/remote.cpp" 'P51SourceTransferRequest transfer_request' || return 1
+    require_text "$root/client/remote.cpp" 'make_p51_source_transfer_operation' || return 1
+    require_text "$root/client/remote.cpp" 'transfer_p51_source(' || return 1
     require_text "$root/client/remote.cpp" 'begin_authenticated' || return 1
     require_text "$root/client/remote.cpp" 'make_source_transfer_operation' || return 1
     require_text "$root/client/remote.cpp" 'source.release()' || return 1
@@ -70,7 +76,6 @@ contract() {
     done
     if grep -F 'P50ZstdSourceSender sender' "$root/client/remote.cpp" >/dev/null ||
        grep -F 'begin_p50_client_transfer' "$root/client/remote.cpp" >/dev/null ||
-       grep -F 'P50SourceArmFields' "$root/client/remote.cpp" >/dev/null ||
        grep -F 'make_hello' "$root/client/remote.cpp" >/dev/null; then
         return 1
     fi
@@ -137,6 +142,14 @@ contract() {
         '--cache-service "$build/cache/icecc-cache-service"' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" \
         '--cache-runtime-dir "$work/cache-runtime-c"' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'compile_binding = (db, db_sha, compile_source, compile_output) if db else ("-", "-", "-", "-")' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'batch compile binding has partial empty-column sentinels' || return 1
+    require_text "$root/unittests/p51wrappercompile-run.sh" \
+        'measured_offset=$(cat "$work/f-measured-log-offset-0")' || return 1
+    require_text "$root/unittests/p51wrappercompile-run.sh" \
+        'P51 cache-link descriptor adopted by sidecar' || return 1
 }
 
 # Keep primitive P50 evidence visible in this test. These assertions prevent
@@ -155,6 +168,35 @@ done
 
 if ! contract "$src"; then
     say_skip "daemon/client compiler integration is still a hard prerequisite"
+fi
+
+# The batch TSV is read with tab in IFS, where adjacent empty columns collapse.
+# Exercise the exact nonempty sentinel contract for no binding, a complete
+# binding, and malformed partially-empty rows before relying on the runner.
+decode_optional_binding() {
+    row=$1
+    IFS="$(printf '\t')" read -r db db_sha binding_source binding_output <<EOF
+$row
+EOF
+    if test "$db" = "-"; then
+        test "$db_sha" = "-" && test "$binding_source" = "-" && \
+            test "$binding_output" = "-"
+    else
+        test "$db_sha" != "-" && test "$binding_source" != "-" && \
+            test "$binding_output" != "-"
+    fi
+}
+decode_optional_binding "-$(printf '\t')-$(printf '\t')-$(printf '\t')-" || {
+    echo "FAIL: empty optional compile binding shifted TSV columns" >&2
+    exit 1
+}
+decode_optional_binding "db.json$(printf '\t')abc123$(printf '\t')src.cpp$(printf '\t')out.o" || {
+    echo "FAIL: complete optional compile binding rejected" >&2
+    exit 1
+}
+if decode_optional_binding "db.json$(printf '\t')-$(printf '\t')src.cpp$(printf '\t')-"; then
+    echo "FAIL: partially empty optional compile binding survived" >&2
+    exit 1
 fi
 
 # Every production edge above is deletion-sensitive. Remove each required
@@ -181,6 +223,10 @@ for pair in \
     "daemon/workit.cpp|ICECC_P50_C1F1_REQUIRED" \
     "client/remote.cpp|job.setCompileInputIdentity(*identity)" \
     "client/remote.cpp|P50CacheSessionFdRequestMsg(fd_request)" \
+    "client/remote.cpp|P51SourceLeaseRequestMsg(lease_request)" \
+    "client/remote.cpp|receive_p51_cache_fd_reply" \
+    "client/remote.cpp|P51SourceArmMsg arm_message" \
+    "client/remote.cpp|make_p51_source_transfer_operation" \
     "client/remote.cpp|receive_p50_cache_fd_reply" \
     "client/remote.cpp|begin_authenticated" \
     "client/remote.cpp|make_source_transfer_operation" \

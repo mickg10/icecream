@@ -257,20 +257,33 @@ The daemon, service and fixture binaries are unchanged from the final standard
 runner. These are small-input concurrency tests, not throughput measurements
 or proof of process-restart recovery.
 
-Continuation handoff: the three Luna agents temporarily stopped with
-usage-limit errors, then resumed on retry. Actual-wrapper success is not
-established; its script and source-contract update remain under development.
-The wrapper scratch roots start with `/tanksmall/scratch/tmp/p51-wrapper-w31`.
-The retained r3 run fails before compilation: both daemon sidecar lifecycles
-enter DegradedLegacy before launch. The generated private runtime path is
-112 characters before adding `/cache.sock`, exceeding the Unix socket path
-limit of 107. The harness is being rerun with a shorter container mount alias,
-still backed by host scratch storage; the daemon-account warning is not the
-cause. A C1F2/F-cache and C2F1/C-cache process-restart fixture is being written
-and reviewed; it is not yet qualified. Next: finish actual-wrapper 31-job object comparison,
-standard daemon rerun on the combined commit, real C/F/S restart gates, and
-mixed-version qualification. Do not count same-process socket recovery as a
-process-restart test.
+The actual wrapper now passes 31 sequential remote compilations for each of
+P29V1, ZSTD_TU and ZSTD_ROUTE, with byte-identical local/remote objects and one
+persistent data link per measured batch. Environment warmup and deliberate
+pre-batch sidecar rotations are excluded from that connection count.
+The harness uses short container paths backed by host scratch storage and
+preserves empty optional compile-database columns with explicit TSV sentinels;
+shell whitespace collapsing previously misread a source file as a database.
+Evidence: `/tanksmall/scratch/tmp/p51-wrapper-rerun3.log` (exit 0, SHA256
+`461efdd7131395e1f24c38353d6169bf30b8c75a9755caf25825a9b2b8d09909`).
+Per-profile logs, offsets and corpus are retained in
+`/tanksmall/scratch/tmp/p51-wrapper-rerun.9klM9c/evidence-31/`.
+The coherent test snapshot includes the combined integration/cancellation
+changes and private diagnostic logging. Client/daemon/service binary SHA256:
+`cdf21ff1ef1767595a00815de301f4ede2d77d68198d77d65240ae6acb950361`,
+`967a582c54a40079d927abd1d1fac74d416af7da0c353f21493ce6f6070aaedb`,
+`007c22e2f6aa206dc8bed5c5fd81b2fadc02d28de66a19b26adcdfdf449e3fac`.
+This proves sequential link reuse, not 30 simultaneous wrapper invocations;
+the separate receipt gate proves W30 concurrency. C01's 2/100-job cells and
+the opt-in Make entry point remain in progress.
+
+Real C1F2/F-cache and C2F1/C-cache restart fixtures are not yet qualified.
+The F-cache restart case exposed excessive retries of the obsolete F identity;
+bounded shared retry backoff and typed R2 rejection are being investigated.
+Fresh replacement attachment still needs diagnosis. The observed cancellation
+withdrawal refers to the dead old incarnation, not its successor. Next: finish
+wrapper C01, real C/F/S restart gates, and mixed-version qualification. Do not
+count same-process socket recovery as a process-restart test.
 
 A separate coherent integration snapshot passes 55 native P50 targets,
 including ordinary 43/49/50/51, R1/R2 and profile-selection boundary tests:
