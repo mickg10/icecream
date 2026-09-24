@@ -2988,20 +2988,27 @@ bool DaemonSidecarAdapter::outer_advance_input(
         result_status == InputLifecycleStatus::ReplacementInstalledRecordRetained ||
         result_status == InputLifecycleStatus::JobClosedRecordRetained ||
         result_status == InputLifecycleStatus::JobClosedRecordReclaimed;
-    /* UnknownRecord on CancelAttempt or close of an absent lease row is a
-       transport/idempotency outcome (e.g. a client teardown before route
-       commit), not proof that the store incarnation is compromised.  It
-       must not trigger a sidecar replacement.  Timeout and Disconnected stay
-       relationship-fatal: retrying an op whose outcome is unknown needs
-       idempotence proofs the protocol does not provide. */
-    const bool transient =
-        result_status == InputLifecycleStatus::UnknownRecord;
+    /* UnknownRecord on CancelAttempt or CloseAcceptedJob is a benign
+       idempotency outcome: the lease row was never created (e.g. a client
+       teardown before route commit) or already collected.  It is not proof
+       of store corruption and must not trigger a sidecar replacement.
+       For every other action, UnknownRecord means the daemon and sidecar
+       disagree about state and stays relationship-fatal.  Timeout and
+       Disconnected stay relationship-fatal in all cases. */
+    const bool transient_unknown =
+        result_status == InputLifecycleStatus::UnknownRecord &&
+        (request.action == InputLifecycleAction::CancelAttempt ||
+         request.action == InputLifecycleAction::CloseAcceptedJob);
     if (success && !remember_completed_input_lifecycle(request)) {
         retire_input_lifecycle_relationship(AdapterError::InputLifecycleCapacity);
     } else if (success && !pending_input_lifecycle_.empty() &&
                pending_input_lifecycle_.front() == request) {
         pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
-    } else if (!success && !transient && !relationship_failure_routed) {
+    } else if (transient_unknown && !pending_input_lifecycle_.empty() &&
+               pending_input_lifecycle_.front() == request) {
+        /* Treat as done: erase from the queue so later ops advance. */
+        pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
+    } else if (!success && !transient_unknown && !relationship_failure_routed) {
         // Stale/mismatched identity, a rejected replay, and every malformed
         // semantic result retire the current incarnation.  There is no
         // second input-specific cleanup/retry path; the lifecycle reducer
