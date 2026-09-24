@@ -201,6 +201,7 @@ struct P50ZstdSourceSender::Impl {
         ClientRunResult client_result{};
         std::optional<bool> system_source_reuse;
         std::exception_ptr failure;
+        uint64_t failure_physical_link_generation = 0;
         bool replayed_after_reset = false;
         bool ready = false;
         bool done = false;
@@ -433,7 +434,9 @@ struct P50ZstdSourceSender::Impl {
     std::map<uint64_t, std::shared_ptr<PendingReceipt>> r2_retained_jobs;
     std::set<PrepareRequestKey> r2_active_requests;
     bool r2_reader_running = false;
+    uint64_t r2_reader_generation = 0;
     bool r2_ack_pump_running = false;
+    uint64_t r2_ack_pump_generation = 0;
     uint64_t r2_pending_ack_ordinal = 0;
     uint64_t r2_retained_raw_bytes = 0;
     uint64_t r2_physical_link_generation = 0;
@@ -533,7 +536,8 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
     co_return false;
 }
 
-boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
+boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
+    uint64_t physical_link_generation) {
     const auto executor = co_await boost::asio::this_coro::executor;
     if (impl_->config.hold_r2_receipt_reader_for_test) {
         boost::asio::steady_timer test_gate(executor);
@@ -549,6 +553,9 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
         bool wait_for_bundle = false;
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_physical_link_generation != physical_link_generation ||
+                impl_->r2_reader_generation != physical_link_generation)
+                co_return;
             if (impl_->r2_receipt_queue.empty()) {
                 impl_->r2_reader_running = false;
                 co_return;
@@ -568,14 +575,26 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
         }
 
         bool receipt_validated = false;
+        ClientRunResult read_result;
+        std::exception_ptr read_failure;
         try {
-            if (!impl_->r2_socket)
+            if (!impl_->r2_socket ||
+                impl_->r2_physical_link_generation != physical_link_generation)
                 throw std::logic_error("R2 receipt reader lost its live socket");
-            pending->client_result = co_await impl_->endpoint->read_r2_receipt(
+            read_result = co_await impl_->endpoint->read_r2_receipt(
                 *impl_->r2_socket, pending->sent, pending->deadline);
-            if (pending->client_result.status != ClientRunStatus::Committed ||
-                !pending->client_result.committed_commit)
+            {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                if (impl_->r2_physical_link_generation != physical_link_generation ||
+                    impl_->r2_reader_generation != physical_link_generation ||
+                    impl_->r2_receipt_queue.empty() ||
+                    impl_->r2_receipt_queue.front() != pending)
+                    co_return;
+            }
+            if (read_result.status != ClientRunStatus::Committed ||
+                !read_result.committed_commit)
                 throw std::invalid_argument("R2 receipt was not an exact commit");
+            pending->client_result = std::move(read_result);
             if (pending->sent.binding.profile == ProfileId::P29V1)
                 pending->system_source_reuse =
                     impl_->authority->p29v1_system_source_reuse(
@@ -600,13 +619,20 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
             }
             receipt_validated = true;
         } catch (...) {
-            pending->failure = std::current_exception();
+            read_failure = std::current_exception();
         }
 
         std::vector<std::shared_ptr<boost::asio::steady_timer>> wake_window;
         bool start_ack_pump = false;
+        const bool is_current_generation =
+            impl_->r2_physical_link_generation == physical_link_generation;
         if (receipt_validated) {
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (!is_current_generation ||
+                impl_->r2_reader_generation != physical_link_generation ||
+                impl_->r2_receipt_queue.empty() ||
+                impl_->r2_receipt_queue.front() != pending)
+                co_return;
             impl_->r2_retained_jobs.erase(
                 pending->sent.binding.relationship_ordinal);
             impl_->r2_pending_ack_ordinal = std::max(
@@ -614,27 +640,42 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
                 pending->sent.binding.relationship_ordinal);
             if (!impl_->r2_ack_pump_running) {
                 impl_->r2_ack_pump_running = true;
+                impl_->r2_ack_pump_generation = physical_link_generation;
                 start_ack_pump = true;
             }
             wake_window.swap(impl_->r2_window_waiters);
         } else {
-            impl_->r2_recovery_required = true;
-            impl_->r2_failed_physical_generation =
-                pending->sent.binding.physical_link_generation;
-            impl_->r2_recovery_floor =
+            const uint64_t confirmed_floor =
                 impl_->endpoint->r2_confirmed_prefix();
-            impl_->route_transport_quarantined = true;
-            if (impl_->r2_socket) {
-                boost::system::error_code ignored;
-                impl_->r2_socket->close(ignored);
-            }
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (!is_current_generation ||
+                impl_->r2_physical_link_generation != physical_link_generation ||
+                impl_->r2_reader_generation != physical_link_generation ||
+                impl_->r2_receipt_queue.empty() ||
+                impl_->r2_receipt_queue.front() != pending)
+                co_return;
+            pending->failure = std::move(read_failure);
+            pending->failure_physical_link_generation = physical_link_generation;
+            if (impl_->r2_physical_link_generation == physical_link_generation) {
+                impl_->r2_recovery_required = true;
+                impl_->r2_failed_physical_generation =
+                    physical_link_generation;
+                impl_->r2_recovery_floor = confirmed_floor;
+                impl_->route_transport_quarantined = true;
+                if (impl_->r2_socket) {
+                    boost::system::error_code ignored;
+                    impl_->r2_socket->close(ignored);
+                }
+            }
             wake_window.swap(impl_->r2_window_waiters);
         }
 
         std::vector<std::shared_ptr<Impl::PendingReceipt>> failed_rows;
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_reader_generation != physical_link_generation ||
+                impl_->r2_physical_link_generation != physical_link_generation)
+                co_return;
             if (!impl_->r2_receipt_queue.empty() &&
                 impl_->r2_receipt_queue.front() == pending)
                 impl_->r2_receipt_queue.pop_front();
@@ -646,6 +687,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
                 impl_->r2_reader_running = false;
                 for (const auto& row : failed_rows) {
                     row->failure = pending->failure;
+                    row->failure_physical_link_generation =
+                        physical_link_generation;
                     row->done = true;
                 }
             }
@@ -658,7 +701,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
         if (start_ack_pump) {
             auto keepalive = shared_from_this();
             boost::asio::co_spawn(
-                executor, run_r2_ack_pump(),
+                executor, run_r2_ack_pump(physical_link_generation),
                 [keepalive = std::move(keepalive)](std::exception_ptr) {});
         }
         if (!receipt_validated) {
@@ -670,43 +713,73 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
     }
 }
 
-boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump() {
+boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
+    uint64_t physical_link_generation) {
     for (;;) {
         uint64_t target = 0;
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
             target = impl_->r2_pending_ack_ordinal;
-            if (target == 0) {
-                impl_->r2_ack_pump_running = false;
+        if (target == 0) {
+                if (impl_->r2_ack_pump_generation == physical_link_generation)
+                    impl_->r2_ack_pump_running = false;
                 co_return;
             }
+        }
+        if (impl_->r2_physical_link_generation != physical_link_generation ||
+            impl_->r2_ack_pump_generation != physical_link_generation) {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_ack_pump_generation == physical_link_generation)
+                impl_->r2_ack_pump_running = false;
+            co_return;
         }
         const auto deadline = Clock::now() + impl_->config.maximum_duration;
         try {
             if (!co_await acquire_r2_writer(deadline))
                 throw boost::system::system_error(boost::asio::error::timed_out);
             Impl::R2TransferGuard writer_guard(impl_.get());
+            {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                if (impl_->r2_physical_link_generation != physical_link_generation ||
+                    impl_->r2_ack_pump_generation != physical_link_generation)
+                    co_return;
+            }
             if (!impl_->r2_socket || !impl_->r2_socket->is_open())
                 throw std::logic_error("R2 ACK pump lost its physical link");
             co_await impl_->endpoint->flush_r2_ack(
                 *impl_->r2_socket, deadline);
-        } catch (...) {
-            impl_->r2_recovery_required = true;
-            impl_->r2_failed_physical_generation =
-                impl_->r2_physical_link_generation;
-            impl_->r2_recovery_floor =
-                impl_->endpoint->r2_confirmed_prefix();
-            impl_->route_transport_quarantined = true;
-            if (impl_->r2_socket) {
-                boost::system::error_code ignored;
-                impl_->r2_socket->close(ignored);
+            {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                if (impl_->r2_physical_link_generation != physical_link_generation ||
+                    impl_->r2_ack_pump_generation != physical_link_generation)
+                    co_return;
             }
+        } catch (...) {
+            const uint64_t confirmed_floor =
+                impl_->endpoint->r2_confirmed_prefix();
             std::lock_guard lock(impl_->r2_transfer_mutex);
-            impl_->r2_ack_pump_running = false;
+            if (impl_->r2_physical_link_generation == physical_link_generation &&
+                impl_->r2_ack_pump_generation == physical_link_generation) {
+                impl_->r2_recovery_required = true;
+                impl_->r2_failed_physical_generation =
+                    physical_link_generation;
+                impl_->r2_recovery_floor = confirmed_floor;
+                impl_->route_transport_quarantined = true;
+                if (impl_->r2_socket) {
+                    boost::system::error_code ignored;
+                    impl_->r2_socket->close(ignored);
+                }
+            }
+            if (impl_->r2_ack_pump_generation == physical_link_generation)
+                impl_->r2_ack_pump_running = false;
             co_return;
         }
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_physical_link_generation != physical_link_generation ||
+                impl_->r2_ack_pump_generation != physical_link_generation) {
+                co_return;
+            }
             if (impl_->r2_pending_ack_ordinal <= target)
                 impl_->r2_pending_ack_ordinal = 0;
         }
@@ -903,6 +976,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
             *impl_->r2_socket, binding, old_witness.prepared,
             pending->deadline);
         pending->failure = nullptr;
+        pending->failure_physical_link_generation = 0;
         pending->done = false;
         pending->ready = true;
         pending->replayed_after_reset = true;
@@ -912,6 +986,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
             impl_->r2_receipt_queue.push_back(pending);
             if (!impl_->r2_reader_running) {
                 impl_->r2_reader_running = true;
+                impl_->r2_reader_generation = physical_generation;
                 reader_started = true;
             }
         }
@@ -922,7 +997,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
             // rebuilding the bounded suffix. ACK output remains queued behind
             // this transfer's writer permit, so frames cannot interleave.
             auto keepalive = shared_from_this();
-            boost::asio::co_spawn(executor, run_r2_receipt_reader(),
+            boost::asio::co_spawn(
+                executor, run_r2_receipt_reader(physical_generation),
                 [keepalive = std::move(keepalive)](std::exception_ptr) {});
             reader_started = false;
         }
@@ -1218,6 +1294,7 @@ P50ZstdSourceSender::transfer_p51_route(
     std::shared_ptr<Impl::PendingReceipt> pending;
     bool bundle_complete = false;
     bool recovery_needed = false;
+    uint64_t observed_failure_generation = 0;
     try {
         if (impl_->route_replacement_required)
             throw std::runtime_error("R2 link is quarantined");
@@ -1303,6 +1380,8 @@ P50ZstdSourceSender::transfer_p51_route(
             pending->ready = true;
             if (!impl_->r2_reader_running) {
                 impl_->r2_reader_running = true;
+                impl_->r2_reader_generation =
+                    pending->sent.binding.physical_link_generation;
                 start_reader = true;
             }
         }
@@ -1311,7 +1390,9 @@ P50ZstdSourceSender::transfer_p51_route(
         if (start_reader) {
             auto keepalive = shared_from_this();
             boost::asio::co_spawn(
-                executor, run_r2_receipt_reader(),
+                executor,
+                run_r2_receipt_reader(
+                    pending->sent.binding.physical_link_generation),
                 [keepalive = std::move(keepalive)](std::exception_ptr) {});
         }
 
@@ -1332,8 +1413,16 @@ P50ZstdSourceSender::transfer_p51_route(
                   throw boost::system::system_error(boost::asio::error::timed_out);
           }
       }
-      if (pending->failure)
-            std::rethrow_exception(pending->failure);
+      std::exception_ptr observed_failure;
+      {
+          std::lock_guard lock(impl_->r2_transfer_mutex);
+          observed_failure = pending->failure;
+          if (observed_failure)
+              observed_failure_generation =
+                  pending->failure_physical_link_generation;
+      }
+      if (observed_failure)
+          std::rethrow_exception(observed_failure);
       if (pending->client_result.status != ClientRunStatus::Committed ||
           !pending->client_result.committed_commit)
           throw std::invalid_argument("R2 receipt was not an exact commit");
@@ -1401,6 +1490,25 @@ P50ZstdSourceSender::transfer_p51_route(
             impl_->remember_completed(request, source, raw_digest, result);
         co_return result;
     } catch (...) {
+        const std::exception_ptr transfer_failure = std::current_exception();
+        const uint64_t error_generation = observed_failure_generation != 0
+            ? observed_failure_generation
+            : (pending && pending->sent.binding.physical_link_generation != 0
+                   ? pending->sent.binding.physical_link_generation
+                   : physical_link_generation);
+        bool stale_generation = false;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            stale_generation =
+                impl_->r2_physical_link_generation != error_generation;
+        }
+        if (stale_generation && pending) {
+            // Another caller already advanced this relationship to a newer
+            // physical link. This waiter's old socket error must not remove,
+            // reset, or release the shared pending row. Join it after leaving
+            // this handler, since coroutine awaits are not legal in a catch.
+            recovery_needed = true;
+        } else {
         bool has_staged_witness = pending && bundle_complete;
         if (pending && !bundle_complete && impl_->r2_socket) {
             try {
@@ -1421,7 +1529,7 @@ P50ZstdSourceSender::transfer_p51_route(
             if (pending->sent.binding.relationship_ordinal != 0)
                 impl_->r2_retained_jobs.erase(
                     pending->sent.binding.relationship_ordinal);
-            pending->failure = std::current_exception();
+            pending->failure = transfer_failure;
             pending->done = true;
             pending->notification.expires_at(Clock::now());
         }
@@ -1445,17 +1553,24 @@ P50ZstdSourceSender::transfer_p51_route(
                 }
             } catch (...) {}
         }
-        impl_->r2_recovery_required = true;
-        impl_->r2_failed_physical_generation =
-            impl_->r2_physical_link_generation;
-        impl_->r2_recovery_floor =
+        const uint64_t confirmed_floor =
             impl_->endpoint->r2_confirmed_prefix();
-        impl_->route_transport_quarantined = true;
-        if (impl_->r2_socket) {
-            boost::system::error_code ignored;
-            impl_->r2_socket->close(ignored);
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_physical_link_generation == error_generation) {
+                impl_->r2_recovery_required = true;
+                impl_->r2_failed_physical_generation = error_generation;
+                impl_->r2_recovery_floor = confirmed_floor;
+                impl_->route_transport_quarantined = true;
+                if (impl_->r2_socket) {
+                    boost::system::error_code ignored;
+                    impl_->r2_socket->close(ignored);
+                }
+            }
         }
-        recovery_needed = pending && has_staged_witness;
+        recovery_needed = pending && has_staged_witness &&
+            impl_->r2_physical_link_generation == error_generation;
+        }
     }
 
     if (recovery_needed) {

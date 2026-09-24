@@ -616,6 +616,8 @@ sender_r2_accept_recovery_with_lost_reset_ack(
         }
         results[index] = co_await endpoint.run_adopted_r2(
             std::move(socket), std::move(control));
+        std::fprintf(stderr, "R2 shared-failure server[%zu] status=%u\n", index,
+                     static_cast<unsigned>(results[index].status));
         if (results[index].terminal_error)
             std::fprintf(stderr, "R2 recovery server[%zu]: %s\n", index,
                          results[index].terminal_error->detail.c_str());
@@ -661,6 +663,7 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
                                     : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
                                     : "ZSTD_TU";
+    std::cerr << "P51_SENDER_W30_PROFILE_START=" << profile_name << "\n";
     constexpr size_t kJobs = 31;
     constexpr size_t kWindow = 30;
     const auto [c_guid, f_guid] = sender_r2_store_guids();
@@ -862,9 +865,37 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
 
     {
         std::unique_lock lock(progress_mutex);
-        CHECK(progress_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+        const bool first_bundle_seen = progress_cv.wait_for(
+            lock, std::chrono::seconds(5), [&] {
             return bundles_sent.load(std::memory_order_acquire) >= 1;
-        }));
+        });
+        if (!first_bundle_seen) {
+            std::cerr << "P51_SENDER_W30_FIRST_BUNDLE_TIMEOUT profile="
+                      << profile_name << " connector=" << connector_calls.load()
+                      << " sent=" << bundles_sent.load()
+                      << " committed=" << committed.load() << "\n";
+            if (results.front().wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+                const auto first = results.front().get();
+                std::cerr << "P51_SENDER_W30_FIRST_RESULT status="
+                          << static_cast<unsigned>(first.status)
+                          << " terminal="
+                          << (first.terminal_error
+                                  ? first.terminal_error->detail : "none")
+                          << "\n";
+            }
+            if (server_future.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+                const auto server = server_future.get();
+                std::cerr << "P51_SENDER_W30_SERVER_RESULT status="
+                          << static_cast<unsigned>(server.status)
+                          << " terminal="
+                          << (server.terminal_error
+                                  ? server.terminal_error->detail : "none")
+                          << "\n";
+            }
+            CHECK(first_bundle_seen);
+        }
     }
     // Exercise duplicate identities while the first exact transaction is
     // known to be in flight. Exact replay may join or reject locally; a
@@ -1246,9 +1277,12 @@ void test_p51_sender_recovers_lost_commit_reply_after_connector_failure() {
     run_p51_sender_recovery_case(true);
 }
 
-void run_p51_sender_shared_failure_case(size_t kJobs) {
+void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile) {
     CHECK(kJobs >= 2 && kJobs <= 30);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
+    const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
+                                    : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
+                                    : "ZSTD_TU";
     const auto [c_guid, f_guid] = sender_r2_store_guids();
     const Id128 relationship_id = Id128::from_u64(0x5102);
     std::vector<P51SourceArmedFields> armed(kJobs);
@@ -1256,17 +1290,20 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
     for (size_t index = 0; index != kJobs; ++index) {
         auto arm = sender_r2_arm(c_guid, 921 + index,
                                  static_cast<uint32_t>(1921 + index),
-                                 kWindow, ProfileId::ZSTD_TU);
+                                 kWindow, profile);
         armed[index] = sender_r2_armed(std::move(arm), f_guid,
                                        0x529100 + index, kWindow);
-        input[index].resize(128);
-        uint32_t state = static_cast<uint32_t>(0x13579bdfU + index);
-        for (auto& byte : input[index]) {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            byte = static_cast<uint8_t>(state);
-        }
+        const std::string file = "/tmp/p51-shared-" +
+            std::string(profile_name) + "-" + std::to_string(index) + ".cc";
+        const std::string text = "# 1 \"" + file + "\"\n" +
+            "int p51_value_" + std::to_string(index) + " = " +
+            std::to_string(index + 17) + ";\n" +
+            "extern int shared_preprocessed_line;\n" +
+            "extern int shared_preprocessed_line;\n" +
+            "extern int shared_preprocessed_line;\n" +
+            "extern int shared_preprocessed_line;\n" +
+            "int p51_tail_" + std::to_string(index) + ";\n";
+        input[index].assign(text.begin(), text.end());
     }
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
@@ -1292,22 +1329,31 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
     std::mutex commit_mutex;
     std::vector<std::optional<R2TxCommit>> retained_commits(kJobs);
     std::optional<ResetRequest> retained_reset;
+    std::optional<HistoryNonce> initial_history_nonce;
 
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
-    server_caps.profile = ProfileId::ZSTD_TU;
-    server_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    server_caps.profile = profile;
+    server_caps.supported_profiles = profile_bit(profile);
     server_caps.zstd.max_raw_bytes = 1U << 20;
     server_caps.zstd.max_encoded_body_bytes = 1U << 20;
     server_config.input_job_state = [&](CStoreGuid, const TxBegin& begin,
                                         const TxCommit& commit,
                                         std::span<const uint8_t> bytes) {
         const size_t index = static_cast<size_t>(begin.tu_seq.value);
-        if (index >= kJobs || begin.profile != ProfileId::ZSTD_TU ||
+        if (index >= kJobs || begin.profile != profile ||
             (index < kJobs && commit.raw_digest != icecc::digest128(input[index])) ||
             (index < kJobs && bytes.size() != input[index].size()) ||
             (index < kJobs &&
              !std::equal(bytes.begin(), bytes.end(), input[index].begin()))) {
+            input_mismatches.fetch_add(1, std::memory_order_relaxed);
+        } else if (index == 0) {
+            if (!initial_history_nonce || begin.history_nonce != *initial_history_nonce)
+                input_mismatches.fetch_add(1, std::memory_order_relaxed);
+        } else if (retained_reset &&
+                   begin.history_nonce != retained_reset->new_history_nonce) {
+            // Replayed suffix TUs must be rebuilt under confirmed fresh
+            // history while preserving the original input identity.
             input_mismatches.fetch_add(1, std::memory_order_relaxed);
         }
         input_selections.fetch_add(1, std::memory_order_relaxed);
@@ -1316,11 +1362,24 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
     server_config.lookup_p51_link_reservation =
         [&, deadline](const LinkHello& hello)
             -> std::optional<P51SourceLinkLease> {
-        if (hello.profile != ProfileId::ZSTD_TU || hello.window != kWindow ||
+        if (hello.profile != profile || hello.window != kWindow ||
             hello.relationship_id != relationship_id ||
             hello.c_store_guid != c_guid || hello.f_store_guid != f_guid ||
             hello.reservation_id != Id128{armed[0].reservation_id})
             return std::nullopt;
+        if (hello.start_mode == LinkStartMode::Initial) {
+            if (hello.relationship_epoch != armed[0].relationship_epoch ||
+                initial_history_nonce)
+                return std::nullopt;
+            initial_history_nonce = hello.history_nonce;
+        } else if (hello.start_mode == LinkStartMode::Reconnect) {
+            if (!initial_history_nonce ||
+                hello.relationship_epoch != armed[0].relationship_epoch ||
+                hello.history_nonce != *initial_history_nonce)
+                return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
         P51SourceLinkLease lease;
         lease.initial_armed = armed[0];
         lease.initial_armed.relationship_epoch = hello.relationship_epoch;
@@ -1340,16 +1399,29 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
         if (binding.relationship_ordinal == 0 ||
             binding.relationship_ordinal > kJobs ||
             binding.physical_link_generation != hello.physical_link_generation ||
-            binding.profile != ProfileId::ZSTD_TU)
+            binding.profile != profile)
             return std::nullopt;
         const size_t index = static_cast<size_t>(binding.relationship_ordinal - 1);
         if (binding.reservation_id != Id128{armed[index].reservation_id} ||
             binding.wire_job_id != armed[index].arm.source.wire_job_id ||
             binding.source_request_id != armed[index].arm.source.source_request_id ||
             binding.assignment_nonce != armed[index].arm.source.assignment_nonce ||
+            binding.assignment_epoch != armed[index].arm.source.assignment_epoch ||
+            binding.logical_job != armed[index].arm.source.logical_job ||
+            binding.compiler_attempt != armed[index].arm.source.compiler_attempt ||
+            binding.tu_seq.value != index ||
             binding.raw_bytes != input[index].size() ||
             binding.raw_digest != icecc::digest128(input[index]))
             return std::nullopt;
+        if (hello.start_mode == LinkStartMode::Initial) {
+            if (hello.relationship_epoch != armed[index].relationship_epoch)
+                return std::nullopt;
+        } else if (!retained_reset ||
+                   hello.relationship_epoch !=
+                       retained_reset->new_relationship_epoch ||
+                   hello.history_nonce != retained_reset->new_history_nonce) {
+            return std::nullopt;
+        }
         const unsigned prior = binds[index].fetch_add(1, std::memory_order_relaxed);
         if (prior != 0 &&
             (hello.start_mode != LinkStartMode::Reconnect || index != 1))
@@ -1411,19 +1483,28 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
             commit = retained_commits[0];
         }
         if (hello.start_mode != LinkStartMode::Reconnect ||
+            !initial_history_nonce ||
+            hello.history_nonce != *initial_history_nonce ||
             begin.relationship_id != relationship_id ||
             begin.verified_floor_a != 0 || begin.prepared_prefix_p != kJobs ||
             begin.witness_count != kJobs || witnesses.size() != kJobs ||
             end.witness_count != kJobs || !commit ||
             witnesses[0].relationship_ordinal != 1 ||
             witnesses[1].relationship_ordinal != 2 ||
-            witnesses[0].inner.raw_digest != icecc::digest128(input[0]) ||
-            witnesses[1].inner.raw_digest != icecc::digest128(input[1]) ||
             commit->binding_digest != witnesses[0].binding_digest ||
             commit->transaction_digest != witnesses[0].transaction_digest ||
             commit->inner.tu_seq != witnesses[0].inner.tu_seq ||
             commit->inner.raw_digest != witnesses[0].inner.raw_digest)
             return std::nullopt;
+        for (size_t index = 0; index != kJobs; ++index) {
+            if (witnesses[index].relationship_ordinal != index + 1 ||
+                witnesses[index].inner.tu_seq.value != index ||
+                witnesses[index].inner.history_nonce != *initial_history_nonce ||
+                witnesses[index].inner.profile != profile ||
+                witnesses[index].inner.raw_bytes != input[index].size() ||
+                witnesses[index].inner.raw_digest != icecc::digest128(input[index]))
+                return std::nullopt;
+        }
         P51RecoveryReceiptInterval interval;
         interval.rows.push_back(ReceiptRow{
             begin.relationship_id, begin.relationship_epoch,
@@ -1439,7 +1520,10 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
             -> std::optional<ResetAck> {
         if (request.settled_prefix_k != 1 ||
             request.old_relationship_epoch != hello.relationship_epoch ||
-            request.new_relationship_epoch != request.old_relationship_epoch + 1)
+            request.new_relationship_epoch != request.old_relationship_epoch + 1 ||
+            !initial_history_nonce ||
+            request.old_history_nonce != *initial_history_nonce ||
+            request.new_history_nonce == request.old_history_nonce)
             return std::nullopt;
         if (retained_reset &&
             (retained_reset->operation_id != request.operation_id ||
@@ -1497,17 +1581,19 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
     limits.max_speculative_raw_bytes = 1U << 20;
     limits.max_live_entries = kJobs + 4;
     EndpointCaps caps;
-    caps.profile = ProfileId::ZSTD_TU;
-    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     auto authority = std::make_shared<P50PreparationAuthority>(
-        c_guid, caps.zstd, limits, 1, ProfileId::ZSTD_TU);
-    const PreparationRouteKey route{f_guid, 23, ProfileId::ZSTD_TU};
+        c_guid, caps.zstd, limits, 1, profile);
+    const PreparationRouteKey route{f_guid, 23, profile};
     ZstdSourceTransferConfig sender_config = config();
     sender_config.deadline = deadline.as_steady_time_point();
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
+    if (profile == ProfileId::ZSTD_ROUTE)
+        sender_config.compression_level = 3;
     sender_config.after_r2_bundle_sent_for_test = [&](uint64_t) {
         bundles_sent.fetch_add(1, std::memory_order_release);
         gate_cv.notify_all();
@@ -1543,6 +1629,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
                 " commits=" + std::to_string(materialized.load()) +
                 " connectors=" + std::to_string(connector_calls.load()));
         CHECK(outcomes[index].committed_input.has_value());
+        CHECK((outcomes[index].committed_input ==
+               InputRecordKey{c_guid, TuSeq{index}}));
         CHECK(outcomes[index].raw_digest == icecc::digest128(input[index]));
     }
     CHECK(bundles_sent.load() == kJobs); // all original callers were in flight
@@ -1552,8 +1640,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
               << " materialized=" << materialized.load()
               << " binds=" << binds[0].load() << ".."
               << binds[kJobs - 1].load()
-              << " commit0=" << commits[0].load()
-              << " commit1=" << commits[1].load()
+              << " commits=" << commits[0].load() << ".."
+              << commits[kJobs - 1].load()
               << " ack=" << acknowledged.load()
               << " connectors=" << connector_calls.load() << "\n";
     CHECK(input_selections.load() == kJobs);
@@ -1596,15 +1684,19 @@ void run_p51_sender_shared_failure_case(size_t kJobs) {
     CHECK(server_runs.size() == 2);
     CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
     CHECK(server_runs[1].status == ServerRunStatus::Disconnected);
-    std::cerr << "P51_SENDER_SHARED_FAILURE callers=" << kJobs
+    std::cerr << "P51_SENDER_SHARED_FAILURE profile=" << profile_name
+              << " callers=" << kJobs
               << " initial_sent=" << kJobs
               << " replayed_suffix=" << (kJobs - 1)
               << " recovered_prefix=1 PASS\n";
 }
 
 void test_p51_sender_shared_failure_recovers_pending_callers() {
-    run_p51_sender_shared_failure_case(2);
-    run_p51_sender_shared_failure_case(30);
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        run_p51_sender_shared_failure_case(2, profile);
+        run_p51_sender_shared_failure_case(30, profile);
+    }
 }
 
 void test_route_failure_requires_cold_replacement() {
@@ -1976,6 +2068,12 @@ int main(int argc, char** argv) {
         std::string_view(argv[1]) == "--shared-failure-recovery") {
         test_p51_sender_shared_failure_recovers_pending_callers();
         std::cerr << "P51_SENDER_SHARED_FAILURE_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--shared-failure-route30") {
+        run_p51_sender_shared_failure_case(30, ProfileId::ZSTD_ROUTE);
+        std::cerr << "P51_SENDER_SHARED_FAILURE_ROUTE30_SELECTOR PASS\n";
         return 0;
     }
     test_exact_network_transfer();

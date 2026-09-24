@@ -86,7 +86,22 @@ not measure large-payload recovery throughput.
 The full sender suite, including this regression and bounded teardown, passes.
 Evidence: `logs/p50zstdsender-full-shared-failure-r3.log` under the same root
 (SHA256 `efdfe14176d8da8f328faaf8c210366f055583655e2f42ea6713c399d21cd2e7`).
-This does not qualify P29V1/ZSTD_ROUTE recovery,
+The expanded direct sender suite now passes both 2 and 30 concurrent callers
+for each of ZSTD_TU, P29V1 and ZSTD_ROUTE. The replacement reader, ACK writer
+and original callers are fenced by physical-link generation so an old failure
+cannot close or clear its successor's state. Original callers share the same
+recovery loop, rather than requiring a new request to trigger progress.
+Every shared-failure cell verifies all inputs committed exactly once, ACK
+through the final ordinal, and exactly two connections. Inputs are small
+generated source fragments, not a corpus throughput test.
+The full suite also passes healthy W30 for all three profiles and the prior
+single-caller recovery cases. Evidence:
+`logs/sender-w30-diagnostics-r2.log` under the same recovery root
+(SHA256 `392024009e370355a9e9d7ffdefac92d7a9ae0b6ac1d9b1d85df4d78cc1578f9`);
+binary SHA256 `e339bf425be0901c75e13f0d7f7c8a0392e4c5c6ac00eac6862a06d7a8dec3be`.
+This run took 93.96 seconds. An earlier first-bundle timeout did not reproduce
+in the subsequent full runs; its cause remains unresolved and bounded failure
+diagnostics are retained. This does not qualify repeated shared-link failures,
 service integration, cancellation/expiry, or process restart behavior.
 
 The P51 source-control codec now restores the ARM identity before validating

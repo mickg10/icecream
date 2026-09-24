@@ -205,8 +205,10 @@ private:
         bool explicit_route,
         std::shared_ptr<const std::vector<uint8_t>> source);
 
-    boost::asio::awaitable<void> run_r2_receipt_reader();
-    boost::asio::awaitable<void> run_r2_ack_pump();
+    boost::asio::awaitable<void> run_r2_receipt_reader(
+        uint64_t physical_link_generation);
+    boost::asio::awaitable<void> run_r2_ack_pump(
+        uint64_t physical_link_generation);
     boost::asio::awaitable<void> recover_r2_link(
         AsyncConnectedFdFactory connection, uint64_t requested_generation,
         std::chrono::steady_clock::time_point deadline);
