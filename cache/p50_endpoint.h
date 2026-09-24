@@ -206,7 +206,9 @@ struct PreparationRouteKey {
 struct PreparationAuthorityLimits {
     size_t max_live_entries = 4096;
     uint64_t max_retained_encoded_bytes = uint64_t{512} << 20;
-    uint64_t max_interner_reserved_bytes = UINT64_C(2463121408);
+    // Only a gate: the interner allocates firefox() (2.32 GiB) if it fits
+    // under this, else probe().  It never grows into the remainder.
+    uint64_t max_interner_reserved_bytes = uint64_t{24} << 30;
     uint64_t max_route_state_bytes = uint64_t{1} << 30;
     auto operator<=>(const PreparationAuthorityLimits&) const = default;
 };

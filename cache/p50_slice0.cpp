@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1643,6 +1644,56 @@ struct CAuthority::P29V1State {
         throw std::length_error("P29V1 interner budget admits no production layout");
     }
 
+    // ICECC_P50_INTERNER_STATS=N adds an "enabled" line and a "stats" line
+    // every N successful preparations.
+    static uint64_t stats_period() {
+        static const uint64_t period = [] {
+            const char* value = std::getenv("ICECC_P50_INTERNER_STATS");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        return period;
+    }
+
+    // One JSON line on iceccd's stderr.  A failure is always reported: the
+    // endpoint turns every interner failure into the same
+    // P29V1CapabilityUnavailable message, so the full table is named here.
+    void report(const char* event, const char* reason) const {
+        char why[160] = {};
+        if (reason != nullptr) {
+            std::snprintf(why, sizeof(why), "%s", reason);
+            for (char& ch : why)
+                if (ch == '"' || ch == '\\' ||
+                    (ch != '\0' && static_cast<unsigned char>(ch) < 0x20))
+                    ch = '?';
+        }
+        const codec::P29InternUsage used = interner.usage();
+        const auto n = [](uint64_t value) {
+            return static_cast<unsigned long long>(value);
+        };
+        std::fprintf(
+            stderr,
+            "{\"schema\":\"icecream-p50-interner-v1\",\"event\":\"%s\","
+            "\"reason\":\"%s\",\"prepares\":%llu,\"raw_bytes\":%llu,"
+            "\"reserved\":%llu,\"committed\":%llu,"
+            "\"tiny\":[%llu,%llu],\"short\":[%llu,%llu],"
+            "\"line_slots\":[%llu,%llu],\"line_refs\":[%llu,%llu],"
+            "\"line_bytes\":[%llu,%llu],\"region_slots\":[%llu,%llu],"
+            "\"regions\":[%llu,%llu],\"region_bytes\":[%llu,%llu],"
+            "\"region_line_ids\":[%llu,%llu]}\n",
+            event, why, n(prepares), n(raw_bytes), n(provider.reserved()),
+            n(provider.committed()), n(used.tiny_slots),
+            n(layout.tiny_capacity), n(used.short_slots),
+            n(layout.short_capacity), n(used.line_slots),
+            n(layout.line_capacity), n(used.line_references),
+            n(layout.line_reference_capacity), n(used.line_bytes),
+            n(layout.line_bytes_capacity), n(used.regions),
+            n(layout.region_index_capacity), n(used.regions),
+            n(layout.region_capacity), n(used.region_bytes),
+            n(layout.region_bytes_capacity), n(used.region_line_ids),
+            n(layout.region_line_id_capacity));
+        std::fflush(stderr);
+    }
+
     P29V1State(uint64_t budget, uint64_t max_tu,
                P29InternerFaultInjection fault_injection)
         : provider(static_cast<size_t>(std::min<uint64_t>(
@@ -1658,6 +1709,8 @@ struct CAuthority::P29V1State {
     uint64_t max_tu_bytes = 0;
     bool inject_failure_once = false;
     bool runnable = true;
+    uint64_t prepares = 0;
+    uint64_t raw_bytes = 0;
 };
 
 CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
@@ -1683,6 +1736,8 @@ void CAuthority::enable_p29v1(uint64_t max_interner_reserved_bytes,
     p29v1_ = std::make_unique<P29V1State>(max_interner_reserved_bytes,
                                          max_tu_bytes,
                                          p29v1_fault_injection_);
+    if (P29V1State::stats_period() != 0)
+        p29v1_->report("enabled", nullptr);
 }
 
 bool CAuthority::p29v1_runnable() const noexcept {
@@ -1736,9 +1791,19 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
         prepared->tu_seq = tu_seq;
         prepared->raw_bytes = exact_input.size();
         prepared->raw_digest = exact_digest;
+        ++p29v1_->prepares;
+        p29v1_->raw_bytes += exact_input.size();
+        const uint64_t period = P29V1State::stats_period();
+        if (period != 0 && p29v1_->prepares % period == 0)
+            p29v1_->report("stats", nullptr);
         return prepared;
+    } catch (const std::exception& error) {
+        p29v1_->runnable = false;
+        p29v1_->report("nonrunnable", error.what());
+        throw;
     } catch (...) {
         p29v1_->runnable = false;
+        p29v1_->report("nonrunnable", "non-standard exception");
         throw;
     }
 }

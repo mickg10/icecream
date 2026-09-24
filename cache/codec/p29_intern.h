@@ -38,17 +38,34 @@ struct P29InternLayout {
 
     [[nodiscard]] static constexpr P29InternLayout probe() { return {}; }
 
+    // Region counts are 4x upstream's.  A whole-repo build (8685 TUs,
+    // 141 GB rewrite-includes input) interns 295K distinct Regions, so 1 << 18
+    // filled at TU ~7000 while every other table was 11-56% full.
     [[nodiscard]] static constexpr P29InternLayout firefox() {
         P29InternLayout value;
         value.line_capacity = std::size_t{1} << 23;
-        value.region_index_capacity = std::size_t{1} << 19;
-        value.region_capacity = std::size_t{1} << 18;
+        value.region_index_capacity = std::size_t{1} << 21;
+        value.region_capacity = std::size_t{1} << 20;
         value.line_reference_capacity = std::size_t{1} << 22;
         value.line_bytes_capacity = std::size_t{1} << 30;
         value.region_bytes_capacity = std::size_t{1} << 30;
         value.region_line_id_capacity = std::size_t{1} << 24;
         return value;
     }
+};
+
+// Occupancy of the fixed-capacity tables, in the units P29InternLayout sizes
+// them in.  process() fails once any one of them is full.  Every Region also
+// occupies one region-index slot.
+struct P29InternUsage {
+    std::size_t tiny_slots = 0;
+    std::size_t short_slots = 0;
+    std::size_t line_slots = 0;
+    std::size_t line_references = 0;
+    std::size_t line_bytes = 0;
+    std::size_t regions = 0;
+    std::size_t region_bytes = 0;
+    std::size_t region_line_ids = 0;
 };
 
 template <class P>
@@ -328,6 +345,12 @@ template <P29InternProvider Provider> class P29Interner {
     }
     [[nodiscard]] std::uint64_t successor_hits() const { return successor_hits_; }
     [[nodiscard]] std::size_t reserved_bytes() const { return reserved_bytes_; }
+
+    [[nodiscard]] P29InternUsage usage() const noexcept {
+        return {tiny_occupied_,   short_occupied_,    line_occupied_,
+                next_line_id_,    line_bytes_used_,   region_count_,
+                region_bytes_used_, region_ids_used_};
+    }
 
     [[nodiscard]] std::size_t committed_bytes() const {
         using namespace p29_intern_detail;
