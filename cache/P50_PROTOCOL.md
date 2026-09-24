@@ -65,6 +65,54 @@ not repeated in the raw descriptor reply. Ordinary traffic, changed request
 identity, malformed descriptor data or a non-clean boundary invalidates the
 exchange. End-to-end asynchronous daemon integration remains a separate gate.
 
+### Dormant CacheWire R2 W1 record codecs
+
+Normal negotiation remains capped at protocol 50 and these CacheWire records
+are not advertised or accepted by the production endpoint. The following
+fixed records are codec groundwork for W1; R1 records and bytes remain
+unchanged. The outer frame remains `type:u8, payload_length:u24, payload`,
+all record integers are big-endian, and GUIDs/digests/reservation IDs are 16
+raw bytes. Revisions and profiles are u16; windows and frame caps are u32.
+Payloads have no padding or reserved extensibility bytes. Types 19–25 are
+reserved for recovery/close records and are not implemented by this codec
+snapshot.
+
+| Type | Record | Exact payload fields / byte offsets | Bytes |
+|---:|---|---|---:|
+| 10 | LINK_HELLO | revision u16@0; profile u16@2; window u32@4; max frame u32@8; raw/encoded/output caps u64@12/@20/@28; reservation ID@36; relationship ID@52; relationship epoch u64@68; physical link generation u64@76; C GUID@84; C store generation u64@100; F GUID@108; F store generation u64@124; C control generation/attempt u64@132/@140; C system-source fingerprint@148; history nonce u64@164; verified floor A u64@172; start mode u8@180 (`0` initial, `1` reconnect) | 181 |
+| 11 | LINK_STATE | revision u16@0; profile u16@2; window u32@4; reservation ID@8; relationship ID@24; relationship epoch u64@40; physical generation u64@48; C GUID@56; C store generation u64@72; F GUID@80; F store generation u64@96; C control generation/attempt u64@104/@112; selected frame cap u32@120; selected raw/encoded/output caps u64@124/@132/@140; F system-source fingerprint@148; history nonce u64@164; next REL_SEQ u64@172; state digest@180; committed prefix K u64@196; acknowledged prefix Q u64@204 | 212 |
+| 12 | JOB_BIND | reservation ID@0; physical generation u64@16; relationship ordinal u64@24; job ID u32@32; assignment epoch/nonce u64@36/@44; logical job/attempt/source request/TU sequence u64@52/@60/@68/@76; profile u16@84; raw bytes u64@86; raw digest@94 | 110 |
+| 13 | TU_BEGIN | relationship ordinal u64@0 followed by the exact 116-byte R1 TX_BEGIN payload at@8 | 124 |
+| 14 | BODY | exact encoded BODY bytes; may be fragmented across bounded frames | variable |
+| 15 | FILL | exact encoded FILL bytes; may be fragmented across bounded frames | variable |
+| 16 | TU_END | relationship ordinal u64@0; binding digest@8; outer transaction digest@24 | 40 |
+| 17 | R2_TX_COMMIT | relationship ordinal u64@0; binding digest@8; outer transaction digest@24; exact 72-byte R1 TX_COMMIT payload@40 | 112 |
+| 18 | COMMIT_ACK | relationship ID@0; relationship epoch u64@16; physical generation u64@24; contiguous verified ordinal u64@32 | 40 |
+
+LINK_HELLO starts revision 2 and pins one profile/window to a physical link.
+R1 transaction bytes are nested at TU_BEGIN and R2_TX_COMMIT but do not by
+themselves bind job ownership or the R2 transaction envelope. LINK_STATE
+returns actual selected budgets and F's fingerprint; the receiver validates
+its echo against the original offer and retained reservation. P29 source-file
+reuse requires equal nonzero C and F fingerprints. The selected frame cap
+must be at least the 212-byte LINK_STATE size and no larger than both peers'
+offers, the implementation cap, or the outer u24 limit. Raw, encoded and
+materialized-output budgets are independent and must be reserved before
+allocation.
+
+JOB_BIND is canonicalized exactly as its 110 payload bytes. Its binding digest
+is XXH3-128 over ASCII `R2-binding-v1` (no NUL) followed by those bytes. The
+outer TU digest is XXH3-128 over ASCII `R2-transaction-v1` (no NUL), the
+binding digest, then TU_BEGIN and every BODY/FILL payload in wire order; each
+frame contributes its type u8, payload length u64, then exact payload bytes.
+TU_END is excluded from its own digest. F independently derives the expected
+P29 NEED and validates FILL; there is no R2 NEED frame. F validates job,
+physical generation, ordinal, inner TX_BEGIN identity and both digests before
+publishing. COMMIT_ACK advances only a contiguous ordinal and is checked
+against F's committed prefix K. These codecs do not yet implement session
+adoption, the persistent two-job loop, receipt recovery/reset, or an R2
+advertisement/selection gate.
+
 ## Selection and advertisement
 
 The only implemented profiles are:

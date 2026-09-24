@@ -111,6 +111,10 @@ constexpr uint16_t kP50WireRevision = 1;
 constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
 // TX_BEGIN is the largest fixed-size mandatory V1 control payload.
 constexpr uint32_t kMandatoryControlFramePayload = 116;
+constexpr uint32_t kR2LinkHelloPayloadBytes = 181;
+constexpr uint32_t kR2LinkStatePayloadBytes = 212;
+constexpr uint32_t kR2MandatoryControlFramePayload =
+    kR2LinkStatePayloadBytes;
 constexpr uint64_t kInitialMaxFillRecordBytes = uint64_t{1} << 32;
 
 enum class MessageType : uint8_t {
@@ -123,7 +127,18 @@ enum class MessageType : uint8_t {
     NEED = 7,
     FILL = 8,
     TX_COMMIT = 9,
+    LINK_HELLO = 10,
+    LINK_STATE = 11,
+    JOB_BIND = 12,
+    TU_BEGIN = 13,
+    R2_BODY = 14,
+    R2_FILL = 15,
+    TU_END = 16,
+    R2_TX_COMMIT = 17,
+    COMMIT_ACK = 18,
 };
+
+enum class LinkStartMode : uint8_t { Initial = 0, Reconnect = 1 };
 
 enum class ErrorCode : uint16_t {
     WIRE_REVISION_MISMATCH = 4,
@@ -239,6 +254,107 @@ struct TxBegin {
     auto operator<=>(const TxBegin&) const = default;
 };
 
+// CacheWire R2 W1 link binding. These records are codecs only until the
+// persistent endpoint and recovery path are qualified; ordinary R1 records
+// retain their original byte layouts.
+struct LinkHello {
+    uint16_t revision = 2;
+    ProfileId profile = ProfileId::P29V1;
+    uint32_t window = 1;
+    uint32_t max_frame_payload = kInitialMaxFramePayload;
+    uint64_t max_raw_bytes = 0;
+    uint64_t max_encoded_bytes = 0;
+    uint64_t max_output_bytes = 0;
+    Id128 reservation_id{};
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    CStoreGuid c_store_guid{};
+    uint64_t c_store_generation = 0;
+    FStoreGuid f_store_guid{};
+    uint64_t f_store_generation = 0;
+    uint64_t c_control_generation = 0;
+    uint64_t c_control_attempt = 0;
+    Digest128 system_source_fingerprint{};
+    HistoryNonce history_nonce{};
+    uint64_t verified_receipt_floor = 0;
+    LinkStartMode start_mode = LinkStartMode::Initial;
+    auto operator<=>(const LinkHello&) const = default;
+};
+
+struct LinkState {
+    uint16_t revision = 2;
+    ProfileId profile = ProfileId::P29V1;
+    uint32_t window = 1;
+    Id128 reservation_id{};
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    CStoreGuid c_store_guid{};
+    uint64_t c_store_generation = 0;
+    FStoreGuid f_store_guid{};
+    uint64_t f_store_generation = 0;
+    uint64_t c_control_generation = 0;
+    uint64_t c_control_attempt = 0;
+    uint32_t selected_max_frame_payload = 0;
+    uint64_t selected_max_raw_bytes = 0;
+    uint64_t selected_max_encoded_bytes = 0;
+    uint64_t selected_max_output_bytes = 0;
+    Digest128 f_system_source_fingerprint{};
+    HistoryNonce history_nonce{};
+    RelSeq next_rel_seq{};
+    Digest128 state_digest{};
+    uint64_t committed_prefix_k = 0;
+    uint64_t acknowledged_prefix_q = 0;
+    auto operator<=>(const LinkState&) const = default;
+};
+
+struct JobBind {
+    Id128 reservation_id{};
+    uint64_t physical_link_generation = 0;
+    uint64_t relationship_ordinal = 0;
+    uint32_t wire_job_id = 0;
+    uint64_t assignment_epoch = 0;
+    uint64_t assignment_nonce = 0;
+    uint64_t logical_job = 0;
+    uint64_t compiler_attempt = 0;
+    uint64_t source_request_id = 0;
+    TuSeq tu_seq{};
+    ProfileId profile = ProfileId::P29V1;
+    uint64_t raw_bytes = 0;
+    Digest128 raw_digest{};
+    auto operator<=>(const JobBind&) const = default;
+};
+
+struct TuBegin {
+    uint64_t relationship_ordinal = 0;
+    TxBegin inner{};
+    auto operator<=>(const TuBegin&) const = default;
+};
+
+struct TuEnd {
+    uint64_t relationship_ordinal = 0;
+    Digest128 binding_digest{};
+    Digest128 transaction_digest{};
+    auto operator<=>(const TuEnd&) const = default;
+};
+
+struct R2TxCommit {
+    uint64_t relationship_ordinal = 0;
+    Digest128 binding_digest{};
+    Digest128 transaction_digest{};
+    TxCommit inner{};
+    auto operator<=>(const R2TxCommit&) const = default;
+};
+
+struct CommitAck {
+    Id128 relationship_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    uint64_t contiguous_verified_ordinal = 0;
+    auto operator<=>(const CommitAck&) const = default;
+};
+
 // Client receive gate for a SESSION_STATE negotiated from the original offer.
 void validate_session_state(const SessionHello& hello,
                             const SessionState& received_state);
@@ -264,9 +380,21 @@ struct FillMessage {
     auto operator<=>(const FillMessage&) const = default;
 };
 
+struct R2BodyMessage {
+    std::vector<uint8_t> bytes;
+    auto operator<=>(const R2BodyMessage&) const = default;
+};
+
+struct R2FillMessage {
+    std::vector<uint8_t> bytes;
+    auto operator<=>(const R2FillMessage&) const = default;
+};
+
 using Message = std::variant<SessionHello, SessionState, HistoryReset, ErrorMessage,
                              TxBegin, BodyMessage, NeedMessage, FillMessage,
-                             TxCommit>;
+                             TxCommit, LinkHello, LinkState, JobBind, TuBegin,
+                             R2TxCommit, CommitAck, TuEnd,
+                             R2BodyMessage, R2FillMessage>;
 
 struct Frame {
     MessageType type = MessageType::ERROR;
@@ -283,6 +411,11 @@ struct FrameHeader {
 MessageType message_type(const Message& message);
 std::vector<uint8_t> encode_payload(const Message& message);
 Message decode_payload(MessageType type, std::span<const uint8_t> payload);
+[[nodiscard]] Digest128 compute_r2_binding_digest(const JobBind& binding);
+[[nodiscard]] Digest128 compute_r2_transaction_digest(
+    const JobBind& binding, const TuBegin& begin,
+    std::span<const R2BodyMessage> bodies,
+    std::span<const R2FillMessage> fills);
 std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_bytes);
 FrameHeader decode_frame_header(std::span<const uint8_t> header,
                                 uint32_t max_payload = kInitialMaxFramePayload);

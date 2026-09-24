@@ -85,6 +85,27 @@ remain failed, not rewritten as a clean full-suite run. The draft asynchronous
 daemon integration compiled separately but has no runtime qualification yet
 and is not included in this codec checkpoint.
 
+### CacheWire R2 record component
+
+The dormant R2 record codecs and exact wire table are implemented. The focused
+`p50wire` test passed in the bounded SDK container from the isolated source
+snapshot `/tanksmall/scratch/tmp/p50-r2-codec-snapshot-20260924/source`.
+It covers fixed sizes/offsets, round trips, truncation/trailing-byte rejection,
+distinct R1/R2 BODY/FILL types, empty-source binding, and an independently
+constructed digest transcript with byte/length/type/binding mutations.
+The tested binary SHA256 is
+`11783b4482799f443fcdaa96dacceab3a4ffe41c08516f12a3459e14a5f0ac2d`.
+Test source SHA256 is
+`ef45bf41966dd246a3795af62d8c394c833988514cb3a1213d0e1ba876e716bd`;
+protocol header/source SHA256 values are respectively
+`42c04da7acfa7ffd09ca3b64a6d2caf7348203f672168525dfa0f26fed1655ba`
+and `0a8e4d806839444a2f56a7c0b4a4655b321206d386067b46f6f3e50c35ec40da`.
+The test exits silently on success; its retained runtime log is empty.
+Initial combined builds failed on stale dependent archives and a cancellation
+codec type error; those attempts are not passing gates. This wire-only gate
+does not qualify reservation service behavior, live persistent sessions,
+recovery, or W30. Ordinary negotiation remains capped at 50.
+
 ### Speculative P29 codec component
 
 The P29 speculative-codec component now has a focused passing gate: 30 TUs

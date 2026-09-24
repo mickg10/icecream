@@ -1,4 +1,5 @@
 #include "protocol50.h"
+#include "../services/p50_store_identity_wire.h"
 
 #include <algorithm>
 #include <cstring>
@@ -33,7 +34,7 @@ bool known_object_type(ObjectType type) {
 bool known_message_type(MessageType type) {
     const uint8_t value = static_cast<uint8_t>(type);
     return value >= static_cast<uint8_t>(MessageType::SESSION_HELLO) &&
-           value <= static_cast<uint8_t>(MessageType::TX_COMMIT);
+           value <= static_cast<uint8_t>(MessageType::COMMIT_ACK);
 }
 
 bool known_profile(ProfileId profile) {
@@ -122,6 +123,106 @@ void validate_history_reset(const HistoryReset& reset) {
 void validate_error(const ErrorMessage& error) {
     if (error.code == 0)
         throw std::invalid_argument("ERROR code zero is reserved");
+}
+
+template <size_t N>
+bool nonzero_id(const std::array<uint8_t, N>& id) {
+    return std::any_of(id.begin(), id.end(),
+                       [](uint8_t byte) { return byte != 0; });
+}
+
+void validate_link_hello(const LinkHello& value) {
+    if (value.revision != 2 || !known_profile(value.profile) ||
+        value.window == 0 || value.window > 30 ||
+        value.max_frame_payload < kR2MandatoryControlFramePayload ||
+        value.max_frame_payload > kInitialMaxFramePayload ||
+        value.max_frame_payload > 0x00ffffffU ||
+        value.max_raw_bytes == 0 || value.max_encoded_bytes == 0 ||
+        value.max_output_bytes == 0 || !nonzero_id(value.reservation_id.bytes) ||
+        !nonzero_id(value.relationship_id.bytes) ||
+        value.relationship_epoch == 0 || value.physical_link_generation == 0 ||
+        value.c_store_guid == CStoreGuid{} || value.c_store_generation == 0 ||
+        value.f_store_guid == FStoreGuid{} || value.f_store_generation == 0 ||
+        value.c_control_generation == 0 || value.c_control_attempt == 0 ||
+        value.history_nonce.value == 0 ||
+        (value.start_mode != LinkStartMode::Initial &&
+         value.start_mode != LinkStartMode::Reconnect) ||
+        (value.start_mode == LinkStartMode::Initial &&
+         value.verified_receipt_floor != 0))
+        throw std::invalid_argument("LINK_HELLO fields are invalid");
+    if (!store_identity_guid_valid_for_role(value.c_store_guid.bytes,
+                                            kStoreIdentityClientRole) ||
+        !store_identity_guid_valid_for_role(value.f_store_guid.bytes,
+                                            kStoreIdentityFileRole) ||
+        store_identity_file_guid_matches_client(value.c_store_guid.bytes,
+                                               value.f_store_guid.bytes))
+        throw std::invalid_argument("LINK_HELLO store identities are invalid");
+}
+
+void validate_link_state(const LinkState& value) {
+    if (value.revision != 2 || !known_profile(value.profile) ||
+        value.window == 0 || value.window > 30 ||
+        !nonzero_id(value.reservation_id.bytes) ||
+        !nonzero_id(value.relationship_id.bytes) ||
+        value.relationship_epoch == 0 || value.physical_link_generation == 0 ||
+        value.c_store_guid == CStoreGuid{} || value.c_store_generation == 0 ||
+        value.f_store_guid == FStoreGuid{} || value.f_store_generation == 0 ||
+        value.history_nonce.value == 0 ||
+        value.acknowledged_prefix_q > value.committed_prefix_k ||
+        value.c_control_generation == 0 || value.c_control_attempt == 0 ||
+        value.selected_max_frame_payload < kR2MandatoryControlFramePayload ||
+        value.selected_max_frame_payload > kInitialMaxFramePayload ||
+        value.selected_max_frame_payload > 0x00ffffffU ||
+        value.selected_max_raw_bytes == 0 ||
+        value.selected_max_encoded_bytes == 0 ||
+        value.selected_max_output_bytes == 0)
+        throw std::invalid_argument("LINK_STATE fields are invalid");
+    if (!store_identity_guid_valid_for_role(value.c_store_guid.bytes,
+                                            kStoreIdentityClientRole) ||
+        !store_identity_guid_valid_for_role(value.f_store_guid.bytes,
+                                            kStoreIdentityFileRole) ||
+        store_identity_file_guid_matches_client(value.c_store_guid.bytes,
+                                               value.f_store_guid.bytes))
+        throw std::invalid_argument("LINK_STATE store identities are invalid");
+}
+
+void validate_job_bind(const JobBind& value) {
+    if (!nonzero_id(value.reservation_id.bytes) ||
+        value.physical_link_generation == 0 ||
+        value.relationship_ordinal == 0 || value.wire_job_id == 0 ||
+        value.assignment_epoch == 0 || value.assignment_nonce == 0 ||
+        value.logical_job == 0 || value.compiler_attempt == 0 ||
+        value.source_request_id == 0 || !known_profile(value.profile))
+        throw std::invalid_argument("JOB_BIND fields are invalid");
+}
+
+void validate_tu_begin(const TuBegin& value) {
+    if (value.relationship_ordinal == 0)
+        throw std::invalid_argument("TU_BEGIN ordinal zero is reserved");
+    validate_tx_begin_intrinsic(value.inner);
+}
+
+void validate_tu_end(const TuEnd& value) {
+    if (value.relationship_ordinal == 0 ||
+        value.binding_digest == Digest128{} ||
+        value.transaction_digest == Digest128{})
+        throw std::invalid_argument("TU_END fields are invalid");
+}
+
+void validate_r2_commit(const R2TxCommit& value) {
+    if (value.relationship_ordinal == 0 ||
+        value.binding_digest == Digest128{} ||
+        value.transaction_digest == Digest128{})
+        throw std::invalid_argument("R2 TX_COMMIT fields are invalid");
+    validate_commit(value.inner);
+}
+
+void validate_commit_ack(const CommitAck& value) {
+    if (!nonzero_id(value.relationship_id.bytes) ||
+        value.relationship_epoch == 0 ||
+        value.physical_link_generation == 0 ||
+        value.contiguous_verified_ordinal == 0)
+        throw std::invalid_argument("COMMIT_ACK fields are invalid");
 }
 
 class Encoder {
@@ -427,7 +528,16 @@ MessageType message_type(const Message& message) {
         if constexpr (std::is_same_v<T, BodyMessage>) return MessageType::BODY;
         if constexpr (std::is_same_v<T, NeedMessage>) return MessageType::NEED;
         if constexpr (std::is_same_v<T, FillMessage>) return MessageType::FILL;
-        return MessageType::TX_COMMIT;
+        if constexpr (std::is_same_v<T, TxCommit>) return MessageType::TX_COMMIT;
+        if constexpr (std::is_same_v<T, LinkHello>) return MessageType::LINK_HELLO;
+        if constexpr (std::is_same_v<T, LinkState>) return MessageType::LINK_STATE;
+        if constexpr (std::is_same_v<T, JobBind>) return MessageType::JOB_BIND;
+        if constexpr (std::is_same_v<T, TuBegin>) return MessageType::TU_BEGIN;
+        if constexpr (std::is_same_v<T, R2BodyMessage>) return MessageType::R2_BODY;
+        if constexpr (std::is_same_v<T, R2FillMessage>) return MessageType::R2_FILL;
+        if constexpr (std::is_same_v<T, TuEnd>) return MessageType::TU_END;
+        if constexpr (std::is_same_v<T, R2TxCommit>) return MessageType::R2_TX_COMMIT;
+        return MessageType::COMMIT_ACK;
     }, message);
 }
 
@@ -479,10 +589,104 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.digest(value.transaction_digest);
         } else if constexpr (std::is_same_v<T, BodyMessage> ||
                              std::is_same_v<T, NeedMessage> ||
-                             std::is_same_v<T, FillMessage>) {
+                             std::is_same_v<T, FillMessage> ||
+                             std::is_same_v<T, R2BodyMessage> ||
+                             std::is_same_v<T, R2FillMessage>) {
             out.bytes(value.bytes);
-        } else {
+        } else if constexpr (std::is_same_v<T, TxCommit>) {
             encode_commit(out, value);
+        } else if constexpr (std::is_same_v<T, LinkHello>) {
+            validate_link_hello(value);
+            out.u16(value.revision);
+            out.u16(static_cast<uint16_t>(value.profile));
+            out.u32(value.window);
+            out.u32(value.max_frame_payload);
+            out.u64(value.max_raw_bytes);
+            out.u64(value.max_encoded_bytes);
+            out.u64(value.max_output_bytes);
+            out.id(value.reservation_id);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.c_store_guid);
+            out.u64(value.c_store_generation);
+            out.id(value.f_store_guid);
+            out.u64(value.f_store_generation);
+            out.u64(value.c_control_generation);
+            out.u64(value.c_control_attempt);
+            out.digest(value.system_source_fingerprint);
+            out.u64(value.history_nonce.value);
+            out.u64(value.verified_receipt_floor);
+            out.u8(static_cast<uint8_t>(value.start_mode));
+        } else if constexpr (std::is_same_v<T, LinkState>) {
+            validate_link_state(value);
+            out.u16(value.revision);
+            out.u16(static_cast<uint16_t>(value.profile));
+            out.u32(value.window);
+            out.id(value.reservation_id);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.id(value.c_store_guid);
+            out.u64(value.c_store_generation);
+            out.id(value.f_store_guid);
+            out.u64(value.f_store_generation);
+            out.u64(value.c_control_generation);
+            out.u64(value.c_control_attempt);
+            out.u32(value.selected_max_frame_payload);
+            out.u64(value.selected_max_raw_bytes);
+            out.u64(value.selected_max_encoded_bytes);
+            out.u64(value.selected_max_output_bytes);
+            out.digest(value.f_system_source_fingerprint);
+            out.u64(value.history_nonce.value);
+            out.u64(value.next_rel_seq.value);
+            out.digest(value.state_digest);
+            out.u64(value.committed_prefix_k);
+            out.u64(value.acknowledged_prefix_q);
+        } else if constexpr (std::is_same_v<T, JobBind>) {
+            validate_job_bind(value);
+            out.id(value.reservation_id);
+            out.u64(value.physical_link_generation);
+            out.u64(value.relationship_ordinal);
+            out.u32(value.wire_job_id);
+            out.u64(value.assignment_epoch);
+            out.u64(value.assignment_nonce);
+            out.u64(value.logical_job);
+            out.u64(value.compiler_attempt);
+            out.u64(value.source_request_id);
+            out.u64(value.tu_seq.value);
+            out.u16(static_cast<uint16_t>(value.profile));
+            out.u64(value.raw_bytes);
+            out.digest(value.raw_digest);
+        } else if constexpr (std::is_same_v<T, TuBegin>) {
+            validate_tu_begin(value);
+            out.u64(value.relationship_ordinal);
+            out.u64(value.inner.history_nonce.value);
+            out.u64(value.inner.rel_seq.value);
+            out.u64(value.inner.tu_seq.value);
+            out.u16(static_cast<uint16_t>(value.inner.profile));
+            out.digest(value.inner.pre_state_digest);
+            encode_descriptor(out, value.inner.body);
+            out.u64(value.inner.raw_bytes);
+            out.digest(value.inner.raw_digest);
+            out.digest(value.inner.transaction_digest);
+        } else if constexpr (std::is_same_v<T, TuEnd>) {
+            validate_tu_end(value);
+            out.u64(value.relationship_ordinal);
+            out.digest(value.binding_digest);
+            out.digest(value.transaction_digest);
+        } else if constexpr (std::is_same_v<T, R2TxCommit>) {
+            validate_r2_commit(value);
+            out.u64(value.relationship_ordinal);
+            out.digest(value.binding_digest);
+            out.digest(value.transaction_digest);
+            encode_commit(out, value.inner);
+        } else if constexpr (std::is_same_v<T, CommitAck>) {
+            validate_commit_ack(value);
+            out.id(value.relationship_id);
+            out.u64(value.relationship_epoch);
+            out.u64(value.physical_link_generation);
+            out.u64(value.contiguous_verified_ordinal);
         }
     }, message);
     return out.take();
@@ -563,8 +767,173 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         in.exact_end();
         return value;
     }
+    case MessageType::LINK_HELLO: {
+        LinkHello value;
+        value.revision = in.u16();
+        value.profile = static_cast<ProfileId>(in.u16());
+        value.window = in.u32();
+        value.max_frame_payload = in.u32();
+        value.max_raw_bytes = in.u64();
+        value.max_encoded_bytes = in.u64();
+        value.max_output_bytes = in.u64();
+        value.reservation_id = in.id();
+        value.relationship_id = in.id();
+        value.relationship_epoch = in.u64();
+        value.physical_link_generation = in.u64();
+        value.c_store_guid = in.id();
+        value.c_store_generation = in.u64();
+        value.f_store_guid = in.id();
+        value.f_store_generation = in.u64();
+        value.c_control_generation = in.u64();
+        value.c_control_attempt = in.u64();
+        value.system_source_fingerprint = in.digest();
+        value.history_nonce.value = in.u64();
+        value.verified_receipt_floor = in.u64();
+        value.start_mode = static_cast<LinkStartMode>(in.u8());
+        in.exact_end();
+        validate_link_hello(value);
+        return value;
+    }
+    case MessageType::LINK_STATE: {
+        LinkState value;
+        value.revision = in.u16();
+        value.profile = static_cast<ProfileId>(in.u16());
+        value.window = in.u32();
+        value.reservation_id = in.id();
+        value.relationship_id = in.id();
+        value.relationship_epoch = in.u64();
+        value.physical_link_generation = in.u64();
+        value.c_store_guid = in.id();
+        value.c_store_generation = in.u64();
+        value.f_store_guid = in.id();
+        value.f_store_generation = in.u64();
+        value.c_control_generation = in.u64();
+        value.c_control_attempt = in.u64();
+        value.selected_max_frame_payload = in.u32();
+        value.selected_max_raw_bytes = in.u64();
+        value.selected_max_encoded_bytes = in.u64();
+        value.selected_max_output_bytes = in.u64();
+        value.f_system_source_fingerprint = in.digest();
+        value.history_nonce.value = in.u64();
+        value.next_rel_seq.value = in.u64();
+        value.state_digest = in.digest();
+        value.committed_prefix_k = in.u64();
+        value.acknowledged_prefix_q = in.u64();
+        in.exact_end();
+        validate_link_state(value);
+        return value;
+    }
+    case MessageType::JOB_BIND: {
+        JobBind value;
+        value.reservation_id = in.id();
+        value.physical_link_generation = in.u64();
+        value.relationship_ordinal = in.u64();
+        value.wire_job_id = in.u32();
+        value.assignment_epoch = in.u64();
+        value.assignment_nonce = in.u64();
+        value.logical_job = in.u64();
+        value.compiler_attempt = in.u64();
+        value.source_request_id = in.u64();
+        value.tu_seq.value = in.u64();
+        value.profile = static_cast<ProfileId>(in.u16());
+        value.raw_bytes = in.u64();
+        value.raw_digest = in.digest();
+        in.exact_end();
+        validate_job_bind(value);
+        return value;
+    }
+    case MessageType::TU_BEGIN: {
+        TuBegin value;
+        value.relationship_ordinal = in.u64();
+        value.inner.history_nonce.value = in.u64();
+        value.inner.rel_seq.value = in.u64();
+        value.inner.tu_seq.value = in.u64();
+        value.inner.profile = static_cast<ProfileId>(in.u16());
+        value.inner.pre_state_digest = in.digest();
+        value.inner.body = decode_descriptor(in);
+        value.inner.raw_bytes = in.u64();
+        value.inner.raw_digest = in.digest();
+        value.inner.transaction_digest = in.digest();
+        in.exact_end();
+        validate_tu_begin(value);
+        return value;
+    }
+    case MessageType::R2_BODY:
+        return R2BodyMessage{in.bytes(in.remaining())};
+    case MessageType::R2_FILL:
+        return R2FillMessage{in.bytes(in.remaining())};
+    case MessageType::TU_END: {
+        TuEnd value;
+        value.relationship_ordinal = in.u64();
+        value.binding_digest = in.digest();
+        value.transaction_digest = in.digest();
+        in.exact_end();
+        validate_tu_end(value);
+        return value;
+    }
+    case MessageType::R2_TX_COMMIT: {
+        R2TxCommit value;
+        value.relationship_ordinal = in.u64();
+        value.binding_digest = in.digest();
+        value.transaction_digest = in.digest();
+        value.inner = decode_commit(in);
+        in.exact_end();
+        validate_r2_commit(value);
+        return value;
+    }
+    case MessageType::COMMIT_ACK: {
+        CommitAck value;
+        value.relationship_id = in.id();
+        value.relationship_epoch = in.u64();
+        value.physical_link_generation = in.u64();
+        value.contiguous_verified_ordinal = in.u64();
+        in.exact_end();
+        validate_commit_ack(value);
+        return value;
+    }
     }
     throw std::invalid_argument("unknown message type");
+}
+
+Digest128 compute_r2_binding_digest(const JobBind& binding) {
+    const std::vector<uint8_t> canonical = encode_payload(Message{binding});
+    icecc::Digest128Builder digest;
+    digest.append("R2-binding-v1");
+    digest.append(canonical);
+    return digest.finish();
+}
+
+Digest128 compute_r2_transaction_digest(
+    const JobBind& binding, const TuBegin& begin,
+    std::span<const R2BodyMessage> bodies,
+    std::span<const R2FillMessage> fills) {
+    validate_job_bind(binding);
+    validate_tu_begin(begin);
+    if (begin.relationship_ordinal != binding.relationship_ordinal ||
+        begin.inner.tu_seq != binding.tu_seq ||
+        begin.inner.profile != binding.profile ||
+        begin.inner.raw_bytes != binding.raw_bytes ||
+        begin.inner.raw_digest != binding.raw_digest)
+        throw std::invalid_argument("R2 transaction differs from its JOB_BIND");
+    const Digest128 binding_digest = compute_r2_binding_digest(binding);
+    icecc::Digest128Builder digest;
+    digest.append("R2-transaction-v1");
+    digest.append_digest(binding_digest);
+    auto append_frame = [&digest](MessageType type,
+                                  std::span<const uint8_t> payload) {
+        digest.append_u8(static_cast<uint8_t>(type));
+        digest.append_u64(static_cast<uint64_t>(payload.size()));
+        digest.append(payload);
+    };
+    const std::vector<uint8_t> begin_payload = encode_payload(Message{begin});
+    append_frame(MessageType::TU_BEGIN, begin_payload);
+    for (const R2BodyMessage& body : bodies)
+        append_frame(MessageType::R2_BODY,
+                     std::span<const uint8_t>(body.bytes));
+    for (const R2FillMessage& fill : fills)
+        append_frame(MessageType::R2_FILL,
+                     std::span<const uint8_t>(fill.bytes));
+    return digest.finish();
 }
 
 std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_bytes) {
