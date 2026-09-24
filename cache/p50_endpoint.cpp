@@ -1850,6 +1850,10 @@ struct P50ClientEndpoint::Impl {
     HistoryNonce history_nonce{};
     RelSeq next_rel{};
     Digest128 state{};
+    bool pipelined_begin = false;
+    // F's fingerprint and limits from the STATE that last admitted a TX_BEGIN.
+    std::optional<Digest128> route_f_fingerprint;
+    SessionLimits route_limits{};
     std::optional<Active> active;
     PreparedInputPtr queued;
     PreparedTuHandle queued_handle;
@@ -3233,6 +3237,10 @@ P50ClientEndpoint::P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> pr
 
 P50ClientEndpoint::~P50ClientEndpoint() = default;
 
+void P50ClientEndpoint::enable_pipelined_begin() noexcept {
+    impl_->pipelined_begin = true;
+}
+
 boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run(
     tcp::endpoint remote, PreparedTuHandle prepared, EndpointIoControl control,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
@@ -3432,6 +3440,28 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
 
+        // Only fresh work on an exact retained route: anything else needs
+        // STATE first.  STATE must then confirm that route or the run fails.
+        const bool pipelined =
+            impl_->pipelined_begin && impl_->caps.profile == ProfileId::P29V1 &&
+            !impl_->active && impl_->queued && impl_->route_known &&
+            impl_->f_guid && impl_->route_f_fingerprint && !impl_->run_identity_seed;
+        if (pipelined) {
+            impl_->preparation->pin_p29v1_system_source_reuse(
+                impl_->queued_handle, *impl_->route_f_fingerprint);
+            impl_->start_active(impl_->queued, impl_->queued_handle, serial);
+            impl_->queued.reset();
+            impl_->queued_handle = {};
+            co_await async_write_message(socket, impl_->active->begin,
+                                         impl_->route_limits.max_frame_payload,
+                                         impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                                         impl_->completions, control, verify);
+            co_await async_write_component<BodyMessage>(
+                socket, impl_->active->prepared->body, impl_->route_limits.max_frame_payload,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                impl_->completions, control, verify);
+        }
+
         Frame state_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
@@ -3466,6 +3496,34 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                            impl_->route_known && peer.history_nonce == impl_->history_nonce &&
                            peer.next_rel_seq == impl_->next_rel &&
                            peer.state_digest == impl_->state;
+        if (pipelined && same_f && !exact) {
+            // This F refused a begin for a route it no longer holds.  Abort
+            // it; the retry reads STATE first and resets the route.
+            impl_->record(ActionType::TX_ABORTED, impl_->active->begin, serial,
+                          impl_->active->begin.pre_state_digest);
+            impl_->queued = impl_->active->prepared;
+            impl_->queued_handle = impl_->active->handle;
+            impl_->active.reset();
+            impl_->route_f_fingerprint.reset();
+            result.status = ClientRunStatus::Disconnected;
+            result.observation = ClientRunObservation::Disconnected;
+            result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
+            close_now(socket);
+            boost::system::error_code timer_error;
+            io->timer.cancel(timer_error);
+            impl_->active_session = 0;
+            co_return result;
+        }
+        if (pipelined && (!exact || negotiated_f_fingerprint != *impl_->route_f_fingerprint ||
+                          peer.limits != impl_->route_limits)) {
+            const ErrorMessage terminal = bounded_error(
+                2, "pipelined TX_BEGIN met a different F route",
+                peer.limits.max_frame_payload);
+            co_await async_report_client_terminal(
+                socket, terminal, peer.limits.max_frame_payload,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                impl_->completions, control, verify);
+        }
 
         // An adopted descriptor is already an exact FSession claim.  A local
         // peer observation that is not the exact retained route cannot grant
@@ -3484,7 +3542,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             impl_->active_session = 0;
             co_return result;
         }
-        if (same_f && impl_->active && peer.last_commit && peer.namespace_present &&
+        if (!pipelined && same_f && impl_->active && peer.last_commit && peer.namespace_present &&
             peer.route_present && same_commit(*peer.last_commit, impl_->active->begin) &&
             peer.history_nonce == impl_->history_nonce &&
             peer.next_rel_seq.value == impl_->active->begin.rel_seq.value + 1 &&
@@ -3593,7 +3651,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             impl_->active->p29v1_transport_retry = false;
         }
 
-        if (impl_->caps.profile == ProfileId::P29V1) {
+        if (!pipelined && impl_->caps.profile == ProfileId::P29V1) {
             const PreparedTuHandle fingerprint_handle =
                 impl_->active ? impl_->active->handle : impl_->queued_handle;
             impl_->preparation->pin_p29v1_system_source_reuse(
@@ -3609,21 +3667,30 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             impl_->queued.reset();
             impl_->queued_handle = {};
         }
-        TxBegin begin = impl_->active->begin;
-        if (control.outbound_begin_transform)
-            begin = control.outbound_begin_transform(
-                begin, impl_->active->prepared->body);
-        require_outbound_profile_negotiated(peer.negotiated_profiles, begin);
         const uint32_t frame_cap = peer.limits.max_frame_payload;
-        co_await async_write_message(socket, begin, frame_cap,
-                                     impl_->stamp(session, AsyncOperationKind::WriteFragment),
-                                     impl_->completions, control, verify);
-
-        if (begin.profile == ProfileId::P29V1) {
+        ProfileId sent_profile = impl_->active->begin.profile;
+        if (pipelined) {
+            require_outbound_profile_negotiated(peer.negotiated_profiles,
+                                                impl_->active->begin);
+        } else {
+            TxBegin begin = impl_->active->begin;
+            if (control.outbound_begin_transform)
+                begin = control.outbound_begin_transform(
+                    begin, impl_->active->prepared->body);
+            require_outbound_profile_negotiated(peer.negotiated_profiles, begin);
+            sent_profile = begin.profile;
+            impl_->route_f_fingerprint = negotiated_f_fingerprint;
+            impl_->route_limits = peer.limits;
+            co_await async_write_message(socket, begin, frame_cap,
+                                         impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                                         impl_->completions, control, verify);
             co_await async_write_component<BodyMessage>(
                 socket, impl_->active->prepared->body, frame_cap,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment),
                 impl_->completions, control, verify);
+        }
+
+        if (sent_profile == ProfileId::P29V1) {
             codec::P29WireLimits wire_limits;
             wire_limits.max_tu_bytes = static_cast<size_t>(
                 impl_->caps.zstd.max_raw_bytes);
@@ -3657,11 +3724,6 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                     socket, fill, frame_cap,
                     impl_->stamp(session, AsyncOperationKind::WriteFragment),
                     impl_->completions, control, verify);
-        } else {
-            co_await async_write_component<BodyMessage>(
-                socket, impl_->active->prepared->body, frame_cap,
-                impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
-                control, verify);
         }
         Frame commit_frame = co_await async_read_frame(
             socket, frame_cap, impl_->stamp(session, AsyncOperationKind::ReadHeader),

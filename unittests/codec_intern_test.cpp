@@ -306,6 +306,46 @@ void mutation_and_capacity_controls() {
             "Line-table failure overwrote an occupied slot");
 }
 
+// With budget beyond the layout, full hash tables add levels instead of
+// failing, and no id moves.
+void growth_controls() {
+    P29InternLayout layout = small_layout(4);
+    layout.region_capacity = 512;
+    layout.line_reference_capacity = 2048;
+    layout.line_bytes_capacity = 1 << 16;
+    layout.region_bytes_capacity = 1 << 16;
+    layout.region_line_id_capacity = 1024;
+    MmapProvider provider(independent_reservation(layout) + (1 << 20));
+    P29Interner<MmapProvider> interner(provider, layout);
+    std::vector<std::uint32_t> ids;
+    std::string corpus;
+    for (int index = 0; index != 300; ++index) {
+        const std::string name = std::to_string(index);
+        ids.push_back(interner.intern_line(bytes("growing-line-table-" + name + "\n")));
+        ids.push_back(interner.intern_line(bytes("s" + name + "\n")));
+        corpus += "# " + name + " \"r\"\nregion-" + name + "\n";
+    }
+    std::vector<std::uint32_t> regions;
+    interner.process(bytes(corpus), regions);
+    for (int index = 0; index != 300; ++index) {
+        const std::string name = std::to_string(index);
+        require(interner.intern_line(bytes("growing-line-table-" + name + "\n")) ==
+                        ids[2 * index] &&
+                    interner.intern_line(bytes("s" + name + "\n")) == ids[2 * index + 1],
+                "a Line moved when its table grew");
+    }
+    std::vector<std::uint32_t> again;
+    interner.process(bytes(corpus), again);
+    const P29InternLayout grown = interner.capacity();
+    require(regions.size() == 300 && again == regions &&
+                grown.line_capacity > layout.line_capacity &&
+                grown.short_capacity > layout.short_capacity &&
+                grown.region_index_capacity > layout.region_index_capacity &&
+                provider.reserved() == interner.reserved_bytes() &&
+                provider.reported_reserved() == interner.reserved_bytes(),
+            "hash tables did not grow within the provider budget");
+}
+
 void product_provider_control() {
     const P29InternLayout layout = small_layout();
     ProductTestProvider provider(independent_reservation(layout));
@@ -477,10 +517,10 @@ struct Options {
             const std::string_view selected = value();
             if (selected == "probe")
                 result.layout = P29InternLayout::probe();
-            else if (selected == "firefox")
-                result.layout = P29InternLayout::firefox();
+            else if (selected == "sidecar")
+                result.layout = P29InternLayout::sidecar();
             else
-                die("layout must be probe or firefox");
+                die("layout must be probe or sidecar");
         } else if (option == "--expected-regions") {
             result.expected_regions = number(value(), "Region count");
         } else if (option == "--expected-occurrences") {
@@ -549,6 +589,7 @@ int main(int argc, char **argv) {
         require(committed_first == committed_second,
                 "committed high-water is nondeterministic");
         mutation_and_capacity_controls();
+        growth_controls();
         product_provider_control();
 
         const Options config = options(argc, argv);

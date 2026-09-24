@@ -308,6 +308,27 @@ The executable trace gates reject:
 - begin or commit at exhausted `REL_SEQ`;
 - loss of the durable-commit reconciliation witness.
 
+## Pipelined TX_BEGIN
+
+An idle route-bound P29V1 client may send `TX_BEGIN` and `BODY` before reading
+`SESSION_STATE`. It uses its retained cursor plus the F fingerprint and limits
+of the last `SESSION_STATE` that admitted a begin. F writes `SESSION_STATE`
+before reading another frame, so when that state confirms all three, F receives
+the bytes of an ordinary run. `C_TX_BEGIN` changes only `cActiveOp`. The F steps
+between C's and F's `TX_BEGIN` (the retired session's `SESSION_DISCONNECTED`,
+`SESSION_OPENED` at activation) neither read it nor move the route, so it
+commutes to just before `F_TX_BEGIN`, where its guards hold. Ordinary runs
+already rely on this: C records `TX_BEGIN` before F records `SESSION_OPENED`,
+and neither trace gate orders the two. F's route is frozen between its
+`SESSION_STATE` and its read of the begin, so F refuses a begin for a route that
+`SESSION_STATE` does not show exactly, before activation, which is a stutter.
+C then records `TX_ABORTED` (F has nothing pending), requeues the TU and
+reports a disconnect; the retry reads `SESSION_STATE` first and takes the
+ordinary `HISTORY_RESET` row, e.g. after F dropped only its P29V1 codec on input
+eviction. Any other mismatch (another F, fingerprint or limit drift) is a
+terminal error before `FILL`, and P29V1 cannot close an installed begin without
+`FILL`, so nothing commits.
+
 ## P50 assignment identity through the client
 
 `Protocol50AssignmentIdentity.tla` refines the accepted assignment and

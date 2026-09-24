@@ -134,6 +134,8 @@ struct P50ZstdSourceSender::Impl {
             authority, config.endpoint_caps, HistoryNonce{1}, &wire_completions, nullptr,
             std::nullopt, std::function<void(EndpointCancelPermit)>{},
             std::function<void(EndpointCancelPermit, EndpointTerminalResult)>{}, route);
+        // A route-bound sender belongs to one C/F-incarnation relationship.
+        endpoint->enable_pipelined_begin();
     }
 
     ZstdSourceTransferResult invalid(ZstdSourceTransferStatus status) const {

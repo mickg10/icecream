@@ -1257,10 +1257,10 @@ Options options(int argc, char **argv) {
       const std::string_view layout = value();
       if (layout == "probe")
         result.layout = P29InternLayout::probe();
-      else if (layout == "firefox")
-        result.layout = P29InternLayout::firefox();
+      else if (layout == "sidecar")
+        result.layout = P29InternLayout::sidecar();
       else
-        die("layout must be probe or firefox");
+        die("layout must be probe or sidecar");
     } else if (option == "--cf-reference") {
       result.cf_reference = value();
     } else if (option == "--fc-reference") {

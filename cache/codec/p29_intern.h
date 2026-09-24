@@ -26,6 +26,8 @@ enum class P29InternAllocation : std::uint8_t {
     RegionLineIds,
 };
 
+// The four hash tables start at their capacity here and grow; the five
+// append-only arenas are reserved whole up front.
 struct P29InternLayout {
     std::size_t tiny_capacity = std::size_t{1} << 10;
     std::size_t short_capacity = std::size_t{1} << 17;
@@ -39,25 +41,23 @@ struct P29InternLayout {
 
     [[nodiscard]] static constexpr P29InternLayout probe() { return {}; }
 
-    // Region counts are 4x upstream's.  A whole-repo build (8685 TUs,
-    // 141 GB rewrite-includes input) interns 295K distinct Regions, so 1 << 18
-    // filled at TU ~7000 while every other table was 11-56% full.
-    [[nodiscard]] static constexpr P29InternLayout firefox() {
+    // One sidecar interns every build it serves.  Two whole-repo builds
+    // and 550 Firefox TUs filled 4M Line references; only touched pages of
+    // these arenas cost memory.
+    [[nodiscard]] static constexpr P29InternLayout sidecar() {
         P29InternLayout value;
-        value.line_capacity = std::size_t{1} << 23;
-        value.region_index_capacity = std::size_t{1} << 21;
-        value.region_capacity = std::size_t{1} << 20;
-        value.line_reference_capacity = std::size_t{1} << 22;
-        value.line_bytes_capacity = std::size_t{1} << 30;
-        value.region_bytes_capacity = std::size_t{1} << 30;
-        value.region_line_id_capacity = std::size_t{1} << 24;
+        value.region_capacity = std::size_t{1} << 24;
+        value.line_reference_capacity = std::size_t{1} << 26;
+        value.line_bytes_capacity = std::numeric_limits<std::uint32_t>::max();
+        value.region_bytes_capacity = std::numeric_limits<std::uint32_t>::max();
+        value.region_line_id_capacity = std::size_t{1} << 28;
         return value;
     }
 };
 
-// Occupancy of the fixed-capacity tables, in the units P29InternLayout sizes
-// them in.  process() fails once any one of them is full.  Every Region also
-// occupies one region-index slot.
+// Occupancy of the tables, in the units P29InternLayout sizes them in.
+// process() fails once an arena, or a hash table that cannot grow, is full.
+// Every Region also occupies one region-index slot.
 struct P29InternUsage {
     std::size_t tiny_slots = 0;
     std::size_t short_slots = 0;
@@ -129,6 +129,31 @@ struct RegionRecord {
     std::uint32_t next1;
     std::uint32_t next2;
 };
+
+// An open-addressing table whose entries never move: instead of rehashing,
+// a twice-larger level is added and a lookup probes every level, oldest
+// first.
+inline constexpr unsigned kMaxLevels = 16;
+
+template <class Slot> struct Levels {
+    Slot *slots[kMaxLevels] = {};
+    std::size_t capacity[kMaxLevels] = {};
+    unsigned count = 0;
+    std::size_t occupied = 0;
+    std::size_t newest_occupied = 0;
+
+    [[nodiscard]] std::size_t total_capacity() const noexcept {
+        std::size_t total = 0;
+        for (unsigned level = 0; level != count; ++level)
+            total += capacity[level];
+        return total;
+    }
+};
+
+[[nodiscard]] inline bool occupied(const TinySlot &slot) { return slot.id != 0; }
+[[nodiscard]] inline bool occupied(const ShortSlot &slot) { return slot.id != 0; }
+[[nodiscard]] inline bool occupied(const LineSlot &slot) { return slot.id != 0; }
+[[nodiscard]] inline bool occupied(std::uint32_t slot) { return slot != 0; }
 
 static_assert(sizeof(LineRef) == 8);
 static_assert(sizeof(TinySlot) == 16);
@@ -299,14 +324,14 @@ template <P29InternProvider Provider> class P29Interner {
             fail("P29 interner reservation exceeds provider budget");
         reservation_active_ = true;
         try {
-            tiny_ = allocate<p29_intern_detail::TinySlot>(
-                P29InternAllocation::TinyTable, layout_.tiny_capacity);
-            short_ = allocate<p29_intern_detail::ShortSlot>(
-                P29InternAllocation::ShortTable, layout_.short_capacity);
-            lines_ = allocate<p29_intern_detail::LineSlot>(
-                P29InternAllocation::LineTable, layout_.line_capacity);
-            region_index_ = allocate<std::uint32_t>(
-                P29InternAllocation::RegionIndex, layout_.region_index_capacity);
+            open_level(tiny_, P29InternAllocation::TinyTable,
+                       layout_.tiny_capacity);
+            open_level(short_, P29InternAllocation::ShortTable,
+                       layout_.short_capacity);
+            open_level(lines_, P29InternAllocation::LineTable,
+                       layout_.line_capacity);
+            open_level(region_index_, P29InternAllocation::RegionIndex,
+                       layout_.region_index_capacity);
             region_records_ = allocate<p29_intern_detail::RegionRecord>(
                 P29InternAllocation::RegionRecords, layout_.region_capacity);
             line_refs_ = allocate<p29_intern_detail::LineRef>(
@@ -348,17 +373,27 @@ template <P29InternProvider Provider> class P29Interner {
     [[nodiscard]] std::size_t reserved_bytes() const { return reserved_bytes_; }
 
     [[nodiscard]] P29InternUsage usage() const noexcept {
-        return {tiny_occupied_,   short_occupied_,    line_occupied_,
+        return {tiny_.occupied,   short_.occupied,    lines_.occupied,
                 next_line_id_,    line_bytes_used_,   region_count_,
                 region_bytes_used_, region_ids_used_};
+    }
+
+    // The layout with each hash table at its current, grown capacity.
+    [[nodiscard]] P29InternLayout capacity() const noexcept {
+        P29InternLayout value = layout_;
+        value.tiny_capacity = tiny_.total_capacity();
+        value.short_capacity = short_.total_capacity();
+        value.line_capacity = lines_.total_capacity();
+        value.region_index_capacity = region_index_.total_capacity();
+        return value;
     }
 
     [[nodiscard]] std::size_t committed_bytes() const {
         using namespace p29_intern_detail;
         std::size_t total = 0;
-        checked_add(total, checked_product(tiny_occupied_, sizeof(TinySlot)));
-        checked_add(total, checked_product(short_occupied_, sizeof(ShortSlot)));
-        checked_add(total, checked_product(line_occupied_, sizeof(LineSlot)));
+        checked_add(total, checked_product(tiny_.occupied, sizeof(TinySlot)));
+        checked_add(total, checked_product(short_.occupied, sizeof(ShortSlot)));
+        checked_add(total, checked_product(lines_.occupied, sizeof(LineSlot)));
         checked_add(total,
                     checked_product(region_count_, sizeof(std::uint32_t)));
         checked_add(total, checked_product(region_count_, sizeof(RegionRecord)));
@@ -416,7 +451,7 @@ template <P29InternProvider Provider> class P29Interner {
                 }
             }
 
-            std::size_t open_region_slot = 0;
+            std::uint32_t *open_region_slot = nullptr;
             if (!found) {
                 const std::uint8_t *next =
                     p29_intern_detail::next_region(position, end);
@@ -425,31 +460,26 @@ template <P29InternProvider Provider> class P29Interner {
                     fail("P29 Region exceeds u32 length");
                 raw_length = static_cast<std::uint32_t>(wide_length);
                 hash = p29_intern_detail::sampled_hash(position, raw_length) | 1ULL;
-                open_region_slot = std::uint32_t(hash) &
-                                   (layout_.region_index_capacity - 1);
-                std::size_t probes = 0;
-                for (;;) {
-                    if (++probes > layout_.region_index_capacity)
-                        fail("P29 Region table is full");
-                    const std::uint32_t encoded = region_index_[open_region_slot];
-                    if (!encoded)
-                        break;
-                    auto &candidate = region_records_[encoded - 1];
-                    if (candidate.hash == hash && candidate.raw_len == raw_length &&
-                        std::memcmp(region_bytes_ + candidate.raw_off, position,
-                                    raw_length) == 0) {
-                        region_id = encoded - 1;
-                        found = true;
-                        break;
-                    }
-                    open_region_slot =
-                        (open_region_slot + 1) &
-                        (layout_.region_index_capacity - 1);
+                grow(region_index_, P29InternAllocation::RegionIndex);
+                if (const std::uint32_t *match = find(
+                        region_index_, hash,
+                        [&](std::uint32_t encoded) {
+                            const auto &candidate = region_records_[encoded - 1];
+                            return candidate.hash == hash &&
+                                   candidate.raw_len == raw_length &&
+                                   std::memcmp(region_bytes_ + candidate.raw_off,
+                                               position, raw_length) == 0;
+                        },
+                        open_region_slot)) {
+                    region_id = *match - 1;
+                    found = true;
                 }
             }
 
             if (!found) {
-                region_id = add_region(position, raw_length, hash, open_region_slot);
+                if (!open_region_slot)
+                    fail("P29 Region table is full");
+                region_id = add_region(position, raw_length, hash, *open_region_slot);
             }
 
             regions.push_back(region_id);
@@ -480,23 +510,23 @@ template <P29InternProvider Provider> class P29Interner {
 
         const std::uint64_t hash =
             p29_intern_detail::line_hash(bytes.data(), length) | 1ULL;
-        std::size_t slot = std::uint32_t(hash) & (layout_.line_capacity - 1);
-        std::size_t probes = 0;
-        for (;;) {
-            if (++probes > layout_.line_capacity)
-                fail("P29 Line table is full");
-            auto &candidate = lines_[slot];
-            if (!candidate.id) {
-                const std::uint32_t id = add_line(bytes.data(), length);
-                candidate = {hash, line_refs_[id].off, length, id, 0};
-                ++line_occupied_;
-                return id;
-            }
-            if (candidate.hash == hash && candidate.len == length &&
-                std::memcmp(line_bytes_ + candidate.off, bytes.data(), length) == 0)
-                return candidate.id;
-            slot = (slot + 1) & (layout_.line_capacity - 1);
-        }
+        grow(lines_, P29InternAllocation::LineTable);
+        p29_intern_detail::LineSlot *open = nullptr;
+        if (const auto *match = find(
+                lines_, hash,
+                [&](const p29_intern_detail::LineSlot &candidate) {
+                    return candidate.hash == hash && candidate.len == length &&
+                           std::memcmp(line_bytes_ + candidate.off, bytes.data(),
+                                       length) == 0;
+                },
+                open))
+            return match->id;
+        if (!open)
+            fail("P29 Line table is full");
+        const std::uint32_t id = add_line(bytes.data(), length);
+        *open = {hash, line_refs_[id].off, length, id, 0};
+        claim(lines_);
+        return id;
     }
 
     [[nodiscard]] std::span<const std::uint8_t> line(std::uint32_t id) const {
@@ -545,6 +575,59 @@ template <P29InternProvider Provider> class P29Interner {
             layout_.region_bytes_capacity > kNone ||
             layout_.region_line_id_capacity > kNone)
             throw std::invalid_argument("P29 interner layout exceeds u32 addressing");
+    }
+
+    template <class Slot>
+    void open_level(p29_intern_detail::Levels<Slot> &table,
+                    P29InternAllocation kind, std::size_t capacity) {
+        table.slots[table.count] = allocate<Slot>(kind, capacity);
+        table.capacity[table.count++] = capacity;
+        table.newest_occupied = 0;
+    }
+
+    // Adds a twice-larger level once the newest is 3/4 full, while the
+    // provider's budget admits it; otherwise the newest level fills up.
+    template <class Slot>
+    void grow(p29_intern_detail::Levels<Slot> &table, P29InternAllocation kind) {
+        const std::size_t capacity = table.capacity[table.count - 1];
+        if (4 * table.newest_occupied < 3 * capacity ||
+            table.count == p29_intern_detail::kMaxLevels)
+            return;
+        const std::size_t bytes =
+            p29_intern_detail::checked_product(2 * capacity, sizeof(Slot));
+        if (!provider_.try_reserve_interner(bytes))
+            return;
+        reserved_bytes_ += bytes;
+        open_level(table, kind, 2 * capacity);
+    }
+
+    // The slot holding a match, else nullptr with `open` set to a free slot
+    // of the newest level (nullptr if that level is full).
+    template <class Slot, class Match>
+    [[nodiscard]] Slot *find(p29_intern_detail::Levels<Slot> &table,
+                             std::uint64_t hash, Match match, Slot *&open) {
+        open = nullptr;
+        for (unsigned level = 0; level != table.count; ++level) {
+            const std::size_t mask = table.capacity[level] - 1;
+            std::size_t slot = hash & mask;
+            for (std::size_t probes = 0; probes <= mask; ++probes) {
+                Slot &candidate = table.slots[level][slot];
+                if (!p29_intern_detail::occupied(candidate)) {
+                    if (level + 1 == table.count)
+                        open = &candidate;
+                    break;
+                }
+                if (match(candidate))
+                    return &candidate;
+                slot = (slot + 1) & mask;
+            }
+        }
+        return nullptr;
+    }
+
+    template <class Slot> static void claim(p29_intern_detail::Levels<Slot> &table) {
+        ++table.occupied;
+        ++table.newest_occupied;
     }
 
     template <class T>
@@ -597,26 +680,25 @@ template <P29InternProvider Provider> class P29Interner {
     [[nodiscard]] std::uint32_t intern_tiny(const std::uint8_t *data,
                                             std::uint32_t length) {
         const std::uint64_t bytes = p29_intern_detail::read_tail(data, length);
-        std::size_t slot = std::uint32_t(p29_intern_detail::mix64(
-                               bytes ^ (std::uint64_t(length) << 56))) &
-                           (layout_.tiny_capacity - 1);
-        std::size_t probes = 0;
-        for (;;) {
-            if (++probes > layout_.tiny_capacity)
-                fail("P29 Tiny Line table is full");
-            auto &candidate = tiny_[slot];
-            if (!candidate.id) {
-                const std::uint32_t id = add_line(data, length);
-                candidate.bytes = bytes;
-                candidate.id = id;
-                candidate.len = static_cast<std::uint8_t>(length);
-                ++tiny_occupied_;
-                return id;
-            }
-            if (candidate.len == length && candidate.bytes == bytes)
-                return candidate.id;
-            slot = (slot + 1) & (layout_.tiny_capacity - 1);
-        }
+        const std::uint64_t hash = std::uint32_t(
+            p29_intern_detail::mix64(bytes ^ (std::uint64_t(length) << 56)));
+        grow(tiny_, P29InternAllocation::TinyTable);
+        p29_intern_detail::TinySlot *open = nullptr;
+        if (const auto *match = find(
+                tiny_, hash,
+                [&](const p29_intern_detail::TinySlot &candidate) {
+                    return candidate.len == length && candidate.bytes == bytes;
+                },
+                open))
+            return match->id;
+        if (!open)
+            fail("P29 Tiny Line table is full");
+        const std::uint32_t id = add_line(data, length);
+        open->bytes = bytes;
+        open->id = id;
+        open->len = static_cast<std::uint8_t>(length);
+        claim(tiny_);
+        return id;
     }
 
     [[nodiscard]] std::uint32_t intern_short(const std::uint8_t *data,
@@ -631,33 +713,31 @@ template <P29InternProvider Provider> class P29Interner {
         const std::uint64_t hash = p29_intern_detail::fold128(
             low ^ 0xa0761d6478bd642fULL,
             high ^ std::uint64_t(length) * 0xe7037ed1a0b428dbULL);
-        std::size_t slot = std::uint32_t(hash) &
-                           (layout_.short_capacity - 1);
-        std::size_t probes = 0;
-        for (;;) {
-            if (++probes > layout_.short_capacity)
-                fail("P29 Short Line table is full");
-            auto &candidate = short_[slot];
-            if (!candidate.id) {
-                const std::uint32_t id = add_line(data, length);
-                candidate.lo = low;
-                candidate.hi = high;
-                candidate.id = id;
-                candidate.len = static_cast<std::uint8_t>(length);
-                ++short_occupied_;
-                return id;
-            }
-            if (candidate.len == length && candidate.lo == low &&
-                candidate.hi == high)
-                return candidate.id;
-            slot = (slot + 1) & (layout_.short_capacity - 1);
-        }
+        grow(short_, P29InternAllocation::ShortTable);
+        p29_intern_detail::ShortSlot *open = nullptr;
+        if (const auto *match = find(
+                short_, std::uint32_t(hash),
+                [&](const p29_intern_detail::ShortSlot &candidate) {
+                    return candidate.len == length && candidate.lo == low &&
+                           candidate.hi == high;
+                },
+                open))
+            return match->id;
+        if (!open)
+            fail("P29 Short Line table is full");
+        const std::uint32_t id = add_line(data, length);
+        open->lo = low;
+        open->hi = high;
+        open->id = id;
+        open->len = static_cast<std::uint8_t>(length);
+        claim(short_);
+        return id;
     }
 
     [[nodiscard]] std::uint32_t add_region(const std::uint8_t *data,
                                            std::uint32_t raw_length,
                                            std::uint64_t hash,
-                                           std::size_t index_slot) {
+                                           std::uint32_t &index_slot) {
         const std::size_t region_count = region_count_.load(std::memory_order_relaxed);
         if (region_count >= layout_.region_capacity || region_count == kNone)
             fail("P29 Region record arena is full");
@@ -700,7 +780,8 @@ template <P29InternProvider Provider> class P29Interner {
             0,
             0,
         };
-        region_index_[index_slot] = region_id + 1;
+        index_slot = region_id + 1;
+        claim(region_index_);
         region_count_.store(region_count + 1, std::memory_order_release);
         return region_id;
     }
@@ -709,22 +790,19 @@ template <P29InternProvider Provider> class P29Interner {
     P29InternLayout layout_;
     std::size_t reserved_bytes_ = 0;
     bool reservation_active_ = false;
-    Allocation allocations_[9]{};
+    Allocation allocations_[5 + 4 * p29_intern_detail::kMaxLevels]{};
     std::size_t allocation_count_ = 0;
 
-    p29_intern_detail::TinySlot *tiny_ = nullptr;
-    p29_intern_detail::ShortSlot *short_ = nullptr;
-    p29_intern_detail::LineSlot *lines_ = nullptr;
-    std::uint32_t *region_index_ = nullptr;
+    p29_intern_detail::Levels<p29_intern_detail::TinySlot> tiny_;
+    p29_intern_detail::Levels<p29_intern_detail::ShortSlot> short_;
+    p29_intern_detail::Levels<p29_intern_detail::LineSlot> lines_;
+    p29_intern_detail::Levels<std::uint32_t> region_index_;
     p29_intern_detail::RegionRecord *region_records_ = nullptr;
     p29_intern_detail::LineRef *line_refs_ = nullptr;
     std::uint8_t *line_bytes_ = nullptr;
     std::uint8_t *region_bytes_ = nullptr;
     std::uint32_t *region_ids_ = nullptr;
 
-    std::size_t tiny_occupied_ = 0;
-    std::size_t short_occupied_ = 0;
-    std::size_t line_occupied_ = 0;
     std::size_t line_bytes_used_ = 0;
     std::size_t region_bytes_used_ = 0;
     std::size_t region_ids_used_ = 0;

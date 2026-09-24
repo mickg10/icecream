@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -940,6 +941,99 @@ void test_p29v1_endpoint_route_dialogue_lifetime() {
         });
     require(!capped_published,
             "P29V1 projected route-cap failure published receiver state");
+}
+
+void test_p29v1_pipelined_begin() {
+    const P5coStoreGuids guids = p5co_store_guids(233);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    CompletionLog completions;
+    TestClient client(guids.c, caps, HistoryNonce{1}, &completions, &actions,
+                      authority_limits);
+    client.endpoint.enable_pipelined_begin();
+    for (int run = 0; run != 3; ++run) {
+        const std::vector<uint8_t> input = bytes(
+            "# 1 \"/tmp/p29v1-pipelined.cc\"\nsame-line\nsame-line\nrun-" +
+            std::to_string(run) + "\n");
+        const PairResult pair = run_pair(client, server, admit(client, input));
+        require(pair.client.status == ClientRunStatus::Committed &&
+                    pair.server.status == ServerRunStatus::Completed &&
+                    copy_input(server, guids.c) == input,
+                "pipelined P29V1 TU did not commit exact bytes");
+    }
+    if (const auto error = check_action_trace(actions.records()))
+        fail("pipelined P29V1 trace: " + *error);
+
+    // C writes before its first read, per session in run order.
+    std::vector<std::pair<uint64_t, size_t>> writes_before_read;
+    std::set<uint64_t> read_seen;
+    for (const AsyncCompletion& completion : completions.completions()) {
+        if (completion.stamp.actor != ActorSide::C)
+            continue;
+        const uint64_t serial = completion.stamp.session_serial;
+        if (writes_before_read.empty() || writes_before_read.back().first != serial)
+            writes_before_read.emplace_back(serial, 0);
+        if (completion.stamp.operation == AsyncOperationKind::ReadHeader)
+            read_seen.insert(serial);
+        else if (completion.stamp.operation == AsyncOperationKind::WriteFragment &&
+                 !read_seen.contains(serial))
+            ++writes_before_read.back().second;
+    }
+    require(writes_before_read.size() == 3 && writes_before_read[0].second < 3 &&
+                writes_before_read[1].second >= 3 &&
+                writes_before_read[2].second >= 3,
+            "retained P29V1 route did not send TX_BEGIN and BODY before STATE");
+
+    // Another F incarnation behind the same address must fail closed.
+    const P5coStoreGuids other = p5co_store_guids(234);
+    P50ServerEndpoint other_server(other.f, caps);
+    const std::vector<uint8_t> refused = bytes("# 1 \"/tmp/p29v1-other.cc\"\nother\n");
+    const PairResult mismatch = run_pair(client, other_server, admit(client, refused));
+    require(mismatch.client.status == ClientRunStatus::TerminalError &&
+                mismatch.server.status != ServerRunStatus::Completed &&
+                !other_server.last_committed_input(guids.c),
+            "pipelined TX_BEGIN committed on a different F");
+
+    // The same F dropped the route to make room for another C: the early
+    // begin is aborted, and the retry resets the route from STATE.
+    ActionTrace evict_actions;
+    P50ServerEndpointConfig evicting;
+    evicting.owner_limits.max_retained_input_records = 1;
+    const P5coStoreGuids evict = p5co_store_guids(235);
+    P50ServerEndpoint small(evict.f, caps, nullptr, &evict_actions,
+                            std::move(evicting));
+    TestClient first(evict.c, caps, HistoryNonce{1}, nullptr, &evict_actions,
+                     authority_limits);
+    TestClient second(p5co_store_guids(236).c, caps, HistoryNonce{1}, nullptr,
+                      &evict_actions, authority_limits);
+    first.endpoint.enable_pipelined_begin();
+    const PairResult warm =
+        run_pair(first, small, admit(first, bytes("# 1 \"/tmp/a.cc\"\nfirst\n")));
+    require(warm.server.committed_input.has_value(), "eviction fixture did not commit");
+    small.close_input_job(*warm.server.committed_input);
+    const PairResult displacing =
+        run_pair(second, small, admit(second, bytes("# 1 \"/tmp/b.cc\"\nsecond\n")));
+    require(displacing.server.committed_input.has_value(),
+            "displacing namespace did not commit");
+    small.close_input_job(*displacing.server.committed_input);
+    const PreparedTuHandle next = admit(first, bytes("# 1 \"/tmp/a.cc\"\nagain\n"));
+    const PairResult aborted = run_pair(first, small, next);
+    const PairResult reset = run_pair(first, small, next);
+    require(warm.client.status == ClientRunStatus::Committed &&
+                displacing.client.status == ClientRunStatus::Committed &&
+                aborted.client.status == ClientRunStatus::Disconnected &&
+                reset.client.status == ClientRunStatus::Committed &&
+                reset.client.reconnect == EndpointReconnectOutcome::RouteHistoryReset &&
+                copy_input(small, evict.c) == bytes("# 1 \"/tmp/a.cc\"\nagain\n"),
+            "pipelined TX_BEGIN on an evicted route did not recover by reset");
+    if (const auto error = check_action_trace(evict_actions.records()))
+        fail("pipelined abort trace: " + *error);
 }
 
 void test_profile_materialized_result_digest_gates() {
@@ -6244,6 +6338,7 @@ int main(int argc, char** argv) {
     }
     if (std::getenv("ICECC_P50_P29_DIALOGUE_FOCUS") != nullptr) {
         test_p29v1_endpoint_route_dialogue_lifetime();
+        test_p29v1_pipelined_begin();
         std::cout << "p50_endpoint_test: focused P29V1 dialogue PASS\n";
         return 0;
     }
@@ -6293,6 +6388,7 @@ int main(int argc, char** argv) {
     test_zstd_route_authority_bounded_history();
     test_server_routes_are_isolated_by_profile();
     test_p29v1_endpoint_route_dialogue_lifetime();
+    test_p29v1_pipelined_begin();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())

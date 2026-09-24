@@ -206,8 +206,8 @@ struct PreparationRouteKey {
 struct PreparationAuthorityLimits {
     size_t max_live_entries = 4096;
     uint64_t max_retained_encoded_bytes = uint64_t{512} << 20;
-    // Only a gate: the interner allocates firefox() (2.32 GiB) if it fits
-    // under this, else probe().  It never grows into the remainder.
+    // The interner reserves sidecar() (10 GiB, mostly untouched arenas) if
+    // it fits under this, else probe(); its hash tables grow into the rest.
     uint64_t max_interner_reserved_bytes = uint64_t{24} << 30;
     uint64_t max_route_state_bytes = uint64_t{1} << 30;
     auto operator<=>(const PreparationAuthorityLimits&) const = default;
@@ -481,6 +481,11 @@ public:
     ~P50ClientEndpoint();
     P50ClientEndpoint(const P50ClientEndpoint&) = delete;
     P50ClientEndpoint& operator=(const P50ClientEndpoint&) = delete;
+
+    // For callers that only ever reach one F incarnation: with an exact
+    // retained P29V1 route, TX_BEGIN and BODY follow HELLO without waiting
+    // for STATE, which is checked afterwards.
+    void enable_pipelined_begin() noexcept;
 
     // The deadline is an absolute steady-clock time.  Omitting it preserves
     // the historical unbounded behavior for callers that do not opt in.

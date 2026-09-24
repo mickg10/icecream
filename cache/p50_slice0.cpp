@@ -1635,9 +1635,9 @@ const ImmutableObject& CObjectArena::object(Key64 key) const {
 
 struct CAuthority::P29V1State {
     static codec::P29InternLayout select_layout(uint64_t budget) {
-        const codec::P29InternLayout firefox = codec::P29InternLayout::firefox();
-        if (codec::p29_interner_reservation(firefox) <= budget)
-            return firefox;
+        const codec::P29InternLayout sidecar = codec::P29InternLayout::sidecar();
+        if (codec::p29_interner_reservation(sidecar) <= budget)
+            return sidecar;
         const codec::P29InternLayout probe = codec::P29InternLayout::probe();
         if (codec::p29_interner_reservation(probe) <= budget)
             return probe;
@@ -1667,6 +1667,7 @@ struct CAuthority::P29V1State {
                     ch = '?';
         }
         const codec::P29InternUsage used = interner.usage();
+        const codec::P29InternLayout layout = interner.capacity();
         const auto n = [](uint64_t value) {
             return static_cast<unsigned long long>(value);
         };
