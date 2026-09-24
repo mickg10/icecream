@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <poll.h>
 
 #ifdef __FreeBSD__
@@ -282,18 +283,31 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
         return icecc::p50::OwnedSourceFd(fd);
     }
 
-    char *temporary_path = nullptr;
-    if (dcc_make_tmpnam("icecc-p50", ".ix", &temporary_path, 0) != 0 ||
-        temporary_path == nullptr)
-        throw client_error(10, "Error 10 - unable to create preprocessor output");
-    TempSourceFile temporary(temporary_path);
-    int write_fd = ::open(temporary.path(), O_WRONLY | O_TRUNC | O_CLOEXEC);
-    if (write_fd < 0)
-        throw client_error(10, "Error 10 - unable to open preprocessor output");
+    // Use memfd to avoid disk writeback throttling under memory pressure.
+    int memfd = ::memfd_create("icecc-p50", MFD_CLOEXEC);
+    const bool use_memfd = memfd >= 0;
+    int read_fd = -1;
+    int write_fd = -1;
+    std::unique_ptr<TempSourceFile> temporary;
+    if (use_memfd) {
+        // Dup before call_cpp: it closes write_fd in the parent after fork.
+        write_fd = ::dup(memfd);
+        read_fd = ::dup(memfd);
+        ::lseek(read_fd, 0, SEEK_SET);
+    } else {
+        char *temporary_path = nullptr;
+        if (dcc_make_tmpnam("icecc-p50", ".ix", &temporary_path, 0) != 0 ||
+            temporary_path == nullptr)
+            throw client_error(10, "Error 10 - unable to create preprocessor output");
+        temporary = std::make_unique<TempSourceFile>(temporary_path);
+        write_fd = ::open(temporary->path(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+        if (write_fd < 0)
+            throw client_error(10, "Error 10 - unable to open preprocessor output");
+    }
 
     const pid_t cpp_pid = call_cpp(job, write_fd);
     if (cpp_pid == -1) {
-        (void)::close(write_fd); // call_cpp closes it only after a successful fork.
+        if (use_memfd) { ::close(memfd); ::close(read_fd); }
         throw client_error(18, "Error 18 - (fork error?)");
     }
 
@@ -302,13 +316,16 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     do {
         waited = ::waitpid(cpp_pid, &wait_status, 0);
     } while (waited < 0 && errno == EINTR);
-    if (waited != cpp_pid)
+    if (waited != cpp_pid) {
+        if (use_memfd) { ::close(memfd); ::close(read_fd); }
         throw client_error(18, "Error 18 - unable to wait for local cpp");
+    }
 
     cpp_status = shell_exit_status(wait_status);
     if (cpp_status != 0) {
         log_warning() << "call_cpp process failed with exit status "
                       << cpp_status << std::endl;
+        if (use_memfd) { ::close(memfd); ::close(read_fd); }
         if (!compiler_is_clang(job) && compiler_only_rewrite_includes(job))
             throw remote_error(
                 103,
@@ -316,14 +333,19 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
         return icecc::p50::OwnedSourceFd(-1);
     }
 
-    if (!retain_p50_preprocessed_capture(temporary.path()))
+    if (use_memfd) {
+        ::close(memfd);
+        return icecc::p50::OwnedSourceFd(read_fd);
+    }
+
+    if (!retain_p50_preprocessed_capture(temporary->path()))
         throw client_error(
             11, "Error 11 - unable to retain configured preprocessed input");
 
-    const int read_fd = ::open(temporary.path(), O_RDONLY | O_CLOEXEC);
+    read_fd = ::open(temporary->path(), O_RDONLY | O_CLOEXEC);
     if (read_fd < 0)
         throw client_error(11, "Error 11 - unable to reopen preprocessed file");
-    if (!temporary.unlink_now()) {
+    if (!temporary->unlink_now()) {
         (void)::close(read_fd);
         throw client_error(11, "Error 11 - unable to unlink preprocessed file");
     }
