@@ -451,6 +451,66 @@ void test_p51_source_reservation_v7_codec() {
     // local clock and checking expiry belong to the reservation service.
 }
 
+void test_p51_source_transfer_downselected_window_v7_codec() {
+    const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
+    const auto deadline =
+        icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    P51SourceArmFields arm = p51_source_arm();
+    arm.requested_window = 30;
+
+    for (const uint32_t selected_window : {1u, 30u}) {
+        P51SourceTransferRequest request;
+        request.armed = p51_source_armed(arm);
+        request.armed.selected_window = selected_window;
+        request.absolute_deadline = deadline;
+        CHECK(request.armed.valid());
+        const ControlOperation operation = make_p51_source_transfer_operation(
+            Identity{91, 17}, request, arm.source.source_request_id);
+        const auto wire = encode_control_operation(operation);
+        CHECK(wire.size() == kP51SourceReservationOperationBytes);
+        ControlOperation decoded;
+        check(decode_control_operation(wire, decoded),
+              selected_window == 1 ? "P51 transfer selected window one decodes"
+                                   : "P51 transfer selected window thirty decodes");
+        CHECK(decoded.kind == ControlOperationKind::P51SourceTransfer);
+        CHECK(decoded.p51_source_transfer == request);
+
+        P50SourceTransferResult error;
+        error.code = SourceTransferResultCode::Error;
+        error.error_code = 9;
+        error.attempts = 1;
+        const ControlOperation reply =
+            make_p51_source_transfer_reply_operation(operation, error);
+        const auto reply_wire = encode_control_operation(reply);
+        CHECK(reply_wire.size() == kP51SourceReservationOperationBytes);
+        ControlOperation decoded_reply;
+        CHECK(decode_control_operation(reply_wire, decoded_reply));
+        CHECK(decoded_reply.p51_source_transfer == request);
+        CHECK(decoded_reply.p51_source_transfer_result == error);
+    }
+
+    P51SourceTransferRequest invalid;
+    invalid.armed = p51_source_armed(arm);
+    invalid.absolute_deadline = deadline;
+    invalid.armed.selected_window = 0;
+    CHECK(encode_control_operation(make_p51_source_transfer_operation(
+              Identity{91, 17}, invalid, arm.source.source_request_id)).empty());
+    invalid.armed.selected_window = 31;
+    CHECK(encode_control_operation(make_p51_source_transfer_operation(
+              Identity{91, 17}, invalid, arm.source.source_request_id)).empty());
+    invalid.armed.selected_window = 1;
+    invalid.armed.selected_revision = 3;
+    CHECK(encode_control_operation(make_p51_source_transfer_operation(
+              Identity{91, 17}, invalid, arm.source.source_request_id)).empty());
+    invalid.armed.selected_revision = CACHE_WIRE_REVISION_R2;
+    CHECK(encode_control_operation(make_p51_source_transfer_operation(
+              Identity{91, 17}, invalid,
+              arm.source.source_request_id + 1)).empty());
+    std::puts("P51_SOURCE_TRANSFER v7 down-selected-window request/reply: ok");
+}
+
 void test_canonical_request_codec_both_directions() {
     const ControlOperation expected = operation();
     const HandoffRequest request{expected.identity, expected.request_id};
@@ -936,6 +996,7 @@ int main() {
     test_extra_fd_is_closed_and_rejected();
     test_source_transfer_reply_and_tu0();
     test_p51_source_reservation_v7_codec();
+    test_p51_source_transfer_downselected_window_v7_codec();
     test_canonical_request_codec_both_directions();
     test_nonzero_reserved_code_rejected();
     test_client_frame_trailing_rejected();

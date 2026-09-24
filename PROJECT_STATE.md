@@ -76,21 +76,36 @@ Evidence: `logs/p50zstdsender-full-shared-failure-r3.log` under the same root
 This does not qualify P29V1/ZSTD_ROUTE recovery,
 service integration, cancellation/expiry, or process restart behavior.
 
+The P51 source-control codec now restores the ARM identity before validating
+ARMED metadata and accepts a selected window from 1 through the offered
+window. Focused request/reply round trips pass for offer 30 with selections
+1 and 30; invalid selections, revision and request identity are rejected by
+the encoder. Evidence:
+`/tanksmall/scratch/tmp/p51-service-own.ntIYnn/codec-r3.log`
+(SHA256 `36fa0b4edd65ca7554ec1e323b4019176eec77ce4eab0aa15569fea4512a9979`).
+
 The annotated tag `sorbet_1.5_pipeline_plan` freezes the detailed C/D plan at
 `6dfd606de89bd60abb9315b398b53df37c878640`; the tag is pushed and its remote
 target was verified. It is a plan checkpoint, not a W30 release.
 
-Luna lanes are implementing product changes, focused tests and the bounded
-recovery model; primary owns architecture and review. First comes the named
-version-gate audit and minimal wire definitions, followed by a complete opt-in
-persistent W1 path. Original-compiler-socket ARM cannot be enabled while the
-sidecar still depends on re-arming its separate R1 connection: job binding and
-the persistent endpoint therefore share one feature-enable gate. Keep current
-R1 behavior and withhold R2 advertisement until that vertical path works.
-Recovery precedes W2–W30. A focused F receiver persistent-link test now passes
-(scope below); the production wrapper/daemon path and W30 remain unqualified.
-The Stage A results below do not qualify these changes. No Chromium build/download has
-been started for this implementation step.
+Luna lanes implement product changes and run tests; primary owns architecture,
+review and integration. The uncommitted integration candidate now passes a
+one-job vertical test with distinct real C/F daemons and sidecars. The test
+uses the assigned GetCS/UseCS local channel for the C lease, negotiates R2
+window 30, commits exact TU0 input through source-control kind 8, and obtains
+an accepted input attachment through CompileFile on the original F channel.
+Both daemons exit cleanly. This exercises test-driven ordinary messages, not
+the actual compiler wrapper, and does not prove 30 concurrent transfers or a
+successful compiler output. Endpoint shutdown reports status 1 after one
+commit; this is not evidence of a graceful CacheWire CLOSE exchange.
+Evidence: `/tanksmall/scratch/tmp/p51-vertical-logs/p51-vertical-r5.log`
+(SHA256 `765640ef4ab1964cd0522a53c844aa8f442bde65bfd4092439c2f21357d2d9cf`).
+The candidate corrects source-control decoding and removes Unix-only
+credential requirements from the public TCP auxiliary-link admission check;
+the exact live connection lease and pristine-channel checks remain required.
+Full service concurrency, recovery, restarts, wrapper and mixed-farm gates
+remain open. The Stage A results below do not qualify these changes.
+No Chromium build/download has been started for this implementation step.
 
 The focused `run_adopted_r2` receiver fixture passed two sequential ZSTD_TU
 jobs on one TCP link: one W1 HELLO, distinct one-shot reservations, two

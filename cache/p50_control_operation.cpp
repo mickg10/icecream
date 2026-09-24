@@ -256,10 +256,7 @@ std::vector<uint8_t> encode_control_operation(
                   operation.p51_reservation.has_value() ||
                   operation.p51_reservation_cancel.has_value();
         if (!invalid && operation.p51_source_transfer_result.has_value())
-            invalid = !operation.p51_source_transfer_result->valid() ||
-                      (operation.p51_source_transfer_result->code ==
-                           SourceTransferResultCode::Committed &&
-                       operation.p51_source_transfer_result->raw_bytes == 0);
+            invalid = !operation.p51_source_transfer_result->valid();
     }
     if (invalid)
         return {};
@@ -774,9 +771,12 @@ bool decode_control_operation(std::span<const uint8_t> wire,
         P51SourceArmedFields armed;
         if (!request.absolute_deadline.valid() ||
             !decode_p51_arm(wire.data() + 64, arm) ||
-            !decode_p51_armed(wire.data() + kP51ReplyOffset, armed) ||
-            armed.arm != arm || armed.selected_window != arm.requested_window ||
             operation.request_id != arm.source.source_request_id)
+            return false;
+        armed.arm = arm;
+        if (!decode_p51_armed(wire.data() + kP51ReplyOffset, armed) ||
+            !armed.valid() ||
+            armed.arm != arm)
             return false;
         request.armed = std::move(armed);
         operation.absolute_deadline = request.absolute_deadline;
