@@ -594,13 +594,16 @@ asio::awaitable<ServerRunResult> sender_r2_accept(
 asio::awaitable<std::vector<ServerRunResult>>
 sender_r2_accept_recovery_with_lost_reset_ack(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
-    size_t connection_count, size_t interrupted_materializations) {
+    size_t connection_count, size_t interrupted_materializations,
+    bool close_initial_commit = false) {
     std::vector<ServerRunResult> results(connection_count);
     for (size_t index = 0; index != results.size(); ++index) {
         tcp::socket socket(co_await asio::this_coro::executor);
         co_await acceptor.async_accept(socket, asio::use_awaitable);
         socket.set_option(tcp::socket::receive_buffer_size(4096));
         EndpointIoControl control;
+        if (index == 0 && close_initial_commit)
+            control.close_before_write = MessageType::R2_TX_COMMIT;
         if (index == 1)
             control.close_before_write = MessageType::RESET_ACK;
         if (index == 0 || index == 2) {
@@ -631,15 +634,18 @@ sender_r2_accept_shared_failure(
     std::atomic<unsigned>& bundles_sent,
     size_t bundles_required, std::mutex& gate_mutex,
     std::condition_variable& gate_cv, bool repeat_recovery_loss,
-    bool retire_after_positive_receipt) {
+    bool retire_after_positive_receipt,
+    bool expire_after_positive_receipt = false) {
     const size_t connection_count = repeat_recovery_loss ? 3
-        : retire_after_positive_receipt ? 1 : 2;
+        : (retire_after_positive_receipt || expire_after_positive_receipt) ? 1
+                                                                           : 2;
     std::vector<ServerRunResult> results(connection_count);
     for (size_t index = 0; index != results.size(); ++index) {
         tcp::socket socket(co_await acceptor.async_accept(asio::use_awaitable));
         socket.set_option(tcp::socket::receive_buffer_size(4096));
         EndpointIoControl control;
-        if (index == 0 && !retire_after_positive_receipt) {
+        if (index == 0 && !retire_after_positive_receipt &&
+            !expire_after_positive_receipt) {
             control.close_before_write = MessageType::R2_TX_COMMIT;
             control.before_materialize_on_worker = [&] {
                 std::unique_lock lock(gate_mutex);
@@ -980,7 +986,8 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
 }
 
 void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
-                                  bool retire_during_recovery = false) {
+                                  bool retire_during_recovery = false,
+                                  bool expire_during_recovery = false) {
     const auto [c_guid, f_guid] = sender_r2_store_guids();
     const Id128 relationship_id = Id128::from_u64(0x5102);
     P51SourceArmFields source_arm = sender_r2_arm(
@@ -997,7 +1004,9 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     }
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(25),
+        std::chrono::steady_clock::now() +
+            (expire_during_recovery ? std::chrono::seconds(3)
+                                    : std::chrono::seconds(25)),
         clock.clock_domain_id, clock.time_namespace_id);
 
     std::mutex commit_mutex;
@@ -1207,9 +1216,10 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
         f_context,
         sender_r2_accept_recovery_with_lost_reset_ack(
             acceptor, server,
-            retire_during_recovery ? 2 :
+            expire_during_recovery ? 1 : retire_during_recovery ? 2 :
                 (repeat_interrupted_materialization ? 4 : 3),
-            repeat_interrupted_materialization ? 2 : 0),
+            repeat_interrupted_materialization ? 2 : 0,
+            expire_during_recovery),
         asio::use_future);
     std::thread f_thread([&] { f_context.run(); });
     struct RecoveryThreadCleanup {
@@ -1238,8 +1248,7 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
         c_guid, caps.zstd, limits, 1, ProfileId::ZSTD_TU);
     const PreparationRouteKey route{f_guid, 23, ProfileId::ZSTD_TU};
     ZstdSourceTransferConfig sender_config = config();
-    sender_config.deadline = std::chrono::steady_clock::now() +
-                             std::chrono::seconds(25);
+    sender_config.deadline = deadline.as_steady_time_point();
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
     sender_config.disconnect_r2_after_bundle_for_test =
@@ -1260,9 +1269,32 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     auto c_work = asio::make_work_guard(c_context);
     const tcp::endpoint remote = acceptor.local_endpoint();
     std::atomic<unsigned> connector_calls{0};
+    std::thread deadline_connector_thread;
+    struct DeadlineConnectorCleanup {
+        std::thread& connector_thread;
+        ~DeadlineConnectorCleanup() {
+            if (connector_thread.joinable()) connector_thread.join();
+        }
+    } connector_cleanup{deadline_connector_thread};
+    std::mutex deadline_connector_mutex;
+    std::condition_variable deadline_connector_cv;
+    bool deadline_connector_waiting = false;
     AsyncConnectedFdFactory connector = [&](auto deadline_at, auto completion) {
         const unsigned call = connector_calls.fetch_add(1,
             std::memory_order_relaxed) + 1;
+        if (expire_during_recovery && call == 2) {
+            {
+                std::lock_guard lock(deadline_connector_mutex);
+                deadline_connector_waiting = true;
+            }
+            deadline_connector_cv.notify_all();
+            deadline_connector_thread = std::thread(
+                [deadline_at, completion = std::move(completion)]() mutable {
+                    std::this_thread::sleep_until(deadline_at);
+                    completion(-1);
+                });
+            return;
+        }
         if (std::chrono::steady_clock::now() >= deadline_at || call == 2) {
             completion(-1);  // Failed connector cannot consume retained suffix.
             return;
@@ -1280,6 +1312,55 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
             asio::use_future);
     };
     std::future<ZstdSourceTransferResult> transfer = invoke();
+    if (expire_during_recovery) {
+        {
+            std::unique_lock lock(deadline_connector_mutex);
+            CHECK(deadline_connector_cv.wait_for(
+                lock, std::chrono::seconds(5), [&] {
+                    return deadline_connector_waiting;
+                }));
+        }
+        CHECK(transfer.wait_for(std::chrono::seconds(8)) ==
+              std::future_status::ready);
+        const auto expired = transfer.get();
+        if (deadline_connector_thread.joinable())
+            deadline_connector_thread.join();
+        CHECK(expired.status == ZstdSourceTransferStatus::DeadlineExceeded);
+        CHECK(std::chrono::steady_clock::now() >= deadline.as_steady_time_point());
+        CHECK(std::chrono::steady_clock::now() - deadline.as_steady_time_point() <
+              std::chrono::seconds(2));
+        CHECK(connector_calls.load() == 2);
+        CHECK(resets.load() == 0);
+        CHECK(consumed.load() == 1);
+        CHECK(materialized.load() == 1);
+        CHECK(input_selectors.load() == 1);
+        {
+            std::lock_guard lock(commit_mutex);
+            CHECK(retained_commit.has_value());
+            CHECK(retained_commit->inner.raw_digest ==
+                  icecc::digest128(source));
+        }
+        std::promise<void> retirement_posted;
+        auto retirement_done = retirement_posted.get_future();
+        asio::post(c_context, [&sender, &retirement_posted] {
+            sender->retire_for_replacement();
+            retirement_posted.set_value();
+        });
+        CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        c_work.reset();
+        c_context.stop();
+        c_thread.join();
+        f_context.stop();
+        f_thread.join();
+        const auto server_runs = server_future.get();
+        CHECK(server_runs.size() == 1);
+        CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
+        std::cerr << "P51_SENDER_RECOVERY_DEADLINE expiry_during_connector PASS\n";
+        return;
+    }
     if (retire_during_recovery) {
         {
             std::unique_lock lock(recovery_gate_mutex);
@@ -1381,7 +1462,8 @@ void test_p51_sender_recovers_lost_commit_reply_after_connector_failure() {
 
 void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool repeat_recovery_loss = false,
-                                        bool retire_after_positive_receipt = false) {
+                                        bool retire_after_positive_receipt = false,
+                                        bool expire_after_positive_receipt = false) {
     CHECK(kJobs >= 1 && kJobs <= 30);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
@@ -1411,13 +1493,19 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     }
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(30),
+        std::chrono::steady_clock::now() +
+            (expire_after_positive_receipt ? std::chrono::seconds(3)
+                                           : std::chrono::seconds(30)),
         clock.clock_domain_id, clock.time_namespace_id);
 
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
     std::mutex ack_mutex;
     std::condition_variable ack_cv;
+    std::mutex receipt_hook_mutex;
+    std::condition_variable receipt_hook_cv;
+    std::atomic<bool> receipt_hook_entered{false};
+    std::atomic<bool> receipt_hook_before_deadline{false};
     std::atomic<unsigned> bundles_sent{0};
     std::atomic<unsigned> connector_calls{0};
     std::atomic<unsigned> input_selections{0};
@@ -1685,7 +1773,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     auto server_future = asio::co_spawn(
         f_context, sender_r2_accept_shared_failure(
             acceptor, server, bundles_sent, kJobs, gate_mutex, gate_cv,
-            repeat_recovery_loss, retire_after_positive_receipt),
+            repeat_recovery_loss, retire_after_positive_receipt,
+            expire_after_positive_receipt),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -1716,6 +1805,22 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             [&sender](uint64_t ordinal) {
                 if (ordinal == 1)
                     sender->retire_for_replacement();
+            };
+    } else if (expire_after_positive_receipt) {
+        sender_config.after_r2_receipt_validated_for_test =
+            [&, deadline](uint64_t ordinal) {
+                if (ordinal != 1) return;
+                receipt_hook_before_deadline.store(
+                    std::chrono::steady_clock::now() <
+                        deadline.as_steady_time_point(),
+                    std::memory_order_release);
+                receipt_hook_entered.store(true, std::memory_order_release);
+                receipt_hook_cv.notify_all();
+                std::unique_lock lock(receipt_hook_mutex);
+                while (std::chrono::steady_clock::now() <
+                       deadline.as_steady_time_point())
+                    receipt_hook_cv.wait_until(
+                        lock, deadline.as_steady_time_point());
             };
     }
     sender = std::make_shared<P50ZstdSourceSender>(
@@ -1752,6 +1857,16 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         CHECK((outcomes[index].committed_input ==
                InputRecordKey{c_guid, TuSeq{index}}));
         CHECK(outcomes[index].raw_digest == icecc::digest128(input[index]));
+    }
+    if (expire_after_positive_receipt) {
+        CHECK(kJobs == 1);
+        CHECK(receipt_hook_entered.load(std::memory_order_acquire));
+        CHECK(receipt_hook_before_deadline.load(std::memory_order_acquire));
+        CHECK(std::chrono::steady_clock::now() >=
+              deadline.as_steady_time_point());
+        // A positive exact receipt wins even though the original caller's
+        // deadline expires before it can acquire the ACK writer.
+        CHECK(outcomes[0].status == ZstdSourceTransferStatus::Committed);
     }
     if (retire_after_positive_receipt) {
         auto duplicate = asio::co_spawn(c_context,
@@ -1795,10 +1910,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                std::chrono::steady_clock::now() < deadline.as_steady_time_point())
             ack_cv.wait_until(lock, deadline.as_steady_time_point());
     }
-    CHECK(acknowledged.load() == (retire_after_positive_receipt ? 0U
-                                                                  : kJobs));
-    CHECK(connector_calls.load() == (retire_after_positive_receipt ? 1U
-        : repeat_recovery_loss ? 3U : 2U));
+    if (expire_after_positive_receipt)
+        CHECK(acknowledged.load() <= kJobs);
+    else
+        CHECK(acknowledged.load() == (retire_after_positive_receipt ? 0U
+                                                                     : kJobs));
+    CHECK(connector_calls.load() ==
+          ((retire_after_positive_receipt || expire_after_positive_receipt)
+               ? 1U : repeat_recovery_loss ? 3U : 2U));
     CHECK(binds[0].load() == 1);
     for (size_t index = 1; index != kJobs; ++index)
         CHECK(binds[index].load() == 1); // uncommitted suffix binds after reset
@@ -1823,7 +1942,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     c_thread.join();
     f_thread.join();
     CHECK(server_runs.size() == (repeat_recovery_loss ? 3U
-        : retire_after_positive_receipt ? 1U : 2U));
+        : (retire_after_positive_receipt || expire_after_positive_receipt)
+            ? 1U : 2U));
     CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
     if (server_runs.size() > 1)
         CHECK(server_runs[1].status == ServerRunStatus::Disconnected);
@@ -1857,6 +1977,12 @@ void test_p51_sender_retirement_during_recovery() {
     run_p51_sender_recovery_case(false, true);
     run_p51_sender_shared_failure_case(
         1, ProfileId::ZSTD_TU, false, true);
+}
+
+void test_p51_sender_deadline_during_recovery_and_ack() {
+    run_p51_sender_recovery_case(false, false, true);
+    run_p51_sender_shared_failure_case(
+        1, ProfileId::ZSTD_TU, false, false, true);
 }
 
 void test_route_failure_requires_cold_replacement() {
@@ -2248,6 +2374,12 @@ int main(int argc, char** argv) {
         std::cerr << "P51_SENDER_RETIRE_DURING_RECOVERY_SELECTOR PASS\n";
         return 0;
     }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--deadline-recovery-ack") {
+        test_p51_sender_deadline_during_recovery_and_ack();
+        std::cerr << "P51_SENDER_DEADLINE_RECOVERY_ACK_SELECTOR PASS\n";
+        return 0;
+    }
     const auto run = [](const char* name, auto test) {
         std::cerr << "P51_TEST_BEGIN " << name << "\n";
         test();
@@ -2261,6 +2393,7 @@ int main(int argc, char** argv) {
     run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
     run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
     run("retirement", test_p51_sender_retirement_during_recovery);
+    run("deadline_recovery_ack", test_p51_sender_deadline_during_recovery_and_ack);
     run("cold_replacement", test_route_failure_requires_cold_replacement);
     run("explicit_route", test_explicit_route_operations_bind_request_and_deadline);
     run("explicit_retry", test_explicit_route_retry_is_bounded_then_replaced);

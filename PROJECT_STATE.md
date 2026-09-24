@@ -125,6 +125,17 @@ stopping its event loop; previously it could wait forever on a future whose
 executor had already stopped. This does not resolve the separately recorded
 first-bundle timeout or qualify process restarts and real-daemon integration.
 
+The focused `p50zstdsender --deadline-recovery-ack` selector also passes:
+expiry during the recovery connector returns DeadlineExceeded on the original
+deadline (two connection attempts, no RESET, exact F commit retained), while
+expiry after an exact validated receipt preserves Committed without opening
+another connection. ACK drain after expiry is not required. This is a
+test-only addition; the full sender suite was not rerun for it. Evidence:
+`/tanksmall/scratch/tmp/p51-deadline-tests-r2-20260924T221518Z/logs/deadline-recovery-ack-r2.log`
+(SHA256 `c2cb8fe2e92a84bab3ef1406825743adc492fe530c0c4e43c591c6377749a7c9`),
+exit 0; binary SHA256
+`51c6950de873a46f873b2832e6635f7c68d4e1835f60bb2018c6b4664b82d3de`.
+
 The P51 source-control codec now restores the ARM identity before validating
 ARMED metadata and accepts a selected window from 1 through the offered
 window. Focused request/reply round trips pass for offer 30 with selections
