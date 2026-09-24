@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <string>
 #include <thread>
 
@@ -57,12 +58,12 @@ struct RuntimeConfig {
     std::optional<SidecarLaunchIdentity> sidecar_launch;
     size_t max_live_handoffs = 1;
     size_t max_input_lifecycle_replays = 8192;
-    size_t max_route_completed_requests = 4096;
+    size_t max_route_completed_requests = 65536;
     size_t max_route_relationships = 256;
     size_t max_route_endpoint_identities = 256;
-    // Connecting, negotiating, arming, and crossing CACHE_SESSION must never
-    // monopolize the process-wide route-owner gate for the full source
-    // operation deadline. F acknowledges an arm before doing source work;
+    // Connecting, negotiating, arming, and crossing CACHE_SESSION happen
+    // before the route gate but must not consume the full source operation
+    // deadline. F acknowledges an arm before doing source work;
     // five seconds covers bounded connect retransmission and scheduling while
     // leaving the unchanged outer deadline for queued and CacheWire work.
     std::chrono::milliseconds source_open_arm_timeout{5000};
@@ -232,16 +233,29 @@ private:
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     std::unique_ptr<P50CRouteOwner> route_owner_;
+    // route_owner_'s authority, fixed before the owner thread starts so
+    // control workers can prepare sources on their own threads.
+    std::shared_ptr<P50PreparationAuthority> source_authority_;
     // Endpoint address is the stable scheduler-facing relationship key.  Its
     // exact authenticated F incarnation is owner-affine and bounded; a change
     // retires every old-profile route before the successor is admitted.
+    // Guarded by source_route_mutex_.
     std::map<RouteEndpointKey, RouteStoreIdentity> route_endpoint_identities_;
-    // P50CRouteOwner retains one sender per C/F/profile relationship and its
-    // preparation authority permits only one uncommitted successor.  Source
-    // requests arrive on independent bounded control workers, so serialize
-    // them here under their unchanged absolute deadline before touching that
-    // single-owner state.  This also bounds buffered source memory to one TU.
-    std::timed_mutex source_transfer_mutex_;
+    // P50CRouteOwner retains one sender per C/F/profile relationship and each
+    // route permits only one uncommitted successor, so uploads to one F
+    // endpoint are serialized by its transfer gate under their unchanged
+    // absolute deadline.  A few more may connect and arm F ahead of the gate;
+    // the bound keeps idle armed sessions off F's shared session table.
+    // Uploads to different F overlap on the owner executor.  Buffered source
+    // memory is at most kArmedSessions TUs per F endpoint.
+    struct RouteGate {
+        static constexpr std::ptrdiff_t kArmedSessions = 3;
+        std::counting_semaphore<kArmedSessions> armed{kArmedSessions};
+        std::timed_mutex transfer;
+    };
+    std::mutex source_route_mutex_;
+    std::map<RouteEndpointKey, std::shared_ptr<RouteGate>> source_route_gates_;
+    std::atomic<size_t> active_source_transfers_{0};
     // This is the outermost opener fence.  P50CRouteOwner also retains its
     // own latch, but transfer_source_on_owner must refuse before it connects
     // to or arms any F after whole-sidecar replacement becomes necessary.

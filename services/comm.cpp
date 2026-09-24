@@ -1372,18 +1372,19 @@ static int prepare_connect(const string &hostname, unsigned short p,
         return -1;
     }
 
-    struct hostent *host = gethostbyname(hostname.c_str());
+    // Not gethostbyname: the P50 sidecar resolves F from several threads and
+    // its shared static result was overwritten mid-copy (wrong F, SIGSEGV).
+    struct addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *found = nullptr;
+    const int resolved = getaddrinfo(hostname.c_str(), nullptr, &hints, &found);
 
-    if (!host) {
-        log_error() << "Connecting to " << hostname << " failed: " << hstrerror( h_errno ) << endl;
-        if ((-1 == close(remote_fd)) && (errno != EBADF)){
-            log_perror("close failed");
+    if (resolved != 0 || found == nullptr) {
+        log_error() << "Connecting to " << hostname << " failed: " << gai_strerror(resolved) << endl;
+        if (found != nullptr) {
+            freeaddrinfo(found);
         }
-        return -1;
-    }
-
-    if (host->h_length != 4) {
-        log_error() << "Invalid address length" << endl;
         if ((-1 == close(remote_fd)) && (errno != EBADF)){
             log_perror("close failed");
         }
@@ -1392,9 +1393,9 @@ static int prepare_connect(const string &hostname, unsigned short p,
 
     setsockopt(remote_fd, IPPROTO_TCP, TCP_NODELAY, (char *) &i, sizeof(i));
 
-    remote_addr.sin_family = AF_INET;
+    remote_addr = *reinterpret_cast<const sockaddr_in *>(found->ai_addr);
     remote_addr.sin_port = htons(p);
-    memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
+    freeaddrinfo(found);
 
     return remote_fd;
 }

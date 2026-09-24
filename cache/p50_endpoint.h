@@ -260,6 +260,19 @@ public:
     PreparedTuHandle prepare_for_route(PreparationRouteKey route,
                                        PrepareRequestKey request,
                                        std::span<const uint8_t> exact_input);
+    // The route-independent half of a P29V1 prepare_for_route (TU_SEQ and
+    // interning).  Unlike every other member it may run on any thread, so a
+    // route's serialized dialogue on the owner need not wait for it.  The
+    // owner installs the result; prepare_for_route then reuses it for the
+    // same request, and release_source drops it if no route admitted it.
+    class PreparedSource;
+    std::shared_ptr<const PreparedSource> prepare_source(
+        PrepareRequestKey request,
+        std::shared_ptr<const std::vector<uint8_t>> exact_input,
+        Digest128 raw_digest);
+    void install_source(PrepareRequestKey request,
+                        std::shared_ptr<const PreparedSource> prepared);
+    void release_source(PrepareRequestKey request) noexcept;
     std::span<const uint8_t> answer_p29v1_need(
         PreparedTuHandle handle, std::span<const uint8_t> inner_need);
     [[nodiscard]] Digest128 p29v1_system_source_fingerprint(

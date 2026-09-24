@@ -1708,7 +1708,8 @@ struct CAuthority::P29V1State {
     codec::P29Interner<P29MmapInternProvider> interner;
     uint64_t max_tu_bytes = 0;
     bool inject_failure_once = false;
-    bool runnable = true;
+    // Cleared by a failed prepare, possibly off the owner thread.
+    std::atomic<bool> runnable{true};
     uint64_t prepares = 0;
     uint64_t raw_bytes = 0;
 };

@@ -101,11 +101,19 @@ else
     echo "Using existing staged snapshot at $SRC (use a fresh /work for another snapshot)."
 fi
 
+# The legacy product source (the mixed-version QA baseline) predates the
+# Python tooling and is only built natively.
+native_only=0
+if [[ "$MODE" == bootstrap && ! -e "$SRC/pyproject.toml" ]]; then
+    native_only=1
+fi
+
 # The managed Python environment was resolved from this exact metadata during
 # SDK image construction. Refuse to run a source snapshot with a different
 # lockfile or interpreter pin; rebuilding the SDK is required instead.
 SDK_METADATA_ROOT=/opt/icecream-python-src
 for metadata in pyproject.toml uv.lock .python-version; do
+    (( native_only )) && break
     if [[ ! -f "$SRC/$metadata" || ! -f "$SDK_METADATA_ROOT/$metadata" ]] ||
        ! cmp -s "$SRC/$metadata" "$SDK_METADATA_ROOT/$metadata"; then
         echo "SDK Python metadata mismatch for $metadata; rebuild the SDK from this source snapshot" >&2
@@ -167,9 +175,11 @@ run_stage() {
 }
 
 # Resolve the locked Python environment as the same unprivileged identity used
-# for source and native QA. This is required in both bootstrap and QA modes;
-# no prebuilt root-owned environment is used as a fallback.
-run_stage python-sync bash -c 'cd "$1" && uv sync --locked --offline --managed-python --python "$(cat .python-version)"' _ "$SRC"
+# for source and native QA. This is required in both bootstrap and QA modes
+# (except for the native-only legacy baseline); no prebuilt root-owned
+# environment is used as a fallback.
+(( native_only )) ||
+    run_stage python-sync bash -c 'cd "$1" && uv sync --locked --offline --managed-python --python "$(cat .python-version)"' _ "$SRC"
 
 prepare_build() {
     run_stage autogen bash -c 'cd "$1" && ./autogen.sh' _ "$SRC"
@@ -218,7 +228,7 @@ for status in "$autogen_status" "$configure_status" "$build_status"; do
 done
 if [[ "$MODE" == bootstrap ]]; then
     [[ "$install_status" == 0 ]] || overall=1
-    [[ "$python_sync_status" == 0 ]] || overall=1
+    (( native_only )) || [[ "$python_sync_status" == 0 ]] || overall=1
 else
     [[ "$install_status" == 0 ]] || overall=1
     [[ "$native_check_status" == 0 && "$build_ok" == 1 ]] || overall=1

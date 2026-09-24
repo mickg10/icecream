@@ -30,7 +30,7 @@ for pair in \
     "$impl|have_f_store_guid" \
     "$impl|structured_launch.c_store_guid" \
     "$impl|structured_launch.f_store_guid" \
-    "$impl|kMaxControlWorkers = 64" \
+    "$impl|kMaxControlWorkers = 1024" \
     "$impl|kSourceTransferLockPoll" \
     "$impl|source_transfer_lock.try_lock_until" \
     "$impl|open_arm_start + open_arm_timeout" \
@@ -52,7 +52,7 @@ for pair in \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
     "$header|source_open_arm_timeout{5000}" \
-    "$header|std::timed_mutex source_transfer_mutex_" \
+    "$header|std::map<RouteEndpointKey, std::shared_ptr<RouteGate>> source_route_gates_" \
     "$header|seed_route_endpoint_identity_for_test" \
     "$header|seed_route_relationship_for_test" \
     "$test_file|legacy_store_identity_launches" \
@@ -115,7 +115,7 @@ fi
 echo 'ok - endpoint-map capacity refusal precedes source read and F open'
 
 relationship_cap_line=$(grep -n -F \
-    'route_owner_->owner_count() >=' "$impl" | head -n 1 | cut -d: -f1)
+    'route_owner_->owner_count() <' "$impl" | head -n 1 | cut -d: -f1)
 if test -z "$relationship_cap_line" || \
         test "$relationship_cap_line" -ge "$source_read_line" || \
         test "$relationship_cap_line" -ge "$f_open_line"; then
@@ -184,9 +184,9 @@ for pair in \
     "$impl|send_cache_session_ready(adopted.get(), deadline)" \
     "$impl|endpoint_->run_adopted" \
     "$impl|busy_.test_and_set" \
-    "$impl|source_transfer_mutex_" \
+    "$impl|source_route_gates_" \
     "$impl|std::min(transfer_deadline, now + kSourceTransferLockPoll)" \
-    "$impl|release source_transfer_mutex_ and admit a successor concurrently" \
+    "$impl|release this route's gate and admit a successor concurrently with" \
     "$impl|cancel_endpoint_run()" \
     "$control|kControlOperationVersionV3" \
     "$control|ControlCancelTargetRole::CSource" \

@@ -70,6 +70,17 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    // Shares the caller's buffer instead of copying it.
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer(
+        P50RouteRelationship relationship, PrepareRequestKey request,
+        ConnectedFdFactory connection,
+        std::chrono::steady_clock::time_point deadline,
+        std::shared_ptr<const std::vector<uint8_t>> source);
+
+    // The shared C preparation authority, created on first use.
+    [[nodiscard]] std::shared_ptr<P50PreparationAuthority> authority(
+        CStoreGuid c_store_guid);
+
     // Drops every profile view for one exact retired F incarnation.  False
     // means at least one route still owns an uncommitted preparation; callers
     // must replace the whole C sidecar and must not admit the successor.
@@ -98,6 +109,7 @@ private:
     Sender& get_or_create(const P50RouteRelationship& relationship,
                           PrepareRequestKey request,
                           std::chrono::steady_clock::time_point deadline);
+    void ensure_authority(CStoreGuid c_store_guid);
 
     P50RouteOwnerConfig config_{};
     std::shared_ptr<P50PreparationAuthority> authority_;

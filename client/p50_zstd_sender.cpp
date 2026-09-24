@@ -7,6 +7,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <limits>
+#include <deque>
 #include <map>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -196,9 +197,20 @@ struct P50ZstdSourceSender::Impl {
         return value.result;
     }
 
+    // A request cannot be replayed once maximum_duration has passed since it
+    // completed: its absolute deadline is already behind it.
+    void expire_completed() {
+        const auto horizon = std::chrono::steady_clock::now() - config.maximum_duration;
+        while (!completed_order.empty() && completed_order.front().first < horizon) {
+            completed.erase(completed_order.front().second);
+            completed_order.pop_front();
+        }
+    }
+
     void remember_completed(PrepareRequestKey key, std::span<const uint8_t> source,
                             Digest128 raw_digest,
                             const ZstdSourceTransferResult& result) {
+        expire_completed();
         if (completed.size() >= config.max_completed_requests)
             throw std::length_error("sender completed-request ledger is full");
         const auto [position, inserted] = completed.emplace(
@@ -206,6 +218,7 @@ struct P50ZstdSourceSender::Impl {
         if (!inserted)
             throw std::logic_error("sender completed request was admitted twice");
         (void)position;
+        completed_order.emplace_back(std::chrono::steady_clock::now(), key);
     }
 
     void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
@@ -255,6 +268,8 @@ struct P50ZstdSourceSender::Impl {
     CompletionLog wire_completions;
     std::unique_ptr<P50ClientEndpoint> endpoint;
     std::map<PrepareRequestKey, CompletedRequest> completed;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, PrepareRequestKey>>
+        completed_order;
     bool used = false;
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
@@ -383,6 +398,17 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
+                                    PrepareRequestKey request,
+                                    Clock::time_point deadline,
+                                    std::shared_ptr<const std::vector<uint8_t>> source) {
+    if (source && source->size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
+        source.reset();
+    return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
+                          deadline, true, std::move(source));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_bytes(
     ConnectionTarget target,
     PrepareRequestKey request,
@@ -422,6 +448,7 @@ P50ZstdSourceSender::transfer_bytes(
         result.route_local_failure = impl_->route_transport_quarantined;
         co_return result;
     }
+    impl_->expire_completed();
     if (impl_->completed.size() >= impl_->config.max_completed_requests)
         co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
                                      explicit_route);

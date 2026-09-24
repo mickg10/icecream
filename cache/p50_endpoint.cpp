@@ -904,7 +904,7 @@ struct P50PreparationAuthority::Impl {
         PrepareRequestKey request{};
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};
-        std::vector<uint8_t> raw;
+        std::shared_ptr<const std::vector<uint8_t>> raw;
         TuSeq tu_seq{};
         PreparedTUPtr p29_source;
         std::map<PreparationRouteKey, uint64_t> entries;
@@ -944,10 +944,15 @@ struct P50PreparationAuthority::Impl {
             c_guid, p29::OnlineS1::Config{}, first_tu_seq,
             fault_injection);
         if (profile == ProfileId::P29V1)
-            ensure_p29v1();
+            ensure_p29v1_locked();
     }
 
     void ensure_p29v1() {
+        std::lock_guard lock(source_mutex);
+        ensure_p29v1_locked();
+    }
+
+    void ensure_p29v1_locked() {
         if (p29v1_enabled)
             return;
         try {
@@ -1018,6 +1023,9 @@ struct P50PreparationAuthority::Impl {
     ZstdRouteCodec route_codec;
     std::unique_ptr<CAuthority> p29_authority;
     bool p29v1_enabled = false;
+    // Serializes TU_SEQ allocation and interning between the owner and
+    // prepare_source callers.
+    std::mutex source_mutex;
     std::map<PreparationRouteKey, std::unique_ptr<RouteState>> routes;
     ProfileId profile = ProfileId::ZSTD_TU;
     std::map<PrepareRequestKey, std::shared_ptr<Shared>> requests;
@@ -1064,7 +1072,8 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         shared = request_position->second;
         if (shared->raw_bytes != exact_input.size())
             throw std::invalid_argument("PrepareRequestKey was reused for different input");
-        if (!std::equal(shared->raw.begin(), shared->raw.end(), exact_input.begin()))
+        if (shared->raw->data() != exact_input.data() &&
+            !std::equal(shared->raw->begin(), shared->raw->end(), exact_input.begin()))
             throw std::invalid_argument("PrepareRequestKey was reused for different input");
         if (const auto route_entry = shared->entries.find(route_key);
             route_entry != shared->entries.end())
@@ -1089,12 +1098,15 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
     if (retained_room == 0)
         throw std::length_error("C preparation authority reached its retained-byte bound");
 
+    std::unique_lock source_lock(impl_->source_mutex, std::defer_lock);
     if (!shared) {
+        source_lock.lock();
         shared = std::make_shared<Impl::Shared>();
         shared->request = request;
         shared->raw_bytes = exact_input.size();
         shared->raw_digest = raw_digest;
-        shared->raw.assign(exact_input.begin(), exact_input.end());
+        shared->raw = std::make_shared<const std::vector<uint8_t>>(
+            exact_input.begin(), exact_input.end());
         // Reserve exactly once at C-wide request admission.  The reservation
         // is committed only after encoding and all retained-entry bookkeeping
         // succeeds, so a failed attempt leaves the same TU_SEQ for retry.
@@ -1124,6 +1136,8 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
                 PreparedInputEnvelope{envelope.begin, envelope.body});
         } else if (route.profile == ProfileId::P29V1) {
             if (!shared->p29_source) {
+                if (!source_lock.owns_lock())
+                    source_lock.lock();
                 try {
                     shared->p29_source =
                         impl_->p29_authority->prepare_p29v1_at_seq(
@@ -1203,6 +1217,49 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             route.uncommitted_route_entry.reset();
         throw;
     }
+}
+
+class P50PreparationAuthority::PreparedSource {
+public:
+    std::shared_ptr<Impl::Shared> shared;
+};
+
+std::shared_ptr<const P50PreparationAuthority::PreparedSource>
+P50PreparationAuthority::prepare_source(
+    PrepareRequestKey request,
+    std::shared_ptr<const std::vector<uint8_t>> exact_input,
+    Digest128 raw_digest) {
+    if (!exact_input || request.producer_session == 0 || request.request_token == 0 ||
+        exact_input->size() > impl_->zstd_limits.max_raw_bytes)
+        return nullptr;
+    auto shared = std::make_shared<Impl::Shared>();
+    shared->request = request;
+    shared->raw_bytes = exact_input->size();
+    shared->raw_digest = raw_digest;
+    shared->raw = std::move(exact_input);
+    std::lock_guard lock(impl_->source_mutex);
+    impl_->ensure_p29v1_locked();
+    const TuSeq tu_seq = impl_->p29_authority->reserve_tu_seq();
+    shared->tu_seq = tu_seq;
+    shared->p29_source = impl_->p29_authority->prepare_p29v1_at_seq(
+        *shared->raw, tu_seq, raw_digest);
+    impl_->p29_authority->commit_tu_seq(tu_seq);
+    auto prepared = std::make_shared<PreparedSource>();
+    prepared->shared = std::move(shared);
+    return prepared;
+}
+
+void P50PreparationAuthority::install_source(
+    PrepareRequestKey request, std::shared_ptr<const PreparedSource> prepared) {
+    impl_->owner.require();
+    if (prepared && prepared->shared->request == request)
+        impl_->requests.emplace(request, prepared->shared);
+}
+
+void P50PreparationAuthority::release_source(PrepareRequestKey request) noexcept {
+    const auto position = impl_->requests.find(request);
+    if (position != impl_->requests.end() && position->second->entries.empty())
+        impl_->requests.erase(position);
 }
 
 std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
@@ -1399,20 +1456,20 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         const size_t limit = static_cast<size_t>(std::min<uint64_t>(
             impl_->zstd_limits.max_history_bytes,
             uint64_t{1} << impl_->zstd_limits.max_window_log));
-        if (entry.shared->raw.size() >= limit) {
+        const std::vector<uint8_t>& raw = *entry.shared->raw;
+        if (raw.size() >= limit) {
             route.committed_route_history.assign(
-                entry.shared->raw.end() - static_cast<std::ptrdiff_t>(limit),
-                entry.shared->raw.end());
+                raw.end() - static_cast<std::ptrdiff_t>(limit), raw.end());
         } else {
-            const size_t excess = route.committed_route_history.size() + entry.shared->raw.size() > limit
-                                      ? route.committed_route_history.size() + entry.shared->raw.size() - limit
+            const size_t excess = route.committed_route_history.size() + raw.size() > limit
+                                      ? route.committed_route_history.size() + raw.size() - limit
                                       : 0;
             if (excess != 0)
                 route.committed_route_history.erase(
                     route.committed_route_history.begin(),
                     route.committed_route_history.begin() + excess);
             route.committed_route_history.insert(route.committed_route_history.end(),
-                                                  entry.shared->raw.begin(), entry.shared->raw.end());
+                                                  raw.begin(), raw.end());
         }
         route.committed_route_history_digest = digest128(
             std::span<const uint8_t>(route.committed_route_history));
@@ -1889,6 +1946,8 @@ struct P50ServerEndpoint::Impl {
         Digest128 candidate_c_fingerprint{};
         Digest128 candidate_f_fingerprint{};
         bool activated = false;
+        // Wrote TX_COMMIT and only waits for C's EOF.
+        bool committed = false;
     };
 
     struct Session {
@@ -2487,6 +2546,7 @@ struct P50ServerEndpoint::Impl {
             throw std::invalid_argument("SESSION_HELLO C_STORE_GUID zero is reserved");
         const ProfileId profile =
             require_single_route_profile(selection.negotiated_profiles);
+        retire_committed_session(hello.c_store_guid);
         const uint64_t revision = current_revision(hello.c_store_guid);
         SessionState state = snapshot(hello, selection);
         session.c_guid = hello.c_store_guid;
@@ -2583,6 +2643,24 @@ struct P50ServerEndpoint::Impl {
         live.activated = true;
         session.candidate_state.reset();
         record(replaced ? ActionType::SESSION_REPLACED : ActionType::SESSION_OPENED, session);
+    }
+
+    // C sends a new HELLO only once it is done with its previous session.  If
+    // that session has committed, its EOF may still be in flight on the other
+    // connection; retire it now so the EOF cannot advance the revision under
+    // the new candidate.
+    void retire_committed_session(CStoreGuid c_guid) {
+        const auto space = namespaces.find(c_guid);
+        if (space == namespaces.end() || space->second.active_session == 0)
+            return;
+        const auto previous = live_sessions.find(space->second.active_session);
+        if (previous == live_sessions.end() || !previous->second.committed)
+            return;
+        Session retired;
+        retired.serial = previous->first;
+        retired.c_guid = previous->second.c_guid;
+        retired.profile = previous->second.profile;
+        disconnect(retired, false);
     }
 
     void disconnect(const Session& session, bool retain_interrupted) {
@@ -4140,6 +4218,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             session, std::move(materialized), job_state,
             result.candidate_input,
             result.completed_input, result.committed_input);
+        impl_->live_sessions.at(session.serial).committed = true;
         co_await async_write_message(
             socket, commit, selection.limits.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::WriteFragment, &committed_begin),

@@ -71,7 +71,7 @@ The older experimental model under `formal/protocol50/` on the capability branch
 The cache model includes:
 
 - one C-side active operation and one F-side pending overlay;
-- two possible F destinations, exercised one relationship at a time;
+- two possible F destinations, exercised one relationship at a time. Production overlaps relationships to different F but keeps one dialogue per C/F pair at a time. F replicas share no route or session state, and `TU_SEQ` is a unique C-wide identity that need not be ordered or contiguous per route, so each relationship refines this model on its own. Both trace checkers keep their state per relationship;
 - immutable `Key64 -> content` binding;
 - atomic Need computation that pins every already-present required object;
 - immediate pinning of each requested object when it is completely installed;
@@ -293,10 +293,13 @@ ACCEPT_RETRY_COMMIT
 
 A large implementation trace need not contain every modeled action, but every mutating implementation event must refine one modeled transition.
 
+Session open is atomic in the model. Production stages a candidate at `SESSION_HELLO`, then activates it at the first `TX_BEGIN` or `HISTORY_RESET` only if F's revision for that C namespace is unchanged; the open is recorded at activation. A stale candidate is refused without `SESSION_OPENED`/`SESSION_REPLACED`, which is a stutter here. An armed connection that has not sent `SESSION_HELLO` belongs to no C namespace and is below this abstraction. A `SESSION_HELLO` first retires its namespace's previous session if that session has already written `TX_COMMIT`; the retirement is that session's `SESSION_DISCONNECTED`. C sends that `SESSION_HELLO` only after accepting or abandoning the commit, so a normal `COMMIT_ACCEPTED` still precedes the disconnect.
+
 The executable trace gates reject:
 
 - abort while F still owns a pending overlay;
 - abort after durable F commit and before normal/lost acceptance;
+- normal acceptance after F disconnected or replaced the committing session, and lost acceptance without that disconnect or replacement;
 - F mutation from a stale session serial;
 - reused or non-increasing session serials;
 - a second `HISTORY_RESET` in one session;

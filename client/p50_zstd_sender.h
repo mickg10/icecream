@@ -157,6 +157,11 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
+        ConnectedFdFactory connection, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        std::shared_ptr<const std::vector<uint8_t>> source);
+
 private:
     using ConnectionTarget =
         std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory>;

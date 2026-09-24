@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -335,10 +336,10 @@ template <P29InternProvider Provider> class P29Interner {
     P29Interner &operator=(P29Interner &&) = delete;
 
     [[nodiscard]] std::uint32_t distinct_lines() const {
-        return next_line_id_ - 1;
+        return next_line_id_.load(std::memory_order_acquire) - 1;
     }
     [[nodiscard]] std::uint32_t distinct_regions() const {
-        return static_cast<std::uint32_t>(region_count_);
+        return static_cast<std::uint32_t>(region_count_.load(std::memory_order_acquire));
     }
     [[nodiscard]] std::uint64_t region_occurrences() const {
         return region_occurrences_;
@@ -499,7 +500,7 @@ template <P29InternProvider Provider> class P29Interner {
     }
 
     [[nodiscard]] std::span<const std::uint8_t> line(std::uint32_t id) const {
-        if (id == 0 || id >= next_line_id_)
+        if (id == 0 || id >= next_line_id_.load(std::memory_order_acquire))
             throw std::out_of_range("P29 Line id is absent");
         const auto &reference = line_refs_[id];
         return {line_bytes_ + reference.off, reference.len};
@@ -507,7 +508,7 @@ template <P29InternProvider Provider> class P29Interner {
 
     [[nodiscard]] std::span<const std::uint32_t>
     region_lines(std::uint32_t id) const {
-        if (id >= region_count_)
+        if (id >= region_count_.load(std::memory_order_acquire))
             throw std::out_of_range("P29 Region id is absent");
         const auto &record = region_records_[id];
         return {region_ids_ + record.ids_off, record.ids_count};
@@ -515,7 +516,7 @@ template <P29InternProvider Provider> class P29Interner {
 
     [[nodiscard]] std::span<const std::uint8_t>
     region_bytes(std::uint32_t id) const {
-        if (id >= region_count_)
+        if (id >= region_count_.load(std::memory_order_acquire))
             throw std::out_of_range("P29 Region id is absent");
         const auto &record = region_records_[id];
         return {region_bytes_ + record.raw_off, record.raw_len};
@@ -579,18 +580,17 @@ template <P29InternProvider Provider> class P29Interner {
 
     [[nodiscard]] std::uint32_t add_line(const std::uint8_t *data,
                                          std::uint32_t length) {
-        if (next_line_id_ == kNone ||
-            next_line_id_ >= layout_.line_reference_capacity)
+        const std::uint32_t id = next_line_id_.load(std::memory_order_relaxed);
+        if (id == kNone || id >= layout_.line_reference_capacity)
             fail("P29 Line reference arena is full");
         if (length > layout_.line_bytes_capacity - line_bytes_used_)
             fail("P29 Line byte arena is full");
-        const std::uint32_t id = next_line_id_;
         provider_.publish_line(id, {data, length});
         const auto offset = static_cast<std::uint32_t>(line_bytes_used_);
         std::memcpy(line_bytes_ + line_bytes_used_, data, length);
         line_bytes_used_ += length;
         line_refs_[id] = {offset, length};
-        ++next_line_id_;
+        next_line_id_.store(id + 1, std::memory_order_release);
         return id;
     }
 
@@ -658,7 +658,8 @@ template <P29InternProvider Provider> class P29Interner {
                                            std::uint32_t raw_length,
                                            std::uint64_t hash,
                                            std::size_t index_slot) {
-        if (region_count_ >= layout_.region_capacity || region_count_ == kNone)
+        const std::size_t region_count = region_count_.load(std::memory_order_relaxed);
+        if (region_count >= layout_.region_capacity || region_count == kNone)
             fail("P29 Region record arena is full");
         if (raw_length > layout_.region_bytes_capacity - region_bytes_used_)
             fail("P29 Region byte arena is full");
@@ -682,7 +683,7 @@ template <P29InternProvider Provider> class P29Interner {
         if (ids_count > std::numeric_limits<std::uint32_t>::max())
             fail("P29 Region has too many Line ids");
         const std::uint32_t region_id =
-            static_cast<std::uint32_t>(region_count_);
+            static_cast<std::uint32_t>(region_count);
         provider_.publish_region(
             region_id,
             {region_ids_ + ids_begin, static_cast<std::size_t>(ids_count)});
@@ -690,7 +691,7 @@ template <P29InternProvider Provider> class P29Interner {
         const auto raw_offset = static_cast<std::uint32_t>(region_bytes_used_);
         std::memcpy(region_bytes_ + region_bytes_used_, data, raw_length);
         region_bytes_used_ += raw_length;
-        region_records_[region_count_] = {
+        region_records_[region_count] = {
             hash,
             raw_offset,
             raw_length,
@@ -700,7 +701,7 @@ template <P29InternProvider Provider> class P29Interner {
             0,
         };
         region_index_[index_slot] = region_id + 1;
-        ++region_count_;
+        region_count_.store(region_count + 1, std::memory_order_release);
         return region_id;
     }
 
@@ -727,8 +728,10 @@ template <P29InternProvider Provider> class P29Interner {
     std::size_t line_bytes_used_ = 0;
     std::size_t region_bytes_used_ = 0;
     std::size_t region_ids_used_ = 0;
-    std::size_t region_count_ = 0;
-    std::uint32_t next_line_id_ = 1;
+    // Other threads may read ids a finished process() published while the
+    // one writer interns more; these counters are all they share.
+    std::atomic<std::size_t> region_count_{0};
+    std::atomic<std::uint32_t> next_line_id_{1};
     std::uint64_t region_occurrences_ = 0;
     std::uint64_t successor_hits_ = 0;
 };

@@ -67,15 +67,7 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
     if (owners_.size() >= config_.max_relationships)
         throw std::length_error("route relationship table is full");
 
-    if (!authority_) {
-        authority_ = std::make_shared<P50PreparationAuthority>(
-            relationship.c_store_guid, config_.endpoint_caps.zstd,
-            config_.authority_limits, config_.compression_level,
-            config_.endpoint_caps.profile, TuSeq{},
-            config_.p29_interner_fault_injection);
-    } else if (authority_->c_store_guid() != relationship.c_store_guid) {
-        throw std::invalid_argument("route belongs to another C store");
-    }
+    ensure_authority(relationship.c_store_guid);
     ZstdSourceTransferConfig config =
         sender_config(config_, relationship.profile, deadline);
     auto sender = std::make_unique<P50ZstdSourceSender>(
@@ -84,6 +76,24 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
         owners_.emplace(relationship, std::move(sender));
     (void)ignored;
     return inserted->second;
+}
+
+void P50CRouteOwner::ensure_authority(CStoreGuid c_store_guid) {
+    if (!authority_) {
+        authority_ = std::make_shared<P50PreparationAuthority>(
+            c_store_guid, config_.endpoint_caps.zstd,
+            config_.authority_limits, config_.compression_level,
+            config_.endpoint_caps.profile, TuSeq{},
+            config_.p29_interner_fault_injection);
+    } else if (authority_->c_store_guid() != c_store_guid) {
+        throw std::invalid_argument("route belongs to another C store");
+    }
+}
+
+std::shared_ptr<P50PreparationAuthority> P50CRouteOwner::authority(
+    CStoreGuid c_store_guid) {
+    ensure_authority(c_store_guid);
+    return authority_;
 }
 
 PreparationRouteKey P50CRouteOwner::route_key(
@@ -128,6 +138,16 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     ConnectedFdFactory connection,
     std::chrono::steady_clock::time_point deadline,
     std::span<const uint8_t> source) {
+    co_return co_await transfer(
+        relationship, request, std::move(connection), deadline,
+        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
+    P50RouteRelationship relationship, PrepareRequestKey request,
+    ConnectedFdFactory connection,
+    std::chrono::steady_clock::time_point deadline,
+    std::shared_ptr<const std::vector<uint8_t>> source) {
     if (!relationship.valid() ||
         request.producer_session == 0 ||
         request.request_token == 0 || !connection)
