@@ -1187,11 +1187,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     return cpp_status;
                 }
 
-                /* The local CPU slot covers only the local cpp step.
-                   Release it before the network upload so the next
-                   local cpp on this CPU can proceed while the transfer
-                   runs.  dcc_unlock is idempotent; HostUnlock's
-                   destructor is a safe no-op after this. */
+                // Release the CPU slot before the network upload; dcc_unlock is idempotent.
                 dcc_unlock();
 
                 if (p50_observation != nullptr)
