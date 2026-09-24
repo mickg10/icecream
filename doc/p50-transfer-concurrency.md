@@ -646,6 +646,48 @@ Duplicate binding, extra END, trailing bytes, missing frames, excessive
 lengths, wrong profile and mismatched digest are explicit errors before
 publication. No successful compiler reply is inferred from a source prefix.
 
+#### 7.4.1 Planned link-rejection completion
+
+This extension is pending implementation and qualification; it is not a claim
+about the current wire codec. Real F-process restart testing exposed silent
+rejection of an old F identity followed by excessive reconnect attempts.
+Land shared retry pacing first, independently of this wire extension.
+
+Proposed frame 25, `R2_LINK_REJECT`, has exactly 18 payload bytes: a big-endian
+u16 reason at offset 0 and a Digest128 at offset 2. Reasons are `1` StoreReplaced
+and `2` ReservationMissing; other values, truncation and trailing bytes are
+invalid. The digest is XXH3-128 over ASCII `R2-link-offer-v1` (no NUL), followed
+by the canonical 181-byte LINK_HELLO payload, without its outer frame header.
+Use the existing Digest128 byte representation. This binds the complete offer,
+including reservation, relationship/epoch, physical generation, C/F identities,
+C control incarnation, profile, window and limits.
+
+F may emit this record only in reply to a decoded, structurally valid LINK_HELLO:
+StoreReplaced means the offered F store identity differs from the current one;
+ReservationMissing means the current store cannot find the exact offered lease.
+Malformed input does not receive an invented identity-bound rejection. C accepts
+the rejection only when the reason and digest match the outstanding offer. It
+retires that old relationship only, wakes its waiters, and reports a non-success
+outcome for unfinished work. It must preserve any already validated exact COMMIT
+and must not replace the entire C sidecar or disturb a healthy sibling link.
+Fresh assignments to a new F identity remain admissible. No rejection grants
+publication, compilation or receipt credit. R1 framing and behavior are unchanged.
+
+Older R2 peers and transport EOF remain distinguishable only by bounded retry,
+not by an assumed store replacement. Retry pacing is relationship-wide: failed
+recovery attempts back off 5, 10, 20, 40, 80, 160, 320, then at most 500 ms;
+all callers share the next eligible retry instant. Successful reconciliation
+resets the delay; ordinary socket setup alone does not. Waits release writer
+ownership, honor the original caller deadline, and wake on retirement. W30
+callers must not multiply the reconnect rate.
+
+Required tests: codec golden/round-trip and malformed reasons/lengths; changed
+offer fields and stale physical-generation replies cannot retire a newer link;
+actual F restart yields bounded old-call completion and a successful fresh
+assignment; W1/W30 immediate-EOF peers demonstrate an aggregate attempt bound;
+unaffected-link progress and validated-positive-result preservation remain true.
+Do not count retry pacing alone as prompt typed replacement detection.
+
 ### 7.5 Predicted P29 NEED and speculative codec state
 
 `p29_wire.h` already computes the sender's missing-region list; its NEED
