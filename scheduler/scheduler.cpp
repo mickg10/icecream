@@ -584,6 +584,7 @@ static unsigned long assignment_ready_ignored = 0;
 static unsigned long assignment_revoke_requested = 0;
 static unsigned long assignment_terminal_accepted = 0;
 static unsigned long assignment_terminal_ignored = 0;
+static unsigned long assignment_cache_withdraw_redispatches = 0;
 /* Pre-login lease, population bound, and accept quantum (issue #4 P1).
    Named conservative defaults; test overrides via environment.  */
 static uint64_t prelogin_lease_msec = 15000;        // T_login
@@ -2056,6 +2057,23 @@ static list<CompileServer *> filter_ineligible_servers(Job *job)
                                                 job->submitter()))) {
                 return false;
             }
+            /* A strict-nonce remote worker whose cache advertisement has been
+               withdrawn can never complete the READY->UseCS handoff: the
+               re-login handler exposes a held assignment only once a present
+               cache snapshot arrives, and a sidecar loss makes that never
+               come.  Selecting such a worker would strand the job in an
+               unbounded ASSIGNMENT_READY hold. */
+            if (cs != job->submitter()
+                    && assignment_fence_mode == ConfCSMsg::StrictNonce
+                    && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
+                    && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                                           job->submitter())
+                    && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, cs)
+                    && !cache_advertisement_is_well_formed_present(
+                        cs->cacheEndpointPort(), cs->cacheProtocol(),
+                        cs->cacheProfileMask())) {
+                return false;
+            }
             /* PREPARE is admitted only onto an empty S->F userspace queue.
                Appending another assignment behind deferred output would make
                an already bounded backlog the admission path for new work. */
@@ -2501,9 +2519,19 @@ static CompileServer *pick_server(Job *job,
                 && (!IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
                     || !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
                                             job->submitter()));
+            const bool cache_absent = cs != job->submitter()
+                && assignment_fence_mode == ConfCSMsg::StrictNonce
+                && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
+                && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                                       job->submitter())
+                && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, cs)
+                && !cache_advertisement_is_well_formed_present(
+                    cs->cacheEndpointPort(), cs->cacheProtocol(),
+                    cs->cacheProfileMask());
             if (!redispatch_local && cs->matches(job->preferredHost())
                     && cs->is_eligible_now(job)
-                    && !prepare_backlogged && !strict_incompatible) {
+                    && !prepare_backlogged && !strict_incompatible
+                    && !cache_absent) {
 #if DEBUG_SCHEDULER > 1
                 trace() << "taking preferred " << cs->nodeName() << " " <<  server_speed(cs, job, true) << endl;
 #endif
@@ -3301,21 +3329,39 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
        processed by S.  Its first projection was intentionally held when the
        retained worker cache tuple was absent; expose those exact jobs now,
        after installing the positive cache snapshot above. */
+    const bool cache_present = cache_advertisement_is_well_formed_present(
+        cs->cacheEndpointPort(), cs->cacheProtocol(),
+        cs->cacheProfileMask());
     for (map<unsigned int, Job *>::const_iterator it = jobs.begin();
          it != jobs.end(); ++it) {
         Job *job = it->second;
         if (job == nullptr || job->server() != cs ||
             job->assignmentPolicy() != Job::ASSIGNMENT_STRICT_NONCE ||
-            job->assignmentPhase() != Job::ASSIGNMENT_READY ||
             job->assignmentReplySent())
             continue;
-        if (!cache_advertisement_is_well_formed_present(
-                cs->cacheEndpointPort(), cs->cacheProtocol(),
-                cs->cacheProfileMask()))
+        if (job->assignmentPhase() != Job::ASSIGNMENT_READY &&
+            job->assignmentPhase() != Job::ASSIGNMENT_PREPARED)
             continue;
-        if (!send_remote_dispatch_reply(job))
-            return false;
-        job->setAssignmentReplySent(true);
+        if (cache_present) {
+            if (job->assignmentPhase() != Job::ASSIGNMENT_READY)
+                continue;
+            if (!send_remote_dispatch_reply(job))
+                return false;
+            job->setAssignmentReplySent(true);
+        } else {
+            /* The cache sidecar is gone.  A strict assignment held on this
+               worker can never complete the READY->UseCS handoff without a
+               present cache.  Revoke before start; the matching RevokeResult
+               redispatches the unexposed job back to the queue.  If the
+               revoke send fails the job falls through to the worker-loss
+               redispatch on that worker's eventual teardown. */
+            trace() << "cache withdrawn on relogin; revoking strict "
+                    << "assignment " << job->id() << " from "
+                    << cs->nodeName() << endl;
+            job->setCacheWithdrawRedispatch(true);
+            if (!request_assignment_revoke(job))
+                job->setCacheWithdrawRedispatch(false);
+        }
     }
 
     return false;
@@ -3383,8 +3429,24 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
     const bool cache_ready = cache_advertisement_is_well_formed_present(
         cs->cacheEndpointPort(), cs->cacheProtocol(), cs->cacheProfileMask());
     if (job->assignmentPolicy() == Job::ASSIGNMENT_STRICT_NONCE && !cache_ready) {
-        trace() << "holding strict READY job " << job->id()
-                << " until worker cache re-login" << endl;
+        /* The worker's cache sidecar is absent.  Holding this READY forever
+           would strand the job.  Revoke the unexposed assignment before
+           start; the matching RevokeResult redispatches it back to the
+           queue so another worker (or the submitter-local fallback) can
+           make progress. */
+        trace() << "strict READY on cache-absent worker; revoking job "
+                << job->id() << " from " << cs->nodeName() << endl;
+        job->setCacheWithdrawRedispatch(true);
+        if (!request_assignment_revoke(job)) {
+            /* The worker channel rejected the ordered control send.  Fall
+               back to direct redispatch; the worker's Reserved row is stale
+               and will be retired by its eventual teardown. */
+            trace() << "revoke send failed; direct redispatch of job "
+                    << job->id() << endl;
+            job->setCacheWithdrawRedispatch(false);
+            if (redispatch_unexposed_assignment(job, cs))
+                ++assignment_cache_withdraw_redispatches;
+        }
         return true;
     }
     if (job->assignmentReadyGated() && !send_remote_dispatch_reply(job)) {
@@ -3438,6 +3500,7 @@ static bool handle_assignment_terminal(CompileServer *cs, Msg *_m)
            Either way ownership remains until the worker's ordinary JobDone. */
         ++assignment_terminal_accepted;
         job->setAssignmentPhase(Job::ASSIGNMENT_CLAIMED_OR_LATER);
+        job->setCacheWithdrawRedispatch(false);
         return true;
     }
 
@@ -3451,6 +3514,33 @@ static bool handle_assignment_terminal(CompileServer *cs, Msg *_m)
     }
 
     ++assignment_terminal_accepted;
+
+    /* A revoked assignment marked for cache-withdraw redispatch goes back
+       to the queue instead of failing the job.  Local fallback remains
+       available (preExposureRedispatch is not set) so the job can complete
+       on the submitter when no cache-present worker exists. */
+    if (job->cacheWithdrawRedispatch()) {
+        trace() << "redispatching cache-withdraw revoked assignment "
+                << job->id() << " from " << cs->nodeName() << endl;
+        cs->removeJob(job);
+        credit_dispatch_credit(job);
+        unindex_fenced_assignment(job);
+        job->setServer(nullptr);
+        job->setState(Job::PENDING);
+        job->setAssignmentPolicy(Job::ASSIGNMENT_LEGACY);
+        job->setAssignmentPhase(Job::ASSIGNMENT_NONE);
+        job->setAssignmentIdentity(0, 0);
+        job->setCompileIdentity(0, 0);
+        job->setAssignmentReplySent(false);
+        job->setCacheWithdrawRedispatch(false);
+        job->setPreExposureRedispatch(false);
+        job->setDispatchProjection(std::string(), false, 0);
+        job->setSelectedEnvironment(std::string());
+        enqueue_job_request(job);
+        ++assignment_cache_withdraw_redispatches;
+        return true;
+    }
+
     job->setAssignmentPhase(Job::ASSIGNMENT_TERMINAL);
     /* This accepted Revoked result is the scheduler's authoritative terminal
        boundary for a reservation that never started.  Keep it in the same

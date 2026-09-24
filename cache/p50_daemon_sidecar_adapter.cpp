@@ -2600,6 +2600,14 @@ void DaemonSidecarAdapter::outer_apply_action(
         pending_input_lifecycle_.clear();
         break;
     case sidecar::LifecycleAction::EnterDegradedLegacy:
+        std::fprintf(stderr,
+                     "cache sidecar degraded to legacy"
+                     " (attempts=%u max=%u owner_gen=%llu)\n",
+                     outer_lifecycle_->attempts(),
+                     std::min<uint64_t>(100000,
+                         static_cast<uint64_t>(config_.max_restarts) +
+                             static_cast<uint64_t>(config_.max_attempts_per_recovery)),
+                     static_cast<unsigned long long>(outer_lifecycle_->owner_key().generation));
         outer_authenticated_ = false;
         outer_ready_lease_.reset();
         disable_relationship();
@@ -3297,6 +3305,11 @@ bool DaemonSidecarAdapter::outer_advance_turn(
             if (descriptor.fd == outer_auth_fd_)
                 events = descriptor.revents;
         if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            std::fprintf(stderr,
+                         "cache sidecar auth socket closed"
+                         " (events=0x%x authenticated=%d)\n",
+                         static_cast<int>(events),
+                         static_cast<int>(outer_authenticated_));
             close_owned(outer_auth_fd_);
             outer_authenticated_ = false;
             outer_auth_failure_ = true;
@@ -3343,6 +3356,11 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         outer_replacement_requested_ &&
         outer_lifecycle_->state() == sidecar::LifecycleState::RetryEligible) {
         if (!reserve_outer_restart()) {
+            std::fprintf(stderr,
+                         "cache sidecar restart budget exhausted"
+                         " (restarts=%zu window=%lldms)\n",
+                         restart_times_.size(),
+                         (long long)config_.restart_window.count());
             outer_shutdown_requested_ = true;
             fail(AdapterError::AttemptExhausted);
             outer_observe(update);
@@ -3350,6 +3368,11 @@ bool DaemonSidecarAdapter::outer_advance_turn(
                 *result = update;
             return false;
         }
+        std::fprintf(stderr,
+                     "cache sidecar replacement launched"
+                     " (attempt=%u restarts=%zu)\n",
+                     outer_lifecycle_->attempts() + 1,
+                     restart_times_.size());
         outer_replacement_requested_ = false;
         const sidecar::LifecycleActionResult replacement =
             outer_lifecycle_->begin(now);

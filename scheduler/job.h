@@ -97,6 +97,8 @@ public:
     void setAssignmentReplySent(bool sent) { m_assignmentReplySent = sent; }
     bool preExposureRedispatch() const { return m_preExposureRedispatch; }
     void setPreExposureRedispatch(bool value) { m_preExposureRedispatch = value; }
+    bool cacheWithdrawRedispatch() const { return m_cacheWithdrawRedispatch; }
+    void setCacheWithdrawRedispatch(bool value) { m_cacheWithdrawRedispatch = value; }
 
     /* Prepared modes freeze the complete legacy UseCS projection at the
        dispatch decision.  READY may arrive much later, after selection
@@ -264,6 +266,7 @@ private:
     uint32_t m_dispatchMatchedJobId = 0;
     bool m_assignmentReplySent = false;
     bool m_preExposureRedispatch = false;
+    bool m_cacheWithdrawRedispatch = false;
     CompileServer *m_server;  // on which server we build
     CompileServer *m_submitter;
     bool m_submitterDetached = false;

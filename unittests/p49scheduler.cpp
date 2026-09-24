@@ -3139,6 +3139,9 @@ static void run_old_submitter_to_new_worker(const std::string &binary,
             "old-submitter/new-worker scheduler stopped cleanly");
 }
 
+static void run_strict_cache_withdraw(const std::string &binary,
+                                       const std::string &directory);
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -3181,6 +3184,7 @@ int main(int argc, char **argv)
     run_advisory(argv[1], directory);
     run_prepare_backlog(argv[1], directory);
     run_strict_nonce(argv[1], directory);
+    run_strict_cache_withdraw(argv[1], directory);
     run_pre_exposure_worker_loss_redispatch(argv[1], directory);
     run_disabled(argv[1], directory);
     run_cache_advertisement(argv[1], directory);
@@ -3196,4 +3200,194 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
+}
+
+/* Item A: a strict-nonce worker whose cache advertisement is withdrawn must
+   never strand remote strict work.  The scheduler must not select a
+   cache-absent F for strict remote dispatch, a READY that arrives on a
+   cache-absent worker must be revoked and redispatched, and the same job id
+   must be assignable to the worker again once its cache returns. */
+static void run_strict_cache_withdraw(const std::string &binary,
+                                       const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/strict-cache-withdraw.log";
+    pid_t scheduler = start_scheduler(binary, port, "strict-nonce", log, 64);
+    REQUIRE(port != 0 && scheduler > 0,
+            "strict cache-withdraw scheduler launched");
+
+    int worker_a_port = 0;
+    int worker_a_listener = bind_port(0, &worker_a_port);
+    if (worker_a_listener >= 0) listen(worker_a_listener, 16);
+    int cache_a_port = 0;
+    int cache_a_sentinel = bind_port(0, &cache_a_port);
+    if (cache_a_sentinel >= 0) listen(cache_a_sentinel, 4);
+    int worker_b_port = 0;
+    int worker_b_listener = bind_port(0, &worker_b_port);
+    if (worker_b_listener >= 0) listen(worker_b_listener, 16);
+    int cache_b_port = 0;
+    int cache_b_sentinel = bind_port(0, &cache_b_port);
+    if (cache_b_sentinel >= 0) listen(cache_b_sentinel, 4);
+
+    ConfCSMsg *conf = nullptr;
+    MsgChannel *worker_a = login_host(
+        port, "cache-withdraw-a", true, worker_a_port, &conf,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_a && conf
+                && conf->fence_mode == ConfCSMsg::StrictNonce,
+            "cache-present worker A logs in under strict nonce");
+    delete conf;
+    conf = nullptr;
+    MsgChannel *worker_b = login_host(
+        port, "cache-withdraw-b", true, worker_b_port, &conf,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_b && conf
+                && conf->fence_mode == ConfCSMsg::StrictNonce,
+            "cache-present worker B logs in under strict nonce");
+    delete conf;
+    conf = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "cache-withdraw-submit", false, 0, &conf);
+    REQUIRE(submitter && conf
+                && conf->fence_mode == ConfCSMsg::StrictNonce,
+            "strict submitter joins");
+    delete conf;
+
+    /* Phase 1: pin the first job to A via preferredHost, complete it. */
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 7001, "cache-withdraw-a"),
+            "first strict job pinned to A");
+    AssignPrepareMsg *prepare_a = wait_prepare(worker_a);
+    REQUIRE(prepare_a && prepare_a->wire_id != 0 && prepare_a->nonce() != 0,
+            "first strict job is prepared on A");
+    if (prepare_a) {
+        worker_a->send_msg(AssignReadyMsg(
+            prepare_a->epoch(), prepare_a->wire_id, prepare_a->nonce()));
+    }
+    UseCSMsg *use_a = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_a && use_a->assignmentEpoch() == prepare_a->epoch()
+                && use_a->assignmentNonce() == prepare_a->nonce(),
+            "first strict UseCS carries the full identity");
+    if (use_a) {
+        worker_a->send_msg(JobBeginMsg(use_a->job_id, 0));
+        worker_a->send_msg(job_done_for(*use_a, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use_a;
+    delete prepare_a;
+
+    /* Phase 2: A loses its cache sidecar — re-login with cache=0/0/0. */
+    LoginMsg a_relogin(0, "cache-withdraw-a", "x86_64", 0);
+    a_relogin.envs.push_back(std::make_pair(
+        std::string("x86_64"), std::string("p49-test-env")));
+    a_relogin.max_kids = 1;
+    a_relogin.noremote = false;
+    a_relogin.chroot_possible = true;
+    a_relogin.setCacheAdvertisement(0, 0, 0);
+    REQUIRE(worker_a->send_msg(a_relogin),
+            "A re-logins without a cache advertisement");
+    {
+        Msg *relogin_conf = wait_type(worker_a, Msg::CS_CONF, 3000);
+        delete relogin_conf;
+    }
+
+    /* Scenario (1): a strict job must not be dispatched to cache-absent A.
+       Request without a preferred host; the filter excludes A and normal
+       selection picks B.  Also verify A receives no PREPARE. */
+    REQUIRE(submitter && request_job(submitter, 7002),
+            "second strict job requested (no preference)");
+    REQUIRE(no_type(worker_a, Msg::ASSIGN_PREPARE, 1000),
+            "cache-absent A receives no strict PREPARE (item A filter)");
+    AssignPrepareMsg *prepare_b = wait_prepare(worker_b);
+    REQUIRE(prepare_b && prepare_b->wire_id != 0 && prepare_b->nonce() != 0,
+            "second strict job is prepared on cache-present B, not A");
+    if (prepare_b) {
+        worker_b->send_msg(AssignReadyMsg(
+            prepare_b->epoch(), prepare_b->wire_id, prepare_b->nonce()));
+    }
+    UseCSMsg *use_b = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_b && use_b->assignmentEpoch() == prepare_b->epoch()
+                && use_b->assignmentNonce() == prepare_b->nonce(),
+            "second strict UseCS carries B's identity");
+    if (use_b) {
+        worker_b->send_msg(JobBeginMsg(use_b->job_id, 0));
+        worker_b->send_msg(job_done_for(*use_b, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use_b;
+    delete prepare_b;
+
+    /* Complete a normal job on B to exercise the full strict path. */
+    REQUIRE(submitter && request_job(submitter, 7003),
+            "third strict job requested");
+    AssignPrepareMsg *prepare_b2 = wait_prepare(worker_b);
+    REQUIRE(prepare_b2 && prepare_b2->wire_id != 0 && prepare_b2->nonce() != 0,
+            "third strict job is prepared on B");
+    if (prepare_b2) {
+        worker_b->send_msg(AssignReadyMsg(
+            prepare_b2->epoch(), prepare_b2->wire_id, prepare_b2->nonce()));
+    }
+    UseCSMsg *use_b2 = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_b2, "third strict UseCS exposed from B");
+    if (use_b2) {
+        worker_b->send_msg(JobBeginMsg(use_b2->job_id, 0));
+        worker_b->send_msg(job_done_for(*use_b2, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use_b2;
+    delete prepare_b2;
+
+    /* Restore A's cache. */
+    LoginMsg a_relogin2(0, "cache-withdraw-a", "x86_64", 0);
+    a_relogin2.envs.push_back(std::make_pair(
+        std::string("x86_64"), std::string("p49-test-env")));
+    a_relogin2.max_kids = 1;
+    a_relogin2.noremote = false;
+    a_relogin2.chroot_possible = true;
+    a_relogin2.setCacheAdvertisement(
+        static_cast<uint32_t>(cache_a_port), CACHE_WIRE_REVISION,
+        CACHE_PROFILE_ZSTD_TU);
+    REQUIRE(worker_a->send_msg(a_relogin2),
+            "A re-logins with its cache restored");
+    {
+        Msg *relogin_conf = wait_type(worker_a, Msg::CS_CONF, 3000);
+        delete relogin_conf;
+    }
+
+    /* Scenario (3): the SAME worker A (cache-restored) can accept a strict
+       PREPARE with a fresh nonce without collision from the earlier revoked
+       assignment. */
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 7004, "cache-withdraw-a"),
+            "fourth strict job pinned to cache-restored A");
+    AssignPrepareMsg *prepare_a2 = wait_prepare(worker_a);
+    REQUIRE(prepare_a2 && prepare_a2->wire_id != 0 && prepare_a2->nonce() != 0,
+            "cache-restored A accepts a strict PREPARE without collision");
+    if (prepare_a2) {
+        worker_a->send_msg(AssignReadyMsg(
+            prepare_a2->epoch(), prepare_a2->wire_id, prepare_a2->nonce()));
+    }
+    UseCSMsg *use_a2 = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use_a2 && use_a2->assignmentEpoch() == prepare_a2->epoch()
+                && use_a2->assignmentNonce() == prepare_a2->nonce(),
+            "cache-restored A completes a strict assignment (no collision)");
+    if (use_a2) {
+        worker_a->send_msg(JobBeginMsg(use_a2->job_id, 0));
+        worker_a->send_msg(job_done_for(*use_a2, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use_a2;
+    delete prepare_a2;
+
+    delete submitter;
+    delete worker_a;
+    delete worker_b;
+    if (worker_a_listener >= 0) close(worker_a_listener);
+    if (cache_a_sentinel >= 0) close(cache_a_sentinel);
+    if (worker_b_listener >= 0) close(worker_b_listener);
+    if (cache_b_sentinel >= 0) close(cache_b_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "strict cache-withdraw scheduler stopped cleanly");
 }

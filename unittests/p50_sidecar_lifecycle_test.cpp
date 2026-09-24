@@ -792,6 +792,114 @@ void test_lifecycle() {
     CHECK(!parse_ready_frame(stale_ready_key, replacement.identity, 323, parsed_lease),
           "obsolete READY store-generation key is rejected");
     remove_socket_node(replacement.identity);
+
+    // Item B: a terminal DegradedLegacy state must not keep a stale deadline_.
+    // The daemon's outer poll folds next_deadline() into its timeout; a stale
+    // value forces poll(timeout=0) at 100% CPU forever.  Verify the deadline
+    // is cleared on every path that enters DegradedLegacy.
+    {
+        SidecarLifecycle degraded(config);
+        (void)degraded.begin(t0);
+        move_to_ready(degraded, 600, t0, verifier);
+        const auto degraded_lease = *degraded.current_ready_lease();
+        LifecycleObservation legacy_req;
+        legacy_req.request_legacy = true;
+        (void)degraded.advance(t0, legacy_req);
+        (void)degraded.advance(t0);  // SendTerm
+        CHECK(queue_exact_reap(degraded, 600), "degraded witness queues reap");
+        LifecycleObservation gone;
+        gone.group = GroupObservation::Gone;
+        gone.observed_pgid = 600;
+        gone.group_domain = *verifier->lease_for(600);
+        gone.path_absent = true;
+        gone.observed_path = degraded.identity()->private_directory;
+        gone.observed_device = degraded_lease.listener_device;
+        gone.observed_inode = degraded_lease.listener_inode;
+        remove_socket_node(*degraded.identity());
+        (void)degraded.advance(t0 + std::chrono::milliseconds(10), gone);
+        CHECK(degraded.advance(t0 + std::chrono::milliseconds(10), gone).action ==
+                  LifecycleAction::EnterDegradedLegacy &&
+                  degraded.state() == LifecycleState::DegradedLegacy,
+              "degraded witness reaches DegradedLegacy");
+        CHECK(degraded.next_deadline() == std::chrono::steady_clock::time_point{},
+              "DegradedLegacy clears the stale deadline (item B)");
+        (void)degraded.advance(t0 + std::chrono::milliseconds(100));
+        CHECK(degraded.next_deadline() == std::chrono::steady_clock::time_point{},
+              "DegradedLegacy deadline stays clear after advance");
+    }
+
+    // Item B: FailedClosed must also clear the deadline.
+    {
+        SidecarLifecycle failed(config);
+        (void)failed.begin(t0);
+        move_to_ready(failed, 601, t0, verifier);
+        LifecycleObservation replace;
+        replace.request_replacement = true;
+        (void)failed.advance(t0, replace);
+        (void)failed.advance(t0);       // SendTerm
+        CHECK(failed.advance(t0 + std::chrono::milliseconds(100)).action ==
+                  LifecycleAction::FailedClosed &&
+                  failed.state() == LifecycleState::FailedClosed,
+              "teardown deadline reaches FailedClosed");
+        CHECK(failed.next_deadline() == std::chrono::steady_clock::time_point{},
+              "FailedClosed clears the stale deadline (item B)");
+    }
+
+    // Item C: a healthy READY resets the launch-attempt budget so a
+    // long-lived F survives occasional silent replacements without
+    // permanently degrading after max_attempts losses.
+    {
+        SidecarLifecycle budget(config);
+        (void)budget.begin(t0);
+        CHECK(budget.attempts() == 1, "first begin consumes one attempt");
+        move_to_ready(budget, 602, t0, verifier);
+        CHECK(budget.attempts() == 0,
+              "healthy READY resets the attempt budget (item C)");
+        const auto budget_lease = *budget.current_ready_lease();
+        LifecycleObservation replace;
+        replace.request_replacement = true;
+        (void)budget.advance(t0, replace);
+        (void)budget.advance(t0);       // SendTerm
+        CHECK(queue_exact_reap(budget, 602), "budget witness queues reap");
+        LifecycleObservation gone;
+        gone.group = GroupObservation::Gone;
+        gone.observed_pgid = 602;
+        gone.group_domain = *verifier->lease_for(602);
+        gone.path_absent = true;
+        gone.observed_path = budget.identity()->private_directory;
+        gone.observed_device = budget_lease.listener_device;
+        gone.observed_inode = budget_lease.listener_inode;
+        remove_socket_node(*budget.identity());
+        (void)budget.advance(t0 + std::chrono::milliseconds(10), gone);
+        CHECK(budget.advance(t0 + std::chrono::milliseconds(10), gone).action ==
+                  LifecycleAction::RetryEligible &&
+                  budget.state() == LifecycleState::RetryEligible,
+              "budget witness reaches RetryEligible after teardown");
+        CHECK(budget.attempts() == 0,
+              "RetryEligible after healthy Ready still has budget reset");
+        auto relaunch = budget.begin(t0 + std::chrono::milliseconds(20));
+        CHECK(relaunch.action == LifecycleAction::LaunchPrepared,
+              "budget refilled after healthy Ready allows relaunch (item C)");
+    }
+
+    // Item B: DegradedLegacy from launch exhaustion (max_attempts reached)
+    // must also clear the deadline.
+    {
+        SidecarLifecycleConfig exhaust_config = config;
+        exhaust_config.identities = allocator(config.control_generation);
+        exhaust_config.max_attempts = 1;
+        SidecarLifecycle exhaust(exhaust_config);
+        (void)exhaust.begin(t0);
+        LifecycleObservation launch_fail;
+        launch_fail.exec = ExecObservation::Failed;
+        launch_fail.path_absent = true;
+        (void)exhaust.advance(t0, launch_fail);
+        CHECK(exhaust.state() == LifecycleState::DegradedLegacy,
+              "exhausted-attempts reaches DegradedLegacy");
+        CHECK(exhaust.next_deadline() ==
+                  std::chrono::steady_clock::time_point{},
+              "exhausted-attempts DegradedLegacy clears deadline (item B)");
+    }
 }
 
 } // namespace

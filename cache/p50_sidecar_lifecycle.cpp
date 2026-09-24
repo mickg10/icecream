@@ -736,6 +736,7 @@ LifecycleActionResult SidecarLifecycle::begin(
         return result(LifecycleAction::None);
     if (!valid_config(config_) || !allocate_identity()) {
         state_ = LifecycleState::DegradedLegacy;
+        deadline_ = {};
         return result(LifecycleAction::EnterDegradedLegacy);
     }
     child_pid_ = -1;
@@ -888,6 +889,7 @@ bool SidecarLifecycle::teardown_expired(
 LifecycleActionResult SidecarLifecycle::fail_closed() noexcept {
     withdraw();
     state_ = LifecycleState::FailedClosed;
+    deadline_ = {};
     // Keep the exact identity/PID for diagnostics, but never expose a lease
     // or permit this object to reopen capacity after bounded teardown fails.
     return result(LifecycleAction::FailedClosed);
@@ -921,8 +923,10 @@ LifecycleActionResult SidecarLifecycle::advance(
     }
     consume_reap_events();
     if (state_ == LifecycleState::DegradedLegacy ||
-        state_ == LifecycleState::FailedClosed || state_ == LifecycleState::Stopped)
+        state_ == LifecycleState::FailedClosed || state_ == LifecycleState::Stopped) {
+        deadline_ = {};
         return result(LifecycleAction::None);
+    }
 
     if (observation.child_waitable)
         leader_waitable_ = true;
@@ -954,6 +958,7 @@ LifecycleActionResult SidecarLifecycle::advance(
             withdraw();
             clear_incarnation();
             state_ = LifecycleState::DegradedLegacy;
+            deadline_ = {};
             return result(LifecycleAction::EnterDegradedLegacy);
         }
         if (state_ == LifecycleState::LaunchPrepared && child_pid_ <= 1) {
@@ -964,6 +969,7 @@ LifecycleActionResult SidecarLifecycle::advance(
             // owner can perform any already-captured path cleanup without
             // waiting forever for a group lease that cannot exist.
             state_ = LifecycleState::DegradedLegacy;
+            deadline_ = {};
             return result(LifecycleAction::EnterDegradedLegacy);
         }
         if (state_ != LifecycleState::TerminatingGrace &&
@@ -1019,6 +1025,7 @@ LifecycleActionResult SidecarLifecycle::advance(
             if (!exact_path_absent(observation))
                 return result(LifecycleAction::None);
             state_ = LifecycleState::RetryEligible;
+            deadline_ = {};
             if (attempts_ >= config_.max_attempts) {
                 state_ = LifecycleState::DegradedLegacy;
                 return result(LifecycleAction::EnterDegradedLegacy);
@@ -1067,6 +1074,10 @@ LifecycleActionResult SidecarLifecycle::advance(
         if (accept_ready(observation)) {
             current_ready_lease_ = observation.ready_lease;
             state_ = LifecycleState::Ready;
+            // A healthy READY starts a new life: reset the launch-attempt
+            // budget so a long-lived F survives occasional replacements
+            // without degrading permanently after max_attempts losses.
+            attempts_ = 0;
             // Launch/exec/READY deadlines govern only startup.  Leaving the
             // READY deadline armed makes the daemon's outer poll timeout stay
             // at zero after it expires, burning one core for the lifetime of
@@ -1134,10 +1145,12 @@ LifecycleActionResult SidecarLifecycle::advance(
             if (legacy_requested_) {
                 withdraw();
                 state_ = LifecycleState::DegradedLegacy;
+                deadline_ = {};
                 return result(LifecycleAction::EnterDegradedLegacy);
             }
             clear_incarnation();
             state_ = LifecycleState::RetryEligible;
+            deadline_ = {};
             return result(LifecycleAction::RetryEligible);
         }
         return result(LifecycleAction::None);
