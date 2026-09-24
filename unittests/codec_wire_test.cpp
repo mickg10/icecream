@@ -537,6 +537,68 @@ run_dialogue(const Corpus &corpus,
   return result;
 }
 
+void run_speculative_advancement_control(
+    const Corpus &corpus, const P29Interner<MmapInternProvider> &interner) {
+  require(!corpus.tus.empty(), "speculative advancement control needs a TU");
+  const LogicalTu &tu = corpus.tus.front();
+  const std::vector<std::uint8_t> expected = read_file(tu.path);
+  ResearchProvider sender_provider;
+  ResearchProvider receiver_provider;
+  P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>> serializer(
+      sender_provider, interner);
+  P29Deserializer<ResearchProvider> deserializer(receiver_provider);
+  wire::MessageCodec messages;
+  bool saw_empty_need = false;
+  bool saw_zero_missing_need = false;
+  bool saw_block_reuse = false;
+
+  // F commits every decoded successor, while C advances only the sender's
+  // speculative codec history. Its protocol commit witness is owned by CRoute
+  // and deliberately is not represented by P29Serializer::commit().
+  for (std::size_t ordinal = 0; ordinal != 30; ++ordinal) {
+    const std::vector<std::uint8_t> body = serializer.begin_tu(*tu.regions);
+    const std::vector<wire::FrameView> body_frames = wire::parse_frames(body);
+    const bool has_block_definition = std::any_of(
+        body_frames.begin(), body_frames.end(), [](const wire::FrameView& frame) {
+          return frame.kind == P29WireKind::BlockDefinition;
+        });
+    if (ordinal != 0 && !has_block_definition)
+      saw_block_reuse = true;
+    const std::vector<std::uint8_t> predicted =
+        serializer.predicted_need_frames();
+    saw_empty_need = saw_empty_need || predicted.empty();
+    for (const wire::FrameView& frame : wire::parse_frames(predicted)) {
+      if (frame.kind != P29WireKind::Need)
+        continue;
+      const std::vector<std::uint8_t> decoded = messages.decode(frame.payload);
+      wire::Cursor cursor(decoded);
+      saw_zero_missing_need = saw_zero_missing_need || cursor.varint() == 0;
+    }
+    const std::vector<std::uint8_t> need = deserializer.receive_body(body);
+    require(predicted == need,
+            "speculative sender's predicted NEED differs from F decoder");
+    const std::vector<std::uint8_t> fill = serializer.answer_need(need, false);
+    const std::span<const std::uint8_t> materialized =
+        deserializer.receive_fill(fill, false);
+    require(materialized.size() == expected.size() &&
+                std::equal(materialized.begin(), materialized.end(),
+                           expected.begin()),
+            "speculative F decoder materialized different raw bytes");
+    deserializer.commit();
+    serializer.advance_speculative();
+  }
+
+  const P29SenderRouteState &sender = sender_provider.sender_route();
+  const P29ReceiverRouteState &receiver = receiver_provider.receiver_route();
+  require(sender.paths == receiver.paths &&
+              sender.revision == receiver.revision &&
+              sender.known_region_count == receiver.known_region_count &&
+              sender.known_block_count == receiver.known_block_count,
+          "30-step speculative codec advancement diverged from F route state");
+  require(saw_empty_need && saw_zero_missing_need && saw_block_reuse,
+          "speculative NEED parity missed empty, zero-missing, or block-reuse cases");
+}
+
 [[nodiscard]] std::vector<std::uint8_t>
 make_body(std::span<const std::uint8_t> root_raw,
           std::span<const std::uint8_t> block_raw = {}) {
@@ -1126,9 +1188,12 @@ void run_wire_controls(const Corpus &corpus,
         receiver_provider.receiver_route();
     const std::vector<std::uint8_t> second_body =
         serializer.begin_tu(one_region);
+    const std::vector<std::uint8_t> predicted_second_need =
+        serializer.predicted_need_frames();
     const std::vector<std::uint8_t> second_need =
         deserializer.receive_body(second_body);
-    require(second_need.empty(), "known one-Region TU unexpectedly needs data");
+    require(second_need.empty() && predicted_second_need == second_need,
+            "known one-Region TU predicted a nonempty NEED");
     const std::array<std::uint8_t, 1> unsolicited{0};
     bool rejected = false;
     try {
@@ -1308,6 +1373,7 @@ int main(int argc, char **argv) {
     require(interner.distinct_lines() == config.expected_lines,
             "wire distinct Line count differs");
     run_wire_controls(corpus, interner);
+    run_speculative_advancement_control(corpus, interner);
     run_golden_comparison_controls();
 
     const auto total_start = Clock::now();

@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <map>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -316,6 +317,7 @@ private:
     std::unique_ptr<P29V1State> p29v1_;
 
     friend class CRoute;
+    friend struct P50Slice0TestAccess;
 };
 
 struct CActiveTx {
@@ -325,6 +327,10 @@ struct CActiveTx {
     size_t region_count = 0;
     size_t block_use_count = 0;
     size_t new_block_count = 0;
+};
+
+struct CCommitWitness {
+    TxBegin begin;
 };
 
 class CRoute {
@@ -346,6 +352,10 @@ public:
     void accept_commit(const TxCommit& committed,
                        ActionType action = ActionType::COMMIT_ACCEPTED);
     void abandon_active();
+    void configure_speculative_window(uint32_t max_tus,
+                                      uint64_t max_raw_bytes);
+    [[nodiscard]] std::vector<uint8_t> predicted_need_v1();
+    void advance_speculative_v1();
 
     [[nodiscard]] const std::optional<CActiveTx>& active() const { return active_; }
     [[nodiscard]] const CStoreGuid& c_store_guid() const { return authority_.guid(); }
@@ -353,19 +363,38 @@ public:
     [[nodiscard]] HistoryNonce history_nonce() const { return history_nonce_; }
     [[nodiscard]] RelSeq next_rel_seq() const { return next_rel_seq_; }
     [[nodiscard]] Digest128 state_digest() const { return state_digest_; }
+    [[nodiscard]] RelSeq speculative_next_rel_seq() const {
+        return speculative_next_rel_seq_;
+    }
+    [[nodiscard]] Digest128 speculative_state_digest() const {
+        return speculative_state_digest_;
+    }
+    [[nodiscard]] size_t speculative_tu_count() const {
+        return speculative_.size();
+    }
+    [[nodiscard]] uint64_t speculative_raw_bytes() const {
+        return speculative_raw_bytes_;
+    }
     [[nodiscard]] uint64_t p29v1_route_state_bytes() const noexcept;
     [[nodiscard]] std::optional<bool> p29v1_system_source_reuse() const noexcept;
 
 private:
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);
     void record(ActionType action, const CActiveTx& active);
+    void record(ActionType action, const TxBegin& begin);
 
     CAuthority& authority_;
     FStoreGuid f_store_guid_{};
     HistoryNonce history_nonce_{};
     RelSeq next_rel_seq_{};
     Digest128 state_digest_{};
+    RelSeq speculative_next_rel_seq_{};
+    Digest128 speculative_state_digest_{};
     std::optional<CActiveTx> active_;
+    std::vector<CCommitWitness> speculative_;
+    uint64_t speculative_raw_bytes_ = 0;
+    uint64_t speculative_raw_byte_limit_ = std::numeric_limits<uint64_t>::max();
+    uint32_t speculative_tu_limit_ = 1;
     struct P29V1State;
     std::unique_ptr<P29V1State> p29v1_;
     ActionTrace* trace_ = nullptr;

@@ -217,10 +217,13 @@ static void test_p50_round_trip_and_validation()
     LoginMsg login = fixture_login();
     const Bytes p49 = encode_frame(49, login);
     const Bytes p50 = encode_frame(50, login);
+    const Bytes p51 = encode_frame(51, login);
     REQUIRE(p50.size() == p49.size() + 3 * sizeof(uint32_t)
                 && std::equal(p49.begin() + sizeof(uint32_t), p49.end(),
                               p50.begin() + sizeof(uint32_t)),
             "P50 Login appends exactly three words to the unchanged P49 body");
+    REQUIRE(p51 == p50,
+            "selected R1 cache advertisement keeps exact Login bytes on Protocol 51");
     Pair pair = make_pair(50);
     REQUIRE(pair.left->send_msg(login), "P50 Login advertises a valid endpoint");
     Msg *wire = pair.right->get_msg(2, true);
@@ -229,6 +232,17 @@ static void test_p50_round_trip_and_validation()
                 && decoded->cache_protocol == CACHE_WIRE_REVISION
                 && decoded->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
             "P50 Login round-trips the exact three-word advertisement");
+    delete wire;
+
+    Pair p51_pair = make_pair(51);
+    REQUIRE(p51_pair.left->send_msg(login),
+            "Protocol-50 Login advertisement remains selectable on Protocol 51");
+    wire = p51_pair.right->get_msg(2, true);
+    decoded = dynamic_cast<LoginMsg *>(wire);
+    REQUIRE(decoded && decoded->cache_endpoint_port == UINT32_C(0x0000beef)
+                && decoded->cache_protocol == CACHE_WIRE_REVISION
+                && decoded->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
+            "Protocol-51 decoder accepts the unchanged R1 advertisement");
     delete wire;
 
     LoginMsg absent = fixture_login();

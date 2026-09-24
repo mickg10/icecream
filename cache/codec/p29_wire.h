@@ -216,6 +216,7 @@ enum class P29AllocationEntry : unsigned {
   SenderBeginTu,
   SenderAnswerNeed,
   SenderCommit,
+  SenderAdvanceSpeculative,
   SenderAbandon,
   ReceiverReceiveBody,
   ReceiverReceiveFill,
@@ -755,6 +756,26 @@ public:
     return pending_.fill;
   }
 
+  // The NEED is deterministic from BODY plus the sender's current committed
+  // route knowledge. It is returned without advancing the continuing entropy
+  // streams or publishing any route state.
+  [[nodiscard]] std::vector<std::uint8_t> predicted_need_frames() {
+    require_pending();
+    if (pending_.fill_ready)
+      fail("P29 predicted NEED requested after FILL");
+    if (pending_.manifest_blocks.empty() && pending_.missing_regions.empty())
+      return {};
+    std::vector<std::uint8_t> raw;
+    p29_wire_detail::put_varint(raw, pending_.missing_regions.size());
+    for (std::uint32_t id : pending_.missing_regions)
+      p29_wire_detail::put_varint(raw, id);
+    p29_wire_detail::put_varint(raw, 0);
+    const std::vector<std::uint8_t> encoded = messages_.encode(raw);
+    std::vector<std::uint8_t> result;
+    p29_wire_detail::append_frame(result, P29WireKind::Need, encoded);
+    return result;
+  }
+
   [[nodiscard]] std::size_t root_reference_count() const {
     require_pending();
     return pending_.plan->root.size();
@@ -855,13 +876,46 @@ public:
   }
 
   void commit() {
+    commit_pending(false);
+  }
+
+  // Apply the completed TU to the sender's working route state so a successor
+  // can be encoded. This is deliberately not an F receipt/COMMIT transition;
+  // the owning route keeps that witness pending until accept_commit().
+  void advance_speculative() {
+    commit_pending(true);
+  }
+
+  void abandon() {
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
     p29_wire_detail::P29AllocationScope allocation_scope(
-        p29_wire_detail::P29AllocationEntry::SenderCommit);
+        p29_wire_detail::P29AllocationEntry::SenderAbandon);
+#endif
+    require_pending();
+    if (matcher_.has_pending())
+      matcher_.abort();
+    control_encoder_.reset();
+    literal_encoder_.reset();
+    clear_pending();
+  }
+
+  [[nodiscard]] const p29::BlockCatalogue &catalogue() const {
+    return matcher_.catalogue();
+  }
+
+private:
+  void commit_pending(bool speculative) {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        speculative
+            ? p29_wire_detail::P29AllocationEntry::SenderAdvanceSpeculative
+            : p29_wire_detail::P29AllocationEntry::SenderCommit);
+#else
+    (void)speculative;
 #endif
     require_pending();
     if (!pending_.fill_ready)
-      fail("P29 serializer commit precedes FILL");
+      fail("P29 serializer advance precedes FILL");
     P29SenderRouteState &state = provider_.sender_route();
     if (state.revision != pending_.base_revision ||
         state.paths.size() != pending_.base_paths ||
@@ -903,24 +957,6 @@ public:
     clear_pending();
   }
 
-  void abandon() {
-#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
-    p29_wire_detail::P29AllocationScope allocation_scope(
-        p29_wire_detail::P29AllocationEntry::SenderAbandon);
-#endif
-    require_pending();
-    if (matcher_.has_pending())
-      matcher_.abort();
-    control_encoder_.reset();
-    literal_encoder_.reset();
-    clear_pending();
-  }
-
-  [[nodiscard]] const p29::BlockCatalogue &catalogue() const {
-    return matcher_.catalogue();
-  }
-
-private:
   struct Pending {
     bool active = false;
     bool fill_ready = false;

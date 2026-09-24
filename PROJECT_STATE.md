@@ -85,6 +85,29 @@ remain failed, not rewritten as a clean full-suite run. The draft asynchronous
 daemon integration compiled separately but has no runtime qualification yet
 and is not included in this codec checkpoint.
 
+### Speculative P29 codec component
+
+The P29 speculative-codec component now has a focused passing gate: 30 TUs
+are encoded and materialized by the real F store before C accepts its first
+receipt. Predicted NEED equals F's derived NEED; FILL is built from the
+prediction. Ordered receipt validation advances a separate confirmed cursor,
+rejects wrong or reordered receipts, and releases bounded count/raw credits.
+A separate reset fixture commits and acknowledges one TU, stages two unsent
+TUs, then rebuilds only that uncommitted suffix with the same TU identities
+and a fresh codec history. It rejects an old-history receipt. These are
+in-process codec/store tests, not evidence of 30 bundles sent over a persistent
+socket or of lost-reply recovery.
+
+`p50slice0`, `codec_wire` and `p50cacheadvertisement` passed together in
+66.35 seconds under the existing bounded SDK container. Runtime evidence:
+`/tanksmall/scratch/tmp/p50-stageA-C0C1-20260924.ZJvsRb/tmp/c1-d1-runtime-r2.log`
+(SHA256 `42d1da015801f149a9858b3c6d39063ea147451234b68151a45804dabf5baf75`).
+The initial focused build succeeded but its runtime command used the wrong
+working directory for codec fixtures; that attempt remains failed. The
+corrected command ran the same binaries with the fixture directory resolved.
+Concurrent daemon, local-reservation and preparation-authority integration
+changes are excluded from this component gate.
+
 ### Independent-link pipeline candidate
 
 `sorbet_1.5_pipeline` is a candidate, not a release or a new S* farm
