@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <future>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -4078,7 +4079,8 @@ P50SourceArmFields r2_test_arm(const CStoreGuid& c_guid, uint64_t request,
 
 P51SourceArmedFields r2_test_armed(P51SourceArmFields arm,
                                     const FStoreGuid& f_guid,
-                                    uint64_t reservation_seed) {
+                                    uint64_t reservation_seed,
+                                    uint32_t selected_window = 1) {
     P51SourceArmedFields armed;
     armed.arm = std::move(arm);
     armed.f_control_generation = 21;
@@ -4094,9 +4096,76 @@ P51SourceArmedFields r2_test_armed(P51SourceArmFields arm,
     armed.logical_relationship_id = Id128::from_u64(0x5102).bytes;
     armed.relationship_epoch = 25;
     armed.selected_revision = 2;
-    armed.selected_window = 1;
+    armed.selected_window = selected_window;
     require(armed.valid(), "R2 endpoint fixture produced invalid ARMED data");
     return armed;
+}
+
+asio::awaitable<void> r2_client_write_window_before_receipts(
+    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello,
+    const std::vector<JobBind>& bindings,
+    const std::vector<PreparedTuHandle>& prepared,
+    std::atomic<unsigned>& server_commits,
+    std::function<std::pair<JobBind, PreparedTuHandle>()> make_refill) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(endpoint, asio::use_awaitable);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(20);
+    (void)co_await client.open_r2_link(socket, hello, deadline);
+
+    std::vector<R2SentBundle> sent;
+    constexpr size_t initial_window = 30;
+    require(bindings.size() == 31 && prepared.size() == 30 &&
+                hello.window == 30 && make_refill,
+            "R2 W30 peer requires exactly 30 credits plus one refill bundle");
+    sent.reserve(initial_window);
+    for (size_t index = 0; index != initial_window; ++index) {
+        sent.push_back(co_await client.write_r2_bundle(
+            socket, bindings[index], prepared[index], deadline));
+    }
+
+    // Wait for F to materialize/commit the whole offered window.  No receipt
+    // read or COMMIT_ACK has occurred yet, so this proves the admission window
+    // was exercised across the real TCP receiver, not just accepted by C.
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    const auto commit_wait_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(5);
+    while (server_commits.load(std::memory_order_acquire) < initial_window &&
+           std::chrono::steady_clock::now() < commit_wait_deadline) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    require(server_commits.load(std::memory_order_acquire) == initial_window,
+            "F did not commit the complete R2 window before C receipt reads");
+
+    for (const R2SentBundle& bundle : sent) {
+        const ClientRunResult receipt = co_await client.read_r2_receipt(
+            socket, bundle, deadline);
+        require(receipt.status == ClientRunStatus::Committed &&
+                    receipt.committed_input.has_value() &&
+                    receipt.committed_input->tu_seq == bundle.binding.tu_seq,
+                "C did not accept the exact receipt prefix in ordinal order");
+    }
+    const uint64_t full_prefix = initial_window;
+    co_await client.write_r2_ack(socket, full_prefix, deadline);
+
+    // The 31st bundle is queued only after cumulative Q=30 was written.  It
+    // must fit the same live link without a reconnect or fresh HELLO.
+    const auto [refill_binding, refill_prepared] = make_refill();
+    require(refill_binding.relationship_ordinal == 31,
+            "R2 W30 refill was not ordinal 31");
+    const R2SentBundle refill = co_await client.write_r2_bundle(
+        socket, refill_binding, refill_prepared, deadline);
+    const ClientRunResult refill_receipt = co_await client.read_r2_receipt(
+        socket, refill, deadline);
+    require(refill_receipt.status == ClientRunStatus::Committed &&
+                refill_receipt.committed_input.has_value(),
+            "R2 window did not refill after cumulative ACK");
+    co_await client.write_r2_ack(socket, full_prefix + 1, deadline);
+    co_await raw_write(socket, Message{CloseMessage{}});
+    boost::system::error_code ignored;
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
 }
 
 asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
@@ -4368,6 +4437,231 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
                 "R2 F endpoint materialized different source bytes");
     }
     std::puts("P51_R2_ENDPOINT two-jobs-one-link exact-input: ok");
+}
+
+void test_r2_endpoint_window30_receipts_and_refill() {
+    constexpr size_t window = 30;
+    constexpr size_t total_jobs = window + 1;
+    const P5coStoreGuids stores = p5co_store_guids(0x74);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_speculative_tus = window;
+    authority_limits.max_speculative_raw_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        stores.c, caps.zstd, authority_limits, 1, ProfileId::ZSTD_TU);
+    const PreparationRouteKey route{stores.f, 23, ProfileId::ZSTD_TU};
+
+    std::vector<std::vector<uint8_t>> inputs;
+    std::vector<PreparedTuHandle> prepared_handles;
+    std::vector<JobBind> bindings;
+    std::vector<R2EndpointTestJob> jobs;
+    inputs.reserve(total_jobs);
+    prepared_handles.reserve(window);
+    bindings.reserve(total_jobs);
+    jobs.reserve(total_jobs);
+    std::vector<P51SourceArmFields> arms;
+    std::vector<P51SourceArmedFields> armed;
+    arms.reserve(total_jobs);
+    armed.reserve(total_jobs);
+
+    const sidecar::AbsoluteMonotonicDeadline deadline = r2_test_deadline();
+    for (size_t index = 0; index != window; ++index) {
+        const std::string text = "W30 exact input ordinal=" +
+                                 std::to_string(index + 1) + "\n";
+        inputs.emplace_back(text.begin(), text.end());
+        const PreparedTuHandle handle = authority->prepare_for_route(
+            route, PrepareRequestKey{1000 + index, 2000 + index},
+            inputs.back());
+        const PreparedInputPtr input =
+            P50PreparationAuthorityTestAccess::resolve(*authority, handle);
+        prepared_handles.push_back(handle);
+
+        arms.push_back(P51SourceArmFields{
+            r2_test_arm(stores.c, 3000 + index, 4000 + index),
+            static_cast<uint32_t>(window)});
+        armed.push_back(r2_test_armed(arms.back(), stores.f,
+                                      0x6000 + index,
+                                      static_cast<uint32_t>(window)));
+
+        JobBind binding;
+        binding.reservation_id = Id128{armed.back().reservation_id};
+        binding.physical_link_generation = 27;
+        binding.relationship_ordinal = index + 1;
+        binding.wire_job_id = arms.back().source.wire_job_id;
+        binding.assignment_epoch = arms.back().source.assignment_epoch;
+        binding.assignment_nonce = arms.back().source.assignment_nonce;
+        binding.logical_job = arms.back().source.logical_job;
+        binding.compiler_attempt = arms.back().source.compiler_attempt;
+        binding.source_request_id = arms.back().source.source_request_id;
+        binding.tu_seq = input->begin.tu_seq;
+        binding.profile = ProfileId::ZSTD_TU;
+        binding.raw_bytes = input->begin.raw_bytes;
+        binding.raw_digest = input->begin.raw_digest;
+        bindings.push_back(binding);
+
+        P51SourceJobLease lease;
+        lease.armed = armed.back();
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+        jobs.push_back(R2EndpointTestJob{binding, lease, input});
+    }
+    // Reserve the thirty-first binding slot, but do not prepare that TU until
+    // the first thirty receipts have been accepted and cumulatively ACKed.
+    bindings.emplace_back();
+
+    LinkHello hello;
+    hello.profile = ProfileId::ZSTD_TU;
+    hello.window = static_cast<uint32_t>(window);
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128{armed.front().reservation_id};
+    hello.relationship_id = Id128{armed.front().logical_relationship_id};
+    hello.relationship_epoch = armed.front().relationship_epoch;
+    hello.physical_link_generation = 27;
+    hello.c_store_guid = stores.c;
+    hello.c_store_generation = arms.front().source.c_store_generation;
+    hello.f_store_guid = stores.f;
+    hello.f_store_generation = armed.front().f_store_generation;
+    hello.c_control_generation = arms.front().source.c_control_generation;
+    hello.c_control_attempt = arms.front().source.c_control_attempt;
+    hello.system_source_fingerprint = icecc::digest128("R2 W30 fixture");
+    hello.history_nonce = HistoryNonce{0x51f030};
+    hello.start_mode = LinkStartMode::Initial;
+
+    std::atomic<unsigned> lookup_calls{0};
+    std::atomic<unsigned> consume_calls{0};
+    std::atomic<unsigned> commit_calls{0};
+    std::atomic<unsigned> ack_calls{0};
+    std::atomic<unsigned> terminal_calls{0};
+    uint64_t last_ack = 0;
+    std::vector<bool> consumed(window, false);
+    P50ServerEndpointConfig config;
+    config.lookup_p51_link_reservation =
+        [&, deadline](const LinkHello& observed)
+            -> std::optional<P51SourceLinkLease> {
+            ++lookup_calls;
+            if (observed != hello)
+                return std::nullopt;
+            return P51SourceLinkLease{armed.front(), deadline};
+        };
+    config.consume_p51_job_reservation =
+        [&](const LinkHello& observed, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+            ++consume_calls;
+            if (observed != hello)
+                return std::nullopt;
+            for (size_t index = 0; index != jobs.size(); ++index) {
+                if (jobs[index].binding == binding && !consumed[index]) {
+                    consumed[index] = true;
+                    return jobs[index].lease;
+                }
+            }
+            return std::nullopt;
+        };
+    config.record_p51_job_commit =
+        [&](const LinkHello& observed, const JobBind& binding,
+            const R2TxCommit& commit) {
+            if (observed != hello ||
+                commit.relationship_ordinal != binding.relationship_ordinal ||
+                commit.inner.tu_seq != binding.tu_seq)
+                return false;
+            ++commit_calls;
+            return true;
+        };
+    config.acknowledge_p51_receipt =
+        [&](const LinkHello& observed, const CommitAck& ack) {
+            if (observed != hello ||
+                ack.relationship_id != hello.relationship_id ||
+                ack.contiguous_verified_ordinal <= last_ack ||
+                ack.contiguous_verified_ordinal > commit_calls.load())
+                return false;
+            last_ack = ack.contiguous_verified_ordinal;
+            ++ack_calls;
+            return true;
+        };
+    config.on_p51_link_terminal = [&](const LinkHello& observed) {
+        if (observed == hello)
+            ++terminal_calls;
+    };
+
+    P50ServerEndpoint server(stores.f, caps, nullptr, nullptr,
+                             std::move(config));
+    P50ClientEndpoint client(authority, caps);
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           {asio::ip::address_v4::loopback(), 0});
+    auto accept_future = asio::co_spawn(
+        context, r2_accept_one(acceptor, server), asio::use_future);
+    auto make_refill = [&, authority, route]() {
+        const size_t index = window;
+        const std::string text = "W30 exact input ordinal=31\n";
+        inputs.emplace_back(text.begin(), text.end());
+        const PreparedTuHandle handle = authority->prepare_for_route(
+            route, PrepareRequestKey{1000 + index, 2000 + index},
+            inputs.back());
+        const PreparedInputPtr input =
+            P50PreparationAuthorityTestAccess::resolve(*authority, handle);
+        prepared_handles.push_back(handle);
+        arms.push_back(P51SourceArmFields{
+            r2_test_arm(stores.c, 3000 + index, 4000 + index),
+            static_cast<uint32_t>(window)});
+        armed.push_back(r2_test_armed(arms.back(), stores.f,
+                                      0x6000 + index,
+                                      static_cast<uint32_t>(window)));
+        JobBind binding;
+        binding.reservation_id = Id128{armed.back().reservation_id};
+        binding.physical_link_generation = hello.physical_link_generation;
+        binding.relationship_ordinal = index + 1;
+        binding.wire_job_id = arms.back().source.wire_job_id;
+        binding.assignment_epoch = arms.back().source.assignment_epoch;
+        binding.assignment_nonce = arms.back().source.assignment_nonce;
+        binding.logical_job = arms.back().source.logical_job;
+        binding.compiler_attempt = arms.back().source.compiler_attempt;
+        binding.source_request_id = arms.back().source.source_request_id;
+        binding.tu_seq = input->begin.tu_seq;
+        binding.profile = ProfileId::ZSTD_TU;
+        binding.raw_bytes = input->begin.raw_bytes;
+        binding.raw_digest = input->begin.raw_digest;
+        bindings[index] = binding;
+        P51SourceJobLease lease;
+        lease.armed = armed.back();
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+        jobs.push_back(R2EndpointTestJob{binding, lease, input});
+        consumed.push_back(false);
+        return std::pair{binding, handle};
+    };
+    auto client_future = asio::co_spawn(
+        context, r2_client_write_window_before_receipts(
+                     acceptor.local_endpoint(), client, hello, bindings,
+                     prepared_handles, commit_calls, make_refill),
+        asio::use_future);
+    context.run();
+    const ServerRunResult server_result = accept_future.get();
+    client_future.get();
+    require(server_result.status == ServerRunStatus::Completed &&
+                lookup_calls == 1 && consume_calls == total_jobs &&
+                commit_calls == total_jobs && ack_calls == 2 &&
+                last_ack == total_jobs && terminal_calls == 1,
+            "R2 W30 link failed exact 30-credit drain, cumulative ACK, and refill");
+
+    for (size_t index = 0; index != total_jobs; ++index) {
+        InputCursor cursor = server.attach_input(
+            InputRecordKey{stores.c, bindings[index].tu_seq});
+        std::vector<uint8_t> recovered(inputs[index].size());
+        require(cursor.read(recovered) == recovered.size() &&
+                    recovered == inputs[index],
+                "R2 W30 endpoint changed materialized source bytes");
+    }
+    std::puts("P51_R2_ENDPOINT W30 commits-before-receipts + ACK/refill: ok");
 }
 
 void test_r2_silent_setup_cancelled_before_hello() {
@@ -6765,6 +7059,11 @@ int main(int argc, char** argv) {
     if (std::getenv("ICECC_P50_R2_SETUP_CANCEL_FOCUS") != nullptr) {
         test_r2_silent_setup_cancelled_before_hello();
         std::cout << "p50_endpoint_test: focused R2 pre-HELLO cancellation PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_R2_W30_FOCUS") != nullptr) {
+        test_r2_endpoint_window30_receipts_and_refill();
+        std::cout << "p50_endpoint_test: focused R2 W30/refill PASS\n";
         return 0;
     }
     test_action_hold_rendezvous();

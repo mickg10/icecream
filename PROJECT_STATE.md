@@ -67,6 +67,24 @@ Earlier stale-snapshot failures are not passes; these targeted results close
 those checks only. Newer independent C reader/writer and recovery edits are
 separate work and must obtain their own build/runtime evidence.
 
+The direct ZSTD_TU endpoint W30 test now passes against the endpoint and
+protocol blobs in `4f3efa45267b6cc724de4cc5ef6328ff4ee12676`. C writes 30
+complete bundles on one TCP link; F commits all 30 before C reads any
+receipt. C validates the ordered receipts, sends cumulative ACK 30, then
+prepares and sends job 31 on the same connection. Exact input bytes for all
+31 jobs, ACK 31 and clean CLOSE are checked. Preparation capacity is 30;
+the refill input is not prepared until the first window has drained.
+
+This is **ZSTD_TU direct C/F endpoint evidence only**. It does not qualify
+the production multi-caller sender, P29V1/ZSTD_ROUTE W30, recovery, restart,
+mixed-version operation or farm performance. Evidence:
+`/tanksmall/scratch/tmp/p50-w30-direct.ZafPlb/logs/w30-direct-r2.log`
+(SHA256 `cd8d5a4baae9105837fc927109f6f1e4dfe89c80d0f1899f319f8d2b909ebe19`).
+Test source SHA256:
+`1a134b2cb807417efe1e81e46638e6aba7d3254ee9e9193654eac899bde1a0fa`;
+binary SHA256:
+`9d8430d1cd4a4167ad5b317b3cdd4bca4caa1cf88bd23a6f532ea6cccacaa42c`.
+
 The first version-gate audit preserves ordinary maximum 50 and existing R1
 bytes. Focused `p50sourcearmwire`, `p50cachesessionwire`,
 `p50cacheadvertisement` and the source-arm source guard passed in 92.50s;
