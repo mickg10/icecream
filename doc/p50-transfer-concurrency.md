@@ -452,6 +452,15 @@ reuse a staged source directory for an edited checkout or attribute an older
 binary's results to newer source. A selected native test invocation alone is
 not this complete gate.
 
+For selective rechecks in an existing SDK build, preserve the runner's
+unprivileged staging ownership, writable offline uv environment, scratch
+binds and `SYS_PTRACE` capability. If overriding its entrypoint, use Docker
+`--init` so deliberately orphaned test children are reaped. Do not copy
+unusable worktree Git metadata into a source-only snapshot. Retain failed
+attempts as failed: passing targeted corrections may complement a full run
+when all required cells and exact source/binary identities are accounted for,
+but do not turn that original command into a successful `make qa` invocation.
+
 Run the additional focused formal lane separately, with Java and the pinned
 TLC jar described in [formal setup](../cache/formal/README.md):
 

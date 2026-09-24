@@ -41,13 +41,37 @@ took 490.370s of this run. A subsequent report-wording change passed its
 focused **14-test** suite in 0.08s; it clarifies that summed per-operation
 timings are not build wall time or CPU time, without changing scoring.
 
-The four selected native targets passed under the strict Ubuntu 24.04 SDK
-(GCC 13.3.0), including the concurrency, recovery and bounded-stop cases.
-Restoring the global admission gate also failed the intended healthy-link
-progress assertion in the separate negative control. Full native/root and
-mixed-Docker acceptance are still being completed. The candidate has not been
-uploaded. The release-baseline results below do not satisfy those new
-candidate gates.
+The tested implementation is `be02ac858fc01b60ef380b7c06554bbcd91ec2f8`;
+`bb1cb0c75b6d960a3beb40e4e24e5b92494411a6` adds only an explicit test-helper
+write-result check required by the stricter sanitizer build. Product source
+is identical between those commits. Native checks used the Ubuntu 24.04 SDK
+with GCC 13.3.0, four CPUs and a 16 GiB memory limit.
+
+| Candidate gate | Result |
+| --- | --- |
+| Native suite, including corrected rechecks | 169 passed; 6 optional skips |
+| Separate root cache-service and sanitizer checks | 2/2 passed; 174.91s |
+| Local mixed Docker: P29V1, ZSTD_TU, ZSTD_ROUTE, P43 worker, P43 client | 5/5 passed; actual remote compilation required |
+
+These are complementary runs, not a single clean `make qa` receipt. The first
+full native invocation reported 160 passes, 6 skips and 9 failures. Eight
+failures came from its noncanonical container/staging setup (child reaping,
+the required descriptor-check capability, source permissions and copied Git
+metadata); the ninth was the test-helper compile error. All nine failed
+targets plus the updated ordinary cache-service test then passed in the
+corrected **10/10** rerun in 198.54s. No assertions were relaxed. The original
+invocation remains recorded as FAIL. Restoring global serialization also
+failed the intended healthy-link progress assertion in its negative control.
+
+Native logs and the combined, source-bound evidence index are retained at
+`/tanksmall/scratch/tmp/p50-full-qa-be02ac858/`. Mixed results are at
+`/tanksmall/scratch/tmp/p50-mixed-pipeline-jlq0YJ/mixed/summary.json`, run ID
+`df02604178a746ffb3840772073b3198`. The mixed image contains the tested product;
+its source label uses the developer snapshot digest, not the distinct Git
+archive digest. Detailed identities and limits are in the evidence index.
+The local mixed run is not a renewed external-farm qualification or a
+separately executed old/new-P50-binary rolling-upgrade test. The release-baseline
+results below are historical and were not substituted for these candidate gates.
 
 ### P50 implementation cleanup
 
