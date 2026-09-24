@@ -1,6 +1,7 @@
 #include "p50_route_owner.h"
 #include "services/comm.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -51,6 +52,7 @@ P50CRouteOwner::P50CRouteOwner(P50RouteOwnerConfig config)
         throw std::invalid_argument("route completed-request limit is zero");
     if (config_.max_relationships == 0)
         throw std::invalid_argument("route relationship limit is zero");
+    retired_senders_.reserve(config_.max_relationships);
 }
 
 P50CRouteOwner::~P50CRouteOwner() = default;
@@ -71,16 +73,24 @@ ZstdSourceTransferResult P50CRouteOwner::replacement() const noexcept {
 P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
     const P50RouteRelationship& relationship, PrepareRequestKey request,
     std::chrono::steady_clock::time_point deadline) {
+    reap_retired_senders();
     const auto position = owners_.find(relationship);
     if (position != owners_.end())
         return position->second;
-    if (owners_.size() >= config_.max_relationships)
+    if (owners_.size() + retired_senders_.size() >= config_.max_relationships)
         throw std::length_error("route relationship table is full");
 
     if (!authority_) {
+        PreparationAuthorityLimits authority_limits = config_.authority_limits;
+        // R2 is capped at W30 on the physical link. Raising the preparation
+        // slot count does not pipeline R1: its endpoint remains W1 and keeps
+        // its accepted-commit advancement semantics. The existing raw-byte cap
+        // remains the aggregate bound across retained speculative inputs.
+        authority_limits.max_speculative_tus = std::max<uint32_t>(
+            authority_limits.max_speculative_tus, 30);
         authority_ = std::make_shared<P50PreparationAuthority>(
             relationship.c_store_guid, config_.endpoint_caps.zstd,
-            config_.authority_limits, config_.compression_level,
+            authority_limits, config_.compression_level,
             config_.endpoint_caps.profile, TuSeq{},
             config_.p29_interner_fault_injection);
     } else if (authority_->c_store_guid() != relationship.c_store_guid) {
@@ -88,12 +98,18 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
     }
     ZstdSourceTransferConfig config =
         sender_config(config_, relationship.profile, deadline);
-    auto sender = std::make_unique<P50ZstdSourceSender>(
+    auto sender = std::make_shared<P50ZstdSourceSender>(
         authority_, route_key(relationship), request, std::move(config));
     const auto [inserted, ignored] =
         owners_.emplace(relationship, std::move(sender));
     (void)ignored;
     return inserted->second;
+}
+
+void P50CRouteOwner::reap_retired_senders() noexcept {
+    std::erase_if(retired_senders_, [](const Sender& sender) {
+        return sender.use_count() == 1;
+    });
 }
 
 PreparationRouteKey P50CRouteOwner::route_key(
@@ -115,9 +131,9 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     if (replacement_required_)
         co_return replacement();
 
-    P50ZstdSourceSender* sender = nullptr;
+    Sender sender;
     try {
-        sender = get_or_create(relationship, request, deadline).get();
+        sender = get_or_create(relationship, request, deadline);
     } catch (const std::invalid_argument&) {
         co_return invalid();
     } catch (const std::length_error&) {
@@ -145,9 +161,9 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     if (replacement_required_)
         co_return replacement();
 
-    P50ZstdSourceSender* sender = nullptr;
+    Sender sender;
     try {
-        sender = get_or_create(relationship, request, deadline).get();
+        sender = get_or_create(relationship, request, deadline);
     } catch (const std::invalid_argument&) {
         co_return invalid();
     } catch (const std::length_error&) {
@@ -173,9 +189,9 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     if (replacement_required_)
         co_return replacement();
 
-    P50ZstdSourceSender* sender = nullptr;
+    Sender sender;
     try {
-        sender = get_or_create(relationship, request, deadline).get();
+        sender = get_or_create(relationship, request, deadline);
     } catch (const std::invalid_argument&) {
         co_return invalid();
     } catch (const std::length_error&) {
@@ -220,13 +236,13 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
     if (profile_position != p51_incarnation_profiles_.end() &&
         profile_position->second != relationship.profile)
         co_return invalid();
-    P50ZstdSourceSender* sender = nullptr;
+    Sender sender;
     uint64_t physical_generation = 0;
     try {
         if (profile_position == p51_incarnation_profiles_.end())
             p51_incarnation_profiles_.emplace(incarnation,
                                                relationship.profile);
-        sender = get_or_create(relationship, request, deadline).get();
+        sender = get_or_create(relationship, request, deadline);
         auto position = physical_generations_.find(relationship);
         if (position == physical_generations_.end()) {
             if (next_physical_generation_ == 0 ||
@@ -260,6 +276,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
 bool P50CRouteOwner::reset_f_store_exact(
     FStoreGuid old_f_store_guid,
     uint64_t old_f_store_generation) noexcept {
+    reap_retired_senders();
     if (old_f_store_guid == FStoreGuid{} || old_f_store_generation == 0)
         return false;
     bool reset = true;
@@ -273,6 +290,10 @@ bool P50CRouteOwner::reset_f_store_exact(
                     position->first.f_store_guid,
                     position->first.f_store_generation));
                 physical_generations_.erase(position->first);
+                if (position->second.use_count() > 1) {
+                    position->second->retire_for_replacement();
+                    retired_senders_.push_back(std::move(position->second));
+                }
                 position = owners_.erase(position);
             } else {
                 reset = false;
@@ -287,6 +308,7 @@ bool P50CRouteOwner::reset_f_store_exact(
 }
 
 void P50CRouteOwner::reset() noexcept {
+    reap_retired_senders();
     for (auto position = owners_.begin(); position != owners_.end();) {
         const PreparationRouteKey key = route_key(position->first);
         if (!authority_ || authority_->reset_route(key))
@@ -295,6 +317,10 @@ void P50CRouteOwner::reset() noexcept {
                 position->first.c_store_guid, position->first.f_store_guid,
                 position->first.f_store_generation));
             physical_generations_.erase(position->first);
+            if (position->second.use_count() > 1) {
+                position->second->retire_for_replacement();
+                retired_senders_.push_back(std::move(position->second));
+            }
             position = owners_.erase(position);
         }
         else

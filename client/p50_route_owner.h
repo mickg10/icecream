@@ -102,7 +102,7 @@ public:
 #endif
 
 private:
-    using Sender = std::unique_ptr<P50ZstdSourceSender>;
+    using Sender = std::shared_ptr<P50ZstdSourceSender>;
 
     [[nodiscard]] ZstdSourceTransferResult invalid() const noexcept;
     [[nodiscard]] ZstdSourceTransferResult replacement() const noexcept;
@@ -111,10 +111,12 @@ private:
     Sender& get_or_create(const P50RouteRelationship& relationship,
                           PrepareRequestKey request,
                           std::chrono::steady_clock::time_point deadline);
+    void reap_retired_senders() noexcept;
 
     P50RouteOwnerConfig config_{};
     std::shared_ptr<P50PreparationAuthority> authority_;
     std::map<P50RouteRelationship, Sender> owners_;
+    std::vector<Sender> retired_senders_;
     std::map<P50RouteRelationship, uint64_t> physical_generations_;
     std::map<std::tuple<CStoreGuid, FStoreGuid, uint64_t>, ProfileId>
         p51_incarnation_profiles_;

@@ -95,6 +95,13 @@ struct ZstdSourceTransferConfig {
     // Deterministic unit-test seam for the typed route-poison boundary.
     // Product callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;
+    // Test-only observation after the complete R2 TU bundle is on the socket;
+    // it does not participate in admission or receipt handling.
+    std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
+    // Asynchronous test gate that pauses only the receipt reader. Returning
+    // true yields through a short timer, leaving the sole writer and F peer
+    // independently runnable.
+    std::function<bool()> hold_r2_receipt_reader_for_test;
 };
 
 // Called once per bounded attempt.  The callback returns ownership of one
@@ -115,7 +122,7 @@ using AsyncConnectedFdFactory = std::function<void(
 // advances TU identity while each ZSTD_TU payload remains independently
 // compressed.  P29V1 and ZSTD_ROUTE additionally retain profile-owned state
 // for sequential transfers.
-class P50ZstdSourceSender {
+class P50ZstdSourceSender : public std::enable_shared_from_this<P50ZstdSourceSender> {
 public:
     P50ZstdSourceSender(CStoreGuid c_store_guid, PrepareRequestKey request,
                         ZstdSourceTransferConfig config = {});
@@ -175,6 +182,10 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    // F-incarnation retirement fences the old physical link. Shared owner
+    // references held by active calls/pumps keep this sender alive to drain.
+    void retire_for_replacement() noexcept;
+
 private:
     using ConnectionTarget =
         std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory,
@@ -188,6 +199,7 @@ private:
         std::shared_ptr<const std::vector<uint8_t>> source);
 
     boost::asio::awaitable<void> run_r2_receipt_reader();
+    boost::asio::awaitable<void> run_r2_ack_pump();
     boost::asio::awaitable<bool> acquire_r2_writer(
         std::chrono::steady_clock::time_point deadline);
 

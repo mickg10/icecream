@@ -14,6 +14,21 @@ retained artifact directories.
 
 ### Persistent-link implementation in progress
 
+The production C sender now passes its W30 regression against the direct F
+endpoint for ZSTD_TU: 30 complete bundles and 30 F commits before C processes
+receipts, then cumulative ACK and ordinal-31 refill on one connection. Exact
+and conflicting duplicate-request checks pass, along with the existing sender
+tests. The deliberately small socket buffers take about 22 seconds within the
+original 30-second deadline; this is not a throughput benchmark.
+The clean candidate is based on `b3ae776a` and contains no recovery-only
+endpoint APIs. Evidence:
+`/tanksmall/scratch/tmp/p50-sender-clean-b3ae776a/work/artifacts/final-sender-w30-r2.log`
+(SHA256 `b3ac708968dcc9eba99f3a65986f6d219461ce8a05c804d32a28ca89b7a9a812`).
+Test binary SHA256:
+`7cbb67a0b30dc257e0767c7053576c9bcc28ee7919ff956c8a2d5205fc224874`.
+This does not qualify production P29V1/ZSTD_ROUTE multi-caller sending,
+wrapper/daemon integration, recovery, restarts, or mixed farm operation.
+
 The dormant recovery record codecs now pass the focused `p50wire` gate:
 exact payload sizes and round trips, truncation/trailing-byte rejection,
 invalid subkinds/ordinals/intervals/epochs, and transcript sensitivity to

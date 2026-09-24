@@ -2,6 +2,8 @@
 #include "services/comm.h"
 
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/redirect_error.hpp>
@@ -11,10 +13,12 @@
 #include <cerrno>
 #include <chrono>
 #include <deque>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -180,9 +184,11 @@ struct P50ZstdSourceSender::Impl {
         explicit PendingReceipt(boost::asio::any_io_executor executor)
             : notification(std::move(executor)) {}
         R2SentBundle sent{};
+        P51SourceArmedFields armed{};
         Clock::time_point deadline{};
         boost::asio::steady_timer notification;
         ClientRunResult client_result{};
+        std::optional<bool> system_source_reuse;
         std::exception_ptr failure;
         bool ready = false;
         bool done = false;
@@ -208,6 +214,20 @@ struct P50ZstdSourceSender::Impl {
             }
         }
         Impl* owner;
+    };
+
+    struct R2RequestGuard {
+        R2RequestGuard(Impl* value, PrepareRequestKey request_value)
+            : owner(value), request(request_value) {}
+        R2RequestGuard(const R2RequestGuard&) = delete;
+        R2RequestGuard& operator=(const R2RequestGuard&) = delete;
+        ~R2RequestGuard() {
+            if (!owner) return;
+            std::lock_guard lock(owner->r2_transfer_mutex);
+            owner->r2_active_requests.erase(request);
+        }
+        Impl* owner;
+        PrepareRequestKey request;
     };
 
     Impl(CStoreGuid guid, PrepareRequestKey request_value,
@@ -388,7 +408,13 @@ struct P50ZstdSourceSender::Impl {
     std::deque<std::shared_ptr<WriterWaiter>> r2_transfer_waiters;
     std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_window_waiters;
     std::deque<std::shared_ptr<PendingReceipt>> r2_receipt_queue;
+    // Retain every fully transmitted but not locally verified bundle across a
+    // transport loss. The row owns the exact ARMED lease/deadline, codec
+    // witness, and PreparedTuHandle/raw source needed by RECOVER/RESET.
+    std::map<uint64_t, std::shared_ptr<PendingReceipt>> r2_retained_jobs;
+    std::set<PrepareRequestKey> r2_active_requests;
     bool r2_reader_running = false;
+    bool r2_ack_pump_running = false;
     uint64_t r2_pending_ack_ordinal = 0;
     uint64_t r2_retained_raw_bytes = 0;
     uint64_t r2_physical_link_generation = 0;
@@ -440,6 +466,14 @@ P50ZstdSourceSender::P50ZstdSourceSender(
 
 P50ZstdSourceSender::~P50ZstdSourceSender() = default;
 
+void P50ZstdSourceSender::retire_for_replacement() noexcept {
+    impl_->route_replacement_required = true;
+    if (impl_->r2_socket) {
+        boost::system::error_code ignored;
+        impl_->r2_socket->close(ignored);
+    }
+}
+
 boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
     Clock::time_point deadline) {
     const auto executor = co_await boost::asio::this_coro::executor;
@@ -472,6 +506,16 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
 }
 
 boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
+    const auto executor = co_await boost::asio::this_coro::executor;
+    if (impl_->config.hold_r2_receipt_reader_for_test) {
+        boost::asio::steady_timer test_gate(executor);
+        while (impl_->config.hold_r2_receipt_reader_for_test()) {
+            test_gate.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await test_gate.async_wait(
+                boost::asio::redirect_error(boost::asio::use_awaitable, ignored));
+        }
+    }
     for (;;) {
         std::shared_ptr<Impl::PendingReceipt> pending;
         bool wait_for_bundle = false;
@@ -504,17 +548,30 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
             if (pending->client_result.status != ClientRunStatus::Committed ||
                 !pending->client_result.committed_commit)
                 throw std::invalid_argument("R2 receipt was not an exact commit");
+            if (pending->sent.binding.profile == ProfileId::P29V1)
+                pending->system_source_reuse =
+                    impl_->authority->p29v1_system_source_reuse(
+                        pending->sent.prepared);
+            if (impl_->authority->contains(pending->sent.prepared))
+                (void)impl_->authority->release(pending->sent.prepared);
             receipt_validated = true;
         } catch (...) {
             pending->failure = std::current_exception();
         }
 
         std::vector<std::shared_ptr<boost::asio::steady_timer>> wake_window;
+        bool start_ack_pump = false;
         if (receipt_validated) {
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            impl_->r2_retained_jobs.erase(
+                pending->sent.binding.relationship_ordinal);
             impl_->r2_pending_ack_ordinal = std::max(
                 impl_->r2_pending_ack_ordinal,
                 pending->sent.binding.relationship_ordinal);
+            if (!impl_->r2_ack_pump_running) {
+                impl_->r2_ack_pump_running = true;
+                start_ack_pump = true;
+            }
             wake_window.swap(impl_->r2_window_waiters);
         } else {
             impl_->route_replacement_required = true;
@@ -522,6 +579,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
                 boost::system::error_code ignored;
                 impl_->r2_socket->close(ignored);
             }
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            wake_window.swap(impl_->r2_window_waiters);
         }
 
         std::vector<std::shared_ptr<Impl::PendingReceipt>> failed_rows;
@@ -536,6 +595,10 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
                                    impl_->r2_receipt_queue.end());
                 impl_->r2_receipt_queue.clear();
                 impl_->r2_reader_running = false;
+                for (const auto& row : failed_rows) {
+                    row->failure = pending->failure;
+                    row->done = true;
+                }
             }
         }
         pending->notification.expires_at(Clock::now());
@@ -543,13 +606,64 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
             boost::system::error_code ignored;
             timer->expires_at(Clock::now(), ignored);
         }
+        if (start_ack_pump) {
+            auto keepalive = shared_from_this();
+            boost::asio::co_spawn(
+                executor, run_r2_ack_pump(),
+                [keepalive = std::move(keepalive)](std::exception_ptr) {});
+        }
         if (!receipt_validated) {
             for (const auto& row : failed_rows) {
-                row->failure = pending->failure;
-                row->done = true;
                 row->notification.expires_at(Clock::now());
             }
             co_return;
+        }
+    }
+}
+
+boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump() {
+    for (;;) {
+        uint64_t target = 0;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            target = impl_->r2_pending_ack_ordinal;
+            if (target == 0) {
+                impl_->r2_ack_pump_running = false;
+                co_return;
+            }
+        }
+        const auto deadline = Clock::now() + impl_->config.maximum_duration;
+        try {
+            if (!co_await acquire_r2_writer(deadline))
+                throw boost::system::system_error(boost::asio::error::timed_out);
+            Impl::R2TransferGuard writer_guard(impl_.get());
+            if (!impl_->r2_socket || !impl_->r2_socket->is_open())
+                throw std::logic_error("R2 ACK pump lost its physical link");
+            co_await impl_->endpoint->flush_r2_ack(
+                *impl_->r2_socket, deadline);
+        } catch (...) {
+            impl_->route_replacement_required = true;
+            if (impl_->r2_socket) {
+                boost::system::error_code ignored;
+                impl_->r2_socket->close(ignored);
+            }
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            impl_->r2_ack_pump_running = false;
+            co_return;
+        }
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_pending_ack_ordinal <= target)
+                impl_->r2_pending_ack_ordinal = 0;
+        }
+        std::vector<std::shared_ptr<boost::asio::steady_timer>> wake_window;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            wake_window.swap(impl_->r2_window_waiters);
+        }
+        for (const auto& timer : wake_window) {
+            boost::system::error_code ignored;
+            timer->expires_at(Clock::now(), ignored);
         }
     }
 }
@@ -696,7 +810,60 @@ P50ZstdSourceSender::transfer_p51_route(
         armed.arm.source.assignment_epoch != request.producer_session ||
         armed.arm.source.assignment_nonce != request.request_token)
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        // A request key can have only one live owner. In particular, do not
+        // let an exact in-flight replay ask the preparation authority for its
+        // already-retained handle and emit that TU under a second ordinal.
+        // Completed exact replays are handled by completed_for() below.
+        if (!impl_->r2_active_requests.insert(request).second)
+            co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    }
+    Impl::R2RequestGuard request_guard{impl_.get(), request};
     const auto executor = co_await boost::asio::this_coro::executor;
+    std::unique_ptr<Impl::R2TransferGuard> writer_guard;
+    for (;;) {
+        if (!co_await acquire_r2_writer(deadline))
+            co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+        writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
+        if (impl_->route_replacement_required)
+            co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
+        if (!impl_->r2_socket)
+            break;
+        try {
+            co_await impl_->endpoint->flush_r2_ack(*impl_->r2_socket, deadline);
+        } catch (...) {
+            impl_->route_replacement_required = true;
+            boost::system::error_code ignored;
+            impl_->r2_socket->close(ignored);
+            co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError,
+                                         true);
+        }
+        if (impl_->endpoint->r2_window_available())
+            break;
+        auto wait = std::make_shared<boost::asio::steady_timer>(executor);
+        wait->expires_at(deadline);
+        bool wait_for_credit = false;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (!impl_->endpoint->r2_window_available()) {
+                impl_->r2_window_waiters.push_back(wait);
+                wait_for_credit = true;
+            }
+        }
+        if (!wait_for_credit)
+            break;
+        writer_guard.reset();
+        boost::system::error_code wait_error;
+        co_await wait->async_wait(
+            boost::asio::redirect_error(boost::asio::use_awaitable, wait_error));
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            std::erase(impl_->r2_window_waiters, wait);
+        }
+        if (Clock::now() >= deadline)
+            co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+    }
     const Digest128 raw_digest = digest128(source);
     try {
         if (const auto completed = impl_->completed_for(request, source, raw_digest))
@@ -759,21 +926,25 @@ P50ZstdSourceSender::transfer_p51_route(
         : Digest128{};
     hello.history_nonce = HistoryNonce{1};
 
+    std::shared_ptr<Impl::PendingReceipt> pending;
+    bool bundle_complete = false;
     try {
+        if (impl_->route_replacement_required)
+            throw std::runtime_error("R2 link is quarantined");
+        if (impl_->r2_socket &&
+            (impl_->r2_physical_link_generation != physical_link_generation ||
+             impl_->r2_relationship_id != hello.relationship_id ||
+             impl_->r2_relationship_epoch != hello.relationship_epoch))
+            throw std::invalid_argument("R2 relationship changed on retained socket");
         if (!impl_->r2_socket) {
             const int fd = co_await await_connected_fd(connection, deadline);
-            if (fd < 0) {
-                (void)impl_->authority->release(prepared);
-                co_return impl_->invalid(
-                    Clock::now() >= deadline ? ZstdSourceTransferStatus::DeadlineExceeded
-                                             : ZstdSourceTransferStatus::Unavailable);
-            }
+            if (fd < 0)
+                throw std::runtime_error("R2 link connector failed");
             boost::system::error_code error;
             auto socket = P50ClientEndpoint::adopt_connected_fd(executor, fd, error);
             if (!socket) {
                 impl_->route_replacement_required = true;
-                co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError,
-                                             true);
+                throw std::runtime_error("R2 link socket adoption failed");
             }
             impl_->r2_socket = std::move(*socket);
             impl_->r2_physical_link_generation = physical_link_generation;
@@ -784,44 +955,145 @@ P50ZstdSourceSender::transfer_p51_route(
             if (state.f_store_guid != hello.f_store_guid ||
                 state.f_store_generation != hello.f_store_generation)
                 throw std::invalid_argument("R2 F identity differs from ARMED");
-        } else if (impl_->r2_relationship_id != hello.relationship_id ||
-                   impl_->r2_relationship_epoch != hello.relationship_epoch) {
-            throw std::invalid_argument("R2 relationship changed on retained socket");
         }
-        const R2SentBundle sent = co_await impl_->endpoint->write_r2_bundle(
+
+        // ACK control has priority at every complete-bundle boundary. The F
+        // side admits against K-Q, so never send a new JOB_BIND on speculative
+        // confirmation credit which has not been cumulatively acknowledged.
+        co_await impl_->endpoint->flush_r2_ack(*impl_->r2_socket, deadline);
+        if (!impl_->endpoint->r2_window_available())
+            throw std::logic_error("R2 window was consumed during writer turn");
+
+        binding.relationship_ordinal = impl_->r2_relationship_ordinal;
+        pending = std::make_shared<Impl::PendingReceipt>(executor);
+        pending->armed = armed;
+        pending->deadline = deadline;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            pending->notification.expires_at(Clock::time_point::max());
+            const auto [retained, inserted] = impl_->r2_retained_jobs.emplace(
+                binding.relationship_ordinal, pending);
+            (void)retained;
+            if (!inserted)
+                throw std::logic_error("duplicate retained R2 relationship ordinal");
+            impl_->r2_receipt_queue.push_back(pending);
+        }
+        // The authority and endpoint reserve their exact receipt witness before
+        // the first JOB_BIND byte is made visible on the stream.
+        pending->sent = co_await impl_->endpoint->write_r2_bundle(
             *impl_->r2_socket, binding, prepared, deadline);
-        ClientRunResult run = co_await impl_->endpoint->read_r2_receipt(
-            *impl_->r2_socket, sent, deadline);
-        if (run.status != ClientRunStatus::Committed || !run.committed_commit) {
-            impl_->route_replacement_required = true;
-            co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError, true);
+        bundle_complete = true;
+        ++impl_->r2_relationship_ordinal;
+        if (impl_->config.after_r2_bundle_sent_for_test) {
+            try {
+                impl_->config.after_r2_bundle_sent_for_test(
+                    pending->sent.binding.relationship_ordinal);
+            } catch (...) {
+                // Diagnostic test observation cannot alter transfer state.
+            }
         }
+        bool start_reader = false;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            pending->ready = true;
+            if (!impl_->r2_reader_running) {
+                impl_->r2_reader_running = true;
+                start_reader = true;
+            }
+        }
+        pending->notification.expires_at(Clock::now());
+        writer_guard.reset();
+        if (start_reader) {
+            auto keepalive = shared_from_this();
+            boost::asio::co_spawn(
+                executor, run_r2_receipt_reader(),
+                [keepalive = std::move(keepalive)](std::exception_ptr) {});
+        }
+
+      for (;;) {
+          {
+              std::lock_guard lock(impl_->r2_transfer_mutex);
+              if (pending->done)
+                  break;
+              pending->notification.expires_at(deadline);
+          }
+          boost::system::error_code wait_error;
+          co_await pending->notification.async_wait(
+              boost::asio::redirect_error(boost::asio::use_awaitable,
+                                          wait_error));
+          if (Clock::now() >= deadline) {
+              std::lock_guard lock(impl_->r2_transfer_mutex);
+              if (!pending->done)
+                  throw boost::system::system_error(boost::asio::error::timed_out);
+          }
+      }
+        if (pending->failure)
+            std::rethrow_exception(pending->failure);
+      if (pending->client_result.status != ClientRunStatus::Committed ||
+          !pending->client_result.committed_commit)
+          throw std::invalid_argument("R2 receipt was not an exact commit");
+
+      if (!co_await acquire_r2_writer(deadline))
+          throw boost::system::system_error(boost::asio::error::timed_out);
+      {
+          Impl::R2TransferGuard writer_guard(impl_.get());
+          try {
+              if (impl_->r2_socket)
+                  co_await impl_->endpoint->flush_r2_ack(
+                      *impl_->r2_socket, deadline);
+          } catch (...) {
+              // Exact TX_COMMIT was already validated and accepted. Failure
+              // to return flow-control credit quarantines only this link.
+              impl_->route_replacement_required = true;
+              if (impl_->r2_socket) {
+                  boost::system::error_code ignored;
+                  impl_->r2_socket->close(ignored);
+              }
+          }
+      }
         ZstdSourceTransferResult result;
         result.status = ZstdSourceTransferStatus::Committed;
         result.profile = binding.profile;
-        result.committed_input = run.committed_input;
+        result.committed_input = pending->client_result.committed_input;
         result.raw_bytes = source.size();
         result.raw_digest = raw_digest;
         result.attempts = 1;
         if (binding.profile == ProfileId::P29V1)
-            result.system_source_reuse =
-                impl_->authority->p29v1_system_source_reuse(prepared);
-        (void)impl_->authority->release(prepared);
-        ++impl_->r2_relationship_ordinal;
+            result.system_source_reuse = pending->system_source_reuse;
         impl_->remember_completed(request, source, raw_digest, result);
         co_return result;
     } catch (...) {
-        try {
-            if (impl_->authority->contains(prepared)) {
-                const auto release_count = impl_->authority->release(prepared);
-                (void)release_count;
-            }
-        } catch (...) {}
+        if (pending && !bundle_complete) {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            auto position = std::find(impl_->r2_receipt_queue.begin(),
+                                      impl_->r2_receipt_queue.end(), pending);
+            if (position != impl_->r2_receipt_queue.end())
+                impl_->r2_receipt_queue.erase(position);
+            if (pending->sent.binding.relationship_ordinal != 0)
+                impl_->r2_retained_jobs.erase(
+                    pending->sent.binding.relationship_ordinal);
+            pending->failure = std::current_exception();
+            pending->done = true;
+            pending->notification.expires_at(Clock::now());
+        }
+        if (!bundle_complete) {
+            try {
+                if (impl_->authority->contains(prepared)) {
+                    const auto release_count = impl_->authority->release(prepared);
+                    (void)release_count;
+                }
+            } catch (...) {}
+        } else {
+            // Keep the retained TU/witness alive for the independent reader.
+            // A caller timeout must not tear down a possibly committed bundle.
+            impl_->route_replacement_required = true;
+            co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError,
+                                         true);
+        }
         impl_->route_replacement_required = true;
         if (impl_->r2_socket) {
             boost::system::error_code ignored;
             impl_->r2_socket->close(ignored);
-            impl_->r2_socket.reset();
         }
         co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError, true);
     }
