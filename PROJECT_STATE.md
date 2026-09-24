@@ -42,6 +42,19 @@ guard subsequently passed. On actual protocol-51 enablement, legacy R1 must
 remain explicitly selectable; interim exact-50 guards are not a permanent
 prohibition against the planned new-peer legacy path.
 
+A separate bounded C/D model lane passed 19 rows: eight clean checks and
+eleven exact expected counterexamples (six deliberate faults and five
+reachability witnesses). It includes both topology directions at 2/3/4,
+sent-window and refill witnesses, bounded recovery and a separate W30
+accounting projection. Evidence:
+`/tanksmall/scratch/tmp/p50-pipeline-recovery-final6/runner.log`
+(SHA256 `8b29b46e3cb5258ec00b23ce49ae1e21377008baffca98618d522af4977503ad`).
+The model is not a production receiver-validation proof, a complete restart
+model, or a runtime W30 test. Full epoch/digest validation, lost-confirmation
+recovery and product correspondence remain runtime/model follow-up gates;
+see [formal scope](cache/formal/README.md). Product C1–C3 and P29 speculative
+preparation are being implemented in parallel; neither is qualified yet.
+
 ### Independent-link pipeline candidate
 
 `sorbet_1.5_pipeline` is a candidate, not a release or a new S* farm

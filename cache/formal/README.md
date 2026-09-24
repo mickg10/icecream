@@ -46,6 +46,15 @@ Protocol50TransferConcurrency.tla
     link overlap/progress, per-C/per-F count and byte credits, unique C-wide
     TU allocation, timeout/reconciliation, generation replacement, and
     stale-callback fencing
+
+Protocol50PipelineRecovery.tla
+    bounded W2 ordered speculative-send/commit/receipt/ACK cursors, durable
+    receipt reconciliation, reset confirmation, per-job raw reservations,
+    link/history/relationship callback fencing, and cancellation suffix rebuild
+
+Protocol50PipelineWindowAccounting.tla
+    separate W30 accounting projection for raw, encoded, receipt, and
+    speculative-history byte budgets; not a codec or product-pipeline proof
 ```
 
 ## Bounded transfer-concurrency lane
@@ -81,6 +90,60 @@ The row runner is `run_transfer_concurrency_tlc.sh`; it uses the pinned jar
 and writes distinct TLC metadata under caller-provided `TLC_STATE_ROOT`.
 The aggregate result bundles preserve the actual jar/module/config hashes and
 per-row logs for audit.
+
+## Bounded C/D ordered-pipeline and recovery increment
+
+`Protocol50PipelineRecovery.tla` is a later, separate abstraction; it does not
+replace or upgrade the Stage-A `W=1` results above and is not selected by the
+existing `make protocol50-formal` aggregate. Run it with
+`run_pipeline_recovery_tlc.sh` and a fresh absolute, writable, nonsymlink
+`TLC_STATE_ROOT` (the retained run here uses `/tanksmall/scratch/tmp`).
+Its clean W2 rows cover C2F1/C3F1/C4F1 and C1F2/C1F3/C1F4, with two jobs on
+the target relationship and one on each other relationship. Separate
+reachability controls demonstrate a fully sent target-window saturation and
+another-link publication in both topology directions. A separate three-job
+W2 witness demonstrates reuse of one released window credit. A one-link fault
+row bounds lost commit replies, recovery receipt delivery, sequential reset
+and retry transitions, cancellation of an unsent suffix, and stale worker
+fencing. It does not model replay requests for an earlier reset result or a
+lost RESET_CONFIRM. Named mutants include missing
+receipts, a wrong-job receipt identity, an ACK beyond F's published prefix,
+stale worker publication, non-idempotent reset retry, and a cancellation hole.
+Each must produce its exact invariant failure; parse errors, timeouts, and
+generic nonzero exits are not accepted as controls.
+
+The model separates relationship incarnation, physical link generation,
+codec/history epoch, the C-verified receipt floor `A`, F-published input floor
+`K`, C-staged ordinal `P`, transmitted cumulative ACK floor, and the `Q` that
+advances only when F processes that ACK. Receipts are bounded by the finite
+ordinal set and tied to the `(C,F,job)` ordinal map. Worker tokens carry link,
+relationship, F-store and history generations. Raw reservations are charged
+to C before link open and retained through unresolved commit; per-link
+`P-A`/`K-Q` bounds express the configured speculative and receipt windows.
+Each F receipt and recovery reply carries an immutable ordinal/job/relationship
+epoch/F-generation/history-epoch witness. The model checks preservation of the
+ordinal/job mapping; the wrong-job mutant corrupts the recovered record and is
+detected by `RecoveryResponseIdentityExact`. It does not model a defensive
+wire decoder rejecting malformed recovered identities, nor full epoch/digest
+validation at the receiving implementation boundary. C sends from its local
+staged/sent floors and does not consult F's `Q`; F alone enforces its
+receipt-capacity floor. The fault row permits two bounded disconnect/reset
+cycles and a terminal relationship retirement; it does not model creation/use
+of a replacement relationship incarnation or unbounded reconnects. Reset
+operation identity/count remains in the bounded state, but prior-result replay
+semantics are not covered.
+
+W30 uses a second, intentionally accounting-only model: it checks the cursor
+and symbolic raw/encoded/receipt/speculative-journal caps at `W=30`. Its fixed
+per-slot byte quantities are explicit assumptions, not measured codec output
+or actual dictionary snapshots; history accounting represents metadata for
+one working codec state, not cloned entropy snapshots per TU. The W2 model omits profile-specific codec
+transitions, grammar/key assignment, parallel codec-context cloning, real job
+or TU allocation, wire framing, and implementation refinement. In
+particular, it does not qualify a product W2/W30 pipeline or prove production
+memory sizes. The profiles P29V1, ZSTD_TU and ZSTD_ROUTE share the abstract
+ordered-commit skeleton here; codec correctness remains with their own models
+and tests.
 
 The boundaries are:
 
