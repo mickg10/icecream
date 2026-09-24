@@ -4478,6 +4478,7 @@ void P50ServerEndpoint::close_input_job(InputRecordKey key) {
 
 void P50ServerEndpoint::collect_input_garbage() {
     impl_->owner.require();
+    const auto start = std::chrono::steady_clock::now();
     std::map<CStoreGuid, std::vector<InputRecordKey>> before;
     for (const auto& [c_guid, space] : impl_->namespaces) {
         (void)space;
@@ -4485,6 +4486,15 @@ void P50ServerEndpoint::collect_input_garbage() {
     }
     impl_->input_records.collect_garbage();
     impl_->release_collected_global_inputs(before);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    if (elapsed_ms > 50) {
+        std::fprintf(stderr,
+                     "cache sidecar collect_input_garbage took %lldms"
+                     " (retained_input_records=%zu)\n",
+                     static_cast<long long>(elapsed_ms),
+                     impl_->input_records.record_count());
+    }
 }
 
 P50ServerOwnerUsage P50ServerEndpoint::owner_usage() const {

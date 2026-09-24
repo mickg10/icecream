@@ -533,6 +533,9 @@ InputLifecycleResult DaemonSidecarAdapter::apply_input_lifecycle(
     request.owner = lease.owner;
     request.action = action;
     request.deadline = std::chrono::steady_clock::now() + config_.input_lifecycle_timeout;
+    request.absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        request.deadline, config_.clock_identity.clock_domain_id,
+        config_.clock_identity.time_namespace_id);
     if (lease.identity.generation != config_.generation ||
         lease.identity.attempt == 0 || lease.key.c_store_guid == CStoreGuid{} ||
         !input_lease_owner_valid(lease.owner) || lease.request_id == 0 ||
@@ -777,6 +780,22 @@ void DaemonSidecarAdapter::retire_input_lifecycle_relationship(
     // eligibility immediately, then lets the normal lifecycle turns prove
     // exact child/group/path teardown.  In particular, this path never calls
     // Supervisor::shutdown, waits, or performs name-based emergency cleanup.
+    const char *reason = "unknown";
+    switch (error) {
+    case AdapterError::InputLifecycleProtocol: reason = "protocol"; break;
+    case AdapterError::InputLifecycleCapacity: reason = "capacity"; break;
+    default: break;
+    }
+    std::fprintf(stderr,
+                 "cache sidecar input-lifecycle retirement"
+                 " (reason=%s action=%d status=%d)\n",
+                 reason,
+                 outer_input_request_.has_value()
+                     ? static_cast<int>(outer_input_request_->action)
+                     : -1,
+                 outer_last_input_lifecycle_result_.has_value()
+                     ? static_cast<int>(outer_last_input_lifecycle_result_->status)
+                     : -1);
     fail(error);
     outer_input_failure_ = true;
     // Route the failure through the same A-retirement reducer used by
@@ -2969,16 +2988,24 @@ bool DaemonSidecarAdapter::outer_advance_input(
         result_status == InputLifecycleStatus::ReplacementInstalledRecordRetained ||
         result_status == InputLifecycleStatus::JobClosedRecordRetained ||
         result_status == InputLifecycleStatus::JobClosedRecordReclaimed;
+    /* UnknownRecord on CancelAttempt or close of an absent lease row is a
+       transport/idempotency outcome (e.g. a client teardown before route
+       commit), not proof that the store incarnation is compromised.  It
+       must not trigger a sidecar replacement.  Timeout and Disconnected stay
+       relationship-fatal: retrying an op whose outcome is unknown needs
+       idempotence proofs the protocol does not provide. */
+    const bool transient =
+        result_status == InputLifecycleStatus::UnknownRecord;
     if (success && !remember_completed_input_lifecycle(request)) {
         retire_input_lifecycle_relationship(AdapterError::InputLifecycleCapacity);
     } else if (success && !pending_input_lifecycle_.empty() &&
                pending_input_lifecycle_.front() == request) {
         pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
-    } else if (!success && !relationship_failure_routed) {
-        // Timeout, EOF, stale/mismatched identity, a rejected replay, and
-        // every malformed semantic result all retire the current
-        // incarnation.  There is no second input-specific cleanup/retry path;
-        // the lifecycle reducer owns the resulting replacement ordering.
+    } else if (!success && !transient && !relationship_failure_routed) {
+        // Stale/mismatched identity, a rejected replay, and every malformed
+        // semantic result retire the current incarnation.  There is no
+        // second input-specific cleanup/retry path; the lifecycle reducer
+        // owns the resulting replacement ordering.
         retire_input_lifecycle_relationship(AdapterError::InputLifecycleProtocol);
     }
     outer_input_operation_.reset();
