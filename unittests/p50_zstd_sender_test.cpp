@@ -6,6 +6,7 @@
 #include <boost/asio/use_future.hpp>
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cerrno>
@@ -90,7 +91,8 @@ std::pair<CStoreGuid, FStoreGuid> sender_r2_store_guids() {
 }
 
 P51SourceArmFields sender_r2_arm(CStoreGuid c_guid, uint64_t request_id,
-                                 uint32_t wire_job, uint32_t window) {
+                                 uint32_t wire_job, uint32_t window,
+                                 ProfileId profile) {
     P51SourceArmFields arm;
     arm.source.wire_job_id = wire_job;
     arm.source.assignment_epoch = 3;
@@ -99,14 +101,22 @@ P51SourceArmFields sender_r2_arm(CStoreGuid c_guid, uint64_t request_id,
     arm.source.selected_f_ordinary_port = 42001;
     arm.source.selected_f_cache_port = 42002;
     arm.source.cache_protocol = 2;
-    arm.source.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    arm.source.cache_profile = profile == ProfileId::P29V1
+                                   ? CACHE_PROFILE_P29V1
+                               : profile == ProfileId::ZSTD_ROUTE
+                                   ? CACHE_PROFILE_ZSTD_ROUTE
+                                   : CACHE_PROFILE_ZSTD_TU;
     arm.source.logical_job = 700 + wire_job;
     arm.source.compiler_attempt = 800 + wire_job;
     arm.source.c_store_generation = 11;
     arm.source.c_store_derivation_version = kStoreIdentityDerivationVersion;
     arm.source.c_store_guid = c_guid.bytes;
     arm.source.source_request_id = request_id;
-    arm.source.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    arm.source.source_mode = profile == ProfileId::P29V1
+                                 ? P50_SOURCE_MODE_P29V1
+                             : profile == ProfileId::ZSTD_ROUTE
+                                 ? P50_SOURCE_MODE_ZSTD_ROUTE
+                                 : P50_SOURCE_MODE_ZSTD_TU;
     arm.source.c_control_generation = 12;
     arm.source.c_control_attempt = 13;
     arm.requested_window = window;
@@ -579,6 +589,11 @@ asio::awaitable<ServerRunResult> sender_r2_accept(
 }
 
 void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+    const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
+                                    : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
+                                    : "ZSTD_TU";
     constexpr size_t kJobs = 31;
     constexpr size_t kWindow = 30;
     const auto [c_guid, f_guid] = sender_r2_store_guids();
@@ -592,7 +607,8 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     input.reserve(kJobs);
     for (size_t index = 0; index != kJobs; ++index) {
         P51SourceArmFields arm = sender_r2_arm(
-            c_guid, 100 + index, static_cast<uint32_t>(700 + index), kWindow);
+            c_guid, 100 + index, static_cast<uint32_t>(700 + index), kWindow,
+            profile);
         armed.push_back(sender_r2_armed(std::move(arm), f_guid,
                                         0x520000 + index, kWindow));
         std::vector<uint8_t> bytes(16U << 10);
@@ -618,20 +634,28 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     std::atomic<unsigned> bundles_sent{0};
     std::atomic<unsigned> committed{0};
     std::atomic<unsigned> acknowledged{0};
+    std::atomic<unsigned> exact_input_mismatches{0};
     std::vector<bool> reservation_consumed(kJobs, false);
     std::mutex consumed_mutex;
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
-    server_caps.profile = ProfileId::ZSTD_TU;
-    server_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
-    server_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
-                                       std::span<const uint8_t>) {
+    server_caps.profile = profile;
+    server_caps.supported_profiles = profile_bit(profile);
+    server_config.input_job_state = [&, profile](CStoreGuid, const TxBegin& begin,
+                                                  const TxCommit& commit,
+                                                  std::span<const uint8_t> bytes) {
+        if (begin.profile != profile || begin.tu_seq.value >= input.size() ||
+            bytes.size() != input[begin.tu_seq.value].size() ||
+            !std::equal(bytes.begin(), bytes.end(),
+                        input[begin.tu_seq.value].begin()) ||
+            commit.raw_digest != icecc::digest128(input[begin.tu_seq.value]))
+            exact_input_mismatches.fetch_add(1, std::memory_order_relaxed);
         return InputJobState::Open;
     };
     server_config.lookup_p51_link_reservation =
         [&, deadline](const LinkHello& hello)
             -> std::optional<P51SourceLinkLease> {
-        if (hello.profile != ProfileId::ZSTD_TU || hello.window != kWindow ||
+        if (hello.profile != profile || hello.window != kWindow ||
             hello.reservation_id != Id128{armed.front().reservation_id} ||
             hello.relationship_id != relationship_id ||
             hello.relationship_epoch != armed.front().relationship_epoch ||
@@ -648,7 +672,7 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
             -> std::optional<P51SourceJobLease> {
         if (hello.relationship_id != relationship_id ||
             binding.physical_link_generation != 27 ||
-            binding.profile != ProfileId::ZSTD_TU || binding.tu_seq.value >= kJobs)
+            binding.profile != profile || binding.tu_seq.value >= kJobs)
             return std::nullopt;
         size_t index = kJobs;
         for (size_t i = 0; i != kJobs; ++i) {
@@ -706,16 +730,18 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     limits.max_speculative_raw_bytes = 2U << 20;
     limits.max_live_entries = kJobs + 4;
     EndpointCaps caps;
-    caps.profile = ProfileId::ZSTD_TU;
-    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     auto authority = std::make_shared<P50PreparationAuthority>(
-        c_guid, caps.zstd, limits, 1, ProfileId::ZSTD_TU);
-    const PreparationRouteKey route{f_guid, 23, ProfileId::ZSTD_TU};
+        c_guid, caps.zstd, limits, 1, profile);
+    const PreparationRouteKey route{f_guid, 23, profile};
     ZstdSourceTransferConfig sender_config = config();
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
+    if (profile == ProfileId::ZSTD_ROUTE)
+        sender_config.compression_level = 3;
     sender_config.after_r2_bundle_sent_for_test = [&](uint64_t) {
         bundles_sent.fetch_add(1, std::memory_order_release);
         progress_cv.notify_all();
@@ -845,6 +871,7 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     for (size_t index = 3; index != results.size(); ++index)
         CHECK(results[index].get().status == ZstdSourceTransferStatus::Committed);
     CHECK(committed.load(std::memory_order_acquire) == kJobs);
+    CHECK(exact_input_mismatches.load(std::memory_order_relaxed) == 0);
     {
         std::unique_lock lock(ack_mutex);
         CHECK(ack_cv.wait_for(lock, std::chrono::seconds(5), [&] {
@@ -860,6 +887,8 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     CHECK(server_result.status == ServerRunStatus::Disconnected);
     f_context.stop();
     f_thread.join();
+    std::cerr << "P51_SENDER_W30_PROFILE=" << profile_name << " PASS\n";
+    }
 }
 
 void test_route_failure_requires_cold_replacement() {
@@ -1236,4 +1265,5 @@ int main() {
     test_absolute_deadline_is_required();
     test_disconnected_retry_is_bounded_and_exactly_once();
     test_factory_cannot_extend_absolute_deadline();
+    std::cerr << "P50_SENDER_W30_ALL_PROFILES=PASS\n";
 }
