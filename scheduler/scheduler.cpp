@@ -3518,8 +3518,10 @@ static bool handle_assignment_terminal(CompileServer *cs, Msg *_m)
     /* A revoked assignment marked for cache-withdraw redispatch goes back
        to the queue instead of failing the job.  Local fallback remains
        available (preExposureRedispatch is not set) so the job can complete
-       on the submitter when no cache-present worker exists. */
-    if (job->cacheWithdrawRedispatch()) {
+       on the submitter when no cache-present worker exists.  A detached
+       submitter has no queue to re-enter; fall through to the normal
+       terminal path that deletes the job. */
+    if (job->cacheWithdrawRedispatch() && !job->submitterDetached()) {
         trace() << "redispatching cache-withdraw revoked assignment "
                 << job->id() << " from " << cs->nodeName() << endl;
         cs->removeJob(job);
@@ -3792,17 +3794,43 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         m->cGuid() == 0 && m->tuSeq() == 0;
     if (!assignment_identity_matches ||
         (!compile_identity_matches && !exact_precompile_worker_failure)) {
-        /* A terminal with a mismatched identity from a job that has not yet
-           begun compiling is likely a stale terminal from a lost sidecar
-           session, not a whole-worker protocol violation.  Removing the
-           entire F would kill every unrelated in-flight compile.  Drop only
-           this stale terminal; the worker's other assignments continue.  A
-           begun compile with a mismatched identity is still a protocol
-           violation and removes the worker. */
+        /* A terminal whose (epoch, nonce) differs from the job's current
+           assignment identity is truly stale (e.g. from before a requeue).
+           Drop it without touching the worker; the job's real terminal is
+           still expected.  Removing the whole F for one stale terminal
+           would kill every unrelated in-flight compile. */
+        if (!assignment_identity_matches) {
+            log_info() << "stale terminal for job " << m->job_id
+                       << " from " << cs->nodeName()
+                       << " (epoch/nonce mismatch: got e=" << m->assignmentEpoch()
+                       << " n=" << m->assignmentNonce()
+                       << " have e=" << j->assignmentEpoch()
+                       << " n=" << j->assignmentNonce()
+                       << ") dropped, worker retained" << endl;
+            return true;
+        }
+        /* The assignment identity matches but the compile identity differs.
+           For a job that has not yet begun (still WAITINGFORCS), this is a
+           stale terminal from a lost sidecar session: retire just this job
+           so its slot and dispatch credit are released, but leave the
+           worker's other in-flight compiles untouched.  For a begun compile
+           (COMPILING), a mismatched compile identity is a protocol violation
+           that removes the worker. */
         if (j->state() == Job::WAITINGFORCS) {
-            log_info() << "terminal identity mismatch for unexposed job "
+            log_info() << "terminal compile identity mismatch for job "
                        << m->job_id << " from " << cs->nodeName()
-                       << " (stale terminal dropped, worker retained)" << endl;
+                       << " (cGuid: got " << m->cGuid() << " have " << j->cGuid()
+                       << " tuSeq: got " << m->tuSeq() << " have " << j->tuSeq()
+                       << ") retiring job, worker retained" << endl;
+            cs->removeJob(j);
+            credit_dispatch_credit(j);
+            if (j->assignmentFenced())
+                unindex_fenced_assignment(j);
+            notify_monitors(new MonJobDoneMsg(JobDoneMsg(j->id(), 255)));
+            map<unsigned int, Job *>::iterator it = jobs.find(m->job_id);
+            if (it != jobs.end() && it->second == j)
+                remove_job_entry(it);
+            delete j;
             return true;
         }
         log_info() << "terminal assignment/compile identity mismatch for job "

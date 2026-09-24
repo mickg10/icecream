@@ -135,3 +135,19 @@ The model is intentionally small. It does not duplicate scheduling, credit,
 capacity, compiler input, or Protocol-50 cache state. Its only purpose is to
 make the assignment-keyed formal actions realizable by the wire and to cover
 the advisory claim/PREPARE race.
+
+## Cache-withdraw revocation and requeue
+
+When a strict-nonce worker's cache advertisement is withdrawn, the scheduler
+never holds a strict READY indefinitely.  It sends a `REVOKE_BEFORE_START` for
+the unexposed assignment and, on the exact-key `Revoked` result, re-dispatches
+the request under a fresh nonce.  This re-dispatch is exactly `NewA` in the
+model: `SwitchToNew` is unconstrained, so every interleaving of `NewA` with
+`OldA`'s delayed READY and revoke traffic is already explored, including the
+case where `NewA` is created after `OldA` is `Revoked`.  The existing
+invariants `RevokeResultHasMatchingWorkerProof`, `CrossedClaimWinsRevoke`, and
+`StaleNonceResultDoesNotReleaseCurrent` cover the code obligations (requeue
+only on an exact-key `Revoked` result, never on `ClaimedOrLater`, and unindex
+before requeue so stale `OldA` traffic cannot touch `NewA`).  The READY hold
+and the cache-absent filter are scheduler policy (not publishing is a stutter);
+no spec models cache advertisement, and the wedge was liveness, not safety.
