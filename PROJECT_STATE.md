@@ -135,6 +135,17 @@ Evidence: `/tanksmall/scratch/tmp/p51-vertical-logs/p51-vertical-r5.log`
 The candidate corrects source-control decoding and removes Unix-only
 credential requirements from the public TCP auxiliary-link admission check;
 the exact live connection lease and pristine-channel checks remain required.
+The integration overlay also passes a real-daemon ZSTD_TU W30 gate against
+the committed recovery core plus its narrowly scoped GCC 13 receipt-reader
+allocator-warning guard. A relay holds 30 distinct complete COMMIT frames
+while all 30 callers remain pending, then releases them; all exact inputs and
+all 30 original compiler-channel attachments are accepted. This is a small
+synthetic concurrency gate, not a compiler-output or throughput benchmark.
+Evidence: `/tanksmall/scratch/tmp/p51-vertical-clean-candidate/run-28b-w30-r1.log`
+(SHA256 `fd7ffa8a726b164c4dddfb827039327e17602bdf771834521a191bdaa6fc92ca`).
+Its strict build passes in `build-28b-r4.log` under the same directory
+(SHA256 `6418bb7ee60b658afd539110c57f122f2cd2524fb8cfcade70db37906f65acd1`).
+The integration overlay is not yet committed or qualified for all profiles.
 Full service concurrency, recovery, restarts, wrapper and mixed-farm gates
 remain open. The Stage A results below do not qualify these changes.
 No Chromium build/download has been started for this implementation step.

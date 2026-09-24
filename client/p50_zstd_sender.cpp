@@ -536,6 +536,14 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
     co_return false;
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+// Boost.Asio pairs its awaitable-frame class new/delete through the same
+// tagged allocator; GCC 13 can nevertheless diagnose the inlined aligned
+// allocator as mismatched (PR103993). Keep this suppression scoped to this
+// coroutine, as with the existing sender coroutine scopes below.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
     uint64_t physical_link_generation) {
     const auto executor = co_await boost::asio::this_coro::executor;
@@ -712,6 +720,10 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
         }
     }
 }
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic pop
+#endif
 
 boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
     uint64_t physical_link_generation) {
