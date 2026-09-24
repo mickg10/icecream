@@ -98,6 +98,13 @@ struct ZstdSourceTransferConfig {
     // Test-only observation after the complete R2 TU bundle is on the socket;
     // it does not participate in admission or receipt handling.
     std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
+    // Deterministic fault seam: after a complete bundle is on the wire, the
+    // callback may request a transport close before the independent receipt
+    // reader begins. Product callers leave this empty.
+    std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;
+    // One-shot frame-boundary fault injection for the next C bundle write;
+    // recovery rebuilds always use the normal framing path.
+    EndpointIoControl r2_bundle_io_control_for_test{};
     // Asynchronous test gate that pauses only the receipt reader. Returning
     // true yields through a short timer, leaving the sole writer and F peer
     // independently runnable.
@@ -200,6 +207,9 @@ private:
 
     boost::asio::awaitable<void> run_r2_receipt_reader();
     boost::asio::awaitable<void> run_r2_ack_pump();
+    boost::asio::awaitable<void> recover_r2_link(
+        AsyncConnectedFdFactory connection, uint64_t requested_generation,
+        std::chrono::steady_clock::time_point deadline);
     boost::asio::awaitable<bool> acquire_r2_writer(
         std::chrono::steady_clock::time_point deadline);
 

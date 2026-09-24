@@ -274,6 +274,13 @@ public:
     // bytes reached the socket. P29V1 must use the explicit NEED/FILL path
     // above before advancing its continuing codec state.
     void advance_speculative(PreparedTuHandle handle);
+    // Coordinated R2 transport recovery resets only relationship codec
+    // history. C-wide TU/job identity and immutable source records survive.
+    void reset_r2_route_for_recovery(PreparationRouteKey route,
+                                     FStoreGuid f_store_guid,
+                                     HistoryNonce history_nonce);
+    void rebuild_r2_entry_for_recovery(PreparedTuHandle handle,
+                                       Digest128 f_system_source_fingerprint);
     [[nodiscard]] TxBegin r2_staged_begin(
         PreparedTuHandle handle, HistoryNonce history_nonce,
         RelSeq rel_seq, Digest128 pre_state_digest) const;
@@ -398,6 +405,12 @@ struct R2SentBundle {
     PreparedTuHandle prepared{};
 };
 
+struct R2RecoveryResult {
+    LinkState link_state{};
+    std::vector<R2TxCommit> committed_receipts;
+    ResetRequest reset_request{};
+};
+
 enum class ServerRunStatus : uint8_t {
     Completed,
     Disconnected,
@@ -470,6 +483,16 @@ struct P51SourceJobLease {
 struct P51SourceLinkLease {
     P51SourceArmedFields initial_armed{};
     sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    bool reconnect = false;
+    uint64_t relationship_epoch = 0;
+    HistoryNonce history_nonce{};
+    uint64_t committed_prefix_k = 0;
+    uint64_t acknowledged_prefix_q = 0;
+};
+
+struct P51RecoveryReceiptInterval {
+    ReceiptsEnd end{};
+    std::vector<ReceiptRow> rows;
 };
 
 struct P50ServerEndpointConfig {
@@ -496,10 +519,29 @@ struct P50ServerEndpointConfig {
         lookup_p51_link_reservation;
     std::function<std::optional<P51SourceJobLease>(const LinkHello&, const JobBind&)>
         consume_p51_job_reservation;
+    std::function<bool(const LinkHello&, const JobBind&)>
+        authorize_p51_job_publication;
+    std::function<void(const LinkHello&, const JobBind&)>
+        settle_p51_cancelled_job;
     std::function<bool(const LinkHello&, const JobBind&, const R2TxCommit&)>
         record_p51_job_commit;
     std::function<bool(const LinkHello&, const CommitAck&)>
         acknowledge_p51_receipt;
+    std::function<std::optional<P51RecoveryReceiptInterval>(
+        const LinkHello&, const RecoverBegin&,
+        std::span<const RecoverWitness>, const RecoverEnd&)>
+        recover_p51_receipts;
+    std::function<bool(const LinkHello&)> settle_p51_interrupted_job;
+    // True only when the authoritative F reservation owner has permanently
+    // cancelled/expired this exact retained job. Used to retire its bounded
+    // uncommitted global-install tombstone; a failed consume is not proof.
+    std::function<bool(const JobBind&)> p51_source_reservation_terminal;
+    std::function<std::optional<ResetAck>(const LinkHello&, const ResetRequest&)>
+        validate_p51_reset;
+    std::function<bool(const LinkHello&, const ResetRequest&, const ResetAck&)>
+        commit_p51_reset;
+    std::function<bool(const LinkHello&, const ResetConfirm&)>
+        confirm_p51_reset;
     std::function<void(const LinkHello&)> on_p51_link_terminal;
 };
 
@@ -557,10 +599,17 @@ public:
     boost::asio::awaitable<LinkState> open_r2_link(
         boost::asio::ip::tcp::socket& socket, LinkHello hello,
         std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<R2RecoveryResult> recover_r2_link(
+        boost::asio::ip::tcp::socket& socket, LinkHello hello,
+        std::span<const R2SentBundle> witnesses, uint64_t verified_floor_a,
+        Id128 operation_id, uint64_t new_relationship_epoch,
+        HistoryNonce new_history_nonce,
+        std::chrono::steady_clock::time_point deadline);
     boost::asio::awaitable<R2SentBundle> write_r2_bundle(
         boost::asio::ip::tcp::socket& socket, JobBind binding,
         PreparedTuHandle prepared,
-        std::chrono::steady_clock::time_point deadline);
+        std::chrono::steady_clock::time_point deadline,
+        EndpointIoControl control = {});
     boost::asio::awaitable<ClientRunResult> read_r2_receipt(
         boost::asio::ip::tcp::socket& socket, const R2SentBundle& sent,
         std::chrono::steady_clock::time_point deadline);
@@ -571,6 +620,9 @@ public:
         boost::asio::ip::tcp::socket& socket,
         std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] bool r2_window_available() const noexcept;
+    [[nodiscard]] uint64_t r2_confirmed_prefix() const noexcept;
+    [[nodiscard]] std::vector<R2SentBundle> r2_pending_witnesses(
+        uint64_t after_ordinal) const;
 
     static std::optional<boost::asio::ip::tcp::socket> adopt_connected_fd(
         boost::asio::any_io_executor executor, int fd,
@@ -641,6 +693,12 @@ public:
     boost::asio::awaitable<ServerRunResult> run_adopted_r2(
         boost::asio::ip::tcp::socket socket,
         EndpointIoControl control = {});
+
+    // Owner-affine terminal cleanup for one exact cancelled/expired R2 job.
+    // Removes only that route's uncommitted Absent+crashed install tombstones;
+    // committed residents and unrelated recovery rows are untouched.
+    bool retire_p51_recovery_install(const JobBind& binding);
+    bool retire_p51_recovery_install(Id128 reservation_id);
 
     // Cancels the active socket on the endpoint's owner executor. The caller
     // must arrange that affinity (SidecarRuntime posts this method); it never

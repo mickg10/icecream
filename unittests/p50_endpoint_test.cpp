@@ -4378,6 +4378,7 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
             if (observed != hello)
                 return std::nullopt;
             P51SourceLinkLease lease{first_armed, deadline};
+            lease.relationship_epoch = observed.relationship_epoch;
             return lease;
         };
     config.consume_p51_job_reservation =
@@ -4586,6 +4587,7 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
             if (observed != hello)
                 return std::nullopt;
             P51SourceLinkLease lease{armed.front(), deadline};
+            lease.relationship_epoch = observed.relationship_epoch;
             return lease;
         };
     config.consume_p51_job_reservation =

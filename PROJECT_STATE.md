@@ -48,8 +48,24 @@ invalid subkinds/ordinals/intervals/epochs, and transcript sensitivity to
 changed witness bytes. Evidence:
 `/tanksmall/scratch/tmp/p50-recovery-closure.avtx9r/logs/p50wire-recovery-r1.log`
 (SHA256 `e52b1bd8ba96eb0b174bb3b3a7d708581b3f4107ecf52f886a8f2b686d7782a1`).
-This proves record encoding/decoding only, not reconnect/reset execution,
-production sender W30, or restart correctness. Those runtime gates remain open.
+That wire test proves record encoding/decoding only.
+
+The direct production sender recovery regression now passes for ZSTD_TU:
+the original caller completes after a lost commit reply, failed connector,
+and lost RESET_ACK; a separate case completes after two interrupted
+materializations and two resets. Exact input identity is preserved, with one
+successful materialization. The same binary passes the full sender suite,
+including W30 for all three profiles. Evidence:
+`/tanksmall/scratch/tmp/p50-recovery-closure.avtx9r/logs/p50zstdsender-full-r11.log`
+(SHA256 `81c06e890ba6a090933b082cd7dd6364c937619eeff3c691fd55838210e4931c`).
+Binary SHA256:
+`d1f3319e4c25d78e503495b90fab60d37c5b8f233ceb3aff3644dd7dc5afbcc0`.
+The same source closure passes `p50slice0` (including exact interrupted-install
+retry and resource accounting) and `p50endpoint`. Endpoint log:
+`/tanksmall/scratch/tmp/p50-recovery-closure.avtx9r/logs/recovery-endpoint-r3.log`
+(SHA256 `a9c299f9195e67f9c64f8afa1b52ac4201f88d7e2635fff03a448ed80f953b10`).
+This does not qualify concurrent-caller recovery, P29V1/ZSTD_ROUTE recovery,
+service integration, cancellation/expiry, or process restart behavior.
 
 The annotated tag `sorbet_1.5_pipeline_plan` freezes the detailed C/D plan at
 `6dfd606de89bd60abb9315b398b53df37c878640`; the tag is pushed and its remote

@@ -1291,9 +1291,16 @@ void GlobalResourceModel::begin_install(CStoreGuid c_store_guid, Key64 key,
             throw std::logic_error(
                 "P29Segment install lacks same-TU Blob staging");
     }
-    auto& object = space.objects[key];
-    if (object.state != GlobalObjectState::Absent || (!retry && object.attempts != 0) ||
-        (retry && (!object.crashed || object.attempts != 1)))
+    auto object_position = space.objects.find(key);
+    const bool fresh_object = object_position == space.objects.end();
+    const Object empty_object{};
+    const Object& prior = fresh_object ? empty_object : object_position->second;
+    if (prior.state != GlobalObjectState::Absent ||
+        (!retry && prior.attempts != 0) ||
+        (retry && (!prior.crashed || prior.attempts != 1 ||
+                   (key.type() != ObjectType::P29Segment &&
+                    (prior.content_digest != content_digest ||
+                     prior.bytes != bytes)))))
         throw std::logic_error("global install does not start from the required state");
     const auto owner = slots_.find(slot);
     if (owner != slots_.end() && !faults_.ignore_slot_ownership)
@@ -1310,11 +1317,14 @@ void GlobalResourceModel::begin_install(CStoreGuid c_store_guid, Key64 key,
          !checked_add(resident_bytes(), next_staged = staged + bytes,
                       limits_.max_total_bytes)))
         throw std::length_error("global total byte cap exceeded");
+    if (fresh_object)
+        object_position = space.objects.emplace(key, Object{}).first;
+    Object& object = object_position->second;
     object.state = GlobalObjectState::Installing;
     object.content_digest = content_digest;
     object.bytes = bytes;
     object.slot = slot;
-    object.attempts = retry ? 2 : 1;
+    object.attempts = 1;
     object.crashed = false;
     slots_[slot] = {c_store_guid, key};
     emit({retry ? GlobalActionType::ARENA_RETRY_INSTALLING : GlobalActionType::ARENA_INSTALLING,
@@ -1444,9 +1454,12 @@ void GlobalResourceModel::crash_install(CStoreGuid c_store_guid, Key64 key, size
         owner == slots_.end() || owner->second != std::pair{c_store_guid, key})
         throw std::logic_error("global crash does not identify the installing owner");
     const uint64_t bytes = position->second.bytes;
-    position->second = Object{};
+    // Keep the immutable identity and attempt count as a bounded tombstone.
+    // Recovery can retry only this exact object; the same key cannot be
+    // silently rebound to different bytes after a history reset.
+    position->second.state = GlobalObjectState::Absent;
+    position->second.slot = 0;
     position->second.crashed = true;
-    position->second.attempts = 1;
     slots_.erase(owner);
     emit({GlobalActionType::INSTALL_CRASHED, c_store_guid, {}, space.generation, key,
           static_cast<uint32_t>(slot), bytes});
@@ -1622,6 +1635,18 @@ bool GlobalResourceModel::install_retry_required(
     return position != space.objects.end() &&
            position->second.state == GlobalObjectState::Absent &&
            position->second.crashed && position->second.attempts == 1;
+}
+
+bool GlobalResourceModel::discard_crashed_install(CStoreGuid c_store_guid,
+                                                   Key64 key) {
+    Namespace& space = require_namespace(c_store_guid);
+    const auto position = space.objects.find(key);
+    if (position == space.objects.end() ||
+        position->second.state != GlobalObjectState::Absent ||
+        !position->second.crashed || position->second.attempts != 1)
+        return false;
+    space.objects.erase(position);
+    return true;
 }
 
 void GlobalResourceModel::release(CStoreGuid c_store_guid, Key64 key) {
@@ -2031,7 +2056,7 @@ void CRoute::restart_v1_for_transport_retry() {
 
 void CRoute::reset_v1_route(FStoreGuid f_store_guid,
                             HistoryNonce history_nonce) {
-    if ((!active_ && speculative_.empty()) ||
+    if (!p29v1_ ||
         (active_ && active_->begin.profile != ProfileId::P29V1))
         throw std::logic_error(
             "C route has no P29V1 transaction history to reset");

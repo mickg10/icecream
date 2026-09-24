@@ -155,6 +155,73 @@ void test_global_resource_owner() {
             "global release left resident bytes behind");
 }
 
+void test_interrupted_install_retry_preserves_exact_identity() {
+    const GlobalResourceLimits limits{
+        .max_aggregate_bytes = 64,
+        .max_namespace_bytes = 64,
+        .max_staging_bytes = 64,
+        .max_total_bytes = 128,
+        .max_generation = 1,
+        .max_staging_slots = 2,
+    };
+    const CStoreGuid c_guid = CStoreGuid::from_u64(12);
+    const Key64 key = *Key64::make(ObjectType::Blob, 0, 7);
+    const Digest128 digest = tagged_digest(91);
+    GlobalResourceModel model(limits);
+    model.admit(c_guid);
+
+    // Two interrupted attempts (the initial transfer plus one replay) retain
+    // only an identity tombstone: no staging slot or bytes remain charged.
+    for (unsigned attempt = 0; attempt != 2; ++attempt) {
+        model.start_tu(c_guid);
+        const bool retry = model.install_retry_required(c_guid, key);
+        require(retry == (attempt != 0),
+                "interrupted install retry eligibility was not preserved");
+        model.begin_install(c_guid, key, digest, 17, attempt, retry);
+        model.crash_install(c_guid, key, attempt);
+        model.finish_tu(c_guid);
+        require(model.staging_bytes() == 0 && model.resident_bytes() == 0 &&
+                    model.free_staging_slots() == limits.max_staging_slots &&
+                    !model.check_invariants(),
+                "interrupted install leaked global resources");
+    }
+
+    model.start_tu(c_guid);
+    require_throws<std::logic_error>(
+        [&] { model.begin_install(c_guid, key, tagged_digest(92), 17, 0, true); },
+        "global retry accepted a different content digest");
+    require_throws<std::logic_error>(
+        [&] { model.begin_install(c_guid, key, digest, 18, 0, true); },
+        "global retry accepted a different byte count");
+    require(model.staging_bytes() == 0 && model.free_staging_slots() == 2,
+            "rejected retries changed staging accounting");
+
+    // A second interrupted replay is also bounded and exact; the final retry
+    // installs/publishes the same object without accumulating stale bytes.
+    model.begin_install(c_guid, key, digest, 17, 0, true);
+    model.crash_install(c_guid, key, 0);
+    model.finish_tu(c_guid);
+    require(model.install_retry_required(c_guid, key),
+            "second interrupted replay lost its retry tombstone");
+    model.start_tu(c_guid);
+    model.begin_install(c_guid, key, digest, 17, 0, true);
+    model.publish(c_guid, key, 0, digest);
+    model.finish_tu(c_guid);
+    require(model.resident_bytes() == 17 && model.staging_bytes() == 0 &&
+                !model.check_invariants(),
+            "exact interrupted install retry did not publish cleanly");
+    const Key64 abandoned = *Key64::make(ObjectType::Blob, 0, 8);
+    model.start_tu(c_guid);
+    model.begin_install(c_guid, abandoned, tagged_digest(93), 9, 1);
+    model.crash_install(c_guid, abandoned, 1);
+    model.finish_tu(c_guid);
+    require(model.discard_crashed_install(c_guid, abandoned) &&
+                !model.discard_crashed_install(c_guid, abandoned) &&
+                model.resident_bytes() == 17 && model.staging_bytes() == 0 &&
+                !model.check_invariants(),
+            "terminal tombstone retirement changed resident/staging state");
+}
+
 void test_atomic_p29v1_pair_preflight() {
     const CStoreGuid c_guid = CStoreGuid::from_u64(20);
     const Key64 blob = *Key64::make(ObjectType::Blob, 0, 7);
@@ -581,6 +648,7 @@ void test_terminal_session_serial() {
 int main() {
     test_object_arena_and_canonical_records();
     test_global_resource_owner();
+    test_interrupted_install_retry_preserves_exact_identity();
     test_atomic_p29v1_pair_preflight();
     test_global_reverse_invariants_catch_mutants();
     test_f_store_session_and_route_fencing();

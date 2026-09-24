@@ -232,6 +232,10 @@ public:
     [[nodiscard]] std::optional<size_t> first_free_staging_slot() const;
     [[nodiscard]] bool install_retry_required(CStoreGuid c_store_guid,
                                               Key64 key) const;
+    // Retire only an Absent+crashed uncommitted install tombstone. Resident
+    // and currently installing objects are never removed by this operation.
+    [[nodiscard]] bool discard_crashed_install(CStoreGuid c_store_guid,
+                                               Key64 key);
     void release(CStoreGuid c_store_guid, Key64 key);
 
     // Exposed only so the out-of-line implementation can keep the model's
