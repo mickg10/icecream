@@ -50,6 +50,19 @@ changed witness bytes. Evidence:
 (SHA256 `e52b1bd8ba96eb0b174bb3b3a7d708581b3f4107ecf52f886a8f2b686d7782a1`).
 That wire test proves record encoding/decoding only.
 
+ZSTD_ROUTE recovery preparation now advances its bounded speculative history
+and REL_SEQ after each successfully rebuilt suffix entry. The regression
+checks three retained entries against fresh sequential preparation: exact
+encoded bytes, pre-state digests, REL 0/1/2 and unchanged raw identity. An
+out-of-order rebuild is rejected without consuming the cursor. Focused
+evidence: `logs/zstd-route-recovery-authority-r2.log` under the recovery root
+(SHA256 `d41cc3deb4f51de335528dee08dd5eab7b8b029760eb300c7268c98a8b4aafbc`).
+The full endpoint suite also passes in
+`logs/route-recovery-endpoint-and-sender-full-r1.log`; its endpoint binary is
+`b2c85b8b6c6991066dd6a6186f0368471cbf6b917ff08a43a370287974dfc61c`.
+The subsequent sender suite in that combined run fails at the first-bundle
+wait after its ZSTD_TU W30 case; the combined run is not a passing sender gate.
+
 The direct production sender recovery regression now passes for ZSTD_TU:
 the original caller completes after a lost commit reply, failed connector,
 and lost RESET_ACK; a separate case completes after two interrupted
@@ -106,6 +119,19 @@ the exact live connection lease and pristine-channel checks remain required.
 Full service concurrency, recovery, restarts, wrapper and mixed-farm gates
 remain open. The Stage A results below do not qualify these changes.
 No Chromium build/download has been started for this implementation step.
+
+The separate async-service candidate passes the full `p50cacheservice` suite
+against the committed sender/endpoint. Added cases cover local reply deadline
+and peer closure, slot reuse, the global 120-reservation limit, cancellation
+and idle expiry, publication/reset lifecycle, and shutdown while an accepted
+connection stalls before ordinary protocol admission completes. That last
+case verifies both operation and raw-byte credits return to zero. The optional
+cancellation-aware handshake polls do not extend the original deadline.
+This does not yet prove cancellation after R2 HELLO or 120 active transfers.
+Evidence: `/tanksmall/scratch/tmp/p51-service-own.ntIYnn/build/unittests/p50cacheservice.log`
+(SHA256 `cb0abf2f093f03a5ac669b764c037478cc0a501860ab2d2e31b477beac20c9dd`);
+test binary SHA256
+`fbd07ab0b3504eef5e3cf0b75a52d6e07420fee6f61f8f9ed82686ea5e07b15b`.
 
 The focused `run_adopted_r2` receiver fixture passed two sequential ZSTD_TU
 jobs on one TCP link: one W1 HELLO, distinct one-shot reservations, two

@@ -4038,6 +4038,71 @@ void test_preparation_authority_window_refill_and_receipts() {
             "failed P29 cancellation dropped a retained route witness");
 }
 
+void test_zstd_route_recovery_rebuild_cursor() {
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = 3;
+    limits.max_speculative_raw_bytes = 1U << 16;
+    limits.max_retained_encoded_bytes = 1U << 20;
+    const CStoreGuid c_guid = Id128::from_u64(0x525245434f564552ULL);
+    const PreparationRouteKey route{
+        Id128::from_u64(0x525245434f555445ULL), 17, ProfileId::ZSTD_ROUTE};
+    auto recovering = std::make_shared<P50PreparationAuthority>(
+        c_guid, EndpointCaps{}.zstd, limits, 3, ProfileId::ZSTD_ROUTE);
+    auto reference = std::make_shared<P50PreparationAuthority>(
+        c_guid, EndpointCaps{}.zstd, limits, 3, ProfileId::ZSTD_ROUTE);
+
+    const std::array<std::string, 3> texts{
+        "# 1 \"/tmp/recovery-a.cc\"\nint common_route_value = 41;\n",
+        "# 1 \"/tmp/recovery-b.cc\"\nint common_route_value = 42;\n",
+        "# 1 \"/tmp/recovery-c.cc\"\nint common_route_value = 43;\n"};
+    std::array<PreparedTuHandle, 3> recovering_handles;
+    std::array<PreparedInputPtr, 3> reference_inputs;
+    for (size_t index = 0; index < texts.size(); ++index) {
+        const std::vector<uint8_t> raw(texts[index].begin(), texts[index].end());
+        recovering_handles[index] = recovering->prepare_for_route(
+            route, PrepareRequestKey{100, 1000 + index}, raw);
+        const PreparedTuHandle reference_handle = reference->prepare_for_route(
+            route, PrepareRequestKey{100, 1000 + index}, raw);
+        reference_inputs[index] =
+            P50PreparationAuthorityTestAccess::resolve(*reference,
+                                                        reference_handle);
+        recovering->advance_speculative(recovering_handles[index]);
+        reference->advance_speculative(reference_handle);
+    }
+
+    recovering->reset_r2_route_for_recovery(
+        route, FStoreGuid{Id128::from_u64(0x52524653544f5245ULL)},
+        HistoryNonce{73});
+
+    // An out-of-order rebuild must leave the cursor/history unchanged; the
+    // complete suffix can then be rebuilt in relationship order.
+    require_throws<std::logic_error>(
+        [&] {
+            recovering->rebuild_r2_entry_for_recovery(
+                recovering_handles[1], Digest128{});
+        },
+        "ZSTD_ROUTE recovery rebuilt a suffix TU before its predecessor");
+
+    for (size_t index = 0; index < texts.size(); ++index) {
+        const PreparedTuHandle handle = recovering_handles[index];
+        recovering->rebuild_r2_entry_for_recovery(handle, Digest128{});
+        const PreparedInputPtr rebuilt =
+            P50PreparationAuthorityTestAccess::resolve(*recovering, handle);
+        require(rebuilt->begin.rel_seq.value == index,
+                "ZSTD_ROUTE recovery reused a speculative REL_SEQ");
+        require(rebuilt->body == reference_inputs[index]->body &&
+                    rebuilt->begin.pre_state_digest ==
+                        reference_inputs[index]->begin.pre_state_digest,
+                "ZSTD_ROUTE recovery rebuilt suffix with the wrong history prefix");
+        require(rebuilt->begin.raw_digest == reference_inputs[index]->begin.raw_digest &&
+                    rebuilt->begin.raw_bytes == reference_inputs[index]->begin.raw_bytes,
+                "ZSTD_ROUTE recovery changed an immutable raw TU witness");
+        recovering->advance_speculative(handle);
+    }
+    require(recovering->live_entry_count() == texts.size(),
+            "ZSTD_ROUTE recovery rebuild lost a retained suffix witness");
+}
+
 struct R2EndpointTestJob {
     JobBind binding;
     P51SourceJobLease lease;
@@ -7069,6 +7134,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused R2 pre-HELLO cancellation PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_ROUTE_RECOVERY_FOCUS") != nullptr) {
+        test_zstd_route_recovery_rebuild_cursor();
+        std::cout << "p50_endpoint_test: focused ZSTD_ROUTE recovery rebuild PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_R2_W30_FOCUS") != nullptr) {
         test_r2_endpoint_window30_receipts_and_refill(ProfileId::ZSTD_TU);
         std::cout << "p50_endpoint_test: focused R2 W30/refill ZSTD_TU PASS\n";
@@ -7099,6 +7169,7 @@ int main(int argc, char** argv) {
     test_lost_final_commit_identity_negative_matrix();
     test_idempotent_prepare_admission();
     test_preparation_authority_window_refill_and_receipts();
+    test_zstd_route_recovery_rebuild_cursor();
     test_r2_endpoint_commits_two_jobs_on_one_link();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();

@@ -1468,6 +1468,9 @@ void P50PreparationAuthority::rebuild_r2_entry_for_recovery(
 
     PreparedInputPtr replacement = entry.prepared;
     bool started_p29 = false;
+    bool advance_route_history = false;
+    std::vector<uint8_t> next_route_history;
+    Digest128 next_route_history_digest{};
     try {
         if (entry.route.profile == ProfileId::P29V1) {
             if (!route.p29_route || route.active_p29_entry ||
@@ -1493,9 +1496,30 @@ void P50PreparationAuthority::rebuild_r2_entry_for_recovery(
                 entry.shared->tu_seq, route.speculative_route_history_digest,
                 std::span<const uint8_t>(route.speculative_route_history),
                 std::span<const uint8_t>(entry.shared->raw), impl_->zstd_limits);
-            (void)route_limit;
             replacement = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{envelope.begin, envelope.body});
+            const auto& raw = entry.shared->raw;
+            next_route_history = route.speculative_route_history;
+            if (raw.size() >= route_limit) {
+                next_route_history.assign(
+                    raw.end() - static_cast<std::ptrdiff_t>(route_limit),
+                    raw.end());
+            } else {
+                const size_t excess =
+                    next_route_history.size() + raw.size() > route_limit
+                        ? next_route_history.size() + raw.size() - route_limit
+                        : 0;
+                if (excess != 0)
+                    next_route_history.erase(
+                        next_route_history.begin(),
+                        next_route_history.begin() +
+                            static_cast<std::ptrdiff_t>(excess));
+                next_route_history.insert(next_route_history.end(), raw.begin(),
+                                          raw.end());
+            }
+            next_route_history_digest = digest128(
+                std::span<const uint8_t>(next_route_history));
+            advance_route_history = true;
         } else if (entry.route.profile != ProfileId::ZSTD_TU) {
             throw std::logic_error("unsupported R2 recovery codec profile");
         }
@@ -1508,6 +1532,12 @@ void P50PreparationAuthority::rebuild_r2_entry_for_recovery(
         entry.retained_bytes = retained;
         entry.prepared = std::move(replacement);
         entry.r2_rebuild_required = false;
+        if (advance_route_history) {
+            route.speculative_route_history = std::move(next_route_history);
+            route.speculative_route_history_digest =
+                next_route_history_digest;
+            ++route.next_speculative_route_rel;
+        }
     } catch (...) {
         if (started_p29 && route.p29_route)
             route.p29_route->abandon_active();
