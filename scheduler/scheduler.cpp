@@ -3792,6 +3792,19 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         m->cGuid() == 0 && m->tuSeq() == 0;
     if (!assignment_identity_matches ||
         (!compile_identity_matches && !exact_precompile_worker_failure)) {
+        /* A terminal with a mismatched identity from a job that has not yet
+           begun compiling is likely a stale terminal from a lost sidecar
+           session, not a whole-worker protocol violation.  Removing the
+           entire F would kill every unrelated in-flight compile.  Drop only
+           this stale terminal; the worker's other assignments continue.  A
+           begun compile with a mismatched identity is still a protocol
+           violation and removes the worker. */
+        if (j->state() == Job::WAITINGFORCS) {
+            log_info() << "terminal identity mismatch for unexposed job "
+                       << m->job_id << " from " << cs->nodeName()
+                       << " (stale terminal dropped, worker retained)" << endl;
+            return true;
+        }
         log_info() << "terminal assignment/compile identity mismatch for job "
                    << m->job_id << endl;
         handle_end(cs, nullptr);

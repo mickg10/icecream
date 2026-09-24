@@ -7658,7 +7658,7 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
                 reconcile_cache_route_state();
             }
         } else {
-            log_warning()
+            trace()
                 << "ignored invalid or stale P50 cache-route observation for job "
                 << m->job_id << endl;
         }
