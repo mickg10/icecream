@@ -248,6 +248,15 @@ the final-source standard-daemon rerun also passes all four invocations:
 These four invocations
 include a one-job vertical transfer, not the separate 30-job receipt gate.
 
+The same final daemon also passes the explicit three-profile W30 target:
+P29V1, ZSTD_TU and ZSTD_ROUTE each observe `jobs=30 peak_held_commits=30`,
+then exact input identities and accepted original-channel compiler attachments.
+Evidence: `run-w30-target-r2.log` in the same logs root (exit 0, SHA256
+`71c9668635d4d51a7d80722f08a935017ead1521016007a3d37d5988640ed64d`).
+The daemon, service and fixture binaries are unchanged from the final standard
+runner. These are small-input concurrency tests, not throughput measurements
+or proof of process-restart recovery.
+
 Continuation handoff: the three Luna agents temporarily stopped with
 usage-limit errors, then resumed on retry. Actual-wrapper success is not
 established; its script and source-contract update remain under development.
