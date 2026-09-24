@@ -40,7 +40,47 @@ Protocol50IncarnationBridge.tla
     verified F_STORE_GUID replacement while an old transaction is in flight
     or after a durable but unaccepted commit, preservation of C retry identity,
     independently owned compiler input, cold replay, and scoped progress
+
+Protocol50TransferConcurrency.tla
+    bounded per-(C,F-generation) admission and owner publication, independent
+    link overlap/progress, per-C/per-F count and byte credits, unique C-wide
+    TU allocation, timeout/reconciliation, generation replacement, and
+    stale-callback fencing
 ```
+
+## Bounded transfer-concurrency lane
+
+The `transfer-concurrency` lane is deliberately separate from the legacy
+formal rows and is selected by the existing `make protocol50-formal`
+aggregator. Its six topology configurations cover C2F1/C3F1/C4F1 and
+C1F2/C1F3/C1F4. Each has a clean safety run and a separate reachability
+witness that succeeds only when every distinct `(C,F)` relationship is in
+`Running` simultaneously. A blocked-running-link progress row, byte-pressure
+row, generation-replacement row, and six named negative controls exercise the
+independent-link and stale-identity failure modes. Expected negative outcomes
+are accepted only when the runner sees their exact invariant/temporal
+diagnostic; parse failures, timeouts, and generic nonzero exits are failures.
+
+The model treats profile as a route selector, not as part of the relationship
+identity. It represents admission credits as count and abstract raw-byte
+units, with both C-owned and F-owned limits; it does not model codec internals.
+The retained lost-ack witness and physical reservation are one bounded
+reconciliation abstraction here, so this is not a claim that production must
+hold physical bytes for the entire ambiguity window. C/F generation
+replacement, callbacks, timeout and cancellation are finite abstractions, not
+an unbounded restart proof. Ordinary `CACHE_SESSION`/ready and namespace
+activation at `SESSION_HELLO`, blocking DNS, OS shutdown, and the full
+compressed-codec lifecycle remain outside this model. In particular, the
+lane proves Stage-A `W=1` reservation/owner behavior only; it does not prove
+the future ordered `W>1` pipeline or a `30 TU` depth.
+The finite sequence allocator starts at 1 because 0 is its unallocated
+sentinel; this is an offset abstraction of production `TU_SEQ`, which starts
+at 0. Only C-wide uniqueness and monotonic allocation are claimed.
+
+The row runner is `run_transfer_concurrency_tlc.sh`; it uses the pinned jar
+and writes distinct TLC metadata under caller-provided `TLC_STATE_ROOT`.
+The aggregate result bundles preserve the actual jar/module/config hashes and
+per-row logs for audit.
 
 The boundaries are:
 
@@ -240,7 +280,7 @@ It does **not** claim unconditional liveness under infinitely recurring failures
 
 ## One shared C namespace
 
-The product topology for this effort is one shared C-side authority/GUID used by all local C producer processes. The formal cache model therefore has one C namespace and independent F replicas. A separate “two unrelated C GUIDs assign the same Key64 differently” model is not part of the current product contract. Executable namespace-isolation tests may remain as robustness tests.
+The legacy `Protocol50.tla` cache-state model has one C namespace and independent F replicas; it does not model profile codec/key assignment. The separate bounded `Protocol50TransferConcurrency.tla` lane now checks both multi-C/one-F and one-C/multi-F admission topologies, including C-wide TU uniqueness, without modeling codec internals or claiming cross-C key-namespace equivalence.
 
 Local Prepare must be idempotent across a lost local reply. A producer-session/request token binds the raw length and digest: retrying the same token and identity returns the same PreparedTU/TU_SEQ; reusing the token for different input is rejected. This is local request replay, not a new remote P50 message.
 
@@ -329,7 +369,8 @@ make protocol50-formal
 ```
 
 The target runs the core, assignment-delivery, assignment-identity, global,
-and bounded ZSTD_ROUTE/FInput lanes selected by that manifest.  It allocates a
+bounded transfer-concurrency, and bounded ZSTD_ROUTE/FInput lanes selected by
+that manifest.  It allocates a
 unique retained directory below `P50_FORMAL_RESULTS_ROOT` (or
 `$ICEFARM_TMPDIR/icecream-formal`), authenticates the shared jar before any
 lane starts, hashes every selected input, and records commands, logs, state

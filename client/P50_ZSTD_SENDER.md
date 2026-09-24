@@ -1,4 +1,4 @@
-# P50 client ZSTD_TU source sender
+# P50 client source sender
 
 `p50_zstd_sender.*` is the client-side ownership seam for one complete
 preprocessed source. It accepts either an owned regular-file descriptor or a
@@ -6,6 +6,8 @@ copied byte span, admits one `PrepareRequestKey`, uses one
 `P50PreparationAuthority` and one `P50ClientEndpoint`, and permits exactly one
 replay of the same prepared handle after a disconnected run. It has no
 FileChunk path.
+The historical `P50ZstdSourceSender` name covers P29V1, ZSTD_TU and
+ZSTD_ROUTE; the selected profile determines the codec, not the class name.
 
 The sender requires a caller-owned nonzero `CStoreGuid` and request identity;
 it does not invent product identity. A successful endpoint result must carry
@@ -13,8 +15,11 @@ the directly validated `TxCommit` and exact `(C_GUID,TU_SEQ)` key. The sender
 checks their TU sequence, C namespace, and raw digest without treating the
 diagnostic action trace as authority.
 
-Production callers may supply a connected-fd factory. It is invoked once per
-bounded attempt.  The production factory sends the ordinary `CACHE_SESSION`,
+Callers may supply a connected-fd factory. It is invoked once per bounded
+attempt. Production uses the asynchronous factory form so a retry's blocking
+connection/arm work does not occupy the shared route-owner executor; the
+synchronous form remains available for simple callers and fixtures.
+The production factory sends the ordinary `CACHE_SESSION`,
 retains the socket, waits under the sender's unchanged absolute deadline for
 the exact raw sidecar-ownership witness `50 f0 00 01`, and only then returns
 the descriptor to CacheWire.  Wrong, partial, missing, late, or read-ahead

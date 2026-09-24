@@ -12,12 +12,14 @@
 #include "p50_incarnation_identity.h"
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <future>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -33,6 +35,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/thread_pool.hpp>
 
 namespace icecc::p50::service {
 
@@ -60,6 +63,10 @@ struct RuntimeConfig {
     size_t max_route_completed_requests = 4096;
     size_t max_route_relationships = 256;
     size_t max_route_endpoint_identities = 256;
+    // Source work is admitted independently across C/F relationships.  Raw
+    // bytes are reserved from the regular-file length before vector allocation.
+    size_t max_active_source_transfers = 4;
+    uint64_t max_aggregate_source_raw_bytes = uint64_t{2} * 1024 * 1024 * 1024;
     // Connecting, negotiating, arming, and crossing CACHE_SESSION must never
     // monopolize the process-wide route-owner gate for the full source
     // operation deadline. F acknowledges an arm before doing source work;
@@ -205,6 +212,12 @@ private:
         auto operator<=>(const RouteStoreIdentity&) const = default;
     };
 
+    struct SourceIncarnationKey {
+        FStoreGuid guid{};
+        uint64_t generation = 0;
+        auto operator<=>(const SourceIncarnationKey&) const = default;
+    };
+
     struct EndpointOwnerResult {
         RuntimeStatus status = RuntimeStatus::EndpointFailed;
         std::optional<ServerRunResult> endpoint;
@@ -226,31 +239,84 @@ private:
     [[nodiscard]] bool bind_route_endpoint_identity(
         const RouteEndpointKey& endpoint,
         RouteStoreIdentity observed) noexcept;
+    [[nodiscard]] bool acquire_source_address(
+        const RouteEndpointKey& endpoint,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool acquire_source_incarnation(
+        const SourceIncarnationKey& incarnation,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool acquire_source_incarnations(
+        std::vector<SourceIncarnationKey> incarnations,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool transition_source_incarnation(
+        const SourceIncarnationKey& predecessor,
+        const SourceIncarnationKey& successor,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool acquire_source_credit(
+        uint64_t raw_bytes,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    void release_source_admission(
+        const RouteEndpointKey& endpoint,
+        const std::optional<SourceIncarnationKey>& incarnation,
+        const std::optional<SourceIncarnationKey>& predecessor,
+        const std::optional<P50RouteRelationship>& relationship,
+        bool address_admitted, bool relationship_reserved,
+        uint64_t raw_bytes, bool has_credit) noexcept;
+    void release_source_credit(uint64_t raw_bytes) noexcept;
+    void latch_route_replacement() noexcept;
+    [[nodiscard]] bool owner_preflight_source_endpoint(
+        const RouteEndpointKey& endpoint,
+        std::optional<RouteStoreIdentity>& known_identity,
+        bool& route_fatal,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool owner_round_trip(
+        std::function<void()> operation,
+        std::chrono::steady_clock::time_point deadline,
+        bool allow_during_stop = false) noexcept;
 
     RuntimeConfig config_;
     InputLifecycleRegistry input_lifecycle_;
     boost::asio::io_context context_;
+    boost::asio::thread_pool source_setup_pool_;
+    // Outstanding (queued + running) blocking retry setup tasks. Shared with
+    // each task so a resolver that outlives its source deadline still holds
+    // one bounded slot until its completion path actually returns.
+    std::shared_ptr<std::atomic<size_t>> source_setup_inflight_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     std::unique_ptr<P50CRouteOwner> route_owner_;
     // Endpoint address is the stable scheduler-facing relationship key.  Its
     // exact authenticated F incarnation is owner-affine and bounded; a change
     // retires every old-profile route before the successor is admitted.
     std::map<RouteEndpointKey, RouteStoreIdentity> route_endpoint_identities_;
-    // P50CRouteOwner retains one sender per C/F/profile relationship and its
-    // preparation authority permits only one uncommitted successor.  Source
-    // requests arrive on independent bounded control workers, so serialize
-    // them here under their unchanged absolute deadline before touching that
-    // single-owner state.  This also bounds buffered source memory to one TU.
-    std::timed_mutex source_transfer_mutex_;
+    // Owner-affine reservations keep parallel novel addresses from all
+    // passing endpoint-table preflight against the same final free slot.
+    std::set<RouteEndpointKey> pending_route_endpoint_identities_;
+    std::set<P50RouteRelationship> pending_route_relationships_;
+    // Owner-affine tombstones prevent a stale endpoint alias from recreating
+    // route history after its incarnation has been retired at another alias.
+    std::set<SourceIncarnationKey> retired_source_incarnations_;
+    // The bookkeeping mutex is short-held and never spans file I/O, setup,
+    // CacheWire, or commit waiting. Admission leases themselves intentionally
+    // remain held for the admitted operation.
+    std::mutex source_admission_mutex_;
+    std::condition_variable source_admission_changed_;
+    std::set<RouteEndpointKey> active_source_addresses_;
+    std::set<SourceIncarnationKey> active_source_incarnations_;
+    std::set<SourceIncarnationKey> retiring_source_incarnations_;
+    size_t active_source_count_ = 0;
+    uint64_t active_source_raw_bytes_ = 0;
     // This is the outermost opener fence.  P50CRouteOwner also retains its
     // own latch, but transfer_source_on_owner must refuse before it connects
     // to or arms any F after whole-sidecar replacement becomes necessary.
     std::atomic<bool> route_replacement_required_{false};
+    std::shared_ptr<std::atomic<bool>> source_setup_cancelled_ =
+        std::make_shared<std::atomic<bool>>(false);
     EndpointWorkGuard endpoint_work_guard_;
     std::thread endpoint_owner_thread_;
     std::atomic<bool> endpoint_owner_failed_{false};
     std::atomic_flag busy_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<int64_t> stop_requested_at_ns_{0};
     std::atomic<size_t> live_sessions_{0};
     std::atomic<int> active_control_cancel_fd_{-1};
     mutable std::mutex endpoint_cancel_mutex_;

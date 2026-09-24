@@ -149,8 +149,8 @@ void append_source_result_trace(
     CStoreGuid c_store_guid,
     ProfileId profile,
     const ZstdSourceTransferResult& transfer,
-    uint64_t source_mutex_wait_ns,
-    uint64_t source_mutex_service_ns) noexcept {
+    uint64_t admission_wait_ns,
+    uint64_t admitted_service_ns) noexcept {
     const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
     if (path == nullptr || *path == '\0')
         return;
@@ -177,7 +177,7 @@ void append_source_result_trace(
     char line[1024];
     const int length = std::snprintf(
         line, sizeof(line),
-        "{\"schema\":\"icecream-p50-source-result-v2\","
+        "{\"schema\":\"icecream-p50-source-result-v3\","
         "\"wire_job_id\":%llu,\"logical_job\":%llu,"
         "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
         "\"c_store_guid\":\"%s\","
@@ -206,8 +206,8 @@ void append_source_result_trace(
         raw_digest.c_str(),
         static_cast<unsigned long long>(transfer.c_to_f_bytes),
         static_cast<unsigned long long>(transfer.f_to_c_bytes),
-        static_cast<unsigned long long>(source_mutex_wait_ns),
-        static_cast<unsigned long long>(source_mutex_service_ns),
+        static_cast<unsigned long long>(admission_wait_ns),
+        static_cast<unsigned long long>(admitted_service_ns),
         static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
@@ -1287,6 +1287,16 @@ bool handle_connection(local::Connection connection, const Options& options,
 
 namespace {
 
+struct SourceSetupTaskSlot {
+    explicit SourceSetupTaskSlot(
+        std::shared_ptr<std::atomic<size_t>> outstanding_tasks)
+        : outstanding(std::move(outstanding_tasks)) {}
+    ~SourceSetupTaskSlot() {
+        outstanding->fetch_sub(1, std::memory_order_relaxed);
+    }
+    std::shared_ptr<std::atomic<size_t>> outstanding;
+};
+
 RuntimeConfig validate_runtime_config(RuntimeConfig config) {
     if (config.f_store_guid == FStoreGuid{})
         throw std::invalid_argument("sidecar runtime requires a nonzero F_STORE_GUID");
@@ -1297,6 +1307,10 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         config.max_route_completed_requests == 0 ||
         config.max_route_relationships == 0 ||
         config.max_route_endpoint_identities == 0 ||
+        config.max_active_source_transfers == 0 ||
+        config.max_active_source_transfers > kMaxControlWorkers ||
+        config.max_aggregate_source_raw_bytes == 0 ||
+        config.max_aggregate_source_raw_bytes > SIZE_MAX ||
         config.source_open_arm_timeout <= std::chrono::milliseconds::zero() ||
         config.source_open_arm_timeout > std::chrono::seconds(60) ||
         config.cancellation_grace <= std::chrono::milliseconds::zero())
@@ -1341,21 +1355,42 @@ local::P50SourceTransferResult source_transfer_result(
     return result;
 }
 
-std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
-    int fd, uint64_t limit) noexcept {
+std::optional<uint64_t> source_fd_size(int fd, uint64_t limit) noexcept {
     if (fd < 0 || limit > SIZE_MAX)
         return std::nullopt;
     struct stat info{};
     if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
         static_cast<uint64_t>(info.st_size) > limit)
         return std::nullopt;
+    return static_cast<uint64_t>(info.st_size);
+}
+
+std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
+    int fd, uint64_t limit, uint64_t reserved_size,
+    std::chrono::steady_clock::time_point deadline,
+    const std::atomic<bool>& stopped) noexcept {
+    if (fd < 0 || reserved_size > limit || reserved_size > SIZE_MAX)
+        return std::nullopt;
+    struct stat before{};
+    if (::fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) ||
+        before.st_size < 0 ||
+        static_cast<uint64_t>(before.st_size) != reserved_size)
+        return std::nullopt;
+    if (stopped.load(std::memory_order_acquire) ||
+        std::chrono::steady_clock::now() >= deadline)
+        return std::nullopt;
     try {
         auto result = std::make_shared<std::vector<uint8_t>>(
-            static_cast<size_t>(info.st_size));
+            static_cast<size_t>(reserved_size));
         size_t offset = 0;
         while (offset != result->size()) {
+            if (stopped.load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= deadline)
+                return std::nullopt;
+            const size_t amount = std::min<size_t>(64 * 1024,
+                                                   result->size() - offset);
             const ssize_t count = ::pread(fd, result->data() + offset,
-                                          result->size() - offset,
+                                          amount,
                                           static_cast<off_t>(offset));
             if (count > 0) {
                 offset += static_cast<size_t>(count);
@@ -1365,6 +1400,14 @@ std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
                 continue;
             return std::nullopt;
         }
+        if (stopped.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= deadline)
+            return std::nullopt;
+        struct stat after{};
+        if (::fstat(fd, &after) != 0 || !S_ISREG(after.st_mode) ||
+            after.st_size < 0 ||
+            static_cast<uint64_t>(after.st_size) != reserved_size)
+            return std::nullopt;
         return std::const_pointer_cast<const std::vector<uint8_t>>(result);
     } catch (...) {
         return std::nullopt;
@@ -1378,6 +1421,8 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
       input_lifecycle_(
           config_.endpoint_config.owner_limits.max_retained_input_records,
           config_.max_input_lifecycle_replays),
+      source_setup_pool_(config_.max_active_source_transfers),
+      source_setup_inflight_(std::make_shared<std::atomic<size_t>>(0)),
       endpoint_work_guard_(asio::make_work_guard(context_)),
       // One C sidecar may serve twenty persistent relationships, with two
       // compile slots per F.  Keep the operation table bounded while leaving
@@ -1456,7 +1501,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     sidecar::AbsoluteMonotonicDeadline deadline,
     local::HandoffFd source) noexcept {
     const auto clock = sidecar::process_monotonic_clock_identity();
-    if (!route_owner_ || !request.valid() || !config_.sidecar_launch.has_value() ||
+    if (!request.valid() || !config_.sidecar_launch.has_value() ||
         !config_.sidecar_launch->valid() ||
         config_.sidecar_launch->c_store_guid != config_.c_store_guid ||
         config_.f_store_guid == FStoreGuid{} || config_.f_store_generation == 0 ||
@@ -1470,55 +1515,15 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         return source_transfer_error(1);
 
     const auto transfer_deadline = deadline.as_steady_time_point();
-    const auto source_mutex_wait_start = std::chrono::steady_clock::now();
-    std::unique_lock<std::timed_mutex> source_transfer_lock(
-        source_transfer_mutex_, std::defer_lock);
-    constexpr auto kSourceTransferLockPoll = std::chrono::milliseconds(50);
-    for (;;) {
-        if (stop_requested_.load(std::memory_order_acquire))
-            return source_transfer_error(7);
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= transfer_deadline)
-            return source_transfer_error(7);
-        if (source_transfer_lock.try_lock_until(
-                std::min(transfer_deadline, now + kSourceTransferLockPoll)))
-            break;
-    }
-    const auto source_mutex_service_start = std::chrono::steady_clock::now();
-    const auto source_mutex_wait_elapsed =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            source_mutex_service_start - source_mutex_wait_start)
-            .count();
-    const uint64_t source_mutex_wait_ns =
-        source_mutex_wait_elapsed > 0
-            ? static_cast<uint64_t>(source_mutex_wait_elapsed)
-            : 0;
+    uint64_t admission_wait_ns = 0;
+    auto wait_started = std::chrono::steady_clock::now();
+    const auto operation_started = wait_started;
     if (stop_requested_.load(std::memory_order_acquire) ||
         std::chrono::steady_clock::now() >= transfer_deadline)
         return source_transfer_error(7);
     if (route_replacement_required_.load(std::memory_order_acquire))
         return source_transfer_error(static_cast<uint16_t>(
             local::SourceTransferErrorCode::RouteReplacementRequired));
-
-    // Capacity is decidable from the immutable selected endpoint before
-    // reading C's source or opening/claiming F.  Refuse a novel endpoint at
-    // the process-lifetime bound without creating the detached F owner that
-    // the later identity-binding check exists to protect.
-    std::optional<RouteStoreIdentity> known_endpoint_identity;
-    for (const auto& [endpoint, identity] : route_endpoint_identities_) {
-        if (endpoint.host == request.selected_f_host &&
-            endpoint.cache_port == request.selected_f_cache_port) {
-            known_endpoint_identity = identity;
-            break;
-        }
-    }
-    if (!known_endpoint_identity.has_value() &&
-        route_endpoint_identities_.size() >=
-            config_.max_route_endpoint_identities) {
-        route_replacement_required_.store(true, std::memory_order_release);
-        return source_transfer_error(static_cast<uint16_t>(
-            local::SourceTransferErrorCode::RouteReplacementRequired));
-    }
 
     P50SourceArmFields arm;
     arm.wire_job_id = request.wire_job_id;
@@ -1551,42 +1556,122 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     else
         return source_transfer_error(2);
 
-    // For an already authenticated endpoint, its exact F incarnation and the
-    // requested profile make the relationship key knowable before opening F.
-    // Do not claim/arm a worker when the bounded owner table cannot retain
-    // that new key.  A novel endpoint cannot use this preflight: its address
-    // may name an already retained incarnation, which is learned only from
-    // the authenticated arm acknowledgement.
+    const RouteEndpointKey endpoint_key{
+        arm.selected_f_host, arm.selected_f_cache_port};
+    bool address_admitted = false;
+    bool incarnation_admitted = false;
+    bool credit_admitted = false;
+    bool relationship_reservation_owned = false;
+    uint64_t reserved_raw_bytes = 0;
+    std::optional<SourceIncarnationKey> admitted_incarnation;
+    std::optional<SourceIncarnationKey> predecessor_incarnation;
+    std::optional<P50RouteRelationship> admitted_relationship;
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1),
+        [this, &endpoint_key, &admitted_incarnation,
+         &predecessor_incarnation, &reserved_raw_bytes, &credit_admitted,
+         &address_admitted, &incarnation_admitted,
+         &admitted_relationship, &relationship_reservation_owned](int*) {
+            release_source_admission(
+                endpoint_key,
+                incarnation_admitted ? admitted_incarnation : std::nullopt,
+                incarnation_admitted ? predecessor_incarnation : std::nullopt,
+                relationship_reservation_owned ? admitted_relationship
+                                               : std::nullopt,
+                address_admitted, relationship_reservation_owned,
+                reserved_raw_bytes, credit_admitted);
+        });
+
+    const auto wait_ns_since = [&wait_started, &admission_wait_ns] {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count();
+        if (elapsed > 0)
+            admission_wait_ns += static_cast<uint64_t>(elapsed);
+        wait_started = std::chrono::steady_clock::now();
+    };
+    wait_started = std::chrono::steady_clock::now();
+    if (!acquire_source_address(endpoint_key, transfer_deadline))
+        return source_transfer_error(7);
+    address_admitted = true;
+    wait_ns_since();
+
+    std::optional<RouteStoreIdentity> known_endpoint_identity;
+    bool route_fatal = false;
+    if (!owner_preflight_source_endpoint(endpoint_key,
+                                         known_endpoint_identity,
+                                         route_fatal,
+                                         transfer_deadline)) {
+        if (route_fatal)
+            latch_route_replacement();
+        return source_transfer_error(route_fatal
+            ? static_cast<uint16_t>(
+                  local::SourceTransferErrorCode::RouteReplacementRequired)
+            : 7);
+    }
+
+    const auto source_size = source_fd_size(
+        source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
+    if (!source_size.has_value())
+        return source_transfer_error(3);
+    reserved_raw_bytes = *source_size;
+
     if (known_endpoint_identity.has_value()) {
+        admitted_incarnation = SourceIncarnationKey{
+            known_endpoint_identity->guid,
+            known_endpoint_identity->generation};
+        wait_started = std::chrono::steady_clock::now();
+        if (!acquire_source_incarnation(*admitted_incarnation,
+                                        transfer_deadline))
+            return source_transfer_error(7);
+        incarnation_admitted = true;
+        wait_ns_since();
         const P50RouteRelationship known_relationship{
             config_.c_store_guid, known_endpoint_identity->guid,
             known_endpoint_identity->generation, profile};
-        if (!route_owner_->owns(known_relationship) &&
-            route_owner_->owner_count() >= config_.max_route_relationships) {
-            route_replacement_required_.store(true, std::memory_order_release);
+        auto inserted = std::make_shared<bool>(false);
+        auto accepted = std::make_shared<bool>(false);
+        admitted_relationship = known_relationship;
+        const bool reserved = owner_round_trip(
+            [this, known_relationship, inserted, accepted] {
+                if (!route_owner_ || route_replacement_required_.load(
+                                         std::memory_order_acquire))
+                    return;
+                if (route_owner_->owns(known_relationship)) {
+                    *accepted = true;
+                    return;
+                }
+                if (route_owner_->owner_count() +
+                        pending_route_relationships_.size() >=
+                    config_.max_route_relationships)
+                    return;
+                try {
+                    *inserted = pending_route_relationships_
+                                    .insert(known_relationship)
+                                    .second;
+                    *accepted = *inserted;
+                } catch (...) {
+                }
+            },
+            transfer_deadline);
+        relationship_reservation_owned = *inserted;
+        if (!reserved || !*accepted) {
+            if (!reserved &&
+                (std::chrono::steady_clock::now() >= transfer_deadline ||
+                 stop_requested_.load(std::memory_order_acquire)))
+                return source_transfer_error(7);
+            latch_route_replacement();
             return source_transfer_error(static_cast<uint16_t>(
                 local::SourceTransferErrorCode::RouteReplacementRequired));
         }
     }
-    const auto source_read_start = std::chrono::steady_clock::now();
-    const auto source_bytes = read_source_fd(
-        source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
-    const auto source_read_elapsed =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - source_read_start)
-            .count();
-    const uint64_t source_read_ns =
-        source_read_elapsed > 0 ? static_cast<uint64_t>(source_read_elapsed) : 0;
-    if (!source_bytes.has_value()) {
-        std::fprintf(stderr,
-                     "P50_SOURCE_TRANSFER_REFUSED stage=source-read request=%llu "
-                     "f_host=%s f_cache_port=%u source_read_ns=%llu\n",
-                     static_cast<unsigned long long>(arm.source_request_id),
-                     arm.selected_f_host.c_str(), arm.selected_f_cache_port,
-                     static_cast<unsigned long long>(source_read_ns));
-        std::fflush(stderr);
-        return source_transfer_error(3);
-    }
+
+    wait_started = std::chrono::steady_clock::now();
+    if (!acquire_source_credit(reserved_raw_bytes, transfer_deadline))
+        return source_transfer_error(7);
+    credit_admitted = true;
+    wait_ns_since();
+
+    auto source_read_ns = std::make_shared<std::atomic<uint64_t>>(0);
 
     const PrepareRequestKey route_request{arm.assignment_epoch,
                                           arm.assignment_nonce};
@@ -1595,7 +1680,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         int fd = -1;
         ~PendingFd() { if (fd >= 0) ::close(fd); }
     };
-    auto open_armed = [arm, source_read_ns,
+    auto setup_cancelled = source_setup_cancelled_;
+    auto setup_inflight = source_setup_inflight_;
+    const size_t setup_limit = config_.max_active_source_transfers;
+    auto open_armed = [arm, source_read_ns, setup_cancelled,
                        open_arm_timeout = config_.source_open_arm_timeout](
                           std::chrono::steady_clock::time_point outer_limit,
                           FStoreGuid& remote_guid,
@@ -1625,7 +1713,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                          static_cast<unsigned long long>(arm.source_request_id),
                          arm.selected_f_host.c_str(), arm.selected_f_cache_port,
                          detail,
-                         static_cast<unsigned long long>(source_read_ns),
+                         static_cast<unsigned long long>(
+                             source_read_ns->load(std::memory_order_relaxed)),
                          static_cast<long long>(open_arm_timeout.count()),
                          static_cast<unsigned long long>(
                              open_arm_elapsed > 0 ? open_arm_elapsed : 0),
@@ -1635,6 +1724,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             return -1;
         };
         try {
+            if (setup_cancelled->load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= limit)
+                return refused("setup-cancelled");
             std::unique_ptr<MsgChannel> channel(Service::createChannelRetryUntil(
                 arm.selected_f_host,
                 static_cast<unsigned short>(arm.selected_f_cache_port), limit,
@@ -1642,12 +1734,16 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 Service::ChannelRetryPolicy::HedgeAfterFirst));
             if (!channel)
                 return refused("f-connect");
+            if (setup_cancelled->load(std::memory_order_acquire))
+                return refused("setup-cancelled");
             if (channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
                 return refused("f-protocol", channel->protocol);
             if (std::chrono::steady_clock::now() >= limit)
                 return refused("f-connect-deadline");
             stage_start = std::chrono::steady_clock::now();
             const P50SourceArmMsg request_message(arm);
+            if (setup_cancelled->load(std::memory_order_acquire))
+                return refused("setup-cancelled");
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
                 return refused("f-arm-send");
             stage_start = std::chrono::steady_clock::now();
@@ -1666,6 +1762,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             remote_generation = acknowledgement->f_store_generation;
             if (remote_guid == FStoreGuid{} || remote_generation == 0)
                 return refused("f-store-identity");
+            if (setup_cancelled->load(std::memory_order_acquire))
+                return refused("setup-cancelled");
             if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
                 return refused("f-cache-session-send");
             stage_start = std::chrono::steady_clock::now();
@@ -1686,25 +1784,234 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     first->fd = first_fd;
     const P50RouteRelationship relationship{
         config_.c_store_guid, remote_f_guid, remote_f_generation, profile};
-    const ConnectedFdFactory connection =
-        [first, open_armed, expected_guid = remote_f_guid,
+
+    struct IdentityResolution {
+        bool accepted = false;
+        std::optional<RouteStoreIdentity> previous;
+    };
+    auto resolution = std::make_shared<IdentityResolution>();
+    const bool resolved = owner_round_trip(
+        [this, endpoint_key, relationship, resolution] {
+            if (!route_owner_ || route_replacement_required_.load(
+                                     std::memory_order_acquire))
+                return;
+            const auto endpoint_position =
+                route_endpoint_identities_.find(endpoint_key);
+            if (endpoint_position != route_endpoint_identities_.end()) {
+                resolution->previous = endpoint_position->second;
+            } else if (!pending_route_endpoint_identities_.contains(endpoint_key)) {
+                return;
+            }
+            const SourceIncarnationKey observed_incarnation{
+                relationship.f_store_guid, relationship.f_store_generation};
+            if (retired_source_incarnations_.contains(observed_incarnation))
+                return;
+            resolution->accepted = true;
+        },
+        transfer_deadline);
+    if (!resolved || !resolution->accepted) {
+        first.reset();
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired));
+    }
+
+    const SourceIncarnationKey observed_incarnation{
+        remote_f_guid, remote_f_generation};
+    const bool known_same = known_endpoint_identity.has_value() &&
+        known_endpoint_identity->guid == remote_f_guid &&
+        known_endpoint_identity->generation == remote_f_generation;
+    if (!known_same) {
+        // Do not let an endpoint alias parked behind a busy incarnation pin a
+        // global execution or raw-byte credit.  No source vector exists yet.
+        release_source_credit(reserved_raw_bytes);
+        credit_admitted = false;
+        std::vector<SourceIncarnationKey> gates{observed_incarnation};
+        if (resolution->previous.has_value() &&
+            (resolution->previous->guid != remote_f_guid ||
+             resolution->previous->generation != remote_f_generation)) {
+            predecessor_incarnation = SourceIncarnationKey{
+                resolution->previous->guid,
+                resolution->previous->generation};
+            gates.push_back(*predecessor_incarnation);
+        }
+        wait_started = std::chrono::steady_clock::now();
+        const bool transitioned = incarnation_admitted && admitted_incarnation &&
+            predecessor_incarnation &&
+            *admitted_incarnation == *predecessor_incarnation
+                ? transition_source_incarnation(*admitted_incarnation,
+                                                observed_incarnation,
+                                                transfer_deadline)
+                : acquire_source_incarnations(std::move(gates),
+                                              transfer_deadline);
+        if (!transitioned) {
+            first.reset();
+            return source_transfer_error(7);
+        }
+        admitted_incarnation = observed_incarnation;
+        incarnation_admitted = true;
+        wait_ns_since();
+
+        if (relationship_reservation_owned && admitted_relationship &&
+            *admitted_relationship != relationship) {
+            const P50RouteRelationship prior = *admitted_relationship;
+            if (!owner_round_trip(
+                    [this, prior] {
+                        pending_route_relationships_.erase(prior);
+                    },
+                    transfer_deadline)) {
+                if (std::chrono::steady_clock::now() >= transfer_deadline ||
+                    stop_requested_.load(std::memory_order_acquire)) {
+                    first.reset();
+                    return source_transfer_error(7);
+                }
+                latch_route_replacement();
+                first.reset();
+                return source_transfer_error(static_cast<uint16_t>(
+                    local::SourceTransferErrorCode::RouteReplacementRequired));
+            }
+            relationship_reservation_owned = false;
+        }
+        admitted_relationship = relationship;
+        auto inserted = std::make_shared<bool>(false);
+        auto accepted = std::make_shared<bool>(false);
+        const bool relationship_reserved = owner_round_trip(
+            [this, relationship, inserted, accepted] {
+                if (!route_owner_ || route_replacement_required_.load(
+                                         std::memory_order_acquire))
+                    return;
+                if (route_owner_->owns(relationship)) {
+                    *accepted = true;
+                    return;
+                }
+                if (route_owner_->owner_count() +
+                        pending_route_relationships_.size() >=
+                    config_.max_route_relationships)
+                    return;
+                try {
+                    *inserted =
+                        pending_route_relationships_.insert(relationship).second;
+                    *accepted = *inserted;
+                } catch (...) {
+                }
+            },
+            transfer_deadline);
+        relationship_reservation_owned = *inserted;
+        if (!relationship_reserved || !*accepted) {
+            if (!relationship_reserved &&
+                (std::chrono::steady_clock::now() >= transfer_deadline ||
+                 stop_requested_.load(std::memory_order_acquire))) {
+                first.reset();
+                return source_transfer_error(7);
+            }
+            latch_route_replacement();
+            first.reset();
+            return source_transfer_error(static_cast<uint16_t>(
+                local::SourceTransferErrorCode::RouteReplacementRequired));
+        }
+
+        wait_started = std::chrono::steady_clock::now();
+        if (!acquire_source_credit(reserved_raw_bytes, transfer_deadline)) {
+            first.reset();
+            return source_transfer_error(7);
+        }
+        credit_admitted = true;
+        wait_ns_since();
+    }
+
+    const auto source_read_start = std::chrono::steady_clock::now();
+    const auto source_bytes = read_source_fd(
+        source.get(), config_.endpoint_caps.zstd.max_raw_bytes,
+        reserved_raw_bytes, transfer_deadline, stop_requested_);
+    const auto source_read_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - source_read_start)
+            .count();
+    const uint64_t elapsed_read_ns = source_read_elapsed > 0
+        ? static_cast<uint64_t>(source_read_elapsed) : 0;
+    source_read_ns->store(elapsed_read_ns, std::memory_order_relaxed);
+    if (!source_bytes.has_value()) {
+        std::fprintf(stderr,
+                     "P50_SOURCE_TRANSFER_REFUSED stage=source-read request=%llu "
+                     "f_host=%s f_cache_port=%u source_read_ns=%llu\n",
+                     static_cast<unsigned long long>(arm.source_request_id),
+                     arm.selected_f_host.c_str(), arm.selected_f_cache_port,
+                     static_cast<unsigned long long>(elapsed_read_ns));
+        std::fflush(stderr);
+        return source_transfer_error(3);
+    }
+    const AsyncConnectedFdFactory connection =
+        [this, first, open_armed, setup_cancelled, setup_inflight, setup_limit,
+         expected_guid = remote_f_guid,
          expected_generation = remote_f_generation](
-            std::chrono::steady_clock::time_point limit) mutable {
+            std::chrono::steady_clock::time_point limit,
+            std::function<void(int)> completion) mutable {
+            if (setup_cancelled->load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= limit) {
+                if (first->fd >= 0) {
+                    (void)::close(first->fd);
+                    first->fd = -1;
+                }
+                completion(-1);
+                return;
+            }
             if (first->fd >= 0) {
                 const int fd = first->fd;
                 first->fd = -1;
-                return fd;
+                completion(fd);
+                return;
             }
-            FStoreGuid observed_guid;
-            uint64_t observed_generation = 0;
-            const int fd = open_armed(limit, observed_guid, observed_generation);
-            if (fd < 0 || observed_guid != expected_guid ||
-                observed_generation != expected_generation) {
-                if (fd >= 0)
-                    ::close(fd);
-                return -1;
+            size_t outstanding = setup_inflight->load(
+                std::memory_order_relaxed);
+            while (outstanding < setup_limit &&
+                   !setup_inflight->compare_exchange_weak(
+                       outstanding, outstanding + 1,
+                       std::memory_order_acq_rel,
+                       std::memory_order_relaxed)) {}
+            if (outstanding >= setup_limit) {
+                completion(-1);
+                return;
             }
-            return fd;
+            std::shared_ptr<SourceSetupTaskSlot> setup_slot;
+            try {
+                setup_slot = std::make_shared<SourceSetupTaskSlot>(
+                    setup_inflight);
+            } catch (...) {
+                setup_inflight->fetch_sub(1, std::memory_order_relaxed);
+                completion(-1);
+                return;
+            }
+            std::shared_ptr<std::function<void(int)>> shared_completion;
+            try {
+                shared_completion =
+                    std::make_shared<std::function<void(int)>>(completion);
+                asio::post(source_setup_pool_,
+                    [open_armed, setup_cancelled, expected_guid,
+                     expected_generation, limit,
+                     shared_completion, setup_slot] {
+                        if (setup_cancelled->load(std::memory_order_acquire) ||
+                            std::chrono::steady_clock::now() >= limit) {
+                            (*shared_completion)(-1);
+                            return;
+                        }
+                        FStoreGuid observed_guid;
+                        uint64_t observed_generation = 0;
+                        int fd = open_armed(limit, observed_guid,
+                                            observed_generation);
+                        if (fd >= 0 &&
+                            (observed_guid != expected_guid ||
+                             observed_generation != expected_generation ||
+                             std::chrono::steady_clock::now() >= limit)) {
+                            (void)::close(fd);
+                            fd = -1;
+                        }
+                        (*shared_completion)(fd);
+                    });
+            } catch (...) {
+                if (shared_completion && *shared_completion)
+                    (*shared_completion)(-1);
+                else
+                    completion(-1);
+            }
         };
 
     auto completion = std::make_shared<std::promise<local::P50SourceTransferResult>>();
@@ -1714,12 +2021,21 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             context_,
             [this, relationship, request, connection, transfer_deadline,
              source_bytes = *source_bytes, completion, route_request,
-             expected_c_guid = config_.c_store_guid, source_mutex_wait_ns,
-             source_mutex_service_start]() mutable
+             expected_c_guid = config_.c_store_guid, admission_wait_ns,
+             operation_started]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
                 ZstdSourceTransferResult observed;
                 try {
+                    if (stop_requested_.load(std::memory_order_acquire) ||
+                        route_replacement_required_.load(
+                            std::memory_order_acquire)) {
+                        observed.status = ZstdSourceTransferStatus::Unavailable;
+                        observed.profile = relationship.profile;
+                        observed.replacement_required =
+                            route_replacement_required_.load(
+                                std::memory_order_acquire);
+                    } else {
                     const RouteEndpointKey endpoint_key{
                         request.selected_f_host, request.selected_f_cache_port};
                     const RouteStoreIdentity store_identity{
@@ -1731,16 +2047,29 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                         observed.profile = relationship.profile;
                         observed.replacement_required = true;
                     } else {
+                        pending_route_relationships_.erase(relationship);
+                        if (stop_requested_.load(std::memory_order_acquire) ||
+                            route_replacement_required_.load(
+                                std::memory_order_acquire)) {
+                            observed.status =
+                                ZstdSourceTransferStatus::Unavailable;
+                            observed.profile = relationship.profile;
+                            observed.replacement_required =
+                                route_replacement_required_.load(
+                                    std::memory_order_acquire);
+                        } else {
                         observed = co_await route_owner_->transfer(
                             relationship, route_request, connection,
                             transfer_deadline,
                             std::span<const uint8_t>(*source_bytes));
+                        }
+                    }
                     }
                     if (observed.replacement_required && !observed.route_local_failure)
-                        route_replacement_required_.store(
-                            true, std::memory_order_release);
+                        latch_route_replacement();
                     value = source_transfer_result(observed, expected_c_guid);
                 } catch (const P29V1CapabilityUnavailable&) {
+                    latch_route_replacement();
                     value = source_transfer_error(static_cast<uint16_t>(
                         local::SourceTransferErrorCode::
                             PermanentLocalProfileUnavailable));
@@ -1748,40 +2077,50 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     observed.status = ZstdSourceTransferStatus::TerminalError;
                     observed.profile = relationship.profile;
                     observed.replacement_required = true;
-                    route_replacement_required_.store(
-                        true, std::memory_order_release);
+                    latch_route_replacement();
                     value = source_transfer_result(observed, expected_c_guid);
                 }
-                const auto source_mutex_service_elapsed =
+                const auto source_service_elapsed =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() -
-                        source_mutex_service_start)
+                        std::chrono::steady_clock::now() - operation_started)
                         .count();
-                const uint64_t source_mutex_service_ns =
-                    source_mutex_service_elapsed > 0
-                        ? static_cast<uint64_t>(source_mutex_service_elapsed)
-                        : 0;
+                const uint64_t source_elapsed_ns = source_service_elapsed > 0
+                    ? static_cast<uint64_t>(source_service_elapsed) : 0;
+                const uint64_t source_service_ns =
+                    source_elapsed_ns > admission_wait_ns
+                        ? source_elapsed_ns - admission_wait_ns : 0;
                 append_source_result_trace(
                     request, expected_c_guid, relationship.profile, observed,
-                    source_mutex_wait_ns, source_mutex_service_ns);
+                    admission_wait_ns, source_service_ns);
                 completion->set_value(value);
                 co_return;
             },
             asio::detached);
     } catch (...) {
-        route_replacement_required_.store(true, std::memory_order_release);
+        latch_route_replacement();
         return source_transfer_error(static_cast<uint16_t>(
             local::SourceTransferErrorCode::RouteReplacementRequired));
     }
     // The route owner uses the same absolute deadline for connect, arm, and
     // CacheWire.  A bounded grace lets the owner coroutine publish its typed
     // terminal result without allowing a control worker to wait forever.
-    const auto wait_limit = transfer_deadline + config_.cancellation_grace;
-    if (result.wait_until(wait_limit) != std::future_status::ready) {
-        // The coroutine still owns the retained route state.  Returning would
-        // release source_transfer_mutex_ and admit a successor concurrently
-        // with that live operation, recreating the overlap this gate forbids.
-        // Retire the supervised sidecar instead of exposing ambiguous state.
+    auto wait_limit = transfer_deadline + config_.cancellation_grace;
+    while (result.wait_for(std::chrono::milliseconds(10)) !=
+           std::future_status::ready) {
+        const int64_t stop_ns =
+            stop_requested_at_ns_.load(std::memory_order_acquire);
+        if (stop_ns != 0) {
+            const auto stopped_at = std::chrono::steady_clock::time_point(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::nanoseconds(stop_ns)));
+            wait_limit = std::min(wait_limit,
+                                  stopped_at + config_.cancellation_grace);
+        }
+        if (std::chrono::steady_clock::now() < wait_limit)
+            continue;
+        // The coroutine still owns retained route state and admission leases.
+        // Retire the supervised sidecar instead of publishing a successor
+        // while its prior owner-affine operation remains live.
         if (config_.fail_stop)
             config_.fail_stop();
         std::_Exit(125);
@@ -1797,11 +2136,20 @@ bool SidecarRuntime::bind_route_endpoint_identity(
         return false;
     const auto position = route_endpoint_identities_.find(endpoint);
     if (position == route_endpoint_identities_.end()) {
-        if (route_endpoint_identities_.size() >=
-            config_.max_route_endpoint_identities)
+        if (retired_source_incarnations_.contains(
+                SourceIncarnationKey{observed.guid, observed.generation}))
+            return false;
+        const bool reserved = pending_route_endpoint_identities_.contains(endpoint);
+        if (!reserved && route_endpoint_identities_.size() +
+                                 pending_route_endpoint_identities_.size() >=
+                             config_.max_route_endpoint_identities)
             return false;
         try {
-            return route_endpoint_identities_.emplace(endpoint, observed).second;
+            const bool inserted =
+                route_endpoint_identities_.emplace(endpoint, observed).second;
+            if (inserted && reserved)
+                pending_route_endpoint_identities_.erase(endpoint);
+            return inserted;
         } catch (...) {
             return false;
         }
@@ -1812,15 +2160,395 @@ bool SidecarRuntime::bind_route_endpoint_identity(
     // The map still names the predecessor until every one of its profile
     // owners is retired.  Passing the newly observed GUID here would leak old
     // history into the successor incarnation.
+    const SourceIncarnationKey retired{
+        position->second.guid, position->second.generation};
+    if (retired_source_incarnations_.size() >=
+            config_.max_route_endpoint_identities &&
+        !retired_source_incarnations_.contains(retired)) {
+        latch_route_replacement();
+        return false;
+    }
+    const SourceIncarnationKey successor{observed.guid, observed.generation};
+    if (retired_source_incarnations_.contains(successor))
+        return false;
     if (!route_owner_->reset_f_store_exact(position->second.guid,
                                            position->second.generation))
         return false;
+    try {
+        retired_source_incarnations_.insert(retired);
+    } catch (...) {
+        latch_route_replacement();
+        return false;
+    }
     position->second = observed;
     return true;
 }
 
+bool SidecarRuntime::owner_round_trip(
+    std::function<void()> operation,
+    std::chrono::steady_clock::time_point deadline,
+    bool allow_during_stop) noexcept {
+    if (!operation ||
+        (!allow_during_stop && stop_requested_.load(std::memory_order_acquire)) ||
+        std::chrono::steady_clock::now() >= deadline)
+        return false;
+    auto completion = std::make_shared<std::promise<bool>>();
+    std::future<bool> result = completion->get_future();
+    auto queued_state = std::make_shared<std::atomic<uint8_t>>(0);
+    try {
+        asio::post(context_, [this, operation = std::move(operation), completion,
+                              queued_state, allow_during_stop, deadline]() mutable {
+            uint8_t expected = 0;
+            if (!queued_state->compare_exchange_strong(
+                    expected, 2, std::memory_order_acq_rel)) {
+                try { completion->set_value(false); } catch (...) {}
+                return;
+            }
+            bool executed = false;
+            if ((allow_during_stop ||
+                 !stop_requested_.load(std::memory_order_acquire)) &&
+                std::chrono::steady_clock::now() < deadline) {
+                try {
+                    operation();
+                    executed = true;
+                } catch (...) {
+                }
+            }
+            try { completion->set_value(executed); } catch (...) {}
+        });
+    } catch (...) {
+        return false;
+    }
+    if (result.wait_until(deadline) == std::future_status::ready)
+        return result.get() &&
+               (allow_during_stop ||
+                !stop_requested_.load(std::memory_order_acquire));
+    uint8_t expected = 0;
+    if (queued_state->compare_exchange_strong(expected, 1,
+                                               std::memory_order_acq_rel))
+        return false;
+    const auto settle_until = std::chrono::steady_clock::now() +
+                              config_.cancellation_grace;
+    if (result.wait_until(settle_until) != std::future_status::ready) {
+        if (config_.fail_stop)
+            config_.fail_stop();
+        std::_Exit(125);
+    }
+    return result.get();
+}
+
+bool SidecarRuntime::owner_preflight_source_endpoint(
+    const RouteEndpointKey& endpoint,
+    std::optional<RouteStoreIdentity>& known_identity,
+    bool& route_fatal,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    auto result = std::make_shared<std::optional<RouteStoreIdentity>>();
+    auto accepted = std::make_shared<bool>(false);
+    auto fatal = std::make_shared<bool>(false);
+    const bool completed = owner_round_trip(
+        [this, endpoint, result, accepted, fatal] {
+            if (!route_owner_ || route_replacement_required_.load(
+                                     std::memory_order_acquire)) {
+                *fatal = !route_owner_ || route_replacement_required_.load(
+                                              std::memory_order_acquire);
+                return;
+            }
+            const auto position = route_endpoint_identities_.find(endpoint);
+            if (position == route_endpoint_identities_.end()) {
+                if (route_endpoint_identities_.size() +
+                        pending_route_endpoint_identities_.size() >=
+                    config_.max_route_endpoint_identities) {
+                    *fatal = true;
+                    return;
+                }
+                try {
+                    if (!pending_route_endpoint_identities_.insert(endpoint).second)
+                        return;
+                } catch (...) {
+                    *fatal = true;
+                    return;
+                }
+                *accepted = true;
+                return;
+            }
+            *result = position->second;
+            const SourceIncarnationKey incarnation{
+                position->second.guid, position->second.generation};
+            if (retired_source_incarnations_.contains(incarnation)) {
+                *fatal = true;
+                return;
+            }
+            *accepted = true;
+        },
+        deadline);
+    if (!completed || !*accepted)
+    {
+        route_fatal = *fatal;
+        return false;
+    }
+    known_identity = *result;
+    route_fatal = false;
+    return true;
+}
+
+bool SidecarRuntime::acquire_source_address(
+    const RouteEndpointKey& endpoint,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    try {
+        std::unique_lock lock(source_admission_mutex_);
+        const bool ready = source_admission_changed_.wait_until(
+            lock, deadline, [this, &endpoint] {
+                return stop_requested_.load(std::memory_order_acquire) ||
+                       route_replacement_required_.load(
+                           std::memory_order_acquire) ||
+                       !active_source_addresses_.contains(endpoint);
+            });
+        if (!ready || std::chrono::steady_clock::now() >= deadline ||
+            stop_requested_.load(std::memory_order_acquire) ||
+            route_replacement_required_.load(std::memory_order_acquire))
+            return false;
+        return active_source_addresses_.insert(endpoint).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool SidecarRuntime::acquire_source_incarnation(
+    const SourceIncarnationKey& incarnation,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    return acquire_source_incarnations({incarnation}, deadline);
+}
+
+bool SidecarRuntime::acquire_source_incarnations(
+    std::vector<SourceIncarnationKey> incarnations,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (incarnations.empty())
+        return false;
+    try {
+        std::sort(incarnations.begin(), incarnations.end());
+        incarnations.erase(std::unique(incarnations.begin(), incarnations.end()),
+                           incarnations.end());
+        std::unique_lock lock(source_admission_mutex_);
+        const bool ready = source_admission_changed_.wait_until(
+            lock, deadline, [this, &incarnations] {
+                if (stop_requested_.load(std::memory_order_acquire))
+                    return true;
+                if (route_replacement_required_.load(
+                        std::memory_order_acquire))
+                    return true;
+                return std::none_of(incarnations.begin(), incarnations.end(),
+                                    [this](const auto& key) {
+                                        return active_source_incarnations_.contains(key) ||
+                                               retiring_source_incarnations_.contains(key);
+                                    });
+            });
+        if (!ready || std::chrono::steady_clock::now() >= deadline ||
+            stop_requested_.load(std::memory_order_acquire) ||
+            route_replacement_required_.load(std::memory_order_acquire))
+            return false;
+        std::vector<SourceIncarnationKey> inserted;
+        try {
+            inserted.reserve(incarnations.size());
+            for (const auto& key : incarnations) {
+                active_source_incarnations_.insert(key);
+                inserted.push_back(key);
+            }
+        } catch (...) {
+            for (const auto& key : inserted)
+                active_source_incarnations_.erase(key);
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool SidecarRuntime::transition_source_incarnation(
+    const SourceIncarnationKey& predecessor,
+    const SourceIncarnationKey& successor,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (predecessor == successor)
+        return true;
+    try {
+        std::unique_lock lock(source_admission_mutex_);
+        auto predecessor_node =
+            active_source_incarnations_.extract(predecessor);
+        if (predecessor_node.empty())
+            return false;
+        try {
+            retiring_source_incarnations_.insert(std::move(predecessor_node));
+        } catch (...) {
+            active_source_incarnations_.insert(std::move(predecessor_node));
+            return false;
+        }
+        source_admission_changed_.notify_all();
+        const bool ready = source_admission_changed_.wait_until(
+            lock, deadline, [this, &predecessor, &successor] {
+                return stop_requested_.load(std::memory_order_acquire) ||
+                       route_replacement_required_.load(
+                           std::memory_order_acquire) ||
+                       (!active_source_incarnations_.contains(predecessor) &&
+                        !active_source_incarnations_.contains(successor) &&
+                        !retiring_source_incarnations_.contains(successor));
+            });
+        if (!ready || std::chrono::steady_clock::now() >= deadline ||
+            stop_requested_.load(std::memory_order_acquire) ||
+            route_replacement_required_.load(std::memory_order_acquire)) {
+            active_source_incarnations_.insert(
+                retiring_source_incarnations_.extract(predecessor));
+            lock.unlock();
+            source_admission_changed_.notify_all();
+            return false;
+        }
+        try {
+            active_source_incarnations_.insert(
+                retiring_source_incarnations_.extract(predecessor));
+            active_source_incarnations_.insert(successor);
+        } catch (...) {
+            active_source_incarnations_.erase(successor);
+            retiring_source_incarnations_.erase(predecessor);
+            lock.unlock();
+            source_admission_changed_.notify_all();
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool SidecarRuntime::acquire_source_credit(
+    uint64_t raw_bytes,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (raw_bytes > config_.max_aggregate_source_raw_bytes)
+        return false;
+    try {
+        std::unique_lock lock(source_admission_mutex_);
+        const bool ready = source_admission_changed_.wait_until(
+            lock, deadline, [this, raw_bytes] {
+                return stop_requested_.load(std::memory_order_acquire) ||
+                       route_replacement_required_.load(
+                           std::memory_order_acquire) ||
+                       (active_source_count_ <
+                            config_.max_active_source_transfers &&
+                        raw_bytes <= config_.max_aggregate_source_raw_bytes -
+                                         active_source_raw_bytes_);
+            });
+        if (!ready || std::chrono::steady_clock::now() >= deadline ||
+            stop_requested_.load(std::memory_order_acquire) ||
+            route_replacement_required_.load(std::memory_order_acquire))
+            return false;
+        ++active_source_count_;
+        active_source_raw_bytes_ += raw_bytes;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void SidecarRuntime::release_source_credit(uint64_t raw_bytes) noexcept {
+    {
+        std::lock_guard lock(source_admission_mutex_);
+        if (active_source_count_ == 0 || raw_bytes > active_source_raw_bytes_) {
+            if (config_.fail_stop)
+                config_.fail_stop();
+            std::_Exit(125);
+        }
+        --active_source_count_;
+        active_source_raw_bytes_ -= raw_bytes;
+    }
+    source_admission_changed_.notify_all();
+}
+
+void SidecarRuntime::release_source_admission(
+    const RouteEndpointKey& endpoint,
+    const std::optional<SourceIncarnationKey>& incarnation,
+    const std::optional<SourceIncarnationKey>& predecessor,
+    const std::optional<P50RouteRelationship>& relationship,
+    bool address_admitted, bool relationship_reserved,
+    uint64_t raw_bytes, bool has_credit) noexcept {
+    if (!address_admitted && !incarnation && !predecessor &&
+        !relationship_reserved && !has_credit)
+        return;
+    try {
+        asio::post(context_, [this, endpoint, incarnation, predecessor,
+                              relationship, address_admitted,
+                              relationship_reserved, raw_bytes, has_credit] {
+            // The address/incarnation gates remain held until these owner map
+            // reservations are cleared, so a successor cannot erase or reuse
+            // the predecessor's capacity token.
+            if (address_admitted)
+                pending_route_endpoint_identities_.erase(endpoint);
+            if (relationship_reserved && relationship)
+                pending_route_relationships_.erase(*relationship);
+            {
+                std::lock_guard lock(source_admission_mutex_);
+                if (address_admitted)
+                    active_source_addresses_.erase(endpoint);
+                if (incarnation)
+                    active_source_incarnations_.erase(*incarnation);
+                if (predecessor)
+                    active_source_incarnations_.erase(*predecessor);
+                if (predecessor)
+                    retiring_source_incarnations_.erase(*predecessor);
+                if (has_credit) {
+                    if (active_source_count_ == 0 ||
+                        raw_bytes > active_source_raw_bytes_) {
+                        if (config_.fail_stop)
+                            config_.fail_stop();
+                        std::_Exit(125);
+                    }
+                    --active_source_count_;
+                    active_source_raw_bytes_ -= raw_bytes;
+                }
+            }
+            source_admission_changed_.notify_all();
+        });
+    } catch (...) {
+        // The owner cannot process a deferred release. Fail closed before
+        // waking waiters; no later operation may consume retained route state.
+        latch_route_replacement();
+        {
+            std::lock_guard lock(source_admission_mutex_);
+            if (address_admitted)
+                active_source_addresses_.erase(endpoint);
+            if (incarnation)
+                active_source_incarnations_.erase(*incarnation);
+            if (predecessor)
+                active_source_incarnations_.erase(*predecessor);
+            if (has_credit && active_source_count_ != 0 &&
+                raw_bytes <= active_source_raw_bytes_) {
+                --active_source_count_;
+                active_source_raw_bytes_ -= raw_bytes;
+            }
+        }
+        source_admission_changed_.notify_all();
+    }
+}
+
+void SidecarRuntime::latch_route_replacement() noexcept {
+    route_replacement_required_.store(true, std::memory_order_release);
+    source_setup_cancelled_->store(true, std::memory_order_release);
+    source_admission_changed_.notify_all();
+}
+
 SidecarRuntime::~SidecarRuntime() {
     stop();
+    const auto setup_settle_until =
+        std::chrono::steady_clock::now() + config_.cancellation_grace;
+    while (source_setup_inflight_->load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < setup_settle_until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (source_setup_inflight_->load(std::memory_order_acquire) != 0) {
+        // A blocking system resolver cannot be cancelled portably. Do not
+        // block destruction indefinitely or let a successor reuse this
+        // sidecar's retained state while the task remains live.
+        if (config_.fail_stop)
+            config_.fail_stop();
+        std::_Exit(125);
+    }
+    source_setup_pool_.join();
     endpoint_work_guard_.reset();
     if (endpoint_owner_thread_.joinable())
         endpoint_owner_thread_.join();
@@ -2561,28 +3289,36 @@ size_t SidecarRuntime::live_fsession_operations() const noexcept {
 bool SidecarRuntime::seed_route_endpoint_identity_for_test(
     std::string host, uint32_t cache_port, FStoreGuid guid,
     uint64_t generation) noexcept {
-    std::unique_lock<std::timed_mutex> lock(source_transfer_mutex_,
-                                            std::try_to_lock);
-    if (!lock.owns_lock())
-        return false;
-    return bind_route_endpoint_identity(
-        RouteEndpointKey{std::move(host), cache_port},
-        RouteStoreIdentity{guid, generation});
+    auto result = std::make_shared<bool>(false);
+    return owner_round_trip(
+        [this, host = std::move(host), cache_port, guid, generation, result] {
+            *result = bind_route_endpoint_identity(
+                RouteEndpointKey{host, cache_port},
+                RouteStoreIdentity{guid, generation});
+        },
+        std::chrono::steady_clock::now() + config_.cancellation_grace) &&
+        *result;
 }
 
 bool SidecarRuntime::seed_route_relationship_for_test(
     std::string host, uint32_t cache_port, FStoreGuid guid,
     uint64_t generation, ProfileId profile) noexcept {
-    std::unique_lock<std::timed_mutex> lock(source_transfer_mutex_,
-                                            std::try_to_lock);
-    if (!lock.owns_lock() || !route_owner_)
-        return false;
-    const RouteEndpointKey endpoint{std::move(host), cache_port};
-    const RouteStoreIdentity identity{guid, generation};
-    if (!bind_route_endpoint_identity(endpoint, identity))
-        return false;
-    return route_owner_->seed_relationship_for_test(P50RouteRelationship{
-        config_.c_store_guid, guid, generation, profile});
+    auto result = std::make_shared<bool>(false);
+    return owner_round_trip(
+        [this, host = std::move(host), cache_port, guid, generation,
+         profile, result] {
+            if (!route_owner_)
+                return;
+            const RouteEndpointKey endpoint{host, cache_port};
+            const RouteStoreIdentity identity{guid, generation};
+            if (!bind_route_endpoint_identity(endpoint, identity))
+                return;
+            *result = route_owner_->seed_relationship_for_test(
+                P50RouteRelationship{config_.c_store_guid, guid, generation,
+                                     profile});
+        },
+        std::chrono::steady_clock::now() + config_.cancellation_grace) &&
+        *result;
 }
 #endif
 
@@ -2626,7 +3362,18 @@ void SidecarRuntime::cancel_endpoint_incarnation() noexcept {
 }
 
 void SidecarRuntime::stop() noexcept {
-    stop_requested_.store(true, std::memory_order_release);
+    bool expected = false;
+    if (stop_requested_.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel)) {
+        const int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        stop_requested_at_ns_.store(now_ns == 0 ? 1 : now_ns,
+                                    std::memory_order_release);
+    }
+    source_setup_cancelled_->store(true, std::memory_order_release);
+    source_admission_changed_.notify_all();
     cancel_active_control();
     cancel_endpoint_incarnation();
     // Whole-incarnation teardown of dedicated F-session connections: posted to

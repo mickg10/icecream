@@ -522,14 +522,13 @@ static void maybe_set_tcp_congestion_control(int fd)
         return;
     }
 
-    static bool logged_success = false;
-    static bool logged_failure = false;
+    static std::atomic<bool> logged_success{false};
+    static std::atomic<bool> logged_failure{false};
 
     if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, requested, strlen(requested)) == 0) {
-        if (!logged_success) {
+        if (!logged_success.exchange(true, std::memory_order_relaxed)) {
             log_info() << "using TCP congestion control " << requested
                        << " (set ICECC_TCP_CONGESTION to override)" << endl;
-            logged_success = true;
         }
         return;
     }
@@ -544,10 +543,9 @@ static void maybe_set_tcp_congestion_control(int fd)
         return;
     }
 
-    if (!logged_failure) {
+    if (!logged_failure.exchange(true, std::memory_order_relaxed)) {
         log_warning() << "failed to set TCP congestion control to " << requested
                       << ": " << strerror(err) << " (errno " << err << ")" << endl;
-        logged_failure = true;
     }
 #endif
 }
@@ -1372,17 +1370,27 @@ static int prepare_connect(const string &hostname, unsigned short p,
         return -1;
     }
 
-    struct hostent *host = gethostbyname(hostname.c_str());
-
-    if (!host) {
-        log_error() << "Connecting to " << hostname << " failed: " << hstrerror( h_errno ) << endl;
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *resolved = nullptr;
+    const int resolve_error = getaddrinfo(hostname.c_str(), nullptr, &hints,
+                                          &resolved);
+    if (resolve_error != 0 || !resolved) {
+        log_error() << "Connecting to " << hostname << " failed: "
+                    << (resolve_error != 0 ? gai_strerror(resolve_error)
+                                           : "no IPv4 address") << endl;
         if ((-1 == close(remote_fd)) && (errno != EBADF)){
             log_perror("close failed");
         }
         return -1;
     }
-
-    if (host->h_length != 4) {
+    const struct addrinfo *ipv4 = resolved;
+    while (ipv4 && (ipv4->ai_family != AF_INET ||
+                    ipv4->ai_addrlen < sizeof(sockaddr_in)))
+        ipv4 = ipv4->ai_next;
+    if (!ipv4) {
+        freeaddrinfo(resolved);
         log_error() << "Invalid address length" << endl;
         if ((-1 == close(remote_fd)) && (errno != EBADF)){
             log_perror("close failed");
@@ -1390,11 +1398,14 @@ static int prepare_connect(const string &hostname, unsigned short p,
         return -1;
     }
 
+    sockaddr_in resolved_address{};
+    memcpy(&resolved_address, ipv4->ai_addr, sizeof(resolved_address));
+    freeaddrinfo(resolved);
+
     setsockopt(remote_fd, IPPROTO_TCP, TCP_NODELAY, (char *) &i, sizeof(i));
 
-    remote_addr.sin_family = AF_INET;
+    remote_addr = resolved_address;
     remote_addr.sin_port = htons(p);
-    memcpy(&remote_addr.sin_addr.s_addr, host->h_addr_list[0], host->h_length);
 
     return remote_fd;
 }

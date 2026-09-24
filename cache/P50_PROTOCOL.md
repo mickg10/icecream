@@ -247,6 +247,21 @@ a fresh ordinary socket for each attempt. It requires a directly validated
 TxCommit and exact input key rather than treating diagnostic trace output as
 a completion witness. See [client sender](../client/P50_ZSTD_SENDER.md).
 
+Independent C/F relationships can make progress concurrently; this is not
+multi-TU pipelining on one socket. C-side admission permits one active source
+operation per exact F-store GUID/generation, across all profiles, and joins
+endpoint aliases onto that same gate before SESSION_HELLO. The default C-side
+limits are four active source operations and 2 GiB of reserved source-vector
+lengths in total. These limits do not account for all retained codec state or
+process memory. Route state remains owned by one executor, and production
+retry connection setup runs outside that executor.
+
+CacheWire revision 1 still transfers one TU per ordinary connection. No new
+capability bit, wire field or P43 layout accompanies local concurrency. The
+[implementation and acceptance contract](../doc/p50-transfer-concurrency.md)
+separates independent-link concurrency from future persistent-link/pipeline
+extensions and specifies the required tests; it is not a validation receipt.
+
 ## Compiler input and result lifecycle
 
 The service's InputFdAttachment operation uses the complete cache key and

@@ -573,6 +573,7 @@ def check_cache_service(source: str) -> None:
                            "void append_terminal_lifecycle_test_trace(")
     for token in ("transfer.raw_digest", "digest128_hex",
                   '"raw_digest\\\":\\\"%s',
+                  'icecream-p50-source-result-v3',
                   '"source_mutex_wait_ns\\\":%llu',
                   '"source_mutex_service_ns\\\":%llu',
                   '"terminal_error_code\\\":%u',
@@ -582,14 +583,30 @@ def check_cache_service(source: str) -> None:
                 f"C-side source-result trace omits {token}")
     transfer = section(source, "SidecarRuntime::transfer_source_on_owner(",
                        "bool SidecarRuntime::bind_route_endpoint_identity(")
+    for token in (
+        "acquire_source_address(endpoint_key, transfer_deadline)",
+        "owner_preflight_source_endpoint(endpoint_key,",
+        "source_fd_size(",
+        "acquire_source_credit(reserved_raw_bytes, transfer_deadline)",
+        "acquire_source_incarnations(",
+        "read_source_fd(",
+        "reserved_raw_bytes, transfer_deadline, stop_requested_",
+        "append_source_result_trace(",
+        "completion->set_value(value)",
+    ):
+        require(token in transfer,
+                f"bounded independent source admission omits {token}")
     ordered(transfer,
-            "const auto source_mutex_wait_start = std::chrono::steady_clock::now();",
-            "source_transfer_lock.try_lock_until(",
-            "const auto source_mutex_service_start = std::chrono::steady_clock::now();",
-            "source_mutex_service_start - source_mutex_wait_start",
-            "std::chrono::steady_clock::now() -\n                        source_mutex_service_start",
+            "acquire_source_address(endpoint_key, transfer_deadline)",
+            "owner_preflight_source_endpoint(endpoint_key,",
+            "source_fd_size(",
+            "const int first_fd = open_armed(",
+            "const auto source_bytes = read_source_fd(",
             "append_source_result_trace(",
             "completion->set_value(value)")
+    require("source_transfer_mutex_" not in source and
+            "source_transfer_lock" not in transfer,
+            "source transfer still has a process-wide blocking gate")
     helper = section(source, "void append_terminal_lifecycle_test_trace(",
                      "volatile sig_atomic_t g_stop_requested")
     for token in ("ICECC_P50_C1F1_REQUIRED",

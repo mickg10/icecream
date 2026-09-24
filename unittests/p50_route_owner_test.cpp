@@ -7,6 +7,7 @@
 #include <boost/asio/use_future.hpp>
 
 #include <chrono>
+#include <functional>
 #include <future>
 #include <limits>
 #include <stdexcept>
@@ -247,6 +248,77 @@ void test_multiroute_release_lifetime() {
     CHECK(authority.retained_encoded_bytes() == 0);
     for (const auto& route : routes)
         CHECK(authority.reset_route(route));
+}
+
+void test_aborted_route_block_is_defined_on_other_f() {
+    const auto caps_config = config(ProfileId::P29V1);
+    P50PreparationAuthority authority(
+        Id128::from_u64(195), caps_config.endpoint_caps.zstd,
+        caps_config.authority_limits, caps_config.compression_level,
+        ProfileId::P29V1);
+    const PreparationRouteKey aborted_route{
+        Id128::from_u64(295), 1, ProfileId::P29V1};
+    const PreparationRouteKey live_route{
+        Id128::from_u64(296), 1, ProfileId::P29V1};
+    const std::vector<uint8_t> source{
+        '#', ' ', '1', ' ', '"', 's', 'h', 'a', 'r', 'e', 'd', '.', 'h', '"', '\n',
+        's', 'h', 'a', 'r', 'e', 'd', '-', 'b', 'l', 'o', 'c', 'k', '\n',
+        's', 'h', 'a', 'r', 'e', 'd', '-', 'b', 'l', 'o', 'c', 'k', '\n',
+        'l', 'i', 'v', 'e', '-', 'r', 'o', 'u', 't', 'e', '\n'};
+    const PreparedTuHandle h_aborted = authority.prepare_for_route(
+        aborted_route, {7802, 1}, source);
+    const PreparedTuHandle h_live = authority.prepare_for_route(
+        live_route, {7802, 2}, source);
+    CHECK(authority.prepared_tu_seq(h_aborted) == TuSeq{0});
+    CHECK(authority.prepared_tu_seq(h_live) == TuSeq{1});
+    CHECK(authority.p29v1_interner_reserved_bytes() > 0);
+
+    // Releasing an uncommitted route abandons its serializer state, but the
+    // C-wide interner Block is shared by h_live and must remain usable.
+    CHECK(authority.release(h_aborted) == 0);
+    CHECK(!authority.contains(h_aborted));
+    CHECK(authority.contains(h_live));
+    CHECK(authority.live_entry_count() == 1);
+
+    std::vector<uint8_t> reconstructed;
+    unsigned job_state_calls = 0;
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::P29V1;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    server_caps.zstd = caps_config.endpoint_caps.zstd;
+    P50ServerEndpoint server(
+        live_route.f_store_guid, server_caps, nullptr, nullptr,
+        P50ServerEndpointConfig{
+            .input_job_state = [&reconstructed, &job_state_calls](
+                CStoreGuid, const TxBegin&, const TxCommit&,
+                std::span<const uint8_t> exact_input) {
+                ++job_state_calls;
+                reconstructed.assign(exact_input.begin(), exact_input.end());
+                return InputJobState::Open;
+            }});
+    ActionTrace actions;
+    auto authority_ptr = std::shared_ptr<P50PreparationAuthority>(
+        &authority, [](P50PreparationAuthority*) {});
+    P50ClientEndpoint endpoint(authority_ptr, server_caps, HistoryNonce{1},
+                               nullptr, &actions);
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    auto server_future = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+    auto client_future = asio::co_spawn(
+        context, endpoint.run(
+                     acceptor.local_endpoint(), h_live, {},
+                     std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+        asio::use_future);
+    context.run();
+    const auto client_result = client_future.get();
+    CHECK(server_future.get().status == ServerRunStatus::Completed);
+    CHECK(client_result.status == ClientRunStatus::Committed);
+    CHECK(client_result.committed_commit->tu_seq == TuSeq{1});
+    CHECK(reconstructed == source);
+    CHECK(job_state_calls == 1);
+    CHECK(actions.valid());
+    CHECK(authority.release(h_live) == 0);
 }
 
 void test_tu_seq_reservation_and_exhaustion() {
@@ -805,6 +877,94 @@ void test_typed_poison_catch_is_owner_wide() {
     CHECK(owner.owner_count() == 1);
 }
 
+void test_typed_poison_does_not_destroy_another_active_route() {
+    P50RouteOwnerConfig injected = config(ProfileId::P29V1);
+    unsigned prepare_calls = 0;
+    injected.before_prepare_for_route_for_test = [&prepare_calls]() {
+        if (++prepare_calls == 2)
+            throw P50RoutePoisoned("injected C-wide terminalization");
+    };
+    P50CRouteOwner owner(std::move(injected));
+    const auto active_route = relationship(183, 283, 1, ProfileId::P29V1);
+    const auto poisoned_route = relationship(183, 284, 1, ProfileId::P29V1);
+    const auto refused_route = relationship(183, 285, 1, ProfileId::P29V1);
+    const std::vector<uint8_t> source{'a', 'c', 't', 'i', 'v', 'e', '\n'};
+    asio::io_context context;
+
+    std::function<void(int)> release_active_connect;
+    unsigned active_connect_calls = 0;
+    AsyncConnectedFdFactory held_connection =
+        [&release_active_connect, &active_connect_calls](
+            auto, std::function<void(int)> completion) {
+            ++active_connect_calls;
+            if (active_connect_calls == 1)
+                release_active_connect = std::move(completion);
+            else
+                completion(-1);
+        };
+    auto active = asio::co_spawn(
+        context,
+        owner.transfer(active_route, {7503, 1}, std::move(held_connection),
+                       std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                       source),
+        asio::use_future);
+    context.poll();
+    CHECK(active_connect_calls == 1);
+    CHECK(static_cast<bool>(release_active_connect));
+    CHECK(active.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+
+    AsyncConnectedFdFactory unused_poison_connection =
+        [](auto, std::function<void(int)> completion) { completion(-1); };
+    auto poisoned = asio::co_spawn(
+        context,
+        owner.transfer(poisoned_route, {7503, 2},
+                       std::move(unused_poison_connection),
+                       std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                       source),
+        asio::use_future);
+    context.poll();
+    CHECK(poisoned.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+    const auto poison_result = poisoned.get();
+    CHECK(poison_result.status == ZstdSourceTransferStatus::TerminalError);
+    CHECK(poison_result.replacement_required);
+    CHECK(prepare_calls == 2);
+    CHECK(active.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+    CHECK(owner.owns(active_route) && owner.owns(poisoned_route));
+
+    unsigned refused_connection_calls = 0;
+    auto refused = asio::co_spawn(
+        context,
+        owner.transfer(
+            refused_route, {7503, 3},
+            ConnectedFdFactory{[&refused_connection_calls](auto) {
+                ++refused_connection_calls;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.poll();
+    CHECK(refused.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+    const auto refused_result = refused.get();
+    CHECK(refused_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(refused_result.replacement_required);
+    CHECK(refused_connection_calls == 0);
+    CHECK(owner.owner_count() == 2);
+
+    // The route-owner unit stops at this layer: keep the captured coroutine's
+    // sender/authority alive until its exact operation settles, then join it.
+    // It does not assert the supervised Runtime's no-retry fence or shutdown.
+    release_active_connect(-1);
+    release_active_connect = {};
+    context.run();
+    CHECK(active.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+    const auto active_result = active.get();
+    CHECK(active_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(active_result.route_local_failure);
+    CHECK(active_connect_calls == 2);
+    CHECK(owner.owns(active_route) && owner.owns(poisoned_route));
+    CHECK(owner.owner_count() == 2);
+}
+
 void test_p29v1_relationship_owner() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -898,7 +1058,9 @@ int main() {
     test_p29v1_retry_and_reset_owner();
     test_p29v1_relationship_owner();
     test_relationship_table_cap_requests_replacement();
+    test_aborted_route_block_is_defined_on_other_f();
     test_transport_loss_does_not_reject_another_worker();
     test_typed_poison_catch_is_owner_wide();
+    test_typed_poison_does_not_destroy_another_active_route();
     test_interner_fault_is_sticky_only_for_p29v1();
 }

@@ -186,6 +186,16 @@ def render_s80_report(report: Mapping[str, Any]) -> str:
                 + " | ".join(str(value) for value in score_values)
                 + " |"
             )
+    lines.extend(
+        (
+            "",
+            "Timing note: the legacy ‘Mutex wait/service’ column labels are retained "
+            "for compatibility. v2 values are global-gate timings; v3 values are sums "
+            "of per-operation address/incarnation/credit admission wait and service, "
+            "and concurrent operations can overlap. These sums are neither elapsed "
+            "wall time nor CPU time; headline scores use measured wall time.",
+        )
+    )
     lines.extend(("", "## Headline clauses", ""))
     for clause in report["clauses"]:
         lines.append(

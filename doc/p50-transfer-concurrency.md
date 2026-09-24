@@ -136,6 +136,15 @@ open another source session. Prefer normal settlement of active work; if it
 cannot settle within the existing cancellation grace, supervised process exit
 is an allowed bounded outcome, not a successful graceful shutdown.
 
+Initial setup still runs on a control worker. A blocking system resolver there
+can hold that worker and the in-process service's join; the retry-pool grace
+does not make this path cancellable. The daemon-managed sidecar's outer
+supervisor escalates from TERM to KILL under its configured bounds and requires
+exact process-group absence/reap before replacement. Direct, embedded service
+use has no equivalent intrinsic resolver bound. Numeric scheduler-selected
+addresses and ordinary arm/deadline handling are the tested local path; do not
+describe A13 as proving cancellation of arbitrary resolver or filesystem calls.
+
 Route preparation and answer-NEED remain owner-affine in A. Thus A overlaps
 network/setup waits; it does not claim parallel C encoding. A long CPU task
 or blocked retry must not be confused with the same failure in measurements.
@@ -382,6 +391,10 @@ Native evidence includes binary digest and build/toolchain identity. Formal
 evidence includes TLC jar/module/config digests, command, explored states,
 completion marker and each expected-failure diagnostic. Record source changes
 after a build instead of attributing a stale binary to the latest checkout.
+When one executable checks several cells, its command/log may be shared by
+those cells. Record `elapsed_scope: "command"` if only that executable's
+duration was measured; do not invent individual cell timings or sum the
+repeated command duration as total test time.
 
 ### 5.2 Performance experiment, separate from correctness
 
@@ -419,3 +432,49 @@ ceiling is `min(N/s, 1/c, B/q, aggregate F capacity)`. None of these bounds is
 a measured gain. If source transfer accounts for fraction f of build wall
 time, a source-only speedup k gives at most `1 / (1 - f + f/k)` build speedup
 under that simplified workload model.
+
+## 6. Reproduction and candidate publication
+
+Run the normal checkout gate from the repository root on a Linux Docker host
+with Git, Make and the pinned uv installed:
+
+```sh
+export ICEFARM_TMPDIR=/absolute/existing/writable/scratch
+make qa
+```
+
+This uses the checked-in `farm.json`; see [developer QA](../dev/README.md)
+for a different resource preset or an offline SDK image. It builds and installs
+the source, runs native checks (including the service and sender concurrency
+cases), the separate root service checks, the Python suite, and all five local
+mixed Docker cases. The wrapper retains a unique result directory. Do not
+reuse a staged source directory for an edited checkout or attribute an older
+binary's results to newer source. A selected native test invocation alone is
+not this complete gate.
+
+Run the additional focused formal lane separately, with Java and the pinned
+TLC jar described in [formal setup](../cache/formal/README.md):
+
+```sh
+export TLA2TOOLS_JAR=/absolute/path/to/tla2tools.jar
+TLC_STATE_ROOT=$(mktemp -d "$ICEFARM_TMPDIR/p50-concurrency-tlc.XXXXXX")
+export TLC_STATE_ROOT
+ROW_TIMEOUT_SECONDS=120 sh cache/formal/run_transfer_concurrency_tlc.sh \
+  > "$TLC_STATE_ROOT/lane.log" 2>&1
+```
+
+The runner checks the jar digest, uses two TLC workers and a 2 GiB heap, and
+refuses reused row outputs. Inspect its exit status and exact expected-failure
+diagnostics. Its 21 rows are the six topology safety checks, six simultaneous
+running witnesses, isolated healthy-link progress, byte pressure, bounded
+generation replacement, and six negative controls. A new focused lane pass
+does not assert a fresh run of every pre-existing formal model.
+
+For the candidate branch `sorbet_1.5_pipeline`, commit these directions before
+the implementation. Before upload, freeze the source, complete the required
+Stage A cells and compatibility checks, and retain the section 5.1 evidence
+index with exact source/binary/tool identities. Record results and limitations
+in [PROJECT_STATE.md](../PROJECT_STATE.md). Commit the tested implementation,
+push only the candidate branch, and verify its remote commit. Do not create a
+release tag, replace the release branch, or describe this as W30, a measured
+corpus speedup, or renewed external S* qualification.

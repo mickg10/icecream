@@ -27,6 +27,8 @@
 
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_future.hpp>
@@ -847,7 +849,8 @@ struct RuntimeCase {
     local::Connection receiver;
 };
 
-int loopback_listener(uint16_t& port);
+int loopback_listener(uint16_t& port,
+                      uint32_t bind_ipv4_host_order = INADDR_LOOPBACK);
 
 RuntimeCase authenticated_runtime_pair() {
     int sockets[2] = {-1, -1};
@@ -1514,17 +1517,18 @@ void test_runtime_identity_disconnect_and_endpoint_failure() {
     }
 }
 
-int loopback_listener(uint16_t& port) {
+int loopback_listener(uint16_t& port,
+                      uint32_t bind_ipv4_host_order) {
     const int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     CHECK(listener >= 0);
     int reuse = 1;
     CHECK(::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = htonl(bind_ipv4_host_order);
     address.sin_port = 0;
     CHECK(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
-    CHECK(::listen(listener, 1) == 0);
+    CHECK(::listen(listener, 16) == 0);
     socklen_t length = sizeof(address);
     CHECK(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0);
     port = ntohs(address.sin_port);
@@ -1540,10 +1544,108 @@ struct SourceArmServerObservation {
     bool ready_sent = false;
     bool eof_without_cachewire = false;
     bool transfer_completed = false;
+    bool arm_barrier_passed = false;
+    bool commit_barrier_passed = false;
+    bool commit_identity_matches_input = false;
+    CStoreGuid committed_c_store_guid{};
+    uint64_t committed_tu_seq = UINT64_MAX;
+    uint64_t committed_rel_seq = UINT64_MAX;
+    HistoryNonce committed_history_nonce{};
+    ProfileId committed_profile = ProfileId::P29V1;
+    std::vector<uint8_t> committed_input;
+};
+
+class SourceTransferBarrier {
+public:
+    explicit SourceTransferBarrier(size_t participants) : participants_(participants) {}
+
+    bool arrive_and_wait(std::chrono::milliseconds timeout =
+                             std::chrono::milliseconds(1200)) {
+        std::unique_lock lock(mutex_);
+        ++arrived_;
+        changed_.notify_all();
+        return changed_.wait_for(lock, timeout,
+                                 [&] { return arrived_ >= participants_; });
+    }
+
+    [[nodiscard]] size_t arrived() const {
+        std::lock_guard lock(mutex_);
+        return arrived_;
+    }
+
+private:
+    const size_t participants_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    size_t arrived_ = 0;
+};
+
+class SourceCommitHold {
+public:
+    void enter_and_wait() noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            entered_ = true;
+        }
+        changed_.notify_all();
+        std::unique_lock lock(mutex_);
+        (void)changed_.wait_for(lock, std::chrono::seconds(5),
+                                [&] { return released_; });
+    }
+
+    bool wait_until_entered(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, timeout, [&] { return entered_; });
+    }
+
+    void release() noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+        }
+        changed_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
+class CodecWorkerGate {
+public:
+    void enter_and_wait() noexcept {
+        std::unique_lock lock(mutex_);
+        ++arrived_;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+
+    bool wait_for_arrivals(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, timeout,
+                                 [&] { return arrived_ >= count; });
+    }
+
+    void release() noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+        }
+        changed_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    size_t arrived_ = 0;
+    bool released_ = false;
 };
 
 void serve_stalled_source_arm(int listener,
-                              std::atomic<bool>& arm_received) noexcept {
+                              std::atomic<bool>& arm_received,
+                              std::shared_future<void> release) noexcept {
     try {
         sockaddr_in peer{};
         socklen_t peer_size = sizeof(peer);
@@ -1563,15 +1665,7 @@ void serve_stalled_source_arm(int listener,
         if (arm == nullptr || !arm->valid_payload())
             return;
         arm_received.store(true, std::memory_order_release);
-        pollfd descriptor{channel->fd, POLLIN | POLLHUP | POLLERR, 0};
-        int ready = -1;
-        do {
-            ready = ::poll(&descriptor, 1, 4000);
-        } while (ready < 0 && errno == EINTR);
-        if (ready > 0) {
-            uint8_t byte = 0;
-            (void)::recv(channel->fd, &byte, 1, 0);
-        }
+        (void)release.wait_for(std::chrono::seconds(5));
     } catch (...) {
         (void)::close(listener);
     }
@@ -1641,7 +1735,10 @@ void serve_accepted_source_transfer(
     int accepted, sockaddr_in peer, socklen_t peer_size,
     FStoreGuid f_store_guid, uint64_t f_store_generation,
     SourceArmServerObservation& observation,
-    bool disconnect_after_ready = false) noexcept {
+    bool disconnect_after_ready = false,
+    SourceTransferBarrier* arm_barrier = nullptr,
+    SourceTransferBarrier* commit_barrier = nullptr,
+    SourceCommitHold* commit_hold = nullptr) noexcept {
     try {
         if (accepted < 0)
             return;
@@ -1658,6 +1755,11 @@ void serve_accepted_source_transfer(
         if (arm == nullptr || !arm->valid_payload())
             return;
         observation.arm_received = true;
+        if (arm_barrier != nullptr) {
+            observation.arm_barrier_passed = arm_barrier->arrive_and_wait();
+            if (!observation.arm_barrier_passed)
+                return;
+        }
         ClaimAttemptCapability128 capability_1;
         ClaimAttemptCapability128 capability_2;
         capability_1.bytes.fill(0xd1);
@@ -1695,9 +1797,30 @@ void serve_accepted_source_transfer(
         if (!socket.has_value())
             return;
         P50ServerEndpointConfig server_config;
-        server_config.input_job_state = [](
-            CStoreGuid, const TxBegin&, const TxCommit&,
-            std::span<const uint8_t>) { return InputJobState::Open; };
+        server_config.input_job_state = [&, commit_barrier, commit_hold](
+            CStoreGuid c_store_guid, const TxBegin& begin,
+            const TxCommit& commit, std::span<const uint8_t> input) {
+            observation.committed_c_store_guid = c_store_guid;
+            observation.committed_tu_seq = begin.tu_seq.value;
+            observation.committed_rel_seq = begin.rel_seq.value;
+            observation.committed_history_nonce = begin.history_nonce;
+            observation.committed_profile = begin.profile;
+            observation.committed_input.assign(input.begin(), input.end());
+            observation.commit_identity_matches_input =
+                commit.tu_seq == begin.tu_seq &&
+                begin.raw_bytes == input.size() &&
+                begin.raw_digest == icecc::digest128(input) &&
+                commit.raw_digest == begin.raw_digest;
+            if (commit_hold != nullptr)
+                commit_hold->enter_and_wait();
+            if (commit_barrier != nullptr) {
+                observation.commit_barrier_passed =
+                    commit_barrier->arrive_and_wait();
+                if (!observation.commit_barrier_passed)
+                    return InputJobState::Closed;
+            }
+            return InputJobState::Open;
+        };
         P50ServerEndpoint endpoint(f_store_guid, {}, nullptr, nullptr,
                                    std::move(server_config));
         auto result = asio::co_spawn(
@@ -1712,19 +1835,313 @@ void serve_accepted_source_transfer(
 
 void serve_one_source_transfer(int listener, FStoreGuid f_store_guid,
                                uint64_t f_store_generation,
-                               SourceArmServerObservation& observation) noexcept {
+                               SourceArmServerObservation& observation,
+                               SourceTransferBarrier* arm_barrier = nullptr,
+                               SourceTransferBarrier* commit_barrier = nullptr) noexcept {
     sockaddr_in peer{};
     socklen_t peer_size = sizeof(peer);
     const int accepted = ::accept(
         listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
     (void)::close(listener);
     serve_accepted_source_transfer(accepted, peer, peer_size, f_store_guid,
-                                   f_store_generation, observation);
+                                   f_store_generation, observation, false,
+                                   arm_barrier, commit_barrier);
+}
+
+template <size_t N>
+void serve_source_transfers_on_persistent_f(
+    int listener, FStoreGuid f_store_guid, uint64_t f_store_generation,
+    CStoreGuid expected_c_guid,
+    std::array<SourceArmServerObservation, N>& observations,
+    SourceTransferBarrier* first_arm_barrier = nullptr,
+    SourceTransferBarrier* first_commit_barrier = nullptr,
+    SourceCommitHold* first_commit_hold = nullptr) noexcept {
+    namespace asio = boost::asio;
+    try {
+        asio::io_context context;
+        size_t current_index = 0;
+        SourceArmServerObservation* current_observation = nullptr;
+        SourceTransferBarrier* current_commit_barrier = nullptr;
+        SourceCommitHold* current_commit_hold = nullptr;
+        P50ServerEndpointConfig server_config;
+        server_config.input_job_state = [&](CStoreGuid c_guid,
+                                             const TxBegin& begin,
+                                             const TxCommit& commit,
+                                             std::span<const uint8_t> input) {
+            if (current_observation == nullptr || c_guid != expected_c_guid)
+                return InputJobState::Closed;
+            auto& observation = *current_observation;
+            observation.committed_c_store_guid = c_guid;
+            observation.committed_tu_seq = begin.tu_seq.value;
+            observation.committed_rel_seq = begin.rel_seq.value;
+            observation.committed_history_nonce = begin.history_nonce;
+            observation.committed_profile = begin.profile;
+            observation.committed_input.assign(input.begin(), input.end());
+            observation.commit_identity_matches_input =
+                commit.tu_seq == begin.tu_seq &&
+                begin.raw_bytes == input.size() &&
+                begin.raw_digest == icecc::digest128(input) &&
+                commit.raw_digest == begin.raw_digest;
+            if (current_commit_hold != nullptr)
+                current_commit_hold->enter_and_wait();
+            if (current_commit_barrier != nullptr) {
+                observation.commit_barrier_passed =
+                    current_commit_barrier->arrive_and_wait();
+                if (!observation.commit_barrier_passed)
+                    return InputJobState::Closed;
+            }
+            return InputJobState::Open;
+        };
+        P50ServerEndpoint endpoint(f_store_guid, {}, nullptr, nullptr,
+                                   std::move(server_config));
+        for (current_index = 0; current_index < observations.size();
+             ++current_index) {
+            auto& observation = observations[current_index];
+            current_observation = &observation;
+            current_commit_barrier = current_index == 0
+                                         ? first_commit_barrier
+                                         : nullptr;
+            current_commit_hold = current_index == 0
+                                      ? first_commit_hold
+                                      : nullptr;
+            sockaddr_in peer{};
+            socklen_t peer_size = sizeof(peer);
+            const int accepted = ::accept(
+                listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            if (accepted < 0)
+                break;
+            observation.accepted = true;
+            std::unique_ptr<MsgChannel> channel(Service::createChannel(
+                accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                break;
+            observation.protocol_50 = channel->protocol == PROTOCOL_VERSION;
+            std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+            const auto* arm = arm_message != nullptr
+                                  ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                                  : nullptr;
+            if (arm == nullptr || !arm->valid_payload())
+                break;
+            observation.arm_received = true;
+            if (current_index == 0 && first_arm_barrier != nullptr) {
+                observation.arm_barrier_passed =
+                    first_arm_barrier->arrive_and_wait();
+                if (!observation.arm_barrier_passed)
+                    break;
+            }
+            ClaimAttemptCapability128 capability_1;
+            ClaimAttemptCapability128 capability_2;
+            capability_1.bytes.fill(static_cast<uint8_t>(0xd1 + current_index));
+            capability_2.bytes.fill(static_cast<uint8_t>(0xe1 + current_index));
+            const P50SourceArmedMsg acknowledgement(
+                arm->arm, 101, 102, f_store_generation, f_store_guid.bytes,
+                kStoreIdentityDerivationVersion, 103, 2500,
+                capability_1, capability_2);
+            if (!channel->send_msg(acknowledgement))
+                break;
+            observation.armed_sent = true;
+            std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+            if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+                break;
+            observation.cache_session_received = true;
+            const int raw_fd = channel->release_fd_if_input_empty();
+            if (raw_fd < 0)
+                break;
+            observation.ready_sent = send_cache_session_ready(
+                raw_fd, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+            if (!observation.ready_sent) {
+                (void)::close(raw_fd);
+                break;
+            }
+            boost::system::error_code error;
+            auto socket = P50ServerEndpoint::adopt_connected_fd(
+                context.get_executor(), raw_fd, error);
+            if (!socket)
+                break;
+            auto result = asio::co_spawn(
+                context, endpoint.run_adopted(std::move(*socket)),
+                asio::use_future);
+            context.run();
+            context.restart();
+            const ServerRunResult server_result = result.get();
+            observation.transfer_completed =
+                server_result.status == ServerRunStatus::Completed &&
+                server_result.committed_input.has_value();
+        }
+        (void)::close(listener);
+    } catch (...) {
+        (void)::close(listener);
+    }
+}
+
+void serve_two_held_source_transfers(
+    int listener, FStoreGuid f_store_guid, uint64_t f_store_generation,
+    std::array<SourceArmServerObservation, 2>& observations,
+    SourceCommitHold& hold, uint64_t second_generation = 0) noexcept {
+    for (size_t index = 0; index != observations.size(); ++index) {
+        sockaddr_in peer{};
+        socklen_t peer_size = sizeof(peer);
+        const int accepted = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+        if (accepted < 0)
+            break;
+        serve_accepted_source_transfer(
+            accepted, peer, peer_size, f_store_guid,
+            index == 1 && second_generation != 0
+                ? second_generation : f_store_generation,
+            observations[index], false, nullptr, nullptr,
+            index == 0 ? &hold : nullptr);
+    }
+    (void)::close(listener);
+}
+
+void serve_many_source_transfers_on_shared_f_endpoint(
+    int listener, FStoreGuid f_store_guid, uint64_t f_store_generation,
+    std::vector<SourceArmServerObservation>& observations,
+    const std::vector<CStoreGuid>& expected_c_guids,
+    CodecWorkerGate& codec_gate,
+    std::atomic<size_t>& observed_live_sessions,
+    std::atomic<size_t>& observed_namespaces,
+    std::atomic<bool>& stop_sampling) noexcept {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+    try {
+        asio::io_context context;
+        std::map<CStoreGuid, SourceArmServerObservation*> observation_by_c;
+        for (size_t i = 0; i < expected_c_guids.size(); ++i)
+            observation_by_c.emplace(expected_c_guids[i], &observations[i]);
+        P50ServerEndpointConfig server_config;
+        server_config.input_job_state = [&observation_by_c](
+            CStoreGuid c_guid, const TxBegin& begin, const TxCommit& commit,
+            std::span<const uint8_t> input) {
+            const auto found = observation_by_c.find(c_guid);
+            if (found == observation_by_c.end())
+                return InputJobState::Closed;
+            auto& observation = *found->second;
+            observation.committed_c_store_guid = c_guid;
+            observation.committed_tu_seq = begin.tu_seq.value;
+            observation.committed_profile = begin.profile;
+            observation.committed_input.assign(input.begin(), input.end());
+            observation.commit_identity_matches_input =
+                commit.tu_seq == begin.tu_seq &&
+                begin.raw_bytes == input.size() &&
+                begin.raw_digest == icecc::digest128(input) &&
+                commit.raw_digest == begin.raw_digest;
+            return InputJobState::Open;
+        };
+        P50ServerEndpoint endpoint(f_store_guid, {}, nullptr, nullptr,
+                                   std::move(server_config));
+
+        std::vector<tcp::socket> sockets;
+        sockets.reserve(observations.size());
+        for (size_t i = 0; i < observations.size(); ++i) {
+            sockaddr_in peer{};
+            socklen_t peer_size = sizeof(peer);
+            const int accepted = ::accept(
+                listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            if (accepted < 0) {
+                (void)::close(listener);
+                return;
+            }
+            auto& observation = observations[i];
+            observation.accepted = true;
+            std::unique_ptr<MsgChannel> channel(Service::createChannel(
+                accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                return;
+            observation.protocol_50 = channel->protocol == PROTOCOL_VERSION;
+            std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+            const auto* arm = arm_message != nullptr
+                                  ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                                  : nullptr;
+            if (arm == nullptr || !arm->valid_payload())
+                return;
+            observation.arm_received = true;
+            ClaimAttemptCapability128 capability_1;
+            ClaimAttemptCapability128 capability_2;
+            capability_1.bytes.fill(static_cast<uint8_t>(0xd1 + i));
+            capability_2.bytes.fill(static_cast<uint8_t>(0xe1 + i));
+            const P50SourceArmedMsg acknowledgement(
+                arm->arm, 101, 102, f_store_generation, f_store_guid.bytes,
+                kStoreIdentityDerivationVersion, 103, 2500,
+                capability_1, capability_2);
+            if (!channel->send_msg(acknowledgement))
+                return;
+            observation.armed_sent = true;
+            std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+            if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+                return;
+            observation.cache_session_received = true;
+            const int raw_fd = channel->release_fd_if_input_empty();
+            if (raw_fd < 0)
+                return;
+            observation.ready_sent = send_cache_session_ready(
+                raw_fd, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+            if (!observation.ready_sent) {
+                (void)::close(raw_fd);
+                return;
+            }
+            boost::system::error_code error;
+            auto socket = P50ServerEndpoint::adopt_connected_fd(
+                context.get_executor(), raw_fd, error);
+            if (!socket)
+                return;
+            sockets.push_back(std::move(*socket));
+        }
+        (void)::close(listener);
+
+        std::vector<std::future<ServerRunResult>> results;
+        results.reserve(sockets.size());
+        for (auto& socket : sockets) {
+            EndpointIoControl control;
+            control.before_materialize_on_worker = [&codec_gate] {
+                codec_gate.enter_and_wait();
+            };
+            results.push_back(asio::co_spawn(
+                context, endpoint.run_adopted(std::move(socket),
+                                               std::move(control)),
+                asio::use_future));
+        }
+        auto sampler = std::make_shared<asio::steady_timer>(context);
+        auto sample_once = std::make_shared<std::function<void()>>();
+        *sample_once = [&, sampler, sample_once] {
+            observed_live_sessions.store(endpoint.live_session_count(),
+                                         std::memory_order_release);
+            observed_namespaces.store(endpoint.namespace_count(),
+                                      std::memory_order_release);
+            if (stop_sampling.load(std::memory_order_acquire))
+                return;
+            sampler->expires_after(std::chrono::milliseconds(1));
+            sampler->async_wait([sample_once](const boost::system::error_code& ec) {
+                if (!ec)
+                    (*sample_once)();
+            });
+        };
+        (*sample_once)();
+        context.run();
+        for (size_t i = 0; i < results.size(); ++i) {
+            const ServerRunResult result = results[i].get();
+            if (result.completed_input.has_value()) {
+                const auto found = observation_by_c.find(
+                    result.completed_input->c_store_guid);
+                if (found != observation_by_c.end())
+                    found->second->transfer_completed =
+                        result.status == ServerRunStatus::Completed &&
+                        result.committed_input.has_value();
+            }
+        }
+        *sample_once = {};
+    } catch (...) {
+        codec_gate.release();
+        stop_sampling.store(true, std::memory_order_release);
+        (void)::close(listener);
+    }
 }
 
 struct SourceConnectRetryObservation {
     unsigned int accepted_connections = 0;
     std::vector<uint8_t> first_connection_bytes;
+    SourceArmServerObservation first_attempt;
     SourceArmServerObservation successful;
 };
 
@@ -1787,6 +2204,58 @@ void serve_source_transfer_after_protocol_stall(
         serve_accepted_source_transfer(
             accepted, retry_peer, retry_peer_size, f_store_guid,
             f_store_generation, observation.successful);
+    } catch (...) {
+        (void)::close(listener);
+    }
+}
+
+void serve_source_transfer_with_held_retry(
+    int listener, FStoreGuid f_store_guid, uint64_t f_store_generation,
+    SourceConnectRetryObservation& observation,
+    std::promise<void>& retry_accepted,
+    std::shared_future<void> release_retry) noexcept {
+    try {
+        sockaddr_in first_peer{};
+        socklen_t first_peer_size = sizeof(first_peer);
+        const int first = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&first_peer),
+            &first_peer_size);
+        if (first < 0) {
+            (void)::close(listener);
+            return;
+        }
+        ++observation.accepted_connections;
+        // Complete SOURCE_ARMED and the cache-session ready handoff, then
+        // disconnect before CacheWire.  The sender's explicit retry factory
+        // must therefore run on the offloaded path exercised by this test.
+        serve_accepted_source_transfer(
+            first, first_peer, first_peer_size, f_store_guid,
+            f_store_generation, observation.first_attempt,
+            /*disconnect_after_ready=*/true);
+
+        pollfd descriptor{listener, POLLIN, 0};
+        int ready = -1;
+        do {
+            ready = ::poll(&descriptor, 1, 2500);
+        } while (ready < 0 && errno == EINTR);
+        sockaddr_in retry_peer{};
+        socklen_t retry_peer_size = sizeof(retry_peer);
+        const int accepted = ready > 0
+                                 ? ::accept(listener,
+                                            reinterpret_cast<sockaddr*>(&retry_peer),
+                                            &retry_peer_size)
+                                 : -1;
+        if (accepted < 0) {
+            (void)::close(listener);
+            return;
+        }
+        ++observation.accepted_connections;
+        retry_accepted.set_value();
+        (void)release_retry.wait_for(std::chrono::seconds(4));
+        serve_accepted_source_transfer(
+            accepted, retry_peer, retry_peer_size, f_store_guid,
+            f_store_generation, observation.successful);
+        (void)::close(listener);
     } catch (...) {
         (void)::close(listener);
     }
@@ -1862,8 +2331,11 @@ local::P50SourceTransferRequest source_transfer_request(
 
 int source_file(std::string_view stem, std::span<const uint8_t> bytes) {
     std::array<char, 128> path{};
+    const char* temporary_directory = std::getenv("TMPDIR");
+    if (temporary_directory == nullptr || temporary_directory[0] == '\0')
+        temporary_directory = "/tmp";
     const int length = std::snprintf(
-        path.data(), path.size(), "/tmp/%.*s-XXXXXX",
+        path.data(), path.size(), "%s/%.*s-XXXXXX", temporary_directory,
         static_cast<int>(stem.size()), stem.data());
     CHECK(length > 0 && static_cast<size_t>(length) < path.size());
     const int fd = ::mkstemp(path.data());
@@ -1976,7 +2448,8 @@ void test_source_connect_protocol_slices_share_one_outer_budget() {
           elapsed < std::chrono::milliseconds(3200));
 }
 
-void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
+void test_stalled_f_arm_is_bounded_before_healthy_transfer(
+    uint32_t profile, size_t max_active_source_transfers = 4) {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x61;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
@@ -1985,35 +2458,42 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
     config.f_store_guid = launch.f_store_guid;
     config.f_store_generation = launch.store_generation;
     config.sidecar_launch = launch;
-    config.source_open_arm_timeout = std::chrono::milliseconds(1500);
+    config.source_open_arm_timeout = std::chrono::seconds(4);
+    config.max_active_source_transfers = max_active_source_transfers;
     service::SidecarRuntime runtime(std::move(config));
 
     uint16_t stalled_port = 0;
     const int stalled_listener = loopback_listener(stalled_port);
     std::atomic<bool> stalled_arm_received{false};
+    std::promise<void> release_stalled_server;
+    const std::shared_future<void> release_stalled_future =
+        release_stalled_server.get_future().share();
     std::thread stalled_server([&] {
-        serve_stalled_source_arm(stalled_listener, stalled_arm_received);
+        serve_stalled_source_arm(stalled_listener, stalled_arm_received,
+                                 release_stalled_future);
     });
     const std::array<uint8_t, 8> stalled_source{
         's', 't', 'a', 'l', 'l', 'e', 'd', '\n'};
-    local::P50SourceTransferResult stalled_result;
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto stalled_deadline =
         sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
             std::chrono::steady_clock::now() + std::chrono::seconds(5),
             clock.clock_domain_id, clock.time_namespace_id);
+    std::promise<local::P50SourceTransferResult> stalled_completion;
+    std::future<local::P50SourceTransferResult> stalled_future =
+        stalled_completion.get_future();
     std::thread stalled_transfer([&] {
-        stalled_result = runtime.transfer_source_on_owner(
-            source_transfer_request(stalled_port, 121, CACHE_PROFILE_ZSTD_TU),
+        stalled_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(stalled_port, 121, profile),
             stalled_deadline,
-            local::HandoffFd(source_file("p50-stalled-arm", stalled_source)));
+            local::HandoffFd(source_file("p50-stalled-arm", stalled_source))));
     });
     const auto arm_wait_limit =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!stalled_arm_received.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < arm_wait_limit)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    CHECK(stalled_arm_received.load(std::memory_order_acquire));
+    const bool arm_received = stalled_arm_received.load(std::memory_order_acquire);
 
     StoreIdentityRoot healthy_root{};
     healthy_root.bytes[14] = 0x62;
@@ -2029,22 +2509,57 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
         'h', 'e', 'a', 'l', 't', 'h', 'y', '!', '\n'};
     const auto healthy_deadline =
         sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            std::chrono::steady_clock::now() + std::chrono::seconds(2),
             clock.clock_domain_id, clock.time_namespace_id);
-    const auto healthy_started = std::chrono::steady_clock::now();
-    const local::P50SourceTransferResult healthy_result =
-        runtime.transfer_source_on_owner(
-            source_transfer_request(healthy_port, 131, CACHE_PROFILE_ZSTD_TU),
+    std::promise<local::P50SourceTransferResult> healthy_completion;
+    std::future<local::P50SourceTransferResult> healthy_future =
+        healthy_completion.get_future();
+    std::thread healthy_transfer([&] {
+        healthy_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(healthy_port, 131, profile),
             healthy_deadline,
-            local::HandoffFd(source_file("p50-healthy-arm", healthy_source)));
-    const auto healthy_elapsed =
-        std::chrono::steady_clock::now() - healthy_started;
-
+            local::HandoffFd(source_file("p50-healthy-arm", healthy_source))));
+    });
+    // F_A has received its arm but intentionally withholds its acknowledgement.
+    // F_B must still reach a committed CacheWire input before A is released.
+    // The deadline bounds this regression on the implementation with the old
+    // process-wide transfer lock.
+    const bool healthy_ready_before_release =
+        healthy_future.wait_for(std::chrono::milliseconds(2200)) ==
+        std::future_status::ready;
+    std::optional<local::P50SourceTransferResult> early_healthy_result;
+    if (healthy_ready_before_release)
+        early_healthy_result = healthy_future.get();
+    const bool healthy_finished_before_release =
+        early_healthy_result.has_value() &&
+        early_healthy_result->code ==
+            local::SourceTransferResultCode::Committed;
+    release_stalled_server.set_value();
+    local::P50SourceTransferResult healthy_result =
+        early_healthy_result.has_value()
+            ? std::move(*early_healthy_result)
+            : healthy_future.get();
+    const local::P50SourceTransferResult stalled_result = stalled_future.get();
+    {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(healthy_port);
+        (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                        sizeof(address));
+        (void)::close(wake);
+        }
+    }
+    healthy_transfer.join();
     stalled_transfer.join();
     stalled_server.join();
     healthy_server.join();
+    CHECK(arm_received);
     CHECK(stalled_result.code == local::SourceTransferResultCode::Error);
     CHECK(stalled_result.error_code == 4 && stalled_result.attempts == 0);
+    CHECK(healthy_finished_before_release);
     CHECK(healthy_result.code == local::SourceTransferResultCode::Committed);
     CHECK(healthy_result.attempts == 1);
     CHECK(healthy_result.raw_bytes == healthy_source.size());
@@ -2054,7 +2569,1668 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
           healthy_observation.cache_session_received &&
           healthy_observation.ready_sent &&
           healthy_observation.transfer_completed);
-    CHECK(healthy_elapsed < std::chrono::seconds(3));
+    CHECK(healthy_result.tu_seq == 0);
+    CHECK(healthy_observation.committed_c_store_guid == launch.c_store_guid);
+    CHECK(healthy_observation.committed_profile ==
+          (profile == CACHE_PROFILE_P29V1
+               ? ProfileId::P29V1
+               : profile == CACHE_PROFILE_ZSTD_ROUTE
+                     ? ProfileId::ZSTD_ROUTE
+                     : ProfileId::ZSTD_TU));
+    CHECK(healthy_observation.committed_input ==
+          std::vector<uint8_t>(healthy_source.begin(), healthy_source.end()));
+    CHECK(healthy_observation.commit_identity_matches_input);
+    const char* profile_name = profile == CACHE_PROFILE_P29V1
+                                   ? "P29V1"
+                                   : profile == CACHE_PROFILE_ZSTD_ROUTE
+                                         ? "ZSTD_ROUTE"
+                                         : "ZSTD_TU";
+    std::printf("A05 %s: healthy F_B committed while F_A SOURCE_ARMED "
+                "was held\n", profile_name);
+    std::fflush(stdout);
+}
+
+void test_held_retry_does_not_block_healthy_link(uint32_t profile) {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x69;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::seconds(5);
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot retry_root{};
+    retry_root.bytes[14] = 0x6a;
+    const FStoreGuid retry_guid = f_store_guid_for_root(retry_root);
+    uint16_t retry_port = 0;
+    const int retry_listener = loopback_listener(retry_port);
+    SourceConnectRetryObservation retry_observation;
+    std::promise<void> retry_accepted_promise;
+    std::future<void> retry_accepted = retry_accepted_promise.get_future();
+    std::promise<void> release_retry_promise;
+    const std::shared_future<void> release_retry =
+        release_retry_promise.get_future().share();
+    std::thread retry_server([&] {
+        serve_source_transfer_with_held_retry(
+            retry_listener, retry_guid, 29, retry_observation,
+            retry_accepted_promise, release_retry);
+    });
+
+    const std::array<uint8_t, 11> retry_source{
+        'r', 'e', 't', 'r', 'y', '-', 'h', 'e', 'l', 'd', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto retry_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(8),
+            clock.clock_domain_id, clock.time_namespace_id);
+    std::promise<local::P50SourceTransferResult> retry_completion;
+    std::future<local::P50SourceTransferResult> retry_result =
+        retry_completion.get_future();
+    std::thread retry_transfer([&] {
+        retry_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(retry_port, 161, profile),
+            retry_deadline,
+            local::HandoffFd(source_file("p50-held-retry", retry_source))));
+    });
+    const bool retry_is_held = retry_accepted.wait_for(std::chrono::seconds(3)) ==
+                               std::future_status::ready;
+
+    StoreIdentityRoot healthy_root{};
+    healthy_root.bytes[14] = 0x6b;
+    const FStoreGuid healthy_guid = f_store_guid_for_root(healthy_root);
+    uint16_t healthy_port = 0;
+    const int healthy_listener = loopback_listener(healthy_port);
+    SourceArmServerObservation healthy_observation;
+    std::thread healthy_server([&] {
+        serve_one_source_transfer(healthy_listener, healthy_guid, 31,
+                                  healthy_observation);
+    });
+    const std::array<uint8_t, 10> healthy_source{
+        'h', 'e', 'a', 'l', 't', 'h', 'y', '-', 'b', '\n'};
+    const auto healthy_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(3),
+            clock.clock_domain_id, clock.time_namespace_id);
+    std::promise<local::P50SourceTransferResult> healthy_completion;
+    std::future<local::P50SourceTransferResult> healthy_result =
+        healthy_completion.get_future();
+    std::thread healthy_transfer([&] {
+        healthy_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(healthy_port, 171, profile),
+            healthy_deadline,
+            local::HandoffFd(source_file("p50-healthy-during-retry", healthy_source))));
+    });
+    const bool healthy_finished_before_retry_release =
+        healthy_result.wait_for(std::chrono::milliseconds(1800)) ==
+        std::future_status::ready;
+
+    release_retry_promise.set_value();
+    const bool retry_finished = retry_result.wait_for(std::chrono::seconds(4)) ==
+                                std::future_status::ready;
+    const bool healthy_finished = healthy_result.wait_for(std::chrono::seconds(4)) ==
+                                  std::future_status::ready;
+    local::P50SourceTransferResult retry_value;
+    local::P50SourceTransferResult healthy_value;
+    if (retry_finished)
+        retry_value = retry_result.get();
+    if (healthy_finished)
+        healthy_value = healthy_result.get();
+    retry_transfer.join();
+    healthy_transfer.join();
+    if (!healthy_observation.accepted) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(healthy_port);
+            (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake);
+        }
+    }
+    retry_server.join();
+    healthy_server.join();
+
+    CHECK(retry_is_held);
+    CHECK(healthy_finished_before_retry_release);
+    CHECK(retry_finished && healthy_finished);
+    CHECK(retry_observation.accepted_connections == 2);
+    CHECK(retry_observation.first_attempt.accepted &&
+          retry_observation.first_attempt.protocol_50 &&
+          retry_observation.first_attempt.arm_received &&
+          retry_observation.first_attempt.armed_sent &&
+          retry_observation.first_attempt.cache_session_received &&
+          retry_observation.first_attempt.ready_sent);
+    CHECK(retry_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(retry_value.attempts == 2);
+    CHECK(retry_value.tu_seq == 0);
+    CHECK(retry_value.raw_bytes == retry_source.size() &&
+          retry_value.raw_digest == icecc::digest128(retry_source));
+    CHECK(retry_observation.successful.committed_input ==
+          std::vector<uint8_t>(retry_source.begin(), retry_source.end()));
+    const ProfileId expected_profile =
+        profile == CACHE_PROFILE_P29V1
+            ? ProfileId::P29V1
+            : profile == CACHE_PROFILE_ZSTD_ROUTE ? ProfileId::ZSTD_ROUTE
+                                                   : ProfileId::ZSTD_TU;
+    CHECK(retry_observation.successful.committed_profile == expected_profile);
+    CHECK(healthy_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(healthy_value.tu_seq == 1);
+    CHECK(healthy_value.raw_bytes == healthy_source.size() &&
+          healthy_value.raw_digest == icecc::digest128(healthy_source));
+    CHECK(healthy_observation.committed_c_store_guid == launch.c_store_guid);
+    CHECK(healthy_observation.committed_profile == expected_profile);
+    CHECK(healthy_observation.committed_input ==
+          std::vector<uint8_t>(healthy_source.begin(), healthy_source.end()));
+    CHECK(healthy_observation.commit_identity_matches_input);
+    const char* profile_name = profile == CACHE_PROFILE_P29V1
+                                   ? "P29V1"
+                                   : profile == CACHE_PROFILE_ZSTD_ROUTE
+                                         ? "ZSTD_ROUTE"
+                                         : "ZSTD_TU";
+    std::printf("A06 %s: healthy F_B committed while F_A retry socket was held\n",
+                profile_name);
+    std::fflush(stdout);
+}
+
+void test_parallel_distinct_f_cachewire(size_t f_count, uint32_t profile) {
+    CHECK(f_count >= 2 && f_count <= 4);
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = static_cast<uint8_t>(0x80 + f_count + profile);
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_active_source_transfers = 4;
+    config.max_aggregate_source_raw_bytes = 4096;
+    service::SidecarRuntime runtime(std::move(config));
+
+    SourceTransferBarrier arm_barrier(f_count);
+    SourceTransferBarrier commit_barrier(f_count);
+    std::vector<uint16_t> ports(f_count);
+    std::vector<int> listeners(f_count);
+    std::vector<FStoreGuid> f_guids(f_count);
+    std::vector<std::array<std::vector<uint8_t>, 3>> inputs(f_count);
+    std::vector<std::array<SourceArmServerObservation, 3>> observations(f_count);
+    std::vector<std::thread> servers;
+    servers.reserve(f_count);
+    for (size_t index = 0; index != f_count; ++index) {
+        StoreIdentityRoot remote_root{};
+        remote_root.bytes[14] = static_cast<uint8_t>(0x30 + index);
+        remote_root.bytes[15] = static_cast<uint8_t>(0xa0 + f_count);
+        f_guids[index] = f_store_guid_for_root(remote_root);
+        listeners[index] = loopback_listener(ports[index]);
+        inputs[index][0].resize(73 + index * 11);
+        inputs[index][1] = inputs[index][0]; // warm repeat on the same F route
+        inputs[index][2].resize(inputs[index][0].size() + 7);
+        for (size_t byte = 0; byte != inputs[index][0].size(); ++byte)
+            inputs[index][0][byte] = static_cast<uint8_t>(
+                (byte * 37 + index * 53 + f_count * 7) & 0xff);
+        inputs[index][1] = inputs[index][0];
+        for (size_t byte = 0; byte != inputs[index][2].size(); ++byte)
+            inputs[index][2][byte] = static_cast<uint8_t>(
+                (byte * 41 + index * 59 + f_count * 11 + 3) & 0xff);
+        servers.emplace_back([&, index] {
+            serve_source_transfers_on_persistent_f(
+                listeners[index], f_guids[index], 170 + index,
+                launch.c_store_guid, observations[index], &arm_barrier,
+                &commit_barrier);
+        });
+    }
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    std::array<std::vector<local::P50SourceTransferResult>, 3> committed;
+    for (size_t wave = 0; wave != 3; ++wave) {
+        std::vector<std::promise<local::P50SourceTransferResult>> completions;
+        std::vector<std::future<local::P50SourceTransferResult>> results;
+        std::vector<std::thread> transfers;
+        completions.reserve(f_count);
+        results.reserve(f_count);
+        transfers.reserve(f_count);
+        const auto deadline =
+            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                std::chrono::steady_clock::now() + std::chrono::seconds(7),
+                clock.clock_domain_id, clock.time_namespace_id);
+        for (size_t index = 0; index != f_count; ++index) {
+            completions.emplace_back();
+            results.push_back(completions.back().get_future());
+            const uint16_t port = ports[index];
+            const uint64_t request_id =
+                400 + wave * 100 + index + f_count * 10 + profile;
+            transfers.emplace_back([&, index, port, request_id, wave] {
+                completions[index].set_value(runtime.transfer_source_on_owner(
+                    source_transfer_request(port, request_id, profile), deadline,
+                    local::HandoffFd(source_file("p50-distinct-f",
+                                                 inputs[index][wave]))));
+            });
+        }
+        committed[wave].reserve(f_count);
+        for (auto& result : results)
+            committed[wave].push_back(result.get());
+        for (auto& transfer : transfers)
+            transfer.join();
+    }
+    // A server whose client expired before connect is still blocked in accept;
+    // a best-effort loopback connect wakes that fixture for bounded cleanup.
+    for (uint16_t port : ports) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(wake >= 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                        sizeof(address));
+        (void)::close(wake);
+    }
+    for (auto& server : servers)
+        server.join();
+
+    std::vector<std::vector<uint64_t>> tu_sequences(3);
+    for (size_t wave = 0; wave != 3; ++wave) {
+        tu_sequences[wave].reserve(f_count);
+        for (size_t index = 0; index != f_count; ++index) {
+            const auto& result = committed[wave][index];
+            const auto& observation = observations[index][wave];
+            CHECK(result.code == local::SourceTransferResultCode::Committed);
+            CHECK(result.valid() && result.attempts == 1);
+            CHECK(result.c_store_guid == launch.c_store_guid);
+            CHECK(result.raw_bytes == inputs[index][wave].size());
+            CHECK(result.raw_digest == icecc::digest128(inputs[index][wave]));
+            CHECK(observation.committed_c_store_guid == launch.c_store_guid);
+            CHECK(observation.committed_tu_seq == result.tu_seq);
+            CHECK(observation.committed_rel_seq == wave);
+            CHECK(observation.committed_profile ==
+                  (profile == CACHE_PROFILE_P29V1
+                       ? ProfileId::P29V1
+                       : profile == CACHE_PROFILE_ZSTD_ROUTE
+                             ? ProfileId::ZSTD_ROUTE
+                             : ProfileId::ZSTD_TU));
+            CHECK(observation.committed_input == inputs[index][wave]);
+            CHECK(observation.commit_identity_matches_input);
+            CHECK(observation.transfer_completed);
+            CHECK(observation.accepted && observation.protocol_50 &&
+                  observation.arm_received && observation.armed_sent &&
+                  observation.cache_session_received && observation.ready_sent);
+            if (wave == 0) {
+                CHECK(observation.arm_barrier_passed &&
+                      observation.commit_barrier_passed);
+            }
+            if (wave != 0)
+                CHECK(observation.committed_history_nonce ==
+                      observations[index][0].committed_history_nonce);
+            tu_sequences[wave].push_back(result.tu_seq);
+        }
+        std::sort(tu_sequences[wave].begin(), tu_sequences[wave].end());
+        CHECK(std::adjacent_find(tu_sequences[wave].begin(),
+                                 tu_sequences[wave].end()) ==
+              tu_sequences[wave].end());
+        const uint64_t expected_start = wave * f_count;
+        for (size_t index = 0; index != f_count; ++index)
+            CHECK(tu_sequences[wave][index] == expected_start + index);
+    }
+    CHECK(arm_barrier.arrived() == f_count);
+    CHECK(commit_barrier.arrived() == f_count);
+
+    const char* profile_name = profile == CACHE_PROFILE_P29V1
+                                   ? "P29V1"
+                                   : profile == CACHE_PROFILE_ZSTD_ROUTE
+                                         ? "ZSTD_ROUTE"
+                                         : "ZSTD_TU";
+    std::printf("A01-%zu %s: first-wave CacheWire overlap plus same-F warm "
+                "repeat/edited REL_SEQ 0/1/2; %zu exact commits\n",
+                f_count, profile_name, f_count);
+    std::fflush(stdout);
+}
+
+void test_parallel_distinct_f_matrix() {
+    for (size_t count : {size_t{2}, size_t{3}, size_t{4}}) {
+        test_parallel_distinct_f_cachewire(count, CACHE_PROFILE_ZSTD_TU);
+        test_parallel_distinct_f_cachewire(count, CACHE_PROFILE_ZSTD_ROUTE);
+    }
+    test_parallel_distinct_f_cachewire(2, CACHE_PROFILE_P29V1);
+    test_parallel_distinct_f_cachewire(3, CACHE_PROFILE_P29V1);
+    test_parallel_distinct_f_cachewire(4, CACHE_PROFILE_P29V1);
+}
+
+void test_same_link_serialization(uint32_t first_profile,
+                                  uint32_t second_profile,
+                                  std::string_view case_id) {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = static_cast<uint8_t>(0x91 + first_profile +
+                                                second_profile);
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::seconds(5);
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0x93;
+    const FStoreGuid f_guid = f_store_guid_for_root(remote_root);
+    constexpr uint64_t f_generation = 0x559;
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    std::array<SourceArmServerObservation, 2> observations;
+    SourceCommitHold hold;
+    std::thread server([&] {
+        serve_source_transfers_on_persistent_f(
+            listener, f_guid, f_generation, launch.c_store_guid, observations,
+            nullptr, nullptr, &hold);
+    });
+
+    const std::array<uint8_t, 12> first_source{
+        'f', 'i', 'r', 's', 't', '-', 'i', 'n', 'p', 'u', 't', '\n'};
+    const std::array<uint8_t, 13> second_source{
+        's', 'e', 'c', 'o', 'n', 'd', '-', 'i', 'n', 'p', 'u', 't', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(8),
+        clock.clock_domain_id, clock.time_namespace_id);
+    std::promise<local::P50SourceTransferResult> first_completion;
+    std::future<local::P50SourceTransferResult> first_result =
+        first_completion.get_future();
+    std::thread first_transfer([&] {
+        first_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(port, 810, first_profile), deadline,
+            local::HandoffFd(source_file("p50-same-link-first", first_source))));
+    });
+    const bool first_held = hold.wait_until_entered(std::chrono::seconds(3));
+
+    std::promise<local::P50SourceTransferResult> second_completion;
+    std::future<local::P50SourceTransferResult> second_result =
+        second_completion.get_future();
+    std::thread second_transfer([&] {
+        second_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(port, 811, second_profile), deadline,
+            local::HandoffFd(source_file("p50-same-link-second", second_source))));
+    });
+    pollfd pending_connection{listener, POLLIN, 0};
+    int pending = -1;
+    do {
+        pending = ::poll(&pending_connection, 1, 180);
+    } while (pending < 0 && errno == EINTR);
+    const bool second_connected_while_first_held = pending > 0;
+
+    // Release regardless of assertion outcomes before joining owned threads.
+    hold.release();
+    const bool first_ready = first_result.wait_for(std::chrono::seconds(4)) ==
+                             std::future_status::ready;
+    const bool second_ready = second_result.wait_for(std::chrono::seconds(4)) ==
+                              std::future_status::ready;
+    local::P50SourceTransferResult first_value;
+    local::P50SourceTransferResult second_value;
+    if (first_ready)
+        first_value = first_result.get();
+    if (second_ready)
+        second_value = second_result.get();
+    first_transfer.join();
+    second_transfer.join();
+    // If either request expired before its socket was accepted, wake the
+    // fixture's bounded accept so it can close cleanly.
+    if (!observations[1].accepted) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(port);
+            (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake);
+        }
+    }
+    server.join();
+
+    CHECK(first_held);
+    CHECK(!second_connected_while_first_held);
+    CHECK(first_ready && second_ready);
+    CHECK(first_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(second_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(first_value.c_store_guid == launch.c_store_guid &&
+          second_value.c_store_guid == launch.c_store_guid);
+    CHECK(first_value.tu_seq == 0 && second_value.tu_seq == 1);
+    CHECK(first_value.raw_bytes == first_source.size() &&
+          first_value.raw_digest == icecc::digest128(first_source));
+    CHECK(second_value.raw_bytes == second_source.size() &&
+          second_value.raw_digest == icecc::digest128(second_source));
+    CHECK(observations[0].committed_input ==
+          std::vector<uint8_t>(first_source.begin(), first_source.end()));
+    CHECK(observations[1].committed_input ==
+          std::vector<uint8_t>(second_source.begin(), second_source.end()));
+    CHECK(observations[0].committed_profile ==
+          (first_profile == CACHE_PROFILE_P29V1
+               ? ProfileId::P29V1
+               : first_profile == CACHE_PROFILE_ZSTD_ROUTE
+                     ? ProfileId::ZSTD_ROUTE
+                     : ProfileId::ZSTD_TU));
+    CHECK(observations[1].committed_profile ==
+          (second_profile == CACHE_PROFILE_P29V1
+               ? ProfileId::P29V1
+               : second_profile == CACHE_PROFILE_ZSTD_ROUTE
+                     ? ProfileId::ZSTD_ROUTE
+                     : ProfileId::ZSTD_TU));
+    CHECK(observations[0].committed_rel_seq == 0);
+    CHECK(observations[1].committed_rel_seq ==
+          (first_profile == second_profile ? 1 : 0));
+    if (first_profile == second_profile)
+        CHECK(observations[0].committed_history_nonce ==
+              observations[1].committed_history_nonce);
+    CHECK(observations[0].commit_identity_matches_input &&
+          observations[1].commit_identity_matches_input);
+    std::printf("%.*s: same C/F operations serialized across profile selection; "
+                "both exact inputs committed in TU order\n",
+                static_cast<int>(case_id.size()), case_id.data());
+    std::fflush(stdout);
+}
+
+void test_same_link_serialization_matrix() {
+    test_same_link_serialization(CACHE_PROFILE_P29V1, CACHE_PROFILE_P29V1,
+                                 "A03 P29V1");
+    test_same_link_serialization(CACHE_PROFILE_ZSTD_TU,
+                                 CACHE_PROFILE_ZSTD_TU, "A03 ZSTD_TU");
+    test_same_link_serialization(CACHE_PROFILE_ZSTD_ROUTE,
+                                 CACHE_PROFILE_ZSTD_ROUTE,
+                                 "A03 ZSTD_ROUTE");
+    test_same_link_serialization(CACHE_PROFILE_P29V1,
+                                 CACHE_PROFILE_ZSTD_TU, "A04 P29V1->TU");
+    test_same_link_serialization(CACHE_PROFILE_ZSTD_TU,
+                                 CACHE_PROFILE_ZSTD_ROUTE,
+                                 "A04 TU->ROUTE");
+    test_same_link_serialization(CACHE_PROFILE_ZSTD_ROUTE,
+                                 CACHE_PROFILE_P29V1,
+                                 "A04 ROUTE->P29V1");
+}
+
+void test_expired_alias_cannot_release_held_incarnation() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0xa1;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_active_source_transfers = 3;
+    config.max_aggregate_source_raw_bytes = 1024;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0xa2;
+    const FStoreGuid f_guid = f_store_guid_for_root(remote_root);
+    constexpr uint64_t f_generation = 0xa3;
+    uint16_t port = 0;
+    const int listener = loopback_listener(port, INADDR_ANY);
+    CHECK(runtime.seed_route_endpoint_identity_for_test(
+        "127.0.0.1", port, f_guid, f_generation));
+    CHECK(runtime.seed_route_endpoint_identity_for_test(
+        "127.0.0.2", port, f_guid, f_generation));
+    CHECK(runtime.seed_route_endpoint_identity_for_test(
+        "127.0.0.3", port, f_guid, f_generation));
+
+    std::array<SourceArmServerObservation, 2> observations;
+    SourceCommitHold hold;
+    std::thread server([&] {
+        serve_source_transfers_on_persistent_f(
+            listener, f_guid, f_generation, launch.c_store_guid, observations,
+            nullptr, nullptr, &hold);
+    });
+    const std::array<uint8_t, 12> first_source{
+        'a', 'l', 'i', 'a', 's', '-', 'o', 'n', 'e', '\n', '!', '\n'};
+    const std::array<uint8_t, 13> expired_source{
+        'a', 'l', 'i', 'a', 's', '-', 't', 'w', 'o', '\n', '!', '\n', '!'};
+    const std::array<uint8_t, 14> final_source{
+        'a', 'l', 'i', 'a', 's', '-', 't', 'h', 'r', 'e', 'e', '\n', '!', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto first_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(7),
+            clock.clock_domain_id, clock.time_namespace_id);
+    auto first_request = source_transfer_request(
+        port, 910, CACHE_PROFILE_ZSTD_TU);
+    std::promise<local::P50SourceTransferResult> first_completion;
+    auto first_result = first_completion.get_future();
+    std::thread first_transfer([&] {
+        first_completion.set_value(runtime.transfer_source_on_owner(
+            first_request, first_deadline,
+            local::HandoffFd(source_file("p50-alias-held", first_source))));
+    });
+    const bool first_held = hold.wait_until_entered(std::chrono::seconds(3));
+
+    const auto expired_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500),
+            clock.clock_domain_id, clock.time_namespace_id);
+    auto expired_request = source_transfer_request(
+        port, 911, CACHE_PROFILE_ZSTD_TU);
+    expired_request.selected_f_host = "127.0.0.2";
+    std::promise<local::P50SourceTransferResult> expired_completion;
+    auto expired_result = expired_completion.get_future();
+    std::thread expired_transfer([&] {
+        expired_completion.set_value(runtime.transfer_source_on_owner(
+            expired_request, expired_deadline,
+            local::HandoffFd(source_file("p50-alias-expired", expired_source))));
+    });
+
+    const auto final_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    auto final_request = source_transfer_request(
+        port, 912, CACHE_PROFILE_ZSTD_TU);
+    final_request.selected_f_host = "127.0.0.3";
+    std::promise<local::P50SourceTransferResult> final_completion;
+    auto final_result = final_completion.get_future();
+    std::thread final_transfer([&] {
+        final_completion.set_value(runtime.transfer_source_on_owner(
+            final_request, final_deadline,
+            local::HandoffFd(source_file("p50-alias-final", final_source))));
+    });
+
+    const bool expired_before_release =
+        expired_result.wait_for(std::chrono::seconds(2)) ==
+        std::future_status::ready;
+    local::P50SourceTransferResult expired_value;
+    if (expired_before_release)
+        expired_value = expired_result.get();
+    const bool final_still_waiting_after_expiry =
+        final_result.wait_for(std::chrono::milliseconds(250)) ==
+        std::future_status::timeout;
+    pollfd pending_connection{listener, POLLIN, 0};
+    int pending = -1;
+    do {
+        pending = ::poll(&pending_connection, 1, 0);
+    } while (pending < 0 && errno == EINTR);
+    const bool alias_connected_before_predecessor_release = pending > 0;
+
+    hold.release();
+    const bool first_ready = first_result.wait_for(std::chrono::seconds(3)) ==
+                             std::future_status::ready;
+    const bool final_ready = final_result.wait_for(std::chrono::seconds(3)) ==
+                             std::future_status::ready;
+    local::P50SourceTransferResult first_value;
+    local::P50SourceTransferResult final_value;
+    if (first_ready)
+        first_value = first_result.get();
+    if (final_ready)
+        final_value = final_result.get();
+    first_transfer.join();
+    expired_transfer.join();
+    final_transfer.join();
+    server.join();
+
+    CHECK(first_held);
+    CHECK(expired_before_release);
+    CHECK(expired_value.code == local::SourceTransferResultCode::Error);
+    CHECK(expired_value.error_code == 7 && expired_value.attempts == 0);
+    CHECK(final_still_waiting_after_expiry);
+    CHECK(!alias_connected_before_predecessor_release);
+    CHECK(first_ready && final_ready);
+    CHECK(first_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(first_value.tu_seq == 0 && first_value.c_store_guid == launch.c_store_guid);
+    CHECK(first_value.raw_bytes == first_source.size() &&
+          first_value.raw_digest == icecc::digest128(first_source));
+    CHECK(final_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(final_value.tu_seq == 1 && final_value.c_store_guid == launch.c_store_guid);
+    CHECK(final_value.raw_bytes == final_source.size() &&
+          final_value.raw_digest == icecc::digest128(final_source));
+    CHECK(observations[0].committed_input ==
+          std::vector<uint8_t>(first_source.begin(), first_source.end()));
+    CHECK(observations[1].committed_input ==
+          std::vector<uint8_t>(final_source.begin(), final_source.end()));
+    CHECK(observations[0].committed_profile == ProfileId::ZSTD_TU &&
+          observations[1].committed_profile == ProfileId::ZSTD_TU);
+    CHECK(observations[0].commit_identity_matches_input &&
+          observations[1].commit_identity_matches_input);
+    std::puts("A07/A12 ZSTD_TU: expired endpoint alias did not release held F incarnation");
+    std::fflush(stdout);
+}
+
+void test_incarnation_change_waits_for_old_operation() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0xa8;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_route_relationships = 2;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0xa9;
+    const FStoreGuid f_guid = f_store_guid_for_root(remote_root);
+    constexpr uint64_t old_generation = 0xaa;
+    constexpr uint64_t new_generation = 0xab;
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    CHECK(runtime.seed_route_endpoint_identity_for_test(
+        "127.0.0.1", port, f_guid, old_generation));
+    std::array<SourceArmServerObservation, 2> observations;
+    SourceCommitHold hold;
+    std::thread server([&] {
+        serve_two_held_source_transfers(listener, f_guid, old_generation,
+                                        observations, hold, new_generation);
+    });
+
+    const std::array<uint8_t, 15> old_source{
+        'o', 'l', 'd', '-', 'i', 'n', 'c', 'a', 'r', 'n', 'a', 't', 'i', 'o', 'n'};
+    const std::array<uint8_t, 15> new_source{
+        'n', 'e', 'w', '-', 'i', 'n', 'c', 'a', 'r', 'n', 'a', 't', 'i', 'o', 'n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(8),
+        clock.clock_domain_id, clock.time_namespace_id);
+    std::promise<local::P50SourceTransferResult> old_completion;
+    auto old_result = old_completion.get_future();
+    std::thread old_transfer([&] {
+        old_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(port, 920, CACHE_PROFILE_ZSTD_TU), deadline,
+            local::HandoffFd(source_file("p50-old-incarnation", old_source))));
+    });
+    const bool old_held = hold.wait_until_entered(std::chrono::seconds(3));
+
+    std::promise<local::P50SourceTransferResult> new_completion;
+    auto new_result = new_completion.get_future();
+    std::thread new_transfer([&] {
+        new_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(port, 921, CACHE_PROFILE_ZSTD_ROUTE), deadline,
+            local::HandoffFd(source_file("p50-new-incarnation", new_source))));
+    });
+    pollfd pending_connection{listener, POLLIN, 0};
+    int pending = -1;
+    do {
+        pending = ::poll(&pending_connection, 1, 180);
+    } while (pending < 0 && errno == EINTR);
+    const bool replacement_connected_while_old_held = pending > 0;
+    hold.release();
+    const bool old_ready = old_result.wait_for(std::chrono::seconds(4)) ==
+                           std::future_status::ready;
+    const bool new_ready = new_result.wait_for(std::chrono::seconds(4)) ==
+                           std::future_status::ready;
+    local::P50SourceTransferResult old_value;
+    local::P50SourceTransferResult new_value;
+    if (old_ready)
+        old_value = old_result.get();
+    if (new_ready)
+        new_value = new_result.get();
+    old_transfer.join();
+    new_transfer.join();
+    server.join();
+
+    CHECK(old_held);
+    CHECK(!replacement_connected_while_old_held);
+    CHECK(old_ready && new_ready);
+    CHECK(old_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(new_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(old_value.tu_seq == 0 && new_value.tu_seq == 1);
+    CHECK(old_value.c_store_guid == launch.c_store_guid &&
+          new_value.c_store_guid == launch.c_store_guid);
+    CHECK(old_value.raw_bytes == old_source.size() &&
+          old_value.raw_digest == icecc::digest128(old_source));
+    CHECK(new_value.raw_bytes == new_source.size() &&
+          new_value.raw_digest == icecc::digest128(new_source));
+    CHECK(observations[0].committed_input ==
+          std::vector<uint8_t>(old_source.begin(), old_source.end()));
+    CHECK(observations[1].committed_input ==
+          std::vector<uint8_t>(new_source.begin(), new_source.end()));
+    CHECK(observations[0].committed_profile == ProfileId::ZSTD_TU &&
+          observations[1].committed_profile == ProfileId::ZSTD_ROUTE);
+    CHECK(observations[0].commit_identity_matches_input &&
+          observations[1].commit_identity_matches_input);
+    std::puts("A08 ZSTD_TU->ZSTD_ROUTE: generation change waited for old input to settle; new identity committed exactly");
+    std::fflush(stdout);
+}
+
+void test_parallel_distinct_c_one_f(size_t c_count) {
+    CHECK(c_count >= 2 && c_count <= 4);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0x4f;
+    remote_root.bytes[15] = 0xe1;
+    const FStoreGuid f_guid = f_store_guid_for_root(remote_root);
+    constexpr uint64_t f_generation = 0x771;
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    std::vector<SourceArmServerObservation> observations(c_count);
+    CodecWorkerGate codec_gate;
+    std::atomic<size_t> observed_live_sessions{0};
+    std::atomic<size_t> observed_namespaces{0};
+    std::atomic<bool> stop_sampling{false};
+
+    std::vector<SidecarLaunchIdentity> launches;
+    std::vector<std::unique_ptr<service::SidecarRuntime>> runtimes;
+    std::vector<std::vector<uint8_t>> inputs(c_count);
+    launches.reserve(c_count);
+    runtimes.reserve(c_count);
+    for (size_t index = 0; index != c_count; ++index) {
+        StoreIdentityRoot local_root{};
+        local_root.bytes[14] = 0x80;
+        local_root.bytes[15] = static_cast<uint8_t>(0x20 + index);
+        launches.push_back(test_sidecar_launch(local_root));
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launches.back().c_store_guid;
+        config.f_store_guid = launches.back().f_store_guid;
+        config.f_store_generation = launches.back().store_generation;
+        config.sidecar_launch = launches.back();
+        config.max_active_source_transfers = 1;
+        config.max_aggregate_source_raw_bytes = 1024;
+        runtimes.push_back(
+            std::make_unique<service::SidecarRuntime>(std::move(config)));
+        inputs[index].resize(101 + index * 13);
+        for (size_t byte = 0; byte != inputs[index].size(); ++byte)
+            inputs[index][byte] = static_cast<uint8_t>(
+                (byte * 19 + index * 71 + 5) & 0xff);
+    }
+    std::vector<CStoreGuid> expected_c_guids;
+    expected_c_guids.reserve(c_count);
+    for (const auto& launch : launches)
+        expected_c_guids.push_back(launch.c_store_guid);
+    std::thread server([&] {
+        serve_many_source_transfers_on_shared_f_endpoint(
+            listener, f_guid, f_generation, observations, expected_c_guids,
+            codec_gate, observed_live_sessions, observed_namespaces,
+            stop_sampling);
+    });
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(5),
+        clock.clock_domain_id, clock.time_namespace_id);
+    std::vector<std::promise<local::P50SourceTransferResult>> completions;
+    std::vector<std::future<local::P50SourceTransferResult>> results;
+    std::vector<std::thread> transfers;
+    completions.reserve(c_count);
+    results.reserve(c_count);
+    transfers.reserve(c_count);
+    for (size_t index = 0; index != c_count; ++index) {
+        completions.emplace_back();
+        results.push_back(completions.back().get_future());
+        const uint64_t request_id = 700 + index + c_count * 10;
+        transfers.emplace_back([&, index, request_id] {
+            completions[index].set_value(runtimes[index]->transfer_source_on_owner(
+                source_transfer_request(port, request_id,
+                                        CACHE_PROFILE_ZSTD_TU),
+                deadline,
+                local::HandoffFd(source_file("p50-distinct-c", inputs[index]))));
+        });
+    }
+    const size_t held_workers = std::min<size_t>(2, c_count);
+    const bool codec_workers_held =
+        codec_gate.wait_for_arrivals(held_workers, std::chrono::seconds(3));
+    const auto overlap_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(3);
+    while ((observed_live_sessions.load(std::memory_order_acquire) < c_count ||
+            observed_namespaces.load(std::memory_order_acquire) < c_count) &&
+           std::chrono::steady_clock::now() < overlap_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool all_namespaces_live_while_workers_held =
+        observed_live_sessions.load(std::memory_order_acquire) >= c_count &&
+        observed_namespaces.load(std::memory_order_acquire) >= c_count;
+    stop_sampling.store(true, std::memory_order_release);
+    codec_gate.release();
+    std::vector<local::P50SourceTransferResult> committed;
+    committed.reserve(c_count);
+    for (auto& result : results)
+        committed.push_back(result.get());
+    for (size_t index = 0; index != c_count; ++index) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake < 0)
+            continue;
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                        sizeof(address));
+        (void)::close(wake);
+    }
+    for (auto& transfer : transfers)
+        transfer.join();
+    server.join();
+
+    std::vector<CStoreGuid> c_guids;
+    for (size_t index = 0; index != c_count; ++index) {
+        const auto& result = committed[index];
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+        CHECK(result.valid() && result.attempts == 1 && result.tu_seq == 0);
+        CHECK(result.c_store_guid == launches[index].c_store_guid);
+        CHECK(result.raw_bytes == inputs[index].size());
+        CHECK(result.raw_digest == icecc::digest128(inputs[index]));
+        const auto observation = std::find_if(
+            observations.begin(), observations.end(), [&](const auto& seen) {
+                return seen.committed_c_store_guid == launches[index].c_store_guid;
+            });
+        CHECK(observation != observations.end());
+        CHECK(observation->committed_input == inputs[index]);
+        CHECK(observation->committed_profile == ProfileId::ZSTD_TU);
+        CHECK(observation->commit_identity_matches_input);
+        CHECK(observation->accepted && observation->protocol_50 &&
+              observation->arm_received && observation->armed_sent &&
+              observation->cache_session_received &&
+              observation->ready_sent && observation->transfer_completed);
+        c_guids.push_back(result.c_store_guid);
+    }
+    std::sort(c_guids.begin(), c_guids.end());
+    CHECK(std::adjacent_find(c_guids.begin(), c_guids.end()) == c_guids.end());
+    CHECK(codec_workers_held);
+    CHECK(all_namespaces_live_while_workers_held);
+    std::printf("A02-%zu ZSTD_TU: one F owner held %zu codec workers while all "
+                "C namespaces were live\n", c_count, held_workers);
+    std::fflush(stdout);
+}
+
+void test_parallel_distinct_c_matrix() {
+    for (size_t count : {size_t{2}, size_t{3}, size_t{4}})
+        test_parallel_distinct_c_one_f(count);
+}
+
+void test_source_active_count_cap_waits_then_releases() {
+    StoreIdentityRoot root{};
+    root.bytes[15] = 0xb1;
+    const auto launch = test_sidecar_launch(root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_active_source_transfers = 1;
+    config.max_aggregate_source_raw_bytes = 128;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot first_root{};
+    first_root.bytes[14] = 0xb2;
+    StoreIdentityRoot second_root{};
+    second_root.bytes[14] = 0xb3;
+    const auto first_guid = f_store_guid_for_root(first_root);
+    const auto second_guid = f_store_guid_for_root(second_root);
+    uint16_t first_port = 0;
+    uint16_t second_port = 0;
+    const int first_listener = loopback_listener(first_port);
+    const int second_listener = loopback_listener(second_port);
+    SourceArmServerObservation first_observation;
+    SourceArmServerObservation second_observation;
+    SourceCommitHold first_hold;
+    std::thread first_server([&] {
+        sockaddr_in peer{};
+        socklen_t size = sizeof(peer);
+        const int accepted = ::accept(
+            first_listener, reinterpret_cast<sockaddr*>(&peer), &size);
+        (void)::close(first_listener);
+        serve_accepted_source_transfer(
+            accepted, peer, size, first_guid, 301, first_observation,
+            false, nullptr, nullptr, &first_hold);
+    });
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto make_deadline = [&clock](std::chrono::seconds duration) {
+        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + duration,
+            clock.clock_domain_id, clock.time_namespace_id);
+    };
+    const std::array<uint8_t, 12> first_source{
+        'c', 'o', 'u', 'n', 't', '-', 'c', 'a', 'p', '-', '1', '!'};
+    const std::array<uint8_t, 10> second_source{
+        'c', 'o', 'u', 'n', 't', '-', 'c', 'a', 'p', '!'};
+    std::promise<local::P50SourceTransferResult> first_completion;
+    std::promise<local::P50SourceTransferResult> second_completion;
+    auto first_result = first_completion.get_future();
+    auto second_result = second_completion.get_future();
+    std::thread first_transfer([&] {
+        first_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(first_port, 1301, CACHE_PROFILE_ZSTD_TU),
+            make_deadline(std::chrono::seconds(6)),
+            local::HandoffFd(source_file("p50-count-cap-first", first_source))));
+    });
+    const bool first_held =
+        first_hold.wait_until_entered(std::chrono::seconds(3));
+    std::promise<void> second_started;
+    auto second_started_result = second_started.get_future();
+    std::thread second_transfer([&] {
+        second_started.set_value();
+        second_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(second_port, 1302, CACHE_PROFILE_ZSTD_TU),
+            make_deadline(std::chrono::seconds(6)),
+            local::HandoffFd(source_file("p50-count-cap-second", second_source))));
+    });
+    second_started_result.wait();
+    pollfd second_ready{second_listener, POLLIN, 0};
+    int accepted_before_release = -1;
+    do {
+        accepted_before_release = ::poll(&second_ready, 1, 180);
+    } while (accepted_before_release < 0 && errno == EINTR);
+
+    first_hold.release();
+    std::thread second_server([&] {
+        serve_one_source_transfer(second_listener, second_guid, 302,
+                                  second_observation);
+    });
+    const bool first_ready = first_result.wait_for(std::chrono::seconds(7)) ==
+                             std::future_status::ready;
+    const bool second_ready_result =
+        second_result.wait_for(std::chrono::seconds(7)) ==
+        std::future_status::ready;
+    local::P50SourceTransferResult first_value;
+    local::P50SourceTransferResult second_value;
+    if (first_ready)
+        first_value = first_result.get();
+    if (second_ready_result)
+        second_value = second_result.get();
+    first_transfer.join();
+    second_transfer.join();
+    for (const uint16_t port : {first_port, second_port}) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(port);
+            (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake);
+        }
+    }
+    first_server.join();
+    second_server.join();
+    CHECK(first_held);
+    CHECK(accepted_before_release == 0);
+    CHECK(first_ready && second_ready_result);
+    CHECK(first_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(second_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(first_value.raw_bytes == first_source.size() &&
+          first_value.raw_digest == icecc::digest128(first_source));
+    CHECK(second_value.raw_bytes == second_source.size() &&
+          second_value.raw_digest == icecc::digest128(second_source));
+    CHECK(first_value.c_store_guid == launch.c_store_guid &&
+          second_value.c_store_guid == launch.c_store_guid);
+    CHECK(first_value.tu_seq == 0 && second_value.tu_seq == 1);
+    CHECK(first_observation.committed_input ==
+          std::vector<uint8_t>(first_source.begin(), first_source.end()));
+    CHECK(second_observation.committed_input ==
+          std::vector<uint8_t>(second_source.begin(), second_source.end()));
+    CHECK(first_observation.committed_profile == ProfileId::ZSTD_TU &&
+          second_observation.committed_profile == ProfileId::ZSTD_TU);
+    CHECK(first_observation.commit_identity_matches_input &&
+          second_observation.commit_identity_matches_input);
+    CHECK(first_observation.transfer_completed &&
+          second_observation.transfer_completed);
+    CHECK(second_observation.arm_received);
+    std::printf("A09: active-source count pressure waited and released after commit\n");
+    std::fflush(stdout);
+}
+
+void test_source_raw_byte_cap_waits_then_releases() {
+    StoreIdentityRoot root{};
+    root.bytes[15] = 0xb4;
+    const auto launch = test_sidecar_launch(root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_active_source_transfers = 4;
+    config.max_aggregate_source_raw_bytes = 32;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot first_root{};
+    first_root.bytes[14] = 0xb5;
+    StoreIdentityRoot second_root{};
+    second_root.bytes[14] = 0xb6;
+    const auto first_guid = f_store_guid_for_root(first_root);
+    const auto second_guid = f_store_guid_for_root(second_root);
+    uint16_t first_port = 0;
+    uint16_t second_port = 0;
+    const int first_listener = loopback_listener(first_port);
+    const int second_listener = loopback_listener(second_port);
+    SourceArmServerObservation first_observation;
+    SourceArmServerObservation second_observation;
+    SourceCommitHold first_hold;
+    std::thread first_server([&] {
+        sockaddr_in peer{};
+        socklen_t size = sizeof(peer);
+        const int accepted = ::accept(
+            first_listener, reinterpret_cast<sockaddr*>(&peer), &size);
+        (void)::close(first_listener);
+        serve_accepted_source_transfer(
+            accepted, peer, size, first_guid, 311, first_observation,
+            false, nullptr, nullptr, &first_hold);
+    });
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = [&clock] {
+        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(6),
+            clock.clock_domain_id, clock.time_namespace_id);
+    };
+    const std::array<uint8_t, 24> first_source{
+        'r','a','w','-','b','y','t','e','-','c','a','p','-','f','i','r','s','t','!','!','!','!','!','!'};
+    const std::array<uint8_t, 9> second_source{
+        'r','a','w','-','b','y','t','e','!'};
+    std::promise<local::P50SourceTransferResult> first_completion;
+    std::promise<local::P50SourceTransferResult> second_completion;
+    auto first_result = first_completion.get_future();
+    auto second_result = second_completion.get_future();
+    std::thread first_transfer([&] {
+        first_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(first_port, 1311, CACHE_PROFILE_ZSTD_ROUTE),
+            deadline(),
+            local::HandoffFd(source_file("p50-byte-cap-first", first_source))));
+    });
+    const bool first_held =
+        first_hold.wait_until_entered(std::chrono::seconds(3));
+    std::promise<void> second_started;
+    auto second_started_result = second_started.get_future();
+    std::thread second_transfer([&] {
+        second_started.set_value();
+        second_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(second_port, 1312, CACHE_PROFILE_ZSTD_ROUTE),
+            deadline(),
+            local::HandoffFd(source_file("p50-byte-cap-second", second_source))));
+    });
+    second_started_result.wait();
+    pollfd second_ready{second_listener, POLLIN, 0};
+    int accepted_before_release = -1;
+    do {
+        accepted_before_release = ::poll(&second_ready, 1, 180);
+    } while (accepted_before_release < 0 && errno == EINTR);
+
+    first_hold.release();
+    std::thread second_server([&] {
+        serve_one_source_transfer(second_listener, second_guid, 312,
+                                  second_observation);
+    });
+    const bool first_ready = first_result.wait_for(std::chrono::seconds(7)) ==
+                             std::future_status::ready;
+    const bool second_ready_result =
+        second_result.wait_for(std::chrono::seconds(7)) ==
+        std::future_status::ready;
+    local::P50SourceTransferResult first_value;
+    local::P50SourceTransferResult second_value;
+    if (first_ready)
+        first_value = first_result.get();
+    if (second_ready_result)
+        second_value = second_result.get();
+    first_transfer.join();
+    second_transfer.join();
+    for (const uint16_t port : {first_port, second_port}) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(port);
+            (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake);
+        }
+    }
+    first_server.join();
+    second_server.join();
+    CHECK(first_held);
+    CHECK(accepted_before_release == 0);
+    CHECK(first_ready && second_ready_result);
+    CHECK(first_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(second_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(first_value.raw_bytes == first_source.size() &&
+          first_value.raw_digest == icecc::digest128(first_source));
+    CHECK(second_value.raw_bytes == second_source.size() &&
+          second_value.raw_digest == icecc::digest128(second_source));
+    CHECK(first_value.c_store_guid == launch.c_store_guid &&
+          second_value.c_store_guid == launch.c_store_guid);
+    CHECK(first_value.tu_seq == 0 && second_value.tu_seq == 1);
+    CHECK(first_observation.committed_profile == ProfileId::ZSTD_ROUTE &&
+          second_observation.committed_profile == ProfileId::ZSTD_ROUTE);
+    CHECK(first_observation.commit_identity_matches_input &&
+          second_observation.commit_identity_matches_input);
+    CHECK(first_observation.committed_input ==
+          std::vector<uint8_t>(first_source.begin(), first_source.end()));
+    CHECK(second_observation.committed_input ==
+          std::vector<uint8_t>(second_source.begin(), second_source.end()));
+    CHECK(second_observation.transfer_completed);
+    std::printf("A10: aggregate raw-byte pressure waited and released exactly\n");
+    std::fflush(stdout);
+}
+
+void test_source_admission_releases_on_open_read_error_and_expiry() {
+    StoreIdentityRoot root{};
+    root.bytes[15] = 0xb7;
+    const auto launch = test_sidecar_launch(root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_active_source_transfers = 1;
+    config.max_aggregate_source_raw_bytes = 64;
+    config.source_open_arm_timeout = std::chrono::milliseconds(500);
+    service::SidecarRuntime runtime(std::move(config));
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = [&clock](std::chrono::milliseconds duration) {
+        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + duration,
+            clock.clock_domain_id, clock.time_namespace_id);
+    };
+    const auto root_guid = [](uint8_t value) {
+        StoreIdentityRoot remote{};
+        remote.bytes[14] = 0xb8;
+        remote.bytes[15] = value;
+        return f_store_guid_for_root(remote);
+    };
+
+    // An accepted F that never answers SOURCE_ARMED forces an open failure
+    // after the source count and byte reservation have already been granted.
+    uint16_t open_port = 0;
+    const int open_listener = loopback_listener(open_port);
+    std::atomic<bool> open_arm_received{false};
+    std::promise<void> release_open_server;
+    auto release_open = release_open_server.get_future().share();
+    std::thread open_server([&] {
+        serve_stalled_source_arm(open_listener, open_arm_received, release_open);
+    });
+    const std::array<uint8_t, 8> open_source{'o','p','e','n','-','e','r','r'};
+    std::promise<local::P50SourceTransferResult> open_completion;
+    auto open_result = open_completion.get_future();
+    std::thread open_transfer([&] {
+        open_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(open_port, 1321, CACHE_PROFILE_ZSTD_TU),
+            deadline(std::chrono::seconds(4)),
+            local::HandoffFd(source_file("p50-open-error", open_source))));
+    });
+    const auto arm_wait_until = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(2);
+    while (!open_arm_received.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < arm_wait_until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const bool open_arm_seen = open_arm_received.load(std::memory_order_acquire);
+    const auto open_value = open_result.get();
+    open_transfer.join();
+    release_open_server.set_value();
+    open_server.join();
+    CHECK(open_arm_seen);
+    CHECK(open_value.code == local::SourceTransferResultCode::Error);
+
+    // Change the already-reserved file after SOURCE_ARMED is observed but
+    // before the owner releases the admission barrier; read must refuse it.
+    uint16_t read_port = 0;
+    const int read_listener = loopback_listener(read_port);
+    const FStoreGuid read_guid = root_guid(0xb9);
+    SourceArmServerObservation read_observation;
+    SourceTransferBarrier read_barrier(2);
+    std::thread read_server([&] {
+        serve_one_source_transfer(read_listener, read_guid, 321,
+                                  read_observation, &read_barrier);
+    });
+    const std::array<uint8_t, 12> read_source{
+        'r','e','a','d','-','e','r','r','o','r','!','!'};
+    const int read_fd = source_file("p50-read-error", read_source);
+    const int mutation_fd = ::dup(read_fd);
+    CHECK(mutation_fd >= 0);
+    std::promise<local::P50SourceTransferResult> read_completion;
+    auto read_result = read_completion.get_future();
+    std::thread read_transfer([&] {
+        read_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(read_port, 1322, CACHE_PROFILE_ZSTD_ROUTE),
+            deadline(std::chrono::seconds(4)), local::HandoffFd(read_fd)));
+    });
+    const auto barrier_wait_until = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(2);
+    while (read_barrier.arrived() == 0 &&
+           std::chrono::steady_clock::now() < barrier_wait_until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const bool read_barrier_seen = read_barrier.arrived() == 1;
+    const bool read_file_truncated = ::ftruncate(mutation_fd, 0) == 0;
+    (void)::close(mutation_fd);
+    bool read_barrier_released = false;
+    if (read_barrier_seen)
+        read_barrier_released = read_barrier.arrive_and_wait();
+    else {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(read_port);
+            (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake);
+        }
+    }
+    const auto read_value = read_result.get();
+    read_transfer.join();
+    read_server.join();
+    CHECK(read_barrier_seen);
+    CHECK(read_file_truncated);
+    CHECK(read_barrier_released);
+    CHECK(read_value.code == local::SourceTransferResultCode::Error);
+    CHECK(!read_observation.transfer_completed);
+
+    // A held successful operation owns the sole count slot. The independent
+    // F waiter expires before it can set up a connection; after release, a
+    // fresh operation must still succeed (no leaked or stolen lease).
+    uint16_t held_port = 0;
+    const int held_listener = loopback_listener(held_port);
+    SourceArmServerObservation held_observation;
+    SourceCommitHold held_commit;
+    const FStoreGuid held_guid = root_guid(0xba);
+    std::thread held_server([&] {
+        sockaddr_in peer{};
+        socklen_t size = sizeof(peer);
+        const int accepted = ::accept(
+            held_listener, reinterpret_cast<sockaddr*>(&peer), &size);
+        (void)::close(held_listener);
+        serve_accepted_source_transfer(
+            accepted, peer, size, held_guid, 322, held_observation,
+            false, nullptr, nullptr, &held_commit);
+    });
+    const std::array<uint8_t, 9> held_source{'h','e','l','d','-','o','k','!','!'};
+    std::promise<local::P50SourceTransferResult> held_completion;
+    auto held_result = held_completion.get_future();
+    std::thread held_transfer([&] {
+        held_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(held_port, 1323, CACHE_PROFILE_ZSTD_TU),
+            deadline(std::chrono::seconds(5)),
+            local::HandoffFd(source_file("p50-held-release", held_source))));
+    });
+    const bool held_entered =
+        held_commit.wait_until_entered(std::chrono::seconds(3));
+
+    uint16_t expired_port = 0;
+    const int expired_listener = loopback_listener(expired_port);
+    SourceArmServerObservation expired_observation;
+    const std::array<uint8_t, 8> expired_source{'e','x','p','i','r','e','d','!'};
+    const auto expired_value = runtime.transfer_source_on_owner(
+        source_transfer_request(expired_port, 1324, CACHE_PROFILE_ZSTD_TU),
+        deadline(std::chrono::milliseconds(220)),
+        local::HandoffFd(source_file("p50-credit-expiry", expired_source)));
+    pollfd expired_ready{expired_listener, POLLIN, 0};
+    int expired_pending = -1;
+    do {
+        expired_pending = ::poll(&expired_ready, 1, 0);
+    } while (expired_pending < 0 && errno == EINTR);
+    std::thread expired_server([&] {
+        serve_one_source_transfer(expired_listener, root_guid(0xbb), 323,
+                                  expired_observation);
+    });
+    held_commit.release();
+    const auto held_value = held_result.get();
+    held_transfer.join();
+    const int held_wake_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (held_wake_fd >= 0) {
+        sockaddr_in held_address{};
+        held_address.sin_family = AF_INET;
+        held_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        held_address.sin_port = htons(held_port);
+        (void)::connect(held_wake_fd,
+                        reinterpret_cast<const sockaddr*>(&held_address),
+                        sizeof(held_address));
+        (void)::close(held_wake_fd);
+    }
+    held_server.join();
+    // Wake the fixture whose request intentionally expired before setup.
+    const int wake_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(wake_fd >= 0);
+    sockaddr_in expired_address{};
+    expired_address.sin_family = AF_INET;
+    expired_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    expired_address.sin_port = htons(expired_port);
+    (void)::connect(wake_fd, reinterpret_cast<const sockaddr*>(&expired_address),
+                    sizeof(expired_address));
+    (void)::close(wake_fd);
+    expired_server.join();
+    CHECK(held_entered);
+    CHECK(expired_value.code == local::SourceTransferResultCode::Error);
+    CHECK(expired_pending == 0);
+    CHECK(held_value.code == local::SourceTransferResultCode::Committed);
+
+    uint16_t final_port = 0;
+    const int final_listener = loopback_listener(final_port);
+    SourceArmServerObservation final_observation;
+    const FStoreGuid final_guid = root_guid(0xbc);
+    std::thread final_server([&] {
+        serve_one_source_transfer(final_listener, final_guid, 324,
+                                  final_observation);
+    });
+    const std::array<uint8_t, 7> final_source{'f','i','n','a','l','!','!'};
+    const auto final_value = runtime.transfer_source_on_owner(
+        source_transfer_request(final_port, 1325, CACHE_PROFILE_ZSTD_TU),
+        deadline(std::chrono::seconds(4)),
+        local::HandoffFd(source_file("p50-final-release", final_source)));
+    const int final_wake_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (final_wake_fd >= 0) {
+        sockaddr_in final_address{};
+        final_address.sin_family = AF_INET;
+        final_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        final_address.sin_port = htons(final_port);
+        (void)::connect(final_wake_fd,
+                        reinterpret_cast<const sockaddr*>(&final_address),
+                        sizeof(final_address));
+        (void)::close(final_wake_fd);
+    }
+    final_server.join();
+    CHECK(final_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(final_value.raw_bytes == final_source.size() &&
+          final_value.raw_digest == icecc::digest128(final_source));
+    CHECK(final_observation.committed_input ==
+          std::vector<uint8_t>(final_source.begin(), final_source.end()));
+    std::printf("A11: success/open/read/expiry paths released bounded source leases\n");
+    std::fflush(stdout);
+}
+
+void test_alias_waiter_releases_active_source_credit_for_independent_f() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0xbd;
+    const auto launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_active_source_transfers = 2;
+    config.max_aggregate_source_raw_bytes = 128;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot shared_root{};
+    shared_root.bytes[14] = 0xbe;
+    StoreIdentityRoot independent_root{};
+    independent_root.bytes[14] = 0xbf;
+    const FStoreGuid shared_guid = f_store_guid_for_root(shared_root);
+    const FStoreGuid independent_guid =
+        f_store_guid_for_root(independent_root);
+    constexpr uint64_t shared_generation = 401;
+    uint16_t held_port = 0;
+    uint16_t alias_port = 0;
+    uint16_t independent_port = 0;
+    const int held_listener = loopback_listener(held_port);
+    const int alias_listener = loopback_listener(alias_port);
+    const int independent_listener = loopback_listener(independent_port);
+    SourceArmServerObservation held_observation;
+    SourceArmServerObservation alias_observation;
+    SourceArmServerObservation independent_observation;
+    SourceCommitHold held_commit;
+    SourceTransferBarrier alias_arm_barrier(2);
+    std::promise<bool> alias_ready_promise;
+    auto alias_ready = alias_ready_promise.get_future();
+    const std::array<uint8_t, 10> held_source{
+        'a','l','i','a','s','-','h','o','l','d'};
+    const std::array<uint8_t, 11> alias_source{
+        'a','l','i','a','s','-','w','a','i','t','!'};
+    const std::array<uint8_t, 12> independent_source{
+        'i','n','d','e','p','e','n','d','-','f','!','!'};
+    std::promise<int> alias_fd_promise;
+    auto alias_fd_future = alias_fd_promise.get_future();
+    std::promise<void> held_endpoint_done_promise;
+    auto held_endpoint_done_future = held_endpoint_done_promise.get_future();
+    const auto accept_ready_fd = [&](int listener,
+                                     SourceArmServerObservation& observation,
+                                     SourceTransferBarrier* arm_barrier) {
+        sockaddr_in peer{};
+        socklen_t size = sizeof(peer);
+        const int accepted = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&peer), &size);
+        (void)::close(listener);
+        if (accepted < 0)
+            return -1;
+        std::unique_ptr<MsgChannel> channel(Service::createChannel(
+            accepted, reinterpret_cast<sockaddr*>(&peer), size));
+        if (!channel)
+            return -1;
+        observation.accepted = true;
+        observation.protocol_50 = channel->protocol == PROTOCOL_VERSION;
+        std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+        const auto* arm = arm_message != nullptr
+                              ? dynamic_cast<P50SourceArmMsg*>(
+                                    arm_message.get())
+                              : nullptr;
+        if (arm == nullptr || !arm->valid_payload())
+            return -1;
+        observation.arm_received = true;
+        if (arm_barrier != nullptr) {
+            observation.arm_barrier_passed =
+                arm_barrier->arrive_and_wait();
+            if (!observation.arm_barrier_passed)
+                return -1;
+        }
+        ClaimAttemptCapability128 capability_1;
+        ClaimAttemptCapability128 capability_2;
+        capability_1.bytes.fill(0xd1);
+        capability_2.bytes.fill(0xd2);
+        const P50SourceArmedMsg acknowledgement(
+            arm->arm, 101, 102, shared_generation, shared_guid.bytes,
+            kStoreIdentityDerivationVersion, 103, 2500,
+            capability_1, capability_2);
+        if (!channel->send_msg(acknowledgement))
+            return -1;
+        observation.armed_sent = true;
+        std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+        if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+            return -1;
+        observation.cache_session_received = true;
+        const int raw_fd = channel->release_fd_if_input_empty();
+        if (raw_fd < 0)
+            return -1;
+        observation.ready_sent = send_cache_session_ready(
+            raw_fd, std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2));
+        if (!observation.ready_sent) {
+            (void)::close(raw_fd);
+            return -1;
+        }
+        return raw_fd;
+    };
+
+    std::thread held_server([&] {
+        try {
+            const int raw_fd = accept_ready_fd(
+                held_listener, held_observation, nullptr);
+            if (raw_fd < 0) {
+                try { held_endpoint_done_promise.set_value(); } catch (...) {}
+                return;
+            }
+            namespace asio = boost::asio;
+            asio::io_context f_context;
+            P50ServerEndpointConfig server_config;
+            server_config.input_job_state =
+                [&](CStoreGuid c_guid, const TxBegin& begin,
+                    const TxCommit& commit, std::span<const uint8_t> input) {
+                    SourceArmServerObservation* observation = nullptr;
+                    if (std::equal(input.begin(), input.end(),
+                                   held_source.begin(), held_source.end())) {
+                        observation = &held_observation;
+                        held_commit.enter_and_wait();
+                    } else {
+                        observation = &alias_observation;
+                    }
+                    observation->committed_c_store_guid = c_guid;
+                    observation->committed_tu_seq = begin.tu_seq.value;
+                    observation->committed_profile = begin.profile;
+                    observation->committed_input.assign(input.begin(),
+                                                        input.end());
+                    observation->commit_identity_matches_input =
+                        commit.tu_seq == begin.tu_seq &&
+                        begin.raw_bytes == input.size() &&
+                        begin.raw_digest == icecc::digest128(input) &&
+                        commit.raw_digest == begin.raw_digest;
+                    return InputJobState::Open;
+                };
+            P50ServerEndpoint f_endpoint(shared_guid, {}, nullptr, nullptr,
+                                         std::move(server_config));
+            const auto run_f_session = [&](int adopted_fd,
+                                           SourceArmServerObservation& observation) {
+                boost::system::error_code error;
+                auto socket = P50ServerEndpoint::adopt_connected_fd(
+                    f_context.get_executor(), adopted_fd, error);
+                if (!socket.has_value()) {
+                    (void)::close(adopted_fd);
+                    return;
+                }
+                f_context.restart();
+                auto result = asio::co_spawn(
+                    f_context,
+                    f_endpoint.run_adopted(std::move(*socket)),
+                    asio::use_future);
+                f_context.run();
+                const ServerRunResult value = result.get();
+                observation.transfer_completed =
+                    value.status == ServerRunStatus::Completed &&
+                    value.committed_input.has_value();
+            };
+            run_f_session(raw_fd, held_observation);
+            try { held_endpoint_done_promise.set_value(); } catch (...) {}
+            const int alias_fd = alias_fd_future.get();
+            if (alias_fd >= 0)
+                run_f_session(alias_fd, alias_observation);
+        } catch (...) {}
+        try { held_endpoint_done_promise.set_value(); } catch (...) {}
+    });
+    std::thread alias_server([&] {
+        int raw_fd = -1;
+        try {
+            raw_fd = accept_ready_fd(alias_listener, alias_observation,
+                                     &alias_arm_barrier);
+        } catch (...) {
+            if (raw_fd >= 0)
+                (void)::close(raw_fd);
+        }
+        try { alias_fd_promise.set_value(raw_fd); } catch (...) {
+            if (raw_fd >= 0)
+                (void)::close(raw_fd);
+        }
+        try { alias_ready_promise.set_value(raw_fd >= 0); } catch (...) {}
+    });
+    std::thread independent_server([&] {
+        serve_one_source_transfer(independent_listener, independent_guid, 402,
+                                  independent_observation);
+    });
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto make_deadline = [&clock] {
+        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(8),
+            clock.clock_domain_id, clock.time_namespace_id);
+    };
+    std::promise<local::P50SourceTransferResult> held_completion;
+    auto held_result = held_completion.get_future();
+    std::thread held_transfer([&] {
+        held_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(held_port, 1401, CACHE_PROFILE_ZSTD_TU),
+            make_deadline(),
+            local::HandoffFd(source_file("p50-alias-progress-held",
+                                         held_source))));
+    });
+    const bool held_entered =
+        held_commit.wait_until_entered(std::chrono::seconds(3));
+
+    std::promise<local::P50SourceTransferResult> alias_completion;
+    auto alias_result = alias_completion.get_future();
+    std::thread alias_transfer([&] {
+        alias_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(alias_port, 1402, CACHE_PROFILE_ZSTD_TU),
+            make_deadline(),
+            local::HandoffFd(source_file("p50-alias-progress-waiter",
+                                         alias_source))));
+    });
+    const auto alias_arm_wait_until = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(3);
+    while (alias_arm_barrier.arrived() == 0 &&
+           std::chrono::steady_clock::now() < alias_arm_wait_until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool alias_arm_seen = alias_arm_barrier.arrived() == 1;
+    const bool alias_arm_released = alias_arm_seen &&
+                                    alias_arm_barrier.arrive_and_wait();
+    const bool alias_ready_received = alias_ready.wait_for(
+        std::chrono::seconds(3)) == std::future_status::ready;
+    const bool alias_ready_seen = alias_ready_received && alias_ready.get();
+
+    std::promise<local::P50SourceTransferResult> independent_completion;
+    auto independent_result = independent_completion.get_future();
+    std::thread independent_transfer([&] {
+        independent_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(independent_port, 1403,
+                                    CACHE_PROFILE_ZSTD_TU),
+            make_deadline(),
+            local::HandoffFd(source_file("p50-alias-progress-independent",
+                                         independent_source))));
+    });
+    const bool independent_before_release =
+        independent_result.wait_for(std::chrono::seconds(3)) ==
+        std::future_status::ready;
+
+    held_commit.release();
+    const bool held_ready = held_result.wait_for(std::chrono::seconds(7)) ==
+                            std::future_status::ready;
+    const bool alias_done = alias_result.wait_for(std::chrono::seconds(7)) ==
+                            std::future_status::ready;
+    const bool independent_done = independent_before_release ||
+        independent_result.wait_for(std::chrono::seconds(5)) ==
+            std::future_status::ready;
+    const bool held_endpoint_settled = held_endpoint_done_future.wait_for(
+        std::chrono::seconds(2)) == std::future_status::ready;
+    local::P50SourceTransferResult held_value;
+    local::P50SourceTransferResult alias_value;
+    local::P50SourceTransferResult independent_value;
+    if (held_ready)
+        held_value = held_result.get();
+    if (alias_done)
+        alias_value = alias_result.get();
+    if (independent_done)
+        independent_value = independent_result.get();
+    held_transfer.join();
+    alias_transfer.join();
+    independent_transfer.join();
+    for (const uint16_t port : {held_port, alias_port, independent_port}) {
+        const int wake = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(port);
+            (void)::connect(wake, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake);
+        }
+    }
+    alias_server.join();
+    held_server.join();
+    independent_server.join();
+
+    CHECK(held_entered);
+    CHECK(alias_arm_seen && alias_arm_released && alias_ready_seen);
+    CHECK(held_endpoint_settled);
+    CHECK(independent_before_release);
+    CHECK(held_ready && alias_done && independent_done);
+    CHECK(held_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(independent_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(alias_value.code == local::SourceTransferResultCode::Committed);
+    CHECK(held_value.tu_seq == 0 && independent_value.tu_seq == 1 &&
+          alias_value.tu_seq == 2);
+    CHECK(held_value.raw_bytes == held_source.size() &&
+          held_value.raw_digest == icecc::digest128(held_source));
+    CHECK(independent_value.raw_bytes == independent_source.size() &&
+          independent_value.raw_digest == icecc::digest128(independent_source));
+    CHECK(alias_value.raw_bytes == alias_source.size() &&
+          alias_value.raw_digest == icecc::digest128(alias_source));
+    CHECK(held_observation.committed_input ==
+          std::vector<uint8_t>(held_source.begin(), held_source.end()));
+    CHECK(independent_observation.committed_input ==
+          std::vector<uint8_t>(independent_source.begin(),
+                               independent_source.end()));
+    CHECK(alias_observation.committed_input ==
+          std::vector<uint8_t>(alias_source.begin(), alias_source.end()));
+    CHECK(alias_observation.committed_c_store_guid == launch.c_store_guid);
+    CHECK(alias_observation.committed_tu_seq == 2);
+    CHECK(alias_observation.committed_profile == ProfileId::ZSTD_TU);
+    CHECK(alias_observation.commit_identity_matches_input &&
+          alias_observation.transfer_completed);
+    std::puts("A09 alias progress: waiting F incarnation released global credits for independent F");
+    std::fflush(stdout);
 }
 
 void test_transport_loss_preserves_other_worker_service() {
@@ -2571,6 +4747,331 @@ void test_operation_cancel_commit_race_preserves_witness() {
           client_value.committed_input == runtime_result.endpoint->completed_input);
 }
 
+void test_runtime_interner_poison_preserves_active_commit() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x7a;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.p29_interner_fault_injection = P29InternerFaultInjection::FailOnce;
+    config.source_open_arm_timeout = std::chrono::milliseconds(500);
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot active_root{};
+    active_root.bytes[15] = 0x7b;
+    const FStoreGuid active_f_guid = f_store_guid_for_root(active_root);
+    StoreIdentityRoot poison_root{};
+    poison_root.bytes[15] = 0x7c;
+    const FStoreGuid poison_f_guid = f_store_guid_for_root(poison_root);
+    uint16_t active_port = 0;
+    const int active_listener = loopback_listener(active_port);
+    uint16_t poison_port = 0;
+    const int poison_listener = loopback_listener(poison_port);
+    uint16_t refused_port = 0;
+    const int refused_listener = loopback_listener(refused_port);
+    SourceArmServerObservation active_observation;
+    SourceArmServerObservation poison_observation;
+    SourceCommitHold hold_active_commit;
+    std::thread active_server([&] {
+        pollfd ready{active_listener, POLLIN, 0};
+        if (::poll(&ready, 1, 3000) <= 0) {
+            (void)::close(active_listener);
+            return;
+        }
+        sockaddr_in peer{};
+        socklen_t peer_size = sizeof(peer);
+        const int accepted = ::accept(
+            active_listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+        (void)::close(active_listener);
+        serve_accepted_source_transfer(
+            accepted, peer, peer_size, active_f_guid, 17,
+            active_observation, false, nullptr, nullptr, &hold_active_commit);
+    });
+    std::thread poison_server([&] {
+        pollfd ready{poison_listener, POLLIN, 0};
+        if (::poll(&ready, 1, 3000) <= 0) {
+            (void)::close(poison_listener);
+            return;
+        }
+        serve_one_source_arm(poison_listener, poison_f_guid, 17,
+                             poison_observation);
+    });
+
+    const std::vector<uint8_t> active_source{
+        'a', 'c', 't', 'i', 'v', 'e', '-', 'c', '-', 'w', 'i', 't', 'n', 'e', 's', 's', '\n'};
+    const std::vector<uint8_t> poison_source{
+        '#', ' ', '1', ' ', '"', 'p', 'o', 'i', 's', 'o', 'n', '.', 'h', '"', '\n',
+        'p', 'o', 'i', 's', 'o', 'n', '-', 'r', 'e', 'g', 'i', 'o', 'n', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(5),
+        clock.clock_domain_id, clock.time_namespace_id);
+    local::P50SourceTransferResult active_result;
+    std::thread active_transfer([&] {
+        active_result = runtime.transfer_source_on_owner(
+            source_transfer_request(active_port, 860, CACHE_PROFILE_ZSTD_TU),
+            deadline, local::HandoffFd(source_file("p50-runtime-active", active_source)));
+    });
+    const bool active_commit_held =
+        hold_active_commit.wait_until_entered(std::chrono::seconds(2));
+
+    // This is the actual injected C-interner FailOnce path, distinct from the
+    // typed route-poison test seam: it terminalizes P29 preparation after a
+    // different profile already owns a live exact input/commit operation.
+    const auto poison_result = runtime.transfer_source_on_owner(
+        source_transfer_request(poison_port, 861, CACHE_PROFILE_P29V1),
+        deadline, local::HandoffFd(source_file("p50-runtime-poison", poison_source)));
+    const bool poison_was_permanent =
+        poison_result.code == local::SourceTransferResultCode::Error &&
+        poison_result.error_code == static_cast<uint16_t>(
+            local::SourceTransferErrorCode::PermanentLocalProfileUnavailable);
+
+    const auto retry_result = runtime.transfer_source_on_owner(
+        source_transfer_request(poison_port, 861, CACHE_PROFILE_P29V1),
+        deadline, local::HandoffFd(source_file("p50-runtime-poison-retry", poison_source)));
+    const bool retry_required_replacement =
+        retry_result.code == local::SourceTransferResultCode::Error &&
+        retry_result.error_code == static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired);
+    const auto refused_result = runtime.transfer_source_on_owner(
+        source_transfer_request(refused_port, 862, CACHE_PROFILE_ZSTD_ROUTE),
+        deadline, local::HandoffFd(source_file("p50-runtime-refused", poison_source)));
+    const bool new_route_required_replacement =
+        refused_result.code == local::SourceTransferResultCode::Error &&
+        refused_result.error_code == static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired);
+    pollfd refused_connection{};
+    refused_connection.fd = refused_listener;
+    refused_connection.events = POLLIN;
+    const bool new_route_was_not_opened =
+        ::poll(&refused_connection, 1, 0) == 0;
+
+    // Terminal preparation state fences new work but cannot erase the active
+    // route's F-side exact commit witness. Settle and join it before teardown.
+    hold_active_commit.release();
+    active_transfer.join();
+    active_server.join();
+    poison_server.join();
+    const bool poison_f_saw_only_open_handshake =
+        poison_observation.arm_received && poison_observation.armed_sent &&
+        poison_observation.cache_session_received && poison_observation.ready_sent &&
+        poison_observation.eof_without_cachewire;
+    const bool active_exact_commit_witness =
+        active_result.code == local::SourceTransferResultCode::Committed &&
+        active_result.tu_seq == 0 &&
+        active_result.raw_bytes == active_source.size() &&
+        active_result.raw_digest == icecc::digest128(active_source) &&
+        active_observation.transfer_completed &&
+        active_observation.committed_input == active_source &&
+        active_observation.commit_identity_matches_input;
+    CHECK(active_commit_held);
+    CHECK(poison_was_permanent);
+    CHECK(retry_required_replacement);
+    CHECK(new_route_required_replacement);
+    CHECK(new_route_was_not_opened);
+    CHECK(poison_f_saw_only_open_handshake);
+    CHECK(active_exact_commit_witness);
+    CHECK(::close(refused_listener) == 0);
+}
+
+[[noreturn]] void run_active_source_stop_fail_stop_child(int marker_fd) {
+    auto child_abort = [] { _exit(126); };
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x7e;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    CHECK(config.cancellation_grace == std::chrono::milliseconds(100));
+    CodecWorkerGate held_c_prepare;
+    config.before_route_prepare_for_test = [&held_c_prepare] {
+        held_c_prepare.enter_and_wait();
+    };
+    config.fail_stop = [marker_fd] {
+        const uint8_t byte = 'S';
+        (void)::write(marker_fd, &byte, sizeof(byte));
+    };
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot active_root{};
+    active_root.bytes[15] = 0x7f;
+    const FStoreGuid active_f_guid = f_store_guid_for_root(active_root);
+    uint16_t active_port = 0;
+    const int active_listener = loopback_listener(active_port);
+    SourceArmServerObservation active_observation;
+    std::thread active_server([&] {
+        serve_one_source_arm(active_listener, active_f_guid, 18,
+                             active_observation);
+    });
+    const std::vector<uint8_t> active_source{
+        's', 't', 'o', 'p', '-', 'a', 'c', 't', 'i', 'v', 'e', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(10),
+        clock.clock_domain_id, clock.time_namespace_id);
+    std::thread active_transfer([&] {
+        (void)runtime.transfer_source_on_owner(
+            source_transfer_request(active_port, 863, CACHE_PROFILE_ZSTD_TU),
+            deadline, local::HandoffFd(source_file("p50-runtime-stop", active_source)));
+    });
+    if (!held_c_prepare.wait_for_arrivals(1, std::chrono::seconds(3)))
+        child_abort();
+    const uint8_t ready = 'R';
+    if (::write(marker_fd, &ready, sizeof(ready)) != sizeof(ready))
+        child_abort();
+    // The test-only C route-owner callback remains held across stop. A fresh
+    // exec child avoids inheriting a dead static codec-pool thread after fork.
+    runtime.stop();
+    for (;;)
+        (void)::pause();
+}
+
+void test_runtime_active_source_stop_fail_stops_bounded() {
+    int marker[2] = {-1, -1};
+    CHECK(::pipe(marker) == 0);
+    const pid_t child = ::fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        (void)::close(marker[0]);
+        const std::string marker_arg = std::to_string(marker[1]);
+        ::execl("/proc/self/exe", "p50cacheservice",
+                "--p50-runtime-active-source-stop-child",
+                marker_arg.c_str(), static_cast<char*>(nullptr));
+        _exit(126);
+    }
+
+    (void)::close(marker[1]);
+    ReapOnFailure reaper(child, {&marker[0], nullptr, nullptr, nullptr, nullptr});
+    struct pollfd marker_ready{marker[0], POLLIN | POLLHUP, 0};
+    CHECK(::poll(&marker_ready, 1, 4000) > 0);
+    uint8_t marker_byte = 0;
+    CHECK(::read(marker[0], &marker_byte, sizeof(marker_byte)) == 1);
+    CHECK(marker_byte == 'R');
+    const auto stop_requested_at = std::chrono::steady_clock::now();
+    marker_ready.revents = 0;
+    CHECK(::poll(&marker_ready, 1, 1500) > 0);
+    CHECK(::read(marker[0], &marker_byte, sizeof(marker_byte)) == 1);
+    CHECK(marker_byte == 'S');
+    int status = 0;
+    CHECK(wait_for_exit_bounded(child, 1500, status));
+    reaper.pid = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 125);
+    CHECK(std::chrono::steady_clock::now() - stop_requested_at <
+          std::chrono::milliseconds(1200));
+    CHECK(::close(marker[0]) == 0);
+    reaper.descriptors[0] = nullptr;
+}
+
+void test_runtime_stop_bounds_opening_source_arm() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x80;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.source_open_arm_timeout = std::chrono::milliseconds(350);
+    config.max_active_source_transfers = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    uint16_t open_port = 0;
+    const int open_listener = loopback_listener(open_port);
+    uint16_t queued_port = 0;
+    const int queued_listener = loopback_listener(queued_port);
+    std::atomic<bool> arm_received{false};
+    std::promise<void> release_server_promise;
+    const auto release_server = release_server_promise.get_future().share();
+    std::thread open_server([&] {
+        serve_stalled_source_arm(open_listener, arm_received, release_server);
+    });
+
+    const std::vector<uint8_t> source{'o', 'p', 'e', 'n', '-', 's', 't', 'o', 'p', '\n'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(3),
+        clock.clock_domain_id, clock.time_namespace_id);
+    std::promise<local::P50SourceTransferResult> completion;
+    auto result = completion.get_future();
+    std::thread opening_transfer([&] {
+        completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(open_port, 864, CACHE_PROFILE_ZSTD_TU),
+            deadline, local::HandoffFd(source_file("p50-runtime-open-stop", source))));
+    });
+
+    const std::vector<uint8_t> queued_source{'q', 'u', 'e', 'u', 'e', 'd', '\n'};
+    std::promise<void> queued_call_started_promise;
+    auto queued_call_started = queued_call_started_promise.get_future();
+    std::promise<local::P50SourceTransferResult> queued_completion;
+    auto queued_result = queued_completion.get_future();
+    std::thread queued_transfer([&] {
+        queued_call_started_promise.set_value();
+        queued_completion.set_value(runtime.transfer_source_on_owner(
+            source_transfer_request(queued_port, 865, CACHE_PROFILE_ZSTD_ROUTE),
+            deadline, local::HandoffFd(source_file("p50-runtime-queued-stop", queued_source))));
+    });
+
+    // The F has received SOURCE_ARM, proving C has admitted and reserved the
+    // opening operation, but deliberately withholds SOURCE_ARMED. Stop must
+    // bound this non-cancellable initial handshake by source_open_arm_timeout.
+    const auto arm_deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+    while (!arm_received.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < arm_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool opening_barrier_reached =
+        arm_received.load(std::memory_order_acquire);
+    const bool queued_call_started_in_time =
+        queued_call_started.wait_for(std::chrono::seconds(1)) ==
+        std::future_status::ready;
+    pollfd queued_connection{};
+    queued_connection.fd = queued_listener;
+    queued_connection.events = POLLIN;
+    const bool queued_request_did_not_open_f =
+        ::poll(&queued_connection, 1, 0) == 0;
+    const auto stopped_at = std::chrono::steady_clock::now();
+    runtime.stop();
+    const bool opening_rejected_within_bound =
+        result.wait_for(std::chrono::milliseconds(700)) ==
+        std::future_status::ready;
+    const auto opening_elapsed = std::chrono::steady_clock::now() - stopped_at;
+    const bool queued_rejected_within_bound =
+        queued_result.wait_for(std::chrono::milliseconds(700)) ==
+        std::future_status::ready;
+    const auto queued_elapsed = std::chrono::steady_clock::now() - stopped_at;
+    // If a broken implementation failed to settle, close the held peer so the
+    // test reports a bounded assertion rather than stranding its server thread.
+    if (!opening_rejected_within_bound)
+        release_server_promise.set_value();
+    opening_transfer.join();
+    queued_transfer.join();
+    if (opening_rejected_within_bound)
+        release_server_promise.set_value();
+    open_server.join();
+    const auto value = result.get();
+    const auto queued_value = queued_result.get();
+    const bool opening_rejected =
+        value.code == local::SourceTransferResultCode::Error;
+    const bool queued_rejected =
+        queued_value.code == local::SourceTransferResultCode::Error &&
+        queued_value.error_code == 7;
+    CHECK(opening_barrier_reached);
+    CHECK(queued_call_started_in_time);
+    CHECK(queued_request_did_not_open_f);
+    CHECK(opening_rejected_within_bound);
+    CHECK(queued_rejected_within_bound);
+    CHECK(opening_rejected);
+    CHECK(queued_rejected);
+    CHECK(opening_elapsed < std::chrono::milliseconds(700));
+    CHECK(queued_elapsed < std::chrono::milliseconds(700));
+    CHECK(::close(queued_listener) == 0);
+}
+
 void test_runtime_stop_interrupts_active_endpoint() {
     service::SidecarRuntime runtime(test_runtime_config());
     RuntimeCase control = authenticated_runtime_pair();
@@ -2752,6 +5253,26 @@ void ready_requires_bind_and_replacement_is_preserved() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 &&
+            std::strcmp(argv[1],
+                        "--p50-runtime-active-source-stop-child") == 0) {
+            char* end = nullptr;
+            errno = 0;
+            const long marker_fd = std::strtol(argv[2], &end, 10);
+            CHECK(errno == 0 && end != argv[2] && *end == '\0' &&
+                  marker_fd >= 0 && marker_fd <= INT32_MAX);
+            run_active_source_stop_fail_stop_child(
+                static_cast<int>(marker_fd));
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--a05-global-gate-negative-control") == 0) {
+            // A one-credit cap deliberately recreates whole-process admission
+            // serialization.  The ordinary A05 progress assertion must fail
+            // by name after both fixture threads have been released/joined.
+            test_stalled_f_arm_is_bounded_before_healthy_transfer(
+                CACHE_PROFILE_P29V1, 1);
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--transport-isolation") == 0) {
             test_transport_loss_preserves_other_worker_service();
             test_route_poison_latches_before_successor_f_open();
@@ -2778,7 +5299,24 @@ int main(int argc, char** argv) {
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();
         test_source_connect_protocol_slices_share_one_outer_budget();
-        test_stalled_f_arm_is_bounded_before_healthy_transfer();
+        test_stalled_f_arm_is_bounded_before_healthy_transfer(
+            CACHE_PROFILE_P29V1);
+        test_stalled_f_arm_is_bounded_before_healthy_transfer(
+            CACHE_PROFILE_ZSTD_TU);
+        test_stalled_f_arm_is_bounded_before_healthy_transfer(
+            CACHE_PROFILE_ZSTD_ROUTE);
+        test_held_retry_does_not_block_healthy_link(CACHE_PROFILE_P29V1);
+        test_held_retry_does_not_block_healthy_link(CACHE_PROFILE_ZSTD_TU);
+        test_held_retry_does_not_block_healthy_link(CACHE_PROFILE_ZSTD_ROUTE);
+        test_parallel_distinct_f_matrix();
+        test_parallel_distinct_c_matrix();
+        test_same_link_serialization_matrix();
+        test_expired_alias_cannot_release_held_incarnation();
+        test_incarnation_change_waits_for_old_operation();
+        test_source_active_count_cap_waits_then_releases();
+        test_source_raw_byte_cap_waits_then_releases();
+        test_source_admission_releases_on_open_read_error_and_expiry();
+        test_alias_waiter_releases_active_source_credit_for_independent_f();
         test_route_poison_latches_before_successor_f_open();
         test_transport_loss_preserves_other_worker_service();
         test_interner_fault_returns_permanent_profile_unavailable();
@@ -2793,6 +5331,9 @@ int main(int argc, char** argv) {
         test_runtime_live_owner_failure_fail_stop_subprocess();
         test_runtime_zstd_tu_af_unix_loopback();
         test_operation_cancel_commit_race_preserves_witness();
+        test_runtime_interner_poison_preserves_active_commit();
+        test_runtime_stop_bounds_opening_source_arm();
+        test_runtime_active_source_stop_fail_stops_bounded();
         test_runtime_stop_interrupts_active_endpoint();
         ready_reader_close_after_bind_is_fail_closed();
         ready_requires_bind_and_replacement_is_preserved();

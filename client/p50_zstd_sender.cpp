@@ -1,6 +1,10 @@
 #include "p50_zstd_sender.h"
 
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -8,6 +12,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -35,6 +40,83 @@ bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration
 
 bool route_history_profile(ProfileId profile) noexcept {
     return profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_ROUTE;
+}
+
+struct AsyncFdCompletion {
+    explicit AsyncFdCompletion(boost::asio::any_io_executor executor)
+        : timer(std::make_shared<boost::asio::steady_timer>(executor)) {}
+    std::mutex mutex;
+    bool completed = false;
+    bool abandoned = false;
+    int fd = -1;
+    std::shared_ptr<boost::asio::steady_timer> timer;
+    ~AsyncFdCompletion() {
+        if (fd >= 0)
+            (void)::close(fd);
+    }
+};
+
+boost::asio::awaitable<int> await_connected_fd(
+    AsyncConnectedFdFactory factory, Clock::time_point deadline) {
+    const auto executor = co_await boost::asio::this_coro::executor;
+    auto state = std::make_shared<AsyncFdCompletion>(executor);
+    state->timer->expires_at(deadline);
+    try {
+        factory(deadline, [state, executor, deadline](int fd) mutable {
+            bool close_fd = false;
+            bool rejected = false;
+            {
+                std::lock_guard lock(state->mutex);
+                if (state->abandoned || state->completed ||
+                    Clock::now() >= deadline) {
+                    rejected = true;
+                    close_fd = fd >= 0;
+                } else {
+                    state->completed = true;
+                    state->fd = fd;
+                }
+            }
+            if (rejected) {
+                if (close_fd)
+                    (void)::close(fd);
+                return;
+            }
+            try {
+                boost::asio::post(executor, [state] {
+                    boost::system::error_code ignored;
+                    state->timer->cancel(ignored);
+                });
+            } catch (...) {
+                // The deadline timer remains a wakeup path; the shared state
+                // destructor closes any descriptor if the executor is gone.
+            }
+        });
+    } catch (...) {
+        std::lock_guard lock(state->mutex);
+        state->abandoned = true;
+        if (state->fd >= 0)
+            (void)::close(state->fd);
+        state->fd = -1;
+        co_return -1;
+    }
+    boost::system::error_code wait_error;
+    co_await state->timer->async_wait(
+        boost::asio::redirect_error(boost::asio::use_awaitable, wait_error));
+    (void)wait_error;
+    std::lock_guard lock(state->mutex);
+    if (!state->completed) {
+        state->abandoned = true;
+        co_return -1;
+    }
+    if (Clock::now() >= deadline) {
+        if (state->fd >= 0)
+            (void)::close(state->fd);
+        state->fd = -1;
+        co_return -1;
+    }
+    const int fd = state->fd;
+    state->fd = -1;
+    co_return fd;
 }
 
 std::optional<std::vector<uint8_t>> read_complete_fd(int fd, uint64_t limit) {
@@ -383,6 +465,30 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_route(AsyncConnectedFdFactory connection,
+                                    PrepareRequestKey request,
+                                    Clock::time_point deadline,
+                                    std::span<const uint8_t> source) {
+    if (!connection || source.size() >
+                           impl_->config.endpoint_caps.zstd.max_raw_bytes)
+        co_return impl_->invalid(connection
+            ? ZstdSourceTransferStatus::SourceError
+            : ZstdSourceTransferStatus::InvalidRequest);
+    co_return co_await transfer_bytes(
+        ConnectionTarget{std::move(connection)}, request, deadline, true,
+        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+}
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+    // GCC 13 can diagnose Boost.Asio's awaitable-frame allocator as a
+    // mismatched new/delete when this coroutine is inlined (GCC PR103993).
+    // Boost 1.83 pairs awaitable_frame_tag allocate/deallocate, ultimately
+    // using aligned_alloc/aligned_free; keep this workaround local to the
+    // coroutine and leave all other -Werror diagnostics enabled.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_bytes(
     ConnectionTarget target,
     PrepareRequestKey request,
@@ -399,7 +505,10 @@ P50ZstdSourceSender::transfer_bytes(
         const auto remote = std::get<boost::asio::ip::tcp::endpoint>(target);
         if (remote.port() == 0 || remote.address().is_unspecified())
             co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
-    } else if (!std::get<ConnectedFdFactory>(target)) {
+    } else if (std::holds_alternative<ConnectedFdFactory>(target)) {
+        if (!std::get<ConnectedFdFactory>(target))
+            co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    } else if (!std::get<AsyncConnectedFdFactory>(target)) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     }
     if (!source)
@@ -472,8 +581,12 @@ P50ZstdSourceSender::transfer_bytes(
             } else {
                 int connected_fd = -1;
                 try {
-                    connected_fd = std::get<ConnectedFdFactory>(target)(
-                        deadline);
+                    if (std::holds_alternative<AsyncConnectedFdFactory>(target))
+                        connected_fd = co_await await_connected_fd(
+                            std::get<AsyncConnectedFdFactory>(target), deadline);
+                    else
+                        connected_fd = std::get<ConnectedFdFactory>(target)(
+                            deadline);
                 } catch (...) {
                     ZstdSourceTransferResult result =
                         impl_->invalid(ZstdSourceTransferStatus::TerminalError);
@@ -573,5 +686,8 @@ P50ZstdSourceSender::transfer_bytes(
     co_return impl_->replacement(ZstdSourceTransferStatus::RetryExhausted,
                                  explicit_route);
 }
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic pop
+#endif
 
 }  // namespace icecc::p50

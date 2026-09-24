@@ -7,6 +7,7 @@ import pytest
 from farmharness.integration.performance import (
     S80_ORDER,
     S80EvidenceError,
+    render_s80_report,
     s80_cell_from_bundle,
     score_s80_cells,
 )
@@ -91,6 +92,17 @@ def test_s80_fails_when_p29_loses_only_turn_b() -> None:
         ("B", 1_000_000_000),
         ("B", 100_000_000),
     }
+
+
+def test_s80_render_explains_legacy_mutex_timing_columns() -> None:
+    rendered = render_s80_report(score_s80_cells(_cells()))
+
+    assert "legacy ‘Mutex wait/service’ column labels" in rendered
+    assert "v2 values are global-gate timings" in rendered
+    assert "v3 values are sums of per-operation" in rendered
+    assert "concurrent operations can overlap" in rendered
+    assert "neither elapsed wall time nor CPU time" in rendered
+    assert "headline scores use measured wall time" in rendered
 
 
 def test_s80_tie_is_not_a_strict_win() -> None:

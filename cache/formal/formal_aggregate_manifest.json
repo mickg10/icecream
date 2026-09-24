@@ -150,6 +150,34 @@
         {"id": "composition-safety-resource-bounds", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCoreResourceBoundsDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CoreResourceBounds"},
         {"id": "composition-safety-payload-release", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCorePayloadReleasedOnSettlementDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CorePayloadReleasedOnSettlement"}
       ]
+    },
+    {
+      "id": "transfer-concurrency",
+      "runner": "run_transfer_concurrency_tlc.sh",
+      "timeout_seconds": 7200,
+      "rows": [
+        {"id": "safety-c2f1", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC2F1.cfg", "outcome": "clean", "marker": "== transfer-concurrency: safety-C2F1 =="},
+        {"id": "safety-c3f1", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC3F1.cfg", "outcome": "clean", "marker": "== transfer-concurrency: safety-C3F1 =="},
+        {"id": "safety-c4f1", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC4F1.cfg", "outcome": "clean", "marker": "== transfer-concurrency: safety-C4F1 =="},
+        {"id": "safety-c1f2", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F2.cfg", "outcome": "clean", "marker": "== transfer-concurrency: safety-C1F2 =="},
+        {"id": "safety-c1f3", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F3.cfg", "outcome": "clean", "marker": "== transfer-concurrency: safety-C1F3 =="},
+        {"id": "safety-c1f4", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F4.cfg", "outcome": "clean", "marker": "== transfer-concurrency: safety-C1F4 =="},
+        {"id": "overlap-c2f1", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC2F1Overlap.cfg", "outcome": "expected-failure", "invariant": "NoAllLinksRunning", "marker": "== transfer-concurrency: overlap-C2F1 ("},
+        {"id": "overlap-c3f1", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC3F1Overlap.cfg", "outcome": "expected-failure", "invariant": "NoAllLinksRunning", "marker": "== transfer-concurrency: overlap-C3F1 ("},
+        {"id": "overlap-c4f1", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC4F1Overlap.cfg", "outcome": "expected-failure", "invariant": "NoAllLinksRunning", "marker": "== transfer-concurrency: overlap-C4F1 ("},
+        {"id": "overlap-c1f2", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F2Overlap.cfg", "outcome": "expected-failure", "invariant": "NoAllLinksRunning", "marker": "== transfer-concurrency: overlap-C1F2 ("},
+        {"id": "overlap-c1f3", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F3Overlap.cfg", "outcome": "expected-failure", "invariant": "NoAllLinksRunning", "marker": "== transfer-concurrency: overlap-C1F3 ("},
+        {"id": "overlap-c1f4", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F4Overlap.cfg", "outcome": "expected-failure", "invariant": "NoAllLinksRunning", "marker": "== transfer-concurrency: overlap-C1F4 ("},
+        {"id": "blocked-link-progress", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyC1F2Progress.cfg", "outcome": "clean", "marker": "== transfer-concurrency: blocked-progress =="},
+        {"id": "byte-cap-pressure", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyByteCap.cfg", "outcome": "clean", "marker": "== transfer-concurrency: byte-cap-pressure =="},
+        {"id": "generation-replacement", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyGenerationReplacement.cfg", "outcome": "clean", "marker": "== transfer-concurrency: generation-replacement =="},
+        {"id": "global-serialization-mutant", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyGlobalGateMutant.cfg", "outcome": "expected-failure", "property": "BlockedLinkDoesNotBlockHealthyProgress", "marker": "== transfer-concurrency: global-serialization-mutant ("},
+        {"id": "profile-in-key-mutant", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyProfileKeyMutant.cfg", "outcome": "expected-failure", "invariant": "OneOwnerPerExactRelationship", "marker": "== transfer-concurrency: profile-in-key-mutant ("},
+        {"id": "stale-publication-mutant", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyStalePublishMutant.cfg", "outcome": "expected-failure", "invariant": "OwnerPublicationMatchesGeneration", "marker": "== transfer-concurrency: stale-publication-mutant ("},
+        {"id": "stale-credit-release-mutant", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyWrongCreditMutant.cfg", "outcome": "expected-failure", "invariant": "ReservationCountsMatchOwnedOperations", "marker": "== transfer-concurrency: stale-credit-release-mutant ("},
+        {"id": "duplicate-release-mutant", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyDuplicateReleaseMutant.cfg", "outcome": "expected-failure", "invariant": "ReservationReleasedAtMostOnce", "marker": "== transfer-concurrency: duplicate-release-mutant ("},
+        {"id": "lost-ack-early-release-mutant", "module": "Protocol50TransferConcurrency.tla", "config": "Protocol50TransferConcurrencyLostAckMutant.cfg", "outcome": "expected-failure", "invariant": "ReservationCountsMatchOwnedOperations", "marker": "== transfer-concurrency: lost-ack-early-release-mutant ("}
+      ]
     }
   ]
 }

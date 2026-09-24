@@ -70,6 +70,12 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer(
+        P50RouteRelationship relationship, PrepareRequestKey request,
+        AsyncConnectedFdFactory connection,
+        std::chrono::steady_clock::time_point deadline,
+        std::span<const uint8_t> source);
+
     // Drops every profile view for one exact retired F incarnation.  False
     // means at least one route still owns an uncommitted preparation; callers
     // must replace the whole C sidecar and must not admit the successor.

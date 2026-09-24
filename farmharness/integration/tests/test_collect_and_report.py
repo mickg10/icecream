@@ -255,6 +255,49 @@ def test_source_result_authenticates_named_wire_revision_mismatch(
     assert _source_results(path) == {(2, 1, 1): record}
 
 
+def test_source_results_accept_v2_and_v3_rows_in_one_stream(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    v2 = _source_result_record()
+    v3 = _source_result_record()
+    v2["wire_job_id"] = 20
+    v2["logical_job"] = 20
+    v2["schema"] = "icecream-p50-source-result-v2"
+    v3["wire_job_id"] = 30
+    v3["logical_job"] = 30
+    v3["schema"] = "icecream-p50-source-result-v3"
+    _write_jsonl(path, [v2, v3])
+
+    assert _source_results(path) == {
+        (20, 1, 1): v2,
+        (30, 1, 1): v3,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("unknown-schema", "missing-field", "extra-field", "non-string-schema"),
+)
+def test_source_result_rejects_unknown_or_changed_schema(
+    tmp_path: Path, mutation: str,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    if mutation == "unknown-schema":
+        record["schema"] = "icecream-p50-source-result-v4"
+    elif mutation == "missing-field":
+        record.pop("source_mutex_wait_ns")
+    elif mutation == "extra-field":
+        record["unexpected"] = 1
+    else:
+        record["schema"] = ["icecream-p50-source-result-v3"]
+    _write_jsonl(path, [record])
+
+    with pytest.raises(CollectError, match="source-result schema mismatch"):
+        _source_results(path)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (

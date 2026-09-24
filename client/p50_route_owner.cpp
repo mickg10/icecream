@@ -151,6 +151,34 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     co_return result;
 }
 
+boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
+    P50RouteRelationship relationship, PrepareRequestKey request,
+    AsyncConnectedFdFactory connection,
+    std::chrono::steady_clock::time_point deadline,
+    std::span<const uint8_t> source) {
+    if (!relationship.valid() || request.producer_session == 0 ||
+        request.request_token == 0 || !connection ||
+        source.size() > config_.endpoint_caps.zstd.max_raw_bytes)
+        co_return invalid();
+    if (replacement_required_)
+        co_return replacement();
+
+    P50ZstdSourceSender* sender = nullptr;
+    try {
+        sender = get_or_create(relationship, request, deadline).get();
+    } catch (const std::invalid_argument&) {
+        co_return invalid();
+    } catch (const std::length_error&) {
+        replacement_required_ = true;
+        co_return replacement();
+    }
+    ZstdSourceTransferResult result = co_await sender->transfer_route(
+        std::move(connection), request, deadline, source);
+    if (result.replacement_required && !result.route_local_failure)
+        replacement_required_ = true;
+    co_return result;
+}
+
 bool P50CRouteOwner::reset_f_store_exact(
     FStoreGuid old_f_store_guid,
     uint64_t old_f_store_generation) noexcept {

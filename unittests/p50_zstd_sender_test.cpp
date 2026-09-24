@@ -6,6 +6,7 @@
 #include <boost/asio/use_future.hpp>
 
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -189,6 +190,128 @@ void test_adopted_fd_factory_exact_transfer() {
     CHECK(result.f_to_c_bytes > 0);
     CHECK(!result.system_source_reuse.has_value());
     CHECK(calls == 1);
+}
+
+void test_async_fd_factory_exact_transfer() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_ROUTE;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [](CStoreGuid, const TxBegin&,
+                                       const TxCommit&,
+                                       std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    P50ServerEndpoint server(Id128::from_u64(7032), caps, nullptr, nullptr,
+                             server_config);
+    P50ZstdSourceSender sender(Id128::from_u64(7031),
+                               PrepareRequestKey{99, 1}, route_config());
+    const std::vector<uint8_t> source{'a', 's', 'y', 'n', 'c'};
+    unsigned calls = 0;
+    int duplicate_fd = -1;
+    AsyncConnectedFdFactory factory =
+        [remote = acceptor.local_endpoint(), &calls,
+         &duplicate_fd](auto deadline, auto completion) {
+            ++calls;
+            const int fd = std::chrono::steady_clock::now() < deadline
+                               ? connect_fd(remote)
+                               : -1;
+            completion(fd);
+            duplicate_fd = connect_fd(remote);
+            completion(duplicate_fd);
+        };
+    auto server_result = asio::co_spawn(context, server.accept_one(acceptor),
+                                         asio::use_future);
+    auto sender_result = asio::co_spawn(
+        context,
+        sender.transfer_route(std::move(factory), PrepareRequestKey{99, 1},
+                              std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(3),
+                              source),
+        asio::use_future);
+    context.run();
+    const auto result = sender_result.get();
+    CHECK(server_result.get().status == ServerRunStatus::Completed);
+    CHECK(result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(result.raw_digest == icecc::digest128(source));
+    CHECK(result.attempts == 1);
+    CHECK(calls == 1);
+    errno = 0;
+    CHECK(::fcntl(duplicate_fd, F_GETFD) == -1 && errno == EBADF);
+}
+
+void test_async_fd_factory_late_and_throwing_completion_close_fds() {
+    {
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        auto sender_config = route_config();
+        sender_config.deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(150);
+        P50ZstdSourceSender sender(Id128::from_u64(7041),
+                                   PrepareRequestKey{100, 1}, sender_config);
+        const std::vector<uint8_t> source{'l', 'a', 't', 'e'};
+        std::function<void(int)> late_completion;
+        unsigned calls = 0;
+        AsyncConnectedFdFactory factory =
+            [&late_completion, &calls](auto, auto completion) {
+                ++calls;
+                if (calls == 1)
+                    completion(-1);
+                else
+                    late_completion = std::move(completion);
+            };
+        auto result = asio::co_spawn(
+            context,
+            sender.transfer_route(std::move(factory), PrepareRequestKey{100, 1},
+                                  sender_config.deadline, source),
+            asio::use_future);
+        context.run();
+        CHECK(result.get().status == ZstdSourceTransferStatus::DeadlineExceeded);
+        CHECK(calls == 2);
+        CHECK(static_cast<bool>(late_completion));
+        const int fd = connect_fd(acceptor.local_endpoint());
+        CHECK(fd >= 0);
+        late_completion(fd);
+        errno = 0;
+        CHECK(::fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+    }
+    {
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        auto sender_config = route_config();
+        sender_config.deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(3);
+        P50ZstdSourceSender sender(Id128::from_u64(7051),
+                                   PrepareRequestKey{101, 1}, sender_config);
+        const std::vector<uint8_t> source{'t', 'h', 'r', 'o', 'w'};
+        std::vector<int> descriptors;
+        unsigned calls = 0;
+        AsyncConnectedFdFactory factory =
+            [&descriptors, &calls, remote = acceptor.local_endpoint()](
+                auto, auto completion) {
+                ++calls;
+                const int fd = connect_fd(remote);
+                descriptors.push_back(fd);
+                completion(fd);
+                throw std::runtime_error("factory threw after completion");
+            };
+        auto result = asio::co_spawn(
+            context,
+            sender.transfer_route(std::move(factory), PrepareRequestKey{101, 1},
+                                  sender_config.deadline, source),
+            asio::use_future);
+        context.run();
+        CHECK(result.get().status == ZstdSourceTransferStatus::RetryExhausted);
+        CHECK(calls == 2);
+        CHECK(descriptors.size() == 2);
+        for (const int fd : descriptors) {
+            errno = 0;
+            CHECK(::fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+        }
+    }
 }
 
 void test_route_sender_reuses_relationship_for_two_transfers() {
@@ -742,6 +865,8 @@ int main() {
     test_owned_fd_and_fail_closed_validation();
     test_owned_fd_release_transfers_single_ownership();
     test_adopted_fd_factory_exact_transfer();
+    test_async_fd_factory_exact_transfer();
+    test_async_fd_factory_late_and_throwing_completion_close_fds();
     test_absolute_deadline_is_required();
     test_disconnected_retry_is_bounded_and_exactly_once();
     test_factory_cannot_extend_absolute_deadline();

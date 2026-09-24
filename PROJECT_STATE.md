@@ -1,6 +1,6 @@
 # Sorbet 1.5.0: validation and remaining work
 
-Updated 2026-09-23. Package version is **1.5.0**; the release branch is
+Updated 2026-09-24. Package version is **1.5.0**; the release branch is
 `sorbet_v1.5`. The repository is public. The Docker bootstrap implementation
 was published as `de027cefc31d79d062c3158400951916a9aa5d63`.
 A pushed branch is not a published release tag or a newly qualified farm image.
@@ -11,6 +11,43 @@ agent log. Earlier diagnostic reports remain in Git history and their
 retained artifact directories.
 
 ## Developer QA
+
+### Independent-link pipeline candidate
+
+`sorbet_1.5_pipeline` is a candidate, not a release or a new S* farm
+qualification. Its first commit, `7fb131be`, contains the
+[implementation and exact acceptance contract](doc/p50-transfer-concurrency.md).
+Stage A removes C-wide source serialization in favor of bounded independent
+C/F relationships: four active operations by default, one per exact F
+incarnation across profiles, and 2 GiB of reserved source-vector lengths.
+Retry setup no longer blocks the route-owner executor. CacheWire R1 and P43
+bytes remain unchanged. Encoding remains owner-affine; persistent connections
+and W30 are later, unimplemented stages. No corpus speedup is claimed.
+
+The focused formal lane passed all 21 rows for both topology directions at
+2, 3 and 4 stores, including simultaneous-running witnesses and six negative
+controls. The final current-runner reproduction took 35.30s. The bounded
+model is not a proof of arbitrary C++ execution or W30. Its retained results
+are at `/tanksmall/scratch/tmp/p50-transfer-concurrency-final-SNpfoF/`.
+
+The separate staged-source Python run passed **1,511 tests with 2 skips in
+577.44s**, under the offline Ubuntu 24.04 SDK, Python 3.12.12 and pytest
+8.4.2. Its source digest was
+`3da3354b8ba4c131e432f6d1e24be68cf5fd85ca49208c029d3c390366f4c5f3`;
+evidence is at `/tanksmall/scratch/tmp/p50-full-python-qa-2Uz5Ek/`.
+The skips were an unavailable user/PID namespace capability and an absent
+retained production fixture. The existing thorough Firefox authority test
+took 490.370s of this run. A subsequent report-wording change passed its
+focused **14-test** suite in 0.08s; it clarifies that summed per-operation
+timings are not build wall time or CPU time, without changing scoring.
+
+The four selected native targets passed under the strict Ubuntu 24.04 SDK
+(GCC 13.3.0), including the concurrency, recovery and bounded-stop cases.
+Restoring the global admission gate also failed the intended healthy-link
+progress assertion in the separate negative control. Full native/root and
+mixed-Docker acceptance are still being completed. The candidate has not been
+uploaded. The release-baseline results below do not satisfy those new
+candidate gates.
 
 ### P50 implementation cleanup
 

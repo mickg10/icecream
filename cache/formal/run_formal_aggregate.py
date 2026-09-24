@@ -244,14 +244,24 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
         config_name = raw.get("config")
         outcome = raw.get("outcome")
         invariant = raw.get("invariant")
+        property_name = raw.get("property")
         marker = raw.get("marker")
         if not isinstance(row_id, str) or not row_id or row_id in row_ids:
             raise Refusal(f"lane {lane_id} has a missing or duplicate row identity")
         row_ids.add(row_id)
         if outcome not in {"clean", "expected-failure"}:
             raise Refusal(f"lane {lane_id}/{row_id} has an invalid outcome")
-        if outcome == "expected-failure" and (not isinstance(invariant, str) or not invariant):
-            raise Refusal(f"lane {lane_id}/{row_id} lacks its expected invariant")
+        if outcome == "expected-failure":
+            has_invariant = isinstance(invariant, str) and bool(invariant)
+            has_property = isinstance(property_name, str) and bool(property_name)
+            if has_invariant == has_property:
+                raise Refusal(
+                    f"lane {lane_id}/{row_id} must select exactly one expected invariant or property"
+                )
+        elif invariant is not None or property_name is not None:
+            raise Refusal(
+                f"lane {lane_id}/{row_id} clean outcome cannot select an expected failure"
+            )
         if marker is not None and (not isinstance(marker, str) or not marker):
             raise Refusal(f"lane {lane_id}/{row_id} has an invalid log marker")
         module = _relative_file(formal_root, module_name, f"lane {lane_id}/{row_id} module")
@@ -262,12 +272,15 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
             raise Refusal(f"lane {lane_id}/{row_id} is not selected by its runner")
         if invariant is not None and str(invariant) not in binding_text:
             raise Refusal(f"lane {lane_id}/{row_id} invariant is not bound by its runner")
+        if property_name is not None and str(property_name) not in binding_text:
+            raise Refusal(f"lane {lane_id}/{row_id} property is not bound by its runner")
         prepared = {
             "id": row_id,
             "module": str(module_name),
             "config": str(config_name),
             "outcome": outcome,
             **({"invariant": invariant} if invariant is not None else {}),
+            **({"property": property_name} if property_name is not None else {}),
             **({"marker": marker} if marker is not None else {}),
         }
         prepared_rows.append(prepared)

@@ -103,6 +103,9 @@ struct ZstdSourceTransferConfig {
 // the unchanged absolute sender deadline and must not extend it.
 using ConnectedFdFactory =
     std::function<int(std::chrono::steady_clock::time_point deadline)>;
+using AsyncConnectedFdFactory = std::function<void(
+    std::chrono::steady_clock::time_point deadline,
+    std::function<void(int)> completion)>;
 
 // C-side source transfer.  The historical class name is retained for source
 // compatibility; endpoint_caps.profile selects the exact P29V1, ZSTD_TU, or
@@ -157,9 +160,15 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
+        AsyncConnectedFdFactory connection, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        std::span<const uint8_t> source);
+
 private:
     using ConnectionTarget =
-        std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory>;
+        std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory,
+                     AsyncConnectedFdFactory>;
 
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_bytes(
         ConnectionTarget target,

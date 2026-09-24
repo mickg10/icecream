@@ -109,29 +109,81 @@ def test_packaged_manifest_selects_every_formal_lane_and_preflights() -> None:
         "assignment-identity",
         "global",
         "zstd-route-finput",
+        "transfer-concurrency",
     ]
-    assert [len(lane["rows"]) for lane in prepared] == [35, 7, 29, 17, 9]
+    assert [len(lane["rows"]) for lane in prepared] == [35, 7, 29, 17, 9, 21]
     assert manifest["tool"]["sha256"] == (
         "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
     )
     assert manifest["default_workers"] == 8
-    zstd = prepared[-1]
+    zstd = next(lane for lane in prepared if lane["id"] == "zstd-route-finput")
     assert zstd["environment"]["S6_PORTABLE_EXECUTION"] == "1"
     assert zstd["result_contract"] == "zstd-selected-jsonl"
     authority = FORMAL / "PORTABLE_EXECUTION_AUTHORITY.md"
     zstd_runner = (FORMAL / "run_zstd_route_finput_composition_tlc.sh").read_text()
     assert _digest(authority) in zstd_runner
     assert "/tmp/s6-zstd-route-finput-v5-correction-spec-20260828.md" in zstd_runner
+    concurrency = next(lane for lane in prepared if lane["id"] == "transfer-concurrency")
+    assert concurrency["runner"].name == "run_transfer_concurrency_tlc.sh"
+    assert concurrency["timeout_seconds"] == 7200
+    assert all(row["module"] == "Protocol50TransferConcurrency.tla" for row in concurrency["rows"])
+    assert {row["id"] for row in concurrency["rows"]} >= {
+        "safety-c2f1",
+        "safety-c3f1",
+        "safety-c4f1",
+        "safety-c1f2",
+        "safety-c1f3",
+        "safety-c1f4",
+        "overlap-c2f1",
+        "overlap-c3f1",
+        "overlap-c4f1",
+        "overlap-c1f2",
+        "overlap-c1f3",
+        "overlap-c1f4",
+        "blocked-link-progress",
+        "byte-cap-pressure",
+        "generation-replacement",
+        "global-serialization-mutant",
+        "profile-in-key-mutant",
+        "stale-publication-mutant",
+        "stale-credit-release-mutant",
+        "duplicate-release-mutant",
+        "lost-ack-early-release-mutant",
+    }
+    concurrency_runner = concurrency["runner"].read_text()
+    assert "NoAllLinksRunning" in concurrency_runner
+    assert "ReservationReleasedAtMostOnce" in concurrency_runner
+    assert "Temporal properties were violated." in concurrency_runner
+    assert "ROW_TIMEOUT_SECONDS=${ROW_TIMEOUT_SECONDS:-120}" in concurrency_runner
+    assert "TLA2TOOLS_JAR does not match the pinned tool SHA-256" in concurrency_runner
+    assert "ROW_TIMEOUT_SECONDS must be an integer in 1..300" in concurrency_runner
+    gate_mutant = next(
+        row for row in concurrency["rows"] if row["id"] == "global-serialization-mutant"
+    )
+    assert gate_mutant["outcome"] == "expected-failure"
+    assert gate_mutant["property"] == "BlockedLinkDoesNotBlockHealthyProgress"
     for makefile in ("GNUmakefile", "Makefile.am"):
         make_text = (ROOT / makefile).read_text()
         target = make_text.split("protocol50-formal:", 1)[1]
         assert "run_formal_aggregate.py" in target
 
 
+def test_expected_temporal_failure_is_bound_as_one_named_property() -> None:
+    runner = _load_runner()
+    manifest = runner._load_manifest(FORMAL / "formal_aggregate_manifest.json")
+    lane = copy.deepcopy(
+        next(item for item in manifest["lanes"] if item["id"] == "transfer-concurrency")
+    )
+    row = next(item for item in lane["rows"] if item["id"] == "global-serialization-mutant")
+    row["invariant"] = "ReservationCountsMatchOwnedOperations"
+    with pytest.raises(runner.Refusal, match="exactly one expected invariant or property"):
+        runner._prepare_lane(FORMAL, lane)
+
+
 def test_zstd_declaration_must_match_its_same_id_authority_row() -> None:
     runner = _load_runner()
     manifest = runner._load_manifest(FORMAL / "formal_aggregate_manifest.json")
-    lane = copy.deepcopy(manifest["lanes"][-1])
+    lane = copy.deepcopy(next(item for item in manifest["lanes"] if item["id"] == "zstd-route-finput"))
     lane["rows"][0]["config"] = "Protocol50ZstdRouteCollapsedTUMutant.cfg"
     lane["rows"][0]["invariant"] = "DistinctOperationTUs"
     with pytest.raises(

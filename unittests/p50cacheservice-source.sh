@@ -31,8 +31,16 @@ for pair in \
     "$impl|structured_launch.c_store_guid" \
     "$impl|structured_launch.f_store_guid" \
     "$impl|kMaxControlWorkers = 64" \
-    "$impl|kSourceTransferLockPoll" \
-    "$impl|source_transfer_lock.try_lock_until" \
+    "$impl|SidecarRuntime::acquire_source_address" \
+    "$impl|SidecarRuntime::acquire_source_incarnations" \
+    "$impl|SidecarRuntime::acquire_source_credit" \
+    "$impl|SidecarRuntime::release_source_admission" \
+    "$impl|owner_preflight_source_endpoint" \
+    "$impl|source_fd_size(" \
+    "$impl|static_cast<uint64_t>(before.st_size) != reserved_size" \
+    "$impl|std::make_shared<std::vector<uint8_t>>(" \
+    "$impl|source_admission_changed_.wait_until" \
+    "$impl|source_admission_changed_.notify_all()" \
     "$impl|open_arm_start + open_arm_timeout" \
     "$impl|kSourceConnectAttemptBudget" \
     "$impl|Service::createChannelRetryUntil(" \
@@ -52,7 +60,12 @@ for pair in \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
     "$header|source_open_arm_timeout{5000}" \
-    "$header|std::timed_mutex source_transfer_mutex_" \
+    "$header|max_active_source_transfers = 4" \
+    "$header|max_aggregate_source_raw_bytes = uint64_t{2} * 1024 * 1024 * 1024" \
+    "$header|active_source_addresses_" \
+    "$header|active_source_incarnations_" \
+    "$header|active_source_count_" \
+    "$header|active_source_raw_bytes_" \
     "$header|seed_route_endpoint_identity_for_test" \
     "$header|seed_route_relationship_for_test" \
     "$test_file|legacy_store_identity_launches" \
@@ -66,6 +79,48 @@ for pair in \
     "$test_file|attempts.size() == 2" \
     "$test_file|test_stalled_f_arm_is_bounded_before_healthy_transfer" \
     "$test_file|healthy_result.code == local::SourceTransferResultCode::Committed" \
+    "$test_file|test_parallel_distinct_f_matrix" \
+    "$test_file|serve_source_transfers_on_persistent_f" \
+    "$test_file|committed_rel_seq == wave" \
+    "$test_file|committed_history_nonce ==" \
+    "$test_file|--a05-global-gate-negative-control" \
+    "$test_file|test_same_link_serialization_matrix" \
+    "$test_file|test_same_link_serialization(CACHE_PROFILE_P29V1" \
+    "$test_file|second_connected_while_first_held" \
+    "$test_file|first_value.tu_seq == 0 && second_value.tu_seq == 1" \
+    "$test_file|A03 ZSTD_ROUTE" \
+    "$test_file|A04 ROUTE->P29V1" \
+    "$test_file|test_expired_alias_cannot_release_held_incarnation" \
+    "$test_file|final_still_waiting_after_expiry" \
+    "$test_file|alias_connected_before_predecessor_release" \
+    "$test_file|A07/A12 ZSTD_TU" \
+    "$test_file|test_incarnation_change_waits_for_old_operation" \
+    "$test_file|replacement_connected_while_old_held" \
+    "$test_file|A08 ZSTD_TU->ZSTD_ROUTE" \
+    "$test_file|test_source_active_count_cap_waits_then_releases" \
+    "$test_file|test_source_raw_byte_cap_waits_then_releases" \
+    "$test_file|test_source_admission_releases_on_open_read_error_and_expiry" \
+    "$test_file|test_alias_waiter_releases_active_source_credit_for_independent_f" \
+    "$test_file|accepted_before_release == 0" \
+    "$test_file|A09: active-source count pressure" \
+    "$test_file|A10: aggregate raw-byte pressure" \
+    "$test_file|A11: success/open/read/expiry" \
+    "$test_file|test_runtime_interner_poison_preserves_active_commit" \
+    "$test_file|test_runtime_active_source_stop_fail_stops_bounded" \
+    "$test_file|--p50-runtime-active-source-stop-child" \
+    "$test_file|run_active_source_stop_fail_stop_child" \
+    "$test_file|test_runtime_stop_bounds_opening_source_arm" \
+    "$test_file|seed_route_endpoint_identity_for_test(" \
+    "$test_file|release_retry.wait_for" \
+    "$test_file|test_held_retry_does_not_block_healthy_link" \
+    "$test_file|healthy_finished_before_retry_release" \
+    "$test_file|A06 %s" \
+    "$test_file|test_parallel_distinct_c_matrix" \
+    "$test_file|codec_gate.wait_for_arrivals(held_workers" \
+    "$test_file|all_namespaces_live_while_workers_held" \
+    "$test_file|arm_barrier.arrived() == f_count" \
+    "$test_file|commit_barrier.arrived() == f_count" \
+    "$test_file|healthy_finished_before_release" \
     "$test_file|test_route_poison_latches_before_successor_f_open" \
     "$test_file|first_observation.eof_without_cachewire" \
     "$test_file|authenticated_control_farm_accepts_twenty_and_stops" \
@@ -100,29 +155,38 @@ if test -z "$fingerprint_start_line" || test -z "$fingerprint_wait_line" || \
 fi
 echo 'ok - P29 fingerprint completes before cache-service READY'
 
-endpoint_cap_line=$(grep -n -F \
-    'route_endpoint_identities_.size() >=' "$impl" | head -n 1 | cut -d: -f1)
+owner_preflight_line=$(grep -n -F \
+    'if (!owner_preflight_source_endpoint(endpoint_key,' "$impl" | head -n 1 | cut -d: -f1)
+source_size_line=$(grep -n -F 'const auto source_size = source_fd_size(' \
+    "$impl" | head -n 1 | cut -d: -f1)
 source_read_line=$(grep -n -F 'const auto source_bytes = read_source_fd(' \
     "$impl" | head -n 1 | cut -d: -f1)
 f_open_line=$(grep -n -F 'const int first_fd = open_armed(' \
     "$impl" | head -n 1 | cut -d: -f1)
-if test -z "$endpoint_cap_line" || test -z "$source_read_line" || \
-        test -z "$f_open_line" || test "$endpoint_cap_line" -ge "$source_read_line" || \
-        test "$endpoint_cap_line" -ge "$f_open_line"; then
-    echo 'FAIL: endpoint-map capacity must refuse before source read and F open' >&2
+credit_line=$(grep -n -F 'if (!acquire_source_credit(reserved_raw_bytes,' \
+    "$impl" | head -n 1 | cut -d: -f1)
+if test -z "$owner_preflight_line" || test -z "$source_size_line" || \
+        test -z "$source_read_line" || test -z "$f_open_line" || \
+        test -z "$credit_line" || test "$owner_preflight_line" -ge "$f_open_line" || \
+        test "$owner_preflight_line" -ge "$source_size_line" || \
+        test "$source_size_line" -ge "$credit_line" || \
+        test "$credit_line" -ge "$f_open_line" || \
+        test "$f_open_line" -ge "$source_read_line"; then
+    echo 'FAIL: preflight, source sizing and credits must precede F open and source read' >&2
     exit 1
 fi
-echo 'ok - endpoint-map capacity refusal precedes source read and F open'
+echo 'ok - endpoint preflight and raw-byte reservation precede F open/read'
 
 relationship_cap_line=$(grep -n -F \
-    'route_owner_->owner_count() >=' "$impl" | head -n 1 | cut -d: -f1)
+    'route_owner_->owner_count() +' \
+    "$impl" | head -n 1 | cut -d: -f1)
 if test -z "$relationship_cap_line" || \
-        test "$relationship_cap_line" -ge "$source_read_line" || \
-        test "$relationship_cap_line" -ge "$f_open_line"; then
-    echo 'FAIL: known relationship capacity must refuse before source read and F open' >&2
+        ! grep -F 'pending_route_relationships_.size() >=' "$impl" >/dev/null || \
+        test "$owner_preflight_line" -ge "$f_open_line"; then
+    echo 'FAIL: known relationship capacity must refuse before F open' >&2
     exit 1
 fi
-echo 'ok - known relationship capacity refusal precedes source read and F open'
+echo 'ok - known relationship capacity is checked by pre-open owner preflight'
 
 if sed -n '/^icecc_cache_service_CPPFLAGS =/,/^icecc_cache_service_CXXFLAGS =/p' \
     "$product_makefile" | grep -Fq 'ICECC_P50_ENDPOINT_TEST_HOOKS'; then
@@ -184,9 +248,10 @@ for pair in \
     "$impl|send_cache_session_ready(adopted.get(), deadline)" \
     "$impl|endpoint_->run_adopted" \
     "$impl|busy_.test_and_set" \
-    "$impl|source_transfer_mutex_" \
-    "$impl|std::min(transfer_deadline, now + kSourceTransferLockPoll)" \
-    "$impl|release source_transfer_mutex_ and admit a successor concurrently" \
+    "$impl|source_admission_mutex_" \
+    "$impl|raw_bytes <= config_.max_aggregate_source_raw_bytes -" \
+    "$impl|active_source_count_ <" \
+    "$impl|config_.max_active_source_transfers" \
     "$impl|cancel_endpoint_run()" \
     "$control|kControlOperationVersionV3" \
     "$control|ControlCancelTargetRole::CSource" \

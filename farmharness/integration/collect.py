@@ -56,7 +56,12 @@ except ImportError:  # Direct execution from this directory.
     from verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
 
 
-SOURCE_RESULT_SCHEMA = "icecream-p50-source-result-v2"
+SOURCE_RESULT_SCHEMAS = frozenset(
+    {
+        "icecream-p50-source-result-v2",
+        "icecream-p50-source-result-v3",
+    }
+)
 P29_INTERNER_FAULT_SCHEMA = "icecream-p50-fault-v1"
 P29_INTERNER_FAULT = "p29-interner-fail-once"
 P29_INTERNER_FAULT_OUTCOME = "fired"
@@ -751,7 +756,8 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
     for index, item in enumerate(_read_jsonl(path), start=1):
         if (
             frozenset(item) != SOURCE_RESULT_FIELDS
-            or item.get("schema") != SOURCE_RESULT_SCHEMA
+            or not isinstance(item.get("schema"), str)
+            or item.get("schema") not in SOURCE_RESULT_SCHEMAS
         ):
             raise CollectError(f"{path}:{index}: source-result schema mismatch")
         integers = (
