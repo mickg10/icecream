@@ -38,3 +38,7 @@ operation encoding is implemented in `p50_control_operation.cpp`.
 
 For build and QA commands, use the [project README](../README.md) and
 [test entrypoints](../farmharness/integration/tests/README.md).
+
+The [transfer-concurrency implementation and test contract](../doc/p50-transfer-concurrency.md)
+separates independent revision-1 relationships from later persistent-link
+and multi-TU pipelining work. Its acceptance matrix is not a passing-test receipt.
