@@ -309,6 +309,120 @@ static void test_p50_round_trip_and_validation()
             "decoder rejects unknown profile advertisement");
 }
 
+static void test_p51_login_and_opt_in_selection_matrix()
+{
+    // The Login envelope stays the same size at protocol 50 and 51. Revision
+    // two is syntactically accepted there, but scheduler assignment must still
+    // require protocol 51 at both ordinary peers.
+    LoginMsg r2_login = fixture_login();
+    r2_login.setCacheAdvertisement(UINT32_C(0x0000beef),
+                                  CACHE_WIRE_REVISION_R2,
+                                  CACHE_ADVERTISABLE_PROFILE_MASK);
+    const Bytes r2_p50 = encode_frame(50, r2_login);
+    const Bytes r2_p51 = encode_frame(51, r2_login);
+    REQUIRE(!r2_p50.empty() && r2_p50 == r2_p51,
+            "R2 Login advertisement has identical protocol-50/51 bytes");
+    for (const int protocol : {50, 51}) {
+        Pair pair = make_pair(protocol);
+        REQUIRE(pair.left->send_msg(r2_login),
+                "Login revision two is syntactically accepted on protocol 50/51");
+        Msg *wire = pair.right->get_msg(2, true);
+        LoginMsg *decoded = dynamic_cast<LoginMsg *>(wire);
+        REQUIRE(decoded && decoded->cache_protocol == CACHE_WIRE_REVISION_R2 &&
+                    decoded->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK,
+                "Login revision-two advertisement round-trips on protocol 50/51");
+        delete wire;
+    }
+
+    struct EnvironmentRestore {
+        const char *name;
+        bool was_set;
+        std::string old_value;
+        explicit EnvironmentRestore(const char *variable)
+            : name(variable), was_set(std::getenv(variable) != nullptr),
+              old_value(was_set ? std::getenv(variable) : "") {}
+        ~EnvironmentRestore()
+        {
+            if (was_set)
+                (void)setenv(name, old_value.c_str(), 1);
+            else
+                (void)unsetenv(name);
+        }
+        bool set(const char *value)
+        {
+            return value != nullptr ? setenv(name, value, 1) == 0
+                                    : unsetenv(name) == 0;
+        }
+    } p50_mode("ICECC_P50_MODE"), p51_mode("ICECC_P51_MODE");
+    REQUIRE(p50_mode.set("on"), "set P50 wrapper opt-in for selector matrix");
+
+    struct ModeRow {
+        int protocol;
+        const char *mode;
+        uint32_t expected_revision;
+        const char *label;
+    };
+    const ModeRow rows[] = {
+        {50, nullptr, CACHE_WIRE_REVISION_R1, "P50 mode unset"},
+        {50, "off", CACHE_WIRE_REVISION_R1, "P50 mode off"},
+        {50, "on", 0, "P50 cannot opt into R2"},
+        {50, "malformed", 0, "P50 malformed mode"},
+        {51, nullptr, CACHE_WIRE_REVISION_R1, "P51 mode unset defaults to R1"},
+        {51, "off", CACHE_WIRE_REVISION_R1, "P51 mode off keeps R1"},
+        {51, "on", CACHE_WIRE_REVISION_R2, "P51 explicit opt-in selects R2"},
+        {51, "malformed", 0, "P51 malformed mode fails closed"},
+    };
+    for (const ModeRow &row : rows) {
+        REQUIRE(p51_mode.set(row.mode), "set P51 mode row");
+        const uint32_t revision =
+            p50_cache_revision_from_environment(row.protocol);
+        const P50CacheClientCapability capability =
+            p50_cache_client_capability_from_env(row.protocol);
+        char label[180];
+        std::snprintf(label, sizeof(label),
+                      "%s (ordinary=%d) chooses revision %u", row.label,
+                      row.protocol, row.expected_revision);
+        REQUIRE(revision == row.expected_revision, label);
+        REQUIRE(capability.protocol == row.expected_revision &&
+                    capability.profile_mask ==
+                        (row.expected_revision != 0
+                             ? CACHE_ADVERTISABLE_PROFILE_MASK : 0),
+                "client capability projection matches the mode/version row");
+    }
+    REQUIRE(p51_mode.set("on"), "enable P51 for ordinary-peer matrix");
+    REQUIRE(p50_cache_pair_ordinary_protocols_compatible(
+                CACHE_WIRE_REVISION_R1, 50, 50) &&
+                p50_cache_pair_ordinary_protocols_compatible(
+                    CACHE_WIRE_REVISION_R1, 50, 51) &&
+                p50_cache_pair_ordinary_protocols_compatible(
+                    CACHE_WIRE_REVISION_R1, 51, 50) &&
+                p50_cache_pair_ordinary_protocols_compatible(
+                    CACHE_WIRE_REVISION_R1, 51, 51),
+            "R1 remains selectable for all protocol-50/51 peer pairs");
+    REQUIRE(p50_cache_pair_ordinary_protocols_compatible(
+                CACHE_WIRE_REVISION_R2, 51, 51) &&
+                !p50_cache_pair_ordinary_protocols_compatible(
+                    CACHE_WIRE_REVISION_R2, 50, 51) &&
+                !p50_cache_pair_ordinary_protocols_compatible(
+                    CACHE_WIRE_REVISION_R2, 51, 50) &&
+                !p50_cache_pair_ordinary_protocols_compatible(
+                    CACHE_WIRE_REVISION_R2, 50, 50),
+            "R2 assignment requires protocol 51 at both ordinary peers");
+    REQUIRE(!p50_cache_pair_ordinary_protocols_compatible(
+                CACHE_WIRE_REVISION_R2 + 1, 51, 51),
+            "unknown CacheWire revision never selects for protocol-51 peers");
+    REQUIRE(p51_mode.set("off") &&
+                p50_cache_revision_from_environment(51) ==
+                    CACHE_WIRE_REVISION_R1 &&
+                p50_cache_client_capability_from_env(51).protocol ==
+                    CACHE_WIRE_REVISION_R1,
+            "explicitly disabled R2 retains the R1 path");
+    REQUIRE(p50_mode.set("off") && p51_mode.set("on") &&
+                p50_cache_client_capability_from_env(51) ==
+                    P50CacheClientCapability{},
+            "P50 kill switch suppresses even an R2 P51 capability request");
+}
+
 static GetCSMsg fixture_getcs()
 {
     Environments environments;
@@ -1173,6 +1287,7 @@ int main()
 {
     test_legacy_bytes();
     test_p50_round_trip_and_validation();
+    test_p51_login_and_opt_in_selection_matrix();
     test_getcs_cache_request_wire_and_laws();
     test_usecs_legacy_bytes();
     test_usecs_p50_round_trip_and_validation();

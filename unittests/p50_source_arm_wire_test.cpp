@@ -439,8 +439,8 @@ void test_rejects_malformed_and_legacy()
 
 void test_r1_private_messages_keep_exact_bytes_on_protocol_51()
 {
-    static_assert(PROTOCOL_VERSION == 50,
-                  "the codec checkpoint must not enable protocol 51");
+    static_assert(PROTOCOL_VERSION == PROTOCOL_VERSION_CACHE_R2_NEGOTIATION,
+                  "ordinary protocol 51 enables the negotiated CacheWire path");
     static_assert(PROTOCOL_VERSION_P50_SOURCE_ARM_R1 == 50);
     static_assert(PROTOCOL_VERSION_P50_CACHE_SESSION_R1 == 50);
     const P50SourceArmMsg request(arm());

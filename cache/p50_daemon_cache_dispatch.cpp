@@ -104,9 +104,12 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
                                                       int negotiated_protocol,
                                                       uint32_t decoded_type) noexcept {
     const bool r1_session = decoded_type == kCacheSession &&
-                            negotiated_protocol == 50;
+                            protocol_supports_p50_r1_bridge(
+                                negotiated_protocol);
     const bool r2_link = decoded_type == kP51CacheLinkSession &&
-                         protocol_supports_cache_r2(negotiated_protocol);
+                         protocol_supports_cache_r2(negotiated_protocol) &&
+                         p50_cache_revision_from_environment(
+                             PROTOCOL_VERSION) == CACHE_WIRE_REVISION_R2;
     if (!r1_session && !r2_link)
         return CacheDispatchOutcome{CacheDispatchResult::NotCacheSession};
 

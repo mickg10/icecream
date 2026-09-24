@@ -13,10 +13,14 @@ constexpr Snapshot kAbsent{};
 
 Snapshot present_snapshot(uint32_t port) noexcept
 {
+    const uint32_t revision =
+        p50_cache_revision_from_environment(PROTOCOL_VERSION);
+    if (revision == 0)
+        return kAbsent;
     constexpr uint32_t profiles =
         CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU |
         CACHE_PROFILE_ZSTD_ROUTE;
-    return Snapshot{port, CACHE_WIRE_REVISION,
+    return Snapshot{port, revision,
                     profiles};
 }
 

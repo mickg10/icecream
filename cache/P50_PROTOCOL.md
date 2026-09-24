@@ -1,4 +1,4 @@
-# Protocol 50 and CacheWire revision 1
+# Ordinary protocols 50/51 and CacheWire revisions 1/2
 
 This is the current cache protocol and runtime contract for Sorbet 1.5.0.
 It describes the live path first and identifies separately tested components
@@ -9,8 +9,8 @@ or a claim that every possible deployment has been verified.
 
 | Layer | Purpose | Definition |
 |---|---|---|
-| Ordinary Icecream protocol 50 | Scheduling, assignment, source admission, socket transition, results | [comm.h](../services/comm.h), [comm.cpp](../services/comm.cpp) |
-| CacheWire revision 1 | Session negotiation, route identity, transactions and commits | [protocol50.h](protocol50.h), [protocol50.cpp](protocol50.cpp) |
+| Ordinary Icecream protocols 50/51 | Scheduling, assignment, source admission, socket transition, results | [comm.h](../services/comm.h), [comm.cpp](../services/comm.cpp) |
+| CacheWire revisions 1/2 | Session negotiation, route identity, transactions and commits | [protocol50.h](protocol50.h), [protocol50.cpp](protocol50.cpp) |
 | P29V1, profile 1 | Content reuse and requested Region transfer | [P29v1 format](codec/P29V1_FORMAT.md) |
 | ZSTD_TU / ZSTD_ROUTE, profiles 2 / 3 | Independent TU frames / frames with committed route history | [ZSTD formats](codec/ZSTD_FORMATS.md) |
 | Private local transport | Daemon/sidecar control and descriptor transfer | [p50_local_transport.h](p50_local_transport.h), [p50_fd_handoff.h](p50_fd_handoff.h) |
@@ -19,26 +19,39 @@ These version numbers are independent. The old codec v0 fixtures are not
 deployable CacheWire revision-1 profiles. Ordinary legacy FileChunk compression
 also remains separate from the cache profiles.
 
-Normal ordinary negotiation remains capped at protocol 50. Named R1 gates
-and `protocol_supports_p50_r1_bridge` also permit unchanged R1 records on an
-explicitly selected protocol-51 fixture channel, preparing legacy coexistence
-when 51 is enabled. This does not convert CACHE_SESSION release/READY or its
+Ordinary negotiation supports protocol 51. Named R1 gates and
+`protocol_supports_p50_r1_bridge` permit unchanged R1 records on ordinary
+protocol 50 or 51. This does not convert CACHE_SESSION release/READY or its
 one-TU EOF contract into a persistent session. Versions outside the explicitly
 supported range are rejected. Assignment identity remains a version-50 feature
 threshold independent of the ordinary maximum.
-The cache-advertisement fields described below are the existing v50 prefix;
-they do not advertise a later CacheWire revision or persistent-link support.
+The cache-advertisement fields retain the existing v50 layout; their revision
+field distinguishes R1 from opt-in R2. R2 assignment requires ordinary 51 at
+both submitting and fulfilling peers, matching cache revisions, and scheduler
+opt-in. An unknown cache revision must not invalidate an otherwise usable worker.
+
+### Revision selection
+
+Set `ICECC_P51_MODE=on` in the wrapper, participating daemons/sidecars, and
+scheduler environments to request R2. Unset or `off` selects R1; any other
+value disables cache selection. Explicit R2 cannot be selected over ordinary
+50 and does not silently become R1. `ICECC_P50_MODE=off` remains the wrapper
+cache-use kill switch. These settings do not change the separate policy for
+allowing or prohibiting local compilation.
+
+R2 is a candidate path, not a fully qualified release default. See
+[validation status](../PROJECT_STATE.md) for the exact runtime evidence and
+remaining recovery, restart, capacity and mixed-farm gates.
 
 C means the submitting cache role and F the fulfilling cache role; S is the
 scheduler. A TU is one exact preprocessed translation unit. A compiler attempt
 is not a cache transaction: one committed TU may support a replacement attempt.
 
-## Dormant protocol-51 source-control codecs
+## Protocol-51 source control
 
-These ordinary-message and descriptor codecs are preparation for the
-[persistent-link implementation](../doc/p50-transfer-concurrency.md#7-persistent-links-and-w30-implementation-specification),
-not an enabled R2 endpoint. Normal negotiation cannot select 51 yet; scheduler
-advertisement and CacheWire remain R1. Codec tests select 51 explicitly.
+These ordinary-message and descriptor codecs serve the opt-in
+[persistent-link implementation](../doc/p50-transfer-concurrency.md#7-persistent-links-and-w30-implementation-specification).
+Ordinary 51 alone does not enable R2; revision selection above still applies.
 
 All integers below use network byte order, with no struct padding.
 
@@ -82,12 +95,12 @@ original compiler connection, and JOB_BIND consumes its exact reservation on
 the persistent link. These are implementation requirements, not a claim that
 the production transition has passed its integration gate.
 
-### Dormant CacheWire R2 record codecs
+### CacheWire R2 records
 
-Normal negotiation remains capped at protocol 50 and these CacheWire records
-are not advertised or accepted by the production endpoint. The following
-fixed records are codec groundwork; R1 records and bytes remain
-unchanged. The outer frame remains `type:u8, payload_length:u24, payload`,
+The opt-in persistent endpoint uses the following records. Record availability
+does not prove recovery correctness; recovery gates remain separately tracked.
+R1 records and bytes remain unchanged.
+The outer frame remains `type:u8, payload_length:u24, payload`,
 all record integers are big-endian, and GUIDs/digests/reservation IDs are 16
 raw bytes. Revisions and profiles are u16; windows and frame caps are u32.
 Payloads have no padding or reserved extensibility bytes. Type 25 remains

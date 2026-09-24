@@ -166,7 +166,43 @@ Evidence: `/tanksmall/scratch/tmp/p51-vertical-clean-candidate/run-28b-w30-r1.lo
 (SHA256 `fd7ffa8a726b164c4dddfb827039327e17602bdf771834521a191bdaa6fc92ca`).
 Its strict build passes in `build-28b-r4.log` under the same directory
 (SHA256 `6418bb7ee60b658afd539110c57f122f2cd2524fb8cfcade70db37906f65acd1`).
-The integration overlay is not yet committed or qualified for all profiles.
+The integration overlay now passes that real-daemon W30 gate for P29V1,
+ZSTD_TU and ZSTD_ROUTE, with temporary diagnostics removed. Each profile
+holds 30 complete COMMIT frames before releasing any receipts, then checks
+30 exact results and original-channel input attachments. Evidence:
+`/tanksmall/scratch/tmp/p51-vertical-unified-0ed20/logs/run-all-profiles-w30-clean-r1.log`
+(SHA256 `2061531188b1b9ce1d4e1e50398a5cacfbce714383054493d7cd6a5b5b6d4d4e`),
+exit 0; test binary SHA256
+`325712e79d9efc8d32ac938f3ea66314398eca35f7a18dc2ba146d9c09108cdc`.
+This snapshot uses the pre-retirement-change sender core, not the later
+`94e9b440` sender. The route-only failure was a product bug: two reservation
+checks cast the advertisement bitmask (ZSTD_ROUTE = 4) to the profile ID
+(ZSTD_ROUTE = 3). Explicit mapping fixes both link lookup and job admission.
+The focused service regression covers all three profiles and verifies that
+wrong-profile rejection leaves the correct reservation consumable.
+The opt-in integration is included on the candidate branch. With the two
+daemon-cleanup fixes, the explicit
+`make -C unittests p50daemonpositive-p51-w30-check` target passes all three
+30-job profiles in an isolated root container with NET_ADMIN, iptables,
+an unprivileged `icecc` identity and writable scratch. It is not part of the
+default native test set. Final target evidence under the same root:
+`logs/run-w30-make-target-r1.log`
+(SHA256 `c49b6edaccfc7fe711944b1f7333059a453d7eda29fa4ea4ef207f51596068a5`).
+The standard daemon runner also passes default, pending-disconnect, P51
+cancellation/replacement and one-job vertical modes:
+`logs/run-daemon-standard-direct-r1.log`
+(SHA256 `d43259eed25ae938a10663e598df5480420a0ff275ba95cf51da025f6a06b9e2`).
+These runs retain the pinned pre-retirement sender core described above;
+combined qualification with the newer sender remains required. Allocation
+failure in orphaned-ARM retention was reviewed but not directly injected.
+
+A separate coherent integration snapshot passes 55 native P50 targets,
+including ordinary 43/49/50/51, R1/R2 and profile-selection boundary tests:
+`/tanksmall/scratch/tmp/p51-compat-qa.W5ISl6/native-p50-suite-r4.log`
+(SHA256 `020755ec900944ee44f1ccf6edb95959005a8da75a4f12ca53ebf07c6921feb2`).
+The subsequent profile-mapping service regression also passes in
+`profile-mask-service-r1.log` under that root
+(SHA256 `ababdabd15ab1df014beb1a969cd8ab3a50d89bd860a546ce357552238925da0`).
 Full service concurrency, recovery, restarts, wrapper and mixed-farm gates
 remain open. The Stage A results below do not qualify these changes.
 No Chromium build/download has been started for this implementation step.

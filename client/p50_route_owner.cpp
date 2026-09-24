@@ -328,6 +328,18 @@ void P50CRouteOwner::reset() noexcept {
     }
 }
 
+void P50CRouteOwner::cancel_active_p51_transfers() noexcept {
+    for (const auto& [relationship, sender] : owners_) {
+        (void)relationship;
+        if (sender)
+            sender->retire_for_replacement();
+    }
+    for (const auto& sender : retired_senders_) {
+        if (sender)
+            sender->retire_for_replacement();
+    }
+}
+
 bool P50CRouteOwner::owns(
     const P50RouteRelationship& relationship) const noexcept {
     return owners_.find(relationship) != owners_.end();

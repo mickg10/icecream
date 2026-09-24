@@ -3,7 +3,9 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #include <sys/socket.h>
@@ -86,7 +88,109 @@ UseCSMsg admissible_assignment() {
                     CACHE_PROFILE_ZSTD_TU};
 }
 
+class SavedEnvironment {
+public:
+    explicit SavedEnvironment(const char* name) : name_(name) {
+        if (const char* value = std::getenv(name))
+            value_ = value;
+    }
+
+    ~SavedEnvironment() { restore(); }
+
+    void set(const char* value) {
+        const int result = value == nullptr
+            ? ::unsetenv(name_.c_str())
+            : ::setenv(name_.c_str(), value, 1);
+        CHECK(result == 0);
+    }
+
+    void restore() noexcept {
+        if (restored_)
+            return;
+        if (value_)
+            (void)::setenv(name_.c_str(), value_->c_str(), 1);
+        else
+            (void)::unsetenv(name_.c_str());
+        restored_ = true;
+    }
+
+private:
+    std::string name_;
+    std::optional<std::string> value_;
+    bool restored_ = false;
+};
+
+void test_compile_binding_p51_mode_matrix() {
+    SavedEnvironment mode("ICECC_P51_MODE");
+    const struct ModeCase {
+        const char* name;
+        const char* value;
+        uint32_t selected_when_supported;
+    } modes[] = {
+        {"unset", nullptr, CACHE_WIRE_REVISION_R1},
+        {"off", "off", CACHE_WIRE_REVISION_R1},
+        {"on", "on", CACHE_WIRE_REVISION_R2},
+        {"invalid", "maybe", 0},
+    };
+    const int ordinary_protocols[] = {
+        43,
+        PROTOCOL_VERSION_ASSIGNMENT_FENCE,
+        PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
+        PROTOCOL_VERSION_CACHE_R2_NEGOTIATION,
+    };
+    const uint32_t wire_revisions[] = {
+        CACHE_WIRE_REVISION_R1, CACHE_WIRE_REVISION_R2,
+    };
+    const struct ProfileCase {
+        uint32_t mask;
+        ProfileId profile;
+    } profiles[] = {
+        {CACHE_PROFILE_P29V1, ProfileId::P29V1},
+        {CACHE_PROFILE_ZSTD_TU, ProfileId::ZSTD_TU},
+        {CACHE_PROFILE_ZSTD_ROUTE, ProfileId::ZSTD_ROUTE},
+    };
+
+    for (const ModeCase& mode_case : modes) {
+        mode.set(mode_case.value);
+        for (const int ordinary_protocol : ordinary_protocols) {
+            const bool protocol_supported =
+                ordinary_protocol >= PROTOCOL_VERSION_CACHE_ADVERTISEMENT;
+            const uint32_t expected_revision = !protocol_supported
+                ? 0
+                : (mode_case.selected_when_supported ==
+                           CACHE_WIRE_REVISION_R2 &&
+                       ordinary_protocol <
+                           PROTOCOL_VERSION_CACHE_R2_NEGOTIATION
+                       ? 0
+                       : mode_case.selected_when_supported);
+            CHECK(p50_cache_revision_from_environment(ordinary_protocol) ==
+                  expected_revision);
+
+            for (const uint32_t wire_revision : wire_revisions) {
+                for (const ProfileCase& profile : profiles) {
+                    UseCSMsg assignment = admissible_assignment();
+                    assignment.cache_protocol = wire_revision;
+                    assignment.cache_profile_mask = profile.mask;
+                    const bool expected = expected_revision != 0 &&
+                                          wire_revision == expected_revision;
+                    CHECK(p50_zstd_compile_admissible(
+                              assignment, ordinary_protocol) == expected);
+                    const auto selected = p50_zstd_selected_profile(
+                        assignment, ordinary_protocol);
+                    CHECK(selected.has_value() == expected);
+                    if (expected)
+                        CHECK(*selected == profile.profile);
+                }
+            }
+        }
+    }
+
+    mode.restore();
+}
+
 void test_exact_mode_admission() {
+    SavedEnvironment mode("ICECC_P51_MODE");
+    mode.set(nullptr);
     UseCSMsg assignment = admissible_assignment();
     CHECK(p50_zstd_compile_admissible(assignment,
                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
@@ -128,6 +232,7 @@ void test_exact_mode_admission() {
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
     CHECK(!p50_zstd_compile_admissible(assignment,
                                        PROTOCOL_VERSION_ASSIGNMENT_FENCE));
+    mode.restore();
 }
 
 void test_explicit_profile_selection() {
@@ -371,6 +476,7 @@ void test_authenticated_sidecar_result_binds_real_identity() {
 
 int main() {
     test_exact_mode_admission();
+    test_compile_binding_p51_mode_matrix();
     test_explicit_profile_selection();
     test_namespace_and_request_are_assignment_bound();
     test_old_scheduler_gets_only_a_local_wire_identity();

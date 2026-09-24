@@ -51,10 +51,11 @@ bool p50_zstd_compile_admissible(const UseCSMsg& assignment,
 
 std::optional<ProfileId> p50_zstd_selected_profile(
     const UseCSMsg& assignment, int compiler_protocol) noexcept {
-    if (compiler_protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
+    if (assignment.cache_protocol !=
+            p50_cache_revision_from_environment(compiler_protocol) ||
+        assignment.cache_protocol == 0 ||
         assignment.hostname.empty() || assignment.port == 0 ||
         !usecs_cache_handoff_admissible(assignment) ||
-        assignment.cache_protocol != CACHE_WIRE_REVISION ||
         !p50_source_profile_selection_valid(assignment.cache_profile_mask))
         return std::nullopt;
     if (assignment.cache_profile_mask == CACHE_PROFILE_P29V1)

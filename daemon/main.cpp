@@ -594,6 +594,23 @@ public:
         Stage stage = Stage::Connecting;
     };
 
+    struct PendingP51SourceCancel {
+        enum class Stage : uint8_t {
+            HelloSend = 0,
+            HelloAckRead,
+            CancelSend,
+            CancelReplyRead,
+            GoodbyeSend,
+        };
+        icecc::p50::local::P51SourceReservationCancel request;
+        icecc::p50::sidecar::ReadyLease ready_lease;
+        std::chrono::steady_clock::time_point deadline{};
+        std::unique_ptr<icecc::p50::local::UnixConnectOperation> connect;
+        std::unique_ptr<icecc::p50::local::Connection> control;
+        std::unique_ptr<icecc::p50::local::FrameOperation> frame;
+        Stage stage = Stage::HelloSend;
+    };
+
     enum class P50InputLeaseState : uint8_t {
         None = 0,
         Active,
@@ -853,6 +870,8 @@ public:
     std::optional<P51SourceArmFields> p51_source_arm_fields;
     std::optional<P51SourceArmedFields> p51_source_armed_fields;
     std::optional<icecc::p50::sidecar::ReadyLease> p50_source_f_lease;
+    std::optional<icecc::p50::sidecar::AbsoluteMonotonicDeadline>
+        p51_source_absolute_deadline;
     // Retain the complete ACK, not just a compact lease projection.  The
     // later cache-session join must be derivable from the canonical arm plus
     // every F-side ACK fact without consulting a second mutable table.
@@ -1520,6 +1539,10 @@ struct Daemon {
     icecc::p50::sidecar::CentralChildReaperRegistry cache_child_reaper;
     std::unique_ptr<icecc::p50::daemon::DaemonSidecarAdapter> cache_adapter;
     bool cache_adapter_start_attempted;
+    vector<std::unique_ptr<Client::PendingP51SourceCancel>>
+        pending_p51_source_cancels;
+    vector<std::unique_ptr<Client::PendingP51SourceArm>>
+        orphaned_p51_source_arms;
     uint64_t next_p50_arm_observation_id;
     icecc::p50::advertisement::Snapshot scheduler_cache_snapshot;
     bool scheduler_cache_snapshot_valid;
@@ -1695,6 +1718,17 @@ struct Daemon {
     bool handle_p51_source_arm(Client *client, P51SourceArmMsg *msg)
         __attribute_warn_unused_result__;
     bool advance_p51_source_arms(const std::vector<pollfd>& pollfds);
+    void queue_p51_source_cancel(
+        const P51SourceArmFields& arm,
+        const P51SourceArmedFields& armed,
+        const icecc::p50::sidecar::AbsoluteMonotonicDeadline& deadline,
+        const icecc::p50::sidecar::ReadyLease& ready_lease) noexcept;
+    void withdraw_p51_source_incarnation(
+        const icecc::p50::sidecar::ReadyLease& ready_lease,
+        const char* reason) noexcept;
+    bool advance_p51_source_cancels(const std::vector<pollfd>& pollfds);
+    bool advance_orphaned_p51_source_arms(
+        const std::vector<pollfd>& pollfds);
     bool handle_p51_cache_link_session(
         Client *client, P51CacheLinkSessionMsg *msg)
         __attribute_warn_unused_result__;
@@ -8936,6 +8970,56 @@ void Daemon::handle_end(Client *client, int exitcode)
                 client->p50_source_arm_fields.has_value()
             ? client->p50_source_arm_fields
             : std::nullopt;
+    if (client->pending_p51_source_arm) {
+        auto& pending = client->pending_p51_source_arm;
+        const auto stage = static_cast<uint8_t>(pending->stage);
+        if (stage >= static_cast<uint8_t>(
+                         Client::PendingP51SourceArm::Stage::ReservationSend) &&
+            orphaned_p51_source_arms.size() < 64) {
+            try {
+                orphaned_p51_source_arms.push_back(std::move(pending));
+            } catch (...) {
+                log_warning() << "cannot retain bounded in-flight P51 ARM cleanup"
+                              << endl;
+                if (pending && pending->armed.has_value() &&
+                    pending->reservation_error_code == 0)
+                    queue_p51_source_cancel(
+                        pending->arm, *pending->armed,
+                        pending->absolute_deadline, pending->ready_lease);
+                else if (pending &&
+                         pending->reservation_error_code == 0)
+                    withdraw_p51_source_incarnation(
+                        pending->ready_lease,
+                        "orphaned ARM cleanup retention failure");
+                pending.reset();
+            }
+        } else if (stage >= static_cast<uint8_t>(
+                                Client::PendingP51SourceArm::Stage::ReservationSend)) {
+            if (pending->armed.has_value() &&
+                pending->reservation_error_code == 0)
+                queue_p51_source_cancel(pending->arm, *pending->armed,
+                                        pending->absolute_deadline,
+                                        pending->ready_lease);
+            else
+                withdraw_p51_source_incarnation(
+                    pending->ready_lease, "orphaned ARM cleanup saturation");
+        } else if (pending->armed.has_value() &&
+                   pending->reservation_error_code == 0) {
+            queue_p51_source_cancel(pending->arm, *pending->armed,
+                                    pending->absolute_deadline,
+                                    pending->ready_lease);
+        }
+    } else if (client->status == Client::WAITP50INPUT &&
+        client->p51_source_arm_fields.has_value() &&
+        client->p51_source_armed_fields.has_value() &&
+        client->p51_source_absolute_deadline.has_value() &&
+        client->p50_source_f_lease.has_value()) {
+        queue_p51_source_cancel(
+            *client->p51_source_arm_fields,
+            *client->p51_source_armed_fields,
+            *client->p51_source_absolute_deadline,
+            *client->p50_source_f_lease);
+    }
     // A normal disconnect, worker failure, scheduler loss, or retry says only
     // that this assignment attempt is over.  It must not terminally close the
     // logical job; an explicit result disposition does that before handle_end.
@@ -8977,6 +9061,7 @@ void Daemon::handle_end(Client *client, int exitcode)
     client->p50_source_arm_fields.reset();
     client->p51_source_arm_fields.reset();
     client->p51_source_armed_fields.reset();
+    client->p51_source_absolute_deadline.reset();
     client->p50_attachment.reset();
     client->p50_attachment_job.reset();
     client->p50_attachment_result.reset();
@@ -10018,6 +10103,247 @@ bool Daemon::handle_p51_source_arm(Client *client, P51SourceArmMsg *msg)
     return true;
 }
 
+void Daemon::withdraw_p51_source_incarnation(
+    const icecc::p50::sidecar::ReadyLease& ready_lease,
+    const char* reason) noexcept
+{
+    if (cache_adapter == nullptr || !ready_lease.valid())
+        return;
+    const auto current = cache_adapter->outer_current_ready_lease();
+    if (!current.has_value() ||
+        !icecc::p50::daemon::p50_ready_lease_observation_equal(
+            ready_lease, *current))
+        return;
+    log_error() << "withdrawing exact P51 sidecar incarnation after "
+                << reason << endl;
+    // This is a recoverable exact-incarnation withdrawal, not final daemon
+    // shutdown. The main lifecycle reducer will publish the advertisement
+    // transition on its next owner turn and may mint a successor only after
+    // the fenced teardown completes.
+    cache_adapter->outer_request_replacement();
+}
+
+void Daemon::queue_p51_source_cancel(
+    const P51SourceArmFields& arm,
+    const P51SourceArmedFields& armed,
+    const icecc::p50::sidecar::AbsoluteMonotonicDeadline& absolute_deadline,
+    const icecc::p50::sidecar::ReadyLease& ready_lease) noexcept
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    if (!arm.valid() || !armed.valid() ||
+        !armed.acknowledges(P51SourceArmMsg{arm}) ||
+        !absolute_deadline.valid() || !ready_lease.valid() ||
+        pending_p51_source_cancels.size() >= 64) {
+        if (pending_p51_source_cancels.size() >= 64)
+            withdraw_p51_source_incarnation(
+                ready_lease, "reservation-cancel queue saturation");
+        return;
+    }
+    try {
+        auto pending = std::make_unique<Client::PendingP51SourceCancel>();
+        pending->request.arm = arm;
+        pending->request.armed = armed;
+        pending->request.absolute_deadline = absolute_deadline;
+        pending->ready_lease = ready_lease;
+        pending->deadline = absolute_deadline.as_steady_time_point();
+        if (pending->deadline <= std::chrono::steady_clock::now())
+            return;
+        pending->connect = std::make_unique<UnixConnectOperation>(
+            ready_lease.socket_path, pending->deadline);
+        pending->connect->advance();
+        pending_p51_source_cancels.push_back(std::move(pending));
+    } catch (...) {
+        log_warning() << "cannot queue bounded P51 source-reservation cancellation"
+                      << endl;
+        withdraw_p51_source_incarnation(
+            ready_lease, "reservation-cancel queue allocation failure");
+    }
+}
+
+bool Daemon::advance_p51_source_cancels(const std::vector<pollfd> &pollfds)
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    bool progressed = false;
+    for (auto it = pending_p51_source_cancels.begin();
+         it != pending_p51_source_cancels.end();) {
+        auto& pending = **it;
+        if (std::chrono::steady_clock::now() >= pending.deadline) {
+            log_warning() << "P51 source-reservation cancellation expired"
+                          << endl;
+            it = pending_p51_source_cancels.erase(it);
+            progressed = true;
+            continue;
+        }
+        short revents = 0;
+        const int operation_fd = pending.connect
+            ? pending.connect->poll_fd()
+            : pending.control ? pending.control->native_handle() : -1;
+        for (const pollfd& descriptor : pollfds)
+            if (descriptor.fd == operation_fd)
+                revents |= descriptor.revents;
+
+        auto fail = [&](const char* reason) {
+            log_warning() << "P51 source-reservation cancellation failed: "
+                          << reason << endl;
+            if (std::chrono::steady_clock::now() < pending.deadline)
+                withdraw_p51_source_incarnation(pending.ready_lease, reason);
+            it = pending_p51_source_cancels.erase(it);
+            progressed = true;
+        };
+        if (pending.connect) {
+            pending.connect->advance(revents);
+            if (!pending.connect->done()) {
+                ++it;
+                continue;
+            }
+            if (pending.connect->status() != Status::Ok) {
+                fail("sidecar connect");
+                continue;
+            }
+            try {
+                pending.control = std::make_unique<Connection>(
+                    pending.connect->take_connection());
+                pending.connect.reset();
+                CredentialExpectation expected_peer;
+                expected_peer.uid = ::geteuid();
+                expected_peer.gid = ::getegid();
+                if (!pending.control->valid() ||
+                    pending.control->verify_peer_credentials(expected_peer) !=
+                        Status::Ok) {
+                    fail("sidecar credentials");
+                    continue;
+                }
+                const Identity identity{
+                    pending.ready_lease.identity.generation,
+                    pending.ready_lease.identity.attempt};
+                pending.frame = std::make_unique<FrameOperation>(
+                    *pending.control,
+                    make_hello(PeerRole::Daemon, identity), pending.deadline);
+                pending.stage = Client::PendingP51SourceCancel::Stage::HelloSend;
+                progressed = true;
+            } catch (...) {
+                fail("hello setup");
+                continue;
+            }
+        }
+        if (!pending.frame) {
+            ++it;
+            continue;
+        }
+        pending.frame->advance();
+        if (!pending.frame->done()) {
+            ++it;
+            continue;
+        }
+        if (pending.frame->status() != Status::Ok) {
+            fail("control frame I/O");
+            continue;
+        }
+        const Identity identity{
+            pending.ready_lease.identity.generation,
+            pending.ready_lease.identity.attempt};
+        try {
+            switch (pending.stage) {
+            case Client::PendingP51SourceCancel::Stage::HelloSend:
+                pending.frame = std::make_unique<FrameOperation>(
+                    *pending.control, pending.deadline);
+                pending.stage =
+                    Client::PendingP51SourceCancel::Stage::HelloAckRead;
+                break;
+            case Client::PendingP51SourceCancel::Stage::HelloAckRead:
+                if (validate_handshake(
+                        pending.frame->frame(), local::MessageType::HelloAck,
+                        PeerRole::Sidecar, identity) != Status::Ok) {
+                    fail("hello acknowledgement identity");
+                    continue;
+                }
+                {
+                    ControlOperation operation;
+                    operation.kind = ControlOperationKind::SourceReservationCancel;
+                    operation.identity = identity;
+                    operation.request_id =
+                        pending.request.arm.source.source_request_id;
+                    operation.sender_role = ControlOperationRole::Daemon;
+                    operation.p51_reservation_cancel = pending.request;
+                    const std::vector<uint8_t> payload =
+                        encode_control_operation(operation);
+                    if (payload.empty()) {
+                        fail("cancel request encoding");
+                        continue;
+                    }
+                    const local::Frame frame{
+                        local::kProtocolVersion, local::MessageType::Data,
+                        identity, payload};
+                    pending.frame = std::make_unique<FrameOperation>(
+                        *pending.control, frame, pending.deadline);
+                    pending.stage =
+                        Client::PendingP51SourceCancel::Stage::CancelSend;
+                }
+                break;
+            case Client::PendingP51SourceCancel::Stage::CancelSend:
+                pending.frame = std::make_unique<FrameOperation>(
+                    *pending.control, pending.deadline);
+                pending.stage =
+                    Client::PendingP51SourceCancel::Stage::CancelReplyRead;
+                break;
+            case Client::PendingP51SourceCancel::Stage::CancelReplyRead: {
+                ControlOperation observed;
+                const local::Frame& frame = pending.frame->frame();
+                if (frame.type != local::MessageType::Data ||
+                    validate_identity(frame, identity) != Status::Ok ||
+                    !decode_control_operation(frame.payload, observed) ||
+                    observed.kind !=
+                        ControlOperationKind::SourceReservationCancel ||
+                    observed.identity != identity ||
+                    observed.request_id !=
+                        pending.request.arm.source.source_request_id ||
+                    !observed.p51_reservation_cancel.has_value() ||
+                    [&] {
+                        auto expected = pending.request;
+                        expected.cancelled =
+                            observed.p51_reservation_cancel->cancelled;
+                        return *observed.p51_reservation_cancel != expected;
+                    }() ||
+                    !observed.p51_reservation_cancel->cancelled.has_value() ||
+                    observed.p51_reservation_cancel_result !=
+                        observed.p51_reservation_cancel->cancelled) {
+                    fail("cancel reply binding");
+                    continue;
+                }
+                if (*observed.p51_reservation_cancel_result)
+                    trace() << "P51 exact source reservation cancelled" << endl;
+                else
+                    trace() << "P51 source reservation was already settled"
+                            << endl;
+                const local::Frame goodbye{
+                    local::kProtocolVersion, local::MessageType::Goodbye,
+                    identity, {}};
+                pending.frame = std::make_unique<FrameOperation>(
+                    *pending.control, goodbye, pending.deadline);
+                pending.stage =
+                    Client::PendingP51SourceCancel::Stage::GoodbyeSend;
+                break;
+            }
+            case Client::PendingP51SourceCancel::Stage::GoodbyeSend:
+                log_info() << "cancelled exact P51 source reservation"
+                           << endl;
+                it = pending_p51_source_cancels.erase(it);
+                progressed = true;
+                continue;
+            }
+            progressed = true;
+        } catch (...) {
+            fail("control stage setup");
+            continue;
+        }
+        if (it != pending_p51_source_cancels.end())
+            ++it;
+    }
+    return progressed;
+}
+
 bool Daemon::advance_p51_source_leases(const std::vector<pollfd> &pollfds)
 {
     for (const auto &entry : clients) {
@@ -10240,8 +10566,20 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
                 revents |= descriptor.revents;
 
         auto fail = [&](const char *reason) {
-            log_warning() << "P51 source arm setup failed: " << reason << endl;
+            log_warning() << "P51 source arm setup failed: " << reason
+                          << " stage=" << static_cast<unsigned>(pending->stage)
+                          << " fd=" << operation_fd
+                          << " frame_status="
+                          << (pending->frame
+                                  ? static_cast<unsigned>(pending->frame->status())
+                                  : 255u)
+                          << endl;
             const uint32_t job_id = pending->arm.source.wire_job_id;
+            if (pending->armed.has_value() &&
+                pending->reservation_error_code == 0)
+                queue_p51_source_cancel(pending->arm, *pending->armed,
+                                        pending->absolute_deadline,
+                                        pending->ready_lease);
             pending.reset();
             if (job_id != 0)
                 finish_assignment_claim(job_id);
@@ -10412,6 +10750,11 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
                 }
                 if (!icecc::p50::daemon::p50_ready_lease_observation_equal(
                         pending->ready_lease, *current_lease)) {
+                    if (pending->armed.has_value() &&
+                        pending->reservation_error_code == 0)
+                        queue_p51_source_cancel(pending->arm, *pending->armed,
+                                                pending->absolute_deadline,
+                                                pending->ready_lease);
                     pending->frame.reset();
                     pending->control.reset();
                     pending->connect.reset();
@@ -10459,6 +10802,8 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
                     client->connection_provenance;
                 client->p50_source_deadline_msec =
                     monotonic_msec() + remaining;
+                client->p51_source_absolute_deadline =
+                    pending->absolute_deadline;
                 client->p50_source_compile_pending = false;
                 client->set_status(
                     Client::WAITP50INPUT,
@@ -10484,6 +10829,148 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
         }
     }
     return false;
+}
+
+bool Daemon::advance_orphaned_p51_source_arms(
+    const std::vector<pollfd>& pollfds)
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    (void)pollfds;
+    bool progressed = false;
+    for (auto it = orphaned_p51_source_arms.begin();
+         it != orphaned_p51_source_arms.end();) {
+        auto& pending = **it;
+        if (std::chrono::steady_clock::now() >= pending.deadline) {
+            log_warning() << "orphaned P51 ARM expired before reservation cancel"
+                          << endl;
+            it = orphaned_p51_source_arms.erase(it);
+            progressed = true;
+            continue;
+        }
+        if (!pending.control || !pending.frame || pending.connect) {
+            log_warning() << "orphaned P51 ARM lost its in-flight control state"
+                          << endl;
+            const bool cancel = pending.armed.has_value() &&
+                                pending.reservation_error_code == 0;
+            const auto arm = pending.arm;
+            const auto armed = pending.armed;
+            const auto deadline = pending.absolute_deadline;
+            const auto ready_lease = pending.ready_lease;
+            it = orphaned_p51_source_arms.erase(it);
+            if (cancel)
+                queue_p51_source_cancel(arm, *armed, deadline, ready_lease);
+            else
+                withdraw_p51_source_incarnation(
+                    ready_lease, "orphaned ARM control state loss");
+            progressed = true;
+            continue;
+        }
+        pending.frame->advance();
+        if (!pending.frame->done()) {
+            ++it;
+            continue;
+        }
+        if (pending.frame->status() != Status::Ok) {
+            const bool cancel = pending.armed.has_value() &&
+                                pending.reservation_error_code == 0;
+            const auto arm = pending.arm;
+            const auto armed = pending.armed;
+            const auto deadline = pending.absolute_deadline;
+            const auto steady_deadline = pending.deadline;
+            const auto ready_lease = pending.ready_lease;
+            log_warning() << "orphaned P51 ARM control exchange failed" << endl;
+            it = orphaned_p51_source_arms.erase(it);
+            if (cancel)
+                queue_p51_source_cancel(arm, *armed, deadline, ready_lease);
+            else if (std::chrono::steady_clock::now() < steady_deadline)
+                withdraw_p51_source_incarnation(
+                    ready_lease, "orphaned ARM response loss");
+            progressed = true;
+            continue;
+        }
+        try {
+            switch (pending.stage) {
+            case Client::PendingP51SourceArm::Stage::ReservationSend:
+                pending.frame = std::make_unique<FrameOperation>(
+                    *pending.control, pending.deadline);
+                pending.stage =
+                    Client::PendingP51SourceArm::Stage::ReservationReplyRead;
+                break;
+            case Client::PendingP51SourceArm::Stage::ReservationReplyRead: {
+                ControlOperation observed;
+                const local::Frame& frame = pending.frame->frame();
+                const Identity identity{
+                    pending.ready_lease.identity.generation,
+                    pending.ready_lease.identity.attempt};
+                const P51SourceReservationRequest request{
+                    pending.arm, pending.absolute_deadline};
+                if (frame.type != local::MessageType::Data ||
+                    validate_identity(frame, identity) != Status::Ok ||
+                    !decode_control_operation(frame.payload, observed) ||
+                    observed.kind != ControlOperationKind::SourceReservation ||
+                    observed.identity != identity ||
+                    observed.request_id != pending.arm.source.source_request_id ||
+                    observed.p51_reservation != request ||
+                    !observed.p51_reservation_result.has_value() ||
+                    !observed.p51_reservation_result->valid())
+                    throw std::invalid_argument(
+                        "late reservation response identity mismatch");
+                pending.reservation_error_code =
+                    observed.p51_reservation_result->error_code;
+                pending.armed = observed.p51_reservation_result->armed;
+                {
+                    const local::Frame goodbye{
+                        local::kProtocolVersion, local::MessageType::Goodbye,
+                        identity, {}};
+                    pending.frame = std::make_unique<FrameOperation>(
+                        *pending.control, goodbye, pending.deadline);
+                }
+                pending.stage = Client::PendingP51SourceArm::Stage::GoodbyeSend;
+                break;
+            }
+            case Client::PendingP51SourceArm::Stage::GoodbyeSend:
+                {
+                    const bool cancel = pending.armed.has_value() &&
+                                        pending.reservation_error_code == 0;
+                    const auto arm = pending.arm;
+                    const auto armed = pending.armed;
+                    const auto deadline = pending.absolute_deadline;
+                    const auto ready_lease = pending.ready_lease;
+                    it = orphaned_p51_source_arms.erase(it);
+                    if (cancel)
+                        queue_p51_source_cancel(arm, *armed, deadline,
+                                                ready_lease);
+                }
+                progressed = true;
+                continue;
+            default:
+                throw std::logic_error(
+                    "orphaned P51 ARM reached invalid cleanup stage");
+            }
+            progressed = true;
+        } catch (const std::exception& error) {
+            log_warning() << "orphaned P51 ARM cleanup failed: "
+                          << error.what() << endl;
+            const bool cancel = pending.armed.has_value() &&
+                                pending.reservation_error_code == 0;
+            const auto arm = pending.arm;
+            const auto armed = pending.armed;
+            const auto deadline = pending.absolute_deadline;
+            const auto steady_deadline = pending.deadline;
+            const auto ready_lease = pending.ready_lease;
+            it = orphaned_p51_source_arms.erase(it);
+            if (cancel)
+                queue_p51_source_cancel(arm, *armed, deadline, ready_lease);
+            else if (std::chrono::steady_clock::now() < steady_deadline)
+                withdraw_p51_source_incarnation(
+                    ready_lease, "orphaned ARM validation failure");
+            progressed = true;
+            continue;
+        }
+        ++it;
+    }
+    return progressed;
 }
 
 bool Daemon::handle_cache_session(Client *client, Msg *msg)
@@ -10578,15 +11065,26 @@ bool Daemon::handle_p51_cache_link_session(
 
     const int old_fd = client->channel->fd;
     const auto &provenance = client->connection_provenance;
+    const bool public_tcp_cache_link =
+        provenance.listener == ListenerKind::TcpLoopback ||
+        provenance.listener == ListenerKind::TcpRemote;
     if (client->status != Client::UNKNOWN || client->job != nullptr ||
         client->usecsmsg != nullptr ||
         client->p50_source_arm_fields.has_value() ||
+        client->p51_source_arm_fields.has_value() ||
+        client->p51_source_armed_fields.has_value() ||
         client->pending_p51_source_lease || client->p50_attachment ||
-        client->p50_attachment_lease.has_value() ||
-        !provenance.cache_eligible() ||
-        !connection_leases.revalidate_live(
-            provenance.lease, client, client->channel, provenance.peer))
+        client->pending_p51_source_arm ||
+        client->p50_attachment_lease.has_value())
         return refuse("link channel is not a pristine live public TCP connection");
+    if (!public_tcp_cache_link)
+        return refuse("link channel did not arrive on a public TCP listener");
+    // Public TCP sockets have no Unix peer credentials by design. The
+    // immutable accepted-peer tuple is still part of the lease comparison;
+    // peer.complete() is required only for Unix-local provenance.
+    if (!connection_leases.revalidate_live(
+            provenance.lease, client, client->channel, provenance.peer))
+        return refuse("link channel connection lease is stale");
     if (cache_adapter == nullptr || !cache_adapter->authenticated() ||
         cache_adapter->dispatcher() == nullptr)
         return refuse("authenticated cache sidecar is unavailable");
@@ -11268,11 +11766,14 @@ void Daemon::answer_client_requests()
         pollfds.push_back(pfd);
     }
 
+    bool p51_connect_completion_pending = false;
     for (const auto &entry : clients) {
         const Client *client = entry.second;
         if (!client->pending_p51_source_lease)
             continue;
         const auto &pending = *client->pending_p51_source_lease;
+        p51_connect_completion_pending |=
+            pending.connect && pending.connect->done();
         if (pending.connect && pending.connect->poll_fd() >= 0)
             pollfds.push_back(pollfd{pending.connect->poll_fd(),
                                      pending.connect->poll_events(), 0});
@@ -11285,12 +11786,29 @@ void Daemon::answer_client_requests()
         if (!client->pending_p51_source_arm)
             continue;
         const auto &pending = *client->pending_p51_source_arm;
+        p51_connect_completion_pending |=
+            pending.connect && pending.connect->done();
         if (pending.connect && pending.connect->poll_fd() >= 0)
             pollfds.push_back(pollfd{pending.connect->poll_fd(),
                                      pending.connect->poll_events(), 0});
         else if (pending.control && pending.frame)
             pollfds.push_back(pollfd{pending.control->native_handle(),
                                      pending.frame->poll_events(), 0});
+    }
+    for (const auto& pending : pending_p51_source_cancels) {
+        p51_connect_completion_pending |=
+            pending->connect && pending->connect->done();
+        if (pending->connect && pending->connect->poll_fd() >= 0)
+            pollfds.push_back(pollfd{pending->connect->poll_fd(),
+                                     pending->connect->poll_events(), 0});
+        else if (pending->control && pending->frame)
+            pollfds.push_back(pollfd{pending->control->native_handle(),
+                                     pending->frame->poll_events(), 0});
+    }
+    for (const auto& pending : orphaned_p51_source_arms) {
+        if (pending->control && pending->frame)
+            pollfds.push_back(pollfd{pending->control->native_handle(),
+                                     pending->frame->poll_events(), 0});
     }
 
     /* G4 (16:47#1): set when a client had more than one complete message already
@@ -11428,6 +11946,30 @@ void Daemon::answer_client_requests()
         if (poll_timeout_msec < 0 || timeout < poll_timeout_msec)
             poll_timeout_msec = timeout;
     }
+    for (const auto& pending : pending_p51_source_cancels) {
+        auto wakeup = pending->deadline;
+        if (pending->connect)
+            wakeup = std::min(wakeup, pending->connect->next_wakeup());
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                wakeup - std::chrono::steady_clock::now()).count();
+        const int timeout = static_cast<int>(std::clamp<int64_t>(
+            remaining, 0, std::numeric_limits<int>::max()));
+        if (poll_timeout_msec < 0 || timeout < poll_timeout_msec)
+            poll_timeout_msec = timeout;
+    }
+    for (const auto& pending : orphaned_p51_source_arms) {
+        auto wakeup = pending->deadline;
+        if (pending->connect)
+            wakeup = std::min(wakeup, pending->connect->next_wakeup());
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                wakeup - std::chrono::steady_clock::now()).count();
+        const int timeout = static_cast<int>(std::clamp<int64_t>(
+            remaining, 0, std::numeric_limits<int>::max()));
+        if (poll_timeout_msec < 0 || timeout < poll_timeout_msec)
+            poll_timeout_msec = timeout;
+    }
     if (state_dump_interval_s && (!state_jsonl_path.empty() || state_dump_log)) {
         const uint64_t now = monotonic_msec();
         if (!next_state_dump_msec) {
@@ -11524,6 +12066,12 @@ void Daemon::answer_client_requests()
     if (buffered_client_pending) {
         poll_timeout_msec = 0;
     }
+    // UnixConnectOperation may complete synchronously in its initial
+    // advance(). A completed operation has no poll fd; give its owner state
+    // machine another turn before a blocking poll can outlive the sidecar's
+    // bounded handshake budget.
+    if (p51_connect_completion_pending)
+        poll_timeout_msec = 0;
     /* An armed sidecar launch/cleanup plan advances exactly one bounded
        action per turn. Grant zero-timeout turns while already-admitted work
        can progress, so the finite plan reaches fork or exact teardown before
@@ -11549,6 +12097,14 @@ void Daemon::answer_client_requests()
     // at the same instant.  Re-run the exact owner sweep before touching any
     // revents so an expired owner cannot consume a late frame.
     if (expire_p50_source_waiters()) {
+        return;
+    }
+    if (advance_orphaned_p51_source_arms(pollfds)) {
+        finish_scheduler_loss_if_needed();
+        return;
+    }
+    if (advance_p51_source_cancels(pollfds)) {
+        finish_scheduler_loss_if_needed();
         return;
     }
     if (advance_p51_source_leases(pollfds)) {

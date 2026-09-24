@@ -910,9 +910,11 @@ local::P51SourceReservationRequest test_p51_reservation_request(
     source.c_store_derivation_version = kStoreIdentityDerivationVersion;
     source.c_store_guid = c_guid.bytes;
     source.source_request_id = source_request_id;
-    source.source_mode = profile == CACHE_PROFILE_ZSTD_ROUTE
-                             ? P50_SOURCE_MODE_ZSTD_ROUTE
-                             : P50_SOURCE_MODE_ZSTD_TU;
+    source.source_mode = profile == CACHE_PROFILE_P29V1
+                             ? P50_SOURCE_MODE_P29V1
+                             : profile == CACHE_PROFILE_ZSTD_ROUTE
+                                   ? P50_SOURCE_MODE_ZSTD_ROUTE
+                                   : P50_SOURCE_MODE_ZSTD_TU;
     source.c_control_generation = c_control_generation;
     source.c_control_attempt = c_control_attempt;
 
@@ -1065,6 +1067,1076 @@ void test_p51_reservation_capacity_identity_and_window() {
     CHECK(successor_result.armed->relationship_epoch >
           expiring_result.armed->relationship_epoch);
     std::puts("P51_RESERVATION_OWNER exact-duplicate/window/identity/expiry: ok");
+}
+
+bool wait_for_source_operation_count(service::SidecarRuntime& runtime,
+                                     size_t expected,
+                                     std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (runtime.pending_p51_source_operations_for_test() == expected)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return runtime.pending_p51_source_operations_for_test() == expected;
+}
+
+local::HandoffFd oversized_test_source_fd() {
+    char path[] = "/tmp/icecc-p51-async-source-XXXXXX";
+    const int fd = ::mkstemp(path);
+    CHECK(fd >= 0);
+    CHECK(::unlink(path) == 0);
+    const uint8_t bytes[2] = {0x51, 0x52};
+    CHECK(write_all(fd, bytes));
+    return local::HandoffFd(fd);
+}
+
+void receive_p51_transfer_error(local::Connection& peer,
+                                local::Identity identity,
+                                uint64_t request_id,
+                                std::chrono::steady_clock::time_point deadline,
+                                bool acknowledge) {
+    local::Frame response;
+    CHECK(peer.receive_until(response, deadline) == local::Status::Ok);
+    CHECK(response.type == local::MessageType::Data);
+    CHECK(local::validate_identity(response, identity) == local::Status::Ok);
+    local::ControlOperation decoded;
+    CHECK(local::decode_control_operation(response.payload, decoded));
+    CHECK(decoded.kind == local::ControlOperationKind::P51SourceTransfer);
+    CHECK(decoded.request_id == request_id);
+    CHECK(decoded.p51_source_transfer_result.has_value());
+    CHECK(decoded.p51_source_transfer_result->code ==
+          local::SourceTransferResultCode::Error);
+    if (acknowledge) {
+        const local::Frame goodbye{local::kProtocolVersion,
+                                   local::MessageType::Goodbye,
+                                   identity, {}};
+        CHECK(peer.send_until(goodbye, deadline) == local::Status::Ok);
+    }
+}
+
+void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x35;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x36;
+    const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.endpoint_caps.zstd.max_raw_bytes = 1;
+    config.max_pending_p51_source_reservations = 8;
+    config.max_active_p51_source_transfers = 1;
+    config.max_pending_p51_source_operations = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto make_request = [&](uint64_t request_id,
+                            std::chrono::milliseconds lifetime) {
+        auto reservation = test_p51_reservation_request(
+            remote_c, 31, launch.identity.generation, launch.identity.attempt,
+            request_id, CACHE_PROFILE_ZSTD_TU, 30, lifetime);
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = 1;
+        const auto armed = runtime.reserve_p51_source_on_owner(reservation);
+        CHECK(armed.error_code == 0 && armed.armed.has_value());
+        return local::P51SourceTransferRequest{
+            *armed.armed, reservation.absolute_deadline};
+    };
+    auto enqueue = [&](RuntimeCase& pair,
+                       const local::P51SourceTransferRequest& request) {
+        const auto operation = local::make_p51_source_transfer_operation(
+            launch.identity, request,
+            request.armed.arm.source.source_request_id);
+        return runtime.enqueue_p51_source_transfer(
+            std::move(pair.sender), launch.identity, operation,
+            oversized_test_source_fd());
+    };
+
+    // A response stays admitted until Goodbye or the original source deadline;
+    // a cap+1 request is refused without consuming the queued socket/FD.
+    RuntimeCase stalled = authenticated_runtime_pair();
+    const auto short_request = make_request(7101, std::chrono::milliseconds(350));
+    CHECK(enqueue(stalled, short_request));
+    const auto short_deadline = short_request.absolute_deadline.as_steady_time_point();
+    receive_p51_transfer_error(stalled.receiver, launch.identity, 7101,
+                               short_deadline, false);
+    CHECK(wait_for_source_operation_count(runtime, 1, std::chrono::seconds(1)));
+
+    RuntimeCase refused = authenticated_runtime_pair();
+    const auto refused_request = make_request(7102, std::chrono::seconds(2));
+    CHECK(!enqueue(refused, refused_request));
+    CHECK(refused.sender.valid()); // cap refusal leaves ownership with caller
+    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(2)));
+
+    // A later request reuses the released slot; successful local receipt and
+    // Goodbye are both required to retire the operation normally.
+    RuntimeCase normal = authenticated_runtime_pair();
+    const auto normal_request = make_request(7103, std::chrono::seconds(2));
+    CHECK(enqueue(normal, normal_request));
+    receive_p51_transfer_error(
+        normal.receiver, launch.identity, 7103,
+        normal_request.absolute_deadline.as_steady_time_point(), true);
+    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
+
+    // Peer EOF is also terminal for the local reply pump and releases its
+    // bounded queue reservation without waiting out the source deadline.
+    RuntimeCase disconnected = authenticated_runtime_pair();
+    const auto disconnected_request = make_request(7104, std::chrono::seconds(2));
+    CHECK(enqueue(disconnected, disconnected_request));
+    disconnected.receiver = local::Connection(-1);
+    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
+
+    RuntimeCase stopped = authenticated_runtime_pair();
+    const auto stopped_request = make_request(7105, std::chrono::seconds(2));
+    CHECK(enqueue(stopped, stopped_request));
+    receive_p51_transfer_error(
+        stopped.receiver, launch.identity, 7105,
+        stopped_request.absolute_deadline.as_steady_time_point(), false);
+    CHECK(wait_for_source_operation_count(runtime, 1, std::chrono::seconds(1)));
+    runtime.stop();
+    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
+    std::puts("P51_ASYNC_TRANSFER local-reply/deadline/peer-close/slot-reuse: ok");
+}
+
+bool wait_for_source_raw_bytes(service::SidecarRuntime& runtime,
+                               uint64_t expected,
+                               std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (runtime.active_source_raw_bytes_for_test() == expected)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return runtime.active_source_raw_bytes_for_test() == expected;
+}
+
+void test_p51_admitted_transfer_stop_releases_raw_credit() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x3b;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+
+    uint16_t f_port = 0;
+    const int listener_fd = loopback_listener(f_port);
+    CHECK(listener_fd >= 0 && f_port != 0);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_aggregate_source_raw_bytes = 2;
+    config.max_active_p51_source_transfers = 1;
+    config.max_pending_p51_source_operations = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto reservation = test_p51_reservation_request(
+        launch.c_store_guid, launch.store_generation,
+        launch.identity.generation, launch.identity.attempt,
+        7110, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(5));
+    reservation.arm.source.selected_f_host = "127.0.0.1";
+    reservation.arm.source.selected_f_cache_port = f_port;
+    const SidecarLaunchIdentity remote_f = [] {
+        StoreIdentityRoot root{};
+        root.bytes[15] = 0x3d;
+        return test_sidecar_launch(root);
+    }();
+    P51SourceArmedFields armed;
+    armed.arm = reservation.arm;
+    armed.f_control_generation = 17;
+    armed.f_control_attempt = 18;
+    armed.f_store_generation = remote_f.store_generation;
+    armed.f_store_guid = remote_f.f_store_guid.bytes;
+    armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+    armed.arm_observation_id = 19;
+    armed.source_budget_msec = 5000;
+    armed.attempt_capability_1.bytes.fill(0xa1);
+    armed.attempt_capability_2.bytes.fill(0xa2);
+    armed.reservation_id.fill(0xb1);
+    armed.logical_relationship_id.fill(0xb2);
+    armed.relationship_epoch = 1;
+    armed.selected_revision = CACHE_WIRE_REVISION_R2;
+    armed.selected_window = 30;
+    CHECK(armed.valid());
+    const local::P51SourceTransferRequest request{
+        armed, reservation.absolute_deadline};
+
+    std::promise<int> accepted_promise;
+    auto accepted_future = accepted_promise.get_future();
+    std::thread acceptor([listener_fd,
+                          accepted_promise = std::move(accepted_promise)]() mutable {
+        struct pollfd descriptor{listener_fd, POLLIN, 0};
+        int accepted = -1;
+        int ready;
+        do {
+            ready = ::poll(&descriptor, 1, 3000);
+        } while (ready < 0 && errno == EINTR);
+        if (ready > 0) {
+            do {
+                accepted = ::accept(listener_fd, nullptr, nullptr);
+            } while (accepted < 0 && errno == EINTR);
+        }
+        accepted_promise.set_value(accepted);
+    });
+
+    RuntimeCase pair = authenticated_runtime_pair();
+    const local::ControlOperation operation =
+        local::make_p51_source_transfer_operation(
+            launch.identity, request, request.armed.arm.source.source_request_id);
+    const bool enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(pair.sender), launch.identity, operation,
+        oversized_test_source_fd());
+    const bool operation_seen = enqueued && wait_for_source_operation_count(
+        runtime, 1, std::chrono::seconds(1));
+    const bool accepted_ready = operation_seen &&
+        accepted_future.wait_for(std::chrono::seconds(4)) ==
+            std::future_status::ready;
+    const int accepted_fd = accepted_ready ? accepted_future.get() : -1;
+    const bool connected = accepted_fd >= 0;
+    const bool raw_credit_held = connected &&
+        wait_for_source_raw_bytes(runtime, 2, std::chrono::seconds(1));
+
+    // The accepted source is now beyond FD read and holds aggregate raw-byte
+    // credit while the peer stalls during ordinary protocol admission. Stop
+    // must cancel setup and return both its operation and byte slot.
+    runtime.stop();
+    pair.receiver = local::Connection(-1);
+    const bool operation_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(2));
+    const bool raw_credit_released =
+        wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1));
+    if (accepted_fd >= 0)
+        (void)::close(accepted_fd);
+    (void)::close(listener_fd);
+    acceptor.join();
+    CHECK(enqueued);
+    CHECK(operation_seen);
+    CHECK(connected);
+    CHECK(raw_credit_held);
+    CHECK(operation_released);
+    CHECK(raw_credit_released);
+    std::puts("P51_ASYNC_TRANSFER admitted-stop/raw-credit-release: ok");
+}
+
+void test_p51_stop_while_waiting_for_link_session_echo() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x3e;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    uint16_t f_port = 0;
+    const int listener_fd = loopback_listener(f_port);
+    CHECK(listener_fd >= 0 && f_port != 0);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_aggregate_source_raw_bytes = 2;
+    config.max_active_p51_source_transfers = 1;
+    config.max_pending_p51_source_operations = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto reservation = test_p51_reservation_request(
+        launch.c_store_guid, launch.store_generation,
+        launch.identity.generation, launch.identity.attempt,
+        7111, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(5));
+    reservation.arm.source.selected_f_host = "127.0.0.1";
+    reservation.arm.source.selected_f_cache_port = f_port;
+    const SidecarLaunchIdentity remote_f = [] {
+        StoreIdentityRoot root{};
+        root.bytes[15] = 0x3f;
+        return test_sidecar_launch(root);
+    }();
+    P51SourceArmedFields armed;
+    armed.arm = reservation.arm;
+    armed.f_control_generation = 27;
+    armed.f_control_attempt = 28;
+    armed.f_store_generation = remote_f.store_generation;
+    armed.f_store_guid = remote_f.f_store_guid.bytes;
+    armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+    armed.arm_observation_id = 29;
+    armed.source_budget_msec = 5000;
+    armed.attempt_capability_1.bytes.fill(0xb1);
+    armed.attempt_capability_2.bytes.fill(0xb2);
+    armed.reservation_id.fill(0xc1);
+    armed.logical_relationship_id.fill(0xc2);
+    armed.relationship_epoch = 1;
+    armed.selected_revision = CACHE_WIRE_REVISION_R2;
+    armed.selected_window = 30;
+    CHECK(armed.valid());
+    const local::P51SourceTransferRequest request{
+        armed, reservation.absolute_deadline};
+
+    std::promise<bool> request_seen_promise;
+    auto request_seen_future = request_seen_promise.get_future();
+    std::thread peer([listener_fd,
+                      request_seen_promise = std::move(request_seen_promise)]() mutable {
+        struct pollfd listener{listener_fd, POLLIN, 0};
+        int ready;
+        do {
+            ready = ::poll(&listener, 1, 3000);
+        } while (ready < 0 && errno == EINTR);
+        int accepted = -1;
+        sockaddr_storage address{};
+        socklen_t address_length = sizeof(address);
+        if (ready > 0) {
+            do {
+                accepted = ::accept(listener_fd,
+                    reinterpret_cast<sockaddr*>(&address), &address_length);
+            } while (accepted < 0 && errno == EINTR);
+        }
+        std::unique_ptr<MsgChannel> channel(
+            accepted >= 0
+                ? Service::createChannelAccepted(
+                    accepted, reinterpret_cast<sockaddr*>(&address),
+                    address_length)
+                : nullptr);
+        bool saw_request = false;
+        const auto handshake_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (channel && channel->protocol_admission_state() ==
+                              MsgChannel::ProtocolAdmissionState::Pending &&
+               std::chrono::steady_clock::now() < handshake_deadline) {
+            short events = POLLIN;
+            if (channel->has_pending_write())
+                events |= POLLOUT;
+            struct pollfd socket{channel->fd, events, 0};
+            int polled;
+            do {
+                polled = ::poll(&socket, 1, 50);
+            } while (polled < 0 && errno == EINTR);
+            if (polled < 0 || (socket.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                break;
+            if ((socket.revents & POLLOUT) && !channel->flush_pending())
+                break;
+            if ((socket.revents & POLLIN) && !channel->read_a_bit())
+                break;
+        }
+        if (channel && channel->protocol_admission_state() ==
+                           MsgChannel::ProtocolAdmissionState::Ready &&
+            channel->finish_protocol_admission()) {
+            std::unique_ptr<Msg> message(channel->get_msg_until(
+                std::chrono::steady_clock::now() + std::chrono::seconds(3)));
+            saw_request = dynamic_cast<P51CacheLinkSessionMsg*>(
+                              message.get()) != nullptr;
+        }
+        try {
+            request_seen_promise.set_value(saw_request);
+        } catch (...) {
+        }
+        if (saw_request && channel) {
+            const auto close_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (std::chrono::steady_clock::now() < close_deadline) {
+                struct pollfd socket{channel->fd, POLLIN, 0};
+                int polled;
+                do {
+                    polled = ::poll(&socket, 1, 50);
+                } while (polled < 0 && errno == EINTR);
+                if (polled < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                    break;
+                if ((socket.revents & POLLIN) != 0) {
+                    char byte = 0;
+                    const ssize_t count = ::recv(channel->fd, &byte, 1,
+                                                 MSG_PEEK | MSG_DONTWAIT);
+                    if (count == 0 || (count < 0 && errno != EAGAIN &&
+                                       errno != EWOULDBLOCK && errno != EINTR))
+                        break;
+                }
+            }
+        }
+    });
+
+    RuntimeCase pair = authenticated_runtime_pair();
+    const local::ControlOperation operation =
+        local::make_p51_source_transfer_operation(
+            launch.identity, request, request.armed.arm.source.source_request_id);
+    const bool enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(pair.sender), launch.identity, operation,
+        oversized_test_source_fd());
+    const bool operation_seen = enqueued && wait_for_source_operation_count(
+        runtime, 1, std::chrono::seconds(1));
+    const bool got_p51_request = operation_seen &&
+        request_seen_future.wait_for(std::chrono::seconds(4)) ==
+            std::future_status::ready && request_seen_future.get();
+    const bool raw_credit_held = got_p51_request &&
+        wait_for_source_raw_bytes(runtime, 2, std::chrono::seconds(1));
+
+    // The ordinary protocol reached READY and the peer decoded the auxiliary
+    // P51_CACHE_LINK_SESSION request, but deliberately withholds its echo.
+    runtime.stop();
+    pair.receiver = local::Connection(-1);
+    const bool operation_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(2));
+    const bool raw_credit_released =
+        wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1));
+    (void)::close(listener_fd);
+    peer.join();
+    CHECK(enqueued);
+    CHECK(operation_seen);
+    CHECK(got_p51_request);
+    CHECK(raw_credit_held);
+    CHECK(operation_released);
+    CHECK(raw_credit_released);
+    std::puts("P51_ASYNC_TRANSFER post-protocol-stop/raw-credit-release: ok");
+}
+
+void test_p51_stop_while_waiting_for_link_state() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x40;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    uint16_t f_port = 0;
+    const int listener_fd = loopback_listener(f_port);
+    CHECK(listener_fd >= 0 && f_port != 0);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_aggregate_source_raw_bytes = 2;
+    config.max_active_p51_source_transfers = 1;
+    config.max_pending_p51_source_operations = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto reservation = test_p51_reservation_request(
+        launch.c_store_guid, launch.store_generation,
+        launch.identity.generation, launch.identity.attempt,
+        7112, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(5));
+    reservation.arm.source.selected_f_host = "127.0.0.1";
+    reservation.arm.source.selected_f_cache_port = f_port;
+    const SidecarLaunchIdentity remote_f = [] {
+        StoreIdentityRoot root{};
+        root.bytes[15] = 0x41;
+        return test_sidecar_launch(root);
+    }();
+    P51SourceArmedFields armed;
+    armed.arm = reservation.arm;
+    armed.f_control_generation = 37;
+    armed.f_control_attempt = 38;
+    armed.f_store_generation = remote_f.store_generation;
+    armed.f_store_guid = remote_f.f_store_guid.bytes;
+    armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+    armed.arm_observation_id = 39;
+    armed.source_budget_msec = 5000;
+    armed.attempt_capability_1.bytes.fill(0xd1);
+    armed.attempt_capability_2.bytes.fill(0xd2);
+    armed.reservation_id.fill(0xe1);
+    armed.logical_relationship_id.fill(0xe2);
+    armed.relationship_epoch = 1;
+    armed.selected_revision = CACHE_WIRE_REVISION_R2;
+    armed.selected_window = 30;
+    CHECK(armed.valid());
+    const local::P51SourceTransferRequest request{
+        armed, reservation.absolute_deadline};
+
+    std::promise<bool> hello_seen_promise;
+    auto hello_seen_future = hello_seen_promise.get_future();
+    std::thread peer([listener_fd,
+                      hello_seen_promise = std::move(hello_seen_promise)]() mutable {
+        struct pollfd listener{listener_fd, POLLIN, 0};
+        int ready;
+        do {
+            ready = ::poll(&listener, 1, 3000);
+        } while (ready < 0 && errno == EINTR);
+        int accepted = -1;
+        sockaddr_storage address{};
+        socklen_t address_length = sizeof(address);
+        if (ready > 0) {
+            do {
+                accepted = ::accept(listener_fd,
+                    reinterpret_cast<sockaddr*>(&address), &address_length);
+            } while (accepted < 0 && errno == EINTR);
+        }
+        std::unique_ptr<MsgChannel> channel(
+            accepted >= 0
+                ? Service::createChannelAccepted(
+                    accepted, reinterpret_cast<sockaddr*>(&address),
+                    address_length)
+                : nullptr);
+        const auto handshake_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (channel && channel->protocol_admission_state() ==
+                              MsgChannel::ProtocolAdmissionState::Pending &&
+               std::chrono::steady_clock::now() < handshake_deadline) {
+            short events = POLLIN;
+            if (channel->has_pending_write())
+                events |= POLLOUT;
+            struct pollfd socket{channel->fd, events, 0};
+            int polled;
+            do {
+                polled = ::poll(&socket, 1, 50);
+            } while (polled < 0 && errno == EINTR);
+            if (polled < 0 || (socket.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                break;
+            if ((socket.revents & POLLOUT) && !channel->flush_pending())
+                break;
+            if ((socket.revents & POLLIN) && !channel->read_a_bit())
+                break;
+        }
+        int raw_fd = -1;
+        if (channel && channel->protocol_admission_state() ==
+                           MsgChannel::ProtocolAdmissionState::Ready &&
+            channel->finish_protocol_admission()) {
+            std::unique_ptr<Msg> message(channel->get_msg_until(
+                std::chrono::steady_clock::now() + std::chrono::seconds(3)));
+            if (dynamic_cast<P51CacheLinkSessionMsg*>(message.get()) != nullptr)
+                raw_fd = channel->send_p51_cache_link_session_ready_and_release(
+                    std::chrono::steady_clock::now() + std::chrono::seconds(3));
+        }
+        channel.reset();
+
+        bool hello_seen = false;
+        if (raw_fd >= 0) {
+            FrameParser parser;
+            const auto hello_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            std::array<uint8_t, 512> buffer{};
+            while (!hello_seen &&
+                   std::chrono::steady_clock::now() < hello_deadline) {
+                struct pollfd socket{raw_fd, POLLIN, 0};
+                int polled;
+                do {
+                    polled = ::poll(&socket, 1, 50);
+                } while (polled < 0 && errno == EINTR);
+                if (polled < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                    break;
+                if ((socket.revents & POLLIN) == 0)
+                    continue;
+                const ssize_t count = ::recv(raw_fd, buffer.data(), buffer.size(), 0);
+                if (count <= 0)
+                    break;
+                for (const auto& frame : parser.feed(
+                         std::span<const uint8_t>(buffer.data(),
+                                                 static_cast<size_t>(count)))) {
+                    const Message message = decode_payload(frame.type, frame.payload);
+                    hello_seen = std::holds_alternative<LinkHello>(message);
+                    if (hello_seen)
+                        break;
+                }
+            }
+        }
+        try {
+            hello_seen_promise.set_value(hello_seen);
+        } catch (...) {
+        }
+        if (hello_seen) {
+            const auto close_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (std::chrono::steady_clock::now() < close_deadline) {
+                struct pollfd socket{raw_fd, POLLIN, 0};
+                int polled;
+                do {
+                    polled = ::poll(&socket, 1, 50);
+                } while (polled < 0 && errno == EINTR);
+                if (polled < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                    break;
+                if ((socket.revents & POLLIN) != 0) {
+                    uint8_t byte = 0;
+                    const ssize_t count = ::recv(raw_fd, &byte, 1,
+                                                 MSG_PEEK | MSG_DONTWAIT);
+                    if (count == 0 || (count < 0 && errno != EAGAIN &&
+                                       errno != EWOULDBLOCK && errno != EINTR))
+                        break;
+                }
+            }
+        }
+        if (raw_fd >= 0)
+            (void)::close(raw_fd);
+    });
+
+    RuntimeCase pair = authenticated_runtime_pair();
+    const local::ControlOperation operation =
+        local::make_p51_source_transfer_operation(
+            launch.identity, request, request.armed.arm.source.source_request_id);
+    const bool enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(pair.sender), launch.identity, operation,
+        oversized_test_source_fd());
+    const bool operation_seen = enqueued && wait_for_source_operation_count(
+        runtime, 1, std::chrono::seconds(1));
+    const bool got_hello = operation_seen &&
+        hello_seen_future.wait_for(std::chrono::seconds(4)) ==
+            std::future_status::ready && hello_seen_future.get();
+    const bool raw_credit_held = got_hello &&
+        wait_for_source_raw_bytes(runtime, 2, std::chrono::seconds(1));
+
+    // The peer has acknowledged local link adoption and decoded LINK_HELLO,
+    // but withholds LINK_STATE. Stop must close that exact physical link.
+    runtime.stop();
+    pair.receiver = local::Connection(-1);
+    const bool operation_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(2));
+    const bool raw_credit_released =
+        wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1));
+    (void)::close(listener_fd);
+    peer.join();
+    CHECK(enqueued);
+    CHECK(operation_seen);
+    CHECK(got_hello);
+    CHECK(raw_credit_held);
+    CHECK(operation_released);
+    CHECK(raw_credit_released);
+    std::puts("P51_ASYNC_TRANSFER post-HELLO-stop/raw-credit-release: ok");
+}
+
+void test_p51_reservation_capacity_120_cancel_and_expiry() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x37;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x38;
+    const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_pending_p51_source_reservations = 120;
+    service::SidecarRuntime runtime(std::move(config));
+
+    std::vector<local::P51SourceReservationRequest> requests;
+    std::vector<P51SourceArmedFields> armed;
+    requests.reserve(120);
+    armed.reserve(120);
+    for (uint64_t index = 0; index != 120; ++index) {
+        auto request = test_p51_reservation_request(
+            remote_c, 41, launch.identity.generation, launch.identity.attempt,
+            7200 + index, CACHE_PROFILE_ZSTD_TU, 30,
+            index == 119 ? std::chrono::seconds(2) : std::chrono::seconds(10));
+        const local::P51SourceReservationResult result =
+            runtime.reserve_p51_source_on_owner(request);
+        CHECK(result.error_code == 0 && result.armed.has_value());
+        requests.push_back(std::move(request));
+        armed.push_back(*result.armed);
+    }
+    auto overflow = test_p51_reservation_request(
+        remote_c, 41, launch.identity.generation, launch.identity.attempt,
+        7320, CACHE_PROFILE_ZSTD_TU, 30);
+    CHECK(!runtime.reserve_p51_source_on_owner(overflow).armed.has_value());
+
+    CHECK(runtime.cancel_p51_source_on_owner(
+        requests[1].arm, armed[1].reservation_id,
+        std::chrono::steady_clock::now() + std::chrono::seconds(1)));
+    auto after_cancel = test_p51_reservation_request(
+        remote_c, 41, launch.identity.generation, launch.identity.attempt,
+        7321, CACHE_PROFILE_ZSTD_TU, 30);
+    CHECK(runtime.reserve_p51_source_on_owner(after_cancel).armed.has_value());
+
+    // No further owner request is issued while the first row expires; the
+    // timer sweep itself must release its exact global metadata slot.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    auto after_expiry = test_p51_reservation_request(
+        remote_c, 41, launch.identity.generation, launch.identity.attempt,
+        7322, CACHE_PROFILE_ZSTD_TU, 30);
+    CHECK(runtime.reserve_p51_source_on_owner(after_expiry).armed.has_value());
+    std::puts("P51_RESERVATION_CAP global120/cancel/idle-expiry: ok");
+}
+
+LinkHello test_p51_link_hello(const P51SourceArmedFields& armed,
+                              uint64_t physical_generation,
+                              HistoryNonce nonce,
+                              LinkStartMode start_mode = LinkStartMode::Initial,
+                              uint64_t verified_floor = 0) {
+    LinkHello hello;
+    switch (armed.arm.source.cache_profile) {
+    case CACHE_PROFILE_P29V1: hello.profile = ProfileId::P29V1; break;
+    case CACHE_PROFILE_ZSTD_TU: hello.profile = ProfileId::ZSTD_TU; break;
+    case CACHE_PROFILE_ZSTD_ROUTE: hello.profile = ProfileId::ZSTD_ROUTE; break;
+    default: CHECK(false);
+    }
+    hello.window = armed.selected_window;
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128{armed.reservation_id};
+    hello.relationship_id = Id128{armed.logical_relationship_id};
+    hello.relationship_epoch = armed.relationship_epoch;
+    hello.physical_link_generation = physical_generation;
+    hello.c_store_guid = CStoreGuid{armed.arm.source.c_store_guid};
+    hello.c_store_generation = armed.arm.source.c_store_generation;
+    hello.f_store_guid = FStoreGuid{armed.f_store_guid};
+    hello.f_store_generation = armed.f_store_generation;
+    hello.c_control_generation = armed.arm.source.c_control_generation;
+    hello.c_control_attempt = armed.arm.source.c_control_attempt;
+    hello.system_source_fingerprint = icecc::digest128("P51 owner regression");
+    hello.history_nonce = nonce;
+    hello.start_mode = start_mode;
+    hello.verified_receipt_floor = verified_floor;
+    return hello;
+}
+
+JobBind test_p51_job_binding(const P51SourceArmedFields& armed,
+                             uint64_t physical_generation,
+                             uint64_t ordinal, uint64_t tu_seq,
+                             std::string_view raw) {
+    JobBind binding;
+    binding.reservation_id = Id128{armed.reservation_id};
+    binding.physical_link_generation = physical_generation;
+    binding.relationship_ordinal = ordinal;
+    binding.wire_job_id = armed.arm.source.wire_job_id;
+    binding.assignment_epoch = armed.arm.source.assignment_epoch;
+    binding.assignment_nonce = armed.arm.source.assignment_nonce;
+    binding.logical_job = armed.arm.source.logical_job;
+    binding.compiler_attempt = armed.arm.source.compiler_attempt;
+    binding.source_request_id = armed.arm.source.source_request_id;
+    binding.tu_seq = TuSeq{tu_seq};
+    switch (armed.arm.source.cache_profile) {
+    case CACHE_PROFILE_P29V1: binding.profile = ProfileId::P29V1; break;
+    case CACHE_PROFILE_ZSTD_TU: binding.profile = ProfileId::ZSTD_TU; break;
+    case CACHE_PROFILE_ZSTD_ROUTE: binding.profile = ProfileId::ZSTD_ROUTE; break;
+    default: CHECK(false);
+    }
+    binding.raw_bytes = raw.size();
+    binding.raw_digest = icecc::digest128(raw);
+    return binding;
+}
+
+RecoverBegin test_p51_recover_begin(const LinkHello& link, uint64_t floor,
+                                    uint64_t prepared,
+                                    uint32_t witness_count,
+                                    Id128 operation_id) {
+    RecoverBegin begin;
+    begin.relationship_id = link.relationship_id;
+    begin.relationship_epoch = link.relationship_epoch;
+    begin.physical_link_generation = link.physical_link_generation;
+    begin.operation_id = operation_id;
+    begin.verified_floor_a = floor;
+    begin.prepared_prefix_p = prepared;
+    begin.witness_count = witness_count;
+    return begin;
+}
+
+RecoverEnd test_p51_recover_end(const RecoverBegin& begin,
+                                std::span<const RecoverWitness> witnesses) {
+    RecoverEnd end;
+    end.relationship_id = begin.relationship_id;
+    end.relationship_epoch = begin.relationship_epoch;
+    end.physical_link_generation = begin.physical_link_generation;
+    end.operation_id = begin.operation_id;
+    end.witness_count = static_cast<uint32_t>(witnesses.size());
+    end.transcript_digest = compute_r2_recovery_transcript_digest(begin, witnesses);
+    return end;
+}
+
+void test_p51_cancel_publication_and_reset_lifecycle() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x39;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x3a;
+    const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+    const auto owner_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(2);
+
+    // Cancellation wins before publication: authorization refuses to start
+    // the commit, endpoint settlement drops the pending decode, and RESET
+    // must not resurrect the cancelled ARM or an already-expired suffix row.
+    {
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        service::SidecarRuntime runtime(std::move(config));
+        P51SourceArmedFields armed;
+        local::P51SourceReservationResult expiring_result;
+        LinkHello hello;
+        auto request = test_p51_reservation_request(
+            remote_c, 51, launch.identity.generation, launch.identity.attempt,
+            5101, CACHE_PROFILE_ZSTD_TU, 30);
+        auto expiring_request = test_p51_reservation_request(
+            remote_c, 51, launch.identity.generation, launch.identity.attempt,
+            5102, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::milliseconds(100));
+        const auto result = runtime.reserve_p51_source_on_owner(request);
+        CHECK(result.error_code == 0 && result.armed.has_value());
+        armed = *result.armed;
+        hello = test_p51_link_hello(armed, 1, HistoryNonce{0x510001});
+        const JobBind binding = test_p51_job_binding(
+            armed, hello.physical_link_generation, 1, 81,
+            "cancel-before-publish");
+        runtime.run_owner_callback_for_test([&] {
+            CHECK(runtime.lookup_p51_link_reservation_on_owner(hello).has_value());
+            CHECK(runtime.consume_p51_job_reservation_on_owner(
+                hello, binding).has_value());
+        });
+        CHECK(runtime.cancel_p51_source_on_owner(
+            request.arm, armed.reservation_id, owner_deadline));
+        runtime.run_owner_callback_for_test([&] {
+            CHECK(!runtime.authorize_p51_job_publication_on_owner(hello, binding));
+            runtime.settle_p51_cancelled_job_on_owner(hello, binding);
+        });
+        expiring_result = runtime.reserve_p51_source_on_owner(expiring_request);
+        CHECK(expiring_result.error_code == 0 &&
+              expiring_result.armed.has_value());
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        const Id128 operation_id{icecc::digest128("cancel reset op").bytes};
+        ResetRequest reset;
+        ResetConfirm confirm;
+        runtime.run_owner_callback_for_test([&] {
+            const RecoverBegin begin = test_p51_recover_begin(
+                hello, 0, 0, 0, operation_id);
+            const std::array<RecoverWitness, 0> no_witnesses{};
+            const auto recovered = runtime.recover_p51_receipts_on_owner(
+                hello, begin, no_witnesses,
+                test_p51_recover_end(begin, no_witnesses));
+            CHECK(recovered.has_value());
+            reset.relationship_id = hello.relationship_id;
+            reset.old_relationship_epoch = hello.relationship_epoch;
+            reset.new_relationship_epoch = hello.relationship_epoch + 1;
+            reset.physical_link_generation = hello.physical_link_generation;
+            reset.operation_id = operation_id;
+            reset.settled_prefix_k = 0;
+            reset.old_history_nonce = hello.history_nonce;
+            reset.new_history_nonce = HistoryNonce{hello.history_nonce.value + 1};
+            const auto ack = runtime.validate_p51_reset_on_owner(hello, reset);
+            CHECK(ack.has_value());
+            CHECK(runtime.commit_p51_reset_on_owner(hello, reset, *ack));
+            confirm.relationship_id = reset.relationship_id;
+            confirm.new_relationship_epoch = reset.new_relationship_epoch;
+            confirm.physical_link_generation = reset.physical_link_generation;
+            confirm.operation_id = reset.operation_id;
+            confirm.new_history_nonce = reset.new_history_nonce;
+            confirm.settled_prefix_k = reset.settled_prefix_k;
+            CHECK(runtime.confirm_p51_reset_on_owner(hello, confirm));
+
+            LinkHello reconnect = test_p51_link_hello(
+                armed, 2, reset.new_history_nonce, LinkStartMode::Reconnect, 0);
+            reconnect.relationship_epoch = reset.new_relationship_epoch;
+            CHECK(runtime.lookup_p51_link_reservation_on_owner(
+                reconnect).has_value());
+            JobBind cancelled_binding = test_p51_job_binding(
+                armed, reconnect.physical_link_generation, 1, 81,
+                "cancel-before-publish");
+            CHECK(!runtime.consume_p51_job_reservation_on_owner(
+                reconnect, cancelled_binding).has_value());
+            JobBind expired_binding = test_p51_job_binding(
+                *expiring_result.armed, reconnect.physical_link_generation,
+                1, 82, "expired-before-reset");
+            CHECK(!runtime.consume_p51_job_reservation_on_owner(
+                reconnect, expired_binding).has_value());
+        });
+    }
+
+    // Publication wins once the owner marks the reservation as publishing.
+    // The later cancel cannot retract that exact committed receipt. A repeated
+    // RESET_CONFIRM after a subsequent commit stays idempotent and preserves K.
+    {
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        service::SidecarRuntime runtime(std::move(config));
+        auto first_request = test_p51_reservation_request(
+            remote_c, 61, launch.identity.generation, launch.identity.attempt,
+            6101, CACHE_PROFILE_ZSTD_TU, 30);
+        const auto first_result = runtime.reserve_p51_source_on_owner(first_request);
+        CHECK(first_result.error_code == 0 && first_result.armed.has_value());
+        const P51SourceArmedFields first_armed = *first_result.armed;
+        LinkHello link = test_p51_link_hello(
+            first_armed, 11, HistoryNonce{0x610001});
+        JobBind first_binding = test_p51_job_binding(
+            first_armed, link.physical_link_generation, 1, 91,
+            "publication-before-cancel");
+        auto make_commit = [&](const LinkHello& current_link,
+                               const JobBind& binding) {
+            R2TxCommit commit;
+            commit.relationship_ordinal = binding.relationship_ordinal;
+            commit.binding_digest = compute_r2_binding_digest(binding);
+            commit.transaction_digest = icecc::digest128(
+                "receipt/" + std::to_string(binding.relationship_ordinal));
+            commit.inner.history_nonce = current_link.history_nonce;
+            commit.inner.rel_seq = RelSeq{binding.relationship_ordinal - 1};
+            commit.inner.tu_seq = binding.tu_seq;
+            commit.inner.transaction_digest = commit.transaction_digest;
+            commit.inner.raw_digest = binding.raw_digest;
+            return commit;
+        };
+        ResetRequest reset;
+        ResetConfirm confirm;
+        runtime.run_owner_callback_for_test([&] {
+            CHECK(runtime.lookup_p51_link_reservation_on_owner(link).has_value());
+            CHECK(runtime.consume_p51_job_reservation_on_owner(
+                link, first_binding).has_value());
+            CHECK(runtime.authorize_p51_job_publication_on_owner(
+                link, first_binding));
+        });
+        CHECK(!runtime.cancel_p51_source_on_owner(
+            first_request.arm, first_armed.reservation_id, owner_deadline));
+
+        const R2TxCommit first_commit = make_commit(link, first_binding);
+        runtime.run_owner_callback_for_test([&] {
+        CHECK(runtime.record_p51_job_commit_on_owner(
+            link, first_binding, first_commit));
+
+        const Id128 operation_id{icecc::digest128("publication reset op").bytes};
+        const RecoverBegin begin = test_p51_recover_begin(
+            link, 0, 1, 1, operation_id);
+        RecoverWitness witness;
+        witness.relationship_id = begin.relationship_id;
+        witness.relationship_epoch = begin.relationship_epoch;
+        witness.physical_link_generation = begin.physical_link_generation;
+        witness.operation_id = begin.operation_id;
+        witness.relationship_ordinal = 1;
+        witness.binding_digest = first_commit.binding_digest;
+        witness.transaction_digest = first_commit.transaction_digest;
+        witness.inner.history_nonce = first_commit.inner.history_nonce;
+        witness.inner.rel_seq = first_commit.inner.rel_seq;
+        witness.inner.tu_seq = first_commit.inner.tu_seq;
+        witness.inner.profile = first_binding.profile;
+        witness.inner.raw_bytes = first_binding.raw_bytes;
+        witness.inner.raw_digest = first_binding.raw_digest;
+        witness.inner.transaction_digest =
+            first_commit.inner.transaction_digest;
+        const std::array<RecoverWitness, 1> witnesses{witness};
+        const auto recovered = runtime.recover_p51_receipts_on_owner(
+            link, begin, witnesses, test_p51_recover_end(begin, witnesses));
+        CHECK(recovered.has_value() && recovered->rows.size() == 1);
+        reset.relationship_id = link.relationship_id;
+        reset.old_relationship_epoch = link.relationship_epoch;
+        reset.new_relationship_epoch = link.relationship_epoch + 1;
+        reset.physical_link_generation = link.physical_link_generation;
+        reset.operation_id = operation_id;
+        reset.settled_prefix_k = 1;
+        reset.old_history_nonce = link.history_nonce;
+        reset.new_history_nonce = HistoryNonce{link.history_nonce.value + 1};
+        const auto ack = runtime.validate_p51_reset_on_owner(link, reset);
+        CHECK(ack.has_value());
+        CHECK(runtime.commit_p51_reset_on_owner(link, reset, *ack));
+        confirm.relationship_id = reset.relationship_id;
+        confirm.new_relationship_epoch = reset.new_relationship_epoch;
+        confirm.physical_link_generation = reset.physical_link_generation;
+        confirm.operation_id = reset.operation_id;
+        confirm.new_history_nonce = reset.new_history_nonce;
+        confirm.settled_prefix_k = reset.settled_prefix_k;
+        CHECK(runtime.confirm_p51_reset_on_owner(link, confirm));
+        });
+
+        auto second_request = test_p51_reservation_request(
+            remote_c, 61, launch.identity.generation, launch.identity.attempt,
+            6102, CACHE_PROFILE_ZSTD_TU, 30);
+        const auto second_result = runtime.reserve_p51_source_on_owner(second_request);
+        CHECK(second_result.error_code == 0 && second_result.armed.has_value());
+        runtime.run_owner_callback_for_test([&] {
+        link.relationship_epoch = reset.new_relationship_epoch;
+        link.history_nonce = reset.new_history_nonce;
+        link.verified_receipt_floor = 1;
+        JobBind second_binding = test_p51_job_binding(
+            *second_result.armed, link.physical_link_generation, 2, 92,
+            "later-commit");
+        CHECK(runtime.consume_p51_job_reservation_on_owner(
+            link, second_binding).has_value());
+        CHECK(runtime.authorize_p51_job_publication_on_owner(link, second_binding));
+        const R2TxCommit second_commit = make_commit(link, second_binding);
+        CHECK(runtime.record_p51_job_commit_on_owner(
+            link, second_binding, second_commit));
+        CHECK(runtime.confirm_p51_reset_on_owner(link, confirm));
+
+        const RecoverBegin after_duplicate_confirm = test_p51_recover_begin(
+            link, 1, 2, 1, Id128{icecc::digest128("post-confirm inspect").bytes});
+        RecoverWitness second_witness;
+        second_witness.relationship_id = after_duplicate_confirm.relationship_id;
+        second_witness.relationship_epoch = after_duplicate_confirm.relationship_epoch;
+        second_witness.physical_link_generation =
+            after_duplicate_confirm.physical_link_generation;
+        second_witness.operation_id = after_duplicate_confirm.operation_id;
+        second_witness.relationship_ordinal = 2;
+        second_witness.binding_digest = second_commit.binding_digest;
+        second_witness.transaction_digest = second_commit.transaction_digest;
+        second_witness.inner.history_nonce = second_commit.inner.history_nonce;
+        second_witness.inner.rel_seq = second_commit.inner.rel_seq;
+        second_witness.inner.tu_seq = second_commit.inner.tu_seq;
+        second_witness.inner.profile = second_binding.profile;
+        second_witness.inner.raw_bytes = second_binding.raw_bytes;
+        second_witness.inner.raw_digest = second_binding.raw_digest;
+        second_witness.inner.transaction_digest =
+            second_commit.inner.transaction_digest;
+        const std::array<RecoverWitness, 1> second_witnesses{second_witness};
+        const auto retained = runtime.recover_p51_receipts_on_owner(
+            link, after_duplicate_confirm, second_witnesses,
+            test_p51_recover_end(after_duplicate_confirm, second_witnesses));
+        CHECK(retained.has_value());
+        CHECK(retained->end.committed_prefix_k == 2);
+        CHECK(retained->end.acknowledged_prefix_q == 1);
+        CHECK(retained->rows.size() == 1 &&
+              retained->rows.front().receipt == second_commit);
+        });
+    }
+    std::puts("P51_SOURCE_LIFECYCLE cancel/publication/reset/idempotent-confirm: ok");
+}
+
+void test_p51_reservation_profile_mask_mapping() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x49;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x4a;
+    const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+    const struct ProfileCase {
+        uint32_t mask;
+        ProfileId id;
+    } profiles[] = {
+        {CACHE_PROFILE_P29V1, ProfileId::P29V1},
+        {CACHE_PROFILE_ZSTD_TU, ProfileId::ZSTD_TU},
+        {CACHE_PROFILE_ZSTD_ROUTE, ProfileId::ZSTD_ROUTE},
+    };
+
+    for (size_t index = 0; index != std::size(profiles); ++index) {
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        service::SidecarRuntime runtime(std::move(config));
+        const auto request = test_p51_reservation_request(
+            remote_c, 70 + index, launch.identity.generation,
+            launch.identity.attempt, 7400 + index, profiles[index].mask, 30);
+        const auto result = runtime.reserve_p51_source_on_owner(request);
+        CHECK(result.error_code == 0 && result.armed.has_value());
+
+        LinkHello hello = test_p51_link_hello(
+            *result.armed, 700 + index, HistoryNonce{0x7400 + index});
+        CHECK(hello.profile == profiles[index].id);
+        LinkHello wrong_profile_hello = hello;
+        wrong_profile_hello.profile = profiles[index].id == ProfileId::ZSTD_ROUTE
+                                          ? ProfileId::ZSTD_TU
+                                          : ProfileId::ZSTD_ROUTE;
+        std::optional<P51SourceLinkLease> link_lease;
+        runtime.run_owner_callback_for_test([&] {
+            CHECK(!runtime.lookup_p51_link_reservation_on_owner(
+                wrong_profile_hello).has_value());
+            link_lease = runtime.lookup_p51_link_reservation_on_owner(hello);
+        });
+        CHECK(link_lease.has_value());
+
+        JobBind binding = test_p51_job_binding(
+            *result.armed, hello.physical_link_generation, 1, 84 + index,
+            "profile-mask-binding");
+        CHECK(binding.profile == profiles[index].id);
+        JobBind wrong_profile_binding = binding;
+        wrong_profile_binding.profile =
+            profiles[index].id == ProfileId::ZSTD_ROUTE
+                ? ProfileId::ZSTD_TU
+                : ProfileId::ZSTD_ROUTE;
+        std::optional<P51SourceJobLease> consumed;
+        runtime.run_owner_callback_for_test([&] {
+            CHECK(!runtime.consume_p51_job_reservation_on_owner(
+                hello, wrong_profile_binding).has_value());
+            consumed = runtime.consume_p51_job_reservation_on_owner(
+                hello, binding);
+        });
+        CHECK(consumed.has_value());
+    }
+    std::puts("P51_RESERVATION_OWNER profile-mask-mapping/all-three: ok");
 }
 
 void test_route_endpoint_cap_refuses_before_f_open() {
@@ -5454,6 +6526,13 @@ int main(int argc, char** argv) {
         test_runtime_store_identity_is_explicit_and_role_tagged();
         test_source_open_arm_timeout_bounds();
         test_p51_reservation_capacity_identity_and_window();
+        test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
+        test_p51_admitted_transfer_stop_releases_raw_credit();
+        test_p51_stop_while_waiting_for_link_session_echo();
+        test_p51_stop_while_waiting_for_link_state();
+        test_p51_reservation_capacity_120_cancel_and_expiry();
+        test_p51_cancel_publication_and_reset_lifecycle();
+        test_p51_reservation_profile_mask_mapping();
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();

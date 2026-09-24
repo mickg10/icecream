@@ -35,6 +35,7 @@
 
 #include "job.h"
 #include "p50_store_identity_wire.h"
+#include <atomic>
 #include <chrono>
 #include <array>
 #include <compare>
@@ -49,7 +50,7 @@
 #include <vector>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 50
+#define PROTOCOL_VERSION 51
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 #define PROTOCOL_VERSION_JOB_TIMING 47
@@ -73,11 +74,9 @@
 #define PROTOCOL_VERSION_CACHE_ADVERTISEMENT 50
 #define PROTOCOL_VERSION_CACHE_R2_NEGOTIATION 51
 
-/* CacheWire R1 and its ordinary CACHE_SESSION/source-arm bridge are pinned
-   to the exact protocol-50 draft. Keep these gates independent from
-   PROTOCOL_VERSION: protocol 51 must not silently reinterpret a one-TU R1
-   socket as persistent. These aliases are intentionally 50 until a fully
-   negotiated R2 path is implemented. */
+/* CacheWire revisions are independent from ordinary Icecream framing.
+   R1 bridges retain their exact bytes on ordinary protocol 50 and 51; R2
+   messages require ordinary protocol 51. */
 #define PROTOCOL_VERSION_P50_SOURCE_ARM_R1 50
 #define PROTOCOL_VERSION_P50_CACHE_SESSION_R1 50
 #define PROTOCOL_VERSION_SUPPORTED_MAX 51
@@ -614,6 +613,33 @@ inline constexpr uint32_t CACHE_WIRE_REVISION_R1 = 1;
 inline constexpr uint32_t CACHE_WIRE_REVISION_R2 = 2;
 inline constexpr uint32_t CACHE_WIRE_REVISION = CACHE_WIRE_REVISION_R1;
 
+inline constexpr bool p50_cache_pair_ordinary_protocols_compatible(
+    uint32_t cache_revision, int client_protocol,
+    int server_protocol) noexcept
+{
+    if (cache_revision == CACHE_WIRE_REVISION_R1)
+        return protocol_supports_p50_r1_bridge(client_protocol) &&
+               protocol_supports_p50_r1_bridge(server_protocol);
+    if (cache_revision == CACHE_WIRE_REVISION_R2)
+        return protocol_supports_cache_r2(client_protocol) &&
+               protocol_supports_cache_r2(server_protocol);
+    return false;
+}
+
+inline uint32_t p50_cache_revision_from_environment(int ordinary_protocol) noexcept
+{
+    if (ordinary_protocol < PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
+        return 0;
+    const char *const value = std::getenv("ICECC_P51_MODE");
+    if (value == nullptr || std::string_view(value) == "off")
+        return CACHE_WIRE_REVISION_R1;
+    if (std::string_view(value) == "on")
+        return protocol_supports_cache_r2(ordinary_protocol)
+                   ? CACHE_WIRE_REVISION_R2
+                   : 0;
+    return 0;
+}
+
 /* Raw four-byte transition witness sent by the F sidecar only after it has
    accepted ownership of the detached ordinary socket.  This is not an
    ordinary framed message and carries no CacheWire identity. */
@@ -701,7 +727,8 @@ inline bool p50_cache_client_request_is_valid(
             protocol, profile_mask, affinity_profile_mask, affinity_port,
             affinity_host))
         return true;
-    if (protocol != CACHE_WIRE_REVISION_R1 || profile_mask == 0 ||
+    if ((protocol != CACHE_WIRE_REVISION_R1 &&
+         protocol != CACHE_WIRE_REVISION_R2) || profile_mask == 0 ||
         (profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0 ||
         (affinity_profile_mask & ~profile_mask) != 0 ||
         affinity_port > UINT16_MAX ||
@@ -730,8 +757,17 @@ inline P50CacheClientCapability p50_cache_client_capability_from_mode(
 inline P50CacheClientCapability p50_cache_client_capability_from_env(
     int wrapper_protocol) noexcept
 {
-    return p50_cache_client_capability_from_mode(
-        std::getenv("ICECC_P50_MODE"), wrapper_protocol);
+    if (wrapper_protocol < PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
+        return {};
+    const char *const mode = std::getenv("ICECC_P50_MODE");
+    if (mode != nullptr && std::string_view(mode) != "on")
+        return {};
+    const uint32_t revision =
+        p50_cache_revision_from_environment(wrapper_protocol);
+    return revision != 0
+               ? P50CacheClientCapability{revision,
+                                           CACHE_ADVERTISABLE_PROFILE_MASK}
+               : P50CacheClientCapability{};
 }
 
 /* An optional scheduler-local request chooses the one source profile carried
@@ -806,8 +842,9 @@ inline constexpr uint32_t p50_select_pair_cache_profile(
     uint32_t server_protocol, uint32_t server_profiles,
     P50CacheProfileRequest request) noexcept
 {
-    if (client_protocol != CACHE_WIRE_REVISION_R1 ||
-        server_protocol != CACHE_WIRE_REVISION_R1 ||
+    if (client_protocol == 0 || client_protocol != server_protocol ||
+        (client_protocol != CACHE_WIRE_REVISION_R1 &&
+         client_protocol != CACHE_WIRE_REVISION_R2) ||
         client_profiles == 0 || server_profiles == 0 ||
         (client_profiles & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0 ||
         (server_profiles & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0)
@@ -1015,7 +1052,8 @@ inline bool cache_advertisement_is_valid_present(uint32_t port,
 {
     return cache_advertisement_is_well_formed_present(port, protocol,
                                                        profile_mask)
-        && protocol == CACHE_WIRE_REVISION_R1;
+        && (protocol == CACHE_WIRE_REVISION_R1 ||
+            protocol == CACHE_WIRE_REVISION_R2);
 }
 
 inline bool cache_assignment_is_valid_present(uint32_t port,
@@ -1125,7 +1163,8 @@ public:
     Msg *get_msg(int timeout = 10, bool eofAllowed = false);
     // Partial frames and EINTR consume the same absolute receive budget.
     Msg *get_msg_until(std::chrono::steady_clock::time_point deadline,
-                       bool eofAllowed = false);
+                       bool eofAllowed = false,
+                       const std::atomic<bool> *cancelled = nullptr);
 
     // A malformed P50_SOURCE_ARM is never returned as a message, but its
     // first exact assignment triple is retained long enough for the daemon's
@@ -1570,7 +1609,11 @@ public:
         const std::string &host, unsigned short p,
         std::chrono::steady_clock::time_point deadline,
         std::chrono::milliseconds attempt_budget,
-        ChannelRetryPolicy policy);
+        ChannelRetryPolicy policy,
+        // Cooperative cancellation is polled during the hedged policy's
+        // nonblocking connect/protocol loop. Other policies only inspect it
+        // between their existing blocking attempt slices.
+        const std::atomic<bool> *cancelled = nullptr);
     static MsgChannel *createChannel(const std::string &domain_socket);
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
     // Daemon accept-side factory: construct and emit the initial protocol

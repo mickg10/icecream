@@ -10,6 +10,13 @@
 #include "config.h"
 #include "comm.h"
 #include "../cache/p50_incarnation_identity.h"
+#include "../cache/p50_daemon_control.h"
+#include "../cache/p50_control_operation.h"
+#include "../cache/p50_endpoint.h"
+
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/use_future.hpp>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -32,6 +39,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <future>
+#include <condition_variable>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -185,6 +196,295 @@ static bool write_all(int fd, const void *data, size_t size)
     return true;
 }
 
+static bool run_iptables_rule(const std::vector<std::string>& arguments)
+{
+    const pid_t child = ::fork();
+    if (child < 0) return false;
+    if (child == 0) {
+        std::vector<char *> argv;
+        argv.reserve(arguments.size() + 2);
+        argv.push_back(const_cast<char *>("iptables"));
+        for (const auto &argument : arguments)
+            argv.push_back(const_cast<char *>(argument.c_str()));
+        argv.push_back(nullptr);
+        ::execvp(argv[0], argv.data());
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+class P51CommitReceiptGate {
+public:
+    P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected)
+        : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected)
+    {
+        listener_fd_ = listen_ephemeral(&proxy_port_);
+        if (listener_fd_ < 0 || proxy_port_ <= 0) return;
+        const auto rule = [&](const char *action) {
+            return run_iptables_rule({"-t", "nat", action, "OUTPUT", "-p", "tcp",
+                "-d", "127.0.0.1", "--dport", std::to_string(endpoint_port_),
+                "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
+                "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
+        };
+        rule_installed_ = rule("-A");
+        if (rule_installed_) thread_ = std::thread([this] {
+            try { run(); }
+            catch (...) { fail(); }
+        });
+    }
+
+    P51CommitReceiptGate(const P51CommitReceiptGate&) = delete;
+    P51CommitReceiptGate& operator=(const P51CommitReceiptGate&) = delete;
+
+    ~P51CommitReceiptGate()
+    {
+        stop_.store(true, std::memory_order_release);
+        {
+            std::lock_guard lock(mutex_);
+            release_ = true;
+        }
+        changed_.notify_all();
+        if (thread_.joinable()) thread_.join();
+        if (client_fd_ >= 0) { ::close(client_fd_); client_fd_ = -1; }
+        if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
+        if (listener_fd_ >= 0) { ::close(listener_fd_); listener_fd_ = -1; }
+        if (rule_installed_)
+            (void)run_iptables_rule({"-t", "nat", "-D", "OUTPUT", "-p", "tcp",
+                "-d", "127.0.0.1", "--dport", std::to_string(endpoint_port_),
+                "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
+                "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
+    }
+
+    bool ready() const noexcept { return listener_fd_ >= 0 && rule_installed_; }
+    int proxy_port() const noexcept { return proxy_port_; }
+    size_t observed_commits() const
+    {
+        std::lock_guard lock(mutex_);
+        return peak_commits_;
+    }
+
+    bool wait_for_commits(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, timeout, [&] {
+            return failed_ || commits_.size() >= expected_;
+        }) && !failed_ && commits_.size() == expected_ &&
+            ordinals_.size() == expected_ && *ordinals_.begin() == 1 &&
+            *ordinals_.rbegin() == expected_;
+    }
+
+    void release_commits()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            release_ = true;
+        }
+        changed_.notify_all();
+    }
+
+private:
+    bool write_relay_bytes(int fd, const void *buffer, size_t size)
+    {
+        const auto *position = static_cast<const unsigned char *>(buffer);
+        while (size != 0 && !stop_.load(std::memory_order_acquire)) {
+            pollfd descriptor{fd, POLLOUT, 0};
+            const int ready = ::poll(&descriptor, 1, 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0 || (ready > 0 &&
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))))
+                return false;
+            if (ready == 0) continue;
+            const ssize_t count = ::send(fd, position, size,
+                                         MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (count > 0) {
+                position += count;
+                size -= static_cast<size_t>(count);
+                continue;
+            }
+            if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
+            return false;
+        }
+        return size == 0;
+    }
+
+    bool read_relay_bytes(int fd, void *buffer, size_t size)
+    {
+        auto *position = static_cast<unsigned char *>(buffer);
+        while (size != 0 && !stop_.load(std::memory_order_acquire)) {
+            pollfd descriptor{fd, POLLIN, 0};
+            const int ready = ::poll(&descriptor, 1, 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0 || (ready > 0 &&
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))))
+                return false;
+            if (ready == 0) continue;
+            const ssize_t count = ::recv(fd, position, size, 0);
+            if (count > 0) {
+                position += count;
+                size -= static_cast<size_t>(count);
+                continue;
+            }
+            if (count < 0 && errno == EINTR) continue;
+            return false;
+        }
+        return size == 0;
+    }
+
+    void fail()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            failed_ = true;
+        }
+        changed_.notify_all();
+    }
+
+    void run()
+    {
+        pollfd listener{listener_fd_, POLLIN, 0};
+        int ready = 0;
+        while (!stop_.load(std::memory_order_acquire)) {
+            ready = ::poll(&listener, 1, 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready != 0) break;
+        }
+        if (stop_.load(std::memory_order_acquire) || ready <= 0) { fail(); return; }
+        client_fd_ = ::accept(listener_fd_, nullptr, nullptr);
+        if (client_fd_ < 0) { fail(); return; }
+        server_fd_ = connect_raw_tcp(endpoint_port_);
+        if (server_fd_ < 0) { fail(); return; }
+        std::thread client_to_server([this] {
+            char bytes[8192];
+            for (;;) {
+                if (stop_.load(std::memory_order_acquire)) break;
+                pollfd descriptor{client_fd_, POLLIN, 0};
+                const int ready = ::poll(&descriptor, 1, 100);
+                if (ready < 0 && errno == EINTR) continue;
+                if (ready < 0 || (ready > 0 &&
+                    (descriptor.revents & (POLLERR | POLLNVAL)))) break;
+                if (ready == 0) continue;
+                const ssize_t count = ::recv(client_fd_, bytes, sizeof(bytes), 0);
+                if (count > 0) {
+                    if (!write_relay_bytes(server_fd_, bytes,
+                                           static_cast<size_t>(count))) break;
+                    continue;
+                }
+                if (count < 0 && errno == EINTR) continue;
+                break;
+            }
+            ::shutdown(server_fd_, SHUT_WR);
+        });
+
+        // Forward the negotiated ordinary-protocol word, then detect R2 by
+        // its first LINK_STATE frame.  Ordinary MsgChannel frame lengths stay
+        // below 1 MiB and therefore cannot alias an R2 type byte.
+        unsigned char header[4];
+        if (!read_relay_bytes(server_fd_, header, sizeof(header)) ||
+            !write_relay_bytes(client_fd_, header, sizeof(header))) {
+            fail();
+        } else {
+            // MsgChannel exchanges both the peer's maximum version and the
+            // selected version in each direction before ordinary frames.
+            if (!read_relay_bytes(server_fd_, header, sizeof(header)) ||
+                !(header[0] == 51 && header[1] == 0 &&
+                  header[2] == 0 && header[3] == 0) ||
+                !write_relay_bytes(client_fd_, header, sizeof(header))) {
+                fail();
+            }
+            bool r2 = false;
+            while (!stop_.load(std::memory_order_acquire) && !failed_) {
+                if (!read_relay_bytes(server_fd_, header, sizeof(header))) break;
+                const uint32_t word = (uint32_t(header[0]) << 24) |
+                    (uint32_t(header[1]) << 16) |
+                    (uint32_t(header[2]) << 8) | uint32_t(header[3]);
+                const uint8_t type_byte = header[0];
+                if (!r2 && type_byte == static_cast<uint8_t>(
+                        icecc::p50::MessageType::LINK_STATE))
+                    r2 = true;
+                uint32_t payload_bytes = word;
+                if (r2) {
+                    try {
+                        payload_bytes = icecc::p50::decode_frame_header(
+                            std::span<const uint8_t>(header, sizeof(header))).payload_bytes;
+                    } catch (...) { fail(); break; }
+                } else if (payload_bytes > (1u << 20)) { fail(); break; }
+                std::vector<uint8_t> frame(header, header + sizeof(header));
+                const size_t payload_offset = frame.size();
+                frame.resize(payload_offset + payload_bytes);
+                if (payload_bytes != 0 && !read_relay_bytes(
+                        server_fd_, frame.data() + payload_offset, payload_bytes))
+                    break;
+                if (r2 && type_byte == static_cast<uint8_t>(
+                        icecc::p50::MessageType::R2_TX_COMMIT)) {
+                    try {
+                        const auto decoded = icecc::p50::decode_payload(
+                            icecc::p50::MessageType::R2_TX_COMMIT,
+                            std::span<const uint8_t>(frame.data() + 4,
+                                                     payload_bytes));
+                        const auto& commit = std::get<icecc::p50::R2TxCommit>(decoded);
+                        std::unique_lock lock(mutex_);
+                        if (!ordinals_.insert(commit.relationship_ordinal).second) {
+                            failed_ = true;
+                            changed_.notify_all();
+                            break;
+                        }
+                        commits_.push_back(std::move(frame));
+                        peak_commits_ = std::max(peak_commits_, commits_.size());
+                        changed_.notify_all();
+                        if (commits_.size() == expected_) {
+                            if (!changed_.wait_for(lock, std::chrono::seconds(30),
+                                                   [&] { return release_ || failed_; }) ||
+                                failed_) break;
+                            for (const auto& held : commits_) {
+                                if (!write_relay_bytes(
+                                        client_fd_, held.data(), held.size())) {
+                                    failed_ = true;
+                                    break;
+                                }
+                            }
+                            commits_.clear();
+                            changed_.notify_all();
+                            if (failed_) break;
+                        }
+                    } catch (...) { fail(); break; }
+                } else if (!write_relay_bytes(
+                               client_fd_, frame.data(), frame.size())) {
+                    break;
+                }
+            }
+        }
+        stop_.store(true, std::memory_order_release);
+        ::shutdown(client_fd_, SHUT_WR);
+        ::shutdown(server_fd_, SHUT_RDWR);
+        if (client_to_server.joinable()) client_to_server.join();
+        fail();
+    }
+
+    int endpoint_port_ = 0;
+    uid_t sidecar_uid_ = 0;
+    size_t expected_ = 0;
+    int proxy_port_ = 0;
+    int listener_fd_ = -1;
+    int client_fd_ = -1;
+    int server_fd_ = -1;
+    bool rule_installed_ = false;
+    std::thread thread_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    std::vector<std::vector<uint8_t>> commits_;
+    std::set<uint64_t> ordinals_;
+    size_t peak_commits_ = 0;
+    bool release_ = false;
+    bool failed_ = false;
+    std::atomic<bool> stop_{false};
+};
+
 /* Queue a complete protocol-50 negotiation plus an ordinary CACHE_SESSION
    frame while the daemon process is stopped.  The listener can then resume
    with the entire burst already resident in its kernel accept queue, making
@@ -330,10 +630,11 @@ static bool absent(const LoginMsg *login)
         && login->cache_protocol == 0 && login->cache_profile_mask == 0;
 }
 
-static bool present(const LoginMsg *login, uint32_t port)
+static bool present_revision(const LoginMsg *login, uint32_t port,
+                             uint32_t revision)
 {
     return login != nullptr && login->cache_endpoint_port == port
-        && login->cache_protocol == CACHE_WIRE_REVISION
+        && login->cache_protocol == revision
         && login->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK;
 }
 
@@ -402,7 +703,8 @@ static bool wait_attachment_log(const std::string &path, uintmax_t offset,
 
 static CompileJob attachment_compile_job(uint32_t wire_id, uint64_t epoch,
                                          uint64_t nonce,
-                                         const P50SourceArmFields &arm)
+                                         const P50SourceArmFields &arm,
+                                         const icecc::p50::local::P50SourceTransferResult *published)
 {
     CompileJob job;
     job.setLanguage(CompileJob::Lang_CXX);
@@ -418,16 +720,648 @@ static CompileJob attachment_compile_job(uint32_t wire_id, uint64_t epoch,
     job.appendFlag("-O2", Arg_Remote);
     CompileInputIdentity input;
     input.profile = CompileInputIdentity::ZstdTuProfile;
-    input.c_store_guid = arm.c_store_guid;
-    input.tu_seq = 0;
-    input.raw_bytes = 1;
-    input.raw_digest.fill(0xa5);
+    input.c_store_guid = published ? published->c_store_guid.bytes : arm.c_store_guid;
+    input.tu_seq = published ? published->tu_seq : 0;
+    input.raw_bytes = published ? published->raw_bytes : 1;
+    if (published)
+        input.raw_digest = published->raw_digest.bytes;
+    else
+        input.raw_digest.fill(0xa5);
     input.attempt_id = arm.compiler_attempt;
     input.request_id = arm.source_request_id;
     job.setCompileInputIdentity(input);
     return job;
 }
+
+static pid_t launch_vertical_daemon(const char *daemon_binary,
+                                    const char *cache_service,
+                                    const std::string& socket_path,
+                                    const std::string& envdir,
+                                    const std::string& runtime,
+                                    const std::string& log,
+                                    int scheduler_port, int public_port,
+                                    const char *hostname, unsigned max_jobs)
+{
+    const pid_t child = ::fork();
+    if (child != 0) return child;
+    char scheduler[64];
+    char public_port_text[16];
+    char max_jobs_text[16];
+    std::snprintf(scheduler, sizeof(scheduler), "127.0.0.1:%d", scheduler_port);
+    std::snprintf(public_port_text, sizeof(public_port_text), "%d", public_port);
+    std::snprintf(max_jobs_text, sizeof(max_jobs_text), "%u", max_jobs);
+    ::setenv("ICECC_TESTS", "1", 1);
+    ::setenv("ICECC_P51_MODE", "on", 1);
+    ::setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
+    ::execl(daemon_binary, daemon_binary, "-p", public_port_text, "-m", max_jobs_text,
+            "-s", scheduler, "-n", hostname, "-N", hostname,
+            "-b", envdir.c_str(), "-l", log.c_str(),
+            "--cache-service", cache_service,
+            "--cache-runtime-dir", runtime.c_str(),
+            "-v", "-v", "-v", static_cast<char *>(nullptr));
+    ::_exit(127);
+}
+
+static int make_vertical_source_fd(const std::string& work,
+                                   const std::string& bytes)
+{
+    const std::string path = work + "/vertical-source.XXXXXX";
+    std::vector<char> mutable_path(path.begin(), path.end());
+    mutable_path.push_back('\0');
+    const int fd = ::mkstemp(mutable_path.data());
+    if (fd < 0) return -1;
+    (void)::unlink(mutable_path.data());
+    const char *position = bytes.data();
+    size_t remaining = bytes.size();
+    bool written_all = true;
+    while (remaining != 0) {
+        const ssize_t written = ::write(fd, position, remaining);
+        if (written > 0) {
+            position += written;
+            remaining -= static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        written_all = false;
+        break;
+    }
+    if (!written_all || ::lseek(fd, 0, SEEK_SET) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
+    MsgChannel& local, MsgChannel& compiler_channel,
+    uint32_t wire_id, uint64_t epoch, uint64_t nonce,
+    uint32_t f_port, int source_fd, uint32_t profile_mask)
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    P50SourceTransferResult failed{};
+    const auto deadline = Clock::now() + std::chrono::seconds(30);
+    if (!protocol_supports_cache_r2(local.protocol)) {
+        ::close(source_fd);
+        return failed;
+    }
+
+    P51SourceLeaseRequestFields lease_request;
+    lease_request.wire_job_id = wire_id;
+    lease_request.assignment_epoch = epoch;
+    lease_request.assignment_nonce = nonce;
+    lease_request.profile = profile_mask;
+    lease_request.requested_cache_revision = CACHE_WIRE_REVISION_R2;
+    lease_request.requested_window = 30;
+    if (!lease_request.valid() ||
+        !local.send_msg(P51SourceLeaseRequestMsg(lease_request))) {
+        ::close(source_fd);
+        return failed;
+    }
+    P51CacheControlIdentity control_identity;
+    const int control_fd = local.receive_p51_cache_fd_reply(
+        lease_request, control_identity, deadline);
+    if (control_fd < 0 || !control_identity.valid()) {
+        if (control_fd >= 0) ::close(control_fd);
+        ::close(source_fd);
+        return failed;
+    }
+
+    P50SourceArmFields source = source_arm(
+        wire_id, epoch, nonce, f_port, f_port);
+    source.cache_protocol = CACHE_WIRE_REVISION_R2;
+    source.cache_profile = profile_mask;
+    source.source_mode = profile_mask == CACHE_PROFILE_P29V1
+        ? P50_SOURCE_MODE_P29V1
+        : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+            ? P50_SOURCE_MODE_ZSTD_ROUTE : P50_SOURCE_MODE_ZSTD_TU;
+    source.c_store_generation = control_identity.c_store_generation;
+    source.c_store_derivation_version = control_identity.derivation_version;
+    source.c_store_guid = control_identity.c_store_guid;
+    source.c_control_generation = control_identity.control_generation;
+    source.c_control_attempt = control_identity.control_attempt;
+    const P51SourceArmFields arm{source, 30};
+    const P51SourceArmMsg arm_message{arm};
+    if (!arm.valid() || !arm_message.valid_for_protocol(compiler_channel.protocol) ||
+        !compiler_channel.send_msg(arm_message)) {
+        ::close(control_fd);
+        ::close(source_fd);
+        return failed;
+    }
+    std::unique_ptr<Msg> response(compiler_channel.get_msg_until(deadline));
+    const auto *armed_message =
+        dynamic_cast<const P51SourceArmedMsg *>(response.get());
+    if (armed_message == nullptr || !armed_message->valid_payload() ||
+        !armed_message->acknowledges(arm_message) ||
+        armed_message->selected_revision != CACHE_WIRE_REVISION_R2 ||
+        armed_message->selected_window == 0 || armed_message->selected_window > 30) {
+        std::fprintf(stderr,
+            "P51 fixture: ARMED invalid offer_window=%u selected_revision=%u selected_window=%u\n",
+            arm.requested_window,
+            armed_message ? armed_message->selected_revision : 0,
+            armed_message ? armed_message->selected_window : 0);
+        ::close(control_fd);
+        ::close(source_fd);
+        return failed;
+    }
+    std::fprintf(stderr,
+        "P51 fixture: ARMED offer_window=%u selected_revision=%u selected_window=%u\n",
+        arm.requested_window, armed_message->selected_revision,
+        armed_message->selected_window);
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        deadline, clock.clock_domain_id, clock.time_namespace_id);
+    const P51SourceTransferRequest request{
+        static_cast<const P51SourceArmedFields&>(*armed_message), absolute_deadline};
+    const Identity identity{control_identity.control_generation,
+                             control_identity.control_attempt};
+    const ControlOperation operation = make_p51_source_transfer_operation(
+        identity, request, source.source_request_id);
+    CredentialExpectation credentials;
+    credentials.uid = control_identity.peer_uid;
+    credentials.gid = control_identity.peer_gid;
+    DaemonControlOperation control;
+    const DaemonControlStatus started = control.begin_authenticated(
+        control_fd, operation, source_fd, credentials, identity, deadline,
+        DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
+    if (started != DaemonControlStatus::InProgress)
+        return failed;
+
+    while (!control.done()) {
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            (void)control.advance(now, 0);
+            break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        pollfd descriptor{control.native_handle(), control.desired_events(), 0};
+        const int ready = ::poll(&descriptor, 1,
+            static_cast<int>(std::max<int64_t>(1, remaining.count())));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            (void)control.advance(Clock::now(), POLLERR);
+            break;
+        }
+        (void)control.advance(Clock::now(),
+                              ready == 0 ? short{0} : descriptor.revents);
+    }
+    if (control.status() != DaemonControlStatus::Complete ||
+        !control.source_transfer_result().has_value())
+        return failed;
+    return *control.source_transfer_result();
+}
+
+// Publish the exact input into the already-ARMED F store through the native
+// P50 client endpoint. This fixture is intentionally not a C-daemon lease:
+// the daemon under test is the F owner and correctly refuses to source itself.
+static icecc::p50::local::P50SourceTransferResult publish_input_to_armed_f(
+    MsgChannel& compiler_channel, const P50SourceArmFields& arm,
+    std::string_view exact_source)
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    P50SourceTransferResult failed{};
+    const auto deadline = Clock::now() + std::chrono::seconds(15);
+    const P50SourceArmMsg arm_message(arm);
+    if (!arm.valid() ||
+        !arm_message.valid_for_protocol(compiler_channel.protocol) ||
+        !compiler_channel.send_msg(arm_message))
+        return failed;
+    std::unique_ptr<Msg> response(compiler_channel.get_msg_until(deadline));
+    const auto* armed = dynamic_cast<const P50SourceArmedMsg*>(response.get());
+    if (!armed || !armed->valid_payload() || !armed->acknowledges(arm_message))
+        return failed;
+    if (!compiler_channel.send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
+        return failed;
+    const int endpoint_fd = compiler_channel.release_fd_after_cache_session_ready(deadline);
+    if (endpoint_fd < 0)
+        return failed;
+
+    CStoreGuid c_guid;
+    c_guid.bytes = arm.c_store_guid;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_guid, ZstdTuLimits{uint64_t{64} << 20, uint64_t{2} << 30},
+        PreparationAuthorityLimits{}, 1, ProfileId::ZSTD_TU, TuSeq{0});
+    const PreparationRouteKey route{
+        armed->f_store_guid, armed->f_store_generation, ProfileId::ZSTD_TU};
+    const PreparedTuHandle prepared = authority->prepare_for_route(
+        route, PrepareRequestKey{arm.logical_job, arm.source_request_id},
+        std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(exact_source.data()), exact_source.size()));
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.supported_profiles = kOperationalProfileMask;
+    P50ClientEndpoint endpoint(authority, caps, HistoryNonce{1}, nullptr, nullptr,
+                               std::nullopt, {}, {}, route);
+    boost::asio::io_context context;
+    boost::system::error_code socket_error;
+    auto socket = P50ServerEndpoint::adopt_connected_fd(
+        context.get_executor(), endpoint_fd, socket_error);
+    if (!socket)
+        return failed;
+    auto result = boost::asio::co_spawn(
+        context,
+        endpoint.run(std::move(*socket), prepared, {}, deadline),
+        boost::asio::use_future);
+    context.run();
+    const ClientRunResult client_result = result.get();
+    if (client_result.status != ClientRunStatus::Committed ||
+        !client_result.committed_commit || !client_result.committed_input)
+        return failed;
+    failed.code = SourceTransferResultCode::Committed;
+    failed.attempts = 1;
+    failed.tu_seq = client_result.committed_input->tu_seq.value;
+    failed.raw_bytes = exact_source.size();
+    failed.raw_digest = icecc::digest128(exact_source);
+    failed.c_store_guid = client_result.committed_input->c_store_guid;
+    return failed;
+}
+
+static int run_p51_vertical(const char *daemon_binary, const char *cache_service,
+                            passwd *icecc, unsigned job_count,
+                            uint32_t profile_mask)
+{
+    ::signal(SIGPIPE, SIG_IGN);
+    const char *temporary_root = ::getenv("TMPDIR");
+    const std::string prefix = temporary_root && *temporary_root
+        ? temporary_root : "/tmp";
+    std::string pattern = prefix + "/p51vertical.XXXXXX";
+    std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
+    mutable_pattern.push_back('\0');
+    char *created = ::mkdtemp(mutable_pattern.data());
+    REQUIRE(created != nullptr, "vertical test temporary root created");
+    if (created == nullptr) return 2;
+    const std::string work(created);
+    const std::string cdir = work + "/c";
+    const std::string fdir = work + "/f";
+    const auto prepare_role = [&](const std::string& directory) {
+        const bool made = ::mkdir(directory.c_str(), 0700) == 0;
+        const bool owned = made && ::chown(directory.c_str(), icecc->pw_uid,
+                                            icecc->pw_gid) == 0;
+        const bool env = owned && ::mkdir((directory + "/envs").c_str(), 0700) == 0 &&
+            ::chown((directory + "/envs").c_str(), icecc->pw_uid, icecc->pw_gid) == 0;
+        const bool runtime = env &&
+            ::mkdir((directory + "/runtime").c_str(), 0700) == 0 &&
+            ::chown((directory + "/runtime").c_str(), icecc->pw_uid, icecc->pw_gid) == 0;
+        return runtime;
+    };
+    REQUIRE(::chown(work.c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
+                ::chmod(work.c_str(), 0700) == 0 && prepare_role(cdir) && prepare_role(fdir),
+            "distinct C and F daemons have exact private runtime ownership");
+    if (failures) return 2;
+
+    int c_scheduler_port = 0, f_scheduler_port = 0;
+    const int c_scheduler_listener = listen_ephemeral(&c_scheduler_port);
+    const int f_scheduler_listener = listen_ephemeral(&f_scheduler_port);
+    const int c_port = reserve_port(), f_port = reserve_port();
+    REQUIRE(c_scheduler_listener >= 0 && f_scheduler_listener >= 0 &&
+                c_port > 0 && f_port > 0 && c_port != f_port,
+            "C and F use independent scheduler/client endpoints");
+    if (c_scheduler_listener < 0 || f_scheduler_listener < 0 ||
+        c_port <= 0 || f_port <= 0 || c_port == f_port) return 2;
+
+    const pid_t c_pid = launch_vertical_daemon(
+        daemon_binary, cache_service, cdir + "/iceccd.sock", cdir + "/envs",
+        cdir + "/runtime", cdir + "/iceccd.log", c_scheduler_port, c_port,
+        "p51-c", job_count + 2);
+    const pid_t f_pid = launch_vertical_daemon(
+        daemon_binary, cache_service, fdir + "/iceccd.sock", fdir + "/envs",
+        fdir + "/runtime", fdir + "/iceccd.log", f_scheduler_port, f_port,
+        "p51-f", job_count + 2);
+    REQUIRE(c_pid > 0 && f_pid > 0, "distinct real C and F daemons started");
+    if (c_pid <= 0 || f_pid <= 0) return 2;
+    struct DaemonPairCleanup {
+        pid_t c_pid;
+        pid_t f_pid;
+        ~DaemonPairCleanup() {
+            for (pid_t pid : {c_pid, f_pid}) {
+                if (pid <= 0) continue;
+                (void)::kill(pid, SIGTERM);
+                int status = 0;
+                if (!wait_child(pid, 3000, &status)) {
+                    (void)::kill(pid, SIGKILL);
+                    (void)::waitpid(pid, &status, 0);
+                }
+            }
+        }
+    } daemon_cleanup{c_pid, f_pid};
+    MsgChannel *c_scheduler = accept_channel(c_scheduler_listener, 10000);
+    MsgChannel *f_scheduler = accept_channel(f_scheduler_listener, 10000);
+    Msg *c_initial_msg = wait_for_type(c_scheduler, Msg::LOGIN, 5000);
+    Msg *f_initial_msg = wait_for_type(f_scheduler, Msg::LOGIN, 5000);
+    const bool initial_absent = absent(dynamic_cast<LoginMsg *>(c_initial_msg)) &&
+        absent(dynamic_cast<LoginMsg *>(f_initial_msg));
+    REQUIRE(initial_absent, "both independent daemons begin cache-absent");
+    delete c_initial_msg;
+    delete f_initial_msg;
+    const uint64_t epoch = UINT64_C(0x51c0000000000001);
+    const ConfCSMsg activate(epoch, ConfCSMsg::StrictNonce);
+    const bool activated = c_scheduler && f_scheduler &&
+        c_scheduler->send_msg(activate) && f_scheduler->send_msg(activate);
+    Msg *c_login_msg = activated ? wait_for_type(c_scheduler, Msg::LOGIN, 10000) : nullptr;
+    Msg *f_login_msg = activated ? wait_for_type(f_scheduler, Msg::LOGIN, 10000) : nullptr;
+    const bool both_ready = present_revision(dynamic_cast<LoginMsg *>(c_login_msg),
+            static_cast<uint32_t>(c_port), CACHE_WIRE_REVISION_R2) &&
+        present_revision(dynamic_cast<LoginMsg *>(f_login_msg),
+            static_cast<uint32_t>(f_port), CACHE_WIRE_REVISION_R2);
+    REQUIRE(both_ready, "distinct C and F sidecars publish opt-in R2 READY");
+    delete c_login_msg;
+    delete f_login_msg;
+    if (!both_ready) return 1;
+
+    struct VerticalJob {
+        uint32_t wire_id = 0;
+        uint64_t nonce = 0;
+        MsgChannel *wrapper = nullptr;
+        MsgChannel *compiler = nullptr;
+        std::string bytes;
+        int source_fd = -1;
+        icecc::p50::local::P50SourceTransferResult result{};
+        std::atomic<bool> finished{false};
+        bool assigned = false;
+        bool source_ready = false;
+        bool compile_sent = false;
+        bool attached = false;
+        bool compile_bounded = false;
+        uintmax_t attach_log_offset = 0;
+    };
+    std::vector<VerticalJob> jobs(job_count);
+    bool all_assignments_ready = true;
+    for (unsigned index = 0; index < job_count; ++index) {
+        auto& job = jobs[index];
+        job.wire_id = 0x51c001 + index;
+        job.nonce = UINT64_C(0x51c00100000001) + index;
+        const bool c_prepared = c_scheduler->send_msg(
+            AssignPrepareMsg(epoch, job.wire_id, job.nonce, 1));
+        const bool f_prepared = f_scheduler->send_msg(
+            AssignPrepareMsg(epoch, job.wire_id, job.nonce, 1));
+        Msg *c_ready_msg = c_prepared
+            ? wait_for_type(c_scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
+        Msg *f_ready_msg = f_prepared
+            ? wait_for_type(f_scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
+        const auto *c_ready = dynamic_cast<const AssignReadyMsg *>(c_ready_msg);
+        const auto *f_ready = dynamic_cast<const AssignReadyMsg *>(f_ready_msg);
+        job.assigned = c_ready && f_ready &&
+            c_ready->wire_id == job.wire_id && f_ready->wire_id == job.wire_id &&
+            c_ready->epoch() == epoch && f_ready->epoch() == epoch &&
+            c_ready->nonce() == job.nonce && f_ready->nonce() == job.nonce;
+        delete c_ready_msg;
+        delete f_ready_msg;
+        job.compiler = job.assigned ? connect_tcp_bounded(f_port, 5000) : nullptr;
+
+        job.wrapper = Service::createChannel(cdir + "/iceccd.sock");
+        Environments source_envs;
+        source_envs.emplace_back("x86_64", "vertical-env");
+        GetCSMsg source_get(source_envs, "vertical.cpp", CompileJob::Lang_CXX,
+                            1, "x86_64", 0, "", PROTOCOL_VERSION, 0, 0);
+        source_get.cache_protocol = CACHE_WIRE_REVISION_R2;
+        source_get.cache_profile_mask = profile_mask;
+        const bool source_get_sent = job.wrapper && job.wrapper->send_msg(source_get);
+        Msg *source_get_msg = source_get_sent
+            ? wait_for_type(c_scheduler, Msg::GET_CS, 5000) : nullptr;
+        const auto *source_get_forwarded =
+            dynamic_cast<const GetCSMsg *>(source_get_msg);
+        const uint32_t source_client_id = source_get_forwarded
+            ? source_get_forwarded->client_id : 0;
+        const bool source_use_sent = source_get_forwarded &&
+            c_scheduler->send_msg(UseCSMsg(
+                "x86_64", "127.0.0.1", f_port, job.wire_id, true,
+                source_client_id, 0, epoch, job.nonce, f_port,
+                CACHE_WIRE_REVISION_R2, profile_mask));
+        delete source_get_msg;
+        std::unique_ptr<Msg> source_use_msg(source_use_sent
+            ? job.wrapper->get_msg_until(Clock::now() + std::chrono::seconds(5))
+            : nullptr);
+        const auto *source_use = dynamic_cast<const UseCSMsg*>(source_use_msg.get());
+        job.source_ready = source_use &&
+            source_use->job_id == job.wire_id &&
+            source_use->assignmentEpoch() == epoch &&
+            source_use->assignmentNonce() == job.nonce &&
+            source_use->cache_endpoint_port == static_cast<uint32_t>(f_port) &&
+            source_use->cache_protocol == CACHE_WIRE_REVISION_R2 &&
+            source_use->cache_profile_mask == profile_mask;
+        job.bytes = "vertical P51 source bytes job=" + std::to_string(index) + "\\n";
+        job.source_fd = job.compiler
+            ? make_vertical_source_fd(work, job.bytes) : -1;
+        all_assignments_ready &= job.assigned && job.compiler != nullptr &&
+            job.source_ready && job.source_fd >= 0;
+    }
+    REQUIRE(all_assignments_ready,
+            "all C and F assignments retain distinct authenticated wrapper channels");
+    if (!all_assignments_ready) return 1;
+    std::unique_ptr<P51CommitReceiptGate> receipt_gate;
+    if (job_count > 1) {
+        receipt_gate = std::make_unique<P51CommitReceiptGate>(
+            f_port, icecc->pw_uid, job_count);
+        REQUIRE(receipt_gate->ready(),
+                "W30 receipt gate has NET_ADMIN, iptables and its scoped UID redirect");
+        if (!receipt_gate->ready()) {
+            std::fprintf(stderr,
+                "required W30 setup unavailable: install iptables and grant NET_ADMIN in the disposable test container\n");
+            return 2;
+        }
+    }
+    bool all_source_fds_ready = true;
+    for (auto& job : jobs) {
+        job.source_fd = make_vertical_source_fd(work, job.bytes);
+        all_source_fds_ready &= job.source_fd >= 0;
+    }
+    REQUIRE(all_source_fds_ready, "all exact source files are available before concurrent transfer");
+    if (!all_source_fds_ready) {
+        if (receipt_gate) receipt_gate->release_commits();
+        for (auto& job : jobs) {
+            if (job.source_fd >= 0) ::close(job.source_fd);
+            delete job.wrapper;
+            delete job.compiler;
+        }
+        return 1;
+    }
+
+    const auto transfer_started = Clock::now();
+    std::vector<std::thread> transfers;
+    transfers.reserve(job_count);
+    for (unsigned index = 0; index < job_count; ++index) {
+        transfers.emplace_back([&, index] {
+            auto& current = jobs[index];
+            current.result = execute_p51_kind8(
+                *current.wrapper, *current.compiler, current.wire_id,
+                epoch, current.nonce, static_cast<uint32_t>(f_port), current.source_fd,
+                profile_mask);
+            current.finished.store(true, std::memory_order_release);
+        });
+    }
+
+    bool held_all_commits = false;
+    if (receipt_gate) held_all_commits = receipt_gate->wait_for_commits(
+        std::chrono::seconds(30));
+    else {
+        const auto settle_deadline = Clock::now() + std::chrono::seconds(30);
+        while (Clock::now() < settle_deadline &&
+               !jobs.front().finished.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        held_all_commits = jobs.front().finished.load(std::memory_order_acquire);
+    }
+    if (receipt_gate)
+        std::fprintf(stderr,
+            "P51 receipt gate held_commits=%zu expected=%u before_release=%u\n",
+            receipt_gate->observed_commits(), job_count,
+            held_all_commits ? 1u : 0u);
+    bool no_transfer_completed_before_release = true;
+    if (receipt_gate) {
+        for (const auto& job : jobs)
+            no_transfer_completed_before_release &=
+                !job.finished.load(std::memory_order_acquire);
+    }
+    if (receipt_gate) receipt_gate->release_commits();
+    for (auto& transfer : transfers) if (transfer.joinable()) transfer.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - transfer_started).count();
+
+    std::set<uint64_t> observed_tu_sequences;
+    bool all_transfers_committed = true;
+    for (unsigned index = 0; index < job_count; ++index) {
+        const auto& job = jobs[index];
+        const auto& result = job.result;
+        const bool exact = result.code ==
+                icecc::p50::local::SourceTransferResultCode::Committed &&
+            result.error_code == 0 && result.raw_bytes == job.bytes.size() &&
+            result.raw_digest == icecc::digest128(job.bytes) &&
+            result.c_store_guid != icecc::p50::CStoreGuid{} &&
+            observed_tu_sequences.insert(result.tu_seq).second;
+        all_transfers_committed &= exact;
+        if (!exact)
+            std::fprintf(stderr,
+                "P51 fixture job=%u result code=%u error=%u attempts=%u tu=%llu raw=%llu expected=%zu digest_match=%u guid_valid=%u\n",
+                index, static_cast<unsigned>(result.code), result.error_code,
+                result.attempts, static_cast<unsigned long long>(result.tu_seq),
+                static_cast<unsigned long long>(result.raw_bytes), job.bytes.size(),
+                result.raw_digest == icecc::digest128(job.bytes) ? 1u : 0u,
+                result.c_store_guid != icecc::p50::CStoreGuid{} ? 1u : 0u);
+    }
+    const bool contiguous_tu_sequences = observed_tu_sequences.size() == job_count &&
+        *observed_tu_sequences.begin() == 0 &&
+        *observed_tu_sequences.rbegin() == job_count - 1;
+    REQUIRE(held_all_commits,
+            "F emitted exactly W30 distinct complete COMMIT frames before any C receipt release");
+    REQUIRE(no_transfer_completed_before_release,
+            "all source-transfer callers remain pending while COMMIT receipts are withheld");
+    REQUIRE(all_transfers_committed && contiguous_tu_sequences && elapsed < 30000,
+            "real C kind-8 service completes all W30 exact distinct inputs and TU identities");
+    if (receipt_gate)
+        std::fprintf(stderr,
+            "P51 vertical summary jobs=%u buffered_commits=%zu elapsed_ms=%lld\n",
+            job_count, receipt_gate->observed_commits(), static_cast<long long>(elapsed));
+
+    bool all_compilefile_sent = true;
+    bool all_exactly_attached = true;
+    bool all_compilefile_bounded = true;
+    for (auto& item : jobs) {
+        if (item.result.code != icecc::p50::local::SourceTransferResultCode::Committed ||
+            item.compiler == nullptr) {
+            all_compilefile_sent = all_exactly_attached = all_compilefile_bounded = false;
+            continue;
+        }
+        CompileJob compile_job = attachment_compile_job(
+            item.wire_id, epoch, item.nonce,
+            source_arm(item.wire_id, epoch, item.nonce,
+                       static_cast<uint32_t>(f_port), static_cast<uint32_t>(f_port)),
+            nullptr);
+        CompileInputIdentity identity;
+        identity.profile = profile_mask == CACHE_PROFILE_P29V1
+            ? CompileInputIdentity::P29V1Profile
+            : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+                ? CompileInputIdentity::ZstdRouteProfile
+                : CompileInputIdentity::ZstdTuProfile;
+        identity.c_store_guid = item.result.c_store_guid.bytes;
+        identity.tu_seq = item.result.tu_seq;
+        identity.raw_bytes = item.result.raw_bytes;
+        identity.raw_digest = item.result.raw_digest.bytes;
+        identity.attempt_id = item.nonce;
+        identity.request_id = item.nonce;
+        compile_job.setCompileInputIdentity(identity);
+        std::error_code attach_log_error;
+        item.attach_log_offset = std::filesystem::file_size(
+            fdir + "/iceccd.log", attach_log_error);
+        item.compile_sent = !attach_log_error &&
+            item.compiler->send_msg(CompileFileMsg(&compile_job));
+        all_compilefile_sent &= item.compile_sent;
+    }
+    for (auto& item : jobs) {
+        if (!item.compile_sent) {
+            all_exactly_attached = all_compilefile_bounded = false;
+            continue;
+        }
+        const std::string accepted_marker =
+            "P50_INPUT_ATTACH_END job=" + std::to_string(item.wire_id) +
+            " epoch=" + std::to_string(epoch) +
+            " nonce=" + std::to_string(item.nonce) +
+            " request=" + std::to_string(item.nonce) + " elapsed_ms=";
+        bool attached = wait_attachment_log(
+            fdir + "/iceccd.log", item.attach_log_offset, accepted_marker, 15000);
+        if (attached) {
+            const std::string suffix = read_file_suffix(
+                fdir + "/iceccd.log", item.attach_log_offset);
+            const size_t marker_pos = suffix.find(accepted_marker);
+            const size_t status_pos = marker_pos == std::string::npos
+                ? std::string::npos : suffix.find(" status=0", marker_pos);
+            attached = status_pos != std::string::npos;
+        }
+        item.attached = attached;
+        item.compile_bounded = wait_eof(item.compiler, 15000);
+        all_exactly_attached &= item.attached;
+        all_compilefile_bounded &= item.compile_bounded;
+    }
+    REQUIRE(all_compilefile_sent,
+            "all original F compiler TCP channels accept their CompileFile after R2 receipt");
+    REQUIRE(all_exactly_attached,
+            "F reports Accepted attachment for every exact committed input identity");
+    REQUIRE(all_compilefile_bounded,
+            "F daemon settles all W30 CompileFile attachments within bounds");
+    for (auto& job : jobs) {
+        delete job.wrapper;
+        delete job.compiler;
+    }
+    const size_t peak_held_commits = receipt_gate
+        ? receipt_gate->observed_commits() : 0;
+    receipt_gate.reset();
+
+    for (pid_t pid : {c_pid, f_pid}) ::kill(pid, SIGTERM);
+    int c_status = 0, f_status = 0;
+    const bool c_reaped = wait_child(c_pid, 10000, &c_status);
+    const bool f_reaped = wait_child(f_pid, 10000, &f_status);
+    if (c_reaped) daemon_cleanup.c_pid = -1;
+    if (f_reaped) daemon_cleanup.f_pid = -1;
+    REQUIRE(c_reaped && WIFEXITED(c_status) && WEXITSTATUS(c_status) == 0,
+            "C daemon exits cleanly after the vertical transfer");
+    REQUIRE(f_reaped && WIFEXITED(f_status) && WEXITSTATUS(f_status) == 0,
+            "F daemon exits cleanly after the vertical transfer");
+    delete c_scheduler;
+    delete f_scheduler;
+    ::close(c_scheduler_listener);
+    ::close(f_scheduler_listener);
+    if (failures == 0) std::filesystem::remove_all(work);
+    else std::fprintf(stderr, "retained vertical work directory: %s\n", work.c_str());
+    if (failures == 0 && job_count == 30)
+        std::fprintf(stderr,
+            "P51_VERTICAL_W30_PASS jobs=%u peak_held_commits=%zu elapsed_ms=%lld\n",
+            job_count, peak_held_commits, static_cast<long long>(elapsed));
+    return failures ? 1 : 0;
+}
 #endif
+
+static uint32_t selected_vertical_profile()
+{
+    const char *value = ::getenv("ICECC_TEST_P51_PROFILE");
+    if (value == nullptr || std::strcmp(value, "ZSTD_TU") == 0)
+        return CACHE_PROFILE_ZSTD_TU;
+    if (std::strcmp(value, "P29V1") == 0)
+        return CACHE_PROFILE_P29V1;
+    if (std::strcmp(value, "ZSTD_ROUTE") == 0)
+        return CACHE_PROFILE_ZSTD_ROUTE;
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -451,6 +1385,18 @@ int main(int argc, char **argv)
     if (icecc == nullptr || icecc->pw_uid == 0 || icecc->pw_gid == 0) {
         std::fprintf(stderr, "SKIP: isolated image has no unprivileged icecc identity\n");
         return 77;
+    }
+
+    if (::getenv("ICECC_TEST_P51_VERTICAL_W30") != nullptr ||
+        ::getenv("ICECC_TEST_P51_VERTICAL") != nullptr) {
+        const uint32_t profile_mask = selected_vertical_profile();
+        if (profile_mask == 0) {
+            std::fprintf(stderr, "FAIL: ICECC_TEST_P51_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE\n");
+            return 2;
+        }
+        const unsigned count = ::getenv("ICECC_TEST_P51_VERTICAL_W30") != nullptr
+            ? 30u : 1u;
+        return run_p51_vertical(argv[1], argv[2], icecc, count, profile_mask);
     }
 
     ::signal(SIGPIPE, SIG_IGN);
@@ -537,9 +1483,150 @@ int main(int argc, char **argv)
             "first ConfCS activates the scheduler session");
     Msg *positive_message = wait_for_type(scheduler, Msg::LOGIN, 10000);
     LoginMsg *positive = dynamic_cast<LoginMsg *>(positive_message);
-    REQUIRE(present(positive, static_cast<uint32_t>(daemon_port)),
+    const bool p51_cancel_case =
+        std::getenv("ICECC_TEST_P51_CANCEL_REPLACEMENT") != nullptr;
+    REQUIRE(present_revision(
+                positive, static_cast<uint32_t>(daemon_port),
+                p51_cancel_case ? CACHE_WIRE_REVISION_R2
+                                : CACHE_WIRE_REVISION_R1),
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
+
+    if (p51_cancel_case) {
+        const uint32_t wire_id = 0x7a710301;
+        const uint64_t nonce = UINT64_C(0x7a71030100000001);
+        P50SourceArmFields source = source_arm(
+            wire_id, epoch, nonce, static_cast<uint32_t>(daemon_port),
+            static_cast<uint32_t>(daemon_port));
+        source.cache_protocol = CACHE_WIRE_REVISION_R2;
+        const P51SourceArmFields arm{source, 30};
+        const bool prepared = scheduler && scheduler->send_msg(
+            AssignPrepareMsg(epoch, wire_id, nonce, 1));
+        Msg *ready_message = prepared
+            ? wait_for_type(scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
+        const auto *ready = dynamic_cast<const AssignReadyMsg *>(ready_message);
+        const bool assignment_ready = ready && ready->wire_id == wire_id &&
+            ready->epoch() == epoch && ready->nonce() == nonce;
+        delete ready_message;
+
+        MsgChannel *wrapper = assignment_ready
+            ? connect_tcp_bounded(daemon_port, 5000) : nullptr;
+        const P51SourceArmMsg request{arm};
+        const bool request_sent = wrapper && wrapper->send_msg(request);
+        Msg *armed_message = request_sent
+            ? wait_for_type(wrapper, Msg::P51_SOURCE_ARMED, 5000) : nullptr;
+        auto *armed = dynamic_cast<P51SourceArmedMsg *>(armed_message);
+        const bool arm_ready = armed && armed->acknowledges(request) &&
+            armed->f_store_generation != 0 && armed->selected_window == 30;
+        delete armed_message;
+        REQUIRE(assignment_ready && request_sent && arm_ready,
+                "opt-in P51 ARM reserves the authenticated job at W30");
+        if (!assignment_ready || !request_sent || !arm_ready) {
+            delete wrapper;
+            ::kill(daemon_pid, SIGTERM);
+            int failed_status = 0;
+            bool failed_reaped = wait_child(daemon_pid, 10000, &failed_status);
+            if (!failed_reaped) {
+                ::kill(daemon_pid, SIGKILL);
+                (void)::waitpid(daemon_pid, &failed_status, 0);
+            }
+            delete scheduler;
+            ::close(scheduler_listener);
+            std::fprintf(stderr,
+                         "retained failing work directory: %s\n", work.c_str());
+            return 1;
+        }
+
+        std::error_code replace_log_error;
+        const uintmax_t replace_log_offset =
+            std::filesystem::file_size(log, replace_log_error);
+        const pid_t old_sidecar = find_attachment_sidecar(daemon_pid, argv[2]);
+        const bool killed_old = old_sidecar > 1 &&
+            ::kill(old_sidecar, SIGKILL) == 0;
+        const auto replacement_deadline =
+            Clock::now() + std::chrono::seconds(15);
+        pid_t new_sidecar = -1;
+        bool replacement_advertised = false;
+        while (killed_old && Clock::now() < replacement_deadline) {
+            new_sidecar = find_attachment_sidecar(daemon_pid, argv[2]);
+            if (new_sidecar > 1 && new_sidecar != old_sidecar) {
+                Msg *login_message = wait_for_type(scheduler, Msg::LOGIN, 1000);
+                auto *login = dynamic_cast<LoginMsg *>(login_message);
+                replacement_advertised = present_revision(
+                    login, static_cast<uint32_t>(daemon_port),
+                    CACHE_WIRE_REVISION_R2);
+                delete login_message;
+                if (replacement_advertised) break;
+            }
+            ::usleep(10000);
+        }
+        REQUIRE(killed_old && new_sidecar > 1 && new_sidecar != old_sidecar &&
+                    replacement_advertised,
+                "READY replacement publishes a distinct P51 sidecar incarnation");
+
+        // Disconnect only after the READY replacement. The queued cancellation
+        // still names the old immutable lease; its failure must not withdraw
+        // or shut down the newly published incarnation.
+        delete wrapper;
+        wrapper = nullptr;
+        const bool old_cancel_failed = wait_attachment_log(
+            log, replace_log_offset,
+            "P51 source-reservation cancellation failed:", 5000);
+        REQUIRE(old_cancel_failed,
+                "late old-incarnation cancellation fails closed after replacement");
+
+        const uint32_t successor_id = wire_id + 1;
+        const uint64_t successor_nonce = nonce + 1;
+        P50SourceArmFields successor_source = source_arm(
+            successor_id, epoch, successor_nonce,
+            static_cast<uint32_t>(daemon_port),
+            static_cast<uint32_t>(daemon_port));
+        successor_source.cache_protocol = CACHE_WIRE_REVISION_R2;
+        const P51SourceArmFields successor_arm{successor_source, 30};
+        const bool successor_prepared = scheduler && scheduler->send_msg(
+            AssignPrepareMsg(epoch, successor_id, successor_nonce, 1));
+        Msg *successor_ready_message = successor_prepared
+            ? wait_for_type(scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
+        const auto *successor_ready =
+            dynamic_cast<const AssignReadyMsg *>(successor_ready_message);
+        const bool successor_assignment_ready = successor_ready &&
+            successor_ready->wire_id == successor_id &&
+            successor_ready->epoch() == epoch &&
+            successor_ready->nonce() == successor_nonce;
+        delete successor_ready_message;
+        MsgChannel *successor = successor_assignment_ready
+            ? connect_tcp_bounded(daemon_port, 5000) : nullptr;
+        const P51SourceArmMsg successor_request{successor_arm};
+        const bool successor_sent = successor &&
+            successor->send_msg(successor_request);
+        Msg *successor_reply_message = successor_sent
+            ? wait_for_type(successor, Msg::P51_SOURCE_ARMED, 5000) : nullptr;
+        auto *successor_reply =
+            dynamic_cast<P51SourceArmedMsg *>(successor_reply_message);
+        const bool successor_arm_ready = successor_reply &&
+            successor_reply->acknowledges(successor_request) &&
+            successor_reply->selected_window == 30;
+        delete successor_reply_message;
+        delete successor;
+        REQUIRE(successor_assignment_ready && successor_sent &&
+                    successor_arm_ready,
+                "stale cancellation cannot withdraw the replacement P51 sidecar");
+
+        ::kill(daemon_pid, SIGTERM);
+        int status = 0;
+        bool reaped = wait_child(daemon_pid, 10000, &status);
+        if (!reaped) {
+            ::kill(daemon_pid, SIGKILL);
+            (void)::waitpid(daemon_pid, &status, 0);
+        }
+        REQUIRE(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "P51 cancellation replacement daemon exits cleanly");
+        delete scheduler;
+        ::close(scheduler_listener);
+        if (failures == 0) std::filesystem::remove_all(work);
+        else std::fprintf(stderr, "retained failing work directory: %s\n", work.c_str());
+        return failures ? 1 : 0;
+    }
 
     // Diagnostic regression: a synchronous compiler-input attachment must not
     // prevent a fresh ordinary peer from completing admission.  The sidecar
@@ -571,15 +1658,62 @@ int main(int argc, char **argv)
     delete attach_ready_message;
 
     MsgChannel *attach_wrapper = connect_tcp_bounded(daemon_port, 5000);
-    REQUIRE(attach_wrapper && attach_wrapper->send_msg(P50SourceArmMsg(attach_arm)),
-            "attachment diagnostic source arm is sent");
-    Msg *attach_armed_message = wait_for_type(attach_wrapper, Msg::P50_SOURCE_ARMED, 5000);
-    auto *attach_armed = dynamic_cast<P50SourceArmedMsg *>(attach_armed_message);
-    REQUIRE(attach_armed != nullptr && attach_armed->arm == attach_arm,
-            "attachment diagnostic source arm is acknowledged");
-    delete attach_armed_message;
-    REQUIRE(attach_wrapper && attach_wrapper->send_msg(CacheSessionMsg()),
-            "attachment diagnostic wrapper enters CACHE_SESSION");
+    icecc::p50::local::P50SourceTransferResult published_input{};
+    bool attach_source_ready = false;
+    if (disconnect_pending) {
+        REQUIRE(attach_wrapper && attach_wrapper->send_msg(P50SourceArmMsg(attach_arm)),
+                "pending-disconnect source arm is sent without a source transfer");
+        Msg *attach_armed_message = wait_for_type(
+            attach_wrapper, Msg::P50_SOURCE_ARMED, 5000);
+        auto *attach_armed = dynamic_cast<P50SourceArmedMsg *>(attach_armed_message);
+        attach_source_ready = attach_armed != nullptr && attach_armed->arm == attach_arm;
+        delete attach_armed_message;
+        REQUIRE(attach_source_ready,
+                "pending-disconnect source arm is acknowledged before deliberate no-input attach");
+        REQUIRE(attach_wrapper && attach_wrapper->send_msg(CacheSessionMsg()),
+                "pending-disconnect wrapper enters CACHE_SESSION with no committed input");
+    } else {
+        const std::string exact_source = "published P50 attachment input\\n";
+        published_input = attach_wrapper
+            ? publish_input_to_armed_f(*attach_wrapper, attach_arm, exact_source)
+            : icecc::p50::local::P50SourceTransferResult{};
+        attach_source_ready = published_input.code ==
+                icecc::p50::local::SourceTransferResultCode::Committed &&
+            published_input.error_code == 0 && published_input.tu_seq == 0 &&
+            published_input.raw_bytes == exact_source.size() &&
+            published_input.raw_digest == icecc::digest128(exact_source) &&
+            published_input.c_store_guid != icecc::p50::CStoreGuid{};
+        if (!attach_source_ready) {
+            std::fprintf(stderr,
+                "R1 fixture result code=%u error=%u attempts=%u tu=%llu bytes=%llu/%zu digest_match=%d c_guid_nonzero=%d\n",
+                static_cast<unsigned>(published_input.code), published_input.error_code,
+                published_input.attempts,
+                static_cast<unsigned long long>(published_input.tu_seq),
+                static_cast<unsigned long long>(published_input.raw_bytes),
+                exact_source.size(),
+                int(published_input.raw_digest == icecc::digest128(exact_source)),
+                int(published_input.c_store_guid != icecc::p50::CStoreGuid{}));
+        }
+        REQUIRE(attach_source_ready,
+                "attachment input is committed before CompileFile uses its exact identity");
+    }
+    if (::getenv("ICECC_TEST_R1_PUBLISH_ONLY") != nullptr) {
+        delete attach_wrapper;
+        (void)::kill(daemon_pid, SIGTERM);
+        int status = 0;
+        bool reaped = wait_child(daemon_pid, 10000, &status);
+        if (!reaped) {
+            (void)::kill(daemon_pid, SIGKILL);
+            (void)::waitpid(daemon_pid, &status, 0);
+        }
+        REQUIRE(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "R1 source publication daemon exits cleanly");
+        delete scheduler;
+        ::close(scheduler_listener);
+        if (failures == 0) std::filesystem::remove_all(work);
+        else std::fprintf(stderr, "retained failing work directory: %s\n", work.c_str());
+        return failures ? 1 : 0;
+    }
     ::usleep(100 * 1000);
 
     const pid_t attach_sidecar_pid = find_attachment_sidecar(daemon_pid, argv[2]);
@@ -605,7 +1739,8 @@ int main(int argc, char **argv)
     const uintmax_t attach_log_offset = std::filesystem::file_size(log, attach_log_error);
     MsgChannel *attach_compile_client = connect_tcp_bounded(daemon_port, 5000);
     CompileJob attach_job = attachment_compile_job(
-        attach_wire_id, attach_epoch, attach_nonce, attach_arm);
+        attach_wire_id, attach_epoch, attach_nonce, attach_arm,
+        disconnect_pending ? nullptr : &published_input);
     const bool attach_compile_sent = attach_compile_client &&
         attach_compile_client->send_msg(CompileFileMsg(&attach_job));
     REQUIRE(attach_compile_sent, "attachment diagnostic valid CompileFile is sent");

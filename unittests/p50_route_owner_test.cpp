@@ -1331,6 +1331,8 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count,
             P51SourceLinkLease lease;
             lease.initial_armed = link.armed.front();
             lease.absolute_deadline = deadline;
+            lease.relationship_epoch = hello.relationship_epoch;
+            lease.history_nonce = hello.history_nonce;
             return lease;
         };
         server_config.consume_p51_job_reservation =
@@ -1551,11 +1553,14 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count,
         CHECK(reached && window_reached);
     }
     unsigned admitted_before_ack = 0;
+    uint64_t raw_bytes_before_ack = 0;
     for (const auto& link : links) {
         CHECK(link->sent.load(std::memory_order_acquire) >= kWindow);
         CHECK(link->committed.load(std::memory_order_acquire) >= kWindow);
         CHECK(link->acknowledged.load(std::memory_order_acquire) == 0);
         admitted_before_ack += link->sent.load(std::memory_order_acquire);
+        for (size_t job = 0; job != kWindow; ++job)
+            raw_bytes_before_ack += link->input[job].size();
     }
     CHECK(admitted_before_ack == link_count * kWindow);
 
@@ -1588,8 +1593,9 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count,
     CHECK(aggregate_acknowledged == link_count * kRefill);
     for (auto& result : server_results)
         CHECK(result.get().status == ServerRunStatus::Disconnected);
-    std::fprintf(stderr, "P51_DIRECT_TOPOLOGY_PASS C%zuF%zu %s links=%zu peak=%u committed=%u ack=%u\n",
+    std::fprintf(stderr, "P51_DIRECT_TOPOLOGY_PASS C%zuF%zu %s links=%zu peak=%u raw_bytes=%llu committed=%u ack=%u\n",
                  c_count, f_count, topology_profile_name(profile), link_count, admitted_before_ack,
+                 static_cast<unsigned long long>(raw_bytes_before_ack),
                  aggregate_committed, aggregate_acknowledged);
     std::fflush(stderr);
 }

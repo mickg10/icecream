@@ -1680,7 +1680,8 @@ MsgChannel *Service::createChannelUntil(
 static MsgChannel *create_channel_hedged_until(
     const string &hostname, unsigned short port,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::milliseconds first_budget)
+    std::chrono::milliseconds first_budget,
+    const std::atomic<bool> *cancelled)
 {
     using Clock = std::chrono::steady_clock;
     struct Attempt {
@@ -1693,8 +1694,13 @@ static MsgChannel *create_channel_hedged_until(
     if (Clock::now() >= deadline)
         return nullptr;
     const int first_fd = prepare_connect(hostname, port, address);
-    if (first_fd < 0)
+    if (first_fd < 0 ||
+        (cancelled != nullptr &&
+         cancelled->load(std::memory_order_acquire))) {
+        if (first_fd >= 0)
+            (void)close(first_fd);
         return nullptr;
+    }
 
     auto promote = [&](Attempt &attempt) {
         const int fd = std::exchange(attempt.connecting_fd, -1);
@@ -1720,7 +1726,9 @@ static MsgChannel *create_channel_hedged_until(
         return nullptr;
     unsigned count = 1;
     for (;;) {
-        if (Clock::now() >= deadline)
+        if ((cancelled != nullptr &&
+             cancelled->load(std::memory_order_acquire)) ||
+            Clock::now() >= deadline)
             return nullptr;
         for (unsigned i = 0; i != count; ++i) {
             auto &channel = attempts[i].channel;
@@ -1774,8 +1782,12 @@ static MsgChannel *create_channel_hedged_until(
             if (attempt.channel && attempt.channel->has_pending_write())
                 descriptors[i].events |= POLLOUT;
         }
-        const int ready = poll(descriptors, count, poll_milliseconds_until(
-            count == 1 ? hedge_at : deadline));
+        auto wake_deadline = count == 1 ? hedge_at : deadline;
+        if (cancelled != nullptr)
+            wake_deadline = std::min(wake_deadline,
+                Clock::now() + std::chrono::milliseconds(25));
+        const int ready = poll(descriptors, count,
+                               poll_milliseconds_until(wake_deadline));
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
@@ -1818,15 +1830,22 @@ MsgChannel *Service::createChannelRetryUntil(
 MsgChannel *Service::createChannelRetryUntil(
     const string &hostname, unsigned short p,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::milliseconds attempt_budget, ChannelRetryPolicy policy)
+    std::chrono::milliseconds attempt_budget, ChannelRetryPolicy policy,
+    const std::atomic<bool> *cancelled)
 {
-    if (attempt_budget <= std::chrono::milliseconds::zero())
+    if (attempt_budget <= std::chrono::milliseconds::zero() ||
+        (cancelled != nullptr &&
+         cancelled->load(std::memory_order_acquire)))
         return nullptr;
     if (policy == ChannelRetryPolicy::HedgeAfterFirst)
-        return create_channel_hedged_until(hostname, p, deadline, attempt_budget);
+        return create_channel_hedged_until(hostname, p, deadline, attempt_budget,
+                                           cancelled);
 
     unsigned int attempt = 0;
     for (;;) {
+        if (cancelled != nullptr &&
+            cancelled->load(std::memory_order_acquire))
+            return nullptr;
         const auto started = std::chrono::steady_clock::now();
         if (started >= deadline)
             return nullptr;
@@ -2534,7 +2553,8 @@ void MsgChannel::begin_receive() noexcept
 }
 
 Msg *MsgChannel::get_msg_until(
-    std::chrono::steady_clock::time_point deadline, bool eofAllowed)
+    std::chrono::steady_clock::time_point deadline, bool eofAllowed,
+    const std::atomic<bool> *cancelled)
 {
     struct DeadlineReceiveScope {
         bool &active;
@@ -2545,16 +2565,28 @@ Msg *MsgChannel::get_msg_until(
     } scope(deadline_receive_active);
     begin_receive();
     while (std::chrono::steady_clock::now() < deadline) {
+        if (cancelled != nullptr &&
+            cancelled->load(std::memory_order_acquire))
+            return nullptr;
         if (instate == ERROR)
             return nullptr;
         if (has_msg())
             return get_msg(0, eofAllowed);
-        const int timeout = poll_milliseconds_until(deadline);
-        if (timeout == 0)
-            return nullptr;
+        auto wake_deadline = deadline;
+        if (cancelled != nullptr)
+            wake_deadline = std::min(wake_deadline,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(25));
+        const int timeout = poll_milliseconds_until(wake_deadline);
+        if (timeout == 0) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                return nullptr;
+            continue;
+        }
         pollfd descriptor{fd, POLLIN, 0};
         const int ready = poll(&descriptor, 1, timeout);
         if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready == 0 && cancelled != nullptr)
             continue;
         if (ready <= 0 ||
             (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0)
@@ -5388,7 +5420,8 @@ bool GetCSMsg::valid_payload() const
         remote_required <= 1 &&
         (!p50_cache_retry_avoid_is_present(
              cache_retry_avoid_port, cache_retry_avoid_host) ||
-         cache_protocol == CACHE_WIRE_REVISION);
+         cache_protocol == CACHE_WIRE_REVISION_R1 ||
+         cache_protocol == CACHE_WIRE_REVISION_R2);
 }
 
 void UseCSMsg::fill_from_channel(MsgChannel *c)

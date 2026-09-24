@@ -1823,10 +1823,11 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
            wrappers, whose newly-decoded fields default to zero).  The local C
            daemon remains authoritative: it intersects this request with its
            own kill-switch-controlled capability before forwarding GetCS. */
-        if (request_p50 &&
-            IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
-                                local_daemon)) {
-            getcs.cache_protocol = CACHE_WIRE_REVISION;
+        const uint32_t requested_cache_revision = request_p50
+            ? p50_cache_revision_from_environment(local_daemon->protocol)
+            : 0;
+        if (requested_cache_revision != 0) {
+            getcs.cache_protocol = requested_cache_revision;
             getcs.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
             if (p50_cache_retry_avoid_is_present(
                     retry_avoid_port, retry_avoid_host)) {

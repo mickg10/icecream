@@ -241,6 +241,13 @@ bool CompileServer::cacheCompatible(const Job *job) const
         !cache_advertisement_is_valid_present(
             cacheEndpointPort(), cacheProtocol(), cacheProfileMask()))
         return false;
+    if (cacheProtocol() == CACHE_WIRE_REVISION_R2 &&
+        (!job->submitter() ||
+         !p50_cache_pair_ordinary_protocols_compatible(
+             cacheProtocol(), job->submitter()->protocol, protocol) ||
+         p50_cache_revision_from_environment(PROTOCOL_VERSION) !=
+             CACHE_WIRE_REVISION_R2))
+        return false;
     return p50_select_pair_cache_profile(
         job->cacheProtocol(), job->cacheProfileMask(),
         cacheProtocol(), cacheProfileMask(),

@@ -2108,6 +2108,10 @@ static uint32_t selected_cache_profile(const Job *job,
 {
     if (job == nullptr || cs == nullptr || cs == job->submitter() ||
         !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, cs) ||
+        !p50_cache_pair_ordinary_protocols_compatible(
+            cs->cacheProtocol(),
+            job->submitter() != nullptr ? job->submitter()->protocol : 0,
+            cs->protocol) ||
         !cache_advertisement_is_valid_present(
             cs->cacheEndpointPort(), cs->cacheProtocol(),
             cs->cacheProfileMask()))
@@ -3247,7 +3251,16 @@ static void project_cache_handoff(const Job *job,
     // unavailable requests remain absent rather than silently switching.
     const auto request = p50_cache_profile_request_from_env();
     const uint32_t selected_mask = selected_cache_profile(job, cs, request);
-    if (identity_complete &&
+    const int submitter_protocol = job->submitter() != nullptr
+                                       ? job->submitter()->protocol
+                                       : 0;
+    const bool ordinary_peer_compatible =
+        p50_cache_pair_ordinary_protocols_compatible(
+            protocol, submitter_protocol, cs->protocol) &&
+        (protocol != CACHE_WIRE_REVISION_R2 ||
+         p50_cache_revision_from_environment(PROTOCOL_VERSION) ==
+             CACHE_WIRE_REVISION_R2);
+    if (identity_complete && ordinary_peer_compatible &&
         cache_advertisement_is_valid_present(port, protocol, mask) &&
         selected_mask != 0) {
         out_port = port;

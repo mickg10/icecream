@@ -348,8 +348,18 @@ p50daemonsidecaradapter_DEPENDENCIES = \
 	../cache/libp50localtransport.a \
 	../services/libicecc.la ../cache/icecc-cache-service
 p50daemonpositive_SOURCES = p50daemonpositive.cpp
-p50daemonpositive_LDADD = ../services/libicecc.la
+p50daemonpositive_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+p50daemonpositive_LDFLAGS = $(BOOST_LDFLAGS)
+p50daemonpositive_LDADD = ../cache/libp50endpoint.a \
+	../cache/libp50adoptedoutcomewriter.a \
+	../cache/libp50localtransport.a ../cache/libprotocol50.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service
+.PHONY: p50daemonpositive-p51-w30-check
+p50daemonpositive-p51-w30-check: p50daemonpositive
+	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
+	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
+	$(SHELL) '$(srcdir)/p50daemonpositive-p51-w30.sh'
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
@@ -528,7 +538,7 @@ CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.
 EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 EXTRA_DIST += codec_golden_compare.h
 
-EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
+EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50daemonpositive-p51-w30.sh p50zstdsender-source.sh
 EXTRA_DIST += releaseidentity-source.sh
 EXTRA_DIST += releaseidentity-artifact.sh
 EXTRA_DIST += p50sourcearm-source.sh p50sourcearm-wait-mutants.sh p50phaseopen-source.sh

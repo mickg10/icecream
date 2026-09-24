@@ -36,6 +36,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
 
 namespace icecc::p50::service {
@@ -64,13 +65,16 @@ struct RuntimeConfig {
     size_t max_route_completed_requests = 4096;
     size_t max_route_relationships = 256;
     size_t max_route_endpoint_identities = 256;
-    size_t max_pending_p51_source_reservations = 64;
+    size_t max_pending_p51_source_reservations = 120;
     // Source work is admitted independently across C/F relationships.  Raw
     // bytes are reserved from the regular-file length before vector allocation.
     size_t max_active_source_transfers = 4;
     // P51 jobs retain raw/window credit independently of R1's opener count.
-    // Control operations remain globally bounded by kMaxControlWorkers.
-    size_t max_active_p51_source_transfers = 64;
+    // Control operations remain globally bounded by kMaxControlWorkers.  This
+    // independently bounded queue includes accepted source jobs waiting for
+    // preparation and reply settlement.
+    size_t max_active_p51_source_transfers = 120;
+    size_t max_pending_p51_source_operations = 120;
     uint64_t max_aggregate_source_raw_bytes = uint64_t{2} * 1024 * 1024 * 1024;
     // Connecting, negotiating, arming, and crossing CACHE_SESSION must never
     // monopolize the process-wide route-owner gate for the full source
@@ -85,6 +89,10 @@ struct RuntimeConfig {
     // arm/CacheSession.  Test builds use this to prove owner poison reaches
     // SidecarRuntime's process-wide pre-open fence; production has no field.
     std::function<void()> before_route_prepare_for_test;
+    // Owner-thread witness for deadline/cancel retirement tests. Called only
+    // after an exact reservation row and any matching endpoint tombstone have
+    // been retired; production builds have no callback field.
+    std::function<void(Id128, bool)> p51_reservation_retired_for_test;
 #endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like
@@ -171,6 +179,15 @@ public:
     [[nodiscard]] local::P50SourceTransferResult transfer_p51_source_on_owner(
         local::P51SourceTransferRequest request,
         local::HandoffFd source) noexcept;
+    // Takes ownership of one authenticated kind-8 connection and source FD,
+    // then returns immediately. File preparation runs on a bounded pool;
+    // route work and the local reply/Goodbye exchange stay asynchronous on
+    // the owner executor. The operation's original absolute deadline covers
+    // queueing and every later phase.
+    [[nodiscard]] bool enqueue_p51_source_transfer(
+        local::Connection&& connection, local::Identity identity,
+        local::ControlOperation operation,
+        local::HandoffFd source) noexcept;
 
     // Reserve one P51 source job on the endpoint owner before the daemon
     // publishes ARMED. The reservation is bounded and idempotent for the
@@ -187,11 +204,41 @@ public:
     [[nodiscard]] std::optional<P51SourceJobLease>
     consume_p51_job_reservation_on_owner(const LinkHello& link,
                                          const JobBind& binding) noexcept;
+    [[nodiscard]] bool authorize_p51_job_publication_on_owner(
+        const LinkHello& link, const JobBind& binding) noexcept;
+    void settle_p51_cancelled_job_on_owner(
+        const LinkHello& link, const JobBind& binding) noexcept;
     [[nodiscard]] bool record_p51_job_commit_on_owner(
         const LinkHello& link, const JobBind& binding,
         const R2TxCommit& commit) noexcept;
     [[nodiscard]] bool acknowledge_p51_receipt_on_owner(
         const LinkHello& link, const CommitAck& ack) noexcept;
+    [[nodiscard]] std::optional<P51RecoveryReceiptInterval>
+    recover_p51_receipts_on_owner(
+        const LinkHello& link, const RecoverBegin& begin,
+        std::span<const RecoverWitness> witnesses,
+        const RecoverEnd& end) noexcept;
+    [[nodiscard]] bool settle_p51_interrupted_job_on_owner(
+        const LinkHello& link) noexcept;
+    [[nodiscard]] std::optional<ResetAck> validate_p51_reset_on_owner(
+        const LinkHello& link, const ResetRequest& request) noexcept;
+    [[nodiscard]] bool commit_p51_reset_on_owner(
+        const LinkHello& link, const ResetRequest& request,
+        const ResetAck& ack) noexcept;
+    [[nodiscard]] bool confirm_p51_reset_on_owner(
+        const LinkHello& link, const ResetConfirm& confirm) noexcept;
+    [[nodiscard]] bool p51_source_reservation_terminal_on_owner(
+        const JobBind& binding) noexcept;
+    void schedule_p51_reservation_sweep_on_owner() noexcept;
+    void sweep_p51_reservations_on_owner() noexcept;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Runs a short assertion/setup callback on the mutable endpoint owner.
+    // Test code must not call *_on_owner methods from its own thread while
+    // reservation expiry timers are active.
+    void run_owner_callback_for_test(std::function<void()> callback);
+    void notify_p51_reservation_retired_for_test(
+        const Id128& id, bool endpoint_marker_retired) noexcept;
+#endif
     void release_p51_link_on_owner(const LinkHello& hello) noexcept;
 
     // Route an authenticated dedicated F-session control connection (first
@@ -229,6 +276,10 @@ public:
     [[nodiscard]] bool seed_route_relationship_for_test(
         std::string host, uint32_t cache_port, FStoreGuid guid,
         uint64_t generation, ProfileId profile) noexcept;
+    [[nodiscard]] size_t pending_p51_source_operations_for_test() const noexcept {
+        return p51_source_operation_count_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] uint64_t active_source_raw_bytes_for_test() noexcept;
 #endif
 
 private:
@@ -265,6 +316,7 @@ private:
         uint32_t selected_window = 0;
         uint64_t next_relationship_ordinal = 1;
         uint64_t pending_ordinal = 0;
+        uint64_t pending_physical_link_generation = 0;
         Digest128 pending_binding_digest{};
         uint64_t committed_prefix_k = 0;
         uint64_t acknowledged_prefix_q = 0;
@@ -273,12 +325,34 @@ private:
         uint64_t physical_link_generation = 0;
         uint64_t highest_physical_link_generation = 0;
         bool has_receipts = false;
+        P51SourceArmedFields anchor_armed{};
+        Id128 anchor_reservation_id{};
+        HistoryNonce history_nonce{};
+        struct RecoveryContext {
+            Id128 operation_id{};
+            uint64_t physical_link_generation = 0;
+            uint64_t relationship_epoch = 0;
+            uint64_t verified_floor_a = 0;
+            uint64_t prepared_prefix_p = 0;
+            uint64_t committed_prefix_k = 0;
+            uint64_t acknowledged_prefix_q = 0;
+            Digest128 transcript_digest{};
+        };
+        std::optional<RecoveryContext> recovery_context;
+        std::optional<ResetAck> last_reset_ack;
+        bool last_reset_confirmed = false;
         std::array<std::optional<R2TxCommit>, 30> receipt_rows{};
     };
 
     struct P51SourceReservationRow {
         P51SourceArmedFields armed{};
         sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+        bool consumed = false;
+        uint64_t consumed_ordinal = 0;
+        uint64_t consumed_physical_link_generation = 0;
+        bool cancel_requested = false;
+        bool publishing = false;
+        std::optional<JobBind> consumed_binding;
     };
 
     using EndpointWorkGuard =
@@ -340,7 +414,10 @@ private:
     RuntimeConfig config_;
     InputLifecycleRegistry input_lifecycle_;
     boost::asio::io_context context_;
+    boost::asio::steady_timer p51_reservation_sweep_timer_{context_};
     boost::asio::thread_pool source_setup_pool_;
+    boost::asio::thread_pool p51_source_prepare_pool_;
+    std::atomic<size_t> p51_source_operation_count_{0};
     // Outstanding (queued + running) blocking retry setup tasks. Shared with
     // each task so a resolver that outlives its source deadline still holds
     // one bounded slot until its completion path actually returns.
@@ -396,12 +473,24 @@ private:
 
     // --- dedicated F-session control connections (owner-affine) -----------
     struct FSessionPump;
+    struct P51TransferReplyPump;
+    struct P51RawCredit;
     void fsession_arm_read(std::shared_ptr<FSessionPump> pump) noexcept;
     void fsession_drain(std::shared_ptr<FSessionPump> pump) noexcept;
     void fsession_close(std::shared_ptr<FSessionPump> pump) noexcept;
+    void start_p51_transfer_reply(
+        local::Connection connection, local::Identity identity,
+        local::ControlOperation operation,
+        local::P50SourceTransferResult result,
+        std::function<void()> settled) noexcept;
+    void advance_p51_transfer_reply(
+        std::shared_ptr<P51TransferReplyPump> pump) noexcept;
+    void close_p51_transfer_reply(
+        std::shared_ptr<P51TransferReplyPump> pump) noexcept;
     // Accessed only on the endpoint owner executor.
     fsession::FSessionServiceOwner fsession_owner_{4};
     std::vector<std::shared_ptr<FSessionPump>> fsession_pumps_;
+    std::vector<std::shared_ptr<P51TransferReplyPump>> p51_transfer_reply_pumps_;
     std::atomic<size_t> fsession_live_{0};
 };
 

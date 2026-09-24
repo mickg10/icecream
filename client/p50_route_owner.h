@@ -89,6 +89,10 @@ public:
     [[nodiscard]] bool reset_f_store_exact(
         FStoreGuid old_f_store_guid,
         uint64_t old_f_store_generation) noexcept;
+    // Stop/fail the C runtime's current R2 physical links without touching
+    // retained route maps from another thread. Must run on the route owner's
+    // executor; active senders close their exact socket and wake their waits.
+    void cancel_active_p51_transfers() noexcept;
     void reset() noexcept;
 
     [[nodiscard]] size_t owner_count() const noexcept { return owners_.size(); }
