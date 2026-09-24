@@ -216,16 +216,27 @@ the successful build. Evidence under
 (SHA256 `1bdee288b20d6c9bb0cbecf0663010098d435082dc9ab156638eb97c4a31be38`)
 and `run-w30-target-r1.log`
 (SHA256 `001c3bd76ae1bf1e3d32721f24ea16cd847a9c5561cd14c527f408ece4c4865b`),
-both exit 0. The standard daemon runner has not yet been rerun on that exact
-combined commit.
+both exit 0. A subsequent standard daemon runner on the exact combined commit
+passes its default invocation but fails in the pending-disconnect invocation:
+the later source-arm ACK and dependent CACHE_SESSION checks fail. Evidence:
+`run-daemon-standard-r1.log` under the same root (exit 1, SHA256
+`454cf61e8a85f6d2642a1e2a554420a6848d800dec04952cba8f4953e9f4e6a4`).
+The runner stops there, before P51 cancellation/replacement and vertical modes.
+The daemon rejects the next source ARM with `advertisement=0`; whether this
+is a readiness-fixture error or a product regression remains under investigation.
+This is not a passing full runner.
 
-Continuation handoff: the three Luna agents stopped with usage-limit errors.
-No task test container remained running at the final check. Uncommitted work
-is limited to `unittests/p51wrappercompile-run.sh` and
-`unittests/p50compilee2e-source.sh`; actual-wrapper success is not established.
+Continuation handoff: the three Luna agents temporarily stopped with
+usage-limit errors, then resumed on retry. Actual-wrapper success is not
+established; its script and source-contract update remain under development.
 The wrapper scratch roots start with `/tanksmall/scratch/tmp/p51-wrapper-w31`.
-Real C/F process-restart coverage was identified as missing but no restart
-test patch was completed. Next: finish actual-wrapper 31-job object comparison,
+The retained r3 run fails before compilation: both daemon sidecar lifecycles
+enter DegradedLegacy before launch. The generated private runtime path is
+112 characters before adding `/cache.sock`, exceeding the Unix socket path
+limit of 107. The harness is being rerun with a shorter container mount alias,
+still backed by host scratch storage; the daemon-account warning is not the
+cause. A C1F2/F-cache and C2F1/C-cache process-restart fixture is being written
+and reviewed; it is not yet qualified. Next: finish actual-wrapper 31-job object comparison,
 standard daemon rerun on the combined commit, real C/F/S restart gates, and
 mixed-version qualification. Do not count same-process socket recovery as a
 process-restart test.
