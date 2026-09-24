@@ -76,23 +76,26 @@ Earlier stale-snapshot failures are not passes; these targeted results close
 those checks only. Newer independent C reader/writer and recovery edits are
 separate work and must obtain their own build/runtime evidence.
 
-The direct ZSTD_TU endpoint W30 test now passes against the endpoint and
-protocol blobs in `4f3efa45267b6cc724de4cc5ef6328ff4ee12676`. C writes 30
+The direct endpoint W30 test passes for ZSTD_TU, P29V1 and ZSTD_ROUTE on a
+clean `959fee2c` overlay containing the R2 P29 NEED-transition fix and the
+generalized regression test. C writes 30
 complete bundles on one TCP link; F commits all 30 before C reads any
 receipt. C validates the ordered receipts, sends cumulative ACK 30, then
 prepares and sends job 31 on the same connection. Exact input bytes for all
 31 jobs, ACK 31 and clean CLOSE are checked. Preparation capacity is 30;
 the refill input is not prepared until the first window has drained.
 
-This is **ZSTD_TU direct C/F endpoint evidence only**. It does not qualify
-the production multi-caller sender, P29V1/ZSTD_ROUTE W30, recovery, restart,
-mixed-version operation or farm performance. Evidence:
-`/tanksmall/scratch/tmp/p50-w30-direct.ZafPlb/logs/w30-direct-r2.log`
-(SHA256 `cd8d5a4baae9105837fc927109f6f1e4dfe89c80d0f1899f319f8d2b909ebe19`).
+This is **three-profile direct C/F endpoint evidence only**. It does not
+qualify the production multi-caller sender, recovery, restart, mixed-version
+operation or farm performance. P29 derives its local NEED state after BODY,
+without sending a NEED frame; waiting for FILL-dependent completion here
+previously prevented P29 commits. Evidence:
+`/tanksmall/scratch/tmp/p50-p29-clean-959fee2c/work/artifacts/focused-build-test-r3.log`
+(SHA256 `2b916738daac2e9384a256ac8234b8e62cabd56e1b9609936153935228ec2f10`).
 Test source SHA256:
-`1a134b2cb807417efe1e81e46638e6aba7d3254ee9e9193654eac899bde1a0fa`;
+`a091cfea40cfdf62af6ffdc86ff3b51aa4afe01d89101c3b8683c54621e6bfba`;
 binary SHA256:
-`9d8430d1cd4a4167ad5b317b3cdd4bca4caa1cf88bd23a6f532ea6cccacaa42c`.
+`25a54f9566b954bbe4ca0bf650378c8aa1fff324fc297feef07a82fd2e7ef355`.
 
 The first version-gate audit preserves ordinary maximum 50 and existing R1
 bytes. Focused `p50sourcearmwire`, `p50cachesessionwire`,

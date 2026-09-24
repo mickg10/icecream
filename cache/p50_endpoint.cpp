@@ -5372,13 +5372,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     outer_digest.append(component.payload);
                     impl_->append_body(session,
                                        BodyMessage{component.payload});
-                    if (impl_->body_complete(session)) {
-                        // The R2 sender predicted this exact NEED locally;
-                        // F derives the same profile obligations here but
-                        // intentionally emits no NEED frame on the wire.
-                        (void)impl_->require_route(session)
-                            .pending->dialogue->need_messages(frame_cap);
-                    }
+                    // R2 has no NEED wire frame, but P29 still needs its
+                    // local dialogue transition before the FILL messages.
+                    // Invoke after every BODY: it is a no-op until the full
+                    // encoded body is present, and P29's BodyClosed state is
+                    // reached only after FILL completes.
+                    (void)impl_->require_route(session)
+                        .pending->dialogue->need_messages(frame_cap);
                     continue;
                 }
                 if (component.type == MessageType::R2_FILL) {
