@@ -2621,11 +2621,12 @@ void DaemonSidecarAdapter::outer_apply_action(
     case sidecar::LifecycleAction::EnterDegradedLegacy:
         std::fprintf(stderr,
                      "cache sidecar degraded to legacy"
-                     " (attempts=%u max=%u owner_gen=%llu)\n",
+                     " (attempts=%u max=%llu owner_gen=%llu)\n",
                      outer_lifecycle_->attempts(),
-                     std::min<uint64_t>(100000,
-                         static_cast<uint64_t>(config_.max_restarts) +
-                             static_cast<uint64_t>(config_.max_attempts_per_recovery)),
+                     static_cast<unsigned long long>(
+                         std::min<uint64_t>(100000,
+                             static_cast<uint64_t>(config_.max_restarts) +
+                                 static_cast<uint64_t>(config_.max_attempts_per_recovery))),
                      static_cast<unsigned long long>(outer_lifecycle_->owner_key().generation));
         outer_authenticated_ = false;
         outer_ready_lease_.reset();
