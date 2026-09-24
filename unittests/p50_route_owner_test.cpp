@@ -1134,7 +1134,35 @@ std::array<uint8_t, 16> topology_guid(uint8_t seed, bool file_role) {
     return bytes;
 }
 
-P51SourceArmFields topology_arm(const TopologyLink& link, uint32_t wire_job) {
+uint32_t topology_cache_profile(ProfileId profile) {
+    switch (profile) {
+    case ProfileId::P29V1: return CACHE_PROFILE_P29V1;
+    case ProfileId::ZSTD_TU: return CACHE_PROFILE_ZSTD_TU;
+    case ProfileId::ZSTD_ROUTE: return CACHE_PROFILE_ZSTD_ROUTE;
+    }
+    return 0;
+}
+
+uint32_t topology_source_mode(ProfileId profile) {
+    switch (profile) {
+    case ProfileId::P29V1: return P50_SOURCE_MODE_P29V1;
+    case ProfileId::ZSTD_TU: return P50_SOURCE_MODE_ZSTD_TU;
+    case ProfileId::ZSTD_ROUTE: return P50_SOURCE_MODE_ZSTD_ROUTE;
+    }
+    return 0;
+}
+
+const char* topology_profile_name(ProfileId profile) {
+    switch (profile) {
+    case ProfileId::P29V1: return "P29V1";
+    case ProfileId::ZSTD_TU: return "ZSTD_TU";
+    case ProfileId::ZSTD_ROUTE: return "ZSTD_ROUTE";
+    }
+    return "invalid";
+}
+
+P51SourceArmFields topology_arm(const TopologyLink& link, uint32_t wire_job,
+                                ProfileId profile) {
     P51SourceArmFields arm;
     arm.source.wire_job_id = wire_job;
     arm.source.assignment_epoch = 3;
@@ -1143,14 +1171,14 @@ P51SourceArmFields topology_arm(const TopologyLink& link, uint32_t wire_job) {
     arm.source.selected_f_ordinary_port = 42001;
     arm.source.selected_f_cache_port = 42002;
     arm.source.cache_protocol = 2;
-    arm.source.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    arm.source.cache_profile = topology_cache_profile(profile);
     arm.source.logical_job = 700 + wire_job;
     arm.source.compiler_attempt = 900 + wire_job;
     arm.source.c_store_generation = link.c_generation;
     arm.source.c_store_derivation_version = kStoreIdentityDerivationVersion;
     arm.source.c_store_guid = link.c_guid.bytes;
     arm.source.source_request_id = static_cast<uint64_t>(wire_job) + 1000;
-    arm.source.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    arm.source.source_mode = topology_source_mode(profile);
     arm.source.c_control_generation = link.control_generation;
     arm.source.c_control_attempt = link.control_attempt;
     arm.requested_window = 30;
@@ -1181,11 +1209,12 @@ P51SourceArmedFields topology_armed(const TopologyLink& link,
     return armed;
 }
 
-void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
+void test_p51_w30_direct_topology(size_t c_count, size_t f_count,
+                                  ProfileId profile) {
     constexpr size_t kWindow = 30;
     constexpr size_t kRefill = 31;
-    std::fprintf(stderr, "P51_DIRECT_TOPOLOGY_BEGIN C%zuF%zu W30\n",
-                 c_count, f_count);
+    std::fprintf(stderr, "P51_DIRECT_TOPOLOGY_BEGIN C%zuF%zu %s W30\n",
+                 c_count, f_count, topology_profile_name(profile));
     std::fflush(stderr);
     CHECK((c_count == 1 && f_count >= 2 && f_count <= 4) ||
           (f_count == 1 && c_count >= 2 && c_count <= 4));
@@ -1207,8 +1236,8 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
     limits.max_speculative_raw_bytes = 2U << 20;
     limits.max_live_entries = 256;
     EndpointCaps caps;
-    caps.profile = ProfileId::ZSTD_TU;
-    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
 
@@ -1218,7 +1247,7 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
         CHECK(store_identity_guid_valid_for_role(c_guid.bytes,
                                                  kStoreIdentityClientRole));
         authorities[c] = std::make_shared<P50PreparationAuthority>(
-            c_guid, caps.zstd, limits, 1, ProfileId::ZSTD_TU);
+            c_guid, caps.zstd, limits, 1, profile);
     }
 
     for (size_t i = 0; i != link_count; ++i) {
@@ -1243,11 +1272,23 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
         link->input.reserve(kRefill);
         for (size_t job = 0; job != kRefill; ++job) {
             const uint32_t wire_job = static_cast<uint32_t>(10000 + i * 100 + job);
-            auto arm = topology_arm(*link, wire_job);
+            auto arm = topology_arm(*link, wire_job, profile);
             link->armed.push_back(topology_armed(*link, std::move(arm), job));
-            std::vector<uint8_t> bytes(96);
-            for (size_t b = 0; b != bytes.size(); ++b)
-                bytes[b] = static_cast<uint8_t>((i * 31 + job * 7 + b) & 0xff);
+            std::vector<uint8_t> bytes;
+            if (profile == ProfileId::ZSTD_TU) {
+                bytes.resize(96);
+                for (size_t b = 0; b != bytes.size(); ++b)
+                    bytes[b] = static_cast<uint8_t>((i * 31 + job * 7 + b) & 0xff);
+            } else {
+                const std::string source =
+                    "#define TOPO_" + std::to_string(i) + "_" +
+                    std::to_string(job) + " " + std::to_string(job + 1) +
+                    "\nstatic const unsigned int topo_" + std::to_string(i) +
+                    "_" + std::to_string(job) + " = TOPO_" +
+                    std::to_string(i) + "_" + std::to_string(job) +
+                    ";\n/* exact preprocessed source fixture */\n";
+                bytes.assign(source.begin(), source.end());
+            }
             link->input.push_back(std::move(bytes));
         }
         relationship_index.emplace(link->relationship, i);
@@ -1285,7 +1326,7 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
                 hello.f_store_guid != link.f_guid ||
                 hello.relationship_epoch != link.relationship_epoch ||
                 hello.physical_link_generation != link.physical_generation ||
-                hello.window != kWindow || hello.profile != ProfileId::ZSTD_TU)
+                hello.window != kWindow || hello.profile != profile)
                 return std::nullopt;
             P51SourceLinkLease lease;
             lease.initial_armed = link.armed.front();
@@ -1308,7 +1349,7 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
             if (job == link.armed.size() ||
                 binding.relationship_ordinal != job + 1 ||
                 binding.physical_link_generation != link.physical_generation ||
-                binding.profile != ProfileId::ZSTD_TU ||
+                binding.profile != profile ||
                 binding.raw_bytes != link.input[job].size() ||
                 binding.raw_digest != icecc::digest128(link.input[job]) ||
                 binding.wire_job_id != link.armed[job].arm.source.wire_job_id ||
@@ -1387,6 +1428,7 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
         ZstdSourceTransferConfig sender_config;
         sender_config.endpoint_caps = caps;
         sender_config.authority_limits = limits;
+        sender_config.endpoint_caps.profile = profile;
         sender_config.compression_level = 1;
         sender_config.deadline = deadline.as_steady_time_point();
         sender_config.hold_r2_receipt_reader_for_test = [&] {
@@ -1397,7 +1439,7 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
             progress_cv.notify_all();
         };
         const PreparationRouteKey route{
-            link.f_guid, link.f_generation, ProfileId::ZSTD_TU};
+            link.f_guid, link.f_generation, profile};
         link.sender = std::make_shared<P50ZstdSourceSender>(
             link.authority, route, PrepareRequestKey{3, 101}, sender_config);
         const tcp::endpoint remote = acceptors[f_count == 1 ? 0 : i]->local_endpoint();
@@ -1546,8 +1588,8 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count) {
     CHECK(aggregate_acknowledged == link_count * kRefill);
     for (auto& result : server_results)
         CHECK(result.get().status == ServerRunStatus::Disconnected);
-    std::fprintf(stderr, "P51_DIRECT_TOPOLOGY_PASS C%zuF%zu links=%zu peak=%u committed=%u ack=%u\n",
-                 c_count, f_count, link_count, admitted_before_ack,
+    std::fprintf(stderr, "P51_DIRECT_TOPOLOGY_PASS C%zuF%zu %s links=%zu peak=%u committed=%u ack=%u\n",
+                 c_count, f_count, topology_profile_name(profile), link_count, admitted_before_ack,
                  aggregate_committed, aggregate_acknowledged);
     std::fflush(stderr);
 }
@@ -1569,10 +1611,13 @@ int main() {
     test_typed_poison_catch_is_owner_wide();
     test_typed_poison_does_not_destroy_another_active_route();
     test_interner_fault_is_sticky_only_for_p29v1();
-    test_p51_w30_direct_topology(1, 2);
-    test_p51_w30_direct_topology(1, 3);
-    test_p51_w30_direct_topology(1, 4);
-    test_p51_w30_direct_topology(2, 1);
-    test_p51_w30_direct_topology(3, 1);
-    test_p51_w30_direct_topology(4, 1);
+    for (const ProfileId profile :
+         {ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE}) {
+        test_p51_w30_direct_topology(1, 2, profile);
+        test_p51_w30_direct_topology(1, 3, profile);
+        test_p51_w30_direct_topology(1, 4, profile);
+        test_p51_w30_direct_topology(2, 1, profile);
+        test_p51_w30_direct_topology(3, 1, profile);
+        test_p51_w30_direct_topology(4, 1, profile);
+    }
 }

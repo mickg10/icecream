@@ -30,16 +30,17 @@ Test binary SHA256:
 This does not qualify wrapper/daemon integration, recovery, restarts,
 multi-link topologies, or mixed farm operation.
 
-The direct ZSTD_TU topology regression also passes C1F2, C1F3, C1F4,
-C2F1, C3F1 and C4F1 against the committed production sender/endpoint.
+The direct topology regression also passes C1F2, C1F3, C1F4,
+C2F1, C3F1 and C4F1 for each of P29V1, ZSTD_TU and ZSTD_ROUTE
+against the committed production sender/endpoint (18 cells).
 The shared-C cases use one preparation authority; shared-F cases use one
 endpoint/store. Every link reaches 30 sends and 30 F commits before any ACK,
 then reaches 31 commits and cumulative ACK after refill. Aggregate pre-ACK
 occupancy is 60, 90 or 120. Exact input bytes and digests are checked.
-Evidence: `/tanksmall/scratch/tmp/p50-w30-topology-20260924/artifacts/run-r5.log`
-(SHA256 `07a91569f94b229a8e9c9760ecd8654ab7d79fdb932e25853a4688ef09cbf33f`).
-This does not prove multi-link P29V1/ZSTD_ROUTE, service-worker saturation,
-recovery, restart behavior, or mixed farm operation.
+Evidence: `/tanksmall/scratch/tmp/p50-w30-topology-20260924/artifacts/run-profiles-r1.log`
+(SHA256 `00f8889e16998f67a60bece78ec32ef10271dba2880789b4b53e9de160697d29`).
+This does not prove service-worker saturation, recovery, restart behavior,
+or mixed farm operation.
 
 The dormant recovery record codecs now pass the focused `p50wire` gate:
 exact payload sizes and round trips, truncation/trailing-byte rejection,
