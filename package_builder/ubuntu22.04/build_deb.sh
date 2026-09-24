@@ -159,7 +159,9 @@ cd "$NEW_DIR"
 
 dch --newversion "$DEB_VERSION" --distribution "$DEB_DIST" "Local build from git checkout."
 
-dpkg-buildpackage -us -uc -b
+# The distro asciidoc runs "python3 -m asciidoc", so the build must find the
+# distro python3 before the uv environment; tests re-enter dev/python.sh.
+PATH="/usr/bin:$PATH" dpkg-buildpackage -us -uc -b
 
 cd ..
 # Empty per-run output directory + manifest (PKG-2): repeated runs used to
