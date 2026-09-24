@@ -47,7 +47,7 @@ All integers below use network byte order, with no struct padding.
 | P51_SOURCE_LEASE_REQUEST | `0x51f00000` | Exactly 32 bytes: job u32, assignment epoch u64, assignment nonce u64, profile u32, requested cache revision u32, requested window u32 |
 | P51_SOURCE_ARM | `0x51f00010` | Existing source-arm field ordering with cache revision 2, followed by requested window u32; separate validation from R1 |
 | P51_SOURCE_ARMED | `0x51f00011` | Exact P51 ARM echo, existing F identity/observation/budget/two-attempt-value fields, then reservation ID 16 bytes, logical relationship ID 16 bytes, relationship epoch u64, selected revision u32 and selected window u32 |
-| P51_CACHE_LINK_SESSION | `0x51f00012` | Reserved ordinary link-setup discriminator; no functioning persistent transition is provided by this codec checkpoint |
+| P51_CACHE_LINK_SESSION | `0x51f00012` | Empty link-setup request and empty READY echo; production transition remains under implementation |
 
 Requested revision is 2; requested window is 1–30. ARMED must select revision
 2 and a nonzero window no larger than requested. Reservation and relationship
@@ -64,6 +64,23 @@ consumed once under a bounded deadline. The version-4 ticket retains the full
 not repeated in the raw descriptor reply. Ordinary traffic, changed request
 identity, malformed descriptor data or a non-clean boundary invalidates the
 exchange. End-to-end asynchronous daemon integration remains a separate gate.
+
+The R2 auxiliary-link transition uses one protocol-51 ordinary connection per
+physical link. C sends empty P51_CACHE_LINK_SESSION and waits for the same
+empty message as READY. F first checks local sidecar availability and the
+clean ordinary parser boundary, then sends and flushes READY and hands off
+the descriptor without another ordinary read. C likewise hands off after
+decoding READY. Only then does C send LINK_HELLO. Any failure after READY
+closes that physical connection; it must not resume ordinary parsing.
+
+Buffered ordinary input prevents handoff. Kernel-queued R2 input after READY
+does not: a fast peer may already have sent HELLO while F finishes handing off
+the descriptor. Sending READY must preserve exactly the one-shot handoff
+associated with the decoded request; unrelated ordinary sends must not do so.
+The auxiliary connection owns no compiler job. Per-job ARM/ARMED stays on the
+original compiler connection, and JOB_BIND consumes its exact reservation on
+the persistent link. These are implementation requirements, not a claim that
+the production transition has passed its integration gate.
 
 ### Dormant CacheWire R2 W1 record codecs
 
