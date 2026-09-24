@@ -38,6 +38,12 @@
 #include <thread>
 #include <vector>
 
+// GCC 11 reports Boost.Asio's coroutine frame allocator as a new/delete
+// mismatch, and this target builds with -Werror.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+
 namespace icecc::p50::service {
 
 bool parse_p29_interner_fault_injection(
