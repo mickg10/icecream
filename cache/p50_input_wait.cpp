@@ -86,7 +86,9 @@ bool P50InputWaitState::arm_input(const P50SourceArm& arm) noexcept {
 }
 
 bool P50InputWaitState::arm_input(const P50SourceArmFields& arm) noexcept {
-    if (state_ != State::Idle || !arm.valid())
+    if (state_ != State::Idle ||
+        (!arm.valid_for_cache_revision(1) &&
+         !arm.valid_for_cache_revision(2)))
         return false;
     canonical_arm_ = arm;
     arm_ = P50SourceArm{};

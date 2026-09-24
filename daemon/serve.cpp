@@ -312,7 +312,7 @@ int handle_connection(const string &basedir, CompileJob *job,
     /* The compile worker enters the compiler environment below.  Preserve
        the F-side legacy-wire evidence destination across that namespace
        transition without exposing it to the executed compiler. */
-    if (!p50_input && client->protocol >= PROTOCOL_VERSION &&
+    if (!p50_input && protocol_supports_p50_r1_bridge(client->protocol) &&
         !client->p50_legacy_wire_prepare_trace()) {
         log_warning() << "legacy wire trace could not be prepared before environment entry for job "
                       << job->jobID() << endl;
@@ -489,7 +489,7 @@ int handle_connection(const string &basedir, CompileJob *job,
             }
         }
 
-        if (!p50_input && client->protocol >= PROTOCOL_VERSION &&
+        if (!p50_input && protocol_supports_p50_r1_bridge(client->protocol) &&
             !client->p50_legacy_wire_complete()) {
             log_warning() << "legacy wire witness did not reach completion for job "
                           << job->jobID() << endl;

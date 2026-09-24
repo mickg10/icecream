@@ -561,6 +561,39 @@ public:
         P50CacheFdReplyTicket replyTicket;
     };
 
+    struct PendingP51SourceLease {
+        P51SourceLeaseRequestFields request;
+        P51CacheFdReplyTicket reply_ticket;
+        icecc::p50::sidecar::ReadyLease ready_lease;
+        std::chrono::steady_clock::time_point deadline{};
+        std::unique_ptr<icecc::p50::local::UnixConnectOperation> connect;
+        std::unique_ptr<icecc::p50::local::Connection> control;
+        std::unique_ptr<icecc::p50::local::FrameOperation> frame;
+        bool hello_sent = false;
+    };
+
+    struct PendingP51SourceArm {
+        enum class Stage : uint8_t {
+            Connecting = 0,
+            HelloSend,
+            HelloAckRead,
+            ReservationSend,
+            ReservationReplyRead,
+            GoodbyeSend,
+        };
+        P51SourceArmFields arm;
+        icecc::p50::sidecar::ReadyLease ready_lease;
+        std::chrono::steady_clock::time_point deadline{};
+        uint64_t deadline_msec = 0;
+        icecc::p50::sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+        std::unique_ptr<icecc::p50::local::UnixConnectOperation> connect;
+        std::unique_ptr<icecc::p50::local::Connection> control;
+        std::unique_ptr<icecc::p50::local::FrameOperation> frame;
+        std::optional<P51SourceArmedFields> armed;
+        uint16_t reservation_error_code = 0;
+        Stage stage = Stage::Connecting;
+    };
+
     enum class P50InputLeaseState : uint8_t {
         None = 0,
         Active,
@@ -740,6 +773,8 @@ public:
     // closing the ordinary submitter proxy or minting another scheduler job.
     std::optional<DeferredP50CacheFdRequest>
         deferred_p50_cache_fd_request;
+    std::unique_ptr<PendingP51SourceLease> pending_p51_source_lease;
+    std::unique_ptr<PendingP51SourceArm> pending_p51_source_arm;
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
@@ -815,6 +850,8 @@ public:
     // projection above is only a state gate; these values are the authority
     // used for later CompileFile matching and teardown settlement.
     std::optional<P50SourceArmFields> p50_source_arm_fields;
+    std::optional<P51SourceArmFields> p51_source_arm_fields;
+    std::optional<P51SourceArmedFields> p51_source_armed_fields;
     std::optional<icecc::p50::sidecar::ReadyLease> p50_source_f_lease;
     // Retain the complete ACK, not just a compact lease projection.  The
     // later cache-session join must be derivable from the canonical arm plus
@@ -952,9 +989,7 @@ public:
 
     [[nodiscard]] bool source_arm_matches_compile_claim(
         const CompileJob& candidate) const {
-        if (!p50_source_arm_fields.has_value() ||
-            !p50_source_armed_ack.has_value() ||
-            !p50_source_armed_ack->valid_payload() || !source_budget_live() ||
+        if (!p50_source_arm_fields.has_value() || !source_budget_live() ||
             p50_source_arm_provenance != connection_provenance ||
             !candidate.hasAssignmentIdentity() || candidate.jobID() == 0 ||
             candidate.jobID() != p50_source_arm_fields->wire_job_id ||
@@ -964,17 +999,36 @@ public:
             return false;
         }
         const CompileInputIdentity& input = candidate.compileInputIdentity();
-        const P50SourceArmedMsg& acknowledgement = *p50_source_armed_ack;
-        const bool ack_matches_lease = p50_source_f_lease.has_value() &&
-            acknowledgement.arm == *p50_source_arm_fields &&
-            acknowledgement.f_control_generation ==
-                p50_source_f_lease->identity.generation &&
-            acknowledgement.f_control_attempt ==
-                p50_source_f_lease->identity.attempt &&
-            acknowledgement.f_store_generation == p50_source_f_store_generation &&
-            acknowledgement.f_store_guid == p50_source_f_lease->f_store_guid.bytes &&
-            acknowledgement.f_store_derivation_version ==
-                p50_source_f_lease->store_derivation_version;
+        bool ack_matches_lease = false;
+        if (p51_source_arm_fields.has_value() &&
+            p51_source_armed_fields.has_value()) {
+            const P51SourceArmedFields &acknowledgement =
+                *p51_source_armed_fields;
+            ack_matches_lease = p50_source_f_lease.has_value() &&
+                acknowledgement.acknowledges(
+                    P51SourceArmMsg{*p51_source_arm_fields}) &&
+                acknowledgement.f_control_generation ==
+                    p50_source_f_lease->identity.generation &&
+                acknowledgement.f_control_attempt ==
+                    p50_source_f_lease->identity.attempt &&
+                acknowledgement.f_store_generation == p50_source_f_store_generation &&
+                acknowledgement.f_store_guid == p50_source_f_lease->f_store_guid.bytes &&
+                acknowledgement.f_store_derivation_version ==
+                    p50_source_f_lease->store_derivation_version;
+        } else if (p50_source_armed_ack.has_value() &&
+                   p50_source_armed_ack->valid_payload()) {
+            const P50SourceArmedMsg& acknowledgement = *p50_source_armed_ack;
+            ack_matches_lease = p50_source_f_lease.has_value() &&
+                acknowledgement.arm == *p50_source_arm_fields &&
+                acknowledgement.f_control_generation ==
+                    p50_source_f_lease->identity.generation &&
+                acknowledgement.f_control_attempt ==
+                    p50_source_f_lease->identity.attempt &&
+                acknowledgement.f_store_generation == p50_source_f_store_generation &&
+                acknowledgement.f_store_guid == p50_source_f_lease->f_store_guid.bytes &&
+                acknowledgement.f_store_derivation_version ==
+                    p50_source_f_lease->store_derivation_version;
+        }
         return ack_matches_lease &&
                ((input.profile == CompileInputIdentity::P29V1Profile &&
                  p50_source_arm_fields->cache_profile == CACHE_PROFILE_P29V1) ||
@@ -1634,6 +1688,17 @@ struct Daemon {
         Client *client, P50CacheSessionFdRequestMsg *msg,
         P50CacheFdReplyTicket reply_ticket = {})
         __attribute_warn_unused_result__;
+    bool handle_p51_source_lease_request(
+        Client *client, P51SourceLeaseRequestMsg *msg,
+        P51CacheFdReplyTicket reply_ticket = {})
+        __attribute_warn_unused_result__;
+    bool handle_p51_source_arm(Client *client, P51SourceArmMsg *msg)
+        __attribute_warn_unused_result__;
+    bool advance_p51_source_arms(const std::vector<pollfd>& pollfds);
+    bool handle_p51_cache_link_session(
+        Client *client, P51CacheLinkSessionMsg *msg)
+        __attribute_warn_unused_result__;
+    bool advance_p51_source_leases(const std::vector<pollfd>& pollfds);
     bool handle_compile_done(Client *client) __attribute_warn_unused_result__;
     bool handle_verify_env(Client *client, VerifyEnvMsg *msg) __attribute_warn_unused_result__;
     bool handle_blacklist_host_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
@@ -5352,6 +5417,11 @@ uint64_t Daemon::next_p50_source_deadline_msec() const noexcept
     uint64_t earliest = 0;
     for (const auto& entry : clients) {
         const Client *client = entry.second;
+        if (client != nullptr && client->pending_p51_source_arm &&
+            client->pending_p51_source_arm->deadline_msec != 0 &&
+            (earliest == 0 ||
+             client->pending_p51_source_arm->deadline_msec < earliest))
+            earliest = client->pending_p51_source_arm->deadline_msec;
         if (client == nullptr || client->status != Client::WAITP50INPUT ||
             !client->p50_source_arm_fields.has_value() ||
             client->p50_source_deadline_msec == 0) {
@@ -8873,6 +8943,7 @@ void Daemon::handle_end(Client *client, int exitcode)
     // becomes Active. Close its transport first, then revoke that exact
     // pending incarnation even when completion never published an active lease.
     client->p50_attachment.reset();
+    client->pending_p51_source_arm.reset();
     if (client->p50_attachment_lease.has_value()) {
         const auto lease = *client->p50_attachment_lease;
         client->p50_attachment_lease.reset();
@@ -8904,6 +8975,8 @@ void Daemon::handle_end(Client *client, int exitcode)
         client->p50_input_wait.close();
     }
     client->p50_source_arm_fields.reset();
+    client->p51_source_arm_fields.reset();
+    client->p51_source_armed_fields.reset();
     client->p50_attachment.reset();
     client->p50_attachment_job.reset();
     client->p50_attachment_result.reset();
@@ -9763,6 +9836,656 @@ bool Daemon::handle_p50_cache_session_fd_request(
     return true;
 }
 
+bool Daemon::handle_p51_source_lease_request(
+    Client *client, P51SourceLeaseRequestMsg *msg,
+    P51CacheFdReplyTicket reply_ticket)
+{
+    auto refuse = [&](const char *reason) {
+        log_warning() << "P51 C-cache source lease refused: " << reason << endl;
+        if (client != nullptr && client->channel != nullptr)
+            (void)client->channel->send_msg(EndMsg());
+        if (client != nullptr)
+            handle_end(client, 151);
+        return false;
+    };
+    if (client == nullptr || client->channel == nullptr || msg == nullptr ||
+        !msg->valid_payload() ||
+        !protocol_supports_cache_r2(client->channel->protocol))
+        return refuse("invalid request or protocol");
+
+    const P51SourceLeaseRequestFields &request = msg->request;
+    const ConnectionProvenance &provenance = client->connection_provenance;
+    const UseCSMsg *const assignment = client->usecsmsg;
+    Client::CacheHandoff &handoff = client->cacheHandoff;
+    const bool assignment_owner_status =
+        client->status == Client::WAITCOMPILE ||
+        client->status == Client::CLIENTWORK;
+    if (!assignment_owner_status || !provenance.cache_eligible() ||
+        !connection_leases.revalidate(provenance.lease, client, client->channel,
+                                      provenance.peer).has_value())
+        return refuse("wrapper is not the live assignment owner");
+    if (assignment == nullptr || !assignment->valid_payload() ||
+        !handoff.valid || request.wire_job_id != assignment->job_id ||
+        request.assignment_epoch != assignment->assignmentEpoch() ||
+        request.assignment_nonce != assignment->assignmentNonce() ||
+        request.wire_job_id != handoff.wireJobId ||
+        request.assignment_epoch != handoff.assignmentEpoch ||
+        request.assignment_nonce != handoff.assignmentNonce ||
+        assignment->cache_endpoint_port != handoff.cachePort ||
+        assignment->cache_protocol != request.requested_cache_revision ||
+        handoff.cacheProtocol != request.requested_cache_revision ||
+        assignment->cache_profile_mask != handoff.cacheProfileMask ||
+        (request.profile & handoff.cacheProfileMask) != request.profile)
+        return refuse("request does not match the retained R2 assignment");
+
+    if (!reply_ticket.valid())
+        reply_ticket = client->channel->take_p51_cache_fd_reply_ticket(*msg);
+    if (!reply_ticket.valid())
+        return refuse("source-lease reply authority is unavailable");
+    if (cache_adapter == nullptr || !cache_adapter->authenticated())
+        return refuse("supervised cache service is unavailable");
+    const auto ready_lease = cache_adapter->outer_current_ready_lease();
+    if (!ready_lease.has_value() || !ready_lease->valid())
+        return refuse("supervised cache service has no current READY lease");
+    if (client->pending_p51_source_lease)
+        return refuse("a source lease is already pending on this wrapper");
+    size_t pending_count = 0;
+    for (const auto &entry : clients)
+        pending_count += entry.second->pending_p51_source_lease ? 1u : 0u;
+    if (pending_count >= 64)
+        return refuse("bounded source-lease setup capacity is full");
+    if (!handoff.readyLease.has_value() || !handoff.readyLease->valid())
+        return refuse("assignment has no retained READY lease");
+    if (!icecc::p50::daemon::p50_ready_lease_observation_equal(
+            *handoff.readyLease, *ready_lease)) {
+        const bool eligible_successor =
+            scheduler_owns_getcs_assignment(client) &&
+            assignment->cache_protocol == handoff.cacheProtocol &&
+            (request.profile & handoff.cacheProfileMask) == request.profile &&
+            (request.profile & cache_unavailable_profile_mask) == 0;
+        if (!eligible_successor)
+            return refuse("assignment READY lease changed before source setup");
+        handoff.readyLease = *ready_lease;
+        handoff.routeStateGeneration = cache_route_state_generation;
+    }
+
+    try {
+        auto pending = std::make_unique<Client::PendingP51SourceLease>();
+        pending->request = request;
+        pending->reply_ticket = std::move(reply_ticket);
+        pending->ready_lease = *ready_lease;
+        pending->deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(1);
+        pending->connect = std::make_unique<
+            icecc::p50::local::UnixConnectOperation>(
+                ready_lease->socket_path, pending->deadline);
+        pending->connect->advance();
+        client->pending_p51_source_lease = std::move(pending);
+    } catch (...) {
+        return refuse("cannot allocate bounded source-lease setup state");
+    }
+    return true;
+}
+
+bool Daemon::handle_p51_source_arm(Client *client, P51SourceArmMsg *msg)
+{
+    auto refuse = [&](const char *reason) {
+        log_warning() << "P51 source arm refused: " << reason << endl;
+        if (client != nullptr && client->channel != nullptr)
+            (void)client->channel->send_msg(EndMsg());
+        if (client != nullptr)
+            handle_end(client, 153);
+        return false;
+    };
+    if (client == nullptr || client->channel == nullptr || msg == nullptr ||
+        !msg->valid_payload() ||
+        !protocol_supports_cache_r2(client->channel->protocol))
+        return refuse("invalid request or protocol");
+
+    const P51SourceArmFields arm = msg->arm;
+    const P50SourceArmFields &source = arm.source;
+    const auto &provenance = client->connection_provenance;
+    if (client->status != Client::UNKNOWN || client->p50_source_arm_fields ||
+        client->p51_source_arm_fields || client->pending_p51_source_lease ||
+        client->pending_p51_source_arm || client->job != nullptr ||
+        !client->source_wrapper_provenance_valid() ||
+        cache_adapter == nullptr || !cache_adapter->authenticated() ||
+        !scheduler_session_active || !cache_advertisement_snapshot().present() ||
+        !connection_leases.revalidate_live(
+            provenance.lease, client, client->channel, provenance.peer))
+        return refuse("daemon state or assignment owner is not eligible");
+
+    const auto &current_lease = cache_adapter->outer_current_ready_lease();
+    if (!current_lease.has_value() || !current_lease->valid())
+        return refuse("sidecar has no READY lease");
+    const auto snapshot = cache_advertisement_snapshot();
+    if (source.selected_f_host != remote_name ||
+        source.selected_f_ordinary_port != static_cast<uint32_t>(daemon_port) ||
+        source.selected_f_cache_port != snapshot.endpoint_port ||
+        source.cache_protocol != snapshot.protocol ||
+        source.cache_protocol != CACHE_WIRE_REVISION_R2 ||
+        !p50_source_profile_selection_valid(source.cache_profile) ||
+        !p50_source_profile_mode_valid(source.cache_profile, source.source_mode) ||
+        (snapshot.profile_mask & source.cache_profile) != source.cache_profile ||
+        source.c_store_derivation_version != current_lease->store_derivation_version ||
+        icecc::p50::store_identity_file_guid_matches_client(
+            source.c_store_guid, current_lease->f_store_guid.bytes))
+        return refuse("source request differs from the selected R2 endpoint");
+    if (!authorize_source_arm_claim(
+            source, static_cast<uint32_t>(client->client_id)))
+        return refuse("assignment claim was refused");
+    client->job_id = source.wire_job_id;
+    client->last_known_job_id = source.wire_job_id;
+
+    const uint64_t budget_msec = p50_source_arm_budget_msec();
+    const uint64_t now_msec = monotonic_msec();
+    if (budget_msec == 0 ||
+        budget_msec > P50SourceArmedFields::MaxSourceBudgetMsec ||
+        now_msec > UINT64_MAX - budget_msec) {
+        finish_assignment_claim(source.wire_job_id);
+        return refuse("source deadline cannot be represented");
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(budget_msec);
+    try {
+        size_t pending_count = 0;
+        for (const auto &entry : clients)
+            pending_count += entry.second->pending_p51_source_arm ? 1u : 0u;
+        if (pending_count >= 64) {
+            finish_assignment_claim(source.wire_job_id);
+            return refuse("bounded reservation setup capacity is full");
+        }
+        auto pending = std::make_unique<Client::PendingP51SourceArm>();
+        pending->arm = arm;
+        pending->ready_lease = *current_lease;
+        pending->deadline = deadline;
+        pending->deadline_msec = now_msec + budget_msec;
+        const auto clock =
+            icecc::p50::sidecar::process_monotonic_clock_identity();
+        pending->absolute_deadline =
+            icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                deadline, clock.clock_domain_id, clock.time_namespace_id);
+        if (!pending->absolute_deadline.valid())
+            throw std::invalid_argument("invalid monotonic deadline");
+        pending->connect = std::make_unique<icecc::p50::local::UnixConnectOperation>(
+            current_lease->socket_path, deadline);
+        pending->connect->advance();
+        client->pending_p51_source_arm = std::move(pending);
+    } catch (...) {
+        finish_assignment_claim(source.wire_job_id);
+        return refuse("cannot allocate bounded sidecar reservation state");
+    }
+    return true;
+}
+
+bool Daemon::advance_p51_source_leases(const std::vector<pollfd> &pollfds)
+{
+    for (const auto &entry : clients) {
+        Client *client = entry.second;
+        auto &pending = client->pending_p51_source_lease;
+        if (!pending)
+            continue;
+        short revents = 0;
+        const int operation_fd = pending->connect
+            ? pending->connect->poll_fd()
+            : pending->control && pending->frame
+                ? pending->control->native_handle() : -1;
+        for (const pollfd &descriptor : pollfds)
+            if (descriptor.fd == operation_fd)
+                revents |= descriptor.revents;
+
+        auto fail = [&](const char *reason) {
+            log_warning() << "P51 source lease setup failed: " << reason << endl;
+            pending.reset();
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 151);
+        };
+        if (std::chrono::steady_clock::now() >= pending->deadline) {
+            fail("deadline");
+            return true;
+        }
+        if (pending->connect) {
+            pending->connect->advance(revents);
+            if (!pending->connect->done())
+                continue;
+            if (pending->connect->status() !=
+                icecc::p50::local::Status::Ok) {
+                fail("connect");
+                return true;
+            }
+            try {
+                pending->control = std::make_unique<
+                    icecc::p50::local::Connection>(
+                        pending->connect->take_connection());
+                pending->connect.reset();
+                icecc::p50::local::CredentialExpectation expected_peer;
+                expected_peer.uid = ::geteuid();
+                expected_peer.gid = ::getegid();
+                if (!pending->control->valid() ||
+                    pending->control->verify_peer_credentials(expected_peer) !=
+                        icecc::p50::local::Status::Ok) {
+                    fail("peer credentials");
+                    return true;
+                }
+                const icecc::p50::local::Identity identity{
+                    pending->ready_lease.identity.generation,
+                    pending->ready_lease.identity.attempt};
+                pending->frame = std::make_unique<
+                    icecc::p50::local::FrameOperation>(
+                        *pending->control,
+                        icecc::p50::local::make_hello(
+                            icecc::p50::local::PeerRole::Daemon, identity),
+                        pending->deadline);
+            } catch (...) {
+                fail("hello setup");
+                return true;
+            }
+        }
+        if (!pending->frame)
+            continue;
+        pending->frame->advance();
+        if (!pending->frame->done())
+            continue;
+        if (pending->frame->status() != icecc::p50::local::Status::Ok) {
+            fail(pending->hello_sent ? "hello acknowledgement receive"
+                                     : "hello send");
+            return true;
+        }
+        if (!pending->hello_sent) {
+            pending->hello_sent = true;
+            const icecc::p50::local::Identity identity{
+                pending->ready_lease.identity.generation,
+                pending->ready_lease.identity.attempt};
+            try {
+                pending->frame = std::make_unique<
+                    icecc::p50::local::FrameOperation>(
+                        *pending->control, pending->deadline);
+            } catch (...) {
+                fail("acknowledgement setup");
+                return true;
+            }
+            (void)identity;
+            continue;
+        }
+        const icecc::p50::local::Identity identity{
+            pending->ready_lease.identity.generation,
+            pending->ready_lease.identity.attempt};
+        if (icecc::p50::local::validate_handshake(
+                pending->frame->frame(),
+                icecc::p50::local::MessageType::HelloAck,
+                icecc::p50::local::PeerRole::Sidecar, identity) !=
+            icecc::p50::local::Status::Ok) {
+            fail("acknowledgement identity");
+            return true;
+        }
+
+        const int client_fd = client->channel->fd;
+        const auto live = fd2client.find(client_fd);
+        const auto current_lease = cache_adapter != nullptr
+            ? cache_adapter->outer_current_ready_lease()
+            : std::optional<icecc::p50::sidecar::ReadyLease>{};
+        const auto revalidated = connection_leases.revalidate_live(
+            client->connection_provenance.lease, client, client->channel,
+            client->connection_provenance.peer);
+        const bool exact_assignment = client->usecsmsg != nullptr &&
+            client->cacheHandoff.valid &&
+            pending->request.wire_job_id == client->usecsmsg->job_id &&
+            pending->request.assignment_epoch ==
+                client->usecsmsg->assignmentEpoch() &&
+            pending->request.assignment_nonce ==
+                client->usecsmsg->assignmentNonce() &&
+            pending->request.requested_cache_revision ==
+                client->usecsmsg->cache_protocol &&
+            pending->request.requested_cache_revision ==
+                client->cacheHandoff.cacheProtocol &&
+            client->usecsmsg->cache_endpoint_port ==
+                client->cacheHandoff.cachePort &&
+            (pending->request.profile &
+             client->cacheHandoff.cacheProfileMask) ==
+                pending->request.profile;
+        if (live == fd2client.end() || live->second != client ||
+            !revalidated || !exact_assignment || !current_lease ||
+            !current_lease->valid() ||
+            !client->cacheHandoff.readyLease.has_value() ||
+            !client->cacheHandoff.readyLease->valid()) {
+            fail("stale Client, assignment, or READY lease");
+            return true;
+        }
+        if (!icecc::p50::daemon::p50_ready_lease_observation_equal(
+                pending->ready_lease, *current_lease) ||
+            !icecc::p50::daemon::p50_ready_lease_observation_equal(
+                *client->cacheHandoff.readyLease, *current_lease)) {
+            const bool eligible_successor =
+                scheduler_owns_getcs_assignment(client) &&
+                client->usecsmsg->cache_protocol ==
+                    client->cacheHandoff.cacheProtocol &&
+                (pending->request.profile &
+                 client->cacheHandoff.cacheProfileMask) ==
+                    pending->request.profile &&
+                (pending->request.profile &
+                 cache_unavailable_profile_mask) == 0;
+            if (!eligible_successor) {
+                fail("READY replacement is not assignment-eligible");
+                return true;
+            }
+            pending->frame.reset();
+            pending->control.reset();
+            pending->connect.reset();
+            pending->hello_sent = false;
+            pending->ready_lease = *current_lease;
+            client->cacheHandoff.readyLease = *current_lease;
+            client->cacheHandoff.routeStateGeneration =
+                cache_route_state_generation;
+            try {
+                pending->connect = std::make_unique<
+                    icecc::p50::local::UnixConnectOperation>(
+                        current_lease->socket_path, pending->deadline);
+                pending->connect->advance();
+            } catch (...) {
+                fail("successor READY connect allocation");
+            }
+            return true;
+        }
+        const int transfer_fd = ::dup(pending->control->native_handle());
+        if (transfer_fd < 0) {
+            fail("descriptor duplication");
+            return true;
+        }
+        const int flags = ::fcntl(transfer_fd, F_GETFD);
+        if (flags < 0 ||
+            ::fcntl(transfer_fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+            (void)::close(transfer_fd);
+            fail("descriptor CLOEXEC");
+            return true;
+        }
+        const P51CacheControlIdentity control_identity{
+            identity.generation, identity.attempt,
+            static_cast<uint64_t>(::geteuid()),
+            static_cast<uint64_t>(::getegid()),
+            pending->ready_lease.store_generation,
+            pending->ready_lease.store_derivation_version,
+            pending->ready_lease.c_store_guid.bytes};
+        const P51SourceLeaseRequestFields request = pending->request;
+        const auto reply_deadline = pending->deadline;
+        P51CacheFdReplyTicket ticket = std::move(pending->reply_ticket);
+        pending.reset();
+        if (!client->channel->send_p51_cache_fd_reply(
+                std::move(ticket), control_identity, transfer_fd,
+                reply_deadline)) {
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 151);
+            return true;
+        }
+        trace() << "P51 C-cache source-control lease delivered for assignment "
+                << request.wire_job_id << " profile " << request.profile
+                << " window " << request.requested_window << endl;
+        return true;
+    }
+    return false;
+}
+
+bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
+{
+    for (const auto &entry : clients) {
+        Client *client = entry.second;
+        auto &pending = client->pending_p51_source_arm;
+        if (!pending)
+            continue;
+        short revents = 0;
+        const int operation_fd = pending->connect
+            ? pending->connect->poll_fd()
+            : pending->control ? pending->control->native_handle() : -1;
+        for (const pollfd &descriptor : pollfds)
+            if (descriptor.fd == operation_fd)
+                revents |= descriptor.revents;
+
+        auto fail = [&](const char *reason) {
+            log_warning() << "P51 source arm setup failed: " << reason << endl;
+            const uint32_t job_id = pending->arm.source.wire_job_id;
+            pending.reset();
+            if (job_id != 0)
+                finish_assignment_claim(job_id);
+            if (client->channel != nullptr)
+                (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 153);
+        };
+        if (std::chrono::steady_clock::now() >= pending->deadline) {
+            fail("absolute source deadline");
+            return true;
+        }
+        if (pending->connect) {
+            pending->connect->advance(revents);
+            if (!pending->connect->done())
+                continue;
+            if (pending->connect->status() !=
+                icecc::p50::local::Status::Ok) {
+                fail("sidecar connect");
+                return true;
+            }
+            try {
+                pending->control = std::make_unique<icecc::p50::local::Connection>(
+                    pending->connect->take_connection());
+                pending->connect.reset();
+                icecc::p50::local::CredentialExpectation expected_peer;
+                expected_peer.uid = ::geteuid();
+                expected_peer.gid = ::getegid();
+                if (!pending->control->valid() ||
+                    pending->control->verify_peer_credentials(expected_peer) !=
+                        icecc::p50::local::Status::Ok) {
+                    fail("sidecar peer credentials");
+                    return true;
+                }
+                const icecc::p50::local::Identity identity{
+                    pending->ready_lease.identity.generation,
+                    pending->ready_lease.identity.attempt};
+                pending->frame = std::make_unique<icecc::p50::local::FrameOperation>(
+                    *pending->control,
+                    icecc::p50::local::make_hello(
+                        icecc::p50::local::PeerRole::Daemon, identity),
+                    pending->deadline);
+                pending->stage = Client::PendingP51SourceArm::Stage::HelloSend;
+            } catch (...) {
+                fail("sidecar hello setup");
+                return true;
+            }
+        }
+        if (!pending->frame)
+            continue;
+        pending->frame->advance();
+        if (!pending->frame->done())
+            continue;
+        if (pending->frame->status() != icecc::p50::local::Status::Ok) {
+            fail("sidecar control frame I/O");
+            return true;
+        }
+
+        const icecc::p50::local::Identity identity{
+            pending->ready_lease.identity.generation,
+            pending->ready_lease.identity.attempt};
+        try {
+            switch (pending->stage) {
+            case Client::PendingP51SourceArm::Stage::Connecting:
+                fail("invalid connect state");
+                return true;
+            case Client::PendingP51SourceArm::Stage::HelloSend:
+                pending->frame = std::make_unique<icecc::p50::local::FrameOperation>(
+                    *pending->control, pending->deadline);
+                pending->stage =
+                    Client::PendingP51SourceArm::Stage::HelloAckRead;
+                break;
+            case Client::PendingP51SourceArm::Stage::HelloAckRead:
+                if (icecc::p50::local::validate_handshake(
+                        pending->frame->frame(),
+                        icecc::p50::local::MessageType::HelloAck,
+                        icecc::p50::local::PeerRole::Sidecar, identity) !=
+                    icecc::p50::local::Status::Ok) {
+                    fail("sidecar hello acknowledgement identity");
+                    return true;
+                }
+                {
+                    const icecc::p50::local::P51SourceReservationRequest request{
+                        pending->arm, pending->absolute_deadline};
+                    auto operation =
+                        icecc::p50::local::make_p51_source_reservation_operation(
+                            identity, request);
+                    const std::vector<uint8_t> payload =
+                        icecc::p50::local::encode_control_operation(operation);
+                    if (payload.empty()) {
+                        fail("reservation request encoding");
+                        return true;
+                    }
+                    const icecc::p50::local::Frame frame{
+                        icecc::p50::local::kProtocolVersion,
+                        icecc::p50::local::MessageType::Data, identity, payload};
+                    pending->frame =
+                        std::make_unique<icecc::p50::local::FrameOperation>(
+                            *pending->control, frame, pending->deadline);
+                    pending->stage =
+                        Client::PendingP51SourceArm::Stage::ReservationSend;
+                }
+                break;
+            case Client::PendingP51SourceArm::Stage::ReservationSend:
+                pending->frame = std::make_unique<icecc::p50::local::FrameOperation>(
+                    *pending->control, pending->deadline);
+                pending->stage =
+                    Client::PendingP51SourceArm::Stage::ReservationReplyRead;
+                break;
+            case Client::PendingP51SourceArm::Stage::ReservationReplyRead: {
+                icecc::p50::local::ControlOperation observed;
+                const auto &frame = pending->frame->frame();
+                if (frame.type != icecc::p50::local::MessageType::Data ||
+                    icecc::p50::local::validate_identity(frame, identity) !=
+                        icecc::p50::local::Status::Ok ||
+                    !icecc::p50::local::decode_control_operation(
+                        frame.payload, observed) ||
+                    observed.kind !=
+                        icecc::p50::local::ControlOperationKind::SourceReservation ||
+                    observed.identity != identity ||
+                    observed.request_id != pending->arm.source.source_request_id ||
+                    !observed.p51_reservation.has_value() ||
+                    *observed.p51_reservation !=
+                        icecc::p50::local::P51SourceReservationRequest{
+                            pending->arm, pending->absolute_deadline} ||
+                    !observed.p51_reservation_result.has_value() ||
+                    !observed.p51_reservation_result->valid()) {
+                    fail("reservation response binding");
+                    return true;
+                }
+                pending->reservation_error_code =
+                    observed.p51_reservation_result->error_code;
+                pending->armed = observed.p51_reservation_result->armed;
+                const auto goodbye = icecc::p50::local::Frame{
+                    icecc::p50::local::kProtocolVersion,
+                    icecc::p50::local::MessageType::Goodbye, identity, {}};
+                pending->frame =
+                    std::make_unique<icecc::p50::local::FrameOperation>(
+                        *pending->control, goodbye, pending->deadline);
+                pending->stage = Client::PendingP51SourceArm::Stage::GoodbyeSend;
+                break;
+            }
+            case Client::PendingP51SourceArm::Stage::GoodbyeSend: {
+                const auto current_lease = cache_adapter != nullptr
+                    ? cache_adapter->outer_current_ready_lease()
+                    : std::optional<icecc::p50::sidecar::ReadyLease>{};
+                const int client_fd = client->channel != nullptr
+                    ? client->channel->fd : -1;
+                const auto live_fd = fd2client.find(client_fd);
+                const auto provenance = connection_leases.revalidate_live(
+                    client->connection_provenance.lease, client, client->channel,
+                    client->connection_provenance.peer);
+                const auto assignment = live_assignments.find(
+                    pending->arm.source.wire_job_id);
+                const bool exact_assignment =
+                    assignment != live_assignments.end() &&
+                    assignment->second.phase == WorkerAssignment::Claimed &&
+                    assignment->second.claimant ==
+                        static_cast<uint32_t>(client->client_id) &&
+                    assignment->second.key.epoch ==
+                        pending->arm.source.assignment_epoch &&
+                    assignment->second.key.nonce ==
+                        pending->arm.source.assignment_nonce;
+                if (live_fd == fd2client.end() || live_fd->second != client ||
+                    !provenance || !exact_assignment || !current_lease ||
+                    !current_lease->valid()) {
+                    fail("stale Client, assignment, or READY completion");
+                    return true;
+                }
+                if (!icecc::p50::daemon::p50_ready_lease_observation_equal(
+                        pending->ready_lease, *current_lease)) {
+                    pending->frame.reset();
+                    pending->control.reset();
+                    pending->connect.reset();
+                    pending->armed.reset();
+                    pending->ready_lease = *current_lease;
+                    pending->connect =
+                        std::make_unique<icecc::p50::local::UnixConnectOperation>(
+                            current_lease->socket_path, pending->deadline);
+                    pending->connect->advance();
+                    pending->stage =
+                        Client::PendingP51SourceArm::Stage::Connecting;
+                    return true;
+                }
+                if (pending->reservation_error_code != 0 ||
+                    !pending->armed.has_value()) {
+                    fail("F rejected source reservation");
+                    return true;
+                }
+                if (pending->deadline <= std::chrono::steady_clock::now() ||
+                    !pending->armed->acknowledges(
+                        P51SourceArmMsg{pending->arm})) {
+                    fail("expired or mismatched ARMED result");
+                    return true;
+                }
+                const uint64_t remaining = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        pending->deadline - std::chrono::steady_clock::now())
+                        .count());
+                if (remaining == 0 || remaining >
+                        P50SourceArmedFields::MaxSourceBudgetMsec) {
+                    fail("source deadline expired before ARMED");
+                    return true;
+                }
+                client->p50_source_arm_fields = pending->arm.source;
+                client->p51_source_arm_fields = pending->arm;
+                client->p51_source_armed_fields = *pending->armed;
+                if (!client->p50_input_wait.arm_input(pending->arm.source)) {
+                    fail("cannot install R2 input wait");
+                    return true;
+                }
+                client->p50_source_f_lease = *current_lease;
+                client->p50_source_f_store_generation =
+                    current_lease->store_generation;
+                client->p50_source_arm_provenance =
+                    client->connection_provenance;
+                client->p50_source_deadline_msec =
+                    monotonic_msec() + remaining;
+                client->p50_source_compile_pending = false;
+                client->set_status(
+                    Client::WAITP50INPUT,
+                    "p51: exact source reservation armed; waiting for CompileFile");
+                const P51SourceArmedMsg acknowledgement{*pending->armed};
+                if (!acknowledgement.valid_payload()) {
+                    fail("invalid final ARMED witness");
+                    return true;
+                }
+                pending.reset();
+                if (!client->channel->send_msg(acknowledgement)) {
+                    finish_assignment_claim(client->job_id);
+                    (void)client->channel->send_msg(EndMsg());
+                    handle_end(client, 153);
+                    return true;
+                }
+                return true;
+            }
+            }
+        } catch (...) {
+            fail("reservation state transition exception");
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Daemon::handle_cache_session(Client *client, Msg *msg)
 {
     if (!client || !client->channel || !msg || *msg != Msg::CACHE_SESSION) {
@@ -9836,6 +10559,72 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
             << ready_lease->identity.generation << "/"
             << ready_lease->identity.attempt << ")" << endl;
     return true;
+}
+
+bool Daemon::handle_p51_cache_link_session(
+    Client *client, P51CacheLinkSessionMsg *msg)
+{
+    auto refuse = [&](const char *reason) {
+        log_warning() << "P51 cache-link setup refused: " << reason << endl;
+        if (client != nullptr && client->channel != nullptr)
+            (void)client->channel->send_msg(EndMsg());
+        if (client != nullptr)
+            handle_end(client, 152);
+        return false;
+    };
+    if (client == nullptr || client->channel == nullptr || msg == nullptr ||
+        !protocol_supports_cache_r2(client->channel->protocol))
+        return refuse("invalid request or protocol");
+
+    const int old_fd = client->channel->fd;
+    const auto &provenance = client->connection_provenance;
+    if (client->status != Client::UNKNOWN || client->job != nullptr ||
+        client->usecsmsg != nullptr ||
+        client->p50_source_arm_fields.has_value() ||
+        client->pending_p51_source_lease || client->p50_attachment ||
+        client->p50_attachment_lease.has_value() ||
+        !provenance.cache_eligible() ||
+        !connection_leases.revalidate_live(
+            provenance.lease, client, client->channel, provenance.peer))
+        return refuse("link channel is not a pristine live public TCP connection");
+    if (cache_adapter == nullptr || !cache_adapter->authenticated() ||
+        cache_adapter->dispatcher() == nullptr)
+        return refuse("authenticated cache sidecar is unavailable");
+    const auto ready_lease = cache_adapter->outer_current_ready_lease();
+    if (!ready_lease.has_value() || !ready_lease->valid())
+        return refuse("sidecar has no current READY endpoint");
+
+    const auto outcome = cache_adapter->dispatcher()->dispatch(
+        *client->channel, client->channel->protocol,
+        static_cast<uint32_t>(Msg::P51_CACHE_LINK_SESSION));
+    if (outcome.result != icecc::p50::daemon::CacheDispatchResult::Accepted ||
+        !outcome.detached || !outcome.handoff_acknowledged ||
+        !outcome.trailing_byte_barrier) {
+        log_warning() << "P51 cache-link handoff failed (result="
+                      << int(outcome.result) << ", handoff="
+                      << icecc::p50::local::fd_handoff_status_name(
+                             outcome.handoff_status)
+                      << ", detached=" << (outcome.detached ? 1 : 0)
+                      << ", acknowledged="
+                      << (outcome.handoff_acknowledged ? 1 : 0)
+                      << ", boundary="
+                      << (outcome.trailing_byte_barrier ? 1 : 0) << ")"
+                      << endl;
+        handle_end(client, 152);
+        return false;
+    }
+
+    // This is an auxiliary persistent-data-link setup socket, not a compiler
+    // assignment owner.  The clean descriptor is now owned by the sidecar;
+    // remove only this temporary ordinary client without settling any job.
+    const auto fd_entry = fd2client.find(old_fd);
+    if (fd_entry != fd2client.end() && fd_entry->second == client)
+        fd2client.erase(fd_entry);
+    trace() << "P51 cache-link descriptor adopted by sidecar (generation "
+            << ready_lease->identity.generation << "/"
+            << ready_lease->identity.attempt << ")" << endl;
+    handle_end(client, 0);
+    return false;
 }
 
 bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
@@ -10038,6 +10827,14 @@ bool Daemon::handle_activity(Client *client)
         return false;
     }
 
+    if (client->pending_p51_source_lease) {
+        delete msg;
+        log_warning() << "P51 wrapper sent another frame before its source lease completed"
+                      << endl;
+        handle_end(client, 151);
+        return false;
+    }
+
     // Recheck the one absolute F-local deadline before every later ordinary
     // message.  No CompileFile/arm replay can renew this nonrenewable lease.
     if (client->p50_source_arm_fields.has_value() &&
@@ -10091,9 +10888,21 @@ bool Daemon::handle_activity(Client *client)
         ret = handle_p50_cache_session_fd_request(
             client, dynamic_cast<P50CacheSessionFdRequestMsg *>(msg));
         break;
+    case Msg::P51_SOURCE_LEASE_REQUEST:
+        ret = handle_p51_source_lease_request(
+            client, dynamic_cast<P51SourceLeaseRequestMsg *>(msg));
+        break;
+    case Msg::P51_CACHE_LINK_SESSION:
+        ret = handle_p51_cache_link_session(
+            client, dynamic_cast<P51CacheLinkSessionMsg *>(msg));
+        break;
     case Msg::P50_SOURCE_ARM:
         ret = handle_p50_source_arm(client,
                                     dynamic_cast<P50SourceArmMsg *>(msg));
+        break;
+    case Msg::P51_SOURCE_ARM:
+        ret = handle_p51_source_arm(
+            client, dynamic_cast<P51SourceArmMsg *>(msg));
         break;
     case Msg::VERIFY_ENV:
         ret = handle_verify_env(client, dynamic_cast<VerifyEnvMsg *>(msg));
@@ -10459,6 +11268,31 @@ void Daemon::answer_client_requests()
         pollfds.push_back(pfd);
     }
 
+    for (const auto &entry : clients) {
+        const Client *client = entry.second;
+        if (!client->pending_p51_source_lease)
+            continue;
+        const auto &pending = *client->pending_p51_source_lease;
+        if (pending.connect && pending.connect->poll_fd() >= 0)
+            pollfds.push_back(pollfd{pending.connect->poll_fd(),
+                                     pending.connect->poll_events(), 0});
+        else if (pending.control && pending.frame)
+            pollfds.push_back(pollfd{pending.control->native_handle(),
+                                     pending.frame->poll_events(), 0});
+    }
+    for (const auto &entry : clients) {
+        const Client *client = entry.second;
+        if (!client->pending_p51_source_arm)
+            continue;
+        const auto &pending = *client->pending_p51_source_arm;
+        if (pending.connect && pending.connect->poll_fd() >= 0)
+            pollfds.push_back(pollfd{pending.connect->poll_fd(),
+                                     pending.connect->poll_events(), 0});
+        else if (pending.control && pending.frame)
+            pollfds.push_back(pollfd{pending.control->native_handle(),
+                                     pending.frame->poll_events(), 0});
+    }
+
     /* G4 (16:47#1): set when a client had more than one complete message already
        parsed into its channel's userspace buffer; fd readiness will not re-fire
        for bytes drained out of the kernel, so we force a zero-timeout poll below
@@ -10570,6 +11404,19 @@ void Daemon::answer_client_requests()
             poll_timeout_msec = remaining;
     }
     for (const auto& entry : clients) {
+        const auto &lease = entry.second->pending_p51_source_lease;
+        if (lease) {
+            auto wakeup = lease->deadline;
+            if (lease->connect)
+                wakeup = std::min(wakeup, lease->connect->next_wakeup());
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    wakeup - std::chrono::steady_clock::now()).count();
+            const int timeout = static_cast<int>(std::clamp<int64_t>(
+                remaining, 0, std::numeric_limits<int>::max()));
+            if (poll_timeout_msec < 0 || timeout < poll_timeout_msec)
+                poll_timeout_msec = timeout;
+        }
         const auto& attachment = entry.second->p50_attachment;
         if (!attachment) continue;
         if (attachment->poll_fd() >= 0)
@@ -10702,6 +11549,14 @@ void Daemon::answer_client_requests()
     // at the same instant.  Re-run the exact owner sweep before touching any
     // revents so an expired owner cannot consume a late frame.
     if (expire_p50_source_waiters()) {
+        return;
+    }
+    if (advance_p51_source_leases(pollfds)) {
+        finish_scheduler_loss_if_needed();
+        return;
+    }
+    if (advance_p51_source_arms(pollfds)) {
+        finish_scheduler_loss_if_needed();
         return;
     }
     if (cache_adapter != nullptr && cache_adapter_start_attempted) {

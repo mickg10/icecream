@@ -611,6 +611,7 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
    Revision 1 is the first deployable shape; ordinary peers still negotiate
    Icecream protocol 50 before these fields are present. */
 inline constexpr uint32_t CACHE_WIRE_REVISION_R1 = 1;
+inline constexpr uint32_t CACHE_WIRE_REVISION_R2 = 2;
 inline constexpr uint32_t CACHE_WIRE_REVISION = CACHE_WIRE_REVISION_R1;
 
 /* Raw four-byte transition witness sent by the F sidecar only after it has
@@ -1180,6 +1181,20 @@ public:
        return -1 without reading or dropping input. */
     int release_fd_if_input_empty();
 
+    /* P51 counterpart for the auxiliary, once-per-physical-link transition.
+       The immediately preceding decoded message must be the empty
+       P51_CACHE_LINK_SESSION echo; unlike CACHE_SESSION this does not carry
+       per-job ARM state. */
+    int release_fd_after_p51_link_session_ready(
+        std::chrono::steady_clock::time_point deadline);
+
+    /* F-side counterpart: release only after the decoded empty request has
+       received its exact empty P51 echo in a fully flushed frame. Kernel
+       peeking is intentionally omitted because C may already have written
+       LINK_HELLO immediately after observing that echo. */
+    int send_p51_cache_link_session_ready_and_release(
+        std::chrono::steady_clock::time_point deadline);
+
     /* After a successfully flushed Protocol-50 CACHE_SESSION, wait under the
        caller's unchanged absolute deadline for the exact raw sidecar READY
        witness.  Only then transfer the client descriptor.  Every call consumes
@@ -1448,6 +1463,7 @@ protected:
     // any subsequent decode or ordinary send attempt; there is no generic
     // clean-boundary escape.
     bool cache_session_release_armed;
+    bool p51_link_session_release_armed;
     // Armed only by a fully flushed outbound CACHE_SESSION with no earlier
     // queued frame. Any later send/receive clears it permanently.
     bool cache_session_send_release_armed;
@@ -1773,7 +1789,9 @@ struct P50SourceArmFields {
 
     [[nodiscard]] bool valid_for_cache_revision(uint32_t revision) const noexcept
     {
-        return wire_job_id != 0 && assignment_epoch != 0 &&
+        return (revision == CACHE_WIRE_REVISION_R1 ||
+                revision == CACHE_WIRE_REVISION_R2) &&
+               wire_job_id != 0 && assignment_epoch != 0 &&
                assignment_nonce != 0 && !selected_f_host.empty() &&
                selected_f_host.size() <= 255 &&
                selected_f_host.find('\0') == std::string::npos &&

@@ -8,6 +8,7 @@
 #include "p50_slice0.h"
 #include "p50_endpoint_run_cancel.h"
 #include "services/p50_cache_session_wire.h"
+#include "services/comm.h"
 
 #include <utility>
 
@@ -186,6 +187,10 @@ struct EndpointIoControl {
     // written successfully. It receives an immutable message copy and cannot
     // change product framing or endpoint state.
     std::function<void(ActorSide, const Message&)> outbound_message_observer;
+    // Test-only observation fired after an R2 setup socket is registered for
+    // incarnation cancellation and before the first protocol read starts.
+    // Product callers leave it unset.
+    std::function<void()> after_r2_setup_registered;
 };
 
 struct PrepareRequestKey {
@@ -208,6 +213,8 @@ struct PreparationAuthorityLimits {
     uint64_t max_retained_encoded_bytes = uint64_t{512} << 20;
     uint64_t max_interner_reserved_bytes = UINT64_C(2463121408);
     uint64_t max_route_state_bytes = uint64_t{1} << 30;
+    uint32_t max_speculative_tus = 1;
+    uint64_t max_speculative_raw_bytes = uint64_t{512} << 20;
     auto operator<=>(const PreparationAuthorityLimits&) const = default;
 };
 
@@ -260,6 +267,22 @@ public:
                                        std::span<const uint8_t> exact_input);
     std::span<const uint8_t> answer_p29v1_need(
         PreparedTuHandle handle, std::span<const uint8_t> inner_need);
+    [[nodiscard]] std::vector<uint8_t> predicted_p29v1_need(
+        PreparedTuHandle handle);
+    void advance_p29v1_speculative(PreparedTuHandle handle);
+    // Advances/stages in relationship order; this does not assert that any
+    // bytes reached the socket. P29V1 must use the explicit NEED/FILL path
+    // above before advancing its continuing codec state.
+    void advance_speculative(PreparedTuHandle handle);
+    [[nodiscard]] TxBegin r2_staged_begin(
+        PreparedTuHandle handle, HistoryNonce history_nonce,
+        RelSeq rel_seq, Digest128 pre_state_digest) const;
+    // R2 callers must pass the actual receiver receipt. The legacy commit()
+    // overload remains for the R1 single-active-TU path only.
+    void accept_commit(PreparedTuHandle handle, const TxCommit& receipt);
+    void accept_commit(PreparedTuHandle handle, const TxBegin& sent_begin,
+                       const TxCommit& receipt);
+    void accept_p29v1_commit(PreparedTuHandle handle, const TxCommit& receipt);
     [[nodiscard]] Digest128 p29v1_system_source_fingerprint(
         PreparedTuHandle handle) const;
     [[nodiscard]] std::optional<bool> p29v1_system_source_reuse(
@@ -307,6 +330,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class P50ClientEndpoint;
+    friend struct P50PreparationAuthorityTestAccess;
 };
 
 enum class EndpointReconnectOutcome : uint8_t {
@@ -361,6 +385,17 @@ struct ClientRunResult {
     std::optional<TxCommit> committed_commit;
     std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
+};
+
+// Immutable C-side witness for one completely written R2 TU bundle. It is
+// produced by the sole writer and consumed independently by the receipt
+// reader; creation does not imply F commit or advance the confirmed cursor.
+struct R2SentBundle {
+    JobBind binding{};
+    TuBegin begin{};
+    Digest128 binding_digest{};
+    Digest128 transaction_digest{};
+    PreparedTuHandle prepared{};
 };
 
 enum class ServerRunStatus : uint8_t {
@@ -421,6 +456,22 @@ struct P50ServerOwnerUsage {
     auto operator<=>(const P50ServerOwnerUsage&) const = default;
 };
 
+// A JOB_BIND consumes the exact daemon-armed source lease. Keep the original
+// same-host deadline and input lifecycle key with it; source_budget_msec is
+// only an advertised bound and must never be used to mint a fresh deadline.
+struct P51SourceJobLease {
+    P51SourceArmedFields armed{};
+    sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    JobBind binding{};
+    Digest128 binding_digest{};
+    InputRecordKey input_key{};
+};
+
+struct P51SourceLinkLease {
+    P51SourceArmedFields initial_armed{};
+    sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+};
+
 struct P50ServerEndpointConfig {
     uint16_t protocol_error_code = 1;
     P50ServerOwnerLimits owner_limits{};
@@ -437,6 +488,19 @@ struct P50ServerEndpointConfig {
     std::function<void(InputRecordKey, bool)> on_input_committed;
     std::function<void(EndpointCancelPermit)> on_run_admitted;
     std::function<void(EndpointCancelPermit, EndpointTerminalResult)> on_run_terminal;
+    // SidecarRuntime installs these endpoint-owner callbacks for R2. HELLO
+    // lookup is non-consuming; each JOB_BIND consumes one exact reservation
+    // and returns the immutable input/deadline binding used through commit.
+    // No control-worker route-map access is permitted.
+    std::function<std::optional<P51SourceLinkLease>(const LinkHello&)>
+        lookup_p51_link_reservation;
+    std::function<std::optional<P51SourceJobLease>(const LinkHello&, const JobBind&)>
+        consume_p51_job_reservation;
+    std::function<bool(const LinkHello&, const JobBind&, const R2TxCommit&)>
+        record_p51_job_commit;
+    std::function<bool(const LinkHello&, const CommitAck&)>
+        acknowledge_p51_receipt;
+    std::function<void(const LinkHello&)> on_p51_link_terminal;
 };
 
 // Outbound-admission law shared by the client's production send path and its
@@ -486,6 +550,27 @@ public:
     boost::asio::awaitable<ClientRunResult> run_adopted_fd(
         int fd, PreparedTuHandle prepared = {}, EndpointIoControl control = {},
         std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
+
+    // Persistent R2 link primitives. LINK_HELLO/LINK_STATE happen exactly
+    // once per connection; the writer and reader are separate so later
+    // windowed senders can overlap socket writes with receipt waits.
+    boost::asio::awaitable<LinkState> open_r2_link(
+        boost::asio::ip::tcp::socket& socket, LinkHello hello,
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<R2SentBundle> write_r2_bundle(
+        boost::asio::ip::tcp::socket& socket, JobBind binding,
+        PreparedTuHandle prepared,
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<ClientRunResult> read_r2_receipt(
+        boost::asio::ip::tcp::socket& socket, const R2SentBundle& sent,
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<void> write_r2_ack(
+        boost::asio::ip::tcp::socket& socket, uint64_t cumulative_ordinal,
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<void> flush_r2_ack(
+        boost::asio::ip::tcp::socket& socket,
+        std::chrono::steady_clock::time_point deadline);
+    [[nodiscard]] bool r2_window_available() const noexcept;
 
     static std::optional<boost::asio::ip::tcp::socket> adopt_connected_fd(
         boost::asio::any_io_executor executor, int fd,
@@ -550,6 +635,13 @@ public:
         sidecar::P5coEndpointHandoff handoff,
         EndpointIoControl control = {});
 
+    // Explicit CacheWire R2 entry. The initial reservation is retained from
+    // F's already-completed ARM/ARMED exchange; the session then remains live
+    // across ordered JOB_BIND/TU bundles until CLOSE or transport loss.
+    boost::asio::awaitable<ServerRunResult> run_adopted_r2(
+        boost::asio::ip::tcp::socket socket,
+        EndpointIoControl control = {});
+
     // Cancels the active socket on the endpoint's owner executor. The caller
     // must arrange that affinity (SidecarRuntime posts this method); it never
     // changes listener or store ownership and is a no-op between dialogues.
@@ -581,6 +673,9 @@ private:
         EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor,
         std::optional<sidecar::AbsoluteMonotonicDeadline> deadline,
         std::optional<CStoreGuid> expected_c_store_guid);
+    boost::asio::awaitable<ServerRunResult> run_r2_connected(
+        boost::asio::ip::tcp::socket socket, SessionRegistration registration,
+        EndpointIoControl control);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

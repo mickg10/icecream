@@ -1,8 +1,9 @@
 #include "../cache/p50_daemon_control.h"
 #include "../cache/p50_fd_handoff.h"
 
-#include <chrono>
 #include <array>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -46,6 +47,72 @@ ControlOperation source_operation() {
         std::chrono::steady_clock::now() + std::chrono::seconds(5),
         clock.clock_domain_id, clock.time_namespace_id);
     return make_source_transfer_operation(Identity{91, 17}, arm, deadline);
+}
+
+P51SourceArmFields p51_source_arm() {
+    P50SourceArmFields source;
+    source.wire_job_id = 7;
+    source.assignment_epoch = 3;
+    source.assignment_nonce = 4;
+    source.selected_f_host = "worker.example";
+    source.selected_f_ordinary_port = 10245;
+    source.selected_f_cache_port = 10246;
+    source.cache_protocol = 2;
+    source.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    source.logical_job = 19;
+    source.compiler_attempt = 20;
+    source.c_store_generation = 31;
+    source.c_store_derivation_version =
+        icecc::p50::kStoreIdentityDerivationVersion;
+    for (size_t i = 0; i != source.c_store_guid.size(); ++i)
+        source.c_store_guid[i] = static_cast<uint8_t>(i + 1);
+    source.c_store_guid[icecc::p50::kStoreIdentityRoleByte] &=
+        static_cast<uint8_t>(~icecc::p50::kStoreIdentityRoleMask);
+    source.source_request_id = 23;
+    source.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    source.c_control_generation = 41;
+    source.c_control_attempt = 42;
+    return P51SourceArmFields{source, 4};
+}
+
+P51SourceArmedFields p51_source_armed(const P51SourceArmFields& arm) {
+    P51SourceArmedFields result;
+    result.arm = arm;
+    result.f_control_generation = 51;
+    result.f_control_attempt = 52;
+    result.f_store_generation = 53;
+    result.f_store_derivation_version =
+        icecc::p50::kStoreIdentityDerivationVersion;
+    for (size_t i = 0; i != result.f_store_guid.size(); ++i)
+        result.f_store_guid[i] = static_cast<uint8_t>(i + 101);
+    result.f_store_guid[icecc::p50::kStoreIdentityRoleByte] |=
+        icecc::p50::kStoreIdentityRoleMask;
+    result.arm_observation_id = 54;
+    result.source_budget_msec = 5000;
+    for (size_t i = 0; i != result.attempt_capability_1.bytes.size(); ++i) {
+        result.attempt_capability_1.bytes[i] = static_cast<uint8_t>(i + 1);
+        result.attempt_capability_2.bytes[i] = static_cast<uint8_t>(i + 33);
+        result.reservation_id[i] = static_cast<uint8_t>(i + 65);
+        result.logical_relationship_id[i] = static_cast<uint8_t>(i + 81);
+    }
+    result.relationship_epoch = 91;
+    result.selected_revision = 2;
+    result.selected_window = 4;
+    return result;
+}
+
+ControlOperation p51_reservation_operation() {
+    ControlOperation operation;
+    operation.kind = ControlOperationKind::SourceReservation;
+    operation.identity = Identity{91, 17};
+    operation.request_id = 23;
+    P51SourceReservationRequest request;
+    request.arm = p51_source_arm();
+    request.absolute_deadline = icecc::p50::sidecar::AbsoluteMonotonicDeadline{
+        INT64_C(0x0102030405060708), UINT64_C(0x1112131415161718),
+        UINT64_C(0x2122232425262728)};
+    operation.p51_reservation = request;
+    return operation;
 }
 
 CredentialExpectation credentials() {
@@ -269,6 +336,119 @@ void test_source_transfer_reply_and_tu0() {
     CHECK(sender.source_transfer_result().has_value());
     CHECK(sender.source_transfer_result()->tu_seq == 0);
     ::close(pair[1]);
+}
+
+void test_p51_source_reservation_v7_codec() {
+    const ControlOperation request = p51_reservation_operation();
+    const auto wire = encode_control_operation(request);
+    CHECK(request.p51_reservation.has_value());
+    CHECK(request.p51_reservation->arm.valid());
+    CHECK(wire.size() == kP51SourceReservationOperationBytes);
+    CHECK(wire[0] == 0 && wire[1] == 7 &&
+          wire[2] == 0 && wire[3] == 6 &&
+          wire[4] == 0 && wire[5] == 0 && wire[6] == 4 && wire[7] == 0);
+    CHECK(wire[32] == 0 && wire[33] == 0 &&
+          std::all_of(wire.begin() + 34, wire.begin() + 40,
+                      [](uint8_t value) { return value == 0; }));
+    const std::array<uint8_t, 24> deadline_fixture{
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28};
+    CHECK(std::equal(deadline_fixture.begin(), deadline_fixture.end(),
+                     wire.begin() + 40));
+    const std::array<uint8_t, 22> arm_prefix_fixture{
+        0x00, 0x00, 0x00, 0x07,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x0e};
+    CHECK(std::equal(arm_prefix_fixture.begin(), arm_prefix_fixture.end(),
+                     wire.begin() + 64));
+    CHECK(std::equal(request.p51_reservation->arm.source.selected_f_host.begin(),
+                     request.p51_reservation->arm.source.selected_f_host.end(),
+                     wire.begin() + 86));
+    CHECK(wire[344] == 0x00 && wire[345] == 0x00 &&
+          wire[346] == 0x28 && wire[347] == 0x05);
+    CHECK(wire[352] == 0 && wire[353] == 0 &&
+          wire[354] == 0 && wire[355] == 2);
+    CHECK(wire[436] == 0 && wire[437] == 0 &&
+          wire[438] == 0 && wire[439] == 4);
+
+    ControlOperation decoded;
+    CHECK(decode_control_operation(wire, decoded));
+    CHECK(decoded.kind == ControlOperationKind::SourceReservation);
+    CHECK(decoded.identity == request.identity &&
+          decoded.request_id == request.request_id);
+    CHECK(decoded.p51_reservation == request.p51_reservation);
+    CHECK(!decoded.p51_reservation_result.has_value());
+
+    ControlOperation success = request;
+    success.p51_reservation_result = P51SourceReservationResult{
+        0, p51_source_armed(request.p51_reservation->arm)};
+    const auto success_wire = encode_control_operation(success);
+    CHECK(success_wire.size() == kP51SourceReservationOperationBytes);
+    CHECK(success_wire[32] == 0 && success_wire[33] == 1);
+    ControlOperation success_decoded;
+    CHECK(decode_control_operation(success_wire, success_decoded));
+    CHECK(success_decoded.p51_reservation == success.p51_reservation);
+    CHECK(success_decoded.p51_reservation_result ==
+          success.p51_reservation_result);
+
+    ControlOperation refused = request;
+    refused.p51_reservation_result = P51SourceReservationResult{0x5001,
+                                                                std::nullopt};
+    const auto refused_wire = encode_control_operation(refused);
+    CHECK(refused_wire.size() == kP51SourceReservationOperationBytes);
+    CHECK(refused_wire[32] == 0 && refused_wire[33] == 2 &&
+          refused_wire[34] == 0x50 && refused_wire[35] == 0x01);
+    ControlOperation refused_decoded;
+    CHECK(decode_control_operation(refused_wire, refused_decoded));
+    CHECK(refused_decoded.p51_reservation_result ==
+          refused.p51_reservation_result);
+
+    CHECK(!decode_control_operation(
+        std::span<const uint8_t>(wire.data(), wire.size() - 1), decoded));
+    auto oversized = wire;
+    oversized.push_back(0);
+    CHECK(!decode_control_operation(oversized, decoded));
+    auto bad_header = wire;
+    bad_header[1] = 6;
+    CHECK(!decode_control_operation(bad_header, decoded));
+    auto nonzero_header_padding = wire;
+    nonzero_header_padding[36] = 1;
+    CHECK(!decode_control_operation(nonzero_header_padding, decoded));
+    auto noncanonical_host_padding = wire;
+    noncanonical_host_padding[100] = 1;
+    CHECK(!decode_control_operation(noncanonical_host_padding, decoded));
+    auto nonzero_arm_padding = wire;
+    nonzero_arm_padding[440] = 1;
+    CHECK(!decode_control_operation(nonzero_arm_padding, decoded));
+    auto invalid_phase = wire;
+    invalid_phase[33] = 3;
+    CHECK(!decode_control_operation(invalid_phase, decoded));
+    auto request_with_error = wire;
+    request_with_error[35] = 1;
+    CHECK(!decode_control_operation(request_with_error, decoded));
+    auto success_with_error = success_wire;
+    success_with_error[35] = 1;
+    CHECK(!decode_control_operation(success_with_error, decoded));
+    auto refusal_without_error = refused_wire;
+    refusal_without_error[34] = refusal_without_error[35] = 0;
+    CHECK(!decode_control_operation(refusal_without_error, decoded));
+    auto success_padding = success_wire;
+    success_padding.back() = 1;
+    CHECK(!decode_control_operation(success_padding, decoded));
+    auto armed_padding = success_wire;
+    armed_padding[456 + 140] = 1;
+    CHECK(!decode_control_operation(armed_padding, decoded));
+
+    ControlOperation inconsistent_echo = success;
+    ++inconsistent_echo.p51_reservation_result->armed->arm.requested_window;
+    CHECK(encode_control_operation(inconsistent_echo).empty());
+    auto invalid_request = request;
+    invalid_request.p51_reservation->arm.requested_window = 31;
+    CHECK(encode_control_operation(invalid_request).empty());
+    // The wire codec preserves absolute clock tuples exactly; matching the
+    // local clock and checking expiry belong to the reservation service.
 }
 
 void test_canonical_request_codec_both_directions() {
@@ -755,6 +935,7 @@ int main() {
     test_incremental_handoff_and_fairness();
     test_extra_fd_is_closed_and_rejected();
     test_source_transfer_reply_and_tu0();
+    test_p51_source_reservation_v7_codec();
     test_canonical_request_codec_both_directions();
     test_nonzero_reserved_code_rejected();
     test_client_frame_trailing_rejected();

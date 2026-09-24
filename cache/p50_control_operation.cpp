@@ -4,17 +4,131 @@
 
 namespace icecc::p50::local {
 
+namespace {
+
+constexpr size_t kP51ArmBytes = 376;
+constexpr size_t kP51ReplyOffset = 456;
+constexpr size_t kP51ReplyBytes = 144;
+constexpr size_t kP51TransferResultOffset = 600;
+constexpr size_t kP51TransferResultBytes = 56;
+
+void encode_p51_arm(uint8_t* out, const P51SourceArmFields& arm) {
+    const P50SourceArmFields& source = arm.source;
+    detail::control_put_u32(out, source.wire_job_id);
+    detail::control_put_u64(out + 4, source.assignment_epoch);
+    detail::control_put_u64(out + 12, source.assignment_nonce);
+    detail::control_put_u16(out + 20,
+                            static_cast<uint16_t>(source.selected_f_host.size()));
+    std::copy(source.selected_f_host.begin(), source.selected_f_host.end(), out + 22);
+    detail::control_put_u32(out + 280, source.selected_f_ordinary_port);
+    detail::control_put_u32(out + 284, source.selected_f_cache_port);
+    detail::control_put_u32(out + 288, source.cache_protocol);
+    detail::control_put_u32(out + 292, source.cache_profile);
+    detail::control_put_u64(out + 296, source.logical_job);
+    detail::control_put_u64(out + 304, source.compiler_attempt);
+    detail::control_put_u64(out + 312, source.c_store_generation);
+    detail::control_put_u64(out + 320, source.c_store_derivation_version);
+    std::copy(source.c_store_guid.begin(), source.c_store_guid.end(), out + 328);
+    detail::control_put_u64(out + 344, source.source_request_id);
+    detail::control_put_u32(out + 352, source.source_mode);
+    detail::control_put_u64(out + 356, source.c_control_generation);
+    detail::control_put_u64(out + 364, source.c_control_attempt);
+    detail::control_put_u32(out + 372, arm.requested_window);
+}
+
+bool decode_p51_arm(const uint8_t* in, P51SourceArmFields& arm) {
+    arm = {};
+    P50SourceArmFields& source = arm.source;
+    source.wire_job_id = detail::control_get_u32(in);
+    source.assignment_epoch = detail::control_get_u64(in + 4);
+    source.assignment_nonce = detail::control_get_u64(in + 12);
+    const uint16_t host_size = detail::control_get_u16(in + 20);
+    if (host_size == 0 || host_size > 255 ||
+        std::any_of(in + 22 + host_size, in + 277,
+                    [](uint8_t byte) { return byte != 0; }) ||
+        std::any_of(in + 277, in + 280,
+                    [](uint8_t byte) { return byte != 0; }))
+        return false;
+    source.selected_f_host.assign(reinterpret_cast<const char*>(in + 22), host_size);
+    source.selected_f_ordinary_port = detail::control_get_u32(in + 280);
+    source.selected_f_cache_port = detail::control_get_u32(in + 284);
+    source.cache_protocol = detail::control_get_u32(in + 288);
+    source.cache_profile = detail::control_get_u32(in + 292);
+    source.logical_job = detail::control_get_u64(in + 296);
+    source.compiler_attempt = detail::control_get_u64(in + 304);
+    source.c_store_generation = detail::control_get_u64(in + 312);
+    source.c_store_derivation_version = detail::control_get_u64(in + 320);
+    std::copy(in + 328, in + 344, source.c_store_guid.begin());
+    source.source_request_id = detail::control_get_u64(in + 344);
+    source.source_mode = detail::control_get_u32(in + 352);
+    source.c_control_generation = detail::control_get_u64(in + 356);
+    source.c_control_attempt = detail::control_get_u64(in + 364);
+    arm.requested_window = detail::control_get_u32(in + 372);
+    return std::all_of(in + 376, in + kP51ArmBytes,
+                       [](uint8_t byte) { return byte == 0; }) &&
+           arm.valid();
+}
+
+void encode_p51_armed(uint8_t* out, const P51SourceArmedFields& armed) {
+    detail::control_put_u64(out, armed.f_control_generation);
+    detail::control_put_u64(out + 8, armed.f_control_attempt);
+    detail::control_put_u64(out + 16, armed.f_store_generation);
+    std::copy(armed.f_store_guid.begin(), armed.f_store_guid.end(), out + 24);
+    detail::control_put_u64(out + 40, armed.f_store_derivation_version);
+    detail::control_put_u64(out + 48, armed.arm_observation_id);
+    detail::control_put_u32(out + 56, armed.source_budget_msec);
+    std::copy(armed.attempt_capability_1.bytes.begin(),
+              armed.attempt_capability_1.bytes.end(), out + 60);
+    std::copy(armed.attempt_capability_2.bytes.begin(),
+              armed.attempt_capability_2.bytes.end(), out + 76);
+    std::copy(armed.reservation_id.begin(), armed.reservation_id.end(), out + 92);
+    std::copy(armed.logical_relationship_id.begin(),
+              armed.logical_relationship_id.end(), out + 108);
+    detail::control_put_u64(out + 124, armed.relationship_epoch);
+    detail::control_put_u32(out + 132, armed.selected_revision);
+    detail::control_put_u32(out + 136, armed.selected_window);
+}
+
+bool decode_p51_armed(const uint8_t* in, P51SourceArmedFields& armed) {
+    armed.f_control_generation = detail::control_get_u64(in);
+    armed.f_control_attempt = detail::control_get_u64(in + 8);
+    armed.f_store_generation = detail::control_get_u64(in + 16);
+    std::copy(in + 24, in + 40, armed.f_store_guid.begin());
+    armed.f_store_derivation_version = detail::control_get_u64(in + 40);
+    armed.arm_observation_id = detail::control_get_u64(in + 48);
+    armed.source_budget_msec = detail::control_get_u32(in + 56);
+    std::copy(in + 60, in + 76, armed.attempt_capability_1.bytes.begin());
+    std::copy(in + 76, in + 92, armed.attempt_capability_2.bytes.begin());
+    std::copy(in + 92, in + 108, armed.reservation_id.begin());
+    std::copy(in + 108, in + 124, armed.logical_relationship_id.begin());
+    armed.relationship_epoch = detail::control_get_u64(in + 124);
+    armed.selected_revision = detail::control_get_u32(in + 132);
+    armed.selected_window = detail::control_get_u32(in + 136);
+    return std::all_of(in + 140, in + kP51ReplyBytes,
+                       [](uint8_t byte) { return byte == 0; });
+}
+
+} // namespace
+
 std::vector<uint8_t> encode_control_operation(
     const ControlOperation& operation) {
     const bool input = detail::control_kind_has_input(operation.kind);
     const bool cancel = operation.kind == ControlOperationKind::OperationCancel;
     const bool source = operation.kind == ControlOperationKind::SourceTransfer;
+    const bool p51_reservation =
+        operation.kind == ControlOperationKind::SourceReservation;
+    const bool p51_reservation_cancel =
+        operation.kind == ControlOperationKind::SourceReservationCancel;
+    const bool p51_transfer =
+        operation.kind == ControlOperationKind::P51SourceTransfer;
     const bool retirement = operation.kind == ControlOperationKind::InputLifecycle &&
                             detail::retirement_action(operation.lifecycle_action);
     bool invalid = !detail::control_identity_valid(operation.identity) ||
                    operation.request_id == 0 ||
                    !detail::control_kind_valid(operation.kind);
-    if (!invalid && operation.kind == ControlOperationKind::CacheSession) {
+    if (!invalid &&
+        (operation.kind == ControlOperationKind::CacheSession ||
+         operation.kind == ControlOperationKind::CacheLinkSession)) {
         invalid = operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
                   operation.lifecycle_result.has_value() ||
@@ -102,10 +216,57 @@ std::vector<uint8_t> encode_control_operation(
             operation.source_result->raw_bytes == 0)
             invalid = true;
     }
+    if (!invalid && p51_reservation) {
+        invalid = !operation.p51_reservation.has_value() ||
+                  !operation.p51_reservation->arm.valid() ||
+                  !operation.p51_reservation->absolute_deadline.valid() ||
+                  operation.request_id !=
+                      operation.p51_reservation->arm.source.source_request_id ||
+                  operation.source_arm.has_value() ||
+                  operation.source_result.has_value();
+        if (!invalid && operation.p51_reservation_result.has_value())
+            invalid = !operation.p51_reservation_result->valid() ||
+                      (operation.p51_reservation_result->armed.has_value() &&
+                       operation.p51_reservation_result->armed->arm !=
+                           operation.p51_reservation->arm);
+    }
+    if (!invalid && p51_reservation_cancel) {
+        invalid = !operation.p51_reservation_cancel.has_value() ||
+                  !operation.p51_reservation_cancel->arm.valid() ||
+                  !operation.p51_reservation_cancel->armed.valid() ||
+                  operation.p51_reservation_cancel->armed.arm !=
+                      operation.p51_reservation_cancel->arm ||
+                  !operation.p51_reservation_cancel->absolute_deadline.valid() ||
+                  operation.request_id != operation.p51_reservation_cancel->arm.source.source_request_id ||
+                  operation.p51_reservation.has_value() ||
+                  operation.p51_reservation_result.has_value() ||
+                  (operation.p51_reservation_cancel_result !=
+                       operation.p51_reservation_cancel->cancelled);
+    }
+    if (!invalid && p51_transfer) {
+        invalid = !operation.p51_source_transfer.has_value() ||
+                  !operation.p51_source_transfer->armed.valid() ||
+                  !operation.p51_source_transfer->absolute_deadline.valid() ||
+                  operation.absolute_deadline !=
+                      operation.p51_source_transfer->absolute_deadline ||
+                  operation.request_id != operation.p51_source_transfer->armed
+                                              .arm.source.source_request_id ||
+                  operation.source_arm.has_value() ||
+                  operation.source_result.has_value() ||
+                  operation.p51_reservation.has_value() ||
+                  operation.p51_reservation_cancel.has_value();
+        if (!invalid && operation.p51_source_transfer_result.has_value())
+            invalid = !operation.p51_source_transfer_result->valid() ||
+                      (operation.p51_source_transfer_result->code ==
+                           SourceTransferResultCode::Committed &&
+                       operation.p51_source_transfer_result->raw_bytes == 0);
+    }
     if (invalid)
         return {};
 
-    const size_t size = source ? kSourceTransferOperationBytes
+    const size_t size = (p51_reservation || p51_reservation_cancel || p51_transfer)
+                               ? kP51SourceReservationOperationBytes
+                               : source ? kSourceTransferOperationBytes
                                : retirement ? kInputAttemptRetirementOperationBytes
                                    : input ? kInputFdAttachmentOperationBytes
                               : cancel ? kOperationCancelOperationBytes
@@ -114,8 +275,12 @@ std::vector<uint8_t> encode_control_operation(
     detail::control_put_u16(
         wire.data(), operation.kind == ControlOperationKind::CacheSession
                          ? kControlOperationVersionV1
+                         : operation.kind == ControlOperationKind::CacheLinkSession
+                             ? kControlOperationVersionV2
                          : cancel ? kControlOperationVersionV3
-                                  : source ? kControlOperationVersionV6
+                         : (p51_reservation || p51_reservation_cancel || p51_transfer)
+                               ? kControlOperationVersionV7
+                         : source ? kControlOperationVersionV6
                                   : retirement ? kControlOperationVersionV5
                                                 : kControlOperationVersionV2);
     detail::control_put_u16(wire.data() + 2, static_cast<uint16_t>(operation.kind));
@@ -211,6 +376,86 @@ std::vector<uint8_t> encode_control_operation(
                       wire.begin() + 472);
         }
     }
+    if (p51_reservation) {
+        const P51SourceReservationRequest& request = *operation.p51_reservation;
+        const uint16_t phase = !operation.p51_reservation_result.has_value()
+                                   ? 0
+                               : operation.p51_reservation_result->armed.has_value()
+                                   ? 1
+                                   : 2;
+        detail::control_put_u16(wire.data() + 32, phase);
+        if (phase == 2)
+            detail::control_put_u16(
+                wire.data() + 34,
+                operation.p51_reservation_result->error_code);
+        detail::control_put_u64(
+            wire.data() + 40,
+            static_cast<uint64_t>(request.absolute_deadline.expires_at_ns));
+        detail::control_put_u64(wire.data() + 48,
+                                request.absolute_deadline.clock_domain_id);
+        detail::control_put_u64(wire.data() + 56,
+                                request.absolute_deadline.time_namespace_id);
+        encode_p51_arm(wire.data() + 64, request.arm);
+        if (phase == 1)
+            encode_p51_armed(wire.data() + kP51ReplyOffset,
+                             *operation.p51_reservation_result->armed);
+    }
+    if (p51_reservation_cancel) {
+        const P51SourceReservationCancel& cancel =
+            *operation.p51_reservation_cancel;
+        const uint16_t phase = !operation.p51_reservation_cancel_result.has_value()
+                                   ? 0
+                               : *operation.p51_reservation_cancel_result ? 1 : 2;
+        detail::control_put_u16(wire.data() + 32, phase);
+        detail::control_put_u64(
+            wire.data() + 40,
+            static_cast<uint64_t>(cancel.absolute_deadline.expires_at_ns));
+        detail::control_put_u64(wire.data() + 48,
+                                cancel.absolute_deadline.clock_domain_id);
+        detail::control_put_u64(wire.data() + 56,
+                                cancel.absolute_deadline.time_namespace_id);
+        encode_p51_arm(wire.data() + 64,
+                       P51SourceArmFields{cancel.arm.source,
+                                          cancel.armed.arm.requested_window});
+        encode_p51_armed(wire.data() + kP51ReplyOffset, cancel.armed);
+    }
+    if (p51_transfer) {
+        const P51SourceTransferRequest& request =
+            *operation.p51_source_transfer;
+        detail::control_put_u16(
+            wire.data() + 32,
+            operation.p51_source_transfer_result.has_value() ? 1 : 0);
+        detail::control_put_u64(
+            wire.data() + 40,
+            static_cast<uint64_t>(request.absolute_deadline.expires_at_ns));
+        detail::control_put_u64(wire.data() + 48,
+                                request.absolute_deadline.clock_domain_id);
+        detail::control_put_u64(wire.data() + 56,
+                                request.absolute_deadline.time_namespace_id);
+        encode_p51_arm(wire.data() + 64, request.armed.arm);
+        encode_p51_armed(wire.data() + kP51ReplyOffset, request.armed);
+        if (operation.p51_source_transfer_result.has_value()) {
+            const P50SourceTransferResult& result =
+                *operation.p51_source_transfer_result;
+            std::copy(result.c_store_guid.bytes.begin(),
+                      result.c_store_guid.bytes.end(),
+                      wire.begin() + kP51TransferResultOffset);
+            detail::control_put_u16(
+                wire.data() + kP51TransferResultOffset + 16,
+                static_cast<uint16_t>(result.code));
+            detail::control_put_u16(
+                wire.data() + kP51TransferResultOffset + 18,
+                result.error_code);
+            wire[kP51TransferResultOffset + 20] = result.attempts;
+            detail::control_put_u64(
+                wire.data() + kP51TransferResultOffset + 24, result.tu_seq);
+            detail::control_put_u64(
+                wire.data() + kP51TransferResultOffset + 32, result.raw_bytes);
+            std::copy(result.raw_digest.bytes.begin(),
+                      result.raw_digest.bytes.end(),
+                      wire.begin() + kP51TransferResultOffset + 40);
+        }
+    }
     return wire;
 }
 
@@ -226,6 +471,9 @@ bool decode_control_operation(std::span<const uint8_t> wire,
         kind == ControlOperationKind::CacheSession &&
                 version == kControlOperationVersionV1
             ? kCacheSessionOperationBytes
+            : kind == ControlOperationKind::CacheLinkSession &&
+                      version == kControlOperationVersionV2
+                  ? kCacheSessionOperationBytes
             : kind == ControlOperationKind::InputFdAttachment &&
                       version == kControlOperationVersionV1
                   ? kLegacyInputFdAttachmentOperationBytes
@@ -244,6 +492,15 @@ bool decode_control_operation(std::span<const uint8_t> wire,
             : kind == ControlOperationKind::SourceTransfer &&
                       version == kControlOperationVersionV6
                   ? kSourceTransferOperationBytes
+            : kind == ControlOperationKind::SourceReservation &&
+                      version == kControlOperationVersionV7
+                  ? kP51SourceReservationOperationBytes
+            : kind == ControlOperationKind::SourceReservationCancel &&
+                      version == kControlOperationVersionV7
+                  ? kP51SourceReservationOperationBytes
+            : kind == ControlOperationKind::P51SourceTransfer &&
+                      version == kControlOperationVersionV7
+                  ? kP51SourceReservationOperationBytes
                   : 0;
     if (expected_size == 0 || wire.size() != expected_size ||
         detail::control_get_u32(wire.data() + 4) != expected_size)
@@ -415,6 +672,146 @@ bool decode_control_operation(std::span<const uint8_t> wire,
             if (!result.valid())
                 return false;
             operation.source_result = result;
+        }
+    }
+    if (kind == ControlOperationKind::SourceReservation) {
+        const uint16_t phase = detail::control_get_u16(wire.data() + 32);
+        const uint16_t error = detail::control_get_u16(wire.data() + 34);
+        if (phase > 2 || (phase == 0 && error != 0) ||
+            (phase == 1 && error != 0) ||
+            (phase == 2 && error == 0) ||
+            std::any_of(wire.begin() + 36, wire.begin() + 40,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + 440, wire.begin() + kP51ReplyOffset,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + kP51ReplyOffset + kP51ReplyBytes,
+                        wire.end(), [](uint8_t byte) { return byte != 0; }))
+            return false;
+        P51SourceReservationRequest request;
+        request.absolute_deadline.expires_at_ns =
+            static_cast<int64_t>(detail::control_get_u64(wire.data() + 40));
+        request.absolute_deadline.clock_domain_id =
+            detail::control_get_u64(wire.data() + 48);
+        request.absolute_deadline.time_namespace_id =
+            detail::control_get_u64(wire.data() + 56);
+        if (!request.absolute_deadline.valid() ||
+            !decode_p51_arm(wire.data() + 64, request.arm) ||
+            operation.request_id != request.arm.source.source_request_id)
+            return false;
+        operation.p51_reservation = request;
+        if (phase != 0) {
+            P51SourceReservationResult result;
+            result.error_code = error;
+            if (phase == 1) {
+                P51SourceArmedFields armed;
+                armed.arm = request.arm;
+                if (!decode_p51_armed(wire.data() + kP51ReplyOffset, armed))
+                    return false;
+                result.armed = std::move(armed);
+            }
+            if (!result.valid())
+                return false;
+            operation.p51_reservation_result = std::move(result);
+        }
+        if (phase != 1 &&
+            std::any_of(wire.begin() + kP51ReplyOffset, wire.end(),
+                        [](uint8_t byte) { return byte != 0; }))
+            return false;
+    }
+    if (kind == ControlOperationKind::SourceReservationCancel) {
+        const uint16_t phase = detail::control_get_u16(wire.data() + 32);
+        if (phase > 2 || detail::control_get_u16(wire.data() + 34) != 0 ||
+            std::any_of(wire.begin() + 36, wire.begin() + 40,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + 440, wire.begin() + kP51ReplyOffset,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + kP51ReplyOffset + kP51ReplyBytes,
+                        wire.end(), [](uint8_t byte) { return byte != 0; }))
+            return false;
+        P51SourceReservationCancel cancel;
+        cancel.absolute_deadline.expires_at_ns =
+            static_cast<int64_t>(detail::control_get_u64(wire.data() + 40));
+        cancel.absolute_deadline.clock_domain_id =
+            detail::control_get_u64(wire.data() + 48);
+        cancel.absolute_deadline.time_namespace_id =
+            detail::control_get_u64(wire.data() + 56);
+        P51SourceArmFields arm;
+        if (!cancel.absolute_deadline.valid() ||
+            !decode_p51_arm(wire.data() + 64, arm) ||
+            operation.request_id != arm.source.source_request_id)
+            return false;
+        P51SourceArmedFields armed;
+        armed.arm = arm;
+        if (!decode_p51_armed(wire.data() + kP51ReplyOffset, armed))
+            return false;
+        cancel.arm = arm;
+        cancel.armed = std::move(armed);
+        if (phase != 0)
+            cancel.cancelled = phase == 1;
+        operation.p51_reservation_cancel = std::move(cancel);
+        operation.p51_reservation_cancel_result =
+            operation.p51_reservation_cancel->cancelled;
+    }
+    if (kind == ControlOperationKind::P51SourceTransfer) {
+        const uint16_t phase = detail::control_get_u16(wire.data() + 32);
+        if (phase > 1 || detail::control_get_u16(wire.data() + 34) != 0 ||
+            std::any_of(wire.begin() + 36, wire.begin() + 40,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + 440, wire.begin() + kP51ReplyOffset,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + kP51TransferResultOffset +
+                            kP51TransferResultBytes,
+                        wire.end(), [](uint8_t byte) { return byte != 0; }))
+            return false;
+        P51SourceTransferRequest request;
+        request.absolute_deadline.expires_at_ns =
+            static_cast<int64_t>(detail::control_get_u64(wire.data() + 40));
+        request.absolute_deadline.clock_domain_id =
+            detail::control_get_u64(wire.data() + 48);
+        request.absolute_deadline.time_namespace_id =
+            detail::control_get_u64(wire.data() + 56);
+        P51SourceArmFields arm;
+        P51SourceArmedFields armed;
+        if (!request.absolute_deadline.valid() ||
+            !decode_p51_arm(wire.data() + 64, arm) ||
+            !decode_p51_armed(wire.data() + kP51ReplyOffset, armed) ||
+            armed.arm != arm || armed.selected_window != arm.requested_window ||
+            operation.request_id != arm.source.source_request_id)
+            return false;
+        request.armed = std::move(armed);
+        operation.absolute_deadline = request.absolute_deadline;
+        operation.p51_source_transfer = request;
+        if (phase == 1) {
+            P50SourceTransferResult result;
+            std::copy(wire.begin() + kP51TransferResultOffset,
+                      wire.begin() + kP51TransferResultOffset + 16,
+                      result.c_store_guid.bytes.begin());
+            result.code = static_cast<SourceTransferResultCode>(
+                detail::control_get_u16(wire.data() +
+                                        kP51TransferResultOffset + 16));
+            result.error_code = detail::control_get_u16(
+                wire.data() + kP51TransferResultOffset + 18);
+            result.attempts = wire[kP51TransferResultOffset + 20];
+            if (wire[kP51TransferResultOffset + 21] != 0 ||
+                wire[kP51TransferResultOffset + 22] != 0 ||
+                wire[kP51TransferResultOffset + 23] != 0)
+                return false;
+            result.tu_seq = detail::control_get_u64(
+                wire.data() + kP51TransferResultOffset + 24);
+            result.raw_bytes = detail::control_get_u64(
+                wire.data() + kP51TransferResultOffset + 32);
+            std::copy(wire.begin() + kP51TransferResultOffset + 40,
+                      wire.begin() + kP51TransferResultOffset + 56,
+                      result.raw_digest.bytes.begin());
+            if (!result.valid())
+                return false;
+            operation.p51_source_transfer_result = std::move(result);
+        } else if (std::any_of(
+                       wire.begin() + kP51TransferResultOffset,
+                       wire.begin() + kP51TransferResultOffset +
+                           kP51TransferResultBytes,
+                       [](uint8_t byte) { return byte != 0; })) {
+            return false;
         }
     }
     return true;

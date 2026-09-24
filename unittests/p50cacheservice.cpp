@@ -890,6 +890,43 @@ service::RuntimeConfig test_runtime_config() {
     return config;
 }
 
+local::P51SourceReservationRequest test_p51_reservation_request(
+    const CStoreGuid& c_guid, uint64_t c_store_generation,
+    uint64_t c_control_generation, uint64_t c_control_attempt,
+    uint64_t source_request_id, uint32_t profile, uint32_t requested_window,
+    std::chrono::milliseconds lifetime = std::chrono::seconds(2)) {
+    P50SourceArmFields source;
+    source.wire_job_id = static_cast<uint32_t>(source_request_id + 10);
+    source.assignment_epoch = 3;
+    source.assignment_nonce = 4;
+    source.selected_f_host = "worker.example";
+    source.selected_f_ordinary_port = 10245;
+    source.selected_f_cache_port = 10246;
+    source.cache_protocol = 2;
+    source.cache_profile = profile;
+    source.logical_job = 19;
+    source.compiler_attempt = 20;
+    source.c_store_generation = c_store_generation;
+    source.c_store_derivation_version = kStoreIdentityDerivationVersion;
+    source.c_store_guid = c_guid.bytes;
+    source.source_request_id = source_request_id;
+    source.source_mode = profile == CACHE_PROFILE_ZSTD_ROUTE
+                             ? P50_SOURCE_MODE_ZSTD_ROUTE
+                             : P50_SOURCE_MODE_ZSTD_TU;
+    source.c_control_generation = c_control_generation;
+    source.c_control_attempt = c_control_attempt;
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    local::P51SourceReservationRequest request;
+    request.arm = P51SourceArmFields{source, requested_window};
+    request.absolute_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + lifetime,
+            clock.clock_domain_id, clock.time_namespace_id);
+    CHECK(request.arm.valid());
+    return request;
+}
+
 void test_source_open_arm_timeout_bounds() {
     for (const auto timeout : {
              std::chrono::milliseconds::zero(),
@@ -932,6 +969,102 @@ SidecarLaunchIdentity test_sidecar_launch(StoreIdentityRoot root) {
     launch.f_store_guid = f_store_guid_for_root(root);
     CHECK(launch.valid());
     return launch;
+}
+
+void test_p51_reservation_capacity_identity_and_window() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x29;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_pending_p51_source_reservations = 1;
+    config.max_route_relationships = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    // The simulated remote C store must be an independent incarnation, not
+    // the C/F pair represented by this F sidecar's own launch identity.
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x2b;
+    const CStoreGuid remote_c_guid = c_store_guid_for_root(remote_root);
+    CHECK(!icecc::p50::store_identity_file_guid_matches_client(
+        remote_c_guid.bytes, launch.f_store_guid.bytes));
+
+    auto first = test_p51_reservation_request(
+        remote_c_guid, 31, launch.identity.generation,
+        launch.identity.attempt, 23, CACHE_PROFILE_ZSTD_TU, 30);
+    const auto first_result = runtime.reserve_p51_source_on_owner(first);
+    CHECK(first_result.error_code == 0 && first_result.armed.has_value());
+    CHECK(first_result.armed->selected_window == 30);
+    CHECK(first_result.armed->arm == first.arm);
+
+    // An exact duplicate is idempotent even when the one-row pending table is
+    // full; it must return the original reservation, not consume another slot.
+    const auto duplicate = runtime.reserve_p51_source_on_owner(first);
+    CHECK(duplicate.error_code == 0 && duplicate.armed == first_result.armed);
+
+    auto conflicting_duplicate = test_p51_reservation_request(
+        remote_c_guid, 31, launch.identity.generation,
+        launch.identity.attempt, 23, CACHE_PROFILE_ZSTD_TU, 29);
+    const auto conflict_result =
+        runtime.reserve_p51_source_on_owner(conflicting_duplicate);
+    CHECK(!conflict_result.armed.has_value() &&
+          conflict_result.error_code == 0x5101);
+
+    CHECK(runtime.cancel_p51_source_on_owner(
+        first.arm, first_result.armed->reservation_id,
+        std::chrono::steady_clock::now() + std::chrono::seconds(1)));
+
+    // The relationship's negotiated window is fixed by its first ARM. A later
+    // smaller request cannot silently shrink/reinterpret the same live link.
+    auto too_small = test_p51_reservation_request(
+        remote_c_guid, 31, launch.identity.generation,
+        launch.identity.attempt, 24, CACHE_PROFILE_ZSTD_TU, 1);
+    const auto small_result = runtime.reserve_p51_source_on_owner(too_small);
+    CHECK(!small_result.armed.has_value() && small_result.error_code == 0x5103);
+
+    auto changed_profile = test_p51_reservation_request(
+        remote_c_guid, 31, launch.identity.generation,
+        launch.identity.attempt, 25, CACHE_PROFILE_ZSTD_ROUTE, 30);
+    const auto profile_result =
+        runtime.reserve_p51_source_on_owner(changed_profile);
+    CHECK(!profile_result.armed.has_value() &&
+          profile_result.error_code == 0x5103);
+
+    auto changed_incarnation = test_p51_reservation_request(
+        remote_c_guid, 32, launch.identity.generation,
+        launch.identity.attempt, 26, CACHE_PROFILE_ZSTD_TU, 30);
+    const auto incarnation_result =
+        runtime.reserve_p51_source_on_owner(changed_incarnation);
+    CHECK(!incarnation_result.armed.has_value() &&
+          incarnation_result.error_code == 0x5101);
+
+    // Expiry retires the pending reservation and its idle relationship. A
+    // distinct C incarnation can then use the sole relationship slot.
+    auto expiring = test_p51_reservation_request(
+        remote_c_guid, 31, launch.identity.generation,
+        launch.identity.attempt, 27, CACHE_PROFILE_ZSTD_TU, 30,
+        std::chrono::milliseconds(100));
+    const auto expiring_result = runtime.reserve_p51_source_on_owner(expiring);
+    CHECK(expiring_result.error_code == 0 &&
+          expiring_result.armed.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    StoreIdentityRoot other_root{};
+    other_root.bytes[15] = 0x2a;
+    const CStoreGuid other_c_guid = c_store_guid_for_root(other_root);
+    auto successor = test_p51_reservation_request(
+        other_c_guid, 1, launch.identity.generation,
+        launch.identity.attempt, 28, CACHE_PROFILE_ZSTD_TU, 30);
+    const auto successor_result = runtime.reserve_p51_source_on_owner(successor);
+    CHECK(successor_result.error_code == 0 &&
+          successor_result.armed.has_value());
+    CHECK(successor_result.armed->logical_relationship_id !=
+          expiring_result.armed->logical_relationship_id);
+    CHECK(successor_result.armed->relationship_epoch >
+          expiring_result.armed->relationship_epoch);
+    std::puts("P51_RESERVATION_OWNER exact-duplicate/window/identity/expiry: ok");
 }
 
 void test_route_endpoint_cap_refuses_before_f_open() {
@@ -5006,6 +5139,39 @@ void test_runtime_stop_bounds_opening_source_arm() {
             deadline, local::HandoffFd(source_file("p50-runtime-open-stop", source))));
     });
 
+    // The F has received SOURCE_ARM, proving C has admitted and reserved the
+    // opening operation, but deliberately withholds SOURCE_ARMED. Stop must
+    // bound this non-cancellable initial handshake by source_open_arm_timeout.
+    const auto arm_deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+    while (!arm_received.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < arm_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool opening_barrier_reached =
+        arm_received.load(std::memory_order_acquire);
+    if (!opening_barrier_reached) {
+        // Do not start the queued operation unless the opening operation has
+        // demonstrably consumed the sole setup slot. Stop the transfer and
+        // issue a wake connection so either accept() or the ordinary-frame
+        // read in the fixture server is released before reporting failure.
+        release_server_promise.set_value();
+        runtime.stop();
+        opening_transfer.join();
+        const int wake_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (wake_fd >= 0) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(open_port);
+            (void)::connect(wake_fd, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+            (void)::close(wake_fd);
+        }
+        open_server.join();
+        (void)::close(queued_listener);
+        CHECK(opening_barrier_reached);
+    }
+
     const std::vector<uint8_t> queued_source{'q', 'u', 'e', 'u', 'e', 'd', '\n'};
     std::promise<void> queued_call_started_promise;
     auto queued_call_started = queued_call_started_promise.get_future();
@@ -5018,16 +5184,6 @@ void test_runtime_stop_bounds_opening_source_arm() {
             deadline, local::HandoffFd(source_file("p50-runtime-queued-stop", queued_source))));
     });
 
-    // The F has received SOURCE_ARM, proving C has admitted and reserved the
-    // opening operation, but deliberately withholds SOURCE_ARMED. Stop must
-    // bound this non-cancellable initial handshake by source_open_arm_timeout.
-    const auto arm_deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(2);
-    while (!arm_received.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < arm_deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    const bool opening_barrier_reached =
-        arm_received.load(std::memory_order_acquire);
     const bool queued_call_started_in_time =
         queued_call_started.wait_for(std::chrono::seconds(1)) ==
         std::future_status::ready;
@@ -5297,6 +5453,7 @@ int main(int argc, char** argv) {
         frame_header_and_payload_share_one_deadline();
         test_runtime_store_identity_is_explicit_and_role_tagged();
         test_source_open_arm_timeout_bounds();
+        test_p51_reservation_capacity_identity_and_window();
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();

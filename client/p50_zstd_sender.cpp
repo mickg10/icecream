@@ -1,4 +1,5 @@
 #include "p50_zstd_sender.h"
+#include "services/comm.h"
 
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <deque>
 #include <fcntl.h>
 #include <limits>
 #include <map>
@@ -30,6 +32,16 @@ bool nonzero(CStoreGuid guid) {
 
 bool nonzero_request(PrepareRequestKey request) {
     return request.producer_session != 0 && request.request_token != 0;
+}
+
+std::optional<ProfileId> profile_from_cache_mask(uint32_t mask) noexcept {
+    if (mask == CACHE_PROFILE_P29V1)
+        return ProfileId::P29V1;
+    if (mask == CACHE_PROFILE_ZSTD_TU)
+        return ProfileId::ZSTD_TU;
+    if (mask == CACHE_PROFILE_ZSTD_ROUTE)
+        return ProfileId::ZSTD_ROUTE;
+    return std::nullopt;
 }
 
 bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration,
@@ -162,6 +174,40 @@ struct P50ZstdSourceSender::Impl {
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};
         ZstdSourceTransferResult result{};
+    };
+
+    struct PendingReceipt {
+        explicit PendingReceipt(boost::asio::any_io_executor executor)
+            : notification(std::move(executor)) {}
+        R2SentBundle sent{};
+        Clock::time_point deadline{};
+        boost::asio::steady_timer notification;
+        ClientRunResult client_result{};
+        std::exception_ptr failure;
+        bool ready = false;
+        bool done = false;
+    };
+
+    struct WriterWaiter {
+        explicit WriterWaiter(boost::asio::any_io_executor executor)
+            : notification(std::move(executor)) {}
+        boost::asio::steady_timer notification;
+        Clock::time_point deadline{};
+        bool granted = false;
+    };
+
+    struct R2TransferGuard {
+        explicit R2TransferGuard(Impl* value) : owner(value) {}
+        R2TransferGuard(const R2TransferGuard&) = delete;
+        R2TransferGuard& operator=(const R2TransferGuard&) = delete;
+        ~R2TransferGuard() { release(); }
+        void release() noexcept {
+            if (owner) {
+                owner->release_r2_transfer();
+                owner = nullptr;
+            }
+        }
+        Impl* owner;
     };
 
     Impl(CStoreGuid guid, PrepareRequestKey request_value,
@@ -336,10 +382,48 @@ struct P50ZstdSourceSender::Impl {
     bool route_bound = false;
     CompletionLog wire_completions;
     std::unique_ptr<P50ClientEndpoint> endpoint;
+    std::optional<boost::asio::ip::tcp::socket> r2_socket;
+    std::mutex r2_transfer_mutex;
+    bool r2_transfer_active = false;
+    std::deque<std::shared_ptr<WriterWaiter>> r2_transfer_waiters;
+    std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_window_waiters;
+    std::deque<std::shared_ptr<PendingReceipt>> r2_receipt_queue;
+    bool r2_reader_running = false;
+    uint64_t r2_pending_ack_ordinal = 0;
+    uint64_t r2_retained_raw_bytes = 0;
+    uint64_t r2_physical_link_generation = 0;
+    Id128 r2_relationship_id{};
+    uint64_t r2_relationship_epoch = 0;
+    uint64_t r2_relationship_ordinal = 1;
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
+
+    void release_r2_transfer() noexcept {
+        std::shared_ptr<WriterWaiter> wake;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            while (!r2_transfer_waiters.empty()) {
+                wake = std::move(r2_transfer_waiters.front());
+                r2_transfer_waiters.pop_front();
+                if (wake->deadline > Clock::now())
+                    break;
+                wake.reset();
+            }
+            if (wake) {
+                wake->granted = true;
+                // Ownership passes atomically to the FIFO head.
+                r2_transfer_active = true;
+            } else {
+                r2_transfer_active = false;
+            }
+        }
+        if (wake) {
+            boost::system::error_code ignored;
+            wake->notification.expires_at(Clock::now(), ignored);
+        }
+    }
 };
 
 P50ZstdSourceSender::P50ZstdSourceSender(CStoreGuid c_store_guid,
@@ -355,6 +439,120 @@ P50ZstdSourceSender::P50ZstdSourceSender(
                                    std::move(config))) {}
 
 P50ZstdSourceSender::~P50ZstdSourceSender() = default;
+
+boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
+    Clock::time_point deadline) {
+    const auto executor = co_await boost::asio::this_coro::executor;
+    std::shared_ptr<Impl::WriterWaiter> waiter;
+    try {
+        waiter = std::make_shared<Impl::WriterWaiter>(executor);
+        waiter->deadline = deadline;
+        waiter->notification.expires_at(deadline);
+    } catch (...) {
+        co_return false;
+    }
+    {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        if (!impl_->r2_transfer_active && impl_->r2_transfer_waiters.empty()) {
+            impl_->r2_transfer_active = true;
+            co_return true;
+        }
+        impl_->r2_transfer_waiters.push_back(waiter);
+    }
+    boost::system::error_code wait_error;
+    co_await waiter->notification.async_wait(
+        boost::asio::redirect_error(boost::asio::use_awaitable, wait_error));
+    {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        if (waiter->granted)
+            co_return true;
+        std::erase(impl_->r2_transfer_waiters, waiter);
+    }
+    co_return false;
+}
+
+boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader() {
+    for (;;) {
+        std::shared_ptr<Impl::PendingReceipt> pending;
+        bool wait_for_bundle = false;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_receipt_queue.empty()) {
+                impl_->r2_reader_running = false;
+                co_return;
+            }
+            pending = impl_->r2_receipt_queue.front();
+            if (!pending->ready) {
+                pending->notification.expires_at(Clock::time_point::max());
+                wait_for_bundle = true;
+            }
+        }
+        if (wait_for_bundle) {
+            boost::system::error_code wait_error;
+            co_await pending->notification.async_wait(
+                boost::asio::redirect_error(boost::asio::use_awaitable,
+                                            wait_error));
+            continue;
+        }
+
+        bool receipt_validated = false;
+        try {
+            if (!impl_->r2_socket)
+                throw std::logic_error("R2 receipt reader lost its live socket");
+            pending->client_result = co_await impl_->endpoint->read_r2_receipt(
+                *impl_->r2_socket, pending->sent, pending->deadline);
+            if (pending->client_result.status != ClientRunStatus::Committed ||
+                !pending->client_result.committed_commit)
+                throw std::invalid_argument("R2 receipt was not an exact commit");
+            receipt_validated = true;
+        } catch (...) {
+            pending->failure = std::current_exception();
+        }
+
+        std::vector<std::shared_ptr<boost::asio::steady_timer>> wake_window;
+        if (receipt_validated) {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            impl_->r2_pending_ack_ordinal = std::max(
+                impl_->r2_pending_ack_ordinal,
+                pending->sent.binding.relationship_ordinal);
+            wake_window.swap(impl_->r2_window_waiters);
+        } else {
+            impl_->route_replacement_required = true;
+            if (impl_->r2_socket) {
+                boost::system::error_code ignored;
+                impl_->r2_socket->close(ignored);
+            }
+        }
+
+        std::vector<std::shared_ptr<Impl::PendingReceipt>> failed_rows;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (!impl_->r2_receipt_queue.empty() &&
+                impl_->r2_receipt_queue.front() == pending)
+                impl_->r2_receipt_queue.pop_front();
+            pending->done = true;
+            if (!receipt_validated) {
+                failed_rows.assign(impl_->r2_receipt_queue.begin(),
+                                   impl_->r2_receipt_queue.end());
+                impl_->r2_receipt_queue.clear();
+                impl_->r2_reader_running = false;
+            }
+        }
+        pending->notification.expires_at(Clock::now());
+        for (const auto& timer : wake_window) {
+            boost::system::error_code ignored;
+            timer->expires_at(Clock::now(), ignored);
+        }
+        if (!receipt_validated) {
+            for (const auto& row : failed_rows) {
+                row->failure = pending->failure;
+                row->done = true;
+                row->notification.expires_at(Clock::now());
+            }
+            co_return;
+        }
+    }
+}
 
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
@@ -478,6 +676,159 @@ P50ZstdSourceSender::transfer_route(AsyncConnectedFdFactory connection,
         ConnectionTarget{std::move(connection)}, request, deadline, true,
         std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
 }
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_p51_route(
+    P51SourceArmedFields armed, uint64_t physical_link_generation,
+    AsyncConnectedFdFactory connection, PrepareRequestKey request,
+    Clock::time_point deadline, std::span<const uint8_t> source) {
+    const std::optional<ProfileId> armed_profile =
+        profile_from_cache_mask(armed.arm.source.cache_profile);
+    if (!impl_->route_bound || !armed.valid() || !armed_profile || !connection ||
+        physical_link_generation == 0 || !valid_deadline(
+            deadline, impl_->config.maximum_duration, Clock::now()) ||
+        source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes ||
+        *armed_profile != impl_->config.endpoint_caps.profile ||
+        armed.arm.source.assignment_epoch != request.producer_session ||
+        armed.arm.source.assignment_nonce != request.request_token)
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    const auto executor = co_await boost::asio::this_coro::executor;
+    const Digest128 raw_digest = digest128(source);
+    try {
+        if (const auto completed = impl_->completed_for(request, source, raw_digest))
+            co_return *completed;
+    } catch (...) {
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    }
+    if (impl_->route_replacement_required)
+        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
+    if (impl_->completed.size() >= impl_->config.max_completed_requests)
+        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
+
+    PreparedTuHandle prepared;
+    try {
+        prepared = impl_->authority->prepare_for_route(
+            impl_->route, request, source);
+    } catch (const P29V1CapabilityUnavailable&) {
+        co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError, true);
+    } catch (...) {
+        co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
+    }
+    if (impl_->authority->prepared_profile(prepared) != *armed_profile) {
+        try { (void)impl_->authority->release(prepared); } catch (...) {}
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    }
+    const TuSeq tu_seq = impl_->authority->prepared_tu_seq(prepared);
+    JobBind binding;
+    binding.reservation_id.bytes = armed.reservation_id;
+    binding.physical_link_generation = physical_link_generation;
+    binding.wire_job_id = armed.arm.source.wire_job_id;
+    binding.assignment_epoch = armed.arm.source.assignment_epoch;
+    binding.assignment_nonce = armed.arm.source.assignment_nonce;
+    binding.logical_job = armed.arm.source.logical_job;
+    binding.compiler_attempt = armed.arm.source.compiler_attempt;
+    binding.source_request_id = armed.arm.source.source_request_id;
+    binding.tu_seq = tu_seq;
+    binding.profile = *armed_profile;
+    binding.raw_bytes = source.size();
+    binding.raw_digest = raw_digest;
+
+    LinkHello hello;
+    hello.profile = binding.profile;
+    hello.window = armed.selected_window;
+    hello.max_frame_payload = impl_->config.endpoint_caps.wire.max_frame_payload;
+    hello.max_raw_bytes = impl_->config.endpoint_caps.zstd.max_raw_bytes;
+    hello.max_encoded_bytes = impl_->config.endpoint_caps.zstd.max_encoded_body_bytes;
+    hello.max_output_bytes = impl_->config.endpoint_caps.zstd.max_raw_bytes;
+    hello.reservation_id = Id128{armed.reservation_id};
+    hello.relationship_id = Id128{armed.logical_relationship_id};
+    hello.relationship_epoch = armed.relationship_epoch;
+    hello.physical_link_generation = physical_link_generation;
+    hello.c_store_guid = CStoreGuid{armed.arm.source.c_store_guid};
+    hello.c_store_generation = armed.arm.source.c_store_generation;
+    hello.f_store_guid = FStoreGuid{armed.f_store_guid};
+    hello.f_store_generation = armed.f_store_generation;
+    hello.c_control_generation = armed.arm.source.c_control_generation;
+    hello.c_control_attempt = armed.arm.source.c_control_attempt;
+    hello.system_source_fingerprint = binding.profile == ProfileId::P29V1
+        ? impl_->authority->p29v1_system_source_fingerprint(prepared)
+        : Digest128{};
+    hello.history_nonce = HistoryNonce{1};
+
+    try {
+        if (!impl_->r2_socket) {
+            const int fd = co_await await_connected_fd(connection, deadline);
+            if (fd < 0) {
+                (void)impl_->authority->release(prepared);
+                co_return impl_->invalid(
+                    Clock::now() >= deadline ? ZstdSourceTransferStatus::DeadlineExceeded
+                                             : ZstdSourceTransferStatus::Unavailable);
+            }
+            boost::system::error_code error;
+            auto socket = P50ClientEndpoint::adopt_connected_fd(executor, fd, error);
+            if (!socket) {
+                impl_->route_replacement_required = true;
+                co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError,
+                                             true);
+            }
+            impl_->r2_socket = std::move(*socket);
+            impl_->r2_physical_link_generation = physical_link_generation;
+            impl_->r2_relationship_id = hello.relationship_id;
+            impl_->r2_relationship_epoch = hello.relationship_epoch;
+            const LinkState state = co_await impl_->endpoint->open_r2_link(
+                *impl_->r2_socket, hello, deadline);
+            if (state.f_store_guid != hello.f_store_guid ||
+                state.f_store_generation != hello.f_store_generation)
+                throw std::invalid_argument("R2 F identity differs from ARMED");
+        } else if (impl_->r2_relationship_id != hello.relationship_id ||
+                   impl_->r2_relationship_epoch != hello.relationship_epoch) {
+            throw std::invalid_argument("R2 relationship changed on retained socket");
+        }
+        const R2SentBundle sent = co_await impl_->endpoint->write_r2_bundle(
+            *impl_->r2_socket, binding, prepared, deadline);
+        ClientRunResult run = co_await impl_->endpoint->read_r2_receipt(
+            *impl_->r2_socket, sent, deadline);
+        if (run.status != ClientRunStatus::Committed || !run.committed_commit) {
+            impl_->route_replacement_required = true;
+            co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError, true);
+        }
+        ZstdSourceTransferResult result;
+        result.status = ZstdSourceTransferStatus::Committed;
+        result.profile = binding.profile;
+        result.committed_input = run.committed_input;
+        result.raw_bytes = source.size();
+        result.raw_digest = raw_digest;
+        result.attempts = 1;
+        if (binding.profile == ProfileId::P29V1)
+            result.system_source_reuse =
+                impl_->authority->p29v1_system_source_reuse(prepared);
+        (void)impl_->authority->release(prepared);
+        ++impl_->r2_relationship_ordinal;
+        impl_->remember_completed(request, source, raw_digest, result);
+        co_return result;
+    } catch (...) {
+        try {
+            if (impl_->authority->contains(prepared)) {
+                const auto release_count = impl_->authority->release(prepared);
+                (void)release_count;
+            }
+        } catch (...) {}
+        impl_->route_replacement_required = true;
+        if (impl_->r2_socket) {
+            boost::system::error_code ignored;
+            impl_->r2_socket->close(ignored);
+            impl_->r2_socket.reset();
+        }
+        co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError, true);
+    }
+}
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic pop
+#endif
 
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
     // GCC 13 can diagnose Boost.Asio's awaitable-frame allocator as a

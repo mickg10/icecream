@@ -31,6 +31,7 @@ inline constexpr uint16_t kControlOperationVersionV4 = 4;
 // CLOCK_MONOTONIC deadline and daemon/sidecar clock-namespace identity.
 inline constexpr uint16_t kControlOperationVersionV5 = 5;
 inline constexpr uint16_t kControlOperationVersionV6 = 6;
+inline constexpr uint16_t kControlOperationVersionV7 = 7;
 inline constexpr size_t kCacheSessionOperationBytes = 32;
 inline constexpr size_t kLegacyInputFdAttachmentOperationBytes = 56;
 inline constexpr size_t kInputFdAttachmentOperationBytes = 88;
@@ -43,6 +44,10 @@ inline constexpr size_t kOperationCancelOperationBytes = 72;
 // sending P50SourceArm to F.  The fixed envelope keeps operation demux bounded
 // while leaving the host field at its protocol maximum.
 inline constexpr size_t kSourceTransferOperationBytes = 512;
+// P51 carries the full source arm, its unchanged monotonic deadline and (on
+// reply) the F-minted reservation/relationship binding. Fixed-size and
+// bounded independently of the local transport frame maximum.
+inline constexpr size_t kP51SourceReservationOperationBytes = 1024;
 
 enum class ControlOperationKind : uint16_t {
     CacheSession = 1,
@@ -50,6 +55,10 @@ enum class ControlOperationKind : uint16_t {
     InputLifecycle = 3,
     OperationCancel = 4,
     SourceTransfer = 5,
+    SourceReservation = 6,
+    SourceReservationCancel = 7,
+    P51SourceTransfer = 8,
+    CacheLinkSession = 9,
 };
 
 enum class SourceTransferResultCode : uint16_t {
@@ -119,6 +128,40 @@ struct P50SourceTransferResult {
     auto operator<=>(const P50SourceTransferResult&) const = default;
 };
 
+struct P51SourceReservationRequest {
+    P51SourceArmFields arm{};
+    sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    auto operator<=>(const P51SourceReservationRequest&) const = default;
+};
+
+struct P51SourceReservationResult {
+    uint16_t error_code = 0;
+    std::optional<P51SourceArmedFields> armed;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return (error_code == 0) == armed.has_value() &&
+               (!armed.has_value() || armed->valid());
+    }
+    auto operator<=>(const P51SourceReservationResult&) const = default;
+};
+
+struct P51SourceReservationCancel {
+    P51SourceArmFields arm{};
+    P51SourceArmedFields armed{};
+    sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    std::optional<bool> cancelled;
+    auto operator<=>(const P51SourceReservationCancel&) const = default;
+};
+
+// Transfer one P51 source over the existing authenticated C-sidecar control
+// operation. The complete F-minted ARMED witness is required; the raw source
+// itself remains the operation's single SCM_RIGHTS descriptor.
+struct P51SourceTransferRequest {
+    P51SourceArmedFields armed{};
+    sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    auto operator<=>(const P51SourceTransferRequest&) const = default;
+};
+
 enum class ControlOperationRole : uint16_t {
     Daemon = 1,
     Sidecar = 2,
@@ -163,6 +206,12 @@ struct ControlOperation {
     sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
     std::optional<P50SourceTransferRequest> source_arm;
     std::optional<P50SourceTransferResult> source_result;
+    std::optional<P51SourceReservationRequest> p51_reservation;
+    std::optional<P51SourceReservationResult> p51_reservation_result;
+    std::optional<P51SourceReservationCancel> p51_reservation_cancel;
+    std::optional<bool> p51_reservation_cancel_result;
+    std::optional<P51SourceTransferRequest> p51_source_transfer;
+    std::optional<P50SourceTransferResult> p51_source_transfer_result;
 };
 
 namespace detail {
@@ -209,7 +258,11 @@ inline bool control_kind_valid(ControlOperationKind kind) noexcept {
            kind == ControlOperationKind::InputFdAttachment ||
            kind == ControlOperationKind::InputLifecycle ||
            kind == ControlOperationKind::OperationCancel ||
-           kind == ControlOperationKind::SourceTransfer;
+           kind == ControlOperationKind::SourceTransfer ||
+           kind == ControlOperationKind::SourceReservation ||
+           kind == ControlOperationKind::SourceReservationCancel ||
+           kind == ControlOperationKind::P51SourceTransfer ||
+           kind == ControlOperationKind::CacheLinkSession;
 }
 
 inline bool control_role_valid(ControlOperationRole role) noexcept {
@@ -265,7 +318,16 @@ inline ControlOperation make_cache_session_operation(Identity identity,
                              ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {}, 0, {}, 0,
-                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt,
+                             std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                             std::nullopt, std::nullopt};
+}
+
+inline ControlOperation make_cache_link_session_operation(
+    Identity identity, uint64_t request_id) noexcept {
+    ControlOperation operation = make_cache_session_operation(identity, request_id);
+    operation.kind = ControlOperationKind::CacheLinkSession;
+    return operation;
 }
 
 inline ControlOperation make_input_fd_attachment_operation(
@@ -276,7 +338,9 @@ inline ControlOperation make_input_fd_attachment_operation(
                              std::nullopt, ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {}, 0, {}, 0,
-                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt,
+                             std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                             std::nullopt, std::nullopt};
 }
 
 inline ControlOperation make_input_lifecycle_operation(
@@ -287,7 +351,9 @@ inline ControlOperation make_input_lifecycle_operation(
                                ControlOperationRole::Daemon,
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                               std::nullopt, std::nullopt};
     operation.f_store_generation = request.f_store_generation;
     operation.f_store_guid = request.f_store_guid;
     operation.immutable_size = request.immutable_size;
@@ -306,7 +372,9 @@ inline ControlOperation make_input_lifecycle_reply_operation(
                                request.action, status, ControlOperationRole::Sidecar,
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                               std::nullopt, std::nullopt};
     operation.f_store_generation = request.f_store_generation;
     operation.f_store_guid = request.f_store_guid;
     operation.immutable_size = request.immutable_size;
@@ -329,7 +397,9 @@ inline ControlOperation make_operation_cancel_operation(
                             std::nullopt, std::nullopt, InputLifecycleAction::None,
                             std::nullopt, sender_role, target_role,
                             reason, binding_placeholder, 0, {}, 0, {}, 0,
-                            std::nullopt, {}, std::nullopt, std::nullopt};
+                            std::nullopt, {}, std::nullopt, std::nullopt,
+                            std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                            std::nullopt, std::nullopt};
 }
 
 inline ControlOperation make_source_transfer_operation(
@@ -341,7 +411,9 @@ inline ControlOperation make_source_transfer_operation(
                                ControlOperationRole::Daemon,
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                               std::nullopt, std::nullopt};
     operation.absolute_deadline = deadline;
     operation.source_arm = arm;
     return operation;
@@ -352,6 +424,44 @@ inline ControlOperation make_source_transfer_reply_operation(
     ControlOperation operation = request;
     operation.source_result = result;
     operation.sender_role = ControlOperationRole::Sidecar;
+    return operation;
+}
+
+inline ControlOperation make_p51_source_transfer_operation(
+    Identity identity, const P51SourceTransferRequest& request,
+    uint64_t request_id) {
+    ControlOperation operation{};
+    operation.kind = ControlOperationKind::P51SourceTransfer;
+    operation.identity = identity;
+    operation.request_id = request_id;
+    operation.p51_source_transfer = request;
+    operation.absolute_deadline = request.absolute_deadline;
+    return operation;
+}
+
+inline ControlOperation make_p51_source_reservation_operation(
+    Identity identity, const P51SourceReservationRequest& request) noexcept {
+    ControlOperation operation = make_cache_session_operation(
+        identity, request.arm.source.source_request_id);
+    operation.kind = ControlOperationKind::SourceReservation;
+    operation.absolute_deadline = request.absolute_deadline;
+    operation.p51_reservation = request;
+    return operation;
+}
+
+inline ControlOperation make_p51_source_reservation_reply_operation(
+    const ControlOperation& request,
+    P51SourceReservationResult result) noexcept {
+    ControlOperation operation = request;
+    operation.p51_reservation_result = std::move(result);
+    operation.sender_role = ControlOperationRole::Sidecar;
+    return operation;
+}
+
+inline ControlOperation make_p51_source_transfer_reply_operation(
+        const ControlOperation& request, P50SourceTransferResult result) {
+    ControlOperation operation = request;
+    operation.p51_source_transfer_result = std::move(result);
     return operation;
 }
 

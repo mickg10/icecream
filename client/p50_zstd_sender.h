@@ -165,6 +165,16 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    // Persistent P51 R2 relationship path. The connector is used once on
+    // first use to obtain the clean post-P51_CACHE_LINK_SESSION TCP socket;
+    // later exact-incarnation jobs reuse that socket and send one bundle at a
+    // time at W1 while the endpoint's writer/reader primitives remain split.
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_p51_route(
+        P51SourceArmedFields armed, uint64_t physical_link_generation,
+        AsyncConnectedFdFactory connection, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        std::span<const uint8_t> source);
+
 private:
     using ConnectionTarget =
         std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory,
@@ -176,6 +186,10 @@ private:
         std::chrono::steady_clock::time_point deadline,
         bool explicit_route,
         std::shared_ptr<const std::vector<uint8_t>> source);
+
+    boost::asio::awaitable<void> run_r2_receipt_reader();
+    boost::asio::awaitable<bool> acquire_r2_writer(
+        std::chrono::steady_clock::time_point deadline);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

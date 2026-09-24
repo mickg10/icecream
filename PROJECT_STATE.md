@@ -43,6 +43,30 @@ The tested endpoint source snapshot is
 `411c78435893110f04683a7e835c8244be4708a81b8350c703d9e23aac243895`;
 ongoing integration edits are not covered by that snapshot.
 
+The next dormant implementation checkpoint includes ordinary P51 source
+control and descriptor handoff, persistent endpoint plumbing, bounded
+reservation/receipt storage, and F-side window admission up to 30. It does
+not enable production R2 advertisement or qualify C-side W30, recovery, or
+restart behavior. The frozen source is
+`/tanksmall/scratch/tmp/p50-r2-w30-snapshot-20260924/source`.
+Its services, sidecar, daemon, client and scheduler compiled and linked;
+the full make invocation subsequently failed on test-build temporary-file
+permissions. Targeted builds and runtime checks were then run after fixing
+that environment issue. Source-arm validation (R2 empty input, R1 empty-input
+rejection and unsupported-revision rejection) and the full cache-service
+suite passed. Evidence:
+`/tanksmall/scratch/tmp/p50-r2-w30-snapshot-20260924/tmp/c1-sourcearm-service-run-r1.log`
+(SHA256 `99b6041f997bc59b899018934fcb36a03280a926ccafd87b492db4eba05ce829`).
+The same snapshot also passed both direct-F endpoint checks: two sequential
+exact jobs on one connection and silent-before-HELLO incarnation cancellation.
+Log: `tmp/c1-endpoint-current-focus-r1.log` under the snapshot root above
+(SHA256 `85adb880dfe4f779bc5c775d544bf766b29ecdc4954ee9d222243d3f4920bb4c`).
+Endpoint binary SHA256:
+`550d0e63db95e1ea7e723637d5f72c57a72aac99845ca9af8c9cf4c730877871`.
+Earlier stale-snapshot failures are not passes; these targeted results close
+those checks only. Newer independent C reader/writer and recovery edits are
+separate work and must obtain their own build/runtime evidence.
+
 The first version-gate audit preserves ordinary maximum 50 and existing R1
 bytes. Focused `p50sourcearmwire`, `p50cachesessionwire`,
 `p50cacheadvertisement` and the source-arm source guard passed in 92.50s;

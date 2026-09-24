@@ -228,6 +228,57 @@ void wait_state() {
     ::close(close_fds[1]);
 }
 
+void r2_empty_input_and_revision_guard() {
+    P50SourceArm r2 = arm();
+    r2.cache_protocol = 2;
+    require(r2.valid_for_cache_revision(2),
+            "CacheWire revision 2 source arm was rejected");
+    require(!r2.valid_for_cache_revision(1) &&
+                !r2.valid_for_cache_revision(3),
+            "R2 identity was accepted under a different revision");
+
+    P50SourceArmFields canonical_r2 = canonical_arm();
+    canonical_r2.cache_protocol = 2;
+    require(canonical_r2.valid_for_cache_revision(2),
+            "complete R2 arm was rejected");
+    P50SourceArmFields unsupported = canonical_r2;
+    unsupported.cache_protocol = 3;
+    require(!unsupported.valid_for_cache_revision(3) &&
+                !unsupported.valid_for_cache_revision(2),
+            "unsupported CacheWire revision was accepted");
+
+    P50InputReady empty_r2 = ready_for(r2);
+    empty_r2.raw_bytes = 0;
+    const auto empty_wire = icecc::p50::encode_input_ready(empty_r2);
+    const auto empty_roundtrip = icecc::p50::decode_input_ready(empty_wire);
+    require(!empty_wire.empty() && empty_roundtrip.has_value() &&
+                *empty_roundtrip == empty_r2,
+            "empty R2 TU failed exact input-ready roundtrip");
+
+    P50InputReady empty_r1 = ready_for(arm());
+    empty_r1.raw_bytes = 0;
+    require(!empty_r1.valid() &&
+                icecc::p50::encode_input_ready(empty_r1).empty(),
+            "empty input was incorrectly enabled for legacy R1");
+
+    P50InputWaitState wait;
+    require(wait.arm_input(canonical_r2),
+            "R2 complete arm failed to enter WAITP50INPUT");
+    int fds[2] = {-1, -1};
+    require(::pipe(fds) == 0, "R2 empty-input pipe setup failed");
+    P50SourceArmFields wrong = canonical_r2;
+    wrong.cache_protocol = 1;
+    require(!wait.accept_ready(wrong, empty_r2, fds[0]),
+            "R1 arm was allowed to consume an R2 empty-input READY");
+    require(wait.accept_ready(canonical_r2, empty_r2, fds[0]),
+            "exact R2 empty-input READY was rejected");
+    const int fork_fd = wait.take_for_fork();
+    require(fork_fd == fds[0],
+            "R2 empty input did not transfer its sealed descriptor once");
+    ::close(fork_fd);
+    ::close(fds[1]);
+}
+
 }  // namespace
 
 int main() {
@@ -235,6 +286,7 @@ int main() {
         wire_fixture();
         arm_ack_order();
         wait_state();
+        r2_empty_input_and_revision_guard();
         std::cout << "ok - P50 two-phase source arm and WAITP50INPUT reducer\n";
         return 0;
     } catch (const std::exception& error) {

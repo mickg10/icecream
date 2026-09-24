@@ -472,6 +472,128 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     return *control.source_transfer_result();
 }
 
+icecc::p50::local::P50SourceTransferResult transfer_p51_source(
+    CompileJob &job, const UseCSMsg &assignment, MsgChannel &cserver,
+    MsgChannel &local_daemon, icecc::p50::OwnedSourceFd source,
+    icecc::p50::ProfileId profile)
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(120);
+    const std::optional<uint32_t> profile_wire = p50_profile_wire(profile);
+    const std::optional<uint32_t> source_mode = p50_source_mode_wire(profile);
+    if (!profile_wire || !source_mode || !source ||
+        !protocol_supports_cache_r2(cserver.protocol) ||
+        assignment.cache_protocol != CACHE_WIRE_REVISION_R2)
+        return p50_transfer_error(1);
+
+    P51SourceLeaseRequestFields lease_request;
+    lease_request.wire_job_id = assignment.job_id;
+    lease_request.assignment_epoch = assignment.assignmentEpoch();
+    lease_request.assignment_nonce = assignment.assignmentNonce();
+    lease_request.profile = *profile_wire;
+    lease_request.requested_cache_revision = CACHE_WIRE_REVISION_R2;
+    lease_request.requested_window = 30;
+    if (!lease_request.valid() ||
+        !local_daemon.send_msg(P51SourceLeaseRequestMsg(lease_request)))
+        return p50_transfer_error(2);
+
+    P51CacheControlIdentity control_identity;
+    const int control_fd = local_daemon.receive_p51_cache_fd_reply(
+        lease_request, control_identity, deadline);
+    if (control_fd < 0 || !control_identity.valid()) {
+        if (control_fd >= 0)
+            ::close(control_fd);
+        return p50_transfer_error(3);
+    }
+
+    P50SourceArmFields source_arm;
+    source_arm.wire_job_id = assignment.job_id;
+    source_arm.assignment_epoch = assignment.assignmentEpoch();
+    source_arm.assignment_nonce = assignment.assignmentNonce();
+    source_arm.selected_f_host = assignment.hostname;
+    source_arm.selected_f_ordinary_port = assignment.port;
+    source_arm.selected_f_cache_port = assignment.cache_endpoint_port;
+    source_arm.cache_protocol = CACHE_WIRE_REVISION_R2;
+    source_arm.cache_profile = *profile_wire;
+    source_arm.logical_job = job.jobID();
+    source_arm.compiler_attempt = job.assignmentNonce();
+    source_arm.c_store_generation = control_identity.c_store_generation;
+    source_arm.c_store_derivation_version = control_identity.derivation_version;
+    source_arm.c_store_guid = control_identity.c_store_guid;
+    source_arm.source_request_id = assignment.assignmentNonce();
+    source_arm.source_mode = *source_mode;
+    source_arm.c_control_generation = control_identity.control_generation;
+    source_arm.c_control_attempt = control_identity.control_attempt;
+    P51SourceArmFields arm{source_arm, lease_request.requested_window};
+    P51SourceArmMsg arm_message(arm);
+    if (!arm.valid() || !arm_message.valid_for_protocol(cserver.protocol) ||
+        !cserver.send_msg(arm_message)) {
+        ::close(control_fd);
+        return p50_transfer_error(4);
+    }
+    std::unique_ptr<Msg> response(cserver.get_msg_until(deadline));
+    const auto* armed_message =
+        dynamic_cast<const P51SourceArmedMsg*>(response.get());
+    if (armed_message == nullptr || !armed_message->valid_payload() ||
+        !armed_message->acknowledges(arm_message) ||
+        armed_message->selected_revision != CACHE_WIRE_REVISION_R2 ||
+        armed_message->selected_window == 0 ||
+        armed_message->selected_window > lease_request.requested_window) {
+        ::close(control_fd);
+        return p50_transfer_error(5);
+    }
+
+    const auto absolute_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            deadline, sidecar::process_monotonic_clock_identity().clock_domain_id,
+            sidecar::process_monotonic_clock_identity().time_namespace_id);
+    const Identity identity{control_identity.control_generation,
+                             control_identity.control_attempt};
+    const P51SourceTransferRequest transfer_request{
+        static_cast<const P51SourceArmedFields&>(*armed_message),
+        absolute_deadline};
+    const ControlOperation operation = make_p51_source_transfer_operation(
+        identity, transfer_request,
+        transfer_request.armed.arm.source.source_request_id);
+    CredentialExpectation credentials;
+    credentials.uid = control_identity.peer_uid;
+    credentials.gid = control_identity.peer_gid;
+    DaemonControlOperation control;
+    const int source_fd = source.release();
+    const DaemonControlStatus started = control.begin_authenticated(
+        control_fd, operation, source_fd, credentials, identity, deadline,
+        DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
+    if (started != DaemonControlStatus::InProgress)
+        return p50_transfer_error(6);
+    while (!control.done()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            (void)control.advance(now, 0);
+            break;
+        }
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(deadline - now);
+        const int timeout = static_cast<int>(std::max<int64_t>(
+            1, std::min<int64_t>(remaining.count(), INT_MAX)));
+        pollfd descriptor{control.native_handle(), control.desired_events(), 0};
+        const int ready = ::poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0) {
+            (void)control.advance(std::chrono::steady_clock::now(), POLLERR);
+            break;
+        }
+        (void)control.advance(std::chrono::steady_clock::now(),
+                              ready == 0 ? short{0} : descriptor.revents);
+    }
+    if (control.status() != DaemonControlStatus::Complete ||
+        !control.source_transfer_result().has_value())
+        return p50_transfer_error(7);
+    return *control.source_transfer_result();
+}
+
 }
 
 using namespace std;
@@ -1165,11 +1287,21 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     return cpp_status;
                 }
 
+                // The complete preprocessed input is now owned by an
+                // immutable descriptor. Release the local compile slot
+                // before any potentially long ARM, source read, or cache
+                // receipt wait; remote transfer must not consume a CPU slot.
+                dcc_unlock();
+
                 if (p50_observation != nullptr)
                     p50_observation->transfer_attempted = true;
                 const icecc::p50::local::P50SourceTransferResult transfer =
-                    transfer_p50_source(job, *usecs, *local_daemon,
-                                        std::move(source), p50_profile);
+                    usecs->cache_protocol == CACHE_WIRE_REVISION_R2
+                        ? transfer_p51_source(job, *usecs, *cserver,
+                                              *local_daemon, std::move(source),
+                                              p50_profile)
+                        : transfer_p50_source(job, *usecs, *local_daemon,
+                                              std::move(source), p50_profile);
                 const std::optional<CompileInputIdentity> identity =
                     icecc::p50::bind_compile_input(job, p50_profile, transfer);
                 if (!identity.has_value()) {

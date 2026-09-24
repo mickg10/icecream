@@ -37,6 +37,7 @@ struct P50SourceArm {
 
     auto operator<=>(const P50SourceArm&) const = default;
     [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] bool valid_for_cache_revision(uint32_t revision) const noexcept;
 };
 
 struct P50InputReady {

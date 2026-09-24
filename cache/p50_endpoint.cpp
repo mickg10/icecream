@@ -1,4 +1,5 @@
 #include "p50_endpoint.h"
+#include "../services/digest128.h"
 #include "p50_slice0.h"
 
 #include "p50_adopted_outcome_writer.h"
@@ -261,6 +262,36 @@ void close_now(tcp::socket& socket) {
     socket.close(ignored);
 }
 
+class SocketDeadlineGuard {
+public:
+    SocketDeadlineGuard(asio::any_io_executor executor, tcp::socket& socket,
+                       std::chrono::steady_clock::time_point deadline)
+        : timer_(std::move(executor)), state_(std::make_shared<State>()) {
+        state_->socket = &socket;
+        timer_.expires_at(deadline);
+        timer_.async_wait([state = state_](const boost::system::error_code& error) {
+            if (!error && state->active.exchange(false, std::memory_order_acq_rel) &&
+                state->socket != nullptr)
+                close_now(*state->socket);
+        });
+    }
+    SocketDeadlineGuard(const SocketDeadlineGuard&) = delete;
+    SocketDeadlineGuard& operator=(const SocketDeadlineGuard&) = delete;
+    ~SocketDeadlineGuard() {
+        state_->active.store(false, std::memory_order_release);
+        boost::system::error_code ignored;
+        timer_.cancel(ignored);
+    }
+
+private:
+    struct State {
+        std::atomic<bool> active{true};
+        tcp::socket* socket = nullptr;
+    };
+    asio::steady_timer timer_;
+    std::shared_ptr<State> state_;
+};
+
 // The timer owns the socket through this shared state.  Consequently a
 // canceled/late timer completion can never dereference the run coroutine's
 // stack, and no callback captures the endpoint (whose owner may be gone).
@@ -311,6 +342,7 @@ struct ServerIoState {
     std::weak_ptr<ServerMaterializationAsyncState> materialization;
     bool expired = false;
     bool cancelled = false;
+    uint64_t deadline_generation = 0;
 };
 
 class ServerRunSocketTarget final : public EndpointSocketTarget {
@@ -893,7 +925,16 @@ struct P50PreparationAuthority::Impl {
         ProfileId profile = ProfileId::ZSTD_TU;
         std::vector<uint8_t> committed_route_history;
         Digest128 committed_route_history_digest = digest128(std::span<const uint8_t>{});
-        std::optional<uint64_t> uncommitted_route_entry;
+        std::vector<uint8_t> speculative_route_history;
+        Digest128 speculative_route_history_digest = digest128(std::span<const uint8_t>{});
+        uint64_t next_speculative_route_rel = 0;
+        uint64_t next_confirmed_route_rel = 0;
+        // Ordered per-relationship admission ledger. P29V1 may have one
+        // active NEED/FILL transaction while later entries are staged; all
+        // profiles confirm strictly from the front.
+        std::vector<uint64_t> speculative_entries;
+        std::optional<uint64_t> active_p29_entry;
+        uint64_t speculative_raw_bytes = 0;
         std::unique_ptr<CRoute> p29_route;
         Digest128 p29v1_system_source_fingerprint{};
     };
@@ -918,6 +959,7 @@ struct P50PreparationAuthority::Impl {
         uint64_t references = 1;
         uint64_t retained_bytes = 0;
         bool committed = false;
+        bool speculative_advanced = false;
     };
 
     Impl(CStoreGuid c_store_guid_value, ZstdTuLimits zstd_limits_value,
@@ -934,7 +976,10 @@ struct P50PreparationAuthority::Impl {
         if (authority_limits.max_live_entries == 0 ||
             authority_limits.max_retained_encoded_bytes == 0 ||
             authority_limits.max_interner_reserved_bytes == 0 ||
-            authority_limits.max_route_state_bytes == 0)
+            authority_limits.max_route_state_bytes == 0 ||
+            authority_limits.max_speculative_tus == 0 ||
+            authority_limits.max_speculative_tus > 30 ||
+            authority_limits.max_speculative_raw_bytes == 0)
             throw std::invalid_argument("preparation-authority limits must be nonzero");
         if (profile != ProfileId::P29V1 &&
             profile != ProfileId::ZSTD_TU &&
@@ -976,6 +1021,10 @@ struct P50PreparationAuthority::Impl {
         if (found != routes.end()) return *found->second;
         auto state = std::make_unique<RouteState>();
         state->profile = key.profile;
+        state->speculative_entries.reserve(authority_limits.max_speculative_tus);
+        state->speculative_route_history = state->committed_route_history;
+        state->speculative_route_history_digest =
+            state->committed_route_history_digest;
         if (key.profile == ProfileId::P29V1) {
             ensure_p29v1();
             // A relationship that starts before the asynchronous daemon
@@ -985,9 +1034,13 @@ struct P50PreparationAuthority::Impl {
             state->p29v1_system_source_fingerprint =
                 p29_system_source_fingerprint();
         }
-        if (key.profile == ProfileId::P29V1)
+        if (key.profile == ProfileId::P29V1) {
             state->p29_route = std::make_unique<CRoute>(
                 *p29_authority, key.f_store_guid, HistoryNonce{1});
+            state->p29_route->configure_speculative_window(
+                authority_limits.max_speculative_tus,
+                authority_limits.max_speculative_raw_bytes);
+        }
         RouteState& result = *state;
         routes.emplace(key, std::move(state));
         return result;
@@ -1076,11 +1129,18 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
     // exactly once and cannot change its reuse decision mid-relationship.
     Impl::RouteState& route = impl_->route_state(route_key);
 
-    if ((route.profile == ProfileId::ZSTD_ROUTE ||
-         route.profile == ProfileId::P29V1) &&
-        route.uncommitted_route_entry.has_value())
+    if (route.speculative_entries.size() >=
+        impl_->authority_limits.max_speculative_tus)
+        throw std::length_error(
+            "C preparation authority reached its per-route TU window");
+    if (exact_input.size() > impl_->authority_limits.max_speculative_raw_bytes ||
+        route.speculative_raw_bytes >
+            impl_->authority_limits.max_speculative_raw_bytes - exact_input.size())
+        throw std::length_error(
+            "C preparation authority reached its per-route raw-byte window");
+    if (route.profile == ProfileId::P29V1 && route.active_p29_entry)
         throw std::logic_error(
-            "selected route profile requires its predecessor to commit before preparing the next TU");
+            "P29V1 predecessor must finish NEED/FILL advancement before the next TU");
 
     if (impl_->entries.size() >= impl_->authority_limits.max_live_entries)
         throw std::length_error("C preparation authority reached its live-entry bound");
@@ -1107,6 +1167,9 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
     admission_limits.max_encoded_body_bytes =
         std::min(admission_limits.max_encoded_body_bytes, retained_room);
     PreparedInputPtr prepared;
+    std::vector<uint8_t> next_route_history;
+    Digest128 next_route_history_digest{};
+    bool advance_route_history = false;
     bool p29_active_started = false;
     try {
         if (route.profile == ProfileId::ZSTD_TU) {
@@ -1116,12 +1179,39 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             prepared = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{envelope.begin, envelope.body});
         } else if (route.profile == ProfileId::ZSTD_ROUTE) {
+            const size_t route_limit = static_cast<size_t>(std::min<uint64_t>(
+                impl_->zstd_limits.max_history_bytes,
+                uint64_t{1} << impl_->zstd_limits.max_window_log));
+            next_route_history = route.speculative_route_history;
+            if (exact_input.size() >= route_limit) {
+                next_route_history.assign(
+                    exact_input.end() - static_cast<std::ptrdiff_t>(route_limit),
+                    exact_input.end());
+            } else {
+                const size_t excess = next_route_history.size() + exact_input.size() > route_limit
+                    ? next_route_history.size() + exact_input.size() - route_limit
+                    : 0;
+                if (excess != 0)
+                    next_route_history.erase(
+                        next_route_history.begin(),
+                        next_route_history.begin() + static_cast<std::ptrdiff_t>(excess));
+                next_route_history.insert(next_route_history.end(), exact_input.begin(),
+                                          exact_input.end());
+            }
+            if (route.next_speculative_route_rel ==
+                std::numeric_limits<uint64_t>::max())
+                throw std::overflow_error("ZSTD_ROUTE REL_SEQ space exhausted");
+            const RelSeq route_rel{route.next_speculative_route_rel};
             const ZstdRouteEnvelope envelope = impl_->route_codec.encode(
-                HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{},
-                std::span<const uint8_t>(route.committed_route_history), exact_input,
+                HistoryNonce{1}, route_rel, tu_seq,
+                route.speculative_route_history_digest,
+                std::span<const uint8_t>(route.speculative_route_history), exact_input,
                 admission_limits);
             prepared = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{envelope.begin, envelope.body});
+            next_route_history_digest = digest128(
+                std::span<const uint8_t>(next_route_history));
+            advance_route_history = true;
         } else if (route.profile == ProfileId::P29V1) {
             if (!shared->p29_source) {
                 try {
@@ -1168,7 +1258,7 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         if (!prepared)
             throw std::logic_error("shared preparation route has no prepared input");
         Impl::Entry entry{request, route_key, shared, prepared, 1, retained,
-                          false};
+                          false, false};
         const auto [entry_position, entry_inserted] = impl_->entries.emplace(
             entry_id, std::move(entry));
         (void)entry_position;
@@ -1180,12 +1270,19 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         impl_->requests.emplace(request, shared);
         impl_->retained_bytes += retained;
         retained_added = true;
-        if (route.profile == ProfileId::ZSTD_ROUTE ||
-            route.profile == ProfileId::P29V1)
-            route.uncommitted_route_entry = entry_id;
+        route.speculative_entries.push_back(entry_id);
+        route.speculative_raw_bytes += exact_input.size();
+        if (route.profile == ProfileId::ZSTD_ROUTE)
+            ++route.next_speculative_route_rel;
+        if (route.profile == ProfileId::P29V1)
+            route.active_p29_entry = entry_id;
         impl_->consume_entry();
         if (reserved_tu_seq)
             impl_->p29_authority->commit_tu_seq(*reserved_tu_seq);
+        if (advance_route_history) {
+            route.speculative_route_history = std::move(next_route_history);
+            route.speculative_route_history_digest = next_route_history_digest;
+        }
         return PreparedTuHandle(impl_->identity, entry_id);
     } catch (...) {
         if (p29_active_started && route.p29_route)
@@ -1197,10 +1294,15 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             impl_->requests.erase(request);
         if (entry_added)
             impl_->entries.erase(entry_id);
-        if ((route.profile == ProfileId::ZSTD_ROUTE ||
-             route.profile == ProfileId::P29V1) &&
-            route.uncommitted_route_entry == entry_id)
-            route.uncommitted_route_entry.reset();
+        if (!route.speculative_entries.empty() &&
+            route.speculative_entries.back() == entry_id) {
+            route.speculative_entries.pop_back();
+            route.speculative_raw_bytes -= exact_input.size();
+            if (route.profile == ProfileId::ZSTD_ROUTE)
+                --route.next_speculative_route_rel;
+        }
+        if (route.active_p29_entry == entry_id)
+            route.active_p29_entry.reset();
         throw;
     }
 }
@@ -1218,10 +1320,114 @@ std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
     if (entry.route.profile != ProfileId::P29V1 || entry.committed)
         throw std::invalid_argument("prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(entry.route);
-    if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_)
+    if (!route.p29_route || route.active_p29_entry != handle.entry_id_)
         throw std::logic_error("P29V1 NEED does not identify the route successor");
     return route.p29_route->build_fill_v1(inner_need);
+}
+
+std::vector<uint8_t> P50PreparationAuthority::predicted_p29v1_need(
+    PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed)
+        throw std::invalid_argument("prepared-TU handle is not active P29V1");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route || route.active_p29_entry != handle.entry_id_)
+        throw std::logic_error("P29V1 NEED does not identify the route successor");
+    return route.p29_route->predicted_need_v1();
+}
+
+void P50PreparationAuthority::advance_p29v1_speculative(
+    PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed ||
+        entry.speculative_advanced)
+        throw std::invalid_argument("prepared-TU handle is not unadvanced P29V1");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route || route.active_p29_entry != handle.entry_id_)
+        throw std::logic_error("P29V1 advancement does not identify the active TU");
+    route.p29_route->advance_speculative_v1();
+    entry.speculative_advanced = true;
+    route.active_p29_entry.reset();
+}
+
+void P50PreparationAuthority::advance_speculative(PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.committed || entry.speculative_advanced)
+        throw std::invalid_argument("prepared-TU is already advanced or committed");
+    if (entry.route.profile == ProfileId::P29V1) {
+        advance_p29v1_speculative(handle);
+        return;
+    }
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    const auto first_unadvanced = std::find_if(
+        route.speculative_entries.begin(), route.speculative_entries.end(),
+        [this](uint64_t entry_id) {
+            const auto candidate = impl_->entries.find(entry_id);
+            return candidate == impl_->entries.end() ||
+                   !candidate->second.speculative_advanced;
+        });
+    if (first_unadvanced == route.speculative_entries.end() ||
+        *first_unadvanced != handle.entry_id_)
+        throw std::logic_error(
+            "speculative TU advancement is not in relationship order");
+    entry.speculative_advanced = true;
+}
+
+TxBegin P50PreparationAuthority::r2_staged_begin(
+    PreparedTuHandle handle, HistoryNonce history_nonce, RelSeq rel_seq,
+    Digest128 pre_state_digest) const {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0 ||
+        history_nonce.value == 0)
+        throw std::invalid_argument("R2 staged-begin identity is invalid");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end() || position->second.committed ||
+        position->second.speculative_advanced)
+        throw std::invalid_argument("R2 staged-begin TU is not unadvanced");
+    const Impl::Entry& entry = position->second;
+    if (entry.route.profile == ProfileId::P29V1) {
+        const auto route_position = impl_->routes.find(entry.route);
+        if (route_position == impl_->routes.end() ||
+            !route_position->second->p29_route ||
+            route_position->second->active_p29_entry != handle.entry_id_)
+            throw std::logic_error("P29V1 R2 begin is not the active CRoute TU");
+        const auto& active = route_position->second->p29_route->active();
+        if (!active || active->prepared->tu_seq != entry.prepared->begin.tu_seq)
+            throw std::logic_error("P29V1 R2 begin lost its active prepared TU");
+        const TxBegin& begin = active->begin;
+        if (begin.history_nonce != history_nonce || begin.rel_seq != rel_seq ||
+            begin.pre_state_digest != pre_state_digest)
+            throw std::logic_error("P29V1 speculative cursor differs from its CRoute");
+        return begin;
+    }
+    TxBegin begin = entry.prepared->begin;
+    begin.history_nonce = history_nonce;
+    begin.rel_seq = rel_seq;
+    begin.pre_state_digest = pre_state_digest;
+    begin.transaction_digest = compute_transaction_digest(
+        begin, entry.prepared->body);
+    return begin;
 }
 
 Digest128 P50PreparationAuthority::p29v1_system_source_fingerprint(
@@ -1267,8 +1473,7 @@ void P50PreparationAuthority::pin_p29v1_system_source_reuse(
         position->second.route.profile != ProfileId::P29V1)
         throw std::invalid_argument("prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(position->second.route);
-    if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_)
+    if (!route.p29_route || route.active_p29_entry != handle.entry_id_)
         throw std::logic_error(
             "P29V1 fingerprint does not identify the route successor");
     const Digest128 c_fingerprint = route.p29v1_system_source_fingerprint;
@@ -1290,8 +1495,7 @@ void P50PreparationAuthority::restart_p29v1_transport_retry(
         throw std::invalid_argument(
             "prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(entry.route);
-    if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_)
+    if (!route.p29_route || route.active_p29_entry != handle.entry_id_)
         throw std::logic_error(
             "P29V1 retry does not identify the route successor");
     route.p29_route->restart_v1_for_transport_retry();
@@ -1313,11 +1517,11 @@ PreparedInputPtr P50PreparationAuthority::reset_p29v1_route(
         throw std::invalid_argument(
             "P29V1 route reset identity is invalid");
     Impl::RouteState& route = impl_->route_state(entry.route);
-    if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_ ||
+    if (!route.p29_route || route.active_p29_entry != handle.entry_id_ ||
+        route.speculative_entries.size() != 1 || entry.speculative_advanced ||
         !entry.shared->p29_source)
         throw std::logic_error(
-            "P29V1 route reset does not identify its prepared successor");
+            "single-active P29V1 reset does not identify its prepared successor");
 
     route.p29_route->reset_v1_route(f_store_guid, history_nonce);
     const CActiveTx& active = route.p29_route->begin_v1(
@@ -1338,6 +1542,7 @@ PreparedInputPtr P50PreparationAuthority::reset_p29v1_route(
     impl_->retained_bytes = other_retained + retained;
     entry.retained_bytes = retained;
     entry.prepared = replacement;
+    entry.speculative_advanced = false;
     return replacement;
 }
 
@@ -1362,17 +1567,63 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
         throw std::invalid_argument("prepared-TU handle has already reached zero references");
     Impl::Entry& entry = position->second;
     Impl::RouteState& route = impl_->route_state(entry.route);
+    if (entry.references > 1)
+        return --entry.references;
+    const auto route_entry = std::find(route.speculative_entries.begin(),
+                                       route.speculative_entries.end(),
+                                       handle.entry_id_);
+    if (!entry.committed && route_entry != route.speculative_entries.end()) {
+        if (entry.route.profile == ProfileId::P29V1) {
+            if (route.speculative_entries.size() != 1 ||
+                route.active_p29_entry != handle.entry_id_ ||
+                entry.speculative_advanced)
+                throw std::logic_error(
+                    "unconfirmed P29V1 TU requires ordered receipt or coordinated reset before release");
+            route.p29_route->abandon_active();
+            route.active_p29_entry.reset();
+        } else if (entry.speculative_advanced) {
+            throw std::logic_error(
+                "staged TU requires ordered receipt or coordinated reset before release");
+        } else if (entry.route.profile == ProfileId::ZSTD_ROUTE &&
+                   std::next(route_entry) != route.speculative_entries.end()) {
+            throw std::logic_error(
+                "ZSTD_ROUTE suffix depends on this TU; reset and rebuild before release");
+        }
+        route.speculative_raw_bytes -= entry.shared->raw_bytes;
+        route.speculative_entries.erase(route_entry);
+        if (entry.route.profile == ProfileId::ZSTD_ROUTE) {
+            --route.next_speculative_route_rel;
+            const size_t limit = static_cast<size_t>(std::min<uint64_t>(
+                impl_->zstd_limits.max_history_bytes,
+                uint64_t{1} << impl_->zstd_limits.max_window_log));
+            route.speculative_route_history = route.committed_route_history;
+            for (const uint64_t retained_id : route.speculative_entries) {
+                const auto retained = impl_->entries.find(retained_id);
+                if (retained == impl_->entries.end())
+                    throw std::logic_error("ZSTD_ROUTE speculative ledger is corrupt");
+                const auto& raw = retained->second.shared->raw;
+                if (raw.size() >= limit) {
+                    route.speculative_route_history.assign(
+                        raw.end() - static_cast<std::ptrdiff_t>(limit), raw.end());
+                } else {
+                    const size_t excess = route.speculative_route_history.size() + raw.size() > limit
+                        ? route.speculative_route_history.size() + raw.size() - limit
+                        : 0;
+                    if (excess != 0)
+                        route.speculative_route_history.erase(
+                            route.speculative_route_history.begin(),
+                            route.speculative_route_history.begin() +
+                                static_cast<std::ptrdiff_t>(excess));
+                    route.speculative_route_history.insert(
+                        route.speculative_route_history.end(), raw.begin(), raw.end());
+                }
+            }
+            route.speculative_route_history_digest = digest128(
+                std::span<const uint8_t>(route.speculative_route_history));
+        }
+    }
     if (--entry.references != 0)
         return entry.references;
-    if ((entry.route.profile == ProfileId::ZSTD_ROUTE ||
-         entry.route.profile == ProfileId::P29V1) &&
-        !entry.committed &&
-        route.uncommitted_route_entry == handle.entry_id_)
-    {
-        route.uncommitted_route_entry.reset();
-        if (entry.route.profile == ProfileId::P29V1 && route.p29_route)
-            route.p29_route->abandon_active();
-    }
     impl_->retained_bytes -= entry.retained_bytes;
     const PreparationRouteKey route_key = entry.route;
     const PrepareRequestKey request = entry.request;
@@ -1384,6 +1635,109 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     return 0;
 }
 
+void P50PreparationAuthority::accept_commit(PreparedTuHandle handle,
+                                           const TxCommit& receipt) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    accept_commit(handle, position->second.prepared->begin, receipt);
+}
+
+void P50PreparationAuthority::accept_commit(PreparedTuHandle handle,
+                                            const TxBegin& sent_begin,
+                                            const TxCommit& receipt) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
+    auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    auto& entry = position->second;
+    if (entry.committed)
+        throw std::logic_error("prepared TU already has a confirmed receipt");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (route.speculative_entries.empty() ||
+        route.speculative_entries.front() != handle.entry_id_)
+        throw std::logic_error("receiver receipt is not the relationship ledger front");
+    const TxBegin& prepared_begin = entry.prepared->begin;
+    if (sent_begin.tu_seq != prepared_begin.tu_seq ||
+        sent_begin.profile != prepared_begin.profile ||
+        sent_begin.body != prepared_begin.body ||
+        sent_begin.raw_bytes != prepared_begin.raw_bytes ||
+        sent_begin.raw_digest != prepared_begin.raw_digest ||
+        (sent_begin.profile == ProfileId::P29V1 &&
+         (sent_begin.history_nonce != prepared_begin.history_nonce ||
+          sent_begin.rel_seq != prepared_begin.rel_seq ||
+          sent_begin.pre_state_digest != prepared_begin.pre_state_digest)) ||
+        (sent_begin.profile == ProfileId::ZSTD_ROUTE &&
+         sent_begin.rel_seq != prepared_begin.rel_seq) ||
+        sent_begin.transaction_digest !=
+            compute_transaction_digest(sent_begin, entry.prepared->body) ||
+        !same_commit(receipt, sent_begin))
+        throw std::logic_error("receiver receipt differs from the retained TU witness");
+    if (entry.route.profile == ProfileId::P29V1) {
+        if (!entry.speculative_advanced &&
+            route.active_p29_entry != handle.entry_id_)
+            throw std::logic_error("P29V1 receipt has no active or staged TU");
+        route.p29_route->accept_commit(receipt);
+    } else if (entry.route.profile == ProfileId::ZSTD_ROUTE) {
+        if (sent_begin.rel_seq.value !=
+            route.next_confirmed_route_rel)
+            throw std::logic_error("ZSTD_ROUTE receipt is not the next confirmed REL_SEQ");
+        const size_t limit = static_cast<size_t>(std::min<uint64_t>(
+            impl_->zstd_limits.max_history_bytes,
+            uint64_t{1} << impl_->zstd_limits.max_window_log));
+        std::vector<uint8_t> next_committed_history = route.committed_route_history;
+        const auto& raw = entry.shared->raw;
+        if (raw.size() >= limit) {
+            next_committed_history.assign(
+                raw.end() - static_cast<std::ptrdiff_t>(limit), raw.end());
+        } else {
+            const size_t excess = next_committed_history.size() + raw.size() > limit
+                                      ? next_committed_history.size() + raw.size() - limit
+                                      : 0;
+            if (excess != 0)
+                next_committed_history.erase(
+                    next_committed_history.begin(),
+                    next_committed_history.begin() + static_cast<std::ptrdiff_t>(excess));
+            next_committed_history.insert(next_committed_history.end(), raw.begin(), raw.end());
+        }
+        const Digest128 next_digest = digest128(
+            std::span<const uint8_t>(next_committed_history));
+        route.committed_route_history = std::move(next_committed_history);
+        route.committed_route_history_digest = next_digest;
+        ++route.next_confirmed_route_rel;
+    } else if (entry.route.profile != ProfileId::ZSTD_TU) {
+        throw std::logic_error("unsupported profile in preparation receipt ledger");
+    }
+    entry.committed = true;
+    route.speculative_raw_bytes -= entry.shared->raw_bytes;
+    route.speculative_entries.erase(route.speculative_entries.begin());
+    if (route.active_p29_entry == handle.entry_id_)
+        route.active_p29_entry.reset();
+    if (route.speculative_entries.empty() &&
+        entry.route.profile == ProfileId::ZSTD_ROUTE) {
+        route.speculative_route_history = route.committed_route_history;
+        route.speculative_route_history_digest =
+            route.committed_route_history_digest;
+    }
+}
+
+void P50PreparationAuthority::accept_p29v1_commit(
+    PreparedTuHandle handle, const TxCommit& receipt) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end() ||
+        position->second.route.profile != ProfileId::P29V1)
+        throw std::invalid_argument("prepared-TU handle is not P29V1");
+    accept_commit(handle, receipt);
+}
+
 void P50PreparationAuthority::commit(PreparedTuHandle handle) {
     impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
@@ -1392,51 +1746,22 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
     if (position == impl_->entries.end())
         throw std::invalid_argument("prepared-TU handle has been released");
     auto& entry = position->second;
-    Impl::RouteState& route = impl_->route_state(entry.route);
-    if (entry.route.profile == ProfileId::ZSTD_ROUTE && !entry.committed) {
-        if (route.uncommitted_route_entry != handle.entry_id_)
-            throw std::logic_error("ZSTD_ROUTE commit is not its prepared successor");
-        const size_t limit = static_cast<size_t>(std::min<uint64_t>(
-            impl_->zstd_limits.max_history_bytes,
-            uint64_t{1} << impl_->zstd_limits.max_window_log));
-        if (entry.shared->raw.size() >= limit) {
-            route.committed_route_history.assign(
-                entry.shared->raw.end() - static_cast<std::ptrdiff_t>(limit),
-                entry.shared->raw.end());
-        } else {
-            const size_t excess = route.committed_route_history.size() + entry.shared->raw.size() > limit
-                                      ? route.committed_route_history.size() + entry.shared->raw.size() - limit
-                                      : 0;
-            if (excess != 0)
-                route.committed_route_history.erase(
-                    route.committed_route_history.begin(),
-                    route.committed_route_history.begin() + excess);
-            route.committed_route_history.insert(route.committed_route_history.end(),
-                                                  entry.shared->raw.begin(), entry.shared->raw.end());
-        }
-        route.committed_route_history_digest = digest128(
-            std::span<const uint8_t>(route.committed_route_history));
-        entry.committed = true;
-        route.uncommitted_route_entry.reset();
-    }
-    if (entry.route.profile == ProfileId::P29V1 && !entry.committed) {
-        if (route.uncommitted_route_entry != handle.entry_id_)
-            throw std::logic_error("P29V1 commit is not its prepared successor");
-        const auto commit = TxCommit{entry.prepared->begin.history_nonce,
-                                     entry.prepared->begin.rel_seq,
-                                     entry.prepared->begin.tu_seq,
-                                     entry.prepared->begin.transaction_digest,
-                                     entry.prepared->begin.raw_digest,
-                                     compute_post_state_digest(
-                                         entry.prepared->begin.pre_state_digest,
-                                         entry.prepared->begin.history_nonce,
-                                         entry.prepared->begin.rel_seq,
-                                         entry.prepared->begin.tu_seq,
-                                         entry.prepared->begin.transaction_digest)};
-        route.p29_route->accept_commit(commit);
-        entry.committed = true;
-        route.uncommitted_route_entry.reset();
-    }
+    if (entry.committed) return;
+    if (entry.speculative_advanced)
+        throw std::logic_error(
+            "staged TU requires an actual receiver receipt; synthetic commit is R1-only");
+    const auto receipt = TxCommit{
+        entry.prepared->begin.history_nonce,
+        entry.prepared->begin.rel_seq,
+        entry.prepared->begin.tu_seq,
+        entry.prepared->begin.transaction_digest,
+        entry.prepared->begin.raw_digest,
+        compute_post_state_digest(entry.prepared->begin.pre_state_digest,
+                                  entry.prepared->begin.history_nonce,
+                                  entry.prepared->begin.rel_seq,
+                                  entry.prepared->begin.tu_seq,
+                                  entry.prepared->begin.transaction_digest)};
+    accept_commit(handle, receipt);
 }
 
 CStoreGuid P50PreparationAuthority::c_store_guid() const {
@@ -1794,6 +2119,15 @@ struct P50ClientEndpoint::Impl {
     RelSeq next_rel{};
     Digest128 state{};
     std::optional<Active> active;
+    std::optional<LinkHello> r2_link_hello;
+    std::optional<LinkState> r2_link_state;
+    uint64_t r2_sent_ordinal = 0;
+    uint64_t r2_confirmed_ordinal = 0;
+    uint64_t r2_ack_sent_ordinal = 0;
+    uint64_t r2_speculative_rel = 0;
+    Digest128 r2_speculative_state{};
+    std::map<uint64_t, R2SentBundle> r2_pending_bundles;
+    uint64_t r2_session_serial = 0;
     PreparedInputPtr queued;
     PreparedTuHandle queued_handle;
     CompletionLog* completions = nullptr;
@@ -3082,6 +3416,7 @@ struct P50ServerEndpoint::Impl {
     std::unique_ptr<GlobalResourceModel> global_resources;
     P50ServerEndpointConfig config{};
     EndpointRunRegistry endpoint_runs;
+    std::map<uint64_t, std::weak_ptr<ServerIoState>> pending_r2_setup;
     uint64_t next_run_sequence = 1;
     uint64_t next_socket_ownership_generation = 1;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -3182,6 +3517,389 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_adopted_fd(
         co_return result;
     }
     co_return co_await run(std::move(*socket), std::move(prepared), std::move(control), deadline);
+}
+
+boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
+    tcp::socket& socket, LinkHello hello,
+    std::chrono::steady_clock::time_point deadline) {
+    impl_->owner.require();
+    if (impl_->r2_link_state || !socket.is_open() ||
+        deadline <= std::chrono::steady_clock::now() || hello.revision != 2 ||
+        hello.start_mode != LinkStartMode::Initial ||
+        hello.verified_receipt_floor != 0 ||
+        hello.c_store_guid != impl_->c_guid ||
+        hello.profile != impl_->caps.profile || hello.window == 0 ||
+        hello.window > 30 || hello.physical_link_generation == 0 ||
+        hello.max_frame_payload < kR2MandatoryControlFramePayload)
+        throw std::invalid_argument("invalid initial R2 C link request");
+    const auto executor = co_await asio::this_coro::executor;
+    SocketDeadlineGuard deadline_guard(executor, socket, deadline);
+    EndpointIoControl control;
+    CompletionStamp stamp;
+    stamp.actor = ActorSide::C;
+    stamp.c_store_guid = impl_->c_guid;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    const auto verify = [this, deadline](const CompletionStamp&) {
+        impl_->owner.require();
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    const uint32_t frame_cap = std::min(hello.max_frame_payload,
+                                        impl_->caps.wire.max_frame_payload);
+    co_await async_write_message(socket, Message{hello}, frame_cap, stamp,
+                                 impl_->completions, control, verify);
+    stamp.operation = AsyncOperationKind::ReadHeader;
+    Frame frame = co_await async_read_frame(socket, frame_cap, stamp,
+                                            impl_->completions, verify);
+    if (frame.type != MessageType::LINK_STATE)
+        throw std::invalid_argument("R2 LINK_HELLO did not receive LINK_STATE");
+    const LinkState state = decode_as<LinkState>(frame);
+    if (state.revision != hello.revision || state.profile != hello.profile ||
+        state.window != hello.window || state.reservation_id != hello.reservation_id ||
+        state.relationship_id != hello.relationship_id ||
+        state.relationship_epoch != hello.relationship_epoch ||
+        state.physical_link_generation != hello.physical_link_generation ||
+        state.c_store_guid != hello.c_store_guid ||
+        state.c_store_generation != hello.c_store_generation ||
+        state.c_control_generation != hello.c_control_generation ||
+        state.c_control_attempt != hello.c_control_attempt ||
+        state.f_store_guid != hello.f_store_guid ||
+        state.f_store_generation != hello.f_store_generation ||
+        state.selected_max_frame_payload < kR2MandatoryControlFramePayload ||
+        state.selected_max_frame_payload > frame_cap ||
+        state.selected_max_raw_bytes > hello.max_raw_bytes ||
+        state.selected_max_encoded_bytes > hello.max_encoded_bytes ||
+        state.selected_max_output_bytes > hello.max_output_bytes ||
+        state.selected_max_raw_bytes == 0 || state.selected_max_encoded_bytes == 0 ||
+        state.selected_max_output_bytes == 0 || state.history_nonce.value == 0 ||
+        state.next_rel_seq.value != 0 || state.committed_prefix_k != 0 ||
+        state.acknowledged_prefix_q != 0 ||
+        state.state_digest != initial_route_digest(impl_->c_guid,
+                                                   state.history_nonce))
+        throw std::invalid_argument("R2 LINK_STATE differs from initial C link offer");
+    impl_->f_guid = state.f_store_guid;
+    impl_->route_known = true;
+    impl_->history_nonce = state.history_nonce;
+    impl_->next_rel = state.next_rel_seq;
+    impl_->state = state.state_digest;
+    impl_->r2_link_hello = std::move(hello);
+    impl_->r2_link_state = state;
+    impl_->r2_sent_ordinal = 0;
+    impl_->r2_confirmed_ordinal = 0;
+    impl_->r2_ack_sent_ordinal = 0;
+    impl_->r2_speculative_rel = state.next_rel_seq.value;
+    impl_->r2_speculative_state = state.state_digest;
+    impl_->r2_pending_bundles.clear();
+    impl_->r2_session_serial = impl_->allocate_session();
+    co_return state;
+}
+
+boost::asio::awaitable<R2SentBundle> P50ClientEndpoint::write_r2_bundle(
+    tcp::socket& socket, JobBind binding, PreparedTuHandle prepared,
+    std::chrono::steady_clock::time_point deadline) {
+    impl_->owner.require();
+    if (!impl_->r2_link_hello || !impl_->r2_link_state || !socket.is_open() ||
+        deadline <= std::chrono::steady_clock::now())
+        throw std::logic_error("R2 writer has no idle live link");
+    const LinkHello& link = *impl_->r2_link_hello;
+    const LinkState& link_state = *impl_->r2_link_state;
+    if (binding.relationship_ordinal != impl_->r2_sent_ordinal + 1 ||
+        impl_->r2_sent_ordinal - impl_->r2_ack_sent_ordinal >= link.window ||
+        impl_->r2_pending_bundles.contains(binding.relationship_ordinal) ||
+        binding.physical_link_generation != link.physical_link_generation ||
+        binding.reservation_id == Id128{} ||
+        binding.profile != link.profile ||
+        binding.wire_job_id == 0 || binding.assignment_epoch == 0 ||
+        binding.assignment_nonce == 0 || binding.logical_job == 0 ||
+        binding.compiler_attempt == 0 || binding.source_request_id == 0)
+        throw std::invalid_argument("R2 JOB_BIND is outside its live link");
+    const PreparedInputPtr input = impl_->preparation->resolve(prepared);
+    if (input->begin.tu_seq != binding.tu_seq ||
+        input->begin.profile != binding.profile ||
+        input->begin.raw_bytes != binding.raw_bytes ||
+        input->begin.raw_digest != binding.raw_digest ||
+        binding.raw_bytes > link_state.selected_max_raw_bytes ||
+        binding.raw_bytes > link_state.selected_max_output_bytes ||
+        input->begin.body.encoded_bytes > link_state.selected_max_encoded_bytes ||
+        input->begin.body.decoded_bytes > link_state.selected_max_output_bytes)
+        throw std::invalid_argument("R2 binding differs from retained TU");
+    const auto executor = co_await asio::this_coro::executor;
+    SocketDeadlineGuard deadline_guard(executor, socket, deadline);
+    if (binding.profile == ProfileId::P29V1 &&
+        impl_->preparation->p29v1_system_source_fingerprint(prepared) !=
+            link.system_source_fingerprint)
+        throw std::invalid_argument("R2 LINK_HELLO has wrong C P29 fingerprint");
+    if (binding.profile == ProfileId::P29V1)
+        impl_->preparation->pin_p29v1_system_source_reuse(
+            prepared, impl_->r2_link_state->f_system_source_fingerprint);
+
+    TxBegin begin = impl_->preparation->r2_staged_begin(
+        prepared, link_state.history_nonce,
+        RelSeq{impl_->r2_speculative_rel}, impl_->r2_speculative_state);
+    if (begin.tu_seq != input->begin.tu_seq ||
+        begin.profile != input->begin.profile ||
+        begin.raw_bytes != input->begin.raw_bytes ||
+        begin.raw_digest != input->begin.raw_digest ||
+        begin.body != input->begin.body)
+        throw std::invalid_argument("R2 staged begin differs from prepared envelope");
+    impl_->record(ActionType::TX_BEGIN, begin, impl_->r2_session_serial,
+                  begin.pre_state_digest);
+    const TuBegin tu_begin{binding.relationship_ordinal, begin};
+    const uint32_t frame_cap = link_state.selected_max_frame_payload;
+    std::vector<R2FillMessage> fills;
+    if (binding.profile == ProfileId::P29V1) {
+        codec::P29WireLimits wire_limits;
+        wire_limits.max_tu_bytes = static_cast<size_t>(impl_->caps.zstd.max_raw_bytes);
+        wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+        const std::vector<uint8_t> predicted =
+            impl_->preparation->predicted_p29v1_need(prepared);
+        const std::span<const uint8_t> fill =
+            impl_->preparation->answer_p29v1_need(prepared, predicted);
+        const std::vector<FillMessage> encoded = encode_p29v1_fill_messages(
+            fill, frame_cap, codec::p29v1_fill_inner_bound(wire_limits));
+        fills.reserve(encoded.size());
+        for (const FillMessage& value : encoded)
+            fills.push_back(R2FillMessage{value.bytes});
+    }
+    const Digest128 binding_digest = compute_r2_binding_digest(binding);
+    icecc::Digest128Builder outer_digest;
+    outer_digest.append("R2-transaction-v1");
+    outer_digest.append_digest(binding_digest);
+    const auto append_outer_frame = [&outer_digest](MessageType type,
+                                                    std::span<const uint8_t> bytes) {
+        outer_digest.append_u8(static_cast<uint8_t>(type));
+        outer_digest.append_u64(static_cast<uint64_t>(bytes.size()));
+        outer_digest.append(bytes);
+    };
+    const std::vector<uint8_t> tu_begin_payload =
+        encode_payload(Message{tu_begin});
+    append_outer_frame(MessageType::TU_BEGIN, tu_begin_payload);
+    for (size_t offset = 0; offset < input->body.size();) {
+        const size_t count = std::min<size_t>(
+            frame_cap, input->body.size() - offset);
+        append_outer_frame(
+            MessageType::R2_BODY,
+            std::span<const uint8_t>(input->body).subspan(offset, count));
+        offset += count;
+    }
+    if (input->body.empty())
+        append_outer_frame(MessageType::R2_BODY, std::span<const uint8_t>{});
+    for (const R2FillMessage& fill : fills)
+        append_outer_frame(MessageType::R2_FILL,
+                           std::span<const uint8_t>(fill.bytes));
+    const Digest128 transaction_digest = outer_digest.finish();
+    uint64_t aggregate_encoded_bytes = 0;
+    const auto account_component = [&aggregate_encoded_bytes,
+                                    &link_state](uint64_t bytes) {
+        if (bytes > link_state.selected_max_encoded_bytes -
+                        std::min<uint64_t>(aggregate_encoded_bytes,
+                                           link_state.selected_max_encoded_bytes))
+            throw std::length_error("R2 encoded transaction exceeds link budget");
+        aggregate_encoded_bytes += bytes;
+    };
+    account_component(input->body.size());
+    for (const R2FillMessage& fill : fills)
+        account_component(fill.bytes.size());
+    const TuBegin wire_tu_begin = tu_begin;
+    const TuEnd end{binding.relationship_ordinal, binding_digest,
+                    transaction_digest};
+    R2SentBundle pending{binding, tu_begin, binding_digest,
+                         transaction_digest, prepared};
+    const auto [pending_position, pending_inserted] =
+        impl_->r2_pending_bundles.emplace(binding.relationship_ordinal,
+                                          pending);
+    if (!pending_inserted)
+        throw std::logic_error("R2 ordinal already owns a pending receipt row");
+    struct PendingRowGuard {
+        Impl& impl;
+        uint64_t ordinal;
+        bool keep = false;
+        ~PendingRowGuard() {
+            if (!keep)
+                impl.r2_pending_bundles.erase(ordinal);
+        }
+    } pending_guard{*impl_, binding.relationship_ordinal};
+    EndpointIoControl control;
+    CompletionStamp stamp;
+    stamp.actor = ActorSide::C;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    stamp.c_store_guid = impl_->c_guid;
+    stamp.f_store_guid = link.f_store_guid;
+    stamp.session_serial = impl_->r2_session_serial;
+    stamp.history_nonce = begin.history_nonce;
+    stamp.rel_seq = begin.rel_seq;
+    stamp.tu_seq = begin.tu_seq;
+    stamp.transaction_digest = transaction_digest;
+    stamp.raw_digest = begin.raw_digest;
+    stamp.transaction_bound = true;
+    const auto verify = [this, deadline](const CompletionStamp&) {
+        impl_->owner.require();
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    co_await async_write_message(socket, Message{binding}, frame_cap, stamp,
+                                 impl_->completions, control, verify);
+    co_await async_write_message(socket, Message{wire_tu_begin}, frame_cap, stamp,
+                                 impl_->completions, control, verify);
+    if (input->body.empty()) {
+        co_await async_write_message(socket, Message{R2BodyMessage{}}, frame_cap,
+                                     stamp, impl_->completions, control, verify);
+    } else {
+        for (size_t offset = 0; offset < input->body.size();) {
+            const size_t count = std::min<size_t>(
+                frame_cap, input->body.size() - offset);
+            R2BodyMessage body;
+            body.bytes.assign(input->body.begin() +
+                                  static_cast<std::ptrdiff_t>(offset),
+                              input->body.begin() +
+                                  static_cast<std::ptrdiff_t>(offset + count));
+            co_await async_write_message(socket, Message{std::move(body)},
+                                         frame_cap, stamp, impl_->completions,
+                                         control, verify);
+            offset += count;
+        }
+    }
+    for (const R2FillMessage& fill : fills)
+        co_await async_write_message(socket, Message{fill}, frame_cap, stamp,
+                                     impl_->completions, control, verify);
+    co_await async_write_message(socket, Message{end}, frame_cap, stamp,
+                                 impl_->completions, control, verify);
+    impl_->preparation->advance_speculative(prepared);
+    impl_->r2_speculative_state = compute_post_state_digest(
+        begin.pre_state_digest, begin.history_nonce, begin.rel_seq,
+        begin.tu_seq, begin.transaction_digest);
+    if (impl_->r2_speculative_rel == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("R2 speculative REL_SEQ space exhausted");
+    ++impl_->r2_speculative_rel;
+    impl_->r2_sent_ordinal = binding.relationship_ordinal;
+    pending_guard.keep = true;
+    co_return pending_position->second;
+}
+
+boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::read_r2_receipt(
+    tcp::socket& socket, const R2SentBundle& sent,
+    std::chrono::steady_clock::time_point deadline) {
+    impl_->owner.require();
+    ClientRunResult result;
+    if (!impl_->r2_link_hello || !impl_->r2_link_state || !socket.is_open() ||
+        sent.binding.relationship_ordinal !=
+                              impl_->r2_confirmed_ordinal + 1 ||
+        sent.binding.relationship_ordinal > impl_->r2_sent_ordinal ||
+        !impl_->r2_pending_bundles.contains(
+            sent.binding.relationship_ordinal) ||
+        deadline <= std::chrono::steady_clock::now())
+        throw std::logic_error("R2 receipt has no matching sent transaction");
+    const R2SentBundle& pending = impl_->r2_pending_bundles.at(
+        sent.binding.relationship_ordinal);
+    if (pending.binding != sent.binding ||
+        pending.binding_digest != sent.binding_digest ||
+        pending.transaction_digest != sent.transaction_digest ||
+        pending.prepared != sent.prepared)
+        throw std::logic_error("R2 receipt does not match the reserved ledger row");
+    const LinkHello& link = *impl_->r2_link_hello;
+    const uint32_t frame_cap = impl_->r2_link_state->selected_max_frame_payload;
+    const auto executor = co_await asio::this_coro::executor;
+    SocketDeadlineGuard deadline_guard(executor, socket, deadline);
+    EndpointIoControl control;
+    CompletionStamp stamp;
+    stamp.actor = ActorSide::C;
+    stamp.operation = AsyncOperationKind::ReadHeader;
+    stamp.c_store_guid = impl_->c_guid;
+    stamp.f_store_guid = link.f_store_guid;
+    stamp.session_serial = impl_->r2_session_serial;
+    stamp.history_nonce = sent.begin.inner.history_nonce;
+    stamp.rel_seq = sent.begin.inner.rel_seq;
+    stamp.tu_seq = sent.begin.inner.tu_seq;
+    stamp.transaction_digest = sent.transaction_digest;
+    stamp.raw_digest = sent.begin.inner.raw_digest;
+    stamp.transaction_bound = true;
+    const auto verify = [this, deadline](const CompletionStamp&) {
+        impl_->owner.require();
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    Frame frame = co_await async_read_frame(socket, frame_cap, stamp,
+                                            impl_->completions, verify);
+    if (frame.type != MessageType::R2_TX_COMMIT)
+        throw std::invalid_argument("R2 bundle did not receive TX_COMMIT");
+    const R2TxCommit receipt = decode_as<R2TxCommit>(frame);
+    if (receipt.relationship_ordinal != sent.binding.relationship_ordinal ||
+        receipt.binding_digest != sent.binding_digest ||
+        receipt.transaction_digest != sent.transaction_digest ||
+        !same_commit(receipt.inner, sent.begin.inner))
+        throw std::invalid_argument("R2 TX_COMMIT differs from exact sent witness");
+    if (impl_->next_rel.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("R2 C REL_SEQ space exhausted");
+    impl_->record(ActionType::COMMIT_ACCEPTED, sent.begin.inner,
+                  impl_->r2_session_serial, receipt.inner.post_state_digest);
+    impl_->preparation->accept_commit(sent.prepared, sent.begin.inner,
+                                      receipt.inner);
+    impl_->state = receipt.inner.post_state_digest;
+    ++impl_->next_rel.value;
+    impl_->r2_confirmed_ordinal = sent.binding.relationship_ordinal;
+    impl_->r2_link_state->committed_prefix_k = impl_->r2_confirmed_ordinal;
+    impl_->r2_link_state->next_rel_seq = impl_->next_rel;
+    impl_->r2_link_state->state_digest = impl_->state;
+    result.status = ClientRunStatus::Committed;
+    result.observation = ClientRunObservation::ExactCommitObserved;
+    result.committed_commit = receipt.inner;
+    result.committed_input = InputRecordKey{impl_->c_guid, receipt.inner.tu_seq};
+    impl_->r2_pending_bundles.erase(sent.binding.relationship_ordinal);
+    co_return result;
+}
+
+boost::asio::awaitable<void> P50ClientEndpoint::write_r2_ack(
+    tcp::socket& socket, uint64_t cumulative_ordinal,
+    std::chrono::steady_clock::time_point deadline) {
+    impl_->owner.require();
+    if (!impl_->r2_link_hello || !impl_->r2_link_state || !socket.is_open() ||
+        cumulative_ordinal == 0 ||
+        cumulative_ordinal > impl_->r2_confirmed_ordinal ||
+        cumulative_ordinal < impl_->r2_ack_sent_ordinal ||
+        deadline <= std::chrono::steady_clock::now())
+        throw std::logic_error("R2 cumulative ACK is outside the confirmed prefix");
+    if (cumulative_ordinal == impl_->r2_ack_sent_ordinal)
+        co_return;
+    const LinkHello& link = *impl_->r2_link_hello;
+    const uint32_t frame_cap = impl_->r2_link_state->selected_max_frame_payload;
+    const auto executor = co_await asio::this_coro::executor;
+    SocketDeadlineGuard deadline_guard(executor, socket, deadline);
+    EndpointIoControl control;
+    CompletionStamp stamp;
+    stamp.actor = ActorSide::C;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    stamp.c_store_guid = impl_->c_guid;
+    stamp.f_store_guid = link.f_store_guid;
+    stamp.session_serial = impl_->r2_session_serial;
+    stamp.history_nonce = impl_->history_nonce;
+    stamp.rel_seq = impl_->next_rel;
+    const auto verify = [this, deadline](const CompletionStamp&) {
+        impl_->owner.require();
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    const CommitAck ack{link.relationship_id, link.relationship_epoch,
+                        link.physical_link_generation, cumulative_ordinal};
+    co_await async_write_message(socket, Message{ack}, frame_cap, stamp,
+                                 impl_->completions, control, verify);
+    impl_->r2_ack_sent_ordinal = cumulative_ordinal;
+}
+
+boost::asio::awaitable<void> P50ClientEndpoint::flush_r2_ack(
+    tcp::socket& socket, std::chrono::steady_clock::time_point deadline) {
+    impl_->owner.require();
+    if (!impl_->r2_link_state)
+        throw std::logic_error("R2 ACK flush has no negotiated link");
+    if (impl_->r2_ack_sent_ordinal < impl_->r2_confirmed_ordinal)
+        co_await write_r2_ack(socket, impl_->r2_confirmed_ordinal, deadline);
+}
+
+bool P50ClientEndpoint::r2_window_available() const noexcept {
+    if (!impl_->r2_link_hello ||
+        impl_->r2_sent_ordinal < impl_->r2_ack_sent_ordinal)
+        return false;
+    return impl_->r2_sent_ordinal - impl_->r2_ack_sent_ordinal <
+           impl_->r2_link_hello->window;
 }
 
 boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
@@ -3856,6 +4574,38 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
         expected_c_store_guid);
 }
 
+boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted_r2(
+    tcp::socket socket, EndpointIoControl control) {
+    impl_->owner.require();
+    if (!validate_adopted_socket(socket)) {
+        close_now(socket);
+        co_return ServerRunResult{};
+    }
+    std::optional<daemon::P50FSessionOperationId> operation;
+    std::optional<sidecar::AbsoluteMonotonicDeadline> link_deadline;
+    if (impl_->config.sidecar_launch) {
+        if (impl_->next_run_sequence == 0 ||
+            impl_->next_run_sequence == UINT64_MAX)
+            throw std::overflow_error("R2 link operation sequence exhausted");
+        daemon::P50FSessionOperationId created;
+        created.sidecar_launch = {
+            impl_->config.sidecar_launch->identity.generation,
+            impl_->config.sidecar_launch->identity.attempt};
+        created.role = daemon::P50SessionOperationRole::FSession;
+        created.operation_sequence = impl_->next_run_sequence++;
+        operation = created;
+        const auto clock = sidecar::process_monotonic_clock_identity();
+        link_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::hours(24),
+            clock.clock_domain_id, clock.time_namespace_id);
+    }
+    const Impl::Session session = impl_->allocate_session(operation, link_deadline);
+    SessionRegistration registration(*impl_, session);
+    co_return co_await run_r2_connected(std::move(socket),
+                                        std::move(registration),
+                                        std::move(control));
+}
+
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,
                                                                       EndpointIoControl control) {
     impl_->owner.require();
@@ -4194,6 +4944,528 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     co_return result;
 }
 
+boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
+    tcp::socket socket_value, SessionRegistration registration,
+    EndpointIoControl control) {
+    impl_->owner.require();
+    Impl::Session session = registration.session();
+    const std::optional<sidecar::AbsoluteMonotonicDeadline> link_deadline =
+        session.deadline;
+    ServerRunResult result;
+    result.session_serial = session.serial;
+    auto io = std::make_shared<ServerIoState>(
+        std::move(socket_value), session.operation, std::nullopt);
+    tcp::socket& socket = io->socket;
+    if (impl_->pending_r2_setup.size() >=
+        impl_->config.owner_limits.max_live_sessions)
+        throw std::length_error("R2 setup socket bound is exhausted");
+    const auto [setup_position, setup_inserted] =
+        impl_->pending_r2_setup.emplace(session.serial, io);
+    if (!setup_inserted)
+        throw std::logic_error("duplicate R2 setup socket session serial");
+    struct PendingSetupGuard {
+        Impl& owner;
+        uint64_t session_serial;
+        bool active = true;
+        void remove() noexcept {
+            if (active) {
+                owner.pending_r2_setup.erase(session_serial);
+                active = false;
+            }
+        }
+        ~PendingSetupGuard() { remove(); }
+    } setup_guard{*impl_, session.serial};
+    (void)setup_position;
+    if (control.after_r2_setup_registered)
+        control.after_r2_setup_registered();
+    std::optional<LinkHello> active_link;
+    uint32_t frame_cap = std::min(impl_->caps.wire.max_frame_payload,
+                                  kInitialMaxFramePayload);
+    std::optional<sidecar::AbsoluteMonotonicDeadline> job_deadline;
+    bool activated = false;
+    bool pending_job = false;
+    uint64_t committed_ordinal = 0;
+    uint64_t acknowledged_ordinal = 0;
+    struct EndpointRunLeaseGuard {
+        EndpointRunRegistry* registry = nullptr;
+        std::optional<EndpointRunIdentity> identity;
+        std::optional<EndpointCancelPermit> permit;
+        std::function<void(EndpointCancelPermit, EndpointTerminalResult)> terminal;
+        EndpointTerminalResult result{EndpointTerminalResultState::Failed, 0};
+        ~EndpointRunLeaseGuard() {
+            if (!registry || !identity || !permit)
+                return;
+            if (registry->mark_terminal(*identity, result)) {
+                if (terminal) {
+                    try {
+                        terminal(*permit, result);
+                    } catch (...) {
+                    }
+                }
+                (void)registry->consume_terminal(*identity);
+            }
+        }
+    } run_lease{&impl_->endpoint_runs, std::nullopt, std::nullopt,
+                impl_->config.on_run_terminal,
+                EndpointTerminalResult{EndpointTerminalResultState::Failed, 0}};
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    struct ActiveIoGuard {
+        Impl& owner;
+        ServerIoState* io;
+        ~ActiveIoGuard() {
+            if (owner.active_io == io)
+                owner.active_io = nullptr;
+        }
+    } active_io_guard{*impl_, io.get()};
+    impl_->active_io = io.get();
+#endif
+
+    const auto deadline_crossed = [&]() {
+        if (!job_deadline)
+            return false;
+        sidecar::SystemMonotonicObservationSource observations;
+        const auto observed = observations.observe();
+        return !observed || !observed->valid() ||
+               !job_deadline->matches_clock(observed->clock) ||
+               observed->now_ns >= job_deadline->expires_at_ns;
+    };
+    const auto require_operation = [&]() {
+        impl_->owner.require();
+        if (io->cancelled)
+            throw boost::system::system_error(asio::error::operation_aborted);
+        if (deadline_crossed())
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    const auto verify = [&](const CompletionStamp& expected) {
+        require_operation();
+        CompletionStamp observed = expected;
+        if (control.before_completion_check)
+            control.before_completion_check(observed);
+        observed = completion_for_test(observed, control);
+        require_observed_completion(expected, observed);
+        CompletionLiveIdentity live = impl_->live_identity(session, expected);
+        if (control.before_live_identity_check)
+            control.before_live_identity_check(expected, live);
+        require_live_completion(expected, live);
+        require_operation();
+    };
+    const auto stamp = [&](AsyncOperationKind operation,
+                           const TxBegin* begin = nullptr) {
+        return impl_->stamp(session, operation, begin);
+    };
+    const auto set_completion_deadline = [&session, this](
+        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline) {
+        session.deadline = deadline;
+        const auto live = impl_->live_sessions.find(session.serial);
+        if (live == impl_->live_sessions.end())
+            throw StaleCompletion();
+        live->second.deadline = deadline;
+    };
+    const auto arm_job_deadline = [&](
+        const sidecar::AbsoluteMonotonicDeadline& deadline) {
+        if (io->deadline_timer.is_open()) {
+            boost::system::error_code ignored;
+            io->deadline_timer.cancel(ignored);
+            io->deadline_timer.close(ignored);
+        }
+        io->expired = false;
+        if (io->deadline_generation == UINT64_MAX)
+            throw std::overflow_error("R2 link deadline generation exhausted");
+        const uint64_t timer_generation = ++io->deadline_generation;
+        job_deadline = deadline;
+        require_operation();
+        boost::system::error_code error;
+        if (!arm_absolute_deadline_timer(*io, deadline, error))
+            throw boost::system::system_error(error);
+        io->deadline_timer.async_wait(
+            asio::posix::stream_descriptor::wait_read,
+            [io, timer_generation](const boost::system::error_code& wait_error) {
+                if (wait_error || io->deadline_generation != timer_generation)
+                    return;
+                uint64_t expirations = 0;
+                const ssize_t drained = ::read(
+                    io->deadline_timer.native_handle(), &expirations,
+                    sizeof(expirations));
+                (void)drained;
+                io->expired = true;
+                if (auto materialization = io->materialization.lock())
+                    cancel_materialization_notification(materialization);
+                close_now(io->socket);
+            });
+    };
+    const auto deadline_after = [](std::chrono::seconds duration) {
+        const auto identity = sidecar::process_monotonic_clock_identity();
+        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + duration,
+            identity.clock_domain_id, identity.time_namespace_id);
+    };
+    const auto disarm_job_deadline = [&]() {
+        if (io->deadline_generation != UINT64_MAX)
+            ++io->deadline_generation;
+        if (io->deadline_timer.is_open()) {
+            boost::system::error_code ignored;
+            io->deadline_timer.cancel(ignored);
+            io->deadline_timer.close(ignored);
+        }
+        job_deadline.reset();
+    };
+    const auto append_outer_frame = [](icecc::Digest128Builder& digest,
+                                       const Frame& frame) {
+        digest.append_u8(static_cast<uint8_t>(frame.type));
+        digest.append_u64(static_cast<uint64_t>(frame.payload.size()));
+        digest.append(frame.payload);
+    };
+    const auto clear_link = [&]() {
+        disarm_job_deadline();
+        if (active_link && impl_->config.on_p51_link_terminal) {
+            try {
+                impl_->config.on_p51_link_terminal(*active_link);
+            } catch (...) {
+                // Endpoint teardown must still close the socket and disconnect
+                // the exact F session if a diagnostic callback throws.
+            }
+        }
+        if (activated)
+            impl_->disconnect(session, pending_job);
+    };
+
+    try {
+        arm_job_deadline(deadline_after(std::chrono::seconds(30)));
+        require_operation();
+        Frame hello_frame = co_await async_read_frame(
+            socket, frame_cap, stamp(AsyncOperationKind::ReadHeader),
+            impl_->completions, verify);
+        if (hello_frame.type != MessageType::LINK_HELLO)
+            throw std::invalid_argument("R2 link did not begin with LINK_HELLO");
+        const LinkHello hello = decode_as<LinkHello>(hello_frame);
+        if (hello.start_mode != LinkStartMode::Initial ||
+            hello.verified_receipt_floor != 0 ||
+            hello.window == 0 || hello.window > 30 ||
+            hello.f_store_guid != impl_->f_guid ||
+            hello.max_frame_payload < kR2MandatoryControlFramePayload ||
+            (impl_->caps.supported_profiles & profile_bit(hello.profile)) == 0)
+            throw std::invalid_argument("R2 LINK_HELLO exceeds F admission");
+        if (!impl_->config.lookup_p51_link_reservation)
+            throw std::invalid_argument("R2 link reservation lookup is unavailable");
+        const auto link_lease =
+            impl_->config.lookup_p51_link_reservation(hello);
+        if (!link_lease || !link_lease->initial_armed.valid() ||
+            link_lease->initial_armed.reservation_id != hello.reservation_id.bytes ||
+            link_lease->initial_armed.logical_relationship_id !=
+                hello.relationship_id.bytes ||
+            link_lease->initial_armed.relationship_epoch !=
+                hello.relationship_epoch ||
+            !link_lease->absolute_deadline.valid())
+            throw std::invalid_argument("R2 LINK_HELLO lacks its exact F reservation");
+        active_link = hello;
+        if (impl_->config.sidecar_launch && session.operation &&
+            impl_->config.endpoint_generation != 0 &&
+            impl_->next_socket_ownership_generation != 0) {
+            EndpointRunIdentity identity;
+            identity.sidecar_launch = *impl_->config.sidecar_launch;
+            identity.c_store_guid = hello.c_store_guid;
+            identity.f_store_guid = impl_->f_guid;
+            identity.f_session_operation = *session.operation;
+            identity.endpoint_generation = impl_->config.endpoint_generation;
+            identity.endpoint_session_serial = session.serial;
+            identity.run_sequence = session.operation->operation_sequence;
+            identity.socket_ownership_generation =
+                impl_->next_socket_ownership_generation++;
+            const auto identity_clock = sidecar::process_monotonic_clock_identity();
+            const auto registry_deadline =
+                sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                    std::chrono::steady_clock::now() + std::chrono::hours(24),
+                    identity_clock.clock_domain_id,
+                    identity_clock.time_namespace_id);
+            auto handle = impl_->endpoint_runs.admit(
+                identity, link_deadline.value_or(registry_deadline),
+                std::make_shared<ServerRunSocketTarget>(io));
+            if (!handle)
+                throw std::length_error("R2 endpoint run admission failed");
+            run_lease.identity = identity;
+            run_lease.permit =
+                handle->permit(EndpointCancelReason::CallerRequested);
+            (void)impl_->endpoint_runs.set_phase(identity,
+                                                 EndpointRunPhase::CacheWire);
+            if (impl_->config.on_run_admitted)
+                impl_->config.on_run_admitted(*run_lease.permit);
+        }
+        setup_guard.remove();
+
+        frame_cap = std::min({frame_cap, hello.max_frame_payload,
+                              impl_->caps.wire.max_frame_payload});
+        const uint64_t raw_cap = std::min<uint64_t>(
+            hello.max_raw_bytes, impl_->caps.zstd.max_raw_bytes);
+        const uint64_t encoded_cap = std::min<uint64_t>(
+            hello.max_encoded_bytes, impl_->caps.zstd.max_encoded_body_bytes);
+        const uint64_t output_cap = std::min<uint64_t>(
+            hello.max_output_bytes, impl_->caps.zstd.max_raw_bytes);
+        if (frame_cap < kR2MandatoryControlFramePayload || raw_cap == 0 ||
+            encoded_cap == 0 || output_cap == 0)
+            throw std::invalid_argument("R2 LINK_HELLO has no usable budget");
+
+        SessionHello ordinary_hello;
+        ordinary_hello.wire_revision = kP50WireRevision;
+        ordinary_hello.c_store_guid = hello.c_store_guid;
+        ordinary_hello.system_source_fingerprint =
+            hello.system_source_fingerprint;
+        ordinary_hello.supported_profiles = profile_bit(hello.profile);
+        ordinary_hello.limits.max_frame_payload = frame_cap;
+        ordinary_hello.limits.max_fill_record_bytes = encoded_cap;
+        const SessionSelection selection = negotiate_session(
+            ordinary_hello, kP50WireRevision,
+            impl_->caps.supported_profiles,
+            SessionLimits{frame_cap, encoded_cap});
+        const SessionState staged = impl_->stage(session, ordinary_hello, selection);
+        if (staged.route_present)
+            throw std::invalid_argument(
+                "R2 initial link requires fresh history; recovery is not enabled");
+        impl_->activate(session);
+        activated = true;
+        const HistoryReset initial{
+            hello.history_nonce,
+            initial_route_digest(hello.c_store_guid, hello.history_nonce)};
+        impl_->reset_history(session, initial);
+        const SessionState route_state = impl_->session_state(session, selection);
+        LinkState state;
+        state.profile = hello.profile;
+        state.window = link_lease->initial_armed.selected_window;
+        state.reservation_id = hello.reservation_id;
+        state.relationship_id = hello.relationship_id;
+        state.relationship_epoch = hello.relationship_epoch;
+        state.physical_link_generation = hello.physical_link_generation;
+        state.c_store_guid = hello.c_store_guid;
+        state.c_store_generation = hello.c_store_generation;
+        state.f_store_guid = impl_->f_guid;
+        state.f_store_generation =
+            link_lease->initial_armed.f_store_generation;
+        state.c_control_generation = hello.c_control_generation;
+        state.c_control_attempt = hello.c_control_attempt;
+        state.selected_max_frame_payload = frame_cap;
+        state.selected_max_raw_bytes = raw_cap;
+        state.selected_max_encoded_bytes = encoded_cap;
+        state.selected_max_output_bytes = output_cap;
+        state.f_system_source_fingerprint =
+            route_state.system_source_fingerprint;
+        state.history_nonce = route_state.history_nonce;
+        state.next_rel_seq = route_state.next_rel_seq;
+        state.state_digest = route_state.state_digest;
+        state.committed_prefix_k = 0;
+        state.acknowledged_prefix_q = 0;
+        co_await async_write_message(
+            socket, Message{state}, frame_cap,
+            stamp(AsyncOperationKind::WriteFragment), impl_->completions,
+            control, verify);
+        arm_job_deadline(deadline_after(std::chrono::seconds(60)));
+
+        for (;;) {
+            Frame bind_frame = co_await async_read_frame(
+                socket, frame_cap, stamp(AsyncOperationKind::ReadHeader),
+                impl_->completions, verify);
+            if (bind_frame.type == MessageType::CLOSE) {
+                (void)decode_as<CloseMessage>(bind_frame);
+                if (pending_job || acknowledged_ordinal != committed_ordinal)
+                    throw std::invalid_argument(
+                        "R2 CLOSE arrived with an unsettled receipt prefix");
+                clear_link();
+                result.status = ServerRunStatus::Completed;
+                run_lease.result = EndpointTerminalResult{
+                    EndpointTerminalResultState::Committed, 0};
+                close_now(socket);
+                co_return result;
+            }
+            if (bind_frame.type == MessageType::COMMIT_ACK) {
+                const CommitAck ack = decode_as<CommitAck>(bind_frame);
+                if (ack.relationship_id != hello.relationship_id ||
+                    ack.relationship_epoch != hello.relationship_epoch ||
+                    ack.physical_link_generation !=
+                        hello.physical_link_generation ||
+                    ack.contiguous_verified_ordinal <= acknowledged_ordinal ||
+                    ack.contiguous_verified_ordinal > committed_ordinal ||
+                    !impl_->config.acknowledge_p51_receipt ||
+                    !impl_->config.acknowledge_p51_receipt(hello, ack))
+                    throw std::invalid_argument(
+                        "R2 COMMIT_ACK identity or cumulative prefix mismatch");
+                acknowledged_ordinal = ack.contiguous_verified_ordinal;
+                continue;
+            }
+            if (bind_frame.type != MessageType::JOB_BIND)
+                throw std::invalid_argument(
+                    "R2 link expected JOB_BIND, COMMIT_ACK, or CLOSE");
+            const JobBind binding = decode_as<JobBind>(bind_frame);
+            if (pending_job ||
+                binding.relationship_ordinal != committed_ordinal + 1 ||
+                binding.relationship_ordinal - acknowledged_ordinal > hello.window ||
+                binding.physical_link_generation !=
+                    hello.physical_link_generation ||
+                binding.profile != hello.profile ||
+                binding.raw_bytes > raw_cap ||
+                binding.raw_bytes > output_cap)
+                throw std::invalid_argument("R2 JOB_BIND is outside the link window");
+            if (!impl_->config.consume_p51_job_reservation)
+                throw std::invalid_argument("R2 job reservation consumer is unavailable");
+            const auto job_lease =
+                impl_->config.consume_p51_job_reservation(hello, binding);
+            if (!job_lease || job_lease->binding != binding ||
+                job_lease->input_key.c_store_guid != hello.c_store_guid ||
+                job_lease->input_key.tu_seq != binding.tu_seq ||
+                job_lease->armed.reservation_id != binding.reservation_id.bytes)
+                throw std::invalid_argument("R2 JOB_BIND lacks its exact source lease");
+            arm_job_deadline(job_lease->absolute_deadline);
+            set_completion_deadline(job_lease->absolute_deadline);
+            pending_job = true;
+
+            const Digest128 binding_digest = job_lease->binding_digest;
+            Frame begin_frame = co_await async_read_frame(
+                socket, frame_cap, stamp(AsyncOperationKind::ReadHeader),
+                impl_->completions, verify);
+            if (begin_frame.type != MessageType::TU_BEGIN)
+                throw std::invalid_argument("R2 JOB_BIND was not followed by TU_BEGIN");
+            const TuBegin tu_begin = decode_as<TuBegin>(begin_frame);
+            if (tu_begin.relationship_ordinal != binding.relationship_ordinal ||
+                tu_begin.inner.tu_seq != binding.tu_seq ||
+                tu_begin.inner.profile != binding.profile ||
+                tu_begin.inner.raw_bytes != binding.raw_bytes ||
+                tu_begin.inner.raw_digest != binding.raw_digest)
+                throw std::invalid_argument("R2 TU_BEGIN differs from JOB_BIND");
+            if (binding.raw_bytes > raw_cap ||
+                tu_begin.inner.body.encoded_bytes > encoded_cap ||
+                tu_begin.inner.body.decoded_bytes > output_cap)
+                throw std::length_error("R2 TU exceeds selected link budgets");
+            const uint32_t one_profile = profile_bit(hello.profile);
+            impl_->begin(session, tu_begin.inner, one_profile);
+            icecc::Digest128Builder outer_digest;
+            outer_digest.append("R2-transaction-v1");
+            outer_digest.append_digest(binding_digest);
+            append_outer_frame(outer_digest, begin_frame);
+            uint64_t aggregate_encoded_bytes = 0;
+            Digest128 outer_transaction_digest{};
+
+            for (;;) {
+                Frame component = co_await async_read_frame(
+                    socket, frame_cap, stamp(AsyncOperationKind::ReadHeader),
+                    impl_->completions, verify);
+                if (component.type == MessageType::TU_END) {
+                    const TuEnd end = decode_as<TuEnd>(component);
+                    outer_transaction_digest = outer_digest.finish();
+                    if (end.relationship_ordinal != binding.relationship_ordinal)
+                        throw std::invalid_argument(
+                            "R2 TU_END relationship ordinal mismatch");
+                    if (end.binding_digest != binding_digest)
+                        throw std::invalid_argument(
+                            "R2 TU_END binding digest mismatch");
+                    if (end.transaction_digest != outer_transaction_digest)
+                        throw std::invalid_argument(
+                            "R2 TU_END transaction digest mismatch");
+                    break;
+                }
+                if (component.type == MessageType::R2_BODY) {
+                    if (component.payload.size() > encoded_cap -
+                                                       std::min<uint64_t>(
+                                                           aggregate_encoded_bytes,
+                                                           encoded_cap))
+                        throw std::length_error(
+                            "R2 aggregate BODY/FILL budget exceeded");
+                    aggregate_encoded_bytes += component.payload.size();
+                    outer_digest.append_u8(static_cast<uint8_t>(component.type));
+                    outer_digest.append_u64(component.payload.size());
+                    outer_digest.append(component.payload);
+                    impl_->append_body(session,
+                                       BodyMessage{component.payload});
+                    if (impl_->body_complete(session)) {
+                        // The R2 sender predicted this exact NEED locally;
+                        // F derives the same profile obligations here but
+                        // intentionally emits no NEED frame on the wire.
+                        (void)impl_->require_route(session)
+                            .pending->dialogue->need_messages(frame_cap);
+                    }
+                    continue;
+                }
+                if (component.type == MessageType::R2_FILL) {
+                    if (component.payload.size() > encoded_cap -
+                                                       std::min<uint64_t>(
+                                                           aggregate_encoded_bytes,
+                                                           encoded_cap))
+                        throw std::length_error(
+                            "R2 aggregate BODY/FILL budget exceeded");
+                    aggregate_encoded_bytes += component.payload.size();
+                    outer_digest.append_u8(static_cast<uint8_t>(component.type));
+                    outer_digest.append_u64(component.payload.size());
+                    outer_digest.append(component.payload);
+                    impl_->receive_fill(session,
+                                        FillMessage{component.payload});
+                    continue;
+                }
+                throw std::invalid_argument("unexpected R2 transaction frame");
+            }
+            if (!impl_->body_complete(session))
+                throw std::invalid_argument("R2 TU_END arrived before profile completion");
+
+            ServerMaterializationJob materialization =
+                impl_->begin_materialization(
+                    session, std::move(control.before_materialize_on_worker));
+            ServerMaterializationCompletion materialization_completion =
+                co_await async_materialize(std::move(materialization), io);
+            require_operation();
+            Impl::MaterializedInput materialized = impl_->finish_materialization(
+                session, std::move(materialization_completion));
+            if (materialized.begin.tu_seq != job_lease->input_key.tu_seq ||
+                materialized.begin.raw_bytes != binding.raw_bytes ||
+                materialized.begin.raw_digest != binding.raw_digest)
+                throw StaleCompletion();
+            result.f_apply_materialize_ns = materialized.f_apply_materialize_ns;
+            const InputJobState job_state =
+                impl_->select_materialized_job_state(session, materialized);
+            require_operation();
+            const TxBegin committed_begin = materialized.begin;
+            const TxCommit commit = impl_->commit_materialized(
+                session, std::move(materialized), job_state,
+                result.candidate_input, result.completed_input,
+                result.committed_input);
+            const R2TxCommit r2_commit{binding.relationship_ordinal,
+                                      binding_digest,
+                                      outer_transaction_digest,
+                                      commit};
+            if (!impl_->config.record_p51_job_commit ||
+                !impl_->config.record_p51_job_commit(hello, binding,
+                                                     r2_commit))
+                throw std::logic_error(
+                    "F could not retain the exact R2 receipt before delivery");
+            committed_ordinal = binding.relationship_ordinal;
+            co_await async_write_message(
+                socket, Message{r2_commit}, frame_cap,
+                stamp(AsyncOperationKind::WriteFragment, &committed_begin),
+                impl_->completions, control, verify);
+            pending_job = false;
+            set_completion_deadline(link_deadline);
+            arm_job_deadline(deadline_after(std::chrono::seconds(60)));
+        }
+    } catch (const StaleCompletion&) {
+        clear_link();
+        close_now(socket);
+        result.status = ServerRunStatus::Disconnected;
+        co_return result;
+    } catch (const boost::system::system_error&) {
+        const bool expired = io->expired || deadline_crossed();
+        clear_link();
+        close_now(socket);
+        result.status = expired ? ServerRunStatus::DeadlineExceeded
+                                : ServerRunStatus::Disconnected;
+        co_return result;
+    } catch (const std::exception& error) {
+        clear_link();
+        result.terminal_error = bounded_error(
+            impl_->config.protocol_error_code, error.what(), frame_cap);
+    }
+    if (result.terminal_error) {
+        // Do not send the R1 ERROR control frame on an R2 link.  Until the
+        // bounded R2 ERROR codec is enabled, fail closed by closing the link.
+    }
+    close_now(socket);
+    result.status = ServerRunStatus::TerminalError;
+    co_return result;
+}
+
 EndpointCancelResult P50ServerEndpoint::request_cancel(
     const EndpointCancelPermit& permit) noexcept {
     return impl_->endpoint_runs.request_cancel(permit);
@@ -4201,7 +5473,19 @@ EndpointCancelResult P50ServerEndpoint::request_cancel(
 
 size_t P50ServerEndpoint::cancel_all_for_incarnation(
     const SidecarLaunchIdentity& incarnation) noexcept {
-    return impl_->endpoint_runs.cancel_all_for_incarnation(incarnation);
+    size_t cancelled = impl_->endpoint_runs.cancel_all_for_incarnation(incarnation);
+    if (impl_->config.sidecar_launch &&
+        *impl_->config.sidecar_launch == incarnation) {
+        for (const auto& [serial, weak] : impl_->pending_r2_setup) {
+            (void)serial;
+            if (const auto io = weak.lock()) {
+                io->cancelled = true;
+                close_now(io->socket);
+                ++cancelled;
+            }
+        }
+    }
+    return cancelled;
 }
 
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS

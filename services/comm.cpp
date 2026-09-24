@@ -1988,6 +1988,7 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text,
     text_based = text;
     nonblocking_protocol_handshake = async_protocol_handshake;
     cache_session_release_armed = false;
+    p51_link_session_release_armed = false;
     cache_session_send_release_armed = false;
     p50_channel_generation = next_p50_nonzero(g_p50_channel_generation);
     if (p50_channel_generation == 0)
@@ -2523,6 +2524,7 @@ void MsgChannel::begin_receive() noexcept
     p51_armed_fd_request = {};
     p51_fd_reply_arm_consumed = false;
     cache_session_release_armed = false;
+    p51_link_session_release_armed = false;
     cache_session_send_release_armed = false;
     if (!set_error_recursion) {
         invalid_p50_source_arm_wire_id = 0;
@@ -2893,6 +2895,10 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     if (type == Msg::CACHE_SESSION && instate != ERROR && !eof) {
         cache_session_release_armed = true;
     }
+    if (type == Msg::P51_CACHE_LINK_SESSION && instate != ERROR && !eof &&
+        protocol_supports_cache_r2(protocol)) {
+        p51_link_session_release_armed = true;
+    }
 
     return m;
 }
@@ -3206,6 +3212,80 @@ int MsgChannel::release_fd_if_input_empty()
     return released_fd;
 }
 
+int MsgChannel::release_fd_after_p51_link_session_ready(
+    std::chrono::steady_clock::time_point deadline)
+{
+    p50_note_channel_mutation();
+    p50_clear_outbound_claim();
+    const bool armed = p51_link_session_release_armed;
+    p51_link_session_release_armed = false;
+    if (!armed || fd < 0 || std::chrono::steady_clock::now() >= deadline ||
+        !protocol_supports_cache_r2(protocol) || eof ||
+        instate == ERROR || instate != NEED_LEN || inofs != intogo ||
+        msgtogo != 0 || !pending_frame_ends.empty())
+        return -1;
+
+    unsigned char byte = 0;
+    for (;;) {
+        const ssize_t result =
+            recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+        if (result > 0 || result == 0)
+            return -1;
+        if (errno == EINTR)
+            return -1;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return -1;
+        break;
+    }
+    const int released_fd = fd;
+    fd = -1;
+    return released_fd;
+}
+
+int MsgChannel::send_p51_cache_link_session_ready_and_release(
+    std::chrono::steady_clock::time_point deadline)
+{
+    const bool request_armed = p51_link_session_release_armed;
+    p51_link_session_release_armed = false;
+    p50_note_channel_mutation();
+    p50_clear_outbound_claim();
+    if (!request_armed || fd < 0 ||
+        !protocol_supports_cache_r2(protocol) || eof || instate == ERROR ||
+        instate != NEED_LEN || inofs != intogo || msgtogo != 0 ||
+        !pending_frame_ends.empty() ||
+        std::chrono::steady_clock::now() >= deadline)
+        return -1;
+
+    const uint64_t before = frames_queued_seq;
+    if (!send_msg(P51CacheLinkSessionMsg(), SendNonBlocking))
+        return -1;
+    if (frames_queued_seq != before + 1)
+        return -1;
+    while (msgtogo != 0 || !pending_frame_ends.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return -1;
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(deadline - now).count();
+        const int timeout = static_cast<int>(std::clamp<int64_t>(
+            remaining, 1, INT_MAX));
+        pollfd descriptor{fd, POLLOUT, 0};
+        const int ready = ::poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 || (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)))
+            return -1;
+        if (!flush_writebuf(SendNonBlocking))
+            return -1;
+    }
+    if (framesFlushed() != before + 1 || eof || instate == ERROR ||
+        inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty())
+        return -1;
+    const int released_fd = fd;
+    fd = -1;
+    return released_fd;
+}
+
 bool send_cache_session_ready(
     int fd, std::chrono::steady_clock::time_point deadline) noexcept
 {
@@ -3395,6 +3475,7 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
        ordinary send is attempted, flushing that output must never resurrect
        descriptor release. */
     cache_session_release_armed = false;
+    p51_link_session_release_armed = false;
     cache_session_send_release_armed = false;
 
     if (m == Msg::CACHE_SESSION &&

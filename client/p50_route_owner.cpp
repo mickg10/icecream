@@ -1,4 +1,5 @@
 #include "p50_route_owner.h"
+#include "services/comm.h"
 
 #include <stdexcept>
 #include <utility>
@@ -9,6 +10,15 @@ namespace {
 bool supported_profile(ProfileId profile) noexcept {
     return profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_TU ||
            profile == ProfileId::ZSTD_ROUTE;
+}
+
+uint32_t cache_profile_mask(ProfileId profile) noexcept {
+    switch (profile) {
+    case ProfileId::P29V1: return CACHE_PROFILE_P29V1;
+    case ProfileId::ZSTD_TU: return CACHE_PROFILE_ZSTD_TU;
+    case ProfileId::ZSTD_ROUTE: return CACHE_PROFILE_ZSTD_ROUTE;
+    }
+    return 0;
 }
 
 ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
@@ -179,6 +189,74 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     co_return result;
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
+    P50RouteRelationship relationship, P51SourceArmedFields armed,
+    AsyncConnectedFdFactory connection, PrepareRequestKey request,
+    std::chrono::steady_clock::time_point deadline,
+    std::span<const uint8_t> source) {
+    if (!relationship.valid() || !armed.valid() || !connection ||
+        request.producer_session != armed.arm.source.assignment_epoch ||
+        request.request_token != armed.arm.source.assignment_nonce ||
+        relationship.c_store_guid.bytes != armed.arm.source.c_store_guid ||
+        relationship.f_store_guid.bytes != armed.f_store_guid ||
+        relationship.f_store_generation != armed.f_store_generation ||
+        (relationship.profile != ProfileId::P29V1 &&
+         relationship.profile != ProfileId::ZSTD_TU &&
+         relationship.profile != ProfileId::ZSTD_ROUTE))
+        co_return invalid();
+    if (armed.arm.source.cache_profile != cache_profile_mask(relationship.profile) ||
+        source.size() > config_.endpoint_caps.zstd.max_raw_bytes)
+        co_return invalid();
+    if (replacement_required_)
+        co_return replacement();
+    const auto incarnation = std::make_tuple(
+        relationship.c_store_guid, relationship.f_store_guid,
+        relationship.f_store_generation);
+    const auto profile_position = p51_incarnation_profiles_.find(incarnation);
+    if (profile_position != p51_incarnation_profiles_.end() &&
+        profile_position->second != relationship.profile)
+        co_return invalid();
+    P50ZstdSourceSender* sender = nullptr;
+    uint64_t physical_generation = 0;
+    try {
+        if (profile_position == p51_incarnation_profiles_.end())
+            p51_incarnation_profiles_.emplace(incarnation,
+                                               relationship.profile);
+        sender = get_or_create(relationship, request, deadline).get();
+        auto position = physical_generations_.find(relationship);
+        if (position == physical_generations_.end()) {
+            if (next_physical_generation_ == 0 ||
+                next_physical_generation_ == UINT64_MAX)
+                throw std::overflow_error("physical R2 link generation exhausted");
+            position = physical_generations_.emplace(
+                relationship, next_physical_generation_++).first;
+        }
+        physical_generation = position->second;
+    } catch (const std::invalid_argument&) {
+        if (owners_.find(relationship) == owners_.end())
+            p51_incarnation_profiles_.erase(incarnation);
+        co_return invalid();
+    } catch (...) {
+        if (owners_.find(relationship) == owners_.end())
+            p51_incarnation_profiles_.erase(incarnation);
+        replacement_required_ = true;
+        co_return replacement();
+    }
+    ZstdSourceTransferResult result = co_await sender->transfer_p51_route(
+        std::move(armed), physical_generation, std::move(connection), request,
+        deadline, source);
+    if (result.replacement_required && !result.route_local_failure)
+        replacement_required_ = true;
+    co_return result;
+}
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic pop
+#endif
+
 bool P50CRouteOwner::reset_f_store_exact(
     FStoreGuid old_f_store_guid,
     uint64_t old_f_store_generation) noexcept {
@@ -189,9 +267,14 @@ bool P50CRouteOwner::reset_f_store_exact(
         if (position->first.f_store_guid == old_f_store_guid &&
             position->first.f_store_generation == old_f_store_generation) {
             const PreparationRouteKey key = route_key(position->first);
-            if (!authority_ || authority_->reset_route(key))
+            if (!authority_ || authority_->reset_route(key)) {
+                p51_incarnation_profiles_.erase(std::make_tuple(
+                    position->first.c_store_guid,
+                    position->first.f_store_guid,
+                    position->first.f_store_generation));
+                physical_generations_.erase(position->first);
                 position = owners_.erase(position);
-            else {
+            } else {
                 reset = false;
                 ++position;
             }
@@ -207,7 +290,13 @@ void P50CRouteOwner::reset() noexcept {
     for (auto position = owners_.begin(); position != owners_.end();) {
         const PreparationRouteKey key = route_key(position->first);
         if (!authority_ || authority_->reset_route(key))
+        {
+            p51_incarnation_profiles_.erase(std::make_tuple(
+                position->first.c_store_guid, position->first.f_store_guid,
+                position->first.f_store_generation));
+            physical_generations_.erase(position->first);
             position = owners_.erase(position);
+        }
         else
             ++position;
     }

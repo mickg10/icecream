@@ -1,7 +1,7 @@
 #pragma once
 
-// Bounded daemon-side bridge from an exactly decoded Protocol-50
-// CACHE_SESSION to the already-authenticated sidecar control relationship.
+// Bounded daemon-side bridge from an exactly decoded CACHE_SESSION or
+// P51_CACHE_LINK_SESSION to the already-authenticated sidecar relationship.
 // This class owns neither a listener nor cache bytes: the ordinary link must
 // first prove the MsgChannel release boundary, then ownership moves exactly
 // once into FdHandoffSender.
@@ -92,8 +92,8 @@ public:
     [[nodiscard]] uint64_t next_request_id() const noexcept { return next_request_id_; }
 
     // `decoded_type` must be the result of the immediately preceding
-    // MsgChannel::get_msg().  The release call is made only for the exact
-    // Protocol-50 empty CACHE_SESSION discriminator; no cache byte is read.
+    // MsgChannel::get_msg(). The selected typed release seam is used only for
+    // the exact empty discriminator; no cache byte is read.
     CacheDispatchOutcome dispatch(MsgChannel& channel, int negotiated_protocol,
                                   uint32_t decoded_type) noexcept;
 

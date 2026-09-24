@@ -167,6 +167,12 @@ bool start(Reader& reader, P50SourceWirePhase phase,
 }  // namespace
 
 bool P50SourceArm::valid() const noexcept {
+    return valid_for_cache_revision(kP50WireRevision);
+}
+
+bool P50SourceArm::valid_for_cache_revision(uint32_t revision) const noexcept {
+    if (revision != kP50WireRevision && revision != 2)
+        return false;
     const bool source_mode_known =
         source_mode >= static_cast<uint32_t>(ProfileId::P29V1) &&
         source_mode <= static_cast<uint32_t>(ProfileId::ZSTD_ROUTE);
@@ -179,7 +185,7 @@ bool P50SourceArm::valid() const noexcept {
            selected_f_ordinary_port != 0 &&
            selected_f_ordinary_port <= UINT16_MAX && selected_f_cache_port != 0 &&
            selected_f_cache_port <= UINT16_MAX &&
-           cache_protocol == kP50WireRevision && cache_profile != 0 &&
+           cache_protocol == revision && cache_profile != 0 &&
            (cache_profile & ~kKnownProfileMask) == 0 && source_mode_known &&
            cache_profile == source_profile_bit && logical_job != 0 && attempt_id != 0 &&
            c_store_generation != 0 && c_store_guid != CStoreGuid{} &&
@@ -190,7 +196,9 @@ bool P50InputReady::valid() const noexcept {
     // TU sequence zero is the first valid member of a C-store generation.
     // Presence is carried by the nonzero store GUID/request identities, not
     // by shifting the sequence namespace to one.
-    return arm.valid() && raw_bytes != 0 &&
+    return (arm.valid_for_cache_revision(kP50WireRevision) ||
+            arm.valid_for_cache_revision(2)) &&
+           (raw_bytes != 0 || arm.cache_protocol == 2) &&
            f_store_guid != FStoreGuid{} && attachment_store_generation != 0 &&
            attachment_request_id != 0 && ready_event_id != 0;
 }

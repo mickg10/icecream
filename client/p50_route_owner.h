@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <tuple>
 #include <vector>
 
 namespace icecc::p50 {
@@ -76,6 +77,12 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_p51(
+        P50RouteRelationship relationship, P51SourceArmedFields armed,
+        AsyncConnectedFdFactory connection, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        std::span<const uint8_t> source);
+
     // Drops every profile view for one exact retired F incarnation.  False
     // means at least one route still owns an uncommitted preparation; callers
     // must replace the whole C sidecar and must not admit the successor.
@@ -108,6 +115,10 @@ private:
     P50RouteOwnerConfig config_{};
     std::shared_ptr<P50PreparationAuthority> authority_;
     std::map<P50RouteRelationship, Sender> owners_;
+    std::map<P50RouteRelationship, uint64_t> physical_generations_;
+    std::map<std::tuple<CStoreGuid, FStoreGuid, uint64_t>, ProfileId>
+        p51_incarnation_profiles_;
+    uint64_t next_physical_generation_ = 1;
     // The supervisor replaces this whole C sidecar, not one relationship.
     // Once any sender reports ambiguous state, no other relationship may
     // open F even if the wrapper that observed the first failure disappears.

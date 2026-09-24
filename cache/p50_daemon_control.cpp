@@ -271,7 +271,8 @@ DaemonControlStatus DaemonControlOperation::begin_authenticated(
     own_fd_ = ownership == DaemonControlFdOwnership::Owned;
     transfer_fd_ = transfer_fd;
     if (nonblocking_fd < 0 ||
-        operation.kind != ControlOperationKind::SourceTransfer ||
+        (operation.kind != ControlOperationKind::SourceTransfer &&
+         operation.kind != ControlOperationKind::P51SourceTransfer) ||
         transfer_fd < 0 || transfer_fd == nonblocking_fd ||
         !valid_limits(limits) ||
         deadline <= std::chrono::steady_clock::now() ||
@@ -620,16 +621,23 @@ bool DaemonControlOperation::read_source_reply(size_t& calls,
     if (decode_frame(frame_read_, frame) != Status::Ok ||
         frame.type != MessageType::Data || frame.identity != operation_.identity ||
         !decode_control_operation(frame.payload, observed) ||
-        observed.kind != ControlOperationKind::SourceTransfer ||
+        observed.kind != operation_.kind ||
         observed.identity != operation_.identity ||
         observed.request_id != operation_.request_id ||
-        observed.source_arm != operation_.source_arm ||
         observed.absolute_deadline != operation_.absolute_deadline ||
-        !observed.source_result.has_value()) {
+        (operation_.kind == ControlOperationKind::SourceTransfer &&
+         (observed.source_arm != operation_.source_arm ||
+          !observed.source_result.has_value())) ||
+        (operation_.kind == ControlOperationKind::P51SourceTransfer &&
+         (observed.p51_source_transfer != operation_.p51_source_transfer ||
+          !observed.p51_source_transfer_result.has_value()))) {
         fail(DaemonControlStatus::OperationMismatch);
         return false;
     }
-    source_transfer_result_ = observed.source_result;
+    source_transfer_result_ = operation_.kind ==
+                                      ControlOperationKind::P51SourceTransfer
+                                  ? observed.p51_source_transfer_result
+                                  : observed.source_result;
     offset_ = 0;
     frame_read_.clear();
     frame_expected_ = 0;
@@ -799,7 +807,8 @@ DaemonControlStatus DaemonControlOperation::advance(
     } else if (phase_ == Phase::ReadAck) {
         (void)read_ack(calls, budget);
     } else if (phase_ == Phase::CheckAckTrailing) {
-        if (operation_.kind == ControlOperationKind::SourceTransfer) {
+        if (operation_.kind == ControlOperationKind::SourceTransfer ||
+            operation_.kind == ControlOperationKind::P51SourceTransfer) {
             phase_ = Phase::ReadSourceReply;
         } else if (check_stream_trailing(Phase::None, calls, budget)) {
             (void)::close(transfer_fd_);

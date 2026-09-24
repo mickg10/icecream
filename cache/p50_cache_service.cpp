@@ -1005,7 +1005,10 @@ bool handle_connection(local::Connection connection, const Options& options,
             return true;
         }
 
-        if (operation.kind == local::ControlOperationKind::CacheSession) {
+        if (operation.kind == local::ControlOperationKind::CacheSession ||
+            operation.kind == local::ControlOperationKind::CacheLinkSession) {
+            const bool r2_link =
+                operation.kind == local::ControlOperationKind::CacheLinkSession;
             /*
              * Complete the authenticated one-shot public-descriptor handoff,
              * then move the adopted socket directly to the endpoint owner.
@@ -1041,7 +1044,7 @@ bool handle_connection(local::Connection connection, const Options& options,
                 return true;
             }
             errno = 0;
-            if (!send_cache_session_ready(adopted.get(), deadline)) {
+            if (!r2_link && !send_cache_session_ready(adopted.get(), deadline)) {
                 std::fprintf(
                     stderr,
                     "P50_CACHE_SESSION_REFUSED stage=ready request=%llu "
@@ -1051,10 +1054,14 @@ bool handle_connection(local::Connection connection, const Options& options,
                 return true;
             }
             std::fprintf(
-                stderr, "P50_CACHE_SESSION_READY request=%llu\n",
+                stderr, r2_link ? "P51_CACHE_LINK_READY request=%llu\n"
+                                : "P50_CACHE_SESSION_READY request=%llu\n",
                 static_cast<unsigned long long>(operation.request_id));
             std::fflush(stderr);
-            runtime.start_adopted_endpoint(adopted.release());
+            if (r2_link)
+                runtime.start_adopted_r2_endpoint(adopted.release());
+            else
+                runtime.start_adopted_endpoint(adopted.release());
             return true;
         }
         if (operation.kind == local::ControlOperationKind::SourceTransfer) {
@@ -1170,6 +1177,107 @@ bool handle_connection(local::Connection connection, const Options& options,
                 std::fflush(stderr);
                 return true;
             }
+            return true;
+        }
+        if (operation.kind == local::ControlOperationKind::SourceReservation) {
+            if (!operation.p51_reservation.has_value())
+                return true;
+            const auto operation_deadline =
+                operation.p51_reservation->absolute_deadline.as_steady_time_point();
+            local::ControlOperation response_operation = operation;
+            response_operation.p51_reservation_result =
+                runtime.reserve_p51_source_on_owner(*operation.p51_reservation);
+            const std::vector<uint8_t> response_payload =
+                local::encode_control_operation(response_operation);
+            if (response_payload.empty())
+                return true;
+            const local::Frame response{local::kProtocolVersion,
+                                        local::MessageType::Data,
+                                        options.identity, response_payload};
+            if (connection.send_until(response, operation_deadline) !=
+                local::Status::Ok)
+                return true;
+            local::Frame acknowledgement;
+            if (connection.receive_until(acknowledgement, operation_deadline) !=
+                    local::Status::Ok ||
+                acknowledgement.type != local::MessageType::Goodbye ||
+                !acknowledgement.payload.empty() ||
+                local::validate_identity(acknowledgement, options.identity) !=
+                    local::Status::Ok)
+                return true;
+            return true;
+        }
+        if (operation.kind ==
+            local::ControlOperationKind::SourceReservationCancel) {
+            if (!operation.p51_reservation_cancel.has_value())
+                return true;
+            const auto& cancel = *operation.p51_reservation_cancel;
+            const auto operation_deadline =
+                cancel.absolute_deadline.as_steady_time_point();
+            local::ControlOperation response_operation = operation;
+            const bool cancelled = runtime.cancel_p51_source_on_owner(
+                cancel.arm, cancel.armed.reservation_id, operation_deadline);
+            response_operation.p51_reservation_cancel_result = cancelled;
+            response_operation.p51_reservation_cancel->cancelled = cancelled;
+            const std::vector<uint8_t> response_payload =
+                local::encode_control_operation(response_operation);
+            if (response_payload.empty())
+                return true;
+            const local::Frame response{local::kProtocolVersion,
+                                        local::MessageType::Data,
+                                        options.identity, response_payload};
+            if (connection.send_until(response, operation_deadline) !=
+                local::Status::Ok)
+                return true;
+            local::Frame acknowledgement;
+            if (connection.receive_until(acknowledgement, operation_deadline) !=
+                    local::Status::Ok ||
+                acknowledgement.type != local::MessageType::Goodbye ||
+                !acknowledgement.payload.empty() ||
+                local::validate_identity(acknowledgement, options.identity) !=
+                    local::Status::Ok)
+                return true;
+            return true;
+        }
+        if (operation.kind ==
+            local::ControlOperationKind::P51SourceTransfer) {
+            if (!operation.p51_source_transfer.has_value())
+                return true;
+            const auto operation_deadline =
+                operation.p51_source_transfer->absolute_deadline
+                    .as_steady_time_point();
+            local::FdHandoffReceiver receiver;
+            const local::FdHandoffResult handoff = receiver.receive_and_ack(
+                connection,
+                local::HandoffRequest{options.identity, operation.request_id},
+                operation_deadline);
+            if (handoff.status != local::FdHandoffStatus::Accepted)
+                return true;
+            local::HandoffFd source = receiver.take_adopted_fd();
+            const local::P50SourceTransferResult transfer =
+                runtime.transfer_p51_source_on_owner(
+                    *operation.p51_source_transfer, std::move(source));
+            local::ControlOperation response_operation =
+                local::make_p51_source_transfer_reply_operation(
+                    operation, transfer);
+            const std::vector<uint8_t> response_payload =
+                local::encode_control_operation(response_operation);
+            if (response_payload.empty())
+                return true;
+            const local::Frame response{local::kProtocolVersion,
+                                        local::MessageType::Data,
+                                        options.identity, response_payload};
+            if (connection.send_until(response, operation_deadline) !=
+                local::Status::Ok)
+                return true;
+            local::Frame acknowledgement;
+            if (connection.receive_until(acknowledgement, operation_deadline) !=
+                    local::Status::Ok ||
+                acknowledgement.type != local::MessageType::Goodbye ||
+                !acknowledgement.payload.empty() ||
+                local::validate_identity(acknowledgement, options.identity) !=
+                    local::Status::Ok)
+                return true;
             return true;
         }
         if (!operation.input.has_value() || !operation.owner.has_value())
@@ -1307,8 +1415,12 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         config.max_route_completed_requests == 0 ||
         config.max_route_relationships == 0 ||
         config.max_route_endpoint_identities == 0 ||
+        config.max_pending_p51_source_reservations == 0 ||
+        config.max_pending_p51_source_reservations > 4096 ||
         config.max_active_source_transfers == 0 ||
         config.max_active_source_transfers > kMaxControlWorkers ||
+        config.max_active_p51_source_transfers == 0 ||
+        config.max_active_p51_source_transfers > kMaxControlWorkers ||
         config.max_aggregate_source_raw_bytes == 0 ||
         config.max_aggregate_source_raw_bytes > SIZE_MAX ||
         config.source_open_arm_timeout <= std::chrono::milliseconds::zero() ||
@@ -1474,6 +1586,27 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
             endpoint_cancel_permit_ = std::move(permit);
         };
     }
+    config_.endpoint_config.lookup_p51_link_reservation = [this](
+        const LinkHello& hello) {
+        return lookup_p51_link_reservation_on_owner(hello);
+    };
+    config_.endpoint_config.consume_p51_job_reservation = [this](
+        const LinkHello& link, const JobBind& binding) {
+        return consume_p51_job_reservation_on_owner(link, binding);
+    };
+    config_.endpoint_config.record_p51_job_commit = [this](
+        const LinkHello& link, const JobBind& binding,
+        const R2TxCommit& commit) {
+        return record_p51_job_commit_on_owner(link, binding, commit);
+    };
+    config_.endpoint_config.acknowledge_p51_receipt = [this](
+        const LinkHello& link, const CommitAck& ack) {
+        return acknowledge_p51_receipt_on_owner(link, ack);
+    };
+    config_.endpoint_config.on_p51_link_terminal = [this](
+        const LinkHello& hello) {
+        release_p51_link_on_owner(hello);
+    };
     endpoint_ = std::make_unique<P50ServerEndpoint>(
         config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
         config_.endpoint_config);
@@ -2128,6 +2261,204 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     return result.get();
 }
 
+local::P50SourceTransferResult SidecarRuntime::transfer_p51_source_on_owner(
+    local::P51SourceTransferRequest request,
+    local::HandoffFd source) noexcept {
+    constexpr uint16_t kInvalid = 1;
+    constexpr uint16_t kExpired = 7;
+    constexpr uint16_t kSourceRead = 3;
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = request.absolute_deadline.as_steady_time_point();
+    if (!request.armed.valid() || !request.absolute_deadline.valid() ||
+        !request.absolute_deadline.matches_clock(clock) || !source.valid() ||
+        !config_.sidecar_launch || !config_.sidecar_launch->valid() ||
+        request.armed.arm.source.c_store_guid != config_.c_store_guid.bytes ||
+        request.armed.arm.source.c_store_generation !=
+            config_.sidecar_launch->store_generation ||
+        request.armed.arm.source.c_control_generation !=
+            config_.sidecar_launch->identity.generation ||
+        request.armed.arm.source.c_control_attempt !=
+            config_.sidecar_launch->identity.attempt ||
+        request.armed.f_store_guid == config_.f_store_guid.bytes ||
+        request.armed.f_store_guid == std::array<uint8_t, 16>{} ||
+        request.armed.f_store_generation == 0 ||
+        request.armed.selected_revision != 2)
+        return source_transfer_error(kInvalid);
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        route_replacement_required_.load(std::memory_order_acquire) ||
+        std::chrono::steady_clock::now() >= deadline)
+        return source_transfer_error(kExpired);
+
+    const auto& arm = request.armed.arm.source;
+    ProfileId profile;
+    switch (arm.cache_profile) {
+    case CACHE_PROFILE_P29V1: profile = ProfileId::P29V1; break;
+    case CACHE_PROFILE_ZSTD_TU: profile = ProfileId::ZSTD_TU; break;
+    case CACHE_PROFILE_ZSTD_ROUTE: profile = ProfileId::ZSTD_ROUTE; break;
+    default: return source_transfer_error(kInvalid);
+    }
+    if (request.armed.selected_window == 0 ||
+        request.armed.selected_window > 30 ||
+        arm.selected_f_cache_port == 0 || arm.selected_f_cache_port > UINT16_MAX ||
+        arm.selected_f_host.empty())
+        return source_transfer_error(kInvalid);
+    const auto source_size = source_fd_size(
+        source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
+    if (!source_size.has_value())
+        return source_transfer_error(kSourceRead);
+    if (!acquire_p51_source_credit(*source_size, deadline))
+        return source_transfer_error(kExpired);
+    bool credit_owned = true;
+    auto credit_guard = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [this, source_size, &credit_owned](int*) {
+            if (credit_owned)
+                release_p51_source_credit(*source_size);
+        });
+    const auto raw = read_source_fd(
+        source.get(), config_.endpoint_caps.zstd.max_raw_bytes, *source_size,
+        deadline, stop_requested_);
+    if (!raw.has_value())
+        return source_transfer_error(kSourceRead);
+
+    const P50RouteRelationship relationship{
+        config_.c_store_guid, FStoreGuid{request.armed.f_store_guid},
+        request.armed.f_store_generation, profile};
+    const PrepareRequestKey route_request{
+        arm.assignment_epoch, arm.assignment_nonce};
+    auto setup_cancelled = source_setup_cancelled_;
+    auto setup_inflight = source_setup_inflight_;
+    const size_t setup_limit = config_.max_active_source_transfers;
+    const AsyncConnectedFdFactory connector =
+        [this, host = arm.selected_f_host,
+         port = static_cast<unsigned short>(arm.selected_f_cache_port),
+         setup_cancelled, setup_inflight, setup_limit](
+            std::chrono::steady_clock::time_point limit,
+            std::function<void(int)> completion) mutable {
+            if (setup_cancelled->load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= limit) {
+                completion(-1);
+                return;
+            }
+            size_t outstanding = setup_inflight->load(std::memory_order_relaxed);
+            while (outstanding < setup_limit &&
+                   !setup_inflight->compare_exchange_weak(
+                       outstanding, outstanding + 1, std::memory_order_acq_rel,
+                       std::memory_order_relaxed)) {}
+            if (outstanding >= setup_limit) {
+                completion(-1);
+                return;
+            }
+            std::shared_ptr<SourceSetupTaskSlot> slot;
+            std::shared_ptr<std::function<void(int)>> done;
+            try {
+                slot = std::make_shared<SourceSetupTaskSlot>(setup_inflight);
+                done = std::make_shared<std::function<void(int)>>(completion);
+                asio::post(source_setup_pool_,
+                    [host = std::move(host), port, limit, setup_cancelled,
+                     done, slot] {
+                        int fd = -1;
+                        try {
+                            if (!setup_cancelled->load(std::memory_order_acquire) &&
+                                std::chrono::steady_clock::now() < limit) {
+                                std::unique_ptr<MsgChannel> channel(
+                                    Service::createChannelRetryUntil(
+                                        host, port, limit,
+                                        kSourceConnectAttemptBudget,
+                                        Service::ChannelRetryPolicy::HedgeAfterFirst));
+                                if (channel &&
+                                    protocol_supports_cache_r2(channel->protocol) &&
+                                    std::chrono::steady_clock::now() < limit &&
+                                    channel->send_msg(P51CacheLinkSessionMsg())) {
+                                    std::unique_ptr<Msg> reply(
+                                        channel->get_msg_until(limit));
+                                    if (dynamic_cast<P51CacheLinkSessionMsg*>(
+                                            reply.get()) != nullptr)
+                                        fd = channel->release_fd_after_p51_link_session_ready(
+                                            limit);
+                                }
+                            }
+                        } catch (...) {
+                            fd = -1;
+                        }
+                        (*done)(fd);
+                    });
+            } catch (...) {
+                if (done && *done)
+                    (*done)(-1);
+                else {
+                    if (!slot)
+                        setup_inflight->fetch_sub(1, std::memory_order_relaxed);
+                    completion(-1);
+                }
+            }
+        };
+
+    auto completion = std::make_shared<
+        std::promise<local::P50SourceTransferResult>>();
+    auto result = completion->get_future();
+    try {
+        asio::co_spawn(context_,
+            [this, request = std::move(request), relationship, route_request,
+             connector, deadline, source_bytes = *raw, completion]() mutable
+                -> asio::awaitable<void> {
+                local::P50SourceTransferResult value =
+                    source_transfer_error(kInvalid);
+                ZstdSourceTransferResult observed;
+                try {
+                    const RouteEndpointKey endpoint_key{
+                        request.armed.arm.source.selected_f_host,
+                        static_cast<unsigned short>(
+                            request.armed.arm.source.selected_f_cache_port)};
+                    const RouteStoreIdentity store_identity{
+                        relationship.f_store_guid,
+                        relationship.f_store_generation};
+                    if (!stop_requested_.load(std::memory_order_acquire) &&
+                        !route_replacement_required_.load(
+                            std::memory_order_acquire) &&
+                        bind_route_endpoint_identity(endpoint_key, store_identity)) {
+                        observed = co_await route_owner_->transfer_p51(
+                            relationship, request.armed, connector, route_request,
+                            deadline,
+                            std::span<const uint8_t>(*source_bytes));
+                    } else {
+                        observed.status = ZstdSourceTransferStatus::Unavailable;
+                        observed.profile = relationship.profile;
+                        observed.replacement_required =
+                            route_replacement_required_.load(
+                                std::memory_order_acquire);
+                    }
+                    if (observed.replacement_required &&
+                        !observed.route_local_failure)
+                        latch_route_replacement();
+                    value = source_transfer_result(observed, config_.c_store_guid);
+                } catch (...) {
+                    observed.status = ZstdSourceTransferStatus::TerminalError;
+                    observed.profile = relationship.profile;
+                    observed.replacement_required = true;
+                    latch_route_replacement();
+                    value = source_transfer_result(observed, config_.c_store_guid);
+                }
+                completion->set_value(value);
+                co_return;
+            }, asio::detached);
+    } catch (...) {
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired));
+    }
+    const auto wait_limit = deadline + config_.cancellation_grace;
+    while (result.wait_for(std::chrono::milliseconds(10)) !=
+           std::future_status::ready) {
+        if (std::chrono::steady_clock::now() < wait_limit)
+            continue;
+        if (config_.fail_stop)
+            config_.fail_stop();
+        std::_Exit(125);
+    }
+    credit_owned = false;
+    release_p51_source_credit(*source_size);
+    return result.get();
+}
+
 bool SidecarRuntime::bind_route_endpoint_identity(
     const RouteEndpointKey& endpoint,
     RouteStoreIdentity observed) noexcept {
@@ -2447,6 +2778,50 @@ bool SidecarRuntime::acquire_source_credit(
     }
 }
 
+bool SidecarRuntime::acquire_p51_source_credit(
+    uint64_t raw_bytes,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (raw_bytes > config_.max_aggregate_source_raw_bytes)
+        return false;
+    try {
+        std::unique_lock lock(source_admission_mutex_);
+        const bool ready = source_admission_changed_.wait_until(
+            lock, deadline, [this, raw_bytes] {
+                return stop_requested_.load(std::memory_order_acquire) ||
+                       route_replacement_required_.load(
+                           std::memory_order_acquire) ||
+                       (active_p51_source_count_ <
+                            config_.max_active_p51_source_transfers &&
+                        raw_bytes <= config_.max_aggregate_source_raw_bytes -
+                                         active_source_raw_bytes_);
+            });
+        if (!ready || std::chrono::steady_clock::now() >= deadline ||
+            stop_requested_.load(std::memory_order_acquire) ||
+            route_replacement_required_.load(std::memory_order_acquire))
+            return false;
+        ++active_p51_source_count_;
+        active_source_raw_bytes_ += raw_bytes;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void SidecarRuntime::release_p51_source_credit(uint64_t raw_bytes) noexcept {
+    {
+        std::lock_guard lock(source_admission_mutex_);
+        if (active_p51_source_count_ == 0 ||
+            raw_bytes > active_source_raw_bytes_) {
+            if (config_.fail_stop)
+                config_.fail_stop();
+            std::_Exit(125);
+        }
+        --active_p51_source_count_;
+        active_source_raw_bytes_ -= raw_bytes;
+    }
+    source_admission_changed_.notify_all();
+}
+
 void SidecarRuntime::release_source_credit(uint64_t raw_bytes) noexcept {
     {
         std::lock_guard lock(source_admission_mutex_);
@@ -2570,7 +2945,8 @@ void SidecarRuntime::endpoint_owner_loop() noexcept {
 
 boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
     int adopted_fd, EndpointIoControl endpoint_control,
-    std::promise<EndpointOwnerResult> completion, int completion_wake_fd) {
+    std::promise<EndpointOwnerResult> completion, int completion_wake_fd,
+    bool r2_link) {
     CompletionWake completion_wake{completion_wake_fd};
     int owned_fd = adopted_fd;
     try {
@@ -2618,8 +2994,14 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
         }
         std::fprintf(stderr, "P50_CACHE_SESSION_ENDPOINT_START\n");
         std::fflush(stderr);
-        const ServerRunResult endpoint_result =
-            co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
+        ServerRunResult endpoint_result;
+        if (r2_link) {
+            endpoint_result = co_await endpoint_->run_adopted_r2(
+                std::move(*socket), std::move(endpoint_control));
+        } else {
+            endpoint_result = co_await endpoint_->run_adopted(
+                std::move(*socket), std::move(endpoint_control));
+        }
         std::fprintf(stderr,
                      "P50_CACHE_SESSION_ENDPOINT_DONE status=%u completed=%u "
                      "committed=%u\n",
@@ -2942,6 +3324,473 @@ RuntimeResult SidecarRuntime::run_one(
     return result;
 }
 
+local::P51SourceReservationResult SidecarRuntime::reserve_p51_source_on_owner(
+    local::P51SourceReservationRequest request) noexcept {
+    local::P51SourceReservationResult result;
+    constexpr uint16_t kInvalid = 0x5101;
+    constexpr uint16_t kExpired = 0x5102;
+    constexpr uint16_t kCapacity = 0x5103;
+    constexpr uint16_t kEntropy = 0x5104;
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = request.absolute_deadline.as_steady_time_point();
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    if (!request.arm.valid() || !request.absolute_deadline.valid() ||
+        !request.absolute_deadline.matches_clock(clock) ||
+        request.arm.source.c_store_guid == config_.f_store_guid.bytes ||
+        !config_.sidecar_launch.has_value() ||
+        !config_.sidecar_launch->valid() || config_.f_store_generation == 0 ||
+        config_.sidecar_launch->f_store_guid != config_.f_store_guid ||
+        config_.sidecar_launch->store_generation != config_.f_store_generation) {
+        result.error_code = kInvalid;
+        return result;
+    }
+    if (request.absolute_deadline.expired(
+            now_ns, clock.clock_domain_id, clock.time_namespace_id) ||
+        stop_requested_.load(std::memory_order_acquire)) {
+        result.error_code = kExpired;
+        return result;
+    }
+
+    const bool completed = owner_round_trip(
+        [this, &request, &result, kCapacity, kEntropy, deadline] {
+            if (stop_requested_.load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= deadline)
+                return;
+            const int64_t owner_now_ns = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                                             .count();
+            for (auto it = p51_source_reservations_.begin();
+                 it != p51_source_reservations_.end();) {
+                if (it->second.absolute_deadline.expires_at_ns > owner_now_ns) {
+                    ++it;
+                    continue;
+                }
+                const CStoreGuid expired_c_guid{
+                    it->second.armed.arm.source.c_store_guid};
+                const auto expired_relationship =
+                    p51_source_relationships_.find(expired_c_guid);
+                if (expired_relationship != p51_source_relationships_.end() &&
+                    expired_relationship->second.outstanding != 0)
+                    --expired_relationship->second.outstanding;
+                it = p51_source_reservations_.erase(it);
+            }
+            const CStoreGuid c_guid{request.arm.source.c_store_guid};
+            const ProfileId profile = static_cast<ProfileId>(
+                request.arm.source.cache_profile);
+            for (const auto& [id, row] : p51_source_reservations_) {
+                (void)id;
+                if (row.armed.arm.source.c_store_guid == c_guid.bytes &&
+                    row.armed.arm.source.source_request_id ==
+                        request.arm.source.source_request_id) {
+                    if (row.armed.arm != request.arm) {
+                        result.error_code = kInvalid;
+                        return;
+                    }
+                    result.armed = row.armed;
+                    return;
+                }
+            }
+            if (p51_source_reservations_.size() >=
+                config_.max_pending_p51_source_reservations) {
+                result.error_code = kCapacity;
+                return;
+            }
+            auto relationship = p51_source_relationships_.find(c_guid);
+            bool created_relationship = false;
+            P51SourceRelationship staged_relationship;
+            if (relationship != p51_source_relationships_.end()) {
+                const auto& prior = relationship->second;
+                if (prior.c_store_generation !=
+                        request.arm.source.c_store_generation ||
+                    prior.c_control_generation !=
+                        request.arm.source.c_control_generation ||
+                    prior.c_control_attempt !=
+                        request.arm.source.c_control_attempt) {
+                    result.error_code = kInvalid;
+                    return;
+                }
+                // Profile is fixed for the relationship's physical link. A
+                // drained-link retirement/reset API must explicitly replace
+                // this row before a different profile can be armed.
+                if (relationship->second.profile != profile ||
+                    request.arm.requested_window <
+                        relationship->second.selected_window) {
+                    result.error_code = kCapacity;
+                    return;
+                }
+            } else {
+                if (p51_source_relationships_.size() >=
+                    config_.max_route_relationships) {
+                    for (auto it = p51_source_relationships_.begin();
+                         it != p51_source_relationships_.end();) {
+                        if (it->second.outstanding == 0 &&
+                            !it->second.link_active && !it->second.has_receipts)
+                            it = p51_source_relationships_.erase(it);
+                        else
+                            ++it;
+                        if (p51_source_relationships_.size() <
+                            config_.max_route_relationships)
+                            break;
+                    }
+                }
+                if (p51_source_relationships_.size() >=
+                        config_.max_route_relationships ||
+                    next_p51_relationship_epoch_ == 0 ||
+                    next_p51_relationship_epoch_ == UINT64_MAX) {
+                    result.error_code = kCapacity;
+                    return;
+                }
+                ClaimAttemptCapability128 id_one;
+                ClaimAttemptCapability128 id_two;
+                if (!fresh_claim_attempt_capabilities(id_one, id_two)) {
+                    result.error_code = kEntropy;
+                    return;
+                }
+                staged_relationship.profile = profile;
+                staged_relationship.logical_id = id_one.bytes;
+                staged_relationship.c_store_generation =
+                    request.arm.source.c_store_generation;
+                staged_relationship.c_control_generation =
+                    request.arm.source.c_control_generation;
+                staged_relationship.c_control_attempt =
+                    request.arm.source.c_control_attempt;
+                staged_relationship.epoch = next_p51_relationship_epoch_;
+                staged_relationship.selected_window =
+                    std::min<uint32_t>(request.arm.requested_window, 30u);
+                created_relationship = true;
+            }
+
+            ClaimAttemptCapability128 reservation_id;
+            ClaimAttemptCapability128 unused_id;
+            ClaimAttemptCapability128 capability_1;
+            ClaimAttemptCapability128 capability_2;
+            if (!fresh_claim_attempt_capabilities(reservation_id, unused_id) ||
+                !fresh_claim_attempt_capabilities(capability_1, capability_2) ||
+                reservation_id.bytes == unused_id.bytes ||
+                capability_1 == capability_2) {
+                result.error_code = kEntropy;
+                return;
+            }
+
+            P51SourceRelationship& selected_relationship =
+                created_relationship ? staged_relationship : relationship->second;
+            P51SourceArmedFields armed;
+            armed.arm = request.arm;
+            armed.f_control_generation = config_.sidecar_launch->identity.generation;
+            armed.f_control_attempt = config_.sidecar_launch->identity.attempt;
+            armed.f_store_generation = config_.f_store_generation;
+            armed.f_store_guid = config_.f_store_guid.bytes;
+            armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+            if (next_p51_arm_observation_ == 0 ||
+                next_p51_arm_observation_ == UINT64_MAX) {
+                result.error_code = kCapacity;
+                return;
+            }
+            armed.arm_observation_id = next_p51_arm_observation_++;
+            const auto now = std::chrono::steady_clock::now();
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+            if (remaining <= 0) {
+                result.error_code = kExpired;
+                return;
+            }
+            armed.source_budget_msec = static_cast<uint32_t>(std::min<int64_t>(
+                P50SourceArmedFields::MaxSourceBudgetMsec, remaining));
+            armed.attempt_capability_1 = capability_1;
+            armed.attempt_capability_2 = capability_2;
+            armed.reservation_id = reservation_id.bytes;
+            armed.logical_relationship_id = selected_relationship.logical_id;
+            armed.relationship_epoch = selected_relationship.epoch;
+            armed.selected_revision = CACHE_WIRE_REVISION_R2;
+            armed.selected_window = selected_relationship.selected_window;
+            if (!armed.valid()) {
+                result.error_code = kInvalid;
+                return;
+            }
+            if (created_relationship) {
+                const auto inserted = p51_source_relationships_.emplace(
+                    c_guid, staged_relationship);
+                if (!inserted.second) {
+                    result.error_code = kCapacity;
+                    return;
+                }
+                ++next_p51_relationship_epoch_;
+            }
+            try {
+                const auto inserted = p51_source_reservations_.emplace(
+                    armed.reservation_id,
+                    P51SourceReservationRow{
+                        armed, request.absolute_deadline});
+                if (!inserted.second) {
+                    if (created_relationship)
+                        p51_source_relationships_.erase(c_guid);
+                    result.error_code = kEntropy;
+                    return;
+                }
+            } catch (...) {
+                if (created_relationship)
+                    p51_source_relationships_.erase(c_guid);
+                throw;
+            }
+            P51SourceRelationship& committed_relationship =
+                p51_source_relationships_.find(c_guid)->second;
+            ++committed_relationship.outstanding;
+            result.armed = std::move(armed);
+        }, deadline);
+    if (!completed && !result.armed.has_value() && result.error_code == 0)
+        result.error_code = stop_requested_.load(std::memory_order_acquire)
+                                ? kExpired
+                                : kCapacity;
+    if (!result.valid()) {
+        result = {};
+        result.error_code = kInvalid;
+    }
+    return result;
+}
+
+bool SidecarRuntime::cancel_p51_source_on_owner(
+    const P51SourceArmFields& arm,
+    const std::array<uint8_t, 16>& reservation_id,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (!arm.valid() ||
+        std::all_of(reservation_id.begin(), reservation_id.end(),
+                    [](uint8_t byte) { return byte == 0; }))
+        return false;
+    bool removed = false;
+    const bool completed = owner_round_trip(
+        [this, &arm, &reservation_id, &removed] {
+            const auto position = p51_source_reservations_.find(reservation_id);
+            if (position == p51_source_reservations_.end() ||
+                position->second.armed.arm != arm)
+                return;
+            const CStoreGuid c_guid{arm.source.c_store_guid};
+            const auto relationship = p51_source_relationships_.find(c_guid);
+            if (relationship == p51_source_relationships_.end() ||
+                relationship->second.outstanding == 0)
+                return;
+            --relationship->second.outstanding;
+            p51_source_reservations_.erase(position);
+            removed = true;
+        }, deadline, true);
+    return completed && removed;
+}
+
+std::optional<P51SourceLinkLease>
+SidecarRuntime::lookup_p51_link_reservation_on_owner(
+    const LinkHello& hello) noexcept {
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        hello.revision != 2 || hello.start_mode != LinkStartMode::Initial ||
+        hello.reservation_id == Id128{} || hello.relationship_id == Id128{} ||
+        hello.relationship_epoch == 0 || hello.physical_link_generation == 0)
+        return std::nullopt;
+    const auto position = p51_source_reservations_.find(hello.reservation_id.bytes);
+    if (position == p51_source_reservations_.end())
+        return std::nullopt;
+    const P51SourceArmedFields& armed = position->second.armed;
+    if (!armed.valid() ||
+        position->second.absolute_deadline.expired(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            sidecar::process_monotonic_clock_identity().clock_domain_id,
+            sidecar::process_monotonic_clock_identity().time_namespace_id) ||
+        hello.relationship_id.bytes != armed.logical_relationship_id ||
+        hello.relationship_epoch != armed.relationship_epoch ||
+        hello.c_store_guid.bytes != armed.arm.source.c_store_guid ||
+        hello.c_store_generation != armed.arm.source.c_store_generation ||
+        hello.c_control_generation != armed.arm.source.c_control_generation ||
+        hello.c_control_attempt != armed.arm.source.c_control_attempt ||
+        hello.profile != static_cast<ProfileId>(armed.arm.source.cache_profile) ||
+        hello.window != armed.selected_window ||
+        hello.f_store_guid.bytes != armed.f_store_guid ||
+        hello.f_store_generation != armed.f_store_generation)
+        return std::nullopt;
+    const auto relationship = p51_source_relationships_.find(
+        CStoreGuid{armed.arm.source.c_store_guid});
+    if (relationship == p51_source_relationships_.end() ||
+        relationship->second.logical_id != armed.logical_relationship_id ||
+        relationship->second.epoch != armed.relationship_epoch ||
+        relationship->second.profile != hello.profile ||
+        relationship->second.c_store_generation != hello.c_store_generation ||
+        relationship->second.c_control_generation != hello.c_control_generation ||
+        relationship->second.c_control_attempt != hello.c_control_attempt ||
+        relationship->second.next_relationship_ordinal != 1 ||
+        relationship->second.has_receipts ||
+        relationship->second.link_active ||
+        hello.physical_link_generation <=
+            relationship->second.highest_physical_link_generation)
+        return std::nullopt;
+    relationship->second.link_active = true;
+    relationship->second.physical_link_generation =
+        hello.physical_link_generation;
+    relationship->second.highest_physical_link_generation =
+        hello.physical_link_generation;
+    return P51SourceLinkLease{armed, position->second.absolute_deadline};
+}
+
+std::optional<P51SourceJobLease>
+SidecarRuntime::consume_p51_job_reservation_on_owner(
+    const LinkHello& link, const JobBind& binding) noexcept {
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        binding.reservation_id == Id128{} || binding.relationship_ordinal == 0 ||
+        binding.physical_link_generation == 0 ||
+        binding.physical_link_generation != link.physical_link_generation)
+        return std::nullopt;
+    const auto position = p51_source_reservations_.find(binding.reservation_id.bytes);
+    if (position == p51_source_reservations_.end())
+        return std::nullopt;
+    const P51SourceArmedFields& armed = position->second.armed;
+    const P50SourceArmFields& source = armed.arm.source;
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    if (!armed.valid() || position->second.absolute_deadline.expired(
+                              now_ns, clock.clock_domain_id,
+                              clock.time_namespace_id) ||
+        binding.wire_job_id != source.wire_job_id ||
+        binding.assignment_epoch != source.assignment_epoch ||
+        binding.assignment_nonce != source.assignment_nonce ||
+        binding.logical_job != source.logical_job ||
+        binding.compiler_attempt != source.compiler_attempt ||
+        binding.source_request_id != source.source_request_id ||
+        binding.profile != static_cast<ProfileId>(source.cache_profile) ||
+        link.relationship_id.bytes != armed.logical_relationship_id ||
+        link.relationship_epoch != armed.relationship_epoch ||
+        link.c_store_guid.bytes != source.c_store_guid ||
+        link.c_store_generation != source.c_store_generation ||
+        link.c_control_generation != source.c_control_generation ||
+        link.c_control_attempt != source.c_control_attempt ||
+        link.f_store_guid.bytes != armed.f_store_guid ||
+        link.f_store_generation != armed.f_store_generation ||
+        link.profile != binding.profile ||
+        link.physical_link_generation != binding.physical_link_generation)
+        return std::nullopt;
+    P51SourceJobLease lease;
+    lease.armed = armed;
+    lease.absolute_deadline = position->second.absolute_deadline;
+    lease.binding = binding;
+    lease.input_key = InputRecordKey{CStoreGuid{source.c_store_guid}, binding.tu_seq};
+    const CStoreGuid c_guid{source.c_store_guid};
+    const auto relationship = p51_source_relationships_.find(c_guid);
+    if (relationship == p51_source_relationships_.end() ||
+        relationship->second.outstanding == 0 ||
+        relationship->second.logical_id != armed.logical_relationship_id ||
+        relationship->second.epoch != armed.relationship_epoch ||
+        !relationship->second.link_active ||
+        relationship->second.physical_link_generation !=
+            link.physical_link_generation ||
+        relationship->second.next_relationship_ordinal != binding.relationship_ordinal ||
+        relationship->second.next_relationship_ordinal == UINT64_MAX ||
+        relationship->second.pending_ordinal != 0 ||
+        relationship->second.committed_prefix_k -
+                relationship->second.acknowledged_prefix_q >=
+            relationship->second.selected_window)
+        return std::nullopt;
+    const size_t receipt_index = static_cast<size_t>(
+        (binding.relationship_ordinal - 1) %
+        relationship->second.receipt_rows.size());
+    if (relationship->second.receipt_rows[receipt_index].has_value())
+        return std::nullopt;
+    Digest128 binding_digest;
+    try {
+        binding_digest = compute_r2_binding_digest(binding);
+    } catch (...) {
+        return std::nullopt;
+    }
+    --relationship->second.outstanding;
+    relationship->second.pending_ordinal = binding.relationship_ordinal;
+    relationship->second.pending_binding_digest = binding_digest;
+    lease.binding_digest = binding_digest;
+    p51_source_reservations_.erase(position);
+    return lease;
+}
+
+bool SidecarRuntime::record_p51_job_commit_on_owner(
+    const LinkHello& link, const JobBind& binding,
+    const R2TxCommit& commit) noexcept {
+    const auto relationship = p51_source_relationships_.find(link.c_store_guid);
+    if (relationship == p51_source_relationships_.end() ||
+        !relationship->second.link_active ||
+        relationship->second.physical_link_generation !=
+            link.physical_link_generation ||
+        relationship->second.logical_id != link.relationship_id.bytes ||
+        relationship->second.epoch != link.relationship_epoch ||
+        relationship->second.pending_ordinal != binding.relationship_ordinal ||
+        relationship->second.committed_prefix_k + 1 !=
+            binding.relationship_ordinal ||
+        commit.relationship_ordinal != binding.relationship_ordinal ||
+        commit.binding_digest != relationship->second.pending_binding_digest ||
+        commit.inner.tu_seq != binding.tu_seq ||
+        commit.inner.raw_digest != binding.raw_digest)
+        return false;
+    const size_t row_index = static_cast<size_t>(
+        (binding.relationship_ordinal - 1) %
+        relationship->second.receipt_rows.size());
+    auto& row = relationship->second.receipt_rows[row_index];
+    if (row.has_value())
+        return false;
+    row = commit;
+    relationship->second.committed_prefix_k = binding.relationship_ordinal;
+    relationship->second.next_relationship_ordinal =
+        binding.relationship_ordinal + 1;
+    relationship->second.pending_ordinal = 0;
+    relationship->second.pending_binding_digest = {};
+    relationship->second.has_receipts = true;
+    return true;
+}
+
+bool SidecarRuntime::acknowledge_p51_receipt_on_owner(
+    const LinkHello& link, const CommitAck& ack) noexcept {
+    const auto relationship = p51_source_relationships_.find(link.c_store_guid);
+    if (relationship == p51_source_relationships_.end() ||
+        !relationship->second.link_active ||
+        relationship->second.physical_link_generation !=
+            link.physical_link_generation ||
+        relationship->second.logical_id != ack.relationship_id.bytes ||
+        relationship->second.epoch != ack.relationship_epoch ||
+        ack.physical_link_generation != link.physical_link_generation ||
+        ack.contiguous_verified_ordinal <=
+            relationship->second.acknowledged_prefix_q ||
+        ack.contiguous_verified_ordinal >
+            relationship->second.committed_prefix_k)
+        return false;
+    for (uint64_t ordinal = relationship->second.acknowledged_prefix_q + 1;
+         ordinal <= ack.contiguous_verified_ordinal; ++ordinal) {
+        const size_t row_index = static_cast<size_t>(
+            (ordinal - 1) % relationship->second.receipt_rows.size());
+        const auto& row = relationship->second.receipt_rows[row_index];
+        if (!row.has_value() || row->relationship_ordinal != ordinal)
+            return false;
+    }
+    relationship->second.acknowledged_prefix_q =
+        ack.contiguous_verified_ordinal;
+    for (auto& receipt : relationship->second.receipt_rows) {
+        if (receipt && receipt->relationship_ordinal <=
+                           relationship->second.acknowledged_prefix_q)
+            receipt.reset();
+    }
+    relationship->second.has_receipts =
+        relationship->second.committed_prefix_k >
+        relationship->second.acknowledged_prefix_q;
+    return true;
+}
+
+void SidecarRuntime::release_p51_link_on_owner(const LinkHello& hello) noexcept {
+    const CStoreGuid c_guid = hello.c_store_guid;
+    const auto relationship = p51_source_relationships_.find(c_guid);
+    if (relationship == p51_source_relationships_.end() ||
+        relationship->second.logical_id != hello.relationship_id.bytes ||
+        relationship->second.epoch != hello.relationship_epoch ||
+        relationship->second.physical_link_generation !=
+            hello.physical_link_generation)
+        return;
+    relationship->second.link_active = false;
+    relationship->second.physical_link_generation = 0;
+}
+
 std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
     InputFdRequest request,
     std::chrono::steady_clock::time_point deadline) noexcept {
@@ -3176,6 +4025,23 @@ void SidecarRuntime::start_adopted_endpoint(
                        run_endpoint_on_owner(adopted_fd,
                                               std::move(endpoint_control),
                                               std::move(completion), -1),
+                       asio::detached);
+    } catch (...) {
+        (void)::close(adopted_fd);
+    }
+}
+
+void SidecarRuntime::start_adopted_r2_endpoint(
+    int adopted_fd, EndpointIoControl endpoint_control) noexcept {
+    if (adopted_fd < 0)
+        return;
+    std::promise<EndpointOwnerResult> completion;
+    try {
+        asio::co_spawn(context_,
+                       run_endpoint_on_owner(adopted_fd,
+                                              std::move(endpoint_control),
+                                              std::move(completion), -1,
+                                              true),
                        asio::detached);
     } catch (...) {
         (void)::close(adopted_fd);

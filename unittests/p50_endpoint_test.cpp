@@ -50,6 +50,17 @@
 #include <utility>
 #include <vector>
 
+namespace icecc::p50 {
+
+struct P50PreparationAuthorityTestAccess {
+    static PreparedInputPtr resolve(const P50PreparationAuthority& authority,
+                                    PreparedTuHandle handle) {
+        return authority.resolve(handle);
+    }
+};
+
+} // namespace icecc::p50
+
 namespace {
 
 namespace asio = boost::asio;
@@ -3908,6 +3919,500 @@ void test_idempotent_prepare_admission() {
     }
 }
 
+void test_preparation_authority_window_refill_and_receipts() {
+    const std::array<ProfileId, 3> profiles{
+        ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
+    uint64_t store_id = 0x5252500000000000ULL;
+    uint64_t request_id = 1;
+    for (const ProfileId profile : profiles) {
+        PreparationAuthorityLimits limits;
+        limits.max_speculative_tus = 2;
+        limits.max_speculative_raw_bytes = 1024;
+        limits.max_retained_encoded_bytes = 1U << 20;
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            Id128::from_u64(store_id++), EndpointCaps{}.zstd, limits, 1,
+            profile);
+        const PreparationRouteKey route{
+            Id128::from_u64(store_id++), 1, profile};
+        const auto stage = [&](PreparedTuHandle handle) {
+            if (profile == ProfileId::P29V1) {
+                authority->pin_p29v1_system_source_reuse(handle, Digest128{});
+                const std::vector<uint8_t> predicted =
+                    authority->predicted_p29v1_need(handle);
+                (void)authority->answer_p29v1_need(handle, predicted);
+                authority->advance_p29v1_speculative(handle);
+            } else {
+                authority->advance_speculative(handle);
+            }
+        };
+        const auto receipt_for = [&](PreparedTuHandle handle) {
+            const PreparedInputPtr prepared =
+                P50PreparationAuthorityTestAccess::resolve(*authority, handle);
+            const TxBegin& begin = prepared->begin;
+            return TxCommit{begin.history_nonce, begin.rel_seq, begin.tu_seq,
+                            begin.transaction_digest, begin.raw_digest,
+                            compute_post_state_digest(
+                                begin.pre_state_digest, begin.history_nonce,
+                                begin.rel_seq, begin.tu_seq,
+                                begin.transaction_digest)};
+        };
+
+        const PreparedTuHandle first = authority->prepare_for_route(
+            route, {71, request_id++}, bytes("route window first\n"));
+        stage(first);
+        const PreparedTuHandle second = authority->prepare_for_route(
+            route, {71, request_id++}, bytes("route window second\n"));
+        stage(second);
+        const PreparedInputPtr first_prepared =
+            P50PreparationAuthorityTestAccess::resolve(*authority, first);
+        const PreparedInputPtr second_prepared =
+            P50PreparationAuthorityTestAccess::resolve(*authority, second);
+        if (profile != ProfileId::ZSTD_TU)
+            require(first_prepared->begin.rel_seq.value == 0 &&
+                        second_prepared->begin.rel_seq.value == 1,
+                    "speculative route REL_SEQ did not advance monotonically");
+
+        require_throws<std::logic_error>(
+            [&] { authority->commit(first); },
+            "legacy synthetic commit accepted a staged R2 TU");
+        require_throws<std::logic_error>(
+            [&] { (void)authority->release(first); },
+            "authority released a staged prefix before its receipt");
+
+        const TxCommit first_receipt = receipt_for(first);
+        authority->accept_commit(first, first_receipt);
+        const PreparedTuHandle third = authority->prepare_for_route(
+            route, {71, request_id++}, bytes("route window third\n"));
+        stage(third);
+        const PreparedInputPtr third_prepared =
+            P50PreparationAuthorityTestAccess::resolve(*authority, third);
+        if (profile == ProfileId::ZSTD_ROUTE)
+            require(third_prepared->begin.rel_seq.value == 2,
+                    "partial ACK refill reused a ZSTD_ROUTE REL_SEQ");
+
+        require_throws<std::logic_error>(
+            [&] { authority->accept_commit(third, receipt_for(third)); },
+            "authority accepted an out-of-order receiver receipt");
+        TxCommit incorrect_second = receipt_for(second);
+        incorrect_second.raw_digest = icecc::digest128(bytes("wrong source"));
+        require_throws<std::logic_error>(
+            [&] { authority->accept_commit(second, incorrect_second); },
+            "authority accepted a receipt with a mismatched raw witness");
+        authority->accept_commit(second, receipt_for(second));
+        authority->accept_commit(third, receipt_for(third));
+        for (const PreparedTuHandle& handle : {first, second, third})
+            require(authority->release(handle) == 0,
+                    "confirmed authority entry did not release cleanly");
+        require(authority->live_entry_count() == 0 &&
+                    authority->retained_encoded_bytes() == 0,
+                "ordered receipt drain leaked retained preparation entries");
+    }
+
+    // A staged P29 prefix is not locally rewindable: cancellation must leave
+    // it owned until ordered receipt or coordinated history reset/rebuild.
+    PreparationAuthorityLimits p29_limits;
+    p29_limits.max_speculative_tus = 2;
+    p29_limits.max_speculative_raw_bytes = 1024;
+    P50PreparationAuthority p29(Id128::from_u64(store_id++),
+                                EndpointCaps{}.zstd, p29_limits, 1,
+                                ProfileId::P29V1);
+    const PreparationRouteKey p29_route{
+        Id128::from_u64(store_id++), 1, ProfileId::P29V1};
+    const PreparedTuHandle p29_first = p29.prepare_for_route(
+        p29_route, {72, request_id++}, bytes("cancellation predecessor\n"));
+    p29.pin_p29v1_system_source_reuse(p29_first, Digest128{});
+    const auto need = p29.predicted_p29v1_need(p29_first);
+    (void)p29.answer_p29v1_need(p29_first, need);
+    p29.advance_p29v1_speculative(p29_first);
+    const PreparedTuHandle p29_second = p29.prepare_for_route(
+        p29_route, {72, request_id++}, bytes("cancellation successor\n"));
+    p29.pin_p29v1_system_source_reuse(p29_second, Digest128{});
+    const auto second_need = p29.predicted_p29v1_need(p29_second);
+    (void)p29.answer_p29v1_need(p29_second, second_need);
+    p29.advance_p29v1_speculative(p29_second);
+    require_throws<std::logic_error>(
+        [&] { (void)p29.release(p29_first); },
+        "P29 cancellation rewound a staged successor-dependent prefix");
+    require(p29.contains(p29_first) && p29.contains(p29_second),
+            "failed P29 cancellation dropped a retained route witness");
+}
+
+struct R2EndpointTestJob {
+    JobBind binding;
+    P51SourceJobLease lease;
+    PreparedInputPtr prepared;
+};
+
+sidecar::AbsoluteMonotonicDeadline r2_test_deadline(
+    std::chrono::seconds lifetime = std::chrono::seconds(10)) {
+    const auto identity = sidecar::process_monotonic_clock_identity();
+    return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + lifetime,
+        identity.clock_domain_id, identity.time_namespace_id);
+}
+
+P50SourceArmFields r2_test_arm(const CStoreGuid& c_guid, uint64_t request,
+                               uint32_t wire_job) {
+    P50SourceArmFields source;
+    source.wire_job_id = wire_job;
+    source.assignment_epoch = 3;
+    source.assignment_nonce = 100 + request;
+    source.selected_f_host = "127.0.0.1";
+    source.selected_f_ordinary_port = 42001;
+    source.selected_f_cache_port = 42002;
+    source.cache_protocol = 2;
+    source.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    source.logical_job = 700 + wire_job;
+    source.compiler_attempt = 800 + wire_job;
+    source.c_store_generation = 11;
+    source.c_store_derivation_version = kStoreIdentityDerivationVersion;
+    source.c_store_guid = c_guid.bytes;
+    source.source_request_id = request;
+    source.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    source.c_control_generation = 12;
+    source.c_control_attempt = 13;
+    require(source.valid_for_cache_revision(2),
+            "R2 endpoint fixture produced an invalid source ARM");
+    return source;
+}
+
+P51SourceArmedFields r2_test_armed(P51SourceArmFields arm,
+                                    const FStoreGuid& f_guid,
+                                    uint64_t reservation_seed) {
+    P51SourceArmedFields armed;
+    armed.arm = std::move(arm);
+    armed.f_control_generation = 21;
+    armed.f_control_attempt = 22;
+    armed.f_store_generation = 23;
+    armed.f_store_guid = f_guid.bytes;
+    armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+    armed.arm_observation_id = 24;
+    armed.source_budget_msec = 9000;
+    armed.attempt_capability_1 = p5co_attempt_capability(31);
+    armed.attempt_capability_2 = p5co_attempt_capability(51);
+    armed.reservation_id = Id128::from_u64(reservation_seed).bytes;
+    armed.logical_relationship_id = Id128::from_u64(0x5102).bytes;
+    armed.relationship_epoch = 25;
+    armed.selected_revision = 2;
+    armed.selected_window = 1;
+    require(armed.valid(), "R2 endpoint fixture produced invalid ARMED data");
+    return armed;
+}
+
+asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
+    tcp::endpoint endpoint, LinkHello hello,
+    std::vector<R2EndpointTestJob> jobs) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(endpoint, asio::use_awaitable);
+    co_await raw_write(socket, Message{hello});
+    const Frame state_frame = co_await raw_read(socket, hello.max_frame_payload);
+    require(state_frame.type == MessageType::LINK_STATE,
+            "R2 endpoint did not answer LINK_HELLO with LINK_STATE");
+    LinkState state = std::get<LinkState>(decode_payload(
+        state_frame.type, state_frame.payload));
+    require(state.reservation_id == hello.reservation_id &&
+                state.relationship_id == hello.relationship_id &&
+                state.physical_link_generation ==
+                    hello.physical_link_generation &&
+                state.window == hello.window,
+            "R2 LINK_STATE did not echo the admitted link identity");
+
+    std::vector<R2TxCommit> commits;
+    for (R2EndpointTestJob& job : jobs) {
+        TuBegin begin;
+        begin.relationship_ordinal = job.binding.relationship_ordinal;
+        begin.inner = job.prepared->begin;
+        begin.inner.history_nonce = state.history_nonce;
+        begin.inner.rel_seq = state.next_rel_seq;
+        begin.inner.pre_state_digest = state.state_digest;
+        begin.inner.transaction_digest = compute_transaction_digest(
+            begin.inner, job.prepared->body);
+
+        const std::array<R2BodyMessage, 1> bodies{
+            R2BodyMessage{job.prepared->body}};
+        const Digest128 binding_digest =
+            compute_r2_binding_digest(job.binding);
+        const Digest128 transaction_digest = compute_r2_transaction_digest(
+            job.binding, begin, bodies,
+            std::span<const R2FillMessage>{});
+        const TuEnd end{job.binding.relationship_ordinal, binding_digest,
+                        transaction_digest};
+
+        co_await raw_write(socket, Message{job.binding});
+        co_await raw_write(socket, Message{begin});
+        co_await raw_write(socket, Message{bodies.front()});
+        co_await raw_write(socket, Message{end});
+        const Frame commit_frame =
+            co_await raw_read(socket, hello.max_frame_payload);
+        require(commit_frame.type == MessageType::R2_TX_COMMIT,
+                "R2 endpoint closed or rejected the link after a TU");
+        const R2TxCommit commit = std::get<R2TxCommit>(decode_payload(
+            commit_frame.type, commit_frame.payload));
+        require(commit.relationship_ordinal == job.binding.relationship_ordinal &&
+                    commit.binding_digest == binding_digest &&
+                    commit.transaction_digest == transaction_digest &&
+                    commit.inner.tu_seq == begin.inner.tu_seq &&
+                    commit.inner.raw_digest == begin.inner.raw_digest,
+                "R2 endpoint committed a different source transaction");
+        commits.push_back(commit);
+        state.history_nonce = commit.inner.history_nonce;
+        state.next_rel_seq = RelSeq{commit.inner.rel_seq.value + 1};
+        state.state_digest = commit.inner.post_state_digest;
+
+        co_await raw_write(
+            socket,
+            Message{CommitAck{hello.relationship_id,
+                              hello.relationship_epoch,
+                              hello.physical_link_generation,
+                              job.binding.relationship_ordinal}});
+    }
+    co_await raw_write(socket, Message{CloseMessage{}});
+    boost::system::error_code ignored;
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
+    co_return commits;
+}
+
+asio::awaitable<ServerRunResult> r2_accept_one(
+    tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
+    EndpointIoControl control = {}) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    co_return co_await endpoint.run_adopted_r2(std::move(socket),
+                                                std::move(control));
+}
+
+asio::awaitable<bool> r2_silent_peer(tcp::endpoint endpoint) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(endpoint, asio::use_awaitable);
+    std::array<uint8_t, 1> byte{};
+    boost::system::error_code error;
+    const size_t count = co_await asio::async_read(
+        socket, asio::buffer(byte), asio::redirect_error(asio::use_awaitable,
+                                                         error));
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return count == 0 && error == asio::error::eof;
+}
+
+void test_r2_endpoint_commits_two_jobs_on_one_link() {
+    const P5coStoreGuids stores = p5co_store_guids(0x71);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_speculative_tus = 2;
+    authority_limits.max_speculative_raw_bytes = 1U << 20;
+    P50PreparationAuthority authority(stores.c, caps.zstd,
+                                      authority_limits, 1,
+                                      ProfileId::ZSTD_TU);
+    const PreparationRouteKey route{stores.f, 23, ProfileId::ZSTD_TU};
+    const std::array<std::vector<uint8_t>, 2> inputs{
+        std::vector<uint8_t>{'R','2',' ','f','i','r','s','t','\n'},
+        std::vector<uint8_t>{'R','2',' ','s','e','c','o','n','d','\n'}};
+    std::array<PreparedInputPtr, 2> prepared;
+    std::array<PreparedTuHandle, 2> handles;
+    for (size_t index = 0; index != inputs.size(); ++index) {
+        handles[index] = authority.prepare_for_route(
+            route, PrepareRequestKey{100 + index, 200 + index}, inputs[index]);
+        authority.advance_speculative(handles[index]);
+        prepared[index] = P50PreparationAuthorityTestAccess::resolve(
+            authority, handles[index]);
+    }
+
+    const P51SourceArmFields first_arm{
+        r2_test_arm(stores.c, 301, 401), 1};
+    const P51SourceArmFields second_arm{
+        r2_test_arm(stores.c, 302, 402), 1};
+    const P51SourceArmedFields first_armed =
+        r2_test_armed(first_arm, stores.f, 0x5101);
+    const P51SourceArmedFields second_armed =
+        r2_test_armed(second_arm, stores.f, 0x5103);
+    const sidecar::AbsoluteMonotonicDeadline deadline = r2_test_deadline();
+
+    LinkHello hello;
+    hello.profile = ProfileId::ZSTD_TU;
+    hello.window = 1;
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128{first_armed.reservation_id};
+    hello.relationship_id = Id128{first_armed.logical_relationship_id};
+    hello.relationship_epoch = first_armed.relationship_epoch;
+    hello.physical_link_generation = 26;
+    hello.c_store_guid = stores.c;
+    hello.c_store_generation = first_arm.source.c_store_generation;
+    hello.f_store_guid = stores.f;
+    hello.f_store_generation = first_armed.f_store_generation;
+    hello.c_control_generation = first_arm.source.c_control_generation;
+    hello.c_control_attempt = first_arm.source.c_control_attempt;
+    hello.system_source_fingerprint = icecc::digest128("R2 endpoint fixture");
+    hello.history_nonce = HistoryNonce{0x51f00d};
+    hello.start_mode = LinkStartMode::Initial;
+
+    std::vector<R2EndpointTestJob> jobs;
+    for (size_t index = 0; index != prepared.size(); ++index) {
+        const P51SourceArmFields& source =
+            index == 0 ? first_arm : second_arm;
+        const P51SourceArmedFields& armed =
+            index == 0 ? first_armed : second_armed;
+        JobBind binding;
+        binding.reservation_id = Id128{armed.reservation_id};
+        binding.physical_link_generation = hello.physical_link_generation;
+        binding.relationship_ordinal = index + 1;
+        binding.wire_job_id = source.source.wire_job_id;
+        binding.assignment_epoch = source.source.assignment_epoch;
+        binding.assignment_nonce = source.source.assignment_nonce;
+        binding.logical_job = source.source.logical_job;
+        binding.compiler_attempt = source.source.compiler_attempt;
+        binding.source_request_id = source.source.source_request_id;
+        binding.tu_seq = prepared[index]->begin.tu_seq;
+        binding.profile = ProfileId::ZSTD_TU;
+        binding.raw_bytes = inputs[index].size();
+        binding.raw_digest = prepared[index]->begin.raw_digest;
+
+        P51SourceJobLease lease;
+        lease.armed = armed;
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+        jobs.push_back(R2EndpointTestJob{binding, lease, prepared[index]});
+    }
+
+    std::atomic<unsigned> lookup_calls{0};
+    std::atomic<unsigned> consume_calls{0};
+    std::atomic<unsigned> commit_calls{0};
+    std::atomic<unsigned> ack_calls{0};
+    std::atomic<unsigned> terminal_calls{0};
+    std::array<bool, 2> consumed{};
+    P50ServerEndpointConfig config;
+    config.lookup_p51_link_reservation =
+        [&, deadline](const LinkHello& observed)
+            -> std::optional<P51SourceLinkLease> {
+            ++lookup_calls;
+            if (observed != hello)
+                return std::nullopt;
+            return P51SourceLinkLease{first_armed, deadline};
+        };
+    config.consume_p51_job_reservation =
+        [&](const LinkHello& observed, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+            ++consume_calls;
+            if (observed != hello)
+                return std::nullopt;
+            for (size_t index = 0; index != jobs.size(); ++index) {
+                const R2EndpointTestJob& job = jobs[index];
+                if (job.binding == binding && !consumed[index]) {
+                    consumed[index] = true;
+                    return job.lease;
+                }
+            }
+            return std::nullopt;
+        };
+    config.record_p51_job_commit =
+        [&](const LinkHello& observed, const JobBind& binding,
+            const R2TxCommit& commit) {
+            if (observed != hello ||
+                commit.relationship_ordinal != binding.relationship_ordinal ||
+                commit.inner.tu_seq != binding.tu_seq)
+                return false;
+            ++commit_calls;
+            return true;
+        };
+    config.acknowledge_p51_receipt =
+        [&](const LinkHello& observed, const CommitAck& ack) {
+            if (observed != hello || ack.relationship_id != hello.relationship_id)
+                return false;
+            ++ack_calls;
+            return true;
+        };
+    config.on_p51_link_terminal = [&](const LinkHello&) {
+        ++terminal_calls;
+    };
+
+    P50ServerEndpoint endpoint(stores.f, caps, nullptr, nullptr,
+                               std::move(config));
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           {asio::ip::address_v4::loopback(), 0});
+    auto accept_future = asio::co_spawn(
+        context, r2_accept_one(acceptor, endpoint), asio::use_future);
+    auto peer_future = asio::co_spawn(
+        context, r2_two_job_peer(acceptor.local_endpoint(), hello, jobs),
+        asio::use_future);
+    context.run();
+    const ServerRunResult server_result = accept_future.get();
+    if (server_result.terminal_error)
+        std::cerr << "R2 fixture F terminal error: "
+                  << server_result.terminal_error->detail << '\n';
+    std::vector<R2TxCommit> commits;
+    try {
+        commits = peer_future.get();
+    } catch (const std::exception& error) {
+        std::cerr << "R2 fixture peer error: " << error.what() << '\n';
+        throw;
+    }
+    require(server_result.status == ServerRunStatus::Completed &&
+                commits.size() == 2 && lookup_calls == 1 &&
+                consume_calls == 2 && commit_calls == 2 && ack_calls == 2 &&
+                terminal_calls == 1,
+            "R2 F endpoint did not keep one reservation through two commits and CLOSE");
+    for (size_t index = 0; index != inputs.size(); ++index) {
+        InputCursor cursor = endpoint.attach_input(
+            InputRecordKey{stores.c, prepared[index]->begin.tu_seq});
+        std::vector<uint8_t> recovered(inputs[index].size());
+        require(cursor.read(recovered) == recovered.size() &&
+                    recovered == inputs[index],
+                "R2 F endpoint materialized different source bytes");
+    }
+    std::puts("P51_R2_ENDPOINT two-jobs-one-link exact-input: ok");
+}
+
+void test_r2_silent_setup_cancelled_before_hello() {
+    StoreIdentityRoot root{};
+    root.bytes[15] = 0x2d;
+    SidecarLaunchIdentity launch;
+    launch.identity = {71, 1};
+    launch.store_generation = 23;
+    launch.store_root = root;
+    launch.c_store_guid = c_store_guid_for_root(root);
+    launch.f_store_guid = f_store_guid_for_root(root);
+    require(launch.valid(), "silent R2 setup fixture has invalid launch identity");
+
+    P50ServerEndpointConfig config;
+    config.sidecar_launch = launch;
+    P50ServerEndpoint endpoint(launch.f_store_guid, {}, nullptr, nullptr,
+                               std::move(config));
+    size_t hook_calls = 0;
+    size_t cancelled_setups = 0;
+    EndpointIoControl control;
+    control.after_r2_setup_registered = [&] {
+        ++hook_calls;
+        cancelled_setups = endpoint.cancel_all_for_incarnation(launch);
+    };
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           {asio::ip::address_v4::loopback(), 0});
+    auto accept_future = asio::co_spawn(
+        context, r2_accept_one(acceptor, endpoint, std::move(control)),
+        asio::use_future);
+    auto peer_future = asio::co_spawn(
+        context, r2_silent_peer(acceptor.local_endpoint()), asio::use_future);
+    const auto started = std::chrono::steady_clock::now();
+    context.run();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    const ServerRunResult server_result = accept_future.get();
+    const bool peer_saw_eof = peer_future.get();
+    require(hook_calls == 1 && cancelled_setups == 1 && peer_saw_eof &&
+                server_result.status == ServerRunStatus::Disconnected &&
+                elapsed < std::chrono::seconds(1),
+            "silent pre-HELLO R2 setup was not promptly cancelled by its exact F incarnation");
+    std::puts("P51_R2_ENDPOINT silent-pre-HELLO exact-incarnation-cancel: ok");
+}
+
 void test_candidate_stage_has_no_revision_residue() {
     P50ServerEndpoint server(Id128::from_u64(154));
     for (uint64_t index = 1; index != 17; ++index) {
@@ -6252,6 +6757,16 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused profile digest gates PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_ENDPOINT_FOCUS") != nullptr) {
+        test_r2_endpoint_commits_two_jobs_on_one_link();
+        std::cout << "p50_endpoint_test: focused R2 persistent-link PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_R2_SETUP_CANCEL_FOCUS") != nullptr) {
+        test_r2_silent_setup_cancelled_before_hello();
+        std::cout << "p50_endpoint_test: focused R2 pre-HELLO cancellation PASS\n";
+        return 0;
+    }
     test_action_hold_rendezvous();
     test_normal_zero_and_completion_stamps();
     test_completion_stamp_correspondence();
@@ -6259,6 +6774,8 @@ int main(int argc, char** argv) {
     test_commit_identity_negative_matrix();
     test_lost_final_commit_identity_negative_matrix();
     test_idempotent_prepare_admission();
+    test_preparation_authority_window_refill_and_receipts();
+    test_r2_endpoint_commits_two_jobs_on_one_link();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();
     test_fragmentation_at_every_control_and_body_boundary();

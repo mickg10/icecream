@@ -9,6 +9,7 @@
 // endpoint/store reducer.
 
 #include <cstdint>
+#include <array>
 #include "p50_incarnation_identity.h"
 #include <chrono>
 #include <atomic>
@@ -63,9 +64,13 @@ struct RuntimeConfig {
     size_t max_route_completed_requests = 4096;
     size_t max_route_relationships = 256;
     size_t max_route_endpoint_identities = 256;
+    size_t max_pending_p51_source_reservations = 64;
     // Source work is admitted independently across C/F relationships.  Raw
     // bytes are reserved from the regular-file length before vector allocation.
     size_t max_active_source_transfers = 4;
+    // P51 jobs retain raw/window credit independently of R1's opener count.
+    // Control operations remain globally bounded by kMaxControlWorkers.
+    size_t max_active_p51_source_transfers = 64;
     uint64_t max_aggregate_source_raw_bytes = uint64_t{2} * 1024 * 1024 * 1024;
     // Connecting, negotiating, arming, and crossing CACHE_SESSION must never
     // monopolize the process-wide route-owner gate for the full source
@@ -163,6 +168,31 @@ public:
         local::P50SourceTransferRequest request,
         sidecar::AbsoluteMonotonicDeadline deadline,
         local::HandoffFd source) noexcept;
+    [[nodiscard]] local::P50SourceTransferResult transfer_p51_source_on_owner(
+        local::P51SourceTransferRequest request,
+        local::HandoffFd source) noexcept;
+
+    // Reserve one P51 source job on the endpoint owner before the daemon
+    // publishes ARMED. The reservation is bounded and idempotent for the
+    // exact source request. It does not itself open a data link or claim a
+    // CacheWire session.
+    [[nodiscard]] local::P51SourceReservationResult reserve_p51_source_on_owner(
+        local::P51SourceReservationRequest request) noexcept;
+    [[nodiscard]] bool cancel_p51_source_on_owner(
+        const P51SourceArmFields& arm,
+        const std::array<uint8_t, 16>& reservation_id,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] std::optional<P51SourceLinkLease>
+    lookup_p51_link_reservation_on_owner(const LinkHello& hello) noexcept;
+    [[nodiscard]] std::optional<P51SourceJobLease>
+    consume_p51_job_reservation_on_owner(const LinkHello& link,
+                                         const JobBind& binding) noexcept;
+    [[nodiscard]] bool record_p51_job_commit_on_owner(
+        const LinkHello& link, const JobBind& binding,
+        const R2TxCommit& commit) noexcept;
+    [[nodiscard]] bool acknowledge_p51_receipt_on_owner(
+        const LinkHello& link, const CommitAck& ack) noexcept;
+    void release_p51_link_on_owner(const LinkHello& hello) noexcept;
 
     // Route an authenticated dedicated F-session control connection (first
     // post-handshake bytes carry the P5FS envelope magic) onto the endpoint
@@ -177,6 +207,8 @@ public:
     // out of the production path.
     void start_adopted_endpoint(int adopted_fd,
                                 EndpointIoControl endpoint_control = {}) noexcept;
+    void start_adopted_r2_endpoint(int adopted_fd,
+                                   EndpointIoControl endpoint_control = {}) noexcept;
 
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept { return stop_requested_.load(); }
@@ -223,12 +255,39 @@ private:
         std::optional<ServerRunResult> endpoint;
     };
 
+    struct P51SourceRelationship {
+        ProfileId profile = ProfileId::P29V1;
+        std::array<uint8_t, 16> logical_id{};
+        uint64_t c_store_generation = 0;
+        uint64_t c_control_generation = 0;
+        uint64_t c_control_attempt = 0;
+        uint64_t epoch = 0;
+        uint32_t selected_window = 0;
+        uint64_t next_relationship_ordinal = 1;
+        uint64_t pending_ordinal = 0;
+        Digest128 pending_binding_digest{};
+        uint64_t committed_prefix_k = 0;
+        uint64_t acknowledged_prefix_q = 0;
+        size_t outstanding = 0;
+        bool link_active = false;
+        uint64_t physical_link_generation = 0;
+        uint64_t highest_physical_link_generation = 0;
+        bool has_receipts = false;
+        std::array<std::optional<R2TxCommit>, 30> receipt_rows{};
+    };
+
+    struct P51SourceReservationRow {
+        P51SourceArmedFields armed{};
+        sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    };
+
     using EndpointWorkGuard =
         boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
 
     boost::asio::awaitable<void> run_endpoint_on_owner(
         int adopted_fd, EndpointIoControl endpoint_control,
-        std::promise<EndpointOwnerResult> completion, int completion_wake_fd);
+        std::promise<EndpointOwnerResult> completion, int completion_wake_fd,
+        bool r2_link = false);
     void endpoint_owner_loop() noexcept;
 
     void cancel_endpoint_run() noexcept;
@@ -255,6 +314,10 @@ private:
     [[nodiscard]] bool acquire_source_credit(
         uint64_t raw_bytes,
         std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool acquire_p51_source_credit(
+        uint64_t raw_bytes,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    void release_p51_source_credit(uint64_t raw_bytes) noexcept;
     void release_source_admission(
         const RouteEndpointKey& endpoint,
         const std::optional<SourceIncarnationKey>& incarnation,
@@ -304,11 +367,20 @@ private:
     std::set<SourceIncarnationKey> active_source_incarnations_;
     std::set<SourceIncarnationKey> retiring_source_incarnations_;
     size_t active_source_count_ = 0;
+    size_t active_p51_source_count_ = 0;
     uint64_t active_source_raw_bytes_ = 0;
     // This is the outermost opener fence.  P50CRouteOwner also retains its
     // own latch, but transfer_source_on_owner must refuse before it connects
     // to or arms any F after whole-sidecar replacement becomes necessary.
     std::atomic<bool> route_replacement_required_{false};
+    // P51 reservation identity belongs to the same single endpoint owner as
+    // namespaces/routes. The relationship survives codec-history resets;
+    // only per-job reservation rows are retired.
+    std::map<CStoreGuid, P51SourceRelationship> p51_source_relationships_;
+    std::map<std::array<uint8_t, 16>, P51SourceReservationRow>
+        p51_source_reservations_;
+    uint64_t next_p51_relationship_epoch_ = 1;
+    uint64_t next_p51_arm_observation_ = 1;
     std::shared_ptr<std::atomic<bool>> source_setup_cancelled_ =
         std::make_shared<std::atomic<bool>>(false);
     EndpointWorkGuard endpoint_work_guard_;

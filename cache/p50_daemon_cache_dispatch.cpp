@@ -13,6 +13,7 @@ namespace icecc::p50::daemon {
 namespace {
 
 constexpr uint32_t kCacheSession = 0x50f00000u;
+constexpr uint32_t kP51CacheLinkSession = 0x51f00012u;
 
 } // namespace
 
@@ -102,9 +103,11 @@ CacheDispatchOutcome CacheSessionDispatcher::fail_after_detach(
 CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
                                                       int negotiated_protocol,
                                                       uint32_t decoded_type) noexcept {
-    if (decoded_type != kCacheSession)
-        return CacheDispatchOutcome{CacheDispatchResult::NotCacheSession};
-    if (negotiated_protocol != 50)
+    const bool r1_session = decoded_type == kCacheSession &&
+                            negotiated_protocol == 50;
+    const bool r2_link = decoded_type == kP51CacheLinkSession &&
+                         protocol_supports_cache_r2(negotiated_protocol);
+    if (!r1_session && !r2_link)
         return CacheDispatchOutcome{CacheDispatchResult::NotCacheSession};
 
     // A missing/restarting sidecar fails closed before touching the ordinary
@@ -171,10 +174,12 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     // guessing from the following SCM_RIGHTS frame.  Announce the exact
     // request before touching the ordinary descriptor; every pre-release
     // failure therefore leaves MsgChannel as its sole owner.
+    const local::ControlOperation control_operation = r2_link
+        ? local::make_cache_link_session_operation(identity_, request.request_id)
+        : local::make_cache_session_operation(identity_, request.request_id);
     const local::Frame operation{
         local::kProtocolVersion, local::MessageType::Data, identity_,
-        local::encode_control_operation(
-            local::make_cache_session_operation(identity_, request.request_id))};
+        local::encode_control_operation(control_operation)};
     if (operation.payload.empty() ||
         relationship.send_until(operation, deadline) != local::Status::Ok)
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
@@ -190,7 +195,9 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::NotAuthenticated, request, false};
 
-    const int released_fd = channel.release_fd_if_input_empty();
+    const int released_fd = r2_link
+        ? channel.send_p51_cache_link_session_ready_and_release(deadline)
+        : channel.release_fd_if_input_empty();
     if (released_fd < 0) {
         // The operation has been announced but the ordinary stream did not
         // prove a clean release boundary.  Drop the relationship so the
