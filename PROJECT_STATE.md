@@ -25,9 +25,23 @@ persistent W1 path. Original-compiler-socket ARM cannot be enabled while the
 sidecar still depends on re-arming its separate R1 connection: job binding and
 the persistent endpoint therefore share one feature-enable gate. Keep current
 R1 behavior and withhold R2 advertisement until that vertical path works.
-Recovery precedes W2–W30. No persistent-link runtime passing evidence exists
-yet; the Stage A results below do not qualify these changes. No Chromium build/download has
+Recovery precedes W2–W30. A focused F receiver persistent-link test now passes
+(scope below); the production wrapper/daemon path and W30 remain unqualified.
+The Stage A results below do not qualify these changes. No Chromium build/download has
 been started for this implementation step.
+
+The focused `run_adopted_r2` receiver fixture passed two sequential ZSTD_TU
+jobs on one TCP link: one W1 HELLO, distinct one-shot reservations, two
+complete transactions with commit/ACK, exact materialized input bytes and an
+idle CLOSE. This uses a test peer, not the production C sender or compiler
+wrapper. Evidence:
+`/tanksmall/scratch/tmp/p50-r2-codec-snapshot-20260924/tmp/c1-r2-endpoint-fixture-run-r3.log`
+(SHA256 `9f892ba1282d5459b46db350bcd4fb3f5d9ebf477b0a3dfc2a2ed35373f41e60`).
+Test binary SHA256:
+`f39626002fc634490f91d1531323402be6864cbc9817c944d8ef51e2540a884b`.
+The tested endpoint source snapshot is
+`411c78435893110f04683a7e835c8244be4708a81b8350c703d9e23aac243895`;
+ongoing integration edits are not covered by that snapshot.
 
 The first version-gate audit preserves ordinary maximum 50 and existing R1
 bytes. Focused `p50sourcearmwire`, `p50cachesessionwire`,
