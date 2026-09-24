@@ -882,6 +882,30 @@ void test_lifecycle() {
               "budget refilled after healthy Ready allows relaunch (item C)");
     }
 
+    // Item C: a crash loop that never reaches Ready still exhausts the
+    // lifecycle's own attempt budget and degrades.  The adapter's windowed
+    // reserve_outer_restart is the outer bound on crash-loop rate; the
+    // lifecycle's attempts_ is the inner bound when Ready never lands.
+    {
+        SidecarLifecycleConfig crash_config = config;
+        crash_config.identities = allocator(config.control_generation);
+        crash_config.max_attempts = 3;
+        SidecarLifecycle crash(crash_config);
+        for (uint32_t i = 0; i < crash_config.max_attempts; ++i) {
+            (void)crash.begin(t0 + std::chrono::milliseconds(i * 100));
+            LifecycleObservation fail;
+            fail.exec = ExecObservation::Failed;
+            fail.path_absent = true;
+            (void)crash.advance(t0 + std::chrono::milliseconds(i * 100), fail);
+            if (crash.state() == LifecycleState::DegradedLegacy)
+                break;
+        }
+        CHECK(crash.state() == LifecycleState::DegradedLegacy,
+              "crash loop without Ready exhausts attempts and degrades");
+        CHECK(crash.next_deadline() == std::chrono::steady_clock::time_point{},
+              "crash-loop DegradedLegacy clears deadline");
+    }
+
     // Item B: DegradedLegacy from launch exhaustion (max_attempts reached)
     // must also clear the deadline.
     {
