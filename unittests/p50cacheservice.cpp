@@ -4894,7 +4894,9 @@ void test_runtime_interner_poison_preserves_active_commit() {
     };
     config.fail_stop = [marker_fd] {
         const uint8_t byte = 'S';
-        (void)::write(marker_fd, &byte, sizeof(byte));
+        if (::write(marker_fd, &byte, sizeof(byte)) !=
+            static_cast<ssize_t>(sizeof(byte)))
+            _exit(127);
     };
     service::SidecarRuntime runtime(std::move(config));
 
