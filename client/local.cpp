@@ -38,7 +38,133 @@
 #include "client.h"
 #include "pipes.h"
 
+#include <fcntl.h>
+#include <pwd.h>
+
 using namespace std;
+
+static bool safe_cache_dir(const string &dir)
+{
+    struct stat st{};
+    if (lstat(dir.c_str(), &st) != 0)
+        return false;
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode))
+        return false;
+    if (st.st_uid != getuid() || (st.st_mode & 0777) != 0700)
+        return false;
+    return true;
+}
+
+static bool valid_target(const string &s)
+{
+    if (s.empty() || s.size() > 64)
+        return false;
+    for (char c : s)
+        if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') &&
+            !(c >= '0' && c <= '9') && c != '_' && c != '-' && c != '.')
+            return false;
+    return true;
+}
+
+// Cache -dumpmachine per compiler (one file per realpath), keyed by
+// mtime (ns) + ino + dev + size.  Written via per-process atomic rename.
+static string cached_dumpmachine(const string &compiler)
+{
+    char rp[PATH_MAX];
+    const char *resolved = realpath(compiler.c_str(), rp);
+    if (!resolved)
+        return read_command_line(compiler, {"-dumpmachine"});
+
+    struct stat st{};
+    if (stat(resolved, &st) != 0)
+        return read_command_line(compiler, {"-dumpmachine"});
+
+    string dir = "/tmp/.icecream-";
+    if (struct passwd *pwd = getpwuid(getuid()))
+        dir += pwd->pw_name;
+    else
+        dir += to_string(static_cast<long>(getuid()));
+    if (mkdir(dir.c_str(), 0700) && errno != EEXIST)
+        return read_command_line(compiler, {"-dumpmachine"});
+    if (!safe_cache_dir(dir))
+        return read_command_line(compiler, {"-dumpmachine"});
+
+    // One file per compiler: first 16 hex chars of a simple FNV-1a hash of the path.
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = resolved; *p; p++) {
+        h ^= static_cast<unsigned char>(*p);
+        h *= 1099511628211ULL;
+    }
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(h));
+    string cache_path = dir + "/dm-" + string(hex, 16);
+    string tmp_path = cache_path + ".tmp." + to_string(static_cast<long>(getpid()));
+
+    // Header: "<dev> <ino> <mtv_sec> <mtv_nsec> <size>\n<path>\n"
+    char header[512];
+    int hl = snprintf(header, sizeof(header), "%llu %llu %lld %lld %llu\n%s\n",
+        static_cast<unsigned long long>(st.st_dev),
+        static_cast<unsigned long long>(st.st_ino),
+        static_cast<long long>(st.st_mtim.tv_sec),
+        static_cast<long long>(st.st_mtim.tv_nsec),
+        static_cast<unsigned long long>(st.st_size),
+        resolved);
+
+    // Check existing cache.
+    {
+        int fd = open(cache_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[4096];
+            string content;
+            for (;;) {
+                ssize_t n = read(fd, buf, sizeof(buf));
+                if (n <= 0) break;
+                content.append(buf, n);
+            }
+            close(fd);
+            // Parse: header line, path line, target line.
+            size_t nl1 = content.find('\n');
+            if (nl1 != string::npos) {
+                size_t nl2 = content.find('\n', nl1 + 1);
+                if (nl2 != string::npos && content.back() == '\n') {
+                    string head = content.substr(0, nl1);
+                    string path = content.substr(nl1 + 1, nl2 - nl1 - 1);
+                    string target = content.substr(nl2 + 1, content.size() - nl2 - 2);
+                    unsigned long long cd, ci, cs;
+                    long long ct, ctn;
+                    if (sscanf(head.c_str(), "%llu %llu %lld %lld %llu",
+                               &cd, &ci, &ct, &ctn, &cs) == 5 &&
+                        cd == static_cast<unsigned long long>(st.st_dev) &&
+                        ci == static_cast<unsigned long long>(st.st_ino) &&
+                        ct == static_cast<long long>(st.st_mtim.tv_sec) &&
+                        ctn == static_cast<long long>(st.st_mtim.tv_nsec) &&
+                        cs == static_cast<unsigned long long>(st.st_size) &&
+                        path == resolved && valid_target(target))
+                        return target;
+                }
+            }
+        }
+    }
+
+    // Miss: probe and cache.
+    string target = read_command_line(compiler, {"-dumpmachine"});
+    if (target.empty() || !valid_target(target))
+        return target;
+
+    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return target;
+    if (write(fd, header, hl) != hl ||
+        write(fd, target.c_str(), target.size()) != (ssize_t)target.size() ||
+        write(fd, "\n", 1) != 1) {
+        close(fd);
+        unlink(tmp_path.c_str());
+        return target;
+    }
+    close(fd);
+    rename(tmp_path.c_str(), cache_path.c_str());
+    return target;
+}
 
 /* Name of this program, for trace.c */
 const char *rs_program_name = "icecc";
@@ -189,7 +315,7 @@ bool compiler_only_rewrite_includes(const CompileJob &job)
 
 string clang_get_default_target(const CompileJob &job)
 {
-    return read_command_line( find_compiler( job ), { "-dumpmachine" } );
+    return cached_dumpmachine(find_compiler(job));
 }
 
 bool compiler_get_arch_flags(const CompileJob& job, bool march, bool mcpu, bool mtune, list<string>& args)
