@@ -1197,7 +1197,10 @@ bool handle_connection(local::Connection connection, const Options& options,
                     std::optional<InputCursor> cursor =
                         runtime.attach_input_on_owner(request, deadline);
                     return cursor.has_value() ? std::move(*cursor) : InputCursor{};
-                });
+                },
+                // The compiler must be able to attach every TU the endpoint
+                // accepted; the 64 MiB default refused larger Firefox TUs.
+                static_cast<size_t>(runtime.max_raw_bytes()));
             const InputFdAttachmentResult result = attachment.serve_request(
                 connection, options.identity, options.expected_peer, request,
                 deadline);

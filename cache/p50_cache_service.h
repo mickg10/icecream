@@ -179,6 +179,9 @@ public:
         return busy_.test(std::memory_order_relaxed) ? 1u : 0u;
     }
     [[nodiscard]] FStoreGuid f_store_guid() const noexcept { return config_.f_store_guid; }
+    [[nodiscard]] uint64_t max_raw_bytes() const noexcept {
+        return config_.endpoint_caps.zstd.max_raw_bytes;
+    }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     // Seeds the bounded endpoint map without opening an F connection.  Test
     // builds use this only while no source transfer is active.

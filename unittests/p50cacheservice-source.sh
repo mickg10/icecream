@@ -239,4 +239,6 @@ if grep -F 'std::min(' "$mutant" >/dev/null; then
     exit 1
 fi
 
+# A committed TU of any accepted size must reach the compiler.
+require "$impl" 'static_cast<size_t>(runtime.max_raw_bytes()));'
 echo 'ok - cache service StoreIdentity/operation-control source gates hold'
