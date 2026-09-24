@@ -3,6 +3,7 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/use_future.hpp>
 
 #include <array>
@@ -622,6 +623,36 @@ sender_r2_accept_recovery_with_lost_reset_ack(
     co_return results;
 }
 
+asio::awaitable<std::vector<ServerRunResult>>
+sender_r2_accept_shared_failure(
+    tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
+    std::atomic<unsigned>& bundles_sent,
+    std::mutex& gate_mutex, std::condition_variable& gate_cv) {
+    std::vector<ServerRunResult> results(2);
+    for (size_t index = 0; index != results.size(); ++index) {
+        tcp::socket socket(co_await acceptor.async_accept(asio::use_awaitable));
+        socket.set_option(tcp::socket::receive_buffer_size(4096));
+        EndpointIoControl control;
+        if (index == 0) {
+            control.close_before_write = MessageType::R2_TX_COMMIT;
+            control.before_materialize_on_worker = [&] {
+                std::unique_lock lock(gate_mutex);
+                if (!gate_cv.wait_for(lock, std::chrono::seconds(15), [&] {
+                        return bundles_sent.load(std::memory_order_acquire) >= 2;
+                    }))
+                    throw std::runtime_error(
+                        "second caller did not send before first receipt loss");
+            };
+        }
+        results[index] = co_await endpoint.run_adopted_r2(
+            std::move(socket), std::move(control));
+        if (results[index].terminal_error)
+            std::fprintf(stderr, "R2 shared-failure server[%zu]: %s\n", index,
+                         results[index].terminal_error->detail.c_str());
+    }
+    co_return results;
+}
+
 void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
@@ -1213,6 +1244,354 @@ void test_p51_sender_recovers_lost_commit_reply_after_connector_failure() {
     run_p51_sender_recovery_case(true);
 }
 
+void test_p51_sender_shared_failure_recovers_two_pending_callers() {
+    constexpr size_t kJobs = 2;
+    constexpr uint32_t kWindow = 2;
+    const auto [c_guid, f_guid] = sender_r2_store_guids();
+    const Id128 relationship_id = Id128::from_u64(0x5102);
+    std::array<P51SourceArmedFields, kJobs> armed;
+    std::array<std::vector<uint8_t>, kJobs> input;
+    for (size_t index = 0; index != kJobs; ++index) {
+        auto arm = sender_r2_arm(c_guid, 921 + index,
+                                 static_cast<uint32_t>(1921 + index),
+                                 kWindow, ProfileId::ZSTD_TU);
+        armed[index] = sender_r2_armed(std::move(arm), f_guid,
+                                       0x529100 + index, kWindow);
+        input[index].resize(8192);
+        uint32_t state = static_cast<uint32_t>(0x13579bdfU + index);
+        for (auto& byte : input[index]) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            byte = static_cast<uint8_t>(state);
+        }
+    }
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(30),
+        clock.clock_domain_id, clock.time_namespace_id);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    std::mutex ack_mutex;
+    std::condition_variable ack_cv;
+    std::atomic<unsigned> bundles_sent{0};
+    std::atomic<unsigned> connector_calls{0};
+    std::atomic<unsigned> input_selections{0};
+    std::atomic<unsigned> input_mismatches{0};
+    std::atomic<unsigned> materialized{0};
+    std::atomic<unsigned> acknowledged{0};
+    std::array<std::atomic<unsigned>, kJobs> binds{};
+    std::array<std::atomic<unsigned>, kJobs> commits{};
+    std::mutex commit_mutex;
+    std::array<std::optional<R2TxCommit>, kJobs> retained_commits;
+    std::optional<ResetRequest> retained_reset;
+
+    P50ServerEndpointConfig server_config;
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::ZSTD_TU;
+    server_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    server_caps.zstd.max_raw_bytes = 1U << 20;
+    server_caps.zstd.max_encoded_body_bytes = 1U << 20;
+    server_config.input_job_state = [&](CStoreGuid, const TxBegin& begin,
+                                        const TxCommit& commit,
+                                        std::span<const uint8_t> bytes) {
+        const size_t index = static_cast<size_t>(begin.tu_seq.value);
+        if (index >= kJobs || begin.profile != ProfileId::ZSTD_TU ||
+            (index < kJobs && commit.raw_digest != icecc::digest128(input[index])) ||
+            (index < kJobs && bytes.size() != input[index].size()) ||
+            (index < kJobs &&
+             !std::equal(bytes.begin(), bytes.end(), input[index].begin()))) {
+            input_mismatches.fetch_add(1, std::memory_order_relaxed);
+        }
+        input_selections.fetch_add(1, std::memory_order_relaxed);
+        return InputJobState::Open;
+    };
+    server_config.lookup_p51_link_reservation =
+        [&, deadline](const LinkHello& hello)
+            -> std::optional<P51SourceLinkLease> {
+        if (hello.profile != ProfileId::ZSTD_TU || hello.window != kWindow ||
+            hello.relationship_id != relationship_id ||
+            hello.c_store_guid != c_guid || hello.f_store_guid != f_guid ||
+            hello.reservation_id != Id128{armed[0].reservation_id})
+            return std::nullopt;
+        P51SourceLinkLease lease;
+        lease.initial_armed = armed[0];
+        lease.initial_armed.relationship_epoch = hello.relationship_epoch;
+        lease.absolute_deadline = deadline;
+        lease.reconnect = hello.start_mode == LinkStartMode::Reconnect;
+        lease.relationship_epoch = hello.relationship_epoch;
+        lease.history_nonce = hello.history_nonce;
+        if (lease.reconnect) {
+            lease.committed_prefix_k = 1;
+            lease.acknowledged_prefix_q = 0;
+        }
+        return lease;
+    };
+    server_config.consume_p51_job_reservation =
+        [&, deadline](const LinkHello& hello, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        if (binding.relationship_ordinal == 0 ||
+            binding.relationship_ordinal > kJobs ||
+            binding.physical_link_generation != hello.physical_link_generation ||
+            binding.profile != ProfileId::ZSTD_TU)
+            return std::nullopt;
+        const size_t index = static_cast<size_t>(binding.relationship_ordinal - 1);
+        if (binding.reservation_id != Id128{armed[index].reservation_id} ||
+            binding.wire_job_id != armed[index].arm.source.wire_job_id ||
+            binding.source_request_id != armed[index].arm.source.source_request_id ||
+            binding.assignment_nonce != armed[index].arm.source.assignment_nonce ||
+            binding.raw_bytes != input[index].size() ||
+            binding.raw_digest != icecc::digest128(input[index]))
+            return std::nullopt;
+        const unsigned prior = binds[index].fetch_add(1, std::memory_order_relaxed);
+        if (prior != 0 &&
+            (hello.start_mode != LinkStartMode::Reconnect || index != 1))
+            return std::nullopt;
+        P51SourceJobLease lease;
+        lease.armed = armed[index];
+        lease.armed.relationship_epoch = hello.relationship_epoch;
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+        return lease;
+    };
+    server_config.record_p51_job_commit =
+        [&](const LinkHello& hello, const JobBind& binding,
+            const R2TxCommit& commit) {
+        if (hello.relationship_id != relationship_id ||
+            binding.relationship_ordinal == 0 ||
+            binding.relationship_ordinal > kJobs ||
+            commit.relationship_ordinal != binding.relationship_ordinal ||
+            commit.inner.raw_digest != binding.raw_digest ||
+            commit.inner.tu_seq != binding.tu_seq)
+            return false;
+        const size_t index = static_cast<size_t>(binding.relationship_ordinal - 1);
+        {
+            std::lock_guard lock(commit_mutex);
+            retained_commits[index] = commit;
+        }
+        commits[index].fetch_add(1, std::memory_order_relaxed);
+        materialized.fetch_add(1, std::memory_order_release);
+        return true;
+    };
+    server_config.acknowledge_p51_receipt =
+        [&](const LinkHello& hello, const CommitAck& ack) {
+        if (hello.relationship_id != relationship_id ||
+            ack.relationship_id != relationship_id ||
+            ack.relationship_epoch != hello.relationship_epoch ||
+            ack.physical_link_generation != hello.physical_link_generation ||
+            ack.contiguous_verified_ordinal > kJobs)
+            return false;
+        acknowledged.store(static_cast<unsigned>(ack.contiguous_verified_ordinal),
+                           std::memory_order_release);
+        ack_cv.notify_all();
+        return true;
+    };
+    server_config.settle_p51_interrupted_job =
+        [](const LinkHello& hello) {
+        return hello.start_mode == LinkStartMode::Reconnect;
+    };
+    server_config.p51_source_reservation_terminal =
+        [](const JobBind&) { return false; };
+    server_config.recover_p51_receipts =
+        [&](const LinkHello& hello, const RecoverBegin& begin,
+            std::span<const RecoverWitness> witnesses, const RecoverEnd& end)
+            -> std::optional<P51RecoveryReceiptInterval> {
+        std::optional<R2TxCommit> commit;
+        {
+            std::lock_guard lock(commit_mutex);
+            commit = retained_commits[0];
+        }
+        if (hello.start_mode != LinkStartMode::Reconnect ||
+            begin.relationship_id != relationship_id ||
+            begin.verified_floor_a != 0 || begin.prepared_prefix_p != kJobs ||
+            begin.witness_count != kJobs || witnesses.size() != kJobs ||
+            end.witness_count != kJobs || !commit ||
+            witnesses[0].relationship_ordinal != 1 ||
+            witnesses[1].relationship_ordinal != 2 ||
+            witnesses[0].inner.raw_digest != icecc::digest128(input[0]) ||
+            witnesses[1].inner.raw_digest != icecc::digest128(input[1]) ||
+            commit->binding_digest != witnesses[0].binding_digest ||
+            commit->transaction_digest != witnesses[0].transaction_digest ||
+            commit->inner.tu_seq != witnesses[0].inner.tu_seq ||
+            commit->inner.raw_digest != witnesses[0].inner.raw_digest)
+            return std::nullopt;
+        P51RecoveryReceiptInterval interval;
+        interval.rows.push_back(ReceiptRow{
+            begin.relationship_id, begin.relationship_epoch,
+            begin.physical_link_generation, begin.operation_id, *commit});
+        interval.end = ReceiptsEnd{
+            begin.relationship_id, begin.relationship_epoch,
+            begin.physical_link_generation, begin.operation_id,
+            0, 1, 0, 1};
+        return interval;
+    };
+    server_config.validate_p51_reset =
+        [&](const LinkHello& hello, const ResetRequest& request)
+            -> std::optional<ResetAck> {
+        if (request.settled_prefix_k != 1 ||
+            request.old_relationship_epoch != hello.relationship_epoch ||
+            request.new_relationship_epoch != request.old_relationship_epoch + 1)
+            return std::nullopt;
+        if (retained_reset &&
+            (retained_reset->operation_id != request.operation_id ||
+             retained_reset->old_relationship_epoch !=
+                 request.old_relationship_epoch ||
+             retained_reset->new_relationship_epoch !=
+                 request.new_relationship_epoch ||
+             retained_reset->new_history_nonce != request.new_history_nonce ||
+             retained_reset->settled_prefix_k != request.settled_prefix_k))
+            return std::nullopt;
+        return ResetAck{request,
+                        initial_route_digest(c_guid, request.new_history_nonce),
+                        RelSeq{}};
+    };
+    server_config.commit_p51_reset =
+        [&](const LinkHello&, const ResetRequest& request, const ResetAck&) {
+        retained_reset = request;
+        return true;
+    };
+    server_config.confirm_p51_reset =
+        [](const LinkHello& hello, const ResetConfirm& confirm) {
+        return hello.start_mode == LinkStartMode::Reconnect &&
+               confirm.relationship_id == Id128{hello.relationship_id} &&
+               confirm.settled_prefix_k == 1 &&
+               confirm.new_relationship_epoch == hello.relationship_epoch + 1;
+    };
+
+    P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
+                             std::move(server_config));
+    asio::io_context f_context;
+    tcp::acceptor acceptor(f_context, {asio::ip::address_v4::loopback(), 0});
+    asio::io_context c_context;
+    std::thread c_thread;
+    std::thread f_thread;
+    struct ThreadCleanup {
+        asio::io_context& c_context;
+        asio::io_context& f_context;
+        std::thread& c_thread;
+        std::thread& f_thread;
+        ~ThreadCleanup() {
+            c_context.stop();
+            f_context.stop();
+            if (c_thread.joinable()) c_thread.join();
+            if (f_thread.joinable()) f_thread.join();
+        }
+    } cleanup{c_context, f_context, c_thread, f_thread};
+    auto server_future = asio::co_spawn(
+        f_context, sender_r2_accept_shared_failure(
+            acceptor, server, bundles_sent, gate_mutex, gate_cv), asio::use_future);
+    f_thread = std::thread([&] { f_context.run(); });
+
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = kWindow;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    limits.max_live_entries = 8;
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_guid, caps.zstd, limits, 1, ProfileId::ZSTD_TU);
+    const PreparationRouteKey route{f_guid, 23, ProfileId::ZSTD_TU};
+    ZstdSourceTransferConfig sender_config = config();
+    sender_config.deadline = deadline.as_steady_time_point();
+    sender_config.endpoint_caps = caps;
+    sender_config.authority_limits = limits;
+    sender_config.after_r2_bundle_sent_for_test = [&](uint64_t) {
+        bundles_sent.fetch_add(1, std::memory_order_release);
+        gate_cv.notify_all();
+    };
+    auto sender = std::make_shared<P50ZstdSourceSender>(
+        authority, route, PrepareRequestKey{3, 921}, sender_config);
+
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+        connector_calls.fetch_add(1, std::memory_order_relaxed);
+        completion(connect_fd(remote));
+    };
+    std::array<std::future<ZstdSourceTransferResult>, kJobs> results;
+    for (size_t index = 0; index != kJobs; ++index) {
+        results[index] = asio::co_spawn(c_context,
+            sender->transfer_p51_route(
+                armed[index], 41, connector,
+                PrepareRequestKey{3, 921 + index}, deadline.as_steady_time_point(),
+                input[index]), asio::use_future);
+    }
+    auto c_work = asio::make_work_guard(c_context);
+    c_thread = std::thread([&] { c_context.run(); });
+
+    std::array<ZstdSourceTransferResult, kJobs> outcomes;
+    for (size_t index = 0; index != kJobs; ++index) outcomes[index] = results[index].get();
+    for (size_t index = 0; index != kJobs; ++index) {
+        if (outcomes[index].status != ZstdSourceTransferStatus::Committed)
+            throw std::runtime_error(
+                "shared failure result=" +
+                std::to_string(static_cast<unsigned>(outcomes[index].status)) +
+                " caller=" + std::to_string(index) +
+                " sent=" + std::to_string(bundles_sent.load()) +
+                " commits=" + std::to_string(materialized.load()) +
+                " connectors=" + std::to_string(connector_calls.load()));
+        CHECK(outcomes[index].committed_input.has_value());
+        CHECK(outcomes[index].raw_digest == icecc::digest128(input[index]));
+    }
+    CHECK(bundles_sent.load() == 2); // both original callers were in flight
+    std::cerr << "P51_SENDER_SHARED_FAILURE_COUNTS sent=" << bundles_sent.load()
+              << " selected=" << input_selections.load()
+              << " mismatches=" << input_mismatches.load()
+              << " materialized=" << materialized.load()
+              << " bind0=" << binds[0].load()
+              << " bind1=" << binds[1].load()
+              << " commit0=" << commits[0].load()
+              << " commit1=" << commits[1].load()
+              << " ack=" << acknowledged.load()
+              << " connectors=" << connector_calls.load() << "\n";
+    CHECK(input_selections.load() == kJobs);
+    CHECK(input_mismatches.load() == 0);
+    CHECK(materialized.load() == 2);
+    CHECK(commits[0].load() == 1);
+    CHECK(commits[1].load() == 1);
+    {
+        std::unique_lock lock(ack_mutex);
+        while (acknowledged.load(std::memory_order_acquire) < kJobs &&
+               std::chrono::steady_clock::now() < deadline.as_steady_time_point())
+            ack_cv.wait_until(lock, deadline.as_steady_time_point());
+    }
+    CHECK(acknowledged.load() == 2);
+    CHECK(connector_calls.load() == 2); // one shared reconnect, no late reconnect
+    CHECK(binds[0].load() == 1);
+    CHECK(binds[1].load() == 1); // second bundle was only consumed after reset
+
+    std::promise<void> retirement_posted;
+    auto retirement_done = retirement_posted.get_future();
+    asio::post(c_context, [&sender, &retirement_posted] {
+        sender->retire_for_replacement();
+        retirement_posted.set_value();
+    });
+    CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
+    if (server_future.wait_for(std::chrono::seconds(5)) !=
+        std::future_status::ready) {
+        throw std::runtime_error(
+            "shared-failure F endpoint did not observe retired-link EOF");
+    }
+    const auto server_runs = server_future.get();
+    c_work.reset();
+    c_context.stop();
+    f_context.stop();
+    c_thread.join();
+    f_context.stop();
+    f_thread.join();
+    CHECK(server_runs.size() == 2);
+    CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
+    CHECK(server_runs[1].status == ServerRunStatus::Disconnected);
+    std::cerr << "P51_SENDER_SHARED_FAILURE callers=2 initial_sent=2 "
+                 "replayed_suffix=1 recovered_prefix=1 PASS\n";
+}
+
 void test_route_failure_requires_cold_replacement() {
     ZstdSourceTransferConfig bounded = route_config();
     bounded.authority_limits.max_live_entries = 1;
@@ -1578,11 +1957,18 @@ int main(int argc, char** argv) {
         std::cerr << "P51_SENDER_RECOVERY_SELECTOR PASS\n";
         return 0;
     }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--shared-failure-recovery") {
+        test_p51_sender_shared_failure_recovers_two_pending_callers();
+        std::cerr << "P51_SENDER_SHARED_FAILURE_SELECTOR PASS\n";
+        return 0;
+    }
     test_exact_network_transfer();
     test_route_sender_reuses_relationship_for_two_transfers();
     test_route_completed_ledger_releases_live_entry();
     test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
     test_p51_sender_recovers_lost_commit_reply_after_connector_failure();
+    test_p51_sender_shared_failure_recovers_two_pending_callers();
     test_route_failure_requires_cold_replacement();
     test_explicit_route_operations_bind_request_and_deadline();
     test_explicit_route_retry_is_bounded_then_replaced();

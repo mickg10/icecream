@@ -64,7 +64,14 @@ The same source closure passes `p50slice0` (including exact interrupted-install
 retry and resource accounting) and `p50endpoint`. Endpoint log:
 `/tanksmall/scratch/tmp/p50-recovery-closure.avtx9r/logs/recovery-endpoint-r3.log`
 (SHA256 `a9c299f9195e67f9c64f8afa1b52ac4201f88d7e2635fff03a448ed80f953b10`).
-This does not qualify concurrent-caller recovery, P29V1/ZSTD_ROUTE recovery,
+Two concurrent ZSTD_TU callers also pass shared-link recovery: both initial
+bundles are sent before the first commit reply is lost, F retains prefix 1,
+and one reconnect recovers that receipt and replays only the unfinished
+suffix. Both original callers complete; each exact input is committed once.
+The full sender suite, including this regression and bounded teardown, passes.
+Evidence: `logs/p50zstdsender-full-shared-failure-r2.log` under the same root
+(SHA256 `6045acd1f8ef1e9f42b37ddc7ddc5422c8486830cae5f20263a258cdcbd38ecd`).
+This does not qualify 30-caller recovery, P29V1/ZSTD_ROUTE recovery,
 service integration, cancellation/expiry, or process restart behavior.
 
 The annotated tag `sorbet_1.5_pipeline_plan` freezes the detailed C/D plan at
