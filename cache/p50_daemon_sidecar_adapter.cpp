@@ -533,9 +533,13 @@ InputLifecycleResult DaemonSidecarAdapter::apply_input_lifecycle(
     request.owner = lease.owner;
     request.action = action;
     request.deadline = std::chrono::steady_clock::now() + config_.input_lifecycle_timeout;
-    request.absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        request.deadline, config_.clock_identity.clock_domain_id,
-        config_.clock_identity.time_namespace_id);
+    const bool retirement = action == InputLifecycleAction::PrepareAttemptRetirement ||
+        action == InputLifecycleAction::CommitAttemptReplacement ||
+        action == InputLifecycleAction::CloseLogicalInputLease;
+    if (retirement)
+        request.absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            request.deadline, config_.clock_identity.clock_domain_id,
+            config_.clock_identity.time_namespace_id);
     if (lease.identity.generation != config_.generation ||
         lease.identity.attempt == 0 || lease.key.c_store_guid == CStoreGuid{} ||
         !input_lease_owner_valid(lease.owner) || lease.request_id == 0 ||
@@ -790,8 +794,8 @@ void DaemonSidecarAdapter::retire_input_lifecycle_relationship(
                  "cache sidecar input-lifecycle retirement"
                  " (reason=%s action=%d status=%d)\n",
                  reason,
-                 outer_input_request_.has_value()
-                     ? static_cast<int>(outer_input_request_->action)
+                 outer_last_input_lifecycle_result_.has_value()
+                     ? static_cast<int>(outer_last_input_lifecycle_result_->request.action)
                      : -1,
                  outer_last_input_lifecycle_result_.has_value()
                      ? static_cast<int>(outer_last_input_lifecycle_result_->status)
