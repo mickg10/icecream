@@ -178,6 +178,9 @@ fi
 if ! grep -q 'icecc-test-env' "$SPEC_PATH"; then
     sed -i -E '/^%files[[:space:]]*$/a %{_bindir}/icecc-test-env' "$SPEC_PATH"
 fi
+if ! grep -q 'icecc-cache-service' "$SPEC_PATH"; then
+    sed -i -E '/^%files[[:space:]]*$/a %{_sbindir}/icecc-cache-service' "$SPEC_PATH"
+fi
 SOURCE0_NAME="icecream-${UPSTREAM_VERSION}.tar.xz"
 
 SOURCE0_PATH="${HOME}/rpmbuild/SOURCES/${SOURCE0_NAME}"

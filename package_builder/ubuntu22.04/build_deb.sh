@@ -154,6 +154,9 @@ else
     bash ./make_source_tree.committed.sh "$SRC_DIR" "$NEW_DIR" --bootstrap
 fi
 mv ./debian-packaging "$NEW_DIR/debian"
+# 1.5 also installs the P50 cache sidecar and one more public header.
+echo usr/sbin/icecc-cache-service >> "$NEW_DIR/debian/icecc.install"
+echo usr/include/icecc/p50_store_identity_wire.h >> "$NEW_DIR/debian/libicecc-dev.install"
 
 cd "$NEW_DIR"
 

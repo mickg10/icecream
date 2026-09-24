@@ -186,7 +186,9 @@ cleanup() {
     kill "${WORKER_PID:-0}" >/dev/null 2>&1 || true
 }
 
-iceccd --no-remote -m 1 --max-preprocess 8 -s "$ICECC_SCHEDULER" -vv >/tmp/iceccd.log 2>&1 &
+# The daemons build environments as the icecc user, which cannot write the
+# scratch TMPDIR that dev/python.sh exports.
+TMPDIR=/tmp iceccd --no-remote -m 1 --max-preprocess 8 -s "$ICECC_SCHEDULER" -vv >/tmp/iceccd.log 2>&1 &
 ICECCD_PID=$!
 trap cleanup EXIT
 
@@ -247,7 +249,7 @@ chown "$WORKER_USER" "$WORKER_BASE" 2>/dev/null || true
 # Own unix socket: without it the worker contends with the primary daemon
 # for the default socket and the wrapper may adopt the WORKER as its local
 # daemon, silently changing what this test exercises.
-ICECC_TEST_SOCKET=/tmp/icecc-worker.sock \
+TMPDIR=/tmp ICECC_TEST_SOCKET=/tmp/icecc-worker.sock \
 iceccd -p 10262 -m 2 -s "$ICECC_SCHEDULER" -N pkgworker -b "$WORKER_BASE" \
     -l /tmp/icecc-worker.log -vvv &
 WORKER_PID=$!
