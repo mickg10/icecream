@@ -79,6 +79,9 @@ std::string_view async_operation_name(AsyncOperationKind operation);
 struct CompletionStamp {
     ActorSide actor = ActorSide::C;
     AsyncOperationKind operation = AsyncOperationKind::Connect;
+    // Local accounting classification only; it is not a wire or transaction
+    // identity. R2 can share a route owner with R1 traffic.
+    bool r2_traffic = false;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     std::optional<daemon::P50FSessionOperationId> cache_session_operation;
@@ -121,12 +124,36 @@ struct AsyncCompletion {
 
 class CompletionLog {
 public:
+    enum class StorageMode : uint8_t { Detailed, ClientByteTotals };
+
     explicit CompletionLog(size_t max_records = std::numeric_limits<size_t>::max())
         : max_records_(max_records) {}
+    explicit CompletionLog(StorageMode mode)
+        : mode_(mode) {}
 
     void record(AsyncCompletion completion) noexcept {
         if (!valid_)
             return;
+        if (mode_ == StorageMode::ClientByteTotals) {
+            if (completion.stamp.r2_traffic ||
+                completion.stamp.actor != ActorSide::C)
+                return;
+            uint64_t* total = nullptr;
+            if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
+                total = &c_to_f_bytes_;
+            else if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+                     completion.stamp.operation == AsyncOperationKind::ReadPayload)
+                total = &f_to_c_bytes_;
+            if (total != nullptr) {
+                if (completion.transferred_bytes >
+                    std::numeric_limits<uint64_t>::max() - *total) {
+                    valid_ = false;
+                    return;
+                }
+                *total += completion.transferred_bytes;
+            }
+            return;
+        }
         if (completions_.size() >= max_records_) {
             valid_ = false;
             return;
@@ -139,14 +166,22 @@ public:
     }
     [[nodiscard]] const std::vector<AsyncCompletion>& completions() const { return completions_; }
     [[nodiscard]] bool valid() const { return valid_; }
+    [[nodiscard]] uint64_t c_to_f_bytes() const { return c_to_f_bytes_; }
+    [[nodiscard]] uint64_t f_to_c_bytes() const { return f_to_c_bytes_; }
+    [[nodiscard]] size_t retained_record_count() const { return completions_.size(); }
     void clear() {
         completions_.clear();
+        c_to_f_bytes_ = 0;
+        f_to_c_bytes_ = 0;
         valid_ = true;
     }
 
 private:
+    StorageMode mode_ = StorageMode::Detailed;
     size_t max_records_ = std::numeric_limits<size_t>::max();
     bool valid_ = true;
+    uint64_t c_to_f_bytes_ = 0;
+    uint64_t f_to_c_bytes_ = 0;
     std::vector<AsyncCompletion> completions_;
 };
 

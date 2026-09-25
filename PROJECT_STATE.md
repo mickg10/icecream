@@ -90,6 +90,36 @@ Final helper binary SHA256:
 The published runner differs from that older successful test copy only by
 one wording-only correction to a failure message.
 
+### Bounded persistent-link completion accounting
+
+The product sender now retains fixed-size R1 byte counters instead of an
+ever-growing vector of asynchronous I/O completions. R2 records are excluded
+from those counters because R1 and R2 can share a route owner. Detailed
+endpoint/test logging keeps its prior behavior; overflow makes byte evidence
+unavailable rather than wrapping. This changes neither the wire format nor
+completion identity checks. No farm speedup is established by this change.
+
+The frozen accounting-only candidate passes the full sender, endpoint and
+route-owner suites (all exit 0), including the 18 positive window cells,
+three serial negative controls, exact R1 network accounting, and zero retained
+completion records after persistent R2 traffic. The endpoint suite includes
+the six interrupted BODY cases below. This is not the full D17 sanitizer,
+descriptor and process-memory growth matrix.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-window-matrix-fdf.1A9DCS/`.
+Combined log `accounting-full-regression-r4.log` SHA256:
+`faecdee4ced7c63bde8fc881192d9e011314ed499c4acde0fc6600af82c55cd4`.
+Frozen sender test source SHA256:
+`7a10073069371bb49344c2baf639e6eedc369804b746d9134666ece1ca46e9a4`.
+Earlier setup failures (missing test archives and an accidentally copied
+mid-edit test source) remain retained failures, not passing runs.
+The sender source-boundary gate still fails on the `services/comm.h` include
+introduced by `4f3efa45`, before this accounting change. The sender uses its
+`CACHE_PROFILE_*` constants; removing the direct include merely to pass the
+gate is not a qualified fix. Resolving that dependency and rerunning the
+gate's behavioral mutants remain open. Native-suite success is not a claim
+that every source gate passes.
+
 ### Interrupted R2 BODY recovery
 
 A test-only TCP relay cuts the first R2 BODY after an early or middle payload
@@ -104,8 +134,8 @@ The relay forwards HELLO/JOB_BIND/BEGIN before the partial BODY; its trace
 checks that exact sequence. Cut counts are payload-relative, with the
 four-byte header offset reported separately. This is not exhaustive D03:
 other record boundaries, HELLO/ACK fragmentation and actual EAGAIN remain
-separate. These results use the published product, not the pending accounting
-change; combined accounting qualification is still in progress.
+separate. The original results below use the preceding product snapshot;
+the accounting qualification above also reruns these cases in the full suite.
 
 Evidence root: `/tanksmall/scratch/tmp/p51-d03-body-recovery-r3/`.
 Test source SHA256:

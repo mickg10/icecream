@@ -3904,6 +3904,7 @@ boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
     EndpointIoControl control;
     CompletionStamp stamp;
     stamp.actor = ActorSide::C;
+    stamp.r2_traffic = true;
     stamp.c_store_guid = impl_->c_guid;
     stamp.operation = AsyncOperationKind::WriteFragment;
     const auto verify = [this, deadline](const CompletionStamp&) {
@@ -4064,6 +4065,7 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     EndpointIoControl control;
     CompletionStamp stamp;
     stamp.actor = ActorSide::C;
+    stamp.r2_traffic = true;
     stamp.operation = AsyncOperationKind::WriteFragment;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = state.f_store_guid;
@@ -4372,6 +4374,7 @@ boost::asio::awaitable<R2SentBundle> P50ClientEndpoint::write_r2_bundle(
     pending_guard.keep = true;
     CompletionStamp stamp;
     stamp.actor = ActorSide::C;
+    stamp.r2_traffic = true;
     stamp.operation = AsyncOperationKind::WriteFragment;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = link.f_store_guid;
@@ -4452,6 +4455,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::read_r2_receipt(
     EndpointIoControl control;
     CompletionStamp stamp;
     stamp.actor = ActorSide::C;
+    stamp.r2_traffic = true;
     stamp.operation = AsyncOperationKind::ReadHeader;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = link.f_store_guid;
@@ -4516,6 +4520,7 @@ boost::asio::awaitable<void> P50ClientEndpoint::write_r2_ack(
     EndpointIoControl control;
     CompletionStamp stamp;
     stamp.actor = ActorSide::C;
+    stamp.r2_traffic = true;
     stamp.operation = AsyncOperationKind::WriteFragment;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = link.f_store_guid;
@@ -5802,7 +5807,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
     };
     const auto stamp = [&](AsyncOperationKind operation,
                            const TxBegin* begin = nullptr) {
-        return impl_->stamp(session, operation, begin);
+        CompletionStamp result = impl_->stamp(session, operation, begin);
+        result.r2_traffic = true;
+        return result;
     };
     const auto set_completion_deadline = [&session, this](
         std::optional<sidecar::AbsoluteMonotonicDeadline> deadline) {

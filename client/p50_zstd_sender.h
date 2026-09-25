@@ -227,6 +227,7 @@ public:
     // F-incarnation retirement fences the old physical link. Shared owner
     // references held by active calls/pumps keep this sender alive to drain.
     void retire_for_replacement() noexcept;
+    [[nodiscard]] size_t retained_completion_records_for_test() const noexcept;
     // Owner-affine generation floor used when a strictly newer logical
     // relationship replaces an idle same-key relationship.
     [[nodiscard]] uint64_t current_r2_physical_generation() const noexcept;

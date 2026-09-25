@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <future>
+#include <limits>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
@@ -2155,6 +2156,7 @@ void run_p51_sender_window_concurrent_callers(
         }));
     }
     CHECK(acknowledged.load(std::memory_order_acquire) == kJobs);
+    CHECK(sender->retained_completion_records_for_test() == 0);
     CHECK(connector_calls.load(std::memory_order_relaxed) ==
           (fail_first_connector ? 2U : 1U));
     std::promise<void> retirement_posted;
@@ -4344,6 +4346,91 @@ void test_factory_cannot_extend_absolute_deadline() {
     CHECK(transfer.attempts == 1);
 }
 
+void test_completion_log_bounded_r1_byte_accounting() {
+    CHECK(!CompletionStamp{}.r2_traffic);
+    CompletionLog detailed;
+    CompletionStamp stamp;
+    stamp.actor = ActorSide::C;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    detailed.record({stamp, 5, 0});
+    stamp.operation = AsyncOperationKind::ReadHeader;
+    detailed.record({stamp, 7, 0});
+    stamp.operation = AsyncOperationKind::ReadPayload;
+    detailed.record({stamp, 11, 104});
+    stamp.operation = AsyncOperationKind::Connect;
+    detailed.record({stamp, 13, 0});
+    stamp.operation = AsyncOperationKind::WaitPeerClose;
+    detailed.record({stamp, 17, 0});
+    stamp.r2_traffic = true;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    detailed.record({stamp, 101, 0});
+    stamp.r2_traffic = false;
+    stamp.actor = ActorSide::F;
+    detailed.record({stamp, 103, 0});
+    CHECK(detailed.valid());
+    CHECK(detailed.completions().size() == 7);
+    uint64_t detailed_c_to_f = 0;
+    uint64_t detailed_f_to_c = 0;
+    for (const AsyncCompletion& completion : detailed.completions()) {
+        if (completion.stamp.r2_traffic || completion.stamp.actor != ActorSide::C)
+            continue;
+        if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
+            detailed_c_to_f += completion.transferred_bytes;
+        else if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+                 completion.stamp.operation == AsyncOperationKind::ReadPayload)
+            detailed_f_to_c += completion.transferred_bytes;
+    }
+    CHECK(detailed_c_to_f == 5);
+    CHECK(detailed_f_to_c == 18);
+
+    CompletionLog counters{CompletionLog::StorageMode::ClientByteTotals};
+    stamp.actor = ActorSide::C;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    counters.record({stamp, 5, 0});
+    stamp.operation = AsyncOperationKind::ReadPayload;
+    counters.record({stamp, 7, 0});
+    counters.record({stamp, 11, 104});
+    stamp.operation = AsyncOperationKind::Connect;
+    counters.record({stamp, 13, 0});
+    stamp.operation = AsyncOperationKind::WaitPeerClose;
+    counters.record({stamp, 17, 0});
+    stamp.r2_traffic = true;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    counters.record({stamp, 101, 0});
+    stamp.r2_traffic = false;
+    stamp.actor = ActorSide::F;
+    counters.record({stamp, 103, 0});
+    CHECK(counters.valid());
+    CHECK(counters.retained_record_count() == 0);
+    CHECK(counters.completions().empty());
+    CHECK(counters.c_to_f_bytes() == detailed_c_to_f);
+    CHECK(counters.f_to_c_bytes() == detailed_f_to_c);
+
+    counters.clear();
+    CHECK(counters.valid());
+    CHECK(counters.c_to_f_bytes() == 0);
+    CHECK(counters.f_to_c_bytes() == 0);
+    CHECK(counters.retained_record_count() == 0);
+
+    CompletionLog overflow{CompletionLog::StorageMode::ClientByteTotals};
+    stamp.actor = ActorSide::C;
+    stamp.r2_traffic = false;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    overflow.record({stamp, std::numeric_limits<uint64_t>::max(), 0});
+    overflow.record({stamp, 1, 0});
+    CHECK(!overflow.valid());
+    CHECK(overflow.c_to_f_bytes() == std::numeric_limits<uint64_t>::max());
+    overflow.clear();
+    CHECK(overflow.valid());
+    CHECK(overflow.c_to_f_bytes() == 0);
+
+    CompletionLog zero_capacity{0};
+    zero_capacity.record({stamp, 1, 0});
+    CHECK(!zero_capacity.valid());
+    CHECK(zero_capacity.completions().empty());
+    CHECK(zero_capacity.c_to_f_bytes() == 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -4467,6 +4554,18 @@ int main(int argc, char** argv) {
         std::cerr << "P51_SENDER_DEADLINE_RECOVERY_ACK_SELECTOR PASS\n";
         return 0;
     }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--completion-log-accounting") {
+        test_completion_log_bounded_r1_byte_accounting();
+        std::cerr << "P51_SENDER_COMPLETION_LOG_ACCOUNTING_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--exact-network-r1") {
+        test_exact_network_transfer();
+        std::cerr << "P50_SENDER_EXACT_NETWORK_R1_SELECTOR PASS\n";
+        return 0;
+    }
     const auto run = [](const char* name, auto test) {
         std::cerr << "P51_TEST_BEGIN " << name << "\n";
         test();
@@ -4516,4 +4615,6 @@ int main(int argc, char** argv) {
     run("deadline_required", test_absolute_deadline_is_required);
     run("disconnected_retry", test_disconnected_retry_is_bounded_and_exactly_once);
     run("deadline_not_extended", test_factory_cannot_extend_absolute_deadline);
+    run("completion_log_accounting",
+        test_completion_log_bounded_r1_byte_accounting);
 }

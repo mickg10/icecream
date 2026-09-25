@@ -435,26 +435,8 @@ struct P50ZstdSourceSender::Impl {
     void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
         if (!wire_completions.valid())
             return;
-        uint64_t c_to_f_bytes = 0;
-        uint64_t f_to_c_bytes = 0;
-        for (const AsyncCompletion& completion : wire_completions.completions()) {
-            if (completion.stamp.actor != ActorSide::C)
-                continue;
-            uint64_t* total = nullptr;
-            if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
-                total = &c_to_f_bytes;
-            else if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
-                     completion.stamp.operation == AsyncOperationKind::ReadPayload)
-                total = &f_to_c_bytes;
-            if (total != nullptr) {
-                if (completion.transferred_bytes >
-                    std::numeric_limits<uint64_t>::max() - *total)
-                    return;
-                *total += completion.transferred_bytes;
-            }
-        }
-        result.c_to_f_bytes = c_to_f_bytes;
-        result.f_to_c_bytes = f_to_c_bytes;
+        result.c_to_f_bytes = wire_completions.c_to_f_bytes();
+        result.f_to_c_bytes = wire_completions.f_to_c_bytes();
     }
 
     PrepareRequestKey begin_transfer() {
@@ -476,7 +458,7 @@ struct P50ZstdSourceSender::Impl {
     std::shared_ptr<P50PreparationAuthority> authority;
     PreparationRouteKey route{};
     bool route_bound = false;
-    CompletionLog wire_completions;
+    CompletionLog wire_completions{CompletionLog::StorageMode::ClientByteTotals};
     std::unique_ptr<P50ClientEndpoint> endpoint;
     std::optional<boost::asio::ip::tcp::socket> r2_socket;
     mutable std::mutex r2_transfer_mutex;
@@ -755,6 +737,10 @@ void P50ZstdSourceSender::retire_for_replacement() noexcept {
         boost::system::error_code ignored;
         impl_->r2_socket->close(ignored);
     }
+}
+
+size_t P50ZstdSourceSender::retained_completion_records_for_test() const noexcept {
+    return impl_->wire_completions.retained_record_count();
 }
 
 uint64_t P50ZstdSourceSender::current_r2_physical_generation() const noexcept {
