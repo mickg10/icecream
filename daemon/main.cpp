@@ -10886,7 +10886,7 @@ void Daemon::answer_client_requests()
         // phase, preserving admission-before-activity ordering.
         service_pending_client_admissions(poll_ready);
 
-        auto accept_client_admissions_now = [&]() {
+        auto accept_client_admissions_now = [&]() -> bool {
             /* Pending handshakes above can free admission capacity after the outer
                poll snapshot was built.  A connection beyond the prior accept
                quantum may already be waiting in the kernel queue even though that
@@ -10942,6 +10942,7 @@ void Daemon::answer_client_requests()
                exposed to the ordinary state machine. */
             bool listener_exhausted[3] = { false, false, false };
             size_t exhausted_count = 0;
+            size_t drained_count = 0;
             size_t accepted_count = 0;
             size_t accept_attempt_count = 0;
             while (ready_listener_count != 0 &&
@@ -10972,6 +10973,7 @@ void Daemon::answer_client_requests()
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         listener_exhausted[listener_index] = true;
                         ++exhausted_count;
+                        ++drained_count;
                     } else if (errno != EINTR) {
                         note_accept_error("client", errno);
                         listener_exhausted[listener_index] = true;
@@ -11015,19 +11017,31 @@ void Daemon::answer_client_requests()
             // A previously accepted peer may finish its greeting while ordinary
             // work runs. Progress it even when this probe accepted no new socket.
             service_pending_client_admissions_now();
+
+            // Only EAGAIN from every listener proves nothing admissible is
+            // left queued; a quantum, capacity or accept error may leave one.
+            size_t listener_count = 0;
+            for (const int listen_fd : { tcp_listen_fd, tcp_listen_local_fd, unix_listen_fd })
+                if (listen_fd != -1)
+                    ++listener_count;
+            return drained_count < listener_count;
         };
 
-        accept_client_admissions_now();
+        bool admission_probe_due = accept_client_admissions_now();
 
         /* Accept readiness never suppresses already-established client or
            child readiness from the same poll snapshot. */
         {
             for (auto it = fd2client.begin(); it != fd2client.end();)  {
                 /* A connection can cross into the nonblocking listen queue
-                   after the stale outer snapshot.  Re-probe between ordinary
-                   clients so no full ready set can postpone its protocol
-                   greeting behind an unbounded number of settlements. */
-                accept_client_admissions_now();
+                   after the stale outer snapshot.  Re-probe after every
+                   client that did work, and before every client while the
+                   last probe left an admissible connection queued, so no
+                   full ready set can postpone a protocol greeting behind
+                   more than one settlement.  A client without an event does
+                   no work and needs no probe of its own. */
+                if (admission_probe_due)
+                    admission_probe_due = accept_client_admissions_now();
                 int i = it->first;
                 Client *client = it->second;
                 MsgChannel *c = client->channel;
@@ -11038,6 +11052,7 @@ void Daemon::answer_client_requests()
                         && client->pipe_from_child >= 0
                         && poll_ready.is_set(client->pipe_from_child,
                                              POLLIN | POLLHUP | POLLERR)) {
+                    admission_probe_due = true;
                     if (!handle_compile_done(client)) {
                         finish_scheduler_loss_if_needed();
                         return;
@@ -11046,6 +11061,7 @@ void Daemon::answer_client_requests()
                 if ((client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL)
                         && client->pipe_from_child >= 0
                         && poll_ready.is_set(client->pipe_from_child, POLLIN)) {
+                    admission_probe_due = true;
                     if (!handle_env_install_child_done(client)) {
                         finish_scheduler_loss_if_needed();
                         return;
@@ -11056,6 +11072,7 @@ void Daemon::answer_client_requests()
                     ? poll_ready.is_set(i, POLLIN | POLLHUP | POLLERR)
                     : poll_ready.is_set(i, POLLIN);
                 if (client_event) {
+                    admission_probe_due = true;
                     if( client->status == Client::TOCOMPILE )
                     {
                         /* read as the preprocessed input is ready but don't process it and leave it to the child
