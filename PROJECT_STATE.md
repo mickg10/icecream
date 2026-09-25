@@ -73,6 +73,15 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+The `e2080067` service sanitizer suite passes (Automake exit 0):
+`/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50cacheservice-sanitize.log`,
+SHA256 `d2e4ead2d193e078cedf76731e91127fda40d06c0285005caec0babc5a7c2194`.
+Address/undefined-behavior/leak instrumentation covers the service test,
+service, route owner and sender. Endpoint/protocol static libraries and the
+standalone cache process were not instrumented; this is not whole-stack
+sanitizer coverage. The corrected run used the `services/libicecc.la` Make
+target after an earlier setup attempt requested nonexistent `libicecc.a`.
+
 The full sender suite also passes on the `e2080067` product source, including
 the request-scoped recovery observation and its deterministic regression:
 `/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50zstdsender.log`,
