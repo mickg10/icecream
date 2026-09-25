@@ -12,6 +12,26 @@ retained artifact directories.
 
 ## Developer QA
 
+### Endpoint mutation gate
+
+All 13 compiled endpoint mutations now fail with exit 1 at their registered
+assertions, with passing normal and isolated codec-queue baselines. Timeouts,
+signals, compile failures, and unrelated assertions are rejected. The deadline
+fixture requires completion before its independent watchdog; codec admission
+and slot-release mutations run in isolation, preserving counter increments
+when testing only the queue limit. Per-case logs and a status/hash manifest
+are retained on success as well as failure.
+
+Evidence: `/tanksmall/scratch/tmp/p50-profile-mask-r1.5HGnlt/logs/endpoint-mutants-final-r1.log`,
+SHA256 `b42db9fc714db39847dbaa33528a6e160428c3a8ee9ddc46d5288b07f8ca5fd6`.
+Per-case evidence is under `tmp/p50-endpoint-mutants.28cVMc/` in that root.
+The tested endpoint product SHA256 is
+`27d67566887c6e785b2d203f3e66ed8a0494617a3b2c32aa1e68eb77b9612815`;
+the test TU is `0ad245fb9ac05b68d74660a3d8c9919262c994e111605bc36c3155ed01a60f5e`.
+This qualifies the repaired gate against the published endpoint, not the
+in-progress worker/history repair. The earlier permissive runner's apparent
+pass did not prove intended assertions and is superseded by this evidence.
+
 ### Open worker-lifetime correctness defect
 
 Current endpoint code shares a mutable codec dialogue between the codec pool

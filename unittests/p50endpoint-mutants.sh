@@ -11,22 +11,69 @@ test_object=${ICECC_TEST_ENDPOINT_TEST_OBJECT:-$top_build/unittests/p50endpoint-
 baseline=${ICECC_TEST_ENDPOINT_BINARY:-$top_build/unittests/p50endpoint}
 reference_archive=${ICECC_TEST_REFERENCE_ARCHIVE:-$top_build/unittests/libp50reference.a}
 adopted_archive=${ICECC_TEST_ADOPTED_WRITER_ARCHIVE:-$top_build/cache/libp50adoptedoutcomewriter.a}
+test_hooks_archive=${ICECC_TEST_ENDPOINT_TEST_HOOKS_ARCHIVE:-$top_build/cache/libp50endpointtesthooks.a}
 local_archive=${ICECC_TEST_LOCAL_TRANSPORT_ARCHIVE:-$top_build/cache/libp50localtransport.a}
 protocol_archive=${ICECC_TEST_PROTOCOL50_ARCHIVE:-$top_build/cache/libprotocol50.a}
 input_record_object=${ICECC_TEST_INPUT_RECORD_OBJECT:-}
 services_la=${ICECC_TEST_SERVICES_LA:-$top_build/services/libicecc.la}
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50-endpoint-mutants.XXXXXX")
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+# Keep bounded text evidence on success as well as failure. Each mutant's
+# source/object/binary is removed after its run; the manifest and logs remain.
+cleanup() {
+    echo "endpoint mutant artifacts retained: $work" >&2
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 run_cancel_object="$work/p50_endpoint_run_cancel.o"
 
 for required in "$libtool" "$test_object" "$baseline" "$reference_archive" \
-    "$adopted_archive" \
+    "$adopted_archive" "$test_hooks_archive" \
     "$local_archive" "$protocol_archive" "$services_la"; do
     test -f "$required"
 done
 
 ICECC_P50_ENDPOINT_MUTANT_FOCUS=1 timeout 30s "$baseline" \
     >"$work/baseline.log" 2>&1
+ICECC_P50_ENDPOINT_CODEC_QUEUE_FOCUS=1 timeout 30s "$baseline" \
+    >"$work/codec-queue-baseline.log" 2>&1
+printf 'baseline\t0\tfocused P5CO baseline passed\n' >"$work/manifest.tsv"
+
+expected_failure() {
+    case "$1" in
+    typed-operation-binding)
+        printf '%s' 'complete P5CO endpoint handoff did not commit exact input' ;;
+    claimed-c-binding)
+        printf '%s' 'P5CO endpoint accepted a SESSION_HELLO from another C store' ;;
+    live-operation-fence)
+        printf '%s' 'stale P5CO operation completion advanced the endpoint' ;;
+    absolute-timer-arm)
+        printf '%s' 'P5CO stalled CacheWire read did not expire before external watchdog' ;;
+    deadline-worker-wakeup)
+        printf '%s' 'deadline timer did not promptly settle while codec worker was blocked' ;;
+    owner-thread-codec)
+        printf '%s' 'codec work blocked the endpoint timer owner' ;;
+    worker-completion-wakeup)
+        # The focused positive handoff requires the async worker completion
+        # notification; without it the exact committed input is never observed.
+        printf '%s' 'complete P5CO endpoint handoff did not commit exact input' ;;
+    codec-queue-bound)
+        printf '%s' 'codec pool did not enforce its running-plus-queued job bound' ;;
+    codec-slot-release)
+        printf '%s' 'codec worker completion leaked an admission slot' ;;
+    post-selector-deadline)
+        printf '%s' 'owner job selector published after the absolute deadline' ;;
+    post-transfer-fence)
+        printf '%s' 'post-transfer stale lease was not fenced exactly once' ;;
+    client-completion-deadline)
+        printf '%s' 'post-deadline client completion attempted the first CacheWire write' ;;
+    server-completion-final-recheck)
+        printf '%s' 'server completion callback crossed operation authority' ;;
+    *)
+        return 1 ;;
+    esac
+}
 
 # The endpoint delegates run cancellation to a separate production
 # translation unit. Mutants replace only p50_endpoint.cpp, so compile the
@@ -79,8 +126,8 @@ mutate() {
             "$output"
         ;;
     codec-queue-bound)
-        sed -i \
-            's/if (!codec_pool.try_acquire())/if (false)/' \
+        perl -0pi -e \
+            's/while \(current < kMaxOutstanding\)/while (true)/' \
             "$output"
         ;;
     codec-slot-release)
@@ -137,7 +184,7 @@ compile_mutant() {
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_BOOST_LDFLAGS:-} \
         -pthread -o "$output" "$test_object" "$object" \
         "$run_cancel_object" $input_record_object "$reference_archive" \
-        "$adopted_archive" "$local_archive" \
+        "$test_hooks_archive" "$adopted_archive" "$local_archive" \
         "$protocol_archive" "$services_la" \
         ${ICECC_TEST_LIBZSTD_LIBS:-} \
         ${ICECC_TEST_XXHASH_LIBS:-} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
@@ -145,6 +192,7 @@ compile_mutant() {
 }
 
 count=0
+bad=0
 for name in typed-operation-binding claimed-c-binding live-operation-fence \
     absolute-timer-arm deadline-worker-wakeup owner-thread-codec \
     worker-completion-wakeup codec-queue-bound codec-slot-release \
@@ -157,16 +205,49 @@ for name in typed-operation-binding claimed-c-binding live-operation-fence \
     mutate "$name" "$source"
     if ! compile_mutant "$source" "$object" "$binary"; then
         echo "FAIL: $name did not compile; no semantic witness exists" >&2
-        exit 1
+        printf '%s\tcompile-failed\tno semantic witness\n' "$name" >>"$work/manifest.tsv"
+        bad=$((bad + 1))
+        continue
     fi
-    if ICECC_P50_ENDPOINT_MUTANT_FOCUS=1 timeout 20s "$binary" \
-        >"$work/$name.log" 2>&1; then
-        echo "FAIL: endpoint semantic mutant survived: $name" >&2
+    set +e
+    if test "$name" = codec-queue-bound || test "$name" = codec-slot-release; then
+        ICECC_P50_ENDPOINT_CODEC_QUEUE_FOCUS=1 timeout 20s "$binary" \
+            >"$work/$name.log" 2>&1
+    else
+        ICECC_P50_ENDPOINT_MUTANT_FOCUS=1 timeout 20s "$binary" \
+            >"$work/$name.log" 2>&1
+    fi
+    status=$?
+    set -e
+    expected=$(expected_failure "$name") || {
+        echo "FAIL: no expected assertion registered for $name" >&2
+        printf '%s\tno-expected-assertion\tunknown\n' "$name" >>"$work/manifest.tsv"
+        bad=$((bad + 1))
+        continue
+    }
+    if test "$status" -ne 1; then
+        echo "FAIL: $name expected assertion exit 1, got $status" >&2
         tail -n 20 "$work/$name.log" >&2
-        exit 1
+        printf '%s\t%s\twrong-exit-expected-1\n' "$name" "$status" >>"$work/manifest.tsv"
+        bad=$((bad + 1))
+    elif ! grep -Fq "p50_endpoint_test: $expected" "$work/$name.log"; then
+        echo "FAIL: $name did not hit its intended assertion" >&2
+        tail -n 20 "$work/$name.log" >&2
+        printf '%s\t%s\twrong-assertion-expected=%s\n' "$name" "$status" "$expected" >>"$work/manifest.tsv"
+        bad=$((bad + 1))
+    else
+        printf '%s\t%s\t%s\n' "$name" "$status" "$expected" \
+            >>"$work/manifest.tsv"
+        echo "ok - endpoint semantic mutant hit expected assertion: $name (exit $status)"
     fi
-    echo "ok - endpoint semantic mutant red: $name"
+    sha256sum "$work/$name.log" >>"$work/manifest.tsv"
+    rm -f "$source" "$object" "$binary"
 done
 
 test "$count" -eq 13
+if test "$bad" -ne 0; then
+    echo "DIAGNOSTIC ONLY: $bad of $count endpoint mutant mappings need correction" >&2
+    exit 1
+fi
+echo "endpoint mutant evidence: $work"
 echo 'PASS: all 13 compiled typed-endpoint semantic mutants red'

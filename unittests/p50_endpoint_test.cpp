@@ -1396,15 +1396,34 @@ void test_p5co_endpoint_absolute_deadline_and_binding() {
             pair.take_server(), pair.client, outcome, deadline);
 
         asio::io_context context;
+        bool external_watchdog_fired = false;
+        asio::steady_timer external_watchdog(context);
+        external_watchdog.expires_after(std::chrono::milliseconds(500));
+        external_watchdog.async_wait([&](const boost::system::error_code& error) {
+            if (!error) {
+                external_watchdog_fired = true;
+                (void)::shutdown(pair.client, SHUT_RDWR);
+            }
+        });
         const auto started = std::chrono::steady_clock::now();
-        std::future<ServerRunResult> result = asio::co_spawn(
-            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        std::promise<ServerRunResult> completion;
+        std::future<ServerRunResult> result = completion.get_future();
+        asio::co_spawn(context, server.run_adopted(std::move(handoff)),
+            [&](std::exception_ptr error, ServerRunResult value) {
+                if (error)
+                    completion.set_exception(error);
+                else
+                    completion.set_value(std::move(value));
+                boost::system::error_code ignored;
+                external_watchdog.cancel(ignored);
+            });
         context.run();
         const auto elapsed = std::chrono::steady_clock::now() - started;
         require(result.get().status == ServerRunStatus::DeadlineExceeded &&
+                    !external_watchdog_fired &&
                     elapsed < std::chrono::seconds(2) &&
                     server.live_session_count() == 0,
-                "P5CO stalled CacheWire read did not expire and release its slot");
+                "P5CO stalled CacheWire read did not expire before external watchdog");
         require(!completions.completions().empty() &&
                     completions.completions().front().stamp.operation ==
                         AsyncOperationKind::ReadHeader,
@@ -1850,9 +1869,10 @@ void test_p5co_worker_completion_is_stale_after_deadline_or_cancel() {
 
             require(sentinel_observed.has_value() && sentinel_saw_worker &&
                         *sentinel_observed - started <
-                            std::chrono::milliseconds(250) &&
-                        endpoint_elapsed < std::chrono::milliseconds(300),
+                            std::chrono::milliseconds(250),
                     "codec work blocked the endpoint timer owner");
+            require(endpoint_elapsed < std::chrono::milliseconds(300),
+                    "deadline timer did not promptly settle while codec worker was blocked");
             require(server_result.get().status ==
                             ServerRunStatus::DeadlineExceeded &&
                         client_result.get().status ==
@@ -8312,6 +8332,11 @@ int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
     if (argc > 2 || (argc == 2 && !performance_gate))
         fail("usage: p50endpoint [--performance]");
+    if (std::getenv("ICECC_P50_ENDPOINT_CODEC_QUEUE_FOCUS") != nullptr) {
+        test_p5co_codec_queue_is_bounded();
+        std::cout << "p50_endpoint_test: focused codec queue PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_ENDPOINT_MUTANT_FOCUS") != nullptr) {
         test_complete_p5co_endpoint_handoff();
         test_p5co_endpoint_absolute_deadline_and_binding();
