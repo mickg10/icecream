@@ -115,6 +115,10 @@ P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 testargs_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 testargs_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
+TESTS += dumpmachinecache
+dumpmachinecache_SOURCES = dumpmachinecache.cpp
+dumpmachinecache_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+dumpmachinecache_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
@@ -181,6 +185,7 @@ digest128bench_LDADD = ../services/libicecc.la
 
 check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
 check_PROGRAMS += s3persistence
+check_PROGRAMS += dumpmachinecache
 check_PROGRAMS += p50s3realprocess
 p50fsessioncontrol_SOURCES = p50fsessioncontrol.cpp
 p50fsessioncontrol_LDADD = ../cache/libprotocol50.a
