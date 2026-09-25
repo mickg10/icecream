@@ -56,6 +56,27 @@ binary `47b0e0e00e39a3107857834809ceb4e35f9f22bf164c76e2119d30b966168cdf`.
 SDK image `icecream-dev:sdk-ubuntu24.04-a9fa596a15e7`, 2 CPUs/8 GiB.
 This adds regression coverage, not a product change or full D08/C03 closure.
 
+The default service suite additionally tests real `SidecarRuntime` expiry
+across all three profiles. With the owner executor held, a reservation call
+expires without returning an ARM result; after releasing/draining the owner,
+the single-slot capacity remains usable. A successfully reserved but expired
+request is denied by actual initial HELLO lookup and JOB_BIND consumption.
+A fresh reservation then passes those same lookup/consume checks, ruling out
+an independently invalid binding as the rejection cause. This is Runtime
+result/lease coverage, not daemon wire ARMED or Client/READY race coverage.
+
+Luna's strengthened focused selector and full default service suite both
+exit 0 against product `03d108a3`, with only this test TU changed. Evidence
+root: `/tanksmall/scratch/tmp/p51-c03-sidecar-expiry-r1/`.
+`build/unittests/p50cacheservice.log` SHA256
+`57d5ec2625c0e0c3665e934359496965013b1f9551cfec867798b9f1c93cf64e`;
+`.trs` reports PASS; `tmp/service-full-r3.exit` records 0. Test source SHA256
+`6d6c0e5a802b9f98b1037fc65349ea0ced7d8beb1e6cdbba343dfe3487d5bdaf`.
+The initial full attempt failed scratch-directory permissions before the new
+test; the following make invocation did not rerun the test and is excluded.
+The passing run used corrected task-owned scratch permissions and an actual
+test execution. No product deadlines or limits changed.
+
 ### Shared recovery failure handling
 
 A failed recovery attempt now marks its current physical generation unusable

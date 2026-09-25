@@ -4803,6 +4803,186 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
     std::puts("P51_SOURCE_LIFECYCLE cancel/publication/reset/idempotent-confirm: ok");
 }
 
+void test_p51_reservation_expiry_before_bind_no_late_arm() {
+    struct ProfileCase {
+        uint32_t mask;
+        const char* name;
+    };
+    constexpr ProfileCase profiles[] = {
+        {CACHE_PROFILE_P29V1, "P29V1"},
+        {CACHE_PROFILE_ZSTD_TU, "ZSTD_TU"},
+        {CACHE_PROFILE_ZSTD_ROUTE, "ZSTD_ROUTE"},
+    };
+
+    // Hold the real SidecarRuntime owner executor while reserve() posts its
+    // bounded owner operation. The callback is released only after the
+    // reservation's unchanged absolute deadline has elapsed.
+    struct OwnerQueueBlock {
+        std::promise<void> entered;
+        std::promise<void> release;
+        std::future<void> entered_future{entered.get_future()};
+        std::shared_future<void> release_future{release.get_future().share()};
+        std::thread thread;
+        bool released = false;
+
+        void start(service::SidecarRuntime& runtime) {
+            thread = std::thread([this, &runtime] {
+                runtime.run_owner_callback_for_test([this] {
+                    entered.set_value();
+                    release_future.wait();
+                });
+            });
+        }
+
+        void unblock_and_join() noexcept {
+            if (!released) {
+                released = true;
+                try { release.set_value(); } catch (...) {}
+            }
+            if (thread.joinable())
+                thread.join();
+        }
+
+        ~OwnerQueueBlock() { unblock_and_join(); }
+    };
+
+    for (size_t index = 0; index != std::size(profiles); ++index) {
+        StoreIdentityRoot local_root{};
+        local_root.bytes[15] = static_cast<uint8_t>(0x51 + index);
+        const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+        StoreIdentityRoot remote_root{};
+        remote_root.bytes[15] = static_cast<uint8_t>(0x61 + index);
+        const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        config.max_pending_p51_source_reservations = 1;
+        config.max_route_relationships = 1;
+        service::SidecarRuntime runtime(std::move(config));
+
+        auto queued_request = test_p51_reservation_request(
+            remote_c, 81 + index, launch.identity.generation,
+            launch.identity.attempt, 8100 + index, profiles[index].mask, 30,
+            std::chrono::seconds(2));
+        const auto queued_deadline =
+            queued_request.absolute_deadline.as_steady_time_point();
+        OwnerQueueBlock owner_block;
+        owner_block.start(runtime);
+        const bool owner_entered = owner_block.entered_future.wait_for(
+            std::chrono::seconds(2)) == std::future_status::ready;
+
+        std::promise<void> submitter_started;
+        std::future<void> started = submitter_started.get_future();
+        std::promise<std::pair<local::P51SourceReservationResult,
+                               std::chrono::steady_clock::time_point>>
+            queued_completion;
+        auto queued_result = queued_completion.get_future();
+        std::thread submitter([&] {
+            submitter_started.set_value();
+            auto result = runtime.reserve_p51_source_on_owner(queued_request);
+            queued_completion.set_value(
+                {std::move(result), std::chrono::steady_clock::now()});
+        });
+        const bool submitter_started_in_time = started.wait_for(
+            std::chrono::seconds(2)) == std::future_status::ready;
+        const bool queued_call_completed = queued_result.wait_until(
+            queued_deadline + std::chrono::seconds(2)) ==
+            std::future_status::ready;
+
+        // Always unblock/join before assertions so a failed check cannot
+        // strand the owner or destroy a joinable thread.
+        owner_block.unblock_and_join();
+        if (submitter.joinable())
+            submitter.join();
+
+        CHECK(owner_entered);
+        CHECK(submitter_started_in_time);
+        CHECK(queued_call_completed);
+        auto [queued_arm, returned_at] = queued_result.get();
+        CHECK(returned_at >= queued_deadline);
+        CHECK(!queued_arm.armed.has_value());
+        // No reservation/relationship capacity is occupied here, so 0x5103
+        // identifies the bounded owner-round-trip timeout result for this
+        // valid request (rather than a full-table or validation rejection).
+        CHECK(queued_arm.error_code == 0x5103);
+
+        // Drain the expired queued callback before using the one-row limit as
+        // a leak check. The callback is canceled by owner_round_trip once its
+        // deadline wins; it must not install an ARM after the owner resumes.
+        runtime.run_owner_callback_for_test([] {});
+
+        auto expiring_request = test_p51_reservation_request(
+            remote_c, 81 + index, launch.identity.generation,
+            launch.identity.attempt, 8200 + index, profiles[index].mask, 30,
+            std::chrono::milliseconds(180));
+        const auto expiring_result =
+            runtime.reserve_p51_source_on_owner(expiring_request);
+        CHECK(expiring_result.error_code == 0 &&
+              expiring_result.armed.has_value());
+        const P51SourceArmedFields expiring_armed = *expiring_result.armed;
+        LinkHello initial = test_p51_link_hello(
+            expiring_armed, 1, HistoryNonce{0x820001 + index});
+        JobBind binding = test_p51_job_binding(
+            expiring_armed, initial.physical_link_generation, 1,
+            82000 + index, "expired-before-initial-bind");
+
+        const auto expiring_deadline =
+            expiring_request.absolute_deadline.as_steady_time_point();
+        std::this_thread::sleep_until(
+            expiring_deadline + std::chrono::milliseconds(1));
+        P51SourceLinkLookupResult lookup;
+        std::optional<P51SourceJobLease> consumed;
+        runtime.run_owner_callback_for_test([&] {
+            lookup = runtime.lookup_p51_link_reservation_on_owner(initial);
+            consumed = runtime.consume_p51_job_reservation_on_owner(
+                initial, binding);
+        });
+        CHECK(lookup.status != P51SourceLinkLookupStatus::Found);
+        CHECK(!lookup.lease.has_value());
+        CHECK(!consumed.has_value());
+
+        runtime.run_owner_callback_for_test([&] {
+            runtime.sweep_p51_reservations_on_owner();
+        });
+        auto fresh_request = test_p51_reservation_request(
+            remote_c, 81 + index, launch.identity.generation,
+            launch.identity.attempt, 8300 + index, profiles[index].mask, 30);
+        const auto fresh_result =
+            runtime.reserve_p51_source_on_owner(fresh_request);
+        CHECK(fresh_result.error_code == 0 && fresh_result.armed.has_value());
+        CHECK(fresh_result.armed->reservation_id !=
+              expiring_armed.reservation_id);
+        LinkHello fresh_link = test_p51_link_hello(
+            *fresh_result.armed, 2, HistoryNonce{0x830001 + index});
+        JobBind fresh_binding = test_p51_job_binding(
+            *fresh_result.armed, fresh_link.physical_link_generation, 1,
+            83000 + index, "fresh-after-expired-bind");
+        P51SourceLinkLookupResult fresh_lookup;
+        std::optional<P51SourceJobLease> fresh_consumed;
+        runtime.run_owner_callback_for_test([&] {
+            fresh_lookup = runtime.lookup_p51_link_reservation_on_owner(
+                fresh_link);
+            fresh_consumed = runtime.consume_p51_job_reservation_on_owner(
+                fresh_link, fresh_binding);
+            if (fresh_consumed)
+                runtime.settle_p51_cancelled_job_on_owner(
+                    fresh_link, fresh_binding);
+        });
+        CHECK(fresh_lookup.status == P51SourceLinkLookupStatus::Found);
+        CHECK(fresh_lookup.lease.has_value());
+        CHECK(fresh_consumed.has_value());
+        CHECK(fresh_consumed->binding.reservation_id ==
+              fresh_binding.reservation_id);
+        std::printf("P51_RESERVATION_EXPIRY profile=%s queued=no-arm/slot-free "
+                    "expired-bind=denied fresh=bound\n",
+                    profiles[index].name);
+    }
+    std::puts("P51_RESERVATION_EXPIRY before-bind/no-late-runtime-arm: ok");
+}
+
 void test_p51_reservation_profile_mask_mapping() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x49;
@@ -9800,6 +9980,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--p51-reservation-expiry-before-bind") == 0) {
+            test_p51_reservation_expiry_before_bind_no_late_arm();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--read-peer-close") == 0) {
             test_p51_peer_close_during_active_read_cancels_before_route();
             return 0;
@@ -9898,6 +10083,7 @@ int main(int argc, char** argv) {
         test_p51_stop_while_waiting_for_link_state();
         test_p51_reservation_capacity_120_cancel_and_expiry();
         test_p51_cancel_publication_and_reset_lifecycle();
+        test_p51_reservation_expiry_before_bind_no_late_arm();
         test_p51_reservation_profile_mask_mapping();
         test_replacement_trigger_latches_once_and_is_opt_in();
         test_p51_same_f_missing_relationship_reassignment_keeps_sibling();
