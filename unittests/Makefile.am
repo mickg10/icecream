@@ -50,6 +50,10 @@ TESTS += p50daemoncontrol p50daemoncontrol-source.sh \
 	p50daemoncontrol-mutants.sh p50_daemon_control_sanitize.sh
 TESTS += p50cachefdseam
 TESTS += p50endpointcancel p50endpointcancel-run.sh
+# Two C sidecars overflow one F's live-session bound.  Known failure: the
+# overflowed C quarantines that F relationship until its sidecar is replaced.
+TESTS += p50cacheservice-fcapacity-run.sh
+XFAIL_TESTS = p50cacheservice-fcapacity-run.sh
 TESTS += assignment_identity_test
 TESTS += p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \
@@ -570,6 +574,7 @@ EXTRA_DIST += p50cachesessionwire-source.sh p50cachesessionwire-mutants.sh \
 	p50cachesessionwire-sanitize.sh
 EXTRA_DIST += p50daemoncontrol-source.sh p50daemoncontrol-mutants.sh \
 	p50_daemon_control_sanitize.sh
+EXTRA_DIST += p50cacheservice-fcapacity-run.sh
 EXTRA_DIST += p50endpointcancel-run.sh \
 	p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \

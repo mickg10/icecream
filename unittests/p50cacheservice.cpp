@@ -32,8 +32,10 @@
 #include <boost/asio/use_future.hpp>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <optional>
 #include <vector>
 #include <thread>
 
@@ -2258,6 +2260,331 @@ void test_interner_fault_returns_permanent_profile_unavailable() {
           observation.eof_without_cachewire);
 }
 
+// Accepted end of a fresh loopback TCP connection; its connected peer is
+// returned through peer_fd.
+int loopback_tcp_pair(int& peer_fd) noexcept {
+    peer_fd = -1;
+    const int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0)
+        return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(address);
+    int accepted = -1;
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0 &&
+        ::listen(listener, 1) == 0 &&
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0) {
+        peer_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (peer_fd >= 0 &&
+            ::connect(peer_fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) == 0)
+            accepted = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+    }
+    (void)::close(listener);
+    if (accepted < 0 && peer_fd >= 0) {
+        (void)::close(peer_fd);
+        peer_fd = -1;
+    }
+    return accepted;
+}
+
+template <class Predicate>
+bool eventually(Predicate predicate, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+// Stands in for F's iceccd and its sidecar control worker: acknowledges each
+// arm, answers CACHE_SESSION with READY and then hands the descriptor to the
+// F runtime, as the production control worker does.  Arms from the held C
+// store are parked instead and an idle loopback session is adopted in each
+// one's place, so F keeps one live session per parked arm, as it does for an
+// armed session waiting behind its C transfer gate.
+class CapacityFront {
+public:
+    CapacityFront(service::SidecarRuntime& f_runtime, uint64_t f_store_generation)
+        : f_runtime_(f_runtime), f_store_generation_(f_store_generation),
+          listener_(loopback_listener(port_)) {
+        CHECK(::listen(listener_, 64) == 0);
+        acceptor_ = std::thread([this] { accept_loop(); });
+    }
+    ~CapacityFront() { stop(); }
+    CapacityFront(const CapacityFront&) = delete;
+    CapacityFront& operator=(const CapacityFront&) = delete;
+
+    [[nodiscard]] uint16_t port() const noexcept { return port_; }
+
+    void hold(CStoreGuid c_store) {
+        std::lock_guard lock(mutex_);
+        held_ = c_store;
+    }
+
+    [[nodiscard]] size_t parked() {
+        std::lock_guard lock(mutex_);
+        return parked_.size();
+    }
+
+    // Adopts one more idle session and reports whether F closed it at once.
+    [[nodiscard]] bool probe_refused() {
+        int peer = -1;
+        const int adopted = loopback_tcp_pair(peer);
+        if (adopted < 0)
+            return false;
+        f_runtime_.start_adopted_endpoint(adopted);
+        pollfd descriptor{peer, POLLIN, 0};
+        int ready = -1;
+        do {
+            ready = ::poll(&descriptor, 1, 2000);
+        } while (ready < 0 && errno == EINTR);
+        bool refused = false;
+        if (ready > 0) {
+            uint8_t byte = 0;
+            const ssize_t count = ::recv(peer, &byte, 1, MSG_DONTWAIT);
+            refused = count == 0 || (count < 0 && errno == ECONNRESET);
+        }
+        (void)::close(peer);
+        return refused;
+    }
+
+    // Ends every placeholder, waits until F holds no session, then hands F
+    // the parked CacheWire descriptors.
+    [[nodiscard]] bool release() {
+        std::vector<std::pair<int, int>> parked;
+        {
+            std::lock_guard lock(mutex_);
+            held_.reset();
+            parked.swap(parked_);
+        }
+        for (const auto& entry : parked)
+            (void)::close(entry.second);
+        const bool drained = eventually(
+            [this] { return f_runtime_.live_session_count() == 0; },
+            std::chrono::seconds(5));
+        for (const auto& entry : parked)
+            f_runtime_.start_adopted_endpoint(entry.first);
+        return drained;
+    }
+
+    void stop() noexcept {
+        stopping_.store(true, std::memory_order_release);
+        if (acceptor_.joinable())
+            acceptor_.join();
+        for (std::thread& worker : workers_)
+            if (worker.joinable())
+                worker.join();
+        workers_.clear();
+        std::lock_guard lock(mutex_);
+        for (const auto& entry : parked_) {
+            (void)::close(entry.first);
+            (void)::close(entry.second);
+        }
+        parked_.clear();
+        if (listener_ >= 0)
+            (void)::close(listener_);
+        listener_ = -1;
+    }
+
+private:
+    void accept_loop() noexcept {
+        while (!stopping_.load(std::memory_order_acquire)) {
+            pollfd descriptor{listener_, POLLIN, 0};
+            if (::poll(&descriptor, 1, 20) <= 0)
+                continue;
+            sockaddr_in peer{};
+            socklen_t peer_size = sizeof(peer);
+            const int accepted = ::accept(
+                listener_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            if (accepted < 0)
+                continue;
+            try {
+                workers_.emplace_back([this, accepted, peer, peer_size] {
+                    serve(accepted, peer, peer_size);
+                });
+            } catch (...) {
+                (void)::close(accepted);
+            }
+        }
+    }
+
+    void serve(int accepted, sockaddr_in peer, socklen_t peer_size) noexcept {
+        try {
+            std::unique_ptr<MsgChannel> channel(Service::createChannel(
+                accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                return;
+            std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+            const auto* arm = arm_message != nullptr
+                                  ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                                  : nullptr;
+            if (arm == nullptr || !arm->valid_payload())
+                return;
+            ClaimAttemptCapability128 capability_1;
+            ClaimAttemptCapability128 capability_2;
+            capability_1.bytes.fill(0xe1);
+            capability_2.bytes.fill(0xe2);
+            const P50SourceArmedMsg acknowledgement(
+                arm->arm, 111, 112, f_store_generation_,
+                f_runtime_.f_store_guid().bytes, kStoreIdentityDerivationVersion,
+                113, 2500, capability_1, capability_2);
+            if (!channel->send_msg(acknowledgement))
+                return;
+            std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+            if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+                return;
+            const int raw_fd = channel->release_fd_if_input_empty();
+            if (raw_fd < 0)
+                return;
+            if (!send_cache_session_ready(
+                    raw_fd, std::chrono::steady_clock::now() + std::chrono::seconds(2))) {
+                (void)::close(raw_fd);
+                return;
+            }
+            CStoreGuid c_store;
+            c_store.bytes = arm->arm.c_store_guid;
+            bool park = false;
+            {
+                std::lock_guard lock(mutex_);
+                park = held_ == c_store;
+            }
+            if (!park) {
+                f_runtime_.start_adopted_endpoint(raw_fd);
+                return;
+            }
+            int placeholder_peer = -1;
+            const int placeholder = loopback_tcp_pair(placeholder_peer);
+            if (placeholder < 0) {
+                (void)::close(raw_fd);
+                return;
+            }
+            f_runtime_.start_adopted_endpoint(placeholder);
+            std::lock_guard lock(mutex_);
+            parked_.emplace_back(raw_fd, placeholder_peer);
+        } catch (...) {
+        }
+    }
+
+    service::SidecarRuntime& f_runtime_;
+    const uint64_t f_store_generation_;
+    uint16_t port_ = 0;
+    int listener_ = -1;
+    std::atomic<bool> stopping_{false};
+    std::mutex mutex_;
+    std::optional<CStoreGuid> held_;
+    std::vector<std::pair<int, int>> parked_;
+    std::vector<std::thread> workers_;
+    std::thread acceptor_;
+};
+
+// Two C runtimes with distinct stores arm against one F whose live-session
+// bound is one armed window (RouteGate::kArmedSessions).  C1a's eight arms
+// stay live on F while parked, so every arm from C1b overflows it; F refuses
+// by closing the adopted socket after READY.  The overflow must end in a
+// typed transfer error without a hang and must leave neither C with a
+// replacement latch or a quarantined route: once F is idle again, C1b's next
+// transfer to the same F must commit.
+void test_f_live_session_overflow_from_two_c_runtimes() {
+    constexpr size_t kArmedWindow = 8;
+    constexpr uint64_t kFStoreGeneration = 23;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x91;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    f_config.endpoint_config.owner_limits.max_live_sessions = kArmedWindow;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    const auto c_config = [](uint8_t root_byte) {
+        StoreIdentityRoot root{};
+        root.bytes[15] = root_byte;
+        const SidecarLaunchIdentity launch = test_sidecar_launch(root);
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        return config;
+    };
+    service::RuntimeConfig first_config = c_config(0xa1);
+    const CStoreGuid first_c_store = first_config.c_store_guid;
+    service::SidecarRuntime first_c(std::move(first_config));
+    service::SidecarRuntime second_c(c_config(0xb1));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+    front.hold(first_c_store);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](service::SidecarRuntime& runtime, uint64_t identity) {
+        const std::string text = "window-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            clock.clock_domain_id, clock.time_namespace_id);
+        return runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-f-capacity", source)));
+    };
+
+    std::array<local::P50SourceTransferResult, kArmedWindow> first_results{};
+    std::array<local::P50SourceTransferResult, kArmedWindow> second_results{};
+    std::vector<std::thread> first_transfers;
+    for (size_t index = 0; index != kArmedWindow; ++index)
+        first_transfers.emplace_back([&, index] {
+            first_results[index] = transfer(first_c, 400 + 10 * index);
+        });
+    const bool window_parked = eventually(
+        [&] { return front.parked() == kArmedWindow; }, std::chrono::seconds(10));
+    const bool f_full = window_parked && front.probe_refused();
+
+    const auto overflow_started = std::chrono::steady_clock::now();
+    std::vector<std::thread> second_transfers;
+    for (size_t index = 0; index != kArmedWindow; ++index)
+        second_transfers.emplace_back([&, index] {
+            second_results[index] = transfer(second_c, 600 + 10 * index);
+        });
+    for (std::thread& thread : second_transfers)
+        thread.join();
+    const auto overflow_elapsed = std::chrono::steady_clock::now() - overflow_started;
+
+    const bool released = front.release();
+    for (std::thread& thread : first_transfers)
+        thread.join();
+    const bool first_drained = eventually(
+        [&] { return f_runtime.live_session_count() == 0; }, std::chrono::seconds(5));
+    const local::P50SourceTransferResult first_later = transfer(first_c, 800);
+    const local::P50SourceTransferResult second_later = transfer(second_c, 900);
+    const bool f_idle = eventually(
+        [&] { return f_runtime.live_session_count() == 0; }, std::chrono::seconds(5));
+    front.stop();
+
+    const auto replacement = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired);
+    std::fprintf(stderr, "p50cacheservice: F overflow error/attempts");
+    for (const auto& result : second_results)
+        std::fprintf(stderr, " %u/%u", static_cast<unsigned>(result.error_code),
+                     static_cast<unsigned>(result.attempts));
+    std::fprintf(stderr, "; later code=%u error=%u attempts=%u\n",
+                 static_cast<unsigned>(second_later.code),
+                 static_cast<unsigned>(second_later.error_code),
+                 static_cast<unsigned>(second_later.attempts));
+    CHECK(window_parked && f_full);
+    for (const auto& result : first_results)
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+    for (const auto& result : second_results)
+        CHECK(result.code == local::SourceTransferResultCode::Error &&
+              result.error_code != 0 && result.error_code != replacement);
+    CHECK(overflow_elapsed < std::chrono::seconds(10));
+    CHECK(released && first_drained);
+    CHECK(first_later.code == local::SourceTransferResultCode::Committed);
+    CHECK(second_later.error_code != replacement);
+    CHECK(f_idle);
+    CHECK(second_later.code == local::SourceTransferResultCode::Committed);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -2757,6 +3084,10 @@ int main(int argc, char** argv) {
             test_route_poison_latches_before_successor_f_open();
             test_route_endpoint_cap_refuses_before_f_open();
             test_known_endpoint_relationship_cap_refuses_before_f_open();
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--f-live-capacity") == 0) {
+            test_f_live_session_overflow_from_two_c_runtimes();
             return 0;
         }
         CHECK(argc == 1);
