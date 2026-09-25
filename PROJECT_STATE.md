@@ -12,6 +12,44 @@ retained artifact directories.
 
 ## Developer QA
 
+### Real F receipt-ledger pressure
+
+The default service suite includes W1 and W30 receipt-pressure cases for
+P29V1, ZSTD_TU and ZSTD_ROUTE. A controlled client endpoint talks over one
+TCP connection to a real F SidecarRuntime, reads exact commit receipts and
+withholds ACKs. An owner-thread, test-only snapshot checks K/Q, the selected
+window, exact retained receipt ordinals, pending ordinal, outstanding
+reservations and published input-record count. At capacity, a direct probe
+of the service admission guard rejects the exact next prepared binding
+without changing those counters. After a real wire ACK, that same binding
+commits on the same connection. The test waits for F to process the final ACK,
+checks that receipt rows drain, then sends orderly CLOSE.
+
+This qualifies the service receipt cap/refill, not the independent raw,
+encoded, output or metadata limits, peak memory, or all of D11. The probe
+does not send an invalid over-window JOB_BIND on the wire. Earlier endpoint
+tests cover the separate endpoint window guard.
+
+Frozen source: base `c02dac8c`, three changed service/header/test files, SDK
+`icecream-dev:p51-multilink-retry-r6-iptables` image
+`sha256:ab5df547b92ed5998d46ab828e24bdde81cf86f5e7716797ac65a6ed90039eee`.
+Runs used 2 CPUs, 8 GiB, no container network and explicit scratch mounts.
+Artifacts: `/tanksmall/scratch/tmp/p51-d11-receipt-eEWKvO/artifacts/`.
+Both `p50cacheservice --d11-real-receipt-ledger` (six cells) and the default
+Automake `make -C /work/build/unittests p50cacheservice.log` pass, exit 0.
+
+- Six-cell log SHA256: `4d2aee46c5f3c1563d45f77ceefea820ff6a38541014d85a87bec94f3834b396`.
+- Default test log: `d27eb8eed0e962f9f7670ccea54a09f4cd1d15acf4757141a82bde0b1a524b0a`.
+- Default `.trs` (PASS): `7f175f2f5d04511903d382671ba96ca623e127f57730d53966587cf2c2689229`.
+- Binary: `c8bfc0d001501cdca048c1036ec414d244db503d1206d55aa5abc090bb74eeb2`.
+- Service header: `8bae8b40b3f1d15af23bb4a536778b075dddd66cc3ca59d88562c629418769e4`.
+- Service source: `43a16329cf5d0ff9fd3d3946288a4995f9f72d784814ef8b7908b37492e2bd68`.
+- Test source: `85ed8df58528bf68ce71e92aeb0fc84747426cf2bfe8aa6651bee40bcfc0f0cc`.
+
+The retained initial focused failure sampled Q immediately after C wrote
+the ACK, before F necessarily processed it. It is not a product failure or
+a passing gate; the corrected test observes F's bounded eventual Q instead.
+
 ### Repeated W30 recovery on persistent runtimes
 
 The default service suite now runs three cancellation/reset cycles for each

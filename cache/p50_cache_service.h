@@ -46,6 +46,19 @@ namespace icecc::p50::service {
 struct PendingP51Transfer;
 struct PendingP51Admission;
 
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+struct P51ReceiptLedgerSnapshot {
+    uint64_t committed_prefix_k = 0;
+    uint64_t acknowledged_prefix_q = 0;
+    uint32_t selected_window = 0;
+    uint64_t pending_ordinal = 0;
+    size_t outstanding_reservations = 0;
+    size_t receipt_count = 0;
+    std::array<uint64_t, 30> receipt_ordinals{};
+    P50ServerOwnerUsage endpoint_usage{};
+};
+#endif
+
 // Unset is the production default. Any configured value other than the one
 // deliberately supported live-farm fault is malformed and must prevent READY.
 [[nodiscard]] bool parse_p29_interner_fault_injection(
@@ -316,6 +329,8 @@ public:
         return p51_source_operation_count_.load(std::memory_order_acquire);
     }
     [[nodiscard]] uint64_t active_source_raw_bytes_for_test() noexcept;
+    [[nodiscard]] std::optional<P51ReceiptLedgerSnapshot>
+    p51_receipt_ledger_for_test(const LinkHello& link);
 #endif
 
 private:

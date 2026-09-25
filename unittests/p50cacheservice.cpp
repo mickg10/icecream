@@ -34,7 +34,10 @@
 #include <mutex>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/asio/write.hpp>
 #include <future>
 #include <memory>
 #include <netinet/in.h>
@@ -5334,6 +5337,379 @@ RecoverEnd test_p51_recover_end(const RecoverBegin& begin,
     end.witness_count = static_cast<uint32_t>(witnesses.size());
     end.transcript_digest = compute_r2_recovery_transcript_digest(begin, witnesses);
     return end;
+}
+
+struct D11ReceiptPause {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool at_cap = false;
+    bool continue_after_cap = false;
+    bool after_refill = false;
+    bool finish = false;
+    LinkHello link{};
+    JobBind refill_binding{};
+    std::exception_ptr error;
+};
+
+boost::asio::awaitable<void> d11_receipt_client(
+    uint16_t f_port, ProfileId profile, uint32_t window,
+    const SidecarLaunchIdentity& c_launch,
+    const SidecarLaunchIdentity& f_launch,
+    const std::vector<P51SourceArmedFields>& armed,
+    const std::vector<std::vector<uint8_t>>& raw_inputs,
+    D11ReceiptPause& pause) {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+    const EndpointCaps caps = [&] {
+        EndpointCaps value;
+        value.profile = profile;
+        value.supported_profiles = profile_bit(profile);
+        value.zstd.max_raw_bytes = 1U << 20;
+        value.zstd.max_encoded_body_bytes = 1U << 20;
+        return value;
+    }();
+    const PreparationRouteKey route{FStoreGuid{f_launch.f_store_guid.bytes},
+                                    f_launch.store_generation, profile};
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = 1;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_launch.c_store_guid, caps.zstd, limits, 1, profile);
+    P50ClientEndpoint client(authority, caps, HistoryNonce{1}, nullptr,
+                             nullptr, std::nullopt, {}, {}, route);
+    const tcp::endpoint remote(asio::ip::address_v4::loopback(), f_port);
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(35);
+
+    const auto prepare = [&](size_t index) {
+        return authority->prepare_for_route(
+            route, PrepareRequestKey{0xd110, index + 1}, raw_inputs[index]);
+    };
+    PreparedTuHandle prepared = prepare(0);
+    LinkHello hello = test_p51_link_hello(
+        armed.front(), 1, HistoryNonce{1}, LinkStartMode::Initial);
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.system_source_fingerprint = profile == ProfileId::P29V1
+        ? authority->p29v1_system_source_fingerprint(prepared)
+        : icecc::digest128("D11 real F receipt ledger");
+    (void)co_await client.open_r2_link(socket, hello, deadline);
+
+    const auto make_binding = [&](size_t index,
+                                  PreparedTuHandle handle) {
+        const auto& source = armed[index].arm.source;
+        JobBind binding;
+        binding.reservation_id = Id128{armed[index].reservation_id};
+        binding.physical_link_generation = hello.physical_link_generation;
+        binding.relationship_ordinal = index + 1;
+        binding.wire_job_id = source.wire_job_id;
+        binding.assignment_epoch = source.assignment_epoch;
+        binding.assignment_nonce = source.assignment_nonce;
+        binding.logical_job = source.logical_job;
+        binding.compiler_attempt = source.compiler_attempt;
+        binding.source_request_id = source.source_request_id;
+        binding.tu_seq = authority->prepared_tu_seq(handle);
+        binding.profile = profile;
+        binding.raw_bytes = raw_inputs[index].size();
+        binding.raw_digest = icecc::digest128(raw_inputs[index]);
+        return binding;
+    };
+
+    for (size_t index = 0; index != window; ++index) {
+        if (index != 0)
+            prepared = prepare(index);
+        const JobBind binding = make_binding(index, prepared);
+        const R2SentBundle sent = co_await client.write_r2_bundle(
+            socket, binding, prepared, deadline);
+        const ClientRunResult receipt = co_await client.read_r2_receipt(
+            socket, sent, deadline);
+        CHECK(receipt.status == ClientRunStatus::Committed &&
+              receipt.committed_input.has_value() &&
+              receipt.committed_input->tu_seq == binding.tu_seq &&
+              receipt.committed_commit.has_value() &&
+              receipt.committed_commit->raw_digest == binding.raw_digest);
+    }
+
+    prepared = prepare(window);
+    const JobBind refill_binding = make_binding(window, prepared);
+    {
+        std::unique_lock lock(pause.mutex);
+        pause.link = hello;
+        pause.refill_binding = refill_binding;
+        pause.at_cap = true;
+        pause.changed.notify_all();
+        pause.changed.wait(lock, [&] { return pause.continue_after_cap; });
+    }
+
+    co_await client.write_r2_ack(socket, window, deadline);
+    const R2SentBundle refill = co_await client.write_r2_bundle(
+        socket, refill_binding, prepared, deadline);
+    const ClientRunResult refill_receipt = co_await client.read_r2_receipt(
+        socket, refill, deadline);
+    CHECK(refill_receipt.status == ClientRunStatus::Committed &&
+          refill_receipt.committed_input.has_value() &&
+          refill_receipt.committed_input->tu_seq == refill_binding.tu_seq &&
+          refill_receipt.committed_commit.has_value() &&
+          refill_receipt.committed_commit->raw_digest ==
+              refill_binding.raw_digest);
+    co_await client.write_r2_ack(socket, window + 1, deadline);
+    {
+        std::unique_lock lock(pause.mutex);
+        pause.after_refill = true;
+        pause.changed.notify_all();
+        pause.changed.wait(lock, [&] { return pause.finish; });
+    }
+    const std::vector<uint8_t> close_frame =
+        encode_frame(Message{CloseMessage{}});
+    co_await asio::async_write(socket, asio::buffer(close_frame),
+                               asio::use_awaitable);
+    boost::system::error_code ignored;
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
+}
+
+void test_p51_d11_real_receipt_ledger(ProfileId profile, uint32_t window) {
+    CHECK(window == 1 || window == 30);
+    const char* profile_name = profile == ProfileId::P29V1 ? "P29V1" :
+        profile == ProfileId::ZSTD_TU ? "ZSTD_TU" : "ZSTD_ROUTE";
+    const uint32_t cache_profile = profile == ProfileId::P29V1
+        ? CACHE_PROFILE_P29V1
+        : profile == ProfileId::ZSTD_TU
+              ? CACHE_PROFILE_ZSTD_TU
+              : CACHE_PROFILE_ZSTD_ROUTE;
+    const size_t total_jobs = static_cast<size_t>(window) + 1;
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = static_cast<uint8_t>(0x21 + static_cast<unsigned>(profile));
+    const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = static_cast<uint8_t>(0x41 + static_cast<unsigned>(profile));
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+    uint16_t f_port = 0;
+    const int listener = loopback_listener(f_port);
+    CHECK(listener >= 0 && f_port != 0);
+
+    std::vector<local::P51SourceReservationRequest> requests;
+    std::vector<P51SourceArmedFields> armed;
+    std::vector<std::vector<uint8_t>> raw_inputs;
+    requests.reserve(total_jobs);
+    armed.reserve(total_jobs);
+    raw_inputs.reserve(total_jobs);
+
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.c_store_guid = f_launch.c_store_guid;
+    f_config.f_store_guid = f_launch.f_store_guid;
+    f_config.f_store_generation = f_launch.store_generation;
+    f_config.sidecar_launch = f_launch;
+    f_config.endpoint_caps.profile = profile;
+    f_config.endpoint_caps.supported_profiles = profile_bit(profile);
+    f_config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
+    f_config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
+    f_config.max_pending_p51_source_reservations = total_jobs + 4;
+    std::mutex materialized_mutex;
+    std::vector<std::pair<Digest128, uint64_t>> materialized;
+    f_config.endpoint_config.input_job_state =
+        [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
+            std::span<const uint8_t> bytes) {
+            std::lock_guard lock(materialized_mutex);
+            materialized.emplace_back(icecc::digest128(bytes), bytes.size());
+            CHECK(begin.raw_digest == icecc::digest128(bytes) &&
+                  begin.raw_bytes == bytes.size());
+            return InputJobState::Open;
+        };
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    for (size_t index = 0; index != total_jobs; ++index) {
+        std::string text = "D11 exact F receipt ledger profile=";
+        text += profile_name;
+        text += " window=" + std::to_string(window);
+        text += " ordinal=" + std::to_string(index + 1) + "\n";
+        raw_inputs.emplace_back(text.begin(), text.end());
+        auto request = test_p51_reservation_request(
+            c_launch.c_store_guid, c_launch.store_generation,
+            c_launch.identity.generation, c_launch.identity.attempt,
+            930000 + index, cache_profile, window,
+            std::chrono::seconds(60));
+        request.arm.source.selected_f_host = "127.0.0.1";
+        request.arm.source.selected_f_cache_port = f_port;
+        request.arm.source.logical_job = 600000 + index;
+        request.arm.source.compiler_attempt = 1;
+        const auto result = f_runtime.reserve_p51_source_on_owner(request);
+        CHECK(result.error_code == 0 && result.armed.has_value());
+        requests.push_back(std::move(request));
+        armed.push_back(*result.armed);
+        CHECK(armed.back().selected_window == window);
+        if (index != 0)
+            CHECK(armed.back().logical_relationship_id ==
+                  armed.front().logical_relationship_id &&
+                  armed.back().relationship_epoch ==
+                  armed.front().relationship_epoch);
+    }
+
+    D11ReceiptPause pause;
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<bool> accepted{false};
+    std::thread acceptor([&] {
+        const auto end = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(45);
+        while (!stop_accepting.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < end) {
+            pollfd ready{listener, POLLIN, 0};
+            const int polled = ::poll(&ready, 1, 100);
+            if (polled < 0 && errno == EINTR)
+                continue;
+            if (polled <= 0)
+                continue;
+            int fd = ::accept(listener, nullptr, nullptr);
+            if (fd < 0) {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+            accepted.store(true, std::memory_order_release);
+            f_runtime.start_adopted_r2_endpoint(fd);
+            return;
+        }
+    });
+
+    std::exception_ptr client_error;
+    std::thread client_thread([&] {
+        try {
+            namespace asio = boost::asio;
+            asio::io_context context;
+            auto future = asio::co_spawn(
+                context,
+                d11_receipt_client(f_port, profile, window, c_launch,
+                                   f_launch, armed, raw_inputs, pause),
+                asio::use_future);
+            context.run();
+            future.get();
+        } catch (...) {
+            std::lock_guard lock(pause.mutex);
+            client_error = std::current_exception();
+            pause.changed.notify_all();
+        }
+    });
+
+    const auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            {
+                std::lock_guard lock(pause.mutex);
+                pause.continue_after_cap = true;
+                pause.finish = true;
+            }
+            pause.changed.notify_all();
+            stop_accepting.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (acceptor.joinable())
+                acceptor.join();
+            (void)::close(listener);
+            if (client_thread.joinable())
+                client_thread.join();
+            f_runtime.stop();
+        });
+
+    {
+        std::unique_lock lock(pause.mutex);
+        CHECK(pause.changed.wait_for(lock, std::chrono::seconds(40), [&] {
+            return pause.at_cap || client_error != nullptr;
+        }));
+        if (client_error)
+            std::rethrow_exception(client_error);
+        CHECK(accepted.load(std::memory_order_acquire));
+    }
+
+    const LinkHello link = pause.link;
+    const auto full = f_runtime.p51_receipt_ledger_for_test(link);
+    CHECK(full.has_value() && full->selected_window == window &&
+          full->committed_prefix_k == window &&
+          full->acknowledged_prefix_q == 0 &&
+          full->pending_ordinal == 0 && full->receipt_count == window &&
+          full->outstanding_reservations == 1 &&
+          full->endpoint_usage.retained_input_records == window);
+    for (uint32_t ordinal = 1; ordinal <= window; ++ordinal)
+        CHECK(full->receipt_ordinals[ordinal - 1] == ordinal);
+    {
+        std::lock_guard lock(materialized_mutex);
+        CHECK(materialized.size() == window);
+        for (uint32_t ordinal = 0; ordinal != window; ++ordinal)
+            CHECK(materialized[ordinal].first ==
+                      icecc::digest128(raw_inputs[ordinal]) &&
+                  materialized[ordinal].second == raw_inputs[ordinal].size());
+    }
+
+    // Probe the real owner admission with the exact next reservation while
+    // the receipt ledger is full. Capacity rejection must be read-only: the
+    // reservation remains outstanding and no pending ordinal/record appears.
+    const JobBind blocked_binding = pause.refill_binding;
+    CHECK(blocked_binding.reservation_id ==
+              Id128{armed[window].reservation_id} &&
+          blocked_binding.relationship_ordinal == window + 1 &&
+          blocked_binding.raw_bytes == raw_inputs[window].size() &&
+          blocked_binding.raw_digest == icecc::digest128(raw_inputs[window]));
+    std::optional<P51SourceJobLease> blocked_lease;
+    f_runtime.run_owner_callback_for_test([&] {
+        blocked_lease = f_runtime.consume_p51_job_reservation_on_owner(
+            link, blocked_binding);
+    });
+    CHECK(!blocked_lease.has_value());
+    const auto still_full = f_runtime.p51_receipt_ledger_for_test(link);
+    CHECK(still_full.has_value() && still_full->committed_prefix_k == window &&
+          still_full->acknowledged_prefix_q == 0 &&
+          still_full->pending_ordinal == 0 &&
+          still_full->receipt_count == window &&
+          still_full->outstanding_reservations == 1 &&
+          still_full->endpoint_usage.retained_input_records == window);
+
+    {
+        std::lock_guard lock(pause.mutex);
+        pause.continue_after_cap = true;
+    }
+    pause.changed.notify_all();
+    {
+        std::unique_lock lock(pause.mutex);
+        CHECK(pause.changed.wait_for(lock, std::chrono::seconds(20), [&] {
+            return pause.after_refill || client_error != nullptr;
+        }));
+        if (client_error)
+            std::rethrow_exception(client_error);
+    }
+    std::optional<service::P51ReceiptLedgerSnapshot> refilled;
+    const auto ack_wait_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(3);
+    do {
+        refilled = f_runtime.p51_receipt_ledger_for_test(link);
+        if (refilled && refilled->acknowledged_prefix_q == window + 1)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    } while (std::chrono::steady_clock::now() < ack_wait_deadline);
+    CHECK(refilled.has_value() &&
+          refilled->selected_window == window &&
+          refilled->committed_prefix_k == window + 1 &&
+          refilled->acknowledged_prefix_q == window + 1 &&
+          refilled->pending_ordinal == 0 && refilled->receipt_count == 0 &&
+          refilled->outstanding_reservations == 0 &&
+          refilled->endpoint_usage.retained_input_records == total_jobs);
+    {
+        std::lock_guard lock(materialized_mutex);
+        CHECK(materialized.size() == total_jobs);
+        for (size_t index = 0; index != total_jobs; ++index)
+            CHECK(materialized[index].first ==
+                      icecc::digest128(raw_inputs[index]) &&
+                  materialized[index].second == raw_inputs[index].size());
+    }
+    {
+        std::lock_guard lock(pause.mutex);
+        pause.finish = true;
+    }
+    pause.changed.notify_all();
+    client_thread.join();
+    if (client_error)
+        std::rethrow_exception(client_error);
+    std::printf("P51_D11_REAL_RECEIPT_LEDGER profile=%s window=%u retained=%u refill=%u: PASS\n",
+                profile_name, window, window, window + 1);
 }
 
 void test_p51_cancel_publication_and_reset_lifecycle() {
@@ -10897,6 +11273,21 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-receipt-ledger-zstd-tu-w1") == 0) {
+            test_p51_d11_real_receipt_ledger(ProfileId::ZSTD_TU, 1);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-receipt-ledger") == 0) {
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE}) {
+                test_p51_d11_real_receipt_ledger(profile, 1);
+                test_p51_d11_real_receipt_ledger(profile, 30);
+            }
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--credit-admission-hol-witness") == 0) {
             test_p51_credit_admission_bypasses_blocked_workers();
             return 0;
@@ -10942,6 +11333,12 @@ int main(int argc, char** argv) {
         test_p51_stop_while_waiting_for_link_session_echo();
         test_p51_stop_while_waiting_for_link_state();
         test_p51_reservation_capacity_120_cancel_and_expiry();
+        for (const ProfileId profile : {
+                 ProfileId::P29V1, ProfileId::ZSTD_TU,
+                 ProfileId::ZSTD_ROUTE}) {
+            test_p51_d11_real_receipt_ledger(profile, 1);
+            test_p51_d11_real_receipt_ledger(profile, 30);
+        }
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_reservation_expiry_before_bind_no_late_arm();
         test_p51_reservation_profile_mask_mapping();

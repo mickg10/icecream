@@ -4436,6 +4436,45 @@ uint64_t SidecarRuntime::active_source_raw_bytes_for_test() noexcept {
     return active_source_raw_bytes_;
 }
 
+std::optional<P51ReceiptLedgerSnapshot>
+SidecarRuntime::p51_receipt_ledger_for_test(const LinkHello& link) {
+    auto result = std::make_shared<std::optional<P51ReceiptLedgerSnapshot>>();
+    const bool completed = owner_round_trip(
+        [this, link, result] {
+            const auto position = p51_source_relationships_.find(
+                link.c_store_guid);
+            if (position == p51_source_relationships_.end())
+                return;
+            const P51SourceRelationship& relationship = position->second;
+            if (!relationship.link_active ||
+                relationship.logical_id != link.relationship_id.bytes ||
+                relationship.epoch != link.relationship_epoch ||
+                relationship.profile != link.profile ||
+                relationship.physical_link_generation !=
+                    link.physical_link_generation)
+                return;
+            P51ReceiptLedgerSnapshot snapshot;
+            snapshot.committed_prefix_k = relationship.committed_prefix_k;
+            snapshot.acknowledged_prefix_q = relationship.acknowledged_prefix_q;
+            snapshot.selected_window = relationship.selected_window;
+            snapshot.pending_ordinal = relationship.pending_ordinal;
+            snapshot.outstanding_reservations = relationship.outstanding;
+            for (const auto& row : relationship.receipt_rows) {
+                if (!row)
+                    continue;
+                snapshot.receipt_ordinals[snapshot.receipt_count++] =
+                    row->relationship_ordinal;
+            }
+            if (endpoint_)
+                snapshot.endpoint_usage = endpoint_->owner_usage();
+            *result = snapshot;
+        },
+        std::chrono::steady_clock::now() + config_.cancellation_grace);
+    if (!completed)
+        return std::nullopt;
+    return *result;
+}
+
 void SidecarRuntime::run_owner_callback_for_test(
     std::function<void()> callback) {
     if (!callback)
