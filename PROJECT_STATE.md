@@ -365,7 +365,7 @@ test binary hash is
 This is not a clean upstream qualification, W30 restart test, or all-profile
 restart result; the fixture remains under review.
 
-The corresponding C1F2/F-cache restart fixture **fails**: healthy sibling
+The initial C1F2/F-cache restart fixture **failed**: healthy sibling
 progress succeeds, but the obsolete F identity triggers thousands of retries
 and the fresh assignment returns Error without input identity or attachment.
 Evidence: `restart-attach-diagnostic4.raw.log` under the same root
@@ -379,8 +379,20 @@ so endpoint-identity binding rejects the fresh assignment with error 4 and
 zero transfer attempts. Diagnostic evidence: `restart-reset-diagnostic.raw.log`
 under the same root (SHA256
 `ea84ba3e0a41f9859e1e946ee3b50d206d1202f3470725b3f4858ba53972264e`).
-The fix remains pending: old-incarnation retirement must safely settle retained
-preparations without globally disabling C or disturbing its healthy sibling.
+The in-development old-incarnation retirement fix now passes that C1F2
+ZSTD_TU case with the committed retry-backoff sender: the pre-existing healthy
+sibling attaches while the affected parent is stopped, the discarded old
+receipt is not reported committed, and a fresh F identity commits 47 exact
+bytes and attaches to CompileFile. Evidence:
+`/tanksmall/scratch/tmp/p51-retirement-final.0kjizw/restart-C1F2-stage1.log`
+(SHA256 `1a37f804a3c81d9b9ddfc50083475d7d739d344a9965f31224c04dc05c5b295d`),
+outer exit 0; test binary
+`176ac72fa805f5535dd9fb2666555427d49f76613f8b8942c2e0d2e495fd991c`.
+The old operation made 63 bounded connection attempts during its original
+35-second deadline. This private snapshot predates typed-rejection integration;
+it is not qualification of the current combined worktree, all profiles,
+or 30 concurrent jobs during restart. Landing the tested retirement fix and
+qualifying the combined implementation remain pending.
 Retry backoff alone cannot repair this admission failure. The observed
 cancellation withdrawal refers to the dead old incarnation, not its successor.
 Next: finish
