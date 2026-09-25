@@ -1909,17 +1909,20 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool reject_stale_reconnect = false,
                                         bool retire_during_retry_wait = false,
                                         bool close_reconnect_after_hello = false,
-                                        bool reject_after_positive_receipt = false) {
+                                        bool reject_after_positive_receipt = false,
+                                        bool post_reset_offer_probe = false) {
     CHECK(kJobs >= 1 && kJobs <= 30);
+    CHECK(!post_reset_offer_probe || kJobs == 2);
+    const size_t total_jobs = kJobs + (post_reset_offer_probe ? 1 : 0);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
                                     : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
                                     : "ZSTD_TU";
     const auto [c_guid, f_guid] = sender_r2_store_guids();
     const Id128 relationship_id = Id128::from_u64(0x5102);
-    std::vector<P51SourceArmedFields> armed(kJobs);
-    std::vector<std::vector<uint8_t>> input(kJobs);
-    for (size_t index = 0; index != kJobs; ++index) {
+    std::vector<P51SourceArmedFields> armed(total_jobs);
+    std::vector<std::vector<uint8_t>> input(total_jobs);
+    for (size_t index = 0; index != total_jobs; ++index) {
         auto arm = sender_r2_arm(c_guid, 921 + index,
                                  static_cast<uint32_t>(1921 + index),
                                  kWindow, profile);
@@ -1971,14 +1974,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::atomic<unsigned> input_mismatches{0};
     std::atomic<unsigned> materialized{0};
     std::atomic<unsigned> acknowledged{0};
-    std::vector<std::atomic<unsigned>> binds(kJobs);
-    std::vector<std::atomic<unsigned>> commits(kJobs);
-    for (size_t index = 0; index != kJobs; ++index) {
+    std::vector<std::atomic<unsigned>> binds(total_jobs);
+    std::vector<std::atomic<unsigned>> commits(total_jobs);
+    for (size_t index = 0; index != total_jobs; ++index) {
         binds[index].store(0, std::memory_order_relaxed);
         commits[index].store(0, std::memory_order_relaxed);
     }
     std::mutex commit_mutex;
-    std::vector<std::optional<R2TxCommit>> retained_commits(kJobs);
+    std::vector<std::optional<R2TxCommit>> retained_commits(total_jobs);
     std::optional<ResetRequest> retained_reset;
     std::optional<HistoryNonce> initial_history_nonce;
 
@@ -1992,10 +1995,10 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         const TxCommit& commit,
                                         std::span<const uint8_t> bytes) {
         const size_t index = static_cast<size_t>(begin.tu_seq.value);
-        if (index >= kJobs || begin.profile != profile ||
-            (index < kJobs && commit.raw_digest != icecc::digest128(input[index])) ||
-            (index < kJobs && bytes.size() != input[index].size()) ||
-            (index < kJobs &&
+        if (index >= total_jobs || begin.profile != profile ||
+            (index < total_jobs && commit.raw_digest != icecc::digest128(input[index])) ||
+            (index < total_jobs && bytes.size() != input[index].size()) ||
+            (index < total_jobs &&
              !std::equal(bytes.begin(), bytes.end(), input[index].begin()))) {
             input_mismatches.fetch_add(1, std::memory_order_relaxed);
         } else if (index == 0) {
@@ -2055,7 +2058,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         [&, deadline](const LinkHello& hello, const JobBind& binding)
             -> std::optional<P51SourceJobLease> {
         if (binding.relationship_ordinal == 0 ||
-            binding.relationship_ordinal > kJobs ||
+            binding.relationship_ordinal > total_jobs ||
             binding.physical_link_generation != hello.physical_link_generation ||
             binding.profile != profile)
             return std::nullopt;
@@ -2098,7 +2101,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             const R2TxCommit& commit) {
         if (hello.relationship_id != relationship_id ||
             binding.relationship_ordinal == 0 ||
-            binding.relationship_ordinal > kJobs ||
+            binding.relationship_ordinal > total_jobs ||
             commit.relationship_ordinal != binding.relationship_ordinal ||
             commit.inner.raw_digest != binding.raw_digest ||
             commit.inner.tu_seq != binding.tu_seq)
@@ -2118,7 +2121,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             ack.relationship_id != relationship_id ||
             ack.relationship_epoch != hello.relationship_epoch ||
             ack.physical_link_generation != hello.physical_link_generation ||
-            ack.contiguous_verified_ordinal > kJobs)
+            ack.contiguous_verified_ordinal > total_jobs)
             return false;
         acknowledged.store(static_cast<unsigned>(ack.contiguous_verified_ordinal),
                            std::memory_order_release);
@@ -2594,6 +2597,56 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     for (size_t index = 1; index != kJobs; ++index)
         CHECK(binds[index].load() == 1); // uncommitted suffix binds after reset
 
+    if (post_reset_offer_probe) {
+        CHECK(retained_reset.has_value());
+        CHECK(retained_reset->new_relationship_epoch ==
+              armed[0].relationship_epoch + 1);
+        const unsigned connectors_after_reset =
+            connector_calls.load(std::memory_order_acquire);
+
+        P51SourceArmedFields future_epoch_arm = armed[kJobs];
+        future_epoch_arm.relationship_epoch =
+            retained_reset->new_relationship_epoch + 1;
+        const auto future_result = asio::co_spawn(
+            c_context,
+            sender->transfer_p51_route(
+                future_epoch_arm, 41, connector,
+                PrepareRequestKey{3, 921 + kJobs},
+                deadline.as_steady_time_point(), input[kJobs]),
+            asio::use_future).get();
+        CHECK(future_result.status == ZstdSourceTransferStatus::InvalidRequest);
+        CHECK(!future_result.committed_input);
+        CHECK(connector_calls.load(std::memory_order_acquire) ==
+              connectors_after_reset);
+        CHECK(commits[kJobs].load(std::memory_order_acquire) == 0);
+
+        // A queued pre-RESET ARM remains valid: only its relationship epoch
+        // is rebased to the verified current epoch. The same request must
+        // then commit on the already-recovered physical link.
+        const auto fresh_result = asio::co_spawn(
+            c_context,
+            sender->transfer_p51_route(
+                armed[kJobs], 41, connector,
+                PrepareRequestKey{3, 921 + kJobs},
+                deadline.as_steady_time_point(), input[kJobs]),
+            asio::use_future).get();
+        CHECK(fresh_result.status == ZstdSourceTransferStatus::Committed);
+        CHECK(fresh_result.raw_bytes == input[kJobs].size());
+        CHECK(fresh_result.raw_digest == icecc::digest128(input[kJobs]));
+        CHECK((fresh_result.committed_input ==
+               InputRecordKey{c_guid, TuSeq{kJobs}}));
+        CHECK(commits[kJobs].load(std::memory_order_acquire) == 1);
+        CHECK(connector_calls.load(std::memory_order_acquire) ==
+              connectors_after_reset);
+        {
+            std::unique_lock lock(ack_mutex);
+            CHECK(ack_cv.wait_until(lock, deadline.as_steady_time_point(), [&] {
+                return acknowledged.load(std::memory_order_acquire) == total_jobs;
+            }));
+        }
+        CHECK(acknowledged.load(std::memory_order_acquire) == total_jobs);
+    }
+
     std::promise<void> retirement_posted;
     auto retirement_done = retirement_posted.get_future();
     asio::post(c_context, [&sender, &retirement_posted] {
@@ -2634,6 +2687,15 @@ void test_p51_sender_shared_failure_recovers_pending_callers() {
                                     ProfileId::ZSTD_ROUTE}) {
         run_p51_sender_shared_failure_case(2, profile);
         run_p51_sender_shared_failure_case(30, profile);
+    }
+}
+
+void test_p51_sender_post_reset_offer_rebase_and_future_reject() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        run_p51_sender_shared_failure_case(
+            2, profile, false, false, false, false, false, false,
+            false, true);
     }
 }
 
@@ -3177,6 +3239,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--post-reset-offer-rebase") {
+        test_p51_sender_post_reset_offer_rebase_and_future_reject();
+        std::cerr << "P51_SENDER_POST_RESET_OFFER_REBASE_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--shared-failure-route30") {
         run_p51_sender_shared_failure_case(30, ProfileId::ZSTD_ROUTE);
         std::cerr << "P51_SENDER_SHARED_FAILURE_ROUTE30_SELECTOR PASS\n";
@@ -3248,6 +3316,8 @@ int main(int argc, char** argv) {
     run("positive_after_rejection", test_p51_sender_positive_commit_survives_later_typed_rejection);
     run("lost_commit_recovery", test_p51_sender_recovers_lost_commit_reply_after_connector_failure);
     run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
+    run("post_reset_offer_rebase",
+        test_p51_sender_post_reset_offer_rebase_and_future_reject);
     run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
     run("reconnect_backoff", test_p51_sender_reconnect_backoff_bounds_shared_eof);
     run("retry_wait_retire", test_p51_sender_retirement_wakes_shared_retry_waiter);

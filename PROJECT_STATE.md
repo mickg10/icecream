@@ -52,6 +52,38 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+The sender now rebases an older same-relationship ARM onto its verified
+post-RESET epoch and physical connection. A future-epoch offer on a healthy
+link is rejected before preparation, without disrupting valid work. During
+uncertain recovery, classification waits for the verified recovered epoch;
+rejecting a caller must not mark a successfully recovered link as failed.
+The focused post-RESET probe passes for P29V1, ZSTD_TU and ZSTD_ROUTE: reject
+the future offer, then commit the original older ARM with exact bytes and
+cumulative ACK without another connector call. The full sender suite also
+passes on that frozen closure (retained container
+`p51-postreset-allprofiles-r2`, exit 0). Evidence under
+`/tanksmall/scratch/tmp/p51-route-reap.6Pp7wd/logs/`:
+`post-reset-offer-rebase-allprofiles-r1.log`, SHA256
+`7418d0d67ce14cd527ec8527ab142c1ce41a23620ecbb71b2329de4e97ae6898`;
+`sender-full-after-postreset-r1.log`, SHA256
+`1b05610e9ea5860c78e3e42cf7294867cd429870af1ff4798dfaf7b2fda05e1e`.
+Sender source SHA256:
+`b42a6fb0361f70d1d29a9fb52748e6728d31f5e40a12135f67332118cb5c926c`;
+test source: `f305c2e34e1442679d853a41684b8e108f4ccdaac61a75fbfe13a61c7cca089e`.
+This closure includes endpoint idle-history bookkeeping changes; it is not
+qualification of the combined service/route-owner changes. The focused probe
+does not exercise a future offer acting as recovery coordinator during a
+lost RESET reply, or concurrent replacement callers. Those remain open.
+The matching endpoint unit suite passes separately, exit 0:
+`post-reset-endpoint-unit-r1.log` in the same directory, SHA256
+`a37e440c8ae7d87432f0190baa5f2f6659e8d5506b942437238e2d39fade9532`.
+Endpoint source/header SHA256:
+`bc83d20be683c0b1574a900a16b7fffcb13b64af2a12a080ffd9afdca8c3071d` /
+`58e25a4aaa3424ccbbe3d5c5c232e00271debafc9a34db9a13ccb2ec94312d2b`.
+The endpoint now tracks the exact R2 relationship owning each codec history
+and exposes quiescent history retirement without deleting committed inputs.
+Service/owner adoption and concurrent replacement qualification remain pending.
+
 The R2 sender now retries failed initial connection setup for the original
 caller, retaining its prepared TU, assignment, and absolute deadline. It uses
 the shared bounded backoff, checks retirement before using a returned fd,

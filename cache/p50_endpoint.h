@@ -756,6 +756,13 @@ public:
     // committed residents and unrelated recovery rows are untouched.
     bool retire_p51_recovery_install(const JobBind& binding);
     bool retire_p51_recovery_install(Id128 reservation_id);
+    // Retires only the quiescent codec-history row owned by an exact idle R2
+    // relationship. The C namespace, committed input records, global resident
+    // objects, and other profile histories remain in place.
+    bool retire_idle_p51_route_history(CStoreGuid c_store_guid,
+                                       ProfileId profile,
+                                       Id128 relationship_id,
+                                       uint64_t relationship_epoch) noexcept;
 
     // Cancels the active socket on the endpoint's owner executor. The caller
     // must arrange that affinity (SidecarRuntime posts this method); it never

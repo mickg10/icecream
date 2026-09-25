@@ -2410,6 +2410,12 @@ struct P50ServerEndpoint::Impl {
         HistoryNonce nonce{};
         RelSeq next_rel{};
         Digest128 state{};
+        // R2 relationship identity owns the codec history independently of
+        // the enclosing C namespace. An idle relationship may be retired
+        // while committed input records and other profile routes remain live.
+        bool p51_managed = false;
+        Id128 p51_relationship_id{};
+        uint64_t p51_relationship_epoch = 0;
         Digest128 c_system_source_fingerprint{};
         Digest128 f_system_source_fingerprint{};
         bool system_source_reuse = false;
@@ -5295,6 +5301,48 @@ bool P50ServerEndpoint::retire_p51_recovery_install(
     return false;
 }
 
+bool P50ServerEndpoint::retire_idle_p51_route_history(
+    CStoreGuid c_store_guid, ProfileId profile, Id128 relationship_id,
+    uint64_t relationship_epoch) noexcept {
+    try {
+        impl_->owner.require();
+        if (c_store_guid == CStoreGuid{} || relationship_id == Id128{} ||
+            relationship_epoch == 0 ||
+            (profile != ProfileId::P29V1 && profile != ProfileId::ZSTD_TU &&
+             profile != ProfileId::ZSTD_ROUTE))
+            return false;
+
+        const auto namespace_position = impl_->namespaces.find(c_store_guid);
+        if (namespace_position == impl_->namespaces.end())
+            return true;
+        Impl::Namespace& space = namespace_position->second;
+        if (space.active_session != 0 ||
+            impl_->namespace_has_live_session(c_store_guid))
+            return false;
+        const auto route_position = space.routes.find(profile);
+        if (route_position == space.routes.end())
+            return !space.nonce_high_water.contains(profile);
+
+        const Impl::Route& route = route_position->second;
+        if (!route.p51_managed ||
+            route.p51_relationship_id != relationship_id ||
+            route.p51_relationship_epoch != relationship_epoch ||
+            route.pending || route.interrupted || route.recovery_install)
+            return false;
+
+        // Only this route's P29 dictionary-segment references are released;
+        // the enclosing namespace, InputRecordStore, and unrelated global
+        // residents remain owned exactly as before the relationship retired.
+        if (profile == ProfileId::P29V1)
+            impl_->invalidate_p29v1_codec(c_store_guid, space);
+        space.routes.erase(route_position);
+        space.nonce_high_water.erase(profile);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,
                                                                       EndpointIoControl control) {
     impl_->owner.require();
@@ -5950,6 +5998,21 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
             impl_->caps.supported_profiles,
             SessionLimits{frame_cap, encoded_cap});
         const SessionState staged = impl_->stage(session, ordinary_hello, selection);
+        if (link_lease->reconnect) {
+            const auto retained_namespace =
+                impl_->namespaces.find(hello.c_store_guid);
+            const auto* retained_route =
+                retained_namespace == impl_->namespaces.end()
+                    ? nullptr
+                    : impl_->find_route(retained_namespace->second,
+                                        hello.profile);
+            if (retained_route == nullptr || !retained_route->p51_managed ||
+                retained_route->p51_relationship_id != hello.relationship_id ||
+                retained_route->p51_relationship_epoch !=
+                    link_lease->relationship_epoch)
+                throw std::invalid_argument(
+                    "R2 reconnect does not match retained relationship history");
+        }
         if (!link_lease->reconnect && staged.route_present)
             throw std::invalid_argument(
                 "R2 initial link requires fresh history; recovery is not enabled");
@@ -5992,6 +6055,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 hello.history_nonce,
                 initial_route_digest(hello.c_store_guid, hello.history_nonce)};
             impl_->reset_history(session, initial);
+            auto& route = impl_->namespaces.at(hello.c_store_guid)
+                              .routes.at(hello.profile);
+            route.p51_managed = true;
+            route.p51_relationship_id = hello.relationship_id;
+            route.p51_relationship_epoch = link_lease->relationship_epoch;
         }
         SessionState route_state = impl_->session_state(session, selection);
         if (link_lease->reconnect) {
@@ -6167,6 +6235,12 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                         reset_request.new_history_nonce,
                         reset_ack.initial_state_digest};
                     impl_->reset_history(session, reset);
+                    auto& reset_route = impl_->namespaces.at(hello.c_store_guid)
+                                            .routes.at(hello.profile);
+                    reset_route.p51_managed = true;
+                    reset_route.p51_relationship_id = hello.relationship_id;
+                    reset_route.p51_relationship_epoch =
+                        reset_request.new_relationship_epoch;
                     if (!impl_->config.commit_p51_reset ||
                         !impl_->config.commit_p51_reset(
                             hello, reset_request, reset_ack))

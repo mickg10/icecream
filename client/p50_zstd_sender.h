@@ -124,6 +124,10 @@ struct ZstdSourceTransferConfig {
     // true yields through a short timer, leaving the sole writer and F peer
     // independently runnable.
     std::function<bool()> hold_r2_receipt_reader_for_test;
+    // Asynchronous test gate for the cumulative ACK pump. It is used to prove
+    // that a replacement ARM waits for ACK-only tail work without retiring a
+    // relationship that still has an unsettled bundle.
+    std::function<bool()> hold_r2_ack_pump_for_test;
     // Test-only seam invoked after a recovery caller has registered on the
     // shared retry timer. Product callers leave this empty.
     std::function<void(std::chrono::steady_clock::duration)>
@@ -204,8 +208,9 @@ public:
 
     // Persistent P51 R2 relationship path. The connector is used once on
     // first use to obtain the clean post-P51_CACHE_LINK_SESSION TCP socket;
-    // later exact-incarnation jobs reuse that socket and send one bundle at a
-    // time at W1 while the endpoint's writer/reader primitives remain split.
+    // later exact-incarnation jobs reuse that socket and send bounded bundles
+    // through the sole writer while the independent receipt reader advances
+    // the cumulative-ACK window.
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_p51_route(
         P51SourceArmedFields armed, uint64_t physical_link_generation,
         AsyncConnectedFdFactory connection, PrepareRequestKey request,
@@ -218,6 +223,10 @@ public:
     // Owner-affine generation floor used when a strictly newer logical
     // relationship replaces an idle same-key relationship.
     [[nodiscard]] uint64_t current_r2_physical_generation() const noexcept;
+    [[nodiscard]] bool can_rebind_r2_relationship() const noexcept;
+    // True only while the link has no bundle awaiting a receipt/recovery and
+    // any remaining activity is draining cumulative ACK work or its caller.
+    [[nodiscard]] bool r2_rebind_waitable() const noexcept;
 
 private:
     using ConnectionTarget =

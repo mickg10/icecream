@@ -596,6 +596,27 @@ uint64_t P50ZstdSourceSender::current_r2_physical_generation() const noexcept {
                     impl_->r2_attempted_physical_generation);
 }
 
+bool P50ZstdSourceSender::can_rebind_r2_relationship() const noexcept {
+    std::lock_guard lock(impl_->r2_transfer_mutex);
+    return !impl_->r2_transfer_active && impl_->r2_transfer_waiters.empty() &&
+           impl_->r2_receipt_queue.empty() && impl_->r2_retained_jobs.empty() &&
+           impl_->r2_active_requests.empty() &&
+           !impl_->r2_recovery_required &&
+           impl_->r2_pending_ack_ordinal == 0 &&
+           !impl_->r2_ack_pump_running;
+}
+
+bool P50ZstdSourceSender::r2_rebind_waitable() const noexcept {
+    std::lock_guard lock(impl_->r2_transfer_mutex);
+    const bool no_unsettled_bundle = impl_->r2_receipt_queue.empty() &&
+        impl_->r2_retained_jobs.empty() && !impl_->r2_recovery_required;
+    const bool draining_ack = impl_->r2_pending_ack_ordinal != 0 ||
+        impl_->r2_ack_pump_running;
+    return no_unsettled_bundle && impl_->r2_transfer_waiters.empty() &&
+        (draining_ack || (!impl_->r2_transfer_active &&
+                          !impl_->r2_active_requests.empty()));
+}
+
 boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
     Clock::time_point deadline) {
     const auto executor = co_await boost::asio::this_coro::executor;
@@ -903,6 +924,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
             }
         }
     } notify{&impl_->config.on_r2_background_quiescent};
+    const auto executor = co_await boost::asio::this_coro::executor;
     for (;;) {
         uint64_t target = 0;
         {
@@ -916,6 +938,22 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
         }
         if (impl_->r2_physical_link_generation != physical_link_generation ||
             impl_->r2_ack_pump_generation != physical_link_generation) {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_ack_pump_generation == physical_link_generation)
+                impl_->r2_ack_pump_running = false;
+            co_return;
+        }
+        while (impl_->config.hold_r2_ack_pump_for_test &&
+               impl_->config.hold_r2_ack_pump_for_test()) {
+            if (impl_->route_replacement_required ||
+                impl_->r2_physical_link_generation != physical_link_generation)
+                break;
+            boost::asio::steady_timer hold(executor);
+            hold.expires_after(std::chrono::milliseconds(1));
+            co_await hold.async_wait(boost::asio::use_awaitable);
+        }
+        if (impl_->route_replacement_required ||
+            impl_->r2_physical_link_generation != physical_link_generation) {
             std::lock_guard lock(impl_->r2_transfer_mutex);
             if (impl_->r2_ack_pump_generation == physical_link_generation)
                 impl_->r2_ack_pump_running = false;
@@ -1378,6 +1416,26 @@ P50ZstdSourceSender::transfer_p51_route(
         if (impl_->route_replacement_required)
             co_return impl_->r2_route_replacement_result(
                 ZstdSourceTransferStatus::Unavailable);
+        const Id128 armed_relationship_id{armed.logical_relationship_id};
+        if (impl_->r2_hello &&
+            impl_->r2_hello->relationship_id == armed_relationship_id &&
+            impl_->r2_relationship_id == armed_relationship_id &&
+            !impl_->r2_recovery_required &&
+            impl_->r2_hello->relationship_epoch ==
+                impl_->r2_relationship_epoch) {
+            if (armed.relationship_epoch > impl_->r2_relationship_epoch)
+                co_return impl_->invalid(
+                    ZstdSourceTransferStatus::InvalidRequest);
+            // A prior caller may have completed a validated RESET while this
+            // request's original ARM was queued locally. Preserve its
+            // reservation/job identity but bind it to the sender's verified
+            // current relationship epoch and physical generation.
+            if (armed.relationship_epoch < impl_->r2_relationship_epoch)
+                armed.relationship_epoch = impl_->r2_relationship_epoch;
+            physical_link_generation = std::max(
+                physical_link_generation,
+                current_r2_physical_generation());
+        }
         if (impl_->r2_recovery_required) {
             writer_guard.reset();
             if (!co_await wait_for_r2_recovery_retry(deadline)) {
@@ -1412,6 +1470,15 @@ P50ZstdSourceSender::transfer_p51_route(
             try {
                 co_await recover_r2_link(connection,
                                          physical_link_generation, deadline);
+                if (armed.relationship_epoch >
+                        impl_->r2_relationship_epoch ||
+                    physical_link_generation >
+                        impl_->r2_physical_link_generation)
+                    // Recovery succeeded for the shared link. Reject only
+                    // this caller's inconsistent offer; do not route it
+                    // through the transport-recovery failure handler.
+                    co_return impl_->invalid(
+                        ZstdSourceTransferStatus::InvalidRequest);
                 physical_link_generation =
                     impl_->r2_physical_link_generation;
                 armed.relationship_epoch = impl_->r2_relationship_epoch;
