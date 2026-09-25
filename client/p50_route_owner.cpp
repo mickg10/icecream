@@ -1,6 +1,10 @@
 #include "p50_route_owner.h"
 #include "services/comm.h"
 
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
@@ -39,6 +43,7 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
     result.on_r2_background_quiescent = owner_config.post_retired_reap;
     result.hold_r2_receipt_reader_for_test =
         owner_config.hold_r2_receipt_reader_for_test;
+    result.hold_r2_ack_pump_for_test = owner_config.hold_r2_ack_pump_for_test;
     return result;
 }
 
@@ -140,6 +145,70 @@ void P50CRouteOwner::reap_retired_senders() noexcept {
     }
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+boost::asio::awaitable<bool>
+P50CRouteOwner::wait_for_retired_route_quiescence(
+    PreparationRouteKey route,
+    std::chrono::steady_clock::time_point deadline) {
+    const auto executor = co_await boost::asio::this_coro::executor;
+    const auto pending = [&] {
+        return std::any_of(
+            retired_senders_.begin(), retired_senders_.end(),
+            [&](const RetiredSender& retired) {
+                return retired.abandon_route_when_quiescent &&
+                       *retired.abandon_route_when_quiescent == route;
+            });
+    };
+    while (pending()) {
+        reap_retired_senders();
+        if (!pending())
+            co_return true;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            co_return false;
+        boost::asio::steady_timer timer(executor);
+        timer.expires_at(std::min(
+            deadline, now + std::chrono::milliseconds(2)));
+        co_await timer.async_wait(boost::asio::use_awaitable);
+    }
+    co_return true;
+}
+
+boost::asio::awaitable<bool>
+P50CRouteOwner::wait_for_sender_rebind_quiescence(
+    const Sender& sender,
+    std::chrono::steady_clock::time_point deadline) {
+    const auto executor = co_await boost::asio::this_coro::executor;
+    bool observed_wait = false;
+    while (sender && !sender->can_rebind_r2_relationship()) {
+        // Only a fully settled link whose remaining work is ACK completion (or
+        // the just-finished caller unwinding) may be waited out here. A live
+        // bundle, receipt, recovery, or unrelated writer waiter is a real
+        // overlap and must leave the old relationship untouched.
+        if (!sender->r2_rebind_waitable())
+            co_return false;
+        if (!observed_wait && config_.after_r2_rebind_wait_for_test) {
+            observed_wait = true;
+            try {
+                config_.after_r2_rebind_wait_for_test();
+            } catch (...) {
+                // A fixture observer cannot affect route transition policy.
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            co_return false;
+        boost::asio::steady_timer timer(executor);
+        timer.expires_at(std::min(
+            deadline, now + std::chrono::milliseconds(2)));
+        co_await timer.async_wait(boost::asio::use_awaitable);
+    }
+    co_return sender && sender->can_rebind_r2_relationship();
+}
+
 PreparationRouteKey P50CRouteOwner::route_key(
     const P50RouteRelationship& relationship) const noexcept {
     return {relationship.f_store_guid, relationship.f_store_generation,
@@ -233,10 +302,6 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     co_return result;
 }
 
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-#endif
 boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
     P50RouteRelationship relationship, P51SourceArmedFields armed,
     AsyncConnectedFdFactory connection, PrepareRequestKey request,
@@ -263,7 +328,116 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
     const Id128 logical_relationship_id{armed.logical_relationship_id};
     if (logical_relationship_id == Id128{} || armed.relationship_epoch == 0)
         co_return invalid();
-    const auto logical_position = p51_link_identities_.find(relationship);
+    const PreparationRouteKey preparation_route = route_key(relationship);
+    if (!co_await wait_for_retired_route_quiescence(preparation_route,
+                                                    deadline)) {
+        ZstdSourceTransferResult unavailable;
+        unavailable.status = ZstdSourceTransferStatus::Unavailable;
+        unavailable.profile = relationship.profile;
+        unavailable.route_local_failure = true;
+        co_return unavailable;
+    }
+    auto logical_position = p51_link_identities_.find(relationship);
+    if (logical_position != p51_link_identities_.end() &&
+        logical_position->second.relationship_id != logical_relationship_id) {
+        // A newly authenticated ARM for the same exact C/F/profile route may
+        // replace an idle relationship only at a strictly newer epoch. Fence
+        // its sender before codec authority is discarded; the old callers and
+        // detached reader/ACK pumps retain shared ownership until they unwind.
+        if (armed.relationship_epoch <=
+            logical_position->second.relationship_epoch)
+            co_return invalid();
+        const P51LinkIdentity prior_identity = logical_position->second;
+        auto old_sender = owners_.find(relationship);
+        auto generation_position = physical_generations_.find(relationship);
+        if (old_sender == owners_.end() || !old_sender->second ||
+            generation_position == physical_generations_.end() ||
+            retired_senders_.size() >= config_.max_relationships)
+            co_return invalid();
+        Sender old_sender_keepalive = old_sender->second;
+        if (!old_sender_keepalive->can_rebind_r2_relationship() &&
+            !co_await wait_for_sender_rebind_quiescence(old_sender_keepalive,
+                                                         deadline))
+            co_return invalid();
+
+        // The await above permits another request on this owner to make
+        // progress. Revalidate every route-local assumption before fencing
+        // the prior sender; stale waiters may not retire a successor.
+        logical_position = p51_link_identities_.find(relationship);
+        old_sender = owners_.find(relationship);
+        generation_position = physical_generations_.find(relationship);
+        if (logical_position != p51_link_identities_.end() &&
+            logical_position->second.relationship_id == logical_relationship_id &&
+            logical_position->second.relationship_epoch >=
+                armed.relationship_epoch) {
+            // Another waiter installed this exact authenticated successor
+            // while we were suspended on ACK-only quiescence. Release our old
+            // sender reference before waiting for its route cleanup so it
+            // cannot prevent the first waiter from reaping that route.
+            old_sender_keepalive.reset();
+            if (!co_await wait_for_retired_route_quiescence(preparation_route,
+                                                            deadline)) {
+                ZstdSourceTransferResult unavailable;
+                unavailable.status = ZstdSourceTransferStatus::Unavailable;
+                unavailable.profile = relationship.profile;
+                unavailable.route_local_failure = true;
+                co_return unavailable;
+            }
+            logical_position = p51_link_identities_.find(relationship);
+            if (logical_position == p51_link_identities_.end() ||
+                logical_position->second.relationship_id !=
+                    logical_relationship_id ||
+                logical_position->second.relationship_epoch <
+                    armed.relationship_epoch)
+                co_return invalid();
+        } else {
+            if (logical_position == p51_link_identities_.end() ||
+                logical_position->second.relationship_id !=
+                    prior_identity.relationship_id ||
+                logical_position->second.relationship_epoch !=
+                    prior_identity.relationship_epoch ||
+                old_sender == owners_.end() ||
+                old_sender->second != old_sender_keepalive ||
+                generation_position == physical_generations_.end() ||
+                !old_sender_keepalive->can_rebind_r2_relationship() ||
+                retired_senders_.size() >= config_.max_relationships)
+                co_return invalid();
+            const uint64_t prior_generation =
+                old_sender_keepalive->current_r2_physical_generation();
+            if (prior_generation == UINT64_MAX)
+                co_return invalid();
+            const uint64_t successor_generation = std::max(
+                next_physical_generation_, prior_generation + 1);
+            if (successor_generation == 0 ||
+                successor_generation == UINT64_MAX)
+                co_return invalid();
+
+            old_sender_keepalive->retire_for_replacement();
+            retired_senders_.push_back(
+                {std::move(old_sender_keepalive), preparation_route});
+            owners_.erase(old_sender);
+            generation_position->second = successor_generation;
+            next_physical_generation_ = successor_generation + 1;
+            logical_position->second =
+                P51LinkIdentity{logical_relationship_id,
+                                armed.relationship_epoch};
+            if (!co_await wait_for_retired_route_quiescence(preparation_route,
+                                                            deadline)) {
+                ZstdSourceTransferResult unavailable;
+                unavailable.status = ZstdSourceTransferStatus::Unavailable;
+                unavailable.profile = relationship.profile;
+                unavailable.route_local_failure = true;
+                co_return unavailable;
+            }
+            logical_position = p51_link_identities_.find(relationship);
+            if (logical_position == p51_link_identities_.end() ||
+                logical_position->second.relationship_id !=
+                    logical_relationship_id ||
+                logical_position->second.relationship_epoch <
+                    armed.relationship_epoch)
+                co_return invalid();
+        }
+    }
     if (logical_position != p51_link_identities_.end() &&
         logical_position->second.relationship_id != logical_relationship_id)
         co_return invalid();
@@ -287,6 +461,17 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
                 relationship, next_physical_generation_++).first;
         }
         physical_generation = position->second;
+        const uint64_t sender_generation =
+            sender->current_r2_physical_generation();
+        if (sender_generation == UINT64_MAX)
+            throw std::overflow_error("physical R2 link generation exhausted");
+        if (sender_generation != 0) {
+            physical_generation = std::max(physical_generation,
+                                           sender_generation);
+            position->second = physical_generation;
+            if (next_physical_generation_ <= sender_generation)
+                next_physical_generation_ = sender_generation + 1;
+        }
         if (logical_position == p51_link_identities_.end())
             p51_link_identities_.emplace(
                 relationship,

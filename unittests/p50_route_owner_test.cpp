@@ -6,6 +6,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_future.hpp>
 
@@ -1746,6 +1747,7 @@ void test_retired_route_reaped_when_background_reader_goes_idle() {
     bool server_done = false;
     bool transfer_done = false;
     bool watchdog_fired = false;
+    bool active_new_relationship_rejected = false;
     asio::steady_timer fixture_watchdog(context);
     fixture_watchdog.expires_after(std::chrono::seconds(10));
     fixture_watchdog.async_wait([&](const boost::system::error_code& error) {
@@ -1826,9 +1828,23 @@ void test_retired_route_reaped_when_background_reader_goes_idle() {
             co_await retirement_watch.async_wait(asio::use_awaitable);
         }
         if (reader_entered.load(std::memory_order_acquire) &&
-            commit_calls.load(std::memory_order_acquire) == 1)
+            commit_calls.load(std::memory_order_acquire) == 1) {
+            // A higher-epoch, different-ID ARM cannot retire this route while
+            // its original TU is still awaiting its exact receipt.
+            P51SourceArmedFields newer_arm = armed;
+            newer_arm.logical_relationship_id =
+                Id128::from_u64(0x91310001).bytes;
+            ++newer_arm.relationship_epoch;
+            CHECK(newer_arm.valid());
+            const auto active_result = co_await owner.transfer_p51(
+                route, newer_arm, connector, request_key,
+                deadline.as_steady_time_point(), source);
+            active_new_relationship_rejected =
+                active_result.status == ZstdSourceTransferStatus::InvalidRequest &&
+                !active_result.replacement_required;
             retired = owner.retire_f_store_exact_p51(
                 f_guid, route.f_store_generation);
+        }
         if (!retired)
             hold_reader.store(false, std::memory_order_release);
         co_return;
@@ -1844,6 +1860,7 @@ void test_retired_route_reaped_when_background_reader_goes_idle() {
         CHECK(watchdog_fired);
     }
     CHECK(!watchdog_fired);
+    CHECK(active_new_relationship_rejected);
     CHECK(retired);
     CHECK(caller_finished_before_reap);
     CHECK(transfer_result.status != ZstdSourceTransferStatus::Committed);
@@ -1855,9 +1872,382 @@ void test_retired_route_reaped_when_background_reader_goes_idle() {
     std::puts("P51_ROUTE_OWNER idle background-pump retirement reap: ok");
 }
 
+void test_concurrent_same_successor_joins_one_rebound_sender() {
+    const ProfileId profile = ProfileId::ZSTD_TU;
+    const CStoreGuid c_guid{topology_guid(41, false)};
+    const FStoreGuid f_guid{topology_guid(141, true)};
+    const P50RouteRelationship route{c_guid, f_guid, 92, profile};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(18),
+        clock.clock_domain_id, clock.time_namespace_id);
+
+    TopologyLink old_link;
+    old_link.c_guid = c_guid;
+    old_link.f_guid = f_guid;
+    old_link.relationship = Id128::from_u64(0x9141);
+    old_link.relationship_epoch = 1;
+    old_link.c_generation = 42;
+    old_link.f_generation = route.f_store_generation;
+    old_link.control_generation = 43;
+    old_link.control_attempt = 44;
+    auto old_arm = topology_arm(old_link, 241, profile);
+    P51SourceArmedFields old_armed = topology_armed(
+        old_link, std::move(old_arm), 241);
+    old_armed.selected_window = 1;
+    const PrepareRequestKey old_request{
+        old_armed.arm.source.assignment_epoch,
+        old_armed.arm.source.source_request_id};
+    const std::vector<uint8_t> old_source{'o','l','d','-','r','e','l','a','t','i','o','n'};
+
+    TopologyLink successor_link;
+    successor_link.c_guid = old_link.c_guid;
+    successor_link.f_guid = old_link.f_guid;
+    successor_link.relationship = Id128::from_u64(0x9142);
+    successor_link.relationship_epoch = 2;
+    successor_link.c_generation = old_link.c_generation;
+    successor_link.f_generation = old_link.f_generation;
+    successor_link.control_generation = old_link.control_generation;
+    successor_link.control_attempt = old_link.control_attempt;
+    std::array<P51SourceArmedFields, 2> successor_armed;
+    std::array<std::vector<uint8_t>, 2> successor_source{
+        std::vector<uint8_t>{'n','e','w','-','o','n','e'},
+        std::vector<uint8_t>{'n','e','w','-','t','w','o'}};
+    for (size_t i = 0; i != successor_armed.size(); ++i) {
+        auto arm = topology_arm(successor_link,
+                                static_cast<uint32_t>(242 + i), profile);
+        successor_armed[i] = topology_armed(
+            successor_link, std::move(arm), 242 + i);
+        successor_armed[i].selected_window = 2;
+        CHECK(successor_armed[i].valid());
+    }
+    CHECK(old_armed.valid());
+
+    std::atomic<bool> hold_ack_pump{true};
+    std::atomic<bool> ack_pump_entered{false};
+    std::atomic<unsigned> rebind_waiters{0};
+    std::atomic<unsigned> retired_reaps{0};
+    std::atomic<unsigned> connectors{0};
+    std::atomic<unsigned> old_commits{0};
+    std::array<std::atomic<unsigned>, 2> successor_commits{};
+    std::array<std::atomic<unsigned>, 2> successor_acks{};
+    std::atomic<unsigned> input_mismatches{0};
+    std::mutex observer_mutex;
+    std::condition_variable observer_cv;
+
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50RouteOwnerConfig owner_config = config(profile);
+    owner_config.authority_limits.max_speculative_tus = 2;
+    owner_config.authority_limits.max_speculative_raw_bytes = 1U << 20;
+    owner_config.authority_limits.max_live_entries = 16;
+    owner_config.max_relationships = 4;
+    owner_config.maximum_duration = std::chrono::seconds(18);
+    owner_config.hold_r2_ack_pump_for_test = [&] {
+        ack_pump_entered.store(true, std::memory_order_release);
+        observer_cv.notify_all();
+        return hold_ack_pump.load(std::memory_order_acquire);
+    };
+    owner_config.after_r2_rebind_wait_for_test = [&] {
+        rebind_waiters.fetch_add(1, std::memory_order_release);
+        observer_cv.notify_all();
+    };
+
+    asio::io_context context;
+    P50CRouteOwner* owner_ptr = nullptr;
+    owner_config.post_retired_reap = [&] {
+        context.post([&] {
+            if (owner_ptr)
+                owner_ptr->reap_retired_p51();
+        });
+    };
+    owner_config.after_retired_route_reaped_for_test = [&] {
+        retired_reaps.fetch_add(1, std::memory_order_release);
+        observer_cv.notify_all();
+    };
+    P50CRouteOwner owner(std::move(owner_config));
+    owner_ptr = &owner;
+
+    P50ServerEndpointConfig server_config;
+    const auto find_job = [&](const Id128& reservation) -> int {
+        if (reservation == Id128{old_armed.reservation_id}) return -1;
+        for (size_t i = 0; i != successor_armed.size(); ++i)
+            if (reservation == Id128{successor_armed[i].reservation_id})
+                return static_cast<int>(i);
+        return -2;
+    };
+    server_config.lookup_p51_link_reservation =
+        [&, deadline](const LinkHello& hello)
+            -> std::optional<P51SourceLinkLease> {
+        const int job = find_job(hello.reservation_id);
+        if ((hello.relationship_id != old_link.relationship &&
+             hello.relationship_id != successor_link.relationship) ||
+            hello.f_store_guid != f_guid ||
+            hello.f_store_generation != route.f_store_generation ||
+            hello.c_store_guid != c_guid || job == -2 ||
+            (hello.relationship_id == old_link.relationship && job != -1) ||
+            (hello.relationship_id == successor_link.relationship && job == -1))
+            return std::nullopt;
+        P51SourceLinkLease lease;
+        lease.initial_armed = job == -1 ? old_armed
+                                        : successor_armed[static_cast<size_t>(job)];
+        lease.absolute_deadline = deadline;
+        lease.relationship_epoch = hello.relationship_epoch;
+        lease.history_nonce = hello.history_nonce;
+        return lease;
+    };
+    server_config.consume_p51_job_reservation =
+        [&, deadline](const LinkHello& hello, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        const int job = find_job(binding.reservation_id);
+        const bool old = job == -1;
+        const Id128 expected_relationship = old
+            ? old_link.relationship : successor_link.relationship;
+        const std::span<const uint8_t> expected_source = old
+            ? std::span<const uint8_t>(old_source)
+            : job >= 0 ? std::span<const uint8_t>(
+                             successor_source[static_cast<size_t>(job)])
+                       : std::span<const uint8_t>();
+        if (job == -2 || hello.relationship_id != expected_relationship ||
+            binding.profile != profile || binding.raw_bytes != expected_source.size() ||
+            binding.raw_digest != icecc::digest128(expected_source))
+            return std::nullopt;
+        const P51SourceArmedFields& armed = old
+            ? old_armed : successor_armed[static_cast<size_t>(job)];
+        if (binding.reservation_id != Id128{armed.reservation_id} ||
+            binding.wire_job_id != armed.arm.source.wire_job_id ||
+            binding.source_request_id != armed.arm.source.source_request_id ||
+            binding.assignment_nonce != armed.arm.source.assignment_nonce ||
+            binding.assignment_epoch != armed.arm.source.assignment_epoch)
+            return std::nullopt;
+        P51SourceJobLease lease;
+        lease.armed = armed;
+        lease.armed.relationship_epoch = hello.relationship_epoch;
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+        return lease;
+    };
+    server_config.input_job_state =
+        [&](CStoreGuid, const TxBegin&, const TxCommit& commit,
+            std::span<const uint8_t> bytes) {
+        bool exact = commit.raw_digest == icecc::digest128(old_source) &&
+                     bytes.size() == old_source.size() &&
+                     std::equal(bytes.begin(), bytes.end(), old_source.begin());
+        for (const auto& source : successor_source)
+            exact = exact || (commit.raw_digest == icecc::digest128(source) &&
+                bytes.size() == source.size() &&
+                std::equal(bytes.begin(), bytes.end(), source.begin()));
+        if (!exact)
+            input_mismatches.fetch_add(1, std::memory_order_relaxed);
+        return InputJobState::Open;
+    };
+    server_config.record_p51_job_commit =
+        [&](const LinkHello& hello, const JobBind& binding,
+            const R2TxCommit& commit) {
+        const int job = find_job(binding.reservation_id);
+        if (commit.inner.raw_digest != binding.raw_digest || job == -2)
+            return false;
+        if (job == -1)
+            old_commits.fetch_add(1, std::memory_order_release);
+        else if (hello.relationship_id == successor_link.relationship)
+            successor_commits[static_cast<size_t>(job)].fetch_add(
+                1, std::memory_order_release);
+        else
+            return false;
+        observer_cv.notify_all();
+        return true;
+    };
+    server_config.acknowledge_p51_receipt =
+        [&](const LinkHello& hello, const CommitAck& ack) {
+        if (ack.relationship_id != hello.relationship_id ||
+            ack.relationship_epoch != hello.relationship_epoch ||
+            ack.physical_link_generation != hello.physical_link_generation)
+            return false;
+        if (hello.relationship_id == successor_link.relationship) {
+            if (ack.contiguous_verified_ordinal == 0 ||
+                ack.contiguous_verified_ordinal > successor_acks.size())
+                return false;
+            successor_acks[static_cast<size_t>(ack.contiguous_verified_ordinal - 1)]
+                .store(1, std::memory_order_release);
+        }
+        observer_cv.notify_all();
+        return true;
+    };
+    P50ServerEndpoint server(f_guid, caps, nullptr, nullptr,
+                             std::move(server_config));
+    tcp::acceptor acceptor(
+        context, tcp::endpoint{asio::ip::address_v4::loopback(), 0});
+    std::atomic<bool> old_history_retired{false};
+    auto serve_old_then_successor = [&]() -> asio::awaitable<ServerRunResult> {
+        tcp::socket old_socket(co_await asio::this_coro::executor);
+        co_await acceptor.async_accept(old_socket, asio::use_awaitable);
+        const ServerRunResult old_result = co_await server.run_adopted_r2(
+            std::move(old_socket));
+        if (!server.retire_idle_p51_route_history(
+                c_guid, profile, old_link.relationship,
+                old_link.relationship_epoch))
+            throw std::runtime_error("old idle F relationship history did not retire");
+        old_history_retired.store(true, std::memory_order_release);
+        tcp::socket successor_socket(co_await asio::this_coro::executor);
+        co_await acceptor.async_accept(successor_socket, asio::use_awaitable);
+        const ServerRunResult successor_result = co_await server.run_adopted_r2(
+            std::move(successor_socket));
+        if (old_result.status != ServerRunStatus::Disconnected)
+            co_return old_result;
+        co_return successor_result;
+    };
+    std::promise<ServerRunResult> server_promise;
+    auto server_future = server_promise.get_future();
+    bool server_done = false;
+    asio::steady_timer watchdog(context);
+    watchdog.expires_after(std::chrono::seconds(22));
+    watchdog.async_wait([&](const boost::system::error_code& error) {
+        if (error) return;
+        hold_ack_pump.store(false, std::memory_order_release);
+        if (owner_ptr)
+            (void)owner_ptr->retire_f_store_exact_p51(
+                f_guid, route.f_store_generation);
+        boost::system::error_code ignored;
+        acceptor.cancel(ignored);
+        acceptor.close(ignored);
+    });
+    asio::co_spawn(context, serve_old_then_successor(),
+        [&](std::exception_ptr error, ServerRunResult result) {
+            server_done = true;
+            if (error) server_promise.set_exception(error);
+            else server_promise.set_value(std::move(result));
+            watchdog.cancel();
+        });
+
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    AsyncConnectedFdFactory connector = [&, remote](auto, auto completion) {
+        connectors.fetch_add(1, std::memory_order_relaxed);
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) { completion(-1); return; }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(remote.port());
+        const auto ip = remote.address().to_v4().to_bytes();
+        std::memcpy(&address.sin_addr, ip.data(), ip.size());
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) != 0) {
+            (void)::close(fd);
+            completion(-1);
+            return;
+        }
+        completion(fd);
+    };
+
+    auto work = asio::make_work_guard(context);
+    std::thread event_thread([&] { context.run(); });
+    struct Cleanup {
+        asio::io_context& context;
+        asio::executor_work_guard<asio::io_context::executor_type>& work;
+        std::thread& thread;
+        std::atomic<bool>& release;
+        ~Cleanup() {
+            release.store(false, std::memory_order_release);
+            context.stop();
+            work.reset();
+            if (thread.joinable()) thread.join();
+        }
+    } cleanup{context, work, event_thread, hold_ack_pump};
+
+    auto old_transfer_future = asio::co_spawn(
+        context, owner.transfer_p51(
+            route, old_armed, connector, old_request,
+            deadline.as_steady_time_point(), old_source),
+        asio::use_future);
+    CHECK(old_transfer_future.wait_until(deadline.as_steady_time_point()) ==
+          std::future_status::ready);
+    const auto old_result = old_transfer_future.get();
+    CHECK(old_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(old_result.raw_digest == icecc::digest128(old_source));
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_cv.wait_until(lock, deadline.as_steady_time_point(), [&] {
+            return ack_pump_entered.load(std::memory_order_acquire);
+        }));
+    }
+    CHECK(old_commits.load(std::memory_order_acquire) == 1);
+
+    std::array<std::future<ZstdSourceTransferResult>, 2> successor_results;
+    for (size_t i = 0; i != successor_results.size(); ++i) {
+        const PrepareRequestKey request{
+            successor_armed[i].arm.source.assignment_epoch,
+            successor_armed[i].arm.source.source_request_id};
+        successor_results[i] = asio::co_spawn(
+            context, owner.transfer_p51(
+                route, successor_armed[i], connector, request,
+                deadline.as_steady_time_point(), successor_source[i]),
+            asio::use_future);
+    }
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_cv.wait_until(lock, deadline.as_steady_time_point(), [&] {
+            return rebind_waiters.load(std::memory_order_acquire) >= 2;
+        }));
+    }
+    CHECK(!old_history_retired.load(std::memory_order_acquire));
+    hold_ack_pump.store(false, std::memory_order_release);
+    observer_cv.notify_all();
+
+    for (size_t i = 0; i != successor_results.size(); ++i) {
+        CHECK(successor_results[i].wait_until(deadline.as_steady_time_point()) ==
+              std::future_status::ready);
+        const auto result = successor_results[i].get();
+        CHECK(result.status == ZstdSourceTransferStatus::Committed);
+        CHECK(result.raw_bytes == successor_source[i].size());
+        CHECK(result.raw_digest == icecc::digest128(successor_source[i]));
+    }
+    CHECK(old_history_retired.load(std::memory_order_acquire));
+    CHECK(input_mismatches.load(std::memory_order_acquire) == 0);
+    CHECK(old_commits.load(std::memory_order_acquire) == 1);
+    for (const auto& count : successor_commits)
+        CHECK(count.load(std::memory_order_acquire) == 1);
+    CHECK(connectors.load(std::memory_order_acquire) == 2);
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_cv.wait_until(lock, deadline.as_steady_time_point(), [&] {
+            return successor_acks[1].load(std::memory_order_acquire) == 1;
+        }));
+    }
+    CHECK(successor_acks[1].load(std::memory_order_acquire) == 1);
+    CHECK(retired_reaps.load(std::memory_order_acquire) == 1);
+
+    std::promise<bool> retire_promise;
+    auto retire_future = retire_promise.get_future();
+    asio::post(context, [&] {
+        retire_promise.set_value(owner.retire_f_store_exact_p51(
+            f_guid, route.f_store_generation));
+    });
+    CHECK(retire_future.wait_for(std::chrono::seconds(3)) ==
+          std::future_status::ready);
+    CHECK(retire_future.get());
+    CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
+    const auto server_result = server_future.get();
+    CHECK(server_result.status == ServerRunStatus::Disconnected);
+    work.reset();
+    context.stop();
+    event_thread.join();
+    CHECK(server_done);
+    std::puts("P51_ROUTE_OWNER concurrent same-successor callers share one rebound link: ok");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--same-successor-concurrency") == 0) {
+        test_concurrent_same_successor_joins_one_rebound_sender();
+        return 0;
+    }
     test_source_transfer_operation_wire();
     test_long_lived_relationship_owner();
     test_same_request_route_fork_wire();
@@ -1882,4 +2272,5 @@ int main() {
         test_p51_w30_direct_topology(4, 1, profile);
     }
     test_retired_route_reaped_when_background_reader_goes_idle();
+    test_concurrent_same_successor_joins_one_rebound_sender();
 }

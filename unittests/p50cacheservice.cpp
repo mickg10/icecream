@@ -1082,10 +1082,19 @@ bool wait_for_source_operation_count(service::SidecarRuntime& runtime,
 }
 
 local::HandoffFd oversized_test_source_fd() {
-    char path[] = "/tmp/icecc-p51-async-source-XXXXXX";
-    const int fd = ::mkstemp(path);
+    const char* temporary_directory = std::getenv("TMPDIR");
+    if (temporary_directory == nullptr || temporary_directory[0] == '\0')
+        temporary_directory = "/tmp";
+    std::string path = std::string(temporary_directory) +
+                       "/icecc-p51-async-source-XXXXXX";
+    std::vector<char> mutable_path(path.begin(), path.end());
+    mutable_path.push_back('\0');
+    const int fd = ::mkstemp(mutable_path.data());
+    if (fd < 0)
+        std::fprintf(stderr, "oversized_test_source_fd: mkstemp(%s) failed: %s\n",
+                     mutable_path.data(), std::strerror(errno));
     CHECK(fd >= 0);
-    CHECK(::unlink(path) == 0);
+    CHECK(::unlink(mutable_path.data()) == 0);
     const uint8_t bytes[2] = {0x51, 0x52};
     CHECK(write_all(fd, bytes));
     return local::HandoffFd(fd);
@@ -1100,6 +1109,9 @@ local::HandoffFd sized_test_source_fd(size_t size, uint8_t value) {
     std::vector<char> mutable_path(path.begin(), path.end());
     mutable_path.push_back('\0');
     const int fd = ::mkstemp(mutable_path.data());
+    if (fd < 0)
+        std::fprintf(stderr, "sized_test_source_fd: mkstemp(%s) failed: %s\n",
+                     mutable_path.data(), std::strerror(errno));
     CHECK(fd >= 0);
     CHECK(::unlink(mutable_path.data()) == 0);
     const std::vector<uint8_t> bytes(size, value);
@@ -1401,6 +1413,7 @@ void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
             launch.identity.generation, launch.identity.attempt,
             request_id, CACHE_PROFILE_ZSTD_TU, 30,
             std::chrono::seconds(8));
+        reservation.arm.source.assignment_nonce = request_id;
         reservation.arm.source.selected_f_host = "127.0.0.1";
         reservation.arm.source.selected_f_cache_port = port;
         P51SourceArmedFields armed;
@@ -1544,6 +1557,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
             launch.identity.generation, launch.identity.attempt,
             request_id, CACHE_PROFILE_ZSTD_TU, 30,
             std::chrono::seconds(8));
+        reservation.arm.source.assignment_nonce = request_id;
         reservation.arm.source.selected_f_host = "127.0.0.1";
         reservation.arm.source.selected_f_cache_port = port;
         P51SourceArmedFields armed;
@@ -1829,6 +1843,471 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     CHECK(committed_input == expected_input);
     CHECK(commit_identity_matches);
     std::puts("P51_ASYNC_TRANSFER aggregate-budget fitting R2 commit exact: ok");
+}
+
+void test_p51_credit_admission_bypasses_blocked_workers() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x4f;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    constexpr size_t kBlockedWaiters = 4;
+    constexpr uint64_t kRawCap = 16;
+    uint16_t held_port = 0;
+    std::array<int, kBlockedWaiters + 2> listeners{};
+    std::array<uint16_t, kBlockedWaiters + 2> ports{};
+    listeners[0] = loopback_listener(held_port);
+    ports[0] = held_port;
+    for (size_t i = 1; i < listeners.size(); ++i)
+        listeners[i] = loopback_listener(ports[i]);
+    CHECK(std::all_of(listeners.begin(), listeners.end(),
+                      [](int fd) { return fd >= 0; }));
+
+    std::atomic<size_t> credit_waiters{0};
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.endpoint_caps.zstd.max_raw_bytes = 64;
+    config.max_aggregate_source_raw_bytes = kRawCap;
+    config.max_active_source_transfers = kBlockedWaiters;
+    config.max_active_p51_source_transfers = kBlockedWaiters + 2;
+    config.max_pending_p51_source_operations = kBlockedWaiters + 2;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    config.p51_source_credit_waiting_for_test =
+        [&credit_waiters](uint64_t bytes) {
+            if (bytes == 3)
+                credit_waiters.fetch_add(1, std::memory_order_release);
+        };
+#endif
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto make_request = [&](uint64_t request_id, uint16_t port,
+                            uint8_t reservation_byte,
+                            std::chrono::milliseconds budget =
+                                std::chrono::seconds(8)) {
+        StoreIdentityRoot remote_root{};
+        remote_root.bytes[15] = reservation_byte;
+        const SidecarLaunchIdentity remote_f =
+            test_sidecar_launch(remote_root);
+        auto reservation = test_p51_reservation_request(
+            launch.c_store_guid, launch.store_generation,
+            launch.identity.generation, launch.identity.attempt,
+            request_id, CACHE_PROFILE_ZSTD_TU, 30,
+            budget);
+        reservation.arm.source.assignment_nonce = request_id;
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = port;
+        P51SourceArmedFields armed;
+        armed.arm = reservation.arm;
+        armed.f_control_generation = remote_f.identity.generation;
+        armed.f_control_attempt = remote_f.identity.attempt;
+        armed.f_store_generation = remote_f.store_generation;
+        armed.f_store_guid = remote_f.f_store_guid.bytes;
+        armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+        armed.arm_observation_id = request_id;
+        armed.source_budget_msec = static_cast<uint32_t>(budget.count());
+        armed.attempt_capability_1.bytes.fill(0xf1);
+        armed.attempt_capability_2.bytes.fill(0xf2);
+        armed.reservation_id.fill(reservation_byte);
+        armed.logical_relationship_id.fill(
+            static_cast<uint8_t>(reservation_byte ^ 0x5a));
+        armed.relationship_epoch = 1;
+        armed.selected_revision = CACHE_WIRE_REVISION_R2;
+        armed.selected_window = 30;
+        CHECK(armed.valid());
+        return local::P51SourceTransferRequest{
+            armed, reservation.absolute_deadline};
+    };
+    auto enqueue = [&](RuntimeCase& pair,
+                       const local::P51SourceTransferRequest& request,
+                       uint64_t request_id, size_t bytes, uint8_t fill) {
+        const auto operation = local::make_p51_source_transfer_operation(
+            launch.identity, request, request_id);
+        return runtime.enqueue_p51_source_transfer(
+            std::move(pair.sender), launch.identity, operation,
+            sized_test_source_fd(bytes, fill));
+    };
+
+    std::vector<RuntimeCase> pairs;
+    pairs.reserve(kBlockedWaiters + 2);
+    for (size_t i = 0; i < kBlockedWaiters + 2; ++i)
+        pairs.push_back(authenticated_runtime_pair());
+
+    // Hold 14 of 16 aggregate bytes after connection setup.  The accepted
+    // peer deliberately never completes ordinary admission/READY, keeping
+    // this fitting transfer's raw credit alive while its prep worker returns.
+    const auto held_request = make_request(7230, ports[0], 0xf0);
+    CHECK(enqueue(pairs[0], held_request, 7230, 14, 0xa0));
+    const bool held_credit = wait_for_source_raw_bytes(
+        runtime, 14, std::chrono::seconds(2));
+    pollfd held_ready{listeners[0], POLLIN, 0};
+    int held_polled;
+    do {
+        held_polled = ::poll(&held_ready, 1, 3000);
+    } while (held_polled < 0 && errno == EINTR);
+    int held_fd = -1;
+    if (held_polled > 0)
+        held_fd = ::accept(listeners[0], nullptr, nullptr);
+
+    std::array<local::P51SourceTransferRequest, kBlockedWaiters> blocked_requests;
+    bool blocked_enqueued = held_credit && held_fd >= 0;
+    for (size_t i = 0; i < kBlockedWaiters; ++i) {
+        blocked_requests[i] = make_request(
+            7231 + i, ports[i + 1], static_cast<uint8_t>(0xf5 + i),
+            i == 1 ? std::chrono::milliseconds(700)
+                   : std::chrono::seconds(8));
+        blocked_enqueued = enqueue(
+            pairs[i + 1], blocked_requests[i], 7231 + i, 3,
+            static_cast<uint8_t>(0xb0 + i)) && blocked_enqueued;
+    }
+    const bool all_waiting_operations_seen = blocked_enqueued &&
+        wait_for_source_operation_count(
+            runtime, kBlockedWaiters + 1, std::chrono::seconds(1));
+    const auto waiter_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(2);
+    while (credit_waiters.load(std::memory_order_acquire) < kBlockedWaiters &&
+           std::chrono::steady_clock::now() < waiter_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool four_waiters_reached_credit_gate =
+        credit_waiters.load(std::memory_order_acquire) == kBlockedWaiters;
+
+    // Closing one queued control peer abandons only that job. A different
+    // queued request expires on its original absolute deadline; neither event
+    // consumes raw credit or prevents the fitting request below from running.
+    pairs[1].receiver = local::Connection(-1);
+    const bool closed_waiter_released = wait_for_source_operation_count(
+        runtime, kBlockedWaiters, std::chrono::seconds(2));
+    const bool expired_waiter_released = closed_waiter_released &&
+        wait_for_source_operation_count(
+            runtime, kBlockedWaiters - 1, std::chrono::seconds(2));
+
+    const auto fitting_request = make_request(7235, ports.back(), 0xfa);
+    const bool fitting_enqueued = enqueue(
+        pairs.back(), fitting_request, 7235, 2, 0xc0);
+    const bool operations_after_fit_seen = fitting_enqueued &&
+        wait_for_source_operation_count(
+            runtime, kBlockedWaiters, std::chrono::seconds(1));
+    pollfd fitting_ready{listeners.back(), POLLIN, 0};
+    int fitting_polled;
+    do {
+        fitting_polled = ::poll(&fitting_ready, 1, 1000);
+    } while (fitting_polled < 0 && errno == EINTR);
+    int fitting_fd = -1;
+    if (fitting_polled > 0)
+        fitting_fd = ::accept(listeners.back(), nullptr, nullptr);
+    const uint64_t raw_at_fit_admission =
+        runtime.active_source_raw_bytes_for_test();
+
+    runtime.stop();
+    for (auto& pair : pairs)
+        pair.receiver = local::Connection(-1);
+    if (held_fd >= 0)
+        (void)::close(held_fd);
+    if (fitting_fd >= 0)
+        (void)::close(fitting_fd);
+    const bool operations_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(3));
+    const bool raw_credit_released = wait_for_source_raw_bytes(
+        runtime, 0, std::chrono::seconds(1));
+    for (const int fd : listeners)
+        if (fd >= 0)
+            (void)::close(fd);
+
+    CHECK(held_credit);
+    CHECK(held_fd >= 0);
+    CHECK(all_waiting_operations_seen);
+    CHECK(four_waiters_reached_credit_gate);
+    CHECK(fitting_enqueued);
+    CHECK(operations_after_fit_seen);
+    CHECK(closed_waiter_released);
+    CHECK(expired_waiter_released);
+    CHECK(fitting_fd >= 0);
+    CHECK(raw_at_fit_admission == kRawCap);
+    CHECK(operations_released);
+    CHECK(raw_credit_released);
+    std::puts("P51_ASYNC_TRANSFER fitting request bypassed four blocked credit workers: ok");
+}
+
+void test_p51_credit_admission_bypass_limit_serves_oldest() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0xe1;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    constexpr size_t kBypasses = 30;
+    constexpr uint64_t kRawCap = 16;
+    uint16_t held_port = 0;
+    uint16_t oldest_port = 0;
+    uint16_t blocked_port = 0;
+    const int held_listener = loopback_listener(held_port);
+    const int oldest_listener = loopback_listener(oldest_port);
+    const int blocked_listener = loopback_listener(blocked_port);
+    std::vector<int> bypass_listeners;
+    std::vector<uint16_t> bypass_ports;
+    bypass_listeners.reserve(kBypasses);
+    bypass_ports.reserve(kBypasses);
+    for (size_t i = 0; i < kBypasses; ++i) {
+        uint16_t port = 0;
+        bypass_listeners.push_back(loopback_listener(port));
+        bypass_ports.push_back(port);
+    }
+    CHECK(held_listener >= 0 && oldest_listener >= 0 && blocked_listener >= 0 &&
+          std::all_of(bypass_listeners.begin(), bypass_listeners.end(),
+                      [](int fd) { return fd >= 0; }));
+
+    std::atomic<size_t> oldest_wait_reported{0};
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.endpoint_caps.zstd.max_raw_bytes = 64;
+    config.max_aggregate_source_raw_bytes = kRawCap;
+    // This fixture intentionally exercises the byte-credit bypass policy,
+    // not the separately bounded F connector setup pool.
+    config.max_active_source_transfers = kBypasses + 2;
+    config.max_active_p51_source_transfers = kBypasses + 2;
+    config.max_pending_p51_source_operations = kBypasses + 4;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    config.p51_source_credit_waiting_for_test =
+        [&oldest_wait_reported](uint64_t bytes) {
+            if (bytes == 3)
+                oldest_wait_reported.fetch_add(1, std::memory_order_release);
+        };
+#endif
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto make_request = [&](uint64_t request_id, uint16_t port,
+                            uint8_t identity_byte,
+                            std::chrono::milliseconds budget) {
+        StoreIdentityRoot remote_root{};
+        remote_root.bytes[15] = identity_byte;
+        const SidecarLaunchIdentity remote_f =
+            test_sidecar_launch(remote_root);
+        auto reservation = test_p51_reservation_request(
+            launch.c_store_guid, launch.store_generation,
+            launch.identity.generation, launch.identity.attempt,
+            request_id, CACHE_PROFILE_ZSTD_TU, 30, budget);
+        reservation.arm.source.assignment_nonce = request_id;
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = port;
+        P51SourceArmedFields armed;
+        armed.arm = reservation.arm;
+        armed.f_control_generation = remote_f.identity.generation;
+        armed.f_control_attempt = remote_f.identity.attempt;
+        armed.f_store_generation = remote_f.store_generation;
+        armed.f_store_guid = remote_f.f_store_guid.bytes;
+        armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+        armed.arm_observation_id = request_id;
+        armed.source_budget_msec = static_cast<uint32_t>(budget.count());
+        armed.attempt_capability_1.bytes.fill(identity_byte);
+        armed.attempt_capability_2.bytes.fill(0x02);
+        armed.reservation_id.fill(identity_byte);
+        armed.logical_relationship_id.fill(
+            static_cast<uint8_t>(identity_byte ^ 0xa5));
+        armed.relationship_epoch = 1;
+        armed.selected_revision = CACHE_WIRE_REVISION_R2;
+        armed.selected_window = 30;
+        CHECK(armed.valid());
+        return local::P51SourceTransferRequest{
+            armed, reservation.absolute_deadline};
+    };
+    auto enqueue = [&](RuntimeCase& pair,
+                       const local::P51SourceTransferRequest& request,
+                       size_t raw_bytes) {
+        const uint64_t request_id =
+            request.armed.arm.source.source_request_id;
+        const auto operation = local::make_p51_source_transfer_operation(
+            launch.identity, request, request_id);
+        return runtime.enqueue_p51_source_transfer(
+            std::move(pair.sender), launch.identity, operation,
+            sized_test_source_fd(raw_bytes, 0x91));
+    };
+    auto accept_one = [](int listener, int timeout_ms) {
+        pollfd ready{listener, POLLIN, 0};
+        int polled;
+        do {
+            polled = ::poll(&ready, 1, timeout_ms);
+        } while (polled < 0 && errno == EINTR);
+        if (polled <= 0)
+            return -1;
+        int accepted;
+        do {
+            accepted = ::accept(listener, nullptr, nullptr);
+        } while (accepted < 0 && errno == EINTR);
+        return accepted;
+    };
+
+    const auto held_request = make_request(
+        7260, held_port, 0x31, std::chrono::seconds(20));
+    const auto oldest_request = make_request(
+        7261, oldest_port, 0x32, std::chrono::seconds(30));
+    std::vector<local::P51SourceTransferRequest> bypass_requests;
+    bypass_requests.reserve(kBypasses);
+    for (size_t i = 0; i < kBypasses; ++i) {
+        const uint64_t request_id = 7262 + i;
+        bypass_requests.push_back(make_request(
+            request_id, bypass_ports[i], static_cast<uint8_t>(0x40 + i),
+            std::chrono::seconds(30)));
+    }
+    const auto blocked_request = make_request(
+        7292, blocked_port, 0x7e, std::chrono::seconds(30));
+
+    std::vector<RuntimeCase> pairs;
+    pairs.reserve(kBypasses + 3);
+    for (size_t i = 0; i < kBypasses + 3; ++i)
+        pairs.push_back(authenticated_runtime_pair());
+    std::vector<int> accepted_fds;
+    accepted_fds.reserve(kBypasses + 2);
+
+    const bool held_enqueued = enqueue(pairs[0], held_request, 14);
+    const auto held_enqueued_at = std::chrono::steady_clock::now();
+    local::Status held_reply_status = local::Status::IoError;
+    local::Status held_goodbye_status = local::Status::IoError;
+    std::optional<local::P50SourceTransferResult> held_result;
+    bool held_reply_valid = false;
+    std::chrono::steady_clock::time_point held_reply_finished_at{};
+    const auto held_reply_deadline =
+        held_request.absolute_deadline.as_steady_time_point() +
+        std::chrono::seconds(3);
+    std::thread held_reply_reader([&] {
+        local::Frame response;
+        held_reply_status = pairs[0].receiver.receive_until(
+            response, held_reply_deadline);
+        if (held_reply_status == local::Status::Ok &&
+            response.type == local::MessageType::Data &&
+            local::validate_identity(response, launch.identity) ==
+                local::Status::Ok) {
+            local::ControlOperation decoded;
+            if (local::decode_control_operation(response.payload, decoded) &&
+                decoded.kind == local::ControlOperationKind::P51SourceTransfer &&
+                decoded.request_id == 7260 &&
+                decoded.p51_source_transfer_result &&
+                decoded.p51_source_transfer_result->valid()) {
+                held_result = *decoded.p51_source_transfer_result;
+                held_reply_valid = true;
+                const local::Frame goodbye{local::kProtocolVersion,
+                                           local::MessageType::Goodbye,
+                                           launch.identity, {}};
+                held_goodbye_status = pairs[0].receiver.send_until(
+                    goodbye, held_reply_deadline);
+            }
+        }
+        held_reply_finished_at = std::chrono::steady_clock::now();
+    });
+    int held_fd = accept_one(held_listener, 3000);
+    const bool held_credit = held_enqueued && held_fd >= 0 &&
+        wait_for_source_raw_bytes(runtime, 14, std::chrono::seconds(2));
+
+    const bool oldest_enqueued = enqueue(pairs[1], oldest_request, 3);
+    const auto oldest_enqueued_at = std::chrono::steady_clock::now();
+    const auto oldest_wait_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (oldest_wait_reported.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < oldest_wait_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool oldest_waiting =
+        oldest_wait_reported.load(std::memory_order_acquire) != 0;
+
+    bool all_bypasses_enqueued = held_credit && oldest_enqueued && oldest_waiting;
+    for (size_t i = 0; i < kBypasses; ++i) {
+        all_bypasses_enqueued = enqueue(pairs[i + 2], bypass_requests[i], 0) &&
+                                all_bypasses_enqueued;
+        const int accepted = accept_one(bypass_listeners[i], 2000);
+        all_bypasses_enqueued = accepted >= 0 && all_bypasses_enqueued;
+        if (accepted >= 0)
+            accepted_fds.push_back(accepted);
+    }
+    const auto all_bypasses_accepted_at = std::chrono::steady_clock::now();
+
+    const bool blocked_enqueued = enqueue(
+        pairs.back(), blocked_request, 0);
+    const auto blocked_enqueued_at = std::chrono::steady_clock::now();
+    const bool all_operations_accounted = blocked_enqueued &&
+        wait_for_source_operation_count(
+            runtime, kBypasses + 3, std::chrono::seconds(2));
+    pollfd blocked_ready{blocked_listener, POLLIN, 0};
+    int blocked_polled;
+    do {
+        blocked_polled = ::poll(&blocked_ready, 1, 200);
+    } while (blocked_polled < 0 && errno == EINTR);
+    const bool thirty_first_was_held_behind_oldest = blocked_polled == 0;
+
+    // The oldest waiter and all later zero-byte jobs have long leases. Only
+    // the held transfer may expire to free aggregate bytes. Its control reply
+    // deadline is the transfer deadline; once expired, the service closes the
+    // control channel instead of sending a late result/Goodbye exchange.
+    const bool oldest_started_after_credit_release = held_credit &&
+        wait_for_source_raw_bytes(runtime, 3, std::chrono::seconds(25)) &&
+        (held_request.absolute_deadline.as_steady_time_point() <
+         std::chrono::steady_clock::now());
+    int oldest_fd = accept_one(oldest_listener, 3000);
+    const auto oldest_started_at = std::chrono::steady_clock::now();
+    if (held_reply_reader.joinable())
+        held_reply_reader.join();
+
+    runtime.stop();
+    for (auto& pair : pairs)
+        pair.receiver = local::Connection(-1);
+    if (held_fd >= 0)
+        (void)::close(held_fd);
+    if (oldest_fd >= 0)
+        (void)::close(oldest_fd);
+    if (blocked_polled > 0) {
+        int blocked_fd = ::accept(blocked_listener, nullptr, nullptr);
+        if (blocked_fd >= 0)
+            (void)::close(blocked_fd);
+    }
+    for (int fd : accepted_fds)
+        (void)::close(fd);
+    for (int fd : bypass_listeners)
+        if (fd >= 0)
+            (void)::close(fd);
+    for (int fd : {held_listener, oldest_listener, blocked_listener})
+        if (fd >= 0)
+            (void)::close(fd);
+    const bool operations_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(5));
+    const bool raw_credit_released = wait_for_source_raw_bytes(
+        runtime, 0, std::chrono::seconds(2));
+
+    const auto elapsed_ms = [](auto start, auto finish) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   finish - start).count();
+    };
+    std::fprintf(stderr,
+        "credit-bypass timing: held-deadline=%lldms oldest-enqueue=%lldms 30th-accepted=%lldms "
+        "31st-enqueue=%lldms oldest-start=%lldms held-reply=%lldms accepted=%zu "
+        "held-status=%u held-valid=%d goodbye-status=%u\n",
+        static_cast<long long>(elapsed_ms(held_enqueued_at,
+            held_request.absolute_deadline.as_steady_time_point())),
+        static_cast<long long>(elapsed_ms(held_enqueued_at, oldest_enqueued_at)),
+        static_cast<long long>(elapsed_ms(held_enqueued_at, all_bypasses_accepted_at)),
+        static_cast<long long>(elapsed_ms(held_enqueued_at, blocked_enqueued_at)),
+        static_cast<long long>(elapsed_ms(held_enqueued_at, oldest_started_at)),
+        static_cast<long long>(elapsed_ms(held_enqueued_at,
+                                          held_reply_finished_at)),
+        accepted_fds.size(), static_cast<unsigned>(held_reply_status),
+        held_reply_valid ? 1 : 0,
+        static_cast<unsigned>(held_goodbye_status));
+
+    CHECK(held_credit);
+    CHECK(oldest_enqueued);
+    CHECK(oldest_waiting);
+    CHECK(all_bypasses_enqueued);
+    CHECK(accepted_fds.size() == kBypasses);
+    CHECK(all_bypasses_accepted_at <
+          held_request.absolute_deadline.as_steady_time_point());
+    CHECK(all_operations_accounted);
+    CHECK(thirty_first_was_held_behind_oldest);
+    CHECK(oldest_started_after_credit_release);
+    CHECK(oldest_started_at >
+          held_request.absolute_deadline.as_steady_time_point());
+    CHECK(held_reply_status == local::Status::CleanEof);
+    CHECK(!held_reply_valid);
+    CHECK(!held_result.has_value());
+    CHECK(oldest_fd >= 0);
+    CHECK(operations_released);
+    CHECK(raw_credit_released);
+    std::puts("P51_ASYNC_TRANSFER 30-bypass cap serves oldest queued job: ok");
 }
 
 void test_p51_stop_while_waiting_for_link_session_echo() {
@@ -2354,6 +2833,7 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
         config.f_store_guid = launch.f_store_guid;
         config.f_store_generation = launch.store_generation;
         config.sidecar_launch = launch;
+        config.max_route_relationships = 1;
         service::SidecarRuntime runtime(std::move(config));
         P51SourceArmedFields armed;
         local::P51SourceReservationResult expiring_result;
@@ -2407,6 +2887,11 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
             reset.settled_prefix_k = 0;
             reset.old_history_nonce = hello.history_nonce;
             reset.new_history_nonce = HistoryNonce{hello.history_nonce.value + 1};
+            ResetRequest exhausted_reset = reset;
+            exhausted_reset.new_relationship_epoch = UINT64_MAX;
+            CHECK(!runtime.validate_p51_reset_on_owner(
+                       hello, exhausted_reset)
+                       .has_value());
             const auto ack = runtime.validate_p51_reset_on_owner(hello, reset);
             CHECK(ack.has_value());
             CHECK(runtime.commit_p51_reset_on_owner(hello, reset, *ack));
@@ -2433,7 +2918,28 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
                 1, 82, "expired-before-reset");
             CHECK(!runtime.consume_p51_job_reservation_on_owner(
                 reconnect, expired_binding).has_value());
+            // This fixture exercised lookup only; release its synthetic link
+            // explicitly so the following capacity pressure represents a
+            // genuine idle relationship eligible for route-history eviction.
+            runtime.release_p51_link_on_owner(reconnect);
         });
+
+        // A fresh relationship after idle eviction must advance beyond the
+        // epoch committed by RESET, even though that epoch was not allocated
+        // by the relationship-creation counter.
+        StoreIdentityRoot pressure_root{};
+        pressure_root.bytes[15] = 0x3b;
+        const CStoreGuid pressure_c = c_store_guid_for_root(pressure_root);
+        auto pressure_request = test_p51_reservation_request(
+            pressure_c, 52, launch.identity.generation,
+            launch.identity.attempt, 5201, CACHE_PROFILE_ZSTD_TU, 30);
+        const auto pressure_result =
+            runtime.reserve_p51_source_on_owner(pressure_request);
+        CHECK(pressure_result.error_code == 0 && pressure_result.armed);
+        CHECK(pressure_result.armed->logical_relationship_id !=
+                  armed.logical_relationship_id &&
+              pressure_result.armed->relationship_epoch >
+                  reset.new_relationship_epoch);
     }
 
     // Publication wins once the owner marks the reservation as publishing.
@@ -2820,7 +3326,8 @@ void test_p51_same_f_missing_relationship_reassignment_keeps_sibling() {
     std::puts("P51_RESERVATION_OWNER same-F missing/reassignment preserves sibling: ok");
 }
 
-void test_p51_same_f_missing_real_sender_transfer_keeps_sibling() {
+void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+    bool established_link_reconnect = false) {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x5b;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
@@ -2956,36 +3463,177 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling() {
           sibling_first_result.raw_digest ==
               icecc::digest128(std::string_view(sibling_first)));
 
-    CHECK(server.cancel_p51_source_on_owner(
-        old_request.arm, old_armed.reservation_id,
-        old_request.absolute_deadline.as_steady_time_point()));
-    auto pressure = reserve(remote_c(0x5e), 93, 9301);
-    const auto& pressure_request = pressure.first;
-    const auto& pressure_armed = pressure.second;
-    CHECK(server.cancel_p51_source_on_owner(
-        pressure_request.arm, pressure_armed.reservation_id,
-        pressure_request.absolute_deadline.as_steady_time_point()));
+    uint64_t old_link_generation = 1;
+    if (established_link_reconnect) {
+        const std::string old_first = "int established_old_link = 5;\n";
+        const auto old_first_result =
+            transfer(old_owner, old_c, old_armed, old_first);
+        CHECK(old_first_result.status == ZstdSourceTransferStatus::Committed &&
+              old_first_result.raw_bytes == old_first.size() &&
+              old_first_result.raw_digest ==
+                  icecc::digest128(std::string_view(old_first)));
+        // The returned result is the receipt; give the independent ACK pump a
+        // bounded local scheduling interval before closing this connection.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    const std::string stale_bytes = "int stale_old_relationship = 3;\n";
-    const auto stale_result = transfer(old_owner, old_c, old_armed, stale_bytes);
-    std::fprintf(stderr,
-                 "same-F stale result status=%u reject=%u reason=%u bytes=%llu "
-                 "replacement=%u local=%u attempts=%u\n",
-                 static_cast<unsigned>(stale_result.status),
-                 stale_result.r2_link_rejection.has_value(),
-                 stale_result.r2_link_rejection
-                     ? static_cast<unsigned>(stale_result.r2_link_rejection->reason)
-                     : 0u,
-                 static_cast<unsigned long long>(stale_result.raw_bytes),
-                 stale_result.replacement_required,
-                 stale_result.route_local_failure,
-                 static_cast<unsigned>(stale_result.attempts));
-    CHECK(stale_result.status != ZstdSourceTransferStatus::Committed &&
-          stale_result.r2_link_rejection.has_value() &&
-          stale_result.r2_link_rejection->reason ==
-              LinkRejectReason::ReservationMissing &&
-          stale_result.raw_bytes == 0 && stale_result.raw_digest == Digest128{} &&
-          !stale_result.replacement_required);
+        // Close only the old physical sender, retaining the same C route owner
+        // and the independent sibling relationship. The F endpoint must then
+        // evict only the exact idle relationship history before the stale
+        // reconnect and higher-epoch ARM below.
+        std::promise<void> old_link_closed_promise;
+        auto old_link_closed = old_link_closed_promise.get_future();
+        boost::asio::post(c_context, [&] {
+            old_owner.cancel_active_p51_transfers();
+            old_link_closed_promise.set_value();
+        });
+        CHECK(old_link_closed.wait_for(std::chrono::seconds(3)) ==
+              std::future_status::ready);
+        old_link_closed.get();
+
+        auto pressure_request = test_p51_reservation_request(
+            remote_c(0x5e), 93, launch.identity.generation,
+            launch.identity.attempt, 9301, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::seconds(20));
+        pressure_request.arm.source.selected_f_host = "127.0.0.1";
+        pressure_request.arm.source.selected_f_cache_port = port;
+        std::optional<P51SourceArmedFields> pressure_armed;
+        const auto eviction_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (std::chrono::steady_clock::now() < eviction_deadline) {
+            const auto result =
+                server.reserve_p51_source_on_owner(pressure_request);
+            if (result.armed) {
+                pressure_armed = *result.armed;
+                break;
+            }
+            CHECK(result.error_code == 0x5103); // bounded relationship capacity
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(pressure_armed.has_value());
+        CHECK(server.cancel_p51_source_on_owner(
+            pressure_request.arm, pressure_armed->reservation_id,
+            pressure_request.absolute_deadline.as_steady_time_point()));
+
+        // Profile-history retirement must not evict the already committed
+        // compiler input from the same C namespace. Attach it after the old
+        // relationship has been retired and compare every byte.
+        CHECK(old_first_result.committed_input.has_value());
+        const InputLeaseOwner old_input_owner{
+            old_armed.arm.source.logical_job,
+            old_armed.arm.source.assignment_epoch,
+            old_armed.arm.source.assignment_nonce};
+        const InputFdRequest old_input_request{
+            launch.identity, *old_first_result.committed_input,
+            old_input_owner, 0x5c01};
+        const auto old_input_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        auto old_input_cursor = server.attach_input_on_owner(
+            old_input_request, old_input_deadline);
+        CHECK(old_input_cursor.has_value() &&
+              old_input_cursor->remaining() == old_first.size() &&
+              old_input_cursor->raw_digest() ==
+                  icecc::digest128(std::string_view(old_first)));
+        std::vector<uint8_t> old_input_bytes(old_first.size());
+        CHECK(old_input_cursor->read(old_input_bytes) == old_input_bytes.size());
+        CHECK(old_input_bytes == std::vector<uint8_t>(old_first.begin(),
+                                                       old_first.end()));
+        server.finish_input_attachment_on_owner(
+            old_input_request, true, old_input_deadline);
+
+        LinkHello stale_reconnect = test_p51_link_hello(
+            old_armed, old_link_generation + 1, HistoryNonce{1},
+            LinkStartMode::Reconnect, 1);
+        const int stale_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(stale_fd >= 0);
+        sockaddr_in stale_address{};
+        stale_address.sin_family = AF_INET;
+        stale_address.sin_port = htons(port);
+        stale_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(::connect(stale_fd,
+                        reinterpret_cast<const sockaddr*>(&stale_address),
+                        sizeof(stale_address)) == 0);
+        const auto stale_frame = encode_frame(Message{stale_reconnect});
+        CHECK(write_all(stale_fd, stale_frame));
+        auto read_exact_before = [](int fd, std::span<uint8_t> output,
+                                    std::chrono::steady_clock::time_point deadline) {
+            size_t offset = 0;
+            while (offset != output.size()) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline)
+                    return false;
+                const auto remaining = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(deadline - now);
+                pollfd readable{fd, POLLIN, 0};
+                const int polled = ::poll(
+                    &readable, 1, static_cast<int>(std::max<int64_t>(
+                                      1, remaining.count())));
+                if (polled < 0 && errno == EINTR)
+                    continue;
+                if (polled <= 0 || !(readable.revents & POLLIN) ||
+                    (readable.revents & POLLNVAL))
+                    return false;
+                const ssize_t count = ::recv(
+                    fd, output.data() + offset, output.size() - offset, 0);
+                if (count < 0 && errno == EINTR)
+                    continue;
+                if (count <= 0)
+                    return false;
+                offset += static_cast<size_t>(count);
+            }
+            return true;
+        };
+        const auto response_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        std::array<uint8_t, 4> response_header{};
+        CHECK(read_exact_before(stale_fd, response_header, response_deadline));
+        const FrameHeader decoded_header =
+            decode_frame_header(response_header, kInitialMaxFramePayload);
+        CHECK(decoded_header.type == MessageType::R2_LINK_REJECT);
+        std::vector<uint8_t> response_payload(decoded_header.payload_bytes);
+        CHECK(read_exact_before(stale_fd, response_payload, response_deadline));
+        const Message response =
+            decode_payload(decoded_header.type, response_payload);
+        const auto* rejection = std::get_if<LinkRejectMessage>(&response);
+        CHECK(rejection != nullptr && rejection->valid() &&
+              rejection->reason == LinkRejectReason::ReservationMissing &&
+              rejection->offered_hello_digest ==
+                  compute_r2_link_offer_digest(stale_reconnect));
+        CHECK(::shutdown(stale_fd, SHUT_RDWR) == 0);
+        CHECK(::close(stale_fd) == 0);
+    } else {
+        CHECK(server.cancel_p51_source_on_owner(
+            old_request.arm, old_armed.reservation_id,
+            old_request.absolute_deadline.as_steady_time_point()));
+        auto pressure = reserve(remote_c(0x5e), 93, 9301);
+        const auto& pressure_request = pressure.first;
+        const auto& pressure_armed = pressure.second;
+        CHECK(server.cancel_p51_source_on_owner(
+            pressure_request.arm, pressure_armed.reservation_id,
+            pressure_request.absolute_deadline.as_steady_time_point()));
+
+        const std::string stale_bytes = "int stale_old_relationship = 3;\n";
+        const auto stale_result =
+            transfer(old_owner, old_c, old_armed, stale_bytes);
+        std::fprintf(stderr,
+                     "same-F stale result status=%u reject=%u reason=%u bytes=%llu "
+                     "replacement=%u local=%u attempts=%u\n",
+                     static_cast<unsigned>(stale_result.status),
+                     stale_result.r2_link_rejection.has_value(),
+                     stale_result.r2_link_rejection
+                         ? static_cast<unsigned>(stale_result.r2_link_rejection->reason)
+                         : 0u,
+                     static_cast<unsigned long long>(stale_result.raw_bytes),
+                     stale_result.replacement_required,
+                     stale_result.route_local_failure,
+                     static_cast<unsigned>(stale_result.attempts));
+        CHECK(stale_result.status != ZstdSourceTransferStatus::Committed &&
+              stale_result.r2_link_rejection.has_value() &&
+              stale_result.r2_link_rejection->reason ==
+                  LinkRejectReason::ReservationMissing &&
+              stale_result.raw_bytes == 0 &&
+              stale_result.raw_digest == Digest128{} &&
+              !stale_result.replacement_required);
+    }
 
     const auto [fresh_request, fresh_armed] = reserve(old_c, 91, 9102);
     (void)fresh_request;
@@ -2994,6 +3642,19 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling() {
           fresh_armed.relationship_epoch > old_armed.relationship_epoch);
     const std::string fresh_bytes = "int fresh_same_f_assignment = 7;\n";
     const auto fresh_result = transfer(old_owner, old_c, fresh_armed, fresh_bytes);
+    std::fprintf(stderr,
+                 "same-F fresh result status=%u reject=%u reason=%u bytes=%llu "
+                 "replacement=%u local=%u attempts=%u accepted=%u\n",
+                 static_cast<unsigned>(fresh_result.status),
+                 fresh_result.r2_link_rejection.has_value(),
+                 fresh_result.r2_link_rejection
+                     ? static_cast<unsigned>(fresh_result.r2_link_rejection->reason)
+                     : 0u,
+                 static_cast<unsigned long long>(fresh_result.raw_bytes),
+                 fresh_result.replacement_required,
+                 fresh_result.route_local_failure,
+                 static_cast<unsigned>(fresh_result.attempts),
+                 accepted.load(std::memory_order_relaxed));
     CHECK(fresh_result.status == ZstdSourceTransferStatus::Committed &&
           fresh_result.raw_bytes == fresh_bytes.size() &&
           fresh_result.raw_digest ==
@@ -3027,8 +3688,11 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling() {
     c_retired.get();
     c_work.reset();
     cleanup.reset();
-    CHECK(accepted.load(std::memory_order_relaxed) == 3);
-    std::puts("P51_R2_SERVICE same-F actual sender transfer/missing/reassignment/sibling: ok");
+    CHECK(accepted.load(std::memory_order_relaxed) ==
+          (established_link_reconnect ? 4u : 3u));
+    std::puts(established_link_reconnect
+                  ? "P51_R2_SERVICE established same-F reconnect/missing/reassignment/sibling: ok"
+                  : "P51_R2_SERVICE same-F actual sender transfer/missing/reassignment/sibling: ok");
 }
 
 void test_route_endpoint_cap_refuses_before_f_open() {
@@ -7408,8 +8072,23 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--same-f-established-reconnect") == 0) {
+            test_p51_same_f_missing_real_sender_transfer_keeps_sibling(true);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--aggregate-fit-exact") == 0) {
             test_p51_aggregate_raw_budget_fitting_commit_is_exact();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--credit-admission-hol-witness") == 0) {
+            test_p51_credit_admission_bypasses_blocked_workers();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--credit-admission-bypass-limit") == 0) {
+            test_p51_credit_admission_bypass_limit_serves_oldest();
             return 0;
         }
         CHECK(argc == 1);
@@ -7432,6 +8111,8 @@ int main(int argc, char** argv) {
         test_p51_admitted_transfer_stop_releases_raw_credit();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
+        test_p51_credit_admission_bypasses_blocked_workers();
+        test_p51_credit_admission_bypass_limit_serves_oldest();
         test_p51_stop_while_waiting_for_link_session_echo();
         test_p51_stop_while_waiting_for_link_state();
         test_p51_reservation_capacity_120_cancel_and_expiry();
@@ -7439,6 +8120,7 @@ int main(int argc, char** argv) {
         test_p51_reservation_profile_mask_mapping();
         test_p51_same_f_missing_relationship_reassignment_keeps_sibling();
         test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
+        test_p51_same_f_missing_real_sender_transfer_keeps_sibling(true);
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();

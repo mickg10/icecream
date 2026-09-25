@@ -1,6 +1,6 @@
 # Sorbet 1.5.0: validation and remaining work
 
-Updated 2026-09-24. Package version is **1.5.0**; the release branch is
+Updated 2026-09-25. Package version is **1.5.0**; the release branch is
 `sorbet_v1.5`. The repository is public. The Docker bootstrap implementation
 was published as `de027cefc31d79d062c3158400951916a9aa5d63`.
 A pushed branch is not a published release tag or a newly qualified farm image.
@@ -52,6 +52,69 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+Combined service/route-owner qualification passes in
+`/tanksmall/scratch/tmp/p51-admission-combined-r2/build/unittests/`:
+`p50cacheservice.log` SHA256
+`fee5e6cec4d00286f97a15e9925b3f35362c289c96dec42c054b1baa9d53e603`
+and `p50routeowner.log` SHA256
+`ecc2a108e04741d81c37bbed83df1f314b2fed08b70a79c6fd8ccac8613a07fe`,
+both with Automake PASS results. Client archive and standalone cache service
+were explicitly rebuilt; subdirectory test builds alone do not rebuild those
+dependencies. Scratch must be writable to the test's unprivileged identity.
+The service binary is
+`dc96b0437bdbb0590b8b5376d8fc66224af3fd11b678a415a5060192545092a0`.
+This covers the nonblocking byte-credit queue, bounded 30-admission bypass,
+peer-close/deadline cleanup, same-F idle-history replacement and concurrent
+successor callers. The request is copied before moving its containing control
+operation, independent of compiler argument evaluation order. Active source
+reads still check peer closure only after reading; early read cancellation is
+not established by these tests.
+
+The tested service source differs from published source
+`54640beb7759d7e02124a661808539431b6163b873ce95fc7417724b2616e8b9`
+only by one explanatory comment. Service test source is
+`29fbc2f96ddee697e504c4b17f19cc7ea3d6af3c3bcfa702a5f4b289749afd60`;
+owner source is `aa4a27be1a0da5485a07713273fb4519b3d8f9c2f1448ad7fd8a5294fa288c80`.
+These combined runs use sender source `b42a6fb0` from before the request-scoped
+test observation added in `35ba9dd9`; the latter is qualified separately below.
+They are not a full native/farm/sanitizer or performance qualification.
+
+The synthetic scheduler-epoch W30 fixture passes for P29V1, ZSTD_TU and
+ZSTD_ROUTE on a frozen combined service/owner build. It retains the same
+C/F daemon processes, cache identities and receipt-gated TCP connection:
+30 old receipts are held, old results match those exact witnesses, an old
+assignment's attachment is rejected after the epoch change, and 30 fresh
+receipts (ordinals 31–60) are held before release and exact attachment.
+An independent scheduler pair continues to transfer during the transition.
+This is not an actual shared scheduler-process restart or a test of lost
+old receipts: the gate releases those receipts after the session change.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-synth-sched-r0.sHxOQZ/runtime/`.
+Logs and SHA256:
+
+- `current-p29-run-r4.log`: `2033a1f1a85567308d8dde258bc9538e2d20b3dab53d53c43f8464c3591e6863`
+- `current-tu-run-r1.log`: `b9030d48fee72b3ce56eee024b939553c2c28d9054fdb5a28716f7d48ab4e674`
+- `current-route-run-r1.log`: `2b0155cd97df869e2fd00b7a0ff1de6bdeccd6187702e8d69ca1beef266c0d53`
+
+Fixture source SHA256:
+`50704d4d61f9877f483a7d25c5e0066f7e089e737f66ddb3575ffc147b9cc860`;
+service source `d0bf04b5749e2fe6503745c06455f9b964a2df34bbe6b1f01b7160f626ee484b`;
+owner source `aa4a27be1a0da5485a07713273fb4519b3d8f9c2f1448ad7fd8a5294fa288c80`.
+This build predates the request-copy-before-control-move correction in
+service admission; it does not qualify that later change.
+
+The reproducible opt-in entry point is
+`make -C unittests p50daemonpositive-p51-synthetic-scheduler-w30-check`
+from an already built tree, inside a disposable root container with usable
+NET_ADMIN/iptables, an unprivileged `icecc` identity, and writable
+`ICEFARM_TMPDIR` accessible to that identity. Mount scratch at a short path
+such as `/work/tmp` for Unix socket limits. The named target passed all
+three profile markers on the frozen build above; aggregate log
+`synthetic-scheduler-named-target-run.log` in the same evidence root has
+SHA256 `f4c3b6d7fa4941576ee37baf0b14902a2bf6f08c8be7cef08469f356a36c2645`.
+The outer container exit code was not retained, so the individual exit-0
+profile runs remain the direct process-status evidence.
+
 The sender now rebases an older same-relationship ARM onto its verified
 post-RESET epoch and physical connection. A future-epoch offer on a healthy
 link is rejected before preparation, without disrupting valid work. During
@@ -72,8 +135,18 @@ Sender source SHA256:
 test source: `f305c2e34e1442679d853a41684b8e108f4ccdaac61a75fbfe13a61c7cca089e`.
 This closure includes endpoint idle-history bookkeeping changes; it is not
 qualification of the combined service/route-owner changes. The focused probe
-does not exercise a future offer acting as recovery coordinator during a
-lost RESET reply, or concurrent replacement callers. Those remain open.
+does not exercise a future offer during a lost RESET reply; the separate
+`--future-arm-during-recovery` ZSTD_TU selector now covers that case. A
+request-keyed observation proves the future request enters recovery before
+reconnect completes. It is rejected locally while both original jobs commit
+exactly once, cumulative ACK reaches 2, and connector count remains 3.
+Frozen `future-arm-during-recovery-r5.log` in the same evidence directory
+has SHA256 `877c62b9cdfc8d9efe2d38bdc99bc0ea7f374127556fd6045ae6c4dd988e48f8`,
+exit 0. Sender source/test SHA256:
+`b17e1de52cf94241272c22f224668d7192d8bd098bca93ce792d895b38f69837` /
+`281674764746adcb196acafe8495415e4e9a5403fbd2094593acd54d8968d417`.
+This selector does not establish equivalent coverage for both other profiles.
+Concurrent replacement callers have a separate focused result below.
 The matching endpoint unit suite passes separately, exit 0:
 `post-reset-endpoint-unit-r1.log` in the same directory, SHA256
 `a37e440c8ae7d87432f0190baa5f2f6659e8d5506b942437238e2d39fade9532`.
@@ -82,7 +155,20 @@ Endpoint source/header SHA256:
 `58e25a4aaa3424ccbbe3d5c5c232e00271debafc9a34db9a13ccb2ec94312d2b`.
 The endpoint now tracks the exact R2 relationship owning each codec history
 and exposes quiescent history retirement without deleting committed inputs.
-Service/owner adoption and concurrent replacement qualification remain pending.
+The focused owner test `p50routeowner --same-successor-concurrency` passes:
+two callers for the same successor wait behind the old ACK pump, then both
+commit exact bytes through one replacement connection. It asserts two total
+connectors (old plus successor), one old-history retirement, and executor-owned
+teardown. Evidence: `same-successor-owner-r2.log` under the same log directory,
+SHA256 `3fc256f9e8d6ed800cc4e9ef911f5930f55baf4887f149b2ced723d1a7a28ae2`,
+exit 0. Owner source/header SHA256:
+`aa4a27be1a0da5485a07713273fb4519b3d8f9c2f1448ad7fd8a5294fa288c80` /
+`2c411e5573aec2ac455b0d233e858068bfcd654f2c8d2ec9c89946b1b9e1e1d6`;
+test source `4aa3a205399b89e01fbb11549f35f64cd447ce483ffd121ede4496694ea21e41`;
+binary `ee11355bb64d0874e08eb1fff5e70b0d0ccb52c7ae15ac2bda87efc1d026db4e`.
+This is one ZSTD_TU concurrency case, not qualification of the combined
+service/owner closure or all profiles/topologies. The combined native suites
+are recorded above; broader farm/topology qualification remains open.
 
 The R2 sender now retries failed initial connection setup for the original
 caller, retaining its prepared TU, assignment, and absolute deadline. It uses

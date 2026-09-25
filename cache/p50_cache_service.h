@@ -14,6 +14,7 @@
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <functional>
 #include <map>
@@ -23,6 +24,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "p50_endpoint.h"
 #include "p50_control_operation.h"
@@ -40,6 +42,9 @@
 #include <boost/asio/thread_pool.hpp>
 
 namespace icecc::p50::service {
+
+struct PendingP51Transfer;
+struct PendingP51Admission;
 
 // Unset is the production default. Any configured value other than the one
 // deliberately supported live-farm fault is malformed and must prevent READY.
@@ -93,6 +98,10 @@ struct RuntimeConfig {
     // after an exact reservation row and any matching endpoint tombstone have
     // been retired; production builds have no callback field.
     std::function<void(Id128, bool)> p51_reservation_retired_for_test;
+    // Called on the owner executor when a P51 request is queued but cannot
+    // currently acquire aggregate byte/count credit. Test-only admission
+    // tests use this to synchronize a bounded fairness witness.
+    std::function<void(uint64_t)> p51_source_credit_waiting_for_test;
 #endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like
@@ -175,9 +184,6 @@ public:
     [[nodiscard]] local::P50SourceTransferResult transfer_source_on_owner(
         local::P50SourceTransferRequest request,
         sidecar::AbsoluteMonotonicDeadline deadline,
-        local::HandoffFd source) noexcept;
-    [[nodiscard]] local::P50SourceTransferResult transfer_p51_source_on_owner(
-        local::P51SourceTransferRequest request,
         local::HandoffFd source) noexcept;
     // Takes ownership of one authenticated kind-8 connection and source FD,
     // then returns immediately. File preparation runs on a bounded pool;
@@ -283,6 +289,7 @@ public:
 #endif
 
 private:
+    struct P51RawCredit;
     struct RouteEndpointKey {
         std::string host;
         uint32_t cache_port = 0;
@@ -388,10 +395,27 @@ private:
     [[nodiscard]] bool acquire_source_credit(
         uint64_t raw_bytes,
         std::chrono::steady_clock::time_point deadline) noexcept;
-    [[nodiscard]] bool acquire_p51_source_credit(
-        uint64_t raw_bytes,
-        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] bool try_acquire_p51_source_credit(
+        uint64_t raw_bytes) noexcept;
     void release_p51_source_credit(uint64_t raw_bytes) noexcept;
+    void queue_p51_source_admission(
+        std::shared_ptr<PendingP51Transfer> pending,
+        ProfileId profile, uint64_t raw_bytes) noexcept;
+    void drain_p51_source_admissions() noexcept;
+    void schedule_p51_source_admission_timer() noexcept;
+    void prepare_p51_source_read(
+        std::shared_ptr<PendingP51Transfer> pending, ProfileId profile,
+        uint64_t raw_bytes,
+        std::shared_ptr<P51RawCredit> raw_credit) noexcept;
+    void start_p51_source_transfer_after_read(
+        std::shared_ptr<PendingP51Transfer> pending, ProfileId profile,
+        std::shared_ptr<const std::vector<uint8_t>> raw,
+        std::shared_ptr<P51RawCredit> raw_credit) noexcept;
+    void post_p51_source_transfer_reply(
+        std::shared_ptr<PendingP51Transfer> pending,
+        local::P50SourceTransferResult result) noexcept;
+    [[nodiscard]] bool p51_source_peer_closed(
+        const PendingP51Transfer& pending) const noexcept;
     void release_source_admission(
         const RouteEndpointKey& endpoint,
         const std::optional<SourceIncarnationKey>& incarnation,
@@ -415,9 +439,11 @@ private:
     InputLifecycleRegistry input_lifecycle_;
     boost::asio::io_context context_;
     boost::asio::steady_timer p51_reservation_sweep_timer_{context_};
+    boost::asio::steady_timer p51_source_admission_timer_{context_};
     boost::asio::thread_pool source_setup_pool_;
     boost::asio::thread_pool p51_source_prepare_pool_;
     std::atomic<size_t> p51_source_operation_count_{0};
+    std::atomic<bool> p51_source_admission_wakeup_posted_{false};
     // Outstanding (queued + running) blocking retry setup tasks. Shared with
     // each task so a resolver that outlives its source deadline still holds
     // one bounded slot until its completion path actually returns.
@@ -479,7 +505,8 @@ private:
     // --- dedicated F-session control connections (owner-affine) -----------
     struct FSessionPump;
     struct P51TransferReplyPump;
-    struct P51RawCredit;
+    std::deque<std::shared_ptr<PendingP51Admission>>
+        pending_p51_source_admissions_;
     void fsession_arm_read(std::shared_ptr<FSessionPump> pump) noexcept;
     void fsession_drain(std::shared_ptr<FSessionPump> pump) noexcept;
     void fsession_close(std::shared_ptr<FSessionPump> pump) noexcept;

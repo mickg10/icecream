@@ -51,6 +51,8 @@ struct P50RouteOwnerConfig {
     // Narrow observation seams for proving that a pump-triggered idle reap
     // retires exact route state without a subsequent transfer.
     std::function<bool()> hold_r2_receipt_reader_for_test;
+    std::function<bool()> hold_r2_ack_pump_for_test;
+    std::function<void()> after_r2_rebind_wait_for_test;
     std::function<void()> after_retired_route_reaped_for_test;
     // Forwarded only to the sender's deterministic route-poison unit seam.
     // Production callers always leave this empty.
@@ -150,6 +152,12 @@ private:
                           PrepareRequestKey request,
                           std::chrono::steady_clock::time_point deadline);
     void reap_retired_senders() noexcept;
+    boost::asio::awaitable<bool> wait_for_retired_route_quiescence(
+        PreparationRouteKey route,
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<bool> wait_for_sender_rebind_quiescence(
+        const Sender& sender,
+        std::chrono::steady_clock::time_point deadline);
 
     P50RouteOwnerConfig config_{};
     std::shared_ptr<P50PreparationAuthority> authority_;

@@ -225,8 +225,10 @@ static bool run_iptables_rule(const std::vector<std::string>& arguments)
 
 class P51CommitReceiptGate {
 public:
-    P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected)
-        : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected)
+    P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected,
+                         uint64_t first_ordinal = 1)
+        : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected),
+          first_ordinal_(first_ordinal)
     {
         listener_fd_ = listen_ephemeral(&proxy_port_);
         if (listener_fd_ < 0 || proxy_port_ <= 0) return;
@@ -273,14 +275,75 @@ public:
         return peak_commits_;
     }
 
+    std::optional<icecc::p50::R2TxCommit> first_commit_witness() const
+    {
+        std::lock_guard lock(mutex_);
+        if (commits_.empty() || commits_.front().size() < 4) return std::nullopt;
+        try {
+            const auto decoded = icecc::p50::decode_payload(
+                icecc::p50::MessageType::R2_TX_COMMIT,
+                std::span<const uint8_t>(commits_.front().data() + 4,
+                                         commits_.front().size() - 4));
+            return std::get<icecc::p50::R2TxCommit>(decoded);
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    std::vector<icecc::p50::R2TxCommit> commit_witnesses() const
+    {
+        std::lock_guard lock(mutex_);
+        std::vector<icecc::p50::R2TxCommit> result;
+        result.reserve(commits_.size());
+        for (const auto& frame : commits_) {
+            if (frame.size() < 4) return {};
+            try {
+                const auto decoded = icecc::p50::decode_payload(
+                    icecc::p50::MessageType::R2_TX_COMMIT,
+                    std::span<const uint8_t>(frame.data() + 4, frame.size() - 4));
+                result.push_back(std::get<icecc::p50::R2TxCommit>(decoded));
+            } catch (...) {
+                return {};
+            }
+        }
+        return result;
+    }
+
     bool wait_for_commits(std::chrono::milliseconds timeout)
     {
         std::unique_lock lock(mutex_);
-        return changed_.wait_for(lock, timeout, [&] {
+        const bool woke = changed_.wait_for(lock, timeout, [&] {
             return failed_ || commits_.size() >= expected_;
-        }) && !failed_ && commits_.size() == expected_ &&
-            ordinals_.size() == expected_ && *ordinals_.begin() == 1 &&
-            *ordinals_.rbegin() == expected_;
+        });
+        const bool valid = woke && !failed_ && commits_.size() == expected_ &&
+            ordinals_.size() == expected_ && !ordinals_.empty() &&
+            *ordinals_.begin() == first_ordinal_ &&
+            *ordinals_.rbegin() == first_ordinal_ + expected_ - 1;
+        if (!valid)
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_FAIL port=%d expected=%zu first=%llu woke=%u failed=%u commits=%zu peak=%zu ordinal_count=%zu ordinal_min=%llu ordinal_max=%llu\n",
+                endpoint_port_, expected_, static_cast<unsigned long long>(first_ordinal_),
+                woke ? 1u : 0u, failed_.load(std::memory_order_acquire), commits_.size(),
+                peak_commits_, ordinals_.size(),
+                ordinals_.empty() ? 0ull : static_cast<unsigned long long>(*ordinals_.begin()),
+                ordinals_.empty() ? 0ull : static_cast<unsigned long long>(*ordinals_.rbegin()));
+        return valid;
+    }
+
+    bool rearm(size_t expected, uint64_t first_ordinal)
+    {
+        std::lock_guard lock(mutex_);
+        if (failed_ || stop_.load(std::memory_order_acquire) ||
+            !commits_.empty() || expected == 0 ||
+            first_ordinal > UINT64_MAX - (expected - 1))
+            return false;
+        expected_ = expected;
+        first_ordinal_ = first_ordinal;
+        peak_commits_ = 0;
+        ordinals_.clear();
+        release_ = false;
+        discard_ = false;
+        return true;
     }
 
     void release_commits()
@@ -464,6 +527,7 @@ private:
                                 }
                             }
                             commits_.clear();
+                            ordinals_.clear();
                             changed_.notify_all();
                             if (failed_) break;
                         }
@@ -484,6 +548,7 @@ private:
     int endpoint_port_ = 0;
     uid_t sidecar_uid_ = 0;
     size_t expected_ = 0;
+    uint64_t first_ordinal_ = 1;
     int proxy_port_ = 0;
     int listener_fd_ = -1;
     int client_fd_ = -1;
@@ -2550,6 +2615,7 @@ struct P51RestartRole {
     pid_t daemon_pid = -1;
     MsgChannel *scheduler = nullptr;
     bool paused = false;
+    uint64_t scheduler_epoch = 0;
 
     bool start(const char *daemon_binary, const char *cache_service,
                uint64_t epoch, unsigned max_jobs)
@@ -2607,12 +2673,55 @@ struct P51RestartRole {
             std::unique_ptr<Msg> message(wait_for_type(scheduler, Msg::LOGIN, 500));
             const auto *login = dynamic_cast<const LoginMsg*>(message.get());
             if (present_revision(login, static_cast<uint32_t>(endpoint_port),
-                                 CACHE_WIRE_REVISION_R2))
+                                 CACHE_WIRE_REVISION_R2)) {
+                scheduler_epoch = epoch;
                 return true;
+            }
         }
         std::fprintf(stderr,
             "P51_RESTART_START name=%s phase=ready-timeout endpoint=%d log=%s\n",
             name.c_str(), endpoint_port, log.c_str());
+        std::fprintf(stderr, "%s\n", read_file_suffix(log, 0).c_str());
+        return false;
+    }
+
+    // Close and replace only this fixture's scheduler-side peer. The daemon,
+    // cache sidecar, and listener port remain untouched; this models a new
+    // scheduler session/epoch and is deliberately not a shared S-process test.
+    bool replace_scheduler_epoch(uint64_t epoch)
+    {
+        delete scheduler;
+        scheduler = nullptr;
+        scheduler = accept_channel(scheduler_listener, 15000);
+        std::unique_ptr<Msg> initial(scheduler
+            ? wait_for_type(scheduler, Msg::LOGIN, 5000) : nullptr);
+        const auto *initial_login = dynamic_cast<const LoginMsg*>(initial.get());
+        if (!absent(initial_login)) {
+            std::fprintf(stderr,
+                "P51_SYNTH_SCHEDULER name=%s phase=initial-login type=%d\n",
+                name.c_str(), initial ? static_cast<int>(*initial) : -1);
+            return false;
+        }
+        const ConfCSMsg activate(epoch, ConfCSMsg::StrictNonce);
+        if (!scheduler || !scheduler->send_msg(activate)) {
+            std::fprintf(stderr,
+                "P51_SYNTH_SCHEDULER name=%s phase=activate-send epoch=%llu\n",
+                name.c_str(), static_cast<unsigned long long>(epoch));
+            return false;
+        }
+        const auto ready_deadline = Clock::now() + std::chrono::seconds(10);
+        while (Clock::now() < ready_deadline) {
+            std::unique_ptr<Msg> message(wait_for_type(scheduler, Msg::LOGIN, 500));
+            const auto *login = dynamic_cast<const LoginMsg*>(message.get());
+            if (present_revision(login, static_cast<uint32_t>(endpoint_port),
+                                 CACHE_WIRE_REVISION_R2)) {
+                scheduler_epoch = epoch;
+                return true;
+            }
+        }
+        std::fprintf(stderr,
+            "P51_SYNTH_SCHEDULER name=%s phase=ready-timeout epoch=%llu log=%s\n",
+            name.c_str(), static_cast<unsigned long long>(epoch), log.c_str());
         std::fprintf(stderr, "%s\n", read_file_suffix(log, 0).c_str());
         return false;
     }
@@ -3293,6 +3402,348 @@ static int run_p51_process_restart_case(
         healthy_during ? 1u : 0u);
     return failures ? 1 : 0;
 }
+
+static bool reject_p51_stale_epoch_attach(
+    P51RestartRole& f, const P51RestartJob& old_job,
+    const P51SourceArmedFields& old_armed,
+    const icecc::p50::R2TxCommit& witness, uint32_t profile_mask)
+{
+    const std::string marker = "P50_INPUT_ATTACH_BEGIN job=" +
+        std::to_string(old_job.wire_id) + " epoch=" +
+        std::to_string(old_job.epoch) + " nonce=" +
+        std::to_string(old_job.nonce);
+    std::error_code error;
+    const uintmax_t offset = std::filesystem::file_size(f.log, error);
+    if (error) return false;
+    std::unique_ptr<MsgChannel> stale(connect_tcp_bounded(f.endpoint_port, 5000));
+    if (!stale) return false;
+
+    CompileJob compile_job = attachment_compile_job(
+        old_job.wire_id, old_job.epoch, old_job.nonce,
+        old_armed.arm.source, nullptr);
+    CompileInputIdentity identity;
+    identity.profile = profile_mask == CACHE_PROFILE_P29V1
+        ? CompileInputIdentity::P29V1Profile
+        : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+            ? CompileInputIdentity::ZstdRouteProfile
+            : CompileInputIdentity::ZstdTuProfile;
+    identity.c_store_guid = old_armed.arm.source.c_store_guid;
+    identity.tu_seq = witness.inner.tu_seq.value;
+    identity.raw_bytes = old_job.bytes.size();
+    identity.raw_digest = witness.inner.raw_digest.bytes;
+    identity.attempt_id = old_job.nonce;
+    identity.request_id = old_job.nonce;
+    compile_job.setCompileInputIdentity(identity);
+    if (!stale->send_msg(CompileFileMsg(&compile_job))) return false;
+    const bool closed = wait_eof(stale.get(), 5000);
+    const std::string suffix = read_file_suffix(f.log, offset);
+    const bool attach_started = suffix.find(marker) != std::string::npos;
+    const std::string rejected = "rejecting unprepared/revoked assignment claim " +
+        std::to_string(old_job.wire_id);
+    const bool epoch_assignment_rejected = suffix.find(rejected) != std::string::npos;
+    std::fprintf(stderr,
+        "P51_SYNTH_SCHEDULER_STALE_ATTACH job=%u old_epoch=%llu new_epoch=%llu closed=%u attach_started=%u assignment_reject=%u witness_tu=%llu\n",
+        old_job.wire_id, static_cast<unsigned long long>(old_job.epoch),
+        static_cast<unsigned long long>(f.scheduler_epoch), closed ? 1u : 0u,
+        attach_started ? 1u : 0u, epoch_assignment_rejected ? 1u : 0u,
+        static_cast<unsigned long long>(witness.inner.tu_seq.value));
+    return closed && !attach_started && epoch_assignment_rejected;
+}
+
+static int run_p51_synthetic_scheduler_epoch_w30(
+    const char *daemon_binary, const char *cache_service, passwd *icecc,
+    uint32_t profile_mask)
+{
+    const char *temporary_root = ::getenv("TMPDIR");
+    const std::string prefix = temporary_root && *temporary_root ? temporary_root : "/tmp";
+    std::string pattern = prefix + "/p51s.XXXXXX";
+    std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
+    mutable_pattern.push_back('\0');
+    char *created = ::mkdtemp(mutable_pattern.data());
+    REQUIRE(created != nullptr, "synthetic scheduler fixture root created");
+    if (!created) return 2;
+    const std::string work(created);
+    REQUIRE(::chown(work.c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
+                ::chmod(work.c_str(), 0700) == 0,
+            "synthetic scheduler fixture root has sidecar ownership");
+    if (failures) return 2;
+
+    constexpr uint64_t kOldEpoch = UINT64_C(0x51e0000000000001);
+    constexpr uint64_t kNewEpoch = UINT64_C(0x51e0000000000002);
+    constexpr uint32_t kWireBase = 0x51e21000;
+    P51RestartRole affected_c{"synthetic-c1", work + "/c1", "", -1, 0, 0,
+                              -1, nullptr, false, 0};
+    P51RestartRole healthy_c{"synthetic-c2", work + "/c2", "", -1, 0, 0,
+                             -1, nullptr, false, 0};
+    P51RestartRole affected_f{"synthetic-f1", work + "/f1", "", -1, 0, 0,
+                              -1, nullptr, false, 0};
+    P51RestartRole healthy_f{"synthetic-f2", work + "/f2", "", -1, 0, 0,
+                             -1, nullptr, false, 0};
+    for (P51RestartRole *role : {&affected_c, &healthy_c, &affected_f, &healthy_f}) {
+        const bool made = ::mkdir(role->directory.c_str(), 0700) == 0 &&
+            ::chown(role->directory.c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
+            ::mkdir((role->directory + "/envs").c_str(), 0700) == 0 &&
+            ::chown((role->directory + "/envs").c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
+            ::mkdir((role->directory + "/runtime").c_str(), 0700) == 0 &&
+            ::chown((role->directory + "/runtime").c_str(), icecc->pw_uid, icecc->pw_gid) == 0;
+        REQUIRE(made, "all synthetic scheduler roles have private runtime directories");
+        role->log = role->directory + "/iceccd.log";
+    }
+    if (failures) return 2;
+
+    const bool roles_ready = affected_c.start(daemon_binary, cache_service, kOldEpoch, 64) &&
+        affected_f.start(daemon_binary, cache_service, kOldEpoch, 64) &&
+        healthy_c.start(daemon_binary, cache_service, kOldEpoch, 64) &&
+        healthy_f.start(daemon_binary, cache_service, kOldEpoch, 64);
+    REQUIRE(roles_ready,
+        "four independent daemon/cache roles start under the original scheduler epoch");
+    if (!roles_ready) {
+        affected_c.stop(); affected_f.stop(); healthy_c.stop(); healthy_f.stop();
+        std::fprintf(stderr, "retained synthetic scheduler work directory: %s\n", work.c_str());
+        return 1;
+    }
+    const pid_t c_pid_before = affected_c.daemon_pid;
+    const pid_t f_pid_before = affected_f.daemon_pid;
+    const int old_c_port = affected_c.endpoint_port;
+    const int old_f_port = affected_f.endpoint_port;
+    const uint32_t sidecar_uid = icecc->pw_uid;
+    auto make_job = [&](P51RestartRole& c, P51RestartRole& f,
+                        uint32_t offset, uint64_t epoch) {
+        const uint32_t wire = kWireBase + offset;
+        const uint64_t nonce = (static_cast<uint64_t>(wire) << 32) | offset;
+        return prepare_p51_restart_job(c, f, work, wire, nonce, epoch, profile_mask);
+    };
+
+    auto healthy_initial = make_job(healthy_c, healthy_f, 1, kOldEpoch);
+    P51SourceArmedFields healthy_initial_armed{};
+    const auto healthy_initial_result = healthy_initial
+        ? run_p51_restart_job(healthy_f, *healthy_initial, profile_mask,
+                              &healthy_initial_armed)
+        : icecc::p50::local::P50SourceTransferResult{};
+    const bool healthy_before = healthy_initial && attach_p51_restart_job(
+        healthy_f, *healthy_initial, profile_mask, healthy_initial_armed,
+        healthy_initial_result);
+    REQUIRE(healthy_before,
+        "independent C2/F2 scheduler pair is established before epoch replacement");
+    if (!healthy_before) {
+        healthy_initial.reset();
+        affected_c.stop(); affected_f.stop(); healthy_c.stop(); healthy_f.stop();
+        std::fprintf(stderr, "retained synthetic scheduler work directory: %s\n", work.c_str());
+        return 1;
+    }
+
+    auto old_gate = std::make_unique<P51CommitReceiptGate>(
+        affected_f.endpoint_port, sidecar_uid, 30);
+    REQUIRE(old_gate->ready(), "synthetic epoch gate can hold the old W30 receipts");
+    std::vector<std::unique_ptr<P51RestartTransferCell>> old_cells;
+    old_cells.reserve(30);
+    bool old_prepared = old_gate->ready();
+    for (unsigned index = 0; index < 30 && old_prepared; ++index) {
+        auto job = make_job(affected_c, affected_f, 2 + index, kOldEpoch);
+        old_prepared &= job != nullptr;
+        if (!job) break;
+        old_cells.emplace_back(std::make_unique<P51RestartTransferCell>(std::move(job)));
+    }
+    REQUIRE(old_prepared && old_cells.size() == 30,
+        "old scheduler epoch admits 30 distinct affected compiler assignments");
+    const bool old_started = old_prepared && start_p51_restart_transfers(
+        old_cells, affected_f, profile_mask);
+    REQUIRE(old_started, "old epoch enters a complete pending W30 source window");
+    const bool old_window = old_started && old_gate->wait_for_commits(std::chrono::seconds(30));
+    REQUIRE(old_window && old_gate->observed_commits() == 30,
+        "old epoch reaches 30 F-committed but C-unobserved source receipts");
+    const auto old_witnesses = old_window ? old_gate->commit_witnesses()
+                                          : std::vector<icecc::p50::R2TxCommit>{};
+    const bool old_witnesses_complete = old_witnesses.size() == 30;
+    REQUIRE(old_witnesses_complete,
+        "held old-epoch receipts expose the complete exact commit witness set");
+    if (!old_window || !old_witnesses_complete) {
+        old_gate->discard_held_commits(); old_gate.reset();
+        affected_c.stop(); affected_f.stop(); healthy_c.stop(); healthy_f.stop();
+        (void)wait_p51_restart_transfers(old_cells, Clock::now() + std::chrono::seconds(5));
+        join_p51_restart_transfers(old_cells);
+        std::fprintf(stderr, "retained synthetic scheduler work directory: %s\n", work.c_str());
+        return 1;
+    }
+    const auto& old_witness = old_witnesses.front();
+    // Drop the two affected scheduler sessions but keep both daemon/cache
+    // processes alive. Their reconnects are accepted later under epoch S'.
+    delete affected_c.scheduler; affected_c.scheduler = nullptr;
+    delete affected_f.scheduler; affected_f.scheduler = nullptr;
+    old_gate->release_commits();
+
+    auto healthy_during_job = make_job(healthy_c, healthy_f, 33, kOldEpoch);
+    P51SourceArmedFields healthy_during_armed{};
+    const auto healthy_during_result = healthy_during_job
+        ? run_p51_restart_job(healthy_f, *healthy_during_job, profile_mask,
+                              &healthy_during_armed)
+        : icecc::p50::local::P50SourceTransferResult{};
+    const bool healthy_during = healthy_during_job && attach_p51_restart_job(
+        healthy_f, *healthy_during_job, profile_mask, healthy_during_armed,
+        healthy_during_result);
+    REQUIRE(healthy_during,
+        "unaffected independent scheduler pair transfers and attaches while affected sessions are down");
+
+    const bool c_reconnected = affected_c.replace_scheduler_epoch(kNewEpoch);
+    const bool f_reconnected = affected_f.replace_scheduler_epoch(kNewEpoch);
+    REQUIRE(c_reconnected && f_reconnected && affected_c.scheduler_epoch == kNewEpoch &&
+                affected_f.scheduler_epoch == kNewEpoch,
+        "same C/F daemons reconnect to synthetic scheduler peers under a new assignment epoch");
+    const bool old_settled = wait_p51_restart_transfers(
+        old_cells, Clock::now() + std::chrono::seconds(20));
+    REQUIRE(old_settled, "all old-epoch W30 original callers settle after scheduler loss");
+    if (!old_settled) {
+        affected_c.stop(); affected_f.stop(); healthy_c.stop(); healthy_f.stop();
+        (void)wait_p51_restart_transfers(
+            old_cells, Clock::now() + std::chrono::seconds(5));
+        join_p51_restart_transfers(old_cells);
+        std::fprintf(stderr, "retained synthetic scheduler work directory: %s\n", work.c_str());
+        return 1;
+    }
+    join_p51_restart_transfers(old_cells);
+    const P51SourceArmedFields old_armed = old_cells.front()->armed;
+    const auto old_witness_cell = std::find_if(old_cells.begin(), old_cells.end(),
+        [&](const auto& cell) {
+            return icecc::digest128(cell->job->bytes) == old_witness.inner.raw_digest;
+        });
+    const bool witness_matches_job = old_witness_cell != old_cells.end();
+    REQUIRE(witness_matches_job,
+        "held receipt witness maps to the exact original compiler input");
+    const P51SourceArmedFields witness_armed = witness_matches_job
+        ? (*old_witness_cell)->armed : old_armed;
+    const P51RestartJob& witness_job = witness_matches_job
+        ? *(*old_witness_cell)->job : *old_cells.front()->job;
+    const bool daemon_identity_stable = affected_c.daemon_pid == c_pid_before &&
+        affected_f.daemon_pid == f_pid_before && affected_c.endpoint_port == old_c_port &&
+        affected_f.endpoint_port == old_f_port;
+    REQUIRE(daemon_identity_stable,
+        "scheduler epoch replacement leaves daemon processes and public endpoints unchanged");
+
+    int64_t old_delta_ms = 0;
+    const bool old_deadlines = p51_restart_deadlines_respected(
+        old_cells, std::chrono::seconds(2), &old_delta_ms);
+    REQUIRE(old_deadlines,
+        "old scheduler-epoch callers complete within their original absolute deadlines");
+    size_t old_exact_receipts = 0;
+    for (const auto& cell : old_cells) {
+        if (!cell->settled || cell->result.code !=
+                icecc::p50::local::SourceTransferResultCode::Committed ||
+            cell->result.raw_bytes != cell->job->bytes.size() ||
+            cell->result.raw_digest != icecc::digest128(cell->job->bytes) ||
+            cell->result.c_store_guid.bytes != cell->armed.arm.source.c_store_guid)
+            continue;
+        const bool receipt_seen = std::any_of(
+            old_witnesses.begin(), old_witnesses.end(), [&](const auto& witness) {
+                return witness.inner.tu_seq.value == cell->result.tu_seq &&
+                       witness.inner.raw_digest == cell->result.raw_digest;
+            });
+        old_exact_receipts += receipt_seen;
+    }
+    REQUIRE(old_exact_receipts == 30,
+        "every old result is an exact match for a held F commit witness, never an invented receipt");
+    std::fprintf(stderr,
+        "P51_SYNTH_SCHEDULER_OLD_WINDOW profile=%u held=30 exact_results=%zu max_deadline_delta_ms=%lld\n",
+        profile_mask, old_exact_receipts, static_cast<long long>(old_delta_ms));
+
+    const bool stale_rejected = c_reconnected && f_reconnected &&
+        witness_matches_job &&
+        reject_p51_stale_epoch_attach(affected_f, witness_job,
+                                      witness_armed, old_witness, profile_mask);
+    REQUIRE(stale_rejected,
+        "explicit old-epoch CompileFile attachment is rejected after the new scheduler epoch");
+
+    const uint64_t last_old_ordinal = old_witnesses.empty() ? 0 :
+        std::max_element(old_witnesses.begin(), old_witnesses.end(),
+            [](const auto& left, const auto& right) {
+                return left.relationship_ordinal < right.relationship_ordinal;
+            })->relationship_ordinal;
+    const bool fresh_ordinal_available = last_old_ordinal != UINT64_MAX;
+    REQUIRE(fresh_ordinal_available,
+        "same-store scheduler replacement retains a non-exhausted relationship ordinal");
+    const bool fresh_gate_ready = fresh_ordinal_available &&
+        old_gate->rearm(30, last_old_ordinal + 1);
+    REQUIRE(fresh_gate_ready,
+        "the same persistent-link receipt gate rearms for the new ordinal interval");
+    std::vector<std::unique_ptr<P51RestartTransferCell>> fresh_cells;
+    fresh_cells.reserve(30);
+    bool fresh_prepared = fresh_gate_ready;
+    for (unsigned index = 0; index < 30 && fresh_prepared; ++index) {
+        auto job = make_job(affected_c, affected_f, 34 + index, kNewEpoch);
+        fresh_prepared &= job != nullptr;
+        if (!job) break;
+        fresh_cells.emplace_back(std::make_unique<P51RestartTransferCell>(std::move(job)));
+    }
+    REQUIRE(fresh_prepared && fresh_cells.size() == 30,
+        "new scheduler epoch admits a fresh set of 30 compiler assignments");
+    const bool fresh_started = fresh_prepared && start_p51_restart_transfers(
+        fresh_cells, affected_f, profile_mask);
+    const bool fresh_window = fresh_started && old_gate->wait_for_commits(
+        std::chrono::seconds(30));
+    REQUIRE(fresh_window && old_gate->observed_commits() == 30,
+        "new scheduler epoch reaches a fresh 30-commit W30 window before receipt release");
+    size_t fresh_pending = 0;
+    if (fresh_window) {
+        for (const auto& cell : fresh_cells)
+            fresh_pending += cell->future.wait_for(std::chrono::milliseconds(0)) !=
+                std::future_status::ready;
+    }
+    REQUIRE(fresh_pending == 30,
+        "fresh new-epoch callers remain pending until their own receipt gate opens");
+    if (fresh_window) old_gate->release_commits();
+    else old_gate->discard_held_commits();
+    const bool fresh_settled = fresh_started && wait_p51_restart_transfers(
+        fresh_cells, Clock::now() + std::chrono::seconds(35));
+    REQUIRE(fresh_settled, "fresh epoch callers settle within the bounded fixture watchdog");
+    if (!fresh_settled) {
+        affected_c.stop(); affected_f.stop(); healthy_c.stop(); healthy_f.stop();
+        (void)wait_p51_restart_transfers(
+            fresh_cells, Clock::now() + std::chrono::seconds(5));
+    }
+    join_p51_restart_transfers(fresh_cells);
+    int64_t fresh_delta_ms = 0;
+    const bool fresh_deadlines = p51_restart_deadlines_respected(
+        fresh_cells, std::chrono::seconds(2), &fresh_delta_ms);
+    REQUIRE(fresh_deadlines,
+        "fresh scheduler-epoch callers complete within their original absolute deadlines");
+    size_t fresh_committed = 0;
+    size_t fresh_attached = 0;
+    for (const auto& cell : fresh_cells) {
+        if (cell->settled && cell->result.code ==
+                icecc::p50::local::SourceTransferResultCode::Committed) {
+            ++fresh_committed;
+            fresh_attached += attach_p51_restart_job(
+                affected_f, *cell->job, profile_mask, cell->armed, cell->result);
+        }
+    }
+    REQUIRE(fresh_committed == 30 && fresh_attached == 30,
+        "fresh scheduler-epoch W30 inputs commit and attach exact bytes for all 30 jobs");
+    const bool fresh_identity_present = !fresh_cells.empty();
+    const bool cache_identities_unchanged = fresh_identity_present &&
+        old_armed.f_store_guid == fresh_cells.front()->armed.f_store_guid &&
+        old_armed.f_store_generation == fresh_cells.front()->armed.f_store_generation &&
+        old_armed.arm.source.c_store_guid ==
+            fresh_cells.front()->armed.arm.source.c_store_guid &&
+        old_armed.arm.source.c_store_generation ==
+            fresh_cells.front()->armed.arm.source.c_store_generation;
+    REQUIRE(cache_identities_unchanged,
+        "synthetic scheduler replacement changes epoch but not either cache-store identity");
+    if (failures == 0)
+        std::fprintf(stderr,
+            "P51_SYNTH_SCHEDULER_EPOCH_W30_PASS profile=%u old=30/exact-results fresh=%zu/committed/%zu/attached healthy_sibling=%u daemon_identity_stable=%u old_deadline_delta_ms=%lld fresh_deadline_delta_ms=%lld old_epoch=%llu new_epoch=%llu\n",
+            profile_mask, fresh_committed, fresh_attached, healthy_during ? 1u : 0u,
+            daemon_identity_stable ? 1u : 0u, static_cast<long long>(old_delta_ms),
+            static_cast<long long>(fresh_delta_ms),
+            static_cast<unsigned long long>(kOldEpoch),
+            static_cast<unsigned long long>(kNewEpoch));
+
+    old_gate.reset();
+    healthy_initial.reset(); healthy_during_job.reset();
+    old_cells.clear(); fresh_cells.clear();
+    affected_c.stop(); affected_f.stop(); healthy_c.stop(); healthy_f.stop();
+    if (failures == 0) std::filesystem::remove_all(work);
+    else std::fprintf(stderr, "retained synthetic scheduler work directory: %s\n", work.c_str());
+    return failures ? 1 : 0;
+}
 #endif
 
 static uint32_t selected_vertical_profile()
@@ -3339,10 +3790,13 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_RESTART_W30_F_C1F2") != nullptr;
     const bool restart_w30_c_c2f1 =
         ::getenv("ICECC_TEST_P51_RESTART_W30_C_C2F1") != nullptr;
+    const bool synthetic_scheduler_w30 =
+        ::getenv("ICECC_TEST_P51_SYNTH_SCHEDULER_W30") != nullptr;
     const unsigned restart_selectors = static_cast<unsigned>(restart_f_c1f2) +
         static_cast<unsigned>(restart_c_c2f1) +
         static_cast<unsigned>(restart_w30_f_c1f2) +
-        static_cast<unsigned>(restart_w30_c_c2f1);
+        static_cast<unsigned>(restart_w30_c_c2f1) +
+        static_cast<unsigned>(synthetic_scheduler_w30);
     if (restart_selectors != 0) {
         const uint32_t profile_mask = selected_vertical_profile();
         if (profile_mask == 0) {
@@ -3351,9 +3805,12 @@ int main(int argc, char **argv)
             return 2;
         }
         if (restart_selectors != 1) {
-            std::fprintf(stderr, "FAIL: select one P51 process-restart topology\n");
+            std::fprintf(stderr, "FAIL: select one P51 restart/epoch fixture\n");
             return 2;
         }
+        if (synthetic_scheduler_w30)
+            return run_p51_synthetic_scheduler_epoch_w30(
+                argv[1], argv[2], icecc, profile_mask);
         const bool restart_f = restart_f_c1f2 || restart_w30_f_c1f2;
         const unsigned jobs_per_window =
             restart_w30_f_c1f2 || restart_w30_c_c2f1 ? 30u : 1u;
