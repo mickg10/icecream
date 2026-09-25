@@ -354,7 +354,8 @@ bool InputLifecycleRegistry::begin_attachment(InputRecordKey key,
     if (position == leases_.end())
         return false;
     Lease& lease = position->second;
-    if (!lease.committed || lease.job_closed || lease.attachment_pending)
+    if (!lease.committed || lease.job_closed || lease.attachment_pending ||
+        lease.attempt_retiring)
         return false;
 
     if (!lease.owner.has_value()) {

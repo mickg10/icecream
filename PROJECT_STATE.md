@@ -12,6 +12,34 @@ retained artifact directories.
 
 ## Developer QA
 
+### Retirement-prepared input admission
+
+`InputLifecycleRegistry::begin_attachment` now rejects a lease while
+`attempt_retiring` is set. Previously PREPARE reported a quiesced retained
+attempt but its old owner could still obtain an input attachment. The added
+registry regression failed on the original product specifically at
+`PREPARE left the retiring owner attachable before COMMIT` (exit 1), then
+passed the ASan/UBSan/LSan lifecycle runner with the guard (exit 0). These
+focused outputs were captured in tool transcripts, not separate log files.
+
+A private real R2 fixture passes P29V1, ZSTD_TU and ZSTD_ROUTE: old-owner
+admission denied after PREPARE and after replacement COMMIT, successor denied
+before COMMIT, exact successor attachment after reset/replay, and one exact
+publication and receipt. Full service Automake PASS, process exit 0:
+`/tanksmall/scratch/tmp/p51-d07-active-current.n5c5bZ/build/unittests/p50cacheservice.log`,
+SHA256 `ef9489479353001b1d6eb77d6a1227f3d2d674a9b1c81ea11cbe37c37fd48676`.
+The lifecycle archive, service test and standalone service were explicitly
+rebuilt. Private source is `/tanksmall/scratch/tmp/p51-d07-late-commit.r1/source`;
+service test TU SHA256
+`1b44ad920c543de037e669efc08bee301a507cdba933b9fee00eeafcce6b1b0f`.
+Published registry source SHA256
+`7b5c3bd6690edee2a947eb82880c4737558f28bae041bd26c7c62008abe439ec`;
+registry test SHA256
+`2550e2c68aae19a1d86a871a9c1184a0edabdd7b4dfc4cf9f6bb81d8bbfc0cca`.
+The larger service fixture is not yet integrated with the newer replay-test
+variants; combined candidate qualification remains open. This establishes
+input-attachment admission, not real compiler-process quiescence.
+
 ### Replacement-trigger diagnostics
 
 The opt-in first-latch replacement record is qualified independently of the
