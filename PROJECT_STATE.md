@@ -117,6 +117,26 @@ Build flags include `-O2 -std=c++23`; protocol and endpoint archives were rebuil
 This qualifies the worker repair against these suites, not the entire W30
 plan, independent peer-close-only coverage, or concurrent-memory checking.
 
+Independent peer-close-only coverage now passes for P29V1 and ZSTD_ROUTE:
+the peer closes after sending the full bundle while the real worker is held,
+without calling `reset_store`. An owner-context timer progresses and pending
+raw/encoded/window charges remain held. After worker release, the endpoint
+returns `Disconnected`; any published input must remain exact, no receipt ACK
+is accepted, and all transient byte/history charges must drain to zero.
+In the observed runs publication won and one exact input remained attachable.
+This does not prove immediate EOF detection during decode: the R2 owner waits
+for materialization, explicit cancellation, or its deadline.
+
+The strengthened focused run and full optimized endpoint suite pass on test
+TU SHA256 `fed6b9c5adbdd424ff2d4d52a197fad25a8c88b1a21fa2126d28f9131c206ac1`.
+Logs under `/tanksmall/scratch/tmp/p51-held-worker-final.6pP4qv/logs/`:
+`peer-close-focused-r2.log`, SHA256
+`905bd1e112d64c5475c2840b6939c977d850fe9089c9e911f8c94f66db88c6b2`;
+`endpoint-full-r2.log`, SHA256
+`84b4000ef3def62123d075e3ce90afda31e2d59b25757c48a35079a9b67c7919`.
+Earlier peer-close tests printed but did not assert final zero charges; this
+evidence supersedes them. Concurrent-memory instrumentation remains separate.
+
 ### Active cancellation and mixed-load evidence gaps
 
 Queued cancellation now passes first/middle/last submission positions 0/15/30
