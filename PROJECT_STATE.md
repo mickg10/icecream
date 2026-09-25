@@ -12,6 +12,33 @@ retained artifact directories.
 
 ## Developer QA
 
+### Independent R2 encoded-byte cap
+
+The real F service fixture now covers aggregate pending encoded-byte admission
+at W1 and W30 for ZSTD_TU. One 1,034-byte encoded input is held against a
+1,536-byte cap; two independent C inputs are refused without an extra charge
+or publication. After the first input settles, pending encoded/raw/window
+credits return to zero and an equal-sized input commits. Removing the encoded
+cap check produces an actual 2,068-byte charge and the intended failed
+invariant; restoring it passes both cells again. No production code changed.
+
+Qualification used exact `6f5acde0` plus this test, SDK image
+`7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`.
+The full canonical `make -C /work/build/unittests p50cacheservice.log` also
+passes (exit 0). Artifacts are under
+`/tanksmall/scratch/tmp/icecream-qa-8a9s2j3u/current/`:
+
+- Test source SHA256: `44be987746d844d110103152557886d1f6cd8934935e823501358882c577035c`.
+- Binary: `2fd422eabaf2d0a9b51e5277d44a7e33b2e911e06fc49e99fd4a469960ccf778`.
+- `artifacts/encoded-r7-w30.log`: `9be61021de67a293a2a36a799a56d2e45d4ecedbc35a9e71b7af2853e8364245`.
+- `artifacts/encoded-mutant-w1.log` (expected exit 1): `0d3d9d8e7a10698bdbbf851230e1ff57aaedc4240bfca87961387e39793b6af2`.
+- `build/unittests/p50cacheservice.log`: `efb9ed1efe6490f90d6252a500628b7e7db04b614200e914c137641681c6efb5`.
+
+This does not prove 30 simultaneous decoders, independent raw/metadata caps,
+other profiles' encoded-cap behavior, or peak memory. Those D11 gates remain
+open. Earlier setup/stale-binary failures are retained, not counted as product
+failures or successful negative controls.
+
 ### Canonical QA baseline and remaining native repairs
 
 The frozen `422932c9` canonical `make qa` run completed with overall exit 1:

@@ -6867,6 +6867,581 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
     std::printf("P51_D11_REAL_F_OUTPUT_BYTE_CAP profile=%s window=%u cap/refusal/close/refill: PASS\n",
                 profile_name, window);
 }
+
+struct D11EncodedCapGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    size_t entered = 0;
+    bool release = false;
+};
+
+struct D11EncodedCapClientState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool link_opened = false;
+    bool bundle_attempted = false;
+    bool bundle_written = false;
+    bool refused = false;
+    bool committed = false;
+    bool done = false;
+    bool hold_after_ack = false;
+    bool continue_after_ack = false;
+    uint64_t encoded_bytes = 0;
+    LinkHello link{};
+    JobBind binding{};
+    std::optional<ClientRunResult> result;
+    std::exception_ptr error;
+};
+
+std::vector<uint8_t> d11_encoded_cap_input(size_t size) {
+    std::vector<uint8_t> input(size);
+    uint32_t state = 0x6d2b79f5U;
+    for (uint8_t& byte : input) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<uint8_t>(state >> 24);
+    }
+    return input;
+}
+
+boost::asio::awaitable<void> d11_encoded_cap_client(
+    uint16_t f_port, uint32_t window,
+    const SidecarLaunchIdentity& c_launch,
+    const SidecarLaunchIdentity& f_launch,
+    const P51SourceArmedFields& armed,
+    std::span<const uint8_t> raw,
+    D11EncodedCapClientState& state) {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+    constexpr ProfileId profile = ProfileId::ZSTD_TU;
+    const PreparationRouteKey route{
+        FStoreGuid{f_launch.f_store_guid.bytes}, f_launch.store_generation,
+        profile};
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_speculative_tus = 1;
+    authority_limits.max_speculative_raw_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_launch.c_store_guid, caps.zstd, authority_limits, 1, profile);
+    P50ClientEndpoint client(authority, caps, HistoryNonce{1}, nullptr,
+                             nullptr, std::nullopt, {}, {}, route);
+    const PreparedTuHandle prepared = authority->prepare_for_route(
+        route, PrepareRequestKey{0xd11e, armed.arm.source.source_request_id},
+        raw);
+    JobBind binding = test_p51_job_binding(
+        armed, 1, 1, authority->prepared_tu_seq(prepared).value,
+        std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
+    tcp::socket socket(co_await asio::this_coro::executor);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(60);
+    try {
+        co_await socket.async_connect(
+            tcp::endpoint(asio::ip::address_v4::loopback(), f_port),
+            asio::use_awaitable);
+        LinkHello link = test_p51_link_hello(
+            armed, 1, HistoryNonce{1}, LinkStartMode::Initial);
+        link.max_raw_bytes = 1U << 20;
+        link.max_encoded_bytes = 1U << 20;
+        link.max_output_bytes = 1U << 20;
+        link.system_source_fingerprint =
+            icecc::digest128("D11 aggregate encoded budget");
+        const LinkState opened = co_await client.open_r2_link(
+            socket, link, deadline);
+        CHECK(opened.window == window && opened.profile == profile);
+        {
+            std::lock_guard lock(state.mutex);
+            state.link = link;
+            state.binding = binding;
+            state.link_opened = true;
+        }
+        state.changed.notify_all();
+
+        try {
+            {
+                std::lock_guard lock(state.mutex);
+                state.bundle_attempted = true;
+            }
+            const R2SentBundle sent = co_await client.write_r2_bundle(
+                socket, binding, prepared, deadline);
+            {
+                std::lock_guard lock(state.mutex);
+                state.encoded_bytes = sent.begin.inner.body.encoded_bytes;
+                state.bundle_written = true;
+            }
+            state.changed.notify_all();
+            const ClientRunResult result = co_await client.read_r2_receipt(
+                socket, sent, deadline);
+            {
+                std::lock_guard lock(state.mutex);
+                state.result = result;
+                state.committed = result.status == ClientRunStatus::Committed;
+                state.refused = !state.committed;
+            }
+            state.changed.notify_all();
+            if (result.status == ClientRunStatus::Committed)
+                co_await client.write_r2_ack(
+                    socket, 1, deadline);
+            {
+                std::unique_lock lock(state.mutex);
+                if (state.hold_after_ack &&
+                    !state.changed.wait_for(lock, std::chrono::seconds(10), [&] {
+                        return state.continue_after_ack;
+                    }))
+                    throw std::runtime_error(
+                        "D11 encoded-cap ACK observer was not released");
+            }
+        } catch (const boost::system::system_error& error) {
+            if (error.code() != asio::error::eof &&
+                error.code() != asio::error::connection_reset &&
+                error.code() != asio::error::connection_aborted &&
+                error.code() != asio::error::broken_pipe)
+                throw;
+            std::lock_guard lock(state.mutex);
+            state.refused = true;
+        }
+    } catch (const boost::system::system_error& error) {
+        const bool transport_close =
+            error.code() == asio::error::eof ||
+            error.code() == asio::error::connection_reset ||
+            error.code() == asio::error::connection_aborted ||
+            error.code() == asio::error::broken_pipe;
+        std::lock_guard lock(state.mutex);
+        if (state.link_opened && state.bundle_attempted && transport_close)
+            state.refused = true;
+        else
+            state.error = std::current_exception();
+    } catch (...) {
+        std::lock_guard lock(state.mutex);
+        state.error = std::current_exception();
+    }
+    {
+        std::lock_guard lock(state.mutex);
+        state.done = true;
+    }
+    state.changed.notify_all();
+}
+
+void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
+    constexpr ProfileId profile = ProfileId::ZSTD_TU;
+    constexpr size_t kRawBytes = 1024;
+    constexpr uint64_t kEncodedCap = 1536;
+    CHECK(window == 1 || window == 30);
+
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = 0xe1;
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+    std::array<SidecarLaunchIdentity, 4> c_launches;
+    for (size_t index = 0; index != c_launches.size(); ++index) {
+        StoreIdentityRoot root{};
+        root.bytes[15] = static_cast<uint8_t>(0xe2 + index);
+        c_launches[index] = test_sidecar_launch(root);
+        CHECK(c_launches[index].c_store_guid != f_launch.c_store_guid);
+    }
+
+    uint16_t f_port = 0;
+    const int listener = loopback_listener(f_port);
+    CHECK(listener >= 0 && f_port != 0);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = f_launch.c_store_guid;
+    config.f_store_guid = f_launch.f_store_guid;
+    config.f_store_generation = f_launch.store_generation;
+    config.sidecar_launch = f_launch;
+    config.endpoint_caps.profile = profile;
+    config.endpoint_caps.supported_profiles = profile_bit(profile);
+    config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
+    config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
+    config.endpoint_config.owner_limits.max_pending_encoded_bytes =
+        kEncodedCap;
+    config.endpoint_config.owner_limits.max_pending_raw_bytes =
+        4 * kRawBytes;
+    config.endpoint_config.owner_limits.max_decoder_window_bytes =
+        uint64_t{2} << config.endpoint_caps.zstd.max_window_log;
+    config.endpoint_config.owner_limits.max_retained_input_records = 8;
+    config.endpoint_config.owner_limits.max_retained_input_bytes =
+        8 * kRawBytes;
+    config.max_pending_p51_source_reservations = 8;
+    std::mutex materialized_mutex;
+    std::vector<std::pair<Digest128, uint64_t>> materialized;
+    config.endpoint_config.input_job_state =
+        [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
+            std::span<const uint8_t> bytes) {
+            std::lock_guard lock(materialized_mutex);
+            materialized.emplace_back(icecc::digest128(bytes), bytes.size());
+            CHECK(begin.raw_digest == icecc::digest128(bytes) &&
+                  begin.raw_bytes == bytes.size());
+            return InputJobState::Open;
+        };
+    service::SidecarRuntime runtime(std::move(config));
+
+    std::vector<uint8_t> raw = d11_encoded_cap_input(kRawBytes);
+    std::array<local::P51SourceReservationRequest, 4> requests;
+    std::array<P51SourceArmedFields, 4> armed;
+    for (size_t index = 0; index != requests.size(); ++index) {
+        requests[index] = test_p51_reservation_request(
+            c_launches[index].c_store_guid,
+            c_launches[index].store_generation,
+            c_launches[index].identity.generation,
+            c_launches[index].identity.attempt,
+            0xd110 + index, CACHE_PROFILE_ZSTD_TU, window,
+            std::chrono::seconds(120));
+        requests[index].arm.source.selected_f_host = "127.0.0.1";
+        requests[index].arm.source.selected_f_cache_port = f_port;
+        requests[index].arm.source.logical_job = 0xd120 + index;
+        requests[index].arm.source.assignment_nonce = 0xd130 + index;
+        const auto result = runtime.reserve_p51_source_on_owner(requests[index]);
+        CHECK(result.error_code == 0 && result.armed.has_value() &&
+              result.armed->selected_window == window);
+        armed[index] = *result.armed;
+    }
+
+    D11EncodedCapGate gate;
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<size_t> accepted_connections{0};
+    std::thread acceptor([&] {
+        const auto end = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(90);
+        while (!stop_accepting.load(std::memory_order_acquire) &&
+               accepted_connections.load(std::memory_order_acquire) < 4 &&
+               std::chrono::steady_clock::now() < end) {
+            pollfd ready{listener, POLLIN, 0};
+            int polled;
+            do {
+                polled = ::poll(&ready, 1, 100);
+            } while (polled < 0 && errno == EINTR);
+            if (polled <= 0 || !(ready.revents & POLLIN))
+                continue;
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            int fd;
+            do {
+                fd = ::accept(listener,
+                    reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            } while (fd < 0 && errno == EINTR);
+            if (fd < 0)
+                continue;
+            EndpointIoControl control;
+            if (accepted_connections.load(std::memory_order_acquire) == 0) {
+                control.before_materialize_on_worker = [&gate] {
+                    std::unique_lock lock(gate.mutex);
+                    ++gate.entered;
+                    gate.changed.notify_all();
+                    gate.changed.wait(lock, [&] { return gate.release; });
+                };
+            }
+            accepted_connections.fetch_add(1, std::memory_order_acq_rel);
+            // The low-level P50ClientEndpoint used below speaks R2 directly
+            // on this socket; unlike daemon-driven service fixtures, there is
+            // no ordinary MsgChannel/P51-link-session preamble here.
+            runtime.start_adopted_r2_endpoint(fd, std::move(control));
+        }
+    });
+
+    std::array<D11EncodedCapClientState, 4> states;
+    std::array<std::thread, 4> clients;
+    const auto start_client = [&](size_t index) {
+        clients[index] = std::thread([&, index] {
+            try {
+                namespace asio = boost::asio;
+                asio::io_context context;
+                auto future = asio::co_spawn(
+                    context,
+                    d11_encoded_cap_client(
+                        f_port, window, c_launches[index], f_launch,
+                        armed[index], raw, states[index]),
+                    asio::use_future);
+                context.run();
+                future.get();
+            } catch (...) {
+                std::lock_guard lock(states[index].mutex);
+                states[index].error = std::current_exception();
+                states[index].done = true;
+                states[index].changed.notify_all();
+            }
+        });
+    };
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            {
+                std::lock_guard lock(gate.mutex);
+                gate.release = true;
+            }
+            gate.changed.notify_all();
+            stop_accepting.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (acceptor.joinable())
+                acceptor.join();
+            (void)::close(listener);
+            for (D11EncodedCapClientState& state : states) {
+                {
+                    std::lock_guard lock(state.mutex);
+                    state.continue_after_ack = true;
+                }
+                state.changed.notify_all();
+            }
+            for (std::thread& client : clients) {
+                if (client.joinable())
+                    client.join();
+            }
+            runtime.stop();
+        });
+
+    {
+        std::lock_guard lock(states[0].mutex);
+        states[0].hold_after_ack = true;
+    }
+    start_client(0);
+    {
+        std::unique_lock lock(gate.mutex);
+        CHECK(gate.changed.wait_for(lock, std::chrono::seconds(10), [&] {
+            return gate.entered != 0;
+        }));
+    }
+    {
+        std::unique_lock lock(states[0].mutex);
+        CHECK(states[0].changed.wait_for(lock, std::chrono::seconds(10), [&] {
+            return states[0].bundle_written || states[0].error != nullptr;
+        }));
+        if (states[0].error)
+            std::rethrow_exception(states[0].error);
+        CHECK(states[0].link_opened && states[0].bundle_written);
+    }
+    const LinkHello first_link = states[0].link;
+    const uint64_t encoded_charge = states[0].encoded_bytes;
+    CHECK(encoded_charge != 0 && encoded_charge <= kEncodedCap &&
+          encoded_charge * 2 > kEncodedCap);
+    auto held = runtime.p51_receipt_ledger_for_test(first_link);
+    CHECK(held.has_value() &&
+          held->endpoint_usage.pending_encoded_bytes == encoded_charge &&
+          held->endpoint_usage.pending_raw_bytes == kRawBytes &&
+          held->endpoint_usage.decoder_window_bytes != 0 &&
+          held->endpoint_usage.retained_input_records == 0);
+
+    const auto wait_client = [&](size_t index) {
+        std::unique_lock lock(states[index].mutex);
+        CHECK(states[index].changed.wait_for(lock, std::chrono::seconds(10), [&] {
+            return states[index].done;
+        }));
+        if (states[index].error)
+            std::rethrow_exception(states[index].error);
+    };
+    const auto assert_cap_refused_without_extra_charge = [&](size_t index) {
+        std::unique_lock lock(states[index].mutex);
+        CHECK(states[index].changed.wait_for(lock, std::chrono::seconds(10), [&] {
+            return states[index].bundle_written || states[index].done ||
+                   states[index].error != nullptr;
+        }));
+        if (states[index].error)
+            std::rethrow_exception(states[index].error);
+        CHECK(states[index].link_opened && states[index].bundle_attempted);
+        if (states[index].bundle_written)
+            CHECK(states[index].encoded_bytes == encoded_charge);
+        lock.unlock();
+
+        std::optional<service::P51ReceiptLedgerSnapshot> during_refusal;
+        const auto refusal_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(10);
+        bool done = false;
+        while (std::chrono::steady_clock::now() < refusal_deadline) {
+            during_refusal = runtime.p51_receipt_ledger_for_test(first_link);
+            CHECK(during_refusal.has_value());
+            bool bundle_written = false;
+            {
+                std::lock_guard state_lock(states[index].mutex);
+                if (states[index].error)
+                    std::rethrow_exception(states[index].error);
+                bundle_written = states[index].bundle_written;
+                done = states[index].done;
+            }
+            if (done || during_refusal->endpoint_usage.pending_encoded_bytes !=
+                            encoded_charge)
+                std::fprintf(stderr,
+                             "D11_STAGE c%zu-refusal written=%u done=%u enc=%llu cap=%llu raw=%llu\n",
+                             index + 1,
+                             bundle_written ? 1u : 0u,
+                             done ? 1u : 0u,
+                             static_cast<unsigned long long>(
+                                 during_refusal->endpoint_usage.pending_encoded_bytes),
+                             static_cast<unsigned long long>(kEncodedCap),
+                             static_cast<unsigned long long>(
+                                 during_refusal->endpoint_usage.pending_raw_bytes));
+            CHECK(during_refusal->endpoint_usage.pending_encoded_bytes ==
+                      encoded_charge &&
+                  during_refusal->endpoint_usage.pending_raw_bytes ==
+                      kRawBytes &&
+                  during_refusal->endpoint_usage.retained_input_records == 0);
+            if (done)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(done);
+        {
+            std::lock_guard state_lock(states[index].mutex);
+            CHECK(states[index].refused && !states[index].committed);
+        }
+    };
+    start_client(1);
+    assert_cap_refused_without_extra_charge(1);
+    held = runtime.p51_receipt_ledger_for_test(first_link);
+    CHECK(held.has_value() &&
+          held->endpoint_usage.pending_encoded_bytes == encoded_charge &&
+          held->endpoint_usage.pending_raw_bytes == kRawBytes &&
+          held->endpoint_usage.retained_input_records == 0);
+    {
+        std::lock_guard lock(gate.mutex);
+        CHECK(gate.entered == 1);
+    }
+    {
+        std::lock_guard lock(materialized_mutex);
+        CHECK(materialized.empty());
+    }
+
+    // Negative control: another exact same-size valid TU still cannot pass
+    // while C1's encoded credit remains retained.
+    start_client(2);
+    assert_cap_refused_without_extra_charge(2);
+    held = runtime.p51_receipt_ledger_for_test(first_link);
+    CHECK(held.has_value() &&
+          held->endpoint_usage.pending_encoded_bytes == encoded_charge &&
+          held->endpoint_usage.pending_raw_bytes == kRawBytes &&
+          held->endpoint_usage.retained_input_records == 0);
+
+    {
+        std::lock_guard lock(gate.mutex);
+        gate.release = true;
+    }
+    gate.changed.notify_all();
+    {
+        std::unique_lock lock(states[0].mutex);
+        CHECK(states[0].changed.wait_for(lock, std::chrono::seconds(15), [&] {
+            return states[0].committed || states[0].error != nullptr;
+        }));
+        if (states[0].error)
+            std::rethrow_exception(states[0].error);
+    }
+    std::optional<service::P51ReceiptLedgerSnapshot> released_first;
+    const auto release_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < release_deadline) {
+        released_first = runtime.p51_receipt_ledger_for_test(first_link);
+        if (released_first &&
+            released_first->acknowledged_prefix_q == 1 &&
+            released_first->endpoint_usage.pending_encoded_bytes == 0 &&
+            released_first->endpoint_usage.pending_raw_bytes == 0 &&
+            released_first->endpoint_usage.decoder_window_bytes == 0 &&
+            released_first->endpoint_usage.retained_input_records == 1)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::fprintf(stderr,
+                 "D11_STAGE encoded-release link=%u q=%llu enc=%llu raw=%llu window=%llu retained=%llu\n",
+                 released_first.has_value() ? 1u : 0u,
+                 static_cast<unsigned long long>(released_first ?
+                     released_first->acknowledged_prefix_q : 0),
+                 static_cast<unsigned long long>(released_first ?
+                     released_first->endpoint_usage.pending_encoded_bytes : 0),
+                 static_cast<unsigned long long>(released_first ?
+                     released_first->endpoint_usage.pending_raw_bytes : 0),
+                 static_cast<unsigned long long>(released_first ?
+                     released_first->endpoint_usage.decoder_window_bytes : 0),
+                 static_cast<unsigned long long>(released_first ?
+                     released_first->endpoint_usage.retained_input_records : 0));
+    CHECK(released_first.has_value() &&
+          released_first->acknowledged_prefix_q == 1 &&
+          released_first->endpoint_usage.pending_encoded_bytes == 0 &&
+          released_first->endpoint_usage.pending_raw_bytes == 0 &&
+          released_first->endpoint_usage.decoder_window_bytes == 0 &&
+          released_first->endpoint_usage.retained_input_records == 1);
+    {
+        std::lock_guard lock(states[0].mutex);
+        states[0].continue_after_ack = true;
+    }
+    states[0].changed.notify_all();
+    wait_client(0);
+    CHECK(states[0].committed && states[0].result.has_value() &&
+          states[0].result->committed_input.has_value() &&
+          states[0].result->committed_commit.has_value() &&
+          states[0].result->committed_commit->raw_digest ==
+              icecc::digest128(raw));
+    CHECK(released_first->endpoint_usage.pending_encoded_bytes == 0 &&
+          released_first->endpoint_usage.pending_raw_bytes == 0 &&
+          released_first->endpoint_usage.decoder_window_bytes == 0 &&
+          released_first->endpoint_usage.retained_input_records == 1);
+
+    // The same-size transaction is now admissible after the first lease has
+    // settled and released its encoded charge.
+    {
+        std::lock_guard lock(states[3].mutex);
+        states[3].hold_after_ack = true;
+    }
+    start_client(3);
+    {
+        std::unique_lock lock(states[3].mutex);
+        CHECK(states[3].changed.wait_for(lock, std::chrono::seconds(15), [&] {
+            return states[3].committed || states[3].error != nullptr;
+        }));
+        if (states[3].error)
+            std::rethrow_exception(states[3].error);
+    }
+    std::optional<service::P51ReceiptLedgerSnapshot> refilled;
+    const auto refill_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < refill_deadline) {
+        refilled = runtime.p51_receipt_ledger_for_test(states[3].link);
+        if (refilled && refilled->acknowledged_prefix_q == 1 &&
+            refilled->endpoint_usage.pending_encoded_bytes == 0 &&
+            refilled->endpoint_usage.pending_raw_bytes == 0 &&
+            refilled->endpoint_usage.decoder_window_bytes == 0 &&
+            refilled->endpoint_usage.retained_input_records == 2)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::fprintf(stderr,
+                 "D11_STAGE encoded-refill link=%u q=%llu enc=%llu raw=%llu window=%llu retained=%llu\n",
+                 refilled.has_value() ? 1u : 0u,
+                 static_cast<unsigned long long>(refilled ?
+                     refilled->acknowledged_prefix_q : 0),
+                 static_cast<unsigned long long>(refilled ?
+                     refilled->endpoint_usage.pending_encoded_bytes : 0),
+                 static_cast<unsigned long long>(refilled ?
+                     refilled->endpoint_usage.pending_raw_bytes : 0),
+                 static_cast<unsigned long long>(refilled ?
+                     refilled->endpoint_usage.decoder_window_bytes : 0),
+                 static_cast<unsigned long long>(refilled ?
+                     refilled->endpoint_usage.retained_input_records : 0));
+    CHECK(refilled.has_value() && refilled->acknowledged_prefix_q == 1 &&
+          refilled->endpoint_usage.pending_encoded_bytes == 0 &&
+          refilled->endpoint_usage.pending_raw_bytes == 0 &&
+          refilled->endpoint_usage.decoder_window_bytes == 0 &&
+          refilled->endpoint_usage.retained_input_records == 2);
+    {
+        std::lock_guard lock(states[3].mutex);
+        states[3].continue_after_ack = true;
+    }
+    states[3].changed.notify_all();
+    wait_client(3);
+    CHECK(states[3].link_opened && states[3].bundle_written &&
+          states[3].committed && states[3].result.has_value() &&
+          states[3].result->committed_input.has_value() &&
+          states[3].encoded_bytes == encoded_charge);
+    {
+        std::lock_guard lock(materialized_mutex);
+        CHECK(materialized.size() == 2 &&
+              materialized[0] == std::make_pair(
+                  icecc::digest128(raw), static_cast<uint64_t>(raw.size())) &&
+              materialized[1] == materialized[0]);
+    }
+    CHECK(accepted_connections.load(std::memory_order_acquire) == 4);
+    std::printf(
+        "P51_D11_REAL_R2_ENCODED_CAP profile=ZSTD_TU window=%u encoded=%llu cap=%llu: PASS\n",
+        window, static_cast<unsigned long long>(encoded_charge),
+        static_cast<unsigned long long>(kEncodedCap));
+}
+
 void test_p51_cancel_publication_and_reset_lifecycle() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x39;
@@ -12480,6 +13055,17 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-r2-pending-encoded-cap-zstd-tu-w1") == 0) {
+            test_p51_d11_real_r2_pending_encoded_cap(1);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-r2-pending-encoded-cap") == 0) {
+            test_p51_d11_real_r2_pending_encoded_cap(1);
+            test_p51_d11_real_r2_pending_encoded_cap(30);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--credit-admission-hol-witness") == 0) {
             test_p51_credit_admission_bypasses_blocked_workers();
             return 0;
@@ -12538,6 +13124,8 @@ int main(int argc, char** argv) {
             test_p51_d11_real_f_output_byte_cap(profile, 30);
         }
         test_p51_d11_real_f_output_byte_cap(ProfileId::P29V1, 1, true);
+        test_p51_d11_real_r2_pending_encoded_cap(1);
+        test_p51_d11_real_r2_pending_encoded_cap(30);
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_interrupted_reservation_relationship_isolation();
         test_p51_interrupted_reservation_relationship_isolation(true);
