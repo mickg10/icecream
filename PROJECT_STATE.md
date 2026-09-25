@@ -285,6 +285,14 @@ instrumentation nor a measured RSS/heap plateau or complete D17 qualification.
 The first build stopped on a range-loop-copy warning promoted to an error;
 the successful build retains the warning with only that warning exempted from
 `-Werror`. Its failed build log is preserved, not counted as a runtime result.
+The same sanitizer lane subsequently passes the endpoint held-worker
+reset/successor and independent peer-close cases three times each for P29V1
+and ZSTD_ROUTE, plus InputRecord lifecycle checks (Automake PASS, process
+exit 0). Retained-worker counters remain charged until completion and then
+drain. Endpoint log under the same root:
+`build/unittests/p50endpoint-sanitize.log`, SHA256
+`f40e07600d2e6aab4508bdbb9d3b879f08bc0e9286f88c57df90cae46d2bb1d9`.
+The same uninstrumented services-library limitation applies.
 
 Real multi-survivor replay interruption, all D07 cancellation positions/stages,
 compiler-process quiescence, and the broader external/performance gates remain
