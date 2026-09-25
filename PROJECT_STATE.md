@@ -177,8 +177,20 @@ Earlier runs omitted the ordinary connection handshake or required a recovery
 marker for an unbound request; those fixture failures are excluded.
 
 This does not substitute for partial/full-transfer cancellation.
-Code review identifies a recovery mismatch
-requiring a deterministic regression: F reset removes cancelled reservations,
+A deterministic active-transfer probe now reproduces the recovery mismatch
+against product `06716e64`: the first input commits exactly; F holds the second
+job's worker after its full bundle, with the successor's complete ordinal-3
+bundle buffered. Exact F cancellation is accepted before publication, while
+both original deadlines have about 30 seconds remaining. Neither job receives
+a result before its deadline; eight physical links are accepted. C operation
+and raw credits eventually drain, but successor liveness fails. Evidence:
+`/tanksmall/scratch/tmp/p51-d07-active-head.DkM6x9/tmp/active-r1.log`, SHA256
+`3afa9c86129243af332a39753998bbd57edb745f11e8e535b67133d7220e985d`.
+The observational probe exits zero because it verifies setup and records
+outcomes, not because cancellation recovery passes; a success-asserting
+regression and product repair remain required.
+
+F reset removes cancelled reservations,
 but C's sender currently replays every unresolved suffix witness using its
 old relationship ordinal. The required behavior is exact settlement followed
 by contiguous rebuilding of still-live jobs, preserving their TU identities.
