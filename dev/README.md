@@ -46,6 +46,8 @@ Inside an already built, disposable Linux test container, run:
 make -C "$BUILD/unittests" p50daemonpositive-p51-multilink-check
 make -C "$BUILD/unittests" p50daemonpositive-p51-restart-check
 make -C "$BUILD/unittests" p50daemonpositive-p51-restart-w30-check
+ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
+  make -C "$BUILD/unittests" p51schedulerrestart-w30-check
 ```
 
 `BUILD` is the absolute configured build directory. These gates require root
@@ -54,7 +56,10 @@ Docker `NET_ADMIN`, and writable scratch-backed `ICEFARM_TMPDIR`. The daemon
 account must be able to traverse the build path and temporary directory.
 Mount scratch at a short container path such as `/work/tmp`: these fixtures
 create Unix-domain sockets with a limited path length.
-Do not run these network-redirection fixtures directly on the host.
+Use a private Docker bridge network, never `--network=host`; do not run these
+network-redirection fixtures directly on the host. The scheduler-restart gate
+requires the explicit private-namespace opt-in shown above because its receipt
+helper installs a temporary namespace-local OUTPUT redirection rule.
 
 The multi-link gate covers C1F2/3/4 and C2/3/4F1 for all three profiles, with
 30 outstanding jobs per link (at most 120 total). It checks exact input
@@ -68,6 +73,15 @@ attachments on the replacement identity. It checks bounded settlement; direct
 per-caller completion-time comparison with the original deadline remains
 pending. These targets are not automatically included in the default
 `make qa` workflow and are not throughput benchmarks or cross-host farm tests.
+
+The `p51schedulerrestart-w30-check` target replaces the actual scheduler
+process while C/F daemons and cache processes remain alive, for all three
+profiles. It holds 30 old receipts, verifies old callers settle fail-closed
+under remote-only policy, then verifies 30 fresh-epoch receipts and remote
+objects. It does not promise transparent retry of every interrupted caller.
+The fixture uses the existing three-second test reconnect setting, not the
+production reconnect cadence. It retains evidence and uses orderly timeout
+cleanup; an interrupted case is a failure, never a passing skip.
 
 ### Repository and offline inputs
 

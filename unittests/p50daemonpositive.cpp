@@ -226,15 +226,16 @@ static bool run_iptables_rule(const std::vector<std::string>& arguments)
 class P51CommitReceiptGate {
 public:
     P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected,
-                         uint64_t first_ordinal = 1)
+                         uint64_t first_ordinal = 1,
+                         std::string abort_path = {})
         : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected),
-          first_ordinal_(first_ordinal)
+          first_ordinal_(first_ordinal), abort_path_(std::move(abort_path))
     {
         listener_fd_ = listen_ephemeral(&proxy_port_);
         if (listener_fd_ < 0 || proxy_port_ <= 0) return;
         const auto rule = [&](const char *action) {
             return run_iptables_rule({"-t", "nat", action, "OUTPUT", "-p", "tcp",
-                "-d", "127.0.0.1", "--dport", std::to_string(endpoint_port_),
+                "--dport", std::to_string(endpoint_port_),
                 "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
                 "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
         };
@@ -262,7 +263,7 @@ public:
         if (listener_fd_ >= 0) { ::close(listener_fd_); listener_fd_ = -1; }
         if (rule_installed_)
             (void)run_iptables_rule({"-t", "nat", "-D", "OUTPUT", "-p", "tcp",
-                "-d", "127.0.0.1", "--dport", std::to_string(endpoint_port_),
+                "--dport", std::to_string(endpoint_port_),
                 "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
                 "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
     }
@@ -312,13 +313,28 @@ public:
     bool wait_for_commits(std::chrono::milliseconds timeout)
     {
         std::unique_lock lock(mutex_);
-        const bool woke = changed_.wait_for(lock, timeout, [&] {
-            return failed_ || commits_.size() >= expected_;
-        });
-        const bool valid = woke && !failed_ && commits_.size() == expected_ &&
-            ordinals_.size() == expected_ && !ordinals_.empty() &&
-            *ordinals_.begin() == first_ordinal_ &&
-            *ordinals_.rbegin() == first_ordinal_ + expected_ - 1;
+        const auto deadline = Clock::now() + timeout;
+        bool woke = false;
+        while (!failed_ && commits_.size() < expected_) {
+            if (abort_requested()) {
+                stop_.store(true, std::memory_order_release);
+                failed_.store(true, std::memory_order_release);
+                release_ = true;
+                changed_.notify_all();
+                break;
+            }
+            const auto now = Clock::now();
+            if (now >= deadline) break;
+            changed_.wait_until(lock, std::min(deadline, now +
+                std::chrono::milliseconds(100)));
+        }
+        woke = failed_ || commits_.size() >= expected_;
+        const bool ordinal_range_valid = !ordinals_.empty() &&
+            (*ordinals_.rbegin() - *ordinals_.begin() + 1 == expected_) &&
+            (first_ordinal_ == 0 || *ordinals_.begin() == first_ordinal_);
+        const bool valid = woke && !failed_ && expected_ != 0 &&
+            commits_.size() == expected_ && ordinals_.size() == expected_ &&
+            ordinal_range_valid;
         if (!valid)
             std::fprintf(stderr,
                 "P51_RECEIPT_GATE_FAIL port=%d expected=%zu first=%llu woke=%u failed=%u commits=%zu peak=%zu ordinal_count=%zu ordinal_min=%llu ordinal_max=%llu\n",
@@ -334,8 +350,9 @@ public:
     {
         std::lock_guard lock(mutex_);
         if (failed_ || stop_.load(std::memory_order_acquire) ||
-            !commits_.empty() || expected == 0 ||
-            first_ordinal > UINT64_MAX - (expected - 1))
+            !commits_.empty() ||
+            (expected != 0 && first_ordinal != 0 &&
+             first_ordinal > UINT64_MAX - (expected - 1)))
             return false;
         expected_ = expected;
         first_ordinal_ = first_ordinal;
@@ -366,6 +383,13 @@ public:
     }
 
 private:
+    bool abort_requested() const
+    {
+        if (abort_path_.empty()) return false;
+        std::error_code error;
+        return std::filesystem::exists(abort_path_, error) && !error;
+    }
+
     bool write_relay_bytes(int fd, const void *buffer, size_t size)
     {
         const auto *position = static_cast<const unsigned char *>(buffer);
@@ -507,7 +531,20 @@ private:
                                                      payload_bytes));
                         const auto& commit = std::get<icecc::p50::R2TxCommit>(decoded);
                         std::unique_lock lock(mutex_);
+                        if (expected_ == 0 ||
+                            (first_ordinal_ != 0 &&
+                             commit.relationship_ordinal < first_ordinal_)) {
+                            lock.unlock();
+                            if (!write_relay_bytes(client_fd_, frame.data(), frame.size()))
+                                break;
+                            continue;
+                        }
                         if (!ordinals_.insert(commit.relationship_ordinal).second) {
+                            failed_ = true;
+                            changed_.notify_all();
+                            break;
+                        }
+                        if (commits_.size() >= expected_) {
                             failed_ = true;
                             changed_.notify_all();
                             break;
@@ -549,6 +586,7 @@ private:
     uid_t sidecar_uid_ = 0;
     size_t expected_ = 0;
     uint64_t first_ordinal_ = 1;
+    std::string abort_path_;
     int proxy_port_ = 0;
     int listener_fd_ = -1;
     int client_fd_ = -1;
@@ -565,6 +603,125 @@ private:
     std::atomic<bool> failed_{false};
     std::atomic<bool> stop_{false};
 };
+
+static bool p51_gate_wait_for_path(const std::string& path,
+                                   std::chrono::milliseconds timeout)
+{
+    const auto deadline = Clock::now() + timeout;
+    while (Clock::now() < deadline) {
+        std::error_code error;
+        const auto abort_path = std::filesystem::path(path).parent_path() / "abort";
+        if (std::filesystem::exists(abort_path, error) && !error) return false;
+        error.clear();
+        if (std::filesystem::exists(path, error) && !error) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+static bool p51_gate_write_marker(const std::string& path,
+                                  const std::string& contents = "ok\n")
+{
+    const std::string temporary = path + ".tmp-" + std::to_string(::getpid());
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) return false;
+        output << contents;
+        output.flush();
+        if (!output.good()) {
+            output.close();
+            (void)::unlink(temporary.c_str());
+            return false;
+        }
+    }
+    if (::rename(temporary.c_str(), path.c_str()) == 0) return true;
+    (void)::unlink(temporary.c_str());
+    return false;
+}
+
+static bool p51_gate_wait_rearm(P51CommitReceiptGate& gate, size_t expected,
+                                uint64_t first_ordinal,
+                                const std::string& abort_path)
+{
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (Clock::now() < deadline) {
+        std::error_code error;
+        if (std::filesystem::exists(abort_path, error) && !error) return false;
+        if (gate.rearm(expected, first_ordinal)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
+                                       size_t expected, uint64_t first_ordinal,
+                                       const std::string& control_dir)
+{
+    if (endpoint_port <= 0 || sidecar_uid == 0 || expected == 0 ||
+        expected > 30 || control_dir.empty())
+        return 2;
+    std::error_code error;
+    if (!std::filesystem::create_directories(control_dir, error) && error)
+        return 2;
+    P51CommitReceiptGate gate(endpoint_port, sidecar_uid, expected, first_ordinal,
+                              control_dir + "/abort");
+    if (!gate.ready() || !p51_gate_write_marker(control_dir + "/ready")) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "gate setup failed\n");
+        return 1;
+    }
+    const auto wait_stage = [&](unsigned stage) {
+        if (!gate.wait_for_commits(std::chrono::seconds(30)))
+            return false;
+        const auto witnesses = gate.commit_witnesses();
+        if (witnesses.size() != expected) return false;
+        uint64_t first = UINT64_MAX;
+        uint64_t last = 0;
+        for (const auto& witness : witnesses) {
+            first = std::min(first, witness.relationship_ordinal);
+            last = std::max(last, witness.relationship_ordinal);
+        }
+        const std::string summary = "count=" + std::to_string(witnesses.size()) +
+            " first_ordinal=" + std::to_string(first) +
+            " last_ordinal=" + std::to_string(last) + "\n";
+        if (last - first + 1 != expected || !p51_gate_write_marker(
+                control_dir + "/held-" + std::to_string(stage), summary))
+            return false;
+        return p51_gate_wait_for_path(
+            control_dir + "/release-" + std::to_string(stage),
+            std::chrono::seconds(30));
+    };
+    if (!wait_stage(1)) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "first receipt window failed\n");
+        return 1;
+    }
+    gate.release_commits();
+    if (!p51_gate_wait_rearm(gate, 0, 0, control_dir + "/abort") ||
+        !p51_gate_write_marker(control_dir + "/released-1")) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "first release did not settle\n");
+        return 1;
+    }
+    if (!p51_gate_wait_for_path(control_dir + "/arm-2", std::chrono::seconds(30)) ||
+        !p51_gate_wait_rearm(gate, expected, 0, control_dir + "/abort") ||
+        !p51_gate_write_marker(control_dir + "/armed-2")) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "second receipt window did not arm\n");
+        return 1;
+    }
+    if (!wait_stage(2)) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "second receipt window failed\n");
+        return 1;
+    }
+    gate.release_commits();
+    if (!p51_gate_wait_rearm(gate, 0, 0, control_dir + "/abort") ||
+        !p51_gate_write_marker(control_dir + "/released-2")) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "second release did not settle\n");
+        return 1;
+    }
+    if (!p51_gate_wait_for_path(control_dir + "/finish", std::chrono::seconds(180))) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "fresh batch did not finish before gate shutdown\n");
+        return 1;
+    }
+    return 0;
+}
 
 /* Multi-connection receipt gate for real CxF W30 topology checks.  Unlike the
    single-link gate above, this accepts every C/F persistent TCP relationship
@@ -3760,7 +3917,9 @@ static uint32_t selected_vertical_profile()
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
+    const bool receipt_gate_mode = argc == 7 &&
+        std::strcmp(argv[1], "--p51-commit-receipt-gate") == 0;
+    if (!receipt_gate_mode && argc != 3) {
         std::fprintf(stderr, "usage: %s <iceccd> <icecc-cache-service>\n", argv[0]);
         return 2;
     }
@@ -3780,6 +3939,29 @@ int main(int argc, char **argv)
     if (icecc == nullptr || icecc->pw_uid == 0 || icecc->pw_gid == 0) {
         std::fprintf(stderr, "SKIP: isolated image has no unprivileged icecc identity\n");
         return 77;
+    }
+    if (receipt_gate_mode) {
+        char *end = nullptr;
+        errno = 0;
+        const long endpoint_port = std::strtol(argv[2], &end, 10);
+        if (errno != 0 || end == argv[2] || *end != '\0' ||
+            endpoint_port <= 0 || endpoint_port > 65535)
+            return 2;
+        errno = 0;
+        const unsigned long sidecar_uid = std::strtoul(argv[3], &end, 10);
+        if (errno != 0 || end == argv[3] || *end != '\0' ||
+            sidecar_uid != static_cast<unsigned long>(icecc->pw_uid))
+            return 2;
+        errno = 0;
+        const unsigned long expected = std::strtoul(argv[4], &end, 10);
+        if (errno != 0 || end == argv[4] || *end != '\0' || expected != 30)
+            return 2;
+        errno = 0;
+        const unsigned long long first = std::strtoull(argv[5], &end, 10);
+        if (errno != 0 || end == argv[5] || *end != '\0') return 2;
+        return run_p51_commit_receipt_gate(
+            static_cast<int>(endpoint_port), static_cast<uid_t>(sidecar_uid),
+            static_cast<size_t>(expected), static_cast<uint64_t>(first), argv[6]);
     }
 
     const bool restart_f_c1f2 =

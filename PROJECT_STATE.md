@@ -12,6 +12,39 @@ retained artifact directories.
 
 ## Developer QA
 
+### Actual scheduler-process W30 restart harness
+
+The opt-in `p51schedulerrestart-w30-check` harness passes C1F1/W30 for
+P29V1, ZSTD_TU and ZSTD_ROUTE. It holds 30 old receipts, replaces the actual
+scheduler process while C/F daemon and cache PIDs remain stable, verifies
+the old callers settle fail-closed under remote-only policy, then holds and
+releases 30 fresh receipts and compares every fresh remote object with its
+local result. Old-call settlement is not a transparent-retry guarantee.
+The three-second test reconnect cadence does not qualify production latency.
+Run requirements are in [developer QA](dev/README.md).
+
+Evidence root: `/tanksmall/scratch/tmp/p51-real-s-cleanup/`.
+`runtime-run-r22.log` SHA256
+`0fe45db54ca538767bfbe1f92a42c78c9ed81d265fd159da1baf55ddfdcda2fc`
+contains all three passing profile markers; its exit file is 0.
+`trap-timeout-r2-container.log` SHA256
+`0133d9f85b454f89806d63e5d61ddf17d3f92902e5a5d2bc6675402eedbae405`
+proves actual timeout status 124 after 30 receipts were held, fixture failure,
+a fresh abort marker, and removal of the temporary redirection rule.
+Timeout uses foreground signal delivery and a 20-second cleanup grace.
+
+This qualifies the harness on an older frozen product snapshot, **not** the
+new ledger fix or current combined candidate. Snapshot sender source SHA256:
+`b17e1de52cf94241272c22f224668d7192d8bd098bca93ce792d895b38f69837`;
+endpoint source:
+`bc83d20be683c0b1574a900a16b7fffcb13b64af2a12a080ffd9afdca8c3071d`;
+service source:
+`54640beb7759d7e02124a661808539431b6163b873ce95fc7417724b2616e8b9`.
+Final helper binary SHA256:
+`aadee66274bbbf36bed4fab9ba521c82e295d857e0222479ff157a83200e3ec9`.
+The published runner differs from the successful test copy only by changing
+one failure-message word from "authenticated" to "validated".
+
 ### Bounded sender completion ledger
 
 R2 reserves completion-ledger capacity before admitting a bundle, counting

@@ -24,6 +24,7 @@ reference_witness=${ICECC_P50_REFERENCE_WITNESS:-}
 reference_authority=${ICECC_P50_REFERENCE_AUTHORITY:-}
 predictive_plan=${ICECC_P50_PREDICTIVE_PLAN:-}
 s2_process_loss=${ICECC_P50_S2_PROCESS_LOSS:-0}
+real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
@@ -42,6 +43,10 @@ fi
 case "$s2_process_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_S2_PROCESS_LOSS must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$real_scheduler_restart_w30" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30 must be 0 or 1" >&2; exit 1 ;;
 esac
 case "$suite" in
     C1F1/100000) relationship_count=1; slots_per_f=1; execution_slots=1 ;;
@@ -76,6 +81,30 @@ if test "$s2_process_loss" = 1; then
         echo "FAIL: S2 process-loss external hook is required" >&2
         exit 1
     }
+fi
+if test "$real_scheduler_restart_w30" = 1; then
+    if test "$external_mode" != 0 || test "$suite" != C1F1/100000 || \
+            test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1; then
+        echo "FAIL: real scheduler W30 restart requires local cache-enabled C1F1, WARM=0, PASSES=1" >&2
+        exit 1
+    fi
+    slots_per_f=30
+    execution_slots=30
+    # The daemon's production scheduler reconnect backoff is 20–51 seconds.
+    # This fixture exercises replacement, not that production latency; use
+    # the daemon's test-only 3-second reconnect cadence so the unchanged
+    # per-job deadline remains the limiting bound.
+    export ICECC_TESTS=1
+fi
+worker_maxjobs=$slots_per_f
+if test "$real_scheduler_restart_w30" = 1; then
+    # The scheduler reserves one dispatch-credit slot: when the worker's
+    # advertised farm capacity is N, effective_dispatch_credit() admits at
+    # most N-1 outstanding assignments.  Advertise one spare compile slot so
+    # this test can hold the full 30-receipt R2 window without weakening its
+    # protocol/window assertion.
+    worker_maxjobs=$((slots_per_f + 1))
+    echo "S8_REAL_SCHEDULER_DISPATCH_CREDIT worker_maxjobs=$worker_maxjobs receipt_window=$slots_per_f"
 fi
 if test "$cache_enabled" -eq 0; then
     unset ICECC_P50_C1F1_REQUIRED
@@ -113,6 +142,27 @@ done
 if test "$cache_enabled" -eq 1 && test ! -x "$build/cache/icecc-cache-service"; then
     echo "SKIP: missing built executable $build/cache/icecc-cache-service" >&2
     exit 77
+fi
+if test "$real_scheduler_restart_w30" = 1; then
+    test -x "$build/unittests/p50daemonpositive" || {
+        echo "SKIP: missing built P51 receipt-gate helper $build/unittests/p50daemonpositive" >&2
+        exit 77
+    }
+    test -n "${ICECC_TEST_DAEMON_UID:-}" || {
+        echo "FAIL: real scheduler W30 gate requires ICECC_TEST_DAEMON_UID account" >&2
+        exit 1
+    }
+    daemon_passwd_entry=$(getent passwd "$ICECC_TEST_DAEMON_UID" || true)
+    test -n "$daemon_passwd_entry" || {
+        echo "FAIL: ICECC_TEST_DAEMON_UID does not resolve to a daemon account" >&2
+        exit 1
+    }
+    daemon_account=$(printf '%s\n' "$daemon_passwd_entry" | cut -d: -f1)
+    daemon_uid=$(printf '%s\n' "$daemon_passwd_entry" | cut -d: -f3)
+    test -n "$daemon_account" && test "$daemon_uid" -gt 0 || {
+        echo "FAIL: real scheduler W30 gate requires a non-root daemon account" >&2
+        exit 1
+    }
 fi
 
 command -v timeout >/dev/null 2>&1 || {
@@ -195,7 +245,35 @@ cleanup() {
     # Batch wrappers own their compiler child and remove their planned-lane
     # marker from an EXIT trap.  Stop them before the daemons so an interrupted
     # parallel batch cannot strand a compiler or a lane lease.
-    cleanup_pids="${batch_job_pids:-} ${s2_compile_pid:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    # The receipt proxy owns a namespace-local iptables REDIRECT rule.  Ask it
+    # to stop through its control directory first so its destructor removes
+    # that exact rule before we escalate to signals.
+    if test -n "${receipt_gate_pid:-}" && kill -0 "$receipt_gate_pid" 2>/dev/null; then
+        if test -n "${receipt_gate_dir:-}" && test -d "$receipt_gate_dir"; then
+            abort_tmp="$receipt_gate_dir/.abort-$$"
+            printf 'abort\n' >"$abort_tmp" && mv -f "$abort_tmp" "$receipt_gate_dir/abort" || {
+                rm -f "$abort_tmp"
+                echo "WARN: could not publish receipt-gate abort marker" >&2
+            }
+            for _ in $(seq 1 50); do
+                kill -0 "$receipt_gate_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+        fi
+        if kill -0 "$receipt_gate_pid" 2>/dev/null; then
+            kill "$receipt_gate_pid" 2>/dev/null || :
+            for _ in $(seq 1 20); do
+                kill -0 "$receipt_gate_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+        fi
+        if kill -0 "$receipt_gate_pid" 2>/dev/null; then
+            kill -9 "$receipt_gate_pid" 2>/dev/null || :
+        fi
+        wait "$receipt_gate_pid" 2>/dev/null || :
+        receipt_gate_pid=
+    fi
+    cleanup_pids="${batch_job_pids:-} ${receipt_gate_pid:-} ${s2_compile_pid:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
     for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
@@ -221,7 +299,10 @@ cleanup() {
         rm -rf "$work"
     fi
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" "$work/out" \
     "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
@@ -254,6 +335,7 @@ c_action_trace="$work/s7-warm-c-action-trace.jsonl"
 f_action_trace="$work/s7-warm-f-action-trace.jsonl"
 c_legacy_wire_trace="$work/s7-measured-c-legacy-wire-trace.jsonl"
 f_legacy_wire_trace="$work/s7-measured-f-legacy-wire-trace.jsonl"
+scheduler_current_log="$work/scheduler.log"
 s2_external_evidence="$work/external-s2-process-loss.json"
 if test "$s2_process_loss" = 1; then
     test ! -e "$s2_external_evidence" || {
@@ -342,6 +424,10 @@ include_root=${ICECC_P50_C1F1_INCLUDE_ROOT:-}
 compile_db=${ICECC_P50_C1F1_COMPILE_DB:-}
 compile_source=${ICECC_P50_C1F1_COMPILE_SOURCE:-}
 batch_manifest=${ICECC_P50_C1F1_BATCH_MANIFEST:-}
+if test "$real_scheduler_restart_w30" = 1 && test -z "$batch_manifest"; then
+    echo "FAIL: real scheduler W30 restart requires a validated 60-TU batch manifest" >&2
+    exit 1
+fi
 if test -n "$batch_manifest"; then
     test -z "$source_root" && test -z "$source_relative" && test -z "$source_input" || {
         echo "FAIL: batch manifest cannot be combined with single-input fields" >&2
@@ -472,6 +558,19 @@ PY
         echo "FAIL: batch manifest count does not match selected depth" >&2
         exit 1
     }
+    if test "$real_scheduler_restart_w30" = 1; then
+        test "$batch_expected_count" -eq 60 || {
+            echo "FAIL: real scheduler W30 restart requires exactly 60 distinct TUs" >&2
+            exit 1
+        }
+        sed -n '1,30p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
+        sed -n '31,60p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
+        test "$(wc -l <"$work/batch-old-scheduler.tsv")" -eq 30 && \
+            test "$(wc -l <"$work/batch-new-scheduler.tsv")" -eq 30 || {
+            echo "FAIL: real scheduler W30 batch partition is not exactly 30+30" >&2
+            exit 1
+        }
+    fi
 fi
 if test "$suite" = C1F20/40; then
     test -n "$batch_manifest" || {
@@ -670,7 +769,10 @@ if test -n "${ICECC_P50_C1F1_WORKER_INTERFACE:-}"; then
 fi
 
 run_client_with_timeout() {
-    if test -n "${ICECC_TEST_DAEMON_UID:-}"; then
+    if test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+        timeout "$timeout_s" runuser -u "$ICECC_TEST_WRAPPER_USER" -- \
+            "$build/client/icecc" "$@"
+    elif test -n "${ICECC_TEST_DAEMON_UID:-}"; then
         timeout "$timeout_s" runuser -u "$ICECC_TEST_DAEMON_UID" -- \
             "$build/client/icecc" "$@"
     else
@@ -680,7 +782,8 @@ run_client_with_timeout() {
 
 if test "$external_mode" = 0; then
 "$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
-    --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv &
+    --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv \
+    2>"$work/scheduler-startup.stderr" &
 sched_pid=$!
 sleep 1
 kill -0 "$sched_pid" 2>/dev/null || {
@@ -729,19 +832,19 @@ else
             ICECC_P50_F_LEGACY_WIRE_TRACE="$f_legacy_wire_trace" \
         ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
         ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
-        "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
+        "$build/daemon/iceccd" "$@" -p "$port_worker" -m "$worker_maxjobs" \
         -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
         -b "$work/envs-f" -l "$work/f.log" -vvv \
             --cache-service "$build/cache/icecc-cache-service" \
-            --cache-runtime-dir "$work/cache-runtime-f" &
+            --cache-runtime-dir "$work/cache-runtime-f" 2>"$work/f-daemon-startup.stderr" &
     else
         ICECC_TEST_SOCKET="$work/worker.sock" \
             ICECC_P50_F_LEGACY_WIRE_TRACE="$f_legacy_wire_trace" \
             ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
             ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
-            "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
+            "$build/daemon/iceccd" "$@" -p "$port_worker" -m "$worker_maxjobs" \
             -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
-            -b "$work/envs-f" -l "$work/f.log" -vvv &
+            -b "$work/envs-f" -l "$work/f.log" -vvv 2>"$work/f-daemon-startup.stderr" &
     fi
     worker_pid=$!
     worker_pids="$worker_pid"
@@ -756,7 +859,7 @@ if test "$cache_enabled" -eq 1; then
         -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
         -b "$work/envs-c" -l "$work/c.log" -vvv \
         --cache-service "$build/cache/icecc-cache-service" \
-        --cache-runtime-dir "$work/cache-runtime-c" &
+        --cache-runtime-dir "$work/cache-runtime-c" 2>"$work/c-daemon-startup.stderr" &
 else
     ICECC_TEST_SOCKET="$work/client.sock" \
         ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
@@ -764,7 +867,7 @@ else
         ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
         "$build/daemon/iceccd" "$@" --no-remote -m 0 -p "$port_client" \
         -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
-        -b "$work/envs-c" -l "$work/c.log" -vvv &
+        -b "$work/envs-c" -l "$work/c.log" -vvv 2>"$work/c-daemon-startup.stderr" &
 fi
 client_pid=$!
 
@@ -1381,6 +1484,7 @@ else
     restart_cache_sidecar F 0 "$service_pid" "$worker_pid" "$work/ready-f.trace"
     service_pid=$sidecar_replacement
     restart_cache_sidecar C 0 "$client_service_pid" "$client_pid" "$work/ready-c.trace"
+    client_service_pid=$sidecar_replacement
 fi
 
 post_rotation_ready=0
@@ -1622,7 +1726,7 @@ if test -n "$batch_manifest"; then
         for _ in $(seq 1 200); do
             observed_f_service_identity=$(sed -nE \
                 "s/.*BEGIN: $observed_scheduler_job_id client=[^ ]+ server=([^ (]+).*/\\1/p" \
-                "$work/scheduler.log" | tail -n 1)
+                "$scheduler_current_log" | tail -n 1)
             test -n "$observed_f_service_identity" && break
             sleep 0.005
         done
@@ -1645,6 +1749,10 @@ if test -n "$batch_manifest"; then
     run_batch() {
         run_label=$1
         emit_rows=${2:-1}
+        active_batch_file=${3:-$work/batch.tsv}
+        active_batch_expected=${4:-$batch_expected_count}
+        batch_allow_failures=${5:-0}
+        start_only=${6:-0}
         ordinal=0
         topology_input=/dev/null
         if test "$suite" = C1F20/40; then
@@ -1671,10 +1779,12 @@ if test -n "$batch_manifest"; then
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3
+            elif test "$real_scheduler_restart_w30" = 1; then
+                f_slot=$((ordinal % 30))
             fi
             predecessor_file="$work/input-ready/$run_label-$relationship.last"
             predecessor_ordinal=-1
-            if test -e "$predecessor_file"; then
+            if test "$real_scheduler_restart_w30" != 1 && test -e "$predecessor_file"; then
                 predecessor_ordinal=$(cat "$predecessor_file")
                 test "$predecessor_ordinal" -ge 0 2>/dev/null && \
                     test "$predecessor_ordinal" -lt "$ordinal" || {
@@ -1691,19 +1801,28 @@ if test -n "$batch_manifest"; then
             job_pids="$job_pids $job_pid"
             batch_job_pids="$job_pids"
             ordinal=$((ordinal + 1))
-        done <"$work/batch.tsv" 3<"${topology_input:-/dev/null}"
-        test "$ordinal" -eq "$batch_expected_count" || { echo "FAIL: batch manifest count changed during run" >&2; exit 1; }
+        done <"$active_batch_file" 3<"${topology_input:-/dev/null}"
+        test "$ordinal" -eq "$active_batch_expected" || { echo "FAIL: batch manifest count changed during run" >&2; exit 1; }
+        if test "$start_only" = 1; then
+            return 0
+        fi
+        finish_batch
+    }
+    finish_batch() {
         batch_failed=0
         for pid in $job_pids; do
             if ! wait "$pid"; then
                 batch_failed=1
-                break
             fi
         done
         if test "$batch_failed" -ne 0; then
+            batch_job_pids=""
+            if test "$batch_allow_failures" = 1; then
+                echo "S8_BATCH_SETTLED_WITH_FAILURES run=$run_label count=$ordinal"
+                return 0
+            fi
             for pid in $job_pids; do kill "$pid" 2>/dev/null || :; done
             for pid in $job_pids; do wait "$pid" 2>/dev/null || :; done
-            batch_job_pids=""
             echo "FAIL: real compile job failed ($run_label)" >&2
             cat "$work"/job-"$run_label"-*.log 2>/dev/null || true
             exit 1
@@ -1786,13 +1905,15 @@ PY
             done
         fi
         batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
-                "$batch_end_ns" "$relationship_count" "$slots_per_f" <<'PY'
+                "$batch_end_ns" "$relationship_count" "$slots_per_f" \
+                "$real_scheduler_restart_w30" <<'PY'
 import pathlib, sys
 
 root = pathlib.Path(sys.argv[1])
 run, count = sys.argv[2], int(sys.argv[3])
 batch_start, batch_end = int(sys.argv[4]), int(sys.argv[5])
 relationship_count, slots_per_f = int(sys.argv[6]), int(sys.argv[7])
+real_w30 = sys.argv[8] == "1"
 records = []
 for ordinal in range(count):
     fields = (root / f"result-{run}-{ordinal}.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
@@ -1831,10 +1952,17 @@ for relationship in range(relationship_count):
                       key=lambda record: record["ordinal"])
     if not selected:
         raise SystemExit(f"relationship {relationship} has no work ({run})")
-    for previous, current in zip(selected, selected[1:]):
-        if (current["admission_start"] < previous["input_ready"] or
-                current["tu_seq"] != previous["tu_seq"] + 1):
-            raise SystemExit(f"relationship admission order invalid ({run}-{relationship})")
+    if real_w30:
+        wire_sequences = sorted(record["tu_seq"] for record in selected)
+        if (len(set(wire_sequences)) != len(selected) or
+                any(right != left + 1
+                    for left, right in zip(wire_sequences, wire_sequences[1:]))):
+            raise SystemExit(f"relationship wire TU sequence is not unique and contiguous ({run}-{relationship})")
+    else:
+        for previous, current in zip(selected, selected[1:]):
+            if (current["admission_start"] < previous["input_ready"] or
+                    current["tu_seq"] != previous["tu_seq"] + 1):
+                raise SystemExit(f"relationship admission order invalid ({run}-{relationship})")
     for lane in range(slots_per_f):
         lane_rows = [record for record in selected if record["lane"] == lane]
         for previous, current in zip(lane_rows, lane_rows[1:]):
@@ -1888,8 +2016,265 @@ EOF
                     "$observed_f_service_identity" "$observed_source_tu_seq"
             fi
             ordinal=$((ordinal + 1))
-        done <"$work/batch.tsv"
+        done <"$active_batch_file"
         echo "S8_BATCH_COMPLETE run=$run_label count=$ordinal"
+    }
+    publish_gate_marker() {
+        marker_path=$1
+        marker_tmp="$marker_path.tmp.$$"
+        : >"$marker_tmp"
+        mv -f -- "$marker_tmp" "$marker_path"
+    }
+    scheduler_epoch_from_log() {
+        sed -nE 's/.*assignment fence: strict-nonce epoch=([0-9]+).*/\1/p' "$1" | head -n 1
+    }
+    capture_old_scheduler_assignments() {
+        old_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler.log")
+        test -n "$old_scheduler_epoch" || {
+            echo "FAIL: original scheduler strict-nonce epoch was not logged" >&2
+            return 1
+        }
+        : >"$work/old-scheduler-assignments.tsv"
+        seen_old_assignments=0
+        for assignment_ordinal in $(seq 0 29); do
+            compile_log="$work/client-compile-old-scheduler-$assignment_ordinal.log"
+            job_id=$(sed -nE \
+                's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+                "$compile_log" | head -n 1)
+            test -n "$job_id" || {
+                echo "FAIL: held old cohort lacks original scheduler assignment ($assignment_ordinal)" >&2
+                return 1
+            }
+            assignment=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$compile_log" | head -n 1)
+            read -r bound_job_id bound_epoch bound_nonce <<EOF_ASSIGNMENT
+$assignment
+EOF_ASSIGNMENT
+            test "$bound_job_id" = "$job_id" && \
+                test "$bound_epoch" = "$old_scheduler_epoch" && \
+                case "$bound_nonce" in ''|*[!0-9]*) false ;; *[1-9]*) true ;; *) false ;; esac || {
+                echo "FAIL: old wrapper lacks exact original scheduler epoch/nonce binding (ordinal=$assignment_ordinal job=$job_id identity=$assignment)" >&2
+                return 1
+            }
+            grep -F "put $job_id in joblist of p50-f" "$work/scheduler.log" >/dev/null 2>&1 || {
+                echo "FAIL: original scheduler did not dispatch old job $job_id to the expected F worker" >&2
+                return 1
+            }
+            if grep -F "BEGIN: $job_id " "$work/scheduler.log" >/dev/null 2>&1; then
+                echo "FAIL: old receipt-held job $job_id began compiler execution before input attachment" >&2
+                return 1
+            fi
+            printf '%s\t%s\t%s\n' "$job_id" "$bound_epoch" "$bound_nonce" \
+                >>"$work/old-scheduler-assignments.tsv"
+            seen_old_assignments=$((seen_old_assignments + 1))
+        done
+        unique_old_assignments=$(cut -f1 "$work/old-scheduler-assignments.tsv" | sort -u | wc -l)
+        test "$seen_old_assignments" -eq 30 && test "$unique_old_assignments" -eq 30 || {
+            echo "FAIL: held old cohort does not have 30 unique scheduler assignment identities" >&2
+            return 1
+        }
+        echo "S8_REAL_S_OLD_ASSIGNMENTS_CAPTURED count=$seen_old_assignments old_epoch=$old_scheduler_epoch"
+    }
+    verify_replacement_epoch() {
+        new_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler-replacement.log")
+        test -n "$new_scheduler_epoch" && test "$new_scheduler_epoch" != "$old_scheduler_epoch" || {
+            echo "FAIL: replacement scheduler did not establish a distinct strict-nonce epoch" >&2
+            cat "$work/scheduler-replacement.log" >&2 || true
+            return 1
+        }
+        echo "S8_REAL_S_EPOCH_REPLACED old_epoch=$old_scheduler_epoch new_epoch=$new_scheduler_epoch old_assignment_witnesses=30"
+    }
+    verify_old_cohort_retries() {
+        old_successes=0
+        old_reassignments=0
+        old_expected_failures=0
+        for old_ordinal in $(seq 0 29); do
+            result_file="$work/result-old-scheduler-$old_ordinal.tsv"
+            client_log="$work/client-compile-old-scheduler-$old_ordinal.log"
+            if ! test -f "$result_file"; then
+                grep -Fq 'got exception Error 24 - local daemon did not settle P50 retry predecessor' \
+                    "$client_log" && \
+                grep -Fq 'remote-only policy refuses client-error fallback' "$client_log" || {
+                    echo "FAIL: old wrapper did not settle through the expected fenced-assignment path (ordinal=$old_ordinal)" >&2
+                    return 1
+                }
+                old_expected_failures=$((old_expected_failures + 1))
+                continue
+            fi
+            old_successes=$((old_successes + 1))
+            job_id=$(cut -f19 "$result_file")
+            final_identity=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$client_log" | tail -n 1)
+            read -r final_job_id final_epoch final_nonce <<EOF_FINAL_IDENTITY
+$final_identity
+EOF_FINAL_IDENTITY
+            test -n "$job_id" && test "$final_job_id" = "$job_id" && \
+                test "$final_epoch" = "$new_scheduler_epoch" && \
+                case "$final_nonce" in ''|*[!0-9]*) false ;; *[1-9]*) true ;; *) false ;; esac && \
+                grep -F "BEGIN: $job_id " "$work/scheduler-replacement.log" >/dev/null 2>&1 || {
+                echo "FAIL: old wrapper success lacks a final new-epoch assignment witness (ordinal=$old_ordinal job=$job_id identity=$final_identity)" >&2
+                return 1
+            }
+            old_reassignments=$((old_reassignments + 1))
+        done
+        test "$old_successes" -eq "$old_reassignments" && \
+            test $((old_successes + old_expected_failures)) -eq 30 || return 1
+        if tail -c +$((old_epoch_attach_offset + 1)) "$work/f.log" | \
+                grep -E "P50_INPUT_ATTACH_(BEGIN|END) job=[0-9]+ epoch=$old_scheduler_epoch " \
+                >/dev/null 2>&1; then
+            echo "FAIL: F attached a compiler input under the retired scheduler epoch $old_scheduler_epoch" >&2
+            return 1
+        fi
+        echo "S8_REAL_S_OLD_COHORT_SETTLED expected=30 completed=$old_successes new_epoch_reassignments=$old_reassignments expected_fenced_failures=$old_expected_failures all_callers_joined=1 no_old_epoch_attach=1"
+    }
+    wait_gate_marker() {
+        marker_name=$1
+        marker_deadline=$(( $(date +%s) + 70 ))
+        while test "$(date +%s)" -lt "$marker_deadline"; do
+            test ! -e "$receipt_gate_dir/failed" || {
+                cat "$receipt_gate_dir/failed" >&2
+                cat "$work/receipt-gate.log" >&2 || true
+                echo "FAIL: receipt gate failed while waiting for $marker_name" >&2
+                return 1
+            }
+            test -e "$receipt_gate_dir/$marker_name" && return 0
+            kill -0 "$receipt_gate_pid" 2>/dev/null || {
+                cat "$work/receipt-gate.log" >&2 || true
+                echo "FAIL: receipt gate exited before $marker_name" >&2
+                return 1
+            }
+            sleep 0.05
+        done
+        echo "FAIL: receipt gate timed out waiting for $marker_name" >&2
+        return 1
+    }
+    restart_real_scheduler() {
+        scheduler_pid_before=$sched_pid
+        f_daemon_pid_before=$worker_pid
+        c_daemon_pid_before=$client_pid
+        f_service_pid_before=$service_pid
+        c_service_pid_before=$client_service_pid
+        kill -TERM "$scheduler_pid_before" 2>/dev/null || :
+        wait "$scheduler_pid_before" 2>/dev/null || :
+        sched_pid=
+        : >"$work/scheduler-replacement.log"
+        chmod 0666 "$work/scheduler-replacement.log"
+        "$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
+            --assignment-fence-mode strict-nonce -l "$work/scheduler-replacement.log" -vvv &
+        sched_pid=$!
+        scheduler_current_log="$work/scheduler-replacement.log"
+        scheduler_ready=0
+        for _ in $(seq 1 100); do
+            replacement_c_logins=$(grep -F -c 'login p50-c protocol version:' "$work/scheduler-replacement.log" 2>/dev/null || true)
+            replacement_f_logins=$(grep -F -c 'login p50-f protocol version:' "$work/scheduler-replacement.log" 2>/dev/null || true)
+            if test "${replacement_c_logins:-0}" -ge 1 && \
+                    test "${replacement_f_logins:-0}" -ge 1; then
+                scheduler_ready=1
+                break
+            fi
+            kill -0 "$sched_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        test "$scheduler_ready" -eq 1 || {
+            echo "FAIL: real replacement scheduler did not receive C/F re-logins" >&2
+            cat "$work/scheduler-replacement.log" >&2 || true
+            return 1
+        }
+        stable_processes=1
+        for process in "replacement_scheduler:$sched_pid" "F_daemon:$worker_pid" \
+                "C_daemon:$client_pid" "F_cache:$service_pid" "C_cache:$client_service_pid"; do
+            process_name=${process%%:*}
+            process_pid=${process#*:}
+            if kill -0 "$process_pid" 2>/dev/null; then
+                process_state=$(ps -p "$process_pid" -o stat=,args= 2>/dev/null || true)
+                echo "S8_REAL_S_PROCESS_CHECK role=$process_name pid=$process_pid state=$process_state"
+            else
+                echo "S8_REAL_S_PROCESS_CHECK role=$process_name pid=$process_pid state=missing"
+                stable_processes=0
+            fi
+        done
+        test "$stable_processes" -eq 1 || {
+            echo "FAIL: scheduler restart changed or lost a C/F daemon/cache process" >&2
+            return 1
+        }
+        echo "S8_REAL_S_RESTART old_scheduler_pid=$scheduler_pid_before new_scheduler_pid=$sched_pid c_daemon_pid=$client_pid f_daemon_pid=$worker_pid c_cache_pid=$client_service_pid f_cache_pid=$service_pid replacement_c_logins=$replacement_c_logins replacement_f_logins=$replacement_f_logins"
+    }
+    run_real_scheduler_restart_batches() {
+        test ! -e "$work/receipt-gate" || {
+            echo "FAIL: receipt gate control directory already exists" >&2
+            return 1
+        }
+        receipt_gate_dir="$work/receipt-gate"
+        mkdir -m 0777 "$receipt_gate_dir"
+        "$build/unittests/p50daemonpositive" \
+            --p51-commit-receipt-gate "$port_worker" "$daemon_uid" \
+            30 0 "$receipt_gate_dir" >"$work/receipt-gate.log" 2>&1 &
+        receipt_gate_pid=$!
+        wait_gate_marker ready || return 1
+        echo "S8_REAL_S_RECEIPT_GATE_READY endpoint=$port_worker sidecar_uid=$ICECC_TEST_DAEMON_UID expected=30 control=$receipt_gate_dir"
+
+        run_batch old-scheduler 1 "$work/batch-old-scheduler.tsv" 30 1 1
+        wait_gate_marker held-1 || return 1
+        old_window=$(cat "$receipt_gate_dir/held-1")
+        case "$old_window" in
+            count=30\ first_ordinal=*\ last_ordinal=*) ;;
+            *) echo "FAIL: first source-receipt gate did not hold an exact contiguous W30 interval: $old_window" >&2; return 1 ;;
+        esac
+        for old_ordinal in $(seq 0 29); do
+            client_log="$work/client-compile-old-scheduler-$old_ordinal.log"
+            if grep -Fq 'source committed for P50 CompileFile' "$client_log"; then
+                echo "FAIL: old cohort published a committed source before scheduler replacement (ordinal=$old_ordinal)" >&2
+                return 1
+            fi
+            if test -e "$work/input-ready/old-scheduler-0-$old_ordinal"; then
+                echo "FAIL: old cohort reached compiler input-ready before scheduler replacement (ordinal=$old_ordinal)" >&2
+                return 1
+            fi
+        done
+        echo "S8_REAL_S_OLD_COHORT_PRE_RESTART_UNATTACHED count=30 committed_sources=0 compiler_input_ready=0"
+        echo "S8_REAL_S_OLD_RECEIPTS_HELD $old_window scheduler_pid=$sched_pid"
+        old_epoch_attach_offset=$(wc -c <"$work/f.log")
+        capture_old_scheduler_assignments || return 1
+        restart_real_scheduler || return 1
+        verify_replacement_epoch || return 1
+        publish_gate_marker "$receipt_gate_dir/release-1"
+        wait_gate_marker released-1 || return 1
+        finish_batch
+        verify_old_cohort_retries || return 1
+
+        publish_gate_marker "$receipt_gate_dir/arm-2"
+        wait_gate_marker armed-2 || return 1
+        run_batch new-scheduler 1 "$work/batch-new-scheduler.tsv" 30 0 1
+        wait_gate_marker held-2 || return 1
+        fresh_window=$(cat "$receipt_gate_dir/held-2")
+        case "$fresh_window" in
+            count=30\ first_ordinal=*\ last_ordinal=*) ;;
+            *) echo "FAIL: second source-receipt gate did not hold an exact contiguous W30 interval: $fresh_window" >&2; return 1 ;;
+        esac
+        echo "S8_REAL_S_FRESH_RECEIPTS_HELD $fresh_window scheduler_pid=$sched_pid"
+        publish_gate_marker "$receipt_gate_dir/release-2"
+        wait_gate_marker released-2 || return 1
+        finish_batch
+        publish_gate_marker "$receipt_gate_dir/finish"
+        if ! wait "$receipt_gate_pid"; then
+            receipt_gate_pid=
+            cat "$work/receipt-gate.log" >&2 || true
+            echo "FAIL: persistent receipt gate did not finish cleanly" >&2
+            return 1
+        fi
+        receipt_gate_pid=
+        test "$batch_failed" -eq 0 || return 1
+        fresh_results=0
+        for result_row in "$work"/result-new-scheduler-*.tsv; do
+            test -f "$result_row" && fresh_results=$((fresh_results + 1))
+        done
+        test "$fresh_results" -eq 30 || {
+            echo "FAIL: replacement scheduler produced $fresh_results/30 verified fresh compile results" >&2
+            return 1
+        }
+        echo "S8_REAL_SCHEDULER_RESTART_W30_PASS profile=$profile_marker old_receipts=30 old_callers_settled=30 fresh_receipts=30 fresh_objects_verified=$fresh_results c_f_daemons_stable=1"
     }
     if test "$warm" = 1 && test "$cache_enabled" -eq 1; then
         echo "S7_WARM_PREWARM_BEGIN"
@@ -1925,9 +2310,13 @@ EOF
         fi
         echo "S7_WARM_PREWARM_COMPLETE"
     fi
-    run_batch full-1 1
-    if test "$passes" = 2; then
-        run_batch full-2 1
+    if test "$real_scheduler_restart_w30" = 1; then
+        run_real_scheduler_restart_batches
+    else
+        run_batch full-1 1
+        if test "$passes" = 2; then
+            run_batch full-2 1
+        fi
     fi
     if test "$cache_enabled" -eq 1 && test "$external_mode" -eq 0; then
         merge_parallel_f_traces
@@ -2052,7 +2441,7 @@ if test -n "$batch_manifest"; then
     if test "$suite" = C1F20/40; then
         echo "S8_SCHEDULING mode=relationship-ordered execution_slots=40 relationships=20 planned_admission_lanes_per_relationship=2 physical_slot_observed=0"
     else
-        echo "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 planned_admission_lanes_per_relationship=1"
+        echo "S8_SCHEDULING mode=relationship-ordered execution_slots=$execution_slots relationships=1 planned_admission_lanes_per_relationship=$slots_per_f"
     fi
     binary_roles="scheduler/icecc-scheduler daemon/iceccd client/icecc"
     test "$cache_enabled" -eq 1 && binary_roles="$binary_roles cache/icecc-cache-service"

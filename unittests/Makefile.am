@@ -381,6 +381,11 @@ p50daemonpositive-p51-synthetic-scheduler-w30-check: p50daemonpositive
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
 	$(SHELL) '$(srcdir)/p50daemonpositive-p51-synthetic-scheduler-w30.sh'
+.PHONY: p51schedulerrestart-w30-check
+p51schedulerrestart-w30-check: p50daemonpositive ../daemon/iceccd ../cache/icecc-cache-service
+	ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)' \
+	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
+	$(SHELL) '$(srcdir)/p51schedulerrestart-w30.sh'
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
@@ -613,5 +618,6 @@ EXTRA_DIST += p50endpointcancel-run.sh \
 	p50_adopted_socket_lease_test.cpp \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
+EXTRA_DIST += p51schedulerrestart-w30.sh
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1
