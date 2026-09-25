@@ -6869,14 +6869,29 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
                 profile_name, window);
 }
 
-struct D11EncodedCapGate {
+enum class D11PendingBudgetKind {
+    Encoded,
+    Raw,
+    DecoderWindow,
+};
+
+const char* d11_pending_budget_name(D11PendingBudgetKind kind) noexcept {
+    switch (kind) {
+    case D11PendingBudgetKind::Encoded: return "encoded";
+    case D11PendingBudgetKind::Raw: return "raw";
+    case D11PendingBudgetKind::DecoderWindow: return "decoder-window";
+    }
+    return "invalid";
+}
+
+struct D11PendingBudgetGate {
     std::mutex mutex;
     std::condition_variable changed;
     size_t entered = 0;
     bool release = false;
 };
 
-struct D11EncodedCapClientState {
+struct D11PendingBudgetClientState {
     std::mutex mutex;
     std::condition_variable changed;
     bool link_opened = false;
@@ -6906,13 +6921,13 @@ std::vector<uint8_t> d11_encoded_cap_input(size_t size) {
     return input;
 }
 
-boost::asio::awaitable<void> d11_encoded_cap_client(
+boost::asio::awaitable<void> d11_pending_budget_client(
     uint16_t f_port, uint32_t window,
     const SidecarLaunchIdentity& c_launch,
     const SidecarLaunchIdentity& f_launch,
     const P51SourceArmedFields& armed,
     std::span<const uint8_t> raw,
-    D11EncodedCapClientState& state) {
+    D11PendingBudgetClientState& state) {
     namespace asio = boost::asio;
     using tcp = asio::ip::tcp;
     constexpr ProfileId profile = ProfileId::ZSTD_TU;
@@ -7027,10 +7042,12 @@ boost::asio::awaitable<void> d11_encoded_cap_client(
     state.changed.notify_all();
 }
 
-void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
+void test_p51_d11_real_r2_pending_budget(
+    D11PendingBudgetKind budget_kind, uint32_t window) {
     constexpr ProfileId profile = ProfileId::ZSTD_TU;
     constexpr size_t kRawBytes = 1024;
     constexpr uint64_t kEncodedCap = 1536;
+    constexpr uint64_t kRawCap = 1536;
     CHECK(window == 1 || window == 30);
 
     StoreIdentityRoot f_root{};
@@ -7056,12 +7073,30 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
     config.endpoint_caps.supported_profiles = profile_bit(profile);
     config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
     config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
-    config.endpoint_config.owner_limits.max_pending_encoded_bytes =
-        kEncodedCap;
-    config.endpoint_config.owner_limits.max_pending_raw_bytes =
-        4 * kRawBytes;
+    const uint64_t one_decoder_window =
+        uint64_t{1} << config.endpoint_caps.zstd.max_window_log;
+    const uint64_t budget_cap = [&] {
+        switch (budget_kind) {
+        case D11PendingBudgetKind::Encoded: return kEncodedCap;
+        case D11PendingBudgetKind::Raw: return kRawCap;
+        case D11PendingBudgetKind::DecoderWindow: return one_decoder_window;
+        }
+        return uint64_t{0};
+    }();
+    CHECK(budget_cap != 0);
+    const uint64_t encoded_limit =
+        budget_kind == D11PendingBudgetKind::Encoded ? kEncodedCap
+                                                    : 4 * kRawBytes;
+    const uint64_t raw_limit =
+        budget_kind == D11PendingBudgetKind::Raw ? kRawCap : 4 * kRawBytes;
+    const uint64_t decoder_window_limit =
+        budget_kind == D11PendingBudgetKind::DecoderWindow
+            ? one_decoder_window
+            : uint64_t{2} << config.endpoint_caps.zstd.max_window_log;
+    config.endpoint_config.owner_limits.max_pending_encoded_bytes = encoded_limit;
+    config.endpoint_config.owner_limits.max_pending_raw_bytes = raw_limit;
     config.endpoint_config.owner_limits.max_decoder_window_bytes =
-        uint64_t{2} << config.endpoint_caps.zstd.max_window_log;
+        decoder_window_limit;
     config.endpoint_config.owner_limits.max_retained_input_records = 8;
     config.endpoint_config.owner_limits.max_retained_input_bytes =
         8 * kRawBytes;
@@ -7100,7 +7135,8 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
         armed[index] = *result.armed;
     }
 
-    D11EncodedCapGate gate;
+    D11PendingBudgetGate gate;
+    D11PendingBudgetGate second_gate;
     std::atomic<bool> stop_accepting{false};
     std::atomic<size_t> accepted_connections{0};
     std::thread acceptor([&] {
@@ -7125,16 +7161,29 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
             } while (fd < 0 && errno == EINTR);
             if (fd < 0)
                 continue;
+            const size_t connection_index =
+                accepted_connections.fetch_add(1, std::memory_order_acq_rel);
             EndpointIoControl control;
-            if (accepted_connections.load(std::memory_order_acquire) == 0) {
+            if (connection_index == 0) {
                 control.before_materialize_on_worker = [&gate] {
                     std::unique_lock lock(gate.mutex);
                     ++gate.entered;
                     gate.changed.notify_all();
                     gate.changed.wait(lock, [&] { return gate.release; });
                 };
+            } else if (connection_index == 1) {
+                // If a cap-deletion mutant admits C2, hold it after its
+                // reservation reaches the worker so the over-cap counter is
+                // observable before materialization releases the charge.
+                control.before_materialize_on_worker = [&second_gate] {
+                    std::unique_lock lock(second_gate.mutex);
+                    ++second_gate.entered;
+                    second_gate.changed.notify_all();
+                    second_gate.changed.wait(lock, [&] {
+                        return second_gate.release;
+                    });
+                };
             }
-            accepted_connections.fetch_add(1, std::memory_order_acq_rel);
             // The low-level P50ClientEndpoint used below speaks R2 directly
             // on this socket; unlike daemon-driven service fixtures, there is
             // no ordinary MsgChannel/P51-link-session preamble here.
@@ -7142,7 +7191,7 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
         }
     });
 
-    std::array<D11EncodedCapClientState, 4> states;
+    std::array<D11PendingBudgetClientState, 4> states;
     std::array<std::thread, 4> clients;
     const auto start_client = [&](size_t index) {
         clients[index] = std::thread([&, index] {
@@ -7151,7 +7200,7 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
                 asio::io_context context;
                 auto future = asio::co_spawn(
                     context,
-                    d11_encoded_cap_client(
+                    d11_pending_budget_client(
                         f_port, window, c_launches[index], f_launch,
                         armed[index], raw, states[index]),
                     asio::use_future);
@@ -7172,12 +7221,17 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
                 gate.release = true;
             }
             gate.changed.notify_all();
+            {
+                std::lock_guard lock(second_gate.mutex);
+                second_gate.release = true;
+            }
+            second_gate.changed.notify_all();
             stop_accepting.store(true, std::memory_order_release);
             (void)::shutdown(listener, SHUT_RDWR);
             if (acceptor.joinable())
                 acceptor.join();
             (void)::close(listener);
-            for (D11EncodedCapClientState& state : states) {
+            for (D11PendingBudgetClientState& state : states) {
                 {
                     std::lock_guard lock(state.mutex);
                     state.continue_after_ack = true;
@@ -7213,13 +7267,30 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
     }
     const LinkHello first_link = states[0].link;
     const uint64_t encoded_charge = states[0].encoded_bytes;
-    CHECK(encoded_charge != 0 && encoded_charge <= kEncodedCap &&
-          encoded_charge * 2 > kEncodedCap);
+    const uint64_t raw_charge = raw.size();
+    const uint64_t decoder_window_charge = one_decoder_window;
+    const uint64_t selected_charge = [&] {
+        switch (budget_kind) {
+        case D11PendingBudgetKind::Encoded: return encoded_charge;
+        case D11PendingBudgetKind::Raw: return raw_charge;
+        case D11PendingBudgetKind::DecoderWindow:
+            return decoder_window_charge;
+        }
+        return uint64_t{0};
+    }();
+    CHECK(encoded_charge != 0 && selected_charge != 0 &&
+          selected_charge <= budget_cap && selected_charge * 2 > budget_cap);
+    if (budget_kind != D11PendingBudgetKind::Encoded)
+        CHECK(encoded_charge * 2 <= encoded_limit);
+    if (budget_kind != D11PendingBudgetKind::Raw)
+        CHECK(raw_charge * 2 <= raw_limit);
+    if (budget_kind != D11PendingBudgetKind::DecoderWindow)
+        CHECK(decoder_window_charge * 2 <= decoder_window_limit);
     auto held = runtime.p51_receipt_ledger_for_test(first_link);
     CHECK(held.has_value() &&
           held->endpoint_usage.pending_encoded_bytes == encoded_charge &&
-          held->endpoint_usage.pending_raw_bytes == kRawBytes &&
-          held->endpoint_usage.decoder_window_bytes != 0 &&
+          held->endpoint_usage.pending_raw_bytes == raw_charge &&
+          held->endpoint_usage.decoder_window_bytes == decoder_window_charge &&
           held->endpoint_usage.retained_input_records == 0);
 
     const auto wait_client = [&](size_t index) {
@@ -7243,6 +7314,18 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
             CHECK(states[index].encoded_bytes == encoded_charge);
         lock.unlock();
 
+        const auto selected_usage = [&](
+            const P50ServerOwnerUsage& usage) {
+            switch (budget_kind) {
+            case D11PendingBudgetKind::Encoded:
+                return usage.pending_encoded_bytes;
+            case D11PendingBudgetKind::Raw:
+                return usage.pending_raw_bytes;
+            case D11PendingBudgetKind::DecoderWindow:
+                return usage.decoder_window_bytes;
+            }
+            return uint64_t{0};
+        };
         std::optional<service::P51ReceiptLedgerSnapshot> during_refusal;
         const auto refusal_deadline = std::chrono::steady_clock::now() +
                                       std::chrono::seconds(10);
@@ -7251,29 +7334,54 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
             during_refusal = runtime.p51_receipt_ledger_for_test(first_link);
             CHECK(during_refusal.has_value());
             bool bundle_written = false;
+            bool second_materialization_held = false;
+            bool committed = false;
             {
                 std::lock_guard state_lock(states[index].mutex);
                 if (states[index].error)
                     std::rethrow_exception(states[index].error);
                 bundle_written = states[index].bundle_written;
                 done = states[index].done;
+                committed = states[index].committed;
             }
+            {
+                std::lock_guard gate_lock(second_gate.mutex);
+                second_materialization_held = second_gate.entered != 0;
+            }
+            const uint64_t observed_target =
+                selected_usage(during_refusal->endpoint_usage);
             if (done || during_refusal->endpoint_usage.pending_encoded_bytes !=
-                            encoded_charge)
+                            encoded_charge ||
+                during_refusal->endpoint_usage.pending_raw_bytes != raw_charge ||
+                during_refusal->endpoint_usage.decoder_window_bytes !=
+                    decoder_window_charge ||
+                during_refusal->endpoint_usage.retained_input_records != 0 ||
+                second_materialization_held || committed)
                 std::fprintf(stderr,
-                             "D11_STAGE c%zu-refusal written=%u done=%u enc=%llu cap=%llu raw=%llu\n",
+                             "D11_STAGE %s c%zu-refusal written=%u done=%u committed=%u second-held=%u enc=%llu raw=%llu window=%llu target=%llu cap=%llu retained=%llu\n",
+                             d11_pending_budget_name(budget_kind),
                              index + 1,
                              bundle_written ? 1u : 0u,
                              done ? 1u : 0u,
+                             committed ? 1u : 0u,
+                             second_materialization_held ? 1u : 0u,
                              static_cast<unsigned long long>(
                                  during_refusal->endpoint_usage.pending_encoded_bytes),
-                             static_cast<unsigned long long>(kEncodedCap),
                              static_cast<unsigned long long>(
-                                 during_refusal->endpoint_usage.pending_raw_bytes));
+                                 during_refusal->endpoint_usage.pending_raw_bytes),
+                             static_cast<unsigned long long>(
+                                 during_refusal->endpoint_usage.decoder_window_bytes),
+                             static_cast<unsigned long long>(observed_target),
+                             static_cast<unsigned long long>(budget_cap),
+                             static_cast<unsigned long long>(
+                                 during_refusal->endpoint_usage.retained_input_records));
+            CHECK(observed_target <= budget_cap);
             CHECK(during_refusal->endpoint_usage.pending_encoded_bytes ==
                       encoded_charge &&
                   during_refusal->endpoint_usage.pending_raw_bytes ==
-                      kRawBytes &&
+                      raw_charge &&
+                  during_refusal->endpoint_usage.decoder_window_bytes ==
+                      decoder_window_charge &&
                   during_refusal->endpoint_usage.retained_input_records == 0);
             if (done)
                 break;
@@ -7290,7 +7398,8 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
     held = runtime.p51_receipt_ledger_for_test(first_link);
     CHECK(held.has_value() &&
           held->endpoint_usage.pending_encoded_bytes == encoded_charge &&
-          held->endpoint_usage.pending_raw_bytes == kRawBytes &&
+          held->endpoint_usage.pending_raw_bytes == raw_charge &&
+          held->endpoint_usage.decoder_window_bytes == decoder_window_charge &&
           held->endpoint_usage.retained_input_records == 0);
     {
         std::lock_guard lock(gate.mutex);
@@ -7308,7 +7417,8 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
     held = runtime.p51_receipt_ledger_for_test(first_link);
     CHECK(held.has_value() &&
           held->endpoint_usage.pending_encoded_bytes == encoded_charge &&
-          held->endpoint_usage.pending_raw_bytes == kRawBytes &&
+          held->endpoint_usage.pending_raw_bytes == raw_charge &&
+          held->endpoint_usage.decoder_window_bytes == decoder_window_charge &&
           held->endpoint_usage.retained_input_records == 0);
 
     {
@@ -7339,7 +7449,8 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     std::fprintf(stderr,
-                 "D11_STAGE encoded-release link=%u q=%llu enc=%llu raw=%llu window=%llu retained=%llu\n",
+        "D11_STAGE %s-release link=%u q=%llu enc=%llu raw=%llu window=%llu retained=%llu\n",
+        d11_pending_budget_name(budget_kind),
                  released_first.has_value() ? 1u : 0u,
                  static_cast<unsigned long long>(released_first ?
                      released_first->acknowledged_prefix_q : 0),
@@ -7402,7 +7513,8 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     std::fprintf(stderr,
-                 "D11_STAGE encoded-refill link=%u q=%llu enc=%llu raw=%llu window=%llu retained=%llu\n",
+        "D11_STAGE %s-refill link=%u q=%llu enc=%llu raw=%llu window=%llu retained=%llu\n",
+        d11_pending_budget_name(budget_kind),
                  refilled.has_value() ? 1u : 0u,
                  static_cast<unsigned long long>(refilled ?
                      refilled->acknowledged_prefix_q : 0),
@@ -7438,9 +7550,12 @@ void test_p51_d11_real_r2_pending_encoded_cap(uint32_t window) {
     }
     CHECK(accepted_connections.load(std::memory_order_acquire) == 4);
     std::printf(
-        "P51_D11_REAL_R2_ENCODED_CAP profile=ZSTD_TU window=%u encoded=%llu cap=%llu: PASS\n",
-        window, static_cast<unsigned long long>(encoded_charge),
-        static_cast<unsigned long long>(kEncodedCap));
+        "P51_D11_REAL_R2_PENDING_BUDGET profile=ZSTD_TU kind=%s window=%u encoded=%llu raw=%llu decoder-window=%llu cap=%llu: PASS\n",
+        d11_pending_budget_name(budget_kind), window,
+        static_cast<unsigned long long>(encoded_charge),
+        static_cast<unsigned long long>(raw_charge),
+        static_cast<unsigned long long>(decoder_window_charge),
+        static_cast<unsigned long long>(budget_cap));
 }
 
 void test_p51_cancel_publication_and_reset_lifecycle() {
@@ -13324,13 +13439,38 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-encoded-cap-zstd-tu-w1") == 0) {
-            test_p51_d11_real_r2_pending_encoded_cap(1);
+            test_p51_d11_real_r2_pending_budget(
+                D11PendingBudgetKind::Encoded, 1);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-encoded-cap") == 0) {
-            test_p51_d11_real_r2_pending_encoded_cap(1);
-            test_p51_d11_real_r2_pending_encoded_cap(30);
+            for (const uint32_t window : {1U, 30U}) {
+                test_p51_d11_real_r2_pending_budget(
+                    D11PendingBudgetKind::Encoded, window);
+            }
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-r2-pending-raw-cap-zstd-tu-w1") == 0) {
+            test_p51_d11_real_r2_pending_budget(
+                D11PendingBudgetKind::Raw, 1);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-r2-pending-window-cap-zstd-tu-w1") == 0) {
+            test_p51_d11_real_r2_pending_budget(
+                D11PendingBudgetKind::DecoderWindow, 1);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-r2-pending-raw-window-cap") == 0) {
+            for (const uint32_t window : {1U, 30U}) {
+                test_p51_d11_real_r2_pending_budget(
+                    D11PendingBudgetKind::Raw, window);
+                test_p51_d11_real_r2_pending_budget(
+                    D11PendingBudgetKind::DecoderWindow, window);
+            }
             return 0;
         }
         if (argc == 2 &&
@@ -13392,8 +13532,14 @@ int main(int argc, char** argv) {
             test_p51_d11_real_f_output_byte_cap(profile, 30);
         }
         test_p51_d11_real_f_output_byte_cap(ProfileId::P29V1, 1, true);
-        test_p51_d11_real_r2_pending_encoded_cap(1);
-        test_p51_d11_real_r2_pending_encoded_cap(30);
+        for (const uint32_t window : {1U, 30U}) {
+            test_p51_d11_real_r2_pending_budget(
+                D11PendingBudgetKind::Encoded, window);
+            test_p51_d11_real_r2_pending_budget(
+                D11PendingBudgetKind::Raw, window);
+            test_p51_d11_real_r2_pending_budget(
+                D11PendingBudgetKind::DecoderWindow, window);
+        }
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_interrupted_reservation_relationship_isolation();
         test_p51_interrupted_reservation_relationship_isolation(true);

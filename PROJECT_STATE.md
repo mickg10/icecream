@@ -148,6 +148,36 @@ unpublished F accounting changes are not included in these images.
 
 ### Independent R2 encoded-byte cap
 
+The fixture now independently covers raw-byte and decoder-window caps too,
+reusing the same service/client setup. All six ZSTD_TU cells pass:
+encoded/raw/window limits at W1 and W30. Each asserts that the other dimensions
+can admit two inputs, refuses C2/C3 while C1 retains its charge, then verifies
+ACK settlement returns pending credits to zero and an equal-sized refill
+commits. Separate deletion controls fail on observed target counters:
+raw=2,048 > cap1,536; window=268,435,456 > cap134,217,728. The test-only second
+materialization hold keeps excess credit observable; cleanup releases both
+holds. No production behavior changed.
+
+This extension was qualified on exact86577d3a plus its service-test diff,
+SDK `7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`.
+Source SHA256 `2d9d3378d496860074daba34425a793472482812c7bf832aed003cee4d708549`;
+normal binary `bea3e7cd088d3498989a2600eccd8a37f2710164f69c19bec6407e1a5f80bf4f`.
+Artifacts under
+`/tanksmall/scratch/tmp/p51-d11-raw-window-cap-scratch/icecream-qa-ek5ujsf7/current/artifacts/`:
+
+| Evidence | SHA256 |
+| --- | --- |
+| `final-encoded-matrix-r1.log` (exit 0) | `0a5d3a3fc73d45b77d7d04d13d348ebfc7b12df55406b2eee7789ad3834c6208` |
+| `final-raw-window-matrix-r1.log` (exit 0) | `be2ab3ac84829dbd5fd5c6cd1da69986728bf74421d61878f63f70d1ca8135f0` |
+| `raw-mutant-w1-r2.log` (expected exit 1) | `3add76444abf77e4010d19c7674b5d41d5469b78e15d648c29b791682d6b7f3c` |
+| `window-mutant-w1-r1.log` (expected exit 1) | `43dbe99ca326ff249643aad0ec5902f475348f7461fc57596338ff8cc72a06fb` |
+| `default-service-r3.log` (full suite, .trs PASS) | `0846064ea9f876d06cbfe213974d6f92cb0f9c51355d59e2ffd3112fa9642e50` |
+
+Earlier scratch/managed-Python setup failures are retained and excluded.
+The full-QA run on frozenf004 does not include this test extension. Metadata,
+peak memory, other profiles' independent caps and 30 active decoders remain
+outside this six-cell result.
+
 The real F service fixture now covers aggregate pending encoded-byte admission
 at W1 and W30 for ZSTD_TU. One 1,034-byte encoded input is held against a
 1,536-byte cap; two independent C inputs are refused without an extra charge
