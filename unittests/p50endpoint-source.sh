@@ -121,7 +121,7 @@ grep -F 'impl_->endpoint_runs.request_cancel(permit)' "$endpoint" >/dev/null
 grep -F 'ClientRunObservation::ExactCommitObserved' "$endpoint" >/dev/null
 grep -F 'ClientRunObservation::WrongAdoptedPeer' "$endpoint" >/dev/null
 grep -F 'ClientCancellationDisposition::ReconcileRequired' "$endpoint" >/dev/null
-if rg -n 'whole_new_attempt|ClientRunSettlement|\.settlement|active_remote_transmission_may_have_begun|AbortedPreDurable' \
+if grep -nE 'whole_new_attempt|ClientRunSettlement|\.settlement|active_remote_transmission_may_have_begun|AbortedPreDurable' \
     "$src/cache/p50_endpoint.cpp" "$src/cache/p50_endpoint.h"; then
     echo 'FAIL: local endpoint retained a settlement or pre-durable authority' >&2
     exit 1

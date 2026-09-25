@@ -15,6 +15,7 @@ icedir = $(includedir)/icecc
 ice_HEADERS = \
 	job.h \
 	comm.h \
+	p50_cache_profile_mask.h \
 	p50_store_identity_wire.h \
 	logging.h
 

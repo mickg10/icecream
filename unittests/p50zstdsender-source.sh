@@ -6,6 +6,7 @@ src="$ICECC_TEST_TOP_SRCDIR"
 sender="$ICECC_TEST_TOP_SRCDIR/client/p50_zstd_sender.cpp"
 header="$ICECC_TEST_TOP_SRCDIR/client/p50_zstd_sender.h"
 test -f "$sender" -a -f "$header"
+grep -F '#include "services/p50_cache_profile_mask.h"' "$sender" >/dev/null
 
 # The sender must remain a client-only seam.  These forbidden dependencies
 # would silently widen the lane into daemon/service or FileChunk behavior.
@@ -25,14 +26,34 @@ grep -q 'completed_for(request' "$sender"
 # focused test's attempts==2 assertion must redden it, proving the retry gate
 # is behavioral rather than a source-only grep.
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50-zstd-sender-mutant.XXXXXX")
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+keep_work=1
+cleanup() {
+    status=$?
+    if test "$status" -eq 0 && test "$keep_work" -eq 0; then
+        rm -rf "$work"
+    else
+        echo "sender source-gate artifacts retained: $work" >&2
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+top_build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src/.." && pwd)}
+baseline="$top_build/unittests/p50zstdsender"
+test -x "$baseline"
+timeout 35s "$baseline" --disconnected-retry >"$work/retry-baseline.log" 2>&1
+grep -F 'P50_SENDER_DISCONNECTED_RETRY_SELECTOR PASS' \
+    "$work/retry-baseline.log" >/dev/null
+timeout 35s "$baseline" --route-ledger-replay >"$work/ledger-baseline.log" 2>&1
+grep -F 'P51_SENDER_ROUTE_LEDGER_REPLAY_SELECTOR PASS' \
+    "$work/ledger-baseline.log" >/dev/null
 mutant="$work/p50_zstd_sender.cpp"
 sed 's/attempt <= 2/attempt <= 1/' "$sender" >"$mutant"
 test "$(grep -F -c 'attempt <= 2' "$sender")" -eq 1
 test "$(grep -F -c 'attempt <= 1' "$mutant")" -eq 1
 cxx=${ICECC_TEST_CXX:-${CXX:-c++}}
 standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++23}
-top_build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src/.." && pwd)}
 "$cxx" "$standard" -O1 -g -pthread \
     ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
     -I"$src" -I"$src/client" -I"$src/cache" -I"$src/services" \
@@ -42,11 +63,21 @@ top_build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src/.." && pwd)}
     "$top_build/cache/libprotocol50.a" \
     "$top_build/services/.libs/libicecc.a" \
     ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
-    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -llzo2 -ldl -o "$work/mutant"
-if "$work/mutant" >/dev/null 2>&1; then
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
+    -llzo2 -ldl -o "$work/mutant"
+if timeout 35s "$work/mutant" --disconnected-retry >"$work/retry-mutant.log" 2>&1; then
     echo 'FAIL: retry-deletion mutant survived' >&2
     exit 1
+else
+    mutant_status=$?
 fi
+grep -F 'transfer.attempts == 2' "$work/retry-mutant.log" >/dev/null
+case "$mutant_status" in
+    124|137|143)
+        echo "FAIL: retry mutant timed out (status $mutant_status)" >&2
+        exit 1
+        ;;
+esac
 echo 'ok - deleting the exact retry reddens the focused test'
 
 # Removing the completed-request lookup must make the no-connection replay
@@ -64,9 +95,23 @@ sed 's/impl_->completed_for(request, \*source, raw_digest)/std::optional<ZstdSou
     "$top_build/cache/libprotocol50.a" \
     "$top_build/services/.libs/libicecc.a" \
     ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
-    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -llzo2 -ldl -o "$work/ledger-mutant"
-if "$work/ledger-mutant" >/dev/null 2>&1; then
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
+    -llzo2 -ldl -o "$work/ledger-mutant"
+if timeout 35s "$work/ledger-mutant" --route-ledger-replay \
+    >"$work/ledger-mutant.log" 2>&1; then
     echo 'FAIL: completed-request-ledger deletion mutant survived' >&2
     exit 1
+else
+    ledger_status=$?
 fi
+grep -F 'replay_result.status == ZstdSourceTransferStatus::Committed' \
+    "$work/ledger-mutant.log" >/dev/null
+case "$ledger_status" in
+    124|137|143)
+        echo "FAIL: ledger mutant timed out (status $ledger_status)" >&2
+        exit 1
+        ;;
+esac
 echo 'ok - deleting the completed-request lookup reddens the replay control'
+
+keep_work=0

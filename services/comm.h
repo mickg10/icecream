@@ -34,6 +34,7 @@
 #include <netinet/tcp.h>
 
 #include "job.h"
+#include "p50_cache_profile_mask.h"
 #include "p50_store_identity_wire.h"
 #include <atomic>
 #include <chrono>
@@ -663,15 +664,6 @@ inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = P50_CACHE_FD_LEASE_V3_BYTES;
    steady-clock deadline.  The caller retains descriptor ownership. */
 bool send_cache_session_ready(
     int fd, std::chrono::steady_clock::time_point deadline) noexcept;
-
-/* Registry values are scoped to a CacheWire revision. */
-inline constexpr uint32_t CACHE_PROFILE_P29V1 = (UINT32_C(1) << 0);
-inline constexpr uint32_t CACHE_PROFILE_ZSTD_TU = (UINT32_C(1) << 1);
-inline constexpr uint32_t CACHE_PROFILE_ZSTD_ROUTE = (UINT32_C(1) << 2);
-inline constexpr uint32_t CACHE_DECLARED_PROFILE_MASK =
-    CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
-inline constexpr uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
-    CACHE_DECLARED_PROFILE_MASK;
 
 /* C->S capability request carried by GET_CS at protocol 50.  This is
    deliberately distinct from F's Login advertisement: C states which

@@ -143,12 +143,27 @@ Frozen sender test source SHA256:
 `7a10073069371bb49344c2baf639e6eedc369804b746d9134666ece1ca46e9a4`.
 Earlier setup failures (missing test archives and an accidentally copied
 mid-edit test source) remain retained failures, not passing runs.
-The sender source-boundary gate still fails on the `services/comm.h` include
-introduced by `4f3efa45`, before this accounting change. The sender uses its
-`CACHE_PROFILE_*` constants; removing the direct include merely to pass the
-gate is not a qualified fix. Resolving that dependency and rerunning the
-gate's behavioral mutants remain open. Native-suite success is not a claim
-that every source gate passes.
+The pre-existing sender source-boundary failure is now repaired by moving
+unchanged `CACHE_PROFILE_*` constants to an installed lightweight header,
+re-exported by `comm.h` and directly included by the sender. A consumer
+compiles against staged installed headers, with static assertions for bits
+1/2/4 and mask 7. Both focused retry/replay baselines pass; deleting the retry
+or completed-result lookup fails its intended assertion, not compilation or
+a timeout. Mutation runs are bounded and unexpected failures retain evidence.
+The sender mutant link now uses Automake's configured cap-ng libraries.
+The endpoint source gate uses SDK-provided grep instead of silently skipping
+its forbidden-name check when ripgrep is absent.
+
+Evidence root: `/tanksmall/scratch/tmp/p50-profile-mask-r1.5HGnlt/tmp/`.
+Sender gate `p50zstdsender-source-r2.log` SHA256:
+`6eca83cb2d6b23d035f76c906219cb9714c538cf3c93296b72a7b25c36a852c3`.
+Endpoint source gate `p50endpoint-source-r2.log` SHA256:
+`ee86f5e0b298984d6868a8f9dc5fbbb7b02ba041d9a355130d7ae0c63651764c`.
+Both exit 0. The full endpoint suite with accounting and all 25 frame cuts
+also exits 0; `p50endpoint-full.log` SHA256:
+`9e4542a2fe5d096bc3c3c6398ab8591855a2c0200a5adb138f8e18a89453cc1d`.
+Earlier missing-build-prerequisite and cap-ng link failures remain retained.
+The separate compiled endpoint-mutant suite has not been newly qualified.
 
 ### Interrupted R2 frame recovery
 
@@ -162,8 +177,8 @@ one final commit/ACK. Truncated JOB_BIND consumes no initial reservation;
 the replay consumes one, versus two total when the first binding was complete.
 
 Focused and full endpoint runs both exit 0 on the same frozen binary. This
-snapshot predates the completion-accounting change; combined qualification
-is running separately. These 25 cases are not exhaustive D03 byte offsets,
+snapshot predates the completion-accounting change; the combined qualification
+is recorded above. These 25 cases are not exhaustive D03 byte offsets,
 HELLO/recovery/ACK interruption, or actual EAGAIN coverage.
 
 Evidence root: `/tanksmall/scratch/tmp/p51-d03-frame-cuts-r2/`.

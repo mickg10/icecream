@@ -4877,6 +4877,16 @@ int main(int argc, char** argv) {
         return 77;
 #endif
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--disconnected-retry") {
+        test_disconnected_retry_is_bounded_and_exactly_once();
+        std::cerr << "P50_SENDER_DISCONNECTED_RETRY_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--route-ledger-replay") {
+        test_route_completed_ledger_releases_live_entry();
+        std::cerr << "P51_SENDER_ROUTE_LEDGER_REPLAY_SELECTOR PASS\n";
+        return 0;
+    }
     if (argc == 2 &&
         std::string_view(argv[1]) == "--window-matrix") {
         test_p51_sender_window_matrix_and_serial_control();
