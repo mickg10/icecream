@@ -169,7 +169,9 @@ public:
     // Outer-loop lifecycle seam.  These methods are the only production
     // entry points used by iceccd.  Each call performs at most one reducer
     // turn and at most one launch/TERM/KILL/cleanup/connect/send/receive
-    // action; waiting and deadline selection remain in the daemon poll owner.
+    // action, except that an input lifecycle dialogue chains its ready
+    // phases within its per-turn syscall quota; waiting and deadline
+    // selection remain in the daemon poll owner.
     bool outer_begin_turn(std::chrono::steady_clock::time_point now,
                           advertisement::Update* update = nullptr) noexcept;
     bool outer_advance_turn(std::chrono::steady_clock::time_point now,

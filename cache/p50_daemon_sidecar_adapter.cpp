@@ -2880,11 +2880,13 @@ bool DaemonSidecarAdapter::outer_advance_input(
 #ifdef SOCK_NONBLOCK
             int control_fd = ::socket(AF_UNIX, socket_type, 0);
 #endif
+            // Phases that complete without waiting share one turn, so the
+            // dialogue costs one turn per sidecar reply, not one per phase.
             const local::DaemonControlStatus status = control_fd >= 0
                 ? outer_input_operation_->begin_connecting(
                       socket_path_, control_fd, operation, -1, credentials,
                       request_deadline,
-                      local::DaemonControlLimits{1, 4096},
+                      local::DaemonControlLimits{8, 4096, true},
                       local::DaemonControlFdOwnership::Owned)
                 : local::DaemonControlStatus::IoError;
             if (status != local::DaemonControlStatus::InProgress) {

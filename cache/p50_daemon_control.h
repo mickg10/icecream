@@ -31,6 +31,9 @@ enum class DaemonControlFdOwnership : uint8_t {
 struct DaemonControlLimits {
     size_t syscalls_per_turn = 4;
     size_t bytes_per_turn = 4096;
+    // Off: one phase per advance.  On: phases that complete without waiting
+    // continue in the same advance, within the two quotas above.
+    bool chain_ready_phases = false;
 };
 
 class DaemonControlOperation {
@@ -120,6 +123,7 @@ private:
                                  CheckSourceReplyTrailing, WriteLifecycleGoodbye };
     void fail(DaemonControlStatus status) noexcept;
     void close_fd() noexcept;
+    void advance_phase(size_t& calls, size_t& budget) noexcept;
     bool query_peer() noexcept;
     bool write_bytes(size_t& offset, const std::vector<uint8_t>& bytes,
                      size_t& calls, size_t& budget) noexcept;

@@ -722,18 +722,40 @@ DaemonControlStatus DaemonControlOperation::advance(
         return status_;
     }
     size_t calls = 0, budget = limits_.bytes_per_turn;
-    // Exactly one fallible external operation per outer advance.  In-memory
-    // phase transitions happen at the end of that operation and are resumed
-    // by the next poll turn; this prevents a hidden send/recv/connect loop.
+    // Exactly one fallible external operation per phase.  Without
+    // chain_ready_phases the next phase is resumed by the next poll turn.
+    // With it, a completed phase continues in this call until a would-block,
+    // a short transfer, an in-progress connect or either quota ends the turn,
+    // so there is still no unbounded hidden send/recv/connect loop.
     if (limits_.syscalls_per_turn == 0 || budget == 0) {
         last_calls_ = 0;
         last_bytes_ = 0;
         return status_;
     }
+    for (;;) {
+        const Phase phase_before = phase_;
+        const bool queried_before = peer_queried_;
+        const size_t expected_before = frame_expected_;
+        advance_phase(calls, budget);
+        if (!limits_.chain_ready_phases || status_ != DaemonControlStatus::InProgress ||
+            phase_ == Phase::Connecting || calls >= limits_.syscalls_per_turn ||
+            budget == 0)
+            break;
+        const bool header_read = expected_before <= kFrameHeaderSize &&
+                                 frame_expected_ > kFrameHeaderSize;
+        if (phase_ == phase_before && peer_queried_ == queried_before && !header_read)
+            break;
+    }
+    last_calls_ = calls;
+    last_bytes_ = limits_.bytes_per_turn - budget;
+    return status_;
+}
+
+void DaemonControlOperation::advance_phase(size_t& calls, size_t& budget) noexcept {
     if (phase_ == Phase::ConnectPending) {
         if (connect_path_.empty() || connect_path_.size() >= sizeof(sockaddr_un::sun_path)) {
             fail(DaemonControlStatus::InvalidArgument);
-            return status_;
+            return;
         }
         sockaddr_un address{};
         address.sun_family = AF_UNIX;
@@ -853,9 +875,6 @@ DaemonControlStatus DaemonControlOperation::advance(
     } else {
         fail(DaemonControlStatus::IoError);
     }
-    last_calls_ = calls;
-    last_bytes_ = limits_.bytes_per_turn - budget;
-    return status_;
 }
 
 DaemonControlHandoffReceiver::~DaemonControlHandoffReceiver() { close_all(); }

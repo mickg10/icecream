@@ -749,6 +749,142 @@ void test_authenticated_entry_consumes_transfer_on_every_return() {
     ::close(credential_pair[1]);
 }
 
+icecc::p50::InputLifecycleRequest lifecycle_request() {
+    icecc::p50::InputLifecycleRequest request;
+    request.identity = Identity{91, 17};
+    request.key.c_store_guid.bytes[15] = 5;
+    request.key.tu_seq.value = 3;
+    request.owner = icecc::p50::InputLeaseOwner{7, 3, 4};
+    request.operation_id = 29;
+    request.action = icecc::p50::InputLifecycleAction::CloseAcceptedJob;
+    return request;
+}
+
+void write_lifecycle_reply(int fd, const icecc::p50::InputLifecycleRequest& request) {
+    Frame control;
+    CHECK(read_frame(fd, control) == Status::Ok && control.type == MessageType::Data);
+    ControlOperation decoded;
+    CHECK(decode_control_operation(control.payload, decoded) &&
+          decoded.kind == ControlOperationKind::InputLifecycle &&
+          decoded.request_id == request.operation_id &&
+          decoded.lifecycle_action == request.action);
+    write_frame(fd, Frame{kProtocolVersion, MessageType::Data, request.identity,
+                          encode_control_operation(make_input_lifecycle_reply_operation(
+                              request, icecc::p50::InputLifecycleApplyStatus::Applied))});
+}
+
+void test_lifecycle_chain_takes_one_advance_per_sidecar_reply() {
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const auto request = lifecycle_request();
+    DaemonControlOperation sender;
+    CHECK(sender.begin_connected(pair[0], make_input_lifecycle_operation(request), -1,
+                                 credentials(),
+                                 std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                                 DaemonControlLimits{8, 4096, true},
+                                 DaemonControlFdOwnership::Borrowed) ==
+          DaemonControlStatus::InProgress);
+
+    // Credentials and HELLO; the HELLO_ACK read would block.
+    CHECK(sender.advance(std::chrono::steady_clock::now(), POLLOUT) ==
+          DaemonControlStatus::InProgress);
+    CHECK(sender.last_advance_syscalls() == 3);
+    CHECK(sender.peer_queried() && sender.desired_events() == POLLIN);
+    Frame hello;
+    CHECK(read_frame(pair[1], hello) == Status::Ok && hello.type == MessageType::Hello);
+    write_frame(pair[1], make_hello_ack(PeerRole::Sidecar, request.identity));
+
+    // HELLO_ACK header and payload, trailing probe, control frame; the reply
+    // read would block.
+    CHECK(sender.advance(std::chrono::steady_clock::now(), POLLIN) ==
+          DaemonControlStatus::InProgress);
+    CHECK(sender.last_advance_syscalls() == 5);
+    CHECK(sender.desired_events() == POLLIN);
+    write_lifecycle_reply(pair[1], request);
+
+    // Reply header and payload, trailing probe, GOODBYE.
+    CHECK(sender.advance(std::chrono::steady_clock::now(), POLLIN) ==
+          DaemonControlStatus::Complete);
+    CHECK(sender.last_advance_syscalls() == 4);
+    CHECK(sender.lifecycle_result() == icecc::p50::InputLifecycleApplyStatus::Applied);
+    Frame goodbye;
+    CHECK(read_frame(pair[1], goodbye) == Status::Ok &&
+          goodbye.type == MessageType::Goodbye && goodbye.identity == request.identity);
+    ::close(pair[0]); ::close(pair[1]);
+}
+
+void test_lifecycle_chain_honours_syscall_quota() {
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const auto request = lifecycle_request();
+    DaemonControlOperation sender;
+    CHECK(sender.begin_connected(pair[0], make_input_lifecycle_operation(request), -1,
+                                 credentials(),
+                                 std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                                 DaemonControlLimits{2, 4096, true},
+                                 DaemonControlFdOwnership::Borrowed) ==
+          DaemonControlStatus::InProgress);
+    std::thread peer([&] {
+        Frame hello;
+        CHECK(read_frame(pair[1], hello) == Status::Ok && hello.type == MessageType::Hello);
+        write_frame(pair[1], make_hello_ack(PeerRole::Sidecar, request.identity));
+        write_lifecycle_reply(pair[1], request);
+        Frame goodbye;
+        CHECK(read_frame(pair[1], goodbye) == Status::Ok &&
+              goodbye.type == MessageType::Goodbye);
+    });
+    while (!sender.done()) {
+        pollfd pfd{pair[0], sender.desired_events(), 0};
+        CHECK(::poll(&pfd, 1, 1000) == 1);
+        sender.advance(std::chrono::steady_clock::now(), pfd.revents);
+        CHECK(sender.last_advance_syscalls() <= 2);
+    }
+    peer.join();
+    CHECK(sender.status() == DaemonControlStatus::Complete);
+    CHECK(sender.lifecycle_result() == icecc::p50::InputLifecycleApplyStatus::Applied);
+    ::close(pair[0]); ::close(pair[1]);
+}
+
+void test_lifecycle_chain_stops_at_in_progress_connect() {
+    const std::string path =
+        "/tmp/p50-daemon-control-chain-" + std::to_string(::getpid()) + ".sock";
+    (void)::unlink(path.c_str());
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    CHECK(path.size() < sizeof(address.sun_path));
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    const auto length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                               path.size() + 1);
+    CHECK(::bind(listener, reinterpret_cast<sockaddr*>(&address), length) == 0);
+    // A zero backlog queues one unaccepted connection; the next nonblocking
+    // connect reports EAGAIN, which the operation treats as in progress.
+    CHECK(::listen(listener, 0) == 0);
+    const int queued = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(queued >= 0);
+    CHECK(::connect(queued, reinterpret_cast<sockaddr*>(&address), length) == 0);
+
+    const int client = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(client >= 0);
+    nonblock(client);
+    DaemonControlOperation sender;
+    CHECK(sender.begin_connecting(
+              path, client, make_input_lifecycle_operation(lifecycle_request()), -1,
+              credentials(), std::chrono::steady_clock::now() + std::chrono::seconds(1),
+              DaemonControlLimits{8, 4096, true}, DaemonControlFdOwnership::Owned) ==
+          DaemonControlStatus::InProgress);
+    CHECK(sender.advance(std::chrono::steady_clock::now(), POLLOUT) ==
+          DaemonControlStatus::InProgress);
+    CHECK(sender.last_advance_syscalls() == 1);
+    CHECK(!sender.peer_queried() && sender.desired_events() == POLLOUT);
+    ::close(queued);
+    ::close(listener);
+    (void)::unlink(path.c_str());
+}
+
 } // namespace
 
 int main() {
@@ -765,5 +901,8 @@ int main() {
     test_poll_adapter_relevance_fairness_and_removal();
     test_connect_pending_ignores_preconnect_hup();
     test_authenticated_entry_consumes_transfer_on_every_return();
+    test_lifecycle_chain_takes_one_advance_per_sidecar_reply();
+    test_lifecycle_chain_honours_syscall_quota();
+    test_lifecycle_chain_stops_at_in_progress_connect();
     return 0;
 }
