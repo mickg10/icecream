@@ -293,6 +293,33 @@ dry-run validation passes in `/tanksmall/scratch/tmp/p51-wrapper-make-dryrun.log
 The entry point itself has not yet been executed end-to-end; the underlying
 script runs above provide runtime evidence, and the dry run checks invocation.
 
+The shared R2 reconnect gate now backs off from 5 ms to a 500 ms cap across
+all callers on a relationship, without extending their original deadlines.
+Only successful reconciliation resets the delay. Focused W1/W30 tests observe
+10 aggregate connections in about 1.4 seconds against a replacement F that
+accepts TCP and rejects the stale HELLO. Retirement interrupts a registered
+499 ms retry wait in under 1 ms in the recorded run. Shared/repeated recovery
+for all three profiles, deadline handling and positive-receipt preservation
+also pass. Evidence: `logs/backoff-stage1-final.log` under
+`/tanksmall/scratch/tmp/p51-b1790-qa.1w2Xvi/` (SHA256
+`27f172874d9e75d7825805161b408e8dad697b6f6be18a239b7dd7a2e0966816`).
+The full sender suite passes in `logs/backoff-full-sender.log` under that root
+(SHA256 `fb5ce5afccce501205bf5265951ee2a67b4eb4c463304cb2a7afdc8c84f94974`),
+both with container exit 0. Sender source SHA256 is
+`c10bb81e817ba1ab890b791c55e565b16ab559fc99bf3b9bd71c2cd2d6ce42ec`.
+The wakeup regression is registered in the default suite. After that
+registration-only edit, rebuild and the focused selector pass in
+`logs/backoff-registration-r1.log` (SHA256
+`38a0c1e8579b73ba495e29a2884efc48364bc259bf6af6c8675b322037dc867e`).
+A scratch-only mutation removing the retirement wake fails the intended
+200 ms latency assertion, exit 134, in `logs/backoff-negative-no-wake.log`
+(SHA256 `0c311eb2ca1e11e9c94b815187013a8ad81f8210a1acc12f092c07f35fb3a412`).
+That deliberately failing mutant is not product source. Final test source
+SHA256 is `dcb61c5d0c819e39da74246e2f1618daa1ebad21d4439546f7fdc592796c9aef`.
+These runs use the private build snapshot with the exact sender overlay,
+not a clean final combined candidate. Retry pacing is not a repair for the
+separate old-route retirement failure below and does not add typed rejection.
+
 The in-development real C2F1/C-cache restart fixture passes for ZSTD_TU:
 the independent C2/F1 link attaches exact input while C1's parent is stopped,
 the C1 sidecar PID changes, the discarded old receipt is not reported as a
@@ -313,7 +340,7 @@ Evidence: `restart-attach-diagnostic4.raw.log` under the same root
 (SHA256 `2cb1fd3a7cdf28e5fa3b4e39c599849e958fd302ef5f585dbf32a00df4c197f1`).
 Its final summary's `fresh=1` indicates the selected scenario, not a passing
 fresh-transfer assertion; the log contains explicit FAILED assertions.
-Bounded shared retry backoff and typed R2 rejection are in progress.
+Shared retry pacing is covered above; typed R2 rejection remains pending.
 Fresh replacement attachment now has a confirmed failure path: the old F route
 retains one preparation; `reset_f_store_exact` cannot reset that live route,
 so endpoint-identity binding rejects the fresh assignment with error 4 and

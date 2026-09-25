@@ -631,12 +631,17 @@ sender_r2_accept_recovery_with_lost_reset_ack(
 asio::awaitable<std::vector<ServerRunResult>>
 sender_r2_accept_shared_failure(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
+    EndpointCaps replacement_caps,
     std::atomic<unsigned>& bundles_sent,
     size_t bundles_required, std::mutex& gate_mutex,
     std::condition_variable& gate_cv, bool repeat_recovery_loss,
     bool retire_after_positive_receipt,
-    bool expire_after_positive_receipt = false) {
-    const size_t connection_count = repeat_recovery_loss ? 3
+    bool expire_after_positive_receipt = false,
+    bool reject_stale_reconnect = false,
+    std::atomic<bool>* stop_reconnect_listener = nullptr,
+    std::atomic<unsigned>* rejected_reconnects = nullptr) {
+    const size_t connection_count = reject_stale_reconnect ? 1
+        : repeat_recovery_loss ? 3
         : (retire_after_positive_receipt || expire_after_positive_receipt) ? 1
                                                                            : 2;
     std::vector<ServerRunResult> results(connection_count);
@@ -664,6 +669,42 @@ sender_r2_accept_shared_failure(
         if (results[index].terminal_error)
             std::fprintf(stderr, "R2 shared-failure server[%zu]: %s\n", index,
                          results[index].terminal_error->detail.c_str());
+        if (reject_stale_reconnect) {
+            P50ServerEndpointConfig replacement_config;
+            P50ServerEndpoint replacement(
+                Id128::from_u64(0xf005), replacement_caps, nullptr, nullptr,
+                std::move(replacement_config));
+            boost::system::error_code nonblocking_error;
+            acceptor.non_blocking(true, nonblocking_error);
+            if (nonblocking_error)
+                throw boost::system::system_error(nonblocking_error);
+            while (stop_reconnect_listener == nullptr ||
+                   !stop_reconnect_listener->load(std::memory_order_acquire)) {
+                tcp::socket retry_socket(co_await asio::this_coro::executor);
+                boost::system::error_code accept_error;
+                acceptor.accept(retry_socket, accept_error);
+                if (accept_error == asio::error::would_block ||
+                    accept_error == asio::error::try_again) {
+                    asio::steady_timer poll(co_await asio::this_coro::executor);
+                    poll.expires_after(std::chrono::milliseconds(2));
+                    co_await poll.async_wait(asio::use_awaitable);
+                    continue;
+                }
+                if (accept_error)
+                    throw boost::system::system_error(accept_error);
+                const ServerRunResult rejected = co_await
+                    replacement.run_adopted_r2(std::move(retry_socket));
+                if (rejected.status != ServerRunStatus::TerminalError ||
+                    !rejected.terminal_error ||
+                    rejected.terminal_error->detail !=
+                        "R2 LINK_HELLO exceeds F admission")
+                    throw std::runtime_error(
+                        "replacement F did not reject the stale F identity precisely");
+                if (rejected_reconnects != nullptr)
+                    rejected_reconnects->fetch_add(1, std::memory_order_release);
+            }
+            co_return results;
+        }
     }
     co_return results;
 }
@@ -1463,7 +1504,9 @@ void test_p51_sender_recovers_lost_commit_reply_after_connector_failure() {
 void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool repeat_recovery_loss = false,
                                         bool retire_after_positive_receipt = false,
-                                        bool expire_after_positive_receipt = false) {
+                                        bool expire_after_positive_receipt = false,
+                                        bool reject_stale_reconnect = false,
+                                        bool retire_during_retry_wait = false) {
     CHECK(kJobs >= 1 && kJobs <= 30);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
@@ -1494,7 +1537,10 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
         std::chrono::steady_clock::now() +
-            (expire_after_positive_receipt ? std::chrono::seconds(3)
+            (reject_stale_reconnect
+                 ? (retire_during_retry_wait ? std::chrono::seconds(5)
+                                             : std::chrono::milliseconds(1400))
+             : expire_after_positive_receipt ? std::chrono::seconds(3)
                                            : std::chrono::seconds(30)),
         clock.clock_domain_id, clock.time_namespace_id);
 
@@ -1508,6 +1554,12 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::atomic<bool> receipt_hook_before_deadline{false};
     std::atomic<unsigned> bundles_sent{0};
     std::atomic<unsigned> connector_calls{0};
+    std::atomic<bool> stop_reconnect_listener{false};
+    std::atomic<unsigned> rejected_reconnects{0};
+    std::atomic<bool> retry_wait_registered{false};
+    std::atomic<int64_t> retry_wait_registered_ns{0};
+    std::atomic<unsigned> retry_wait_count{0};
+    std::atomic<int64_t> retry_wait_remaining_ns{0};
     std::atomic<unsigned> input_selections{0};
     std::atomic<unsigned> input_mismatches{0};
     std::atomic<unsigned> materialized{0};
@@ -1772,9 +1824,11 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     } cleanup{c_context, f_context, c_thread, f_thread};
     auto server_future = asio::co_spawn(
         f_context, sender_r2_accept_shared_failure(
-            acceptor, server, bundles_sent, kJobs, gate_mutex, gate_cv,
+            acceptor, server, server_caps, bundles_sent, kJobs,
+            gate_mutex, gate_cv,
             repeat_recovery_loss, retire_after_positive_receipt,
-            expire_after_positive_receipt),
+            expire_after_positive_receipt, reject_stale_reconnect,
+            &stop_reconnect_listener, &rejected_reconnects),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -1822,6 +1876,24 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                     receipt_hook_cv.wait_until(
                         lock, deadline.as_steady_time_point());
             };
+    } else if (retire_during_retry_wait) {
+        sender_config.after_r2_recovery_waiter_registered_for_test =
+            [&](std::chrono::steady_clock::duration retry_delay) {
+            retry_wait_count.fetch_add(1, std::memory_order_acq_rel);
+            // Retire only when the actual registered shared wait has reached
+            // the 500ms cap, proving this interrupts a long retry timer.
+            if (retry_delay < std::chrono::milliseconds(450))
+                return;
+            retry_wait_remaining_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    retry_delay).count(), std::memory_order_release);
+            retry_wait_registered_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_release);
+            retry_wait_registered.store(true, std::memory_order_release);
+            sender->retire_for_replacement();
+        };
     }
     sender = std::make_shared<P50ZstdSourceSender>(
         authority, route, PrepareRequestKey{3, 921}, sender_config);
@@ -1840,10 +1912,97 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                 input[index]), asio::use_future);
     }
     auto c_work = asio::make_work_guard(c_context);
+    const auto transfer_started = std::chrono::steady_clock::now();
     c_thread = std::thread([&] { c_context.run(); });
 
     std::vector<ZstdSourceTransferResult> outcomes(kJobs);
     for (size_t index = 0; index != kJobs; ++index) outcomes[index] = results[index].get();
+    if (retire_during_retry_wait) {
+        CHECK(kJobs == 1);
+        CHECK(retry_wait_registered.load(std::memory_order_acquire));
+        CHECK(retry_wait_count.load(std::memory_order_acquire) > 0);
+        CHECK(outcomes[0].status == ZstdSourceTransferStatus::Unavailable);
+        CHECK(outcomes[0].route_local_failure);
+        CHECK(!outcomes[0].committed_input);
+        CHECK(bundles_sent.load(std::memory_order_acquire) == 1);
+        CHECK(connector_calls.load(std::memory_order_acquire) ==
+              rejected_reconnects.load(std::memory_order_acquire) + 1);
+        CHECK(rejected_reconnects.load(std::memory_order_acquire) > 0);
+        const auto registered = std::chrono::steady_clock::time_point(
+            std::chrono::nanoseconds(retry_wait_registered_ns.load(
+                std::memory_order_acquire)));
+        const auto retirement_wake_elapsed =
+            std::chrono::steady_clock::now() - registered;
+        CHECK(retry_wait_remaining_ns.load(std::memory_order_acquire) >=
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::milliseconds(450)).count());
+        CHECK(retirement_wake_elapsed < std::chrono::milliseconds(200));
+        stop_reconnect_listener.store(true, std::memory_order_release);
+        CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        const auto server_runs = server_future.get();
+        CHECK(server_runs.size() == 1);
+        CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
+        c_work.reset();
+        c_context.stop();
+        f_context.stop();
+        c_thread.join();
+        f_thread.join();
+        std::cerr << "P51_SENDER_RETRY_WAIT_RETIRE jobs=1 connectors="
+                  << connector_calls.load() << " wait_count="
+                  << retry_wait_count.load() << " remaining_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::nanoseconds(retry_wait_remaining_ns.load(
+                             std::memory_order_acquire))).count()
+                  << " retire_wake_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         retirement_wake_elapsed).count()
+                  << " PASS\n";
+        return;
+    }
+    if (reject_stale_reconnect && !retire_during_retry_wait) {
+        CHECK(bundles_sent.load(std::memory_order_acquire) == kJobs);
+        for (const auto& outcome : outcomes) {
+            CHECK(outcome.status == ZstdSourceTransferStatus::DeadlineExceeded);
+            CHECK(outcome.route_local_failure);
+            CHECK(!outcome.committed_input);
+        }
+        const unsigned reconnect_attempts = connector_calls.load();
+        if (reconnect_attempts > 10U)
+            throw std::runtime_error(
+                "R2 shared reconnect gate exceeded aggregate attempt budget: " +
+                std::to_string(reconnect_attempts));
+        CHECK(input_mismatches.load() == 0);
+        CHECK(rejected_reconnects.load(std::memory_order_acquire) > 0);
+        stop_reconnect_listener.store(true, std::memory_order_release);
+        CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        const auto server_runs = server_future.get();
+        CHECK(server_runs.size() == 1);
+        CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
+        std::promise<void> retirement_posted;
+        auto retirement_done = retirement_posted.get_future();
+        asio::post(c_context, [&sender, &retirement_posted] {
+            sender->retire_for_replacement();
+            retirement_posted.set_value();
+        });
+        CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        c_work.reset();
+        c_context.stop();
+        f_context.stop();
+        c_thread.join();
+        f_thread.join();
+        std::cerr << "P51_SENDER_RECONNECT_BACKOFF jobs=" << kJobs
+                  << " initial_bundles=" << bundles_sent.load()
+                  << " aggregate_connects=" << reconnect_attempts
+                  << " elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - transfer_started)
+                         .count()
+                  << " PASS\n";
+        return;
+    }
     for (size_t index = 0; index != kJobs; ++index) {
         if (outcomes[index].status != ZstdSourceTransferStatus::Committed)
             throw std::runtime_error(
@@ -1971,6 +2130,18 @@ void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
         run_p51_sender_shared_failure_case(2, profile, true);
         run_p51_sender_shared_failure_case(30, profile, true);
     }
+}
+
+void test_p51_sender_reconnect_backoff_bounds_shared_eof() {
+    run_p51_sender_shared_failure_case(
+        1, ProfileId::ZSTD_TU, false, false, false, true);
+    run_p51_sender_shared_failure_case(
+        30, ProfileId::ZSTD_TU, false, false, false, true);
+}
+
+void test_p51_sender_retirement_wakes_shared_retry_waiter() {
+    run_p51_sender_shared_failure_case(
+        1, ProfileId::ZSTD_TU, false, false, false, true, true);
 }
 
 void test_p51_sender_retirement_during_recovery() {
@@ -2369,6 +2540,18 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--reconnect-backoff") {
+        test_p51_sender_reconnect_backoff_bounds_shared_eof();
+        std::cerr << "P51_SENDER_RECONNECT_BACKOFF_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--retry-wait-retire") {
+        test_p51_sender_retirement_wakes_shared_retry_waiter();
+        std::cerr << "P51_SENDER_RETRY_WAIT_RETIRE_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--retire-during-recovery") {
         test_p51_sender_retirement_during_recovery();
         std::cerr << "P51_SENDER_RETIRE_DURING_RECOVERY_SELECTOR PASS\n";
@@ -2392,6 +2575,8 @@ int main(int argc, char** argv) {
     run("lost_commit_recovery", test_p51_sender_recovers_lost_commit_reply_after_connector_failure);
     run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
     run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
+    run("reconnect_backoff", test_p51_sender_reconnect_backoff_bounds_shared_eof);
+    run("retry_wait_retire", test_p51_sender_retirement_wakes_shared_retry_waiter);
     run("retirement", test_p51_sender_retirement_during_recovery);
     run("deadline_recovery_ack", test_p51_sender_deadline_during_recovery_and_ack);
     run("cold_replacement", test_route_failure_requires_cold_replacement);

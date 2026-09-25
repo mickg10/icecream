@@ -112,6 +112,10 @@ struct ZstdSourceTransferConfig {
     // true yields through a short timer, leaving the sole writer and F peer
     // independently runnable.
     std::function<bool()> hold_r2_receipt_reader_for_test;
+    // Test-only seam invoked after a recovery caller has registered on the
+    // shared retry timer. Product callers leave this empty.
+    std::function<void(std::chrono::steady_clock::duration)>
+        after_r2_recovery_waiter_registered_for_test;
 };
 
 // Called once per bounded attempt.  The callback returns ownership of one
@@ -214,6 +218,8 @@ private:
         uint64_t physical_link_generation);
     boost::asio::awaitable<void> recover_r2_link(
         AsyncConnectedFdFactory connection, uint64_t requested_generation,
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<bool> wait_for_r2_recovery_retry(
         std::chrono::steady_clock::time_point deadline);
     boost::asio::awaitable<bool> acquire_r2_writer(
         std::chrono::steady_clock::time_point deadline);

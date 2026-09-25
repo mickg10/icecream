@@ -307,6 +307,7 @@ struct P50ZstdSourceSender::Impl {
         if (!persistent_route)
             return;
         route_replacement_required = true;
+        wake_r2_recovery_waiters();
         result.replacement_required = true;
     }
 
@@ -427,6 +428,11 @@ struct P50ZstdSourceSender::Impl {
     bool r2_transfer_active = false;
     std::deque<std::shared_ptr<WriterWaiter>> r2_transfer_waiters;
     std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_window_waiters;
+    // One relationship-wide reconnect gate. All transfer callers observe the
+    // same deadline so a W30 suffix cannot multiply immediate reconnects.
+    std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_recovery_waiters;
+    Clock::time_point r2_recovery_retry_not_before{};
+    unsigned r2_recovery_failures = 0;
     std::deque<std::shared_ptr<PendingReceipt>> r2_receipt_queue;
     // Retain every fully transmitted but not locally verified bundle across a
     // transport loss. The row owns the exact ARMED lease/deadline, codec
@@ -456,6 +462,38 @@ struct P50ZstdSourceSender::Impl {
     bool used = false;
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
+
+    void wake_r2_recovery_waiters() noexcept {
+        std::vector<std::shared_ptr<boost::asio::steady_timer>> wake;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            wake.swap(r2_recovery_waiters);
+        }
+        for (const auto& timer : wake) {
+            boost::system::error_code ignored;
+            timer->expires_at(Clock::now(), ignored);
+        }
+    }
+
+    void note_r2_recovery_failure() noexcept {
+        std::lock_guard lock(r2_transfer_mutex);
+        constexpr auto kBase = std::chrono::milliseconds(5);
+        constexpr auto kMaximum = std::chrono::milliseconds(500);
+        const unsigned exponent = std::min(r2_recovery_failures, 7U);
+        const auto delay = std::min(kMaximum, kBase * (1U << exponent));
+        if (r2_recovery_failures < 7U)
+            ++r2_recovery_failures;
+        r2_recovery_retry_not_before = Clock::now() + delay;
+    }
+
+    void reset_r2_recovery_backoff() noexcept {
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            r2_recovery_failures = 0;
+            r2_recovery_retry_not_before = Clock::time_point{};
+        }
+        wake_r2_recovery_waiters();
+    }
 
     void release_r2_transfer() noexcept {
         std::shared_ptr<WriterWaiter> wake;
@@ -499,6 +537,7 @@ P50ZstdSourceSender::~P50ZstdSourceSender() = default;
 
 void P50ZstdSourceSender::retire_for_replacement() noexcept {
     impl_->route_replacement_required = true;
+    impl_->wake_r2_recovery_waiters();
     if (impl_->r2_socket) {
         boost::system::error_code ignored;
         impl_->r2_socket->close(ignored);
@@ -534,6 +573,47 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
         std::erase(impl_->r2_transfer_waiters, waiter);
     }
     co_return false;
+}
+
+boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_recovery_retry(
+    Clock::time_point deadline) {
+    const auto executor = co_await boost::asio::this_coro::executor;
+    for (;;) {
+        if (Clock::now() >= deadline)
+            co_return false;
+        std::shared_ptr<boost::asio::steady_timer> waiter;
+        Clock::duration retry_delay{};
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->route_replacement_required)
+                co_return false;
+            if (!impl_->r2_recovery_required ||
+                impl_->r2_recovery_retry_not_before <= Clock::now())
+                co_return true;
+            waiter = std::make_shared<boost::asio::steady_timer>(executor);
+            retry_delay = impl_->r2_recovery_retry_not_before - Clock::now();
+            waiter->expires_at(std::min(
+                deadline, impl_->r2_recovery_retry_not_before));
+            impl_->r2_recovery_waiters.push_back(waiter);
+        }
+        if (impl_->config.after_r2_recovery_waiter_registered_for_test)
+            impl_->config.after_r2_recovery_waiter_registered_for_test(
+                retry_delay);
+        boost::system::error_code wait_error;
+        co_await waiter->async_wait(
+            boost::asio::redirect_error(boost::asio::use_awaitable,
+                                        wait_error));
+        bool replaced = false;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            std::erase(impl_->r2_recovery_waiters, waiter);
+            replaced = impl_->route_replacement_required;
+        }
+        if (replaced || Clock::now() >= deadline)
+            co_return false;
+        // A preceding coordinator may have failed again and advanced the
+        // shared timestamp while this caller was asleep; re-read it.
+    }
 }
 
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
@@ -980,6 +1060,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     impl_->r2_recovery_required = false;
     impl_->route_transport_quarantined = false;
     impl_->r2_failed_physical_generation = 0;
+    impl_->reset_r2_recovery_backoff();
 
     bool reader_started = false;
     for (R2SentBundle& old_witness : witnesses) {
@@ -1209,6 +1290,36 @@ P50ZstdSourceSender::transfer_p51_route(
         if (impl_->route_replacement_required)
             co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
         if (impl_->r2_recovery_required) {
+            writer_guard.reset();
+            if (!co_await wait_for_r2_recovery_retry(deadline)) {
+                ZstdSourceTransferResult failed =
+                    impl_->invalid(Clock::now() >= deadline
+                        ? ZstdSourceTransferStatus::DeadlineExceeded
+                        : ZstdSourceTransferStatus::Unavailable);
+                failed.route_local_failure = true;
+                co_return failed;
+            }
+            if (!co_await acquire_r2_writer(deadline)) {
+                ZstdSourceTransferResult failed =
+                    impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+                failed.route_local_failure = true;
+                co_return failed;
+            }
+            writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
+            bool retry_not_before = false;
+            {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                retry_not_before = impl_->r2_recovery_required &&
+                    impl_->r2_recovery_retry_not_before > Clock::now();
+            }
+            if (retry_not_before) {
+                writer_guard.reset();
+                continue;
+            }
+            if (!impl_->r2_recovery_required) {
+                writer_guard.reset();
+                continue;
+            }
             try {
                 co_await recover_r2_link(connection,
                                          physical_link_generation, deadline);
@@ -1216,6 +1327,7 @@ P50ZstdSourceSender::transfer_p51_route(
                     impl_->r2_physical_link_generation;
                 armed.relationship_epoch = impl_->r2_relationship_epoch;
             } catch (...) {
+                impl_->note_r2_recovery_failure();
                 ZstdSourceTransferResult failed =
                     impl_->invalid(ZstdSourceTransferStatus::Unavailable);
                 failed.route_local_failure = true;
@@ -1481,33 +1593,35 @@ P50ZstdSourceSender::transfer_p51_route(
               }
           }
       }
-      if (impl_->r2_recovery_required && Clock::now() < deadline &&
-          !impl_->route_replacement_required &&
-          co_await acquire_r2_writer(deadline)) {
-          Impl::R2TransferGuard recovery_guard(impl_.get());
-          while (impl_->r2_recovery_required && Clock::now() < deadline &&
-                 !impl_->route_replacement_required) {
-              bool recovered = false;
-              try {
-                  co_await recover_r2_link(connection,
-                      impl_->r2_physical_link_generation, deadline);
-                  recovered = true;
-              } catch (...) {
-                  // Exact COMMIT remains the result even if credit recovery
-                  // exhausts this original request's deadline.
-              }
-              if (recovered)
-                  break;
-              if (Clock::now() < deadline) {
-                  boost::asio::steady_timer retry_pause(executor);
-                  retry_pause.expires_at(std::min(
-                      deadline, Clock::now() + std::chrono::milliseconds(5)));
-                  boost::system::error_code ignored;
-                  co_await retry_pause.async_wait(
-                      boost::asio::redirect_error(boost::asio::use_awaitable,
-                                                  ignored));
-              }
+      while (impl_->r2_recovery_required && Clock::now() < deadline &&
+             !impl_->route_replacement_required) {
+          if (!co_await wait_for_r2_recovery_retry(deadline) ||
+              !co_await acquire_r2_writer(deadline))
+              break;
+          auto recovery_guard =
+              std::make_unique<Impl::R2TransferGuard>(impl_.get());
+          bool attempt = false;
+          {
+              std::lock_guard lock(impl_->r2_transfer_mutex);
+              attempt = impl_->r2_recovery_required &&
+                  impl_->r2_recovery_retry_not_before <= Clock::now() &&
+                  !impl_->route_replacement_required;
           }
+          if (!attempt)
+              continue;
+          bool recovered = false;
+          try {
+              co_await recover_r2_link(connection,
+                  impl_->r2_physical_link_generation, deadline);
+              recovered = true;
+          } catch (...) {
+              // Exact COMMIT remains the result even if credit recovery
+              // exhausts this original request's deadline.
+              impl_->note_r2_recovery_failure();
+          }
+          recovery_guard.reset();
+          if (recovered)
+              break;
       }
         ZstdSourceTransferResult result;
         result.status = ZstdSourceTransferStatus::Committed;
@@ -1674,12 +1788,18 @@ P50ZstdSourceSender::transfer_p51_route(
             if (recovery_required) {
                 if (impl_->route_replacement_required)
                     break;
+                writer_guard.reset();
+                if (!co_await wait_for_r2_recovery_retry(deadline))
+                    break;
                 if (!co_await acquire_r2_writer(deadline))
                     break;
                 writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
                 {
                     std::lock_guard lock(impl_->r2_transfer_mutex);
                     recovery_required = impl_->r2_recovery_required;
+                    if (recovery_required &&
+                        impl_->r2_recovery_retry_not_before > Clock::now())
+                        recovery_required = false;
                 }
                 if (!recovery_required) {
                     writer_guard.reset();
@@ -1689,12 +1809,11 @@ P50ZstdSourceSender::transfer_p51_route(
                     writer_guard.reset();
                     break;
                 }
-                bool recovered = false;
                 try {
                     co_await recover_r2_link(connection,
                         impl_->r2_physical_link_generation, deadline);
-                    recovered = true;
                 } catch (...) {
+                    impl_->note_r2_recovery_failure();
                     // Preserve the exact suffix and operation deadline. The
                     // next pass retries with the next physical generation.
                     bool positive_commit = false;
@@ -1722,17 +1841,6 @@ P50ZstdSourceSender::transfer_p51_route(
                 // settles the replayed receipt or while it reports another
                 // physical failure.
                 writer_guard.reset();
-                if (!recovered && Clock::now() < deadline) {
-                    if (impl_->route_replacement_required)
-                        break;
-                    boost::asio::steady_timer retry_pause(executor);
-                    retry_pause.expires_at(std::min(
-                        deadline, Clock::now() + std::chrono::milliseconds(5)));
-                    boost::system::error_code ignored;
-                    co_await retry_pause.async_wait(
-                        boost::asio::redirect_error(boost::asio::use_awaitable,
-                                                    ignored));
-                }
                 continue;
             }
 
