@@ -12,6 +12,28 @@ retained artifact directories.
 
 ## Developer QA
 
+### Opt-in R2 mixed Docker gate
+
+`dev/mixed.py --p51-r2` adds actual remote-compile cases for P29V1,
+ZSTD_TU and ZSTD_ROUTE; all three pass with R2 source leases and worker
+link adoption. Evidence:
+`/tanksmall/scratch/tmp/p51-mixed-r2.vFSVL7/mixed-r2-current-evidence-fix/summary.json`
+(SHA256 `f76bf3f1499539c3da8924ded573a41b00c61f968b6f74f61b2803bc693f4655`).
+Runtime image ID:
+`sha256:9a39ad53e551bf9d5c07a6b3d758afb258cd8f943032583c2ca379e90feddc3f`.
+Its source manifest is `3299b4fe9f7e1070124802a4b1dd690cd18c04fe5ba6a97f99b78146a6b331d4`,
+from the private coherent wrapper build, not a qualification of current HEAD.
+These are sequential one-program cases, not W30 occupancy, reuse, or
+simultaneous mixed-version coexistence tests. Subsequent harness refinements
+(old-scheduler-only selection and scheduler logfile ownership) passed the
+10 focused harness tests; their stdout was not separately retained.
+
+The pinned old protocol-50 scheduler fallback currently **fails**: its
+log reports `invalid message payload (GET_CS)`. The candidate must correct
+peer-version encoding and pass this real fallback case before compatibility
+is claimed. The harness supports isolating that case without repeating
+the passing profile cases; see [dev/README.md](dev/README.md).
+
 ### Persistent-link implementation in progress
 
 The production C sender passes its W30 regression against the direct F

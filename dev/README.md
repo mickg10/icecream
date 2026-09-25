@@ -82,6 +82,34 @@ the requested profile's source commit and exact worker input attachment.
 Roles share product images rather than needing
 separate scheduler/client/worker builds.
 
+For the pipeline candidate, run the mixed-role gate explicitly with R2 enabled:
+
+```sh
+sh dev/python.sh dev/mixed.py \
+  --current-image YOUR_CURRENT_PRODUCT_IMAGE \
+  --legacy-image YOUR_P43_PRODUCT_IMAGE \
+  --output "$ICEFARM_TMPDIR/mixed-r2-new-run" --p51-r2
+```
+
+Set `ICEFARM_TMPDIR` to prepared scratch storage first; the output directory
+must not already exist. These are built product images, not SDK images.
+The default five cases remain unchanged. `--p51-r2` adds three R2 cases,
+one per compression profile; `--only-p51-r2` skips the original five.
+Each R2 case requires a remote compiled program, an R2 source-control lease,
+and worker-side cache-link adoption. A negotiated window of 30 does not
+prove 30 simultaneous transfers or persistent-link reuse: those require the
+separate pipeline tests.
+
+The old-scheduler fallback case additionally requires
+`--ordinary50-scheduler-binary`, `--ordinary50-scheduler-sha256`, and
+`--ordinary50-scheduler-source-commit`. The gate accepts only source commit
+`94e9b44025887412c70c1c46c35fc588d6dec776` and checks the executable's
+supplied SHA256 before mounting it into the scheduler container. Build that
+binary with a compatible runtime; it is not supplied by the current image.
+Add `--only-old50-scheduler-fallback` to isolate this case. Success requires
+remote compilation without R2 selection; supplying an old binary alone does
+not establish compatibility. Each run retains `summary.json` and role logs.
+
 This developer gate does not certify all S* restart scenarios, all compiler
 environments, multi-host performance, or historical qualified image identities.
 Rebuilt legacy binaries are new artifacts, not the old qualified P43 image.

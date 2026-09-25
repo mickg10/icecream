@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -26,7 +27,10 @@ if fail and ((fail == 'scheduler-start' and args[:1] == ['run'] and '--network-a
 if args[:1] == ['exec'] and args[1].endswith('-scheduler'):
     if 'nc -z' in args[-1]:
         raise SystemExit(0)
-    print(' qa-worker (172.18.0.2:10245) 1 1')
+    if 'p51-old50-scheduler-fallback' in args[1]:
+        print(' qa-worker (172.18.0.2:10245) 1 1 cache=off')
+    else:
+        print(' qa-worker (172.18.0.2:10245) 1 1')
     raise SystemExit(0)
 if args[:2] == ['inspect', '--format']:
     print('172.18.0.2')
@@ -35,13 +39,21 @@ if args[:1] == ['logs'] and any(arg.endswith('-worker') for arg in args):
     print('Remote compilation completed with exit code 0')
     joined = ' '.join(args)
     profile = ('ZSTD_TU' if {str(wrong_profile)} else
-               'ZSTD_ROUTE' if 'p50-zstd-route' in joined else
-               'ZSTD_TU' if 'p50-zstd-tu' in joined else 'P29V1')
+               'ZSTD_ROUTE' if ('zstd-route' in joined) else
+               'ZSTD_TU' if ('zstd-tu' in joined) else 'P29V1')
     print('P50 CompileFile attached exact ' + profile + ' input for job 1')
+    if 'p51-r2-' in joined and 'old50' not in joined:
+        print('P51 cache-link descriptor adopted by sidecar')
     raise SystemExit(0)
 if args[:1] == ['logs'] and any(arg.endswith('-scheduler') for arg in args):
     print('assignment fence: strict-nonce')
-    print('RELOGIN qa-worker(x86_64): [] cache=127.0.0.1:11001 cache_wire=v1 cache_protocol=1 cache_profiles=p29v1 zstd_tu zstd_route')
+    joined = ' '.join(args)
+    if 'p51-old50-scheduler-fallback' in joined:
+        print('RELOGIN qa-worker(x86_64): [] cache=off')
+    elif 'p51-r2-' in joined:
+        print('RELOGIN qa-worker(x86_64): [] cache=127.0.0.1:11001 cache_wire=v1 cache_protocol=2 cache_profiles=p29v1 zstd_tu zstd_route')
+    else:
+        print('RELOGIN qa-worker(x86_64): [] cache=127.0.0.1:11001 cache_wire=v1 cache_protocol=1 cache_profiles=p29v1 zstd_tu zstd_route')
     raise SystemExit(0)
 if args[:1] == ['run'] and '--network-alias' not in args:
     mounts = [a for a in args if a.startswith('type=bind,src=') and ',dst=/qa-logs' in a]
@@ -53,6 +65,12 @@ if args[:1] == ['run'] and '--network-alias' not in args:
     p50 = ('P50 assignment identity bound for job 1\\n' + profile + ' source committed for P50 CompileFile\\n'
            if is_p50 else '')
     (log_dir / 'icecc.log').write_text('Have to use host ' + host + ':10245 - Job ID: 1\\n' + p50)
+    is_p51 = 'ICECC_P51_MODE=on' in ' '.join(args)
+    is_old50 = 'p51-old50-scheduler-fallback' in ' '.join(args)
+    if is_p51 and not is_old50:
+        (log_dir / 'client-daemon.log').write_text(
+            'P51 C-cache source-control lease delivered for assignment 1\\n'
+        )
     print('ICECREAM_MIXED_OK')
     raise SystemExit(0)
 if args[:1] == ['network'] and len(args) > 1 and args[1] == 'create':
@@ -65,17 +83,36 @@ raise SystemExit(0)
 
 
 def _run_cli(tmp_path: Path, *, failure: str = "", remote: bool = True,
-             wrong_profile: bool = False) -> tuple[subprocess.CompletedProcess[str], Path, list[list[str]]]:
+             wrong_profile: bool = False, p51_r2: bool = False,
+             only_p51_r2: bool = False,
+             only_old50_scheduler_fallback: bool = False,
+             old50_binary: Path | None = None,
+             old50_sha256: str | None = None) -> tuple[subprocess.CompletedProcess[str], Path, list[list[str]]]:
     docker, calls = _fake_docker(tmp_path, failure=failure, remote=remote,
                                  wrong_profile=wrong_profile)
     output = tmp_path / "mixed-results"
     env = os.environ.copy()
     env.update(ICEFARM_DOCKER=str(docker), FAKE_DOCKER_CALLS=str(calls),
                FAKE_DOCKER_FAILURE=failure, PYTHONDONTWRITEBYTECODE="1")
+    command = [
+        sys.executable, str(ROOT / "dev/mixed.py"),
+        "--current-image", "icecream-dev:current", "--legacy-image", "icecream-dev:p43",
+        "--output", str(output), "--jobs", "2",
+    ]
+    if p51_r2:
+        command.append("--p51-r2")
+    if only_p51_r2:
+        command.append("--only-p51-r2")
+    if only_old50_scheduler_fallback:
+        command.append("--only-old50-scheduler-fallback")
+    if old50_binary is not None:
+        command += [
+            "--ordinary50-scheduler-binary", str(old50_binary),
+            "--ordinary50-scheduler-sha256", old50_sha256 or "",
+            "--ordinary50-scheduler-source-commit", "94e9b44025887412c70c1c46c35fc588d6dec776",
+        ]
     result = subprocess.run(
-        [sys.executable, str(ROOT / "dev/mixed.py"),
-         "--current-image", "icecream-dev:current", "--legacy-image", "icecream-dev:p43",
-         "--output", str(output), "--jobs", "2"],
+        command,
         cwd=ROOT, env=env, text=True, capture_output=True, timeout=20,
     )
     records = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
@@ -150,6 +187,127 @@ def test_mixed_runner_covers_native_and_both_cross_generation_roles(tmp_path: Pa
     assert all((output / name / "source/probe.cpp").is_file()
                for name in ("p50-p29v1", "p50-zstd-tu", "p50-zstd-route",
                             "p43-worker", "p43-client"))
+
+
+def test_opt_in_r2_profiles_and_pinned_old50_scheduler_fallback(tmp_path: Path) -> None:
+    old50 = tmp_path / "icecc-scheduler-50"
+    old50.write_bytes(b"pinned protocol 50 scheduler fixture\n")
+    old50.chmod(0o755)
+    digest = hashlib.sha256(old50.read_bytes()).hexdigest()
+    result, output, commands = _run_cli(
+        tmp_path, p51_r2=True, old50_binary=old50, old50_sha256=digest,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert [case["name"] for case in summary["cases"]] == [
+        "p50-p29v1", "p50-zstd-tu", "p50-zstd-route", "p43-worker", "p43-client",
+        "p51-r2-p29v1", "p51-r2-zstd-tu", "p51-r2-zstd-route",
+        "p51-old50-scheduler-fallback",
+    ]
+    current_r2 = summary["cases"][5:8]
+    assert [case["selected_profile"] for case in current_r2] == [
+        "P29V1", "ZSTD_TU", "ZSTD_ROUTE",
+    ]
+    assert all(case["p51_opt_in"] is True and case["r2_selected"] is True
+               and case["r2_source_lease"] is True and case["r2_link_adopted"] is True
+               for case in current_r2)
+    fallback = summary["cases"][8]
+    assert fallback["ordinary_scheduler_protocol"] == 50
+    assert fallback["ordinary_scheduler_source_commit"] == (
+        "94e9b44025887412c70c1c46c35fc588d6dec776"
+    )
+    assert fallback["ordinary_scheduler_binary_sha256"] == digest
+    assert fallback["p51_opt_in"] is True
+    assert fallback["r2_selected"] is False
+    assert fallback["cache_fallback"] == "R1-or-disabled"
+
+    fallback_scheduler = next(
+        command for command in commands
+        if command[:1] == ["run"] and "--network-alias" in command
+        and command[command.index("--network-alias") + 1] == "scheduler"
+        and "p51-old50-scheduler-fallback" in " ".join(command)
+    )
+    assert any(
+        arg == f"type=bind,src={old50},dst=/qa-bin/icecc-scheduler,readonly"
+        for arg in fallback_scheduler
+    )
+    assert "/qa-bin/icecc-scheduler -n" in " ".join(fallback_scheduler)
+    assert 'chown "$runtime_uid:$runtime_gid" /qa-logs/scheduler.log' in " ".join(fallback_scheduler)
+    assert "ICECC_P51_MODE=on" not in fallback_scheduler
+    fallback_worker = next(
+        command for command in commands
+        if command[:1] == ["run"] and "--network-alias" in command
+        and command[command.index("--network-alias") + 1] == "worker"
+        and "p51-old50-scheduler-fallback" in " ".join(command)
+    )
+    fallback_client = next(
+        command for command in commands
+        if command[:1] == ["run"] and "--network-alias" not in command
+        and "p51-old50-scheduler-fallback" in " ".join(command)
+    )
+    assert "ICECC_P51_MODE=on" in fallback_worker
+    assert "ICECC_P51_MODE=on" in fallback_client
+    assert "ICECC_P50_C1F1_REQUIRED=1" not in " ".join(fallback_client)
+    r2_role_runs = [
+        command for command in commands
+        if command[:1] == ["run"] and "p51-r2-" in " ".join(command)
+        and "--network-alias" in command
+        and command[command.index("--network-alias") + 1] in ("worker", "scheduler")
+    ]
+    assert r2_role_runs
+    assert all("ICECC_P51_MODE=on" in command for command in r2_role_runs
+               if command[command.index("--network-alias") + 1] in ("scheduler", "worker"))
+    r2_client = next(
+        command for command in commands
+        if command[:1] == ["run"] and "--network-alias" not in command
+        and "p51-r2-p29v1" in " ".join(command)
+    )
+    client_script = r2_client[-1]
+    assert "install -m 0644 /dev/null /qa-logs/client-daemon.log" in client_script
+    assert 'chown "$runtime_uid:$runtime_gid" /qa-logs/client-daemon.log' in client_script
+
+
+def test_p51_only_selector_skips_unchanged_legacy_rows(tmp_path: Path) -> None:
+    result, output, commands = _run_cli(tmp_path, p51_r2=True, only_p51_r2=True)
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output / "summary.json").read_text())
+    assert [case["name"] for case in summary["cases"]] == [
+        "p51-r2-p29v1", "p51-r2-zstd-tu", "p51-r2-zstd-route",
+    ]
+    assert all(case["r2_selected"] for case in summary["cases"])
+    assert len([command for command in commands if command[:2] == ["network", "create"]]) == 3
+
+
+def test_old50_only_selector_runs_pinned_fallback_row(tmp_path: Path) -> None:
+    old50 = tmp_path / "icecc-scheduler-50"
+    old50.write_bytes(b"pinned protocol 50 scheduler fixture\n")
+    old50.chmod(0o755)
+    digest = hashlib.sha256(old50.read_bytes()).hexdigest()
+    result, output, commands = _run_cli(
+        tmp_path, p51_r2=True, only_old50_scheduler_fallback=True,
+        old50_binary=old50, old50_sha256=digest,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output / "summary.json").read_text())
+    assert [case["name"] for case in summary["cases"]] == [
+        "p51-old50-scheduler-fallback",
+    ]
+    assert summary["cases"][0]["r2_selected"] is False
+    assert len([command for command in commands if command[:2] == ["network", "create"]]) == 1
+
+
+def test_old50_binary_digest_is_checked_before_docker(tmp_path: Path) -> None:
+    old50 = tmp_path / "icecc-scheduler-50"
+    old50.write_bytes(b"not the pinned binary")
+    old50.chmod(0o755)
+    result, _, commands = _run_cli(
+        tmp_path, p51_r2=True, old50_binary=old50, old50_sha256="0" * 64,
+    )
+    assert result.returncode != 0
+    assert "does not match the scheduler binary" in result.stderr
+    assert not commands
 
 
 def test_docker_failure_is_recorded_and_only_owned_resources_are_cleaned(tmp_path: Path) -> None:
