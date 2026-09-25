@@ -6596,13 +6596,44 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
         cut_identity};
     tcp::socket recovery_socket(executor);
     co_await recovery_socket.async_connect(remote, asio::use_awaitable);
+    const RecoverBegin expected_recovery_begin{
+        reconnect.relationship_id, reconnect.relationship_epoch,
+        reconnect.physical_link_generation, reset_operation, 0, 1, 1};
+    std::vector<RecoverWitness> expected_recovery_witnesses;
+    expected_recovery_witnesses.reserve(witnesses.size());
+    for (const R2SentBundle& sent : witnesses) {
+        RecoverWitness witness;
+        witness.relationship_id = reconnect.relationship_id;
+        witness.relationship_epoch = reconnect.relationship_epoch;
+        witness.physical_link_generation =
+            reconnect.physical_link_generation;
+        witness.operation_id = reset_operation;
+        witness.relationship_ordinal = sent.binding.relationship_ordinal;
+        witness.binding_digest = sent.binding_digest;
+        witness.transaction_digest = sent.transaction_digest;
+        witness.binding = sent.binding;
+        witness.inner = sent.begin.inner;
+        expected_recovery_witnesses.push_back(std::move(witness));
+    }
+    const Digest128 expected_recovery_witness_digest =
+        compute_r2_recovery_witness_digest(
+            expected_recovery_begin, expected_recovery_witnesses);
     const R2RecoveryResult recovered = co_await client.recover_r2_link(
         recovery_socket, reconnect, witnesses, 0, reset_operation,
         initial_hello.relationship_epoch + 1, replacement_nonce, deadline);
     require(recovered.committed_receipts.empty() &&
                 recovered.reset_request.settled_prefix_k == 0 &&
                 recovered.reset_request.operation_id == reset_operation &&
-                recovered.reset_request.new_history_nonce == replacement_nonce,
+                recovered.reset_request.new_history_nonce == replacement_nonce &&
+                recovered.reset_ack.request == recovered.reset_request &&
+                recovered.reset_ack.initial_state_digest ==
+                    recovered.link_state.state_digest &&
+                recovered.reset_ack.next_rel_seq.value == 0 &&
+                recovered.reset_ack.recovery_verified_floor_a == 0 &&
+                recovered.reset_ack.recovery_prepared_prefix_p == 1 &&
+                recovered.reset_ack.recovery_witness_digest ==
+                    expected_recovery_witness_digest &&
+                recovered.reset_ack.unavailable_suffix_mask == 0,
             "partial R2 frame recovery did not settle the exact empty prefix");
 
     authority.reset_r2_route_for_recovery(
@@ -6747,6 +6778,9 @@ void test_r2_fragmented_frame_interruption_recovery() {
             unsigned bind_count = 0;
             bool reset_committed = false;
             std::optional<ResetRequest> retained_reset;
+            uint64_t recovery_floor_a = 0;
+            uint64_t recovery_prefix_p = 0;
+            Digest128 recovery_witness_digest{};
             P50ServerEndpointConfig config;
             config.lookup_p51_link_reservation =
                 [&, job_deadline](const LinkHello& observed)
@@ -6822,10 +6856,15 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     begin.witness_count != 1 || witnesses.size() != 1 ||
                     end.witness_count != 1 ||
                     witnesses.front().relationship_ordinal != 1 ||
+                    witnesses.front().binding != binding ||
                     witnesses.front().binding_digest != binding_digest ||
                     witnesses.front().inner.raw_digest != binding.raw_digest ||
                     end.operation_id != begin.operation_id)
                     return std::nullopt;
+                recovery_floor_a = begin.verified_floor_a;
+                recovery_prefix_p = begin.prepared_prefix_p;
+                recovery_witness_digest =
+                    compute_r2_recovery_witness_digest(begin, witnesses);
                 P51RecoveryReceiptInterval interval;
                 interval.end.relationship_id = begin.relationship_id;
                 interval.end.relationship_epoch = begin.relationship_epoch;
@@ -6853,10 +6892,15 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     request.operation_id == Id128{} ||
                     (retained_reset && *retained_reset != request))
                     return std::nullopt;
-                return ResetAck{
+                ResetAck ack{
                     request,
                     initial_route_digest(stores.c, request.new_history_nonce),
                     RelSeq{}};
+                ack.recovery_verified_floor_a = recovery_floor_a;
+                ack.recovery_prepared_prefix_p = recovery_prefix_p;
+                ack.recovery_witness_digest = recovery_witness_digest;
+                ack.unavailable_suffix_mask = 0;
+                return ack;
             };
             config.commit_p51_reset =
                 [&](const LinkHello&, const ResetRequest& request,

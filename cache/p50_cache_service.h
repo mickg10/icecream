@@ -360,6 +360,10 @@ private:
             uint64_t committed_prefix_k = 0;
             uint64_t acknowledged_prefix_q = 0;
             Digest128 transcript_digest{};
+            Digest128 witness_digest{};
+            std::vector<RecoverWitness> witnesses;
+            bool reset_snapshot_ready = false;
+            uint32_t unavailable_suffix_mask = 0;
         };
         std::optional<RecoveryContext> recovery_context;
         std::optional<ResetAck> last_reset_ack;

@@ -254,6 +254,15 @@ void validate_recover_witness(const RecoverWitness& value) {
         value.binding_digest == Digest128{} ||
         value.transaction_digest == Digest128{})
         throw std::invalid_argument("RECOVER witness fields are invalid");
+    validate_job_bind(value.binding);
+    if (value.relationship_ordinal != value.binding.relationship_ordinal ||
+        value.binding_digest != compute_r2_binding_digest(value.binding) ||
+        value.inner.tu_seq != value.binding.tu_seq ||
+        value.inner.profile != value.binding.profile ||
+        value.inner.raw_bytes != value.binding.raw_bytes ||
+        value.inner.raw_digest != value.binding.raw_digest)
+        throw std::invalid_argument(
+            "RECOVER witness differs from its exact JOB_BIND identity");
     validate_tx_begin_intrinsic(value.inner);
 }
 
@@ -303,8 +312,20 @@ void validate_reset_request(const ResetRequest& value) {
 void validate_reset_ack(const ResetAck& value) {
     validate_reset_request(value.request);
     if (value.initial_state_digest == Digest128{} ||
-        value.next_rel_seq.value != 0)
+        value.next_rel_seq.value != 0 ||
+        value.recovery_verified_floor_a > value.request.settled_prefix_k ||
+        value.request.settled_prefix_k > value.recovery_prepared_prefix_p ||
+        value.recovery_prepared_prefix_p - value.recovery_verified_floor_a > 30 ||
+        value.recovery_witness_digest == Digest128{})
         throw std::invalid_argument("RESET_ACK fields are invalid");
+    const uint32_t suffix_count = static_cast<uint32_t>(
+        value.recovery_prepared_prefix_p - value.request.settled_prefix_k);
+    const uint32_t allowed_mask = suffix_count == 0
+                                      ? 0
+                                      : (uint32_t{1} << suffix_count) - 1;
+    if ((value.unavailable_suffix_mask & ~allowed_mask) != 0)
+        throw std::invalid_argument(
+            "RESET_ACK unavailable suffix mask exceeds its range");
 }
 
 void validate_reset_confirm(const ResetConfirm& value) {
@@ -837,6 +858,20 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.u64(value.relationship_ordinal);
             out.digest(value.binding_digest);
             out.digest(value.transaction_digest);
+            const JobBind& binding = value.binding;
+            out.id(binding.reservation_id);
+            out.u64(binding.physical_link_generation);
+            out.u64(binding.relationship_ordinal);
+            out.u32(binding.wire_job_id);
+            out.u64(binding.assignment_epoch);
+            out.u64(binding.assignment_nonce);
+            out.u64(binding.logical_job);
+            out.u64(binding.compiler_attempt);
+            out.u64(binding.source_request_id);
+            out.u64(binding.tu_seq.value);
+            out.u16(static_cast<uint16_t>(binding.profile));
+            out.u64(binding.raw_bytes);
+            out.digest(binding.raw_digest);
             encode_tx_begin(out, value.inner);
         } else if constexpr (std::is_same_v<T, RecoverEnd>) {
             validate_recover_end(value);
@@ -892,6 +927,10 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.u64(request.new_history_nonce.value);
             out.digest(value.initial_state_digest);
             out.u64(value.next_rel_seq.value);
+            out.u64(value.recovery_verified_floor_a);
+            out.u64(value.recovery_prepared_prefix_p);
+            out.digest(value.recovery_witness_digest);
+            out.u32(value.unavailable_suffix_mask);
         } else if constexpr (std::is_same_v<T, ResetConfirm>) {
             validate_reset_confirm(value);
             out.id(value.relationship_id);
@@ -1139,6 +1178,19 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
             value.relationship_ordinal = in.u64();
             value.binding_digest = in.digest();
             value.transaction_digest = in.digest();
+            value.binding.reservation_id = in.id();
+            value.binding.physical_link_generation = in.u64();
+            value.binding.relationship_ordinal = in.u64();
+            value.binding.wire_job_id = in.u32();
+            value.binding.assignment_epoch = in.u64();
+            value.binding.assignment_nonce = in.u64();
+            value.binding.logical_job = in.u64();
+            value.binding.compiler_attempt = in.u64();
+            value.binding.source_request_id = in.u64();
+            value.binding.tu_seq.value = in.u64();
+            value.binding.profile = static_cast<ProfileId>(in.u16());
+            value.binding.raw_bytes = in.u64();
+            value.binding.raw_digest = in.digest();
             value.inner = decode_tx_begin(in);
             in.exact_end();
             validate_recover_witness(value);
@@ -1220,6 +1272,10 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         value.request.new_history_nonce.value = in.u64();
         value.initial_state_digest = in.digest();
         value.next_rel_seq.value = in.u64();
+        value.recovery_verified_floor_a = in.u64();
+        value.recovery_prepared_prefix_p = in.u64();
+        value.recovery_witness_digest = in.digest();
+        value.unavailable_suffix_mask = in.u32();
         in.exact_end();
         validate_reset_ack(value);
         return value;
@@ -1326,6 +1382,26 @@ Digest128 compute_r2_recovery_transcript_digest(
     }
     if (ordinal != begin.prepared_prefix_p)
         throw std::invalid_argument("RECOVER witness interval is incomplete");
+    return digest.finish();
+}
+
+Digest128 compute_r2_recovery_witness_digest(
+    const RecoverBegin& begin, std::span<const RecoverWitness> witnesses) {
+    // Validate the unnormalized transcript first: normalization must never
+    // turn a mismatched generation/identity into a valid recovery witness set.
+    (void)compute_r2_recovery_transcript_digest(begin, witnesses);
+    RecoverBegin normalized_begin = begin;
+    normalized_begin.physical_link_generation = 1;
+    std::vector<RecoverWitness> normalized_witnesses(witnesses.begin(),
+                                                     witnesses.end());
+    for (RecoverWitness& witness : normalized_witnesses)
+        witness.physical_link_generation = 1;
+    const Digest128 normalized_transcript =
+        compute_r2_recovery_transcript_digest(normalized_begin,
+                                              normalized_witnesses);
+    icecc::Digest128Builder digest;
+    digest.append("R2-recovery-witness-v1");
+    digest.append_digest(normalized_transcript);
     return digest.finish();
 }
 

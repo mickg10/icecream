@@ -551,17 +551,21 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
                                hello.relationship_epoch,
                                hello.physical_link_generation,
                                recovery_operation, 0, 1, 1};
-    RecoverWitness witness{hello.relationship_id,
-                           hello.relationship_epoch,
-                           hello.physical_link_generation,
-                           recovery_operation,
-                           1,
-                           binding_digest,
-                           transaction_digest,
-                           begin.inner};
+    RecoverWitness witness;
+    witness.relationship_id = hello.relationship_id;
+    witness.relationship_epoch = hello.relationship_epoch;
+    witness.physical_link_generation = hello.physical_link_generation;
+    witness.operation_id = recovery_operation;
+    witness.relationship_ordinal = 1;
+    witness.binding_digest = binding_digest;
+    witness.transaction_digest = transaction_digest;
+    witness.binding = binding;
+    witness.inner = begin.inner;
     const std::array<RecoverWitness, 1> witnesses{witness};
     const Digest128 recovery_transcript =
         compute_r2_recovery_transcript_digest(recover_begin, witnesses);
+    require(begin.inner.transaction_digest != transaction_digest,
+            "wire test must distinguish R1 inner and R2 outer transaction digests");
     RecoverEnd recover_end{hello.relationship_id,
                            hello.relationship_epoch,
                            hello.physical_link_generation,
@@ -590,6 +594,10 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
                                hello.history_nonce,
                                HistoryNonce{hello.history_nonce.value + 1}};
     ResetAck reset_ack{reset_request, digest("reset-initial-state"), RelSeq{0}};
+    reset_ack.recovery_verified_floor_a = 0;
+    reset_ack.recovery_prepared_prefix_p = 1;
+    reset_ack.recovery_witness_digest =
+        compute_r2_recovery_witness_digest(recover_begin, witnesses);
     ResetConfirm reset_confirm{hello.relationship_id,
                                reset_request.new_relationship_epoch,
                                hello.physical_link_generation,
@@ -623,6 +631,41 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
             [&] { (void)decode_payload(message_type(message), with_trailing); },
             "R2 recovery payload with trailing bytes was accepted");
     }
+    const auto witness_wire = encode_payload(Message{witness});
+    require_be64(witness_wire, 49, witness.relationship_ordinal,
+                 "RECOVER witness ordinal offset changed");
+    require(std::equal(binding_digest.bytes.begin(), binding_digest.bytes.end(),
+                       witness_wire.begin() + 57) &&
+                std::equal(transaction_digest.bytes.begin(),
+                           transaction_digest.bytes.end(),
+                           witness_wire.begin() + 73),
+            "RECOVER witness digest offsets changed");
+    const auto encoded_binding = encode_payload(Message{binding});
+    const auto encoded_inner_begin = encode_payload(Message{begin.inner});
+    require(std::equal(encoded_binding.begin(), encoded_binding.end(),
+                       witness_wire.begin() + 89) &&
+                std::equal(encoded_inner_begin.begin(), encoded_inner_begin.end(),
+                           witness_wire.begin() + 199),
+            "RECOVER witness must carry exact JOB_BIND followed by TX_BEGIN");
+    auto changed_embedded_binding = witness_wire;
+    changed_embedded_binding[140] ^= 1;
+    require_throws<std::exception>(
+        [&] {
+            (void)decode_payload(MessageType::RECOVER,
+                                 changed_embedded_binding);
+        },
+        "RECOVER accepted a changed JOB_BIND with the old binding digest");
+    const auto reset_ack_wire = encode_payload(Message{reset_ack});
+    require_be64(reset_ack_wire, 104, reset_ack.recovery_verified_floor_a,
+                 "RESET_ACK verified floor offset changed");
+    require_be64(reset_ack_wire, 112, reset_ack.recovery_prepared_prefix_p,
+                 "RESET_ACK prepared prefix offset changed");
+    require(std::equal(reset_ack.recovery_witness_digest.bytes.begin(),
+                       reset_ack.recovery_witness_digest.bytes.end(),
+                       reset_ack_wire.begin() + 120),
+            "RESET_ACK recovery digest offset changed");
+    require_be32(reset_ack_wire, 136, reset_ack.unavailable_suffix_mask,
+                 "RESET_ACK unavailable mask offset changed");
     auto bad_recover_subkind = encode_payload(Message{witness});
     bad_recover_subkind[48] = 0xff;
     require_throws<std::exception>(
@@ -650,11 +693,140 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
         [&] { (void)decode_payload(MessageType::RESET, bad_reset_epoch); },
         "RESET accepted a non-successor relationship epoch");
     auto changed_witnesses = witnesses;
-    changed_witnesses[0].binding_digest.bytes[0] ^= 1;
+    changed_witnesses[0].transaction_digest.bytes[0] ^= 1;
     require(compute_r2_recovery_transcript_digest(recover_begin, witnesses) !=
                 compute_r2_recovery_transcript_digest(recover_begin,
                                                      changed_witnesses),
             "R2 recovery transcript omitted witness identity bytes");
+
+    // The RESET_ACK disposition covers the complete recovery interval, while
+    // its mask is relative to K: here ordinals 2 and 4 survive, ordinal 3 is
+    // explicitly unavailable. This leaves a two-row replayable suffix.
+    RecoverBegin range_begin = recover_begin;
+    range_begin.prepared_prefix_p = 4;
+    range_begin.witness_count = 4;
+    std::array<RecoverWitness, 4> range_witnesses{};
+    for (size_t index = 0; index != range_witnesses.size(); ++index) {
+        RecoverWitness& row = range_witnesses[index];
+        row.relationship_id = range_begin.relationship_id;
+        row.relationship_epoch = range_begin.relationship_epoch;
+        row.physical_link_generation = range_begin.physical_link_generation;
+        row.operation_id = range_begin.operation_id;
+        row.relationship_ordinal = index + 1;
+        row.binding = binding;
+        row.binding.relationship_ordinal = index + 1;
+        row.binding.wire_job_id = static_cast<uint32_t>(index + 2);
+        row.binding_digest = compute_r2_binding_digest(row.binding);
+        row.transaction_digest = transaction_digest;
+        row.inner = begin.inner;
+    }
+    const Digest128 witness_set_digest =
+        compute_r2_recovery_witness_digest(range_begin, range_witnesses);
+    require(witness_set_digest != Digest128{},
+            "normalized recovery witness digest was zero");
+    auto reconnected_begin = range_begin;
+    reconnected_begin.physical_link_generation += 10;
+    auto reconnected_witnesses = range_witnesses;
+    for (RecoverWitness& row : reconnected_witnesses)
+        row.physical_link_generation = reconnected_begin.physical_link_generation;
+    require(compute_r2_recovery_witness_digest(reconnected_begin,
+                                               reconnected_witnesses) ==
+                witness_set_digest,
+            "stable recovery witness digest changed with transport generation");
+    auto wrong_transport_identity = reconnected_witnesses;
+    wrong_transport_identity[0].physical_link_generation += 1;
+    require_throws<std::exception>(
+        [&] {
+            (void)compute_r2_recovery_witness_digest(reconnected_begin,
+                                                     wrong_transport_identity);
+        },
+        "stable recovery digest normalized a mismatched transport generation");
+    auto changed_assignment = range_witnesses;
+    ++changed_assignment[0].binding.assignment_nonce;
+    changed_assignment[0].binding_digest =
+        compute_r2_binding_digest(changed_assignment[0].binding);
+    require(compute_r2_recovery_witness_digest(range_begin,
+                                               changed_assignment) !=
+                witness_set_digest,
+            "stable recovery digest omitted the exact nested JOB_BIND identity");
+    auto changed_original_generation = range_witnesses;
+    ++changed_original_generation[0].binding.physical_link_generation;
+    changed_original_generation[0].binding_digest =
+        compute_r2_binding_digest(changed_original_generation[0].binding);
+    require(compute_r2_recovery_witness_digest(range_begin,
+                                               changed_original_generation) !=
+                witness_set_digest,
+            "stable recovery digest normalized immutable original JOB_BIND generation");
+
+    ResetAck disposition = reset_ack;
+    disposition.request.settled_prefix_k = 1;
+    disposition.recovery_verified_floor_a = 0;
+    disposition.recovery_prepared_prefix_p = 4;
+    disposition.recovery_witness_digest = witness_set_digest;
+    disposition.unavailable_suffix_mask = 0b010;
+    const auto disposition_wire = encode_payload(Message{disposition});
+    require(disposition_wire.size() == kR2ResetAckPayloadBytes &&
+                decode_payload(MessageType::RESET_ACK, disposition_wire) ==
+                    Message{disposition},
+            "RESET_ACK recovery disposition did not round-trip");
+    require(disposition.unavailable_suffix_mask == 0b010,
+            "RESET_ACK mask no longer identifies K+2 as unavailable");
+    auto bad_ack = disposition;
+    bad_ack.unavailable_suffix_mask = 0b1000;
+    require_throws<std::exception>(
+        [&] { (void)encode_payload(Message{bad_ack}); },
+        "RESET_ACK accepted an unavailable bit outside its suffix interval");
+    bad_ack = disposition;
+    bad_ack.recovery_verified_floor_a = 2;
+    require_throws<std::exception>(
+        [&] { (void)encode_payload(Message{bad_ack}); },
+        "RESET_ACK accepted verified floor beyond settled prefix");
+    bad_ack = disposition;
+    bad_ack.recovery_prepared_prefix_p = 0;
+    require_throws<std::exception>(
+        [&] { (void)encode_payload(Message{bad_ack}); },
+        "RESET_ACK accepted prepared prefix below settled prefix");
+    bad_ack = disposition;
+    bad_ack.recovery_prepared_prefix_p = 31;
+    require_throws<std::exception>(
+        [&] { (void)encode_payload(Message{bad_ack}); },
+        "RESET_ACK accepted a recovery interval wider than 30 witnesses");
+    bad_ack = disposition;
+    bad_ack.request.settled_prefix_k = 0;
+    bad_ack.recovery_prepared_prefix_p = 30;
+    bad_ack.unavailable_suffix_mask = (uint32_t{1} << 30) - 1;
+    require(decode_payload(MessageType::RESET_ACK,
+                           encode_payload(Message{bad_ack})) ==
+                Message{bad_ack},
+            "RESET_ACK rejected the maximum 30-witness unavailable mask");
+    auto max_empty_interval = reset_ack;
+    max_empty_interval.request.settled_prefix_k = UINT64_MAX;
+    max_empty_interval.recovery_verified_floor_a = UINT64_MAX;
+    max_empty_interval.recovery_prepared_prefix_p = UINT64_MAX;
+    max_empty_interval.recovery_witness_digest = digest("max-empty-interval");
+    max_empty_interval.unavailable_suffix_mask = 0;
+    require(decode_payload(MessageType::RESET_ACK,
+                           encode_payload(Message{max_empty_interval})) ==
+                Message{max_empty_interval},
+            "RESET_ACK rejected an empty interval at UINT64_MAX");
+    auto max_one_row_interval = max_empty_interval;
+    max_one_row_interval.request.settled_prefix_k = UINT64_MAX - 1;
+    max_one_row_interval.recovery_verified_floor_a = UINT64_MAX - 1;
+    max_one_row_interval.unavailable_suffix_mask = 1;
+    require(decode_payload(MessageType::RESET_ACK,
+                           encode_payload(Message{max_one_row_interval})) ==
+                Message{max_one_row_interval},
+            "RESET_ACK rejected a one-row suffix ending at UINT64_MAX");
+    bad_ack = disposition;
+    bad_ack.recovery_witness_digest = Digest128{};
+    require_throws<std::exception>(
+        [&] { (void)encode_payload(Message{bad_ack}); },
+        "RESET_ACK accepted a zero recovery witness digest");
+    auto bad_ack_wire = disposition_wire;
+    bad_ack_wire.back() = 0x80;
+    require_throws<std::exception>(
+        [&] { (void)decode_payload(MessageType::RESET_ACK, bad_ack_wire); },
+        "RESET_ACK decoder accepted high unavailable-mask bits");
 }
 
 void test_key_layout() {

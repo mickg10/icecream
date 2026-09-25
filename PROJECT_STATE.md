@@ -208,7 +208,7 @@ cancelled reservation retires once. Log in the same directory:
 `active-concurrent-red-r1.log`, SHA256
 `200242364ecedb15c819ccb187da39c87ed2d2357db477d2c77437313429987a`.
 This supersedes the observational probe for the successor-liveness finding.
-The unpublished repair now passes this focused real C/F regression with
+The candidate repair passes this focused real C/F regression with
 ZSTD_TU and W30 configured: the cancelled caller receives a non-success result,
 the exact successor commits within 3 ms, two physical links are accepted,
 and C operation/raw credits drain. Explicit process status is zero. Evidence:
@@ -216,11 +216,69 @@ and C operation/raw credits drain. Explicit process status is zero. Evidence:
 SHA256 `7a376f0f9db6dae84122ec81c534071070aba509c55ce165b0bbf43d2691a9fb`.
 This establishes recovery for the three-job scenario, not actual W30
 occupancy, all profiles, or interrupted replay of multiple survivors.
-The repair remains unpublished pending broader recovery qualification;
-independent lost-confirmation and changed-reset-result tests currently fail
-in their retained-witness fixture checks and are under investigation.
+The strengthened scenario subsequently passes P29V1, ZSTD_TU and ZSTD_ROUTE:
+explicit cancelled-caller error, exact cancelled input absent, one reservation
+retirement, two total links, exact successor bytes and original deadlines,
+with all tracked C operations/raw credits drained. Log:
+`/tanksmall/scratch/tmp/p51-d07-active-current.n5c5bZ/tmp/active-cancel-profiles-r1.log`,
+SHA256 `77c54b7e18628c95f4dd80541e48c415665b81b4cd797cdf6d51303e76b79afe`.
+This still does not prove actual W30 occupancy or compiler-process quiescence.
+The repair implements exact suffix dispositions and contiguous survivor replay.
+The independent full endpoint suite passes (exit 0). Focused sender tests for
+lost RESET_CONFIRM, lost confirmation echo, and changed reset results pass
+all three profiles. Their initial fixture wrongly required F to have observed a staged
+successor binding; the corrected check derives the expected exact binding
+from its ARM and additionally compares any binding F actually consumed.
+Evidence under `/tanksmall/scratch/tmp/p50-recovery-fixture.Mlzk8L/`:
+`endpoint-full-r1.log`, SHA256
+`383619d14070302b6e0ee1966764ec4f695328f529a4547329b8cd6944c5de59`;
+`sender-focused-r2.log`, SHA256
+`127bcb3d2724b2fea9be8d9067b9e9094cdbb0294fd59bece2fef3132b3fd222`.
+The first full sender run failed its separate lost-commit/RESET_ACK scenario:
+the fixture advertised new reset identity with Q=0 despite K=1; real RESET
+sets Q=K. The corrected focused scenario passes, including repeated
+materialization interruption (`lost-commit-r2.log`, SHA256
+`6f4b04216ca18291c91c09649153556b76164af298ef3621edd549e490757163`).
+The next full run exposed the same missing-F-observed-binding fixture error
+in another shared-recovery branch. After correcting that branch, all six
+focused shared-failure cases (2/30 callers across all three profiles) pass:
+`shared-failure-r2.log`, SHA256
+`4345d5accbca4cbf930796f34922c6e78592f1a4d184e4f388fdda97d8d485a9`.
+The complete sender default suite then passes with process exit 0:
+`sender-full-r3.log`, SHA256
+`b0c7849dabd97866f378a14064cef7b7736ca6938e596b91ce1765b17e458545`;
+sender test source SHA256
+`ad041631ea928b273e6b3269a85f9f8bd42c5d60303377f1bbb6b0c1fc87f413`.
+Final consolidated qualification includes the corrected service recovery
+fixtures and bounded-count ordinal loops. Wire, full service and full sender
+suites pass with process exit 0. Both the standalone service and the embedded
+test service were rebuilt. Final evidence root:
+`/tanksmall/scratch/tmp/p51-d07-active-default-run.r2/`.
 
-In the failing published product, F reset removes cancelled reservations,
+| Gate | Log beneath that root | SHA256 |
+|---|---|---|
+| Wire, including maximum-ordinal interval encoding | `tmp/wire-r2.log` | `a72639a77d1abf06080e2f547f03d62832e4cb86ab05cd58aad78ae69068f28f` |
+| Full service; Automake PASS, including all-profile active cancellation | `build/unittests/p50cacheservice.log` | `57ed292f59d92808784f878797fc9f649dee4b5f0ad8f8bd7410afbc54ab66cf` |
+| Full sender | `tmp/sender-full-r4.log` | `03e3f5b7b9fc36fb2948a44f6c63448e972fb469e1e63f8de460120546ca740d` |
+
+Final service source SHA256 is
+`7da582be35371a142449b1823efa518db42a93fa33195526d8b9271b2c3099d9`;
+sender source is
+`aae9f740b20a12b8ee87dd5ec4eb0c34b600a16582592d2e8d3ec4c34656e19b`.
+Endpoint source is unchanged from its passing full suite. The ordinal loops
+iterate at most P-K entries, with addition only inside a nonempty bounded
+interval; UINT64_MAX remains the sender's exhausted sentinel. Wire tests at
+that boundary are codec checks, not an execution of astronomical job counts.
+Earlier fixture failures and the read-only-source Automake refresh setup
+failure remain preserved and are not counted as passes.
+
+Real multi-survivor replay interruption, all D07 cancellation positions/stages,
+compiler-process quiescence, and the broader external/performance gates remain
+open. This qualification is not completion of the full W30 plan. The candidate
+R2 recovery layout changes require upgrading both ends and draining old links;
+P43 and CacheWire R1 records are unchanged.
+
+In the earlier failing product, F reset removes cancelled reservations,
 but C's sender replays every unresolved suffix witness using its
 old relationship ordinal. The required behavior is exact settlement followed
 by contiguous rebuilding of still-live jobs, preserving their TU identities.

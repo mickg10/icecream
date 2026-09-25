@@ -203,6 +203,7 @@ struct P50ZstdSourceSender::Impl {
         std::exception_ptr failure;
         uint64_t failure_physical_link_generation = 0;
         bool replayed_after_reset = false;
+        bool unavailable_by_reset = false;
         bool ready = false;
         bool done = false;
     };
@@ -1326,16 +1327,94 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
         impl_->r2_retained_jobs.erase(position);
     }
 
+    const uint64_t settled_prefix_k =
+        recovered.reset_request.settled_prefix_k;
+    const uint64_t prepared_prefix_p =
+        recovered.reset_ack.recovery_prepared_prefix_p;
+    if (recovered.reset_ack.recovery_verified_floor_a != verified_floor_a ||
+        prepared_prefix_p < settled_prefix_k ||
+        prepared_prefix_p - settled_prefix_k > witnesses.size())
+        throw std::logic_error(
+            "F reset disposition differs from the retained C witness interval");
+    std::vector<PreparedTuHandle> unavailable_handles;
+    std::vector<std::shared_ptr<Impl::PendingReceipt>> unavailable_pending;
+    const uint64_t unavailable_count = prepared_prefix_p - settled_prefix_k;
+    for (uint64_t offset = 0; offset < unavailable_count; ++offset) {
+        const uint64_t ordinal = settled_prefix_k + 1 + offset;
+        const uint32_t bit = uint32_t{1} << static_cast<uint32_t>(offset);
+        if ((recovered.reset_ack.unavailable_suffix_mask & bit) == 0)
+            continue;
+        const size_t witness_index = static_cast<size_t>(
+            ordinal - verified_floor_a - 1);
+        if (witness_index >= witnesses.size() ||
+            witnesses[witness_index].binding.relationship_ordinal != ordinal)
+            throw std::logic_error(
+                "F unavailable disposition has no exact retained witness");
+        auto position = impl_->r2_retained_jobs.find(ordinal);
+        if (position == impl_->r2_retained_jobs.end() ||
+            position->second->sent.binding != witnesses[witness_index].binding ||
+            position->second->sent.prepared != witnesses[witness_index].prepared)
+            throw std::logic_error(
+                "F unavailable disposition differs from the retained caller");
+        unavailable_handles.push_back(position->second->sent.prepared);
+        unavailable_pending.push_back(position->second);
+    }
+    std::vector<std::shared_ptr<Impl::PendingReceipt>> replay_rows;
+    replay_rows.reserve(impl_->r2_retained_jobs.size());
+    for (const auto& [ordinal, pending] : impl_->r2_retained_jobs) {
+        if (ordinal <= settled_prefix_k)
+            throw std::logic_error(
+                "positive recovery prefix retained an unsettled sender row");
+        if (std::find(unavailable_pending.begin(), unavailable_pending.end(),
+                      pending) != unavailable_pending.end())
+            continue;
+        replay_rows.push_back(pending);
+    }
+    std::map<uint64_t, std::shared_ptr<Impl::PendingReceipt>> reindexed_jobs;
+    uint64_t replay_ordinal = settled_prefix_k;
+    for (const auto& pending : replay_rows) {
+        // The F endpoint reserves UINT64_MAX as its exhausted next-ordinal
+        // sentinel; do not rebuild a suffix row at that unadmittable ordinal.
+        if (replay_ordinal >= std::numeric_limits<uint64_t>::max() - 1)
+            throw std::overflow_error("R2 recovery ordinal space exhausted");
+        ++replay_ordinal;
+        if (!reindexed_jobs.emplace(replay_ordinal, pending).second)
+            throw std::logic_error("R2 recovery suffix reindex collided");
+    }
+
+    // All allocating sender-side reconstruction work is complete before the
+    // authority changes its retained route ledger.
     impl_->authority->reset_r2_route_for_recovery(
         impl_->route, recovered.link_state.f_store_guid,
-        recovered.link_state.history_nonce);
+        recovered.link_state.history_nonce, unavailable_handles);
+    for (const auto& pending : unavailable_pending) {
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            pending->unavailable_by_reset = true;
+            pending->failure = nullptr;
+            pending->done = true;
+            pending->client_result.status = ClientRunStatus::TerminalError;
+            pending->client_result.terminal_error = ErrorMessage{
+                0, "F reset reports this exact R2 reservation unavailable"};
+        }
+        pending->notification.expires_at(Clock::now());
+    }
+    for (const auto& [ordinal, pending] : reindexed_jobs) {
+        pending->sent.binding.relationship_ordinal = ordinal;
+        pending->sent.binding.physical_link_generation = physical_generation;
+        pending->armed.relationship_epoch =
+            recovered.reset_request.new_relationship_epoch;
+    }
+    impl_->r2_retained_jobs.swap(reindexed_jobs);
     {
         std::lock_guard lock(impl_->r2_transfer_mutex);
         impl_->r2_receipt_queue.clear();
     }
     impl_->r2_pending_ack_ordinal = 0;
     impl_->r2_relationship_ordinal =
-        recovered.reset_request.settled_prefix_k + 1;
+        settled_prefix_k == std::numeric_limits<uint64_t>::max()
+            ? std::numeric_limits<uint64_t>::max()
+            : settled_prefix_k + 1;
     impl_->r2_hello = hello;
     impl_->r2_hello->relationship_epoch =
         recovered.reset_request.new_relationship_epoch;
@@ -1351,7 +1430,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     impl_->r2_recovery_operation = Id128{};
     impl_->r2_recovery_new_epoch = 0;
     impl_->r2_recovery_new_nonce = HistoryNonce{};
-    impl_->r2_recovery_floor = recovered.reset_request.settled_prefix_k;
+    impl_->r2_recovery_floor = settled_prefix_k;
     // Recovery and RESET are complete for this physical generation. Publish
     // that state before starting the receipt reader; a fast reader failure
     // after replay must not be overwritten by a late success assignment.
@@ -1361,25 +1440,16 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     impl_->reset_r2_recovery_backoff();
 
     bool reader_started = false;
-    for (R2SentBundle& old_witness : witnesses) {
-        const uint64_t ordinal = old_witness.binding.relationship_ordinal;
-        if (ordinal <= recovered.reset_request.settled_prefix_k)
-            continue;
-        auto position = impl_->r2_retained_jobs.find(ordinal);
-        if (position == impl_->r2_retained_jobs.end())
-            throw std::logic_error("recovery suffix lost a retained caller row");
-        std::shared_ptr<Impl::PendingReceipt> pending = position->second;
+    for (const auto& pending : replay_rows) {
+        const uint64_t ordinal = pending->sent.binding.relationship_ordinal;
         if (pending->deadline <= Clock::now())
             throw boost::system::system_error(boost::asio::error::timed_out);
         impl_->authority->rebuild_r2_entry_for_recovery(
-            old_witness.prepared,
+            pending->sent.prepared,
             recovered.link_state.f_system_source_fingerprint);
-        JobBind binding = old_witness.binding;
-        binding.physical_link_generation = physical_generation;
-        pending->armed.relationship_epoch =
-            recovered.reset_request.new_relationship_epoch;
+        JobBind binding = pending->sent.binding;
         pending->sent = co_await impl_->endpoint->write_r2_bundle(
-            *impl_->r2_socket, binding, old_witness.prepared,
+            *impl_->r2_socket, binding, pending->sent.prepared,
             pending->deadline);
         pending->failure = nullptr;
         pending->failure_physical_link_generation = 0;
@@ -1396,8 +1466,12 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
                 reader_started = true;
             }
         }
+        const uint64_t next_ordinal =
+            ordinal == std::numeric_limits<uint64_t>::max()
+                ? std::numeric_limits<uint64_t>::max()
+                : ordinal + 1;
         impl_->r2_relationship_ordinal = std::max(
-            impl_->r2_relationship_ordinal, ordinal + 1);
+            impl_->r2_relationship_ordinal, next_ordinal);
         if (reader_started) {
             // The reader drains each F receipt while the sole writer continues
             // rebuilding the bounded suffix. ACK output remains queued behind
@@ -1896,6 +1970,9 @@ P50ZstdSourceSender::transfer_p51_route(
         if (!impl_->endpoint->r2_window_available())
             throw std::logic_error("R2 window was consumed during writer turn");
 
+        if (impl_->r2_relationship_ordinal ==
+            std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("R2 relationship ordinal space exhausted");
         binding.relationship_ordinal = impl_->r2_relationship_ordinal;
         pending = std::make_shared<Impl::PendingReceipt>(executor);
         pending->armed = armed;
@@ -1919,7 +1996,9 @@ P50ZstdSourceSender::transfer_p51_route(
             *impl_->r2_socket, binding, prepared, deadline,
             std::move(bundle_control));
         bundle_complete = true;
-        ++impl_->r2_relationship_ordinal;
+        if (impl_->r2_relationship_ordinal !=
+            std::numeric_limits<uint64_t>::max())
+            ++impl_->r2_relationship_ordinal;
         if (impl_->config.after_r2_bundle_sent_for_test) {
             try {
                 impl_->config.after_r2_bundle_sent_for_test(
@@ -1978,12 +2057,22 @@ P50ZstdSourceSender::transfer_p51_route(
           }
       }
       std::exception_ptr observed_failure;
+      bool unavailable_by_reset = false;
       {
           std::lock_guard lock(impl_->r2_transfer_mutex);
           observed_failure = pending->failure;
+          unavailable_by_reset = pending->unavailable_by_reset;
           if (observed_failure)
               observed_failure_generation =
                   pending->failure_physical_link_generation;
+      }
+      if (unavailable_by_reset) {
+          ZstdSourceTransferResult unavailable =
+              impl_->invalid(ZstdSourceTransferStatus::Unavailable);
+          unavailable.profile = pending->sent.binding.profile;
+          unavailable.raw_bytes = pending->sent.binding.raw_bytes;
+          unavailable.raw_digest = pending->sent.binding.raw_digest;
+          co_return unavailable;
       }
       if (observed_failure)
           std::rethrow_exception(observed_failure);
@@ -2212,6 +2301,14 @@ P50ZstdSourceSender::transfer_p51_route(
         for (;;) {
             {
                 std::lock_guard lock(impl_->r2_transfer_mutex);
+                if (pending->unavailable_by_reset) {
+                    ZstdSourceTransferResult unavailable = impl_->invalid(
+                        ZstdSourceTransferStatus::Unavailable);
+                    unavailable.profile = pending->sent.binding.profile;
+                    unavailable.raw_bytes = pending->sent.binding.raw_bytes;
+                    unavailable.raw_digest = pending->sent.binding.raw_digest;
+                    co_return unavailable;
+                }
                 if (pending->done && !pending->failure &&
                     pending->client_result.status == ClientRunStatus::Committed &&
                     pending->client_result.committed_commit) {

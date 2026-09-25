@@ -318,7 +318,9 @@ public:
     // history. C-wide TU/job identity and immutable source records survive.
     void reset_r2_route_for_recovery(PreparationRouteKey route,
                                      FStoreGuid f_store_guid,
-                                     HistoryNonce history_nonce);
+                                     HistoryNonce history_nonce,
+                                     std::span<const PreparedTuHandle>
+                                         unavailable_suffix = {});
     void rebuild_r2_entry_for_recovery(PreparedTuHandle handle,
                                        Digest128 f_system_source_fingerprint);
     [[nodiscard]] TxBegin r2_staged_begin(
@@ -470,6 +472,7 @@ struct R2RecoveryResult {
     LinkState link_state{};
     std::vector<R2TxCommit> committed_receipts;
     ResetRequest reset_request{};
+    ResetAck reset_ack{};
 };
 
 enum class ServerRunStatus : uint8_t {

@@ -109,21 +109,22 @@ struct Digest128Hash {
 // remains protocol 50; revision 1 is the first deployable CacheWire shape.
 constexpr uint16_t kP50WireRevision = 1;
 constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
-// TX_BEGIN is the largest fixed-size mandatory V1 control payload.
+// TX_BEGIN is the largest fixed-size mandatory R1 control payload.
 constexpr uint32_t kMandatoryControlFramePayload = 116;
 constexpr uint32_t kR2LinkHelloPayloadBytes = 181;
 constexpr uint32_t kR2LinkStatePayloadBytes = 212;
 constexpr uint32_t kR2RecoverBeginPayloadBytes = 69;
-constexpr uint32_t kR2RecoverWitnessPayloadBytes = 205;
+constexpr uint32_t kJobBindPayloadBytes = 110;
+constexpr uint32_t kR2RecoverWitnessPayloadBytes = 315;
 constexpr uint32_t kR2RecoverEndPayloadBytes = 69;
 constexpr uint32_t kR2ReceiptRowPayloadBytes = 161;
 constexpr uint32_t kR2ReceiptsEndPayloadBytes = 77;
 constexpr uint32_t kR2ResetPayloadBytes = 80;
-constexpr uint32_t kR2ResetAckPayloadBytes = 104;
+constexpr uint32_t kR2ResetAckPayloadBytes = 140;
 constexpr uint32_t kR2ResetConfirmPayloadBytes = 64;
 constexpr uint32_t kR2LinkRejectPayloadBytes = 18;
 constexpr uint32_t kR2MandatoryControlFramePayload =
-    kR2LinkStatePayloadBytes;
+    kR2RecoverWitnessPayloadBytes;
 constexpr uint64_t kInitialMaxFillRecordBytes = uint64_t{1} << 32;
 
 enum class MessageType : uint8_t {
@@ -414,6 +415,10 @@ struct RecoverWitness {
     uint64_t relationship_ordinal = 0;
     Digest128 binding_digest{};
     Digest128 transaction_digest{};
+    // The complete immutable assignment identity whose digest is echoed above.
+    // Its physical-link generation is the generation on which this assignment
+    // was originally offered, not the current RECOVER transport generation.
+    JobBind binding{};
     TxBegin inner{};
     auto operator<=>(const RecoverWitness&) const = default;
 };
@@ -465,6 +470,12 @@ struct ResetAck {
     ResetRequest request{};
     Digest128 initial_state_digest{};
     RelSeq next_rel_seq{};
+    uint64_t recovery_verified_floor_a = 0;
+    uint64_t recovery_prepared_prefix_p = 0;
+    Digest128 recovery_witness_digest{};
+    // Bit i describes ordinal request.settled_prefix_k + 1 + i. A set bit is
+    // F's explicit statement that the exact witness has no replayable lease.
+    uint32_t unavailable_suffix_mask = 0;
     auto operator<=>(const ResetAck&) const = default;
 };
 
@@ -543,6 +554,10 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload);
     std::span<const R2BodyMessage> bodies,
     std::span<const R2FillMessage> fills);
 [[nodiscard]] Digest128 compute_r2_recovery_transcript_digest(
+    const RecoverBegin& begin, std::span<const RecoverWitness> witnesses);
+// Stable across transport reconnects: only the outer RECOVER physical-link
+// generation is canonicalized; original JobBind identity remains immutable.
+[[nodiscard]] Digest128 compute_r2_recovery_witness_digest(
     const RecoverBegin& begin, std::span<const RecoverWitness> witnesses);
 [[nodiscard]] Digest128 compute_r2_link_offer_digest(const LinkHello& hello);
 std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_bytes);

@@ -4834,6 +4834,8 @@ SidecarRuntime::recover_p51_receipts_on_owner(
             return std::nullopt;
 
         uint64_t ordinal = begin.verified_floor_a;
+        std::vector<Id128> witnessed_reservations;
+        witnessed_reservations.reserve(witnesses.size());
         for (const RecoverWitness& witness : witnesses) {
             if (ordinal == UINT64_MAX)
                 return std::nullopt;
@@ -4845,21 +4847,80 @@ SidecarRuntime::recover_p51_receipts_on_owner(
                 witness.operation_id != begin.operation_id ||
                 witness.relationship_ordinal != ordinal)
                 return std::nullopt;
-            if (ordinal > relationship.committed_prefix_k)
-                continue;
-            const size_t row_index = static_cast<size_t>(
-                (ordinal - 1) % relationship.receipt_rows.size());
-            const auto& retained = relationship.receipt_rows[row_index];
-            if (!retained || retained->relationship_ordinal != ordinal ||
-                retained->binding_digest != witness.binding_digest ||
-                retained->transaction_digest != witness.transaction_digest ||
-                retained->inner.history_nonce != witness.inner.history_nonce ||
-                retained->inner.rel_seq != witness.inner.rel_seq ||
-                retained->inner.tu_seq != witness.inner.tu_seq ||
-                retained->inner.transaction_digest !=
-                    witness.inner.transaction_digest ||
-                retained->inner.raw_digest != witness.inner.raw_digest)
+            const Id128 reservation_id = witness.binding.reservation_id;
+            if (witness.binding.profile != link.profile ||
+                witness.binding.physical_link_generation == 0 ||
+                witness.binding.physical_link_generation >=
+                    begin.physical_link_generation)
                 return std::nullopt;
+            if (std::find(witnessed_reservations.begin(),
+                          witnessed_reservations.end(), reservation_id) !=
+                witnessed_reservations.end())
+                return std::nullopt;
+            witnessed_reservations.push_back(reservation_id);
+            if (ordinal > relationship.committed_prefix_k) {
+                const auto reservation =
+                    p51_source_reservations_.find(reservation_id.bytes);
+                if (reservation != p51_source_reservations_.end()) {
+                    const auto& row = reservation->second;
+                    const auto& arm = row.armed;
+                    const auto& source = arm.arm.source;
+                    const auto selected_profile =
+                        profile_from_cache_profile_mask(source.cache_profile);
+                    if (Id128{arm.reservation_id} != reservation_id ||
+                        arm.logical_relationship_id !=
+                            begin.relationship_id.bytes ||
+                        arm.relationship_epoch != begin.relationship_epoch ||
+                        source.c_store_guid != link.c_store_guid.bytes ||
+                        source.c_store_generation !=
+                            relationship.c_store_generation ||
+                        source.c_control_generation !=
+                            relationship.c_control_generation ||
+                        source.c_control_attempt !=
+                            relationship.c_control_attempt ||
+                        arm.f_store_guid != link.f_store_guid.bytes ||
+                        arm.f_store_generation != link.f_store_generation ||
+                        arm.selected_revision != CACHE_WIRE_REVISION_R2 ||
+                        arm.selected_window != relationship.selected_window ||
+                        !selected_profile ||
+                        *selected_profile != relationship.profile ||
+                        witness.binding.wire_job_id != source.wire_job_id ||
+                        witness.binding.assignment_epoch !=
+                            source.assignment_epoch ||
+                        witness.binding.assignment_nonce !=
+                            source.assignment_nonce ||
+                        witness.binding.logical_job != source.logical_job ||
+                        witness.binding.compiler_attempt !=
+                            source.compiler_attempt ||
+                        witness.binding.source_request_id !=
+                            source.source_request_id ||
+                        witness.binding.profile != *selected_profile ||
+                        witness.binding.physical_link_generation == 0 ||
+                        witness.binding.physical_link_generation >=
+                            begin.physical_link_generation ||
+                        (row.consumed &&
+                         (!row.consumed_binding ||
+                          *row.consumed_binding != witness.binding ||
+                          row.consumed_ordinal != ordinal ||
+                          row.consumed_physical_link_generation !=
+                              witness.binding.physical_link_generation)))
+                        return std::nullopt;
+                }
+            } else {
+                const size_t row_index = static_cast<size_t>(
+                    (ordinal - 1) % relationship.receipt_rows.size());
+                const auto& retained = relationship.receipt_rows[row_index];
+                if (!retained || retained->relationship_ordinal != ordinal ||
+                    retained->binding_digest != witness.binding_digest ||
+                    retained->transaction_digest != witness.transaction_digest ||
+                    retained->inner.history_nonce != witness.inner.history_nonce ||
+                    retained->inner.rel_seq != witness.inner.rel_seq ||
+                    retained->inner.tu_seq != witness.inner.tu_seq ||
+                    retained->inner.transaction_digest !=
+                        witness.inner.transaction_digest ||
+                    retained->inner.raw_digest != witness.inner.raw_digest)
+                    return std::nullopt;
+            }
         }
         if (ordinal != begin.prepared_prefix_p)
             return std::nullopt;
@@ -4895,7 +4956,9 @@ SidecarRuntime::recover_p51_receipts_on_owner(
             begin.operation_id, begin.physical_link_generation,
             begin.relationship_epoch, begin.verified_floor_a,
             begin.prepared_prefix_p, relationship.committed_prefix_k,
-            relationship.acknowledged_prefix_q, end.transcript_digest};
+            relationship.acknowledged_prefix_q, end.transcript_digest,
+            compute_r2_recovery_witness_digest(begin, witnesses),
+            std::vector<RecoverWitness>(witnesses.begin(), witnesses.end())};
         return result;
     } catch (...) {
         return std::nullopt;
@@ -4972,6 +5035,44 @@ std::optional<ResetAck> SidecarRuntime::validate_p51_reset_on_owner(
     ack.initial_state_digest =
         initial_route_digest(link.c_store_guid, request.new_history_nonce);
     ack.next_rel_seq = RelSeq{0};
+    auto& recovery = *relationship.recovery_context;
+    ack.recovery_verified_floor_a = recovery.verified_floor_a;
+    ack.recovery_prepared_prefix_p = recovery.prepared_prefix_p;
+    ack.recovery_witness_digest = recovery.witness_digest;
+    if (!recovery.reset_snapshot_ready) {
+        const auto clock = sidecar::process_monotonic_clock_identity();
+        const int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        const uint64_t suffix_count =
+            recovery.prepared_prefix_p - request.settled_prefix_k;
+        for (uint64_t offset = 0; offset < suffix_count; ++offset) {
+            const uint64_t ordinal = request.settled_prefix_k + 1 + offset;
+            const size_t witness_index = static_cast<size_t>(
+                ordinal - recovery.verified_floor_a - 1);
+            if (witness_index >= recovery.witnesses.size())
+                return std::nullopt;
+            const RecoverWitness& witness = recovery.witnesses[witness_index];
+            if (witness.relationship_ordinal != ordinal)
+                return std::nullopt;
+            bool unavailable = false;
+            const auto reservation = p51_source_reservations_.find(
+                witness.binding.reservation_id.bytes);
+            if (reservation == p51_source_reservations_.end()) {
+                unavailable = true;
+            } else {
+                const P51SourceReservationRow& row = reservation->second;
+                unavailable = row.cancel_requested || row.absolute_deadline.expired(
+                    now_ns, clock.clock_domain_id, clock.time_namespace_id);
+            }
+            if (unavailable)
+                recovery.unavailable_suffix_mask |=
+                    uint32_t{1} << static_cast<uint32_t>(offset);
+        }
+        recovery.reset_snapshot_ready = true;
+    }
+    ack.unavailable_suffix_mask = recovery.unavailable_suffix_mask;
     return ack;
 }
 
@@ -5001,6 +5102,44 @@ bool SidecarRuntime::commit_p51_reset_on_owner(
         ack.initial_state_digest !=
             initial_route_digest(link.c_store_guid, request.new_history_nonce))
         return false;
+    if (!relationship.recovery_context ||
+        relationship.recovery_context->operation_id != request.operation_id ||
+        ack.recovery_verified_floor_a !=
+            relationship.recovery_context->verified_floor_a ||
+        ack.recovery_prepared_prefix_p !=
+            relationship.recovery_context->prepared_prefix_p ||
+        ack.recovery_witness_digest !=
+            relationship.recovery_context->witness_digest ||
+        !relationship.recovery_context->reset_snapshot_ready ||
+        ack.unavailable_suffix_mask !=
+            relationship.recovery_context->unavailable_suffix_mask)
+        return false;
+    const auto& recovery = *relationship.recovery_context;
+    const uint64_t suffix_count =
+        recovery.prepared_prefix_p - request.settled_prefix_k;
+    for (uint64_t offset = 0; offset < suffix_count; ++offset) {
+        const uint64_t ordinal = request.settled_prefix_k + 1 + offset;
+        const size_t witness_index = static_cast<size_t>(
+            ordinal - recovery.verified_floor_a - 1);
+        if (witness_index >= recovery.witnesses.size())
+            return false;
+        const auto& witness = recovery.witnesses[witness_index];
+        if (witness.relationship_ordinal != ordinal)
+            return false;
+        const bool unavailable =
+            (ack.unavailable_suffix_mask &
+             (uint32_t{1} << static_cast<uint32_t>(offset))) != 0;
+        const auto reservation = p51_source_reservations_.find(
+            witness.binding.reservation_id.bytes);
+        if (unavailable) {
+            // The ACK is the immutable owner-thread snapshot. Do not recompute
+            // expiration here: the deadline may cross between validation and
+            // commit in this same owner operation.
+        } else if (reservation == p51_source_reservations_.end() ||
+                   reservation->second.cancel_requested) {
+            return false;
+        }
+    }
     // A later idle relationship replacement must receive an epoch newer than
     // every reset already committed for this C store, not merely newer than
     // the last relationship originally allocated. Reserve UINT64_MAX as the
@@ -5021,7 +5160,6 @@ bool SidecarRuntime::commit_p51_reset_on_owner(
     relationship.anchor_armed.relationship_epoch = request.new_relationship_epoch;
     relationship.last_reset_ack = ack;
     relationship.last_reset_confirmed = false;
-    relationship.recovery_context.reset();
     const auto clock = sidecar::process_monotonic_clock_identity();
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now().time_since_epoch())
@@ -5033,9 +5171,29 @@ bool SidecarRuntime::commit_p51_reset_on_owner(
             reservation->second.armed.relationship_epoch ==
                 request.old_relationship_epoch) {
             auto& row = reservation->second;
-            const bool live = !row.cancel_requested &&
-                !row.absolute_deadline.expired(
-                    now_ns, clock.clock_domain_id, clock.time_namespace_id);
+            bool unavailable_in_snapshot = false;
+            bool included_in_recovery = false;
+            for (const RecoverWitness& witness : recovery.witnesses) {
+                if (witness.binding.reservation_id.bytes !=
+                    row.armed.reservation_id)
+                    continue;
+                included_in_recovery = true;
+                const uint64_t ordinal = witness.relationship_ordinal;
+                if (ordinal > request.settled_prefix_k) {
+                    const uint32_t bit = uint32_t{1} <<
+                        static_cast<uint32_t>(ordinal -
+                                              request.settled_prefix_k - 1);
+                    unavailable_in_snapshot =
+                        (recovery.unavailable_suffix_mask & bit) != 0;
+                }
+                break;
+            }
+            const bool live = included_in_recovery
+                                  ? !unavailable_in_snapshot
+                                  : !row.cancel_requested &&
+                                        !row.absolute_deadline.expired(
+                                            now_ns, clock.clock_domain_id,
+                                            clock.time_namespace_id);
             if (!live) {
                 if (!row.consumed && relationship.outstanding != 0)
                     --relationship.outstanding;
@@ -5064,6 +5222,7 @@ bool SidecarRuntime::commit_p51_reset_on_owner(
             ++reservation;
         }
     }
+    relationship.recovery_context.reset();
     schedule_p51_reservation_sweep_on_owner();
     return true;
 }

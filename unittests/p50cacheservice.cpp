@@ -1992,6 +1992,524 @@ void test_p51_d07_queued_cancel_first_middle_last() {
     test_p51_d07_queued_cancel_position(30);
 }
 
+// Active-cancel recovery regression: the first request commits, the second
+// complete bundle is paused on F's materialization worker, and the third
+// request's exact JOB_BIND..TU_END is observed in the TCP receive queue before
+// the second reservation is cancelled. The canceled reservation must settle
+// non-successfully without publication, while the exact successor still
+// commits on the same logical relationship and within its original deadline.
+void test_p51_d07_active_cancel_recovery(ProfileId profile) {
+    uint32_t cache_profile = 0;
+    switch (profile) {
+    case ProfileId::P29V1: cache_profile = CACHE_PROFILE_P29V1; break;
+    case ProfileId::ZSTD_TU: cache_profile = CACHE_PROFILE_ZSTD_TU; break;
+    case ProfileId::ZSTD_ROUTE: cache_profile = CACHE_PROFILE_ZSTD_ROUTE; break;
+    }
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0x6a;
+    const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = 0x7a;
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+    uint16_t f_port = 0;
+    const int listener = loopback_listener(f_port);
+    CHECK(listener >= 0 && f_port != 0);
+
+    std::mutex materialize_mutex;
+    std::condition_variable materialize_changed;
+    unsigned materialize_calls = 0;
+    bool second_bundle_waiting = false;
+    bool release_second_bundle = false;
+    auto before_materialize = [&] {
+        std::unique_lock lock(materialize_mutex);
+        ++materialize_calls;
+        if (materialize_calls != 2)
+            return;
+        second_bundle_waiting = true;
+        materialize_changed.notify_all();
+        materialize_changed.wait(lock, [&] { return release_second_bundle; });
+    };
+
+    std::mutex retired_mutex;
+    std::condition_variable retired_changed;
+    std::vector<std::pair<Id128, bool>> retired_rows;
+
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.c_store_guid = f_launch.c_store_guid;
+    f_config.f_store_guid = f_launch.f_store_guid;
+    f_config.f_store_generation = f_launch.store_generation;
+    f_config.sidecar_launch = f_launch;
+    f_config.endpoint_caps.profile = profile;
+    f_config.endpoint_caps.supported_profiles = profile_bit(profile);
+    f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+    f_config.max_pending_p51_source_reservations = 8;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    f_config.p51_reservation_retired_for_test =
+        [&](Id128 id, bool marker_retired) {
+            {
+                std::lock_guard lock(retired_mutex);
+                retired_rows.emplace_back(id, marker_retired);
+            }
+            retired_changed.notify_all();
+        };
+#endif
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = c_launch.c_store_guid;
+    c_config.f_store_guid = c_launch.f_store_guid;
+    c_config.f_store_generation = c_launch.store_generation;
+    c_config.sidecar_launch = c_launch;
+    c_config.endpoint_caps.profile = profile;
+    c_config.endpoint_caps.supported_profiles = profile_bit(profile);
+    c_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+    c_config.max_active_source_transfers = 4;
+    c_config.max_active_p51_source_transfers = 8;
+    c_config.max_pending_p51_source_operations = 8;
+    c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<size_t> accepted_connections{0};
+    std::atomic<int> probe_fd{-1};
+    std::thread acceptor([&] {
+        const auto end = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(40);
+        while (!stop_accepting.load(std::memory_order_acquire) &&
+               accepted_connections.load(std::memory_order_acquire) < 8 &&
+               std::chrono::steady_clock::now() < end) {
+            pollfd ready{listener, POLLIN, 0};
+            int polled;
+            do {
+                polled = ::poll(&ready, 1, 100);
+            } while (polled < 0 && errno == EINTR);
+            if (polled <= 0 || !(ready.revents & POLLIN))
+                continue;
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            int fd;
+            do {
+                fd = ::accept(listener,
+                    reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            } while (fd < 0 && errno == EINTR);
+            if (fd < 0)
+                continue;
+            std::unique_ptr<MsgChannel> channel(
+                Service::createChannelAccepted(
+                    fd, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                continue;
+            const auto handshake_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            bool protocol_ready = true;
+            while (channel->protocol_admission_state() ==
+                       MsgChannel::ProtocolAdmissionState::Pending &&
+                   std::chrono::steady_clock::now() < handshake_deadline) {
+                short events = POLLIN;
+                if (channel->has_pending_write())
+                    events |= POLLOUT;
+                pollfd socket{channel->fd, events, 0};
+                int result;
+                do {
+                    result = ::poll(&socket, 1, 50);
+                } while (result < 0 && errno == EINTR);
+                if (result < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLOUT) && !channel->flush_pending()) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLIN) && !channel->read_a_bit()) {
+                    protocol_ready = false;
+                    break;
+                }
+            }
+            if (!protocol_ready ||
+                channel->protocol_admission_state() !=
+                    MsgChannel::ProtocolAdmissionState::Ready ||
+                !channel->finish_protocol_admission())
+                continue;
+            std::unique_ptr<Msg> link_request(
+                channel->get_msg_until(handshake_deadline));
+            if (dynamic_cast<P51CacheLinkSessionMsg*>(link_request.get()) ==
+                nullptr)
+                continue;
+            const int adopted_fd =
+                channel->send_p51_cache_link_session_ready_and_release(
+                    handshake_deadline);
+            if (adopted_fd < 0)
+                continue;
+            int duplicate = ::dup(adopted_fd);
+            int expected = -1;
+            if (duplicate >= 0 &&
+                !probe_fd.compare_exchange_strong(
+                    expected, duplicate, std::memory_order_acq_rel))
+                (void)::close(duplicate);
+            EndpointIoControl control;
+            control.before_materialize_on_worker = before_materialize;
+            accepted_connections.fetch_add(1, std::memory_order_release);
+            f_runtime.start_adopted_r2_endpoint(adopted_fd,
+                                                 std::move(control));
+        }
+    });
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            {
+                std::lock_guard lock(materialize_mutex);
+                release_second_bundle = true;
+            }
+            materialize_changed.notify_all();
+            stop_accepting.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (acceptor.joinable())
+                acceptor.join();
+            (void)::close(listener);
+            const int descriptor = probe_fd.exchange(
+                -1, std::memory_order_acq_rel);
+            if (descriptor >= 0)
+                (void)::close(descriptor);
+            c_runtime.stop();
+            f_runtime.stop();
+        });
+
+    struct RequestRow {
+        local::P51SourceTransferRequest request;
+        RuntimeCase pair{local::Connection(-1), local::Connection(-1)};
+        std::vector<uint8_t> bytes;
+        uint64_t request_id = 0;
+    };
+    auto make_request = [&](uint64_t request_id, size_t raw_bytes,
+                            uint8_t fill) {
+        auto reservation = test_p51_reservation_request(
+            c_launch.c_store_guid, c_launch.store_generation,
+            c_launch.identity.generation, c_launch.identity.attempt,
+            request_id, cache_profile, 30,
+            std::chrono::seconds(30));
+        reservation.arm.source.assignment_nonce = request_id;
+        reservation.arm.source.logical_job = 130000 + request_id;
+        reservation.arm.source.compiler_attempt = 1;
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = f_port;
+        const auto armed = f_runtime.reserve_p51_source_on_owner(reservation);
+        CHECK(armed.error_code == 0 && armed.armed.has_value());
+        RequestRow row;
+        row.request = local::P51SourceTransferRequest{
+            *armed.armed, reservation.absolute_deadline};
+        row.pair = authenticated_runtime_pair();
+        row.bytes.assign(raw_bytes, fill);
+        row.request_id = request_id;
+        return row;
+    };
+    auto enqueue = [&](RequestRow& row) {
+        const auto operation = local::make_p51_source_transfer_operation(
+            c_launch.identity, row.request, row.request_id);
+        return c_runtime.enqueue_p51_source_transfer(
+            std::move(row.pair.sender), c_launch.identity, operation,
+            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+    };
+    auto attach_exact = [&](RequestRow& row,
+                            const local::P50SourceTransferResult& result) {
+        if (result.code != local::SourceTransferResultCode::Committed ||
+            !result.valid() || result.c_store_guid != c_launch.c_store_guid ||
+            result.raw_bytes != row.bytes.size() ||
+            result.raw_digest != icecc::digest128(row.bytes))
+            return false;
+        const InputLeaseOwner owner{
+            row.request.armed.arm.source.logical_job,
+            row.request.armed.arm.source.assignment_epoch,
+            row.request.armed.arm.source.assignment_nonce};
+        const InputFdRequest attach_request{
+            f_launch.identity,
+            InputRecordKey{result.c_store_guid, TuSeq{result.tu_seq}}, owner,
+            row.request_id + 70000};
+        auto cursor = f_runtime.attach_input_on_owner(
+            attach_request,
+            row.request.absolute_deadline.as_steady_time_point());
+        bool exact = cursor.has_value() &&
+                     cursor->remaining() == row.bytes.size() &&
+                     cursor->raw_digest() == icecc::digest128(row.bytes);
+        if (exact) {
+            std::vector<uint8_t> actual(row.bytes.size());
+            exact = cursor->read(actual) == actual.size() && actual == row.bytes;
+        }
+        f_runtime.finish_input_attachment_on_owner(
+            attach_request, exact,
+            row.request.absolute_deadline.as_steady_time_point());
+        return exact;
+    };
+
+    RequestRow first = make_request(9101, 512, 0x31);
+    RequestRow cancelled = make_request(9102, 1024, 0x42);
+    RequestRow successor = make_request(9103, 2048, 0x53);
+    CHECK(enqueue(first));
+    const auto first_result = receive_p51_transfer_result(
+        first.pair.receiver, c_launch.identity, first.request_id,
+        first.request.absolute_deadline.as_steady_time_point(), true);
+    const bool first_exact = attach_exact(first, first_result);
+
+    CHECK(enqueue(cancelled));
+    bool second_materialization_waiting = false;
+    {
+        std::unique_lock lock(materialize_mutex);
+        second_materialization_waiting = materialize_changed.wait_for(
+            lock, std::chrono::seconds(8), [&] {
+                return second_bundle_waiting;
+            });
+    }
+    CHECK(second_materialization_waiting);
+    CHECK(enqueue(successor));
+    const bool two_active_operations = wait_for_source_operation_count(
+        c_runtime, 2, std::chrono::seconds(3));
+
+    JobBind observed_successor_binding{};
+    bool successor_bundle_buffered = false;
+    const auto probe_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < probe_deadline &&
+           !successor_bundle_buffered) {
+        const int descriptor = probe_fd.load(std::memory_order_acquire);
+        if (descriptor < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        std::array<uint8_t, 65536> buffered{};
+        const ssize_t received = ::recv(descriptor, buffered.data(),
+                                        buffered.size(),
+                                        MSG_PEEK | MSG_DONTWAIT);
+        if (received < 4) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        size_t offset = 0;
+        bool target_binding_seen = false;
+        bool target_end_seen = false;
+        while (offset + 4 <= static_cast<size_t>(received)) {
+            FrameHeader header;
+            try {
+                header = decode_frame_header(std::span<const uint8_t>(
+                    buffered.data() + offset, 4));
+            } catch (...) {
+                break;
+            }
+            const size_t frame_bytes = 4 + header.payload_bytes;
+            if (frame_bytes > static_cast<size_t>(received) - offset)
+                break;
+            const std::span<const uint8_t> payload(
+                buffered.data() + offset + 4, header.payload_bytes);
+            if (header.type == MessageType::JOB_BIND) {
+                const Message decoded = decode_payload(header.type, payload);
+                const JobBind binding = std::get<JobBind>(decoded);
+                if (binding.reservation_id == Id128{
+                        cancelled.request.armed.reservation_id}) {
+                    // F already consumed this exact bundle before entering
+                    // the second materialization hook.
+                } else if (binding.reservation_id == Id128{
+                               successor.request.armed.reservation_id}) {
+                    observed_successor_binding = binding;
+                    target_binding_seen = true;
+                }
+            } else if (header.type == MessageType::TU_END &&
+                       target_binding_seen) {
+                const Message decoded = decode_payload(header.type, payload);
+                const TuEnd end = std::get<TuEnd>(decoded);
+                target_end_seen = end.relationship_ordinal ==
+                                  observed_successor_binding.relationship_ordinal;
+            }
+            offset += frame_bytes;
+        }
+        successor_bundle_buffered = target_binding_seen && target_end_seen;
+        if (!successor_bundle_buffered)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(two_active_operations);
+    std::fprintf(stderr,
+                 "P51_D07 active-cancel precondition second-materializing=1 "
+                 "active-operations=2 successor-full-bundle-buffered=%d "
+                 "successor-ordinal=%llu\n",
+                 successor_bundle_buffered ? 1 : 0,
+                 static_cast<unsigned long long>(
+                     observed_successor_binding.relationship_ordinal));
+    std::fflush(stderr);
+    CHECK(successor_bundle_buffered);
+    CHECK(observed_successor_binding.source_request_id == successor.request_id);
+    CHECK(observed_successor_binding.relationship_ordinal == 3);
+    // This isolated C runtime submitted only these three jobs, so the checked
+    // contiguous sequence makes the middle TU key exact without guessing a
+    // globally arbitrary sequence number.
+    CHECK(first_result.tu_seq <=
+          std::numeric_limits<uint64_t>::max() - 2);
+    const TuSeq cancelled_tu_seq{first_result.tu_seq + 1};
+    CHECK(observed_successor_binding.tu_seq.value ==
+          first_result.tu_seq + 2);
+    const auto cancellation_time = std::chrono::steady_clock::now();
+    const auto second_deadline =
+        cancelled.request.absolute_deadline.as_steady_time_point();
+    const auto successor_deadline =
+        successor.request.absolute_deadline.as_steady_time_point();
+    const bool f_cancelled = f_runtime.cancel_p51_source_on_owner(
+        cancelled.request.armed.arm,
+        cancelled.request.armed.reservation_id, second_deadline);
+    const bool duplicate_f_cancelled = f_cancelled &&
+        f_runtime.cancel_p51_source_on_owner(
+            cancelled.request.armed.arm,
+            cancelled.request.armed.reservation_id, second_deadline);
+    {
+        std::lock_guard lock(materialize_mutex);
+        release_second_bundle = true;
+    }
+    materialize_changed.notify_all();
+
+    struct TransferObservation {
+        std::optional<local::P50SourceTransferResult> result;
+        std::string error;
+        std::chrono::steady_clock::time_point finished{};
+    } second_observation, successor_observation;
+    auto observe_result = [&](RequestRow& row,
+                              std::chrono::steady_clock::time_point deadline,
+                              TransferObservation& observation) {
+        try {
+            observation.result = receive_p51_transfer_result(
+                row.pair.receiver, c_launch.identity, row.request_id,
+                deadline, true);
+        } catch (const std::exception& error) {
+            observation.error = error.what();
+        } catch (...) {
+            observation.error = "unknown exception";
+        }
+        observation.finished = std::chrono::steady_clock::now();
+    };
+    std::fprintf(stderr,
+                 "P51_D07 active-cancel waiting-results concurrently "
+                 "original-deadline-remaining-ms=%lld/%lld\n",
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     second_deadline - std::chrono::steady_clock::now()).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     successor_deadline - std::chrono::steady_clock::now()).count()));
+    std::fflush(stderr);
+    std::thread second_waiter([&] {
+        observe_result(cancelled, second_deadline, second_observation);
+    });
+    std::thread successor_waiter([&] {
+        observe_result(successor, successor_deadline, successor_observation);
+    });
+    second_waiter.join();
+    successor_waiter.join();
+    const auto second_result = second_observation.result;
+    const auto successor_result = successor_observation.result;
+    bool exact_cancel_retirement = false;
+    {
+        std::unique_lock lock(retired_mutex);
+        retired_changed.wait_for(lock, std::chrono::seconds(3), [&] {
+            return std::any_of(retired_rows.begin(), retired_rows.end(),
+                [&](const auto& row) {
+                    return row.first ==
+                        Id128{cancelled.request.armed.reservation_id};
+                });
+        });
+        const size_t matching = static_cast<size_t>(std::count_if(
+            retired_rows.begin(), retired_rows.end(), [&](const auto& row) {
+                return row.first ==
+                    Id128{cancelled.request.armed.reservation_id};
+            }));
+        exact_cancel_retirement = matching == 1;
+    }
+    const bool second_committed = second_result.has_value() &&
+        second_result->code == local::SourceTransferResultCode::Committed;
+    const bool successor_committed = successor_result.has_value() &&
+        successor_result->code == local::SourceTransferResultCode::Committed;
+    const bool successor_exact = successor_committed &&
+        attach_exact(successor, *successor_result);
+    const InputLeaseOwner cancelled_owner{
+        cancelled.request.armed.arm.source.logical_job,
+        cancelled.request.armed.arm.source.assignment_epoch,
+        cancelled.request.armed.arm.source.assignment_nonce};
+    const InputFdRequest cancelled_attach_request{
+        f_launch.identity,
+        InputRecordKey{c_launch.c_store_guid,
+                       cancelled_tu_seq},
+        cancelled_owner, cancelled.request_id + 70000};
+    auto cancelled_cursor = f_runtime.attach_input_on_owner(
+        cancelled_attach_request,
+        cancelled.request.absolute_deadline.as_steady_time_point());
+    const bool cancelled_input_absent = !cancelled_cursor.has_value();
+    if (cancelled_cursor) {
+        f_runtime.finish_input_attachment_on_owner(
+            cancelled_attach_request, false,
+            cancelled.request.absolute_deadline.as_steady_time_point());
+    }
+    const bool exactly_two_links =
+        accepted_connections.load(std::memory_order_acquire) == 2;
+    const bool original_deadlines_live = cancellation_time < second_deadline &&
+                                         cancellation_time < successor_deadline;
+    const bool all_operations_released = wait_for_source_operation_count(
+        c_runtime, 0, std::chrono::seconds(3));
+    const bool all_raw_credits_released = wait_for_source_raw_bytes(
+        c_runtime, 0, std::chrono::seconds(3));
+    std::printf(
+        "P51_D07 active-cancel profile=%u stage=F-materialization after-full-TU "
+        "successor-full-bundle-buffered=1 accepted-links=%zu cancel=%d "
+        "exactly-two-links=%d duplicate-cancel=%d second-received=%d second-code=%u "
+        "second-error=%u successor-received=%d successor-code=%u "
+        "successor-error=%u successor-exact=%d cancelled-input-absent=%d "
+        "exact-cancel-retirement=%d "
+        "finished-after-cancel-ms=%lld/%lld "
+        "deadline-remains-ms=%lld/%lld C-operations-released=%d "
+        "C-raw-credit-released=%d\n",
+        static_cast<unsigned>(profile),
+        accepted_connections.load(std::memory_order_acquire),
+        f_cancelled ? 1 : 0, exactly_two_links ? 1 : 0,
+        duplicate_f_cancelled ? 1 : 0,
+        second_result.has_value() ? 1 : 0,
+        second_result.has_value()
+            ? static_cast<unsigned>(second_result->code) : 0,
+        second_result.has_value()
+            ? static_cast<unsigned>(second_result->error_code) : 0,
+        successor_result.has_value() ? 1 : 0,
+        successor_result.has_value()
+            ? static_cast<unsigned>(successor_result->code) : 0,
+        successor_result.has_value()
+            ? static_cast<unsigned>(successor_result->error_code) : 0,
+        successor_exact ? 1 : 0,
+        cancelled_input_absent ? 1 : 0,
+        exact_cancel_retirement ? 1 : 0,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            second_observation.finished - cancellation_time).count()),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            successor_observation.finished - cancellation_time).count()),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            second_deadline - cancellation_time).count()),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            successor_deadline - cancellation_time).count()),
+        all_operations_released ? 1 : 0, all_raw_credits_released ? 1 : 0);
+    CHECK(first_exact);
+    CHECK(f_cancelled);
+    CHECK(duplicate_f_cancelled);
+    CHECK(exact_cancel_retirement);
+    CHECK(exactly_two_links);
+    CHECK(second_result.has_value());
+    CHECK(second_result->code == local::SourceTransferResultCode::Error);
+    CHECK(second_result->error_code != 0);
+    CHECK(cancelled_input_absent);
+    CHECK(original_deadlines_live);
+    CHECK(!second_committed);
+    CHECK(successor_result.has_value());
+    CHECK(successor_committed);
+    CHECK(successor_exact);
+    CHECK(second_observation.finished <= second_deadline);
+    CHECK(successor_observation.finished <= successor_deadline);
+    CHECK(all_operations_released);
+    CHECK(all_raw_credits_released);
+}
+
+void test_p51_d07_active_cancel_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+        test_p51_d07_active_cancel_recovery(profile);
+}
+
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x4b;
@@ -3605,13 +4123,23 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
             first_request.arm, first_armed.reservation_id, owner_deadline));
 
         const R2TxCommit first_commit = make_commit(link, first_binding);
+        LinkHello recovery_link;
         runtime.run_owner_callback_for_test([&] {
         CHECK(runtime.record_p51_job_commit_on_owner(
             link, first_binding, first_commit));
 
+        // Recovery witnesses name the original bind, while the RECOVER
+        // exchange is carried by a newer physical link incarnation.
+        runtime.release_p51_link_on_owner(link);
+        recovery_link = test_p51_link_hello(
+            first_armed, link.physical_link_generation + 1,
+            link.history_nonce, LinkStartMode::Reconnect, 0);
+        CHECK(runtime.lookup_p51_link_reservation_on_owner(
+                  recovery_link).has_value());
+
         const Id128 operation_id{icecc::digest128("publication reset op").bytes};
         const RecoverBegin begin = test_p51_recover_begin(
-            link, 0, 1, 1, operation_id);
+            recovery_link, 0, 1, 1, operation_id);
         RecoverWitness witness;
         witness.relationship_id = begin.relationship_id;
         witness.relationship_epoch = begin.relationship_epoch;
@@ -3628,28 +4156,33 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
         witness.inner.raw_digest = first_binding.raw_digest;
         witness.inner.transaction_digest =
             first_commit.inner.transaction_digest;
+        witness.binding = first_binding;
         const std::array<RecoverWitness, 1> witnesses{witness};
         const auto recovered = runtime.recover_p51_receipts_on_owner(
-            link, begin, witnesses, test_p51_recover_end(begin, witnesses));
+            recovery_link, begin, witnesses,
+            test_p51_recover_end(begin, witnesses));
         CHECK(recovered.has_value() && recovered->rows.size() == 1);
-        reset.relationship_id = link.relationship_id;
-        reset.old_relationship_epoch = link.relationship_epoch;
-        reset.new_relationship_epoch = link.relationship_epoch + 1;
-        reset.physical_link_generation = link.physical_link_generation;
+        reset.relationship_id = recovery_link.relationship_id;
+        reset.old_relationship_epoch = recovery_link.relationship_epoch;
+        reset.new_relationship_epoch = recovery_link.relationship_epoch + 1;
+        reset.physical_link_generation =
+            recovery_link.physical_link_generation;
         reset.operation_id = operation_id;
         reset.settled_prefix_k = 1;
-        reset.old_history_nonce = link.history_nonce;
-        reset.new_history_nonce = HistoryNonce{link.history_nonce.value + 1};
-        const auto ack = runtime.validate_p51_reset_on_owner(link, reset);
+        reset.old_history_nonce = recovery_link.history_nonce;
+        reset.new_history_nonce =
+            HistoryNonce{recovery_link.history_nonce.value + 1};
+        const auto ack = runtime.validate_p51_reset_on_owner(
+            recovery_link, reset);
         CHECK(ack.has_value());
-        CHECK(runtime.commit_p51_reset_on_owner(link, reset, *ack));
+        CHECK(runtime.commit_p51_reset_on_owner(recovery_link, reset, *ack));
         confirm.relationship_id = reset.relationship_id;
         confirm.new_relationship_epoch = reset.new_relationship_epoch;
         confirm.physical_link_generation = reset.physical_link_generation;
         confirm.operation_id = reset.operation_id;
         confirm.new_history_nonce = reset.new_history_nonce;
         confirm.settled_prefix_k = reset.settled_prefix_k;
-        CHECK(runtime.confirm_p51_reset_on_owner(link, confirm));
+        CHECK(runtime.confirm_p51_reset_on_owner(recovery_link, confirm));
         });
 
         auto second_request = test_p51_reservation_request(
@@ -3658,6 +4191,7 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
         const auto second_result = runtime.reserve_p51_source_on_owner(second_request);
         CHECK(second_result.error_code == 0 && second_result.armed.has_value());
         runtime.run_owner_callback_for_test([&] {
+        LinkHello& link = recovery_link;
         link.relationship_epoch = reset.new_relationship_epoch;
         link.history_nonce = reset.new_history_nonce;
         link.verified_receipt_floor = 1;
@@ -3672,8 +4206,19 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
             link, second_binding, second_commit));
         CHECK(runtime.confirm_p51_reset_on_owner(link, confirm));
 
+        // Inspect the retained receipt on another physical reconnect. Its
+        // original JOB_BIND generation remains the prior link's generation.
+        runtime.release_p51_link_on_owner(link);
+        LinkHello receipt_reconnect = test_p51_link_hello(
+            first_armed, link.physical_link_generation + 1,
+            reset.new_history_nonce, LinkStartMode::Reconnect, 1);
+        receipt_reconnect.relationship_epoch = reset.new_relationship_epoch;
+        CHECK(runtime.lookup_p51_link_reservation_on_owner(
+                  receipt_reconnect).has_value());
+
         const RecoverBegin after_duplicate_confirm = test_p51_recover_begin(
-            link, 1, 2, 1, Id128{icecc::digest128("post-confirm inspect").bytes});
+            receipt_reconnect, 1, 2, 1,
+            Id128{icecc::digest128("post-confirm inspect").bytes});
         RecoverWitness second_witness;
         second_witness.relationship_id = after_duplicate_confirm.relationship_id;
         second_witness.relationship_epoch = after_duplicate_confirm.relationship_epoch;
@@ -3691,9 +4236,10 @@ void test_p51_cancel_publication_and_reset_lifecycle() {
         second_witness.inner.raw_digest = second_binding.raw_digest;
         second_witness.inner.transaction_digest =
             second_commit.inner.transaction_digest;
+        second_witness.binding = second_binding;
         const std::array<RecoverWitness, 1> second_witnesses{second_witness};
         const auto retained = runtime.recover_p51_receipts_on_owner(
-            link, after_duplicate_confirm, second_witnesses,
+            receipt_reconnect, after_duplicate_confirm, second_witnesses,
             test_p51_recover_end(after_duplicate_confirm, second_witnesses));
         CHECK(retained.has_value());
         CHECK(retained->end.committed_prefix_k == 2);
@@ -8707,6 +9253,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-active-cancel-recovery-probe") == 0) {
+            test_p51_d07_active_cancel_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d07-queued-cancel-first") == 0) {
             test_p51_d07_queued_cancel_position(0);
             return 0;
@@ -8756,6 +9307,7 @@ int main(int argc, char** argv) {
         test_p51_admitted_transfer_stop_releases_raw_credit();
         test_p51_peer_close_during_active_read_cancels_before_route();
         test_p51_d07_queued_cancel_first_middle_last();
+        test_p51_d07_active_cancel_all_profiles();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_credit_admission_bypasses_blocked_workers();

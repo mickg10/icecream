@@ -103,8 +103,14 @@ R1 records and bytes remain unchanged.
 The outer frame remains `type:u8, payload_length:u24, payload`,
 all record integers are big-endian, and GUIDs/digests/reservation IDs are 16
 raw bytes. Revisions and profiles are u16; windows and frame caps are u32.
-Payloads have no padding or reserved extensibility bytes. Type 25 has a
-qualified codec; endpoint emission and sender handling remain pending.
+Payloads have no padding or reserved extensibility bytes. Type 25 has endpoint
+handling and typed sender rejection; qualification scope is recorded separately.
+
+R2 is an unreleased candidate format. The full-witness/suffix-disposition
+layout below is incompatible with earlier candidate recovery records. Upgrade
+both ends of an R2 relationship together and drain old candidate connections;
+do not mix those candidate images or carry their in-memory recovery state
+across the change. This does not change P43 or CacheWire R1 records.
 
 | Type | Record | Exact payload fields / byte offsets | Bytes |
 |---:|---|---|---:|
@@ -118,12 +124,12 @@ qualified codec; endpoint emission and sender handling remain pending.
 | 17 | R2_TX_COMMIT | relationship ordinal u64@0; binding digest@8; outer transaction digest@24; exact 72-byte R1 TX_COMMIT payload@40 | 112 |
 | 18 | COMMIT_ACK | relationship ID@0; relationship epoch u64@16; physical generation u64@24; contiguous verified ordinal u64@32 | 40 |
 | 19 | RECOVER Begin | relationship ID@0; relationship epoch u64@16; new physical generation u64@24; recovery operation ID@32; kind u8@48=`0`; floor A u64@49; prepared prefix P u64@57; witness count u32@65 | 69 |
-| 19 | RECOVER Witness | same common identity through @47; kind u8@48=`1`; ordinal u64@49; binding digest@57; transaction digest@73; exact 116-byte TX_BEGIN@89 | 205 |
+| 19 | RECOVER Witness | same common identity through @47; kind u8@48=`1`; ordinal u64@49; binding digest@57; outer transaction digest@73; exact 110-byte JOB_BIND@89; exact 116-byte TX_BEGIN@199 | 315 |
 | 19 | RECOVER End | same common identity through @47; kind u8@48=`2`; witness count u32@49; transcript digest@53 | 69 |
 | 20 | RECEIPTS Row | relationship ID@0; relationship epoch u64@16; physical generation u64@24; recovery operation ID@32; kind u8@48=`0`; ordinal u64@49; binding digest@57; transaction digest@73; exact 72-byte TX_COMMIT@89 | 161 |
 | 20 | RECEIPTS End | same common identity through @47; kind u8@48=`1`; floor A u64@49; committed prefix K u64@57; acknowledged prefix Q u64@65; receipt count u32@73 | 77 |
 | 21 | RESET | relationship ID@0; old/new relationship epochs u64@16/@24; physical generation u64@32; operation ID@40; settled prefix K u64@56; old/new history nonces u64@64/@72 | 80 |
-| 22 | RESET_ACK | exact RESET payload@0..79; fresh initial state digest@80; next REL_SEQ u64@96 | 104 |
+| 22 | RESET_ACK | exact RESET payload@0..79; fresh initial state digest@80; next REL_SEQ u64@96; recovery floor A u64@104; prepared prefix P u64@112; stable witness digest@120; unavailable suffix mask u32@136 | 140 |
 | 23 | RESET_CONFIRM | relationship ID@0; new relationship epoch u64@16; physical generation u64@24; operation ID@32; new history nonce u64@48; settled prefix K u64@56 | 64 |
 | 24 | CLOSE | empty payload; closes only an idle bound link and settles no receipt | 0 |
 | 25 | R2_LINK_REJECT | reason u16@0 (`1` StoreReplaced, `2` ReservationMissing); exact offered-HELLO digest@2 | 18 |
@@ -149,7 +155,7 @@ themselves bind job ownership or the R2 transaction envelope. LINK_STATE
 returns actual selected budgets and F's fingerprint; the receiver validates
 its echo against the original offer and retained reservation. P29 source-file
 reuse requires equal nonzero C and F fingerprints. The selected frame cap
-must be at least the 212-byte LINK_STATE size and no larger than both peers'
+must be at least the 315-byte RECOVER Witness size and no larger than both peers'
 offers, the implementation cap, or the outer u24 limit. Raw, encoded and
 materialized-output budgets are independent and must be reserved before
 allocation.
@@ -181,6 +187,29 @@ K, Q, and count. C validates the entire interval before advancing its
 verified floor. F refuses `A < Q` or `A > K` and fences older physical-link
 generations before processing recovery.
 
+Each recovery witness includes its original JOB_BIND, including the original
+physical generation. Its binding digest, ordinal, TU, profile and raw identity
+must agree with that binding. The inner TX_BEGIN transaction digest describes
+the codec transaction; it is not the outer transaction digest.
+
+The stable witness digest used by RESET_ACK is XXH3-128 over ASCII
+`R2-recovery-witness-v1` (no NUL), followed by the 16-byte normalized transcript
+digest in the canonical digest byte order. First validate the actual RECOVER
+transcript; then compute its normalized transcript digest using the ordinary
+`R2-recover-v1` algorithm with only the Begin/Witness outer physical generations
+replaced by 1. The nested original JOB_BIND and binding digest remain unchanged.
+Thus a reconnect changes the transport transcript but not its stable witness
+identity. Malformed identities cannot be made valid by normalization.
+
+RESET_ACK requires `A <= K <= P`, `P-A <= 30`, and a nonzero stable witness
+digest. Mask bit i refers to old ordinal `K+1+i`; set bits explicitly report
+that the exact witness has no replayable F reservation. Bits outside `P-K`
+must be zero, including every bit when the suffix is empty. This is an
+Unavailable result, not a cancellation receipt or positive commit. C must
+verify the interval and digest against its retained witnesses, settle the
+positive prefix, then rebuild surviving jobs contiguously without changing
+their logical job/TU identities or original deadlines.
+
 RESET is idempotently keyed by operation ID, advances the relationship epoch
 by exactly one, names the reconciled prefix K, and replaces the codec history
 nonce. RESET_ACK echoes the logical request fields and the new initial state;
@@ -200,9 +229,14 @@ current generation; the echoed RESET_ACK envelope uses that generation while
 the operation ID, epochs, prefix, nonces, and reset state remain identical.
 RESET may settle a reconciled prefix even when the previous COMMIT_ACK was lost; it does
 not delete immutable committed input records. These records are used by the
-R2 recovery lifecycle. Current recovery reports exact committed receipts,
-not per-job cancellation dispositions for the uncommitted suffix; active-job
-cancellation and survivor rebuilding remain an open qualification gap.
+R2 recovery lifecycle. C retains the exact positive receipts and any observed
+RESET_ACK until the confirmation echo succeeds. A retry whose LINK_STATE
+already reflects the reset sends the same RESET directly, rather than
+repeating old-epoch recovery. The unavailable disposition is immutable across
+that retry. Un-emitted surviving jobs remain in C's retained backlog even if
+another disconnect interrupts replay before they reach the new connection.
+See [validation status](../PROJECT_STATE.md) for tested scenarios and remaining
+qualification work.
 
 ## Selection and advertisement
 

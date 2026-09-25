@@ -1550,7 +1550,8 @@ void P50PreparationAuthority::advance_speculative(PreparedTuHandle handle) {
 
 void P50PreparationAuthority::reset_r2_route_for_recovery(
     PreparationRouteKey route_key, FStoreGuid f_store_guid,
-    HistoryNonce history_nonce) {
+    HistoryNonce history_nonce,
+    std::span<const PreparedTuHandle> unavailable_suffix) {
     impl_->owner.require();
     if (f_store_guid == FStoreGuid{} || history_nonce.value == 0)
         throw std::invalid_argument("R2 recovery reset identity is invalid");
@@ -1565,6 +1566,26 @@ void P50PreparationAuthority::reset_r2_route_for_recovery(
     Impl::RouteState& route = *route_position->second;
     if (route.profile != route_key.profile)
         throw std::logic_error("R2 recovery route profile changed");
+    std::vector<uint64_t> remove_ids;
+    remove_ids.reserve(unavailable_suffix.size());
+    for (const PreparedTuHandle handle : unavailable_suffix) {
+        if (handle.authority_.lock() != impl_->identity ||
+            handle.entry_id_ == 0 ||
+            std::find(remove_ids.begin(), remove_ids.end(), handle.entry_id_) !=
+                remove_ids.end())
+            throw std::invalid_argument(
+                "unavailable recovery suffix contains a foreign or duplicate handle");
+        const auto entry = impl_->entries.find(handle.entry_id_);
+        if (entry == impl_->entries.end() || entry->second.committed ||
+            entry->second.route != route_key || entry->second.references != 1 ||
+            std::find(route.speculative_entries.begin(),
+                      route.speculative_entries.end(), handle.entry_id_) ==
+                route.speculative_entries.end())
+            throw std::logic_error(
+                "unavailable recovery handle is not one exact retained suffix entry");
+        remove_ids.push_back(handle.entry_id_);
+    }
+
     uint64_t raw_bytes = 0;
     for (const uint64_t id : route.speculative_entries) {
         const auto position = impl_->entries.find(id);
@@ -1573,12 +1594,37 @@ void P50PreparationAuthority::reset_r2_route_for_recovery(
             position->second.shared->raw_bytes >
                 std::numeric_limits<uint64_t>::max() - raw_bytes)
             throw std::logic_error("R2 recovery suffix ledger is invalid");
-        raw_bytes += position->second.shared->raw_bytes;
+        const bool removed =
+            std::find(remove_ids.begin(), remove_ids.end(), id) != remove_ids.end();
+        if (!removed)
+            raw_bytes += position->second.shared->raw_bytes;
     }
     if (route_key.profile == ProfileId::P29V1) {
         if (!route.p29_route)
             throw std::logic_error("P29V1 recovery lost its C route state");
         route.p29_route->reset_v1_route(f_store_guid, history_nonce);
+    }
+
+    // Filter only the explicit F-unavailable rows after validating the entire
+    // retained suffix. Generic release() deliberately remains strict for
+    // unconfirmed staged entries and cannot safely remove a middle route TU.
+    for (const uint64_t id : remove_ids) {
+        auto position = impl_->entries.find(id);
+        if (position == impl_->entries.end())
+            throw std::logic_error("validated unavailable recovery entry disappeared");
+        Impl::Entry& entry = position->second;
+        impl_->retained_bytes -= entry.retained_bytes;
+        const PreparationRouteKey entry_route = entry.route;
+        const PrepareRequestKey request = entry.request;
+        const std::shared_ptr<Impl::Shared> shared = entry.shared;
+        route.speculative_entries.erase(
+            std::remove(route.speculative_entries.begin(),
+                        route.speculative_entries.end(), id),
+            route.speculative_entries.end());
+        impl_->entries.erase(position);
+        shared->entries.erase(entry_route);
+        if (shared->entries.empty())
+            impl_->requests.erase(request);
     }
     route.committed_route_history.clear();
     route.committed_route_history_digest = digest128(std::span<const uint8_t>{});
@@ -2500,6 +2546,8 @@ struct P50ClientEndpoint::Impl {
     std::map<uint64_t, R2SentBundle> r2_pending_bundles;
     bool r2_recovery_pending = false;
     std::optional<ResetRequest> r2_reset_retry;
+    std::vector<R2TxCommit> r2_recovery_receipts;
+    std::optional<ResetAck> r2_reset_ack_retry;
     std::optional<Id128> r2_recovery_operation;
     uint64_t r2_recovery_floor = 0;
     uint64_t r2_session_serial = 0;
@@ -4186,6 +4234,8 @@ boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
         impl_->r2_speculative_state = state.state_digest;
         impl_->r2_pending_bundles.clear();
         impl_->r2_recovery_pending = false;
+        impl_->r2_recovery_receipts.clear();
+        impl_->r2_reset_ack_retry.reset();
     } else {
         impl_->r2_recovery_pending = true;
     }
@@ -4221,6 +4271,26 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
          new_relationship_epoch <= state.relationship_epoch) ||
         (!impl_->r2_reset_retry && new_history_nonce == state.history_nonce))
         throw std::invalid_argument("F R2 reconnect state cannot be reconciled");
+
+    const bool reset_already_applied =
+        impl_->r2_reset_retry &&
+        state.relationship_epoch ==
+            impl_->r2_reset_retry->new_relationship_epoch &&
+        state.history_nonce == impl_->r2_reset_retry->new_history_nonce;
+    if (impl_->r2_reset_retry &&
+        ((state.relationship_epoch ==
+              impl_->r2_reset_retry->new_relationship_epoch) !=
+             (state.history_nonce == impl_->r2_reset_retry->new_history_nonce)))
+        throw std::invalid_argument("F R2 reset retry state has mixed identity");
+    if (reset_already_applied &&
+        (state.committed_prefix_k !=
+             impl_->r2_reset_retry->settled_prefix_k ||
+         state.acknowledged_prefix_q !=
+             impl_->r2_reset_retry->settled_prefix_k ||
+         impl_->r2_confirmed_ordinal <
+             impl_->r2_reset_retry->settled_prefix_k))
+        throw std::invalid_argument(
+            "F applied RESET differs from C's retained confirmed prefix");
 
     if (impl_->r2_recovery_operation) {
         if (*impl_->r2_recovery_operation != operation_id ||
@@ -4305,6 +4375,7 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
         witness.relationship_ordinal = sent.binding.relationship_ordinal;
         witness.binding_digest = sent.binding_digest;
         witness.transaction_digest = sent.transaction_digest;
+        witness.binding = sent.binding;
         witness.inner = sent.begin.inner;
         recovery_witnesses.push_back(witness);
     }
@@ -4315,54 +4386,62 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
                          static_cast<uint32_t>(recovery_witnesses.size()),
                          compute_r2_recovery_transcript_digest(
                              begin, recovery_witnesses)};
-    co_await async_write_message(socket, Message{begin}, frame_cap, stamp,
-                                 impl_->completions, control, verify);
-    for (const RecoverWitness& witness : recovery_witnesses)
-        co_await async_write_message(socket, Message{witness}, frame_cap, stamp,
-                                     impl_->completions, control, verify);
-    co_await async_write_message(socket, Message{end}, frame_cap, stamp,
-                                 impl_->completions, control, verify);
-
     std::vector<R2TxCommit> receipts;
-    const uint64_t expected_count =
-        state.committed_prefix_k - verified_floor_a;
-    if (expected_count > recovery_witnesses.size())
-        throw std::invalid_argument("F recovery K exceeds C's prepared prefix");
-    receipts.reserve(static_cast<size_t>(expected_count));
-    for (uint64_t index = 0; index != expected_count; ++index) {
+    if (reset_already_applied)
+        receipts = impl_->r2_recovery_receipts;
+    if (!reset_already_applied) {
+        co_await async_write_message(socket, Message{begin}, frame_cap, stamp,
+                                     impl_->completions, control, verify);
+        for (const RecoverWitness& witness : recovery_witnesses)
+            co_await async_write_message(socket, Message{witness}, frame_cap, stamp,
+                                         impl_->completions, control, verify);
+        co_await async_write_message(socket, Message{end}, frame_cap, stamp,
+                                     impl_->completions, control, verify);
+
+        const uint64_t expected_count =
+            state.committed_prefix_k - verified_floor_a;
+        if (expected_count > recovery_witnesses.size())
+            throw std::invalid_argument("F recovery K exceeds C's prepared prefix");
+        receipts.reserve(static_cast<size_t>(expected_count));
+        for (uint64_t index = 0; index != expected_count; ++index) {
+            stamp.operation = AsyncOperationKind::ReadHeader;
+            Frame receipt_frame = co_await async_read_frame(
+                socket, frame_cap, stamp, impl_->completions, verify);
+            if (receipt_frame.type != MessageType::RECEIPTS)
+                throw std::invalid_argument("F recovery omitted an exact receipt row");
+            const ReceiptRow row = decode_as<ReceiptRow>(receipt_frame);
+            const R2SentBundle& sent = witnesses[static_cast<size_t>(index)];
+            if (row.relationship_id != hello.relationship_id ||
+                row.relationship_epoch != hello.relationship_epoch ||
+                row.physical_link_generation != hello.physical_link_generation ||
+                row.operation_id != operation_id ||
+                row.receipt.relationship_ordinal != sent.binding.relationship_ordinal ||
+                row.receipt.binding_digest != sent.binding_digest ||
+                row.receipt.transaction_digest != sent.transaction_digest ||
+                !same_commit(row.receipt.inner, sent.begin.inner))
+                throw std::invalid_argument(
+                    "F recovery receipt differs from retained witness");
+            receipts.push_back(row.receipt);
+        }
         stamp.operation = AsyncOperationKind::ReadHeader;
-        Frame receipt_frame = co_await async_read_frame(
+        Frame receipts_end_frame = co_await async_read_frame(
             socket, frame_cap, stamp, impl_->completions, verify);
-        if (receipt_frame.type != MessageType::RECEIPTS)
-            throw std::invalid_argument("F recovery omitted an exact receipt row");
-        const ReceiptRow row = decode_as<ReceiptRow>(receipt_frame);
-        const R2SentBundle& sent = witnesses[static_cast<size_t>(index)];
-        if (row.relationship_id != hello.relationship_id ||
-            row.relationship_epoch != hello.relationship_epoch ||
-            row.physical_link_generation != hello.physical_link_generation ||
-            row.operation_id != operation_id ||
-            row.receipt.relationship_ordinal != sent.binding.relationship_ordinal ||
-            row.receipt.binding_digest != sent.binding_digest ||
-            row.receipt.transaction_digest != sent.transaction_digest ||
-            !same_commit(row.receipt.inner, sent.begin.inner))
-            throw std::invalid_argument("F recovery receipt differs from retained witness");
-        receipts.push_back(row.receipt);
+        if (receipts_end_frame.type != MessageType::RECEIPTS)
+            throw std::invalid_argument("F recovery omitted the receipt interval end");
+        const ReceiptsEnd receipts_end =
+            decode_as<ReceiptsEnd>(receipts_end_frame);
+        if (receipts_end.relationship_id != hello.relationship_id ||
+            receipts_end.relationship_epoch != hello.relationship_epoch ||
+            receipts_end.physical_link_generation !=
+                hello.physical_link_generation ||
+            receipts_end.operation_id != operation_id ||
+            receipts_end.verified_floor_a != verified_floor_a ||
+            receipts_end.committed_prefix_k != state.committed_prefix_k ||
+            receipts_end.acknowledged_prefix_q != state.acknowledged_prefix_q ||
+            receipts_end.receipt_count != receipts.size())
+            throw std::invalid_argument(
+                "F recovery interval end contradicts LINK_STATE");
     }
-    stamp.operation = AsyncOperationKind::ReadHeader;
-    Frame receipts_end_frame = co_await async_read_frame(
-        socket, frame_cap, stamp, impl_->completions, verify);
-    if (receipts_end_frame.type != MessageType::RECEIPTS)
-        throw std::invalid_argument("F recovery omitted the receipt interval end");
-    const ReceiptsEnd receipts_end = decode_as<ReceiptsEnd>(receipts_end_frame);
-    if (receipts_end.relationship_id != hello.relationship_id ||
-        receipts_end.relationship_epoch != hello.relationship_epoch ||
-        receipts_end.physical_link_generation != hello.physical_link_generation ||
-        receipts_end.operation_id != operation_id ||
-        receipts_end.verified_floor_a != verified_floor_a ||
-        receipts_end.committed_prefix_k != state.committed_prefix_k ||
-        receipts_end.acknowledged_prefix_q != state.acknowledged_prefix_q ||
-        receipts_end.receipt_count != receipts.size())
-        throw std::invalid_argument("F recovery interval end contradicts LINK_STATE");
 
     // Advance the client-side accepted cursor only after the entire interval
     // has been verified against the immutable sent witness list.
@@ -4384,6 +4463,10 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     }
     impl_->r2_confirmed_ordinal = state.committed_prefix_k;
     impl_->r2_link_state->committed_prefix_k = state.committed_prefix_k;
+    // Keep the exact positive witnesses until RESET_CONFIRM has been echoed.
+    // A lost RESET_ACK must not erase commits already accepted by the C route.
+    if (!reset_already_applied)
+        impl_->r2_recovery_receipts = receipts;
 
     ResetRequest reset = *impl_->r2_reset_retry;
     reset.physical_link_generation = hello.physical_link_generation;
@@ -4400,8 +4483,21 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
         initial_route_digest(impl_->c_guid, new_history_nonce);
     if (reset_ack.request != reset ||
         reset_ack.initial_state_digest != expected_initial ||
-        reset_ack.next_rel_seq.value != 0)
+        reset_ack.next_rel_seq.value != 0 ||
+        reset_ack.recovery_verified_floor_a != verified_floor_a ||
+        reset_ack.recovery_prepared_prefix_p != prepared_prefix_p ||
+        reset_ack.recovery_witness_digest !=
+            compute_r2_recovery_witness_digest(begin, recovery_witnesses))
         throw std::invalid_argument("F RESET_ACK differs from exact recovery reset");
+    if (impl_->r2_reset_ack_retry) {
+        ResetAck prior = *impl_->r2_reset_ack_retry;
+        prior.request.physical_link_generation = reset.physical_link_generation;
+        if (prior != reset_ack)
+            throw std::invalid_argument(
+                "F RESET_ACK replay changed the retained disposition snapshot");
+    } else {
+        impl_->r2_reset_ack_retry = reset_ack;
+    }
     ResetConfirm confirm{hello.relationship_id, new_relationship_epoch,
                          hello.physical_link_generation, operation_id,
                          new_history_nonce, state.committed_prefix_k};
@@ -4438,6 +4534,8 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     impl_->r2_pending_bundles.clear();
     impl_->r2_recovery_pending = false;
     impl_->r2_reset_retry.reset();
+    impl_->r2_recovery_receipts.clear();
+    impl_->r2_reset_ack_retry.reset();
     impl_->r2_recovery_operation.reset();
     impl_->r2_recovery_floor = 0;
     impl_->r2_session_serial = impl_->allocate_session();
@@ -4446,6 +4544,7 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     result.link_state = *impl_->r2_link_state;
     result.committed_receipts = std::move(receipts);
     result.reset_request = reset;
+    result.reset_ack = reset_ack;
     co_return result;
 }
 

@@ -1578,12 +1578,14 @@ sender_r2_accept_shared_failure(
     bool lose_reset_confirm = false,
     bool lose_reset_confirm_echo = false,
     bool mismatch_reset_confirm_echo = false,
+    bool change_reset_ack_on_replay = false,
     std::atomic<unsigned>* mismatched_echoes_sent = nullptr,
     std::atomic<bool>* exact_echo_waiting = nullptr,
     std::atomic<bool>* release_exact_echo = nullptr) {
     const size_t connection_count =
         (reject_stale_reconnect || close_reconnect_after_hello ||
          reject_after_positive_receipt) ? 1
+        : change_reset_ack_on_replay ? 4
         : (repeat_recovery_loss || lose_reset_confirm ||
            lose_reset_confirm_echo || mismatch_reset_confirm_echo) ? 3
         : (retire_after_positive_receipt || expire_after_positive_receipt) ? 1
@@ -1635,7 +1637,8 @@ sender_r2_accept_shared_failure(
             };
         } else if (index == 1 && repeat_recovery_loss) {
             control.close_before_write = MessageType::RESET_ACK;
-        } else if (index == 1 && lose_reset_confirm_echo) {
+        } else if ((index == 1 && lose_reset_confirm_echo) ||
+                   (index == 1 && change_reset_ack_on_replay)) {
             // F processes the exact confirmation, then loses the confirmation
             // echo before it can reach C. C must retain and retry this logical
             // operation instead of inventing a new RESET.
@@ -2676,6 +2679,7 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     std::mutex commit_mutex;
     std::condition_variable commit_cv;
     std::optional<R2TxCommit> retained_commit;
+    std::optional<JobBind> retained_binding;
     std::atomic<unsigned> materialized{0};
     std::atomic<unsigned> consumed{0};
     std::atomic<unsigned> resets{0};
@@ -2685,6 +2689,9 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     bool recovery_waiting = false;
     bool release_recovery = false;
     std::optional<ResetRequest> retained_reset;
+    uint64_t recovery_floor_a = 0;
+    uint64_t recovery_prefix_p = 0;
+    Digest128 recovery_witness_digest{};
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
     server_caps.profile = ProfileId::ZSTD_TU;
@@ -2720,7 +2727,8 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
             : hello.history_nonce;
         if (lease.reconnect) {
             lease.committed_prefix_k = repeat_interrupted_materialization ? 0 : 1;
-            lease.acknowledged_prefix_q = 0;
+            lease.acknowledged_prefix_q = retained_reset
+                ? retained_reset->settled_prefix_k : 0;
         }
         return lease;
     };
@@ -2735,6 +2743,10 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
             binding.raw_bytes != source.size() ||
             binding.raw_digest != icecc::digest128(source))
             return std::nullopt;
+        {
+            std::lock_guard lock(commit_mutex);
+            retained_binding = binding;
+        }
         ++consumed;
         P51SourceJobLease lease;
         lease.armed = armed;
@@ -2782,9 +2794,11 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
             std::span<const RecoverWitness> witnesses, const RecoverEnd& end)
             -> std::optional<P51RecoveryReceiptInterval> {
         std::optional<R2TxCommit> commit;
+        std::optional<JobBind> saved_binding;
         {
             std::lock_guard lock(commit_mutex);
             commit = retained_commit;
+            saved_binding = retained_binding;
         }
         const bool committed_before_recovery =
             !repeat_interrupted_materialization;
@@ -2793,11 +2807,16 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
             begin.verified_floor_a != 0 || begin.prepared_prefix_p != 1 ||
             witnesses.size() != 1 || end.witness_count != 1 ||
             witnesses.front().relationship_ordinal != 1 ||
+            !saved_binding || witnesses.front().binding != *saved_binding ||
             witnesses.front().inner.tu_seq.value != 0 ||
             witnesses.front().inner.raw_digest != icecc::digest128(source) ||
             (committed_before_recovery && !commit) ||
             (!committed_before_recovery && commit.has_value()))
             return std::nullopt;
+        recovery_floor_a = begin.verified_floor_a;
+        recovery_prefix_p = begin.prepared_prefix_p;
+        recovery_witness_digest =
+            compute_r2_recovery_witness_digest(begin, witnesses);
         if (retire_during_recovery) {
             std::unique_lock lock(recovery_gate_mutex);
             recovery_waiting = true;
@@ -2851,9 +2870,14 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
         } else if (request.old_relationship_epoch != hello.relationship_epoch) {
             return std::nullopt;
         }
-        return ResetAck{request,
-                        initial_route_digest(c_guid, request.new_history_nonce),
-                        RelSeq{}};
+        ResetAck ack{request,
+                     initial_route_digest(c_guid, request.new_history_nonce),
+                     RelSeq{}};
+        ack.recovery_verified_floor_a = recovery_floor_a;
+        ack.recovery_prepared_prefix_p = recovery_prefix_p;
+        ack.recovery_witness_digest = recovery_witness_digest;
+        ack.unavailable_suffix_mask = 0;
+        return ack;
     };
     server_config.commit_p51_reset =
         [&](const LinkHello&, const ResetRequest& request, const ResetAck&) {
@@ -3136,7 +3160,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool future_offer_during_recovery = false,
                                         bool lose_reset_confirm = false,
                                         bool lose_reset_confirm_echo = false,
-                                        bool mismatch_reset_confirm_echo = false) {
+                                        bool mismatch_reset_confirm_echo = false,
+                                        bool change_reset_ack_on_replay = false) {
     CHECK(kJobs >= 1 && kJobs <= 30);
     CHECK(!post_reset_offer_probe || kJobs == 2);
     CHECK(!future_offer_during_recovery ||
@@ -3149,6 +3174,10 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
           (kJobs == 2 && !repeat_recovery_loss && !post_reset_offer_probe &&
            !future_offer_during_recovery && !lose_reset_confirm &&
            !lose_reset_confirm_echo));
+    CHECK(!change_reset_ack_on_replay ||
+          (kJobs == 2 && !repeat_recovery_loss && !post_reset_offer_probe &&
+           !future_offer_during_recovery && !lose_reset_confirm &&
+           !lose_reset_confirm_echo && !mismatch_reset_confirm_echo));
     const size_t total_jobs = kJobs +
         ((post_reset_offer_probe || future_offer_during_recovery) ? 1 : 0);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
@@ -3159,6 +3188,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     const Id128 relationship_id = Id128::from_u64(0x5102);
     std::vector<P51SourceArmedFields> armed(total_jobs);
     std::vector<std::vector<uint8_t>> input(total_jobs);
+    std::vector<JobBind> expected_bindings(total_jobs);
     for (size_t index = 0; index != total_jobs; ++index) {
         auto arm = sender_r2_arm(c_guid, 921 + index,
                                  static_cast<uint32_t>(1921 + index),
@@ -3176,6 +3206,21 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             "extern int shared_preprocessed_line;\n" +
             "int p51_tail_" + std::to_string(index) + ";\n";
         input[index].assign(text.begin(), text.end());
+        JobBind expected;
+        expected.reservation_id = Id128{armed[index].reservation_id};
+        expected.physical_link_generation = 41;
+        expected.relationship_ordinal = index + 1;
+        expected.wire_job_id = armed[index].arm.source.wire_job_id;
+        expected.assignment_epoch = armed[index].arm.source.assignment_epoch;
+        expected.assignment_nonce = armed[index].arm.source.assignment_nonce;
+        expected.logical_job = armed[index].arm.source.logical_job;
+        expected.compiler_attempt = armed[index].arm.source.compiler_attempt;
+        expected.source_request_id = armed[index].arm.source.source_request_id;
+        expected.tu_seq = TuSeq{index};
+        expected.profile = profile;
+        expected.raw_bytes = input[index].size();
+        expected.raw_digest = icecc::digest128(input[index]);
+        expected_bindings[index] = expected;
     }
     if (future_offer_during_recovery) {
         // The F reset will verify epoch+1; this offer is deliberately one
@@ -3189,7 +3234,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
         std::chrono::steady_clock::now() +
             ((lose_reset_confirm || lose_reset_confirm_echo ||
-              mismatch_reset_confirm_echo)
+              mismatch_reset_confirm_echo || change_reset_ack_on_replay)
                  ? std::chrono::seconds(10)
              : reject_after_positive_receipt
                  ? std::chrono::seconds(8)
@@ -3220,6 +3265,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::atomic<bool> exact_reset_echo_waiting{false};
     std::atomic<bool> release_exact_reset_echo{false};
     std::atomic<unsigned> mismatched_echoes_sent{0};
+    std::atomic<unsigned> changed_reset_acks_sent{0};
     std::atomic<unsigned> recovery_retry_waiters_seen{0};
     std::atomic<bool> future_offer_entered_recovery{false};
     std::atomic<bool> retry_wait_registered{false};
@@ -3238,14 +3284,19 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     }
     std::mutex commit_mutex;
     std::vector<std::optional<R2TxCommit>> retained_commits(total_jobs);
+    std::vector<std::optional<JobBind>> retained_bindings(total_jobs);
     std::optional<ResetRequest> retained_reset;
     std::vector<ResetRequest> reset_requests;
     std::vector<ResetRequest> reset_validation_requests;
+    std::optional<ResetAck> retained_reset_ack_snapshot;
     std::vector<ResetConfirm> reset_confirm_messages;
     bool retained_reset_confirmed = false;
     uint64_t committed_prefix_k = 0;
     uint64_t acknowledged_prefix_q = 0;
     std::optional<HistoryNonce> initial_history_nonce;
+    uint64_t recovery_floor_a = 0;
+    uint64_t recovery_prefix_p = 0;
+    Digest128 recovery_witness_digest{};
 
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
@@ -3294,7 +3345,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                 hello.history_nonce == *initial_history_nonce;
             const bool retained_reset_identity =
                 (lose_reset_confirm || lose_reset_confirm_echo ||
-                 mismatch_reset_confirm_echo) &&
+                 mismatch_reset_confirm_echo || change_reset_ack_on_replay) &&
                 retained_reset &&
                 hello.relationship_epoch ==
                     retained_reset->new_relationship_epoch &&
@@ -3360,8 +3411,13 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         if (prior != 0 &&
             (hello.start_mode != LinkStartMode::Reconnect || index != 1 ||
              (!(lose_reset_confirm || lose_reset_confirm_echo ||
-                mismatch_reset_confirm_echo) && prior != 1)))
+                mismatch_reset_confirm_echo || change_reset_ack_on_replay) &&
+              prior != 1)))
             return std::nullopt;
+        {
+            std::lock_guard lock(commit_mutex);
+            retained_bindings[index] = binding;
+        }
         P51SourceJobLease lease;
         lease.armed = armed[index];
         lease.armed.relationship_epoch = hello.relationship_epoch;
@@ -3417,14 +3473,20 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         [&](const LinkHello& hello, const RecoverBegin& begin,
             std::span<const RecoverWitness> witnesses, const RecoverEnd& end)
             -> std::optional<P51RecoveryReceiptInterval> {
+        recovery_floor_a = begin.verified_floor_a;
+        recovery_prefix_p = begin.prepared_prefix_p;
+        recovery_witness_digest =
+            compute_r2_recovery_witness_digest(begin, witnesses);
         std::vector<R2TxCommit> available_commits;
+        std::vector<std::optional<JobBind>> available_bindings;
         {
             std::lock_guard lock(commit_mutex);
             for (const auto& commit : retained_commits)
                 if (commit) available_commits.push_back(*commit);
+            available_bindings = retained_bindings;
         }
         if (lose_reset_confirm || lose_reset_confirm_echo ||
-            mismatch_reset_confirm_echo) {
+            mismatch_reset_confirm_echo || change_reset_ack_on_replay) {
             if (hello.start_mode != LinkStartMode::Reconnect ||
                 begin.relationship_id != relationship_id ||
                 begin.verified_floor_a > begin.prepared_prefix_p ||
@@ -3434,19 +3496,46 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                 begin.witness_count != witnesses.size() ||
                 end.witness_count != witnesses.size() ||
                 committed_prefix_k < begin.verified_floor_a ||
-                committed_prefix_k > begin.prepared_prefix_p)
+                committed_prefix_k > begin.prepared_prefix_p) {
+                std::fprintf(stderr,
+                    "fixture recover range mismatch A=%llu P=%llu count=%u vector=%zu end=%u K=%llu total=%zu mode=%u\n",
+                    static_cast<unsigned long long>(begin.verified_floor_a),
+                    static_cast<unsigned long long>(begin.prepared_prefix_p),
+                    begin.witness_count, witnesses.size(), end.witness_count,
+                    static_cast<unsigned long long>(committed_prefix_k),
+                    total_jobs, static_cast<unsigned>(hello.start_mode));
                 return std::nullopt;
+            }
             for (size_t index = 0; index != witnesses.size(); ++index) {
                 const auto& witness = witnesses[index];
                 const size_t job = static_cast<size_t>(
                     begin.verified_floor_a + index);
                 if (job >= total_jobs ||
+                    job >= available_bindings.size() ||
+                    witness.binding != expected_bindings[job] ||
+                    (available_bindings[job] &&
+                     witness.binding != *available_bindings[job]) ||
                     witness.relationship_ordinal != job + 1 ||
                     witness.inner.tu_seq.value != job ||
                     witness.inner.profile != profile ||
                     witness.inner.raw_bytes != input[job].size() ||
-                    witness.inner.raw_digest != icecc::digest128(input[job]))
+                    witness.inner.raw_digest != icecc::digest128(input[job])) {
+                    std::fprintf(stderr,
+                        "fixture recover witness mismatch index=%zu job=%zu has_binding=%d binding_eq=%d ordinal=%llu tu=%llu profile=%u bytes=%llu expected_bytes=%zu\n",
+                        index, job,
+                        job < available_bindings.size() &&
+                            available_bindings[job].has_value(),
+                        job < available_bindings.size() &&
+                            available_bindings[job] &&
+                            witness.binding == *available_bindings[job],
+                        static_cast<unsigned long long>(
+                            witness.relationship_ordinal),
+                        static_cast<unsigned long long>(witness.inner.tu_seq.value),
+                        static_cast<unsigned>(witness.inner.profile),
+                        static_cast<unsigned long long>(witness.inner.raw_bytes),
+                        job < input.size() ? input[job].size() : 0);
                     return std::nullopt;
+                }
             }
             P51RecoveryReceiptInterval interval;
             for (uint64_t ordinal = begin.verified_floor_a + 1;
@@ -3511,6 +3600,10 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             return std::nullopt;
         for (size_t index = 0; index != kJobs; ++index) {
             if (witnesses[index].relationship_ordinal != index + 1 ||
+                witnesses[index].binding != expected_bindings[index] ||
+                (index < available_bindings.size() &&
+                 available_bindings[index] &&
+                 witnesses[index].binding != *available_bindings[index]) ||
                 witnesses[index].inner.tu_seq.value != index ||
                 witnesses[index].inner.history_nonce != *initial_history_nonce ||
                 witnesses[index].inner.profile != profile ||
@@ -3534,7 +3627,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         [&](const LinkHello& hello, const ResetRequest& request)
             -> std::optional<ResetAck> {
         if (lose_reset_confirm || lose_reset_confirm_echo ||
-            mismatch_reset_confirm_echo) {
+            mismatch_reset_confirm_echo || change_reset_ack_on_replay) {
             reset_validation_requests.push_back(request);
             if (request.relationship_id != hello.relationship_id ||
                 request.physical_link_generation !=
@@ -3570,10 +3663,32 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                        request.old_history_nonce != hello.history_nonce) {
                 return std::nullopt;
             }
-            return ResetAck{request,
-                            initial_route_digest(c_guid,
-                                                 request.new_history_nonce),
-                            RelSeq{}};
+            ResetAck ack{request,
+                         initial_route_digest(c_guid,
+                                              request.new_history_nonce),
+                         RelSeq{}};
+            ack.recovery_verified_floor_a = recovery_floor_a;
+            ack.recovery_prepared_prefix_p = recovery_prefix_p;
+            ack.recovery_witness_digest = recovery_witness_digest;
+            ack.unavailable_suffix_mask = 0;
+            if (change_reset_ack_on_replay) {
+                if (!retained_reset_ack_snapshot) {
+                    retained_reset_ack_snapshot = ack;
+                } else if (changed_reset_acks_sent.exchange(
+                               1, std::memory_order_acq_rel) == 0) {
+                    CHECK(ack.recovery_prepared_prefix_p >
+                          request.settled_prefix_k);
+                    ResetAck changed = ack;
+                    changed.unavailable_suffix_mask = 1;
+                    return changed;
+                } else {
+                    ResetAck exact = *retained_reset_ack_snapshot;
+                    exact.request.physical_link_generation =
+                        request.physical_link_generation;
+                    return exact;
+                }
+            }
+            return ack;
         }
         if (request.settled_prefix_k != 1 ||
             request.old_relationship_epoch != hello.relationship_epoch ||
@@ -3591,9 +3706,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
              retained_reset->new_history_nonce != request.new_history_nonce ||
              retained_reset->settled_prefix_k != request.settled_prefix_k))
             return std::nullopt;
-        return ResetAck{request,
-                        initial_route_digest(c_guid, request.new_history_nonce),
-                        RelSeq{}};
+        ResetAck ack{request,
+                     initial_route_digest(c_guid, request.new_history_nonce),
+                     RelSeq{}};
+        ack.recovery_verified_floor_a = recovery_floor_a;
+        ack.recovery_prepared_prefix_p = recovery_prefix_p;
+        ack.recovery_witness_digest = recovery_witness_digest;
+        ack.unavailable_suffix_mask = 0;
+        return ack;
     };
     server_config.commit_p51_reset =
         [&](const LinkHello&, const ResetRequest& request, const ResetAck&) {
@@ -3658,7 +3778,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             &positive_receipt_validated, &server_reset_complete,
             future_offer_during_recovery ? &reset_ack_loss_complete : nullptr,
             lose_reset_confirm, lose_reset_confirm_echo,
-            mismatch_reset_confirm_echo, &mismatched_echoes_sent,
+            mismatch_reset_confirm_echo, change_reset_ack_on_replay,
+            &mismatched_echoes_sent,
             &exact_reset_echo_waiting, &release_exact_reset_echo),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
@@ -4062,7 +4183,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     for (size_t index = 1; index != kJobs; ++index)
         CHECK(commits[index].load() == 1);
     if (lose_reset_confirm || lose_reset_confirm_echo ||
-        mismatch_reset_confirm_echo) {
+        mismatch_reset_confirm_echo || change_reset_ack_on_replay) {
         CHECK(reset_confirms_received.load(std::memory_order_acquire) >= 2);
         CHECK(!drop_first_reset_confirm.load(std::memory_order_acquire));
         CHECK(retained_reset.has_value());
@@ -4071,6 +4192,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         CHECK(reset_confirm_messages.size() >= 2);
         if (mismatch_reset_confirm_echo)
             CHECK(mismatched_echoes_sent.load(std::memory_order_acquire) == 1);
+        if (change_reset_ack_on_replay) {
+            CHECK(changed_reset_acks_sent.load(std::memory_order_acquire) == 1);
+            CHECK(retained_reset_ack_snapshot.has_value());
+            CHECK(retained_reset_ack_snapshot->recovery_prepared_prefix_p == 2);
+            CHECK(retained_reset_ack_snapshot->request.settled_prefix_k == 1);
+            CHECK(retained_reset_ack_snapshot->unavailable_suffix_mask == 0);
+            CHECK(reset_validation_requests.size() == 3);
+        }
         const ResetRequest& first_reset = reset_validation_requests.front();
         for (const ResetRequest& replay : reset_validation_requests) {
             CHECK(replay.operation_id == first_reset.operation_id);
@@ -4122,12 +4251,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
           ((retire_after_positive_receipt || expire_after_positive_receipt)
                ? 1U : (repeat_recovery_loss || lose_reset_confirm ||
                        lose_reset_confirm_echo ||
-                       mismatch_reset_confirm_echo) ? 3U : 2U));
+                       mismatch_reset_confirm_echo) ? 3U :
+              change_reset_ack_on_replay ? 4U : 2U));
     CHECK(binds[0].load() == 1);
     for (size_t index = 1; index != kJobs; ++index)
         CHECK((lose_reset_confirm || lose_reset_confirm_echo ||
-               mismatch_reset_confirm_echo)
-                  ? binds[index].load() >= 1 && binds[index].load() <= 3
+               mismatch_reset_confirm_echo || change_reset_ack_on_replay)
+                  ? binds[index].load() >= 1 &&
+                        binds[index].load() <= (change_reset_ack_on_replay ? 4 : 3)
                   : binds[index].load() == 1); // suffix binds after reset
 
     if (post_reset_offer_probe) {
@@ -4199,7 +4330,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     f_context.stop();
     c_thread.join();
     f_thread.join();
-    CHECK(server_runs.size() == ((repeat_recovery_loss || lose_reset_confirm ||
+    CHECK(server_runs.size() == (change_reset_ack_on_replay ? 4U :
+        (repeat_recovery_loss || lose_reset_confirm ||
                                   lose_reset_confirm_echo ||
                                   mismatch_reset_confirm_echo) ? 3U
         : (retire_after_positive_receipt || expire_after_positive_receipt)
@@ -4266,6 +4398,15 @@ void test_p51_sender_rejects_mismatched_reset_confirm_echo_for_all_profiles() {
         run_p51_sender_shared_failure_case(
             2, profile, false, false, false, false, false, false, false,
             false, false, false, false, true);
+    }
+}
+
+void test_p51_sender_rejects_changed_reset_ack_snapshot_for_all_profiles() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        run_p51_sender_shared_failure_case(
+            2, profile, false, false, false, false, false, false, false,
+            false, false, false, false, false, true);
     }
 }
 
@@ -4955,6 +5096,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--changed-reset-ack-replay") {
+        test_p51_sender_rejects_changed_reset_ack_snapshot_for_all_profiles();
+        std::cerr << "P51_SENDER_CHANGED_RESET_ACK_REPLAY_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--mismatched-reset-confirm-echo") {
         test_p51_sender_rejects_mismatched_reset_confirm_echo_for_all_profiles();
         std::cerr << "P51_SENDER_MISMATCHED_RESET_CONFIRM_ECHO_SELECTOR PASS\n";
@@ -5055,6 +5202,8 @@ int main(int argc, char** argv) {
         test_p51_sender_replays_lost_reset_confirm_for_all_profiles);
     run("mismatched_reset_confirm_echo",
         test_p51_sender_rejects_mismatched_reset_confirm_echo_for_all_profiles);
+    run("changed_reset_ack_replay",
+        test_p51_sender_rejects_changed_reset_ack_snapshot_for_all_profiles);
     run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
     run("reconnect_backoff", test_p51_sender_reconnect_backoff_bounds_shared_eof);
     run("retry_wait_retire", test_p51_sender_retirement_wakes_shared_retry_waiter);
