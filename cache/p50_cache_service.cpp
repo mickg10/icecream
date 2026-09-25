@@ -2423,7 +2423,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     }
                     }
                     if (observed.replacement_required && !observed.route_local_failure)
-                        latch_route_replacement();
+                        latch_route_replacement(
+                            observed.replacement_trigger);
                     value = source_transfer_result(observed, expected_c_guid);
                 } catch (const P29V1CapabilityUnavailable&) {
                     latch_route_replacement();
@@ -2434,7 +2435,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     observed.status = ZstdSourceTransferStatus::TerminalError;
                     observed.profile = relationship.profile;
                     observed.replacement_required = true;
-                    latch_route_replacement();
+                    observed.replacement_trigger =
+                        ReplacementTrigger::UnexpectedTransferException;
+                    latch_route_replacement(observed.replacement_trigger);
                     value = source_transfer_result(observed, expected_c_guid);
                 }
                 const auto source_service_elapsed =
@@ -2454,7 +2457,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             },
             asio::detached);
     } catch (...) {
-        latch_route_replacement();
+        latch_route_replacement(
+            ReplacementTrigger::UnexpectedTransferException);
         return source_transfer_error(static_cast<uint16_t>(
             local::SourceTransferErrorCode::RouteReplacementRequired));
     }
@@ -3062,14 +3066,17 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                     }
                     if (observed.replacement_required &&
                         !observed.route_local_failure)
-                        latch_route_replacement();
+                        latch_route_replacement(
+                            observed.replacement_trigger);
                     result = source_transfer_result(
                         observed, config_.c_store_guid, true);
                 } catch (...) {
                     observed.status = ZstdSourceTransferStatus::TerminalError;
                     observed.profile = relationship.profile;
                     observed.replacement_required = true;
-                    latch_route_replacement();
+                    observed.replacement_trigger =
+                        ReplacementTrigger::UnexpectedTransferException;
+                    latch_route_replacement(observed.replacement_trigger);
                     result = source_transfer_result(
                         observed, config_.c_store_guid, true);
                 }
@@ -3120,7 +3127,8 @@ bool SidecarRuntime::bind_route_endpoint_identity(
     if (retired_source_incarnations_.size() >=
             config_.max_route_endpoint_identities &&
         !retired_source_incarnations_.contains(retired)) {
-        latch_route_replacement();
+        latch_route_replacement(
+            ReplacementTrigger::EndpointIdentityRetirementCapacity);
         return false;
     }
     const SourceIncarnationKey successor{observed.guid, observed.generation};
@@ -3149,7 +3157,8 @@ bool SidecarRuntime::bind_route_endpoint_identity(
     try {
         retired_source_incarnations_.insert(retired);
     } catch (...) {
-        latch_route_replacement();
+        latch_route_replacement(
+            ReplacementTrigger::UnexpectedTransferException);
         return false;
     }
     position->second = observed;
@@ -3532,10 +3541,22 @@ void SidecarRuntime::release_source_admission(
     }
 }
 
-void SidecarRuntime::latch_route_replacement() noexcept {
-    route_replacement_required_.store(true, std::memory_order_release);
+void SidecarRuntime::latch_route_replacement(
+    ReplacementTrigger trigger) noexcept {
+    bool expected = false;
+    if (!route_replacement_required_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return;
     source_setup_cancelled_->store(true, std::memory_order_release);
     source_admission_changed_.notify_all();
+    const char* diagnostics = std::getenv("ICECC_P50_DIAGNOSTICS");
+    if (diagnostics != nullptr && std::strcmp(diagnostics, "1") == 0) {
+        std::fprintf(stderr,
+                     "P51_REPLACEMENT_TRIGGER {\"schema_version\":1,\"reason\":\"%s\"}\n",
+                     replacement_trigger_name(trigger));
+        std::fflush(stderr);
+    }
 }
 
 SidecarRuntime::~SidecarRuntime() {

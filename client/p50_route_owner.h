@@ -146,6 +146,7 @@ private:
 
     [[nodiscard]] ZstdSourceTransferResult invalid() const noexcept;
     [[nodiscard]] ZstdSourceTransferResult replacement() const noexcept;
+    void require_replacement(ReplacementTrigger trigger) noexcept;
     [[nodiscard]] PreparationRouteKey route_key(
         const P50RouteRelationship& relationship) const noexcept;
     Sender& get_or_create(const P50RouteRelationship& relationship,
@@ -172,6 +173,8 @@ private:
     // Once any sender reports ambiguous state, no other relationship may
     // open F even if the wrapper that observed the first failure disappears.
     bool replacement_required_ = false;
+    ReplacementTrigger replacement_trigger_ =
+        ReplacementTrigger::Unattributed;
 };
 
 }  // namespace icecc::p50

@@ -840,6 +840,8 @@ void test_p51_completed_ledger_reserves_live_capacity() {
     CHECK(values[0]->status == ZstdSourceTransferStatus::Committed);
     CHECK(values[1]->status == ZstdSourceTransferStatus::Unavailable);
     CHECK(values[1]->replacement_required);
+    CHECK(values[1]->replacement_trigger ==
+          ReplacementTrigger::CompletedRequestCapacity);
     CHECK(values[1]->attempts == 0);
     CHECK((values[0]->committed_input == std::optional<InputRecordKey>{
         InputRecordKey{c_guid, TuSeq{0}}}));
@@ -1157,6 +1159,8 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
         std::memory_order_acquire));
     CHECK(replacement.status == ZstdSourceTransferStatus::Unavailable);
     CHECK(replacement.replacement_required);
+    CHECK(replacement.replacement_trigger ==
+          ReplacementTrigger::ExpiredUnresolvedWitness);
     CHECK(replacement.attempts == 0);
     CHECK(std::chrono::steady_clock::now() - old_deadline <
           std::chrono::seconds(3));
@@ -1177,6 +1181,8 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
     const auto after_result = after.get();
     CHECK(after_result.status == ZstdSourceTransferStatus::Unavailable);
     CHECK(after_result.replacement_required);
+    CHECK(after_result.replacement_trigger ==
+          ReplacementTrigger::ExpiredUnresolvedWitness);
     CHECK(after_result.attempts == 0);
     CHECK(bundles_sent.load(std::memory_order_acquire) == 1);
     CHECK(connector_calls_after_expiry.load(std::memory_order_acquire) == 0);

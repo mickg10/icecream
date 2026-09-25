@@ -76,7 +76,15 @@ ZstdSourceTransferResult P50CRouteOwner::replacement() const noexcept {
     ZstdSourceTransferResult result;
     result.status = ZstdSourceTransferStatus::Unavailable;
     result.replacement_required = true;
+    result.replacement_trigger = replacement_trigger_;
     return result;
+}
+
+void P50CRouteOwner::require_replacement(
+    ReplacementTrigger trigger) noexcept {
+    if (!replacement_required_)
+        replacement_trigger_ = trigger;
+    replacement_required_ = true;
 }
 
 P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
@@ -234,15 +242,17 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     } catch (const std::invalid_argument&) {
         co_return invalid();
     } catch (const std::length_error&) {
-        replacement_required_ = true;
+        require_replacement(ReplacementTrigger::Unattributed);
         co_return replacement();
     }
     // The sender retains only this relationship's route view and retry
     // ledger; TU identity is allocated by the shared C authority.
     ZstdSourceTransferResult result =
         co_await sender->transfer_route(remote, request, deadline, source);
-    if (result.replacement_required && !result.route_local_failure)
-        replacement_required_ = true;
+    if (result.replacement_required && !result.route_local_failure) {
+        require_replacement(result.replacement_trigger);
+        result.replacement_trigger = replacement_trigger_;
+    }
     co_return result;
 }
 
@@ -264,13 +274,15 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     } catch (const std::invalid_argument&) {
         co_return invalid();
     } catch (const std::length_error&) {
-        replacement_required_ = true;
+        require_replacement(ReplacementTrigger::Unattributed);
         co_return replacement();
     }
     ZstdSourceTransferResult result = co_await sender->transfer_route(
         std::move(connection), request, deadline, source);
-    if (result.replacement_required && !result.route_local_failure)
-        replacement_required_ = true;
+    if (result.replacement_required && !result.route_local_failure) {
+        require_replacement(result.replacement_trigger);
+        result.replacement_trigger = replacement_trigger_;
+    }
     co_return result;
 }
 
@@ -292,13 +304,15 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     } catch (const std::invalid_argument&) {
         co_return invalid();
     } catch (const std::length_error&) {
-        replacement_required_ = true;
+        require_replacement(ReplacementTrigger::Unattributed);
         co_return replacement();
     }
     ZstdSourceTransferResult result = co_await sender->transfer_route(
         std::move(connection), request, deadline, source);
-    if (result.replacement_required && !result.route_local_failure)
-        replacement_required_ = true;
+    if (result.replacement_required && !result.route_local_failure) {
+        require_replacement(result.replacement_trigger);
+        result.replacement_trigger = replacement_trigger_;
+    }
     co_return result;
 }
 
@@ -506,7 +520,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
             p51_incarnation_profiles_.erase(incarnation);
         if (owners_.find(relationship) == owners_.end())
             p51_link_identities_.erase(relationship);
-        replacement_required_ = true;
+        require_replacement(ReplacementTrigger::RouteOwnerAdmissionException);
         co_return replacement();
     }
     ZstdSourceTransferResult result = co_await sender->transfer_p51_route(
@@ -553,8 +567,10 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
         result.replacement_required = false;
         result.route_local_failure = true;
     }
-    if (result.replacement_required && !result.route_local_failure)
-        replacement_required_ = true;
+    if (result.replacement_required && !result.route_local_failure) {
+        require_replacement(result.replacement_trigger);
+        result.replacement_trigger = replacement_trigger_;
+    }
     sender.reset();
     reap_retired_senders();
     co_return result;
@@ -617,7 +633,7 @@ bool P50CRouteOwner::reset_f_store_exact(
             ++position;
     }
     if (!reset)
-        replacement_required_ = true;
+        require_replacement(ReplacementTrigger::Unattributed);
     return reset;
 }
 

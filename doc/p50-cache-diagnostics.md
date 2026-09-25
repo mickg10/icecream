@@ -46,6 +46,31 @@ observation of actual service enqueue. These intervals also do not measure
 scheduler assignment-to-client-entry delay, so they cannot alone account for
 all scheduler WAIT time.
 
+## Sidecar replacement trigger
+
+With the same exact `ICECC_P50_DIAGNOSTICS=1` opt-in, the sidecar emits one
+`P51_REPLACEMENT_TRIGGER {json}` record when it first latches whole-sidecar
+route replacement. Its fields are `schema_version` (1) and `reason`:
+
+| Reason | Observed origin |
+| --- | --- |
+| `completed_request_capacity` | A sender's completed-request ledger reaches its configured capacity |
+| `expired_unresolved_witness` | A retained unresolved request reaches its original deadline |
+| `route_owner_admission_exception` | The route owner's R2 admission path throws into its replacement handler |
+| `endpoint_identity_retirement_capacity` | The retired endpoint-identity set reaches its configured capacity |
+| `unexpected_transfer_exception` | A classified transfer/setup exception requests replacement |
+| `unattributed` | Replacement originates from a path without a more specific classification |
+
+The first latch wins, including when its reason is `unattributed`; later
+failures do not relabel it. Cancellation is signalled before the record is
+written. These are local diagnostic categories, not new wire fields or
+changes to limits, recovery, or replacement policy. Exception categories
+identify the handler, not the underlying exception's cause. The record has
+no source data, endpoint identities, or per-relationship operation counts;
+join it with the containing process's service logs. A missing record alone
+does not establish that no replacement occurred (for example, diagnostics
+may be disabled or logging interrupted).
+
 ## Retry and service records
 
 The client writes `P50_RETRY_DIAG {json}` once for each Error 106 retry

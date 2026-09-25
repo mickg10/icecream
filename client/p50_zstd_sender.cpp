@@ -299,25 +299,34 @@ struct P50ZstdSourceSender::Impl {
     }
 
     void require_replacement(ZstdSourceTransferResult& result,
-                             bool persistent_route) noexcept {
+                             bool persistent_route,
+                             ReplacementTrigger trigger =
+                                 ReplacementTrigger::Unattributed) noexcept {
         if (!persistent_route)
             return;
+        if (!route_replacement_required) {
+            route_replacement_trigger = trigger;
+        }
         route_replacement_required = true;
         wake_r2_recovery_waiters();
         wake_r2_completed_capacity_waiters();
         result.replacement_required = true;
+        result.replacement_trigger = route_replacement_trigger;
     }
 
     ZstdSourceTransferResult replacement(
-        ZstdSourceTransferStatus status, bool persistent_route) noexcept {
+        ZstdSourceTransferStatus status, bool persistent_route,
+        ReplacementTrigger trigger =
+            ReplacementTrigger::Unattributed) noexcept {
         ZstdSourceTransferResult result = invalid(status);
-        require_replacement(result, persistent_route);
+        require_replacement(result, persistent_route, trigger);
         return result;
     }
 
     ZstdSourceTransferResult r2_route_replacement_result(
         ZstdSourceTransferStatus status) noexcept {
         ZstdSourceTransferResult result = replacement(status, true);
+        result.replacement_trigger = route_replacement_trigger;
         std::lock_guard lock(r2_transfer_mutex);
         if (r2_terminal_rejection) {
             result.status = ZstdSourceTransferStatus::TerminalError;
@@ -357,6 +366,8 @@ struct P50ZstdSourceSender::Impl {
         {
             std::lock_guard lock(r2_transfer_mutex);
             r2_terminal_rejection = route_rejection;
+            if (!route_replacement_required)
+                route_replacement_trigger = ReplacementTrigger::Unattributed;
             route_replacement_required = true;
             route_transport_quarantined = true;
             r2_recovery_required = false;
@@ -506,6 +517,8 @@ struct P50ZstdSourceSender::Impl {
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
     bool route_replacement_required = false;
+    ReplacementTrigger route_replacement_trigger =
+        ReplacementTrigger::Unattributed;
     bool route_transport_quarantined = false;
 
     void wake_r2_completed_capacity_waiters() noexcept {
@@ -559,6 +572,8 @@ struct P50ZstdSourceSender::Impl {
                 // instead of allowing repeated fresh callers to spin through
                 // failed recovery attempts or extending that deadline.
                 route_replacement_required = true;
+                route_replacement_trigger =
+                    ReplacementTrigger::ExpiredUnresolvedWitness;
                 route_transport_quarantined = true;
             } else {
                 expired = false;
@@ -1691,7 +1706,8 @@ P50ZstdSourceSender::transfer_p51_route(
                         ZstdSourceTransferStatus::Unavailable);
                 if (permanently_full)
                     co_return impl_->replacement(
-                        ZstdSourceTransferStatus::Unavailable, true);
+                        ZstdSourceTransferStatus::Unavailable, true,
+                        ReplacementTrigger::CompletedRequestCapacity);
                 ZstdSourceTransferResult unavailable = impl_->invalid(
                     Clock::now() >= deadline
                         ? ZstdSourceTransferStatus::DeadlineExceeded
@@ -1852,6 +1868,9 @@ P50ZstdSourceSender::transfer_p51_route(
             boost::system::error_code error;
             auto socket = P50ClientEndpoint::adopt_connected_fd(executor, fd, error);
             if (!socket) {
+                if (!impl_->route_replacement_required)
+                    impl_->route_replacement_trigger =
+                        ReplacementTrigger::UnexpectedTransferException;
                 impl_->route_replacement_required = true;
                 impl_->wake_r2_completed_capacity_waiters();
                 throw std::runtime_error("R2 link socket adoption failed");

@@ -52,6 +52,36 @@ enum class ZstdSourceTransferStatus : uint8_t {
     CommittedIdentityUnavailable,
 };
 
+// Local-only first-cause attribution for whole-route replacement. This enum
+// is diagnostic metadata; it is never serialized on CacheWire.
+enum class ReplacementTrigger : uint8_t {
+    Unattributed,
+    CompletedRequestCapacity,
+    ExpiredUnresolvedWitness,
+    RouteOwnerAdmissionException,
+    EndpointIdentityRetirementCapacity,
+    UnexpectedTransferException,
+};
+
+[[nodiscard]] constexpr const char* replacement_trigger_name(
+    ReplacementTrigger trigger) noexcept {
+    switch (trigger) {
+    case ReplacementTrigger::CompletedRequestCapacity:
+        return "completed_request_capacity";
+    case ReplacementTrigger::ExpiredUnresolvedWitness:
+        return "expired_unresolved_witness";
+    case ReplacementTrigger::RouteOwnerAdmissionException:
+        return "route_owner_admission_exception";
+    case ReplacementTrigger::EndpointIdentityRetirementCapacity:
+        return "endpoint_identity_retirement_capacity";
+    case ReplacementTrigger::UnexpectedTransferException:
+        return "unexpected_transfer_exception";
+    case ReplacementTrigger::Unattributed:
+    default:
+        return "unattributed";
+    }
+}
+
 // A validated R2_LINK_REJECT is a terminal result for one exact logical
 // route offer. Keep the complete canonical offer so the route owner can retire
 // only the matching relationship/incarnation; it is never a commit witness.
@@ -81,6 +111,7 @@ struct ZstdSourceTransferResult {
     // Unless route_local_failure is set, the supervised C sidecar must be
     // replaced before any relationship accepts a new request.
     bool replacement_required = false;
+    ReplacementTrigger replacement_trigger = ReplacementTrigger::Unattributed;
     // Transport exhaustion retains/quarantines only this relationship. It
     // must not retire the shared C owner or reject other F relationships.
     // Never set for typed preparation poison or uncertain local state.

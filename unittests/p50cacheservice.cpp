@@ -890,6 +890,103 @@ service::RuntimeConfig test_runtime_config() {
     return config;
 }
 
+void test_replacement_trigger_latches_once_and_is_opt_in() {
+    struct Environment {
+        std::optional<std::string> prior;
+        explicit Environment(const char* value) {
+            if (const char* old = std::getenv("ICECC_P50_DIAGNOSTICS"))
+                prior = old;
+            if (value)
+                CHECK(::setenv("ICECC_P50_DIAGNOSTICS", value, 1) == 0);
+            else
+                CHECK(::unsetenv("ICECC_P50_DIAGNOSTICS") == 0);
+        }
+        ~Environment() {
+            if (prior)
+                (void)::setenv("ICECC_P50_DIAGNOSTICS", prior->c_str(), 1);
+            else
+                (void)::unsetenv("ICECC_P50_DIAGNOSTICS");
+        }
+    };
+    struct Capture {
+        FILE* file = nullptr;
+        int saved_stderr = -1;
+        Capture() {
+            file = std::tmpfile();
+            CHECK(file != nullptr);
+            saved_stderr = ::dup(STDERR_FILENO);
+            CHECK(saved_stderr >= 0);
+            CHECK(::dup2(::fileno(file), STDERR_FILENO) == STDERR_FILENO);
+        }
+        std::string finish() {
+            CHECK(::fflush(stderr) == 0);
+            CHECK(::dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO);
+            ::close(saved_stderr);
+            saved_stderr = -1;
+            CHECK(std::fseek(file, 0, SEEK_SET) == 0);
+            std::string value;
+            char buffer[256];
+            for (;;) {
+                const size_t count = std::fread(buffer, 1, sizeof(buffer), file);
+                value.append(buffer, count);
+                if (count != sizeof(buffer))
+                    break;
+            }
+            std::fclose(file);
+            file = nullptr;
+            return value;
+        }
+        ~Capture() {
+            if (saved_stderr >= 0) {
+                (void)::dup2(saved_stderr, STDERR_FILENO);
+                ::close(saved_stderr);
+            }
+            if (file)
+                std::fclose(file);
+        }
+    };
+
+    {
+        Environment diagnostics("1");
+        Capture capture;
+        service::SidecarRuntime runtime(test_runtime_config());
+        runtime.latch_route_replacement_for_test(
+            ReplacementTrigger::Unattributed);
+        CHECK(runtime.route_replacement_latched_for_test());
+        runtime.latch_route_replacement_for_test(
+            ReplacementTrigger::CompletedRequestCapacity);
+        const std::string output = capture.finish();
+        CHECK(output ==
+              "P51_REPLACEMENT_TRIGGER {\"schema_version\":1,\"reason\":\"unattributed\"}\n");
+        runtime.stop();
+    }
+    {
+        Environment diagnostics("1");
+        Capture capture;
+        service::SidecarRuntime runtime(test_runtime_config());
+        runtime.latch_route_replacement_for_test(
+            ReplacementTrigger::EndpointIdentityRetirementCapacity);
+        runtime.latch_route_replacement_for_test(
+            ReplacementTrigger::Unattributed);
+        const std::string output = capture.finish();
+        CHECK(output ==
+              "P51_REPLACEMENT_TRIGGER {\"schema_version\":1,\"reason\":\"endpoint_identity_retirement_capacity\"}\n");
+        runtime.stop();
+    }
+    const std::array<const char*, 5> disabled_values{
+        nullptr, "0", "01", "true", "1 "};
+    for (const char* value : disabled_values) {
+        Environment diagnostics(value);
+        Capture capture;
+        service::SidecarRuntime runtime(test_runtime_config());
+        runtime.latch_route_replacement_for_test(
+            ReplacementTrigger::ExpiredUnresolvedWitness);
+        CHECK(runtime.route_replacement_latched_for_test());
+        CHECK(capture.finish().empty());
+        runtime.stop();
+    }
+}
+
 local::P51SourceReservationRequest test_p51_reservation_request(
     const CStoreGuid& c_guid, uint64_t c_store_generation,
     uint64_t c_control_generation, uint64_t c_control_attempt,
@@ -8182,6 +8279,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--replacement-trigger-latch") == 0) {
+            test_replacement_trigger_latches_once_and_is_opt_in();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--same-f-real-transfer") == 0) {
             test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
             return 0;
@@ -8239,6 +8341,7 @@ int main(int argc, char** argv) {
         test_p51_reservation_capacity_120_cancel_and_expiry();
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_reservation_profile_mask_mapping();
+        test_replacement_trigger_latches_once_and_is_opt_in();
         test_p51_same_f_missing_relationship_reassignment_keeps_sibling();
         test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
         test_p51_same_f_missing_real_sender_transfer_keeps_sibling(true);

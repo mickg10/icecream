@@ -12,6 +12,24 @@ retained artifact directories.
 
 ## Developer QA
 
+### Replacement-trigger diagnostics
+
+The opt-in first-latch replacement record is qualified independently of the
+worker/history repair. Focused tests cover completed-ledger capacity, expired
+unresolved witnesses, precise reason propagation through subsequent route-owner
+refusals, first-cause retention, and exact diagnostic opt-in. Default sender
+and route-owner suites also pass. No wire format, cap, or replacement policy
+changes are intended; no farm speedup is claimed.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-replacement-trigger-r3.Zzu7jW/tmp/`.
+The final successful build is `build-r2.log`, SHA256
+`d1a8d12604351b61c35fb12f949d524a752514708d1031371fa448715028a907`.
+All six entries in `test-statuses.txt` are zero, SHA256
+`10d990347707be7d6015fbe51471f4ad199aeccb38e589e94e572a0be26b3f6c`;
+`source-hashes.txt` identifies the nine tested source files. Earlier compile
+failures in this and prior scratch snapshots are excluded. The endpoint used
+was the published product (`27d67566…`), not the pending worker repair.
+
 ### Endpoint mutation gate
 
 All 13 compiled endpoint mutations now fail with exit 1 at their registered
@@ -54,6 +72,16 @@ The repair is in progress: exclusive worker codec ownership, exact-current
 completion restoration, and byte reservations that outlive the endpoint and
 its io_context when necessary. The published branch is not qualified against
 this defect. Its connection to measured farm time or F RSS is unproven.
+
+The repair candidate passes the focused pending-credit regression and
+detached-resident model tests, including same-C eviction/re-admission,
+aggregate/per-C/total caps, pinned-object rejection, and lease destruction
+after model destruction. Refreshed evidence:
+`/tanksmall/scratch/tmp/p51-d06-detached.m9ntmb/logs/focus-r5.log`, SHA256
+`1a6d7a350f4136b6247677d19246f99459f27274d728bb3e5f5f5593eb0a460e`.
+Both `SLICE0_EXIT` and `D06_FOCUS_EXIT` are zero. This is not yet evidence
+for real P29/ZSTD_ROUTE held-worker reset/disconnect recovery, healthy
+successor progress, full regression closure, or concurrent-memory checks.
 
 ### Clean-checkout build and mixed-version compatibility
 

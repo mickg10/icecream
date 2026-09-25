@@ -814,8 +814,28 @@ void test_relationship_table_cap_requests_replacement() {
     const auto capped_result = capped.get();
     CHECK(capped_result.status == ZstdSourceTransferStatus::Unavailable);
     CHECK(capped_result.replacement_required);
+    CHECK(capped_result.replacement_trigger ==
+          ReplacementTrigger::Unattributed);
     CHECK(connections == 0);
     CHECK(owner.owner_count() == 1 && owner.owns(first_route));
+
+    context.restart();
+    auto later = asio::co_spawn(
+        context,
+        owner.transfer(
+            relationship(171, 273, 1), {7403, 1},
+            ConnectedFdFactory{[&connections](auto) {
+                ++connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    const auto later_result = later.get();
+    CHECK(later_result.replacement_required);
+    CHECK(later_result.replacement_trigger ==
+          ReplacementTrigger::Unattributed);
+    CHECK(connections == 0);
 }
 
 void test_transport_loss_does_not_reject_another_worker() {
@@ -1245,6 +1265,171 @@ P51SourceArmedFields topology_armed(const TopologyLink& link,
     armed.selected_window = 30;
     CHECK(armed.valid());
     return armed;
+}
+
+void test_p51_route_owner_preserves_precise_capacity_trigger() {
+    constexpr ProfileId profile = ProfileId::ZSTD_ROUTE;
+    TopologyLink link;
+    link.c_guid = CStoreGuid{topology_guid(41, false)};
+    link.f_guid = FStoreGuid{topology_guid(101, true)};
+    link.relationship = Id128::from_u64(0x7182);
+    link.relationship_epoch = 1;
+    link.physical_generation = 77;
+    link.c_generation = 78;
+    link.f_generation = 79;
+    link.control_generation = 80;
+    link.control_attempt = 81;
+    auto first_arm = topology_arm(link, 501, profile);
+    auto second_arm = topology_arm(link, 502, profile);
+    const auto first_armed = topology_armed(link, std::move(first_arm), 1);
+    const auto second_armed = topology_armed(link, std::move(second_arm), 2);
+    const PrepareRequestKey first_request{
+        first_armed.arm.source.assignment_epoch,
+        first_armed.arm.source.source_request_id};
+    const PrepareRequestKey second_request{
+        second_armed.arm.source.assignment_epoch,
+        second_armed.arm.source.source_request_id};
+    const P50RouteRelationship route{link.c_guid, link.f_guid,
+                                     link.f_generation, profile};
+    const std::vector<uint8_t> first_source{'f', 'i', 'r', 's', 't'};
+    const std::vector<uint8_t> second_source{'s', 'e', 'c', 'o', 'n', 'd'};
+
+    P50RouteOwnerConfig owner_config = config(profile);
+    owner_config.max_completed_requests = 1;
+    owner_config.authority_limits.max_speculative_tus = 1;
+    owner_config.authority_limits.max_speculative_raw_bytes = 1U << 20;
+    owner_config.authority_limits.max_live_entries = 4;
+    P50CRouteOwner owner(std::move(owner_config));
+
+    EndpointCaps server_caps;
+    server_caps.profile = profile;
+    server_caps.supported_profiles = profile_bit(profile);
+    server_caps.zstd = config(profile).endpoint_caps.zstd;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(8);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto sidecar_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            deadline, clock.clock_domain_id, clock.time_namespace_id);
+    P50ServerEndpointConfig server_config;
+    server_config.lookup_p51_link_reservation =
+        [&, sidecar_deadline](const LinkHello& hello)
+            -> std::optional<P51SourceLinkLease> {
+        if (hello.relationship_id != link.relationship ||
+            hello.c_store_guid != link.c_guid ||
+            hello.f_store_guid != link.f_guid ||
+            hello.f_store_generation != link.f_generation)
+            return std::nullopt;
+        P51SourceLinkLease lease;
+        lease.initial_armed = first_armed;
+        lease.absolute_deadline = sidecar_deadline;
+        lease.relationship_epoch = hello.relationship_epoch;
+        lease.history_nonce = hello.history_nonce;
+        return lease;
+    };
+    server_config.consume_p51_job_reservation =
+        [&, sidecar_deadline](const LinkHello& hello, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        if (hello.relationship_id != link.relationship ||
+            binding.reservation_id != Id128{first_armed.reservation_id} ||
+            binding.raw_bytes != first_source.size() ||
+            binding.raw_digest != icecc::digest128(first_source))
+            return std::nullopt;
+        P51SourceJobLease lease;
+        lease.armed = first_armed;
+        lease.absolute_deadline = sidecar_deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{link.c_guid, binding.tu_seq};
+        return lease;
+    };
+    server_config.record_p51_job_commit =
+        [&](const LinkHello&, const JobBind&, const R2TxCommit& commit) {
+        return commit.inner.raw_digest == icecc::digest128(first_source);
+    };
+    server_config.acknowledge_p51_receipt =
+        [](const LinkHello&, const CommitAck&) { return true; };
+    P50ServerEndpoint server(link.f_guid, server_caps, nullptr, nullptr,
+                             std::move(server_config));
+
+    asio::io_context context;
+    tcp::acceptor acceptor(
+        context, tcp::endpoint{asio::ip::address_v4::loopback(), 0});
+    auto accept_once = [&]() -> asio::awaitable<ServerRunResult> {
+        tcp::socket socket(co_await asio::this_coro::executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        co_return co_await server.run_adopted_r2(std::move(socket));
+    };
+    auto server_future = asio::co_spawn(context, accept_once(), asio::use_future);
+    auto work = asio::make_work_guard(context);
+    std::thread io_thread([&] { context.run(); });
+    struct Cleanup {
+        asio::io_context& context;
+        asio::executor_work_guard<asio::io_context::executor_type>& work;
+        std::thread& thread;
+        ~Cleanup() {
+            work.reset();
+            context.stop();
+            if (thread.joinable()) thread.join();
+        }
+    } cleanup{context, work, io_thread};
+
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    AsyncConnectedFdFactory connector = [remote](auto, auto completion) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) { completion(-1); return; }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(remote.port());
+        const auto ip = remote.address().to_v4().to_bytes();
+        std::memcpy(&address.sin_addr, ip.data(), ip.size());
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) != 0) {
+            (void)::close(fd);
+            completion(-1);
+            return;
+        }
+        completion(fd);
+    };
+    auto first = asio::co_spawn(
+        context, owner.transfer_p51(route, first_armed, connector,
+                                    first_request, deadline, first_source),
+        asio::use_future);
+    CHECK(first.wait_until(deadline) == std::future_status::ready);
+    CHECK(first.get().status == ZstdSourceTransferStatus::Committed);
+
+    auto full = asio::co_spawn(
+        context, owner.transfer_p51(route, second_armed, connector,
+                                    second_request, deadline, second_source),
+        asio::use_future);
+    CHECK(full.wait_until(deadline) == std::future_status::ready);
+    const auto full_result = full.get();
+    CHECK(full_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(full_result.replacement_required);
+    CHECK(full_result.replacement_trigger ==
+          ReplacementTrigger::CompletedRequestCapacity);
+
+    auto sticky = asio::co_spawn(
+        context, owner.transfer_p51(route, second_armed, connector,
+                                    second_request, deadline, second_source),
+        asio::use_future);
+    CHECK(sticky.wait_until(deadline) == std::future_status::ready);
+    const auto sticky_result = sticky.get();
+    CHECK(sticky_result.replacement_required);
+    CHECK(sticky_result.replacement_trigger ==
+          ReplacementTrigger::CompletedRequestCapacity);
+
+    std::promise<bool> retired_promise;
+    auto retired = retired_promise.get_future();
+    asio::post(context, [&] {
+        retired_promise.set_value(owner.retire_f_store_exact_p51(
+            link.f_guid, link.f_generation));
+    });
+    CHECK(retired.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    CHECK(retired.get());
+    CHECK(server_future.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
 }
 
 void test_p51_w30_direct_topology(size_t c_count, size_t f_count,
@@ -2244,6 +2429,12 @@ void test_concurrent_same_successor_joins_one_rebound_sender() {
 
 int main(int argc, char** argv) {
     if (argc == 2 &&
+        std::strcmp(argv[1], "--replacement-trigger") == 0) {
+        test_relationship_table_cap_requests_replacement();
+        test_p51_route_owner_preserves_precise_capacity_trigger();
+        return 0;
+    }
+    if (argc == 2 &&
         std::strcmp(argv[1], "--same-successor-concurrency") == 0) {
         test_concurrent_same_successor_joins_one_rebound_sender();
         return 0;
@@ -2257,6 +2448,7 @@ int main(int argc, char** argv) {
     test_p29v1_retry_and_reset_owner();
     test_p29v1_relationship_owner();
     test_relationship_table_cap_requests_replacement();
+    test_p51_route_owner_preserves_precise_capacity_trigger();
     test_aborted_route_block_is_defined_on_other_f();
     test_transport_loss_does_not_reject_another_worker();
     test_typed_poison_catch_is_owner_wide();

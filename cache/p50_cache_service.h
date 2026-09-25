@@ -249,6 +249,12 @@ public:
     void run_owner_callback_for_test(std::function<void()> callback);
     void notify_p51_reservation_retired_for_test(
         const Id128& id, bool endpoint_marker_retired) noexcept;
+    void latch_route_replacement_for_test(ReplacementTrigger trigger) noexcept {
+        latch_route_replacement(trigger);
+    }
+    [[nodiscard]] bool route_replacement_latched_for_test() const noexcept {
+        return route_replacement_required_.load(std::memory_order_acquire);
+    }
 #endif
     void release_p51_link_on_owner(const LinkHello& hello) noexcept;
 
@@ -437,7 +443,8 @@ private:
         bool address_admitted, bool relationship_reserved,
         uint64_t raw_bytes, bool has_credit) noexcept;
     void release_source_credit(uint64_t raw_bytes) noexcept;
-    void latch_route_replacement() noexcept;
+    void latch_route_replacement(
+        ReplacementTrigger trigger = ReplacementTrigger::Unattributed) noexcept;
     [[nodiscard]] bool owner_preflight_source_endpoint(
         const RouteEndpointKey& endpoint,
         std::optional<RouteStoreIdentity>& known_identity,
