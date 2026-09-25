@@ -36,6 +36,38 @@ Outer gate log SHA256
 The SDK is `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, with 2 CPUs/8 GiB;
 later README-only wording clarifies the required short mount path.
 
+### Source descriptor lifetime
+
+R1/R2 source-transfer callers now release their owned source descriptor after
+the exact handoff ACK; later reply processing cannot close a reused descriptor
+number. R2 source reading releases the service copy on success, read failure
+or cancellation, before scheduling route work. This does not change wire
+bytes, deadlines, queue limits or input ownership. The R1 service-side source
+descriptor lifetime is unchanged. Queued/pre-handoff source backing is not
+covered by the 2 GiB source-vector credit; no memory-peak or disk-leak claim
+follows from this change.
+
+Luna qualified the five-file patch on base `6a28ea27` in
+`/tanksmall/scratch/tmp/p51-fd-lifetime-build.wu30SL/work`.
+The selected Automake run passes `p50daemoncontrol` and `p50cacheservice`
+(2/2, no skips/failures). Cases include held R1/R2 replies, descriptor-number
+reuse through teardown, cancellation before ACK, transport loss before ACK,
+exact R2 committed bytes, active-read peer cancellation and a deterministic
+read failure. Reverting the early ACK close fails the intended
+`sender_fd_closed` assertion; restoring it passes. Setup errors and the first
+stale-library negative-control attempt are retained but excluded as evidence.
+
+Default service log SHA256:
+`2e3a6b08a317bc11fbd45f8eba79f0d4adb4fc4299ada425a246fabf7ddf2848`;
+default control log:
+`69f1a03b01104868280cf52a6a9e27be1f3d83ed15a9168dbb967912a4d4f1ae`.
+The negative-control and restored logs are respectively
+`artifacts/control-mutant-r2.log` (exit 134) and
+`artifacts/control-restored-r1.log` (exit 0). The final header comment is a
+documentation-only clarification after testing. The outer default run spent
+about nine minutes building unrelated check programs; focused reruns should
+build the required archives/binaries explicitly and use `check-TESTS`.
+
 ### R2 source-trace measurement gap
 
 Source audit of both `ef29049c` and product `03d108a3` finds that R2 results

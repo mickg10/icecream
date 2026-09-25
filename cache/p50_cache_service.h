@@ -107,6 +107,9 @@ struct RuntimeConfig {
     // the second is called when the non-consuming peer probe observes EOF.
     std::function<void()> p51_source_read_chunk_for_test;
     std::function<void()> p51_source_read_peer_closed_for_test;
+    // Called after the source read ends and its original FD is closed,
+    // whether the raw copy succeeded or failed, before owner-executor delivery.
+    std::function<void(bool)> p51_source_read_complete_for_test;
     // Test-only cut after a complete R2 replayed bundle. Production leaves
     // this unset; the sender stops before advancing to the next replay row.
     std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;

@@ -482,6 +482,16 @@ bool DaemonControlOperation::read_ack(size_t& calls, size_t& budget) noexcept {
     else { fail(DaemonControlStatus::IoError); return false; }
     if (ack_offset_ != kHandoffBytes) return false;
     if (!validate_ack()) { fail(DaemonControlStatus::OperationMismatch); return false; }
+    // A validated source-transfer ACK means the peer has adopted its
+    // SCM_RIGHTS copy. The wrapper never reads that descriptor; release the
+    // local copy now and clear the field so later teardown cannot close an
+    // unrelated descriptor that reuses its number.
+    if ((operation_.kind == ControlOperationKind::SourceTransfer ||
+         operation_.kind == ControlOperationKind::P51SourceTransfer) &&
+        transfer_fd_ >= 0) {
+        (void)::close(transfer_fd_);
+        transfer_fd_ = -1;
+    }
     phase_ = Phase::CheckAckTrailing;
     return true;
 }
@@ -839,10 +849,6 @@ DaemonControlStatus DaemonControlOperation::advance(
         (void)read_source_reply(calls, budget);
     } else if (phase_ == Phase::CheckSourceReplyTrailing) {
         if (check_stream_trailing(Phase::WriteLifecycleGoodbye, calls, budget)) {
-            if (transfer_fd_ >= 0) {
-                (void)::close(transfer_fd_);
-                transfer_fd_ = -1;
-            }
             try {
                 lifecycle_goodbye_ = encode_frame(
                     Frame{kProtocolVersion, MessageType::Goodbye,

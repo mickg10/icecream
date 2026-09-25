@@ -1493,6 +1493,11 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
     std::promise<void> release_read_promise;
     const std::shared_future<void> release_read =
         release_read_promise.get_future().share();
+    std::promise<bool> source_read_complete_promise;
+    auto source_read_complete = source_read_complete_promise.get_future();
+    std::promise<void> release_source_read_promise;
+    const std::shared_future<void> release_source_read =
+        release_source_read_promise.get_future().share();
     std::atomic<bool> barrier_entered{false};
     std::atomic<unsigned> read_peer_closed{0};
 
@@ -1512,6 +1517,13 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
     };
     config.p51_source_read_peer_closed_for_test = [&] {
         read_peer_closed.fetch_add(1, std::memory_order_release);
+    };
+    config.p51_source_read_complete_for_test = [&](bool success) {
+        try {
+            source_read_complete_promise.set_value(success);
+            (void)release_source_read.wait_for(std::chrono::seconds(5));
+        } catch (...) {
+        }
     };
     service::SidecarRuntime runtime(std::move(config));
 
@@ -1546,9 +1558,11 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
         local::make_p51_source_transfer_operation(
             launch.identity, request,
             request.armed.arm.source.source_request_id);
+    auto source_fd = oversized_test_source_fd();
+    const int source_fd_number = source_fd.get();
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        oversized_test_source_fd());
+        std::move(source_fd));
     const bool read_entered = enqueued &&
         read_started.wait_for(std::chrono::seconds(3)) ==
             std::future_status::ready;
@@ -1560,6 +1574,25 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
     // read-loop probe observe EOF before the service can connect to F.
     pair.receiver = local::Connection(-1);
     release_read_promise.set_value();
+    const bool source_read_observed = source_read_complete.wait_for(
+        std::chrono::seconds(3)) == std::future_status::ready;
+    bool source_read_succeeded = false;
+    if (source_read_observed)
+        source_read_succeeded = source_read_complete.get();
+    errno = 0;
+    const bool original_source_closed = source_fd_number >= 0 &&
+        ::fcntl(source_fd_number, F_GETFD) == -1 && errno == EBADF;
+    int replacement_source_fd = -1;
+    if (original_source_closed) {
+        const int opened = ::open("/dev/null", O_RDONLY);
+        if (opened == source_fd_number) {
+            replacement_source_fd = opened;
+        } else if (opened >= 0) {
+            replacement_source_fd = ::dup2(opened, source_fd_number);
+            (void)::close(opened);
+        }
+    }
+    release_source_read_promise.set_value();
     const auto cancel_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (read_peer_closed.load(std::memory_order_acquire) == 0 &&
@@ -1583,10 +1616,151 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
     CHECK(read_entered);
     CHECK(credit_held);
     CHECK(read_cancelled);
+    CHECK(source_read_observed && !source_read_succeeded);
+    CHECK(original_source_closed);
+    CHECK(replacement_source_fd == source_fd_number);
     CHECK(operation_released);
     CHECK(raw_credit_released);
     CHECK(connect_observed == 0);
+    CHECK(::fcntl(replacement_source_fd, F_GETFD) >= 0);
+    CHECK(::close(replacement_source_fd) == 0);
     std::puts("P51_ASYNC_TRANSFER active-read peer-close cancels before F connect: ok");
+}
+
+void test_p51_read_failure_releases_original_source_fd() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x3c;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x3d;
+    const SidecarLaunchIdentity remote_f = test_sidecar_launch(remote_root);
+    uint16_t unused_f_port = 0;
+    const int f_listener = loopback_listener(unused_f_port);
+    CHECK(f_listener >= 0 && unused_f_port != 0);
+
+    auto source_fd_number = std::make_shared<std::atomic<int>>(-1);
+    std::atomic<bool> truncated{false};
+    std::atomic<int> truncate_result{-1};
+    std::promise<bool> source_read_complete_promise;
+    auto source_read_complete = source_read_complete_promise.get_future();
+    std::promise<void> release_source_read_promise;
+    const std::shared_future<void> release_source_read =
+        release_source_read_promise.get_future().share();
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_aggregate_source_raw_bytes = 16;
+    config.max_active_p51_source_transfers = 1;
+    config.max_pending_p51_source_operations = 1;
+    config.p51_source_read_chunk_for_test = [&] {
+        if (!truncated.exchange(true, std::memory_order_acq_rel)) {
+            const int fd = source_fd_number->load(std::memory_order_acquire);
+            if (fd >= 0)
+                truncate_result.store(::ftruncate(fd, 0),
+                                      std::memory_order_release);
+        }
+    };
+    config.p51_source_read_complete_for_test = [&](bool success) {
+        try {
+            source_read_complete_promise.set_value(success);
+            (void)release_source_read.wait_for(std::chrono::seconds(5));
+        } catch (...) {
+        }
+    };
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto reservation = test_p51_reservation_request(
+        launch.c_store_guid, launch.store_generation,
+        launch.identity.generation, launch.identity.attempt,
+        7110, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(8));
+    reservation.arm.source.selected_f_host = "127.0.0.1";
+    reservation.arm.source.selected_f_cache_port = unused_f_port;
+    P51SourceArmedFields armed;
+    armed.arm = reservation.arm;
+    armed.f_control_generation = remote_f.identity.generation;
+    armed.f_control_attempt = remote_f.identity.attempt;
+    armed.f_store_generation = remote_f.store_generation;
+    armed.f_store_guid = remote_f.f_store_guid.bytes;
+    armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+    armed.arm_observation_id = 7110;
+    armed.source_budget_msec = 8000;
+    armed.attempt_capability_1.bytes.fill(0x81);
+    armed.attempt_capability_2.bytes.fill(0x82);
+    armed.reservation_id.fill(0x83);
+    armed.logical_relationship_id.fill(0x84);
+    armed.relationship_epoch = 1;
+    armed.selected_revision = CACHE_WIRE_REVISION_R2;
+    armed.selected_window = 30;
+    CHECK(armed.valid());
+    const local::P51SourceTransferRequest request{
+        armed, reservation.absolute_deadline};
+
+    RuntimeCase pair = authenticated_runtime_pair();
+    auto source = sized_test_source_fd(12, 0x91);
+    const int original_fd = source.get();
+    source_fd_number->store(original_fd, std::memory_order_release);
+    const auto operation = local::make_p51_source_transfer_operation(
+        launch.identity, request, request.armed.arm.source.source_request_id);
+    const bool enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(pair.sender), launch.identity, operation, std::move(source));
+    const bool completion_observed = enqueued &&
+        source_read_complete.wait_for(std::chrono::seconds(3)) ==
+            std::future_status::ready;
+    bool read_succeeded = false;
+    if (completion_observed)
+        read_succeeded = source_read_complete.get();
+    errno = 0;
+    const bool source_closed = ::fcntl(original_fd, F_GETFD) == -1 &&
+                               errno == EBADF;
+    int replacement_fd = -1;
+    if (source_closed) {
+        const int opened = ::open("/dev/null", O_RDONLY);
+        if (opened == original_fd) {
+            replacement_fd = opened;
+        } else if (opened >= 0) {
+            replacement_fd = ::dup2(opened, original_fd);
+            (void)::close(opened);
+        }
+    }
+    release_source_read_promise.set_value();
+
+    std::exception_ptr receive_error;
+    bool reported_read_failure = false;
+    try {
+        if (enqueued)
+            receive_p51_transfer_error(
+                pair.receiver, launch.identity, 7110,
+                request.absolute_deadline.as_steady_time_point(), true, 3);
+        reported_read_failure = enqueued;
+    } catch (...) {
+        receive_error = std::current_exception();
+    }
+    const bool raw_credit_released = wait_for_source_raw_bytes(
+        runtime, 0, std::chrono::seconds(2));
+    runtime.stop();
+    pair.receiver = local::Connection(-1);
+    pollfd listener_ready{f_listener, POLLIN, 0};
+    int unexpected_connect;
+    do {
+        unexpected_connect = ::poll(&listener_ready, 1, 0);
+    } while (unexpected_connect < 0 && errno == EINTR);
+    (void)::close(f_listener);
+
+    if (receive_error)
+        std::rethrow_exception(receive_error);
+    CHECK(enqueued);
+    CHECK(completion_observed && !read_succeeded);
+    CHECK(truncated.load(std::memory_order_acquire));
+    CHECK(truncate_result.load(std::memory_order_acquire) == 0);
+    CHECK(source_closed && replacement_fd == original_fd);
+    CHECK(reported_read_failure);
+    CHECK(raw_credit_released);
+    CHECK(unexpected_connect == 0);
+    CHECK(::fcntl(replacement_fd, F_GETFD) >= 0);
+    CHECK(::close(replacement_fd) == 0);
+    std::puts("P51_ASYNC_TRANSFER read failure releases original source fd: ok");
 }
 
 void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
@@ -3233,6 +3407,18 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     runtime_config.max_aggregate_source_raw_bytes = 16;
     runtime_config.max_active_p51_source_transfers = 2;
     runtime_config.max_pending_p51_source_operations = 2;
+    std::promise<bool> source_read_complete_promise;
+    auto source_read_complete = source_read_complete_promise.get_future();
+    std::promise<void> release_source_read_promise;
+    const std::shared_future<void> release_source_read =
+        release_source_read_promise.get_future().share();
+    runtime_config.p51_source_read_complete_for_test = [&](bool success) {
+        try {
+            source_read_complete_promise.set_value(success);
+            (void)release_source_read.wait_for(std::chrono::seconds(5));
+        } catch (...) {
+        }
+    };
     service::SidecarRuntime runtime(std::move(runtime_config));
 
     auto make_request = [&](uint64_t request_id, uint16_t port,
@@ -3468,9 +3654,31 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     RuntimeCase pair = authenticated_runtime_pair();
     const auto operation = local::make_p51_source_transfer_operation(
         launch.identity, request, request.armed.arm.source.source_request_id);
+    auto source_fd = sized_test_source_fd(expected_input.size(), 0xf1);
+    const int source_fd_number = source_fd.get();
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        sized_test_source_fd(expected_input.size(), 0xf1));
+        std::move(source_fd));
+    const bool source_read_observed = enqueued &&
+        source_read_complete.wait_for(std::chrono::seconds(3)) ==
+            std::future_status::ready;
+    bool source_read_succeeded = false;
+    if (source_read_observed)
+        source_read_succeeded = source_read_complete.get();
+    errno = 0;
+    const bool original_source_closed = source_fd_number >= 0 &&
+        ::fcntl(source_fd_number, F_GETFD) == -1 && errno == EBADF;
+    int replacement_source_fd = -1;
+    if (original_source_closed) {
+        const int opened = ::open("/dev/null", O_RDONLY);
+        if (opened == source_fd_number) {
+            replacement_source_fd = opened;
+        } else if (opened >= 0) {
+            replacement_source_fd = ::dup2(opened, source_fd_number);
+            (void)::close(opened);
+        }
+    }
+    release_source_read_promise.set_value();
     local::P50SourceTransferResult result;
     std::exception_ptr transfer_exception;
     try {
@@ -3521,12 +3729,17 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     if (f_exception)
         std::rethrow_exception(f_exception);
     CHECK(enqueued);
+    CHECK(source_read_observed && source_read_succeeded);
+    CHECK(original_source_closed);
+    CHECK(replacement_source_fd == source_fd_number);
     CHECK(exact_result);
     CHECK(credit_released);
     CHECK(f_finished_after_shutdown);
     CHECK(f_result.has_value() && f_result->committed_input.has_value());
     CHECK(committed_input == expected_input);
     CHECK(commit_identity_matches);
+    CHECK(::fcntl(replacement_source_fd, F_GETFD) >= 0);
+    CHECK(::close(replacement_source_fd) == 0);
     std::puts("P51_ASYNC_TRANSFER aggregate-budget fitting R2 commit exact: ok");
 }
 
@@ -9990,6 +10203,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--source-fd-read-failure") == 0) {
+            test_p51_read_failure_releases_original_source_fd();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d07-active-cancel-recovery-probe") == 0) {
             test_p51_d07_active_cancel_all_profiles();
             return 0;
@@ -10070,6 +10288,7 @@ int main(int argc, char** argv) {
         test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
         test_p51_admitted_transfer_stop_releases_raw_credit();
         test_p51_peer_close_during_active_read_cancels_before_route();
+        test_p51_read_failure_releases_original_source_fd();
         test_p51_d07_queued_cancel_first_middle_last();
         test_p51_d07_active_cancel_all_profiles();
         test_p51_d07_active_cancel_replay_interrupt_all_profiles();

@@ -6,10 +6,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
+#include <future>
 #include <poll.h>
 #include <stdexcept>
 #include <span>
+#include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -161,6 +164,29 @@ void write_bytes(int fd, const uint8_t* bytes, size_t byte_count) {
         CHECK(count > 0);
         offset += static_cast<size_t>(count);
     }
+}
+
+int make_source_fd(std::span<const uint8_t> bytes) {
+    const char* temporary_directory = std::getenv("TMPDIR");
+    if (temporary_directory == nullptr || temporary_directory[0] == '\0')
+        temporary_directory = std::getenv("ICEFARM_TMPDIR");
+    CHECK(temporary_directory != nullptr && temporary_directory[0] != '\0');
+    std::string path = std::string(temporary_directory) +
+                       "/icecc-daemon-control-source-XXXXXX";
+    std::vector<char> mutable_path(path.begin(), path.end());
+    mutable_path.push_back('\0');
+    const int fd = ::mkstemp(mutable_path.data());
+    CHECK(fd >= 0);
+    CHECK(::unlink(mutable_path.data()) == 0);
+    size_t offset = 0;
+    while (offset != bytes.size()) {
+        const ssize_t count = ::write(fd, bytes.data() + offset,
+                                      bytes.size() - offset);
+        CHECK(count > 0);
+        offset += static_cast<size_t>(count);
+    }
+    CHECK(::lseek(fd, 0, SEEK_SET) == 0);
+    return fd;
 }
 
 void write_frame(int fd, const Frame& frame) {
@@ -338,6 +364,345 @@ void test_source_transfer_reply_and_tu0() {
     CHECK(sender.source_transfer_result().has_value());
     CHECK(sender.source_transfer_result()->tu_seq == 0);
     ::close(pair[1]);
+}
+
+void test_source_fd_released_after_ack_before_reply(bool p51) {
+    constexpr std::array<uint8_t, 9> expected_bytes{
+        0x50, 0x35, 0x31, 0x00, 0x7f, 0x21, 0x22, 0x23, 0x24};
+    const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
+    const auto deadline = icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(5),
+        clock.clock_domain_id, clock.time_namespace_id);
+    ControlOperation expected;
+    if (p51) {
+        P51SourceArmFields arm = p51_source_arm();
+        arm.source.source_request_id = 23;
+        const P51SourceArmedFields armed = p51_source_armed(arm);
+        expected = make_p51_source_transfer_operation(
+            Identity{91, 17}, P51SourceTransferRequest{armed, deadline}, 23);
+    } else {
+        P50SourceTransferRequest arm;
+        arm.wire_job_id = 7;
+        arm.assignment_epoch = 3;
+        arm.assignment_nonce = 4;
+        arm.selected_f_host = "worker.example";
+        arm.selected_f_ordinary_port = 10245;
+        arm.selected_f_cache_port = 10246;
+        arm.cache_protocol = CACHE_WIRE_REVISION;
+        arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
+        arm.logical_job = 19;
+        arm.compiler_attempt = 20;
+        arm.source_request_id = 23;
+        arm.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+        expected = make_source_transfer_operation(Identity{91, 17}, arm, deadline);
+    }
+    CHECK(!encode_control_operation(expected).empty());
+
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const timeval peer_timeout{6, 0};
+    CHECK(::setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &peer_timeout,
+                       sizeof(peer_timeout)) == 0);
+    const int source_fd = make_source_fd(expected_bytes);
+    const int source_fd_number = source_fd;
+    std::promise<void> ack_sent_promise;
+    auto ack_sent = ack_sent_promise.get_future();
+    std::promise<void> release_reply_promise;
+    const std::shared_future<void> release_reply =
+        release_reply_promise.get_future().share();
+    std::exception_ptr peer_error;
+    bool adopted_bytes_exact = false;
+    std::optional<P50SourceTransferResult> completed_result;
+    int replacement_fd = -1;
+
+    {
+        DaemonControlOperation sender;
+        CHECK(sender.begin_authenticated(
+                  pair[0], expected, source_fd, credentials(), expected.identity,
+                  deadline.as_steady_time_point(), DaemonControlLimits{2, 4096},
+                  DaemonControlFdOwnership::Owned) ==
+              DaemonControlStatus::InProgress);
+        pair[0] = -1; // sender owns the control socket now.
+
+        std::thread peer([&] {
+            try {
+                Connection connection(pair[1]);
+                Frame control;
+                CHECK(read_frame(connection.native_handle(), control) == Status::Ok);
+                ControlOperation decoded;
+                CHECK(control.type == MessageType::Data &&
+                      decode_control_operation(control.payload, decoded));
+                CHECK(encode_control_operation(decoded) ==
+                      encode_control_operation(expected));
+                CHECK(connection.verify_peer_credentials(credentials()) == Status::Ok);
+                FdHandoffReceiver receiver;
+                const auto handoff = receiver.receive_and_ack(
+                    connection, HandoffRequest{expected.identity, expected.request_id},
+                    deadline.as_steady_time_point());
+                CHECK(handoff.status == FdHandoffStatus::Accepted);
+                HandoffFd received = receiver.take_adopted_fd();
+                CHECK(received.valid());
+                std::array<uint8_t, expected_bytes.size()> observed{};
+                CHECK(::pread(received.get(), observed.data(), observed.size(), 0) ==
+                      static_cast<ssize_t>(observed.size()));
+                adopted_bytes_exact = observed == expected_bytes;
+                ack_sent_promise.set_value();
+                CHECK(release_reply.wait_for(std::chrono::seconds(4)) ==
+                      std::future_status::ready);
+
+                P50SourceTransferResult result;
+                result.code = SourceTransferResultCode::Committed;
+                result.attempts = 1;
+                result.tu_seq = 0;
+                result.raw_bytes = expected_bytes.size();
+                result.raw_digest = icecc::digest128(expected_bytes);
+                if (p51) {
+                    result.c_store_guid.bytes =
+                        expected.p51_source_transfer->armed.arm.source.c_store_guid;
+                    const auto reply = make_p51_source_transfer_reply_operation(
+                        expected, result);
+                    write_frame(pair[1], Frame{kProtocolVersion, MessageType::Data,
+                                               expected.identity,
+                                               encode_control_operation(reply)});
+                } else {
+                    result.c_store_guid.bytes[0] = 1;
+                    const auto reply = make_source_transfer_reply_operation(
+                        expected, result);
+                    write_frame(pair[1], Frame{kProtocolVersion, MessageType::Data,
+                                               expected.identity,
+                                               encode_control_operation(reply)});
+                }
+                Frame goodbye;
+                CHECK(read_frame(pair[1], goodbye) == Status::Ok);
+                CHECK(goodbye.type == MessageType::Goodbye &&
+                      goodbye.identity == expected.identity);
+            } catch (...) {
+                peer_error = std::current_exception();
+                try { ack_sent_promise.set_value(); } catch (...) {}
+            }
+        });
+
+        const auto ack_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(2);
+        while (ack_sent.wait_for(std::chrono::milliseconds(0)) !=
+                   std::future_status::ready &&
+               std::chrono::steady_clock::now() < ack_deadline &&
+               sender.status() == DaemonControlStatus::InProgress) {
+            pollfd descriptor{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, 10);
+            sender.advance(std::chrono::steady_clock::now(),
+                           ready > 0 ? descriptor.revents : short{0});
+        }
+        const bool ack_received =
+            ack_sent.wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready;
+
+        const auto fd_release_deadline = std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(1);
+        bool sender_fd_closed = false;
+        while (ack_received && !sender_fd_closed &&
+               std::chrono::steady_clock::now() < fd_release_deadline &&
+               sender.status() == DaemonControlStatus::InProgress) {
+            errno = 0;
+            sender_fd_closed = ::fcntl(source_fd_number, F_GETFD) == -1 &&
+                               errno == EBADF;
+            if (sender_fd_closed)
+                break;
+            pollfd descriptor{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, 10);
+            sender.advance(std::chrono::steady_clock::now(),
+                           ready > 0 ? descriptor.revents : short{0});
+        }
+        errno = 0;
+        sender_fd_closed = sender_fd_closed ||
+            (::fcntl(source_fd_number, F_GETFD) == -1 && errno == EBADF);
+        if (sender_fd_closed) {
+            const int opened = ::open("/dev/null", O_RDONLY);
+            if (opened == source_fd_number) {
+                replacement_fd = opened;
+            } else if (opened >= 0) {
+                replacement_fd = ::dup2(opened, source_fd_number);
+                (void)::close(opened);
+            }
+        }
+
+        // Keep the real sidecar reply withheld until after we have proved the
+        // sender's original descriptor is gone and reused its number.
+        release_reply_promise.set_value();
+        const auto result_deadline = std::chrono::steady_clock::now() +
+                                     std::chrono::seconds(3);
+        while (sender.status() == DaemonControlStatus::InProgress &&
+               std::chrono::steady_clock::now() < result_deadline) {
+            pollfd descriptor{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, 10);
+            sender.advance(std::chrono::steady_clock::now(),
+                           ready > 0 ? descriptor.revents : short{0});
+        }
+        if (sender.source_transfer_result().has_value())
+            completed_result = sender.source_transfer_result();
+        peer.join();
+        CHECK(sender.status() == DaemonControlStatus::Complete);
+        pair[1] = -1;
+        CHECK(ack_received);
+        CHECK(sender_fd_closed);
+        CHECK(replacement_fd == source_fd_number);
+        CHECK(adopted_bytes_exact);
+        CHECK(completed_result.has_value() && completed_result->valid());
+        CHECK(completed_result->raw_bytes == expected_bytes.size());
+        CHECK(completed_result->raw_digest == icecc::digest128(expected_bytes));
+        CHECK(!peer_error);
+    }
+
+    // The completed operation's destructor must not close the numeric FD
+    // reused after ACK.  The receiver still read the exact source bytes and
+    // the delayed source reply completed normally for both R1 and R2.
+    CHECK(replacement_fd == source_fd_number);
+    CHECK(::fcntl(replacement_fd, F_GETFD) >= 0);
+    CHECK(::close(replacement_fd) == 0);
+}
+
+void test_source_fd_remains_owned_until_pre_ack_cancel() {
+    constexpr std::array<uint8_t, 3> bytes{'f', 'd', '0'};
+    const ControlOperation expected = source_operation();
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const int source_fd = make_source_fd(bytes);
+    const int source_number = source_fd;
+    {
+        DaemonControlOperation sender;
+        CHECK(sender.begin_connected(
+                  pair[0], expected, source_fd, credentials(),
+                  std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                  DaemonControlLimits{2, 4096},
+                  DaemonControlFdOwnership::Owned) ==
+              DaemonControlStatus::InProgress);
+        pair[0] = -1;
+        CHECK(::fcntl(source_number, F_GETFD) >= 0);
+        // Destroying an operation before a valid ACK is cancellation: the
+        // sidecar has not established ownership, so the sender still closes
+        // its source descriptor during teardown.
+    }
+    errno = 0;
+    CHECK(::fcntl(source_number, F_GETFD) == -1 && errno == EBADF);
+    const int replacement = ::open("/dev/null", O_RDONLY);
+    CHECK(replacement >= 0);
+    int held = replacement;
+    if (replacement != source_number) {
+        held = ::dup2(replacement, source_number);
+        CHECK(held == source_number);
+        CHECK(::close(replacement) == 0);
+    }
+    CHECK(::fcntl(held, F_GETFD) >= 0);
+    CHECK(::close(held) == 0);
+    CHECK(::close(pair[1]) == 0);
+}
+
+void test_source_fd_closes_after_handoff_failure_without_ack() {
+    constexpr std::array<uint8_t, 3> bytes{'f', 'd', '1'};
+    const ControlOperation expected = source_operation();
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const timeval peer_timeout{6, 0};
+    CHECK(::setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &peer_timeout,
+                       sizeof(peer_timeout)) == 0);
+    const int source_fd = make_source_fd(bytes);
+    const int source_number = source_fd;
+    std::promise<void> control_seen_promise;
+    auto control_seen = control_seen_promise.get_future();
+    std::promise<void> release_peer_close_promise;
+    const std::shared_future<void> release_peer_close =
+        release_peer_close_promise.get_future().share();
+    std::exception_ptr peer_error;
+    std::thread peer([&] {
+        try {
+            Connection connection(pair[1]);
+            Frame hello;
+            CHECK(read_frame(pair[1], hello) == Status::Ok);
+            CHECK(hello.type == MessageType::Hello &&
+                  hello.identity == expected.identity);
+            write_frame(pair[1], make_hello_ack(
+                PeerRole::Sidecar, expected.identity));
+            Frame control;
+            CHECK(read_frame(pair[1], control) == Status::Ok);
+            ControlOperation decoded;
+            CHECK(control.type == MessageType::Data &&
+                  decode_control_operation(control.payload, decoded));
+            CHECK(encode_control_operation(decoded) ==
+                  encode_control_operation(expected));
+            control_seen_promise.set_value();
+            CHECK(release_peer_close.wait_for(std::chrono::seconds(4)) ==
+                  std::future_status::ready);
+            // Close after the sender reports the descriptor rights sent, but
+            // before any ACK is emitted. This is a real failed handoff path.
+        } catch (...) {
+            peer_error = std::current_exception();
+            try { control_seen_promise.set_value(); } catch (...) {}
+        }
+    });
+
+    DaemonControlStatus final_status = DaemonControlStatus::InProgress;
+    bool rights_sent = false;
+    {
+        DaemonControlOperation sender;
+        CHECK(sender.begin_connected(
+                  pair[0], expected, source_fd, credentials(),
+                  std::chrono::steady_clock::now() + std::chrono::seconds(5),
+                  DaemonControlLimits{2, 4096},
+                  DaemonControlFdOwnership::Owned) ==
+              DaemonControlStatus::InProgress);
+        pair[0] = -1;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(4);
+        while (control_seen.wait_for(std::chrono::milliseconds(0)) !=
+                   std::future_status::ready &&
+               sender.status() == DaemonControlStatus::InProgress &&
+               std::chrono::steady_clock::now() < deadline) {
+            pollfd descriptor{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, 10);
+            sender.advance(std::chrono::steady_clock::now(),
+                           ready > 0 ? descriptor.revents : short{0});
+        }
+        while (!sender.rights_sent() &&
+               sender.status() == DaemonControlStatus::InProgress &&
+               std::chrono::steady_clock::now() < deadline) {
+            pollfd descriptor{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, 10);
+            sender.advance(std::chrono::steady_clock::now(),
+                           ready > 0 ? descriptor.revents : short{0});
+        }
+        rights_sent = sender.rights_sent();
+        release_peer_close_promise.set_value();
+        while (sender.status() == DaemonControlStatus::InProgress &&
+               std::chrono::steady_clock::now() < deadline) {
+            pollfd descriptor{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, 10);
+            sender.advance(std::chrono::steady_clock::now(),
+                           ready > 0 ? descriptor.revents : short{0});
+        }
+        final_status = sender.status();
+        peer.join();
+    }
+    CHECK(control_seen.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready);
+    CHECK(rights_sent);
+    CHECK(final_status != DaemonControlStatus::InProgress &&
+          final_status != DaemonControlStatus::Complete);
+    CHECK(!peer_error);
+    errno = 0;
+    CHECK(::fcntl(source_number, F_GETFD) == -1 && errno == EBADF);
+    const int replacement = ::open("/dev/null", O_RDONLY);
+    CHECK(replacement >= 0);
+    int held = replacement;
+    if (replacement != source_number) {
+        held = ::dup2(replacement, source_number);
+        CHECK(held == source_number);
+        CHECK(::close(replacement) == 0);
+    }
+    CHECK(::fcntl(held, F_GETFD) >= 0);
+    CHECK(::close(held) == 0);
 }
 
 void test_p51_source_reservation_v7_codec() {
@@ -1031,6 +1396,10 @@ int main() {
     test_incremental_handoff_and_fairness();
     test_extra_fd_is_closed_and_rejected();
     test_source_transfer_reply_and_tu0();
+    test_source_fd_released_after_ack_before_reply(false);
+    test_source_fd_released_after_ack_before_reply(true);
+    test_source_fd_remains_owned_until_pre_ack_cancel();
+    test_source_fd_closes_after_handoff_failure_without_ack();
     test_p51_source_reservation_v7_codec();
     test_p51_source_transfer_downselected_window_v7_codec();
     test_canonical_request_codec_both_directions();

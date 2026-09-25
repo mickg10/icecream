@@ -2941,6 +2941,19 @@ void SidecarRuntime::prepare_p51_source_read(
 #else
                     {}, {});
 #endif
+                // Reading is complete, whether it succeeded or failed. Drop
+                // the original descriptor before owner scheduling, receipt
+                // waits, or route work can retain this pending operation.
+                pending->source.reset();
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                if (config_.p51_source_read_complete_for_test) {
+                    try {
+                        config_.p51_source_read_complete_for_test(
+                            raw.has_value());
+                    } catch (...) {
+                    }
+                }
+#endif
                 std::chrono::steady_clock::time_point read_finished{};
                 if (pending->collect_metrics) {
                     read_finished = std::chrono::steady_clock::now();
