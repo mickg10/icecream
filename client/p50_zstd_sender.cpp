@@ -2548,7 +2548,8 @@ P50ZstdSourceSender::transfer_bytes(
         co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
                                      explicit_route);
 
-    // One route owner serializes its transfers. Retain only this operation's
+    // This R1 path serializes transfers. R2 uses transfer_p51_route above
+    // with a window of pending receipts. Retain only this R1 operation's
     // completions so byte accounting is bounded and includes either retry.
     impl_->wire_completions.clear();
 
@@ -2570,7 +2571,7 @@ P50ZstdSourceSender::transfer_bytes(
     } catch (const std::length_error&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
     } catch (const std::logic_error&) {
-        // A relationship permits only one uncommitted successor.  A later
+        // An R1 relationship permits only one uncommitted successor. A later
         // wrapper may be the first observer after its predecessor died before
         // publishing the poisoned-route result.  Escalate the retained
         // ambiguity to the same sticky cold-replacement path.
