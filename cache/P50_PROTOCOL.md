@@ -182,7 +182,14 @@ generations before processing recovery.
 RESET is idempotently keyed by operation ID, advances the relationship epoch
 by exactly one, names the reconciled prefix K, and replaces the codec history
 nonce. RESET_ACK echoes the logical request fields and the new initial state;
-RESET_CONFIRM names the same operation, new epoch, nonce, and K. F accepts a
+RESET_CONFIRM names the same operation, new epoch, nonce, and K. After applying
+that confirmation, F echoes the exact RESET_CONFIRM record to C, including
+the current physical generation. C validates this echo before discarding its
+reset retry identity or sending new TU bundles. A successful socket write is
+not proof that F applied the confirmation. Loss of either the confirmation
+or its echo retains the same logical reset for retry, with the original
+deadline; reconnect changes only the physical generation. Duplicate valid
+confirmations are also echoed. F accepts a
 duplicate RESET before checking stale old-epoch state and returns the cached
 logical reset result, including after physical reconnection. A confirmed reset keeps its last
 logical reset outcome until a later confirmed reset or relationship retirement.

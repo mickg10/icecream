@@ -4189,6 +4189,13 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     stamp.operation = AsyncOperationKind::WriteFragment;
     co_await async_write_message(socket, Message{confirm}, frame_cap, stamp,
                                  impl_->completions, control, verify);
+    stamp.operation = AsyncOperationKind::ReadHeader;
+    Frame confirm_echo_frame = co_await async_read_frame(
+        socket, frame_cap, stamp, impl_->completions, verify);
+    if (confirm_echo_frame.type != MessageType::RESET_CONFIRM ||
+        decode_as<ResetConfirm>(confirm_echo_frame) != confirm)
+        throw std::invalid_argument(
+            "F did not echo the exact confirmed R2 reset operation");
 
     hello.relationship_epoch = new_relationship_epoch;
     hello.history_nonce = new_history_nonce;
@@ -6124,6 +6131,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     !impl_->config.confirm_p51_reset(hello, confirm))
                     throw std::invalid_argument(
                         "R2 RESET_CONFIRM does not match retained reset result");
+                co_await async_write_message(
+                    socket, Message{confirm}, frame_cap,
+                    stamp(AsyncOperationKind::WriteFragment),
+                    impl_->completions, control, verify);
                 hello.relationship_epoch = confirm.new_relationship_epoch;
                 hello.history_nonce = confirm.new_history_nonce;
                 hello.verified_receipt_floor = confirm.settled_prefix_k;
@@ -6268,6 +6279,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     !impl_->config.confirm_p51_reset(hello, confirm))
                     throw std::invalid_argument(
                         "R2 RESET_CONFIRM does not match RESET_ACK");
+                co_await async_write_message(
+                    socket, Message{confirm}, frame_cap,
+                    stamp(AsyncOperationKind::WriteFragment),
+                    impl_->completions, control, verify);
                 hello.relationship_epoch = confirm.new_relationship_epoch;
                 hello.history_nonce = confirm.new_history_nonce;
                 hello.verified_receipt_floor = confirm.settled_prefix_k;
@@ -6290,6 +6305,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     !impl_->config.confirm_p51_reset(hello, confirm))
                     throw std::invalid_argument(
                         "R2 duplicate RESET_CONFIRM does not match cached outcome");
+                co_await async_write_message(
+                    socket, Message{confirm}, frame_cap,
+                    stamp(AsyncOperationKind::WriteFragment),
+                    impl_->completions, control, verify);
                 continue;
             }
             if (bind_frame.type == MessageType::CLOSE) {

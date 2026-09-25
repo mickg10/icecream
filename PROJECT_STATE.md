@@ -73,6 +73,25 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+RESET confirmation loss is fixed: F echoes the exact applied RESET_CONFIRM,
+and C waits for that echo before releasing its stable reset retry identity.
+The previous implementation failed the deterministic lost-confirmation test
+by attempting a different reset against F's still-unconfirmed prior result.
+Both confirmation-loss and applied-confirmation/echo-loss cases now pass for
+P29V1, ZSTD_TU and ZSTD_ROUTE, with exact once-only commits and the same reset
+identity across reconnection. Full sender and endpoint executables pass too
+(`SENDER_AND_ENDPOINT_EXIT=0`):
+`/tanksmall/scratch/tmp/p51-lost-confirm-sdk.EK4iRP/logs/full-sender-endpoint-r1.log`,
+SHA256 `4f2aa1af974c33cd2ce82e61ad175aa03641ae6929daac61ac5f8c75950c42a3`.
+Endpoint source SHA256:
+`4e59b1419dec2260a993ae4f379799961e2e93019291c53f3aecb79489985ccb`;
+sender test SHA256:
+`4334876affbbe37ac558a154034ec5d0bcfe758480002c4044a4863b4cd99d28`.
+This changes the unreleased windowed recovery handshake: deploy matching C/F
+binaries. It adds no normal-transfer round trip and does not alter P43.
+Formal echo-loss/early-retry-discard modeling remains a follow-up, not a
+claim established by these native tests.
+
 Active-read cancellation now checks the control peer without consuming bytes
 before each 64 KiB source read. A deterministic read-worker barrier proves
 peer closure is observed inside the read loop, before any F connection, and

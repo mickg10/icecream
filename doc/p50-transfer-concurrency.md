@@ -645,7 +645,7 @@ wire numbers in a design document.
 | COMMIT_ACK | C's contiguous verified receipt floor, relationship/recovery epoch; no gaps or acknowledgement beyond F's committed prefix |
 | RECOVER / RECEIPTS | C's verified floor and retained suffix identity; F's complete bounded receipt interval, not only last commit |
 | RESET / RESET_ACK | Idempotent recovery operation ID, settled prefix, old epoch, fresh history nonce and new epoch; no input-record deletion |
-| RESET_CONFIRM | Exact recovery operation ID and new epoch; C confirms receipt of RESET_ACK before new TU bundles |
+| RESET_CONFIRM | Exact recovery operation ID, new epoch, nonce, K and physical generation; F echoes after application, and C validates the echo before new TU bundles |
 | CLOSE / ERROR | Typed reason and relevant epoch/TU; no successful settlement inferred from EOF |
 
 Use the existing bounded outer-frame shape only if it remains sufficient;
@@ -804,8 +804,12 @@ from blocking the very ACK that frees it.
    Retain the recovery operation/result until C confirms the new epoch.
    If RESET_ACK is lost, repeating RESET returns that same result instead of
    creating another nonce or forgetting the receipt interval.
-   C sends RESET_CONFIRM before new bundles. F deduplicates RESET by operation
-   ID before checking old-nonce staleness; a duplicate confirmation is harmless.
+   C sends RESET_CONFIRM and waits for F's exact RESET_CONFIRM echo before
+   new bundles or clearing its stable reset retry identity. F sends the echo
+   only after applying the confirmation. Lost confirmation or lost echo
+   reuses the same logical reset under a newer physical generation and the
+   original caller deadline. F deduplicates RESET by operation ID before
+   checking old-nonce staleness; duplicate valid confirmations are echoed too.
    Keep one bounded last-reset result per live relationship through the next
    confirmed reset or relationship retirement, so loss of a confirmation does
    not require an unbounded chain of tombstones or erase an ambiguous result.
