@@ -1608,6 +1608,7 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
       // room for every concurrently admitted C/F session (40) plus control
       // churn during replacement.
       fsession_owner_(64, config_.f_store_generation) {
+    config_.endpoint_config.f_store_generation = config_.f_store_generation;
     const auto fsession_ready = fsession::mint_fsession_admission_ready(
         fsession_owner_.service_generation(), 1);
     if (!fsession_owner_.open_admission(fsession_ready))
@@ -1718,6 +1719,24 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.compression_level = 3;
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
+    const std::weak_ptr<std::atomic<bool>> route_owner_alive =
+        route_owner_callback_alive_;
+    route_config.post_retired_reap = [this, route_owner_alive] {
+        const auto alive = route_owner_alive.lock();
+        if (!alive || !alive->load(std::memory_order_acquire))
+            return;
+        // A pump is still holding its sender while this callback runs. Post
+        // rather than reap inline so the coroutine frame/shared_ptr is gone
+        // before the owner checks for quiescence.
+        context_.post([this, route_owner_alive] {
+            const auto posted_alive = route_owner_alive.lock();
+            if (!posted_alive ||
+                !posted_alive->load(std::memory_order_acquire) ||
+                !route_owner_)
+                return;
+            route_owner_->reap_retired_p51();
+        });
+    };
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
         std::move(config_.before_route_prepare_for_test);
@@ -2516,7 +2535,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_p51_source_on_owner(
                     if (!stop_requested_.load(std::memory_order_acquire) &&
                         !route_replacement_required_.load(
                             std::memory_order_acquire) &&
-                        bind_route_endpoint_identity(endpoint_key, store_identity)) {
+                        bind_route_endpoint_identity(endpoint_key, store_identity,
+                                                     true)) {
                         observed = co_await route_owner_->transfer_p51(
                             relationship, request.armed, connector, route_request,
                             deadline,
@@ -2799,7 +2819,7 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
                                 !route_replacement_required_.load(
                                     std::memory_order_acquire) &&
                                 bind_route_endpoint_identity(
-                                    endpoint_key, store_identity)) {
+                                    endpoint_key, store_identity, true)) {
                                 observed = co_await route_owner_->transfer_p51(
                                     relationship,
                                     pending_transfer->request.armed,
@@ -2850,7 +2870,7 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
 
 bool SidecarRuntime::bind_route_endpoint_identity(
     const RouteEndpointKey& endpoint,
-    RouteStoreIdentity observed) noexcept {
+    RouteStoreIdentity observed, bool p51) noexcept {
     if (!route_owner_ || endpoint.host.empty() || endpoint.cache_port == 0 ||
         observed.guid == FStoreGuid{} || observed.generation == 0)
         return false;
@@ -2891,9 +2911,26 @@ bool SidecarRuntime::bind_route_endpoint_identity(
     const SourceIncarnationKey successor{observed.guid, observed.generation};
     if (retired_source_incarnations_.contains(successor))
         return false;
-    if (!route_owner_->reset_f_store_exact(position->second.guid,
-                                           position->second.generation))
+    const RouteStoreIdentity previous = position->second;
+    const bool reset = p51
+        ? route_owner_->retire_f_store_exact_p51(previous.guid,
+                                                 previous.generation)
+        : route_owner_->reset_f_store_exact(previous.guid,
+                                            previous.generation);
+    if (!reset) {
+        std::fprintf(stderr,
+            "P51_ROUTE_IDENTITY_RESET blocked host=%s port=%u old=%02x%02x/%llu new=%02x%02x/%llu owners=%zu\n",
+            endpoint.host.c_str(), endpoint.cache_port,
+            static_cast<unsigned>(previous.guid.bytes[0]),
+            static_cast<unsigned>(previous.guid.bytes[1]),
+            static_cast<unsigned long long>(previous.generation),
+            static_cast<unsigned>(observed.guid.bytes[0]),
+            static_cast<unsigned>(observed.guid.bytes[1]),
+            static_cast<unsigned long long>(observed.generation),
+            route_owner_->owner_count());
+        std::fflush(stderr);
         return false;
+    }
     try {
         retired_source_incarnations_.insert(retired);
     } catch (...) {
@@ -3327,6 +3364,7 @@ SidecarRuntime::~SidecarRuntime() {
             config_.fail_stop();
         std::_Exit(125);
     }
+    route_owner_callback_alive_->store(false, std::memory_order_release);
     endpoint_work_guard_.reset();
     if (endpoint_owner_thread_.joinable())
         endpoint_owner_thread_.join();

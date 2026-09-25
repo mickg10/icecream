@@ -52,6 +52,14 @@ enum class ZstdSourceTransferStatus : uint8_t {
     CommittedIdentityUnavailable,
 };
 
+// A validated R2_LINK_REJECT is a terminal result for one exact logical
+// route offer. Keep the complete canonical offer so the route owner can retire
+// only the matching relationship/incarnation; it is never a commit witness.
+struct ZstdSourceRouteRejection {
+    LinkRejectReason reason = LinkRejectReason::ReservationMissing;
+    LinkHello offered{};
+};
+
 struct ZstdSourceTransferResult {
     ZstdSourceTransferStatus status = ZstdSourceTransferStatus::Unavailable;
     ProfileId profile = ProfileId::ZSTD_TU;
@@ -77,6 +85,10 @@ struct ZstdSourceTransferResult {
     // must not retire the shared C owner or reject other F relationships.
     // Never set for typed preparation poison or uncertain local state.
     bool route_local_failure = false;
+    // Set only after R2LinkRejected validated both the reason and the exact
+    // LINK_HELLO offer. A generic EOF/timeout never populates it. It may
+    // accompany a previously validated commit; the commit witness stays final.
+    std::optional<ZstdSourceRouteRejection> r2_link_rejection;
 };
 
 struct ZstdSourceTransferConfig {
@@ -116,6 +128,10 @@ struct ZstdSourceTransferConfig {
     // shared retry timer. Product callers leave this empty.
     std::function<void(std::chrono::steady_clock::duration)>
         after_r2_recovery_waiter_registered_for_test;
+    // Called as a detached R2 receipt/ACK pump completes. The route owner
+    // uses this only to post an owner-affine deferred-retirement reap; it
+    // must not mutate sender or route state inline from the coroutine.
+    std::function<void()> on_r2_background_quiescent;
 };
 
 // Called once per bounded attempt.  The callback returns ownership of one

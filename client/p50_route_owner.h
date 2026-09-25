@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <vector>
@@ -43,6 +44,14 @@ struct P50RouteOwnerConfig {
     int compression_level = 3;
     P29InternerFaultInjection p29_interner_fault_injection =
         P29InternerFaultInjection::Disabled;
+    // Invoked from detached R2 pump completion. Production installs a
+    // lifetime-fenced callback which posts route reaping onto the owner
+    // executor; tests may leave it empty.
+    std::function<void()> post_retired_reap;
+    // Narrow observation seams for proving that a pump-triggered idle reap
+    // retires exact route state without a subsequent transfer.
+    std::function<bool()> hold_r2_receipt_reader_for_test;
+    std::function<void()> after_retired_route_reaped_for_test;
     // Forwarded only to the sender's deterministic route-poison unit seam.
     // Production callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;
@@ -89,10 +98,27 @@ public:
     [[nodiscard]] bool reset_f_store_exact(
         FStoreGuid old_f_store_guid,
         uint64_t old_f_store_generation) noexcept;
+    // R2-only F incarnation retirement. Active senders are fenced and moved
+    // to the bounded retired table; their route preparation is discarded only
+    // after every caller/pump releases its shared sender reference. R1 reset
+    // semantics above remain unchanged.
+    [[nodiscard]] bool retire_f_store_exact_p51(
+        FStoreGuid old_f_store_guid,
+        uint64_t old_f_store_generation) noexcept;
+    // Retires only the exact R2 logical relationship/epoch on the specified
+    // physical link. This is used for a typed ReservationMissing response on
+    // an otherwise unchanged F store incarnation.
+    [[nodiscard]] bool retire_relationship_exact_p51(
+        const P50RouteRelationship& relationship,
+        const P50ZstdSourceSender* expected_sender, Id128 relationship_id,
+        uint64_t relationship_epoch,
+        uint64_t physical_link_generation) noexcept;
     // Stop/fail the C runtime's current R2 physical links without touching
     // retained route maps from another thread. Must run on the route owner's
     // executor; active senders close their exact socket and wake their waits.
     void cancel_active_p51_transfers() noexcept;
+    // Owner-affine callback target for post-pump retirement notifications.
+    void reap_retired_p51() noexcept { reap_retired_senders(); }
     void reset() noexcept;
 
     [[nodiscard]] size_t owner_count() const noexcept { return owners_.size(); }
@@ -107,6 +133,14 @@ public:
 
 private:
     using Sender = std::shared_ptr<P50ZstdSourceSender>;
+    struct RetiredSender {
+        Sender sender;
+        std::optional<PreparationRouteKey> abandon_route_when_quiescent;
+    };
+    struct P51LinkIdentity {
+        Id128 relationship_id{};
+        uint64_t relationship_epoch = 0;
+    };
 
     [[nodiscard]] ZstdSourceTransferResult invalid() const noexcept;
     [[nodiscard]] ZstdSourceTransferResult replacement() const noexcept;
@@ -120,8 +154,9 @@ private:
     P50RouteOwnerConfig config_{};
     std::shared_ptr<P50PreparationAuthority> authority_;
     std::map<P50RouteRelationship, Sender> owners_;
-    std::vector<Sender> retired_senders_;
+    std::vector<RetiredSender> retired_senders_;
     std::map<P50RouteRelationship, uint64_t> physical_generations_;
+    std::map<P50RouteRelationship, P51LinkIdentity> p51_link_identities_;
     std::map<std::tuple<CStoreGuid, FStoreGuid, uint64_t>, ProfileId>
         p51_incarnation_profiles_;
     uint64_t next_physical_generation_ = 1;

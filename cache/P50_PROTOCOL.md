@@ -131,11 +131,17 @@ qualified codec; endpoint emission and sender handling remain pending.
 The rejection digest is XXH3-128 over ASCII `R2-link-offer-v1` without a NUL,
 followed by the canonical 181-byte LINK_HELLO payload (no outer frame header).
 Unknown reasons, truncated payloads and trailing bytes are invalid. Neither
-reason grants commit or compiler-admission credit. Planned emission and
-retirement rules, including the distinction between definite absence and
-invalid/stale lookup, are specified in
+reason grants commit or compiler-admission credit. The receiver emits
+StoreReplaced for a different F GUID or a mismatch with its explicitly known
+F generation. The sender validates the exact offered HELLO, shares the
+rejection across queued callers, and retires the affected route without
+discarding an already validated positive receipt. Retired route preparation
+is removed only after its callers and background pumps release it.
+ReservationMissing is decoded but is not yet emitted by the runtime:
+generic lookup failure still closes the connection and uses bounded retry.
+The distinction between definite absence and invalid/stale lookup is specified in
 [the implementation plan](../doc/p50-transfer-concurrency.md#741-planned-link-rejection-completion).
-Codec availability alone does not qualify that behavior.
+See [validation status](../PROJECT_STATE.md) for the tested scope and remaining gates.
 
 LINK_HELLO starts revision 2 and pins one profile/window to a physical link.
 R1 transaction bytes are nested at TU_BEGIN and R2_TX_COMMIT but do not by

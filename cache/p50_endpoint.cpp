@@ -2029,6 +2029,67 @@ bool P50PreparationAuthority::reset_route(PreparationRouteKey route_key) noexcep
     }
 }
 
+bool P50PreparationAuthority::abandon_retired_route(
+    PreparationRouteKey route_key) noexcept {
+    try {
+        impl_->owner.require();
+        if (route_key.f_store_guid == FStoreGuid{} ||
+            route_key.f_store_generation == 0 ||
+            (route_key.profile != ProfileId::P29V1 &&
+             route_key.profile != ProfileId::ZSTD_TU &&
+             route_key.profile != ProfileId::ZSTD_ROUTE))
+            return false;
+
+        // Preflight the complete mutation before touching either codec state
+        // or shared request entries. A caller may invoke this only after the
+        // retired sender and all of its prepared-handle users are quiescent.
+        uint64_t released_encoded_bytes = 0;
+        for (const auto& [entry_id, entry] : impl_->entries) {
+            (void)entry_id;
+            if (entry.route != route_key)
+                continue;
+            if (entry.retained_bytes >
+                std::numeric_limits<uint64_t>::max() - released_encoded_bytes)
+                return false;
+            released_encoded_bytes += entry.retained_bytes;
+        }
+        if (released_encoded_bytes > impl_->retained_bytes)
+            return false;
+        for (const auto& [entry_id, entry] : impl_->entries) {
+            (void)entry_id;
+            if (entry.route == route_key &&
+                !entry.shared->entries.contains(route_key))
+                return false;
+        }
+
+        for (auto entry_position = impl_->entries.begin();
+             entry_position != impl_->entries.end();) {
+            if (entry_position->second.route != route_key) {
+                ++entry_position;
+                continue;
+            }
+            const PrepareRequestKey request = entry_position->second.request;
+            const std::shared_ptr<Impl::Shared> shared =
+                entry_position->second.shared;
+            shared->entries.erase(route_key);
+            entry_position = impl_->entries.erase(entry_position);
+            if (shared->entries.empty()) {
+                const auto request_position = impl_->requests.find(request);
+                if (request_position != impl_->requests.end() &&
+                    request_position->second == shared)
+                    impl_->requests.erase(request_position);
+            }
+        }
+        impl_->retained_bytes -= released_encoded_bytes;
+        // Erasing RouteState destroys any P29 route codec/history object. Do
+        // not mutate it first: all fallible accounting checks are complete.
+        impl_->routes.erase(route_key);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 ProfileId P50PreparationAuthority::profile() const {
     impl_->owner.check();
     return impl_->profile;
@@ -3844,6 +3905,15 @@ boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
     stamp.operation = AsyncOperationKind::ReadHeader;
     Frame frame = co_await async_read_frame(socket, frame_cap, stamp,
                                             impl_->completions, verify);
+    if (frame.type == MessageType::R2_LINK_REJECT) {
+        const LinkRejectMessage rejected = decode_as<LinkRejectMessage>(frame);
+        if (!rejected.valid() ||
+            rejected.offered_hello_digest !=
+                compute_r2_link_offer_digest(hello))
+            throw std::invalid_argument(
+                "R2 LINK_REJECT does not bind exact LINK_HELLO offer");
+        throw R2LinkRejected(rejected, std::move(hello));
+    }
     if (frame.type != MessageType::LINK_STATE)
         throw std::invalid_argument("R2 LINK_HELLO did not receive LINK_STATE");
     const LinkState state = decode_as<LinkState>(frame);
@@ -5762,10 +5832,31 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
             (hello.start_mode != LinkStartMode::Initial &&
              hello.start_mode != LinkStartMode::Reconnect) ||
             hello.window == 0 || hello.window > 30 ||
-            hello.f_store_guid != impl_->f_guid ||
             hello.max_frame_payload < kR2MandatoryControlFramePayload ||
             (impl_->caps.supported_profiles & profile_bit(hello.profile)) == 0)
             throw std::invalid_argument("R2 LINK_HELLO exceeds F admission");
+        if (hello.f_store_guid != impl_->f_guid ||
+            (impl_->config.f_store_generation != 0 &&
+             hello.f_store_generation !=
+                 impl_->config.f_store_generation)) {
+            // LINK_HELLO has already passed strict structural/canonical
+            // decoding. The runtime's exact store identity can therefore make
+            // a precise statement that the requested F incarnation was
+            // replaced. Standalone endpoints without an authoritative
+            // generation only type a differing F GUID. Do not turn generic
+            // reservation lookup failures into typed rejection.
+            const LinkRejectMessage rejected{
+                LinkRejectReason::StoreReplaced,
+                compute_r2_link_offer_digest(hello)};
+            co_await async_write_message(
+                socket, Message{rejected}, frame_cap,
+                stamp(AsyncOperationKind::WriteFragment), impl_->completions,
+                control, verify);
+            close_now(socket);
+            impl_->disconnect(session, false);
+            result.status = ServerRunStatus::Disconnected;
+            co_return result;
+        }
         if (!impl_->config.lookup_p51_link_reservation)
             throw std::invalid_argument("R2 link reservation lookup is unavailable");
         const auto link_lease =

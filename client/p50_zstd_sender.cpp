@@ -318,6 +318,24 @@ struct P50ZstdSourceSender::Impl {
         return result;
     }
 
+    ZstdSourceTransferResult r2_route_replacement_result(
+        ZstdSourceTransferStatus status) noexcept {
+        ZstdSourceTransferResult result = replacement(status, true);
+        std::lock_guard lock(r2_transfer_mutex);
+        if (r2_terminal_rejection) {
+            result.status = ZstdSourceTransferStatus::TerminalError;
+            result.replacement_required = false;
+            result.route_local_failure = true;
+            result.r2_link_rejection = r2_terminal_rejection;
+        }
+        return result;
+    }
+
+    std::optional<ZstdSourceRouteRejection> current_r2_route_rejection() {
+        std::lock_guard lock(r2_transfer_mutex);
+        return r2_terminal_rejection;
+    }
+
     void quarantine_transport(ZstdSourceTransferResult& result,
                               bool persistent_route) noexcept {
         require_replacement(result, persistent_route);
@@ -325,6 +343,33 @@ struct P50ZstdSourceSender::Impl {
             route_transport_quarantined = true;
             result.route_local_failure = true;
         }
+    }
+
+    std::optional<ZstdSourceRouteRejection> accept_r2_link_rejection(
+        const R2LinkRejected& rejected) noexcept {
+        const bool known_reason =
+            rejected.rejection.reason == LinkRejectReason::StoreReplaced ||
+            rejected.rejection.reason == LinkRejectReason::ReservationMissing;
+        // Endpoint verifies the canonical offer digest. Require the full
+        // offered record to match this sender's exact in-flight handshake too.
+        if (!known_reason || !r2_attempted_offer ||
+            rejected.offered != *r2_attempted_offer)
+            return std::nullopt;
+        const ZstdSourceRouteRejection route_rejection{
+            rejected.rejection.reason, rejected.offered};
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            r2_terminal_rejection = route_rejection;
+            route_replacement_required = true;
+            route_transport_quarantined = true;
+            r2_recovery_required = false;
+        }
+        wake_r2_recovery_waiters();
+        if (r2_socket) {
+            boost::system::error_code ignored;
+            r2_socket->close(ignored);
+        }
+        return route_rejection;
     }
 
     ZstdSourceTransferResult committed_from_witness(
@@ -452,6 +497,8 @@ struct P50ZstdSourceSender::Impl {
     uint64_t r2_relationship_epoch = 0;
     uint64_t r2_relationship_ordinal = 1;
     std::optional<LinkHello> r2_hello;
+    std::optional<LinkHello> r2_attempted_offer;
+    std::optional<ZstdSourceRouteRejection> r2_terminal_rejection;
     bool r2_recovery_required = false;
     uint64_t r2_recovery_floor = 0;
     Id128 r2_recovery_operation{};
@@ -627,6 +674,19 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_recovery_retry(
 boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
     uint64_t physical_link_generation) {
     const auto executor = co_await boost::asio::this_coro::executor;
+    struct QuiescentNotify {
+        const std::function<void()>* callback;
+        ~QuiescentNotify() noexcept {
+            if (!callback || !*callback)
+                return;
+            try {
+                (*callback)();
+            } catch (...) {
+                // Deferred owner cleanup must never change an already-settled
+                // receipt or escape the sender's detached coroutine.
+            }
+        }
+    } notify{&impl_->config.on_r2_background_quiescent};
     if (impl_->config.hold_r2_receipt_reader_for_test) {
         boost::asio::steady_timer test_gate(executor);
         while (impl_->config.hold_r2_receipt_reader_for_test()) {
@@ -816,6 +876,18 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
 
 boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
     uint64_t physical_link_generation) {
+    struct QuiescentNotify {
+        const std::function<void()>* callback;
+        ~QuiescentNotify() noexcept {
+            if (!callback || !*callback)
+                return;
+            try {
+                (*callback)();
+            } catch (...) {
+                // See the receipt-reader counterpart: reaping is advisory.
+            }
+        }
+    } notify{&impl_->config.on_r2_background_quiescent};
     for (;;) {
         uint64_t target = 0;
         {
@@ -985,6 +1057,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     impl_->r2_socket = std::move(*socket);
     impl_->r2_failed_physical_generation = 0;
 
+    impl_->r2_attempted_offer = hello;
     R2RecoveryResult recovered = co_await impl_->endpoint->recover_r2_link(
         *impl_->r2_socket, hello, witnesses, verified_floor_a,
         impl_->r2_recovery_operation, impl_->r2_recovery_new_epoch,
@@ -1288,7 +1361,8 @@ P50ZstdSourceSender::transfer_p51_route(
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
         writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
         if (impl_->route_replacement_required)
-            co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
+            co_return impl_->r2_route_replacement_result(
+                ZstdSourceTransferStatus::Unavailable);
         if (impl_->r2_recovery_required) {
             writer_guard.reset();
             if (!co_await wait_for_r2_recovery_retry(deadline)) {
@@ -1326,6 +1400,21 @@ P50ZstdSourceSender::transfer_p51_route(
                 physical_link_generation =
                     impl_->r2_physical_link_generation;
                 armed.relationship_epoch = impl_->r2_relationship_epoch;
+            } catch (const R2LinkRejected& rejected) {
+                if (auto route_rejection =
+                        impl_->accept_r2_link_rejection(rejected)) {
+                    ZstdSourceTransferResult failed =
+                        impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+                    failed.profile = impl_->config.endpoint_caps.profile;
+                    failed.route_local_failure = true;
+                    failed.r2_link_rejection = std::move(route_rejection);
+                    co_return failed;
+                }
+                impl_->note_r2_recovery_failure();
+                ZstdSourceTransferResult failed =
+                    impl_->invalid(ZstdSourceTransferStatus::Unavailable);
+                failed.route_local_failure = true;
+                co_return failed;
             } catch (...) {
                 impl_->note_r2_recovery_failure();
                 ZstdSourceTransferResult failed =
@@ -1376,7 +1465,8 @@ P50ZstdSourceSender::transfer_p51_route(
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     }
     if (impl_->route_replacement_required)
-        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
+        co_return impl_->r2_route_replacement_result(
+            ZstdSourceTransferStatus::Unavailable);
     if (impl_->completed.size() >= impl_->config.max_completed_requests)
         co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
 
@@ -1434,10 +1524,12 @@ P50ZstdSourceSender::transfer_p51_route(
     bool bundle_complete = false;
     bool recovery_needed = false;
     bool exact_commit_preserved = false;
+    std::optional<ZstdSourceRouteRejection> terminal_rejection;
     uint64_t observed_failure_generation = 0;
     try {
         if (impl_->route_replacement_required)
-            throw std::runtime_error("R2 link is quarantined");
+            co_return impl_->r2_route_replacement_result(
+                ZstdSourceTransferStatus::Unavailable);
         if (impl_->r2_socket &&
             (impl_->r2_physical_link_generation != physical_link_generation ||
              impl_->r2_relationship_id != hello.relationship_id ||
@@ -1457,6 +1549,7 @@ P50ZstdSourceSender::transfer_p51_route(
             impl_->r2_physical_link_generation = physical_link_generation;
             impl_->r2_relationship_id = hello.relationship_id;
             impl_->r2_relationship_epoch = hello.relationship_epoch;
+            impl_->r2_attempted_offer = hello;
             const LinkState state = co_await impl_->endpoint->open_r2_link(
                 *impl_->r2_socket, hello, deadline);
             impl_->r2_hello = hello;
@@ -1614,6 +1707,11 @@ P50ZstdSourceSender::transfer_p51_route(
               co_await recover_r2_link(connection,
                   impl_->r2_physical_link_generation, deadline);
               recovered = true;
+          } catch (const R2LinkRejected& rejected) {
+              terminal_rejection =
+                  impl_->accept_r2_link_rejection(rejected);
+              if (!terminal_rejection)
+                  impl_->note_r2_recovery_failure();
           } catch (...) {
               // Exact COMMIT remains the result even if credit recovery
               // exhausts this original request's deadline.
@@ -1632,6 +1730,8 @@ P50ZstdSourceSender::transfer_p51_route(
         result.attempts = 1;
         if (binding.profile == ProfileId::P29V1)
             result.system_source_reuse = pending->system_source_reuse;
+        result.r2_link_rejection = terminal_rejection
+            ? terminal_rejection : impl_->current_r2_route_rejection();
         if (!pending->replayed_after_reset)
             impl_->remember_completed(request, source, raw_digest, result);
         co_return result;
@@ -1643,6 +1743,13 @@ P50ZstdSourceSender::transfer_p51_route(
                 !pending->failure &&
                 pending->client_result.status == ClientRunStatus::Committed &&
                 pending->client_result.committed_commit.has_value();
+        }
+        try {
+            std::rethrow_exception(transfer_failure);
+        } catch (const R2LinkRejected& rejected) {
+            terminal_rejection =
+                impl_->accept_r2_link_rejection(rejected);
+        } catch (...) {
         }
         if (!exact_commit_preserved) {
         const uint64_t error_generation = observed_failure_generation != 0
@@ -1656,15 +1763,17 @@ P50ZstdSourceSender::transfer_p51_route(
             stale_generation =
                 impl_->r2_physical_link_generation != error_generation;
         }
-        if (stale_generation && pending) {
+        if (stale_generation && pending && !terminal_rejection) {
             // Another caller already advanced this relationship to a newer
             // physical link. This waiter's old socket error must not remove,
             // reset, or release the shared pending row. Join it after leaving
             // this handler, since coroutine awaits are not legal in a catch.
             recovery_needed = true;
         } else {
-        bool has_staged_witness = pending && bundle_complete;
-        if (pending && !bundle_complete && impl_->r2_socket) {
+        bool has_staged_witness = pending && bundle_complete &&
+            !terminal_rejection.has_value();
+        if (pending && !bundle_complete && impl_->r2_socket &&
+            !terminal_rejection.has_value()) {
             try {
                 auto witnesses = impl_->endpoint->r2_pending_witnesses(
                     impl_->r2_relationship_ordinal - 1);
@@ -1711,7 +1820,8 @@ P50ZstdSourceSender::transfer_p51_route(
             impl_->endpoint->r2_confirmed_prefix();
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
-            if (impl_->r2_physical_link_generation == error_generation) {
+            if (!terminal_rejection.has_value() &&
+                impl_->r2_physical_link_generation == error_generation) {
                 impl_->r2_recovery_required = true;
                 impl_->r2_failed_physical_generation = error_generation;
                 impl_->r2_recovery_floor = confirmed_floor;
@@ -1722,7 +1832,8 @@ P50ZstdSourceSender::transfer_p51_route(
                 }
             }
         }
-        recovery_needed = pending && has_staged_witness &&
+        recovery_needed = !terminal_rejection.has_value() && pending &&
+            has_staged_witness &&
             impl_->r2_physical_link_generation == error_generation;
         }
         }
@@ -1737,9 +1848,20 @@ P50ZstdSourceSender::transfer_p51_route(
         result.raw_digest = pending->sent.binding.raw_digest;
         result.attempts = 1;
         result.system_source_reuse = pending->system_source_reuse;
+        result.r2_link_rejection = terminal_rejection
+            ? terminal_rejection : impl_->current_r2_route_rejection();
         if (!pending->replayed_after_reset)
             impl_->remember_completed(request, source, raw_digest, result);
         co_return result;
+    }
+
+    if (terminal_rejection) {
+        ZstdSourceTransferResult rejected =
+            impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+        rejected.profile = binding.profile;
+        rejected.route_local_failure = true;
+        rejected.r2_link_rejection = std::move(terminal_rejection);
+        co_return rejected;
     }
 
     if (recovery_needed) {
@@ -1762,6 +1884,8 @@ P50ZstdSourceSender::transfer_p51_route(
                     result.raw_digest = pending->sent.binding.raw_digest;
                     result.attempts = 1;
                     result.system_source_reuse = pending->system_source_reuse;
+                    result.r2_link_rejection = terminal_rejection
+                        ? terminal_rejection : impl_->r2_terminal_rejection;
                     co_return result;
                 }
                 if (pending->done && pending->failure) {
@@ -1812,6 +1936,13 @@ P50ZstdSourceSender::transfer_p51_route(
                 try {
                     co_await recover_r2_link(connection,
                         impl_->r2_physical_link_generation, deadline);
+                } catch (const R2LinkRejected& rejected) {
+                    if (auto route_rejection =
+                            impl_->accept_r2_link_rejection(rejected)) {
+                        terminal_rejection = std::move(route_rejection);
+                        break;
+                    }
+                    impl_->note_r2_recovery_failure();
                 } catch (...) {
                     impl_->note_r2_recovery_failure();
                     // Preserve the exact suffix and operation deadline. The
@@ -1880,8 +2011,26 @@ P50ZstdSourceSender::transfer_p51_route(
             result.raw_digest = pending->sent.binding.raw_digest;
             result.attempts = 1;
             result.system_source_reuse = pending->system_source_reuse;
+            result.r2_link_rejection = terminal_rejection
+                ? terminal_rejection : impl_->current_r2_route_rejection();
             co_return result;
         }
+    }
+    if (terminal_rejection) {
+        ZstdSourceTransferResult rejected =
+            impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+        rejected.profile = binding.profile;
+        rejected.route_local_failure = true;
+        rejected.r2_link_rejection = std::move(terminal_rejection);
+        co_return rejected;
+    }
+    if (auto route_rejection = impl_->current_r2_route_rejection()) {
+        ZstdSourceTransferResult rejected =
+            impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+        rejected.profile = binding.profile;
+        rejected.route_local_failure = true;
+        rejected.r2_link_rejection = std::move(route_rejection);
+        co_return rejected;
     }
     ZstdSourceTransferResult failed = impl_->invalid(
         Clock::now() >= deadline ? ZstdSourceTransferStatus::DeadlineExceeded

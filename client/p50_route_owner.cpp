@@ -2,6 +2,7 @@
 #include "services/comm.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -35,6 +36,9 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
     result.compression_level = owner_config.compression_level;
     result.before_prepare_for_route_for_test =
         owner_config.before_prepare_for_route_for_test;
+    result.on_r2_background_quiescent = owner_config.post_retired_reap;
+    result.hold_r2_receipt_reader_for_test =
+        owner_config.hold_r2_receipt_reader_for_test;
     return result;
 }
 
@@ -77,6 +81,12 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
     const auto position = owners_.find(relationship);
     if (position != owners_.end())
         return position->second;
+    const PreparationRouteKey requested_route = route_key(relationship);
+    for (const auto& retired : retired_senders_) {
+        if (retired.abandon_route_when_quiescent &&
+            *retired.abandon_route_when_quiescent == requested_route)
+            throw std::length_error("R2 route retirement is not quiescent");
+    }
     if (owners_.size() + retired_senders_.size() >= config_.max_relationships)
         throw std::length_error("route relationship table is full");
 
@@ -107,9 +117,27 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
 }
 
 void P50CRouteOwner::reap_retired_senders() noexcept {
-    std::erase_if(retired_senders_, [](const Sender& sender) {
-        return sender.use_count() == 1;
-    });
+    for (auto position = retired_senders_.begin();
+         position != retired_senders_.end();) {
+        if (!position->sender || position->sender.use_count() != 1) {
+            ++position;
+            continue;
+        }
+        if (position->abandon_route_when_quiescent &&
+            (!authority_ || !authority_->abandon_retired_route(
+                                *position->abandon_route_when_quiescent))) {
+            ++position;
+            continue;
+        }
+        position = retired_senders_.erase(position);
+        if (config_.after_retired_route_reaped_for_test) {
+            try {
+                config_.after_retired_route_reaped_for_test();
+            } catch (...) {
+                // A test observer must not change bounded owner cleanup.
+            }
+        }
+    }
 }
 
 PreparationRouteKey P50CRouteOwner::route_key(
@@ -232,6 +260,13 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
     const auto incarnation = std::make_tuple(
         relationship.c_store_guid, relationship.f_store_guid,
         relationship.f_store_generation);
+    const Id128 logical_relationship_id{armed.logical_relationship_id};
+    if (logical_relationship_id == Id128{} || armed.relationship_epoch == 0)
+        co_return invalid();
+    const auto logical_position = p51_link_identities_.find(relationship);
+    if (logical_position != p51_link_identities_.end() &&
+        logical_position->second.relationship_id != logical_relationship_id)
+        co_return invalid();
     const auto profile_position = p51_incarnation_profiles_.find(incarnation);
     if (profile_position != p51_incarnation_profiles_.end() &&
         profile_position->second != relationship.profile)
@@ -252,21 +287,91 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
                 relationship, next_physical_generation_++).first;
         }
         physical_generation = position->second;
+        if (logical_position == p51_link_identities_.end())
+            p51_link_identities_.emplace(
+                relationship,
+                P51LinkIdentity{logical_relationship_id,
+                                armed.relationship_epoch});
+        else
+            logical_position->second.relationship_epoch = std::max(
+                logical_position->second.relationship_epoch,
+                armed.relationship_epoch);
     } catch (const std::invalid_argument&) {
         if (owners_.find(relationship) == owners_.end())
             p51_incarnation_profiles_.erase(incarnation);
         co_return invalid();
+    } catch (const std::length_error&) {
+        if (owners_.find(relationship) == owners_.end())
+            p51_incarnation_profiles_.erase(incarnation);
+        ZstdSourceTransferResult unavailable;
+        unavailable.status = ZstdSourceTransferStatus::Unavailable;
+        unavailable.profile = relationship.profile;
+        unavailable.route_local_failure = true;
+        co_return unavailable;
+    } catch (const std::overflow_error&) {
+        if (owners_.find(relationship) == owners_.end())
+            p51_incarnation_profiles_.erase(incarnation);
+        ZstdSourceTransferResult unavailable;
+        unavailable.status = ZstdSourceTransferStatus::Unavailable;
+        unavailable.profile = relationship.profile;
+        unavailable.route_local_failure = true;
+        co_return unavailable;
     } catch (...) {
         if (owners_.find(relationship) == owners_.end())
             p51_incarnation_profiles_.erase(incarnation);
+        if (owners_.find(relationship) == owners_.end())
+            p51_link_identities_.erase(relationship);
         replacement_required_ = true;
         co_return replacement();
     }
     ZstdSourceTransferResult result = co_await sender->transfer_p51_route(
         std::move(armed), physical_generation, std::move(connection), request,
         deadline, source);
+    const auto current = owners_.find(relationship);
+    bool still_current = current != owners_.end() &&
+                         current->second == sender;
+    if (result.r2_link_rejection) {
+        const LinkHello& offered = result.r2_link_rejection->offered;
+        bool retired = false;
+        if (result.r2_link_rejection->reason ==
+            LinkRejectReason::StoreReplaced) {
+            // The offered F identity is the old one; a valid typed response
+            // proves the server is now a different incarnation.
+            if (offered.f_store_guid == relationship.f_store_guid &&
+                offered.f_store_generation == relationship.f_store_generation)
+                retired = retire_f_store_exact_p51(
+                    relationship.f_store_guid,
+                    relationship.f_store_generation);
+        } else if (result.r2_link_rejection->reason ==
+                   LinkRejectReason::ReservationMissing) {
+            if (offered.c_store_guid == relationship.c_store_guid &&
+                offered.f_store_guid == relationship.f_store_guid &&
+                offered.f_store_generation == relationship.f_store_generation)
+                retired = retire_relationship_exact_p51(
+                    relationship, sender.get(), offered.relationship_id,
+                    offered.relationship_epoch,
+                    offered.physical_link_generation);
+        }
+        if (!retired) {
+            // Do not re-open the rejected sender. This is local to its exact
+            // R2 route; unrelated C/F relationships remain usable.
+            result.route_local_failure = true;
+            result.replacement_required = false;
+        } else {
+            still_current = false;
+        }
+    }
+    if (!still_current && result.status != ZstdSourceTransferStatus::Committed) {
+        // A verified old receipt remains positive evidence, but a failed
+        // operation on a retired F incarnation is route-local. It must not
+        // poison the C process or its unrelated F relationships.
+        result.replacement_required = false;
+        result.route_local_failure = true;
+    }
     if (result.replacement_required && !result.route_local_failure)
         replacement_required_ = true;
+    sender.reset();
+    reap_retired_senders();
     co_return result;
 }
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
@@ -284,18 +389,42 @@ bool P50CRouteOwner::reset_f_store_exact(
         if (position->first.f_store_guid == old_f_store_guid &&
             position->first.f_store_generation == old_f_store_generation) {
             const PreparationRouteKey key = route_key(position->first);
-            if (!authority_ || authority_->reset_route(key)) {
+            const bool route_reset = !authority_ || authority_->reset_route(key);
+            if (route_reset) {
                 p51_incarnation_profiles_.erase(std::make_tuple(
                     position->first.c_store_guid,
                     position->first.f_store_guid,
                     position->first.f_store_generation));
                 physical_generations_.erase(position->first);
+                p51_link_identities_.erase(position->first);
                 if (position->second.use_count() > 1) {
                     position->second->retire_for_replacement();
-                    retired_senders_.push_back(std::move(position->second));
+                    retired_senders_.push_back(
+                        {std::move(position->second), std::nullopt});
                 }
                 position = owners_.erase(position);
             } else {
+                size_t live_entries = 0;
+                size_t route_history_entries = 0;
+                try {
+                    if (authority_) {
+                        live_entries = authority_->live_entry_count();
+                        route_history_entries =
+                            authority_->route_history_entries(key);
+                    }
+                } catch (...) {
+                }
+                std::fprintf(stderr,
+                    "P51_ROUTE_RESET_BLOCKED profile=%u c=%02x%02x f=%02x%02x/%llu live_entries=%zu route_history=%zu\n",
+                    static_cast<unsigned>(position->first.profile),
+                    static_cast<unsigned>(position->first.c_store_guid.bytes[0]),
+                    static_cast<unsigned>(position->first.c_store_guid.bytes[1]),
+                    static_cast<unsigned>(position->first.f_store_guid.bytes[0]),
+                    static_cast<unsigned>(position->first.f_store_guid.bytes[1]),
+                    static_cast<unsigned long long>(
+                        position->first.f_store_generation),
+                    live_entries, route_history_entries);
+                std::fflush(stderr);
                 reset = false;
                 ++position;
             }
@@ -305,6 +434,116 @@ bool P50CRouteOwner::reset_f_store_exact(
     if (!reset)
         replacement_required_ = true;
     return reset;
+}
+
+bool P50CRouteOwner::retire_f_store_exact_p51(
+    FStoreGuid old_f_store_guid,
+    uint64_t old_f_store_generation) noexcept {
+    reap_retired_senders();
+    if (old_f_store_guid == FStoreGuid{} || old_f_store_generation == 0)
+        return false;
+
+    // Do not let an R2 replacement silently retire a legacy R1 route which
+    // happens to use the same F store identity.
+    for (const auto& [relationship, sender] : owners_) {
+        (void)sender;
+        if (relationship.f_store_guid == old_f_store_guid &&
+            relationship.f_store_generation == old_f_store_generation &&
+            !p51_incarnation_profiles_.contains(std::make_tuple(
+                relationship.c_store_guid, relationship.f_store_guid,
+                relationship.f_store_generation)))
+            return false;
+    }
+
+    for (auto position = owners_.begin(); position != owners_.end();) {
+        if (position->first.f_store_guid != old_f_store_guid ||
+            position->first.f_store_generation != old_f_store_generation) {
+            ++position;
+            continue;
+        }
+        if (retired_senders_.size() >= config_.max_relationships)
+            return false;
+
+        const P50RouteRelationship relationship = position->first;
+        const PreparationRouteKey key = route_key(relationship);
+        Sender sender = position->second;
+        if (!sender)
+            return false;
+        sender->retire_for_replacement();
+        // Detach the exact sender before attempting codec-state cleanup.
+        // Cleanup may need a later owner turn if a pump/caller still owns the
+        // sender; a typed F replacement must not leave that fenced sender in
+        // the active map or globally poison unrelated relationships.
+        retired_senders_.push_back({std::move(position->second), key});
+        position = owners_.erase(position);
+        sender.reset();
+        reap_retired_senders();
+        physical_generations_.erase(relationship);
+        p51_link_identities_.erase(relationship);
+        p51_incarnation_profiles_.erase(std::make_tuple(
+            relationship.c_store_guid, relationship.f_store_guid,
+            relationship.f_store_generation));
+    }
+    // A repeated typed rejection after the predecessor was already retired is
+    // idempotent; the new incarnation has no matching owner to erase.
+    return true;
+}
+
+bool P50CRouteOwner::retire_relationship_exact_p51(
+    const P50RouteRelationship& relationship,
+    const P50ZstdSourceSender* expected_sender, Id128 relationship_id,
+    uint64_t relationship_epoch,
+    uint64_t physical_link_generation) noexcept {
+    reap_retired_senders();
+    if (!relationship.valid() || !expected_sender ||
+        relationship_id == Id128{} ||
+        relationship_epoch == 0 || physical_link_generation == 0)
+        return false;
+    const auto sender_position = owners_.find(relationship);
+    const auto identity_position = p51_link_identities_.find(relationship);
+    const auto generation_position = physical_generations_.find(relationship);
+    if (sender_position == owners_.end() ||
+        identity_position == p51_link_identities_.end() ||
+        generation_position == physical_generations_.end() ||
+        sender_position->second.get() != expected_sender ||
+        identity_position->second.relationship_id != relationship_id ||
+        !p51_incarnation_profiles_.contains(std::make_tuple(
+            relationship.c_store_guid, relationship.f_store_guid,
+            relationship.f_store_generation)))
+        return false;
+    if (retired_senders_.size() >= config_.max_relationships)
+        return false;
+
+    // Recovery increments the physical generation inside the sender, so the
+    // route-owner's next-allocation counter can lag the exact offer which was
+    // just rejected. Keep same-F relationship reuse strictly above that
+    // validated attempted generation; UINT64_MAX is a permanent local
+    // exhaustion marker and is never wrapped.
+    if (physical_link_generation >= next_physical_generation_) {
+        next_physical_generation_ =
+            physical_link_generation == UINT64_MAX
+                ? UINT64_MAX
+                : physical_link_generation + 1;
+    }
+
+    const PreparationRouteKey key = route_key(relationship);
+    Sender sender = sender_position->second;
+    if (!sender)
+        return false;
+    sender->retire_for_replacement();
+    // As above, owner-map retirement is immediate even when exact authority
+    // cleanup must wait for the final pump/caller reference to drain.
+    retired_senders_.push_back(
+        {std::move(sender_position->second), key});
+    owners_.erase(sender_position);
+    sender.reset();
+    reap_retired_senders();
+    physical_generations_.erase(relationship);
+    p51_link_identities_.erase(relationship);
+    p51_incarnation_profiles_.erase(std::make_tuple(
+        relationship.c_store_guid, relationship.f_store_guid,
+        relationship.f_store_generation));
+    return true;
 }
 
 void P50CRouteOwner::reset() noexcept {
@@ -317,9 +556,11 @@ void P50CRouteOwner::reset() noexcept {
                 position->first.c_store_guid, position->first.f_store_guid,
                 position->first.f_store_generation));
             physical_generations_.erase(position->first);
+            p51_link_identities_.erase(position->first);
             if (position->second.use_count() > 1) {
                 position->second->retire_for_replacement();
-                retired_senders_.push_back(std::move(position->second));
+                retired_senders_.push_back(
+                    {std::move(position->second), std::nullopt});
             }
             position = owners_.erase(position);
         }
@@ -334,9 +575,9 @@ void P50CRouteOwner::cancel_active_p51_transfers() noexcept {
         if (sender)
             sender->retire_for_replacement();
     }
-    for (const auto& sender : retired_senders_) {
-        if (sender)
-            sender->retire_for_replacement();
+    for (const auto& retired : retired_senders_) {
+        if (retired.sender)
+            retired.sender->retire_for_replacement();
     }
 }
 

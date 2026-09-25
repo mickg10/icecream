@@ -365,8 +365,34 @@ under the sender build root above (SHA256
 `43c54a68ea739a6af92fd2dcf26c590ea2ad5207bf856e7c02c4422e95c489ac`),
 container exit 0; test binary SHA256
 `a0f2eefca1d71db084ce76ab531a20cf816ff138376f74e76fbcdc81a53c74a7`.
-This is codec-only evidence: endpoint emission and sender retirement on a
-validated rejection are not yet implemented or qualified.
+That run is codec-only evidence. Subsequent endpoint/owner and sender tests
+cover StoreReplaced emission and exact-offer rejection handling:
+
+- Endpoint stale-generation rejection and full route-owner suite pass,
+  including all 18 direct W30 topology/profile cells and idle background-pump
+  retirement cleanup. Evidence:
+  `/tanksmall/scratch/tmp/p51-route-reap.6Pp7wd/focused-build-run.log`, SHA256
+  `98fce46abb7c5256b110692fee0303ae466cff073ed571a2ccbf2dfd12d8a497`.
+  Earlier failed build/test attempts remain in that log; its final run passed.
+  Route-owner binary: `c2b4b82e5ddef678e5189211f7f09e6e8ba8e11558581440c86aaee35aaa987d`.
+- The combined sender suite passes all-profile W30/recovery, initial and
+  two-caller shared rejection, typed reconnect rejection, and ordinary EOF
+  backoff/retirement. Sender binary:
+  `c9ae15df33977bb2639058d4c451fe3413b38a9a5493edbd2787d8518ab2770a`.
+  The agent retained a concise tool-output excerpt, **not a raw run log**, at
+  `/tanksmall/scratch/tmp/p51-typed-reject.YJYEqc-r2/logs/sender-full-r4-tool-transcript.txt`
+  (SHA256 `7d31b32757ae0c93527a2f98c8fc8c6c5c7c649f4e1fdfc374217fd429a45525`).
+  The fail-fast command reached `SENDER_FULL_PASS`; a separate outer exit-code
+  field was not retained. Tested sender source:
+  `a69768b8739b1ff9598c26339d32e5bb31e322b65f08cceba710e24ca48ebf4e`.
+
+The owner run used the preceding sender snapshot; the full sender run used
+the same endpoint/owner sources plus the shared-caller rejection fix.
+These are not final combined service/restart qualification. Runtime emission
+of ReservationMissing, W30 shared rejection, wrong/stale-offer rejection
+negatives, and rejection after a validated positive receipt still need their
+dedicated gates. The service restart rerun and real multi-link daemon fixture
+remain separate work.
 
 The in-development real C2F1/C-cache restart fixture passes for ZSTD_TU:
 the independent C2/F1 link attaches exact input while C1's parent is stopped,

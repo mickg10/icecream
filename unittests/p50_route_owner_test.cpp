@@ -3,6 +3,7 @@
 #include "cache/p50_endpoint.h"
 
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -334,6 +335,42 @@ void test_aborted_route_block_is_defined_on_other_f() {
     CHECK(job_state_calls == 1);
     CHECK(actions.valid());
     CHECK(authority.release(h_live) == 0);
+
+    // R2 incarnation retirement removes only the retired route's view. The
+    // immutable C-wide request/interner object is still referenced by the
+    // healthy route, so it remains reusable and the C TU allocator stays
+    // monotonic.
+    P50PreparationAuthority retired_authority(
+        Id128::from_u64(196), caps_config.endpoint_caps.zstd,
+        caps_config.authority_limits, caps_config.compression_level,
+        ProfileId::P29V1);
+    const PreparationRouteKey retired_route{
+        Id128::from_u64(395), 1, ProfileId::P29V1};
+    const PreparationRouteKey sibling_route{
+        Id128::from_u64(396), 1, ProfileId::P29V1};
+    const PrepareRequestKey shared_request{7803, 1};
+    const auto retired_view = retired_authority.prepare_for_route(
+        retired_route, shared_request, source);
+    const auto sibling_view = retired_authority.prepare_for_route(
+        sibling_route, shared_request, source);
+    CHECK(retired_authority.live_entry_count() == 2);
+    CHECK(retired_authority.prepared_tu_seq(retired_view) == TuSeq{0});
+    CHECK(retired_authority.prepared_tu_seq(sibling_view) == TuSeq{0});
+    CHECK(retired_authority.abandon_retired_route(retired_route));
+    CHECK(!retired_authority.contains(retired_view));
+    CHECK(retired_authority.contains(sibling_view));
+    CHECK(retired_authority.live_entry_count() == 1);
+    const auto same_request_again = retired_authority.prepare_for_route(
+        sibling_route, shared_request, source);
+    CHECK(retired_authority.prepared_tu_seq(same_request_again) == TuSeq{0});
+    CHECK(retired_authority.p29v1_interner_reserved_bytes() > 0);
+    const PreparationRouteKey successor_route{
+        Id128::from_u64(397), 1, ProfileId::P29V1};
+    const auto next_request = retired_authority.prepare_for_route(
+        successor_route, {7803, 2}, source);
+    CHECK(retired_authority.prepared_tu_seq(next_request) == TuSeq{1});
+    CHECK(retired_authority.abandon_retired_route(sibling_route));
+    CHECK(retired_authority.abandon_retired_route(successor_route));
 }
 
 void test_tu_seq_reservation_and_exhaustion() {
@@ -1600,6 +1637,224 @@ void test_p51_w30_direct_topology(size_t c_count, size_t f_count,
     std::fflush(stderr);
 }
 
+void test_retired_route_reaped_when_background_reader_goes_idle() {
+    const ProfileId profile = ProfileId::ZSTD_TU;
+    const CStoreGuid c_guid{topology_guid(31, false)};
+    const FStoreGuid f_guid{topology_guid(131, true)};
+    const P50RouteRelationship route{c_guid, f_guid, 91, profile};
+    const std::vector<uint8_t> source{'i', 'd', 'l', 'e', '-', 'r', 'e', 'a', 'p'};
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(8),
+        clock.clock_domain_id, clock.time_namespace_id);
+
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    std::atomic<bool> hold_reader{true};
+    std::atomic<bool> reader_entered{false};
+    std::atomic<unsigned> pump_notifications{0};
+    std::atomic<unsigned> reap_notifications{0};
+    asio::io_context context;
+    P50CRouteOwner* owner_ptr = nullptr;
+    P50RouteOwnerConfig owner_config = config(profile);
+    owner_config.hold_r2_receipt_reader_for_test = [&] {
+        reader_entered.store(true, std::memory_order_release);
+        return hold_reader.load(std::memory_order_acquire);
+    };
+    owner_config.post_retired_reap = [&] {
+        pump_notifications.fetch_add(1, std::memory_order_release);
+        context.post([&] {
+            if (owner_ptr)
+                owner_ptr->reap_retired_p51();
+        });
+    };
+    owner_config.after_retired_route_reaped_for_test = [&] {
+        reap_notifications.fetch_add(1, std::memory_order_release);
+    };
+    P50CRouteOwner owner(std::move(owner_config));
+    owner_ptr = &owner;
+
+    TopologyLink link;
+    link.c_guid = c_guid;
+    link.f_guid = f_guid;
+    link.relationship = Id128::from_u64(0x9131);
+    link.relationship_epoch = 1;
+    link.physical_generation = 17;
+    link.c_generation = 18;
+    link.f_generation = route.f_store_generation;
+    link.control_generation = 19;
+    link.control_attempt = 20;
+    auto arm = topology_arm(link, 231, profile);
+    const PrepareRequestKey request_key{
+        arm.source.assignment_epoch, arm.source.source_request_id};
+    P51SourceArmedFields armed = topology_armed(link, std::move(arm), 1);
+    armed.selected_window = 1;
+    CHECK(armed.valid());
+
+    std::atomic<unsigned> commit_calls{0};
+    P50ServerEndpointConfig server_config;
+    server_config.lookup_p51_link_reservation =
+        [&, deadline](const LinkHello& hello)
+            -> std::optional<P51SourceLinkLease> {
+        if (hello.relationship_id != link.relationship ||
+            hello.f_store_guid != f_guid ||
+            hello.f_store_generation != route.f_store_generation)
+            return std::nullopt;
+        return P51SourceLinkLease{armed, deadline, false,
+                                  hello.relationship_epoch,
+                                  hello.history_nonce, 0, 0};
+    };
+    server_config.consume_p51_job_reservation =
+        [&, deadline](const LinkHello& hello, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        if (hello.relationship_id != link.relationship ||
+            binding.reservation_id != Id128{armed.reservation_id} ||
+            binding.raw_bytes != source.size() ||
+            binding.raw_digest != icecc::digest128(source))
+            return std::nullopt;
+        P51SourceJobLease lease;
+        lease.armed = armed;
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+        return lease;
+    };
+    server_config.record_p51_job_commit =
+        [&](const LinkHello&, const JobBind&, const R2TxCommit& commit) {
+            if (commit.inner.raw_digest != icecc::digest128(source))
+                return false;
+            commit_calls.fetch_add(1, std::memory_order_release);
+            return true;
+        };
+    server_config.acknowledge_p51_receipt =
+        [](const LinkHello&, const CommitAck&) { return true; };
+    P50ServerEndpoint server(f_guid, caps, nullptr, nullptr,
+                             std::move(server_config));
+    asio::ip::tcp::acceptor acceptor(
+        context, tcp::endpoint{asio::ip::address_v4::loopback(), 0});
+    auto accept_r2_one = [&]() -> asio::awaitable<ServerRunResult> {
+        tcp::socket socket(co_await asio::this_coro::executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        co_return co_await server.run_adopted_r2(std::move(socket));
+    };
+    std::promise<ServerRunResult> server_promise;
+    auto server_future = server_promise.get_future();
+    bool server_done = false;
+    bool transfer_done = false;
+    bool watchdog_fired = false;
+    asio::steady_timer fixture_watchdog(context);
+    fixture_watchdog.expires_after(std::chrono::seconds(10));
+    fixture_watchdog.async_wait([&](const boost::system::error_code& error) {
+        if (error)
+            return;
+        watchdog_fired = true;
+        hold_reader.store(false, std::memory_order_release);
+        boost::system::error_code ignored;
+        acceptor.cancel(ignored);
+        acceptor.close(ignored);
+        (void)owner.retire_f_store_exact_p51(f_guid, route.f_store_generation);
+    });
+    auto cancel_fixture_watchdog_if_done = [&] {
+        if (server_done && transfer_done)
+            fixture_watchdog.cancel();
+    };
+    asio::co_spawn(
+        context, accept_r2_one(),
+        [&](std::exception_ptr error, ServerRunResult result) {
+            server_done = true;
+            if (error)
+                server_promise.set_exception(error);
+            else
+                server_promise.set_value(std::move(result));
+            cancel_fixture_watchdog_if_done();
+        });
+
+    const auto remote = acceptor.local_endpoint();
+    AsyncConnectedFdFactory connector = [remote](auto, auto completion) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) { completion(-1); return; }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(remote.port());
+        const auto ip = remote.address().to_v4().to_bytes();
+        std::memcpy(&address.sin_addr, ip.data(), ip.size());
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) != 0) {
+            (void)::close(fd);
+            completion(-1);
+            return;
+        }
+        completion(fd);
+    };
+    std::promise<ZstdSourceTransferResult> transfer_promise;
+    auto transfer_future = transfer_promise.get_future();
+    bool retired = false;
+    bool caller_finished_before_reap = false;
+    asio::co_spawn(
+        context,
+        owner.transfer_p51(route, armed, std::move(connector),
+                           request_key,
+                           deadline.as_steady_time_point(), source),
+        [&](std::exception_ptr error, ZstdSourceTransferResult result) {
+            transfer_done = true;
+            caller_finished_before_reap = retired &&
+                hold_reader.load(std::memory_order_acquire) &&
+                reap_notifications.load(std::memory_order_acquire) == 0;
+            if (error)
+                transfer_promise.set_exception(error);
+            else
+                transfer_promise.set_value(std::move(result));
+            hold_reader.store(false, std::memory_order_release);
+            cancel_fixture_watchdog_if_done();
+        });
+    asio::steady_timer retirement_watch(context);
+    const auto reader_wait_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(3);
+    // Keep the coroutine closure alive through context.run(). The reader
+    // remains held after retirement until the original caller has returned,
+    // so caller-return cleanup cannot satisfy the post-pump reap assertion.
+    auto watch_retirement = [&, reader_wait_deadline]() -> asio::awaitable<void> {
+        while (!reader_entered.load(std::memory_order_acquire) ||
+               commit_calls.load(std::memory_order_acquire) != 1) {
+            if (std::chrono::steady_clock::now() >= reader_wait_deadline)
+                break;
+            retirement_watch.expires_after(std::chrono::milliseconds(1));
+            co_await retirement_watch.async_wait(asio::use_awaitable);
+        }
+        if (reader_entered.load(std::memory_order_acquire) &&
+            commit_calls.load(std::memory_order_acquire) == 1)
+            retired = owner.retire_f_store_exact_p51(
+                f_guid, route.f_store_generation);
+        if (!retired)
+            hold_reader.store(false, std::memory_order_release);
+        co_return;
+    };
+    asio::co_spawn(context, watch_retirement(), asio::detached);
+
+    context.run();
+    const ZstdSourceTransferResult transfer_result = transfer_future.get();
+    ServerRunResult server_result;
+    try {
+        server_result = server_future.get();
+    } catch (...) {
+        CHECK(watchdog_fired);
+    }
+    CHECK(!watchdog_fired);
+    CHECK(retired);
+    CHECK(caller_finished_before_reap);
+    CHECK(transfer_result.status != ZstdSourceTransferStatus::Committed);
+    CHECK(commit_calls.load(std::memory_order_acquire) == 1);
+    CHECK(pump_notifications.load(std::memory_order_acquire) != 0);
+    CHECK(reap_notifications.load(std::memory_order_acquire) == 1);
+    CHECK(server_result.status == ServerRunStatus::Disconnected ||
+          server_result.status == ServerRunStatus::TerminalError);
+    std::puts("P51_ROUTE_OWNER idle background-pump retirement reap: ok");
+}
+
 }  // namespace
 
 int main() {
@@ -1626,4 +1881,5 @@ int main() {
         test_p51_w30_direct_topology(3, 1, profile);
         test_p51_w30_direct_topology(4, 1, profile);
     }
+    test_retired_route_reaped_when_background_reader_goes_idle();
 }

@@ -4343,6 +4343,80 @@ asio::awaitable<bool> r2_silent_peer(tcp::endpoint endpoint) {
     co_return count == 0 && error == asio::error::eof;
 }
 
+asio::awaitable<bool> r2_expect_typed_reject(
+    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(endpoint, asio::use_awaitable);
+    try {
+        (void)co_await client.open_r2_link(
+            socket, hello, std::chrono::steady_clock::now() +
+                               std::chrono::seconds(5));
+    } catch (const R2LinkRejected& rejected) {
+        co_return rejected.rejection.reason == LinkRejectReason::StoreReplaced &&
+                  rejected.rejection.offered_hello_digest ==
+                      compute_r2_link_offer_digest(hello) &&
+                  rejected.offered == hello;
+    } catch (...) {
+        co_return false;
+    }
+    co_return false;
+}
+
+void test_r2_store_replaced_rejects_same_guid_old_generation() {
+    const P5coStoreGuids stores = p5co_store_guids(0x72);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    P50ServerEndpointConfig config;
+    config.f_store_generation = 42;
+    std::atomic<unsigned> lookup_calls{0};
+    config.lookup_p51_link_reservation = [&](const LinkHello&) {
+        ++lookup_calls;
+        return std::optional<P51SourceLinkLease>{};
+    };
+    P50ServerEndpoint server(stores.f, caps, nullptr, nullptr,
+                             std::move(config));
+    TestClient client(stores.c, caps);
+
+    LinkHello hello;
+    hello.profile = ProfileId::ZSTD_TU;
+    hello.window = 1;
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128::from_u64(0x7201);
+    hello.relationship_id = Id128::from_u64(0x7202);
+    hello.relationship_epoch = 1;
+    hello.physical_link_generation = 1;
+    hello.c_store_guid = stores.c;
+    hello.c_store_generation = 7;
+    hello.f_store_guid = stores.f;
+    // Same F GUID, stale allocator generation: only the explicit authoritative
+    // generation in P50ServerEndpointConfig can classify this precisely.
+    hello.f_store_generation = 41;
+    hello.c_control_generation = 8;
+    hello.c_control_attempt = 9;
+    hello.system_source_fingerprint = icecc::digest128("same-guid generation retry");
+    hello.history_nonce = HistoryNonce{10};
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           {asio::ip::address_v4::loopback(), 0});
+    auto accept_future = asio::co_spawn(
+        context, r2_accept_one(acceptor, server), asio::use_future);
+    auto client_future = asio::co_spawn(
+        context, r2_expect_typed_reject(acceptor.local_endpoint(),
+                                        client.endpoint, hello),
+        asio::use_future);
+    context.run();
+    const ServerRunResult server_result = accept_future.get();
+    require(client_future.get() && lookup_calls.load() == 0 &&
+                server_result.status == ServerRunStatus::Disconnected,
+            "same-GUID stale-generation LINK_HELLO was not exactly rejected before lease lookup");
+    std::puts("P51_R2_ENDPOINT same-GUID stale-generation typed reject: ok");
+}
+
 void test_r2_endpoint_commits_two_jobs_on_one_link() {
     const P5coStoreGuids stores = p5co_store_guids(0x71);
     EndpointCaps caps;
@@ -7129,6 +7203,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused R2 persistent-link PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_REPLACED_GENERATION_FOCUS") != nullptr) {
+        test_r2_store_replaced_rejects_same_guid_old_generation();
+        std::cout << "p50_endpoint_test: focused same-GUID stale-generation reject PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_R2_SETUP_CANCEL_FOCUS") != nullptr) {
         test_r2_silent_setup_cancelled_before_hello();
         std::cout << "p50_endpoint_test: focused R2 pre-HELLO cancellation PASS\n";
@@ -7170,6 +7249,7 @@ int main(int argc, char** argv) {
     test_idempotent_prepare_admission();
     test_preparation_authority_window_refill_and_receipts();
     test_zstd_route_recovery_rebuild_cursor();
+    test_r2_store_replaced_rejects_same_guid_old_generation();
     test_r2_endpoint_commits_two_jobs_on_one_link();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();

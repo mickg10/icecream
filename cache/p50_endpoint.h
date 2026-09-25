@@ -328,6 +328,13 @@ public:
     // been released.  It drops matcher/history state without touching the
     // C-wide immutable catalogue or TU allocator.
     [[nodiscard]] bool reset_route(PreparationRouteKey route) noexcept;
+    // R2 replacement-only retirement. The caller must first fence the exact
+    // physical sender incarnation and wait until no reader/writer/caller can
+    // still use its handles. This discards only that relationship's live
+    // route views and history; C-wide TU allocation and views owned by other
+    // routes are preserved. It never fabricates a receiver commit.
+    [[nodiscard]] bool abandon_retired_route(
+        PreparationRouteKey route) noexcept;
 
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
@@ -392,6 +399,20 @@ struct ClientRunResult {
     std::optional<TxCommit> committed_commit;
     std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
+};
+
+// A peer can ask the sender to retire only the exact LINK_HELLO offer. This
+// exception is thrown only after the reject's digest has been checked against
+// the canonical bytes sent on this socket; EOF and all other protocol errors
+// remain ordinary transport/protocol failures.
+class R2LinkRejected final : public std::runtime_error {
+public:
+    R2LinkRejected(LinkRejectMessage rejection, LinkHello offered)
+        : std::runtime_error("peer rejected exact R2 LINK_HELLO"),
+          rejection(std::move(rejection)), offered(std::move(offered)) {}
+
+    LinkRejectMessage rejection;
+    LinkHello offered;
 };
 
 // Immutable C-side witness for one completely written R2 TU bundle. It is
@@ -501,6 +522,11 @@ struct P50ServerEndpointConfig {
     InputJobStateSelector input_job_state;
     std::optional<SidecarLaunchIdentity> sidecar_launch;
     uint64_t endpoint_generation = 1;
+    // Optional authoritative F-store generation. Standalone endpoint tests
+    // may omit it; SidecarRuntime always supplies its allocator-issued value.
+    // This lets R2 distinguish a replaced same-GUID incarnation from an
+    // unrelated missing reservation without over-classifying null lookups.
+    uint64_t f_store_generation = 0;
     // Optional owner-visible trace for the global resource binding. The
     // endpoint never owns this sink; callers keep it alive for the endpoint.
     GlobalResourceTrace* global_resource_trace = nullptr;

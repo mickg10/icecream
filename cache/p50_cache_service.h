@@ -371,7 +371,7 @@ private:
     void close_active_control() noexcept;
     [[nodiscard]] bool bind_route_endpoint_identity(
         const RouteEndpointKey& endpoint,
-        RouteStoreIdentity observed) noexcept;
+        RouteStoreIdentity observed, bool p51 = false) noexcept;
     [[nodiscard]] bool acquire_source_address(
         const RouteEndpointKey& endpoint,
         std::chrono::steady_clock::time_point deadline) noexcept;
@@ -424,6 +424,11 @@ private:
     std::shared_ptr<std::atomic<size_t>> source_setup_inflight_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     std::unique_ptr<P50CRouteOwner> route_owner_;
+    // Detached R2 pumps may finish after their caller and request an
+    // owner-affine retired-route reap. The weak lifetime token makes that
+    // posted notification inert once SidecarRuntime begins destruction.
+    std::shared_ptr<std::atomic<bool>> route_owner_callback_alive_ =
+        std::make_shared<std::atomic<bool>>(true);
     // Endpoint address is the stable scheduler-facing relationship key.  Its
     // exact authenticated F incarnation is owner-affine and bounded; a change
     // retires every old-profile route before the successor is admitted.

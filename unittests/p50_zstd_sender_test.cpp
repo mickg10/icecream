@@ -4,7 +4,9 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/read.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/asio/write.hpp>
 
 #include <array>
 #include <algorithm>
@@ -591,6 +593,193 @@ asio::awaitable<ServerRunResult> sender_r2_accept(
     co_return co_await endpoint.run_adopted_r2(std::move(socket));
 }
 
+asio::awaitable<LinkHello> sender_r2_accept_and_reject(
+    tcp::socket socket, LinkRejectReason reason) {
+    std::array<uint8_t, 4> header_bytes{};
+    co_await asio::async_read(socket, asio::buffer(header_bytes),
+                              asio::use_awaitable);
+    const FrameHeader header = decode_frame_header(header_bytes);
+    if (header.type != MessageType::LINK_HELLO)
+        throw std::runtime_error("sender did not begin with R2 LINK_HELLO");
+    std::vector<uint8_t> payload(header.payload_bytes);
+    co_await asio::async_read(socket, asio::buffer(payload), asio::use_awaitable);
+    const Message decoded = decode_payload(header.type, payload);
+    const LinkHello offered = std::get<LinkHello>(decoded);
+    LinkRejectMessage reject;
+    reject.reason = reason;
+    reject.offered_hello_digest = compute_r2_link_offer_digest(offered);
+    const std::vector<uint8_t> frame = encode_frame(Message{reject});
+    co_await asio::async_write(socket, asio::buffer(frame), asio::use_awaitable);
+    co_return offered;
+}
+
+asio::awaitable<LinkHello> sender_r2_accept_and_reject(
+    tcp::acceptor& acceptor, LinkRejectReason reason) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    co_return co_await sender_r2_accept_and_reject(std::move(socket), reason);
+}
+
+asio::awaitable<LinkHello> sender_r2_read_hello(tcp::socket& socket) {
+    std::array<uint8_t, 4> header_bytes{};
+    co_await asio::async_read(socket, asio::buffer(header_bytes),
+                              asio::use_awaitable);
+    const FrameHeader header = decode_frame_header(header_bytes);
+    if (header.type != MessageType::LINK_HELLO)
+        throw std::runtime_error("sender did not begin with R2 LINK_HELLO");
+    std::vector<uint8_t> payload(header.payload_bytes);
+    co_await asio::async_read(socket, asio::buffer(payload), asio::use_awaitable);
+    const Message decoded = decode_payload(header.type, payload);
+    co_return std::get<LinkHello>(decoded);
+}
+
+void test_p51_sender_typed_link_rejection_is_terminal_and_exact() {
+    for (const LinkRejectReason reason : {LinkRejectReason::StoreReplaced,
+                                          LinkRejectReason::ReservationMissing}) {
+        asio::io_context context;
+        tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+        const auto [c_guid, f_guid] = sender_r2_store_guids();
+        const ProfileId profile = ProfileId::ZSTD_TU;
+        P51SourceArmFields arm = sender_r2_arm(c_guid, 991, 71, 1, profile);
+        const P51SourceArmedFields armed =
+            sender_r2_armed(std::move(arm), f_guid, 992, 1);
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        caps.zstd.max_raw_bytes = 1U << 20;
+        caps.zstd.max_encoded_body_bytes = 1U << 20;
+        PreparationAuthorityLimits limits;
+        limits.max_speculative_tus = 1;
+        limits.max_speculative_raw_bytes = 1U << 20;
+        limits.max_live_entries = 4;
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            c_guid, caps.zstd, limits, 1, profile);
+        const PreparationRouteKey route{f_guid, 23, profile};
+        ZstdSourceTransferConfig sender_config = config();
+        sender_config.endpoint_caps = caps;
+        sender_config.authority_limits = limits;
+        P50ZstdSourceSender sender(authority, route,
+                                   PrepareRequestKey{3, 991}, sender_config);
+        const std::vector<uint8_t> source{'t', 'y', 'p', 'e', 'd'};
+        unsigned connector_calls = 0;
+        const tcp::endpoint remote = acceptor.local_endpoint();
+        AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+            ++connector_calls;
+            completion(connect_fd(remote));
+        };
+        auto reject_future = asio::co_spawn(
+            context, sender_r2_accept_and_reject(acceptor, reason),
+            asio::use_future);
+        auto transfer_future = asio::co_spawn(
+            context,
+            sender.transfer_p51_route(
+                armed, 27, connector, PrepareRequestKey{3, 991},
+                std::chrono::steady_clock::now() + std::chrono::seconds(3),
+                source),
+            asio::use_future);
+        context.run();
+        const LinkHello offered = reject_future.get();
+        const ZstdSourceTransferResult result = transfer_future.get();
+        CHECK(connector_calls == 1);
+        CHECK(result.status == ZstdSourceTransferStatus::TerminalError);
+        CHECK(result.route_local_failure);
+        CHECK(!result.replacement_required);
+        CHECK(!result.committed_input.has_value());
+        CHECK(result.raw_bytes == 0);
+        CHECK(result.r2_link_rejection.has_value());
+        CHECK(result.r2_link_rejection->reason == reason);
+        CHECK(result.r2_link_rejection->offered == offered);
+        CHECK(result.r2_link_rejection->offered.physical_link_generation == 27);
+        CHECK(result.r2_link_rejection->offered.relationship_id ==
+              Id128{armed.logical_relationship_id});
+    }
+}
+
+void test_p51_sender_typed_rejection_is_shared_route_local() {
+    asio::io_context c_context;
+    asio::io_context f_context;
+    tcp::acceptor acceptor(f_context,
+        {asio::ip::address_v4::loopback(), 0});
+    const auto [c_guid, f_guid] = sender_r2_store_guids();
+    const ProfileId profile = ProfileId::ZSTD_TU;
+    auto first_arm = sender_r2_arm(c_guid, 995, 75, 1, profile);
+    auto second_arm = sender_r2_arm(c_guid, 996, 76, 1, profile);
+    const auto first_armed = sender_r2_armed(std::move(first_arm), f_guid,
+                                             0x995, 1);
+    const auto second_armed = sender_r2_armed(std::move(second_arm), f_guid,
+                                              0x996, 1);
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = 2;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    limits.max_live_entries = 8;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_guid, caps.zstd, limits, 1, profile);
+    const PreparationRouteKey route{f_guid, 23, profile};
+    ZstdSourceTransferConfig sender_config = config();
+    sender_config.endpoint_caps = caps;
+    sender_config.authority_limits = limits;
+    auto sender = std::make_shared<P50ZstdSourceSender>(
+        authority, route, PrepareRequestKey{3, 995}, sender_config);
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::atomic<unsigned> connector_calls{0};
+    AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+        connector_calls.fetch_add(1, std::memory_order_relaxed);
+        completion(connect_fd(remote));
+    };
+    auto reject_future = asio::co_spawn(
+        f_context,
+        sender_r2_accept_and_reject(acceptor,
+                                    LinkRejectReason::ReservationMissing),
+        asio::use_future);
+    std::thread f_thread([&] { f_context.run(); });
+    struct FThreadCleanup {
+        asio::io_context& context;
+        std::thread& thread;
+        ~FThreadCleanup() {
+            context.stop();
+            if (thread.joinable())
+                thread.join();
+        }
+    } f_thread_cleanup{f_context, f_thread};
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(3);
+    const std::vector<uint8_t> first_source{'f', 'i', 'r', 's', 't'};
+    const std::vector<uint8_t> second_source{'s', 'e', 'c', 'o', 'n', 'd'};
+    auto first = asio::co_spawn(
+        c_context,
+        sender->transfer_p51_route(first_armed, 27, connector,
+            PrepareRequestKey{3, 995}, deadline, first_source),
+        asio::use_future);
+    auto second = asio::co_spawn(
+        c_context,
+        sender->transfer_p51_route(second_armed, 27, connector,
+            PrepareRequestKey{3, 996}, deadline, second_source),
+        asio::use_future);
+    c_context.run();
+    const LinkHello offered = reject_future.get();
+    const auto first_result = first.get();
+    const auto second_result = second.get();
+    CHECK(connector_calls.load(std::memory_order_acquire) == 1);
+    for (const auto* result : {&first_result, &second_result}) {
+        CHECK(result->status == ZstdSourceTransferStatus::TerminalError);
+        CHECK(result->route_local_failure);
+        CHECK(!result->replacement_required);
+        CHECK(!result->committed_input);
+        CHECK(result->r2_link_rejection.has_value());
+        CHECK(result->r2_link_rejection->reason ==
+              LinkRejectReason::ReservationMissing);
+        CHECK(result->r2_link_rejection->offered == offered);
+    }
+    f_context.stop();
+    f_thread.join();
+    std::cerr << "P51_SENDER_SHARED_TYPED_REJECTION callers=2 PASS\n";
+}
+
 asio::awaitable<std::vector<ServerRunResult>>
 sender_r2_accept_recovery_with_lost_reset_ack(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
@@ -639,8 +828,10 @@ sender_r2_accept_shared_failure(
     bool expire_after_positive_receipt = false,
     bool reject_stale_reconnect = false,
     std::atomic<bool>* stop_reconnect_listener = nullptr,
-    std::atomic<unsigned>* rejected_reconnects = nullptr) {
-    const size_t connection_count = reject_stale_reconnect ? 1
+    std::atomic<unsigned>* rejected_reconnects = nullptr,
+    bool close_reconnect_after_hello = false) {
+    const size_t connection_count =
+        (reject_stale_reconnect || close_reconnect_after_hello) ? 1
         : repeat_recovery_loss ? 3
         : (retire_after_positive_receipt || expire_after_positive_receipt) ? 1
                                                                            : 2;
@@ -669,6 +860,33 @@ sender_r2_accept_shared_failure(
         if (results[index].terminal_error)
             std::fprintf(stderr, "R2 shared-failure server[%zu]: %s\n", index,
                          results[index].terminal_error->detail.c_str());
+        if (close_reconnect_after_hello) {
+            boost::system::error_code nonblocking_error;
+            acceptor.non_blocking(true, nonblocking_error);
+            if (nonblocking_error)
+                throw boost::system::system_error(nonblocking_error);
+            while (stop_reconnect_listener == nullptr ||
+                   !stop_reconnect_listener->load(std::memory_order_acquire)) {
+                tcp::socket retry_socket(co_await asio::this_coro::executor);
+                boost::system::error_code accept_error;
+                acceptor.accept(retry_socket, accept_error);
+                if (accept_error == asio::error::would_block ||
+                    accept_error == asio::error::try_again) {
+                    asio::steady_timer poll(co_await asio::this_coro::executor);
+                    poll.expires_after(std::chrono::milliseconds(2));
+                    co_await poll.async_wait(asio::use_awaitable);
+                    continue;
+                }
+                if (accept_error)
+                    throw boost::system::system_error(accept_error);
+                (void)co_await sender_r2_read_hello(retry_socket);
+                boost::system::error_code ignored;
+                retry_socket.close(ignored);
+                if (rejected_reconnects != nullptr)
+                    rejected_reconnects->fetch_add(1, std::memory_order_release);
+            }
+            co_return results;
+        }
         if (reject_stale_reconnect) {
             P50ServerEndpointConfig replacement_config;
             P50ServerEndpoint replacement(
@@ -694,12 +912,9 @@ sender_r2_accept_shared_failure(
                     throw boost::system::system_error(accept_error);
                 const ServerRunResult rejected = co_await
                     replacement.run_adopted_r2(std::move(retry_socket));
-                if (rejected.status != ServerRunStatus::TerminalError ||
-                    !rejected.terminal_error ||
-                    rejected.terminal_error->detail !=
-                        "R2 LINK_HELLO exceeds F admission")
+                if (rejected.status != ServerRunStatus::Disconnected)
                     throw std::runtime_error(
-                        "replacement F did not reject the stale F identity precisely");
+                        "replacement F did not send a typed stale-store rejection");
                 if (rejected_reconnects != nullptr)
                     rejected_reconnects->fetch_add(1, std::memory_order_release);
             }
@@ -1506,7 +1721,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool retire_after_positive_receipt = false,
                                         bool expire_after_positive_receipt = false,
                                         bool reject_stale_reconnect = false,
-                                        bool retire_during_retry_wait = false) {
+                                        bool retire_during_retry_wait = false,
+                                        bool close_reconnect_after_hello = false) {
     CHECK(kJobs >= 1 && kJobs <= 30);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
@@ -1537,7 +1753,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
         std::chrono::steady_clock::now() +
-            (reject_stale_reconnect
+            (reject_stale_reconnect || close_reconnect_after_hello
                  ? (retire_during_retry_wait ? std::chrono::seconds(5)
                                              : std::chrono::milliseconds(1400))
              : expire_after_positive_receipt ? std::chrono::seconds(3)
@@ -1828,7 +2044,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             gate_mutex, gate_cv,
             repeat_recovery_loss, retire_after_positive_receipt,
             expire_after_positive_receipt, reject_stale_reconnect,
-            &stop_reconnect_listener, &rejected_reconnects),
+            &stop_reconnect_listener, &rejected_reconnects,
+            close_reconnect_after_hello),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -1961,6 +2178,44 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         return;
     }
     if (reject_stale_reconnect && !retire_during_retry_wait) {
+        CHECK(kJobs == 1);
+        CHECK(bundles_sent.load(std::memory_order_acquire) == 1);
+        const auto& outcome = outcomes[0];
+        CHECK(outcome.status == ZstdSourceTransferStatus::TerminalError);
+        CHECK(outcome.route_local_failure);
+        CHECK(!outcome.committed_input);
+        CHECK(outcome.r2_link_rejection.has_value());
+        CHECK(outcome.r2_link_rejection->reason ==
+              LinkRejectReason::StoreReplaced);
+        CHECK(outcome.r2_link_rejection->offered.relationship_id ==
+              relationship_id);
+        CHECK(outcome.r2_link_rejection->offered.physical_link_generation != 41);
+        CHECK(connector_calls.load() == 2);
+        CHECK(input_mismatches.load() == 0);
+        stop_reconnect_listener.store(true, std::memory_order_release);
+        CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        const auto server_runs = server_future.get();
+        CHECK(server_runs.size() == 1);
+        CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
+        CHECK(rejected_reconnects.load(std::memory_order_acquire) == 1);
+        std::promise<void> retirement_posted;
+        auto retirement_done = retirement_posted.get_future();
+        asio::post(c_context, [&sender, &retirement_posted] {
+            sender->retire_for_replacement();
+            retirement_posted.set_value();
+        });
+        CHECK(retirement_done.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        c_work.reset();
+        c_context.stop();
+        f_context.stop();
+        c_thread.join();
+        f_thread.join();
+        std::cerr << "P51_SENDER_TYPED_RECONNECT_REJECTION connectors=2 PASS\n";
+        return;
+    }
+    if (close_reconnect_after_hello && !retire_during_retry_wait) {
         CHECK(bundles_sent.load(std::memory_order_acquire) == kJobs);
         for (const auto& outcome : outcomes) {
             CHECK(outcome.status == ZstdSourceTransferStatus::DeadlineExceeded);
@@ -2134,14 +2389,16 @@ void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
 
 void test_p51_sender_reconnect_backoff_bounds_shared_eof() {
     run_p51_sender_shared_failure_case(
-        1, ProfileId::ZSTD_TU, false, false, false, true);
+        1, ProfileId::ZSTD_TU, false, false, false, false, false, true);
     run_p51_sender_shared_failure_case(
-        30, ProfileId::ZSTD_TU, false, false, false, true);
+        30, ProfileId::ZSTD_TU, false, false, false, false, false, true);
+    run_p51_sender_shared_failure_case(
+        1, ProfileId::ZSTD_TU, false, false, false, true);
 }
 
 void test_p51_sender_retirement_wakes_shared_retry_waiter() {
     run_p51_sender_shared_failure_case(
-        1, ProfileId::ZSTD_TU, false, false, false, true, true);
+        1, ProfileId::ZSTD_TU, false, false, false, false, true, true);
 }
 
 void test_p51_sender_retirement_during_recovery() {
@@ -2546,6 +2803,13 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--typed-link-rejection") {
+        test_p51_sender_typed_link_rejection_is_terminal_and_exact();
+        test_p51_sender_typed_rejection_is_shared_route_local();
+        std::cerr << "P51_SENDER_TYPED_LINK_REJECTION_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--retry-wait-retire") {
         test_p51_sender_retirement_wakes_shared_retry_waiter();
         std::cerr << "P51_SENDER_RETRY_WAIT_RETIRE_SELECTOR PASS\n";
@@ -2572,6 +2836,8 @@ int main(int argc, char** argv) {
     run("route_reuse", test_route_sender_reuses_relationship_for_two_transfers);
     run("route_ledger", test_route_completed_ledger_releases_live_entry);
     run("w30_profiles", test_p51_sender_w30_concurrent_callers_refill_and_duplicate);
+    run("typed_link_rejection", test_p51_sender_typed_link_rejection_is_terminal_and_exact);
+    run("shared_typed_rejection", test_p51_sender_typed_rejection_is_shared_route_local);
     run("lost_commit_recovery", test_p51_sender_recovers_lost_commit_reply_after_connector_failure);
     run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
     run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
