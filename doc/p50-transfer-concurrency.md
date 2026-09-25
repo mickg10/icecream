@@ -10,6 +10,26 @@ record of successful execution. Current wire definitions remain in
 
 ## 1. Scope and topology notation
 
+### Current compatibility boundary
+
+The deployment clarification supersedes this plan's earlier requirements to
+preserve experimental ordinary-50/CacheWire R1 interoperability: P50 has not
+been deployed and its format remains changeable. The release obligation is
+compatibility with the user's deployed legacy P40, whose exact build must be
+identified and tested. The existing harness pins commit
+`cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`, which declares ordinary protocol 43;
+that evidence must not be relabeled as P40 coverage.
+
+R2/W30 names the pipeline work; ordinary protocol 51 is its current discovery
+and selection discriminator, not the package version. Do not renumber the
+wire merely to change terminology. Unreleased R1 negotiation/fallback layers
+may be consolidated or removed when that simplifies the shipping design;
+their coexistence matrices below are historical design constraints, not
+independent release blockers. Preserve byte/digest reference tests and all
+W30 resource, ordering, restart, cancellation, and recovery requirements.
+Legacy compatibility still requires real remote compilation in both role
+directions and mixed operation with the deployed legacy build.
+
 `C<n>F<m>/W<w>` means n C-cache stores, m F-cache stores, and at most w
 unacknowledged source transactions per C/F relationship. Compiler processes
 behind either cache are not extra cache stores. Compilation is not included
