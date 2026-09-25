@@ -2081,8 +2081,9 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
         return confirm_p51_reset_on_owner(link, confirm);
     };
     config_.endpoint_config.on_p51_link_terminal = [this](
-        const LinkHello& hello) {
-        release_p51_link_on_owner(hello);
+        const LinkHello& hello,
+        const std::optional<JobBind>& unpublished_binding) {
+        release_p51_link_on_owner(hello, unpublished_binding);
     };
     endpoint_ = std::make_unique<P50ServerEndpoint>(
         config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
@@ -4684,6 +4685,17 @@ void SidecarRuntime::sweep_p51_reservations_on_owner() noexcept {
 }
 
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+std::optional<size_t>
+SidecarRuntime::input_lifecycle_owner_count_for_test() noexcept {
+    auto result = std::make_shared<size_t>(0);
+    const bool completed = owner_round_trip(
+        [this, result] { *result = input_lifecycle_.owner_count(); },
+        std::chrono::steady_clock::now() + config_.cancellation_grace);
+    if (!completed)
+        return std::nullopt;
+    return *result;
+}
+
 uint64_t SidecarRuntime::active_source_raw_bytes_for_test() noexcept {
     std::lock_guard lock(source_admission_mutex_);
     return active_source_raw_bytes_;
@@ -5654,7 +5666,9 @@ bool SidecarRuntime::confirm_p51_reset_on_owner(
     return true;
 }
 
-void SidecarRuntime::release_p51_link_on_owner(const LinkHello& hello) noexcept {
+void SidecarRuntime::release_p51_link_on_owner(
+    const LinkHello& hello,
+    const std::optional<JobBind>& unpublished_binding) noexcept {
     const CStoreGuid c_guid = hello.c_store_guid;
     const auto relationship = p51_source_relationships_.find(c_guid);
     if (relationship == p51_source_relationships_.end() ||
@@ -5662,8 +5676,51 @@ void SidecarRuntime::release_p51_link_on_owner(const LinkHello& hello) noexcept 
         relationship->second.physical_link_generation !=
             hello.physical_link_generation)
         return;
-    relationship->second.link_active = false;
-    relationship->second.physical_link_generation = 0;
+    P51SourceRelationship& row = relationship->second;
+    if (unpublished_binding) {
+        const auto reservation = p51_source_reservations_.find(
+            unpublished_binding->reservation_id.bytes);
+        if (reservation != p51_source_reservations_.end()) {
+            const P51SourceArmedFields& armed = reservation->second.armed;
+            const auto& source = armed.arm.source;
+            const auto selected_profile =
+                profile_from_cache_profile_mask(source.cache_profile);
+            if (armed.logical_relationship_id == row.logical_id &&
+                armed.relationship_epoch == row.epoch &&
+                hello.relationship_epoch == row.epoch &&
+                row.profile == hello.profile &&
+                row.c_store_generation == hello.c_store_generation &&
+                row.c_control_generation == hello.c_control_generation &&
+                row.c_control_attempt == hello.c_control_attempt &&
+                hello.f_store_guid == config_.f_store_guid &&
+                hello.f_store_generation == config_.f_store_generation &&
+                source.c_store_guid == hello.c_store_guid.bytes &&
+                source.c_store_generation == hello.c_store_generation &&
+                source.c_control_generation == hello.c_control_generation &&
+                source.c_control_attempt == hello.c_control_attempt &&
+                selected_profile && *selected_profile == row.profile &&
+                reservation->second.consumed_binding == unpublished_binding &&
+                reservation->second.consumed &&
+                reservation->second.publishing &&
+                reservation->second.consumed_ordinal ==
+                    unpublished_binding->relationship_ordinal &&
+                reservation->second.consumed_physical_link_generation ==
+                    hello.physical_link_generation &&
+                row.pending_ordinal ==
+                    unpublished_binding->relationship_ordinal &&
+                row.pending_physical_link_generation ==
+                    hello.physical_link_generation) {
+                // The exact current transaction did not publish its
+                // InputRecord. Keep consumed proof and the pending ordinal
+                // for recovery, but release its transient publication latch
+                // so cancellation/expiry can settle it after this link ends.
+                reservation->second.publishing = false;
+                schedule_p51_reservation_sweep_on_owner();
+            }
+        }
+    }
+    row.link_active = false;
+    row.physical_link_generation = 0;
 }
 
 std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(

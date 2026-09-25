@@ -12,6 +12,49 @@ retained artifact directories.
 
 ## Developer QA
 
+### R2 output-cap publication cleanup
+
+An F output-cap refusal after publication authorization could leave its
+reservation marked publishing, preventing cancellation and deadline expiry.
+The persistent endpoint also retained a previous job's completion marker,
+which could suppress lifecycle cleanup for the next failed job. Cleanup now
+releases only the exact unpublished binding's transient publication latch,
+retains consumed proof for recovery, and resets per-job result identity at
+accepted JOB_BIND. Existing exact-link deactivation still handles reconnects
+that replay an older RESET offer; an epoch mismatch is not a blanket reason
+to skip physical-link cleanup.
+
+Actual F-service tests pass for P29V1/ZSTD_TU/ZSTD_ROUTE at W1 and W30:
+two inputs fill the output cap, a third fails, cancellation succeeds, RESET
+marks that suffix unavailable, another C cannot refill before input release,
+and releasing the exact input admits a refill. A separate P29V1/W1 case
+observes original-deadline retirement without RESET/reconnect or another
+request triggering a sweep. Both prior inputs remain byte-exact attachable,
+another C's reservation survives, and lifecycle ownership returns to its
+two-input baseline. These cover output capacity, not every D11 resource cap.
+
+Frozen private source base: `96733809` plus this change. Artifacts:
+`/tanksmall/scratch/tmp/p51-d11-output-cap-current.20260925a/work/artifacts/`.
+The canonical targeted `make -C unittests p50cacheservice.log` suite passes,
+exit 0; log `default-service-final-automake-r1.log` SHA256
+`e4a2bff352874f6a8b25450eb2b4c65cec79b30fa38cc9891bbc75572245c6d4`.
+Binary SHA256:
+`3753225696efba51f9b6f623d4bc57e1617bfef233b7d4fd966856176161a3df`.
+Focused matrix log `cap-matrix-final-r1.log` SHA256
+`b8875625094928c65d4c15bb812db3ff629380d52ca5a3d7e7be0573aeb1e1dd`;
+expiry log `expiry-focused-r1.log` SHA256
+`d0c8250c632a15e9c95209a8ffa711a6ebe8c8a21c25ae95d939bb8b51477542`.
+Both focused runs exit 0. The direct default invocation that omitted
+`ICECC_TEST_READY_CLOSE_SHIM` failed and is retained separately, not counted
+as a product pass. The full targeted `p50endpoint.log` suite also passes:
+`default-endpoint-final-r1.log` SHA256
+`d7e05f509bbe292156bdc2809ecc448bb1f43381974900c77ec641e1744c11a7`,
+binary SHA256
+`27ceeea07884319cf6a5d4cab158509b87c707b4cab296f28e3452c5aaaef0d8`.
+The private
+service run predates the separately tested sender-accounting change;
+combined current-tip QA and the remaining full W30 plan are still required.
+
 ### R1/R2 source-check repairs
 
 Canonical QA on `422932c9` exposed three stale supplemental source checks:

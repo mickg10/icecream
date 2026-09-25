@@ -791,7 +791,9 @@ struct P50ServerEndpointConfig {
         commit_p51_reset;
     std::function<bool(const LinkHello&, const ResetConfirm&)>
         confirm_p51_reset;
-    std::function<void(const LinkHello&)> on_p51_link_terminal;
+    std::function<void(const LinkHello&,
+                       const std::optional<JobBind>& unpublished_binding)>
+        on_p51_link_terminal;
 };
 
 // Outbound-admission law shared by the client's production send path and its

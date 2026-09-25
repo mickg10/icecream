@@ -6772,7 +6772,16 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
         disarm_job_deadline();
         if (active_link && impl_->config.on_p51_link_terminal) {
             try {
-                impl_->config.on_p51_link_terminal(*active_link);
+                std::optional<JobBind> unpublished_binding;
+                if (pending_job && session.current_p51_binding) {
+                    const InputRecordKey current_key{
+                        active_link->c_store_guid,
+                        session.current_p51_binding->tu_seq};
+                    if (result.completed_input != current_key)
+                        unpublished_binding = session.current_p51_binding;
+                }
+                impl_->config.on_p51_link_terminal(*active_link,
+                                                   unpublished_binding);
             } catch (...) {
                 // Endpoint teardown must still close the socket and disconnect
                 // the exact F session if a diagnostic callback throws.
@@ -7294,6 +7303,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
             arm_job_deadline(job_lease->absolute_deadline);
             set_completion_deadline(job_lease->absolute_deadline);
             pending_job = true;
+            // The result fields describe the current R2 job. Earlier
+            // successful jobs already settled lifecycle ownership through
+            // on_input_committed and must not masquerade as this job's
+            // publication if its later attempt fails.
+            result.candidate_input.reset();
+            result.completed_input.reset();
+            result.committed_input.reset();
 
             const Digest128 binding_digest = job_lease->binding_digest;
             Frame begin_frame = co_await async_read_frame(
@@ -7395,6 +7411,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 materialized.begin.raw_digest != binding.raw_digest)
                 throw StaleCompletion();
             result.f_apply_materialize_ns = materialized.f_apply_materialize_ns;
+            result.candidate_input = InputRecordKey{
+                hello.c_store_guid, materialized.begin.tu_seq};
             const InputJobState job_state =
                 impl_->select_materialized_job_state(session, materialized);
             require_operation();

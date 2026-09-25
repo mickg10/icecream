@@ -5001,7 +5001,8 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
             ++ack_calls;
             return true;
         };
-    config.on_p51_link_terminal = [&](const LinkHello&) {
+    config.on_p51_link_terminal = [&](
+        const LinkHello&, const std::optional<JobBind>&) {
         ++terminal_calls;
     };
 
@@ -6412,7 +6413,8 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
                 return false;
             return true;
         };
-    config.on_p51_link_terminal = [&](const LinkHello& observed) {
+    config.on_p51_link_terminal = [&](
+        const LinkHello& observed, const std::optional<JobBind>&) {
         if (observed == hello)
             ++terminal_calls;
     };
