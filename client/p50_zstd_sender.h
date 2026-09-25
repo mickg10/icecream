@@ -132,6 +132,9 @@ struct ZstdSourceTransferConfig {
     // shared retry timer. Product callers leave this empty.
     std::function<void(std::chrono::steady_clock::duration)>
         after_r2_recovery_waiter_registered_for_test;
+    // Request-scoped observation used to prove that a queued ARM reaches the
+    // recovery-required branch before a shared reconnect completes.
+    std::function<void(PrepareRequestKey)> before_r2_recovery_for_test;
     // Called as a detached R2 receipt/ACK pump completes. The route owner
     // uses this only to post an owner-affine deferred-retirement reap; it
     // must not mutate sender or route state inline from the coroutine.

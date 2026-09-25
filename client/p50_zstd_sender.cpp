@@ -1437,6 +1437,8 @@ P50ZstdSourceSender::transfer_p51_route(
                 current_r2_physical_generation());
         }
         if (impl_->r2_recovery_required) {
+            if (impl_->config.before_r2_recovery_for_test)
+                impl_->config.before_r2_recovery_for_test(request);
             writer_guard.reset();
             if (!co_await wait_for_r2_recovery_retry(deadline)) {
                 ZstdSourceTransferResult failed =

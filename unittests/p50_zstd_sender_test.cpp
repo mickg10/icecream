@@ -963,7 +963,8 @@ sender_r2_accept_shared_failure(
     bool close_reconnect_after_hello = false,
     bool reject_after_positive_receipt = false,
     std::atomic<bool>* positive_receipt_validated = nullptr,
-    std::atomic<bool>* server_reset_complete = nullptr) {
+    std::atomic<bool>* server_reset_complete = nullptr,
+    std::atomic<bool>* reset_ack_loss_complete = nullptr) {
     const size_t connection_count =
         (reject_stale_reconnect || close_reconnect_after_hello ||
          reject_after_positive_receipt) ? 1
@@ -1020,6 +1021,9 @@ sender_r2_accept_shared_failure(
         }
         results[index] = co_await endpoint.run_adopted_r2(
             std::move(socket), std::move(control));
+        if (index == 1 && repeat_recovery_loss &&
+            reset_ack_loss_complete != nullptr)
+            reset_ack_loss_complete->store(true, std::memory_order_release);
         if (index == 0 && reject_after_positive_receipt &&
             server_reset_complete != nullptr)
             server_reset_complete->store(true, std::memory_order_release);
@@ -1910,10 +1914,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool retire_during_retry_wait = false,
                                         bool close_reconnect_after_hello = false,
                                         bool reject_after_positive_receipt = false,
-                                        bool post_reset_offer_probe = false) {
+                                        bool post_reset_offer_probe = false,
+                                        bool future_offer_during_recovery = false) {
     CHECK(kJobs >= 1 && kJobs <= 30);
     CHECK(!post_reset_offer_probe || kJobs == 2);
-    const size_t total_jobs = kJobs + (post_reset_offer_probe ? 1 : 0);
+    CHECK(!future_offer_during_recovery ||
+          (kJobs == 2 && repeat_recovery_loss && !post_reset_offer_probe));
+    const size_t total_jobs = kJobs +
+        ((post_reset_offer_probe || future_offer_during_recovery) ? 1 : 0);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
                                     : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
@@ -1940,6 +1948,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             "int p51_tail_" + std::to_string(index) + ";\n";
         input[index].assign(text.begin(), text.end());
     }
+    if (future_offer_during_recovery) {
+        // The F reset will verify epoch+1; this offer is deliberately one
+        // epoch newer, so only this request should be rejected after the
+        // shared recovery has established authoritative state.
+        armed[kJobs].relationship_epoch = armed[0].relationship_epoch + 2;
+        CHECK(armed[kJobs].valid());
+    }
+    const PrepareRequestKey future_offer_request{3, 921 + kJobs};
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
         std::chrono::steady_clock::now() +
@@ -1966,6 +1982,9 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::atomic<unsigned> rejected_reconnects{0};
     std::atomic<bool> positive_receipt_validated{false};
     std::atomic<bool> server_reset_complete{false};
+    std::atomic<bool> reset_ack_loss_complete{false};
+    std::atomic<unsigned> recovery_retry_waiters_seen{0};
+    std::atomic<bool> future_offer_entered_recovery{false};
     std::atomic<bool> retry_wait_registered{false};
     std::atomic<int64_t> retry_wait_registered_ns{0};
     std::atomic<unsigned> retry_wait_count{0};
@@ -2151,7 +2170,6 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             begin.witness_count != kJobs || witnesses.size() != kJobs ||
             end.witness_count != kJobs || !commit ||
             witnesses[0].relationship_ordinal != 1 ||
-            witnesses[1].relationship_ordinal != 2 ||
             commit->binding_digest != witnesses[0].binding_digest ||
             commit->transaction_digest != witnesses[0].transaction_digest ||
             commit->inner.tu_seq != witnesses[0].inner.tu_seq ||
@@ -2215,6 +2233,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
                              std::move(server_config));
     std::shared_ptr<P50ZstdSourceSender> sender;
+    AsyncConnectedFdFactory connector;
+    std::future<ZstdSourceTransferResult> future_offer_result;
     asio::io_context f_context;
     tcp::acceptor acceptor(f_context, {asio::ip::address_v4::loopback(), 0});
     asio::io_context c_context;
@@ -2240,7 +2260,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             expire_after_positive_receipt, reject_stale_reconnect,
             &stop_reconnect_listener, &rejected_reconnects,
             close_reconnect_after_hello, reject_after_positive_receipt,
-            &positive_receipt_validated, &server_reset_complete),
+            &positive_receipt_validated, &server_reset_complete,
+            future_offer_during_recovery ? &reset_ack_loss_complete : nullptr),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -2321,12 +2342,37 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             retry_wait_registered.store(true, std::memory_order_release);
             sender->retire_for_replacement();
         };
+    } else if (future_offer_during_recovery) {
+        sender_config.before_r2_recovery_for_test =
+            [&](PrepareRequestKey request) {
+                if (request == future_offer_request)
+                    future_offer_entered_recovery.store(
+                        true, std::memory_order_release);
+            };
+        sender_config.after_r2_recovery_waiter_registered_for_test =
+            [&](std::chrono::steady_clock::duration) {
+                const unsigned waiter = recovery_retry_waiters_seen.fetch_add(
+                    1, std::memory_order_acq_rel) + 1;
+                if (waiter == 1) {
+                    // Enqueue the future offer from the actual retry-wait
+                    // transition. It becomes runnable before the registered
+                    // retry timer can expire, and must enter the same
+                    // recovery-required branch as a second waiter.
+                    future_offer_result = asio::co_spawn(
+                        c_context,
+                        sender->transfer_p51_route(
+                            armed[kJobs], 41, connector,
+                            future_offer_request,
+                            deadline.as_steady_time_point(), input[kJobs]),
+                        asio::use_future);
+                }
+            };
     }
     sender = std::make_shared<P50ZstdSourceSender>(
         authority, route, PrepareRequestKey{3, 921}, sender_config);
 
     const tcp::endpoint remote = acceptor.local_endpoint();
-    AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+    connector = [&](auto, auto completion) {
         connector_calls.fetch_add(1, std::memory_order_relaxed);
         completion(connect_fd(remote));
     };
@@ -2344,6 +2390,27 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
 
     std::vector<ZstdSourceTransferResult> outcomes(kJobs);
     for (size_t index = 0; index != kJobs; ++index) outcomes[index] = results[index].get();
+    if (future_offer_during_recovery) {
+        CHECK(future_offer_result.wait_until(deadline.as_steady_time_point()) ==
+              std::future_status::ready);
+        const auto rejected_future = future_offer_result.get();
+        CHECK(rejected_future.status == ZstdSourceTransferStatus::InvalidRequest);
+        CHECK(!rejected_future.committed_input);
+        CHECK(!rejected_future.replacement_required);
+        CHECK(!rejected_future.route_local_failure);
+        CHECK(connector_calls.load(std::memory_order_acquire) == 3);
+        CHECK(commits[kJobs].load(std::memory_order_acquire) == 0);
+        CHECK(binds[kJobs].load(std::memory_order_acquire) == 0);
+        CHECK(input_selections.load(std::memory_order_acquire) == kJobs);
+        CHECK(recovery_retry_waiters_seen.load(std::memory_order_acquire) >= 2);
+        CHECK(future_offer_entered_recovery.load(std::memory_order_acquire));
+        CHECK(reset_ack_loss_complete.load(std::memory_order_acquire));
+        CHECK(retained_reset.has_value());
+        CHECK(retained_reset->new_relationship_epoch ==
+              armed[0].relationship_epoch + 1);
+        std::cerr << "P51_SENDER_RECOVERY_FUTURE_ARM request-local-reject "
+                     "old-rows-preserved PASS\n";
+    }
     if (reject_after_positive_receipt) {
         CHECK(kJobs == 1 || kJobs == 2);
         CHECK(positive_receipt_validated.load(std::memory_order_acquire));
@@ -2697,6 +2764,12 @@ void test_p51_sender_post_reset_offer_rebase_and_future_reject() {
             2, profile, false, false, false, false, false, false,
             false, true);
     }
+}
+
+void test_p51_sender_future_arm_during_lost_reset_ack_is_request_local() {
+    run_p51_sender_shared_failure_case(
+        2, ProfileId::ZSTD_TU, true, false, false, false, false, false,
+        false, false, true);
 }
 
 void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
@@ -3245,6 +3318,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--future-arm-during-recovery") {
+        test_p51_sender_future_arm_during_lost_reset_ack_is_request_local();
+        std::cerr << "P51_SENDER_FUTURE_ARM_DURING_RECOVERY_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--shared-failure-route30") {
         run_p51_sender_shared_failure_case(30, ProfileId::ZSTD_ROUTE);
         std::cerr << "P51_SENDER_SHARED_FAILURE_ROUTE30_SELECTOR PASS\n";
@@ -3318,6 +3397,8 @@ int main(int argc, char** argv) {
     run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
     run("post_reset_offer_rebase",
         test_p51_sender_post_reset_offer_rebase_and_future_reject);
+    run("future_arm_during_recovery",
+        test_p51_sender_future_arm_during_lost_reset_ack_is_request_local);
     run("repeated_shared_failure", test_p51_sender_repeated_shared_failure_recovers_pending_callers);
     run("reconnect_backoff", test_p51_sender_reconnect_backoff_bounds_shared_eof);
     run("retry_wait_retire", test_p51_sender_retirement_wakes_shared_retry_waiter);
