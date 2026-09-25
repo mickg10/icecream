@@ -12,6 +12,22 @@ retained artifact directories.
 
 ## Developer QA
 
+### Task-count test after thread exit
+
+The daemon task-count test now allows up to two monotonic seconds for the
+joined test thread's `/proc/self/task` entry to disappear, polling every 1 ms.
+Its live-thread detection assertion and the production single-task fork check
+are unchanged. This addresses a post-join test race reported by the other
+candidate branch; it does not relax the daemon's runtime requirement.
+
+Luna's strict SDK compile and 10 sequential plus four concurrent focused runs
+pass, as does `p50daemontaskcount-source.sh`. Evidence is retained under
+`/tanksmall/scratch/tmp/p50-task-count-poll-dc3ac75a/artifacts/`;
+`repeat-parallel.log` SHA256 is
+`5b7d4843b2a8e3e730cb85a5e3f0f9b9e7c87b2dd921c5a806f383d02525d003`.
+Test source SHA256 is
+`9892bb87a94cf5144fb6b7b5c597ba6b3bb333893f0608620120192001f01e43`.
+
 ### Supported Docker process-gate entrypoint
 
 `ICEFARM_TMPDIR=/existing/scratch make dev-gate GATE=p51-arm-expiry`
