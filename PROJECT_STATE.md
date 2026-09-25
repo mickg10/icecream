@@ -12,6 +12,39 @@ retained artifact directories.
 
 ## Developer QA
 
+### Compiler fingerprint validation speed
+
+Root-header corpus promotion now hashes each distinct resolved compiler once
+per validation invocation, instead of once per A/B row. Every row still checks
+its declared hash/path/arguments. File identity (device, inode, size, mtime and
+ctime) must remain stable during hashing and on subsequent rows; no cache is
+shared between validation calls.
+
+The unchanged original 1,000-row authority test passes in 21.98 seconds with
+the optimized validator, versus the recorded 486.65-second baseline (22.1x in
+these runs, 95.5% less elapsed time). No corpus rows or original negative cases
+were removed. Expanded coverage verifies two distinct compiler paths, one hash
+each, conflicting later-row hashes, between-call changes, and file-identity
+changes both during hashing and on a later cached row.
+
+Private exact645-based qualification artifacts are under
+`/tanksmall/scratch/tmp/p51-retained-perf-opt/runtime/`:
+
+- Unchanged test: `original1000-optimized-r1.log`, SHA256
+  `2deb78289bff6bf3a69da5fa8284c32a657dea9ae363025ef505925801928903`.
+- Expanded node: 1 passed in 28.30 seconds, `focused-r7.log`, SHA256
+  `a015c3279547043401d9fe1f211e14ad0dc3473d87495b75c49aafd47cca28df`.
+- Authority module: 19 passed, two skipped in 55.30 seconds, `module-r1.log`,
+  SHA256 `5cbf39a29eabb40ddc6261b5c3e75e2ad6a7a19c4874a0d7b68a0b5a30bfe3ff`.
+  Skips are unavailable user/PID namespace capability and absent retained
+  production trace/compile-command fixtures; neither is counted as covered.
+- Direct promotion module: seven passed in 0.14 seconds,
+  `direct-promotion-r1.log`, SHA256
+  `aa1b23380f91af78302c0ea3ea91977d2b98fe2026f5245da828e71d0b979b81`.
+
+This is validation-time improvement, not a measured distributed build speedup.
+The concurrent full-QA run on frozenf004 predates this optimization.
+
 ### Independent F ACK and terminal accounting
 
 The opt-in R2 trace now includes F-validated cumulative ACKs and one terminal

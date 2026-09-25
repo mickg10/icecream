@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import farmharness.integration.firefox_corpus_promotion as promotion_module
 from farmharness.integration.firefox_corpus_promotion import (
     FirefoxCorpusPromotionError,
     validate_and_verify_bodies,
@@ -81,8 +83,12 @@ def _init_source(tmp_path: Path) -> tuple[Path, Path, str]:
 
 
 def _make_inputs(
-    tmp_path: Path, *, affected: int = AFFECTED
-) -> dict[str, Path | dict[str, object]]:
+    tmp_path: Path,
+    *,
+    affected: int = AFFECTED,
+    compiler_path: Path | None = None,
+    alternate_compiler_path: Path | None = None,
+) -> dict[str, Path | dict[str, object] | None]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     source_root = tmp_path / "source"
     header_before = source_root / "memory" / "mozalloc.h"
@@ -115,6 +121,16 @@ def _make_inputs(
     compile_rows: list[dict[str, object]] = []
     a_paths: list[Path] = []
     b_paths: list[Path] = []
+    compiler_path = (compiler_path or Path(sys.executable)).resolve()
+    alternate_compiler_path = (
+        alternate_compiler_path.resolve() if alternate_compiler_path is not None else None
+    )
+
+    def compiler_for(index: int) -> Path:
+        if alternate_compiler_path is not None and index % 2:
+            return alternate_compiler_path
+        return compiler_path
+
     for index in range(COUNT):
         relative = f"obj/file-{index:04d}.ii"
         actual = actual_root / f"input-{index:04d}.cpp"
@@ -135,7 +151,7 @@ def _make_inputs(
         )
         compile_rows.append(
             {
-                "arguments": [sys.executable, "-c", copy_script, str(actual)],
+                "arguments": [str(compiler_for(index)), "-c", copy_script, str(actual)],
                 "directory": str(tmp_path),
                 "file": str(actual),
             }
@@ -151,8 +167,10 @@ def _make_inputs(
     a_manifest.write_text("".join(f"{path}\n" for path in a_paths), encoding="utf-8")
     b_manifest.write_text("".join(f"{path}\n" for path in b_paths), encoding="utf-8")
     validation_rows: list[dict[str, object]] = []
-    compiler_path = Path(sys.executable).resolve()
-    compiler_sha = _digest(compiler_path)
+    compiler_hashes = {
+        str(path): _digest(path)
+        for path in {compiler_path, alternate_compiler_path} - {None}
+    }
     command_hashes = {
         row["file"]: hashlib.sha256(canonical_bytes(row)).hexdigest()
         for row in compile_rows
@@ -161,13 +179,14 @@ def _make_inputs(
         for turn, path in (("A", a_paths[index]), ("B", b_paths[index])):
             object_path = tmp_path / "receipts" / "objects" / turn / f"{index:04d}.o"
             raw_command = compile_rows[index]
+            row_compiler = compiler_for(index)
             validation_rows.append(
                 {
                     "actual_input": str(actual_root / f"input-{index:04d}.cpp"),
                     "command_sha256": command_hashes[str(actual_root / f"input-{index:04d}.cpp")],
-                    "argv": [str(compiler_path), *raw_command["arguments"][1:-1], str(path), "-o", str(object_path)],
-                    "compiler_path": str(compiler_path),
-                    "compiler_sha256": compiler_sha,
+                    "argv": [str(row_compiler), *raw_command["arguments"][1:-1], str(path), "-o", str(object_path)],
+                    "compiler_path": str(row_compiler),
+                    "compiler_sha256": compiler_hashes[str(row_compiler)],
                     "elapsed_ms": 1.0,
                     "error": "",
                     "exit_code": 0,
@@ -221,6 +240,8 @@ def _make_inputs(
         "b_manifest": b_manifest,
         "compile_commands": compile_commands,
         "compile_validation": compile_validation,
+        "compiler_path": compiler_path,
+        "alternate_compiler_path": alternate_compiler_path,
         "edit_diff": edit_diff,
         "header_after": header_after,
         "header_before": header_before,
@@ -279,18 +300,24 @@ def _promotion_corpus(
     normalized = hashlib.sha256(
         ("\n".join(row["path"] for row in pair["pairs"]) + "\n").encode()
     ).hexdigest()
-    compiler = Path(sys.executable).resolve()
+    compiler_paths = {
+        Path(inputs["compiler_path"]).resolve(),  # type: ignore[arg-type]
+    }
+    alternate = inputs.get("alternate_compiler_path")
+    if isinstance(alternate, Path):
+        compiler_paths.add(alternate.resolve())
     return {
         "authority_receipt": {
             "path": str(inputs["output"] / "authority.json"),  # type: ignore[operator]
             "sha256": _digest(inputs["output"] / "authority.json"),  # type: ignore[operator]
         },
         "compiler_recipes": {
-            "python-test": {
+            f"python-test-{index}": {
                 "arguments": [],
                 "binary_sha256": _digest(compiler),
                 "executable": str(compiler),
             }
+            for index, compiler in enumerate(sorted(compiler_paths))
         },
         "normalized_manifest_sha256": normalized,
         "pair_index_sha256": authority["pair_index"]["sha256"],  # type: ignore[index]
@@ -423,8 +450,12 @@ def test_refuses_non_single_header_edit(tmp_path: Path) -> None:
 
 
 @pytest.mark.thorough
-def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) -> None:
-    inputs = _make_inputs(tmp_path)
+def test_retained_mode_revalidates_namespace_rows_and_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alternate_compiler = tmp_path / "alternate-python"
+    shutil.copy2(sys.executable, alternate_compiler)
+    inputs = _make_inputs(tmp_path, alternate_compiler_path=alternate_compiler)
     b_paths = [Path(line) for line in inputs["b_manifest"].read_text(encoding="utf-8").splitlines()]  # type: ignore[union-attr]
 
     def fake_invoke(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess[bytes]:
@@ -480,7 +511,29 @@ def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) 
     assert validate_root_header_authority(inputs["output"] / "authority.json")["schema"] == AUTHORITY_SCHEMA  # type: ignore[operator]
 
     corpus = _promotion_corpus(inputs, authority)
-    promotion = validate_corpus_promotion(corpus)
+    compiler_paths = {
+        Path(inputs["compiler_path"]).resolve(),  # type: ignore[arg-type]
+        alternate_compiler.resolve(),
+    }
+    original_digest = promotion_module._digest
+    digest_calls: dict[Path, int] = {path: 0 for path in compiler_paths}
+
+    def counted_digest(path: Path) -> str:
+        resolved = Path(path).resolve()
+        if resolved in digest_calls:
+            digest_calls[resolved] += 1
+        return original_digest(path)
+
+    monkeypatch.setattr(promotion_module, "_digest", counted_digest)
+    promotion_result = validate_corpus_promotion(corpus)
+    # Both the authority and alternate row compiler are hashed once despite
+    # appearing in every A/B row.
+    assert digest_calls == {
+        Path(inputs["compiler_path"]).resolve(): 1,  # type: ignore[arg-type]
+        alternate_compiler.resolve(): 1,
+    }
+    monkeypatch.setattr(promotion_module, "_digest", original_digest)
+    promotion = promotion_result
     assert promotion.mutation_kind == "single-insert"
     assert promotion.inserted_byte == ord("X")
     assert len(validate_and_verify_bodies(corpus).pair_rows) == COUNT
@@ -503,6 +556,26 @@ def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) 
 
     authority_path = inputs["output"] / "authority.json"  # type: ignore[operator]
     authority_bytes = authority_path.read_bytes()
+    retained_receipt_path = inputs["output"] / "retained-execution.json"  # type: ignore[operator]
+    retained_receipt_bytes = retained_receipt_path.read_bytes()
+    validation_path = Path(load_json(authority_path)["compile_validation"]["path"])
+    validation_bytes = validation_path.read_bytes()
+
+    tampered_validation = load_json(validation_path)
+    tampered_validation["rows"][-1]["compiler_sha256"] = "0" * 64
+    validation_path.write_bytes(canonical_bytes(tampered_validation))
+    tampered_authority = load_json(authority_path)
+    tampered_authority["compile_validation"]["sha256"] = _digest(validation_path)
+    authority_path.write_bytes(canonical_bytes(tampered_authority))
+    corpus["authority_receipt"]["sha256"] = _digest(authority_path)  # type: ignore[index]
+    with pytest.raises(
+        FirefoxCorpusPromotionError,
+        match=r"compile_validation\.rows\[999,B\].compiler_sha256.*does not match compiler bytes",
+    ):
+        validate_corpus_promotion(corpus)
+    validation_path.write_bytes(validation_bytes)
+    authority_path.write_bytes(authority_bytes)
+    corpus["authority_receipt"]["sha256"] = _digest(authority_path)  # type: ignore[index]
 
     b_path = Path(inputs["b_manifest"].read_text(encoding="utf-8").splitlines()[0])  # type: ignore[union-attr]
     b_bytes = b_path.read_bytes()
@@ -558,7 +631,6 @@ def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) 
     authority_path.write_bytes(authority_bytes)
 
     validation_path = Path(authority["compile_validation"]["path"])  # type: ignore[index]
-    validation_bytes = validation_path.read_bytes()
     tampered_validation = load_json(validation_path)
     tampered_validation["rows"][0]["argv"].insert(1, "--forged")
     validation_path.write_bytes(canonical_bytes(tampered_validation))
@@ -635,6 +707,65 @@ def test_retained_mode_revalidates_namespace_rows_and_authority(tmp_path: Path) 
     with pytest.raises(RootHeaderAuthorityError, match="stderr bind identity"):
         validate_root_header_authority(authority_path)
 
+    # Each validation invocation starts a fresh compiler-byte observation.
+    # A changed executable must not reuse the first invocation's cached SHA.
+    authority_path.write_bytes(authority_bytes)
+    validation_path.write_bytes(validation_bytes)
+    retained_receipt_path.write_bytes(retained_receipt_bytes)
+    alternate_bytes = alternate_compiler.read_bytes()
+    with alternate_compiler.open("ab") as handle:
+        handle.write(b"replacement")
+    with pytest.raises(FirefoxCorpusPromotionError, match="compiler_sha256.*does not match compiler bytes"):
+        validate_corpus_promotion(corpus)
+
+    # A path whose stat identity changes during one hash is rejected rather
+    # than cached as a stable observation for its remaining rows.
+    alternate_compiler.write_bytes(alternate_bytes)
+    alternate_stat = alternate_compiler.stat()
+    mutate_once = True
+
+    def mutate_identity_during_hash(path: Path) -> str:
+        nonlocal mutate_once
+        digest = original_digest(path)
+        if Path(path).resolve() == alternate_compiler.resolve() and mutate_once:
+            mutate_once = False
+            os.utime(
+                alternate_compiler,
+                ns=(alternate_stat.st_atime_ns, alternate_stat.st_mtime_ns + 2_000_000_000),
+            )
+        return digest
+
+    monkeypatch.setattr(promotion_module, "_digest", mutate_identity_during_hash)
+    with pytest.raises(FirefoxCorpusPromotionError, match="compiler_path.*changed while being validated"):
+        promotion_module._validate_root_header_corpus_promotion(
+            corpus, authority_path, load_json(authority_path)
+        )
+
+    os.utime(
+        alternate_compiler,
+        ns=(alternate_stat.st_atime_ns, alternate_stat.st_mtime_ns),
+    )
+    original_executable = promotion_module._executable
+    alternate_resolutions = 0
+
+    def mutate_cached_identity_on_second_row(path: object, subject: str) -> Path:
+        nonlocal alternate_resolutions
+        executable = original_executable(path, subject)  # type: ignore[arg-type]
+        if executable.resolve() == alternate_compiler.resolve():
+            alternate_resolutions += 1
+            if alternate_resolutions == 2:
+                stat = alternate_compiler.stat()
+                os.utime(
+                    alternate_compiler,
+                    ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000),
+                )
+        return executable
+
+    monkeypatch.setattr(promotion_module, "_executable", mutate_cached_identity_on_second_row)
+    with pytest.raises(FirefoxCorpusPromotionError, match="compiler_path.*changed during validation"):
+        promotion_module._validate_root_header_corpus_promotion(
+            corpus, authority_path, load_json(authority_path)
+        )
 
 def test_real_namespace_timeout_kills_descendants() -> None:
     assert tuple(NAMESPACE_TIMEOUT_ARGV[:4]) == NAMESPACE_ARGV

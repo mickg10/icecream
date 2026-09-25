@@ -565,6 +565,7 @@ def _validate_root_header_corpus_promotion(
         _fail("compile_validation.rows", f"expected exactly {2 * tus} rows")
     seen_turns: set[tuple[int, str]] = set()
     compilers: set[tuple[str, str]] = set()
+    compiler_fingerprints: dict[str, tuple[tuple[int, int, int, int, int], str]] = {}
     for raw in rows:
         row = _require_mapping(raw, "compile_validation.rows[]")
         if set(row) != ROOT_HEADER_COMPILE_ROW_FIELDS:
@@ -605,9 +606,43 @@ def _validate_root_header_corpus_promotion(
         executable = _executable(compiler_path, f"compile_validation.rows[{index},{turn}].compiler_path")
         if not isinstance(argv, list) or not argv or argv[0] != str(executable):
             _fail(f"compile_validation.rows[{index},{turn}].argv", "does not start with bound compiler")
-        if _digest(executable.resolve()) != compiler_sha:
+        resolved_executable = executable.resolve()
+        try:
+            stat = resolved_executable.stat()
+        except OSError as exc:
+            _fail(f"compile_validation.rows[{index},{turn}].compiler_path", f"cannot stat compiler: {exc}")
+        file_identity = (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+        resolved_key = str(resolved_executable)
+        verified = compiler_fingerprints.get(resolved_key)
+        if verified is None:
+            observed_compiler_sha = _digest(resolved_executable)
+            try:
+                after = resolved_executable.stat()
+            except OSError as exc:
+                _fail(f"compile_validation.rows[{index},{turn}].compiler_path", f"cannot restat compiler: {exc}")
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if after_identity != file_identity:
+                _fail(f"compile_validation.rows[{index},{turn}].compiler_path", "changed while being validated")
+            compiler_fingerprints[resolved_key] = (file_identity, observed_compiler_sha)
+        else:
+            if verified[0] != file_identity:
+                _fail(f"compile_validation.rows[{index},{turn}].compiler_path", "changed during validation")
+            observed_compiler_sha = verified[1]
+        if observed_compiler_sha != compiler_sha:
             _fail(f"compile_validation.rows[{index},{turn}].compiler_sha256", "does not match compiler bytes")
-        compilers.add((str(executable.resolve()), compiler_sha))
+        compilers.add((resolved_key, compiler_sha))
         if row.get("exit_code") != 0 or row.get("timed_out") is not False:
             _fail(f"compile_validation.rows[{index},{turn}]", "is not a definitive pass")
         for field in ("output_sha256", "stderr_sha256", "stdout_sha256"):
