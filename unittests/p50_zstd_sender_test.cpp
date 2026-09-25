@@ -5,6 +5,8 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_future.hpp>
 #include <boost/asio/write.hpp>
 
@@ -20,6 +22,11 @@
 #include <fcntl.h>
 #include <future>
 #include <limits>
+#if defined(__linux__)
+#include <linux/sockios.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#endif
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
@@ -2213,6 +2220,431 @@ void test_p51_sender_window_matrix_and_serial_control() {
 void test_p51_sender_serial_control_only() {
     test_p51_sender_serial_w1_control_fails_w30_witness();
 }
+
+#if defined(__linux__)
+asio::awaitable<ServerRunResult> sender_r2_accept_with_first_commit_gate(
+    tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
+    std::atomic<int>& observed_peer_fd, std::atomic<bool>& gate_entered,
+    std::mutex& gate_mutex, std::condition_variable& gate_cv,
+    bool& release_gate) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    socket.set_option(tcp::socket::receive_buffer_size(4096));
+    const int duplicate = ::dup(socket.native_handle());
+    observed_peer_fd.store(duplicate, std::memory_order_release);
+    if (duplicate < 0)
+        throw std::runtime_error("D16 could not duplicate the accepted peer socket");
+
+    EndpointIoControl control;
+    control.outbound_message_observer =
+        [&](ActorSide actor, const Message& message) {
+            if (actor != ActorSide::F ||
+                !std::holds_alternative<R2TxCommit>(message) ||
+                std::get<R2TxCommit>(message).inner.tu_seq.value != 0)
+                return;
+            gate_entered.store(true, std::memory_order_release);
+            gate_cv.notify_all();
+            std::unique_lock lock(gate_mutex);
+            if (!gate_cv.wait_for(lock, std::chrono::seconds(10), [&] {
+                    return release_gate;
+                }))
+                throw std::runtime_error("D16 first-COMMIT gate expired");
+        };
+    co_return co_await endpoint.run_adopted_r2(std::move(socket),
+                                               std::move(control));
+}
+
+asio::awaitable<void> sender_test_heartbeat(
+    std::atomic<bool>& stop, std::atomic<uint64_t>& ticks) {
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    while (!stop.load(std::memory_order_acquire)) {
+        timer.expires_after(std::chrono::milliseconds(5));
+        boost::system::error_code error;
+        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable,
+                                                       error));
+        if (error) co_return;
+        ticks.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void run_p51_sender_writer_backpressure_case(ProfileId profile) {
+    constexpr size_t kLargeRawBytes = 512U << 10;
+    constexpr uint64_t kPhysicalGeneration = 27;
+    const auto [c_guid, f_guid] = sender_r2_store_guids();
+    const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
+                                    : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
+                                    : "ZSTD_TU";
+    const Id128 relationship_id = Id128::from_u64(0x5102);
+    constexpr uint32_t kWindow = 2;
+    std::array<P51SourceArmedFields, 2> armed;
+    for (size_t i = 0; i != armed.size(); ++i) {
+        armed[i] = sender_r2_armed(
+            sender_r2_arm(c_guid, 31001 + i,
+                          static_cast<uint32_t>(31101 + i), kWindow, profile),
+            f_guid, 0x531001 + i, kWindow);
+    }
+    std::array<std::vector<uint8_t>, 2> input;
+    input[0] = {'D', '1', '6', '-', 'a', 'c', 'k'};
+    input[1].resize(kLargeRawBytes);
+    uint32_t random = 0x9e3779b9U;
+    for (uint8_t& byte : input[1]) {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        byte = static_cast<uint8_t>(random);
+    }
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(30),
+        clock.clock_domain_id, clock.time_namespace_id);
+
+    asio::io_context c_context;
+    asio::io_context f_context;
+    std::thread c_thread;
+    std::thread f_thread;
+    tcp::acceptor acceptor(f_context,
+        {asio::ip::address_v4::loopback(), 0});
+    std::mutex f_gate_mutex;
+    std::condition_variable f_gate_cv;
+    bool release_f_gate = false;
+    std::atomic<bool> f_gate_entered{false};
+    std::atomic<int> observed_f_fd{-1};
+    std::atomic<unsigned> commit_count{0};
+    std::atomic<unsigned> input_mismatches{0};
+
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [&](CStoreGuid observed_c,
+                                        const TxBegin& begin,
+                                        const TxCommit& commit,
+                                        std::span<const uint8_t> bytes) {
+        const size_t index = static_cast<size_t>(begin.tu_seq.value);
+        if (observed_c != c_guid || index >= input.size() ||
+            begin.profile != profile || bytes.size() != input[index].size() ||
+            !std::equal(bytes.begin(), bytes.end(), input[index].begin()) ||
+            commit.raw_digest != icecc::digest128(input[index]))
+            input_mismatches.fetch_add(1, std::memory_order_relaxed);
+        return InputJobState::Open;
+    };
+    server_config.lookup_p51_link_reservation =
+        [&, deadline](const LinkHello& hello)
+            -> std::optional<P51SourceLinkLease> {
+        if (hello.profile != profile || hello.window != kWindow ||
+            hello.relationship_id != relationship_id ||
+            hello.relationship_epoch != armed[0].relationship_epoch ||
+            hello.reservation_id != Id128{armed[0].reservation_id} ||
+            hello.c_store_guid != c_guid || hello.f_store_guid != f_guid ||
+            hello.physical_link_generation != kPhysicalGeneration)
+            return std::nullopt;
+        P51SourceLinkLease lease;
+        lease.initial_armed = armed[0];
+        lease.absolute_deadline = deadline;
+        lease.relationship_epoch = hello.relationship_epoch;
+        lease.history_nonce = hello.history_nonce;
+        return lease;
+    };
+    server_config.consume_p51_job_reservation =
+        [&, deadline](const LinkHello& hello, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        const size_t index = static_cast<size_t>(binding.tu_seq.value);
+        if (index >= armed.size() || hello.relationship_id != relationship_id ||
+            binding.physical_link_generation != kPhysicalGeneration ||
+            binding.profile != profile ||
+            binding.reservation_id != Id128{armed[index].reservation_id} ||
+            binding.raw_bytes != input[index].size() ||
+            binding.raw_digest != icecc::digest128(input[index]))
+            return std::nullopt;
+        P51SourceJobLease lease;
+        lease.armed = armed[index];
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+        return lease;
+    };
+    server_config.record_p51_job_commit =
+        [&](const LinkHello& hello, const JobBind& binding,
+            const R2TxCommit&) {
+        if (hello.relationship_id != relationship_id ||
+            binding.tu_seq.value >= input.size())
+            return false;
+        commit_count.fetch_add(1, std::memory_order_release);
+        return true;
+    };
+    server_config.acknowledge_p51_receipt =
+        [&](const LinkHello& hello, const CommitAck& ack) {
+        return hello.relationship_id == relationship_id &&
+            ack.relationship_id == relationship_id &&
+            ack.physical_link_generation == kPhysicalGeneration;
+    };
+    EndpointCaps server_caps;
+    server_caps.profile = profile;
+    server_caps.supported_profiles = profile_bit(profile);
+    server_caps.zstd.max_raw_bytes = 1U << 20;
+    server_caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
+                             std::move(server_config));
+    auto server_future = asio::co_spawn(
+        f_context, sender_r2_accept_with_first_commit_gate(
+            acceptor, server, observed_f_fd, f_gate_entered,
+            f_gate_mutex, f_gate_cv, release_f_gate), asio::use_future);
+
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = kWindow;
+    limits.max_speculative_raw_bytes = 2U << 20;
+    limits.max_live_entries = 8;
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_guid, caps.zstd, limits, 1, profile);
+    const PreparationRouteKey route{f_guid, 23, profile};
+    ZstdSourceTransferConfig sender_config = config();
+    sender_config.deadline = deadline.as_steady_time_point();
+    sender_config.endpoint_caps = caps;
+    sender_config.authority_limits = limits;
+    if (profile == ProfileId::ZSTD_ROUTE)
+        sender_config.compression_level = 3;
+    std::atomic<unsigned> complete_bundles{0};
+    std::atomic<bool> first_receipt_validated{false};
+    std::atomic<bool> hold_receipt_reader{true};
+    std::mutex progress_mutex;
+    std::condition_variable progress_cv;
+    sender_config.after_r2_bundle_sent_for_test = [&](uint64_t) {
+        complete_bundles.fetch_add(1, std::memory_order_release);
+        progress_cv.notify_all();
+    };
+    sender_config.after_r2_receipt_validated_for_test = [&](uint64_t ordinal) {
+        if (ordinal == 1)
+            first_receipt_validated.store(true, std::memory_order_release);
+        progress_cv.notify_all();
+    };
+    sender_config.hold_r2_receipt_reader_for_test = [&] {
+        return hold_receipt_reader.load(std::memory_order_acquire);
+    };
+    auto sender = std::make_shared<P50ZstdSourceSender>(
+        authority, route, PrepareRequestKey{3, 31001}, sender_config);
+
+    auto c_work = asio::make_work_guard(c_context);
+    std::atomic<int> observed_c_fd{-1};
+    std::atomic<unsigned> connector_calls{0};
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+        const unsigned call = connector_calls.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (call != 1) {
+            completion(-1);
+            return;
+        }
+        const int fd = connect_fd(remote);
+        if (fd >= 0) {
+            const int tiny = 4096;
+            if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &tiny, sizeof(tiny)) != 0) {
+                (void)::close(fd);
+                completion(-1);
+                return;
+            }
+            const int duplicate = ::dup(fd);
+            observed_c_fd.store(duplicate, std::memory_order_release);
+            if (duplicate < 0) {
+                (void)::close(fd);
+                completion(-1);
+                return;
+            }
+        }
+        completion(fd);
+    };
+    std::atomic<bool> stop_heartbeat{false};
+    std::atomic<uint64_t> heartbeat_ticks{0};
+    auto heartbeat = asio::co_spawn(c_context,
+        sender_test_heartbeat(stop_heartbeat, heartbeat_ticks),
+        asio::use_future);
+    struct Cleanup {
+        asio::io_context& c_context;
+        asio::io_context& f_context;
+        std::thread& c_thread;
+        std::thread& f_thread;
+        std::atomic<bool>& stop_heartbeat;
+        std::atomic<int>& observed_c_fd;
+        std::atomic<int>& observed_f_fd;
+        std::mutex& f_gate_mutex;
+        std::condition_variable& f_gate_cv;
+        bool& release_f_gate;
+        ~Cleanup() {
+            const auto close_observed = [](std::atomic<int>& observed) {
+                const int fd = observed.exchange(-1, std::memory_order_acq_rel);
+                if (fd >= 0) {
+                    (void)::shutdown(fd, SHUT_RDWR);
+                    (void)::close(fd);
+                }
+            };
+            {
+                std::lock_guard lock(f_gate_mutex);
+                release_f_gate = true;
+            }
+            f_gate_cv.notify_all();
+            stop_heartbeat.store(true, std::memory_order_release);
+            close_observed(observed_f_fd);
+            close_observed(observed_c_fd);
+            c_context.stop();
+            f_context.stop();
+            if (c_thread.joinable()) c_thread.join();
+            if (f_thread.joinable()) f_thread.join();
+            // Connector and accept handlers can publish their duplicate FDs
+            // until the contexts have stopped and both threads have joined.
+            close_observed(observed_f_fd);
+            close_observed(observed_c_fd);
+        }
+    } cleanup{c_context, f_context, c_thread, f_thread, stop_heartbeat,
+              observed_c_fd, observed_f_fd, f_gate_mutex, f_gate_cv,
+              release_f_gate};
+
+    // Install cleanup before either event loop thread can own a descriptor or
+    // block in the deliberate F-side gate.
+    f_thread = std::thread([&] { f_context.run(); });
+    c_thread = std::thread([&] { c_context.run(); });
+
+    auto first = asio::co_spawn(c_context,
+        sender->transfer_p51_route(
+            armed[0], kPhysicalGeneration, connector,
+            PrepareRequestKey{3, 31001}, deadline.as_steady_time_point(), input[0]),
+        asio::use_future);
+    const auto wait_for_progress = [&](auto predicate,
+                                       std::chrono::steady_clock::duration budget) {
+        std::unique_lock lock(progress_mutex);
+        return progress_cv.wait_for(lock, budget, predicate);
+    };
+    CHECK(wait_for_progress([&] {
+        return complete_bundles.load(std::memory_order_acquire) == 1;
+    }, std::chrono::seconds(5)));
+    {
+        std::unique_lock lock(f_gate_mutex);
+        CHECK(f_gate_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return f_gate_entered.load(std::memory_order_acquire);
+        }));
+    }
+    CHECK(!first_receipt_validated.load(std::memory_order_acquire));
+    CHECK(first.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::timeout);
+    CHECK(commit_count.load(std::memory_order_acquire) == 1);
+
+    auto second = asio::co_spawn(c_context,
+        sender->transfer_p51_route(
+            armed[1], kPhysicalGeneration, connector,
+            PrepareRequestKey{3, 31002}, deadline.as_steady_time_point(), input[1]),
+        asio::use_future);
+    const uint64_t heartbeat_before = heartbeat_ticks.load(std::memory_order_acquire);
+    const auto blocked_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+    int queued_bytes = 0;
+    int effective_send_buffer = 0;
+    bool socket_not_writable = false;
+    bool kernel_backpressure_witness = false;
+    while (std::chrono::steady_clock::now() < blocked_deadline) {
+        const int fd = observed_c_fd.load(std::memory_order_acquire);
+        if (fd >= 0) {
+            socklen_t option_size = sizeof(effective_send_buffer);
+            (void)::getsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                               &effective_send_buffer, &option_size);
+            pollfd descriptor{fd, POLLOUT, 0};
+            const int ready = ::poll(&descriptor, 1, 0);
+            socket_not_writable = (ready == 0 ||
+                (ready > 0 && (descriptor.revents & POLLOUT) == 0)) &&
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+            if (::ioctl(fd, SIOCOUTQ, &queued_bytes) == 0 &&
+                socket_not_writable && effective_send_buffer > 0 &&
+                queued_bytes >= std::max(4096, effective_send_buffer / 2) &&
+                complete_bundles.load(std::memory_order_acquire) == 1 &&
+                second.wait_for(std::chrono::milliseconds(0)) ==
+                    std::future_status::timeout &&
+                heartbeat_ticks.load(std::memory_order_acquire) > heartbeat_before) {
+                kernel_backpressure_witness = true;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(kernel_backpressure_witness);
+    CHECK(heartbeat_ticks.load(std::memory_order_acquire) > heartbeat_before);
+    std::cerr << "P51_D16_BLOCKED_WRITE profile=" << profile_name
+              << " outq=" << queued_bytes << " sndbuf=" << effective_send_buffer
+              << " not_writable=" << socket_not_writable
+              << " receipt1=held heartbeat=" << heartbeat_ticks.load()
+              << " bundles_completed=" << complete_bundles.load() << "\n";
+
+    hold_receipt_reader.store(false, std::memory_order_release);
+    progress_cv.notify_all();
+    CHECK(wait_for_progress([&] {
+        return first_receipt_validated.load(std::memory_order_acquire);
+    }, std::chrono::seconds(2)));
+    CHECK(complete_bundles.load(std::memory_order_acquire) == 1);
+    CHECK(second.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::timeout);
+    CHECK(heartbeat_ticks.load(std::memory_order_acquire) > heartbeat_before);
+    {
+        const int fd = observed_c_fd.load(std::memory_order_acquire);
+        CHECK(fd >= 0);
+        pollfd descriptor{fd, POLLOUT, 0};
+        const int ready = ::poll(&descriptor, 1, 0);
+        int after_receipt_queue = 0;
+        CHECK(::ioctl(fd, SIOCOUTQ, &after_receipt_queue) == 0);
+        const bool still_blocked = (ready == 0 ||
+            (ready > 0 && (descriptor.revents & POLLOUT) == 0)) &&
+            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+        CHECK(still_blocked);
+        CHECK(after_receipt_queue >= std::max(4096, effective_send_buffer / 2));
+        queued_bytes = after_receipt_queue;
+    }
+    std::cerr << "P51_D16_READER_PROGRESS profile=" << profile_name
+              << " receipt1=validated still_blocked=1 outq=" << queued_bytes
+              << " heartbeat=" << heartbeat_ticks.load()
+              << " second_bundle_complete=0\n";
+
+    const int peer_fd = observed_f_fd.exchange(-1, std::memory_order_acq_rel);
+    CHECK(peer_fd >= 0);
+    CHECK(::shutdown(peer_fd, SHUT_RDWR) == 0);
+    (void)::close(peer_fd);
+    {
+        std::lock_guard lock(f_gate_mutex);
+        release_f_gate = true;
+    }
+    f_gate_cv.notify_all();
+    std::promise<void> retirement_posted;
+    auto retirement_done = retirement_posted.get_future();
+    asio::post(c_context, [&sender, &retirement_posted] {
+        sender->retire_for_replacement();
+        retirement_posted.set_value();
+    });
+    CHECK(retirement_done.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    CHECK(second.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    CHECK(second.get().status != ZstdSourceTransferStatus::Committed);
+    CHECK(first.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    CHECK(first.get().status == ZstdSourceTransferStatus::Committed);
+    CHECK(server_future.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    CHECK(server_future.get().status == ServerRunStatus::Disconnected);
+    CHECK(commit_count.load(std::memory_order_acquire) == 1);
+    CHECK(input_mismatches.load(std::memory_order_relaxed) == 0);
+    CHECK(connector_calls.load(std::memory_order_acquire) <= 2);
+    stop_heartbeat.store(true, std::memory_order_release);
+    c_work.reset();
+    CHECK(heartbeat.wait_for(std::chrono::seconds(1)) ==
+          std::future_status::ready);
+    if (c_thread.joinable()) c_thread.join();
+    f_context.stop();
+    if (f_thread.joinable()) f_thread.join();
+    std::cerr << "P51_D16_BACKPRESSURE_ACK_SHUTDOWN profile=" << profile_name
+              << " first_committed=1 blocked_write=1 receipt_reader_progress=1 bounded=1 PASS\n";
+}
+
+void test_p51_sender_writer_backpressure_ack_and_shutdown() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        run_p51_sender_writer_backpressure_case(profile);
+}
+#endif
 
 void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
                                   bool retire_during_recovery = false,
@@ -4435,6 +4867,17 @@ void test_completion_log_bounded_r1_byte_accounting() {
 
 int main(int argc, char** argv) {
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--writer-backpressure-ack-shutdown") {
+#if defined(__linux__)
+        test_p51_sender_writer_backpressure_ack_and_shutdown();
+        std::cerr << "P51_SENDER_WRITER_BACKPRESSURE_ACK_SHUTDOWN_SELECTOR PASS\n";
+        return 0;
+#else
+        std::cerr << "SKIP: D16 SIOCOUTQ backpressure witness is Linux-only\n";
+        return 77;
+#endif
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--window-matrix") {
         test_p51_sender_window_matrix_and_serial_control();
         std::cerr << "P51_SENDER_WINDOW_MATRIX_SELECTOR PASS\n";
@@ -4617,4 +5060,11 @@ int main(int argc, char** argv) {
     run("deadline_not_extended", test_factory_cannot_extend_absolute_deadline);
     run("completion_log_accounting",
         test_completion_log_bounded_r1_byte_accounting);
+#if defined(__linux__)
+    run("writer_backpressure_ack_shutdown",
+        test_p51_sender_writer_backpressure_ack_and_shutdown);
+#else
+    std::cerr << "P51_TEST_SKIP writer_backpressure_ack_shutdown "
+                 "requires Linux SIOCOUTQ\n";
+#endif
 }

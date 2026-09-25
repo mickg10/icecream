@@ -90,6 +90,36 @@ Final helper binary SHA256:
 The published runner differs from that older successful test copy only by
 one wording-only correction to a failure message.
 
+### Blocked writer with concurrent receipt processing
+
+The Linux default sender suite now includes a kernel-backpressure fixture
+for P29V1/ZSTD_TU/ZSTD_ROUTE. With W2, F publishes the first input then pauses
+its reader. A 512 KiB second input fills C's small send buffer. The test
+observes queued bytes and no `POLLOUT`, an incomplete second bundle and a
+live C event-loop heartbeat, then releases C's receipt reader and requires
+the first receipt to validate while the second write is still blocked.
+Peer shutdown and sender retirement must settle both callers within bounded
+waits, preserving the first committed result and exactly one F publication.
+
+This is partial D16 evidence: kernel backpressure, not an observed `send()`
+EAGAIN return, complete service-process shutdown, or a worker/descriptor/credit
+leak matrix. The focused selector passes all three profiles. The full default
+sender suite also exits 0 on the accounting product snapshot, taking 288.01 s
+wall time (1.46 s user, 1.76 s system). Tiny-buffer drain and deadline fixtures
+dominate this runtime; timing reduction remains separate from correctness.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d16-qa.WkgfTa/`.
+Full log `logs/sender-full-r1.log` SHA256:
+`a46d4c84d70ebe849dc3e9ef16379cb5ade11feb4075f2764c457686c5cf3d20`.
+Frozen test source SHA256:
+`9be181ec4d05f9ec231f6ecdfa93362ab598ff8687426c3ce6d800b1a734b9fc`.
+Full-suite executable SHA256:
+`54850049c4c1042b9520cb03bff60f18ddee0bdda99cb2f497384a330c450da3`.
+An earlier fixture incorrectly required the first caller to finish before
+retiring the blocked writer; that failed run remains retained. The passing
+test checks receipt-reader progress under pressure and preserved positive
+settlement after retirement, without claiming earlier caller completion.
+
 ### Bounded persistent-link completion accounting
 
 The product sender now retains fixed-size R1 byte counters instead of an

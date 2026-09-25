@@ -109,6 +109,22 @@ It covers receipts lost after full commit publication, not an uncommitted
 suffix, and verifies attachment rather than real compiler execution. Keep the
 build and scratch paths short enough for Unix-domain socket limits.
 
+The Linux blocked-writer check runs in the default `p50zstdsender` suite and
+can also be selected independently from an already built checkout:
+
+```sh
+timeout 120s "$BUILD/unittests/p50zstdsender" --writer-backpressure-ack-shutdown
+```
+
+It uses loopback sockets, needs no farm or network-administration capability,
+and checks all three profiles. A small send buffer and paused F reader create
+a non-writable socket with queued bytes; C must validate the first receipt
+while the second bundle remains blocked, then settle after peer shutdown and
+sender retirement. The first committed result must survive. This is a
+component-level kernel-backpressure check, not a full service-process shutdown
+or an observed `send()` EAGAIN trace. Non-Linux focused runs exit 77 because
+the queue witness requires Linux `SIOCOUTQ`; Linux failures are not skips.
+
 ### Repository and offline inputs
 
 Set `image_repository` to a prepared SDK repository, or override it with
