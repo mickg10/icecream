@@ -41,7 +41,8 @@ Both default and sanitizer Automake results are PASS/exit 0. Test TU SHA256:
 `67891838fe3b315c14125948df7f205d7093cbe0f6c580b709e75d31749739ca`;
 ordinary binary SHA256:
 `1accce4b61cd01528c93a80b9705a3a79c91615d2a21043adb4576012f781bc6`.
-SDK image: `sha256:7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`,
+SDK image reported by the test runner:
+`sha256:ab5df547b92ed5998d46ab828e24bdde81cf86f5e7716797ac65a6ed90039eee`,
 limited to two CPUs/8 GiB with scratch-backed temporary storage.
 
 ASan/UBSan/LSan instrument the test TU, service, route owner and sender;
