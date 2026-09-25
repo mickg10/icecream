@@ -2216,10 +2216,12 @@ void CRoute::restart_v1_for_transport_retry() {
 
 void CRoute::reset_v1_route(FStoreGuid f_store_guid,
                             HistoryNonce history_nonce) {
-    if (!p29v1_ ||
-        (active_ && active_->begin.profile != ProfileId::P29V1))
+    // A previous reset clears P29 codec state. If the link is cut before the
+    // next begin/rebuild, the route is idle; another fresh-nonce reset must
+    // still establish the next F identity before any retained suffix rebuild.
+    if (active_ && active_->begin.profile != ProfileId::P29V1)
         throw std::logic_error(
-            "C route has no P29V1 transaction history to reset");
+            "C route has a non-P29V1 active transaction during reset");
     reset_history(f_store_guid, history_nonce);
 }
 

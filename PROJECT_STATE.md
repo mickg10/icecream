@@ -12,6 +12,29 @@ retained artifact directories.
 
 ## Developer QA
 
+### Consecutive P29 recovery resets
+
+`CRoute::reset_v1_route` now permits a fresh-nonce reset when its codec state
+is absent after a previous reset. A disconnect before the first survivor
+rebuild previously made this second reset throw. The reset still clears
+history through the normal path; it is not a skipped reset or a retry with
+an unchanged nonce. The direct speculative-suffix regression now performs
+two consecutive resets without an intervening transaction, rejects a repeated
+nonce, then rebuilds and commits exact surviving inputs.
+
+Luna's full `p50slice0` run exits 0:
+`/tanksmall/scratch/tmp/p51-d07-positive-owner.PfF4BU/tmp/p29-consecutive-reset.log`,
+SHA256 `00ccd965068d1462a75009dd842069a4b60435bec2e99eee0f3a73692c3f6240`.
+Product source SHA256:
+`6ddb4fba49f07351fc7ee4ee5d11aee35684aebff5b3e8961a5e9cffc7d7e0dd`;
+test source `9c115067c354957874e891280c28246b36edb9b6b06db7c898ad3dcdd38fde0f`.
+The private positive-coordinator service case also passes all three profiles,
+but it includes a separate unpublished sender repair. Its log is
+`positive-owner-allprofiles-r1.log` in that directory, SHA256
+`6276413c24540853548e0f31d29bc69d25f30ddbf7a476c01168e5fc048beec5`.
+This commit alone does not fix every interrupted-replay entry path; central
+sender failure-state repair and combined service qualification remain open.
+
 ### W30 cache restart topology expansion
 
 The restart runner now covers C1F2, C1F3, C1F4, C2F1, C3F1 and C4F1

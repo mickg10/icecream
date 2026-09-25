@@ -632,6 +632,7 @@ void test_reset_rebuilds_only_unsent_speculative_suffix() {
     const FStoreGuid f_guid = FStoreGuid::from_u64(75);
     const HistoryNonce old_nonce{76};
     const HistoryNonce new_nonce{77};
+    const HistoryNonce second_new_nonce{78};
     CAuthority authority(c_guid);
     CRoute route(authority, f_guid, old_nonce);
     route.configure_speculative_window(3, 64);
@@ -702,9 +703,16 @@ void test_reset_rebuilds_only_unsent_speculative_suffix() {
         "speculative raw-byte cap admitted an oversized suffix TU");
 
     route.reset_v1_route(f_guid, new_nonce);
+    require_throws<std::invalid_argument>(
+        [&] { route.reset_v1_route(f_guid, new_nonce); },
+        "idle P29V1 route accepted a repeated history nonce");
+    // A positive-prefix recovery may reset a P29 route, then disconnect
+    // before rebuilding the retained suffix. A second fresh reset must still
+    // establish the route identity even though no P29 transaction is active.
+    route.reset_v1_route(f_guid, second_new_nonce);
     store.forget_route(session);
-    store.start_route(session, new_nonce,
-                      initial_route_digest(c_guid, new_nonce));
+    store.start_route(session, second_new_nonce,
+                      initial_route_digest(c_guid, second_new_nonce));
     std::vector<TxCommit> rebuilt_commits;
     rebuilt_commits.reserve(2);
     for (std::size_t i = 1; i != 3; ++i) {
