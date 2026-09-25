@@ -1941,6 +1941,20 @@ construct this result.
 
 ## Formal and historical-tool boundaries
 
+The recovery runner now passes 26 rows, including six explicit reduced-action
+staged-unsent cancellation/reindex witnesses for C2/3/4F1 and C1F2/3/4, and a
+double-release mutant rejected by its exact invariant. Each new witness
+requires committed work on every sibling link. These are reachability checks,
+not exhaustive active-cancellation safety or proof of the pending C++ repair.
+The ordinary specification retains its full action relation. Final log:
+`/tanksmall/scratch/tmp/pipeline-cancel-reindex-spec.RFAWnp/run.log`, SHA256
+`08c08c0fe54dc93108a20c09c1d0c8594a477935d673f281390540d410c2758b`;
+recovery model SHA256
+`7ff25e0a84825e25c25601b19664ddef0d5abd16501e40c92550a6571b7b734b`.
+Earlier model bookkeeping/parser failures and timed-out searches are not
+passing evidence. Active sent/working cancellation and immutable unavailable
+results across lost reset replies remain separate model work.
+
 [TLA+/TLC documentation](cache/formal/README.md) describes the selected bounded
 models and expected-failure controls. Native/Python/Docker success is not a
 fresh full TLC run, and model-check success is not proof of arbitrary C++

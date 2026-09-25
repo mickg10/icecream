@@ -83,6 +83,12 @@ run_row topology-c1f3 Protocol50PipelineRecoveryC1F3.cfg clean
 run_row topology-c1f4 Protocol50PipelineRecoveryC1F4.cfg clean
 run_row recovery-loss-reset-fencing Protocol50PipelineRecoveryFaults.cfg clean
 run_row witness-w2-third-job-refill Protocol50PipelineThirdJobRefillWitness.cfg ThirdJobRefillNotReached
+run_row witness-cancel-reindex-c2f1 Protocol50PipelineCancelReindexC2F1.cfg CancelSuffixReindexWitnessNotReached
+run_row witness-cancel-reindex-c3f1 Protocol50PipelineCancelReindexC3F1.cfg CancelSuffixReindexWitnessNotReached
+run_row witness-cancel-reindex-c4f1 Protocol50PipelineCancelReindexC4F1.cfg CancelSuffixReindexWitnessNotReached
+run_row witness-cancel-reindex-c1f2 Protocol50PipelineCancelReindexC1F2.cfg CancelSuffixReindexWitnessNotReached
+run_row witness-cancel-reindex-c1f3 Protocol50PipelineCancelReindexC1F3.cfg CancelSuffixReindexWitnessNotReached
+run_row witness-cancel-reindex-c1f4 Protocol50PipelineCancelReindexC1F4.cfg CancelSuffixReindexWitnessNotReached
 
 run_row witness-w2-full-window Protocol50PipelineWindowWitnessC2F1.cfg FullWindowWitnessNotReached
 run_row witness-w2-independent-c2f1 Protocol50PipelineIndependentLinksC2F1.cfg NoIndependentProgressWhileTargetFull
@@ -94,8 +100,9 @@ run_row mutant-ack-beyond-k Protocol50PipelineAckBeyondKMutant.cfg CursorAndWind
 run_row mutant-stale-worker Protocol50PipelineStaleWorkerMutant.cfg StaleWorkerCannotPublish
 run_row mutant-reset-retry Protocol50NonIdempotentResetMutant.cfg ResetOperationIdempotent
 run_row mutant-cancel-hole Protocol50PipelineCancelHoleMutant.cfg NoOrdinalHoleThroughPrepared
+run_row mutant-double-cancel-release Protocol50PipelineDoubleCancelReleaseMutant.cfg CancellationCreditReleasedAtMostOnce
 
 run_row accounting-w30 Protocol50PipelineWindowAccountingW30.cfg clean Protocol50PipelineWindowAccounting.tla
 run_row witness-w30-full-window Protocol50PipelineWindowWitnessW30.cfg FullWindowNotReached Protocol50PipelineWindowAccounting.tla
 
-printf 'PIPELINE-RECOVERY-TLC PASS rows=19\n'
+printf 'PIPELINE-RECOVERY-TLC PASS rows=26\n'

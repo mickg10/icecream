@@ -113,9 +113,24 @@ and retry transitions, cancellation of an unsent suffix, and stale worker
 fencing. It does not model replay requests for an earlier reset result or a
 lost RESET_CONFIRM. Named mutants include missing
 receipts, a wrong-job receipt identity, an ACK beyond F's published prefix,
-stale worker publication, non-idempotent reset retry, and a cancellation hole.
-Each must produce its exact invariant failure; parse errors, timeouts, and
-generic nonzero exits are not accepted as controls.
+stale worker publication, non-idempotent reset retry, cancellation hole, and
+double raw-credit release. Each must produce its exact invariant failure;
+parse errors, timeouts, and generic nonzero exits are not accepted as controls.
+
+The runner's six `witness-cancel-reindex-*` rows are reduced-action
+reachability diagnostics, not exhaustive cancellation safety checks. They
+require a settled committed prefix, one staged-unsent middle suffix job whose
+prepublication cancellation is accepted by F, reset-time release of that
+prepared raw credit exactly once, and reindexing/restaging of the surviving
+suffix at the next ordinal. Each also requires at least one committed job on
+every non-target relationship. The six shapes are C2F1/C3F1/C4F1 and
+C1F2/C1F3/C1F4. They deliberately exclude F-accepted cancellation of
+Sent/Working jobs and the materialization/publication race; do not interpret
+them as coverage of active-work cancellation. `CancelReindexSpec` uses a small
+ordered action subset to make the witness tractable; ordinary `Spec` always
+uses `GeneralNext`.
+The standard clean topology rows therefore still use the full pipeline action
+relation. The runner has 26 rows total.
 
 The model separates relationship incarnation, physical link generation,
 codec/history epoch, the C-verified receipt floor `A`, F-published input floor

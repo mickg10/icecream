@@ -24,7 +24,8 @@ CONSTANTS CStores, FStores, TargetC, TargetF,
           RecoveryCase, ThirdJobCase,
           MutantLastReceiptOnly, MutantAckBeyondK,
           MutantStaleWorker, MutantNonIdempotentReset,
-          MutantCancelHole, MutantWrongJobReceipt
+          MutantCancelHole, MutantWrongJobReceipt,
+          MutantDoubleCancelRelease
 
 ASSUME /\ CStores # {}
        /\ FStores # {}
@@ -41,6 +42,7 @@ ASSUME /\ CStores # {}
        /\ MutantNonIdempotentReset \in BOOLEAN
        /\ MutantCancelHole \in BOOLEAN
        /\ MutantWrongJobReceipt \in BOOLEAN
+       /\ MutantDoubleCancelRelease \in BOOLEAN
 
 Links == CStores \X FStores
 TargetLink == <<TargetC, TargetF>>
@@ -68,12 +70,14 @@ JobStates == {"Queued", "Reserved", "Staged", "Sent", "Working",
 LiveLinkPhases == {"Live", "Recovering", "ResetRequested",
                    "ResetAckPending", "ResetConfirmPending"}
 RawUnit(j) == IF j.slot = 1 THEN 1 ELSE 2
+RawHeldState(s) == s \in {"Reserved", "Staged", "Sent", "Working", "Committed"}
 
 VARIABLES jobState, cancelled, compilerAllowed, ordinal, ordJob,
           relEpoch, fGeneration, linkGeneration, historyEpoch,
           phase, A, K, P, Q, ackSent, S, receipts, replyAvailable,
           recoveryComplete, worker, workerEpoch, lateWorkers,
           resetOp, resetReply, resetConfirmed,
+          acceptedFCancel, cancelCreditReleaseCount,
           badStaleMutation, badHole, badAck
 
 vars == <<jobState, cancelled, compilerAllowed, ordinal, ordJob,
@@ -81,6 +85,7 @@ vars == <<jobState, cancelled, compilerAllowed, ordinal, ordJob,
           phase, A, K, P, Q, ackSent, S, receipts, replyAvailable,
           recoveryComplete, worker, workerEpoch, lateWorkers,
           resetOp, resetReply, resetConfirmed,
+          acceptedFCancel, cancelCreditReleaseCount,
           badStaleMutation, badHole, badAck>>
 
 ReceiptFor(r, n) == CHOOSE x \in ReceiptUniverse :
@@ -89,6 +94,8 @@ ReceiptFor(r, n) == CHOOSE x \in ReceiptUniverse :
     /\ x.relationshipEpoch = relEpoch[r]
     /\ x.fGeneration = fGeneration[r]
     /\ x.historyEpoch = historyEpoch[r]
+NextReceiptJob(r) ==
+    (CHOOSE rec \in replyAvailable[r] : rec.ord = A[r] + 1).job
 
 Init ==
     /\ jobState = [j \in Jobs |-> "Queued"]
@@ -116,6 +123,8 @@ Init ==
     /\ resetOp = [r \in Links |-> 0]
     /\ resetReply = [r \in Links |-> FALSE]
     /\ resetConfirmed = [r \in Links |-> "NotSent"]
+    /\ acceptedFCancel = {}
+    /\ cancelCreditReleaseCount = [j \in Jobs |-> 0]
     /\ badStaleMutation = FALSE
     /\ badHole = FALSE
     /\ badAck = FALSE
@@ -140,6 +149,8 @@ WorkerOK(w) ==
 TypeOK ==
     /\ jobState \in [Jobs -> JobStates]
     /\ cancelled \subseteq Jobs
+    /\ acceptedFCancel \subseteq Jobs
+    /\ cancelCreditReleaseCount \in [Jobs -> 0..2]
     /\ compilerAllowed \subseteq Jobs
     /\ ordinal \in [Jobs -> 0..MaxOrd]
     /\ relEpoch \in [Links -> 0..1]
@@ -181,7 +192,7 @@ Reserve(j) ==
                        phase, A, K, P, Q, ackSent, S, receipts,
                        replyAvailable, recoveryComplete, worker, workerEpoch,
                        lateWorkers, resetOp, resetReply, resetConfirmed,
-                       badStaleMutation, badHole, badAck>>
+                       badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 OpenLink(r) ==
     /\ phase[r] = "Closed"
@@ -193,7 +204,7 @@ OpenLink(r) ==
                     relEpoch, fGeneration, historyEpoch, A, K, P, Q,
                     ackSent, S, receipts, replyAvailable, recoveryComplete,
                     worker, workerEpoch, lateWorkers, resetOp, resetReply,
-                    resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetConfirmed, badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 Stage(r, j) ==
     /\ phase[r] = "Live"
@@ -209,7 +220,7 @@ Stage(r, j) ==
                     linkGeneration, historyEpoch, phase, A, K, Q, ackSent,
                     S, receipts, replyAvailable, recoveryComplete, worker,
                     workerEpoch, lateWorkers, resetOp, resetReply,
-                    resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetConfirmed, badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 SendBundle(r) ==
     /\ phase[r] = "Live"
@@ -226,7 +237,7 @@ SendBundle(r) ==
                     phase, A, K, P, Q, ackSent, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 StartFWorker(r) ==
     /\ phase[r] \in {"Live", "Recovering"}
@@ -246,7 +257,7 @@ StartFWorker(r) ==
                     phase, A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, workerEpoch, lateWorkers, resetOp,
                     resetReply, resetConfirmed, badStaleMutation, badHole,
-                    badAck>>
+                    acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 PublishFInput(r) ==
     /\ worker[r] # NoWorker
@@ -258,7 +269,8 @@ PublishFInput(r) ==
     /\ worker[r].ord = K[r] + 1
     /\ K[r] - Q[r] < Window
     /\ LET j == worker[r].job
-       IN /\ jobState[j] = "Working"
+       IN /\ j \notin acceptedFCancel
+          /\ jobState[j] = "Working"
           /\ K' = [K EXCEPT ![r] = @ + 1]
           /\ receipts' = [receipts EXCEPT ![r] = @ \cup {ReceiptFor(r, K[r] + 1)}]
           /\ replyAvailable' = [replyAvailable EXCEPT
@@ -270,7 +282,7 @@ PublishFInput(r) ==
                     relEpoch, fGeneration, linkGeneration, historyEpoch,
                     phase, A, P, Q, ackSent, S,
                     workerEpoch, lateWorkers, resetOp, resetReply,
-                    resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetConfirmed, badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 LoseCommitReply(r, n) ==
     /\ RecoveryCase
@@ -284,7 +296,7 @@ LoseCommitReply(r, n) ==
                     phase, A, K, P, Q, ackSent, S, receipts,
                     worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 ObserveCommitReply(r) ==
     /\ phase[r] = "Live"
@@ -300,11 +312,16 @@ ObserveCommitReply(r) ==
                                 ELSE compilerAllowed \cup {j}
     /\ replyAvailable' = [replyAvailable EXCEPT
           ![r] = {rec \in @ : rec.ord # A[r] + 1}]
+    /\ cancelCreditReleaseCount' = [j \in Jobs |->
+          cancelCreditReleaseCount[j] +
+            IF j = NextReceiptJob(r) /\ j \in cancelled /\
+               jobState[j] = "Committed"
+            THEN IF MutantDoubleCancelRelease THEN 2 ELSE 1 ELSE 0]
     /\ UNCHANGED <<cancelled, ordinal, ordJob, relEpoch, fGeneration,
                     linkGeneration, historyEpoch, phase, K, P, Q, ackSent,
                     S, receipts, recoveryComplete, worker, workerEpoch,
                     lateWorkers, resetOp, resetReply, resetConfirmed,
-                    badStaleMutation, badHole, badAck>>
+                    badStaleMutation, badHole, acceptedFCancel, badAck>>
 
 SendCommitAck(r) ==
     /\ phase[r] \in {"Live", "Recovering"}
@@ -316,7 +333,7 @@ SendCommitAck(r) ==
                     phase, A, K, P, Q, S, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 ProcessCommitAck(r) ==
     /\ phase[r] \in {"Live", "Recovering"}
@@ -331,7 +348,7 @@ ProcessCommitAck(r) ==
                     phase, A, K, P, ackSent, S, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 DropLink(r) ==
     /\ RecoveryCase
@@ -344,7 +361,7 @@ DropLink(r) ==
                     relEpoch, fGeneration, historyEpoch, A, K, P, Q,
                     ackSent, S, receipts, replyAvailable, worker, workerEpoch,
                     lateWorkers, resetOp, resetReply, resetConfirmed,
-                    badStaleMutation, badHole, badAck>>
+                    badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 RecoverReceipts(r) ==
     /\ phase[r] = "Recovering"
@@ -359,7 +376,7 @@ RecoverReceipts(r) ==
                     relEpoch, fGeneration, linkGeneration, historyEpoch,
                     phase, A, K, P, Q, ackSent, S, receipts, worker,
                     workerEpoch, lateWorkers, resetOp, resetReply,
-                    resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetConfirmed, badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 CorruptRecoveryIdentity(r) ==
     /\ RecoveryCase
@@ -379,7 +396,7 @@ CorruptRecoveryIdentity(r) ==
                     phase, A, K, P, Q, ackSent, S, receipts,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 ObserveRecoveredReceipt(r) ==
     /\ phase[r] = "Recovering"
@@ -397,11 +414,16 @@ ObserveRecoveredReceipt(r) ==
     /\ replyAvailable' = [replyAvailable EXCEPT
           ![r] = {rec \in @ : rec.ord # A[r] + 1}]
     /\ recoveryComplete' = [recoveryComplete EXCEPT ![r] = FALSE]
+    /\ cancelCreditReleaseCount' = [j \in Jobs |->
+          cancelCreditReleaseCount[j] +
+            IF j = NextReceiptJob(r) /\ j \in cancelled /\
+               jobState[j] = "Committed"
+            THEN IF MutantDoubleCancelRelease THEN 2 ELSE 1 ELSE 0]
     /\ UNCHANGED <<cancelled, ordinal, ordJob, relEpoch, fGeneration,
                     linkGeneration, historyEpoch, phase, K, P, Q, ackSent,
                     S, receipts, worker, workerEpoch,
                     lateWorkers, resetOp, resetReply, resetConfirmed,
-                    badStaleMutation, badHole, badAck>>
+                    badStaleMutation, badHole, acceptedFCancel, badAck>>
 
 FencePendingWorker(r) ==
     /\ RecoveryCase
@@ -418,7 +440,7 @@ FencePendingWorker(r) ==
                     relEpoch, fGeneration, linkGeneration, historyEpoch,
                     phase, A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, resetOp, resetReply, resetConfirmed,
-                    badStaleMutation, badHole, badAck>>
+                    badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 DeliverStaleWorker(r, w) ==
     /\ RecoveryCase
@@ -435,7 +457,7 @@ DeliverStaleWorker(r, w) ==
                     relEpoch, fGeneration, linkGeneration, historyEpoch,
                     phase, A, P, Q, ackSent, S, replyAvailable,
                     recoveryComplete, worker, workerEpoch, resetOp,
-                    resetReply, resetConfirmed, badHole, badAck>>
+                    resetReply, resetConfirmed, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 RequestReset(r) ==
     /\ RecoveryCase
@@ -452,7 +474,7 @@ RequestReset(r) ==
                     A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetReply, badStaleMutation, badHole,
-                    badAck>>
+                    acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 ApplyReset(r) ==
     /\ RecoveryCase
@@ -473,12 +495,17 @@ ApplyReset(r) ==
           IF Rel(j) = r /\ ordinal[j] > K[r]
           THEN IF j \in cancelled THEN "Released" ELSE "Reserved"
           ELSE jobState[j]]
+    /\ cancelCreditReleaseCount' = [j \in Jobs |->
+          cancelCreditReleaseCount[j] +
+            IF Rel(j) = r /\ ordinal[j] > K[r] /\ j \in cancelled /\
+               RawHeldState(jobState[j])
+            THEN IF MutantDoubleCancelRelease THEN 2 ELSE 1 ELSE 0]
     /\ resetReply' = [resetReply EXCEPT ![r] = TRUE]
     /\ replyAvailable' = [replyAvailable EXCEPT ![r] = {}]
     /\ UNCHANGED <<cancelled, compilerAllowed, relEpoch, fGeneration,
                     linkGeneration, A, K, Q, ackSent, receipts,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
-                    resetOp, resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetOp, resetConfirmed, badStaleMutation, badHole, acceptedFCancel, badAck>>
 
 LoseResetAck(r) ==
     /\ RecoveryCase
@@ -490,7 +517,7 @@ LoseResetAck(r) ==
                     relEpoch, fGeneration, linkGeneration, historyEpoch,
                     phase, A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
-                    resetOp, resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetOp, resetConfirmed, badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 RetryReset(r) ==
     /\ RecoveryCase
@@ -508,7 +535,7 @@ RetryReset(r) ==
                     phase, A, K, P, Q, ackSent, S, receipts,
                     replyAvailable, recoveryComplete, worker, workerEpoch,
                     lateWorkers, resetOp, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 ObserveResetAck(r) ==
     /\ RecoveryCase
@@ -520,7 +547,7 @@ ObserveResetAck(r) ==
                     A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 SendResetConfirm(r) ==
     /\ RecoveryCase
@@ -532,7 +559,7 @@ SendResetConfirm(r) ==
                     phase, A, K, P, Q, ackSent, S, receipts,
                     replyAvailable, recoveryComplete, worker, workerEpoch,
                     lateWorkers, resetOp, resetReply, badStaleMutation,
-                    badHole, badAck>>
+                    badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 ProcessResetConfirm(r) ==
     /\ RecoveryCase
@@ -545,7 +572,7 @@ ProcessResetConfirm(r) ==
                     A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetConfirmed, badStaleMutation, badHole,
-                    badAck>>
+                    acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
 CancelJob(j) ==
     /\ RecoveryCase
@@ -568,13 +595,32 @@ CancelJob(j) ==
                 THEN [ordJob EXCEPT ![r] =
                      [@ EXCEPT ![ordinal[j]] = NoJob]] ELSE ordJob
           /\ badHole' = badHole \/ (MutantCancelHole /\ stagedUnsent)
+          /\ cancelCreditReleaseCount' = [x \in Jobs |->
+                cancelCreditReleaseCount[x] +
+                  IF x = j /\ jobState[j] = "Reserved"
+                  THEN IF MutantDoubleCancelRelease THEN 2 ELSE 1 ELSE 0]
     /\ cancelled' = cancelled \cup {j}
     /\ compilerAllowed' = compilerAllowed \ {j}
     /\ UNCHANGED <<relEpoch, fGeneration, historyEpoch,
                     A, K, P, Q, ackSent, S, receipts, replyAvailable,
                     recoveryComplete, worker, workerEpoch, lateWorkers,
                     resetOp, resetReply, resetConfirmed, badStaleMutation,
-                    badAck>>
+                    acceptedFCancel, badAck>>
+
+AcceptFPrepublicationCancel(j) ==
+    /\ RecoveryCase
+    /\ j \in cancelled
+    /\ j \notin acceptedFCancel
+    /\ jobState[j] = "Staged"
+    /\ ordinal[j] > S[Rel(j)]
+    /\ phase[Rel(j)] = "Recovering"
+    /\ acceptedFCancel' = acceptedFCancel \cup {j}
+    /\ UNCHANGED <<jobState, cancelled, compilerAllowed, ordinal, ordJob,
+                    relEpoch, fGeneration, linkGeneration, historyEpoch,
+                    phase, A, K, P, Q, ackSent, S, receipts,
+                    replyAvailable, recoveryComplete, worker, workerEpoch,
+                    lateWorkers, resetOp, resetReply, resetConfirmed,
+                    cancelCreditReleaseCount, badStaleMutation, badHole, badAck>>
 
 RetireRelationship(r) ==
     /\ RecoveryCase
@@ -591,9 +637,11 @@ RetireRelationship(r) ==
                     linkGeneration, historyEpoch, A, K, P, Q, ackSent, S,
                     receipts, replyAvailable, recoveryComplete, worker,
                     workerEpoch, lateWorkers, resetOp, resetReply,
-                    resetConfirmed, badStaleMutation, badHole, badAck>>
+                    resetConfirmed, badStaleMutation, badHole, acceptedFCancel, cancelCreditReleaseCount, badAck>>
 
-Next ==
+TargetJob(slot) == CHOOSE j \in Jobs : Rel(j) = TargetLink /\ j.slot = slot
+
+GeneralNext ==
     \/ \E j \in Jobs : Reserve(j)
     \/ \E r \in Links : OpenLink(r)
     \/ \E r \in Links : \E j \in JobsFor(r) : Stage(r, j)
@@ -618,10 +666,58 @@ Next ==
     \/ \E r \in Links : SendResetConfirm(r)
     \/ \E r \in Links : ProcessResetConfirm(r)
     \/ \E j \in Jobs : CancelJob(j)
+    \/ \E j \in Jobs : AcceptFPrepublicationCancel(j)
     \/ \E r \in Links : RetireRelationship(r)
     \/ UNCHANGED vars
 
+(***************************************************************************
+Focused reachability driver for the six cancel/reindex witness configs.
+Those configs set RecoveryCase and ThirdJobCase together.  The reduced action
+set keeps all independent links live through one committed job, while ordering
+the target link to a settled prefix, two staged suffix jobs, and one
+prepublication cancellation.  It is a bounded witness harness, not a second
+exhaustive safety model; the standard topology rows still use GeneralNext.
+Only staged-unsent cancellation is modeled here.  F-accepted cancellation of
+Sent/Working jobs and its publication race are deliberately excluded; these
+rows must not be read as evidence about active materialization cancellation.
+***************************************************************************)
+SendPrefixOrSiblingBundle(r) ==
+    /\ (r # TargetLink \/ S[r] = 0)
+    /\ SendBundle(r)
+
+StageForCancelReindex(r, j) ==
+    /\ ((r # TargetLink) \/ (j.slot = 1 /\ P[r] = 0)
+       \/ (j.slot > 1 /\ P[r] > 0))
+    /\ Stage(r, j)
+
+CancelReindexNext ==
+    \/ \E j \in Jobs : Reserve(j)
+    \/ \E r \in Links : OpenLink(r)
+    \/ \E r \in Links : \E j \in JobsFor(r) : StageForCancelReindex(r, j)
+    \/ \E r \in Links : SendPrefixOrSiblingBundle(r)
+    \/ \E r \in Links : StartFWorker(r)
+    \/ \E r \in Links : PublishFInput(r)
+    \/ \E r \in Links : ObserveCommitReply(r)
+    \/ \E r \in Links : SendCommitAck(r)
+    \/ \E r \in Links : ProcessCommitAck(r)
+    \/ (LET r == TargetLink
+            middle == TargetJob(2)
+        IN /\ A[r] = 1 /\ K[r] = 1 /\ Q[r] = 1
+           /\ P[r] = 3 /\ S[r] = 1
+           /\ jobState[middle] = "Staged"
+           /\ ordinal[middle] > S[r]
+           /\ CancelJob(middle))
+    \/ AcceptFPrepublicationCancel(TargetJob(2))
+    \/ RequestReset(TargetLink)
+    \/ ApplyReset(TargetLink)
+    \/ ObserveResetAck(TargetLink)
+    \/ SendResetConfirm(TargetLink)
+    \/ ProcessResetConfirm(TargetLink)
+
+Next == GeneralNext
+
 Spec == Init /\ [][Next]_vars
+CancelReindexSpec == Init /\ [][CancelReindexNext]_vars
 
 CursorAndWindowBounds ==
     \A r \in Links :
@@ -674,6 +770,13 @@ CompilerRequiresVerifiedCommit ==
 
 StaleWorkerCannotPublish == ~badStaleMutation
 CancellationCannotPunchHole == ~badHole
+CancellationCreditReleasedAtMostOnce ==
+    \A j \in Jobs : cancelCreditReleaseCount[j] <= 1
+AcceptedFCancelCreditReleasedOnce ==
+    \A j \in acceptedFCancel : jobState[j] = "Released" =>
+        cancelCreditReleaseCount[j] = 1
+AcceptedFCancelNeverResurrects ==
+    \A j \in acceptedFCancel : jobState[j] \in {"Staged", "Released"}
 AckNeverExceedsCommittedPrefix == \A r \in Links : ackSent[r] <= K[r]
 FullWindowWitnessNotReached ==
     \A r \in Links : S[r] - A[r] < Window
@@ -692,5 +795,34 @@ LastConfirmedResetResult(r) ==
 
 ThirdJobRefillNotReached ==
     \A r \in Links : ~(P[r] = 3 /\ A[r] >= 1 /\ S[r] = 3)
+
+CancelSuffixReindexWitnessNotReached ==
+    LET r == TargetLink
+        prefix == TargetJob(1)
+        cancelledMiddle == TargetJob(2)
+        survivingSuffix == TargetJob(3)
+    IN ~(/\ RecoveryCase
+         /\ ThirdJobCase
+         /\ phase[r] = "Live"
+         /\ \A other \in Links \ {r} : K[other] >= 1
+         /\ resetOp[r] = 1
+         /\ historyEpoch[r] = 1
+         /\ A[r] = 1
+         /\ K[r] = 1
+         /\ Q[r] = 1
+         /\ P[r] = 2
+         /\ S[r] = 1
+         /\ ordinal[prefix] = 1
+         /\ ordJob[r][1] = prefix
+         /\ jobState[prefix] = "Observed"
+         /\ cancelledMiddle \in cancelled
+         /\ cancelledMiddle \in acceptedFCancel
+         /\ jobState[cancelledMiddle] = "Released"
+         /\ ordinal[cancelledMiddle] = NoOrd
+         /\ cancelCreditReleaseCount[cancelledMiddle] = 1
+         /\ survivingSuffix \notin cancelled
+         /\ jobState[survivingSuffix] = "Staged"
+         /\ ordinal[survivingSuffix] = 2
+         /\ ordJob[r][2] = survivingSuffix)
 
 =============================================================================
