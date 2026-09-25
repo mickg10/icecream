@@ -250,9 +250,11 @@ private:
     // absolute deadline.  A few more may connect and arm F ahead of the gate;
     // the bound keeps idle armed sessions off F's shared session table.
     // Uploads to different F overlap on the owner executor.  Buffered source
-    // memory is at most kArmedSessions TUs per F endpoint.
+    // memory is at most kArmedSessions TUs per F endpoint.  Arming costs four
+    // round trips before the gate, so a far F (~18 ms) needs a window of about
+    // eight to keep its gate busy; three capped it near 18 inputs/s.
     struct RouteGate {
-        static constexpr std::ptrdiff_t kArmedSessions = 3;
+        static constexpr std::ptrdiff_t kArmedSessions = 8;
         std::counting_semaphore<kArmedSessions> armed{kArmedSessions};
         std::timed_mutex transfer;
     };
