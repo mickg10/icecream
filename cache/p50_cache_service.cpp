@@ -1544,11 +1544,28 @@ std::optional<uint64_t> source_fd_size(int fd, uint64_t limit) noexcept {
     return static_cast<uint64_t>(info.st_size);
 }
 
+bool source_control_peer_closed(int fd) noexcept {
+    if (fd < 0)
+        return true;
+    char byte = 0;
+    ssize_t result;
+    do {
+        result = ::recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0)
+        return true;
+    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        return true;
+    return false;
+}
+
 std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
     int fd, uint64_t limit, uint64_t reserved_size,
     std::chrono::steady_clock::time_point deadline,
     const std::atomic<bool>& stopped,
-    const std::atomic<bool>* request_cancelled = nullptr) noexcept {
+    int control_peer_fd, std::atomic<bool>* request_cancelled,
+    const std::function<void()>& before_chunk_for_test,
+    const std::function<void()>& peer_closed_for_test) noexcept {
     if (fd < 0 || reserved_size > limit || reserved_size > SIZE_MAX)
         return std::nullopt;
     struct stat before{};
@@ -1571,6 +1588,28 @@ std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
                  request_cancelled->load(std::memory_order_acquire)) ||
                 std::chrono::steady_clock::now() >= deadline)
                 return std::nullopt;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            if (before_chunk_for_test)
+                before_chunk_for_test();
+#else
+            (void)before_chunk_for_test;
+            (void)peer_closed_for_test;
+#endif
+            if (stopped.load(std::memory_order_acquire) ||
+                (request_cancelled != nullptr &&
+                 request_cancelled->load(std::memory_order_acquire)) ||
+                std::chrono::steady_clock::now() >= deadline)
+                return std::nullopt;
+            if (control_peer_fd >= 0 &&
+                source_control_peer_closed(control_peer_fd)) {
+                if (request_cancelled != nullptr)
+                    request_cancelled->store(true, std::memory_order_release);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                if (peer_closed_for_test)
+                    peer_closed_for_test();
+#endif
+                return std::nullopt;
+            }
             const size_t amount = std::min<size_t>(64 * 1024,
                                                    result->size() - offset);
             const ssize_t count = ::pread(fd, result->data() + offset,
@@ -2194,7 +2233,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     const auto source_read_start = std::chrono::steady_clock::now();
     const auto source_bytes = read_source_fd(
         source.get(), config_.endpoint_caps.zstd.max_raw_bytes,
-        reserved_raw_bytes, transfer_deadline, stop_requested_);
+        reserved_raw_bytes, transfer_deadline, stop_requested_, -1,
+        nullptr, {}, {});
     const auto source_read_elapsed =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - source_read_start)
@@ -2527,19 +2567,7 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
 
 bool SidecarRuntime::p51_source_peer_closed(
     const PendingP51Transfer& pending) const noexcept {
-    if (!pending.connection.valid())
-        return true;
-    char byte = 0;
-    ssize_t result;
-    do {
-        result = ::recv(pending.connection.native_handle(), &byte, sizeof(byte),
-                        MSG_PEEK | MSG_DONTWAIT);
-    } while (result < 0 && errno == EINTR);
-    if (result == 0)
-        return true;
-    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-        return true;
-    return false;
+    return source_control_peer_closed(pending.connection.native_handle());
 }
 
 void SidecarRuntime::post_p51_source_transfer_reply(
@@ -2767,7 +2795,14 @@ void SidecarRuntime::prepare_p51_source_read(
                 const auto raw = read_source_fd(
                     pending->source.get(), config_.endpoint_caps.zstd.max_raw_bytes,
                     raw_bytes, deadline, stop_requested_,
-                    &pending->cancel_requested);
+                    pending->connection.native_handle(),
+                    &pending->cancel_requested,
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                    config_.p51_source_read_chunk_for_test,
+                    config_.p51_source_read_peer_closed_for_test);
+#else
+                    {}, {});
+#endif
                 try {
                     asio::post(context_,
                         [this, pending, profile, raw_bytes, raw_credit,

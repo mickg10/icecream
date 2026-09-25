@@ -102,6 +102,11 @@ struct RuntimeConfig {
     // currently acquire aggregate byte/count credit. Test-only admission
     // tests use this to synchronize a bounded fairness witness.
     std::function<void(uint64_t)> p51_source_credit_waiting_for_test;
+    // Read-stage cancellation witnesses run on the bounded preparation pool.
+    // The first hook may block only in a test to coordinate a peer-close race;
+    // the second is called when the non-consuming peer probe observes EOF.
+    std::function<void()> p51_source_read_chunk_for_test;
+    std::function<void()> p51_source_read_peer_closed_for_test;
 #endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like

@@ -1377,6 +1377,121 @@ void test_p51_admitted_transfer_stop_releases_raw_credit() {
     std::puts("P51_ASYNC_TRANSFER admitted-stop/raw-credit-release: ok");
 }
 
+void test_p51_peer_close_during_active_read_cancels_before_route() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x3a;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    const SidecarLaunchIdentity remote_f = [] {
+        StoreIdentityRoot root{};
+        root.bytes[15] = 0x39;
+        return test_sidecar_launch(root);
+    }();
+
+    uint16_t f_port = 0;
+    const int listener_fd = loopback_listener(f_port);
+    CHECK(listener_fd >= 0 && f_port != 0);
+
+    std::promise<void> read_started_promise;
+    auto read_started = read_started_promise.get_future();
+    std::promise<void> release_read_promise;
+    const std::shared_future<void> release_read =
+        release_read_promise.get_future().share();
+    std::atomic<bool> barrier_entered{false};
+    std::atomic<unsigned> read_peer_closed{0};
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_aggregate_source_raw_bytes = 2;
+    config.max_active_p51_source_transfers = 1;
+    config.max_pending_p51_source_operations = 1;
+    config.p51_source_read_chunk_for_test = [&] {
+        if (!barrier_entered.exchange(true, std::memory_order_acq_rel)) {
+            read_started_promise.set_value();
+            (void)release_read.wait_for(std::chrono::seconds(5));
+        }
+    };
+    config.p51_source_read_peer_closed_for_test = [&] {
+        read_peer_closed.fetch_add(1, std::memory_order_release);
+    };
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto reservation = test_p51_reservation_request(
+        launch.c_store_guid, launch.store_generation,
+        launch.identity.generation, launch.identity.attempt,
+        7109, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(5));
+    reservation.arm.source.selected_f_host = "127.0.0.1";
+    reservation.arm.source.selected_f_cache_port = f_port;
+    P51SourceArmedFields armed;
+    armed.arm = reservation.arm;
+    armed.f_control_generation = 15;
+    armed.f_control_attempt = 16;
+    armed.f_store_generation = remote_f.store_generation;
+    armed.f_store_guid = remote_f.f_store_guid.bytes;
+    armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+    armed.arm_observation_id = 17;
+    armed.source_budget_msec = 5000;
+    armed.attempt_capability_1.bytes.fill(0xa1);
+    armed.attempt_capability_2.bytes.fill(0xa2);
+    armed.reservation_id.fill(0xb1);
+    armed.logical_relationship_id.fill(0xb2);
+    armed.relationship_epoch = 1;
+    armed.selected_revision = CACHE_WIRE_REVISION_R2;
+    armed.selected_window = 30;
+    CHECK(armed.valid());
+    const local::P51SourceTransferRequest request{
+        armed, reservation.absolute_deadline};
+
+    RuntimeCase pair = authenticated_runtime_pair();
+    const local::ControlOperation operation =
+        local::make_p51_source_transfer_operation(
+            launch.identity, request,
+            request.armed.arm.source.source_request_id);
+    const bool enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(pair.sender), launch.identity, operation,
+        oversized_test_source_fd());
+    const bool read_entered = enqueued &&
+        read_started.wait_for(std::chrono::seconds(3)) ==
+            std::future_status::ready;
+    const bool credit_held = read_entered &&
+        wait_for_source_raw_bytes(runtime, 2, std::chrono::seconds(1));
+
+    // Close the control peer while the admitted preparation worker is paused
+    // immediately before its first pread.  Releasing the barrier must let the
+    // read-loop probe observe EOF before the service can connect to F.
+    pair.receiver = local::Connection(-1);
+    release_read_promise.set_value();
+    const auto cancel_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (read_peer_closed.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < cancel_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool read_cancelled =
+        read_peer_closed.load(std::memory_order_acquire) != 0;
+    const bool operation_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(2));
+    const bool raw_credit_released = wait_for_source_raw_bytes(
+        runtime, 0, std::chrono::seconds(2));
+    pollfd f_listener{listener_fd, POLLIN, 0};
+    int connect_observed;
+    do {
+        connect_observed = ::poll(&f_listener, 1, 0);
+    } while (connect_observed < 0 && errno == EINTR);
+
+    runtime.stop();
+    (void)::close(listener_fd);
+    CHECK(enqueued);
+    CHECK(read_entered);
+    CHECK(credit_held);
+    CHECK(read_cancelled);
+    CHECK(operation_released);
+    CHECK(raw_credit_released);
+    CHECK(connect_observed == 0);
+    std::puts("P51_ASYNC_TRANSFER active-read peer-close cancels before F connect: ok");
+}
+
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x4b;
@@ -8082,6 +8197,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--read-peer-close") == 0) {
+            test_p51_peer_close_during_active_read_cancels_before_route();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--credit-admission-hol-witness") == 0) {
             test_p51_credit_admission_bypasses_blocked_workers();
             return 0;
@@ -8109,6 +8229,7 @@ int main(int argc, char** argv) {
         test_p51_reservation_capacity_identity_and_window();
         test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
         test_p51_admitted_transfer_stop_releases_raw_credit();
+        test_p51_peer_close_during_active_read_cancels_before_route();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_credit_admission_bypasses_blocked_workers();

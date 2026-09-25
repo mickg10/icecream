@@ -73,14 +73,29 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+Active-read cancellation now checks the control peer without consuming bytes
+before each 64 KiB source read. A deterministic read-worker barrier proves
+peer closure is observed inside the read loop, before any F connection, and
+both operation and raw-byte credits return to zero. This does not interrupt
+an already-blocked disk read. The focused selector and full native service
+suite pass; log SHA256 `ae29bf3deb0a93e45c3618af47f3c63b9e04a0ee40c310a37de8ed5b5e288006`
+at `/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50cacheservice.log`.
+The non-test-hook standalone service builds too (binary SHA256
+`4384ea3d6dd1ffb657610df03f9b68a30f6db1dd618249eb5532494863c0c89c`).
+Updated sanitizer execution is pending; an up-to-date Make result reused the
+earlier sanitizer log and is not evidence for this change.
+
 The `e2080067` service sanitizer suite passes (Automake exit 0):
-`/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50cacheservice-sanitize.log`,
+`/tanksmall/scratch/tmp/p51-e208-qualification/logs/service-sanitize-before-read-cancel.log`,
 SHA256 `d2e4ead2d193e078cedf76731e91127fda40d06c0285005caec0babc5a7c2194`.
 Address/undefined-behavior/leak instrumentation covers the service test,
 service, route owner and sender. Endpoint/protocol static libraries and the
 standalone cache process were not instrumented; this is not whole-stack
 sanitizer coverage. The corrected run used the `services/libicecc.la` Make
 target after an earlier setup attempt requested nonexistent `libicecc.a`.
+The qualification directory was subsequently reused for the active-read
+cancellation candidate; this archived log describes the earlier e208 source,
+not the directory's current source/build contents.
 
 The full sender suite also passes on the `e2080067` product source, including
 the request-scoped recovery observation and its deterministic regression:
