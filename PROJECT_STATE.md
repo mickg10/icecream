@@ -12,6 +12,29 @@ retained artifact directories.
 
 ## Developer QA
 
+### Open worker-lifetime correctness defect
+
+Current endpoint code shares a mutable codec dialogue between the codec pool
+worker and owner-side cancellation/replacement/reset. The completion-state
+mutex does not protect codec state; rejecting an old completion after decode
+cannot prevent an earlier concurrent mutation. This affects the common
+materialization path used by R1 and R2. No concurrent-memory-error run is
+claimed yet.
+
+A focused R1 adopted-endpoint regression deterministically demonstrates the
+related accounting defect: while the worker is held at the existing
+pre-materialization hook, cancellation completes and all three pending-byte
+counters drop to zero. The intended assertion fails with exit 1:
+`held=1 pending_encoded=0 pending_raw=0 decoder_window=0`.
+Log: `/tanksmall/scratch/tmp/p51-d06-credit-red.TqMBA5/logs/credit-pin-red-r3.log`,
+SHA256 `9fbad87a3ded117f4c295c55fad261579d3f5c855b9e1de27990b710b88537e2`.
+Earlier compile and too-small-window fixture failures are not product evidence.
+
+The repair is in progress: exclusive worker codec ownership, exact-current
+completion restoration, and byte reservations that outlive the endpoint and
+its io_context when necessary. The published branch is not qualified against
+this defect. Its connection to measured farm time or F RSS is unproven.
+
 ### Clean-checkout build and mixed-version compatibility
 
 Published `fdf03e25520d9db25746b29da7847e935b747b7f` builds and installs
