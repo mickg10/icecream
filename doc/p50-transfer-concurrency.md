@@ -846,8 +846,13 @@ extend a job deadline. A cleanup grace period must not publish expired work.
 | Input committed, job cancelled | Keep allowed cache data; prohibit that job's compiler admission; settle once |
 | Deadline expired during decode | Recheck before publication; abort/fence and reconcile; never extend deadline |
 
-A non-expired cancellation may finish a complete cache transaction if that is
-the chosen explicit policy, but it must settle the cancelled job separately.
+A local caller disappearing is not evidence that F accepted cancellation.
+For a complete non-expired transaction whose publication has already won, or
+whose exact F cancellation has not been accepted, recovery may discover a
+positive commit; preserve that witness and settle the caller separately.
+Once F acknowledges exact cancellation before publication, that job must not
+publish input or receive new compiler admission. These are distinct outcomes,
+not a selectable policy that permits publication after accepted cancellation.
 Do not continue after an absolute source deadline merely to avoid resetting
 the history. Cancelling first/middle/last entries must preserve the exact
 remaining queue and must not leak a credit or consume a later job's receipt.
