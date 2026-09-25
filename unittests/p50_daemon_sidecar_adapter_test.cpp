@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <poll.h>
 #include <string>
 #include <sys/stat.h>
@@ -157,6 +158,11 @@ bool hold_after_ready()
     for (int i = 0; i < 5000 && ::access(path, F_OK) == 0; ++i)
         ::usleep(1000);
     return ::access(path, F_OK) != 0;
+}
+
+bool token_is(const char* value, const char* expected)
+{
+    return value != nullptr && std::strcmp(value, expected) == 0;
 }
 
 } // namespace
@@ -320,6 +326,7 @@ int main()
 
     // A real child crash is delivered through the one central exact-pidfd
     // registry.  No test-side wait status or anonymous wait is accepted.
+    const uint64_t first_attempt = adapter.attempt();
     if (::kill(first_pid, SIGKILL) != 0)
         return 10;
     if (!drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
@@ -334,6 +341,12 @@ int main()
     if (::access(first_path.c_str(), F_OK) == 0 ||
         ::access(first_directory.c_str(), F_OK) == 0 || adapter.attempt() <= 1)
         return 12;
+    // The exit was observed before any cleanup TERM/KILL, so the child's own
+    // signal, not the control hang-up it caused, is the logged cause.
+    const auto& killed = adapter.outer_last_retirement_diag();
+    if (!token_is(killed.cause, "signal") || killed.code != SIGKILL ||
+        killed.attempt != first_attempt || !killed.ready)
+        return 41;
 
     // Runtime identity loss must withdraw the relationship on an outer turn;
     // a permanently silent/invalid private root may not remain advertised.
@@ -384,7 +397,7 @@ int main()
         return 20;
     const uint64_t parked_attempt = parked_adapter.attempt();
     parked_adapter.outer_set_scheduler_owner(false);
-    parked_adapter.outer_request_replacement();
+    parked_adapter.outer_request_replacement("LocalSidecarReplacementRequired");
     if (!drive_until(parked_adapter, reaper, parked_update,
                      std::chrono::seconds(5), [&] {
                          return parked_adapter.outer_lifecycle_state() ==
@@ -396,6 +409,13 @@ int main()
         parked_adapter.outer_child_pid() > 1 ||
         parked_adapter.outer_immediate_turn_required())
         return 22;
+    // The explicit request stays the cause although our own TERM/KILL then
+    // produced the exit that completed this teardown.
+    const auto& requested = parked_adapter.outer_last_retirement_diag();
+    if (!token_is(requested.cause, "replacement-request") ||
+        !token_is(requested.detail, "LocalSidecarReplacementRequired") ||
+        requested.attempt != parked_attempt || !requested.signalled)
+        return 42;
     parked_adapter.outer_set_scheduler_owner(true);
     if (!drive_until(parked_adapter, reaper, parked_update,
                      std::chrono::seconds(5), [&] {
@@ -468,6 +488,10 @@ int main()
                                     icecc::p50::sidecar::LifecycleState::RetryEligible;
                      }))
         return 39;
+    const auto& input_retired = other_lifecycle_adapter.outer_last_retirement_diag();
+    if (!token_is(input_retired.cause, "input-lifecycle") ||
+        !token_is(input_retired.detail, "InputLifecycleProtocol"))
+        return 43;
     std::puts("absent CloseLogicalInputLease remains fail-closed");
     if (!drive_shutdown(other_lifecycle_adapter, reaper, other_update))
         return 40;

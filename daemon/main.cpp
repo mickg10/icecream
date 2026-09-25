@@ -7792,7 +7792,8 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
                flight.  Replacement clears every possibly ambiguous route
                and bounded replay ledger under the exact current READY lease. */
             if (cache_adapter != nullptr) {
-                cache_adapter->outer_request_replacement();
+                cache_adapter->outer_request_replacement(
+                    "LocalSidecarReplacementRequired");
                 reconcile_cache_route_state();
             }
         } else {
@@ -10182,7 +10183,7 @@ void Daemon::withdraw_p51_source_incarnation(
     // shutdown. The main lifecycle reducer will publish the advertisement
     // transition on its next owner turn and may mint a successor only after
     // the fenced teardown completes.
-    cache_adapter->outer_request_replacement();
+    cache_adapter->outer_request_replacement("P51SourceWithdrawal");
 }
 
 void Daemon::queue_p51_source_cancel(

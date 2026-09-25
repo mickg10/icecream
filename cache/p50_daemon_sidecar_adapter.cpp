@@ -16,10 +16,12 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
 
 #include "services/digest128.h"
+#include "services/logging.h"
 
 extern char **environ;
 
@@ -776,6 +778,12 @@ void DaemonSidecarAdapter::retire_input_lifecycle_relationship(
     // eligibility immediately, then lets the normal lifecycle turns prove
     // exact child/group/path teardown.  In particular, this path never calls
     // Supervisor::shutdown, waits, or performs name-based emergency cleanup.
+    note_retirement("input-lifecycle",
+                    error == AdapterError::InputLifecycleCapacity
+                        ? "InputLifecycleCapacity"
+                        : error == AdapterError::InputLifecycleProtocol
+                              ? "InputLifecycleProtocol"
+                              : "AdapterError");
     fail(error);
     outer_input_failure_ = true;
     // Route the failure through the same A-retirement reducer used by
@@ -865,6 +873,85 @@ void DaemonSidecarAdapter::fail(AdapterError error) noexcept
     last_error_ = error;
     if (error != AdapterError::None)
         state_ = AdapterState::Absent;
+}
+
+void DaemonSidecarAdapter::note_retirement(const char* cause, const char* detail,
+                                           bool definitive) noexcept
+{
+    // The first observed withdrawal reason is the cause.  Later reasons,
+    // including every consequence of our own teardown, never overwrite it.
+    RetirementDiag& record = outer_retirement_;
+    if (record.cause != nullptr)
+        return;
+    record.observed = std::chrono::steady_clock::now();
+    record.pid = outer_pid_;
+    record.cause = cause;
+    record.detail = detail;
+    record.definitive = definitive;
+    record.inputs_pending = pending_input_lifecycle_.size();
+    record.inputs_completed = completed_input_lifecycle_.size();
+}
+
+void DaemonSidecarAdapter::note_reducer_retirement(
+    sidecar::LifecycleState prior, std::chrono::steady_clock::time_point deadline,
+    const sidecar::LifecycleObservation& observation,
+    std::chrono::steady_clock::time_point now) noexcept
+{
+    // Name the startup fact this turn fed the reducer, in the reducer's own
+    // precedence.  Post-READY reasons are noted where the adapter observed
+    // them, so a remaining withdrawal is reported generically.
+    const char* cause = "withdrawn";
+    if (prior == sidecar::LifecycleState::LaunchPrepared ||
+        prior == sidecar::LifecycleState::ForkedAwaitExecAndReady) {
+        if (observation.exec == sidecar::ExecObservation::Failed)
+            cause = "exec-failed";
+        else if (observation.ready == sidecar::ReadyObservation::Invalid)
+            cause = "ready-invalid";
+        else if (deadline != std::chrono::steady_clock::time_point{} &&
+                 now >= deadline)
+            cause = "timeout";
+        else if (observation.ready == sidecar::ReadyObservation::Complete)
+            cause = "ready-invalid";
+    }
+    note_retirement(cause, sidecar::lifecycle_state_name(prior));
+}
+
+void DaemonSidecarAdapter::report_retirement(
+    std::chrono::steady_clock::time_point now) noexcept
+{
+    // One source-free line per retired incarnation.  elapsed_ms runs from the
+    // attempt's launch admission to its first observed withdrawal reason.
+    RetirementDiag& record = outer_retirement_;
+    const auto observed = record.cause != nullptr ? record.observed : now;
+    const long long elapsed_ms =
+        record.started == std::chrono::steady_clock::time_point{}
+            ? -1
+            : static_cast<long long>(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      observed - record.started).count());
+    try {
+        std::ostream& line = log_warning();
+        line << "P50_SIDECAR_REPLACED generation=" << config_.generation
+             << " attempt=" << record.attempt << " pid=" << record.pid
+             << " elapsed_ms=" << elapsed_ms << " cause="
+             << (record.cause != nullptr ? record.cause : "unknown")
+             << " detail=";
+        if (record.detail != nullptr)
+            line << record.detail;
+        else if (record.code >= 0)
+            line << record.code;
+        else
+            line << "none";
+        line << " ready=" << (record.ready ? 1 : 0)
+             << " inputs_pending=" << record.inputs_pending
+             << " inputs_completed=" << record.inputs_completed
+             << " inputs_bound=" << config_.max_pending_input_lifecycle
+             << std::endl;
+    } catch (...) {
+        // A diagnostic stream failure must not escape this noexcept turn.
+    }
+    outer_last_retirement_ = record;
+    record = RetirementDiag{};
 }
 
 void DaemonSidecarAdapter::shutdown(advertisement::Update* result) noexcept
@@ -1138,6 +1225,7 @@ bool DaemonSidecarAdapter::outer_prepare_launch(
 
 void DaemonSidecarAdapter::outer_finish_launch_failure() noexcept
 {
+    note_retirement("launch-failed", nullptr);
     outer_launch_phase_ = launch_phase(OuterLaunchPhase::None);
     outer_launch_identity_valid_ = false;
     outer_launch_setup_failed_ = false;
@@ -2398,7 +2486,12 @@ void DaemonSidecarAdapter::outer_apply_action(
     outer_action_taken_ = true;
     switch (action.action) {
     case sidecar::LifecycleAction::LaunchPrepared:
+        // Each allocator-issued incarnation starts its own retirement account.
+        outer_retirement_ = RetirementDiag{};
+        outer_retirement_.attempt = action.identity.control.attempt;
+        outer_retirement_.started = now;
         if (!outer_prepare_launch(action.identity, now)) {
+            note_retirement("launch-failed", nullptr);
             std::fprintf(stderr,
                          "cache sidecar launch preparation refused"
                          " (identity_valid=%d started=%d phase=%d pid=%ld"
@@ -2473,10 +2566,13 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_observe(pending_advertisement_update_);
         break;
     case sidecar::LifecycleAction::SendTerm:
+        // From here on an exit may be our own cleanup; it is never a cause.
+        outer_retirement_.signalled = true;
         if (outer_group_action(SIGTERM))
             outer_action_taken_ = true;
         break;
     case sidecar::LifecycleAction::SendKill:
+        outer_retirement_.signalled = true;
         if (outer_group_action(SIGKILL))
             outer_action_taken_ = true;
         break;
@@ -2485,6 +2581,7 @@ void DaemonSidecarAdapter::outer_apply_action(
             if (outer_lifecycle_ != nullptr)
                 outer_ready_lease_ = outer_lifecycle_->current_ready_lease();
             if (!outer_ready_lease_.has_value() || !outer_ready_lease_->valid()) {
+                note_retirement("publish-failed", nullptr);
                 outer_launch_failed_ = true;
                 outer_replacement_requested_ = true;
                 outer_replacement_input_close_pending_ = true;
@@ -2526,12 +2623,14 @@ void DaemonSidecarAdapter::outer_apply_action(
             // post-READY classification.  It survives an auth/replacement
             // withdrawal until the central exact-pid reap is delivered.
             outer_ready_had_been_published_ = true;
+            outer_retirement_.ready = true;
             outer_post_ready_exit_counted_ = false;
             outer_reap_was_ready_ = false;
             outer_auth_start_pending_ = true;
             outer_auth_failure_ = false;
         } catch (...) {
             dispatcher_.reset();
+            note_retirement("publish-failed", nullptr);
             outer_launch_failed_ = true;
             // Publication/materialisation failure is an incarnation failure,
             // not a permission to keep A advertised or retry its auth lane.
@@ -2559,6 +2658,8 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_cleanup_waiting_path_observation_ = outer_cleanup_phase_ != 0;
         break;
     case sidecar::LifecycleAction::RetryEligible:
+        // Exact retirement of this incarnation is proved; report why it began.
+        report_retirement(now);
         // The old socket is already absent by the reducer proof.  Directory
         // removal is one separate outer action; allocation cannot happen until
         // this phase has completed on a later turn.
@@ -2675,6 +2776,7 @@ void DaemonSidecarAdapter::outer_observe(advertisement::Update& update) noexcept
         // a reducer observation, not a cleanup authority: withdraw first and
         // let the next outer turn prove exact A teardown before any allocator
         // successor can be launched.
+        note_retirement("runtime-node", nullptr);
         outer_replacement_requested_ = true;
         outer_replacement_input_close_pending_ = true;
         outer_authenticated_ = false;
@@ -3014,6 +3116,20 @@ bool DaemonSidecarAdapter::outer_observe_child_reaped(
         !outer_registration_.valid() ||
         event.registry_generation != outer_registration_.registry_generation())
         return false;
+    // The exit is the retirement cause only when its pidfd edge (or this
+    // exact status) arrived before our own TERM/KILL.  It supersedes a
+    // provisional channel/deadline reason, which a dying child also produces,
+    // but never an explicit request or the status of our own cleanup.
+    RetirementDiag& record = outer_retirement_;
+    if (!record.definitive && (record.exited_unsignalled || !record.signalled) &&
+        (WIFEXITED(event.status) || WIFSIGNALED(event.status))) {
+        const bool exited = WIFEXITED(event.status);
+        note_retirement("exit", nullptr);
+        record.cause = exited ? "exit" : "signal";
+        record.detail = nullptr;
+        record.code = exited ? WEXITSTATUS(event.status) : WTERMSIG(event.status);
+        record.definitive = true;
+    }
     // The registry has already enqueued this immutable value event.  Record
     // the readiness classification for advertisement counters and let the
     // reducer consume the mailbox on its next bounded advance.
@@ -3097,6 +3213,18 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         if (result != nullptr)
             *result = update;
         return false;
+    }
+    // A pidfd poll edge is the kernel's first exit fact for this child.  When
+    // it precedes our own TERM/KILL, the status later delivered by the central
+    // reaper is a cause rather than cleanup.  Diagnostic only.
+    if (outer_pidfd_ >= 0 && !outer_retirement_.signalled &&
+        !outer_retirement_.exited_unsignalled) {
+        for (const pollfd& descriptor : pollfds) {
+            if (descriptor.fd != outer_pidfd_)
+                continue;
+            outer_retirement_.exited_unsignalled = (descriptor.revents & POLLIN) != 0;
+            break;
+        }
     }
     if (outer_launch_phase_ != launch_phase(OuterLaunchPhase::None)) {
         // A shutdown/replacement can arrive while the allocator's launch
@@ -3308,6 +3436,7 @@ bool DaemonSidecarAdapter::outer_advance_turn(
             if (descriptor.fd == outer_auth_fd_)
                 events = descriptor.revents;
         if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            note_retirement("control-hangup", nullptr);
             close_owned(outer_auth_fd_);
             outer_authenticated_ = false;
             outer_auth_failure_ = true;
@@ -3321,6 +3450,7 @@ bool DaemonSidecarAdapter::outer_advance_turn(
 
     if (outer_auth_failure_ && !reaper_delivery_pending) {
         outer_auth_failure_ = false;
+        note_retirement("auth-failed", nullptr);
         sidecar::LifecycleObservation failure;
         failure.request_replacement = true;
         const sidecar::LifecycleActionResult action = outer_lifecycle_->advance(
@@ -3495,8 +3625,14 @@ bool DaemonSidecarAdapter::outer_advance_turn(
     if (outer_group_domain_.has_value())
         observation.group_domain = *outer_group_domain_;
 
+    const sidecar::LifecycleState prior_state = outer_lifecycle_->state();
+    const auto prior_deadline = outer_lifecycle_->next_deadline();
     const sidecar::LifecycleActionResult action = outer_lifecycle_->advance(now,
                                                                              observation);
+    if (!observation.request_legacy &&
+        (action.action == sidecar::LifecycleAction::Withdraw ||
+         action.action == sidecar::LifecycleAction::RetryEligible))
+        note_reducer_retirement(prior_state, prior_deadline, observation, now);
     outer_reap_event_pending_ = false;
     if (action.action != sidecar::LifecycleAction::None) {
         const bool external = action.action == sidecar::LifecycleAction::SendTerm ||
@@ -3544,11 +3680,16 @@ void DaemonSidecarAdapter::outer_set_scheduler_owner(bool active) noexcept
     outer_scheduler_owner_active_ = active;
 }
 
-void DaemonSidecarAdapter::outer_request_replacement() noexcept
+void DaemonSidecarAdapter::outer_request_replacement(const char* reason) noexcept
 {
     if (outer_shutdown_requested_ || outer_replacement_requested_)
         return;
 
+    // An explicit request is the cause unless an earlier withdrawal reason was
+    // already observed; the exit produced by the teardown below never
+    // supersedes it.
+    note_retirement("replacement-request",
+                    reason != nullptr ? reason : "unspecified", true);
     // Scheduler/runtime loss is a replacement request, not a synchronous
     // teardown operation.  Withdraw the relationship immediately so no
     // caller can retain eligibility, but keep the exact A lease, PID, path,

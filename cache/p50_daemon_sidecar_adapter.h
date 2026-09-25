@@ -132,6 +132,30 @@ struct InputRetirementProof {
     }
 };
 
+// Trace-only account of why one incarnation was retired.  The adapter fills
+// it from facts its outer turn already observes and reports it once, as the
+// P50_SIDECAR_REPLACED log line, when exact teardown reaches RetryEligible.
+// No lifecycle decision reads it.
+struct RetirementDiag {
+    uint64_t attempt = 0;
+    pid_t pid = -1;
+    std::chrono::steady_clock::time_point started{};
+    std::chrono::steady_clock::time_point observed{};
+    // Static tokens; `code` is the exit status or signal number when `detail`
+    // is null.
+    const char* cause = nullptr;
+    const char* detail = nullptr;
+    int code = -1;
+    // An explicit daemon request, or a child exit observed before our own
+    // TERM/KILL, is never superseded by a later observation.
+    bool definitive = false;
+    bool ready = false;
+    bool signalled = false;
+    bool exited_unsignalled = false;
+    size_t inputs_pending = 0;
+    size_t inputs_completed = 0;
+};
+
 class DaemonSidecarAdapter {
 public:
     using Config = daemon::Config;
@@ -179,7 +203,9 @@ public:
     // through the lifecycle reducer.  This is distinct from final daemon
     // shutdown: after exact teardown reaches RetryEligible, a later scheduler
     // turn may ask the same allocator to mint the next incarnation.
-    void outer_request_replacement() noexcept;
+    // `reason` is a static token naming the caller's observation; it feeds
+    // only the retirement diagnostic.
+    void outer_request_replacement(const char* reason = nullptr) noexcept;
     // Grants the active scheduler owner permission to mint the next sidecar
     // incarnation after replacement teardown.  Without this grant a parked
     // RetryEligible state cannot launch or force zero-timeout turns.
@@ -220,6 +246,9 @@ public:
     }
     [[nodiscard]] bool outer_launch_failed_diag() const noexcept {
         return outer_launch_failed_;
+    }
+    [[nodiscard]] const RetirementDiag& outer_last_retirement_diag() const noexcept {
+        return outer_last_retirement_;
     }
     [[nodiscard]] const std::optional<InputLifecycleResult>&
     outer_last_input_lifecycle_result() const noexcept {
@@ -337,6 +366,14 @@ private:
     void append_pending_advertisement_update(
         advertisement::Update& destination) noexcept;
     void fail(AdapterError error) noexcept;
+    void note_retirement(const char* cause, const char* detail,
+                         bool definitive = false) noexcept;
+    void note_reducer_retirement(
+        sidecar::LifecycleState prior,
+        std::chrono::steady_clock::time_point deadline,
+        const sidecar::LifecycleObservation& observation,
+        std::chrono::steady_clock::time_point now) noexcept;
+    void report_retirement(std::chrono::steady_clock::time_point now) noexcept;
 
     Config config_;
     AdapterState state_ = AdapterState::Stopped;
@@ -479,6 +516,9 @@ private:
     bool outer_ready_complete_ = false;
     bool outer_ready_invalid_ = false;
     bool outer_auth_failure_ = false;
+    // The current incarnation's retirement account and the last one reported.
+    RetirementDiag outer_retirement_{};
+    RetirementDiag outer_last_retirement_{};
 
     bool outer_prepare_launch(
         const sidecar::LifecycleIdentity& identity,
