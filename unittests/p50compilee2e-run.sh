@@ -8,6 +8,7 @@
 # byte-identical local reference. No fake peer or legacy FileChunk fallback
 # is accepted.
 set -eu
+unset ICECC_TEST_P51_RESTART_W30_TOPOLOGY
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src" && pwd)}

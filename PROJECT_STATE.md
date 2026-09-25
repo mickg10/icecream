@@ -12,6 +12,29 @@ retained artifact directories.
 
 ## Developer QA
 
+### W30 cache restart topology expansion
+
+The restart runner now covers C1F2, C1F3, C1F4, C2F1, C3F1 and C4F1
+for P29V1, ZSTD_TU and ZSTD_ROUTE. All 18 cells report PASS on the frozen
+`f1a2e343` product: 30 discarded old receipts yield noncommitted old callers,
+30 fresh transfers commit and attach exact inputs, and every unaffected
+sibling completes an attachment between successful SIGSTOP and SIGCONT of
+the affected parent. Original caller deadlines are checked with the existing
+2-second cleanup grace. This does not establish compiler-process quiescence,
+scheduler restart chains, or qualification of later product changes.
+
+Evidence: `/tanksmall/scratch/tmp/p51-restart-w30.RWA5X5/restart-matrix-r3.log`,
+SHA256 `d55e17377458e16c9a52837ff4127ddd76dd2c9f212dfdf648cd7d0423f163f3`.
+Each PASS requires the individual case exit status to be zero; the aggregate
+wrapper exit field was not retained. The transcript ends normally after all
+18 markers. Expected old-window `P51_KIND8_FAIL` diagnostics are not test
+assertion failures. Source SHA256:
+`ed4eb1f897cb9a62ab8021e4f208124708f40b93a8f33da7ee9e7ad5b78a5007`;
+runner `83285ef40166ed7ab1ae519c3a6e95feeebfdea37cb2c1ef7fbfaf2cbfa03f36`;
+test binary `eef63506601b43a47bfbae3e1a6d456cd1c9f7eb3b8ef212e2b00c1da3164c58`.
+The SDK container was limited to 2 CPUs and 8 GiB. Adjacent runners unset
+the new topology selector; their shell syntax checks pass separately.
+
 ### Retirement-prepared input admission
 
 `InputLifecycleRegistry::begin_attachment` now rejects a lease while

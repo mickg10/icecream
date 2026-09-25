@@ -36,6 +36,7 @@ export TMPDIR="$short_tmp"
 
 unset ICECC_TEST_P51_RESTART_F_C1F2 ICECC_TEST_P51_RESTART_C_C2F1 \
     ICECC_TEST_P51_RESTART_W30_F_C1F2 ICECC_TEST_P51_RESTART_W30_C_C2F1 \
+    ICECC_TEST_P51_RESTART_W30_TOPOLOGY \
     ICECC_TEST_P51_MULTILINK ICECC_TEST_P51_VERTICAL_W30 \
     ICECC_TEST_P51_VERTICAL ICECC_TEST_P51_CANCEL_REPLACEMENT \
     ICECC_TEST_PENDING_DISCONNECT ICECC_TEST_R1_PUBLISH_ONLY \
@@ -45,33 +46,32 @@ unset ICECC_TEST_P51_RESTART_F_C1F2 ICECC_TEST_P51_RESTART_C_C2F1 \
     ICECC_TEST_BACKPRESSURE_SCHED_PORT ICECC_TEST_SNDBUF_SHIM \
     ICECC_TEST_SOCKET ICECC_TEST_CACHE_SESSION_CLOSE
 
-for topology in C1F2 C2F1; do
+for topology in C1F2 C1F3 C1F4 C2F1 C3F1 C4F1; do
     for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         case "$profile" in
             P29V1) profile_mask=1 ;;
             ZSTD_TU) profile_mask=2 ;;
             ZSTD_ROUTE) profile_mask=4 ;;
         esac
+        case "$topology" in
+            C1F2|C2F1) healthy_siblings=1 ;;
+            C1F3|C3F1) healthy_siblings=2 ;;
+            C1F4|C4F1) healthy_siblings=3 ;;
+        esac
         log="$ICEFARM_TMPDIR/p51-restart-w30-$topology-$profile.log"
         echo "P51_RESTART_W30_START=$topology/$profile"
         set +e
-        if [ "$topology" = C1F2 ]; then
-            timeout --signal=TERM --kill-after=5s 180s env \
-                ICECC_TEST_POSITIVE_DAEMON=1 ICECC_P51_MODE=on \
-                ICECC_TEST_P51_PROFILE="$profile" \
-                ICECC_TEST_P51_RESTART_W30_F_C1F2=1 \
-                "$build_dir/p50daemonpositive" \
-                "$top_build_dir/daemon/iceccd" \
-                "$top_build_dir/cache/icecc-cache-service" >"$log" 2>&1
-        else
-            timeout --signal=TERM --kill-after=5s 180s env \
-                ICECC_TEST_POSITIVE_DAEMON=1 ICECC_P51_MODE=on \
-                ICECC_TEST_P51_PROFILE="$profile" \
-                ICECC_TEST_P51_RESTART_W30_C_C2F1=1 \
-                "$build_dir/p50daemonpositive" \
-                "$top_build_dir/daemon/iceccd" \
-                "$top_build_dir/cache/icecc-cache-service" >"$log" 2>&1
-        fi
+        timeout --signal=TERM --kill-after=5s 180s env \
+            -u ICECC_TEST_P51_RESTART_F_C1F2 \
+            -u ICECC_TEST_P51_RESTART_C_C2F1 \
+            -u ICECC_TEST_P51_RESTART_W30_F_C1F2 \
+            -u ICECC_TEST_P51_RESTART_W30_C_C2F1 \
+            ICECC_TEST_POSITIVE_DAEMON=1 ICECC_P51_MODE=on \
+            ICECC_TEST_P51_PROFILE="$profile" \
+            ICECC_TEST_P51_RESTART_W30_TOPOLOGY="$topology" \
+            "$build_dir/p50daemonpositive" \
+            "$top_build_dir/daemon/iceccd" \
+            "$top_build_dir/cache/icecc-cache-service" >"$log" 2>&1
         status=$?
         set -e
         cat "$log"
@@ -80,7 +80,8 @@ for topology in C1F2 C2F1; do
             exit "$status"
         fi
         marker="P51_PROCESS_RESTART_W30 topology=$topology affected="
-        if ! grep -F "$marker" "$log" | grep -F "profile=$profile_mask jobs=30 fresh_attached=1 healthy_attached=1" >/dev/null; then
+        if ! grep -F "$marker" "$log" | \
+             grep -F "profile=$profile_mask jobs=30 fresh_attached=1 healthy_attached=1 healthy_siblings=$healthy_siblings/$healthy_siblings target_parent_stopped=1" >/dev/null; then
             echo "FAIL: expected W30 restart completion marker missing; log=$log" >&2
             exit 1
         fi

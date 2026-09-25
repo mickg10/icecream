@@ -3355,13 +3355,20 @@ static bool attach_p51_restart_job(
 
 static int run_p51_process_restart_case(
     const char *daemon_binary, const char *cache_service, passwd *icecc,
-    bool restart_f, uint32_t profile_mask, unsigned jobs_per_window = 1)
+    unsigned c_count, unsigned f_count, uint32_t profile_mask,
+    unsigned jobs_per_window = 1)
 {
-    if (jobs_per_window == 0 || jobs_per_window > 30) {
+    if (jobs_per_window == 0 || jobs_per_window > 30 ||
+        c_count == 0 || c_count > 4 || f_count == 0 || f_count > 4 ||
+        c_count * f_count > 4 ||
+        !((c_count == 1 && f_count >= 2) ||
+          (f_count == 1 && c_count >= 2))) {
         std::fprintf(stderr,
-            "FAIL: process-restart window must contain 1..30 jobs\n");
+            "FAIL: unsupported process-restart topology/window C%uF%u W%u\n",
+            c_count, f_count, jobs_per_window);
         return 2;
     }
+    const bool restart_f = f_count > 1;
     const char *temporary_root = ::getenv("TMPDIR");
     const std::string prefix = temporary_root && *temporary_root ? temporary_root : "/tmp";
     std::string pattern = prefix + "/p51r.XXXXXX";
@@ -3378,14 +3385,34 @@ static int run_p51_process_restart_case(
 
     const uint64_t epoch = restart_f ? UINT64_C(0x51f2000000000001)
                                      : UINT64_C(0x51c2000000000001);
-    P51RestartRole primary{restart_f ? "p51-c" : "p51-c1", work + "/c1",
-                           "", -1, 0, 0, -1, nullptr, false};
-    P51RestartRole sibling{restart_f ? "p51-f2" : "p51-c2",
-                           work + (restart_f ? "/f2" : "/c2"),
-                           "", -1, 0, 0, -1, nullptr, false};
-    P51RestartRole target{restart_f ? "p51-f1" : "p51-f1", work + "/f1",
-                          "", -1, 0, 0, -1, nullptr, false};
-    for (P51RestartRole *role : {&primary, &sibling, &target}) {
+    std::vector<P51RestartRole> c_roles;
+    std::vector<P51RestartRole> f_roles;
+    c_roles.reserve(c_count);
+    f_roles.reserve(f_count);
+    for (unsigned index = 0; index < c_count; ++index) {
+        P51RestartRole role;
+        role.name = "p51-c" + std::to_string(index + 1);
+        role.directory = work + "/c" + std::to_string(index + 1);
+        c_roles.push_back(std::move(role));
+    }
+    for (unsigned index = 0; index < f_count; ++index) {
+        P51RestartRole role;
+        role.name = "p51-f" + std::to_string(index + 1);
+        role.directory = work + "/f" + std::to_string(index + 1);
+        f_roles.push_back(std::move(role));
+    }
+    auto stop_roles = [&] {
+        for (auto& role : c_roles) role.stop();
+        for (auto& role : f_roles) role.stop();
+    };
+    auto all_roles = [&] {
+        std::vector<P51RestartRole*> result;
+        result.reserve(c_roles.size() + f_roles.size());
+        for (auto& role : c_roles) result.push_back(&role);
+        for (auto& role : f_roles) result.push_back(&role);
+        return result;
+    };
+    for (P51RestartRole *role : all_roles()) {
         const bool made = ::mkdir(role->directory.c_str(), 0700) == 0 &&
             ::chown(role->directory.c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
             ::mkdir((role->directory + "/envs").c_str(), 0700) == 0 &&
@@ -3397,24 +3424,29 @@ static int run_p51_process_restart_case(
     }
     if (failures) return 2;
 
-    const unsigned role_job_limit = jobs_per_window == 1
-        ? 6u : jobs_per_window * 2u + 4u;
-    const bool roles_ready = primary.start(
-            daemon_binary, cache_service, epoch, role_job_limit) &&
-        sibling.start(daemon_binary, cache_service, epoch, role_job_limit) &&
-        target.start(daemon_binary, cache_service, epoch, role_job_limit);
-    REQUIRE(roles_ready, restart_f
-        ? "C1F2 starts one C cache and two independent F caches"
-        : "C2F1 starts two independent C caches and one F cache");
+    const unsigned legacy_role_limit = jobs_per_window == 1 ? 6u : 64u;
+    const unsigned topology_role_limit = jobs_per_window * 2u +
+        2u * (c_count + f_count - 2u) + 2u;
+    const unsigned role_job_limit = std::max(legacy_role_limit,
+                                              topology_role_limit);
+    bool roles_ready = true;
+    for (auto& role : c_roles)
+        roles_ready &= role.start(daemon_binary, cache_service, epoch,
+                                  role_job_limit);
+    for (auto& role : f_roles)
+        roles_ready &= role.start(daemon_binary, cache_service, epoch,
+                                  role_job_limit);
+    REQUIRE(roles_ready,
+        "all independent C/F daemons start for the requested process-restart topology");
     if (!roles_ready) {
-        primary.stop(); sibling.stop(); target.stop();
+        stop_roles();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 1;
     }
-    P51RestartRole& c_affected = primary;
-    P51RestartRole& f_affected = target;
-    P51RestartRole& c_healthy = restart_f ? primary : sibling;
-    P51RestartRole& f_healthy = restart_f ? sibling : target;
+    P51RestartRole& c_affected = c_roles.front();
+    P51RestartRole& f_affected = f_roles.front();
+    const std::string topology = "C" + std::to_string(c_count) +
+                                 "F" + std::to_string(f_count);
     const uint32_t wire_base = restart_f ? 0x51f21000 : 0x51c21000;
     auto make_job = [&](P51RestartRole& c, P51RestartRole& f,
                         uint32_t offset) {
@@ -3423,8 +3455,10 @@ static int run_p51_process_restart_case(
         return prepare_p51_restart_job(c, f, work, wire, nonce, epoch,
                                        profile_mask);
     };
-    bool healthy_before = false;
-    bool healthy_during = false;
+    bool healthy_before = true;
+    bool healthy_during = true;
+    uint32_t healthy_before_count = 0;
+    uint32_t healthy_during_count = 0;
     bool fresh_attached = false;
     bool stop_parent_ok = false;
     bool kill_sidecar_ok = false;
@@ -3432,24 +3466,50 @@ static int run_p51_process_restart_case(
     pid_t old_sidecar = -1;
     pid_t restarted_sidecar = -1;
     pid_t restart_parent = -1;
-    P51RestartRole& healthy_c = restart_f ? primary : c_healthy;
-    P51RestartRole& healthy_f = restart_f ? f_healthy : target;
-
-    // Establish the sibling relationship before disturbing the affected one.
-    auto healthy_initial = make_job(healthy_c, healthy_f, 1);
-    P51SourceArmedFields healthy_initial_armed{};
-    const auto healthy_initial_result = healthy_initial
-        ? run_p51_restart_job(healthy_f, *healthy_initial,
-                              profile_mask, &healthy_initial_armed)
-        : icecc::p50::local::P50SourceTransferResult{};
-    healthy_before = healthy_initial &&
-        attach_p51_restart_job(healthy_f, *healthy_initial, profile_mask,
-                               healthy_initial_armed, healthy_initial_result);
-    REQUIRE(healthy_before,
-            "unaffected sibling relationship is established and CompileFile-attached before restart");
+    std::vector<std::unique_ptr<P51RestartJob>> healthy_initial_jobs;
+    auto run_healthy = [&](P51RestartRole& c, P51RestartRole& f,
+                           uint32_t offset, const char *phase) {
+        auto job = make_job(c, f, offset);
+        P51SourceArmedFields armed{};
+        const auto result = job
+            ? run_p51_restart_job(f, *job, profile_mask, &armed)
+            : icecc::p50::local::P50SourceTransferResult{};
+        const bool attached = job && attach_p51_restart_job(
+            f, *job, profile_mask, armed, result);
+        std::fprintf(stderr,
+            "P51_RESTART_HEALTHY topology=%s profile=%u phase=%s c=%s f=%s "
+            "committed=%u attached=%u raw=%llu expected=%zu digest_match=%u\n",
+            topology.c_str(), profile_mask, phase, c.name.c_str(), f.name.c_str(),
+            result.code == icecc::p50::local::SourceTransferResultCode::Committed,
+            attached ? 1u : 0u,
+            static_cast<unsigned long long>(result.raw_bytes),
+            job ? job->bytes.size() : 0,
+            job && result.raw_digest == icecc::digest128(job->bytes) ? 1u : 0u);
+        if (job) healthy_initial_jobs.push_back(std::move(job));
+        return attached;
+    };
+    uint32_t next_offset = 1;
+    if (restart_f) {
+        for (size_t index = 1; index < f_roles.size(); ++index) {
+            const bool attached = run_healthy(c_affected, f_roles[index],
+                                              next_offset++, "before");
+            healthy_before &= attached;
+            healthy_before_count += attached;
+        }
+    } else {
+        for (size_t index = 1; index < c_roles.size(); ++index) {
+            const bool attached = run_healthy(c_roles[index], f_affected,
+                                              next_offset++, "before");
+            healthy_before &= attached;
+            healthy_before_count += attached;
+        }
+    }
+    REQUIRE(healthy_before &&
+                healthy_before_count == (restart_f ? f_count - 1 : c_count - 1),
+            "every unaffected sibling relationship establishes and attaches before restart");
     if (!healthy_before) {
-        healthy_initial.reset();
-        primary.stop(); sibling.stop(); target.stop();
+        healthy_initial_jobs.clear();
+        stop_roles();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 1;
     }
@@ -3459,7 +3519,7 @@ static int run_p51_process_restart_case(
         f_affected.endpoint_port, sidecar_uid, jobs_per_window);
     REQUIRE(gate->ready(), "restart gate can hold the affected COMMIT window under NET_ADMIN");
     if (!gate->ready()) {
-        primary.stop(); sibling.stop(); target.stop();
+        stop_roles();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 2;
     }
@@ -3467,7 +3527,7 @@ static int run_p51_process_restart_case(
     affected_cells.reserve(jobs_per_window);
     bool affected_prepared = true;
     for (unsigned index = 0; index < jobs_per_window; ++index) {
-        const uint32_t offset = 2 + index;
+        const uint32_t offset = 100 + index;
         const uint32_t wire = wire_base + offset;
         const uint64_t nonce = (static_cast<uint64_t>(wire) << 32) | offset;
         auto job = prepare_p51_restart_job(
@@ -3480,7 +3540,7 @@ static int run_p51_process_restart_case(
     REQUIRE(affected_prepared && affected_cells.size() == jobs_per_window,
             "affected original compiler assignments and P51 ARMs cover the restart window");
     if (!affected_prepared || affected_cells.size() != jobs_per_window) {
-        gate.reset(); primary.stop(); sibling.stop(); target.stop();
+        gate.reset(); stop_roles();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 1;
     }
@@ -3491,7 +3551,7 @@ static int run_p51_process_restart_case(
     if (!callers_started) {
         gate->discard_held_commits();
         gate.reset();
-        primary.stop(); sibling.stop(); target.stop();
+        stop_roles();
         (void)wait_p51_restart_transfers(
             affected_cells, Clock::now() + std::chrono::seconds(5));
         join_p51_restart_transfers(affected_cells);
@@ -3505,7 +3565,7 @@ static int run_p51_process_restart_case(
     if (!observed_commit) {
         gate->discard_held_commits();
         gate.reset();
-        primary.stop(); sibling.stop(); target.stop();
+        stop_roles();
         (void)wait_p51_restart_transfers(
             affected_cells, Clock::now() + std::chrono::seconds(5));
         join_p51_restart_transfers(affected_cells);
@@ -3531,18 +3591,29 @@ static int run_p51_process_restart_case(
     // proxy so the test does not confuse local positive evidence with restart.
     gate->discard_held_commits();
     gate.reset();
-    auto healthy_during_job = make_job(
-        healthy_c, healthy_f, jobs_per_window + 2);
-    P51SourceArmedFields healthy_during_armed{};
-    const auto healthy_during_result = healthy_during_job
-        ? run_p51_restart_job(healthy_f, *healthy_during_job,
-                              profile_mask, &healthy_during_armed)
-        : icecc::p50::local::P50SourceTransferResult{};
-    healthy_during = healthy_during_job &&
-        attach_p51_restart_job(healthy_f, *healthy_during_job, profile_mask,
-                               healthy_during_armed, healthy_during_result);
-    REQUIRE(healthy_during,
-            "pre-existing sibling C/F relationship commits and attaches while affected daemon is stopped");
+    if (restart_f) {
+        for (size_t index = 1; index < f_roles.size(); ++index) {
+            const bool attached = run_healthy(
+                c_affected, f_roles[index],
+                200 + static_cast<uint32_t>(index - 1), "during-restart");
+            healthy_during &= attached;
+            healthy_during_count += attached;
+        }
+    } else {
+        for (size_t index = 1; index < c_roles.size(); ++index) {
+            const bool attached = run_healthy(
+                c_roles[index], f_affected,
+                200 + static_cast<uint32_t>(index - 1), "during-restart");
+            healthy_during &= attached;
+            healthy_during_count += attached;
+        }
+    }
+    const bool healthy_parent_stopped =
+        restart_f ? f_affected.paused : c_affected.paused;
+    REQUIRE(healthy_parent_stopped &&
+                healthy_during && healthy_during_count ==
+                    (restart_f ? f_count - 1 : c_count - 1),
+            "every pre-existing healthy sibling commits and attaches while affected daemon is stopped");
 
     resumed_parent_ok = stop_parent_ok &&
         ::kill(restart_parent, SIGCONT) == 0;
@@ -3567,14 +3638,14 @@ static int run_p51_process_restart_case(
     if (!affected_settled) {
         std::fprintf(stderr,
             "P51_PROCESS_RESTART affected W30 callers did not settle by bounded wait\n");
-        for (P51RestartRole *role : {&primary, &sibling, &target})
+        for (P51RestartRole *role : all_roles())
             if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
         const bool settled_after_close = wait_p51_restart_transfers(
             affected_cells, Clock::now() + std::chrono::seconds(5));
         join_p51_restart_transfers(affected_cells);
         REQUIRE(settled_after_close,
-                "closing the three test daemons releases every original transfer worker");
-        primary.stop(); sibling.stop(); target.stop();
+                "closing all topology daemons releases every original transfer worker");
+        stop_roles();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 1;
     }
@@ -3586,7 +3657,7 @@ static int run_p51_process_restart_case(
         &affected_max_deadline_delta_ms);
     std::fprintf(stderr,
         "P51_RESTART_DEADLINES topology=%s profile=%u phase=old callers=%zu max_completion_delta_ms=%lld grace_ms=%lld respected=%u\n",
-        restart_f ? "C1F2" : "C2F1", profile_mask, affected_cells.size(),
+        topology.c_str(), profile_mask, affected_cells.size(),
         static_cast<long long>(affected_max_deadline_delta_ms),
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             kSourceDeadlineCleanupGrace).count()),
@@ -3601,13 +3672,13 @@ static int run_p51_process_restart_case(
             "discarded old-incarnation COMMITs never become positive C receipts for any original caller");
     std::fprintf(stderr,
         "P51_RESTART_OLD_WINDOW topology=%s profile=%u callers=%zu held_commits=%zu noncommitted=%zu\n",
-        restart_f ? "C1F2" : "C2F1", profile_mask, affected_cells.size(),
+        topology.c_str(), profile_mask, affected_cells.size(),
         held_old_commits, affected_noncommitted);
     const P51SourceArmedFields old_armed = affected_cells.front()->armed;
     affected_cells.clear();
 
-    P51RestartRole& refreshed_c = restart_f ? primary : c_affected;
-    P51RestartRole& refreshed_f = restart_f ? f_affected : target;
+    P51RestartRole& refreshed_c = c_affected;
+    P51RestartRole& refreshed_f = f_affected;
     auto fresh_gate = std::make_unique<P51CommitReceiptGate>(
         refreshed_f.endpoint_port, sidecar_uid, jobs_per_window);
     REQUIRE(fresh_gate->ready(),
@@ -3616,7 +3687,7 @@ static int run_p51_process_restart_case(
     fresh_cells.reserve(jobs_per_window);
     bool fresh_prepared = fresh_gate->ready();
     for (unsigned index = 0; index < jobs_per_window && fresh_prepared; ++index) {
-        const uint32_t offset = jobs_per_window + 3 + index;
+        const uint32_t offset = 300 + index;
         const uint32_t wire = wire_base + offset;
         const uint64_t nonce = (static_cast<uint64_t>(wire) << 32) | offset;
         auto job = prepare_p51_restart_job(
@@ -3651,7 +3722,7 @@ static int run_p51_process_restart_case(
     REQUIRE(fresh_settled,
             "fresh replacement W30 callers settle before the outer cleanup watchdog");
     if (!fresh_settled) {
-        for (P51RestartRole *role : {&primary, &sibling, &target})
+        for (P51RestartRole *role : all_roles())
             if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
         fresh_settled = wait_p51_restart_transfers(
             fresh_cells, Clock::now() + std::chrono::seconds(5));
@@ -3665,7 +3736,7 @@ static int run_p51_process_restart_case(
         &fresh_max_deadline_delta_ms);
     std::fprintf(stderr,
         "P51_RESTART_DEADLINES topology=%s profile=%u phase=fresh callers=%zu max_completion_delta_ms=%lld grace_ms=%lld respected=%u\n",
-        restart_f ? "C1F2" : "C2F1", profile_mask, fresh_cells.size(),
+        topology.c_str(), profile_mask, fresh_cells.size(),
         static_cast<long long>(fresh_max_deadline_delta_ms),
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             kSourceDeadlineCleanupGrace).count()),
@@ -3691,7 +3762,7 @@ static int run_p51_process_restart_case(
         fresh_attached_count == jobs_per_window;
     std::fprintf(stderr,
         "P51_RESTART_FRESH_WINDOW topology=%s profile=%u callers=%zu commits=%zu attached=%zu held_commits=%zu\n",
-        restart_f ? "C1F2" : "C2F1", profile_mask, fresh_cells.size(),
+        topology.c_str(), profile_mask, fresh_cells.size(),
         fresh_committed, fresh_attached_count,
         fresh_window_observed ? static_cast<size_t>(jobs_per_window) : 0u);
     const auto& fresh_result = fresh_cells.empty()
@@ -3723,14 +3794,18 @@ static int run_p51_process_restart_case(
     REQUIRE(fresh_identity && fresh_attached,
             "replacement transfer uses a fresh F store identity or fresh C store identity");
 
-    healthy_initial.reset(); healthy_during_job.reset(); fresh_cells.clear();
-    primary.stop(); sibling.stop(); target.stop();
+    healthy_initial_jobs.clear(); fresh_cells.clear();
+    stop_roles();
     std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
-    std::fprintf(stderr, "P51_PROCESS_RESTART%s topology=%s affected=%s profile=%u jobs=%u fresh_attached=%u healthy_attached=%u\n",
+    std::fprintf(stderr, "P51_PROCESS_RESTART%s topology=%s affected=%s profile=%u jobs=%u fresh_attached=%u healthy_attached=%u healthy_siblings=%u/%u target_parent_stopped=%u\n",
         jobs_per_window == 30 ? "_W30" : "",
-        restart_f ? "C1F2" : "C2F1", restart_f ? "F-cache" : "C-cache",
+        topology.c_str(), restart_f ? "F-cache" : "C-cache",
         profile_mask, jobs_per_window, fresh_attached ? 1u : 0u,
-        healthy_during ? 1u : 0u);
+        healthy_during ? 1u : 0u, healthy_during_count,
+        restart_f ? f_count - 1 : c_count - 1,
+        healthy_parent_stopped ? 1u : 0u);
+    REQUIRE(healthy_during_count == (restart_f ? f_count - 1 : c_count - 1),
+            "healthy progress was observed for every unaffected topology sibling");
     return failures ? 1 : 0;
 }
 
@@ -4146,6 +4221,10 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_RESTART_W30_F_C1F2") != nullptr;
     const bool restart_w30_c_c2f1 =
         ::getenv("ICECC_TEST_P51_RESTART_W30_C_C2F1") != nullptr;
+    const char *restart_w30_topology =
+        ::getenv("ICECC_TEST_P51_RESTART_W30_TOPOLOGY");
+    const bool restart_w30_topology_selected =
+        restart_w30_topology != nullptr;
     const bool synthetic_scheduler_w30 =
         ::getenv("ICECC_TEST_P51_SYNTH_SCHEDULER_W30") != nullptr;
     const char *lost_receipts_value =
@@ -4155,6 +4234,7 @@ int main(int argc, char **argv)
         static_cast<unsigned>(restart_c_c2f1) +
         static_cast<unsigned>(restart_w30_f_c1f2) +
         static_cast<unsigned>(restart_w30_c_c2f1) +
+        static_cast<unsigned>(restart_w30_topology_selected) +
         static_cast<unsigned>(synthetic_scheduler_w30) +
         static_cast<unsigned>(lost_receipts);
     if (restart_selectors != 0) {
@@ -4186,11 +4266,31 @@ int main(int argc, char **argv)
                                     static_cast<unsigned>(count),
                                     profile_mask, true);
         }
-        const bool restart_f = restart_f_c1f2 || restart_w30_f_c1f2;
-        const unsigned jobs_per_window =
-            restart_w30_f_c1f2 || restart_w30_c_c2f1 ? 30u : 1u;
+        unsigned c_count = 0;
+        unsigned f_count = 0;
+        unsigned jobs_per_window = 1;
+        if (restart_w30_topology_selected) {
+            char trailing = '\0';
+            if (std::sscanf(restart_w30_topology, "C%uF%u%c",
+                            &c_count, &f_count, &trailing) != 2 ||
+                c_count == 0 || c_count > 4 || f_count == 0 || f_count > 4 ||
+                c_count * f_count > 4 ||
+                !((c_count == 1 && f_count >= 2) ||
+                  (f_count == 1 && c_count >= 2))) {
+                std::fprintf(stderr,
+                    "FAIL: ICECC_TEST_P51_RESTART_W30_TOPOLOGY must be C1F2..C1F4 or C2F1..C4F1\n");
+                return 2;
+            }
+            jobs_per_window = 30;
+        } else {
+            const bool restart_f = restart_f_c1f2 || restart_w30_f_c1f2;
+            c_count = restart_f ? 1u : 2u;
+            f_count = restart_f ? 2u : 1u;
+            jobs_per_window =
+                restart_w30_f_c1f2 || restart_w30_c_c2f1 ? 30u : 1u;
+        }
         return run_p51_process_restart_case(
-            argv[1], argv[2], icecc, restart_f, profile_mask,
+            argv[1], argv[2], icecc, c_count, f_count, profile_mask,
             jobs_per_window);
     }
 
