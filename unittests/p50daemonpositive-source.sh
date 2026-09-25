@@ -5,6 +5,7 @@ set -eu
 src=${ICECC_TEST_TOP_SRCDIR:?}
 daemon="$src/daemon/main.cpp"
 makefile="$src/daemon/Makefile.am"
+unittests_makefile="$src/unittests/Makefile.am"
 runtime_test="$src/unittests/p50daemonpositive.cpp"
 
 require() {
@@ -21,7 +22,7 @@ contract() {
     require "$candidate" 'cache_adapter->outer_append_pollfds(pollfds)' &&
     require "$candidate" 'cache_adapter->outer_advance_turn' &&
     require "$candidate" 'reannounce_environments(&update.transitions[index])' &&
-    require "$candidate" 'scheduler_cache_snapshot != current' &&
+    require "$candidate" 'scheduler_cache_snapshot != scheduler_visible' &&
     require "$candidate" 'scheduler_session_active && cache_adapter != nullptr' &&
     require "$candidate" 'cache_advertisement_snapshot().present()' &&
     require "$candidate" 'cache_adapter->outer_request_shutdown(&update)' &&
@@ -91,6 +92,7 @@ if printf '%s\n' "$accept_block" | grep -F 'Service::createChannel(acc_fd' >/dev
 fi
 require "$makefile" 'libp50daemonsidecaradapter.a'
 require "$makefile" 'libp50sidecar.a'
+require "$unittests_makefile" 'p50daemonpositive-p51-restart-check'
 require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/READY'
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
 require "$runtime_test" 'kAdmissionBurstCount = 65'
@@ -106,6 +108,7 @@ require "$runtime_test" 'more than 64 sequential authoritative CacheSessions rem
 require "$runtime_test" 'authoritative CacheSessions leave no retained P5FS descriptors'
 require "$runtime_test" 'accepted handoff keeps the READY advertisement stable'
 require "$runtime_test" 'orderly shutdown withdraws before scheduler teardown'
+require "$runtime_test" 'run_p51_process_restart_case'
 
 if grep -F 'apply_inert_cache_advertisement' "$daemon" >/dev/null \
         || grep -F 'cache_dispatcher->dispatch' "$daemon" >/dev/null; then
@@ -148,7 +151,7 @@ for needle in \
     'cache_adapter->outer_append_pollfds(pollfds)' \
     'cache_adapter->outer_advance_turn' \
     'reannounce_environments(&update.transitions[index])' \
-    'scheduler_cache_snapshot != current' \
+    'scheduler_cache_snapshot != scheduler_visible' \
     'scheduler_session_active && cache_adapter != nullptr' \
     'cache_advertisement_snapshot().present()' \
     'cache_adapter->outer_request_shutdown(&update)' \

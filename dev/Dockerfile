@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         autoconf automake bash build-essential ca-certificates clang coreutils \
         default-jre-headless \
-        file findutils gawk git grep gzip libarchive-dev libboost-dev \
+        file findutils gawk git grep gzip iptables libarchive-dev libboost-dev \
         libcap-ng-dev liblzo2-dev libxxhash-dev libzstd-dev libtool make \
         netcat-openbsd pkg-config procps python3 sed sudo tar \
         time util-linux xz-utils zstd \

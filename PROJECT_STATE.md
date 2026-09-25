@@ -65,8 +65,50 @@ SHA256 `e417952ea5423d56901020fb583c90042253845b8f25fe3a7a7bac66a1c438de`,
 `9327ac45d9436675db13a9af2369d72c0d1610603d1e0040d31e289e4c1c6c05`;
 sender source: `60b7981db89d4eac4d855a9fa33b06a9762046a1a7257534ef28633f46d22c20`;
 test source: `d383676b5a861cc2cc7976293c4b6959fca3a9da352d985a32e29de74c1a8157`.
-This qualifies the sender change, not the pending daemon multi-link matrix,
-admission-queue refactor, or same-F idle-history retirement changes.
+This sender-suite result alone does not qualify daemon multi-link operation,
+the admission-queue refactor, or same-F idle-history retirement changes.
+
+The real-daemon multi-link gate now passes all 18 cells: C1F2/3/4 and
+C2/3/4F1, each with P29V1, ZSTD_TU and ZSTD_ROUTE. Each link reaches 30
+outstanding jobs; the largest cases check 120 exact input attachments and
+healthy-link progress while one relationship's receipts remain held.
+The C4F1/ZSTD_ROUTE cell needed six setup attempts to establish four links
+and still completed all 120 jobs. Evidence:
+`/tanksmall/scratch/tmp/p51-multilink-retry-r6/tmp/matrix-r6.log`, SHA256
+`bfb21a840767a763e6c89e51e4e85df413d6e3ed1399d74a14060764cff764c3`;
+`matrix-r6.exit` records `MULTILINK_MATRIX_EXIT=0`, and the retained
+`p51-multilink-retry-r6-matrix` container exited 0 without OOM.
+Fixture source SHA256:
+`40039cd641a61c1b4a517f02b2ffebc691b96005adf1f6b8a7b0d7d35580963f`;
+fixture binary:
+`00afb791ca3feabfad1bffd341b808ad7b1d260eae270c28426b1fddc3e07603`.
+This frozen build combines the earlier r5 product baseline with the committed
+initial-connection retry sender; its service source is
+`7a05a98f1e74489b3ca064e4f051e35ea9d8bc33b83b1fc5f46333d526ae094f`.
+It predates typed missing-reservation handling and the aggregate-oversize
+error distinction, and excludes the pending admission/history changes.
+It qualifies this matrix fixture and retry integration, not final HEAD,
+restart behavior, cross-host throughput, or the complete W30 release gate.
+
+The same frozen binaries also pass the two cache-process replacement cases:
+ZSTD_TU C1F2/F-cache and C2F1/C-cache. Each holds one affected job after F
+commit but before C observes the receipt, replaces that cache process, checks
+healthy-sibling progress and rejects the discarded old completion, then
+attaches a new assignment using the replacement store identity. Evidence:
+`/tanksmall/scratch/tmp/p51-multilink-retry-r6/tmp/restart-r6-run.log`, SHA256
+`870c09d1537b67c03535be3c5a6c0dbb0639473d18f034735eccffcfbbd6b170`;
+`restart-r6-run.exit` records `RESTART_GATE_EXIT=0`. This is not a W30-occupied
+restart, scheduler/ordinary-daemon restart, all-profile restart matrix, or
+qualification of the pending combined source. An earlier invocation failed
+before testing because the copied script was not executable; the successful
+run invokes it through `sh`, as the Make target does.
+
+The existing default daemon regression wrapper passes on those same frozen
+binaries (`DEFAULT_DAEMON_EXIT=0`):
+`/tanksmall/scratch/tmp/p51-multilink-retry-r6/tmp/default-daemon-r6-run.log`,
+SHA256 `41ad7ecfd4d0ff57c9174334651d5ec8283dd03460132fd6751c3e1653210b13`.
+This checks that the added opt-in fixture modes do not replace the default
+daemon tests; it is not a full native/farm suite result.
 
 The production C sender passes its W30 regression against the direct F
 endpoint for ZSTD_TU, P29V1 and ZSTD_ROUTE: 30 complete bundles and 30 F commits before C processes

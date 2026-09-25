@@ -1,5 +1,6 @@
 #include "p50_daemon_cache_dispatch.h"
 
+#include <cstdio>
 #include <limits>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -125,7 +126,21 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     }
 
     const local::HandoffRequest request{identity_, next_request_id_++};
-    const auto deadline = std::chrono::steady_clock::now() + handoff_timeout_;
+    const auto started_at = std::chrono::steady_clock::now();
+    const auto deadline = started_at + handoff_timeout_;
+    const auto diagnose_r2 = [&](const char *stage, local::Status status) {
+        if (!r2_link)
+            return;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_at).count();
+        std::fprintf(stderr,
+            "P51_CACHE_LINK_DISPATCH_FAIL request=%llu stage=%s status=%u "
+            "elapsed_ms=%lld budget_ms=%lld\n",
+            static_cast<unsigned long long>(request.request_id), stage,
+            static_cast<unsigned>(status), static_cast<long long>(elapsed),
+            static_cast<long long>(handoff_timeout_.count()));
+        std::fflush(stderr);
+    };
 
     // Product dispatch establishes no relationship before the discriminator
     // is decoded.  Connect, exact peer credentials, HELLO and HELLO_ACK all
@@ -135,9 +150,11 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     local::Status connect_status = local::Status::Ok;
     local::Connection relationship = local::connect_unix_until(
         on_demand_->socket_path, deadline, &connect_status);
-    if (!relationship.valid())
+    if (!relationship.valid()) {
+        diagnose_r2("connect", connect_status);
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::Disconnected, request, false};
+    }
     // The supervisor pre-binds the listener before forking the sidecar.  On
     // Linux SO_PEERCRED consequently reports the daemon that created the
     // socket, rather than the child (or worker) that accepts it.  Keep the
@@ -159,19 +176,34 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
             relationship.verify_peer_credentials(creator_expectation) ==
             local::Status::Ok;
     }
-    if (!peer_authenticated)
+    if (!peer_authenticated) {
+        diagnose_r2("peer-credentials", local::Status::PeerCredentialMismatch);
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::NotAuthenticated, request, false};
-    if (relationship.send_until(local::make_hello(local::PeerRole::Daemon, identity_),
-                                deadline) != local::Status::Ok)
+    }
+    const local::Status hello_send_status = relationship.send_until(
+        local::make_hello(local::PeerRole::Daemon, identity_), deadline);
+    if (hello_send_status != local::Status::Ok) {
+        diagnose_r2("hello-send", hello_send_status);
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::Disconnected, request, false};
+    }
     local::Frame acknowledgement;
-    if (relationship.receive_until(acknowledgement, deadline) != local::Status::Ok ||
-        local::validate_handshake(acknowledgement, local::MessageType::HelloAck,
-                                  local::PeerRole::Sidecar, identity_) != local::Status::Ok)
+    const local::Status hello_receive_status =
+        relationship.receive_until(acknowledgement, deadline);
+    if (hello_receive_status != local::Status::Ok) {
+        diagnose_r2("hello-ack-receive", hello_receive_status);
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::Disconnected, request, false};
+    }
+    const local::Status hello_validate_status = local::validate_handshake(
+        acknowledgement, local::MessageType::HelloAck,
+        local::PeerRole::Sidecar, identity_);
+    if (hello_validate_status != local::Status::Ok) {
+        diagnose_r2("hello-ack-validate", hello_validate_status);
+        return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
+                                    local::FdHandoffStatus::Disconnected, request, false};
+    }
 
     // The real sidecar dispatches by an explicit semantic operation, not by
     // guessing from the following SCM_RIGHTS frame.  Announce the exact
@@ -183,10 +215,14 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     const local::Frame operation{
         local::kProtocolVersion, local::MessageType::Data, identity_,
         local::encode_control_operation(control_operation)};
-    if (operation.payload.empty() ||
-        relationship.send_until(operation, deadline) != local::Status::Ok)
+    const local::Status operation_status = operation.payload.empty()
+        ? local::Status::Malformed
+        : relationship.send_until(operation, deadline);
+    if (operation.payload.empty() || operation_status != local::Status::Ok) {
+        diagnose_r2("operation-send", operation_status);
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::Disconnected, request, false};
+    }
 
     // Authentication proves which process owns the connected peer, but the
     // immutable READY lease also names the listener node that made this
@@ -194,14 +230,17 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     // blocking connect/HELLO exchange and immediately before relinquishing
     // the ordinary descriptor. A retired listener can keep an accepted
     // connection alive after its pathname has already been replaced.
-    if (!on_demand_->current_path_matches())
+    if (!on_demand_->current_path_matches()) {
+        diagnose_r2("listener-path", local::Status::IdentityMismatch);
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::NotAuthenticated, request, false};
+    }
 
     const int released_fd = r2_link
         ? channel.send_p51_cache_link_session_ready_and_release(deadline)
         : channel.release_fd_if_input_empty();
     if (released_fd < 0) {
+        diagnose_r2("ordinary-release", local::Status::Malformed);
         // The operation has been announced but the ordinary stream did not
         // prove a clean release boundary.  Drop the relationship so the
         // sidecar cannot wait on or reinterpret a half-announced stream.
@@ -211,8 +250,17 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
 
     local::FdHandoffSender sender{local::HandoffFd(released_fd)};
     const local::FdHandoffResult result = sender.send(relationship, request, deadline);
-    if (result.status != local::FdHandoffStatus::Accepted)
+    if (result.status != local::FdHandoffStatus::Accepted) {
+        diagnose_r2("descriptor-handoff", local::Status::IoError);
+        if (r2_link) {
+            std::fprintf(stderr,
+                "P51_CACHE_LINK_HANDOFF_FAIL request=%llu status=%u\n",
+                static_cast<unsigned long long>(request.request_id),
+                static_cast<unsigned>(result.status));
+            std::fflush(stderr);
+        }
         return fail_after_detach(result.status, request);
+    }
 
     // `relationship` closes here. Retain the immutable endpoint lease so TU2
     // opens a different authenticated relationship to the same incarnation.
