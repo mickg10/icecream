@@ -101,6 +101,13 @@ protocol50-formal:
 	@$(ICEFARM_SCRATCH_GUARD)
 	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) cache/formal/run_formal_aggregate.py
 
+.PHONY: protocol50-pipeline-formal
+protocol50-pipeline-formal:
+	@$(ICEFARM_SCRATCH_GUARD)
+	@test -n "$$TLA2TOOLS_JAR" || { echo "set TLA2TOOLS_JAR to a pinned tla2tools.jar" >&2; exit 2; }
+	@test -n "$$TLC_STATE_ROOT" || { echo "set TLC_STATE_ROOT to a fresh retained scratch directory" >&2; exit 2; }
+	@$(ICEFARM_TMP_ENV) sh cache/formal/run_pipeline_formal_tlc.sh
+
 .PHONY: docker_build docker_test
 docker_build:
 	@cd package_builder/ubuntu22.04 && docker compose run --rm --build deb

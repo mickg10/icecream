@@ -52,6 +52,11 @@ Protocol50PipelineRecovery.tla
     receipt reconciliation, reset confirmation, per-job raw reservations,
     link/history/relationship callback fencing, and cancellation suffix rebuild
 
+Protocol50ReplacementReplay.tla
+    lost RESET_CONFIRM followed by same-operation RESET replay, terminal
+    same-F logical-relationship replacement/use, explicit F-store restart
+    distinction, stale-old-relationship rejection, and unaffected-link progress
+
 Protocol50PipelineWindowAccounting.tla
     separate W30 accounting projection for raw, encoded, receipt, and
     speculative-history byte budgets; not a codec or product-pipeline proof
@@ -131,7 +136,39 @@ receipt-capacity floor. The fault row permits two bounded disconnect/reset
 cycles and a terminal relationship retirement; it does not model creation/use
 of a replacement relationship incarnation or unbounded reconnects. Reset
 operation identity/count remains in the bounded state, but prior-result replay
-semantics are not covered.
+semantics and a lost `RESET_CONFIRM` are covered by the separate focused model
+below.
+
+`Protocol50ReplacementReplay.tla` is an auxiliary, focused single-link
+lifecycle model with abstract sibling-progress tokens rather than a full
+multi-link concurrency model or an enlargement of the W2 transfer state
+space. The six topology rows vary the peer set and demonstrate sibling
+reachability; the existing `Protocol50PipelineRecovery.tla` remains the
+multi-relationship concurrency/recovery model. The auxiliary model captures the lost-confirm
+sequence explicitly: F applies RESET and returns a result, C's first confirm
+is lost, a new physical connection replays the same reset operation, F returns
+the cached result without advancing history again, and the second confirm is
+processed. It then retires the old logical relationship on the same F store,
+creates and uses a strictly new logical identity, and rejects an offer for the
+old identity. An F-store restart is modeled as a distinct transition that
+advances the store generation before a replacement can be used; same-F
+relationship retirement must leave that generation unchanged. Other links in
+the configured topology have explicit progress steps. Six safety rows and six
+separate finite reachability-witness rows cover C2F1/C3F1/C4F1 and
+C1F2/C1F3/C1F4. Three mutants must violate the exact reset-result, stale-offer,
+or same-F/store-generation invariant. Run `run_pipeline_replacement_tlc.sh`
+with the pinned TLC jar and a fresh `TLC_STATE_ROOT`.
+
+These are bounded state-space checks and finite reachability traces, not a
+fairness-based liveness proof. The sibling links are abstract unaffected
+progress tokens, not complete concurrent codec pipelines. The model does not
+establish unbounded reset/reconnect behavior, wire framing, or product
+refinement.
+
+Run both pipeline-level bounded lanes together with
+`make protocol50-pipeline-formal` (set `TLA2TOOLS_JAR` and a fresh absolute
+`TLC_STATE_ROOT`). This target is intentionally separate from the much larger
+`make protocol50-formal` aggregate.
 
 W30 uses a second, intentionally accounting-only model: it checks the cursor
 and symbolic raw/encoded/receipt/speculative-journal caps at `W=30`. Its fixed

@@ -12,6 +12,27 @@ retained artifact directories.
 
 ## Developer QA
 
+### Pipeline formal entry point
+
+`make protocol50-pipeline-formal` passes with explicit `ICEFARM_TMPDIR`,
+pinned `TLA2TOOLS_JAR` and fresh absolute `TLC_STATE_ROOT`. The combined run
+has 19 existing recovery/accounting rows and 15 focused lifecycle rows:
+six safety checks, six replacement-use reachability witnesses and three
+negative controls. The latter exercise lost RESET confirmation and exact
+reset-result replay, same-F logical replacement/use, and separate F-store
+replacement. RESET advances the modeled relationship epoch; a same-F
+replacement must be newer still without changing the store generation.
+
+The lifecycle topology rows vary abstract sibling-progress tokens, not full
+concurrent pipelines. These finite checks do not prove liveness, codec/parser
+correctness, memory safety, or arbitrary W30 interleavings. Existing runtime
+and broader formal requirements remain separate.
+Evidence: `/tanksmall/scratch/tmp/pipeline-formal.krjcXa/pipeline-formal.log`,
+SHA256 `9f08fcaa7aca1f980c592945149f2a2e33f5a13c73b9f96c2a900f25759fd2da`,
+terminal `PIPELINE_FORMAL_EXIT=0`. Lifecycle model SHA256:
+`c27fddb9dce60971401a7711e22c98b6f21540d157d03ce14b3f9e19c089c27f`.
+The log records exact module/config hashes and each intended counterexample.
+
 ### Opt-in R2 mixed Docker gate
 
 `dev/mixed.py --p51-r2` adds actual remote-compile cases for P29V1,
