@@ -443,8 +443,18 @@ result field) when a valid source exceeds the aggregate raw-byte budget;
 it no longer labels that immediate refusal as deadline expiry. The test
 checks the exact returned code, no F connection for that source, fitting
 source credit/socket admission, and stop-time credit release. This does not
-yet prove a fitting source commits under pressure, per-job cancellation while
-waiting, or freedom from preparation-pool head-of-line blocking.
+yet prove per-job cancellation while waiting or freedom from preparation-pool
+head-of-line blocking. An independent `--aggregate-fit-exact` selector now
+proves that the same runtime rejects a 17-byte source against a 16-byte
+aggregate cap, then transfers a fitting 12-byte source through the ordinary
+P51 link-session handshake and real R2 endpoint. It checks materialized bytes,
+commit digest, and released raw credit. Evidence:
+`/tanksmall/scratch/tmp/p51-route-reap.6Pp7wd/logs/aggregate-fit-exact-r1.log`,
+SHA256 `71ee0b557778e1991c3187ce9849a3168aa8c3051bdbe2b7f384fba922f21944`,
+exit 0; binary `33466055777984a1005c060994220804a30c643f0112475abe91d8514f121c95`.
+The executed test TU was `ef1cb58db72da34022a696b832c14f4b62f425e1b6dee12c0b6b780652621328`;
+it also contained separate, unqualified reconnect work, excluded from this
+test's commit. This focused pass does not qualify that work or the full suite.
 
 A real C route-owner/F service test also passes for an initial reservation
 evicted before its first link: typed Missing, fresh same-F relationship with

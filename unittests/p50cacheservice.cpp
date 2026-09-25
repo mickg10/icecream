@@ -1510,6 +1510,327 @@ void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
     std::puts("P51_ASYNC_TRANSFER aggregate-raw-budget oversize/fit/stop-cleanup: ok");
 }
 
+void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x4d;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    const SidecarLaunchIdentity remote_f = [] {
+        StoreIdentityRoot root{};
+        root.bytes[15] = 0x4e;
+        return test_sidecar_launch(root);
+    }();
+    uint16_t oversize_port = 0;
+    const int oversize_listener = loopback_listener(oversize_port);
+    uint16_t f_port = 0;
+    const int f_listener = loopback_listener(f_port);
+    CHECK(oversize_listener >= 0 && f_listener >= 0 &&
+          oversize_port != 0 && f_port != 0);
+
+    service::RuntimeConfig runtime_config = test_runtime_config();
+    runtime_config.c_store_guid = launch.c_store_guid;
+    runtime_config.f_store_guid = launch.f_store_guid;
+    runtime_config.f_store_generation = launch.store_generation;
+    runtime_config.sidecar_launch = launch;
+    runtime_config.endpoint_caps.zstd.max_raw_bytes = 64;
+    runtime_config.max_aggregate_source_raw_bytes = 16;
+    runtime_config.max_active_p51_source_transfers = 2;
+    runtime_config.max_pending_p51_source_operations = 2;
+    service::SidecarRuntime runtime(std::move(runtime_config));
+
+    auto make_request = [&](uint64_t request_id, uint16_t port,
+                            uint8_t reservation_byte) {
+        auto reservation = test_p51_reservation_request(
+            launch.c_store_guid, launch.store_generation,
+            launch.identity.generation, launch.identity.attempt,
+            request_id, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::seconds(8));
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = port;
+        P51SourceArmedFields armed;
+        armed.arm = reservation.arm;
+        armed.f_control_generation = remote_f.identity.generation;
+        armed.f_control_attempt = remote_f.identity.attempt;
+        armed.f_store_generation = remote_f.store_generation;
+        armed.f_store_guid = remote_f.f_store_guid.bytes;
+        armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+        armed.arm_observation_id = request_id;
+        armed.source_budget_msec = 8000;
+        armed.attempt_capability_1.bytes.fill(0xe1);
+        armed.attempt_capability_2.bytes.fill(0xe2);
+        armed.reservation_id.fill(reservation_byte);
+        armed.logical_relationship_id.fill(0xe4);
+        armed.relationship_epoch = 1;
+        armed.selected_revision = CACHE_WIRE_REVISION_R2;
+        armed.selected_window = 30;
+        CHECK(armed.valid());
+        return local::P51SourceTransferRequest{
+            armed, reservation.absolute_deadline};
+    };
+    const auto oversize_request = make_request(7220, oversize_port, 0xe0);
+    const auto request = make_request(7221, f_port, 0xe3);
+    const auto& armed = request.armed;
+
+    const std::vector<uint8_t> expected_input(12, 0xf1);
+
+    // The first R2 job exceeds only the aggregate budget, not the endpoint's
+    // own raw-size bound. It must receive the typed size result without ever
+    // opening the selected F socket; the same runtime then admits the fit job.
+    RuntimeCase oversize = authenticated_runtime_pair();
+    const auto oversize_operation = local::make_p51_source_transfer_operation(
+        launch.identity, oversize_request,
+        oversize_request.armed.arm.source.source_request_id);
+    CHECK(runtime.enqueue_p51_source_transfer(
+        std::move(oversize.sender), launch.identity, oversize_operation,
+        sized_test_source_fd(17, 0xef)));
+    receive_p51_transfer_error(
+        oversize.receiver, launch.identity, 7220,
+        oversize_request.absolute_deadline.as_steady_time_point(), true,
+        static_cast<uint16_t>(local::SourceTransferErrorCode::SourceTooLarge));
+    CHECK(wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1)));
+    pollfd no_oversize_connect{oversize_listener, POLLIN, 0};
+    int oversize_ready;
+    do {
+        oversize_ready = ::poll(&no_oversize_connect, 1, 100);
+    } while (oversize_ready < 0 && errno == EINTR);
+    CHECK(oversize_ready == 0);
+
+    std::vector<uint8_t> committed_input;
+    bool commit_identity_matches = false;
+    // Keep an independently owned duplicate solely for bounded teardown.
+    // The endpoint owns/closes the accepted descriptor, so publishing that
+    // borrowed descriptor to the main thread would risk shutdown on a reused fd.
+    std::atomic<int> f_cancel_fd{-1};
+    std::promise<ServerRunResult> f_done_promise;
+    auto f_done = f_done_promise.get_future();
+    std::optional<ServerRunResult> f_result;
+    std::thread f_server([&] {
+        int adopted_fd = -1;
+        try {
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            pollfd listener{f_listener, POLLIN, 0};
+            int ready;
+            do {
+                ready = ::poll(&listener, 1, 5000);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0)
+                throw std::runtime_error("R2 fit F listener was not contacted");
+            int accepted;
+            do {
+                accepted = ::accept(f_listener,
+                    reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            } while (accepted < 0 && errno == EINTR);
+            if (accepted < 0)
+                throw std::runtime_error("R2 fit F accept failed");
+
+            std::unique_ptr<MsgChannel> channel(
+                Service::createChannelAccepted(
+                    accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                throw std::runtime_error("R2 fit F channel setup failed");
+            const auto handshake_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (channel->protocol_admission_state() ==
+                       MsgChannel::ProtocolAdmissionState::Pending &&
+                   std::chrono::steady_clock::now() < handshake_deadline) {
+                short events = POLLIN;
+                if (channel->has_pending_write())
+                    events |= POLLOUT;
+                pollfd socket{channel->fd, events, 0};
+                int polled;
+                do {
+                    polled = ::poll(&socket, 1, 50);
+                } while (polled < 0 && errno == EINTR);
+                if (polled < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                    throw std::runtime_error("R2 fit F handshake socket failed");
+                if ((socket.revents & POLLOUT) && !channel->flush_pending())
+                    throw std::runtime_error("R2 fit F handshake write failed");
+                if ((socket.revents & POLLIN) && !channel->read_a_bit())
+                    throw std::runtime_error("R2 fit F handshake read failed");
+            }
+            if (channel->protocol_admission_state() !=
+                    MsgChannel::ProtocolAdmissionState::Ready ||
+                !channel->finish_protocol_admission())
+                throw std::runtime_error("R2 fit F protocol admission failed");
+            std::unique_ptr<Msg> link_request(channel->get_msg_until(
+                request.absolute_deadline.as_steady_time_point()));
+            if (dynamic_cast<P51CacheLinkSessionMsg*>(link_request.get()) == nullptr)
+                throw std::runtime_error("R2 fit F expected CACHE_LINK_SESSION");
+            adopted_fd = channel->send_p51_cache_link_session_ready_and_release(
+                request.absolute_deadline.as_steady_time_point());
+            if (adopted_fd < 0)
+                throw std::runtime_error("R2 fit F link-session handoff failed");
+            const int cancel_fd = ::dup(adopted_fd);
+            if (cancel_fd < 0)
+                throw std::runtime_error("R2 fit cancellation fd duplication failed");
+            f_cancel_fd.store(cancel_fd, std::memory_order_release);
+
+            namespace asio = boost::asio;
+            asio::io_context context;
+            boost::system::error_code adopt_error;
+            auto socket = P50ServerEndpoint::adopt_connected_fd(
+                context.get_executor(), adopted_fd, adopt_error);
+            adopted_fd = -1;
+            if (!socket.has_value() || adopt_error)
+                throw std::runtime_error("R2 fit endpoint fd adoption failed");
+
+            P50ServerEndpointConfig endpoint_config;
+            endpoint_config.sidecar_launch = remote_f;
+            endpoint_config.f_store_generation = remote_f.store_generation;
+            endpoint_config.lookup_p51_link_reservation =
+                [armed, request](const LinkHello& hello)
+                    -> P51SourceLinkLookupResult {
+                if (hello.reservation_id != Id128{armed.reservation_id} ||
+                    hello.relationship_id !=
+                        Id128{armed.logical_relationship_id} ||
+                    hello.c_store_guid != CStoreGuid{armed.arm.source.c_store_guid} ||
+                    hello.f_store_guid != FStoreGuid{armed.f_store_guid} ||
+                    hello.f_store_generation != armed.f_store_generation ||
+                    hello.profile != ProfileId::ZSTD_TU ||
+                    hello.relationship_epoch != armed.relationship_epoch)
+                    return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
+                P51SourceLinkLease lease{armed, request.absolute_deadline};
+                lease.relationship_epoch = hello.relationship_epoch;
+                lease.history_nonce = hello.history_nonce;
+                return {P51SourceLinkLookupStatus::Found, std::move(lease)};
+            };
+            endpoint_config.consume_p51_job_reservation =
+                [armed, request, &expected_input](const LinkHello& hello,
+                                                   const JobBind& binding)
+                    -> std::optional<P51SourceJobLease> {
+                if (binding.reservation_id != Id128{armed.reservation_id} ||
+                    binding.physical_link_generation !=
+                        hello.physical_link_generation ||
+                    binding.profile != ProfileId::ZSTD_TU ||
+                    binding.raw_bytes != expected_input.size() ||
+                    binding.raw_digest != icecc::digest128(expected_input))
+                    return std::nullopt;
+                P51SourceJobLease lease;
+                lease.armed = armed;
+                lease.absolute_deadline = request.absolute_deadline;
+                lease.binding = binding;
+                lease.binding_digest = compute_r2_binding_digest(binding);
+                lease.input_key = InputRecordKey{hello.c_store_guid,
+                                                  binding.tu_seq};
+                return lease;
+            };
+            endpoint_config.input_job_state =
+                [&](CStoreGuid, const TxBegin& begin, const TxCommit& commit,
+                    std::span<const uint8_t> bytes) {
+                    committed_input.assign(bytes.begin(), bytes.end());
+                    commit_identity_matches =
+                        begin.raw_bytes == bytes.size() &&
+                        begin.raw_digest == icecc::digest128(bytes) &&
+                        commit.raw_digest == begin.raw_digest;
+                    return InputJobState::Open;
+                };
+            endpoint_config.record_p51_job_commit =
+                [](const LinkHello&, const JobBind& binding,
+                   const R2TxCommit& commit) {
+                    return commit.relationship_ordinal ==
+                               binding.relationship_ordinal &&
+                           commit.binding_digest ==
+                               compute_r2_binding_digest(binding);
+                };
+            endpoint_config.acknowledge_p51_receipt =
+                [](const LinkHello& hello, const CommitAck& ack) {
+                    return ack.relationship_id == hello.relationship_id &&
+                           ack.relationship_epoch == hello.relationship_epoch &&
+                           ack.physical_link_generation ==
+                               hello.physical_link_generation;
+                };
+            P50ServerEndpoint endpoint(remote_f.f_store_guid, {}, nullptr,
+                                       nullptr, std::move(endpoint_config));
+            auto endpoint_result = asio::co_spawn(
+                context,
+                endpoint.run_adopted_r2(std::move(*socket)),
+                asio::use_future);
+            context.run();
+            const int owned_cancel_fd =
+                f_cancel_fd.exchange(-1, std::memory_order_acq_rel);
+            if (owned_cancel_fd >= 0)
+                (void)::close(owned_cancel_fd);
+            f_done_promise.set_value(endpoint_result.get());
+        } catch (...) {
+            if (adopted_fd >= 0)
+                (void)::close(adopted_fd);
+            const int owned_cancel_fd =
+                f_cancel_fd.exchange(-1, std::memory_order_acq_rel);
+            if (owned_cancel_fd >= 0)
+                (void)::close(owned_cancel_fd);
+            try {
+                f_done_promise.set_exception(std::current_exception());
+            } catch (...) {
+            }
+        }
+    });
+
+    RuntimeCase pair = authenticated_runtime_pair();
+    const auto operation = local::make_p51_source_transfer_operation(
+        launch.identity, request, request.armed.arm.source.source_request_id);
+    const bool enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(pair.sender), launch.identity, operation,
+        sized_test_source_fd(expected_input.size(), 0xf1));
+    local::P50SourceTransferResult result;
+    std::exception_ptr transfer_exception;
+    try {
+        if (enqueued)
+            result = receive_p51_transfer_result(
+                pair.receiver, launch.identity, 7221,
+                request.absolute_deadline.as_steady_time_point(), true);
+    } catch (...) {
+        transfer_exception = std::current_exception();
+    }
+    const bool committed = result.code == local::SourceTransferResultCode::Committed;
+    const bool exact_result = committed && result.valid() &&
+        result.raw_bytes == expected_input.size() &&
+        result.raw_digest == icecc::digest128(expected_input);
+    const bool credit_released = wait_for_source_raw_bytes(
+        runtime, 0, std::chrono::seconds(1));
+    runtime.stop();
+    pair.receiver = local::Connection(-1);
+    const bool f_finished = f_done.wait_for(std::chrono::seconds(3)) ==
+                            std::future_status::ready;
+    if (!f_finished) {
+        const int fd = f_cancel_fd.exchange(-1, std::memory_order_acq_rel);
+        if (fd >= 0) {
+            (void)::shutdown(fd, SHUT_RDWR);
+            (void)::close(fd);
+        }
+    }
+    const bool f_finished_after_shutdown = f_finished ||
+        f_done.wait_for(std::chrono::seconds(6)) == std::future_status::ready;
+    std::exception_ptr f_exception;
+    if (f_finished_after_shutdown) {
+        try {
+            f_result = f_done.get();
+        } catch (...) {
+            f_exception = std::current_exception();
+        }
+    }
+    // The absolute source lease bounds the endpoint coroutine; shutdown via
+    // the owned duplicate above forces the remaining socket wait to unwind.
+    // Join rather than detach because the endpoint callbacks capture fixture
+    // state by reference.
+    if (f_server.joinable())
+        f_server.join();
+    (void)::close(f_listener);
+    (void)::close(oversize_listener);
+    if (transfer_exception)
+        std::rethrow_exception(transfer_exception);
+    if (f_exception)
+        std::rethrow_exception(f_exception);
+    CHECK(enqueued);
+    CHECK(exact_result);
+    CHECK(credit_released);
+    CHECK(f_finished_after_shutdown);
+    CHECK(f_result.has_value() && f_result->committed_input.has_value());
+    CHECK(committed_input == expected_input);
+    CHECK(commit_identity_matches);
+    std::puts("P51_ASYNC_TRANSFER aggregate-budget fitting R2 commit exact: ok");
+}
+
 void test_p51_stop_while_waiting_for_link_session_echo() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x3e;
@@ -7086,6 +7407,11 @@ int main(int argc, char** argv) {
             test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
             return 0;
         }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--aggregate-fit-exact") == 0) {
+            test_p51_aggregate_raw_budget_fitting_commit_is_exact();
+            return 0;
+        }
         CHECK(argc == 1);
         exercise_root_contract_then_drop_test_process();
         fingerprint_stop_before_ready_is_bounded();
@@ -7105,6 +7431,7 @@ int main(int argc, char** argv) {
         test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
         test_p51_admitted_transfer_stop_releases_raw_credit();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
+        test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_stop_while_waiting_for_link_session_echo();
         test_p51_stop_while_waiting_for_link_state();
         test_p51_reservation_capacity_120_cancel_and_expiry();
