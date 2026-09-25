@@ -399,7 +399,9 @@ def test_concurrent_mixed_uses_one_scheduler_and_observes_all_role_compilers(
     assert case["concurrent_role_cc1plus"]["p43"]["worker"] == "r1"
     assert case["concurrent_role_cc1plus"]["r1"]["worker"] == "r1"
     assert case["concurrent_role_cc1plus"]["r2"]["worker"] == "r2"
-    assert case["p43_remote"] and case["r1_remote_p29v1"] and case["r2_remote_p29v1"]
+    assert case["p43_remote"] and case["r1_remote"] and case["r2_remote"]
+    assert case["selected_profile"] == "P29V1"
+    assert "r1_remote_p29v1" not in case and "r2_remote_p29v1" not in case
     assert case["r2_source_lease"] and case["r2_link_adopted"]
     assert len([command for command in commands
                 if command[:2] == ["network", "create"]]) == 1
@@ -457,6 +459,8 @@ def test_concurrent_profile_selects_matching_evidence(tmp_path: Path, profile: s
     assert summary["concurrent_profile"] == profile
     case = summary["cases"][0]
     assert case["selected_profile"] == profile
+    assert case["p43_remote"] and case["r1_remote"] and case["r2_remote"]
+    assert "r1_remote_p29v1" not in case and "r2_remote_p29v1" not in case
     assert case["worker_modes"] == {"r1": f"{profile}/R1", "r2": f"{profile}/R2"}
     for command in commands:
         if command[:1] != ["run"] or "--name" not in command:

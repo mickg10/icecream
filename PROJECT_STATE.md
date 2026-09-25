@@ -549,9 +549,18 @@ Pinned P43 source `cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`, image
 These retained summaries contain legacy `r1_remote_p29v1` and
 `r2_remote_p29v1` field names even for ZSTD. The actual selected-profile
 checks and attachment/commit assertions are profile-sensitive; the names
-are a reporting defect, not evidence that the ZSTD runs used P29. A separate
-metadata correction is pending. Source-commit log events lack job IDs, so
-their correlation remains limited to the measured per-role log.
+are a reporting defect, not evidence that the ZSTD runs used P29. The writer
+now uses profile-neutral `r1_remote`/`r2_remote`; `selected_profile` continues
+to identify the tested codec. All 23 fake-Docker tests pass in 110.10 s,
+including neutral-field assertions for all three profiles. Log under the same
+root: `logs-d18-metadata-fake-tests-r2.log`, SHA256
+`edad21199a563116451e3c70294e3dcadefdce24937b871f87e45dcb4138ce85`.
+The first suite attempt passed 22 tests but hit the existing 20-second CLI
+timeout in the nine-case old-scheduler compatibility test; that test passed
+alone in 19.54 s, then the complete suite passed without timeout changes.
+The reporting-only correction does not alter the retained real-run evidence.
+Source-commit log events lack job IDs, so their correlation remains limited
+to the measured per-role log.
 
 Earlier sequential compatibility evidence follows; it is not evidence for
 the newer candidate's other gates.
