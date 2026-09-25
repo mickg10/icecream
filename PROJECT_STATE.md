@@ -135,7 +135,21 @@ Logs under `/tanksmall/scratch/tmp/p51-held-worker-final.6pP4qv/logs/`:
 `endpoint-full-r2.log`, SHA256
 `84b4000ef3def62123d075e3ce90afda31e2d59b25757c48a35079a9b67c7919`.
 Earlier peer-close tests printed but did not assert final zero charges; this
-evidence supersedes them. Concurrent-memory instrumentation remains separate.
+evidence supersedes them.
+
+Focused ASan/UBSan qualification also passes: reset/successor and independent
+peer-close selectors each ran three times for both P29V1 and ZSTD_ROUTE, plus
+the InputRecord sanitizer subtest. Both Automake results are PASS with no
+ASan/UBSan findings. Endpoint, endpoint-test and input sources were instrumented,
+as were rebuilt protocol50 and localtransport archives; `services/libicecc.a`
+remained uninstrumented. This is not TSAN or full-service instrumentation.
+Preserved logs in the same directory:
+`asan-reset-selector-r3.log`, SHA256
+`4e30cae6f1b361c07c64c125019a55a577ba6e57262f102f3fb38dbd04374f62`;
+`asan-peer-close-selector-r1.log`, SHA256
+`3a885437919d42c510198ea207c8cadbc915273c83c07331e21fb64f0083469c`.
+An earlier invocation missing `ICEFARM_TMPDIR` failed setup and is not runtime
+evidence. Concurrent data-race checking remains separate.
 
 ### Active cancellation and mixed-load evidence gaps
 
