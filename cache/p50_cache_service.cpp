@@ -2387,6 +2387,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_p51_source_on_owner(
     constexpr uint16_t kInvalid = 1;
     constexpr uint16_t kExpired = 7;
     constexpr uint16_t kSourceRead = 3;
+    constexpr uint16_t kSourceTooLarge = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::SourceTooLarge);
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = request.absolute_deadline.as_steady_time_point();
     if (!request.armed.valid() || !request.absolute_deadline.valid() ||
@@ -2426,6 +2428,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_p51_source_on_owner(
         source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
     if (!source_size.has_value())
         return source_transfer_error(kSourceRead);
+    if (*source_size > config_.max_aggregate_source_raw_bytes)
+        return source_transfer_error(kSourceTooLarge);
     if (!acquire_p51_source_credit(*source_size, deadline))
         return source_transfer_error(kExpired);
     bool credit_owned = true;
@@ -2633,6 +2637,8 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
             constexpr uint16_t kInvalid = 1;
             constexpr uint16_t kExpired = 7;
             constexpr uint16_t kSourceRead = 3;
+            constexpr uint16_t kSourceTooLarge = static_cast<uint16_t>(
+                local::SourceTransferErrorCode::SourceTooLarge);
             try {
             const auto clock = sidecar::process_monotonic_clock_identity();
             const auto& armed = request.armed;
@@ -2681,6 +2687,10 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
                 pending_transfer->source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
             if (!source_size.has_value()) {
                 reply(source_transfer_error(kSourceRead));
+                return;
+            }
+            if (*source_size > config_.max_aggregate_source_raw_bytes) {
+                reply(source_transfer_error(kSourceTooLarge));
                 return;
             }
             if (!acquire_p51_source_credit(*source_size, deadline)) {

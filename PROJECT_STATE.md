@@ -438,6 +438,28 @@ This used the same daemon binary listed above, without the new handoff
 diagnostics. It does not explain the earlier C4F1 setup disconnect after
 15 passing matrix cells, nor qualify the complete matrix or repeated runs.
 
+The R2 source service now reports `SourceTooLarge` (0x5003 in the existing
+result field) when a valid source exceeds the aggregate raw-byte budget;
+it no longer labels that immediate refusal as deadline expiry. The test
+checks the exact returned code, no F connection for that source, fitting
+source credit/socket admission, and stop-time credit release. This does not
+yet prove a fitting source commits under pressure, per-job cancellation while
+waiting, or freedom from preparation-pool head-of-line blocking.
+
+A real C route-owner/F service test also passes for an initial reservation
+evicted before its first link: typed Missing, fresh same-F relationship with
+the expected committed byte count/digest, and a separate C owner's persistent
+sibling link committing before and after. This is not established-link
+eviction/reconnect or compiler attachment coverage. Both the focused selector
+and full service test executable passed in the same run:
+`/tanksmall/scratch/tmp/p51-route-reap.6Pp7wd/logs/same-f-real-transfer-r4.log`,
+SHA256 `0fdbab6e7d87dfd80dbee900f15c045b923a46d4c850ec175ea2cb10e012e66b`,
+exit 0. Test binary SHA256:
+`b023fc9247c4183754862d60eddc3dfa1ec02acde3148a0e45ba182ce01345ec`;
+test source: `c20d74a5ef3d9bde697cfa2d6e676bc9fc50a0ff10ffb629953d6ae0236fd936`;
+service source: `4fe79a375e23b2a5bfdc5e38af2d5ba87bb5879067c21b4e070f59dfbb145a82`.
+The run rebuilt the service test, not the separate external service executable.
+
 The runtime now distinguishes definite reservation absence from an invalid
 offer in one owner-thread lookup. Only an absent initial reservation or
 absent reconnect relationship produces ReservationMissing; mismatched fields

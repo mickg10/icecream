@@ -1091,11 +1091,29 @@ local::HandoffFd oversized_test_source_fd() {
     return local::HandoffFd(fd);
 }
 
+local::HandoffFd sized_test_source_fd(size_t size, uint8_t value) {
+    const char* temporary_directory = std::getenv("TMPDIR");
+    if (temporary_directory == nullptr || temporary_directory[0] == '\0')
+        temporary_directory = "/tmp";
+    std::string path = std::string(temporary_directory) +
+                       "/icecc-p51-sized-source-XXXXXX";
+    std::vector<char> mutable_path(path.begin(), path.end());
+    mutable_path.push_back('\0');
+    const int fd = ::mkstemp(mutable_path.data());
+    CHECK(fd >= 0);
+    CHECK(::unlink(mutable_path.data()) == 0);
+    const std::vector<uint8_t> bytes(size, value);
+    CHECK(write_all(fd, bytes));
+    CHECK(::lseek(fd, 0, SEEK_SET) == 0);
+    return local::HandoffFd(fd);
+}
+
 void receive_p51_transfer_error(local::Connection& peer,
                                 local::Identity identity,
                                 uint64_t request_id,
                                 std::chrono::steady_clock::time_point deadline,
-                                bool acknowledge) {
+                                bool acknowledge,
+                                uint16_t expected_error_code = 0) {
     local::Frame response;
     CHECK(peer.receive_until(response, deadline) == local::Status::Ok);
     CHECK(response.type == local::MessageType::Data);
@@ -1107,12 +1125,38 @@ void receive_p51_transfer_error(local::Connection& peer,
     CHECK(decoded.p51_source_transfer_result.has_value());
     CHECK(decoded.p51_source_transfer_result->code ==
           local::SourceTransferResultCode::Error);
+    if (expected_error_code != 0)
+        CHECK(decoded.p51_source_transfer_result->error_code ==
+              expected_error_code);
     if (acknowledge) {
         const local::Frame goodbye{local::kProtocolVersion,
                                    local::MessageType::Goodbye,
                                    identity, {}};
         CHECK(peer.send_until(goodbye, deadline) == local::Status::Ok);
     }
+}
+
+local::P50SourceTransferResult receive_p51_transfer_result(
+    local::Connection& peer, local::Identity identity, uint64_t request_id,
+    std::chrono::steady_clock::time_point deadline, bool acknowledge) {
+    local::Frame response;
+    CHECK(peer.receive_until(response, deadline) == local::Status::Ok);
+    CHECK(response.type == local::MessageType::Data);
+    CHECK(local::validate_identity(response, identity) == local::Status::Ok);
+    local::ControlOperation decoded;
+    CHECK(local::decode_control_operation(response.payload, decoded));
+    CHECK(decoded.kind == local::ControlOperationKind::P51SourceTransfer);
+    CHECK(decoded.request_id == request_id);
+    CHECK(decoded.p51_source_transfer_result.has_value());
+    CHECK(decoded.p51_source_transfer_result->valid());
+    const auto result = *decoded.p51_source_transfer_result;
+    if (acknowledge) {
+        const local::Frame goodbye{local::kProtocolVersion,
+                                   local::MessageType::Goodbye,
+                                   identity, {}};
+        CHECK(peer.send_until(goodbye, deadline) == local::Status::Ok);
+    }
+    return result;
 }
 
 void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
@@ -1319,6 +1363,151 @@ void test_p51_admitted_transfer_stop_releases_raw_credit() {
     CHECK(operation_released);
     CHECK(raw_credit_released);
     std::puts("P51_ASYNC_TRANSFER admitted-stop/raw-credit-release: ok");
+}
+
+void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x4b;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    const SidecarLaunchIdentity remote_f = [] {
+        StoreIdentityRoot root{};
+        root.bytes[15] = 0x4c;
+        return test_sidecar_launch(root);
+    }();
+
+    uint16_t oversize_port = 0;
+    const int oversize_listener = loopback_listener(oversize_port);
+    uint16_t fit_port = 0;
+    const int fit_listener = loopback_listener(fit_port);
+    uint16_t waiting_port = 0;
+    const int waiting_listener = loopback_listener(waiting_port);
+    CHECK(oversize_listener >= 0 && fit_listener >= 0 &&
+          waiting_listener >= 0);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.endpoint_caps.zstd.max_raw_bytes = 64;
+    config.max_aggregate_source_raw_bytes = 16;
+    config.max_active_p51_source_transfers = 2;
+    config.max_pending_p51_source_operations = 4;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto make_request = [&](uint64_t request_id, uint16_t port) {
+        auto reservation = test_p51_reservation_request(
+            launch.c_store_guid, launch.store_generation,
+            launch.identity.generation, launch.identity.attempt,
+            request_id, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::seconds(8));
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = port;
+        P51SourceArmedFields armed;
+        armed.arm = reservation.arm;
+        armed.f_control_generation = 47;
+        armed.f_control_attempt = 48;
+        armed.f_store_generation = remote_f.store_generation;
+        armed.f_store_guid = remote_f.f_store_guid.bytes;
+        armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
+        armed.arm_observation_id = request_id;
+        armed.source_budget_msec = 8000;
+        armed.attempt_capability_1.bytes.fill(0xc1);
+        armed.attempt_capability_2.bytes.fill(0xc2);
+        armed.reservation_id.fill(static_cast<uint8_t>(request_id));
+        armed.logical_relationship_id.fill(0xc3);
+        armed.relationship_epoch = 1;
+        armed.selected_revision = CACHE_WIRE_REVISION_R2;
+        armed.selected_window = 30;
+        CHECK(armed.valid());
+        return local::P51SourceTransferRequest{
+            armed, reservation.absolute_deadline};
+    };
+    auto enqueue = [&](RuntimeCase& pair,
+                       const local::P51SourceTransferRequest& request,
+                       local::HandoffFd source) {
+        const auto operation = local::make_p51_source_transfer_operation(
+            launch.identity, request,
+            request.armed.arm.source.source_request_id);
+        return runtime.enqueue_p51_source_transfer(
+            std::move(pair.sender), launch.identity, operation,
+            std::move(source));
+    };
+
+    // An over-cap R2 source is rejected before F connection or aggregate
+    // credit allocation; the same service remains able to admit fitting work.
+    RuntimeCase oversize = authenticated_runtime_pair();
+    const auto oversize_request = make_request(7211, oversize_port);
+    CHECK(enqueue(oversize, oversize_request,
+                  sized_test_source_fd(17, 0xd1)));
+    receive_p51_transfer_error(
+        oversize.receiver, launch.identity, 7211,
+        oversize_request.absolute_deadline.as_steady_time_point(), true,
+        static_cast<uint16_t>(local::SourceTransferErrorCode::SourceTooLarge));
+    CHECK(wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1)));
+    pollfd no_oversize_connect{oversize_listener, POLLIN, 0};
+    int oversize_ready;
+    do {
+        oversize_ready = ::poll(&no_oversize_connect, 1, 100);
+    } while (oversize_ready < 0 && errno == EINTR);
+    CHECK(oversize_ready == 0);
+
+    // A 12-byte R2 source holds credit and reaches its independent F socket.
+    // An 8-byte sibling is then queued at the 16-byte aggregate budget and
+    // must not open its socket or increase accounted bytes until credit frees.
+    RuntimeCase fitting = authenticated_runtime_pair();
+    const auto fitting_request = make_request(7212, fit_port);
+    CHECK(enqueue(fitting, fitting_request, sized_test_source_fd(12, 0xd2)));
+    const bool fitting_operation_seen = wait_for_source_operation_count(
+        runtime, 1, std::chrono::seconds(1));
+    pollfd fit_ready{fit_listener, POLLIN, 0};
+    int fit_polled;
+    do {
+        fit_polled = ::poll(&fit_ready, 1, 3000);
+    } while (fit_polled < 0 && errno == EINTR);
+    int fit_fd = -1;
+    if (fit_polled > 0)
+        fit_fd = ::accept(fit_listener, nullptr, nullptr);
+    const bool fitting_credit_held = fit_fd >= 0 &&
+        wait_for_source_raw_bytes(runtime, 12, std::chrono::seconds(1));
+
+    RuntimeCase waiting = authenticated_runtime_pair();
+    const auto waiting_request = make_request(7213, waiting_port);
+    const bool waiting_enqueued = enqueue(
+        waiting, waiting_request, sized_test_source_fd(8, 0xd3));
+    const bool both_operations_seen = waiting_enqueued &&
+        wait_for_source_operation_count(runtime, 2, std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const bool budget_still_exact =
+        runtime.active_source_raw_bytes_for_test() == 12;
+    pollfd no_waiting_connect{waiting_listener, POLLIN, 0};
+    int waiting_ready;
+    do {
+        waiting_ready = ::poll(&no_waiting_connect, 1, 0);
+    } while (waiting_ready < 0 && errno == EINTR);
+
+    runtime.stop();
+    fitting.receiver = local::Connection(-1);
+    waiting.receiver = local::Connection(-1);
+    if (fit_fd >= 0)
+        (void)::close(fit_fd);
+    const bool operations_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(2));
+    const bool credit_released =
+        wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1));
+
+    (void)::close(oversize_listener);
+    (void)::close(fit_listener);
+    (void)::close(waiting_listener);
+    CHECK(fitting_operation_seen);
+    CHECK(fit_fd >= 0);
+    CHECK(fitting_credit_held);
+    CHECK(both_operations_seen);
+    CHECK(budget_still_exact);
+    CHECK(waiting_ready == 0);
+    CHECK(operations_released);
+    CHECK(credit_released);
+    std::puts("P51_ASYNC_TRANSFER aggregate-raw-budget oversize/fit/stop-cleanup: ok");
 }
 
 void test_p51_stop_while_waiting_for_link_session_echo() {
@@ -2308,6 +2497,217 @@ void test_p51_same_f_missing_relationship_reassignment_keeps_sibling() {
     CHECK(commit_exact(fresh_link, fresh_armed, 1, 0,
                        "fresh same-F relationship assignment"));
     std::puts("P51_RESERVATION_OWNER same-F missing/reassignment preserves sibling: ok");
+}
+
+void test_p51_same_f_missing_real_sender_transfer_keeps_sibling() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x5b;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    auto remote_c = [](uint8_t tag) {
+        StoreIdentityRoot root{};
+        root.bytes[15] = tag;
+        return c_store_guid_for_root(root);
+    };
+    const CStoreGuid old_c = remote_c(0x5c);
+    const CStoreGuid sibling_c = remote_c(0x5d);
+
+    service::RuntimeConfig server_config = test_runtime_config();
+    server_config.c_store_guid = launch.c_store_guid;
+    server_config.f_store_guid = launch.f_store_guid;
+    server_config.f_store_generation = launch.store_generation;
+    server_config.sidecar_launch = launch;
+    server_config.endpoint_caps.profile = ProfileId::ZSTD_TU;
+    server_config.endpoint_caps.supported_profiles =
+        profile_bit(ProfileId::ZSTD_TU);
+    server_config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
+    server_config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
+    server_config.max_route_relationships = 2;
+    const EndpointCaps transfer_caps = server_config.endpoint_caps;
+    service::SidecarRuntime server(std::move(server_config));
+
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    std::atomic<bool> stopping{false};
+    std::atomic<unsigned> accepted{0};
+    std::thread accept_thread([&] {
+        while (!stopping.load(std::memory_order_acquire)) {
+            pollfd ready{listener, POLLIN, 0};
+            const int polled = ::poll(&ready, 1, 100);
+            if (polled < 0 && errno == EINTR)
+                continue;
+            if (polled <= 0)
+                continue;
+            const int fd = ::accept(listener, nullptr, nullptr);
+            if (fd < 0) {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+            accepted.fetch_add(1, std::memory_order_relaxed);
+            server.start_adopted_r2_endpoint(fd);
+        }
+    });
+
+    P50RouteOwnerConfig owner_config;
+    owner_config.endpoint_caps = transfer_caps;
+    owner_config.authority_limits.max_speculative_tus = 30;
+    P50CRouteOwner old_owner(owner_config);
+    P50CRouteOwner sibling_owner(owner_config);
+    boost::asio::io_context c_context;
+    auto c_work = boost::asio::make_work_guard(c_context);
+    std::thread c_thread([&] { c_context.run(); });
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            stopping.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (accept_thread.joinable())
+                accept_thread.join();
+            (void)::close(listener);
+            server.stop();
+            c_context.stop();
+            if (c_thread.joinable())
+                c_thread.join();
+        });
+
+    auto reserve = [&](const CStoreGuid& c_guid, uint64_t c_generation,
+                       uint64_t request_id) {
+        auto request = test_p51_reservation_request(
+            c_guid, c_generation, 71, 1, request_id,
+            CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(20));
+        request.arm.source.selected_f_host = "127.0.0.1";
+        request.arm.source.selected_f_cache_port = port;
+        request.arm.source.assignment_nonce = request_id;
+        const auto result = server.reserve_p51_source_on_owner(request);
+        CHECK(result.error_code == 0 && result.armed.has_value());
+        return std::pair{request, *result.armed};
+    };
+    auto connector = [port](auto deadline, auto completion) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            completion(-1);
+            return;
+        }
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            completion(-1);
+            return;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) != 0) {
+            (void)::close(fd);
+            completion(-1);
+            return;
+        }
+        completion(fd);
+    };
+    auto transfer = [&](P50CRouteOwner& route_owner,
+                        const CStoreGuid& c_guid,
+                        const P51SourceArmedFields& armed,
+                        const std::string& bytes) {
+        const auto& source = armed.arm.source;
+        const P50RouteRelationship relationship{
+            c_guid, FStoreGuid{armed.f_store_guid},
+            armed.f_store_generation, ProfileId::ZSTD_TU};
+        const PrepareRequestKey request{source.assignment_epoch,
+                                        source.assignment_nonce};
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(8);
+        const auto raw = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+        return boost::asio::co_spawn(
+            c_context,
+            route_owner.transfer_p51(relationship, armed, connector,
+                                     request, deadline, raw),
+            boost::asio::use_future).get();
+    };
+
+    const auto [old_request, old_armed] = reserve(old_c, 91, 9101);
+    const auto [sibling_request, sibling_armed] = reserve(sibling_c, 92, 9201);
+    (void)sibling_request;
+    const std::string sibling_first = "int sibling_before = 11;\n";
+    const auto sibling_first_result =
+        transfer(sibling_owner, sibling_c, sibling_armed, sibling_first);
+    CHECK(sibling_first_result.status == ZstdSourceTransferStatus::Committed &&
+          sibling_first_result.raw_bytes == sibling_first.size() &&
+          sibling_first_result.raw_digest ==
+              icecc::digest128(std::string_view(sibling_first)));
+
+    CHECK(server.cancel_p51_source_on_owner(
+        old_request.arm, old_armed.reservation_id,
+        old_request.absolute_deadline.as_steady_time_point()));
+    auto pressure = reserve(remote_c(0x5e), 93, 9301);
+    const auto& pressure_request = pressure.first;
+    const auto& pressure_armed = pressure.second;
+    CHECK(server.cancel_p51_source_on_owner(
+        pressure_request.arm, pressure_armed.reservation_id,
+        pressure_request.absolute_deadline.as_steady_time_point()));
+
+    const std::string stale_bytes = "int stale_old_relationship = 3;\n";
+    const auto stale_result = transfer(old_owner, old_c, old_armed, stale_bytes);
+    std::fprintf(stderr,
+                 "same-F stale result status=%u reject=%u reason=%u bytes=%llu "
+                 "replacement=%u local=%u attempts=%u\n",
+                 static_cast<unsigned>(stale_result.status),
+                 stale_result.r2_link_rejection.has_value(),
+                 stale_result.r2_link_rejection
+                     ? static_cast<unsigned>(stale_result.r2_link_rejection->reason)
+                     : 0u,
+                 static_cast<unsigned long long>(stale_result.raw_bytes),
+                 stale_result.replacement_required,
+                 stale_result.route_local_failure,
+                 static_cast<unsigned>(stale_result.attempts));
+    CHECK(stale_result.status != ZstdSourceTransferStatus::Committed &&
+          stale_result.r2_link_rejection.has_value() &&
+          stale_result.r2_link_rejection->reason ==
+              LinkRejectReason::ReservationMissing &&
+          stale_result.raw_bytes == 0 && stale_result.raw_digest == Digest128{} &&
+          !stale_result.replacement_required);
+
+    const auto [fresh_request, fresh_armed] = reserve(old_c, 91, 9102);
+    (void)fresh_request;
+    CHECK(fresh_armed.logical_relationship_id !=
+              old_armed.logical_relationship_id &&
+          fresh_armed.relationship_epoch > old_armed.relationship_epoch);
+    const std::string fresh_bytes = "int fresh_same_f_assignment = 7;\n";
+    const auto fresh_result = transfer(old_owner, old_c, fresh_armed, fresh_bytes);
+    CHECK(fresh_result.status == ZstdSourceTransferStatus::Committed &&
+          fresh_result.raw_bytes == fresh_bytes.size() &&
+          fresh_result.raw_digest ==
+              icecc::digest128(std::string_view(fresh_bytes)));
+
+    auto sibling_next = reserve(sibling_c, 92, 9202);
+    CHECK(sibling_next.second.logical_relationship_id ==
+          sibling_armed.logical_relationship_id);
+    const std::string sibling_second = "int sibling_after = 13;\n";
+    const auto sibling_second_result =
+        transfer(sibling_owner, sibling_c, sibling_next.second,
+                 sibling_second);
+    CHECK(sibling_second_result.status == ZstdSourceTransferStatus::Committed &&
+          sibling_second_result.raw_bytes == sibling_second.size() &&
+          sibling_second_result.raw_digest ==
+              icecc::digest128(std::string_view(sibling_second)));
+
+    // Retire the actual C senders on their owner executor, then shut the F
+    // endpoint down only after all exact commit results have been observed.
+    std::promise<void> c_retired_promise;
+    auto c_retired = c_retired_promise.get_future();
+    boost::asio::post(c_context, [&] {
+        old_owner.cancel_active_p51_transfers();
+        sibling_owner.cancel_active_p51_transfers();
+        old_owner.reset();
+        sibling_owner.reset();
+        c_retired_promise.set_value();
+    });
+    CHECK(c_retired.wait_for(std::chrono::seconds(3)) ==
+          std::future_status::ready);
+    c_retired.get();
+    c_work.reset();
+    cleanup.reset();
+    CHECK(accepted.load(std::memory_order_relaxed) == 3);
+    std::puts("P51_R2_SERVICE same-F actual sender transfer/missing/reassignment/sibling: ok");
 }
 
 void test_route_endpoint_cap_refuses_before_f_open() {
@@ -6681,6 +7081,11 @@ int main(int argc, char** argv) {
             test_known_endpoint_relationship_cap_refuses_before_f_open();
             return 0;
         }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--same-f-real-transfer") == 0) {
+            test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
+            return 0;
+        }
         CHECK(argc == 1);
         exercise_root_contract_then_drop_test_process();
         fingerprint_stop_before_ready_is_bounded();
@@ -6699,12 +7104,14 @@ int main(int argc, char** argv) {
         test_p51_reservation_capacity_identity_and_window();
         test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
         test_p51_admitted_transfer_stop_releases_raw_credit();
+        test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_stop_while_waiting_for_link_session_echo();
         test_p51_stop_while_waiting_for_link_state();
         test_p51_reservation_capacity_120_cancel_and_expiry();
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_reservation_profile_mask_mapping();
         test_p51_same_f_missing_relationship_reassignment_keeps_sibling();
+        test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();
