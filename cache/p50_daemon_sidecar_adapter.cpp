@@ -916,18 +916,14 @@ void DaemonSidecarAdapter::note_reducer_retirement(
     note_retirement(cause, sidecar::lifecycle_state_name(prior));
 }
 
-void DaemonSidecarAdapter::note_own_teardown() noexcept
+void DaemonSidecarAdapter::note_own_teardown(bool kill) noexcept
 {
-    // From our first TERM/KILL on, an exit may be our own cleanup and is no
-    // cause -- unless the child had already exited, which its pidfd shows.
-    // The central reaper polls that pidfd, so our turn's pollfds may not.
-    RetirementDiag& record = outer_retirement_;
-    if (!record.signalled && !record.exited_unsignalled && outer_pidfd_ >= 0) {
-        pollfd probe{outer_pidfd_, POLLIN, 0};
-        record.exited_unsignalled =
-            ::poll(&probe, 1, 0) == 1 && (probe.revents & POLLIN) != 0;
-    }
-    record.signalled = true;
+    // From our first TERM/KILL on, an exit may be our own cleanup.  A dying
+    // child's control socket can hang up milliseconds before its pidfd turns
+    // readable (its last thread still unmapping), so our TERM may already be
+    // out; the reaped status then tells a signal we never sent from ours.
+    outer_retirement_.signalled = true;
+    outer_retirement_.kill_sent = outer_retirement_.kill_sent || kill;
 }
 
 void DaemonSidecarAdapter::report_retirement(
@@ -2580,12 +2576,12 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_observe(pending_advertisement_update_);
         break;
     case sidecar::LifecycleAction::SendTerm:
-        note_own_teardown();
+        note_own_teardown(false);
         if (outer_group_action(SIGTERM))
             outer_action_taken_ = true;
         break;
     case sidecar::LifecycleAction::SendKill:
-        note_own_teardown();
+        note_own_teardown(true);
         if (outer_group_action(SIGKILL))
             outer_action_taken_ = true;
         break;
@@ -3129,12 +3125,17 @@ bool DaemonSidecarAdapter::outer_observe_child_reaped(
         !outer_registration_.valid() ||
         event.registry_generation != outer_registration_.registry_generation())
         return false;
-    // The exit is the retirement cause only when its pidfd edge (or this
-    // exact status) arrived before our own TERM/KILL.  It supersedes a
-    // provisional channel/deadline reason, which a dying child also produces,
-    // but never an explicit request or the status of our own cleanup.
+    // The exit is the retirement cause when its pidfd edge arrived before our
+    // own TERM/KILL, or when it died of a signal we never sent (we send only
+    // TERM, then KILL).  It supersedes a provisional channel/deadline reason,
+    // which a dying child also produces, but never an explicit request or the
+    // status of our own cleanup.
     RetirementDiag& record = outer_retirement_;
-    if (!record.definitive && (record.exited_unsignalled || !record.signalled) &&
+    const int signo = WIFSIGNALED(event.status) ? WTERMSIG(event.status) : 0;
+    const bool foreign = signo != 0 && signo != SIGTERM &&
+                         (signo != SIGKILL || !record.kill_sent);
+    if (!record.definitive &&
+        (record.exited_unsignalled || !record.signalled || foreign) &&
         (WIFEXITED(event.status) || WIFSIGNALED(event.status))) {
         const bool exited = WIFEXITED(event.status);
         note_retirement("exit", nullptr);

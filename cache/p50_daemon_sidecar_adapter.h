@@ -152,6 +152,7 @@ struct RetirementDiag {
     bool ready = false;
     bool signalled = false;
     bool exited_unsignalled = false;
+    bool kill_sent = false;
     size_t inputs_pending = 0;
     size_t inputs_completed = 0;
 };
@@ -373,7 +374,7 @@ private:
         std::chrono::steady_clock::time_point deadline,
         const sidecar::LifecycleObservation& observation,
         std::chrono::steady_clock::time_point now) noexcept;
-    void note_own_teardown() noexcept;
+    void note_own_teardown(bool kill) noexcept;
     void report_retirement(std::chrono::steady_clock::time_point now) noexcept;
 
     Config config_;
