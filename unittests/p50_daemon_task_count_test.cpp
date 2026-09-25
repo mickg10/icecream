@@ -1,6 +1,7 @@
 #include "daemon/p50_task_count.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -44,7 +45,14 @@ int main()
 
     require(with_hidden_thread.has_value() && *with_hidden_thread >= 2,
             "hidden daemon thread mutant was not observable at fork audit");
-    require(iceccd_task_count() == baseline,
+    // pthread_join returns once the kernel clears the thread id, which can be
+    // before /proc/self/task drops the exited task; give it a bounded moment.
+    auto after = iceccd_task_count();
+    for (int i = 0; i < 2000 && after != baseline; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        after = iceccd_task_count();
+    }
+    require(after == baseline,
             "task audit did not return to the single-task baseline");
 #else
     require(!iceccd_task_count().has_value(),
