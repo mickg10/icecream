@@ -12,6 +12,24 @@ retained artifact directories.
 
 ## Developer QA
 
+### R2 source-trace measurement gap
+
+Source audit of both `ef29049c` and product `03d108a3` finds that R2 results
+leave `c_to_f_bytes`/`f_to_c_bytes` at their default zero and assign
+`attempts=1` even on recovery paths. `bind_wire_evidence()` is used only by
+the serialized R1 sender; its `ClientByteTotals` log explicitly excludes R2
+completions. The v3 service trace prints these R2 defaults without an
+availability marker. Do not interpret them as zero traffic or absence of
+replay, and do not use them to qualify R2 bandwidth acceptance.
+
+R1 accounting is separate. R2 status, identity and reuse observations are
+not byte measurements. Repair requires explicit unavailable values first,
+then measured per-job traffic plus separately identified shared recovery/
+control traffic, with conservation tests. Overlapping per-job differences
+of shared counters would double count. The Implementer has been notified
+before interpreting queued W30 trace runs; existing farm runs need not be
+interrupted. This measurement gap remains open.
+
 ### R2 source-deadline expiry coverage
 
 The default endpoint suite now exercises four expiry stages for each of
