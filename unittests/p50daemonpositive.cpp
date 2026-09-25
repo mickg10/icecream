@@ -41,6 +41,7 @@
 #include <fstream>
 #include <iterator>
 #include <future>
+#include <sstream>
 #include <limits>
 #include <condition_variable>
 #include <map>
@@ -1460,6 +1461,39 @@ static pid_t find_attachment_sidecar(pid_t daemon_pid, const char *service_path)
     return -1;
 }
 
+static std::vector<pid_t> direct_children(pid_t parent)
+{
+    std::ifstream children("/proc/" + std::to_string(parent) + "/task/" +
+                           std::to_string(parent) + "/children");
+    std::vector<pid_t> result;
+    pid_t child = -1;
+    while (children >> child)
+        result.push_back(child);
+    return result;
+}
+
+static uint64_t process_start_time_ticks(pid_t process)
+{
+    std::ifstream stat("/proc/" + std::to_string(process) + "/stat");
+    std::string line;
+    if (!std::getline(stat, line)) return 0;
+    const size_t comm_end = line.rfind(')');
+    if (comm_end == std::string::npos || comm_end + 2 >= line.size()) return 0;
+    std::istringstream fields(line.substr(comm_end + 2));
+    std::string field;
+    for (unsigned number = 3; number <= 22; ++number) {
+        if (!(fields >> field)) return 0;
+        if (number == 22) {
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long ticks = std::strtoull(field.c_str(), &end, 10);
+            if (errno != 0 || end == field.c_str() || *end != '\0') return 0;
+            return static_cast<uint64_t>(ticks);
+        }
+    }
+    return 0;
+}
+
 static bool wait_attachment_log(const std::string &path, uintmax_t offset,
                                 const std::string &marker, int timeout_msec)
 {
@@ -1579,7 +1613,9 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
     uint32_t f_port, int source_fd, uint32_t profile_mask,
     P51SourceArmedFields *observed_armed = nullptr,
     std::atomic<bool> *observed_armed_ready = nullptr,
-    Clock::time_point *source_deadline_out = nullptr)
+    Clock::time_point *source_deadline_out = nullptr,
+    bool stop_after_arm = false,
+    P50SourceArmFields *observed_arm = nullptr)
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
@@ -1665,6 +1701,13 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
         *observed_armed = static_cast<const P51SourceArmedFields&>(*armed_message);
         if (observed_armed_ready != nullptr)
             observed_armed_ready->store(true, std::memory_order_release);
+    }
+    if (observed_arm != nullptr)
+        *observed_arm = source;
+    if (stop_after_arm) {
+        ::close(control_fd);
+        ::close(source_fd);
+        return failed;
     }
 
     const auto clock = sidecar::process_monotonic_clock_identity();
@@ -1803,7 +1846,8 @@ static icecc::p50::local::P50SourceTransferResult publish_input_to_armed_f(
 static int run_p51_vertical(const char *daemon_binary, const char *cache_service,
                             passwd *icecc, unsigned job_count,
                             uint32_t profile_mask,
-                            bool drop_lost_receipts = false)
+                            bool drop_lost_receipts = false,
+                            bool cancel_before_start = false)
 {
     struct EnvironmentRestore {
         std::optional<std::string> capture_stderr;
@@ -1821,7 +1865,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             restore("ICECC_P50_DEBUG_ATTACH", debug_attach);
         }
     } environment_restore;
-    if (drop_lost_receipts) {
+    if (drop_lost_receipts || cancel_before_start) {
         if (const char *previous = ::getenv("ICECC_TEST_CAPTURE_DAEMON_STDERR"))
             environment_restore.capture_stderr = previous;
         if (const char *previous = ::getenv("ICECC_P50_DEBUG_ATTACH"))
@@ -1872,7 +1916,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             captured_logs_ready &= ready;
         }
         REQUIRE(captured_logs_ready,
-                "D04 precreates daemon-owned log files for physical-link/publication evidence");
+                "daemon-owned logs capture source cancellation and lifecycle evidence");
         if (!captured_logs_ready) return 2;
     }
 
@@ -2016,6 +2060,220 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
     REQUIRE(all_assignments_ready,
             "all C and F assignments retain distinct authenticated wrapper channels");
     if (!all_assignments_ready) return 1;
+
+    if (cancel_before_start) {
+        REQUIRE(job_count == 1,
+                "focused prepublication-cancel cell owns one exact assignment");
+        auto& victim = jobs.front();
+        P50SourceArmFields arm{};
+        P51SourceArmedFields armed{};
+        const auto no_transfer = execute_p51_kind8(
+            *victim.wrapper, *victim.compiler, victim.wire_id, epoch,
+            victim.nonce, static_cast<uint32_t>(f_port), victim.source_fd,
+            profile_mask, &armed, nullptr, nullptr, true, &arm);
+        victim.source_fd = -1;
+        victim.armed = armed;
+        const P51SourceArmMsg arm_message{P51SourceArmFields{arm, 30}};
+        REQUIRE(arm_message.valid_payload() && armed.valid() &&
+                    armed.acknowledges(arm_message) &&
+                    no_transfer.code ==
+                        icecc::p50::local::SourceTransferResultCode::None,
+                "exact P51 reservation is armed but no source transfer is started");
+
+        const pid_t f_sidecar = find_attachment_sidecar(f_pid, cache_service);
+        const uint64_t f_sidecar_start_before =
+            process_start_time_ticks(f_sidecar);
+        const bool sidecar_stop_sent = f_sidecar > 1 &&
+            ::kill(f_sidecar, SIGSTOP) == 0;
+        REQUIRE(sidecar_stop_sent,
+                "only the test-owned F sidecar is paused at the prepublication barrier");
+        bool sidecar_stopped = false;
+        const auto stopped_deadline = Clock::now() + std::chrono::seconds(2);
+        while (f_sidecar > 1 && Clock::now() < stopped_deadline) {
+            std::ifstream status(std::string("/proc/") +
+                                std::to_string(f_sidecar) + "/status");
+            std::string line;
+            while (std::getline(status, line))
+                if (line.rfind("State:", 0) == 0 &&
+                    line.find('T') != std::string::npos)
+                    sidecar_stopped = true;
+            if (sidecar_stopped) break;
+            ::usleep(10000);
+        }
+        struct ResumeSidecar {
+            pid_t pid;
+            bool needed;
+            ~ResumeSidecar() {
+                if (needed && pid > 1) (void)::kill(pid, SIGCONT);
+            }
+        } resume_sidecar{f_sidecar, sidecar_stop_sent};
+        REQUIRE(sidecar_stopped,
+                "F sidecar is stopped before the exact CompileFile attach request");
+        if (!sidecar_stopped) {
+            if (sidecar_stop_sent) {
+                (void)::kill(f_sidecar, SIGCONT);
+                resume_sidecar.needed = false;
+            }
+            delete victim.wrapper;
+            victim.wrapper = nullptr;
+            delete victim.compiler;
+            victim.compiler = nullptr;
+            if (victim.source_fd >= 0) ::close(victim.source_fd);
+            return 2;
+        }
+
+        const std::string victim_input =
+            "d07-cancel-before-start-" + std::to_string(victim.wire_id) + ".ii";
+        const std::string victim_output =
+            "d07-cancel-before-start-" + std::to_string(victim.wire_id) + ".o";
+        CompileJob compile_job = attachment_compile_job(
+            victim.wire_id, epoch, victim.nonce, arm, nullptr);
+        compile_job.setInputFile(victim_input);
+        compile_job.setOutputFile(victim_output);
+        CompileInputIdentity input;
+        input.profile = profile_mask == CACHE_PROFILE_P29V1
+            ? CompileInputIdentity::P29V1Profile
+            : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+                ? CompileInputIdentity::ZstdRouteProfile
+                : CompileInputIdentity::ZstdTuProfile;
+        input.c_store_guid = arm.c_store_guid;
+        input.tu_seq = 0;
+        input.raw_bytes = victim.bytes.size();
+        input.raw_digest = icecc::digest128(victim.bytes).bytes;
+        input.attempt_id = victim.nonce;
+        input.request_id = arm.source_request_id;
+        compile_job.setCompileInputIdentity(input);
+        std::error_code attach_log_error;
+        const uintmax_t attach_log_offset = std::filesystem::file_size(
+            fdir + "/iceccd.log", attach_log_error);
+        const bool compile_sent = !attach_log_error && victim.compiler &&
+            victim.compiler->send_msg(CompileFileMsg(&compile_job));
+        REQUIRE(compile_sent,
+                "exact R2 CompileFile is submitted while its input is unpublished");
+        const std::string attach_begin = "P50_INPUT_ATTACH_BEGIN job=" +
+            std::to_string(victim.wire_id) + " epoch=" +
+            std::to_string(epoch) + " nonce=" +
+            std::to_string(victim.nonce) + " request=" +
+            std::to_string(arm.source_request_id);
+        const bool attach_waiting = compile_sent &&
+            wait_attachment_log(fdir + "/iceccd.log", attach_log_offset,
+                                attach_begin, 3000);
+        REQUIRE(attach_waiting,
+                "F entered WAITP50INPUT for the exact unpublished assignment");
+
+        const auto children_before_cancel = direct_children(f_pid);
+        const bool sidecar_is_only_child = children_before_cancel.size() == 1 &&
+            children_before_cancel.front() == f_sidecar;
+        REQUIRE(sidecar_is_only_child,
+                "no compiler child exists before the prepublication cancel");
+        delete victim.compiler;
+        victim.compiler = nullptr;
+        delete victim.wrapper;
+        victim.wrapper = nullptr;
+        (void)::kill(f_sidecar, SIGCONT);
+        resume_sidecar.needed = false;
+
+        const auto hex_id = [](const std::array<uint8_t, 16>& bytes) {
+            static constexpr char digits[] = "0123456789abcdef";
+            std::string value;
+            value.reserve(bytes.size() * 2);
+            for (const uint8_t byte : bytes) {
+                value.push_back(digits[byte >> 4]);
+                value.push_back(digits[byte & 0x0f]);
+            }
+            return value;
+        };
+        const std::string cancel_result =
+            "P51_SOURCE_CANCEL_RESULT job=" + std::to_string(victim.wire_id) +
+            " epoch=" + std::to_string(epoch) +
+            " nonce=" + std::to_string(victim.nonce) +
+            " request=" + std::to_string(arm.source_request_id) +
+            " reservation=" + hex_id(armed.reservation_id) + " cancelled=1";
+        const bool exact_cancel_accepted = wait_attachment_log(
+            fdir + "/iceccd.log", attach_log_offset, cancel_result, 5000);
+        REQUIRE(exact_cancel_accepted,
+                "daemon received accepted P51 cancellation for the exact armed request");
+        const std::string settled_unknown = "P50 input settlement job " +
+            std::to_string(victim.wire_id) + " action 1 status unknown-record";
+        const bool attempt_cancelled_before_publication = wait_attachment_log(
+            fdir + "/iceccd.log", attach_log_offset, settled_unknown, 5000);
+        REQUIRE(attempt_cancelled_before_publication,
+                "exact prepublication InputLifecycle CancelAttempt finds no committed input");
+
+        const auto no_start_deadline = Clock::now() + std::chrono::milliseconds(500);
+        bool no_victim_child = false;
+        while (Clock::now() < no_start_deadline) {
+            const auto children = direct_children(f_pid);
+            no_victim_child = children.size() == 1 &&
+                              children.front() == f_sidecar;
+            if (!no_victim_child) break;
+            ::usleep(10000);
+        }
+        const std::string f_suffix = read_file_suffix(
+            fdir + "/iceccd.log", attach_log_offset);
+        const std::string accepted_attach = "P50_INPUT_ATTACH_END job=" +
+            std::to_string(victim.wire_id) + " epoch=" +
+            std::to_string(epoch) + " nonce=" +
+            std::to_string(victim.nonce) + " request=" +
+            std::to_string(arm.source_request_id);
+        bool no_successful_attach = true;
+        for (size_t at = 0; (at = f_suffix.find(accepted_attach, at)) !=
+                             std::string::npos;) {
+            const size_t end = f_suffix.find('\n', at);
+            const std::string_view line(f_suffix.data() + at,
+                (end == std::string::npos ? f_suffix.size() : end) - at);
+            if (line.find(" status=0") != std::string_view::npos) {
+                no_successful_attach = false;
+                break;
+            }
+            ++at;
+        }
+        REQUIRE(no_victim_child &&
+                    f_suffix.find("final arguments:") == std::string::npos,
+                "prepublication cancellation starts no compiler process");
+        REQUIRE(no_successful_attach,
+                "prepublication cancellation did not publish an accepted attachment");
+        const uint64_t c_start_time = process_start_time_ticks(c_pid);
+        const uint64_t f_start_time = process_start_time_ticks(f_pid);
+        const uint64_t f_sidecar_start_time =
+            process_start_time_ticks(f_sidecar);
+        REQUIRE(c_start_time != 0 && f_start_time != 0 &&
+                    f_sidecar_start_before != 0 &&
+                    f_sidecar_start_time == f_sidecar_start_before,
+                "daemon and sidecar process start-time witnesses are retained");
+        for (pid_t pid : {c_pid, f_pid}) (void)::kill(pid, SIGTERM);
+        int c_status = 0, f_status = 0;
+        const bool c_reaped = wait_child(c_pid, 10000, &c_status);
+        const bool f_reaped = wait_child(f_pid, 10000, &f_status);
+        if (c_reaped) daemon_cleanup.c_pid = -1;
+        if (f_reaped) daemon_cleanup.f_pid = -1;
+        REQUIRE(c_reaped && WIFEXITED(c_status) && WEXITSTATUS(c_status) == 0,
+                "C daemon exits cleanly after the prepublication cancellation");
+        REQUIRE(f_reaped && WIFEXITED(f_status) && WEXITSTATUS(f_status) == 0,
+                "F daemon exits cleanly after the prepublication cancellation");
+        delete c_scheduler;
+        delete f_scheduler;
+        ::close(c_scheduler_listener);
+        ::close(f_scheduler_listener);
+        if (failures == 0) {
+            std::fprintf(stderr,
+                "P51_D07_PREPUBLICATION_CANCEL_PASS profile=%u job=%u epoch=%llu nonce=%llu request=%llu reservation=%s c_pid=%d c_start=%llu f_pid=%d f_start=%llu f_sidecar_pid=%d f_sidecar_start=%llu no_source_transfer=1 no_compiler_start=1\n",
+                profile_mask, victim.wire_id,
+                static_cast<unsigned long long>(epoch),
+                static_cast<unsigned long long>(victim.nonce),
+                static_cast<unsigned long long>(arm.source_request_id),
+                hex_id(armed.reservation_id).c_str(), c_pid,
+                static_cast<unsigned long long>(c_start_time), f_pid,
+                static_cast<unsigned long long>(f_start_time), f_sidecar,
+                static_cast<unsigned long long>(f_sidecar_start_time));
+            std::filesystem::remove_all(work);
+            return 0;
+        }
+        std::fprintf(stderr,
+            "retained prepublication-cancel work directory: %s\n", work.c_str());
+        return 1;
+    }
+
     const pid_t f_sidecar_before = drop_lost_receipts
         ? find_attachment_sidecar(f_pid, cache_service) : -1;
     REQUIRE(!drop_lost_receipts || f_sidecar_before > 1,
@@ -4556,6 +4814,8 @@ int main(int argc, char **argv)
         std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0;
     const bool p51_expired_arm_wire_case =
         ::getenv("ICECC_TEST_P51_EXPIRED_ARM_WIRE") != nullptr;
+    const bool p51_cancel_before_start =
+        ::getenv("ICECC_TEST_P51_CANCEL_BEFORE_START") != nullptr;
     const char *other_p51_modes[] = {
         "ICECC_TEST_P51_CANCEL_REPLACEMENT",
         "ICECC_TEST_P51_MULTILINK",
@@ -4574,8 +4834,14 @@ int main(int argc, char **argv)
     for (const char *name : other_p51_modes)
         conflicting_p51_mode = conflicting_p51_mode ||
             ::getenv(name) != nullptr;
+    if (receipt_gate_mode && p51_cancel_before_start) {
+        std::fprintf(stderr,
+            "FAIL: receipt gate cannot be combined with prepublication cancel mode\n");
+        return 2;
+    }
     if (p51_expired_arm_wire_case &&
-        (receipt_gate_mode || conflicting_p51_mode)) {
+        (receipt_gate_mode || conflicting_p51_mode ||
+         p51_cancel_before_start)) {
         std::fprintf(stderr,
             "FAIL: P51 expired-ARM wire gate cannot be combined with another mode\n");
         return 2;
@@ -4624,6 +4890,22 @@ int main(int argc, char **argv)
             static_cast<int>(endpoint_port), static_cast<uid_t>(sidecar_uid),
             static_cast<size_t>(expected), static_cast<uint64_t>(first), argv[6],
             receipt_gate_once);
+    }
+
+    if (p51_cancel_before_start) {
+        if (conflicting_p51_mode) {
+            std::fprintf(stderr,
+                "FAIL: select only one P51 positive-daemon test mode\n");
+            return 2;
+        }
+        const uint32_t profile_mask = selected_vertical_profile();
+        if (profile_mask == 0) {
+            std::fprintf(stderr,
+                "FAIL: ICECC_TEST_P51_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE\n");
+            return 2;
+        }
+        return run_p51_vertical(argv[1], argv[2], icecc, 1, profile_mask,
+                                false, true);
     }
 
     const bool restart_f_c1f2 =

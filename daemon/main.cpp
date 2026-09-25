@@ -10376,11 +10376,33 @@ bool Daemon::advance_p51_source_cancels(const std::vector<pollfd> &pollfds)
                     fail("cancel reply binding");
                     continue;
                 }
-                if (*observed.p51_reservation_cancel_result)
+                if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr) {
+                    static constexpr char hex_digits[] =
+                        "0123456789abcdef";
+                    std::string reservation_hex;
+                    reservation_hex.reserve(
+                        pending.request.armed.reservation_id.size() * 2);
+                    for (const uint8_t byte :
+                         pending.request.armed.reservation_id) {
+                        reservation_hex.push_back(hex_digits[byte >> 4]);
+                        reservation_hex.push_back(hex_digits[byte & 0x0f]);
+                    }
+                    const auto& source = pending.request.arm.source;
+                    trace() << "P51_SOURCE_CANCEL_RESULT job="
+                            << source.wire_job_id
+                            << " epoch=" << source.assignment_epoch
+                            << " nonce=" << source.assignment_nonce
+                            << " request=" << source.source_request_id
+                            << " reservation=" << reservation_hex
+                            << " cancelled="
+                            << (*observed.p51_reservation_cancel_result ? 1 : 0)
+                            << endl;
+                } else if (*observed.p51_reservation_cancel_result) {
                     trace() << "P51 exact source reservation cancelled" << endl;
-                else
+                } else {
                     trace() << "P51 source reservation was already settled"
                             << endl;
+                }
                 const local::Frame goodbye{
                     local::kProtocolVersion, local::MessageType::Goodbye,
                     identity, {}};

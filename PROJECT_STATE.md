@@ -12,6 +12,54 @@ retained artifact directories.
 
 ## Developer QA
 
+### R2 cancellation before input publication
+
+The opt-in positive-daemon fixture now tests one exact unpublished assignment
+for each of P29V1, ZSTD_TU and ZSTD_ROUTE. It arms an R2 reservation without
+transferring source, pauses its test-owned F sidecar before CompileFile,
+observes the exact WAITP50INPUT attachment request, closes the client peers,
+and resumes the sidecar. The bound cancellation reply must report accepted
+for the exact job/epoch/nonce/request/reservation. Input settlement reports
+unknown-record, no accepted attachment is observed, and both daemons exit
+cleanly. The F sidecar PID/start-time identity remains unchanged.
+
+This is a single-assignment prepublication check, not W30 occupancy or an
+active compiler cancellation/sibling-output gate. The fixture has no real
+compiler environment; its no-start evidence combines sampled child lists
+over 500 ms, absence of compiler-start logging and no accepted attachment.
+It does not claim continuous process tracing. Conflicting test modes are
+rejected rather than silently selecting another gate. The production change
+only adds identity-rich cancellation tracing under `ICECC_P50_DEBUG_ATTACH`.
+
+Qualification used a private `63be94b0` snapshot plus the two-file patch;
+the imported files are byte-identical. Source SHA256 values:
+`daemon/main.cpp`:
+`166c895ec93d5622eaf2bf729b732b4d5a57b4ff8ccc30885c9d54d2c1e3a216`;
+`unittests/p50daemonpositive.cpp`:
+`4875ec0c30f237375e41c514f47c0cb0f89fc0588b1cc236457aa7e02418d50d`.
+Test binary SHA256:
+`f76db034b12d3f88be989f5372b821cfdc87800aa8b1287d96245a9c2b32b43e`.
+All three focused runs exit zero. Logs are retained under
+`/tanksmall/scratch/tmp/p51-d07-compile.YLS0NG/`:
+
+| Log | SHA256 |
+|---|---|
+| `cancel-before-start-r5-P29V1.log` | `04717362adc2ebd59ffb96f45ba6436d7cf86b14aba4deea91092b1ead8f2e35` |
+| `cancel-before-start-r5-ZSTD_TU.log` | `e3fa66769de1106e4bea15d928cb717fee90869625277e161552441fc8a080bc` |
+| `cancel-before-start-r5-ZSTD_ROUTE.log` | `35961f97fd8a436d7d015aa166889059767ef0981e9cf91ec406f386a2314c38` |
+
+The SDK image was
+`sha256:19ef868afec561456949471bd951f7d75aa689eb10af11579eba7f1a966dacb4`,
+limited to two CPUs and 8 GiB with NET_ADMIN. In an isolated root SDK
+container with its standard `icecc` service account,
+select `ICECC_TEST_POSITIVE_DAEMON=1`, `ICECC_P51_MODE=on`,
+`ICECC_P50_DEBUG_ATTACH=1`,
+`ICECC_TEST_P51_CANCEL_BEFORE_START=1` and
+`ICECC_TEST_P51_PROFILE=P29V1` (or either ZSTD profile), then invoke the built
+`unittests/p50daemonpositive` with the built `daemon/iceccd` and
+`cache/icecc-cache-service` paths. Supply the scratch environment used by the
+normal positive-daemon harness. This focused qualification is not full-tip QA.
+
 ### Full-QA failures and focused corrections
 
 Canonical QA on frozen `f0049371` is terminal with overall FAIL: 176 native tests,
