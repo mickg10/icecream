@@ -665,6 +665,11 @@ C control incarnation, profile, window and limits.
 F may emit this record only in reply to a decoded, structurally valid LINK_HELLO:
 StoreReplaced means the offered F store identity differs from the current one;
 ReservationMissing means the current store cannot find the exact offered lease.
+The lookup must distinguish definite absence from stale physical generation,
+control-incarnation mismatch, or other invalid-offer checks: the existing
+optional lease lookup returns no value for all of these and is not by itself
+evidence for ReservationMissing. Ambiguous lookup failure retains bounded EOF
+handling until a precise reason is available.
 Malformed input does not receive an invented identity-bound rejection. C accepts
 the rejection only when the reason and digest match the outstanding offer. It
 retires that old relationship only, wakes its waiters, and reports a non-success
@@ -672,6 +677,18 @@ outcome for unfinished work. It must preserve any already validated exact COMMIT
 and must not replace the entire C sidecar or disturb a healthy sibling link.
 Fresh assignments to a new F identity remain admissible. No rejection grants
 publication, compilation or receipt credit. R1 framing and behavior are unchanged.
+
+Store replacement and logical-link retirement are different operations.
+ReservationMissing must not retire the entire F store identity: a fresh
+assignment may target that same store. Match the rejected relationship, epoch
+and physical generation before changing its owner. Old same-key preparation
+must be quiescent and cleaned before a replacement uses that preparation key;
+late cleanup must never erase the replacement's state. A fresh ARM is not
+proof of a fresh logical relationship, since F may reuse its existing row.
+For a genuinely new F identity, fenced old work may drain in a bounded retired
+table while the new route is admitted. Retired state continues to count against
+resource limits until cleanup; temporary drain pressure must not disable all
+of C's unrelated routes or extend the original request deadline.
 
 Older R2 peers and transport EOF remain distinguishable only by bounded retry,
 not by an assumed store replacement. Retry pacing is relationship-wide: failed
