@@ -14,14 +14,21 @@ retained artifact directories.
 
 ### Pipeline formal entry point
 
-`make protocol50-pipeline-formal` passes with explicit `ICEFARM_TMPDIR`,
-pinned `TLA2TOOLS_JAR` and fresh absolute `TLC_STATE_ROOT`. The combined run
-has 19 existing recovery/accounting rows and 15 focused lifecycle rows:
-six safety checks, six replacement-use reachability witnesses and three
-negative controls. The latter exercise lost RESET confirmation and exact
-reset-result replay, same-F logical replacement/use, and separate F-store
-replacement. RESET advances the modeled relationship epoch; a same-F
-replacement must be newer still without changing the store generation.
+The previously qualified `make protocol50-pipeline-formal` aggregate used
+explicit `ICEFARM_TMPDIR`, pinned `TLA2TOOLS_JAR` and fresh absolute
+`TLC_STATE_ROOT`. That historical combined run had 19 recovery/accounting
+rows and 15 focused lifecycle rows (six safety checks, six replacement-use
+reachability witnesses, and three negative controls). It predates the
+RESET_CONFIRM echo refinement below and must not be read as testing that
+refinement.
+
+The updated focused replacement-model runner passes separately: six safety
+rows, six replacement-use reachability witnesses, two distinct recovery
+witnesses (confirm not applied vs. confirm applied with its echo lost), and
+four expected mutant counterexamples. The model distinguishes C's confirm
+write, F's confirm application, and C's observation of the exact echo; the
+reset operation identity remains retained until echo observation. This is a
+focused rerun only, not a new combined aggregate run.
 
 The lifecycle topology rows vary abstract sibling-progress tokens, not full
 concurrent pipelines. These finite checks do not prove liveness, codec/parser
@@ -32,6 +39,14 @@ SHA256 `9f08fcaa7aca1f980c592945149f2a2e33f5a13c73b9f96c2a900f25759fd2da`,
 terminal `PIPELINE_FORMAL_EXIT=0`. Lifecycle model SHA256:
 `c27fddb9dce60971401a7711e22c98b6f21540d157d03ce14b3f9e19c089c27f`.
 The log records exact module/config hashes and each intended counterexample.
+Focused RESET_CONFIRM model evidence: `/tanksmall/scratch/tmp/pipeline-replacement-echo-final.TCbL9u/runner.log`,
+SHA256 `60f0fe087b568863d79a62795b120b2548b1c0f11b589db24054663f427645c2`,
+terminal `RUNNER_EXIT=0`, runner summary
+`PIPELINE-REPLACEMENT-TLC PASS safety=6 witness=6 reset_confirm_witness=2 mutants=4`.
+Pinned jar SHA256 is
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`; focused
+module SHA256 is
+`411207b2620a3ccfb7e4ddf7c560cc9c78a5ad511f836a83f06d33e428775a95`.
 
 ### Opt-in R2 mixed Docker gate
 

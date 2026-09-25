@@ -144,20 +144,26 @@ lifecycle model with abstract sibling-progress tokens rather than a full
 multi-link concurrency model or an enlargement of the W2 transfer state
 space. The six topology rows vary the peer set and demonstrate sibling
 reachability; the existing `Protocol50PipelineRecovery.tla` remains the
-multi-relationship concurrency/recovery model. The auxiliary model captures the lost-confirm
-sequence explicitly: F applies RESET and returns a result, C's first confirm
-is lost, a new physical connection replays the same reset operation, F returns
-the cached result without advancing history again, and the second confirm is
-processed. It then retires the old logical relationship on the same F store,
-creates and uses a strictly new logical identity, and rejects an offer for the
-old identity. An F-store restart is modeled as a distinct transition that
-advances the store generation before a replacement can be used; same-F
-relationship retirement must leave that generation unchanged. Other links in
-the configured topology have explicit progress steps. Six safety rows and six
-separate finite reachability-witness rows cover C2F1/C3F1/C4F1 and
-C1F2/C1F3/C1F4. Three mutants must violate the exact reset-result, stale-offer,
-or same-F/store-generation invariant. Run `run_pipeline_replacement_tlc.sh`
-with the pinned TLC jar and a fresh `TLC_STATE_ROOT`.
+multi-relationship concurrency/recovery model. The auxiliary model separates
+three RESET_CONFIRM events: C writes a confirm, F applies it, and C observes
+the exact confirm echo. C retains the reset operation identity until that
+echo is observed. It has two separate reachability witnesses: confirm not
+applied before disconnect, and confirm applied but its echo lost. Both
+reconnect paths replay the same reset operation/result without advancing
+history twice, then confirm. It then retires the old logical relationship on
+the same F store, creates and uses a strictly new logical identity, and
+rejects an offer for the old identity. An F-store restart is modeled as a
+distinct transition that advances the store generation before a replacement
+can be used; same-F relationship retirement must leave that generation
+unchanged. Other links in the configured topology have explicit progress
+steps. Six safety rows and six separate finite replacement-use reachability
+witness rows cover C2F1/C3F1/C4F1 and C1F2/C1F3/C1F4. Two additional witness
+rows establish the separate confirm-not-applied and applied-confirm/lost-echo
+paths. Four mutants must violate the exact reset-result, stale-offer,
+same-F/store-generation, or early-confirm-identity-clear invariant. Run
+`run_pipeline_replacement_tlc.sh` with the pinned TLC jar and a fresh
+`TLC_STATE_ROOT`; its focused result does not itself rerun the recovery /
+accounting lane or combined formal aggregate.
 
 These are bounded state-space checks and finite reachability traces, not a
 fairness-based liveness proof. The sibling links are abstract unaffected

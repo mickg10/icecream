@@ -58,6 +58,16 @@ run_row() {
             printf 'REACHABILITY-WITNESS %s exit=%s log=%s\n' "$row" "$rc" "$log"
             return
         fi
+    elif case "$expected" in witness:*) true ;; *) false ;; esac; then
+        invariant=${expected#witness:}
+        diagnostic="Error: Invariant $invariant is violated."
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] && \
+           grep -Fqx "$diagnostic" "$log" && \
+           grep -Fq "$invariant" "$log"; then
+            printf 'REACHABILITY-WITNESS %s invariant=%s exit=%s log=%s\n' \
+                "$row" "$invariant" "$rc" "$log"
+            return
+        fi
     else
         diagnostic="Error: Invariant $expected is violated."
         if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] && \
@@ -81,8 +91,16 @@ for topology in C2F1 C3F1 C4F1 C1F2 C1F3 C1F4; do
     run_row "witness-$topology" "Protocol50Replacement$topology"Witness.cfg witness
 done
 
+run_row confirm-not-applied-recovery \
+    Protocol50ReplacementConfirmNotAppliedWitness.cfg \
+    witness:ConfirmNotAppliedRecoveryWitnessNotReached
+run_row applied-confirm-lost-echo-recovery \
+    Protocol50ReplacementAppliedConfirmEchoLostWitness.cfg \
+    witness:AppliedConfirmLostEchoRecoveryWitnessNotReached
+
 run_row mutant-reset-replay Protocol50ReplacementResetReplayMutant.cfg ResetReplayResultExact
 run_row mutant-old-relationship Protocol50ReplacementOldOfferMutant.cfg OldRelationshipOfferRejected
 run_row mutant-same-f-store-generation Protocol50ReplacementStoreGuidMutant.cfg SameFReplacementPreservesStore
+run_row mutant-early-confirm-forget Protocol50ReplacementEarlyConfirmForgetMutant.cfg NoDifferentResetAttemptWhileUnconfirmed
 
-printf 'PIPELINE-REPLACEMENT-TLC PASS safety=6 witness=6 mutants=3\n'
+printf 'PIPELINE-REPLACEMENT-TLC PASS safety=6 witness=6 reset_confirm_witness=2 mutants=4\n'

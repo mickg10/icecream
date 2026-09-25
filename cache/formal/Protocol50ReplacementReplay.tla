@@ -17,7 +17,7 @@ These are finite reachability/safety checks, not fairness-based liveness.
 
 CONSTANTS CStores, FStores, TargetC, TargetF,
           MutantResetReplay, MutantReuseOldRelationship,
-          MutantSameFChangesStore
+          MutantSameFChangesStore, MutantClearConfirmOnWrite
 
 ASSUME /\ CStores # {}
        /\ FStores # {}
@@ -26,14 +26,16 @@ ASSUME /\ CStores # {}
        /\ MutantResetReplay \in BOOLEAN
        /\ MutantReuseOldRelationship \in BOOLEAN
        /\ MutantSameFChangesStore \in BOOLEAN
+       /\ MutantClearConfirmOnWrite \in BOOLEAN
 
 Links == CStores \X FStores
 TargetLink == <<TargetC, TargetF>>
 SiblingLinks == Links \ {TargetLink}
 
 ResetPhases == {"Idle", "Requested", "Applied", "AckObserved",
-                "ConfirmInFlight", "ConfirmLost", "ReplayPending",
-                "ReplayReply", "ReplayAckObserved", "Confirmed"}
+                "ConfirmInFlight", "ConfirmEchoPending", "ConfirmLost", "ReplayPending",
+                "ConfirmEchoPendingDuplicate", "ReplayReply", "ReplayAckObserved",
+                "ReplayRejected", "Confirmed", "ConfirmedDuplicate"}
 RelationPhases == {"Live", "Retired", "ReplacementLive",
                    "FRestarted", "RestartReplacementLive"}
 ReplacementKinds == {"None", "SameF", "FRestart"}
@@ -41,7 +43,8 @@ ReplacementKinds == {"None", "SameF", "FRestart"}
 VARIABLES resetPhase, resetOp, historyEpoch, resetHistorySnapshot,
           resetRelEpochSnapshot, resetStoreGenerationSnapshot,
           replayedReset, replayHistory, replayRelEpoch, replayStoreGeneration,
-          confirmAttempts, confirmDelivered, relationPhase, logicalId,
+          confirmAttempts, confirmDelivered, confirmEchoObserved,
+          resetIdentityRetained, relationPhase, logicalId,
           relationshipEpoch, fStoreGeneration, retiredLogicalId,
           retiredStoreGeneration, replacementKind,
           replacementStoreGeneration, staleOldOfferAccepted,
@@ -52,7 +55,8 @@ VARIABLES resetPhase, resetOp, historyEpoch, resetHistorySnapshot,
 vars == <<resetPhase, resetOp, historyEpoch, resetHistorySnapshot,
           resetRelEpochSnapshot, resetStoreGenerationSnapshot,
           replayedReset, replayHistory, replayRelEpoch, replayStoreGeneration,
-          confirmAttempts, confirmDelivered, relationPhase, logicalId,
+          confirmAttempts, confirmDelivered, confirmEchoObserved,
+          resetIdentityRetained, relationPhase, logicalId,
           relationshipEpoch, fStoreGeneration, retiredLogicalId,
           retiredStoreGeneration, replacementKind,
           replacementStoreGeneration, staleOldOfferAccepted,
@@ -73,6 +77,8 @@ Init ==
     /\ replayStoreGeneration = 0
     /\ confirmAttempts = 0
     /\ confirmDelivered = FALSE
+    /\ confirmEchoObserved = FALSE
+    /\ resetIdentityRetained = FALSE
     /\ relationPhase = "Live"
     /\ logicalId = 0
     /\ relationshipEpoch = 0
@@ -94,10 +100,12 @@ RequestReset ==
     /\ resetPhase = "Idle"
     /\ resetPhase' = "Requested"
     /\ resetOp' = 1
+    /\ resetIdentityRetained' = TRUE
     /\ UNCHANGED <<historyEpoch, resetHistorySnapshot,
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -117,6 +125,7 @@ ApplyReset ==
     /\ resetStoreGenerationSnapshot' = fStoreGeneration
     /\ UNCHANGED <<resetOp, replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     relationPhase, logicalId,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -132,6 +141,7 @@ ObserveResetAck ==
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -145,10 +155,12 @@ SendResetConfirm ==
     /\ confirmAttempts < 2
     /\ resetPhase' = "ConfirmInFlight"
     /\ confirmAttempts' = confirmAttempts + 1
+    /\ resetIdentityRetained' = IF MutantClearConfirmOnWrite
+                                    THEN FALSE ELSE resetIdentityRetained
     /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
-                    replayStoreGeneration, confirmDelivered,
+                    replayStoreGeneration, confirmDelivered, confirmEchoObserved,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -165,6 +177,7 @@ LoseResetConfirm ==
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -176,10 +189,12 @@ LoseResetConfirm ==
 ReconnectAfterLostConfirm ==
     /\ resetPhase = "ConfirmLost"
     /\ resetPhase' = "ReplayPending"
-    /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
+    /\ resetOp' = IF resetIdentityRetained THEN resetOp ELSE 2
+    /\ UNCHANGED <<historyEpoch, resetHistorySnapshot,
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -201,7 +216,26 @@ ReplayPriorReset ==
     /\ replayStoreGeneration' = fStoreGeneration
     /\ UNCHANGED <<resetOp, resetHistorySnapshot,
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
-                    confirmAttempts, confirmDelivered,
+                    confirmAttempts, confirmDelivered, confirmEchoObserved,
+                    resetIdentityRetained,
+                    relationPhase, logicalId, relationshipEpoch,
+                    fStoreGeneration, retiredLogicalId,
+                    retiredStoreGeneration, replacementKind,
+                    replacementStoreGeneration, staleOldOfferAccepted,
+                    staleOldOfferRejected, replacementUsed,
+                    committedLogicalId, committedRelationshipEpoch,
+                    committedStoreGeneration, siblingProgress>>
+
+RejectDifferentResetReplay ==
+    /\ resetPhase = "ReplayPending"
+    /\ resetOp = 2
+    /\ ~confirmDelivered
+    /\ resetPhase' = "ReplayRejected"
+    /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
+                    resetRelEpochSnapshot, resetStoreGenerationSnapshot,
+                    replayedReset, replayHistory, replayRelEpoch,
+                    replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -217,6 +251,7 @@ ObserveReplayAck ==
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -228,12 +263,65 @@ ObserveReplayAck ==
 ProcessResetConfirm ==
     /\ resetPhase = "ConfirmInFlight"
     /\ ~confirmDelivered
-    /\ resetPhase' = "Confirmed"
+    /\ resetPhase' = "ConfirmEchoPending"
     /\ confirmDelivered' = TRUE
     /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
-                    replayStoreGeneration, confirmAttempts,
+                    replayStoreGeneration, confirmAttempts, confirmEchoObserved,
+                    resetIdentityRetained,
+                    relationPhase, logicalId, relationshipEpoch,
+                    fStoreGeneration, retiredLogicalId,
+                    retiredStoreGeneration, replacementKind,
+                    replacementStoreGeneration, staleOldOfferAccepted,
+                    staleOldOfferRejected, replacementUsed,
+                    committedLogicalId, committedRelationshipEpoch,
+                    committedStoreGeneration, siblingProgress>>
+
+ProcessDuplicateResetConfirm ==
+    /\ resetPhase = "ConfirmInFlight"
+    /\ confirmDelivered
+    /\ resetPhase' = "ConfirmEchoPendingDuplicate"
+    /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
+                    resetRelEpochSnapshot, resetStoreGenerationSnapshot,
+                    replayedReset, replayHistory, replayRelEpoch,
+                    replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
+                    relationPhase, logicalId, relationshipEpoch,
+                    fStoreGeneration, retiredLogicalId,
+                    retiredStoreGeneration, replacementKind,
+                    replacementStoreGeneration, staleOldOfferAccepted,
+                    staleOldOfferRejected, replacementUsed,
+                    committedLogicalId, committedRelationshipEpoch,
+                    committedStoreGeneration, siblingProgress>>
+
+LoseResetConfirmEcho ==
+    /\ resetPhase \in {"ConfirmEchoPending", "ConfirmEchoPendingDuplicate"}
+    /\ resetPhase' = "ConfirmLost"
+    /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
+                    resetRelEpochSnapshot, resetStoreGenerationSnapshot,
+                    replayedReset, replayHistory, replayRelEpoch,
+                    replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
+                    relationPhase, logicalId, relationshipEpoch,
+                    fStoreGeneration, retiredLogicalId,
+                    retiredStoreGeneration, replacementKind,
+                    replacementStoreGeneration, staleOldOfferAccepted,
+                    staleOldOfferRejected, replacementUsed,
+                    committedLogicalId, committedRelationshipEpoch,
+                    committedStoreGeneration, siblingProgress>>
+
+ObserveResetConfirmEcho ==
+    /\ resetPhase \in {"ConfirmEchoPending", "ConfirmEchoPendingDuplicate"}
+    /\ confirmDelivered
+    /\ resetPhase' = IF resetPhase = "ConfirmEchoPending"
+                          THEN "Confirmed" ELSE "ConfirmedDuplicate"
+    /\ confirmEchoObserved' = TRUE
+    /\ resetIdentityRetained' = FALSE
+    /\ UNCHANGED <<resetOp, historyEpoch, resetHistorySnapshot,
+                    resetRelEpochSnapshot, resetStoreGenerationSnapshot,
+                    replayedReset, replayHistory, replayRelEpoch,
+                    replayStoreGeneration, confirmAttempts, confirmDelivered,
                     relationPhase, logicalId, relationshipEpoch,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, replacementKind,
@@ -244,7 +332,7 @@ ProcessResetConfirm ==
 
 RetireSameFRelationship ==
     /\ relationPhase = "Live"
-    /\ resetPhase = "Confirmed"
+    /\ resetPhase \in {"Confirmed", "ConfirmedDuplicate"}
     /\ logicalId = 0
     /\ relationshipEpoch < 2
     /\ relationPhase' = "Retired"
@@ -254,7 +342,8 @@ RetireSameFRelationship ==
                     resetHistorySnapshot, resetRelEpochSnapshot,
                     resetStoreGenerationSnapshot, replayedReset,
                     replayHistory, replayRelEpoch, replayStoreGeneration,
-                    confirmAttempts, confirmDelivered, logicalId,
+                    confirmAttempts, confirmDelivered, confirmEchoObserved,
+                    resetIdentityRetained, logicalId,
                     relationshipEpoch,
                     fStoreGeneration, replacementKind,
                     replacementStoreGeneration, staleOldOfferAccepted,
@@ -282,6 +371,7 @@ CreateSameFReplacement ==
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     retiredLogicalId, retiredStoreGeneration,
                     staleOldOfferAccepted, staleOldOfferRejected,
                     replacementUsed, committedLogicalId,
@@ -302,7 +392,8 @@ TryOldRelationshipOffer ==
                     resetHistorySnapshot, resetRelEpochSnapshot,
                     resetStoreGenerationSnapshot, replayedReset,
                     replayHistory, replayRelEpoch, replayStoreGeneration,
-                    confirmAttempts, confirmDelivered, relationPhase,
+                    confirmAttempts, confirmDelivered, confirmEchoObserved,
+                    resetIdentityRetained, relationPhase,
                     logicalId, relationshipEpoch, fStoreGeneration,
                     retiredLogicalId, retiredStoreGeneration,
                     replacementKind, replacementStoreGeneration,
@@ -313,7 +404,7 @@ TryOldRelationshipOffer ==
 RestartFStore ==
     /\ relationPhase = "Live"
     /\ fStoreGeneration = 0
-    /\ resetPhase \in {"Idle", "Confirmed"}
+    /\ resetPhase \in {"Idle", "Confirmed", "ConfirmedDuplicate"}
     /\ relationPhase' = "FRestarted"
     /\ retiredLogicalId' = logicalId
     /\ retiredStoreGeneration' = fStoreGeneration
@@ -322,7 +413,8 @@ RestartFStore ==
                     resetHistorySnapshot, resetRelEpochSnapshot,
                     resetStoreGenerationSnapshot, replayedReset,
                     replayHistory, replayRelEpoch, replayStoreGeneration,
-                    confirmAttempts, confirmDelivered, logicalId,
+                    confirmAttempts, confirmDelivered, confirmEchoObserved,
+                    resetIdentityRetained, logicalId,
                     relationshipEpoch, replacementKind,
                     replacementStoreGeneration, staleOldOfferAccepted,
                     staleOldOfferRejected, replacementUsed,
@@ -342,6 +434,7 @@ CreateAfterFRestart ==
                     resetRelEpochSnapshot, resetStoreGenerationSnapshot,
                     replayedReset, replayHistory, replayRelEpoch,
                     replayStoreGeneration, confirmAttempts, confirmDelivered,
+                    confirmEchoObserved, resetIdentityRetained,
                     fStoreGeneration, retiredLogicalId,
                     retiredStoreGeneration, staleOldOfferAccepted,
                     staleOldOfferRejected, replacementUsed,
@@ -359,7 +452,8 @@ UseReplacement ==
                     resetHistorySnapshot, resetRelEpochSnapshot,
                     resetStoreGenerationSnapshot, replayedReset,
                     replayHistory, replayRelEpoch, replayStoreGeneration,
-                    confirmAttempts, confirmDelivered, relationPhase,
+                    confirmAttempts, confirmDelivered, confirmEchoObserved,
+                    resetIdentityRetained, relationPhase,
                     logicalId, relationshipEpoch, fStoreGeneration,
                     retiredLogicalId, retiredStoreGeneration,
                     replacementKind, replacementStoreGeneration,
@@ -374,7 +468,8 @@ ProgressSibling(r) ==
                     resetHistorySnapshot, resetRelEpochSnapshot,
                     resetStoreGenerationSnapshot, replayedReset,
                     replayHistory, replayRelEpoch, replayStoreGeneration,
-                    confirmAttempts, confirmDelivered, relationPhase,
+                    confirmAttempts, confirmDelivered, confirmEchoObserved,
+                    resetIdentityRetained, relationPhase,
                     logicalId, relationshipEpoch, fStoreGeneration,
                     retiredLogicalId, retiredStoreGeneration,
                     replacementKind, replacementStoreGeneration,
@@ -388,10 +483,14 @@ Next ==
     \/ ObserveResetAck
     \/ SendResetConfirm
     \/ LoseResetConfirm
+    \/ LoseResetConfirmEcho
     \/ ReconnectAfterLostConfirm
     \/ ReplayPriorReset
+    \/ RejectDifferentResetReplay
     \/ ObserveReplayAck
     \/ ProcessResetConfirm
+    \/ ProcessDuplicateResetConfirm
+    \/ ObserveResetConfirmEcho
     \/ RetireSameFRelationship
     \/ CreateSameFReplacement
     \/ TryOldRelationshipOffer
@@ -405,7 +504,7 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ resetPhase \in ResetPhases
-    /\ resetOp \in 0..1
+    /\ resetOp \in 0..2
     /\ historyEpoch \in 0..2
     /\ resetHistorySnapshot \in 0..2
     /\ resetRelEpochSnapshot \in 0..2
@@ -416,6 +515,8 @@ TypeOK ==
     /\ replayStoreGeneration \in 0..1
     /\ confirmAttempts \in 0..2
     /\ confirmDelivered \in BOOLEAN
+    /\ confirmEchoObserved \in BOOLEAN
+    /\ resetIdentityRetained \in BOOLEAN
     /\ relationPhase \in RelationPhases
     /\ logicalId \in 0..2
     /\ relationshipEpoch \in 0..2
@@ -437,6 +538,12 @@ ResetReplayResultExact ==
         /\ replayHistory = resetHistorySnapshot
         /\ replayRelEpoch = resetRelEpochSnapshot
         /\ replayStoreGeneration = resetStoreGenerationSnapshot
+
+ResetIdentityRetainedUntilEcho ==
+    confirmAttempts > 0 /\ ~confirmEchoObserved => resetIdentityRetained
+
+NoDifferentResetAttemptWhileUnconfirmed ==
+    ~(resetPhase = "ReplayPending" /\ resetOp # 1 /\ ~confirmDelivered)
 
 SameFReplacementPreservesStore ==
     replacementKind = "SameF" =>
@@ -463,11 +570,32 @@ ReplacementUseWitness ==
     /\ replayedReset
     /\ confirmAttempts = 2
     /\ confirmDelivered
+    /\ confirmEchoObserved
     /\ replacementKind = "SameF"
     /\ replacementUsed
     /\ staleOldOfferRejected
     /\ siblingProgress = SiblingLinks
 
 ReplacementUseWitnessNotReached == ~ReplacementUseWitness
+
+ConfirmNotAppliedRecoveryWitness ==
+    /\ replayedReset
+    /\ confirmAttempts = 2
+    /\ confirmDelivered
+    /\ confirmEchoObserved
+    /\ resetPhase = "Confirmed"
+
+ConfirmNotAppliedRecoveryWitnessNotReached ==
+    ~ConfirmNotAppliedRecoveryWitness
+
+AppliedConfirmLostEchoRecoveryWitness ==
+    /\ replayedReset
+    /\ confirmAttempts = 2
+    /\ confirmDelivered
+    /\ confirmEchoObserved
+    /\ resetPhase = "ConfirmedDuplicate"
+
+AppliedConfirmLostEchoRecoveryWitnessNotReached ==
+    ~AppliedConfirmLostEchoRecoveryWitness
 
 =============================================================================
