@@ -83,6 +83,32 @@ The fixture uses the existing three-second test reconnect setting, not the
 production reconnect cadence. It retains evidence and uses orderly timeout
 cleanup; an interrupted case is a failure, never a passing skip.
 
+The opt-in lost-receipt gate validates already-published R2 commits after the
+receipt connection is discarded, for 1, 2, and 30 jobs in each profile:
+
+```sh
+set -eu
+for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
+  for count in 1 2 30; do
+    ICECC_TEST_POSITIVE_DAEMON=1 ICECC_P51_MODE=on \
+      ICECC_TEST_P51_PROFILE="$profile" \
+      ICECC_TEST_P51_LOST_RECEIPTS="$count" \
+      TMPDIR="$ICEFARM_TMPDIR" \
+      "$BUILD/unittests/p50daemonpositive" \
+      "$BUILD/daemon/iceccd" "$BUILD/cache/icecc-cache-service"
+  done
+done
+```
+
+Run this only as root inside a disposable Docker/Podman container on a private
+bridge, with `NET_ADMIN`, `iptables`, an `icecc` account, and writable
+scratch-backed `ICEFARM_TMPDIR`; never use host networking. Every row requires
+the same F sidecar process to remain live across at least two physical cache
+links and checks one exact retained-input attachment per recovered result.
+It covers receipts lost after full commit publication, not an uncommitted
+suffix, and verifies attachment rather than real compiler execution. Keep the
+build and scratch paths short enough for Unix-domain socket limits.
+
 ### Repository and offline inputs
 
 Set `image_repository` to a prepared SDK repository, or override it with

@@ -45,6 +45,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -1771,8 +1772,35 @@ static icecc::p50::local::P50SourceTransferResult publish_input_to_armed_f(
 
 static int run_p51_vertical(const char *daemon_binary, const char *cache_service,
                             passwd *icecc, unsigned job_count,
-                            uint32_t profile_mask)
+                            uint32_t profile_mask,
+                            bool drop_lost_receipts = false)
 {
+    struct EnvironmentRestore {
+        std::optional<std::string> capture_stderr;
+        std::optional<std::string> debug_attach;
+        bool active = false;
+        ~EnvironmentRestore()
+        {
+            if (!active) return;
+            const auto restore = [](const char *name,
+                                    const std::optional<std::string>& previous) {
+                if (previous) (void)::setenv(name, previous->c_str(), 1);
+                else (void)::unsetenv(name);
+            };
+            restore("ICECC_TEST_CAPTURE_DAEMON_STDERR", capture_stderr);
+            restore("ICECC_P50_DEBUG_ATTACH", debug_attach);
+        }
+    } environment_restore;
+    if (drop_lost_receipts) {
+        if (const char *previous = ::getenv("ICECC_TEST_CAPTURE_DAEMON_STDERR"))
+            environment_restore.capture_stderr = previous;
+        if (const char *previous = ::getenv("ICECC_P50_DEBUG_ATTACH"))
+            environment_restore.debug_attach = previous;
+        environment_restore.active = true;
+        if (::setenv("ICECC_TEST_CAPTURE_DAEMON_STDERR", "1", 1) != 0 ||
+            ::setenv("ICECC_P50_DEBUG_ATTACH", "1", 1) != 0)
+            return 2;
+    }
     ::signal(SIGPIPE, SIG_IGN);
     const char *temporary_root = ::getenv("TMPDIR");
     const std::string prefix = temporary_root && *temporary_root
@@ -1801,6 +1829,22 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
                 ::chmod(work.c_str(), 0700) == 0 && prepare_role(cdir) && prepare_role(fdir),
             "distinct C and F daemons have exact private runtime ownership");
     if (failures) return 2;
+    if (drop_lost_receipts) {
+        bool captured_logs_ready = true;
+        for (const std::string& directory : {cdir, fdir}) {
+            const std::string path = directory + "/iceccd.log";
+            const int log_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND,
+                                      0600);
+            const bool ready = log_fd >= 0 &&
+                ::fchown(log_fd, icecc->pw_uid, icecc->pw_gid) == 0 &&
+                ::fchmod(log_fd, 0600) == 0;
+            if (log_fd >= 0) ::close(log_fd);
+            captured_logs_ready &= ready;
+        }
+        REQUIRE(captured_logs_ready,
+                "D04 precreates daemon-owned log files for physical-link/publication evidence");
+        if (!captured_logs_ready) return 2;
+    }
 
     int c_scheduler_port = 0, f_scheduler_port = 0;
     const int c_scheduler_listener = listen_ephemeral(&c_scheduler_port);
@@ -1869,6 +1913,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         std::string bytes;
         int source_fd = -1;
         icecc::p50::local::P50SourceTransferResult result{};
+        P51SourceArmedFields armed{};
         std::atomic<bool> finished{false};
         bool assigned = false;
         bool source_ready = false;
@@ -1941,8 +1986,21 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
     REQUIRE(all_assignments_ready,
             "all C and F assignments retain distinct authenticated wrapper channels");
     if (!all_assignments_ready) return 1;
+    const pid_t f_sidecar_before = drop_lost_receipts
+        ? find_attachment_sidecar(f_pid, cache_service) : -1;
+    REQUIRE(!drop_lost_receipts || f_sidecar_before > 1,
+            "D04 records the live F sidecar incarnation before dropping receipts");
+    uintmax_t f_protocol_log_offset = 0;
+    if (drop_lost_receipts) {
+        std::error_code log_error;
+        f_protocol_log_offset = std::filesystem::file_size(
+            fdir + "/iceccd.log", log_error);
+        REQUIRE(!log_error,
+                "D04 captures the F log boundary before the first R2 link");
+        if (log_error) return 2;
+    }
     std::unique_ptr<P51CommitReceiptGate> receipt_gate;
-    if (job_count > 1) {
+    if (job_count > 1 || drop_lost_receipts) {
         receipt_gate = std::make_unique<P51CommitReceiptGate>(
             f_port, icecc->pw_uid, job_count);
         REQUIRE(receipt_gate->ready(),
@@ -1978,7 +2036,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             current.result = execute_p51_kind8(
                 *current.wrapper, *current.compiler, current.wire_id,
                 epoch, current.nonce, static_cast<uint32_t>(f_port), current.source_fd,
-                profile_mask);
+                profile_mask, drop_lost_receipts ? &current.armed : nullptr);
             current.finished.store(true, std::memory_order_release);
         });
     }
@@ -1998,13 +2056,26 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             "P51 receipt gate held_commits=%zu expected=%u before_release=%u\n",
             receipt_gate->observed_commits(), job_count,
             held_all_commits ? 1u : 0u);
+    const std::vector<icecc::p50::R2TxCommit> held_commit_witnesses =
+        receipt_gate ? receipt_gate->commit_witnesses()
+                     : std::vector<icecc::p50::R2TxCommit>{};
     bool no_transfer_completed_before_release = true;
     if (receipt_gate) {
         for (const auto& job : jobs)
             no_transfer_completed_before_release &=
                 !job.finished.load(std::memory_order_acquire);
     }
-    if (receipt_gate) receipt_gate->release_commits();
+    const size_t held_commit_count = receipt_gate
+        ? receipt_gate->observed_commits() : 0;
+    if (receipt_gate && drop_lost_receipts) {
+        // F has fully published these commits before emitting their frames.
+        // Drop the entire observed receipt window and close only this physical
+        // link; both daemons and the F sidecar remain alive for recovery.
+        receipt_gate->discard_held_commits();
+        receipt_gate.reset();
+    } else if (receipt_gate) {
+        receipt_gate->release_commits();
+    }
     for (auto& transfer : transfers) if (transfer.joinable()) transfer.join();
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - transfer_started).count();
@@ -2033,12 +2104,65 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
     const bool contiguous_tu_sequences = observed_tu_sequences.size() == job_count &&
         *observed_tu_sequences.begin() == 0 &&
         *observed_tu_sequences.rbegin() == job_count - 1;
+    bool recovered_held_commits_exactly = !drop_lost_receipts ||
+        held_commit_witnesses.size() == job_count;
+    if (drop_lost_receipts && held_commit_witnesses.size() == job_count) {
+        std::set<uint64_t> matched_tu_sequences;
+        std::set<uint64_t> held_ordinals;
+        std::set<uint64_t> held_relative_sequences;
+        const auto& anchor = jobs.front().armed;
+        for (const auto& witness : held_commit_witnesses) {
+            const uint64_t tu_seq = witness.inner.tu_seq.value;
+            const auto item = std::find_if(jobs.begin(), jobs.end(),
+                [&](const VerticalJob& job) {
+                    return job.result.tu_seq == tu_seq &&
+                           job.result.code ==
+                               icecc::p50::local::SourceTransferResultCode::Committed;
+                });
+            const bool exact_result = item != jobs.end() &&
+                matched_tu_sequences.insert(tu_seq).second &&
+                item->result.raw_bytes == item->bytes.size() &&
+                item->result.raw_digest == witness.inner.raw_digest &&
+                item->result.raw_digest == icecc::digest128(item->bytes) &&
+                item->result.c_store_guid.bytes ==
+                    item->armed.arm.source.c_store_guid &&
+                item->armed.valid() &&
+                item->armed.arm.source.cache_profile == profile_mask &&
+                item->armed.selected_revision == CACHE_WIRE_REVISION_R2 &&
+                item->armed.relationship_epoch != 0 &&
+                item->armed.logical_relationship_id ==
+                    anchor.logical_relationship_id &&
+                item->armed.relationship_epoch == anchor.relationship_epoch &&
+                item->armed.f_store_guid == anchor.f_store_guid &&
+                item->armed.f_store_generation == anchor.f_store_generation &&
+                item->armed.selected_window == anchor.selected_window &&
+                witness.relationship_ordinal != 0 &&
+                held_ordinals.insert(witness.relationship_ordinal).second &&
+                held_relative_sequences.insert(witness.inner.rel_seq.value).second &&
+                witness.inner.history_nonce.value != 0 &&
+                witness.inner.transaction_digest != icecc::p50::Digest128{} &&
+                witness.binding_digest != icecc::p50::Digest128{} &&
+                witness.transaction_digest != icecc::p50::Digest128{};
+            recovered_held_commits_exactly &= exact_result;
+        }
+        const auto contiguous = [&](const std::set<uint64_t>& values) {
+            return !values.empty() && values.size() == job_count &&
+                *values.rbegin() - *values.begin() + 1 == values.size();
+        };
+        recovered_held_commits_exactly &=
+            contiguous(held_ordinals) && contiguous(held_relative_sequences);
+    }
+    bool one_publication_and_attachment_per_job = true;
+    size_t recovered_physical_links = 0;
+    bool same_f_sidecar_incarnation = false;
     REQUIRE(held_all_commits,
-            "F emitted exactly W30 distinct complete COMMIT frames before any C receipt release");
+            "F emitted the configured exact COMMIT window before receipt release/drop");
     REQUIRE(no_transfer_completed_before_release,
             "all source-transfer callers remain pending while COMMIT receipts are withheld");
     REQUIRE(all_transfers_committed && contiguous_tu_sequences && elapsed < 30000,
-            "real C kind-8 service completes all W30 exact distinct inputs and TU identities");
+            "real C kind-8 service completes the exact distinct input window and TU identities");
+    REQUIRE(!drop_lost_receipts || recovered_held_commits_exactly,
+            "each recovered committed result matches one unique held COMMIT TU/raw-digest witness");
     if (receipt_gate)
         std::fprintf(stderr,
             "P51 vertical summary jobs=%u buffered_commits=%zu elapsed_ms=%lld\n",
@@ -2103,6 +2227,51 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         all_exactly_attached &= item.attached;
         all_compilefile_bounded &= item.compile_bounded;
     }
+    if (drop_lost_receipts) {
+        const std::string f_log = read_file_suffix(
+            fdir + "/iceccd.log", f_protocol_log_offset);
+        const auto occurrences = [&](const std::string& needle) {
+            size_t count = 0;
+            for (size_t at = 0; (at = f_log.find(needle, at)) != std::string::npos;
+                 at += needle.size())
+                ++count;
+            return count;
+        };
+        recovered_physical_links = occurrences("P51_CACHE_LINK_READY request=");
+        for (const auto& job : jobs) {
+            const std::string published = "P50 sidecar lifecycle commit tu=" +
+                std::to_string(job.result.tu_seq) + " retained=1 observed=1\n";
+            const std::string attached = "P50_INPUT_ATTACH_END job=" +
+                std::to_string(job.wire_id) + " epoch=" + std::to_string(epoch) +
+                " nonce=" + std::to_string(job.nonce) + " request=" +
+                std::to_string(job.nonce) + " elapsed_ms=";
+            const size_t attachment_at = f_log.find(attached);
+            const size_t attachment_end = attachment_at == std::string::npos
+                ? std::string::npos : f_log.find('\n', attachment_at);
+            const bool accepted_once = attachment_at != std::string::npos &&
+                attachment_end != std::string::npos &&
+                f_log.substr(attachment_at, attachment_end - attachment_at)
+                    .find(" status=0") != std::string::npos &&
+                occurrences(attached) == 1;
+            one_publication_and_attachment_per_job &=
+                occurrences(published) == 1 && accepted_once;
+        }
+        const pid_t f_sidecar_after = find_attachment_sidecar(f_pid, cache_service);
+        same_f_sidecar_incarnation = f_sidecar_before > 1 &&
+            f_sidecar_after == f_sidecar_before &&
+            ::kill(f_sidecar_before, 0) == 0;
+        std::fprintf(stderr,
+            "P51_D04_OBSERVED count=%u held=%zu witnesses=%zu publication_attachment_ok=%u physical_links=%zu f_pid=%ld/%ld\n",
+            job_count, held_commit_count, held_commit_witnesses.size(),
+            one_publication_and_attachment_per_job ? 1u : 0u,
+            recovered_physical_links, static_cast<long>(f_sidecar_before),
+            static_cast<long>(f_sidecar_after));
+    }
+    REQUIRE(!drop_lost_receipts || one_publication_and_attachment_per_job,
+            "F published and accepted exactly one matching attachment for each recovered input");
+    REQUIRE(!drop_lost_receipts ||
+                (recovered_physical_links >= 2 && same_f_sidecar_incarnation),
+            "lost receipts use a new physical R2 connection to the same live F sidecar incarnation");
     REQUIRE(all_compilefile_sent,
             "all original F compiler TCP channels accept their CompileFile after R2 receipt");
     REQUIRE(all_exactly_attached,
@@ -2114,7 +2283,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         delete job.compiler;
     }
     const size_t peak_held_commits = receipt_gate
-        ? receipt_gate->observed_commits() : 0;
+        ? receipt_gate->observed_commits() : held_commit_count;
     receipt_gate.reset();
 
     for (pid_t pid : {c_pid, f_pid}) ::kill(pid, SIGTERM);
@@ -2137,6 +2306,11 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         std::fprintf(stderr,
             "P51_VERTICAL_W30_PASS jobs=%u peak_held_commits=%zu elapsed_ms=%lld\n",
             job_count, peak_held_commits, static_cast<long long>(elapsed));
+    if (drop_lost_receipts && failures == 0)
+        std::fprintf(stderr,
+            "P51_D04_LOST_RECEIPTS_PASS count=%u profile=%u held=%zu recovered=%zu physical_links=%zu same_f_sidecar=1 suffix_uncommitted=not-covered\n",
+            job_count, profile_mask, held_commit_count, held_commit_witnesses.size(),
+            recovered_physical_links);
     return failures ? 1 : 0;
 }
 
@@ -3974,11 +4148,15 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_RESTART_W30_C_C2F1") != nullptr;
     const bool synthetic_scheduler_w30 =
         ::getenv("ICECC_TEST_P51_SYNTH_SCHEDULER_W30") != nullptr;
+    const char *lost_receipts_value =
+        ::getenv("ICECC_TEST_P51_LOST_RECEIPTS");
+    const bool lost_receipts = lost_receipts_value != nullptr;
     const unsigned restart_selectors = static_cast<unsigned>(restart_f_c1f2) +
         static_cast<unsigned>(restart_c_c2f1) +
         static_cast<unsigned>(restart_w30_f_c1f2) +
         static_cast<unsigned>(restart_w30_c_c2f1) +
-        static_cast<unsigned>(synthetic_scheduler_w30);
+        static_cast<unsigned>(synthetic_scheduler_w30) +
+        static_cast<unsigned>(lost_receipts);
     if (restart_selectors != 0) {
         const uint32_t profile_mask = selected_vertical_profile();
         if (profile_mask == 0) {
@@ -3993,6 +4171,21 @@ int main(int argc, char **argv)
         if (synthetic_scheduler_w30)
             return run_p51_synthetic_scheduler_epoch_w30(
                 argv[1], argv[2], icecc, profile_mask);
+        if (lost_receipts) {
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long count = std::strtoul(
+                lost_receipts_value, &end, 10);
+            if (errno != 0 || end == lost_receipts_value || *end != '\0' ||
+                (count != 1 && count != 2 && count != 30)) {
+                std::fprintf(stderr,
+                    "FAIL: ICECC_TEST_P51_LOST_RECEIPTS must be 1, 2, or 30\n");
+                return 2;
+            }
+            return run_p51_vertical(argv[1], argv[2], icecc,
+                                    static_cast<unsigned>(count),
+                                    profile_mask, true);
+        }
         const bool restart_f = restart_f_c1f2 || restart_w30_f_c1f2;
         const unsigned jobs_per_window =
             restart_w30_f_c1f2 || restart_w30_c_c2f1 ? 30u : 1u;

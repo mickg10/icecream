@@ -90,6 +90,40 @@ Final helper binary SHA256:
 The published runner differs from that older successful test copy only by
 one wording-only correction to a failure message.
 
+### Lost committed receipts with F kept alive
+
+The D04 integration fixture passes all nine cells: drop 1, 2 or 30 fully
+emitted COMMIT replies across P29V1, ZSTD_TU and ZSTD_ROUTE. It closes only
+the proxied connection, keeps the same F sidecar process alive, and verifies
+each recovered result against the held receipt's exposed TU/raw identity.
+Every row observes two physical links, one publication and one accepted
+input attachment per job. The nine-row command exits 0. This uses the
+`fdf03e25` product with the updated test helper; no product change is needed.
+
+This is retained-input attachment evidence, not actual compiler execution.
+It does not cover an uncommitted suffix; the fixture labels that exclusion.
+The local result does not expose every opaque wire digest, so complete
+receipt validation remains the endpoint's responsibility. The held receipt
+set additionally checks unique contiguous ordinals and relationship fields.
+
+Test source SHA256:
+`2709c366a8241ef664c6343ff290336dd811e8db1f8043378b55713b5e195343`.
+Binary SHA256:
+`c62749bf042be34c34198f7df773e614124ae2aaf0c19e5a7c37ca36502dd7b7`.
+All nine logs are under `/tanksmall/scratch/tmp/p51-d04-qa-results/`, named
+`d04-{1,2,30}-{P29V1,ZSTD_TU,ZSTD_ROUTE}.log`. W30 log hashes:
+
+| Profile | SHA256 |
+| --- | --- |
+| P29V1 | `5217698de0bcce35415f3ba8f704e6f19f686d0ac990a3c7d2fc91b4f9b56982` |
+| ZSTD_TU | `4269d62c49e5b4abaa0589da1a6a0c6825b3fd15b6b9a0a9e6c14abc0a6bc44a` |
+| ZSTD_ROUTE | `d41afc2bcf91b7614f56ddf0d481d16075a6f04488bddff2301f723aa2d42376` |
+
+The first focused run recovered successfully but failed its counting checks:
+the fixture had not precreated the stderr capture files. That failed log is
+retained as `d04-count1-tu.log`; the corrected fixture creates owned capture
+files before daemon launch, then checks markers after attachment settlement.
+
 ### Sender window matrix and serial control
 
 The real sender passes W1/2/4/8/16/30 across P29V1, ZSTD_TU and
