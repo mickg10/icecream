@@ -56,6 +56,7 @@
 #include "util.h"
 #include "input_pump.h"
 #include "p50_compile_binding.h"
+#include "p50_remote_diagnostics.h"
 #include "cache/p50_control_operation.h"
 #include "cache/p50_daemon_control.h"
 #include "cache/p50_sidecar_identity.h"
@@ -66,6 +67,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <exception>
 
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
@@ -73,6 +75,95 @@
 
 namespace
 {
+
+using P50RemoteDiagnosticRecord =
+    icecc::p50::diagnostics::RemoteAttemptRecord;
+
+class P50RemoteDiagnosticScope {
+public:
+    explicit P50RemoteDiagnosticScope(bool enabled) noexcept
+    {
+        record_.enabled = enabled;
+        if (enabled)
+            record_.start_ms = icecc::p50::diagnostics::monotonic_milliseconds();
+        uncaught_on_entry_ = std::uncaught_exceptions();
+    }
+
+    ~P50RemoteDiagnosticScope() noexcept
+    {
+        if (!record_.enabled)
+            return;
+        record_.end_ms = icecc::p50::diagnostics::monotonic_milliseconds();
+        if (std::uncaught_exceptions() > uncaught_on_entry_)
+            record_.outcome = icecc::p50::diagnostics::Outcome::Exception;
+        else if (record_.outcome == icecc::p50::diagnostics::Outcome::Incomplete)
+            record_.outcome = icecc::p50::diagnostics::Outcome::Failure;
+        try {
+            const std::string line =
+                icecc::p50::diagnostics::format_remote_attempt(record_);
+            if (!line.empty())
+                std::fprintf(stderr, "%s\n", line.c_str());
+        } catch (...) {
+            // Diagnostics must not affect compilation or exception handling.
+        }
+    }
+
+    P50RemoteDiagnosticRecord &record() noexcept { return record_; }
+
+private:
+    P50RemoteDiagnosticRecord record_;
+    int uncaught_on_entry_ = 0;
+};
+
+template <typename Clock, typename Duration>
+void record_phase(std::optional<uint64_t> &field,
+                  const std::chrono::time_point<Clock, Duration> &start,
+                  const std::chrono::time_point<Clock, Duration> &end) noexcept
+{
+    field = icecc::p50::diagnostics::elapsed_milliseconds(start, end);
+}
+
+class P50DiagnosticPhaseTimer {
+public:
+    P50DiagnosticPhaseTimer(P50RemoteDiagnosticRecord *record,
+                            std::optional<uint64_t> *duration,
+                            icecc::p50::diagnostics::Stage stage,
+                            std::optional<uint64_t> *total_duration = nullptr,
+                            std::chrono::steady_clock::time_point total_start = {},
+                            std::chrono::steady_clock::time_point phase_start = {}) noexcept
+        : record_(record), duration_(duration),
+          start_(record != nullptr && record->enabled
+                     ? (phase_start == std::chrono::steady_clock::time_point{}
+                            ? std::chrono::steady_clock::now() : phase_start)
+                     : std::chrono::steady_clock::time_point{}),
+          total_duration_(total_duration), total_start_(total_start)
+    {
+        if (record_ != nullptr && record_->enabled)
+            record_->stage = stage;
+        else
+            record_ = nullptr;
+    }
+
+    ~P50DiagnosticPhaseTimer() noexcept { finish(); }
+
+    void finish() noexcept
+    {
+        if (record_ == nullptr)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        record_phase(*duration_, start_, now);
+        if (total_duration_ != nullptr)
+            record_phase(*total_duration_, total_start_, now);
+        record_ = nullptr;
+    }
+
+private:
+    P50RemoteDiagnosticRecord *record_;
+    std::optional<uint64_t> *duration_;
+    std::chrono::steady_clock::time_point start_;
+    std::optional<uint64_t> *total_duration_;
+    std::chrono::steady_clock::time_point total_start_;
+};
 
 struct CharBufferDeleter {
     char *buf;
@@ -475,7 +566,7 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
 icecc::p50::local::P50SourceTransferResult transfer_p51_source(
     CompileJob &job, const UseCSMsg &assignment, MsgChannel &cserver,
     MsgChannel &local_daemon, icecc::p50::OwnedSourceFd source,
-    icecc::p50::ProfileId profile)
+    icecc::p50::ProfileId profile, P50RemoteDiagnosticRecord *diagnostic)
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
@@ -485,8 +576,11 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
     const std::optional<uint32_t> source_mode = p50_source_mode_wire(profile);
     if (!profile_wire || !source_mode || !source ||
         !protocol_supports_cache_r2(cserver.protocol) ||
-        assignment.cache_protocol != CACHE_WIRE_REVISION_R2)
+        assignment.cache_protocol != CACHE_WIRE_REVISION_R2) {
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 1;
         return p50_transfer_error(1);
+    }
 
     P51SourceLeaseRequestFields lease_request;
     lease_request.wire_job_id = assignment.job_id;
@@ -495,16 +589,27 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
     lease_request.profile = *profile_wire;
     lease_request.requested_cache_revision = CACHE_WIRE_REVISION_R2;
     lease_request.requested_window = 30;
+    const auto lease_start = std::chrono::steady_clock::now();
+    P50DiagnosticPhaseTimer lease_timer(
+        diagnostic, diagnostic == nullptr ? nullptr : &diagnostic->lease_send_to_fd_ms,
+        icecc::p50::diagnostics::Stage::CLeaseToFd);
     if (!lease_request.valid() ||
-        !local_daemon.send_msg(P51SourceLeaseRequestMsg(lease_request)))
+        !local_daemon.send_msg(P51SourceLeaseRequestMsg(lease_request))) {
+        lease_timer.finish();
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 2;
         return p50_transfer_error(2);
+    }
 
     P51CacheControlIdentity control_identity;
     const int control_fd = local_daemon.receive_p51_cache_fd_reply(
         lease_request, control_identity, deadline);
+    lease_timer.finish();
     if (control_fd < 0 || !control_identity.valid()) {
         if (control_fd >= 0)
             ::close(control_fd);
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 3;
         return p50_transfer_error(3);
     }
 
@@ -528,9 +633,17 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
     source_arm.c_control_attempt = control_identity.control_attempt;
     P51SourceArmFields arm{source_arm, lease_request.requested_window};
     P51SourceArmMsg arm_message(arm);
+    P50DiagnosticPhaseTimer arm_timer(
+        diagnostic, diagnostic == nullptr ? nullptr : &diagnostic->arm_send_to_armed_ms,
+        icecc::p50::diagnostics::Stage::FArmToArmed,
+        diagnostic == nullptr ? nullptr : &diagnostic->lease_send_to_armed_ms,
+        lease_start);
     if (!arm.valid() || !arm_message.valid_for_protocol(cserver.protocol) ||
         !cserver.send_msg(arm_message)) {
+        arm_timer.finish();
         ::close(control_fd);
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 4;
         return p50_transfer_error(4);
     }
     std::unique_ptr<Msg> response(cserver.get_msg_until(deadline));
@@ -541,9 +654,19 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
         armed_message->selected_revision != CACHE_WIRE_REVISION_R2 ||
         armed_message->selected_window == 0 ||
         armed_message->selected_window > lease_request.requested_window) {
+        arm_timer.finish();
         ::close(control_fd);
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 5;
         return p50_transfer_error(5);
     }
+    arm_timer.finish();
+    const auto armed_received_at = std::chrono::steady_clock::now();
+    P50DiagnosticPhaseTimer control_begin_timer(
+        diagnostic,
+        diagnostic == nullptr ? nullptr : &diagnostic->armed_to_control_begin_ms,
+        icecc::p50::diagnostics::Stage::ArmedToControlBegin,
+        nullptr, {}, armed_received_at);
 
     const auto absolute_deadline =
         sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
@@ -565,8 +688,16 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
     const DaemonControlStatus started = control.begin_authenticated(
         control_fd, operation, source_fd, credentials, identity, deadline,
         DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
-    if (started != DaemonControlStatus::InProgress)
+    control_begin_timer.finish();
+    if (started != DaemonControlStatus::InProgress) {
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 6;
         return p50_transfer_error(6);
+    }
+    P50DiagnosticPhaseTimer control_wait_timer(
+        diagnostic,
+        diagnostic == nullptr ? nullptr : &diagnostic->control_wait_ms,
+        icecc::p50::diagnostics::Stage::ControlWait);
     while (!control.done()) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
@@ -588,9 +719,13 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
         (void)control.advance(std::chrono::steady_clock::now(),
                               ready == 0 ? short{0} : descriptor.revents);
     }
+    control_wait_timer.finish();
     if (control.status() != DaemonControlStatus::Complete ||
-        !control.source_transfer_result().has_value())
+        !control.source_transfer_result().has_value()) {
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 7;
         return p50_transfer_error(7);
+    }
     return *control.source_transfer_result();
 }
 
@@ -932,12 +1067,23 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 {
     if (p50_observation != nullptr)
         *p50_observation = {};
+    P50RemoteDiagnosticScope diagnostic_scope(
+        usecs->cache_protocol == CACHE_WIRE_REVISION_R2 &&
+        icecc::p50::diagnostics::enabled_from_environment());
+    P50RemoteDiagnosticRecord *diagnostic =
+        diagnostic_scope.record().enabled ? &diagnostic_scope.record() : nullptr;
+    if (diagnostic != nullptr) {
+        diagnostic->job_id = usecs->job_id;
+        diagnostic->assignment_nonce = usecs->assignmentNonce();
+    }
     string hostname = usecs->hostname;
     unsigned int port = usecs->port;
     int job_id = usecs->job_id;
     bool got_env = usecs->got_env;
     invocation_timing_set_compile_job_id(job_id);
     if (!usecs->applyAssignmentTo(&job)) {
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 9;
         throw client_error(9, "Error 9 - malformed assignment identity");
     }
     if (job.hasAssignmentIdentity()) {
@@ -1127,9 +1273,14 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     << " with 5-second same-endpoint socket slices\n";
             const auto compiler_connect_deadline =
                 std::chrono::steady_clock::now() + kP50CompilerConnectBudget;
+            P50DiagnosticPhaseTimer compiler_connect_timer(
+                diagnostic,
+                diagnostic == nullptr ? nullptr : &diagnostic->compiler_connect_ms,
+                icecc::p50::diagnostics::Stage::CompilerConnect);
             cserver = Service::createChannelRetryUntil(
                 hostname, static_cast<unsigned short>(port),
                 compiler_connect_deadline, kP50CompilerConnectAttemptBudget);
+            compiler_connect_timer.finish();
         } else {
             trace() << "legacy compiler connection uses historical ten-second timeout\n";
             cserver = Service::createChannel(hostname, port, 10);
@@ -1150,6 +1301,11 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 "Error 14 - unable to arm P50 compiler operation timeout");
         }
 
+        P50DiagnosticPhaseTimer environment_ready_timer(
+            diagnostic,
+            diagnostic == nullptr ? nullptr : &diagnostic->environment_ready_ms,
+            icecc::p50::diagnostics::Stage::EnvironmentReady);
+
         // Environment transfer always stays on the ordinary legacy stream.
         // Source selection happens only after this phase and then remains one
         // whole-job mode: FileChunk or P50 ZSTD_TU, never both.
@@ -1169,6 +1325,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
             if (!dcc_lock_host()) {
                 log_error() << "can't lock for local cpp" << endl;
+                if (diagnostic != nullptr)
+                    diagnostic->error_code = EXIT_DISTCC_FAILED;
                 return EXIT_DISTCC_FAILED;
             }
             HostUnlock environment_unlock;
@@ -1229,6 +1387,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             log_warning() << "Host " << hostname << " cannot be verified." << endl;
             throw client_error(26, "Error 26 - environment on " + hostname + " cannot be verified");
         }
+        environment_ready_timer.finish();
 
         // Older remotes don't set properly -x argument.
         if(( job.language() == CompileJob::Lang_OBJC || job.language() == CompileJob::Lang_OBJCXX )
@@ -1255,6 +1414,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     p50_observation->profile_mask =
                         selected_profile_mask.value_or(0);
                 }
+                if (diagnostic != nullptr)
+                    diagnostic->profile_mask = p50_profile_wire(p50_profile);
                 switch (p50_profile) {
                 case icecc::p50::ProfileId::P29V1:
                     p50_profile_name = "P29V1";
@@ -1271,17 +1432,33 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     105,
                     "Error 105 - strict all-P50 assignment has no ZSTD_TU cache handoff");
 
+            P50DiagnosticPhaseTimer local_slot_timer(
+                diagnostic,
+                diagnostic == nullptr ? nullptr : &diagnostic->local_slot_wait_ms,
+                icecc::p50::diagnostics::Stage::LocalSlotWait);
             if (!dcc_lock_host()) {
                 log_error() << "can't lock for local cpp" << endl;
+                if (diagnostic != nullptr)
+                    diagnostic->error_code = EXIT_DISTCC_FAILED;
                 return EXIT_DISTCC_FAILED;
             }
+            local_slot_timer.finish();
             HostUnlock input_unlock;
 
             if (p50_input) {
                 int cpp_status = 0;
+                P50DiagnosticPhaseTimer local_cpp_timer(
+                    diagnostic,
+                    diagnostic == nullptr ? nullptr : &diagnostic->local_cpp_prepare_ms,
+                    icecc::p50::diagnostics::Stage::LocalCppPrepare);
                 icecc::p50::OwnedSourceFd source =
                     prepare_complete_p50_source(job, preproc_file, cpp_status);
+                local_cpp_timer.finish();
                 if (!source) {
+                    if (diagnostic != nullptr) {
+                        diagnostic->error_code = cpp_status < 0
+                            ? 0U : static_cast<uint32_t>(cpp_status);
+                    }
                     delete cserver;
                     cserver = nullptr;
                     return cpp_status;
@@ -1299,12 +1476,14 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     usecs->cache_protocol == CACHE_WIRE_REVISION_R2
                         ? transfer_p51_source(job, *usecs, *cserver,
                                               *local_daemon, std::move(source),
-                                              p50_profile)
+                                              p50_profile, diagnostic)
                         : transfer_p50_source(job, *usecs, *local_daemon,
                                               std::move(source), p50_profile);
                 const std::optional<CompileInputIdentity> identity =
                     icecc::p50::bind_compile_input(job, p50_profile, transfer);
                 if (!identity.has_value()) {
+                    if (diagnostic != nullptr)
+                        diagnostic->error_code = transfer.error_code;
                     if (p50_observation != nullptr &&
                         p50_profile == icecc::p50::ProfileId::P29V1 &&
                         transfer.error_code == static_cast<uint16_t>(
@@ -1444,6 +1623,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             dcc_unlock();
         }
 
+        P50DiagnosticPhaseTimer compiler_result_timer(
+            diagnostic,
+            diagnostic == nullptr ? nullptr : &diagnostic->compiler_result_wait_ms,
+            icecc::p50::diagnostics::Stage::CompilerResultWait);
         Msg *msg;
         {
             log_block wait_cs("wait for cs");
@@ -1565,6 +1748,18 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             p50_observation->accepted = p50_accepted_disposition_sent;
 
     } catch (...) {
+        if (diagnostic != nullptr) {
+            try {
+                throw;
+            } catch (const client_error &error) {
+                if (!diagnostic->error_code.has_value() &&
+                    error.errorCode >= 0)
+                    diagnostic->error_code =
+                        static_cast<uint32_t>(error.errorCode);
+            } catch (...) {
+                // Keep the outcome and last phase for non-client exceptions.
+            }
+        }
         /* Once CompileResultMsg exists, any local exception before Accepted
            is a definitive rejection attempt.  Never emit a second frame after
            a possibly partial first send: the worker applies first-witness
@@ -1589,6 +1784,14 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     }
 
     delete cserver;
+    if (diagnostic != nullptr) {
+        diagnostic->outcome = status == 0
+            ? icecc::p50::diagnostics::Outcome::Success
+            : icecc::p50::diagnostics::Outcome::Failure;
+        if (status != 0)
+            diagnostic->error_code = status < 0 ? 0U : static_cast<uint32_t>(status);
+        diagnostic->stage = icecc::p50::diagnostics::Stage::Complete;
+    }
     return status;
 }
 

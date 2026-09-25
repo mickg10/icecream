@@ -438,6 +438,37 @@ of the separately observed farm delivery backlog.
 
 ### Opt-in source-free diagnostics
 
+The R2 client-phase extension emits `P50_REMOTE_PHASE` for one remote
+invocation, including separate preprocessing, C lease, F ARM, control-transfer,
+and compiler-result intervals. Its private SDK snapshot uses the published
+`33cff860` dependency baseline plus the diagnostic client/header and formatter
+test changes, without the in-progress worker-lifetime repair. The formatter
+runtime test and normal product build pass. Real local C1F1 ZSTD_TU remote
+compiles produce byte-identical objects with diagnostics enabled and disabled;
+the disabled run emits none of the diagnostic record prefixes.
+
+Evidence under `/tanksmall/scratch/tmp/p50-remote-diag-r1/`:
+
+| Evidence file | SHA256 |
+| --- | --- |
+| `r2-success-smoke-r4.log` | `790f34ff0bdd0ec46960596a78a3ef469bb866d70364db9556da7038fdd691e5` |
+| `r2-disabled-smoke-r3.log` | `fc36b5e910e38e1907a209f86276f03f3229392c75e2a6bc49c474e5af2e0b9c` |
+| `r2-source-failure-smoke-r4.log` | `81616940ed7076b3a76b6a50d7987c6ed31dcb17257b94e8f728349e51da9932` |
+
+The attempted source-failure smoke initially failed during sidecar startup:
+its generated Unix socket path exceeded the platform limit. That setup
+failure is not a source-phase diagnostic test. The corrected short-path run
+reaches F's deliberately shortened source deadline: the first phase record
+reports `f_arm_to_armed`, exception, original error 5, and null unreached
+control/result intervals. Exit 100 is the expected strict remote-only compile
+failure, not a successful compile. The subsequent retry independently fails
+with preprocessed-input retention error 11; this does not qualify successful
+retry recovery. Earlier negative runs either omitted opt-in or exposed the
+outer exception overwriting the original error with 106. The final client
+build and negative rerun qualify the error-preservation correction; the
+enabled/disabled successful compiles preceded that catch-only correction.
+These tiny synthetic compiles are not farm throughput evidence.
+
 `ICECC_P50_DIAGNOSTICS=1` enables bounded retry-decision records and service
 timing/resource summaries; see [the schema and timing scope](doc/p50-cache-diagnostics.md).
 The strict SDK build, real completion-flow loss/retry gate with JSON assertions,

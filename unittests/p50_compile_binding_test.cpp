@@ -1,12 +1,17 @@
 #include "client/p50_compile_binding.h"
+#include "client/p50_remote_diagnostics.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -120,6 +125,90 @@ private:
     bool restored_ = false;
 };
 
+std::optional<std::map<std::string, std::string>> parse_remote_diagnostic(
+    std::string_view line) {
+    constexpr std::string_view prefix = "P50_REMOTE_PHASE ";
+    if (!line.starts_with(prefix))
+        return std::nullopt;
+    size_t position = prefix.size();
+    if (position >= line.size() || line[position++] != '{')
+        return std::nullopt;
+
+    auto parse_string = [&](std::string& value) -> bool {
+        if (position >= line.size() || line[position++] != '"')
+            return false;
+        const size_t start = position;
+        while (position < line.size() && line[position] != '"') {
+            const unsigned char byte = static_cast<unsigned char>(line[position]);
+            if (byte < 0x20 || line[position] == '\\')
+                return false;
+            ++position;
+        }
+        if (position >= line.size())
+            return false;
+        value.assign(line.substr(start, position - start));
+        ++position;
+        return true;
+    };
+
+    std::map<std::string, std::string> fields;
+    bool first = true;
+    while (position < line.size()) {
+        if (!first) {
+            if (line[position++] != ',')
+                return std::nullopt;
+        }
+        first = false;
+        std::string key;
+        if (!parse_string(key) || position >= line.size() ||
+            line[position++] != ':')
+            return std::nullopt;
+
+        std::string value;
+        if (position < line.size() && line[position] == '"') {
+            if (!parse_string(value))
+                return std::nullopt;
+        } else {
+            const size_t start = position;
+            while (position < line.size() && line[position] != ',' &&
+                   line[position] != '}')
+                ++position;
+            if (start == position)
+                return std::nullopt;
+            value.assign(line.substr(start, position - start));
+            if (value != "null" &&
+                !std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                    return c >= '0' && c <= '9';
+                }))
+                return std::nullopt;
+        }
+        if (!fields.emplace(std::move(key), std::move(value)).second)
+            return std::nullopt;
+        if (position < line.size() && line[position] == '}') {
+            ++position;
+            if (position != line.size())
+                return std::nullopt;
+            return fields;
+        }
+    }
+    return std::nullopt;
+}
+
+void check_remote_diagnostic_schema(
+    const std::map<std::string, std::string>& fields) {
+    const std::vector<std::string> expected = {
+        "schema_version", "job_id", "assignment_nonce", "profile_mask",
+        "stage", "outcome", "error_code", "start_ms", "end_ms",
+        "compiler_connect_ms", "environment_ready_ms", "local_slot_wait_ms",
+        "local_cpp_prepare_ms", "lease_send_to_fd_ms", "arm_send_to_armed_ms",
+        "lease_send_to_armed_ms", "armed_to_control_begin_ms", "control_wait_ms",
+        "compiler_result_wait_ms",
+    };
+    CHECK(fields.size() == expected.size());
+    for (const std::string& key : expected)
+        CHECK(fields.find(key) != fields.end());
+}
+
 void test_compile_binding_p51_mode_matrix() {
     SavedEnvironment mode("ICECC_P51_MODE");
     const struct ModeCase {
@@ -186,6 +275,106 @@ void test_compile_binding_p51_mode_matrix() {
     }
 
     mode.restore();
+}
+
+void test_remote_diagnostic_formatter_opt_in_and_schema() {
+    using namespace icecc::p50::diagnostics;
+    SavedEnvironment enabled("ICECC_P50_DIAGNOSTICS");
+    RemoteAttemptRecord record;
+
+    const char* disabled_values[] = {nullptr, "0", "", "01", "true", "1 "};
+    for (const char* value : disabled_values) {
+        enabled.set(value);
+        CHECK(!enabled_from_environment());
+        record.enabled = enabled_from_environment();
+        CHECK(format_remote_attempt(record).empty());
+    }
+
+    enabled.set("1");
+    CHECK(enabled_from_environment());
+    record.enabled = true;
+    record.schema_version = 1;
+    record.job_id = 33;
+    record.assignment_nonce = UINT64_C(0x100000002);
+    record.profile_mask = CACHE_PROFILE_ZSTD_ROUTE;
+    record.outcome = Outcome::Success;
+    record.error_code.reset();
+    record.start_ms = 100;
+    record.end_ms = 145;
+    record.stage = Stage::Complete;
+    record.compiler_connect_ms = 2;
+    record.environment_ready_ms = 3;
+    record.local_slot_wait_ms = 0;
+    record.local_cpp_prepare_ms = 5;
+    record.lease_send_to_fd_ms = 7;
+    record.arm_send_to_armed_ms = 11;
+    record.lease_send_to_armed_ms = 18;
+    record.armed_to_control_begin_ms = 1;
+    record.control_wait_ms = 22;
+    record.compiler_result_wait_ms = 24;
+    const std::string success = format_remote_attempt(record);
+    const auto success_fields = parse_remote_diagnostic(success);
+    CHECK(success_fields.has_value());
+    check_remote_diagnostic_schema(*success_fields);
+    CHECK(success_fields->at("schema_version") == "1");
+    CHECK(success_fields->at("assignment_nonce") == "4294967298");
+    CHECK(success_fields->at("outcome") == "success");
+    CHECK(success_fields->at("error_code") == "null");
+    CHECK(success_fields->at("local_slot_wait_ms") == "0");
+    CHECK(success_fields->at("lease_send_to_fd_ms") == "7");
+    CHECK(success_fields->at("arm_send_to_armed_ms") == "11");
+    CHECK(success_fields->at("lease_send_to_armed_ms") == "18");
+    CHECK(success ==
+        "P50_REMOTE_PHASE {\"schema_version\":1,\"job_id\":33,"
+        "\"assignment_nonce\":4294967298,\"profile_mask\":4,"
+        "\"stage\":\"complete\",\"outcome\":\"success\","
+        "\"error_code\":null,\"start_ms\":100,\"end_ms\":145,"
+        "\"compiler_connect_ms\":2,\"environment_ready_ms\":3,"
+        "\"local_slot_wait_ms\":0,\"local_cpp_prepare_ms\":5,"
+        "\"lease_send_to_fd_ms\":7,\"arm_send_to_armed_ms\":11,"
+        "\"lease_send_to_armed_ms\":18,\"armed_to_control_begin_ms\":1,"
+        "\"control_wait_ms\":22,\"compiler_result_wait_ms\":24}");
+
+    record.profile_mask.reset();
+    record.outcome = Outcome::Failure;
+    record.error_code = 7;
+    record.stage = Stage::FArmToArmed;
+    record.lease_send_to_fd_ms = 3;
+    record.arm_send_to_armed_ms = 17;
+    record.lease_send_to_armed_ms = 21;
+    record.armed_to_control_begin_ms.reset();
+    record.control_wait_ms.reset();
+    record.compiler_result_wait_ms.reset();
+    const std::string failure = format_remote_attempt(record);
+    const auto failure_fields = parse_remote_diagnostic(failure);
+    CHECK(failure_fields.has_value());
+    check_remote_diagnostic_schema(*failure_fields);
+    CHECK(failure_fields->at("outcome") == "failure");
+    CHECK(failure_fields->at("stage") == "f_arm_to_armed");
+    CHECK(failure_fields->at("error_code") == "7");
+    CHECK(failure_fields->at("profile_mask") == "null");
+    CHECK(failure_fields->at("lease_send_to_fd_ms") == "3");
+    CHECK(failure_fields->at("arm_send_to_armed_ms") == "17");
+    CHECK(failure_fields->at("lease_send_to_armed_ms") == "21");
+    CHECK(failure_fields->at("armed_to_control_begin_ms") == "null");
+    CHECK(failure_fields->at("control_wait_ms") == "null");
+    CHECK(failure_fields->at("compiler_result_wait_ms") == "null");
+
+    record.outcome = Outcome::Exception;
+    record.error_code.reset();
+    record.stage = Stage::CompilerResultWait;
+    const std::string exception = format_remote_attempt(record);
+    const auto exception_fields = parse_remote_diagnostic(exception);
+    CHECK(exception_fields.has_value());
+    check_remote_diagnostic_schema(*exception_fields);
+    CHECK(exception_fields->at("outcome") == "exception");
+    CHECK(exception_fields->at("stage") == "compiler_result_wait");
+    CHECK(exception_fields->at("error_code") == "null");
+    CHECK(exception_fields->find("path") == exception_fields->end());
+    CHECK(exception_fields->find("argv") == exception_fields->end());
+    CHECK(exception_fields->find("digest") == exception_fields->end());
+    CHECK(exception_fields->find("source") == exception_fields->end());
+    enabled.restore();
 }
 
 void test_exact_mode_admission() {
@@ -477,6 +666,7 @@ void test_authenticated_sidecar_result_binds_real_identity() {
 int main() {
     test_exact_mode_admission();
     test_compile_binding_p51_mode_matrix();
+    test_remote_diagnostic_formatter_opt_in_and_schema();
     test_explicit_profile_selection();
     test_namespace_and_request_are_assignment_bound();
     test_old_scheduler_gets_only_a_local_wire_identity();

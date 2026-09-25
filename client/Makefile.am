@@ -55,6 +55,7 @@ noinst_HEADERS = \
 	client.h \
 	input_pump.h \
 	md5.h \
+	p50_remote_diagnostics.h \
 	util.h
 AM_CPPFLAGS = \
 	-DPLIBDIR=\"$(pkglibexecdir)\" \
