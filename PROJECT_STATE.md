@@ -12,6 +12,38 @@ retained artifact directories.
 
 ## Developer QA
 
+### Concurrent source-credit admission
+
+The enhanced default service fixture passes for P29V1, ZSTD_TU and
+ZSTD_ROUTE with negotiated W30. With a 16-byte aggregate budget, a 14-byte
+source remains held at its read-completion barrier and an older 3-byte
+request is observed waiting for credit. A 17-byte request receives typed
+SourceTooLarge without an observed read or F connection. A newly submitted
+2-byte request then bypasses the still-blocked waiter and completes with
+exact F bytes, digest and result. Its read barrier makes the 16-byte peak
+observable before release. Closing the queued peer retires that request
+while the holder retains its 14 bytes; releasing the holder drains source
+operation/raw counters, checked again after 50 ms.
+
+This is one fitting-request bypass, not 30 active transfers or proof of all
+fairness cases. The separate existing bounded-bypass fixture tests the
+30-bypass limit. The new selector is
+`--p51-d12-oversize-fit-credit-cancel`; the default service suite also runs
+all three profiles. No production code changed.
+
+Qualification used base `6296bc4a` plus the test patch. Imported test source
+SHA256: `0962dd3735744b51609b36a129c3a4faf00311c168b0dd769aeeb3c19f6e65f7`.
+Focused selector and full ordinary service suite both exit zero on binary
+`2df66ec2839829f08cf46e99e7b3402556cba809d3b237136cb681825cdb85b5`;
+the generated `.trs` reports PASS. Retained root:
+`/tanksmall/scratch/tmp/p51-d11-metadata-expiry-c6fce0e7/work/`.
+`artifacts/d12-focused-r4.log` SHA256:
+`d34de63ff4b50ea82945daefcab1db9f56d66f9b556b65e83394ec31702e2840`;
+`build/unittests/p50cacheservice.log` SHA256:
+`d78c5657f9669f2618d2270135bbcdeb9434634d6e9fc908e7254e1ab9f2a180`.
+Earlier polling-only peak checks failed because the fitting transfer could
+finish before sampling; those fixture failures remain retained separately.
+
 ### R2 cancellation before input publication
 
 The opt-in positive-daemon fixture now tests one exact unpublished assignment

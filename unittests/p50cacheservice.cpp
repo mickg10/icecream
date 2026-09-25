@@ -4050,7 +4050,37 @@ void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
     std::puts("P51_ASYNC_TRANSFER aggregate-raw-budget oversize/fit/stop-cleanup: ok");
 }
 
-void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
+void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
+    ProfileId profile = ProfileId::ZSTD_TU) {
+    struct ReadGateRelease {
+        std::promise<void>& holder_promise;
+        std::promise<void>& fit_promise;
+        bool holder_released = false;
+        bool fit_released = false;
+        void release_holder() noexcept {
+            if (holder_released)
+                return;
+            holder_released = true;
+            try {
+                holder_promise.set_value();
+            } catch (...) {
+            }
+        }
+        void release_fit() noexcept {
+            if (fit_released)
+                return;
+            fit_released = true;
+            try {
+                fit_promise.set_value();
+            } catch (...) {
+            }
+        }
+        void release() noexcept {
+            release_fit();
+            release_holder();
+        }
+        ~ReadGateRelease() { release(); }
+    };
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x4d;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
@@ -4061,10 +4091,16 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     }();
     uint16_t oversize_port = 0;
     const int oversize_listener = loopback_listener(oversize_port);
+    uint16_t held_port = 0;
+    const int held_listener = loopback_listener(held_port);
+    uint16_t waiting_port = 0;
+    const int waiting_listener = loopback_listener(waiting_port);
     uint16_t f_port = 0;
     const int f_listener = loopback_listener(f_port);
-    CHECK(oversize_listener >= 0 && f_listener >= 0 &&
-          oversize_port != 0 && f_port != 0);
+    CHECK(oversize_listener >= 0 && held_listener >= 0 &&
+          waiting_listener >= 0 &&
+          f_listener >= 0 && oversize_port != 0 && waiting_port != 0 &&
+          held_port != 0 && f_port != 0);
 
     service::RuntimeConfig runtime_config = test_runtime_config();
     runtime_config.c_store_guid = launch.c_store_guid;
@@ -4073,29 +4109,60 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     runtime_config.sidecar_launch = launch;
     runtime_config.endpoint_caps.zstd.max_raw_bytes = 64;
     runtime_config.max_aggregate_source_raw_bytes = 16;
-    runtime_config.max_active_p51_source_transfers = 2;
-    runtime_config.max_pending_p51_source_operations = 2;
+    runtime_config.max_active_p51_source_transfers = 3;
+    runtime_config.max_pending_p51_source_operations = 3;
     std::promise<bool> source_read_complete_promise;
     auto source_read_complete = source_read_complete_promise.get_future();
     std::promise<void> release_source_read_promise;
     const std::shared_future<void> release_source_read =
         release_source_read_promise.get_future().share();
+    std::promise<void> fit_source_read_complete_promise;
+    auto fit_source_read_complete =
+        fit_source_read_complete_promise.get_future();
+    std::promise<void> release_fit_source_read_promise;
+    const std::shared_future<void> release_fit_source_read =
+        release_fit_source_read_promise.get_future().share();
+    std::atomic<unsigned> source_read_completions{0};
+    std::promise<uint64_t> source_credit_waiting_promise;
+    auto source_credit_waiting = source_credit_waiting_promise.get_future();
     runtime_config.p51_source_read_complete_for_test = [&](bool success) {
+        const unsigned ordinal = source_read_completions.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (ordinal != 0) {
+            if (ordinal == 1) {
+                try {
+                    fit_source_read_complete_promise.set_value();
+                    (void)release_fit_source_read.wait_for(
+                        std::chrono::seconds(15));
+                } catch (...) {
+                }
+            }
+            return;
+        }
         try {
             source_read_complete_promise.set_value(success);
-            (void)release_source_read.wait_for(std::chrono::seconds(5));
+            (void)release_source_read.wait_for(std::chrono::seconds(15));
+        } catch (...) {
+        }
+    };
+    runtime_config.p51_source_credit_waiting_for_test = [&](uint64_t bytes) {
+        try {
+            source_credit_waiting_promise.set_value(bytes);
         } catch (...) {
         }
     };
     service::SidecarRuntime runtime(std::move(runtime_config));
+    ReadGateRelease release_read_gate{release_source_read_promise,
+                                      release_fit_source_read_promise};
 
     auto make_request = [&](uint64_t request_id, uint16_t port,
-                            uint8_t reservation_byte) {
+                            uint8_t reservation_byte,
+                            std::chrono::milliseconds budget =
+                                std::chrono::seconds(8)) {
         auto reservation = test_p51_reservation_request(
             launch.c_store_guid, launch.store_generation,
             launch.identity.generation, launch.identity.attempt,
-            request_id, CACHE_PROFILE_ZSTD_TU, 30,
-            std::chrono::seconds(8));
+            request_id, profile_bit(profile), 30, budget);
         reservation.arm.source.assignment_nonce = request_id;
         reservation.arm.source.selected_f_host = "127.0.0.1";
         reservation.arm.source.selected_f_cache_port = port;
@@ -4107,7 +4174,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
         armed.f_store_guid = remote_f.f_store_guid.bytes;
         armed.f_store_derivation_version = kStoreIdentityDerivationVersion;
         armed.arm_observation_id = request_id;
-        armed.source_budget_msec = 8000;
+        armed.source_budget_msec = static_cast<uint32_t>(budget.count());
         armed.attempt_capability_1.bytes.fill(0xe1);
         armed.attempt_capability_2.bytes.fill(0xe2);
         armed.reservation_id.fill(reservation_byte);
@@ -4121,31 +4188,12 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     };
     const auto oversize_request = make_request(7220, oversize_port, 0xe0);
     const auto request = make_request(7221, f_port, 0xe3);
+    const auto waiting_request = make_request(7222, waiting_port, 0xe5);
+    const auto held_request = make_request(
+        7223, held_port, 0xe6, std::chrono::seconds(30));
     const auto& armed = request.armed;
 
-    const std::vector<uint8_t> expected_input(12, 0xf1);
-
-    // The first R2 job exceeds only the aggregate budget, not the endpoint's
-    // own raw-size bound. It must receive the typed size result without ever
-    // opening the selected F socket; the same runtime then admits the fit job.
-    RuntimeCase oversize = authenticated_runtime_pair();
-    const auto oversize_operation = local::make_p51_source_transfer_operation(
-        launch.identity, oversize_request,
-        oversize_request.armed.arm.source.source_request_id);
-    CHECK(runtime.enqueue_p51_source_transfer(
-        std::move(oversize.sender), launch.identity, oversize_operation,
-        sized_test_source_fd(17, 0xef)));
-    receive_p51_transfer_error(
-        oversize.receiver, launch.identity, 7220,
-        oversize_request.absolute_deadline.as_steady_time_point(), true,
-        static_cast<uint16_t>(local::SourceTransferErrorCode::SourceTooLarge));
-    CHECK(wait_for_source_raw_bytes(runtime, 0, std::chrono::seconds(1)));
-    pollfd no_oversize_connect{oversize_listener, POLLIN, 0};
-    int oversize_ready;
-    do {
-        oversize_ready = ::poll(&no_oversize_connect, 1, 100);
-    } while (oversize_ready < 0 && errno == EINTR);
-    CHECK(oversize_ready == 0);
+    const std::vector<uint8_t> expected_input(2, 0xf1);
 
     std::vector<uint8_t> committed_input;
     bool commit_identity_matches = false;
@@ -4232,7 +4280,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
             endpoint_config.sidecar_launch = remote_f;
             endpoint_config.f_store_generation = remote_f.store_generation;
             endpoint_config.lookup_p51_link_reservation =
-                [armed, request](const LinkHello& hello)
+                [armed, request, profile](const LinkHello& hello)
                     -> P51SourceLinkLookupResult {
                 if (hello.reservation_id != Id128{armed.reservation_id} ||
                     hello.relationship_id !=
@@ -4240,7 +4288,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
                     hello.c_store_guid != CStoreGuid{armed.arm.source.c_store_guid} ||
                     hello.f_store_guid != FStoreGuid{armed.f_store_guid} ||
                     hello.f_store_generation != armed.f_store_generation ||
-                    hello.profile != ProfileId::ZSTD_TU ||
+                    hello.profile != profile ||
                     hello.relationship_epoch != armed.relationship_epoch)
                     return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
                 P51SourceLinkLease lease{armed, request.absolute_deadline};
@@ -4249,13 +4297,13 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
                 return {P51SourceLinkLookupStatus::Found, std::move(lease)};
             };
             endpoint_config.consume_p51_job_reservation =
-                [armed, request, &expected_input](const LinkHello& hello,
-                                                   const JobBind& binding)
+                [armed, request, &expected_input, profile](
+                    const LinkHello& hello, const JobBind& binding)
                     -> std::optional<P51SourceJobLease> {
                 if (binding.reservation_id != Id128{armed.reservation_id} ||
                     binding.physical_link_generation !=
                         hello.physical_link_generation ||
-                    binding.profile != ProfileId::ZSTD_TU ||
+                    binding.profile != profile ||
                     binding.raw_bytes != expected_input.size() ||
                     binding.raw_digest != icecc::digest128(expected_input))
                     return std::nullopt;
@@ -4319,41 +4367,103 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
         }
     });
 
+    RuntimeCase held = authenticated_runtime_pair();
+    const auto held_operation = local::make_p51_source_transfer_operation(
+        launch.identity, held_request,
+        held_request.armed.arm.source.source_request_id);
+    const bool held_enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(held.sender), launch.identity, held_operation,
+        sized_test_source_fd(14, 0xa1));
+    const bool held_read_observed = held_enqueued &&
+        source_read_complete.wait_for(std::chrono::seconds(3)) ==
+            std::future_status::ready;
+    bool held_read_succeeded = false;
+    if (held_read_observed)
+        held_read_succeeded = source_read_complete.get();
+    const bool held_credit = held_read_observed && held_read_succeeded &&
+        wait_for_source_raw_bytes(runtime, 14, std::chrono::seconds(1));
+
+    RuntimeCase waiting = authenticated_runtime_pair();
+    const auto waiting_operation = local::make_p51_source_transfer_operation(
+        launch.identity, waiting_request,
+        waiting_request.armed.arm.source.source_request_id);
+    auto waiting_source_fd = sized_test_source_fd(3, 0xe5);
+    const int waiting_source_fd_number = waiting_source_fd.get();
+    const bool waiting_enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(waiting.sender), launch.identity, waiting_operation,
+        std::move(waiting_source_fd));
+    const bool credit_wait_observed = waiting_enqueued &&
+        source_credit_waiting.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready;
+    uint64_t waiting_credit_bytes = 0;
+    if (credit_wait_observed)
+        waiting_credit_bytes = source_credit_waiting.get();
+    const bool waiting_operation_accounted = credit_wait_observed &&
+        wait_for_source_operation_count(runtime, 2, std::chrono::seconds(1));
+
+    // While the first source holds 14/16 raw bytes and a second exact request
+    // is observed waiting for the remaining credit, an over-cap sibling must
+    // fail before read/allocation without disturbing either request.
+    RuntimeCase oversize = authenticated_runtime_pair();
+    const auto oversize_operation = local::make_p51_source_transfer_operation(
+        launch.identity, oversize_request,
+        oversize_request.armed.arm.source.source_request_id);
+    const bool oversize_enqueued = runtime.enqueue_p51_source_transfer(
+        std::move(oversize.sender), launch.identity, oversize_operation,
+        sized_test_source_fd(17, 0xef));
+    std::exception_ptr oversize_exception;
+    std::chrono::steady_clock::time_point oversize_result_at{};
+    try {
+        if (oversize_enqueued) {
+            receive_p51_transfer_error(
+                oversize.receiver, launch.identity, 7220,
+                oversize_request.absolute_deadline.as_steady_time_point(),
+                true, static_cast<uint16_t>(
+                    local::SourceTransferErrorCode::SourceTooLarge));
+            oversize_result_at = std::chrono::steady_clock::now();
+        }
+    } catch (...) {
+        oversize_exception = std::current_exception();
+    }
+    const bool oversize_no_read_or_credit =
+        source_read_completions.load(std::memory_order_acquire) == 1 &&
+        runtime.active_source_raw_bytes_for_test() == 14;
+    pollfd no_oversize_connect{oversize_listener, POLLIN, 0};
+    int oversize_ready;
+    do {
+        oversize_ready = ::poll(&no_oversize_connect, 1, 0);
+    } while (oversize_ready < 0 && errno == EINTR);
+
+    // The 2-byte fit is submitted after the cap refusal, while the observed
+    // 3-byte waiter remains queued. It may bypass that waiter only because it
+    // fits the remaining credit; prove exact F commit and result before cancel.
     RuntimeCase pair = authenticated_runtime_pair();
     const auto operation = local::make_p51_source_transfer_operation(
         launch.identity, request, request.armed.arm.source.source_request_id);
-    auto source_fd = sized_test_source_fd(expected_input.size(), 0xf1);
-    const int source_fd_number = source_fd.get();
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        std::move(source_fd));
-    const bool source_read_observed = enqueued &&
-        source_read_complete.wait_for(std::chrono::seconds(3)) ==
-            std::future_status::ready;
-    bool source_read_succeeded = false;
-    if (source_read_observed)
-        source_read_succeeded = source_read_complete.get();
-    errno = 0;
-    const bool original_source_closed = source_fd_number >= 0 &&
-        ::fcntl(source_fd_number, F_GETFD) == -1 && errno == EBADF;
-    int replacement_source_fd = -1;
-    if (original_source_closed) {
-        const int opened = ::open("/dev/null", O_RDONLY);
-        if (opened == source_fd_number) {
-            replacement_source_fd = opened;
-        } else if (opened >= 0) {
-            replacement_source_fd = ::dup2(opened, source_fd_number);
-            (void)::close(opened);
-        }
-    }
-    release_source_read_promise.set_value();
+        sized_test_source_fd(expected_input.size(), 0xf1));
+    const bool fit_source_read_observed =
+        fit_source_read_complete.wait_for(std::chrono::seconds(3)) ==
+        std::future_status::ready;
+    // Keep the fit read paused at its completion callback so the raw-credit
+    // peak is sampled deterministically before it can publish and release.
+    const uint64_t fit_credit_at_read_complete =
+        fit_source_read_observed ? runtime.active_source_raw_bytes_for_test()
+                                 : 0;
+    release_read_gate.release_fit();
+    const bool fit_credit_uses_remaining_bytes =
+        fit_source_read_observed && fit_credit_at_read_complete == 16;
     local::P50SourceTransferResult result;
     std::exception_ptr transfer_exception;
+    std::chrono::steady_clock::time_point fit_result_at{};
     try {
-        if (enqueued)
+        if (enqueued) {
             result = receive_p51_transfer_result(
                 pair.receiver, launch.identity, 7221,
                 request.absolute_deadline.as_steady_time_point(), true);
+            fit_result_at = std::chrono::steady_clock::now();
+        }
     } catch (...) {
         transfer_exception = std::current_exception();
     }
@@ -4361,10 +4471,43 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
     const bool exact_result = committed && result.valid() &&
         result.raw_bytes == expected_input.size() &&
         result.raw_digest == icecc::digest128(expected_input);
+    const bool fit_credit_released_to_holder = wait_for_source_raw_bytes(
+        runtime, 14, std::chrono::seconds(1));
+    const bool waiting_still_blocked_after_fit =
+        wait_for_source_operation_count(runtime, 2, std::chrono::seconds(1)) &&
+        runtime.active_source_raw_bytes_for_test() == 14;
+    waiting.receiver = local::Connection(-1);
+    const bool cancelled_waiter_released = waiting_operation_accounted &&
+        wait_for_source_operation_count(runtime, 1, std::chrono::seconds(2));
+    const auto cancelled_waiter_at = std::chrono::steady_clock::now();
+    errno = 0;
+    const bool cancelled_waiter_fd_closed = waiting_source_fd_number >= 0 &&
+        ::fcntl(waiting_source_fd_number, F_GETFD) == -1 && errno == EBADF;
+    pollfd no_waiting_connect{waiting_listener, POLLIN, 0};
+    int waiting_ready;
+    do {
+        waiting_ready = ::poll(&no_waiting_connect, 1, 0);
+    } while (waiting_ready < 0 && errno == EINTR);
+
+    held.receiver = local::Connection(-1);
+    release_read_gate.release();
+    const bool held_operation_released = wait_for_source_operation_count(
+        runtime, 0, std::chrono::seconds(2));
     const bool credit_released = wait_for_source_raw_bytes(
         runtime, 0, std::chrono::seconds(1));
-    runtime.stop();
+    pollfd no_held_connect{held_listener, POLLIN, 0};
+    int held_ready;
+    do {
+        held_ready = ::poll(&no_held_connect, 1, 0);
+    } while (held_ready < 0 && errno == EINTR);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool counters_stayed_drained = held_operation_released &&
+        credit_released &&
+        runtime.pending_p51_source_operations_for_test() == 0 &&
+        runtime.active_source_raw_bytes_for_test() == 0;
     pair.receiver = local::Connection(-1);
+    oversize.receiver = local::Connection(-1);
+    runtime.stop();
     const bool f_finished = f_done.wait_for(std::chrono::seconds(3)) ==
                             std::future_status::ready;
     if (!f_finished) {
@@ -4392,23 +4535,48 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact() {
         f_server.join();
     (void)::close(f_listener);
     (void)::close(oversize_listener);
+    (void)::close(held_listener);
+    (void)::close(waiting_listener);
+    if (oversize_exception)
+        std::rethrow_exception(oversize_exception);
     if (transfer_exception)
         std::rethrow_exception(transfer_exception);
     if (f_exception)
         std::rethrow_exception(f_exception);
     CHECK(enqueued);
-    CHECK(source_read_observed && source_read_succeeded);
-    CHECK(original_source_closed);
-    CHECK(replacement_source_fd == source_fd_number);
+    CHECK(held_enqueued);
+    CHECK(held_read_observed && held_read_succeeded && held_credit);
+    CHECK(waiting_enqueued);
+    CHECK(credit_wait_observed && waiting_credit_bytes == 3);
+    CHECK(waiting_operation_accounted);
+    CHECK(oversize_enqueued);
+    CHECK(oversize_result_at != std::chrono::steady_clock::time_point{} &&
+          oversize_result_at <
+              oversize_request.absolute_deadline.as_steady_time_point());
+    CHECK(oversize_no_read_or_credit);
+    CHECK(oversize_ready == 0);
+    CHECK(fit_source_read_observed);
+    CHECK(fit_credit_uses_remaining_bytes);
+    CHECK(fit_credit_released_to_holder);
+    CHECK(waiting_still_blocked_after_fit);
+    CHECK(cancelled_waiter_released);
+    CHECK(cancelled_waiter_at <
+          waiting_request.absolute_deadline.as_steady_time_point());
+    CHECK(cancelled_waiter_fd_closed);
+    CHECK(waiting_ready == 0);
+    CHECK(held_operation_released);
+    CHECK(held_ready == 0);
     CHECK(exact_result);
+    CHECK(fit_result_at != std::chrono::steady_clock::time_point{} &&
+          fit_result_at < request.absolute_deadline.as_steady_time_point());
     CHECK(credit_released);
+    CHECK(counters_stayed_drained);
     CHECK(f_finished_after_shutdown);
     CHECK(f_result.has_value() && f_result->committed_input.has_value());
     CHECK(committed_input == expected_input);
     CHECK(commit_identity_matches);
-    CHECK(::fcntl(replacement_source_fd, F_GETFD) >= 0);
-    CHECK(::close(replacement_source_fd) == 0);
-    std::puts("P51_ASYNC_TRANSFER aggregate-budget fitting R2 commit exact: ok");
+    std::printf("P51_D12 oversize/credit-cancel/exact-fit profile=%u W30: ok\n",
+                static_cast<unsigned>(profile));
 }
 
 void test_p51_credit_admission_bypasses_blocked_workers() {
@@ -13393,6 +13561,14 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--p51-d12-oversize-fit-credit-cancel") == 0) {
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE})
+                test_p51_aggregate_raw_budget_fitting_commit_is_exact(profile);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--p51-reservation-expiry-before-bind") == 0) {
             test_p51_reservation_expiry_before_bind_no_late_arm();
             return 0;
@@ -13605,7 +13781,10 @@ int main(int argc, char** argv) {
                  ProfileId::ZSTD_ROUTE})
             test_p51_d17_repeated_window_cancel(profile, 3);
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
-        test_p51_aggregate_raw_budget_fitting_commit_is_exact();
+        for (const ProfileId profile : {
+                 ProfileId::P29V1, ProfileId::ZSTD_TU,
+                 ProfileId::ZSTD_ROUTE})
+            test_p51_aggregate_raw_budget_fitting_commit_is_exact(profile);
         test_p51_credit_admission_bypasses_blocked_workers();
         test_p51_credit_admission_bypass_limit_serves_oldest();
         test_p51_stop_while_waiting_for_link_session_echo();
