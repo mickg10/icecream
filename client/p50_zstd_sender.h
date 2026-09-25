@@ -101,6 +101,22 @@ struct ZstdSourceTransferResult {
     // and byte totals; R2 must not present default zeroes as measured values.
     bool attempts_measured = false;
     bool wire_bytes_measured = false;
+    // Present only for an exact R2 logical request that reached a terminal
+    // result. The sender retains this bounded row across reset/replay and
+    // removes it when this snapshot is taken.
+    std::optional<R2WireAccountingSnapshot> r2_wire_accounting;
+    // Exact immutable identity for the measured terminal snapshot, including
+    // failed terminal results that have no committed_input.
+    std::optional<R2WireAccountingKey> r2_wire_accounting_key;
+    // Compatibility field: in observer mode interval deltas are delivered
+    // only through r2_interval_observer and this vector remains empty.
+    std::vector<R2WireControlSnapshot> r2_link_intervals;
+    // False by default so an absent observer cannot look like measured data.
+    bool r2_link_intervals_valid = false;
+    // True when interval snapshots are delivered through the configured
+    // observer instead of being copied into this result.
+    bool r2_link_intervals_external = false;
+    bool r2_accounting_reference = false;
     std::optional<ErrorMessage> terminal_error;
     // Exact CacheWire bytes observed by the C endpoint, including frame
     // headers and bounded retries. These diagnostic witnesses do not grant
@@ -138,6 +154,10 @@ struct ZstdSourceTransferConfig {
     std::chrono::steady_clock::time_point deadline{};
     std::chrono::steady_clock::duration maximum_duration =
         std::chrono::seconds(300);
+    // Optional trace-only sink. When set by the diagnostics-enabled service,
+    // every interval snapshot is delivered once here on the sender owner;
+    // false/throw marks telemetry unavailable and never changes transfer I/O.
+    std::function<bool(const R2WireControlSnapshot&)> r2_interval_observer;
     int compression_level = 1;
     // Deterministic unit-test seam for the typed route-poison boundary.
     // Product callers always leave this empty.

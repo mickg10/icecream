@@ -255,6 +255,535 @@ void record_completion(CompletionLog* log, CompletionStamp stamp, size_t bytes,
         log->record({stamp, static_cast<uint64_t>(bytes), error.value()});
 }
 
+}  // namespace
+
+bool CompletionLog::add_r2_count(uint64_t amount, uint64_t& total) noexcept {
+    if (amount > std::numeric_limits<uint64_t>::max() - total) {
+        total = std::numeric_limits<uint64_t>::max();
+        return false;
+    }
+    total += amount;
+    return true;
+}
+
+namespace {
+
+std::optional<R2WireAccountingKey> r2_accounting_key(
+    const CompletionStamp& stamp) noexcept {
+    if (!stamp.r2_traffic || !stamp.transaction_bound ||
+        stamp.c_store_guid == CStoreGuid{} ||
+        stamp.f_store_guid == FStoreGuid{} ||
+        stamp.logical_link_id == Id128{})
+        return std::nullopt;
+    return R2WireAccountingKey{stamp.c_store_guid, stamp.f_store_guid,
+                               stamp.logical_link_id, stamp.tu_seq,
+                               stamp.raw_digest};
+}
+
+std::optional<R2WireLinkIdentity> r2_link_identity(
+    const CompletionStamp& stamp) noexcept {
+    if (!stamp.r2_traffic || stamp.c_store_guid == CStoreGuid{} ||
+        stamp.f_store_guid == FStoreGuid{} ||
+        stamp.logical_link_id == Id128{} || stamp.relationship_epoch == 0 ||
+        stamp.physical_link_generation == 0)
+        return std::nullopt;
+    return R2WireLinkIdentity{stamp.c_store_guid, stamp.f_store_guid,
+                              stamp.logical_link_id,
+                              stamp.relationship_epoch,
+                              stamp.physical_link_generation};
+}
+
+}  // namespace
+
+void CompletionLog::record_r2_unattributed_locked(
+    uint64_t bytes, bool write, R2WireLinkIdentity link) noexcept {
+    if (link.c_store_guid == CStoreGuid{} || link.f_store_guid == FStoreGuid{} ||
+        link.logical_link_id == Id128{} || link.relationship_epoch == 0 ||
+        link.physical_link_generation == 0) {
+        r2_unattributed_valid_ = false;
+        return;
+    }
+    if (!r2_unattributed_link_)
+        r2_unattributed_link_ = link;
+    else if (*r2_unattributed_link_ != link) {
+        r2_unattributed_valid_ = false;
+    }
+    uint64_t& total = write ? r2_unattributed_write_bytes_
+                            : r2_unattributed_read_bytes_;
+    if (!add_r2_count(bytes, total))
+        r2_unattributed_valid_ = false;
+}
+
+bool CompletionLog::set_r2_interval_link_locked(
+    R2WireLinkIdentity link) noexcept {
+    if (link.c_store_guid == CStoreGuid{} || link.f_store_guid == FStoreGuid{} ||
+        link.logical_link_id == Id128{} || link.relationship_epoch == 0 ||
+        link.physical_link_generation == 0) {
+        r2_unattributed_valid_ = false;
+        return false;
+    }
+    if (!r2_interval_link_) {
+        r2_interval_link_ = link;
+        return true;
+    }
+    if (*r2_interval_link_ != link) {
+        r2_unattributed_valid_ = false;
+        return false;
+    }
+    return true;
+}
+
+void CompletionLog::record_r2_interval_bytes_locked(
+    uint64_t bytes, bool write, R2WireLinkIdentity link) noexcept {
+    (void)set_r2_interval_link_locked(link);
+    uint64_t& total = write ? r2_interval_write_bytes_ : r2_interval_read_bytes_;
+    if (!add_r2_count(bytes, total))
+        r2_unattributed_valid_ = false;
+}
+
+bool CompletionLog::begin_r2_job(const R2WireAccountingKey& key) noexcept {
+    if (!r2_accounting_enabled_)
+        return false;
+    try {
+        std::lock_guard lock(r2_mutex_);
+        if (r2_active_jobs_.contains(key))
+            return true;
+        if (r2_active_jobs_.size() >= 30) {
+            r2_unattributed_valid_ = false;
+            r2_accounting_poisoned_.store(true, std::memory_order_release);
+            return false;
+        }
+        R2ActiveJob row{};
+        row.interval.key = key;
+        return r2_active_jobs_.emplace(key, std::move(row)).second;
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+        return false;
+    }
+}
+
+void CompletionLog::begin_r2_bundle_attempt(
+    const CompletionStamp& stamp) noexcept {
+    if (!r2_accounting_enabled_)
+        return;
+    const auto key = r2_accounting_key(stamp);
+    if (!key) {
+        if (stamp.r2_traffic && stamp.transaction_bound)
+            r2_accounting_poisoned_.store(true, std::memory_order_release);
+        return;
+    }
+    try {
+        std::lock_guard lock(r2_mutex_);
+        const auto position = r2_active_jobs_.find(*key);
+        if (position == r2_active_jobs_.end()) {
+            r2_unattributed_valid_ = false;
+            r2_accounting_poisoned_.store(true, std::memory_order_release);
+            return;
+        }
+        auto& totals = position->second.totals;
+        R2ActiveJob& job = position->second;
+        if (totals.bundle_attempts == std::numeric_limits<uint32_t>::max()) {
+            totals.valid = false;
+            return;
+        }
+        ++totals.bundle_attempts;
+        const auto link = r2_link_identity(stamp);
+        if (!link) {
+            job.interval.valid = false;
+            return;
+        }
+        (void)set_r2_interval_link_locked(*link);
+        if (!job.interval_link)
+            job.interval_link = *link;
+        else if (*job.interval_link != *link)
+            job.interval.valid = false;
+        job.interval.link = *link;
+        if (job.interval.bundle_attempts ==
+            std::numeric_limits<uint32_t>::max()) {
+            job.interval.valid = false;
+        } else {
+            ++job.interval.bundle_attempts;
+        }
+        if (stamp.replay_attempt) {
+            if (totals.replay_attempts == std::numeric_limits<uint32_t>::max()) {
+                totals.valid = false;
+                return;
+            }
+            ++totals.replay_attempts;
+            if (job.interval.replay_attempts ==
+                std::numeric_limits<uint32_t>::max()) {
+                job.interval.valid = false;
+            } else {
+                ++job.interval.replay_attempts;
+            }
+        }
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+}
+
+void CompletionLog::record_r2_accounting(
+    const AsyncCompletion& completion) noexcept {
+    if (!r2_accounting_enabled_)
+        return;
+    const CompletionStamp& stamp = completion.stamp;
+    if (!stamp.r2_traffic || stamp.actor != ActorSide::C ||
+        completion.transferred_bytes == 0)
+        return;
+    const bool write = stamp.operation == AsyncOperationKind::WriteFragment;
+    const bool read = stamp.operation == AsyncOperationKind::ReadHeader ||
+                      stamp.operation == AsyncOperationKind::ReadPayload;
+    if (!write && !read)
+        return;
+
+    try {
+        const auto key = r2_accounting_key(stamp);
+        const auto link = r2_link_identity(stamp);
+        std::lock_guard lock(r2_mutex_);
+        if (link)
+            record_r2_interval_bytes_locked(completion.transferred_bytes,
+                                            write, *link);
+        else
+            r2_unattributed_valid_ = false;
+        if (!key) {
+            if (stamp.transaction_bound)
+                r2_accounting_poisoned_.store(true,
+                                              std::memory_order_release);
+            if (link)
+                record_r2_unattributed_locked(completion.transferred_bytes,
+                                              write, *link);
+            else
+                r2_unattributed_valid_ = false;
+            return;
+        }
+        const auto position = r2_active_jobs_.find(*key);
+        if (position == r2_active_jobs_.end()) {
+            if (link)
+                record_r2_unattributed_locked(completion.transferred_bytes,
+                                              write, *link);
+            else
+                r2_unattributed_valid_ = false;
+            r2_unattributed_valid_ = false;
+            r2_accounting_poisoned_.store(true, std::memory_order_release);
+            return;
+        }
+        R2ActiveJob& job = position->second;
+        if (link) {
+            if (!job.interval_link)
+                job.interval_link = *link;
+            else if (*job.interval_link != *link)
+                job.interval.valid = false;
+            job.interval.link = *link;
+        }
+        if (write) {
+            if (!add_r2_count(completion.transferred_bytes,
+                              job.totals.c_to_f_bundle_bytes))
+                job.totals.valid = false;
+            if (!add_r2_count(completion.transferred_bytes,
+                              job.interval.c_to_f_bundle_bytes))
+                job.interval.valid = false;
+        } else if (job.receipt_read_active) {
+            if (!add_r2_count(completion.transferred_bytes,
+                              job.provisional_receipt_bytes))
+                job.totals.valid = false;
+        } else {
+            if (link)
+                record_r2_unattributed_locked(completion.transferred_bytes,
+                                              false, *link);
+            else
+                r2_unattributed_valid_ = false;
+        }
+    } catch (...) {
+        // Accounting is explicitly best effort and cannot affect I/O results.
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+}
+
+void CompletionLog::begin_r2_receipt_read(
+    const R2WireAccountingKey& key, R2WireLinkIdentity link) noexcept {
+    if (!r2_accounting_enabled_)
+        return;
+    try {
+        std::lock_guard lock(r2_mutex_);
+        const auto position = r2_active_jobs_.find(key);
+        if (position == r2_active_jobs_.end()) {
+            r2_unattributed_valid_ = false;
+            return;
+        }
+        R2ActiveJob& job = position->second;
+        (void)set_r2_interval_link_locked(link);
+        if (!job.interval_link)
+            job.interval_link = link;
+        else if (*job.interval_link != link)
+            job.interval.valid = false;
+        job.interval.link = link;
+        if (job.receipt_read_active || job.provisional_receipt_bytes != 0) {
+            record_r2_unattributed_locked(job.provisional_receipt_bytes,
+                                          false, job.provisional_link);
+            job.provisional_receipt_bytes = 0;
+        }
+        job.receipt_read_active = true;
+        job.provisional_link = link;
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+}
+
+void CompletionLog::confirm_r2_receipt(
+    const R2WireAccountingKey& key) noexcept {
+    if (!r2_accounting_enabled_)
+        return;
+    try {
+        std::lock_guard lock(r2_mutex_);
+        const auto position = r2_active_jobs_.find(key);
+        if (position == r2_active_jobs_.end())
+            return;
+        R2ActiveJob& job = position->second;
+        if (!job.receipt_read_active) {
+            job.totals.valid = false;
+            return;
+        }
+        if (!add_r2_count(job.provisional_receipt_bytes,
+                          job.totals.f_to_c_receipt_bytes))
+            job.totals.valid = false;
+        if (!add_r2_count(job.provisional_receipt_bytes,
+                          job.interval.f_to_c_receipt_bytes))
+            job.interval.valid = false;
+        job.provisional_receipt_bytes = 0;
+        job.receipt_read_active = false;
+        service_r2_checkpoints_locked();
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+}
+
+void CompletionLog::reject_r2_receipt(
+    const R2WireAccountingKey& key) noexcept {
+    if (!r2_accounting_enabled_)
+        return;
+    try {
+        std::lock_guard lock(r2_mutex_);
+        const auto position = r2_active_jobs_.find(key);
+        if (position == r2_active_jobs_.end())
+            return;
+        R2ActiveJob& job = position->second;
+        record_r2_unattributed_locked(job.provisional_receipt_bytes,
+                                      false, job.provisional_link);
+        job.provisional_receipt_bytes = 0;
+        job.receipt_read_active = false;
+        service_r2_checkpoints_locked();
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+}
+
+R2WireAccountingSnapshot CompletionLog::finish_r2_job(
+    const R2WireAccountingKey& key) noexcept {
+    if (!r2_accounting_enabled_)
+        return R2WireAccountingSnapshot{0, 0, 0, 0, false};
+    try {
+        std::lock_guard lock(r2_mutex_);
+        const auto position = r2_active_jobs_.find(key);
+        if (position == r2_active_jobs_.end())
+            return R2WireAccountingSnapshot{0, 0, 0, 0, false};
+        R2ActiveJob& job = position->second;
+        if (job.provisional_receipt_bytes != 0) {
+            record_r2_unattributed_locked(job.provisional_receipt_bytes,
+                                          false, job.provisional_link);
+            job.provisional_receipt_bytes = 0;
+            job.receipt_read_active = false;
+        }
+        R2WireAccountingSnapshot result = job.totals;
+        result.valid = result.valid &&
+            !r2_accounting_poisoned_.load(std::memory_order_acquire);
+        const bool has_interval_data =
+            job.interval.c_to_f_bundle_bytes != 0 ||
+            job.interval.f_to_c_receipt_bytes != 0 ||
+            job.interval.bundle_attempts != 0 ||
+            job.interval.replay_attempts != 0;
+        if (has_interval_data) {
+            if (r2_finished_interval_jobs_.size() >= 30) {
+                job.interval.valid = false;
+                r2_accounting_poisoned_.store(true,
+                                              std::memory_order_release);
+            } else {
+                r2_finished_interval_jobs_.push_back(job.interval);
+                if (r2_finished_interval_jobs_.size() == 30) {
+                    if (r2_pending_checkpoints_.size() >= 30) {
+                        r2_accounting_poisoned_.store(
+                            true, std::memory_order_release);
+                    } else {
+                        r2_pending_checkpoints_.push_back(
+                            R2PendingCheckpoint{
+                                job.interval.link,
+                                R2WireIntervalEnd::WindowPressure, 0, 0});
+                    }
+                }
+            }
+        }
+        r2_active_jobs_.erase(position);
+        service_r2_checkpoints_locked();
+        result.valid = result.valid &&
+            !r2_accounting_poisoned_.load(std::memory_order_acquire);
+        return result;
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+        return R2WireAccountingSnapshot{0, 0, 0, 0, false};
+    }
+}
+
+bool CompletionLog::snapshot_r2_interval_locked(
+    R2WireLinkIdentity link, R2WireIntervalEnd end,
+    uint64_t drained_ack_prefix,
+    uint64_t recovery_confirmed_prefix) noexcept {
+    try {
+        if (r2_unattributed_sequence_ ==
+            std::numeric_limits<uint64_t>::max()) {
+            r2_accounting_poisoned_.store(true, std::memory_order_release);
+            return false;
+        }
+        if (r2_ready_interval_snapshots_.size() >= 30) {
+            r2_accounting_poisoned_.store(true, std::memory_order_release);
+            return false;
+        }
+        R2WireControlSnapshot result{};
+        result.link = link;
+        result.interval_sequence = ++r2_unattributed_sequence_;
+        result.drained_ack_prefix = drained_ack_prefix;
+        result.recovery_confirmed_prefix = recovery_confirmed_prefix;
+        result.end = end;
+        result.total_c_to_f_bytes = r2_interval_write_bytes_;
+        result.total_f_to_c_bytes = r2_interval_read_bytes_;
+        result.shared_c_to_f_bytes = r2_unattributed_write_bytes_;
+        result.shared_f_to_c_bytes = r2_unattributed_read_bytes_;
+        result.valid = r2_unattributed_valid_ &&
+            !r2_accounting_poisoned_.load(std::memory_order_acquire) &&
+            set_r2_interval_link_locked(link);
+        result.jobs.reserve(r2_finished_interval_jobs_.size() +
+                            r2_active_jobs_.size());
+        for (const auto& finished : r2_finished_interval_jobs_) {
+            result.valid = result.valid && finished.valid;
+            if (finished.link != link)
+                result.valid = false;
+            result.jobs.push_back(finished);
+        }
+        r2_finished_interval_jobs_.clear();
+        for (auto& [key, job] : r2_active_jobs_) {
+            const bool has_data =
+                job.interval.c_to_f_bundle_bytes != 0 ||
+                job.interval.f_to_c_receipt_bytes != 0 ||
+                job.interval.bundle_attempts != 0 ||
+                job.interval.replay_attempts != 0;
+            if (job.interval_link && *job.interval_link != link)
+                result.valid = false;
+            if (has_data) {
+                result.valid = result.valid && job.interval.valid;
+                if (job.interval.link != link)
+                    result.valid = false;
+                result.jobs.push_back(job.interval);
+            }
+            job.interval = R2WireJobInterval{};
+            job.interval.key = key;
+            job.interval.link = link;
+            job.interval_link.reset();
+        }
+        uint64_t classified_write = result.shared_c_to_f_bytes;
+        uint64_t classified_read = result.shared_f_to_c_bytes;
+        for (const auto& job : result.jobs) {
+            if (!add_r2_count(job.c_to_f_bundle_bytes, classified_write) ||
+                !add_r2_count(job.f_to_c_receipt_bytes, classified_read))
+                result.valid = false;
+        }
+        if (classified_write != result.total_c_to_f_bytes ||
+            classified_read != result.total_f_to_c_bytes)
+            result.valid = false;
+        r2_interval_write_bytes_ = 0;
+        r2_interval_read_bytes_ = 0;
+        r2_unattributed_write_bytes_ = 0;
+        r2_unattributed_read_bytes_ = 0;
+        r2_unattributed_valid_ = true;
+        r2_unattributed_link_.reset();
+        r2_interval_link_.reset();
+        r2_ready_interval_snapshots_.push_back(std::move(result));
+        return true;
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+        return false;
+    }
+}
+
+void CompletionLog::service_r2_checkpoints_locked() noexcept {
+    for (const auto& [key, job] : r2_active_jobs_) {
+        (void)key;
+        if (job.receipt_read_active)
+            return;
+    }
+    while (!r2_pending_checkpoints_.empty()) {
+        const R2PendingCheckpoint checkpoint =
+            r2_pending_checkpoints_.front();
+        r2_pending_checkpoints_.pop_front();
+        (void)snapshot_r2_interval_locked(checkpoint.link, checkpoint.end,
+                                          checkpoint.drained_ack_prefix,
+                                          checkpoint.recovery_confirmed_prefix);
+    }
+}
+
+void CompletionLog::request_r2_interval_checkpoint(
+    R2WireLinkIdentity link, R2WireIntervalEnd end,
+    uint64_t drained_ack_prefix,
+    uint64_t recovery_confirmed_prefix) noexcept {
+    if (!r2_accounting_enabled_)
+        return;
+    try {
+        std::lock_guard lock(r2_mutex_);
+        bool has_active_read = false;
+        for (const auto& [key, job] : r2_active_jobs_) {
+            (void)key;
+            has_active_read = has_active_read || job.receipt_read_active;
+        }
+        if (has_active_read) {
+            if (r2_pending_checkpoints_.size() >= 30) {
+                r2_accounting_poisoned_.store(true,
+                                              std::memory_order_release);
+                return;
+            }
+            r2_pending_checkpoints_.push_back(
+                R2PendingCheckpoint{link, end, drained_ack_prefix,
+                                    recovery_confirmed_prefix});
+            return;
+        }
+        (void)snapshot_r2_interval_locked(link, end, drained_ack_prefix,
+                                          recovery_confirmed_prefix);
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+}
+
+std::vector<R2WireControlSnapshot>
+CompletionLog::drain_r2_interval_snapshots() noexcept {
+    if (!r2_accounting_enabled_)
+        return {};
+    try {
+        std::lock_guard lock(r2_mutex_);
+        service_r2_checkpoints_locked();
+        std::vector<R2WireControlSnapshot> result;
+        result.reserve(r2_ready_interval_snapshots_.size());
+        while (!r2_ready_interval_snapshots_.empty()) {
+            result.push_back(std::move(r2_ready_interval_snapshots_.front()));
+            r2_ready_interval_snapshots_.pop_front();
+        }
+        if (r2_accounting_poisoned_.load(std::memory_order_acquire))
+            for (auto& interval : result)
+                interval.valid = false;
+        return result;
+    } catch (...) {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+        return {};
+    }
+}
+
+namespace {
+
 void close_now(tcp::socket& socket) {
     boost::system::error_code ignored;
     socket.cancel(ignored);
@@ -882,6 +1411,8 @@ asio::awaitable<void> async_write_message(tcp::socket& socket, Message message,
     std::vector<uint8_t> frame = encode_frame(message);
     if (frame.size() - 4 > max_payload)
         throw std::length_error("outbound frame exceeds the negotiated cap");
+    if (type == MessageType::JOB_BIND && log && stamp.r2_traffic)
+        log->begin_r2_bundle_attempt(stamp);
     size_t offset = 0;
     while (offset != frame.size()) {
         const size_t count = std::min(control.max_write_fragment, frame.size() - offset);
@@ -2541,6 +3072,7 @@ struct P50ClientEndpoint::Impl {
     uint64_t r2_staged_ordinal = 0;
     uint64_t r2_confirmed_ordinal = 0;
     uint64_t r2_ack_sent_ordinal = 0;
+    uint64_t r2_ack_written_prefix = 0;
     uint64_t r2_speculative_rel = 0;
     Digest128 r2_speculative_state{};
     std::map<uint64_t, R2SentBundle> r2_pending_bundles;
@@ -4164,6 +4696,10 @@ boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
     stamp.actor = ActorSide::C;
     stamp.r2_traffic = true;
     stamp.c_store_guid = impl_->c_guid;
+    stamp.f_store_guid = hello.f_store_guid;
+    stamp.logical_link_id = hello.relationship_id;
+    stamp.relationship_epoch = hello.relationship_epoch;
+    stamp.physical_link_generation = hello.physical_link_generation;
     stamp.operation = AsyncOperationKind::WriteFragment;
     const auto verify = [this, deadline](const CompletionStamp&) {
         impl_->owner.require();
@@ -4230,6 +4766,7 @@ boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
         impl_->r2_staged_ordinal = 0;
         impl_->r2_confirmed_ordinal = 0;
         impl_->r2_ack_sent_ordinal = 0;
+        impl_->r2_ack_written_prefix = 0;
         impl_->r2_speculative_rel = state.next_rel_seq.value;
         impl_->r2_speculative_state = state.state_digest;
         impl_->r2_pending_bundles.clear();
@@ -4237,6 +4774,10 @@ boost::asio::awaitable<LinkState> P50ClientEndpoint::open_r2_link(
         impl_->r2_recovery_receipts.clear();
         impl_->r2_reset_ack_retry.reset();
     } else {
+        // ACK-write evidence is per physical link. LINK_STATE may report a
+        // previously acknowledged prefix, but no ACK has been written on this
+        // newly accepted socket yet.
+        impl_->r2_ack_written_prefix = 0;
         impl_->r2_recovery_pending = true;
     }
     impl_->r2_session_serial = impl_->allocate_session();
@@ -4349,6 +4890,9 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     stamp.operation = AsyncOperationKind::WriteFragment;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = state.f_store_guid;
+    stamp.logical_link_id = hello.relationship_id;
+    stamp.relationship_epoch = hello.relationship_epoch;
+    stamp.physical_link_generation = hello.physical_link_generation;
     stamp.session_serial = impl_->r2_session_serial;
     const auto verify = [this, deadline](const CompletionStamp&) {
         impl_->owner.require();
@@ -4529,6 +5073,7 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
     impl_->r2_staged_ordinal = state.committed_prefix_k;
     impl_->r2_confirmed_ordinal = state.committed_prefix_k;
     impl_->r2_ack_sent_ordinal = state.committed_prefix_k;
+    impl_->r2_ack_written_prefix = 0;
     impl_->r2_speculative_rel = 0;
     impl_->r2_speculative_state = expected_initial;
     impl_->r2_pending_bundles.clear();
@@ -4551,7 +5096,7 @@ boost::asio::awaitable<R2RecoveryResult> P50ClientEndpoint::recover_r2_link(
 boost::asio::awaitable<R2SentBundle> P50ClientEndpoint::write_r2_bundle(
     tcp::socket& socket, JobBind binding, PreparedTuHandle prepared,
     std::chrono::steady_clock::time_point deadline,
-    EndpointIoControl control) {
+    EndpointIoControl control, bool replay_attempt) {
     impl_->owner.require();
     if (!impl_->r2_link_hello || !impl_->r2_link_state ||
         impl_->r2_recovery_pending || !socket.is_open() ||
@@ -4687,6 +5232,9 @@ boost::asio::awaitable<R2SentBundle> P50ClientEndpoint::write_r2_bundle(
     stamp.operation = AsyncOperationKind::WriteFragment;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = link.f_store_guid;
+    stamp.logical_link_id = link.relationship_id;
+    stamp.relationship_epoch = link.relationship_epoch;
+    stamp.physical_link_generation = link.physical_link_generation;
     stamp.session_serial = impl_->r2_session_serial;
     stamp.history_nonce = begin.history_nonce;
     stamp.rel_seq = begin.rel_seq;
@@ -4694,6 +5242,13 @@ boost::asio::awaitable<R2SentBundle> P50ClientEndpoint::write_r2_bundle(
     stamp.transaction_digest = transaction_digest;
     stamp.raw_digest = begin.raw_digest;
     stamp.transaction_bound = true;
+    stamp.replay_attempt = replay_attempt;
+    if (impl_->completions) {
+        const R2WireAccountingKey accounting_key{
+            stamp.c_store_guid, stamp.f_store_guid, stamp.logical_link_id,
+            stamp.tu_seq, stamp.raw_digest};
+        (void)impl_->completions->begin_r2_job(accounting_key);
+    }
     const auto verify = [this, deadline](const CompletionStamp&) {
         impl_->owner.require();
         if (std::chrono::steady_clock::now() >= deadline)
@@ -4768,6 +5323,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::read_r2_receipt(
     stamp.operation = AsyncOperationKind::ReadHeader;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = link.f_store_guid;
+    stamp.logical_link_id = link.relationship_id;
+    stamp.relationship_epoch = link.relationship_epoch;
+    stamp.physical_link_generation = link.physical_link_generation;
     stamp.session_serial = impl_->r2_session_serial;
     stamp.history_nonce = sent.begin.inner.history_nonce;
     stamp.rel_seq = sent.begin.inner.rel_seq;
@@ -4775,21 +5333,41 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::read_r2_receipt(
     stamp.transaction_digest = sent.transaction_digest;
     stamp.raw_digest = sent.begin.inner.raw_digest;
     stamp.transaction_bound = true;
+    const R2WireAccountingKey accounting_key{
+        stamp.c_store_guid, stamp.f_store_guid, stamp.logical_link_id,
+        stamp.tu_seq, stamp.raw_digest};
+    if (impl_->completions)
+        impl_->completions->begin_r2_receipt_read(
+            accounting_key,
+            R2WireLinkIdentity{stamp.c_store_guid, stamp.f_store_guid,
+                               stamp.logical_link_id,
+                               stamp.relationship_epoch,
+                               stamp.physical_link_generation});
     const auto verify = [this, deadline](const CompletionStamp&) {
         impl_->owner.require();
         if (std::chrono::steady_clock::now() >= deadline)
             throw boost::system::system_error(asio::error::timed_out);
     };
-    Frame frame = co_await async_read_frame(socket, frame_cap, stamp,
-                                            impl_->completions, verify);
-    if (frame.type != MessageType::R2_TX_COMMIT)
-        throw std::invalid_argument("R2 bundle did not receive TX_COMMIT");
-    const R2TxCommit receipt = decode_as<R2TxCommit>(frame);
-    if (receipt.relationship_ordinal != sent.binding.relationship_ordinal ||
-        receipt.binding_digest != sent.binding_digest ||
-        receipt.transaction_digest != sent.transaction_digest ||
-        !same_commit(receipt.inner, sent.begin.inner))
-        throw std::invalid_argument("R2 TX_COMMIT differs from exact sent witness");
+    R2TxCommit receipt;
+    try {
+        Frame frame = co_await async_read_frame(socket, frame_cap, stamp,
+                                                impl_->completions, verify);
+        if (frame.type != MessageType::R2_TX_COMMIT)
+            throw std::invalid_argument("R2 bundle did not receive TX_COMMIT");
+        receipt = decode_as<R2TxCommit>(frame);
+        if (receipt.relationship_ordinal != sent.binding.relationship_ordinal ||
+            receipt.binding_digest != sent.binding_digest ||
+            receipt.transaction_digest != sent.transaction_digest ||
+            !same_commit(receipt.inner, sent.begin.inner))
+            throw std::invalid_argument(
+                "R2 TX_COMMIT differs from exact sent witness");
+        if (impl_->completions)
+            impl_->completions->confirm_r2_receipt(accounting_key);
+    } catch (...) {
+        if (impl_->completions)
+            impl_->completions->reject_r2_receipt(accounting_key);
+        throw;
+    }
     if (impl_->next_rel.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("R2 C REL_SEQ space exhausted");
     impl_->record(ActionType::COMMIT_ACCEPTED, sent.begin.inner,
@@ -4833,6 +5411,9 @@ boost::asio::awaitable<void> P50ClientEndpoint::write_r2_ack(
     stamp.operation = AsyncOperationKind::WriteFragment;
     stamp.c_store_guid = impl_->c_guid;
     stamp.f_store_guid = link.f_store_guid;
+    stamp.logical_link_id = link.relationship_id;
+    stamp.relationship_epoch = link.relationship_epoch;
+    stamp.physical_link_generation = link.physical_link_generation;
     stamp.session_serial = impl_->r2_session_serial;
     stamp.history_nonce = impl_->history_nonce;
     stamp.rel_seq = impl_->next_rel;
@@ -4846,6 +5427,7 @@ boost::asio::awaitable<void> P50ClientEndpoint::write_r2_ack(
     co_await async_write_message(socket, Message{ack}, frame_cap, stamp,
                                  impl_->completions, control, verify);
     impl_->r2_ack_sent_ordinal = cumulative_ordinal;
+    impl_->r2_ack_written_prefix = cumulative_ordinal;
 }
 
 boost::asio::awaitable<void> P50ClientEndpoint::flush_r2_ack(
@@ -4867,6 +5449,10 @@ bool P50ClientEndpoint::r2_window_available() const noexcept {
 
 uint64_t P50ClientEndpoint::r2_confirmed_prefix() const noexcept {
     return impl_->r2_confirmed_ordinal;
+}
+
+uint64_t P50ClientEndpoint::r2_ack_written_prefix() const noexcept {
+    return impl_->r2_ack_written_prefix;
 }
 
 std::vector<R2SentBundle> P50ClientEndpoint::r2_pending_witnesses(

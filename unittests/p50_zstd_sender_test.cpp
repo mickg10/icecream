@@ -43,6 +43,35 @@ using tcp = asio::ip::tcp;
 
 namespace {
 
+class ScopedP50Diagnostics {
+public:
+    ScopedP50Diagnostics() {
+        if (const char* value = std::getenv("ICECC_P50_DIAGNOSTICS")) {
+            was_set_ = true;
+            previous_ = value;
+        }
+        if (::setenv("ICECC_P50_DIAGNOSTICS", "1", 1) != 0)
+            throw std::runtime_error("could not enable P50 diagnostics for test");
+    }
+    ScopedP50Diagnostics(const ScopedP50Diagnostics&) = delete;
+    ScopedP50Diagnostics& operator=(const ScopedP50Diagnostics&) = delete;
+    ~ScopedP50Diagnostics() {
+        if (was_set_)
+            (void)::setenv("ICECC_P50_DIAGNOSTICS", previous_.c_str(), 1);
+        else
+            (void)::unsetenv("ICECC_P50_DIAGNOSTICS");
+    }
+
+private:
+    bool was_set_ = false;
+    std::string previous_;
+};
+
+bool p50_diagnostics_enabled_for_test() {
+    const char* value = std::getenv("ICECC_P50_DIAGNOSTICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 void check(bool value, const char* expression) {
     if (!value) throw std::runtime_error(expression);
 }
@@ -1762,6 +1791,7 @@ void run_p51_sender_window_concurrent_callers(
     ProfileId profile, size_t kWindow, size_t kJobs,
     size_t required_occupancy, bool fail_first_connector = false,
     bool expect_underfilled_witness = false) {
+    ScopedP50Diagnostics diagnostics;
     CHECK(kWindow != 0 && kWindow <= 30);
     CHECK(kJobs > kWindow && kJobs <= 31);
     CHECK(required_occupancy != 0);
@@ -1810,9 +1840,17 @@ void run_p51_sender_window_concurrent_callers(
     std::atomic<unsigned> acknowledged{0};
     std::atomic<unsigned> exact_input_mismatches{0};
     std::atomic<bool> mismatch_detail_logged{false};
+    std::mutex interval_observer_mutex;
+    std::vector<R2WireControlSnapshot> observed_intervals;
     std::vector<bool> reservation_consumed(kJobs, false);
     std::vector<size_t> input_index_by_tu(kJobs, kJobs);
     std::mutex consumed_mutex;
+    struct ObservedSocketBytes {
+        uint64_t c_to_f = 0;
+        uint64_t f_to_c = 0;
+    };
+    CompletionLog f_socket_observations;
+    std::vector<ObservedSocketBytes> bytes_at_ack;
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
     server_caps.profile = profile;
@@ -1919,12 +1957,34 @@ void run_p51_sender_window_concurrent_callers(
                 ack.relationship_id != relationship_id ||
                 ack.physical_link_generation != 27)
                 return false;
+            ObservedSocketBytes observed;
+            for (const AsyncCompletion& completion :
+                 f_socket_observations.completions()) {
+                if (!completion.stamp.r2_traffic ||
+                    completion.stamp.actor != ActorSide::F)
+                    continue;
+                uint64_t* total = nullptr;
+                if (completion.stamp.operation ==
+                        AsyncOperationKind::ReadHeader ||
+                    completion.stamp.operation ==
+                        AsyncOperationKind::ReadPayload)
+                    total = &observed.c_to_f;
+                else if (completion.stamp.operation ==
+                         AsyncOperationKind::WriteFragment)
+                    total = &observed.f_to_c;
+                if (total != nullptr) {
+                    CHECK(completion.transferred_bytes <=
+                          std::numeric_limits<uint64_t>::max() - *total);
+                    *total += completion.transferred_bytes;
+                }
+            }
+            bytes_at_ack.push_back(observed);
             acknowledged.store(static_cast<unsigned>(ack.contiguous_verified_ordinal),
                                std::memory_order_release);
             ack_cv.notify_all();
             return true;
         };
-    P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
+    P50ServerEndpoint server(f_guid, server_caps, &f_socket_observations, nullptr,
                              std::move(server_config));
     auto server_future = asio::co_spawn(f_context,
         sender_r2_accept(acceptor, server, EndpointIoControl{}, false),
@@ -1946,6 +2006,11 @@ void run_p51_sender_window_concurrent_callers(
     ZstdSourceTransferConfig sender_config = config();
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
+    sender_config.r2_interval_observer = [&](const R2WireControlSnapshot& interval) {
+        std::lock_guard lock(interval_observer_mutex);
+        observed_intervals.push_back(interval);
+        return true;
+    };
     if (profile == ProfileId::ZSTD_ROUTE)
         sender_config.compression_level = 3;
     sender_config.after_r2_bundle_sent_for_test = [&](uint64_t) {
@@ -2127,6 +2192,8 @@ void run_p51_sender_window_concurrent_callers(
     };
     const auto first_result = get_result_by_deadline(results.front());
     CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
+    std::vector<ZstdSourceTransferResult> unique_results(kJobs);
+    unique_results[0] = first_result;
     const auto duplicate_result = get_result_by_deadline(results[1]);
     CHECK(duplicate_result.status == ZstdSourceTransferStatus::Committed ||
           duplicate_result.status == ZstdSourceTransferStatus::InvalidRequest);
@@ -2147,9 +2214,11 @@ void run_p51_sender_window_concurrent_callers(
         CHECK(result.raw_digest == icecc::digest128(input[job_index]));
     };
     validate_committed_result(first_result, 0);
-    for (size_t job_index = 1; job_index != kJobs; ++job_index)
-        validate_committed_result(get_result_by_deadline(results[job_index + 2]),
-                                  job_index);
+    for (size_t job_index = 1; job_index != kJobs; ++job_index) {
+        unique_results[job_index] =
+            get_result_by_deadline(results[job_index + 2]);
+        validate_committed_result(unique_results[job_index], job_index);
+    }
     CHECK(std::all_of(result_tu_seen.begin(), result_tu_seen.end(),
                       [](bool seen) { return seen; }));
     CHECK(committed.load(std::memory_order_acquire) == kJobs);
@@ -2169,6 +2238,73 @@ void run_p51_sender_window_concurrent_callers(
         }));
     }
     CHECK(acknowledged.load(std::memory_order_acquire) == kJobs);
+    CHECK(!bytes_at_ack.empty());
+    CHECK(bytes_at_ack.back().c_to_f != 0 &&
+          bytes_at_ack.back().f_to_c != 0);
+    CHECK(server_future.wait_for(std::chrono::milliseconds(0)) !=
+          std::future_status::ready);
+    std::vector<R2WireControlSnapshot> link_intervals;
+    uint64_t interval_c_to_f = 0;
+    uint64_t interval_f_to_c = 0;
+    for (size_t result_index = 0; result_index != unique_results.size();
+         ++result_index) {
+        const ZstdSourceTransferResult& result = unique_results[result_index];
+        CHECK(result.r2_wire_accounting.has_value());
+        CHECK(result.r2_wire_accounting->valid);
+        CHECK(result.r2_wire_accounting->bundle_attempts == 1);
+        CHECK(result.r2_wire_accounting->replay_attempts == 0);
+        CHECK(result.r2_wire_accounting->c_to_f_bundle_bytes != 0);
+        CHECK(result.r2_wire_accounting->f_to_c_receipt_bytes != 0);
+        CHECK(result.r2_link_intervals_external);
+        CHECK(result.r2_link_intervals.empty());
+        CHECK(result.r2_link_intervals_valid);
+    }
+    {
+        std::lock_guard lock(interval_observer_mutex);
+        link_intervals = observed_intervals;
+    }
+    CHECK(!link_intervals.empty());
+    uint64_t prior_interval_sequence = 0;
+    uint64_t drained_ack_prefix = 0;
+    for (const R2WireControlSnapshot& interval : link_intervals) {
+        CHECK(interval.valid);
+        CHECK(interval.link.c_store_guid == c_guid);
+        CHECK(interval.link.f_store_guid == f_guid);
+        CHECK(interval.link.logical_link_id == relationship_id);
+        CHECK(interval.link.physical_link_generation == 27);
+        CHECK(interval.interval_sequence > prior_interval_sequence);
+        prior_interval_sequence = interval.interval_sequence;
+        if (interval.end == R2WireIntervalEnd::DrainedAckCheckpoint) {
+            CHECK(interval.drained_ack_prefix >= drained_ack_prefix);
+            drained_ack_prefix = interval.drained_ack_prefix;
+        } else {
+            CHECK(interval.end == R2WireIntervalEnd::WindowPressure);
+            CHECK(interval.drained_ack_prefix == 0);
+        }
+        uint64_t classified_c_to_f = interval.shared_c_to_f_bytes;
+        uint64_t classified_f_to_c = interval.shared_f_to_c_bytes;
+        for (const R2WireJobInterval& job : interval.jobs) {
+            CHECK(job.valid);
+            CHECK(job.link == interval.link);
+            CHECK(job.c_to_f_bundle_bytes <=
+                  std::numeric_limits<uint64_t>::max() - classified_c_to_f);
+            CHECK(job.f_to_c_receipt_bytes <=
+                  std::numeric_limits<uint64_t>::max() - classified_f_to_c);
+            classified_c_to_f += job.c_to_f_bundle_bytes;
+            classified_f_to_c += job.f_to_c_receipt_bytes;
+        }
+        CHECK(classified_c_to_f == interval.total_c_to_f_bytes);
+        CHECK(classified_f_to_c == interval.total_f_to_c_bytes);
+        CHECK(interval.total_c_to_f_bytes <=
+              std::numeric_limits<uint64_t>::max() - interval_c_to_f);
+        CHECK(interval.total_f_to_c_bytes <=
+              std::numeric_limits<uint64_t>::max() - interval_f_to_c);
+        interval_c_to_f += interval.total_c_to_f_bytes;
+        interval_f_to_c += interval.total_f_to_c_bytes;
+    }
+    CHECK(interval_c_to_f == bytes_at_ack.back().c_to_f);
+    CHECK(interval_f_to_c == bytes_at_ack.back().f_to_c);
+    CHECK(drained_ack_prefix == kJobs);
     CHECK(sender->retained_completion_records_for_test() == 0);
     CHECK(connector_calls.load(std::memory_order_relaxed) ==
           (fail_first_connector ? 2U : 1U));
@@ -2654,7 +2790,9 @@ void test_p51_sender_writer_backpressure_ack_and_shutdown() {
 
 void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
                                   bool retire_during_recovery = false,
-                                  bool expire_during_recovery = false) {
+                                  bool expire_during_recovery = false,
+                                  bool fail_interval_observer = false) {
+    const bool diagnostics_on = p50_diagnostics_enabled_for_test();
     const auto [c_guid, f_guid] = sender_r2_store_guids();
     const Id128 relationship_id = Id128::from_u64(0x5102);
     P51SourceArmFields source_arm = sender_r2_arm(
@@ -2684,6 +2822,13 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     std::atomic<unsigned> consumed{0};
     std::atomic<unsigned> resets{0};
     std::atomic<unsigned> input_selectors{0};
+    std::atomic<unsigned> acknowledged{0};
+    std::atomic<bool> hold_ack_pump{true};
+    std::atomic<unsigned> interval_observer_calls{0};
+    std::mutex interval_observer_mutex;
+    std::vector<R2WireControlSnapshot> observed_intervals;
+    std::condition_variable ack_observed_cv;
+    std::mutex ack_observed_mutex;
     std::mutex recovery_gate_mutex;
     std::condition_variable recovery_gate_cv;
     bool recovery_waiting = false;
@@ -2693,6 +2838,7 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     uint64_t recovery_prefix_p = 0;
     Digest128 recovery_witness_digest{};
     P50ServerEndpointConfig server_config;
+    CompletionLog f_socket_observations;
     EndpointCaps server_caps;
     server_caps.profile = ProfileId::ZSTD_TU;
     server_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
@@ -2775,13 +2921,18 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
         return true;
     };
     server_config.acknowledge_p51_receipt =
-        [relationship_id](const LinkHello& hello, const CommitAck& ack) {
-        return hello.relationship_id == relationship_id &&
+        [&, relationship_id](const LinkHello& hello, const CommitAck& ack) {
+        const bool valid = hello.relationship_id == relationship_id &&
                ack.relationship_id == relationship_id &&
                ack.relationship_epoch == hello.relationship_epoch &&
                ack.physical_link_generation ==
                    hello.physical_link_generation &&
                ack.contiguous_verified_ordinal == 1;
+        if (valid) {
+            acknowledged.fetch_add(1, std::memory_order_release);
+            ack_observed_cv.notify_all();
+        }
+        return valid;
     };
     server_config.settle_p51_interrupted_job =
         [](const LinkHello& hello) {
@@ -2896,7 +3047,7 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
                    hello.relationship_epoch + 1;
     };
 
-    P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
+    P50ServerEndpoint server(f_guid, server_caps, &f_socket_observations, nullptr,
                              std::move(server_config));
     asio::io_context f_context;
     tcp::acceptor acceptor(f_context, {asio::ip::address_v4::loopback(), 0});
@@ -2939,6 +3090,20 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     sender_config.deadline = deadline.as_steady_time_point();
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
+    sender_config.r2_interval_observer = [&](const R2WireControlSnapshot& interval) {
+        const unsigned call = interval_observer_calls.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (fail_interval_observer && call == 0) return false;
+        if (fail_interval_observer && call == 1)
+            throw std::runtime_error("injected interval observer failure");
+        std::lock_guard lock(interval_observer_mutex);
+        observed_intervals.push_back(interval);
+        return true;
+    };
+    sender_config.hold_r2_ack_pump_for_test = [&] {
+        return repeat_interrupted_materialization &&
+            hold_ack_pump.load(std::memory_order_acquire);
+    };
     sender_config.disconnect_r2_after_bundle_for_test =
         [&](uint64_t ordinal) {
         if (repeat_interrupted_materialization) return false;
@@ -3014,6 +3179,26 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
         if (deadline_connector_thread.joinable())
             deadline_connector_thread.join();
         CHECK(expired.status == ZstdSourceTransferStatus::DeadlineExceeded);
+        if (diagnostics_on) {
+            CHECK(expired.r2_wire_accounting.has_value());
+            CHECK(expired.r2_wire_accounting->valid);
+            CHECK(expired.r2_wire_accounting->bundle_attempts == 1);
+            CHECK(expired.r2_wire_accounting->replay_attempts == 0);
+            CHECK(expired.r2_wire_accounting->c_to_f_bundle_bytes != 0);
+            CHECK(expired.r2_wire_accounting_key.has_value());
+            CHECK(expired.r2_wire_accounting_key->c_store_guid == c_guid);
+            CHECK(expired.r2_wire_accounting_key->f_store_guid == f_guid);
+            CHECK(expired.r2_wire_accounting_key->logical_link_id ==
+                  relationship_id);
+            CHECK(expired.r2_wire_accounting_key->tu_seq == TuSeq{0});
+            CHECK(expired.r2_wire_accounting_key->raw_digest ==
+                  icecc::digest128(source));
+            CHECK(expired.r2_link_intervals_external);
+            CHECK(expired.r2_link_intervals.empty());
+        } else {
+            CHECK(!expired.r2_wire_accounting.has_value());
+            CHECK(!expired.r2_wire_accounting_key.has_value());
+        }
         CHECK(std::chrono::steady_clock::now() >= deadline.as_steady_time_point());
         CHECK(std::chrono::steady_clock::now() - deadline.as_steady_time_point() <
               std::chrono::seconds(2));
@@ -3079,6 +3264,29 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
               << " connectors=" << connector_calls.load()
               << " repeated_abort=" << repeat_interrupted_materialization
               << " retire=" << retire_during_recovery << "\n";
+    if (!retire_during_recovery && !expire_during_recovery) {
+        const ZstdSourceTransferResult duplicate = asio::co_spawn(
+            c_context,
+            sender->transfer_p51_route(
+                armed, 41, connector, PrepareRequestKey{3, 901},
+                source_deadline, source),
+            asio::use_future).get();
+        CHECK(duplicate.status == ZstdSourceTransferStatus::Committed);
+        CHECK(duplicate.r2_accounting_reference);
+        CHECK(!duplicate.r2_wire_accounting.has_value());
+        if (diagnostics_on) {
+            CHECK(duplicate.r2_wire_accounting_key.has_value());
+            CHECK(duplicate.r2_wire_accounting_key->c_store_guid == c_guid);
+            CHECK(duplicate.r2_wire_accounting_key->f_store_guid == f_guid);
+            CHECK(duplicate.r2_wire_accounting_key->logical_link_id ==
+                  relationship_id);
+            CHECK(duplicate.r2_wire_accounting_key->tu_seq == TuSeq{0});
+            CHECK(duplicate.r2_wire_accounting_key->raw_digest ==
+                  icecc::digest128(source));
+        } else {
+            CHECK(!duplicate.r2_wire_accounting_key.has_value());
+        }
+    }
     if (retire_during_recovery) {
         CHECK(recovered.status == ZstdSourceTransferStatus::Unavailable);
         CHECK(connector_calls.load() == 3);
@@ -3109,6 +3317,60 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
             ", resets=" + std::to_string(resets.load()));
     CHECK(recovered.raw_digest == icecc::digest128(source));
     CHECK((recovered.committed_input == InputRecordKey{c_guid, TuSeq{0}}));
+    if (diagnostics_on) {
+        CHECK(recovered.r2_wire_accounting.has_value());
+        CHECK(recovered.r2_wire_accounting->valid);
+        CHECK(recovered.r2_wire_accounting->bundle_attempts ==
+              (repeat_interrupted_materialization ? 3U : 1U));
+        CHECK(recovered.r2_wire_accounting->replay_attempts ==
+              (repeat_interrupted_materialization ? 2U : 0U));
+        CHECK(recovered.r2_wire_accounting->c_to_f_bundle_bytes != 0);
+        CHECK(recovered.r2_wire_accounting_key.has_value());
+        CHECK(recovered.r2_wire_accounting_key->c_store_guid == c_guid);
+        CHECK(recovered.r2_wire_accounting_key->f_store_guid == f_guid);
+        CHECK(recovered.r2_wire_accounting_key->logical_link_id ==
+              relationship_id);
+        CHECK(recovered.r2_wire_accounting_key->tu_seq == TuSeq{0});
+        CHECK(recovered.r2_wire_accounting_key->raw_digest ==
+              icecc::digest128(source));
+        if (repeat_interrupted_materialization)
+            CHECK(recovered.r2_wire_accounting->f_to_c_receipt_bytes != 0);
+        else
+            CHECK(recovered.r2_wire_accounting->f_to_c_receipt_bytes == 0);
+        CHECK(recovered.r2_link_intervals_external);
+        CHECK(recovered.r2_link_intervals.empty());
+        CHECK(recovered.r2_link_intervals_valid != fail_interval_observer);
+        if (fail_interval_observer)
+            CHECK(interval_observer_calls.load(std::memory_order_acquire) >= 2);
+    } else {
+        CHECK(!recovered.r2_wire_accounting.has_value());
+        CHECK(!recovered.r2_link_intervals_external);
+        CHECK(!recovered.r2_link_intervals_valid);
+        std::lock_guard lock(interval_observer_mutex);
+        CHECK(observed_intervals.empty());
+    }
+    if (repeat_interrupted_materialization) {
+        CHECK(acknowledged.load(std::memory_order_acquire) == 0);
+        if (diagnostics_on) {
+            std::lock_guard lock(interval_observer_mutex);
+            CHECK(std::none_of(observed_intervals.begin(),
+                               observed_intervals.end(),
+                [](const R2WireControlSnapshot& interval) {
+                    return interval.end ==
+                               R2WireIntervalEnd::DrainedAckCheckpoint &&
+                           interval.drained_ack_prefix >= 1;
+                }));
+        }
+    }
+    hold_ack_pump.store(false, std::memory_order_release);
+    if (repeat_interrupted_materialization) {
+        std::unique_lock lock(ack_observed_mutex);
+        CHECK(ack_observed_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return acknowledged.load(std::memory_order_acquire) == 1;
+        }));
+    } else {
+        CHECK(acknowledged.load(std::memory_order_acquire) == 0);
+    }
     const unsigned expected_connector_calls =
         repeat_interrupted_materialization ? 5U : 4U;
     if (connector_calls.load() != expected_connector_calls)
@@ -3138,6 +3400,160 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
     f_thread.join();
     const auto server_runs = server_future.get();
     CHECK(server_runs.back().status == ServerRunStatus::Disconnected);
+    std::vector<R2WireControlSnapshot> link_intervals;
+    if (diagnostics_on && !fail_interval_observer) {
+        std::lock_guard lock(interval_observer_mutex);
+        link_intervals = observed_intervals;
+    }
+    if (diagnostics_on && !fail_interval_observer) {
+    uint64_t c_to_f_interval_bytes = 0;
+    uint64_t f_to_c_interval_bytes = 0;
+    uint64_t prior_interval_sequence = 0;
+    uint64_t final_ack_prefix = 0;
+    uint64_t recovery_confirmed_prefix = 0;
+    for (const R2WireControlSnapshot& interval : link_intervals) {
+        CHECK(interval.valid);
+        CHECK(interval.link.c_store_guid == c_guid);
+        CHECK(interval.link.f_store_guid == f_guid);
+        CHECK(interval.link.logical_link_id == relationship_id);
+        CHECK(interval.interval_sequence > prior_interval_sequence);
+        prior_interval_sequence = interval.interval_sequence;
+        if (interval.end == R2WireIntervalEnd::DrainedAckCheckpoint)
+            final_ack_prefix = std::max(final_ack_prefix,
+                                        interval.drained_ack_prefix);
+        else if (interval.end == R2WireIntervalEnd::RecoveryConfirmed) {
+            CHECK(interval.drained_ack_prefix == 0);
+            recovery_confirmed_prefix = std::max(
+                recovery_confirmed_prefix,
+                interval.recovery_confirmed_prefix);
+        } else if (interval.end == R2WireIntervalEnd::WindowPressure) {
+            CHECK(interval.drained_ack_prefix == 0);
+            CHECK(interval.recovery_confirmed_prefix == 0);
+        }
+        uint64_t classified_c_to_f = interval.shared_c_to_f_bytes;
+        uint64_t classified_f_to_c = interval.shared_f_to_c_bytes;
+        for (const R2WireJobInterval& job : interval.jobs) {
+            CHECK(job.valid);
+            CHECK(job.key.c_store_guid == c_guid);
+            CHECK(job.key.f_store_guid == f_guid);
+            CHECK(job.key.logical_link_id == relationship_id);
+            CHECK(job.key.tu_seq == TuSeq{0});
+            CHECK(job.key.raw_digest == icecc::digest128(source));
+            CHECK(job.c_to_f_bundle_bytes <=
+                  std::numeric_limits<uint64_t>::max() - classified_c_to_f);
+            CHECK(job.f_to_c_receipt_bytes <=
+                  std::numeric_limits<uint64_t>::max() - classified_f_to_c);
+            classified_c_to_f += job.c_to_f_bundle_bytes;
+            classified_f_to_c += job.f_to_c_receipt_bytes;
+        }
+        CHECK(classified_c_to_f == interval.total_c_to_f_bytes);
+        CHECK(classified_f_to_c == interval.total_f_to_c_bytes);
+        CHECK(interval.total_c_to_f_bytes <=
+              std::numeric_limits<uint64_t>::max() - c_to_f_interval_bytes);
+        CHECK(interval.total_f_to_c_bytes <=
+              std::numeric_limits<uint64_t>::max() - f_to_c_interval_bytes);
+        c_to_f_interval_bytes += interval.total_c_to_f_bytes;
+        f_to_c_interval_bytes += interval.total_f_to_c_bytes;
+    }
+    uint64_t f_observed_c_to_f = 0;
+    uint64_t f_observed_f_to_c = 0;
+    std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>>
+        c_bytes_by_link, f_bytes_by_link;
+    for (const R2WireControlSnapshot& interval : link_intervals) {
+        auto& totals = c_bytes_by_link[{interval.link.relationship_epoch,
+                                        interval.link.physical_link_generation}];
+        totals.first += interval.total_c_to_f_bytes;
+        totals.second += interval.total_f_to_c_bytes;
+    }
+    for (const AsyncCompletion& completion : f_socket_observations.completions()) {
+        if (!completion.stamp.r2_traffic ||
+            completion.stamp.actor != ActorSide::F)
+            continue;
+        uint64_t* total = nullptr;
+        if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+            completion.stamp.operation == AsyncOperationKind::ReadPayload)
+            total = &f_observed_c_to_f;
+        else if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
+            total = &f_observed_f_to_c;
+        if (!total)
+            continue;
+        CHECK(completion.transferred_bytes <=
+              std::numeric_limits<uint64_t>::max() - *total);
+        *total += completion.transferred_bytes;
+        auto& link_totals = f_bytes_by_link[{completion.stamp.relationship_epoch,
+                                             completion.stamp.physical_link_generation}];
+        uint64_t& link_total = total == &f_observed_c_to_f
+            ? link_totals.first : link_totals.second;
+        CHECK(completion.transferred_bytes <=
+              std::numeric_limits<uint64_t>::max() - link_total);
+        link_total += completion.transferred_bytes;
+    }
+    CHECK(f_socket_observations.valid());
+    if (c_to_f_interval_bytes != f_observed_c_to_f ||
+        f_to_c_interval_bytes > f_observed_f_to_c) {
+        std::cerr << "R2_RECOVERY_CONSERVATION_DIAG repeated_abort="
+                  << repeat_interrupted_materialization << " interval="
+                  << c_to_f_interval_bytes << '/' << f_to_c_interval_bytes
+                  << " peer=" << f_observed_c_to_f << '/'
+                  << f_observed_f_to_c << "\n";
+        for (const auto& [identity, totals] : c_bytes_by_link)
+            std::cerr << "R2_RECOVERY_C_LINK_DIAG epoch=" << identity.first
+                      << " generation=" << identity.second << " bytes="
+                      << totals.first << '/' << totals.second << "\n";
+        for (const auto& [identity, totals] : f_bytes_by_link)
+            std::cerr << "R2_RECOVERY_F_LINK_DIAG epoch=" << identity.first
+                      << " generation=" << identity.second << " bytes="
+                      << totals.first << '/' << totals.second << "\n";
+        for (const auto& interval : link_intervals) {
+            std::cerr << "R2_RECOVERY_INTERVAL_DIAG seq="
+                      << interval.interval_sequence << " end="
+                      << static_cast<unsigned>(interval.end) << " epoch="
+                      << interval.link.relationship_epoch << " generation="
+                      << interval.link.physical_link_generation << " bytes="
+                      << interval.total_c_to_f_bytes << '/'
+                      << interval.total_f_to_c_bytes << " shared="
+                      << interval.shared_c_to_f_bytes << '/'
+                      << interval.shared_f_to_c_bytes << " jobs="
+                      << interval.jobs.size() << "\n";
+            for (const auto& job : interval.jobs)
+                std::cerr << "R2_RECOVERY_JOB_DIAG tu="
+                          << job.key.tu_seq.value << " epoch="
+                          << job.link.relationship_epoch << " generation="
+                          << job.link.physical_link_generation << " attempts="
+                          << job.bundle_attempts << '/'
+                          << job.replay_attempts << " bytes="
+                          << job.c_to_f_bundle_bytes << '/'
+                          << job.f_to_c_receipt_bytes << "\n";
+        }
+    }
+    CHECK(c_to_f_interval_bytes == f_observed_c_to_f);
+    // The fixture deliberately drops several F writes before C can consume
+    // them, so C-side reads are a lower bound on F-side writes, not equality.
+    CHECK(f_to_c_interval_bytes <= f_observed_f_to_c);
+    CHECK(final_ack_prefix == (repeat_interrupted_materialization ? 1U : 0U));
+    CHECK(recovery_confirmed_prefix ==
+          (repeat_interrupted_materialization ? 0U : 1U));
+    std::cerr << "P51_SENDER_R2_RECOVERY_ACCOUNTING repeated_abort="
+              << (repeat_interrupted_materialization ? 1 : 0)
+              << " attempts=" << recovered.r2_wire_accounting->bundle_attempts
+              << " replay_attempts="
+              << recovered.r2_wire_accounting->replay_attempts
+              << " intervals=" << link_intervals.size()
+              << " final_ack_prefix=" << final_ack_prefix
+              << " observed_bytes=" << f_observed_c_to_f << '/'
+              << f_observed_f_to_c << " PASS\n";
+    } else if (diagnostics_on) {
+        // The transfer and positive commit remain valid, but a failed
+        // diagnostic callback makes interval coverage fail closed.
+        CHECK(recovered.r2_wire_accounting.has_value());
+        CHECK(recovered.r2_wire_accounting->valid);
+        CHECK(recovered.r2_link_intervals_external);
+        CHECK(!recovered.r2_link_intervals_valid);
+        std::cerr << "P51_SENDER_R2_OBSERVER_FAILURE fail_closed PASS\n";
+    } else {
+        CHECK(link_intervals.empty());
+        std::cerr << "P51_SENDER_R2_RECOVERY_ACCOUNTING_DISABLED PASS\n";
+    }
     std::cerr << "P51_SENDER_RECOVERY repeated_abort="
               << (repeat_interrupted_materialization ? "true" : "false")
               << " PASS\n";
@@ -3146,6 +3562,11 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
 void test_p51_sender_recovers_lost_commit_reply_after_connector_failure() {
     run_p51_sender_recovery_case(false);
     run_p51_sender_recovery_case(true);
+}
+
+void test_p51_sender_r2_observer_failure_is_fail_closed() {
+    ScopedP50Diagnostics diagnostics;
+    run_p51_sender_recovery_case(false, false, false, true);
 }
 
 void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
@@ -3276,6 +3697,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::atomic<unsigned> input_mismatches{0};
     std::atomic<unsigned> materialized{0};
     std::atomic<unsigned> acknowledged{0};
+    std::mutex r2_interval_observer_mutex;
+    std::vector<R2WireControlSnapshot> r2_observed_intervals;
     std::vector<std::atomic<unsigned>> binds(total_jobs);
     std::vector<std::atomic<unsigned>> commits(total_jobs);
     for (size_t index = 0; index != total_jobs; ++index) {
@@ -3802,6 +4225,12 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     sender_config.authority_limits = limits;
     if (profile == ProfileId::ZSTD_ROUTE)
         sender_config.compression_level = 3;
+    sender_config.r2_interval_observer = [&](
+        const R2WireControlSnapshot& interval) {
+        std::lock_guard lock(r2_interval_observer_mutex);
+        r2_observed_intervals.push_back(interval);
+        return true;
+    };
     sender_config.after_r2_bundle_sent_for_test = [&](uint64_t) {
         bundles_sent.fetch_add(1, std::memory_order_release);
         gate_cv.notify_all();
@@ -4154,6 +4583,18 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             asio::use_future).get();
         CHECK(duplicate.status == ZstdSourceTransferStatus::Committed);
         CHECK(duplicate.raw_digest == icecc::digest128(input[0]));
+        CHECK(duplicate.r2_accounting_reference);
+        if (p50_diagnostics_enabled_for_test()) {
+            CHECK(!duplicate.r2_wire_accounting.has_value());
+            CHECK(duplicate.r2_wire_accounting_key.has_value());
+            CHECK(duplicate.r2_wire_accounting_key->c_store_guid == c_guid);
+            CHECK(duplicate.r2_wire_accounting_key->f_store_guid == f_guid);
+            CHECK(duplicate.r2_wire_accounting_key->logical_link_id ==
+                  relationship_id);
+            CHECK(duplicate.r2_wire_accounting_key->tu_seq == TuSeq{0});
+            CHECK(duplicate.r2_wire_accounting_key->raw_digest ==
+                  icecc::digest128(input[0]));
+        }
         std::vector<uint8_t> conflicting = input[0];
         conflicting.push_back(0x7f);
         auto rejected = asio::co_spawn(c_context,
@@ -4284,6 +4725,20 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
               connectors_after_reset);
         CHECK(commits[kJobs].load(std::memory_order_acquire) == 0);
 
+        const auto drained_prefix_events = [&](uint64_t prefix) {
+            std::lock_guard lock(r2_interval_observer_mutex);
+            return std::count_if(r2_observed_intervals.begin(),
+                                 r2_observed_intervals.end(),
+                [&](const R2WireControlSnapshot& interval) {
+                    return interval.end ==
+                               R2WireIntervalEnd::DrainedAckCheckpoint &&
+                           interval.drained_ack_prefix == prefix;
+                });
+        };
+        const auto ack_prefix_events_before_fresh =
+            drained_prefix_events(kJobs);
+        CHECK(ack_prefix_events_before_fresh > 0);
+
         // A queued pre-RESET ARM remains valid: only its relationship epoch
         // is rebased to the verified current epoch. The same request must
         // then commit on the already-recovered physical link.
@@ -4300,6 +4755,12 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         CHECK((fresh_result.committed_input ==
                InputRecordKey{c_guid, TuSeq{kJobs}}));
         CHECK(commits[kJobs].load(std::memory_order_acquire) == 1);
+        // The pre-bundle ACK flush on the reset-confirmed link is a no-op.
+        // It must not manufacture a second ACK-write interval at the already
+        // recovered prefix; the fresh job's real ACK advances to kJobs + 1.
+        if (p50_diagnostics_enabled_for_test())
+            CHECK(drained_prefix_events(kJobs) ==
+                  ack_prefix_events_before_fresh);
         CHECK(connector_calls.load(std::memory_order_acquire) ==
               connectors_after_reset);
         {
@@ -4366,6 +4827,7 @@ void test_p51_sender_shared_failure_recovers_pending_callers() {
 }
 
 void test_p51_sender_post_reset_offer_rebase_and_future_reject() {
+    ScopedP50Diagnostics diagnostics;
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
         run_p51_sender_shared_failure_case(
@@ -4440,12 +4902,14 @@ void test_p51_sender_retirement_wakes_shared_retry_waiter() {
 }
 
 void test_p51_sender_retirement_during_recovery() {
+    ScopedP50Diagnostics diagnostics;
     run_p51_sender_recovery_case(false, true);
     run_p51_sender_shared_failure_case(
         1, ProfileId::ZSTD_TU, false, true);
 }
 
 void test_p51_sender_deadline_during_recovery_and_ack() {
+    ScopedP50Diagnostics diagnostics;
     run_p51_sender_recovery_case(false, false, true);
     run_p51_sender_shared_failure_case(
         1, ProfileId::ZSTD_TU, false, false, true);
@@ -5038,6 +5502,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--r2-wire-accounting-w30") {
+        test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
+        std::cerr << "P51_SENDER_R2_WIRE_ACCOUNTING_W30_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--serial-w1-control") {
         test_p51_sender_serial_control_only();
         std::cerr << "P51_SENDER_SERIAL_W1_CONTROL_SELECTOR PASS\n";
@@ -5059,6 +5529,12 @@ int main(int argc, char** argv) {
         std::string_view(argv[1]) == "--recovery-lost-commit") {
         test_p51_sender_recovers_lost_commit_reply_after_connector_failure();
         std::cerr << "P51_SENDER_RECOVERY_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--r2-observer-failure") {
+        test_p51_sender_r2_observer_failure_is_fail_closed();
+        std::cerr << "P51_SENDER_R2_OBSERVER_FAILURE_SELECTOR PASS\n";
         return 0;
     }
     if (argc == 2 &&
@@ -5193,6 +5669,8 @@ int main(int argc, char** argv) {
     run("bad_link_reject_echo", test_p51_client_reject_echo_must_match_current_offer);
     run("positive_after_rejection", test_p51_sender_positive_commit_survives_later_typed_rejection);
     run("lost_commit_recovery", test_p51_sender_recovers_lost_commit_reply_after_connector_failure);
+    run("r2_observer_failure",
+        test_p51_sender_r2_observer_failure_is_fail_closed);
     run("shared_failure", test_p51_sender_shared_failure_recovers_pending_callers);
     run("post_reset_offer_rebase",
         test_p51_sender_post_reset_offer_rebase_and_future_reject);

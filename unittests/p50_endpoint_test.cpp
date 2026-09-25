@@ -4370,10 +4370,44 @@ P51SourceArmedFields r2_test_armed(P51SourceArmFields arm,
     return armed;
 }
 
+struct R2ObservedSocketBytes {
+    uint64_t c_to_f = 0;
+    uint64_t f_to_c = 0;
+};
+
+R2ObservedSocketBytes r2_observed_server_socket_bytes(
+    const CompletionLog& observations) {
+    R2ObservedSocketBytes result;
+    for (const AsyncCompletion& completion : observations.completions()) {
+        if (!completion.stamp.r2_traffic ||
+            completion.stamp.actor != ActorSide::F)
+            continue;
+        uint64_t* total = nullptr;
+        if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+            completion.stamp.operation == AsyncOperationKind::ReadPayload)
+            total = &result.c_to_f;
+        else if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
+            total = &result.f_to_c;
+        if (total != nullptr) {
+            require(completion.transferred_bytes <=
+                        std::numeric_limits<uint64_t>::max() - *total,
+                    "independent F socket byte counter overflowed");
+            *total += completion.transferred_bytes;
+        }
+    }
+    return result;
+}
+
 asio::awaitable<void> r2_client_write_window_before_receipts(
     tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello,
     std::atomic<unsigned>& server_commits,
-    std::function<std::pair<JobBind, PreparedTuHandle>(size_t)> make_job) {
+    std::function<std::pair<JobBind, PreparedTuHandle>(size_t)> make_job,
+    CompletionLog* accounting = nullptr,
+    std::atomic<unsigned>* server_acks = nullptr,
+    std::vector<R2WireAccountingSnapshot>* job_accounting = nullptr,
+    std::vector<R2WireControlSnapshot>* interval_accounting = nullptr,
+    CompletionLog* server_observations = nullptr,
+    std::vector<R2ObservedSocketBytes>* peer_boundaries = nullptr) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await socket.async_connect(endpoint, asio::use_awaitable);
     const auto deadline = std::chrono::steady_clock::now() +
@@ -4419,9 +4453,43 @@ asio::awaitable<void> r2_client_write_window_before_receipts(
                     receipt.committed_input.has_value() &&
                     receipt.committed_input->tu_seq == bundle.binding.tu_seq,
                 "C did not accept the exact receipt prefix in ordinal order");
+        if (accounting != nullptr && job_accounting != nullptr) {
+            const R2WireAccountingKey key{
+                CStoreGuid{hello.c_store_guid}, FStoreGuid{hello.f_store_guid},
+                hello.relationship_id, bundle.binding.tu_seq,
+                bundle.binding.raw_digest};
+            job_accounting->push_back(accounting->finish_r2_job(key));
+        }
     }
+    if (server_observations != nullptr && peer_boundaries != nullptr)
+        peer_boundaries->push_back(
+            r2_observed_server_socket_bytes(*server_observations));
     const uint64_t full_prefix = initial_window;
     co_await client.write_r2_ack(socket, full_prefix, deadline);
+    if (accounting != nullptr && server_acks != nullptr &&
+        interval_accounting != nullptr) {
+        asio::steady_timer ack_wait(co_await asio::this_coro::executor);
+        const auto ack_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+        while (server_acks->load(std::memory_order_acquire) < 1 &&
+               std::chrono::steady_clock::now() < ack_deadline) {
+            ack_wait.expires_after(std::chrono::milliseconds(1));
+            co_await ack_wait.async_wait(asio::use_awaitable);
+        }
+        require(server_acks->load(std::memory_order_acquire) >= 1,
+                "F did not observe the first cumulative ACK checkpoint");
+        accounting->request_r2_interval_checkpoint(
+            R2WireLinkIdentity{CStoreGuid{hello.c_store_guid},
+                               FStoreGuid{hello.f_store_guid},
+                               hello.relationship_id,
+                               hello.relationship_epoch,
+                               hello.physical_link_generation},
+            R2WireIntervalEnd::DrainedAckCheckpoint);
+        auto intervals = accounting->drain_r2_interval_snapshots();
+        interval_accounting->insert(interval_accounting->end(),
+                                    std::make_move_iterator(intervals.begin()),
+                                    std::make_move_iterator(intervals.end()));
+    }
 
     // The 31st bundle is queued only after cumulative Q=30 was written.  It
     // must fit the same live link without a reconnect or fresh HELLO.
@@ -4435,7 +4503,38 @@ asio::awaitable<void> r2_client_write_window_before_receipts(
     require(refill_receipt.status == ClientRunStatus::Committed &&
                 refill_receipt.committed_input.has_value(),
             "R2 window did not refill after cumulative ACK");
+    if (accounting != nullptr && job_accounting != nullptr) {
+        const R2WireAccountingKey key{
+            CStoreGuid{hello.c_store_guid}, FStoreGuid{hello.f_store_guid},
+            hello.relationship_id, refill.binding.tu_seq,
+            refill.binding.raw_digest};
+        job_accounting->push_back(accounting->finish_r2_job(key));
+    }
     co_await client.write_r2_ack(socket, full_prefix + 1, deadline);
+    if (accounting != nullptr && server_acks != nullptr &&
+        interval_accounting != nullptr) {
+        asio::steady_timer ack_wait(co_await asio::this_coro::executor);
+        const auto ack_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+        while (server_acks->load(std::memory_order_acquire) < 2 &&
+               std::chrono::steady_clock::now() < ack_deadline) {
+            ack_wait.expires_after(std::chrono::milliseconds(1));
+            co_await ack_wait.async_wait(asio::use_awaitable);
+        }
+        require(server_acks->load(std::memory_order_acquire) >= 2,
+                "F did not observe the refill ACK checkpoint");
+        accounting->request_r2_interval_checkpoint(
+            R2WireLinkIdentity{CStoreGuid{hello.c_store_guid},
+                               FStoreGuid{hello.f_store_guid},
+                               hello.relationship_id,
+                               hello.relationship_epoch,
+                               hello.physical_link_generation},
+            R2WireIntervalEnd::DrainedAckCheckpoint);
+        auto intervals = accounting->drain_r2_interval_snapshots();
+        interval_accounting->insert(interval_accounting->end(),
+                                    std::make_move_iterator(intervals.begin()),
+                                    std::make_move_iterator(intervals.end()));
+    }
     co_await raw_write(socket, Message{CloseMessage{}});
     boost::system::error_code ignored;
     socket.shutdown(tcp::socket::shutdown_both, ignored);
@@ -4942,6 +5041,136 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
                 "R2 F endpoint materialized different source bytes");
     }
     std::puts("P51_R2_ENDPOINT two-jobs-one-link exact-input: ok");
+}
+
+void test_r2_wire_accounting_interval_conservation() {
+    CompletionLog accounting{CompletionLog::StorageMode::ClientByteTotals};
+    accounting.enable_r2_accounting();
+    const CStoreGuid c_guid{Id128::from_u64(0xacc001)};
+    const FStoreGuid f_guid{Id128::from_u64(0xacc002)};
+    const Id128 link_id = Id128::from_u64(0xacc003);
+    const R2WireLinkIdentity link{c_guid, f_guid, link_id, 7, 19};
+    const R2WireAccountingKey key{
+        c_guid, f_guid, link_id, TuSeq{0}, icecc::digest128("acct-input")};
+    require(accounting.begin_r2_job(key),
+            "R2 accounting did not admit one bounded active row");
+
+    CompletionStamp stamp;
+    stamp.actor = ActorSide::C;
+    stamp.r2_traffic = true;
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    stamp.c_store_guid = c_guid;
+    stamp.f_store_guid = f_guid;
+    stamp.logical_link_id = link_id;
+    stamp.relationship_epoch = link.relationship_epoch;
+    stamp.physical_link_generation = link.physical_link_generation;
+    stamp.transaction_bound = true;
+    stamp.rel_seq = RelSeq{0}; // First transaction REL_SEQ is valid.
+    stamp.tu_seq = key.tu_seq;
+    stamp.raw_digest = key.raw_digest;
+    accounting.begin_r2_bundle_attempt(stamp);
+    accounting.record(AsyncCompletion{stamp, 11, 0});
+
+    accounting.begin_r2_receipt_read(key, link);
+    stamp.operation = AsyncOperationKind::ReadHeader;
+    accounting.record(AsyncCompletion{stamp, 4, 0});
+    stamp.operation = AsyncOperationKind::ReadPayload;
+    accounting.record(AsyncCompletion{stamp, 6, 0});
+    accounting.request_r2_interval_checkpoint(
+        link, R2WireIntervalEnd::DrainedAckCheckpoint);
+    require(accounting.drain_r2_interval_snapshots().empty(),
+            "checkpoint escaped before the active receipt was classified");
+    accounting.confirm_r2_receipt(key);
+    auto intervals = accounting.drain_r2_interval_snapshots();
+    if (intervals.size() != 1 || intervals[0].jobs.size() != 1 ||
+        intervals.empty() || !intervals[0].valid ||
+        intervals[0].total_c_to_f_bytes != 11 ||
+        intervals[0].total_f_to_c_bytes != 10 ||
+        intervals[0].shared_c_to_f_bytes != 0 ||
+        intervals[0].shared_f_to_c_bytes != 0) {
+        std::cerr << "synthetic first interval diagnostic n="
+                  << intervals.size();
+        if (!intervals.empty()) {
+            const auto& value = intervals[0];
+            std::cerr << " valid=" << value.valid
+                      << " seq=" << value.interval_sequence
+                      << " totals=" << value.total_c_to_f_bytes << '/'
+                      << value.total_f_to_c_bytes
+                      << " shared=" << value.shared_c_to_f_bytes << '/'
+                      << value.shared_f_to_c_bytes
+                      << " jobs=" << value.jobs.size();
+            if (!value.jobs.empty())
+                std::cerr << " jobvalid=" << value.jobs[0].valid
+                          << " keyeq=" << (value.jobs[0].key == key)
+                          << " jobbytes=" << value.jobs[0].c_to_f_bundle_bytes
+                          << '/' << value.jobs[0].f_to_c_receipt_bytes
+                          << " attempts=" << value.jobs[0].bundle_attempts;
+        }
+        std::cerr << '\n';
+    }
+    require(intervals.size() == 1 && intervals[0].valid &&
+                intervals[0].interval_sequence == 1 &&
+                intervals[0].link == link &&
+                intervals[0].end ==
+                    R2WireIntervalEnd::DrainedAckCheckpoint &&
+                intervals[0].total_c_to_f_bytes == 11 &&
+                intervals[0].total_f_to_c_bytes == 10 &&
+                intervals[0].shared_c_to_f_bytes == 0 &&
+                intervals[0].shared_f_to_c_bytes == 0 &&
+                intervals[0].jobs.size() == 1 &&
+                intervals[0].jobs[0].key == key &&
+                intervals[0].jobs[0].c_to_f_bundle_bytes == 11 &&
+                intervals[0].jobs[0].f_to_c_receipt_bytes == 10 &&
+                intervals[0].jobs[0].bundle_attempts == 1,
+            "validated receipt did not conserve the first interval exactly");
+
+    accounting.begin_r2_receipt_read(key, link);
+    stamp.operation = AsyncOperationKind::ReadHeader;
+    accounting.record(AsyncCompletion{stamp, 3, 0});
+    accounting.request_r2_interval_checkpoint(
+        link, R2WireIntervalEnd::PhysicalLinkRetired);
+    require(accounting.drain_r2_interval_snapshots().empty(),
+            "retirement checkpoint did not defer an incomplete receipt");
+    accounting.reject_r2_receipt(key);
+    intervals = accounting.drain_r2_interval_snapshots();
+    require(intervals.size() == 1 && intervals[0].valid &&
+                intervals[0].interval_sequence == 2 &&
+                intervals[0].end == R2WireIntervalEnd::PhysicalLinkRetired &&
+                intervals[0].total_c_to_f_bytes == 0 &&
+                intervals[0].total_f_to_c_bytes == 3 &&
+                intervals[0].shared_f_to_c_bytes == 3 &&
+                intervals[0].jobs.empty(),
+            "partial receipt was not conserved as shared bytes at retirement");
+
+    stamp.operation = AsyncOperationKind::WriteFragment;
+    stamp.replay_attempt = true;
+    accounting.begin_r2_bundle_attempt(stamp);
+    accounting.record(AsyncCompletion{stamp, 7, 0});
+    const R2WireAccountingSnapshot lifetime = accounting.finish_r2_job(key);
+    accounting.request_r2_interval_checkpoint(
+        link, R2WireIntervalEnd::DrainedAckCheckpoint);
+    intervals = accounting.drain_r2_interval_snapshots();
+    require(lifetime.valid && lifetime.c_to_f_bundle_bytes == 18 &&
+                lifetime.f_to_c_receipt_bytes == 10 &&
+                lifetime.bundle_attempts == 2 && lifetime.replay_attempts == 1 &&
+                intervals.size() == 1 && intervals[0].valid &&
+                intervals[0].interval_sequence == 3 &&
+                intervals[0].total_c_to_f_bytes == 7 &&
+                intervals[0].jobs.size() == 1 &&
+                intervals[0].jobs[0].key == key &&
+                intervals[0].jobs[0].c_to_f_bundle_bytes == 7 &&
+                intervals[0].jobs[0].bundle_attempts == 1 &&
+                intervals[0].jobs[0].replay_attempts == 1,
+            "reindexed replay accounting duplicated or lost a bounded interval");
+
+    CompletionLog poisoned;
+    poisoned.enable_r2_accounting();
+    require(poisoned.begin_r2_job(key),
+            "poison test failed to start accounting row");
+    poisoned.mark_r2_accounting_unavailable();
+    require(!poisoned.finish_r2_job(key).valid,
+            "accounting poison was cleared by a successful later finish");
+    std::puts("P51_R2_WIRE_ACCOUNTING bounded checkpoint conservation: ok");
 }
 
 struct R2WorkerHistoryGate {
@@ -6128,6 +6357,8 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
     std::atomic<unsigned> commit_calls{0};
     std::atomic<unsigned> ack_calls{0};
     std::atomic<unsigned> terminal_calls{0};
+    CompletionLog f_socket_observations;
+    std::vector<R2ObservedSocketBytes> peer_boundaries;
     uint64_t last_ack = 0;
     P50ServerEndpointConfig config;
     config.lookup_p51_link_reservation =
@@ -6172,7 +6403,13 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
                 ack.contiguous_verified_ordinal > commit_calls.load())
                 return false;
             last_ack = ack.contiguous_verified_ordinal;
-            ++ack_calls;
+            const unsigned ack_index =
+                ack_calls.fetch_add(1, std::memory_order_acq_rel);
+            if (ack_index < 2)
+                peer_boundaries.push_back(
+                    r2_observed_server_socket_bytes(f_socket_observations));
+            else
+                return false;
             return true;
         };
     config.on_p51_link_terminal = [&](const LinkHello& observed) {
@@ -6180,9 +6417,13 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
             ++terminal_calls;
     };
 
-    P50ServerEndpoint server(stores.f, caps, nullptr, nullptr,
+    P50ServerEndpoint server(stores.f, caps, &f_socket_observations, nullptr,
                              std::move(config));
-    P50ClientEndpoint client(authority, caps);
+    CompletionLog c_accounting{CompletionLog::StorageMode::ClientByteTotals};
+    P50ClientEndpoint client(authority, caps, hello.history_nonce,
+                             &c_accounting);
+    std::vector<R2WireAccountingSnapshot> job_accounting;
+    std::vector<R2WireControlSnapshot> interval_accounting;
     asio::io_context context;
     tcp::acceptor acceptor(context,
                            {asio::ip::address_v4::loopback(), 0});
@@ -6191,7 +6432,9 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
     auto client_future = asio::co_spawn(
         context, r2_client_write_window_before_receipts(
                      acceptor.local_endpoint(), client, hello, commit_calls,
-                     make_job),
+                     make_job, &c_accounting, &ack_calls, &job_accounting,
+                     &interval_accounting, &f_socket_observations,
+                     &peer_boundaries),
         asio::use_future);
     context.run();
     const ServerRunResult server_result = accept_future.get();
@@ -6209,6 +6452,90 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
                 commit_calls == total_jobs && ack_calls == 2 &&
                 last_ack == total_jobs && terminal_calls == 1,
             "R2 W30 link failed exact 30-credit drain, cumulative ACK, and refill");
+
+    if (job_accounting.size() != total_jobs || interval_accounting.size() != 3 ||
+        peer_boundaries.size() != 3 ||
+        std::any_of(job_accounting.begin(), job_accounting.end(),
+                    [](const R2WireAccountingSnapshot& value) {
+                        return !value.valid || value.bundle_attempts != 1 ||
+                            value.replay_attempts != 0 ||
+                            value.c_to_f_bundle_bytes == 0 ||
+                            value.f_to_c_receipt_bytes == 0;
+                    }) ||
+        (interval_accounting.size() == 3 &&
+         (interval_accounting[0].jobs.size() != window ||
+          !interval_accounting[1].jobs.empty() ||
+          interval_accounting[2].jobs.size() != 1))) {
+        std::cerr << "W30 accounting diagnostic jobs=" << job_accounting.size()
+                  << " intervals=" << interval_accounting.size();
+        for (const R2WireControlSnapshot& interval : interval_accounting) {
+            std::cerr << " [seq=" << interval.interval_sequence
+                      << " valid=" << interval.valid
+                      << " end=" << static_cast<unsigned>(interval.end)
+                      << " jobs=" << interval.jobs.size()
+                      << " total=" << interval.total_c_to_f_bytes << '/'
+                      << interval.total_f_to_c_bytes
+                      << " shared=" << interval.shared_c_to_f_bytes << '/'
+                      << interval.shared_f_to_c_bytes << ']';
+        }
+        for (size_t i = 0; i != std::min<size_t>(job_accounting.size(), 3); ++i) {
+            const auto& job = job_accounting[i];
+            std::cerr << " job" << i << "={" << job.valid << ','
+                      << job.bundle_attempts << ',' << job.replay_attempts << ','
+                      << job.c_to_f_bundle_bytes << ','
+                      << job.f_to_c_receipt_bytes << '}';
+        }
+        std::cerr << '\n';
+    }
+    require(job_accounting.size() == total_jobs &&
+                bindings.front().tu_seq.value == 0 &&
+                std::all_of(job_accounting.begin(), job_accounting.end(),
+                            [](const R2WireAccountingSnapshot& value) {
+                                return value.valid &&
+                                    value.bundle_attempts == 1 &&
+                                    value.replay_attempts == 0 &&
+                                    value.c_to_f_bundle_bytes != 0 &&
+                                    value.f_to_c_receipt_bytes != 0;
+                            }) &&
+                peer_boundaries.size() == 3 &&
+                interval_accounting.size() == 3 &&
+                std::all_of(interval_accounting.begin(),
+                            interval_accounting.end(),
+                            [](const R2WireControlSnapshot& value) {
+                                return value.valid;
+                            }) &&
+                interval_accounting[0].end ==
+                    R2WireIntervalEnd::WindowPressure &&
+                interval_accounting[1].end ==
+                    R2WireIntervalEnd::DrainedAckCheckpoint &&
+                interval_accounting[2].end ==
+                    R2WireIntervalEnd::DrainedAckCheckpoint &&
+                interval_accounting[0].jobs.size() == window &&
+                interval_accounting[1].jobs.empty() &&
+                interval_accounting[2].jobs.size() == 1,
+                "R2 W30 accounting omitted exact jobs or ACK-drained intervals");
+
+    R2ObservedSocketBytes prior_peer{};
+    for (size_t index = 0; index != interval_accounting.size(); ++index) {
+        const R2WireControlSnapshot& interval = interval_accounting[index];
+        uint64_t classified_c_to_f = interval.shared_c_to_f_bytes;
+        uint64_t classified_f_to_c = interval.shared_f_to_c_bytes;
+        for (const R2WireJobInterval& job : interval.jobs) {
+            require(job.valid && job.link == interval.link,
+                    "R2 interval job row escaped its stable physical identity");
+            classified_c_to_f += job.c_to_f_bundle_bytes;
+            classified_f_to_c += job.f_to_c_receipt_bytes;
+        }
+        const R2ObservedSocketBytes peer = peer_boundaries[index];
+        require(interval.total_c_to_f_bytes == classified_c_to_f &&
+                    interval.total_f_to_c_bytes == classified_f_to_c &&
+                    interval.total_c_to_f_bytes == peer.c_to_f -
+                        prior_peer.c_to_f &&
+                    interval.total_f_to_c_bytes == peer.f_to_c -
+                        prior_peer.f_to_c,
+                "R2 interval bytes did not conserve against independent F socket reads/writes");
+        prior_peer = peer;
+    }
 
     for (size_t index = 0; index != total_jobs; ++index) {
         InputCursor cursor = server.attach_input(
@@ -9684,6 +10011,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused R2 persistent-link PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_WIRE_ACCOUNTING_FOCUS") != nullptr) {
+        test_r2_wire_accounting_interval_conservation();
+        std::cout << "p50_endpoint_test: focused R2 accounting PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_P5CO_WORKER_HISTORY_PIN_FOCUS") != nullptr) {
         test_r2_persistent_history_charge_survives_worker_reset();
         std::cout << "p50_endpoint_test: focused P29/ROUTE held-worker reset PASS\n";
@@ -9764,6 +10096,7 @@ int main(int argc, char** argv) {
     test_r2_store_replaced_rejects_same_guid_old_generation();
     test_r2_definite_missing_reservation_is_typed_only_for_absence();
     test_r2_endpoint_commits_two_jobs_on_one_link();
+    test_r2_wire_accounting_interval_conservation();
     test_r2_persistent_history_charge_survives_worker_reset();
     test_r2_peer_close_during_materialization();
     test_r2_deadline_expiry_stages();

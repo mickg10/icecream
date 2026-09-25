@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <fcntl.h>
@@ -36,6 +38,11 @@ bool nonzero(CStoreGuid guid) {
 
 bool nonzero_request(PrepareRequestKey request) {
     return request.producer_session != 0 && request.request_token != 0;
+}
+
+bool p50_diagnostics_requested() noexcept {
+    const char* value = std::getenv("ICECC_P50_DIAGNOSTICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 std::optional<ProfileId> profile_from_cache_mask(uint32_t mask) noexcept {
@@ -200,6 +207,9 @@ struct P50ZstdSourceSender::Impl {
         boost::asio::steady_timer notification;
         ClientRunResult client_result{};
         std::optional<bool> system_source_reuse;
+        R2WireAccountingKey wire_accounting_key{};
+        bool wire_accounting_started = false;
+        bool wire_accounting_finished = false;
         std::exception_ptr failure;
         uint64_t failure_physical_link_generation = 0;
         bool replayed_after_reset = false;
@@ -257,6 +267,8 @@ struct P50ZstdSourceSender::Impl {
             throw std::invalid_argument("sender requires an absolute deadline");
         if (config.endpoint_caps.zstd.max_raw_bytes > SIZE_MAX)
             throw std::invalid_argument("ZSTD_TU raw limit does not fit this process");
+        if (config.r2_interval_observer && p50_diagnostics_requested())
+            wire_completions.enable_r2_accounting();
         authority = std::make_shared<P50PreparationAuthority>(
             c_guid, config.endpoint_caps.zstd, config.authority_limits,
             config.compression_level, config.endpoint_caps.profile);
@@ -287,6 +299,8 @@ struct P50ZstdSourceSender::Impl {
             throw std::invalid_argument("ZSTD_TU raw limit does not fit this process");
         if (config.endpoint_caps.zstd != authority->zstd_limits())
             throw std::invalid_argument("sender and shared authority capabilities differ");
+        if (config.r2_interval_observer && p50_diagnostics_requested())
+            wire_completions.enable_r2_accounting();
         endpoint = std::make_unique<P50ClientEndpoint>(
             authority, config.endpoint_caps, HistoryNonce{1}, &wire_completions, nullptr,
             std::nullopt, std::function<void(EndpointCancelPermit)>{},
@@ -455,6 +469,68 @@ struct P50ZstdSourceSender::Impl {
         }
     }
 
+    void queue_r2_link_interval(R2WireLinkIdentity identity,
+                                R2WireIntervalEnd end,
+                                uint64_t drained_ack_prefix = 0,
+                                uint64_t recovery_confirmed_prefix = 0) noexcept {
+        wire_completions.request_r2_interval_checkpoint(
+            identity, end, drained_ack_prefix, recovery_confirmed_prefix);
+    }
+
+    void checkpoint_r2_ack_drained() noexcept {
+        if (!r2_hello)
+            return;
+        const LinkHello& hello = *r2_hello;
+        const R2WireLinkIdentity link{
+            CStoreGuid{hello.c_store_guid}, FStoreGuid{hello.f_store_guid},
+            hello.relationship_id, hello.relationship_epoch,
+            hello.physical_link_generation};
+        const uint64_t ack_prefix = endpoint->r2_ack_written_prefix();
+        if (r2_accounted_ack_link == link &&
+            r2_accounted_ack_prefix == ack_prefix)
+            return;
+        queue_r2_link_interval(link,
+                               R2WireIntervalEnd::DrainedAckCheckpoint,
+                               ack_prefix);
+        r2_accounted_ack_link = link;
+        r2_accounted_ack_prefix = ack_prefix;
+        publish_r2_interval_snapshots();
+    }
+
+    void publish_r2_interval_snapshots() noexcept {
+        if (!wire_completions.r2_accounting_enabled() ||
+            !config.r2_interval_observer)
+            return;
+        if (!wire_completions.r2_accounting_available())
+            r2_interval_delivery_valid.store(false,
+                                              std::memory_order_release);
+        auto snapshots = wire_completions.drain_r2_interval_snapshots();
+        for (const R2WireControlSnapshot& interval : snapshots) {
+            bool delivered = false;
+            try {
+                delivered = config.r2_interval_observer(interval);
+            } catch (...) {
+                delivered = false;
+            }
+            if (!delivered || !interval.valid)
+                r2_interval_delivery_valid.store(false,
+                                                  std::memory_order_release);
+        }
+    }
+
+    void collect_r2_link_intervals(
+        ZstdSourceTransferResult& result) noexcept {
+        if (!wire_completions.r2_accounting_enabled() ||
+            !config.r2_interval_observer) {
+            result.r2_link_intervals_valid = false;
+            return;
+        }
+        publish_r2_interval_snapshots();
+        result.r2_link_intervals_external = true;
+        result.r2_link_intervals_valid =
+            r2_interval_delivery_valid.load(std::memory_order_acquire);
+    }
+
     PrepareRequestKey begin_transfer() {
         if (config.endpoint_caps.profile == ProfileId::ZSTD_TU) {
             if (used) throw std::logic_error("sender is one-shot");
@@ -493,6 +569,9 @@ struct P50ZstdSourceSender::Impl {
     // transport loss. The row owns the exact ARMED lease/deadline, codec
     // witness, and PreparedTuHandle/raw source needed by RECOVER/RESET.
     std::map<uint64_t, std::shared_ptr<PendingReceipt>> r2_retained_jobs;
+    std::atomic<bool> r2_interval_delivery_valid{true};
+    std::optional<R2WireLinkIdentity> r2_accounted_ack_link;
+    uint64_t r2_accounted_ack_prefix = 0;
     std::set<PrepareRequestKey> r2_active_requests;
     // One bounded completed-ledger slot is reserved before an R2 caller can
     // stage a bundle. A fully-sent unresolved witness keeps its reservation
@@ -969,6 +1048,9 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                 completed.raw_digest = pending->sent.binding.raw_digest;
                 completed.attempts = 1;
                 completed.system_source_reuse = pending->system_source_reuse;
+                if (pending->wire_accounting_started)
+                    completed.r2_wire_accounting_key =
+                        pending->wire_accounting_key;
                 impl_->remember_completed_witness(
                     pending->request, completed.raw_bytes,
                     completed.raw_digest, completed);
@@ -1148,6 +1230,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
                 throw std::logic_error("R2 ACK pump lost its physical link");
             co_await impl_->endpoint->flush_r2_ack(
                 *impl_->r2_socket, deadline);
+            impl_->checkpoint_r2_ack_drained();
             {
                 std::lock_guard lock(impl_->r2_transfer_mutex);
                 if (impl_->r2_physical_link_generation != physical_link_generation ||
@@ -1267,10 +1350,32 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
             HistoryNonce{hello.history_nonce.value + 1};
       }
 
+      // Retire the last physical offer that actually owned bytes. During a
+      // failed recovery, r2_hello is still the last accepted HELLO and can
+      // name an older generation than the attempted connection being closed.
+      const LinkHello* prior_offer = impl_->r2_attempted_offer
+          ? &*impl_->r2_attempted_offer
+          : (impl_->r2_hello ? &*impl_->r2_hello : nullptr);
+      const std::optional<R2WireLinkIdentity> retired_link = prior_offer
+          ? std::optional<R2WireLinkIdentity>{R2WireLinkIdentity{
+                CStoreGuid{prior_offer->c_store_guid},
+                FStoreGuid{prior_offer->f_store_guid},
+                prior_offer->relationship_id,
+                prior_offer->relationship_epoch,
+                prior_offer->physical_link_generation}}
+          : std::nullopt;
       if (impl_->r2_socket) {
         boost::system::error_code ignored;
         impl_->r2_socket->close(ignored);
         impl_->r2_socket.reset();
+      }
+      if (retired_link) {
+        // Writer ownership is held and the receipt reader/ACK pump were
+        // already quiescent at entry, so the close is now a true terminal
+        // boundary for this physical incarnation.
+        impl_->queue_r2_link_interval(*retired_link,
+            R2WireIntervalEnd::PhysicalLinkRetired);
+        impl_->publish_r2_interval_snapshots();
       }
       const int fd = co_await await_connected_fd(connection, deadline);
       if (fd < 0)
@@ -1295,6 +1400,17 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
           impl_->r2_recovery_operation, impl_->r2_recovery_new_epoch,
           impl_->r2_recovery_new_nonce, deadline);
 
+      // The endpoint has fully validated RESET_ACK and RESET_CONFIRM echo.
+      // Close the old-epoch accounting interval before replay can write
+      // bundles stamped with the confirmed new relationship epoch.
+      impl_->queue_r2_link_interval(R2WireLinkIdentity{
+          CStoreGuid{hello.c_store_guid}, FStoreGuid{hello.f_store_guid},
+          hello.relationship_id, hello.relationship_epoch,
+          hello.physical_link_generation},
+          R2WireIntervalEnd::RecoveryConfirmed, 0,
+          recovered.reset_request.settled_prefix_k);
+      impl_->publish_r2_interval_snapshots();
+
       for (const R2TxCommit &receipt : recovered.committed_receipts) {
         auto position =
             impl_->r2_retained_jobs.find(receipt.relationship_ordinal);
@@ -1318,6 +1434,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
           result.system_source_reuse =
               impl_->authority->p29v1_system_source_reuse(
                   pending->sent.prepared);
+        if (pending->wire_accounting_started)
+          result.r2_wire_accounting_key = pending->wire_accounting_key;
         impl_->authority->release(pending->sent.prepared);
         impl_->remember_completed_witness(pending->request, result.raw_bytes,
                                           result.raw_digest, result);
@@ -1438,6 +1556,18 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
           recovered.reset_request.new_history_nonce;
       impl_->r2_hello->verified_receipt_floor =
           recovered.reset_request.settled_prefix_k;
+      // The successful reset changes the logical relationship identity on
+      // this physical connection. Use the confirmed identity when retiring
+      // it on a later recovery attempt.
+      impl_->r2_attempted_offer = *impl_->r2_hello;
+      impl_->r2_accounted_ack_link = R2WireLinkIdentity{
+          CStoreGuid{impl_->r2_hello->c_store_guid},
+          FStoreGuid{impl_->r2_hello->f_store_guid},
+          impl_->r2_hello->relationship_id,
+          impl_->r2_hello->relationship_epoch,
+          impl_->r2_hello->physical_link_generation};
+      impl_->r2_accounted_ack_prefix =
+          impl_->endpoint->r2_ack_written_prefix();
       impl_->r2_relationship_epoch =
           recovered.reset_request.new_relationship_epoch;
       impl_->r2_physical_link_generation = physical_generation;
@@ -1478,7 +1608,7 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
         JobBind binding = pending->sent.binding;
         pending->sent = co_await impl_->endpoint->write_r2_bundle(
             *impl_->r2_socket, binding, pending->sent.prepared,
-            pending->deadline);
+            pending->deadline, {}, true);
         pending->failure = nullptr;
         pending->failure_physical_link_generation = 0;
         pending->done = false;
@@ -1662,6 +1792,10 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
         std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_route(AsyncConnectedFdFactory connection,
                                     PrepareRequestKey request,
@@ -1676,6 +1810,9 @@ P50ZstdSourceSender::transfer_route(AsyncConnectedFdFactory connection,
         ConnectionTarget{std::move(connection)}, request, deadline, true,
         std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
 }
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
+#pragma GCC diagnostic pop
+#endif
 
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
 #pragma GCC diagnostic push
@@ -1698,8 +1835,13 @@ P50ZstdSourceSender::transfer_p51_route(
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     const Digest128 raw_digest = digest128(source);
     try {
-        if (const auto completed = impl_->completed_for(request, source, raw_digest))
-            co_return *completed;
+        if (const auto completed = impl_->completed_for(request, source, raw_digest)) {
+            ZstdSourceTransferResult reference = *completed;
+            reference.r2_wire_accounting.reset();
+            reference.r2_link_intervals.clear();
+            reference.r2_accounting_reference = true;
+            co_return reference;
+        }
     } catch (...) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     }
@@ -1858,6 +2000,7 @@ P50ZstdSourceSender::transfer_p51_route(
             break;
         try {
             co_await impl_->endpoint->flush_r2_ack(*impl_->r2_socket, deadline);
+            impl_->checkpoint_r2_ack_drained();
         } catch (...) {
             impl_->r2_recovery_required = true;
             impl_->r2_recovery_floor =
@@ -1958,6 +2101,32 @@ P50ZstdSourceSender::transfer_p51_route(
     bool exact_commit_preserved = false;
     std::optional<ZstdSourceRouteRejection> terminal_rejection;
     uint64_t observed_failure_generation = 0;
+    struct WireAccountingRetirement {
+        CompletionLog* log = nullptr;
+        R2WireAccountingKey key{};
+        bool active = false;
+        ~WireAccountingRetirement() noexcept {
+            if (active && log) {
+                (void)log->finish_r2_job(key);
+                log->mark_r2_accounting_unavailable();
+            }
+        }
+    } wire_accounting_retirement;
+    auto finish_wire_accounting = [this, &wire_accounting_retirement](
+        ZstdSourceTransferResult result,
+        const std::shared_ptr<Impl::PendingReceipt>& row) {
+        if (row && row->wire_accounting_started &&
+            !row->wire_accounting_finished) {
+            result.r2_wire_accounting =
+                impl_->wire_completions.finish_r2_job(
+                    row->wire_accounting_key);
+            result.r2_wire_accounting_key = row->wire_accounting_key;
+            row->wire_accounting_finished = true;
+            wire_accounting_retirement.active = false;
+        }
+        impl_->collect_r2_link_intervals(result);
+        return result;
+    };
     try {
         if (impl_->route_replacement_required)
             co_return impl_->r2_route_replacement_result(
@@ -2029,6 +2198,7 @@ P50ZstdSourceSender::transfer_p51_route(
         // side admits against K-Q, so never send a new JOB_BIND on speculative
         // confirmation credit which has not been cumulatively acknowledged.
         co_await impl_->endpoint->flush_r2_ack(*impl_->r2_socket, deadline);
+        impl_->checkpoint_r2_ack_drained();
         if (!impl_->endpoint->r2_window_available())
             throw std::logic_error("R2 window was consumed during writer turn");
 
@@ -2040,6 +2210,20 @@ P50ZstdSourceSender::transfer_p51_route(
         pending->armed = armed;
         pending->deadline = deadline;
         pending->request = request;
+        pending->wire_accounting_key = R2WireAccountingKey{
+            CStoreGuid{armed.arm.source.c_store_guid},
+            FStoreGuid{armed.f_store_guid},
+            Id128{armed.logical_relationship_id},
+            binding.tu_seq, binding.raw_digest};
+        pending->wire_accounting_started =
+            impl_->wire_completions.r2_accounting_enabled();
+        if (pending->wire_accounting_started) {
+            (void)impl_->wire_completions.begin_r2_job(
+                pending->wire_accounting_key);
+            wire_accounting_retirement.log = &impl_->wire_completions;
+            wire_accounting_retirement.key = pending->wire_accounting_key;
+            wire_accounting_retirement.active = true;
+        }
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
             pending->notification.expires_at(Clock::time_point::max());
@@ -2134,7 +2318,7 @@ P50ZstdSourceSender::transfer_p51_route(
           unavailable.profile = pending->sent.binding.profile;
           unavailable.raw_bytes = pending->sent.binding.raw_bytes;
           unavailable.raw_digest = pending->sent.binding.raw_digest;
-          co_return unavailable;
+          co_return finish_wire_accounting(std::move(unavailable), pending);
       }
       if (observed_failure)
           std::rethrow_exception(observed_failure);
@@ -2150,6 +2334,7 @@ P50ZstdSourceSender::transfer_p51_route(
               if (impl_->r2_socket)
                   co_await impl_->endpoint->flush_r2_ack(
                       *impl_->r2_socket, deadline);
+              impl_->checkpoint_r2_ack_drained();
           } catch (...) {
               // Exact TX_COMMIT was already validated and accepted. Failure
               // to return flow-control credit quarantines this link until the
@@ -2214,9 +2399,11 @@ P50ZstdSourceSender::transfer_p51_route(
             result.system_source_reuse = pending->system_source_reuse;
         result.r2_link_rejection = terminal_rejection
             ? terminal_rejection : impl_->current_r2_route_rejection();
+        if (pending->wire_accounting_started)
+            result.r2_wire_accounting_key = pending->wire_accounting_key;
         if (!pending->replayed_after_reset)
             impl_->remember_completed(request, source, raw_digest, result);
-        co_return result;
+        co_return finish_wire_accounting(std::move(result), pending);
     } catch (...) {
         const std::exception_ptr transfer_failure = std::current_exception();
         {
@@ -2341,9 +2528,11 @@ P50ZstdSourceSender::transfer_p51_route(
         result.system_source_reuse = pending->system_source_reuse;
         result.r2_link_rejection = terminal_rejection
             ? terminal_rejection : impl_->current_r2_route_rejection();
+        if (pending->wire_accounting_started)
+            result.r2_wire_accounting_key = pending->wire_accounting_key;
         if (!pending->replayed_after_reset)
             impl_->remember_completed(request, source, raw_digest, result);
-        co_return result;
+        co_return finish_wire_accounting(std::move(result), pending);
     }
 
     if (terminal_rejection) {
@@ -2352,7 +2541,7 @@ P50ZstdSourceSender::transfer_p51_route(
         rejected.profile = binding.profile;
         rejected.route_local_failure = true;
         rejected.r2_link_rejection = std::move(terminal_rejection);
-        co_return rejected;
+        co_return finish_wire_accounting(std::move(rejected), pending);
     }
 
     if (recovery_needed) {
@@ -2361,6 +2550,7 @@ P50ZstdSourceSender::transfer_p51_route(
         // compiler request is not required to trigger recovery.
         writer_guard.reset();
         for (;;) {
+            std::optional<ZstdSourceTransferResult> recovery_result;
             {
                 std::lock_guard lock(impl_->r2_transfer_mutex);
                 if (pending->unavailable_by_reset) {
@@ -2369,9 +2559,8 @@ P50ZstdSourceSender::transfer_p51_route(
                     unavailable.profile = pending->sent.binding.profile;
                     unavailable.raw_bytes = pending->sent.binding.raw_bytes;
                     unavailable.raw_digest = pending->sent.binding.raw_digest;
-                    co_return unavailable;
-                }
-                if (pending->done && !pending->failure &&
+                    recovery_result = std::move(unavailable);
+                } else if (pending->done && !pending->failure &&
                     pending->client_result.status == ClientRunStatus::Committed &&
                     pending->client_result.committed_commit) {
                     ZstdSourceTransferResult result;
@@ -2385,9 +2574,8 @@ P50ZstdSourceSender::transfer_p51_route(
                     result.system_source_reuse = pending->system_source_reuse;
                     result.r2_link_rejection = terminal_rejection
                         ? terminal_rejection : impl_->r2_terminal_rejection;
-                    co_return result;
-                }
-                if (pending->done && pending->failure) {
+                    recovery_result = std::move(result);
+                } else if (pending->done && pending->failure) {
                     // A receipt-reader failure means this replay attempt also
                     // lost its physical link. Keep the exact retained witness
                     // and original caller, clear only the per-attempt result,
@@ -2398,6 +2586,8 @@ P50ZstdSourceSender::transfer_p51_route(
                     pending->ready = false;
                 }
             }
+            if (recovery_result)
+                co_return finish_wire_accounting(std::move(*recovery_result), pending);
             if (impl_->route_replacement_required)
                 break;
             if (Clock::now() >= deadline)
@@ -2497,7 +2687,7 @@ P50ZstdSourceSender::transfer_p51_route(
             result.system_source_reuse = pending->system_source_reuse;
             result.r2_link_rejection = terminal_rejection
                 ? terminal_rejection : impl_->current_r2_route_rejection();
-            co_return result;
+            co_return finish_wire_accounting(std::move(result), pending);
         }
     }
     if (terminal_rejection) {
@@ -2506,7 +2696,7 @@ P50ZstdSourceSender::transfer_p51_route(
         rejected.profile = binding.profile;
         rejected.route_local_failure = true;
         rejected.r2_link_rejection = std::move(terminal_rejection);
-        co_return rejected;
+        co_return finish_wire_accounting(std::move(rejected), pending);
     }
     if (auto route_rejection = impl_->current_r2_route_rejection()) {
         ZstdSourceTransferResult rejected =
@@ -2514,13 +2704,13 @@ P50ZstdSourceSender::transfer_p51_route(
         rejected.profile = binding.profile;
         rejected.route_local_failure = true;
         rejected.r2_link_rejection = std::move(route_rejection);
-        co_return rejected;
+        co_return finish_wire_accounting(std::move(rejected), pending);
     }
     ZstdSourceTransferResult failed = impl_->invalid(
         Clock::now() >= deadline ? ZstdSourceTransferStatus::DeadlineExceeded
                                  : ZstdSourceTransferStatus::Unavailable);
     failed.route_local_failure = true;
-    co_return failed;
+    co_return finish_wire_accounting(std::move(failed), pending);
 }
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13
 #pragma GCC diagnostic pop

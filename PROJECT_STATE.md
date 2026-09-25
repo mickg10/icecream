@@ -12,6 +12,48 @@ retained artifact directories.
 
 ## Developer QA
 
+### Opt-in R2 sender wire accounting
+
+The sender now supports a bounded interval observer, enabled only when the
+existing `ICECC_P50_DIAGNOSTICS=1` setting and an observer are both present.
+The normal disabled path does not allocate the R2 accounting maps. Frozen
+job identities include C/F/logical link/TU/raw digest (TU zero is valid).
+Job counters are cumulative; interval counters are additive and include
+shared control traffic. Bundle attempts include replay attempts as a subset.
+RESET confirmation is distinct from an actual completed ACK write.
+
+The observer delivers traffic after the caller's result, including delayed
+ACKs. False returns/exceptions invalidate interval measurements without
+changing transfer outcomes. Duplicate completed results retain their exact
+key but omit duplicate measurement payloads. Retirement is per physical
+link, not a global completeness flag. Normal-stop terminal-event coverage
+and actual service JSONL/collector integration remain separate work; this
+commit alone does not install a production service observer or prove complete
+farm bandwidth accounting. No performance improvement is claimed.
+
+Frozen endpoint and sender full suites pass. Focused runs also cover all
+three profiles at W30, lost-COMMIT and repeated replay, failed-terminal keys,
+duplicate references after recovery, false/throw callbacks, and fresh jobs
+after RESET without fabricated ACK-write checkpoints. The final sender run
+includes the last reference-key correction and narrow GCC13 coroutine warning
+workaround. Endpoint files did not change after their full-suite pass.
+Combined qualification with the current service/D11 files is pending.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-r2-accounting-6faf9b21/`.
+SDK `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, image
+`sha256:7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`,
+GCC 13.3.0; containers limited to 2 CPUs/8 GiB. Production and test-hooks
+endpoint archives were explicitly rebuilt before qualification. A stale
+archive link failure and earlier private accounting failures are retained,
+not counted as passes.
+
+- Full endpoint log `tmp-clean/accounting-endpoint-full-r1.log`: `fff820dbbf0d72e64f5b238b2e5c95c8e8c3f2afc5fe3b1be7caafde46d5f5bd`.
+- Final sender rebuild, focused selectors and full suite log `tmp-clean/accounting-reference-final-r2.log`: `cec94304f3852c51b49121c03ebab4f358208cc3c50c24b49e7cda85e796b315`.
+- Final sender binary: `a71c7f5200e50a25c43b33665b327bf99e864b9c481b32216a902bb243912628`.
+- Endpoint source/header: `6f1e77e3f200cd012e5086f8dabd4eb85ed8a6a7ff2b00f8bf6333e23a79773b` / `cd3e60ff51741f83a98575263b8132f745e4f5de45d094eb14f1b5468ca3f0a2`.
+- Sender source/header: `6d3cf6fbb41a07b1349ebc0c359a82697d5b4bba7ad1395553997527757b84e0` / `c2961614b14b804ed70a06fb7a7fe3725d45e41083c500e0929fd19fdfbe477e`.
+- Endpoint/sender test sources: `5fe62d35afa46fedae8d4ad2c9ba7474d935ca47a138e7dcd493e2d07a0132ab` / `d1b293851c0304f7a6d2c1c1f7f00a3b792e3579df87fed2a370de4e99a1687d`.
+
 ### Real F receipt-ledger pressure
 
 The default service suite includes W1 and W30 receipt-pressure cases for

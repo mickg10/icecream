@@ -18,10 +18,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -93,7 +97,76 @@ struct CompletionStamp {
     Digest128 transaction_digest{};
     Digest128 raw_digest{};
     bool transaction_bound = false;
+    // R2 accounting identity is frozen with the stamp before async I/O. These
+    // fields are diagnostic and never participate in wire validation.
+    Id128 logical_link_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    bool replay_attempt = false;
     auto operator<=>(const CompletionStamp&) const = default;
+};
+
+struct R2WireAccountingKey {
+    CStoreGuid c_store_guid{};
+    FStoreGuid f_store_guid{};
+    Id128 logical_link_id{};
+    TuSeq tu_seq{};
+    Digest128 raw_digest{};
+    auto operator<=>(const R2WireAccountingKey&) const = default;
+};
+
+struct R2WireLinkIdentity {
+    CStoreGuid c_store_guid{};
+    FStoreGuid f_store_guid{};
+    Id128 logical_link_id{};
+    uint64_t relationship_epoch = 0;
+    uint64_t physical_link_generation = 0;
+    auto operator<=>(const R2WireLinkIdentity&) const = default;
+};
+
+struct R2WireAccountingSnapshot {
+    uint64_t c_to_f_bundle_bytes = 0;
+    uint64_t f_to_c_receipt_bytes = 0;
+    uint32_t bundle_attempts = 0;
+    uint32_t replay_attempts = 0;
+    bool valid = true;
+};
+
+enum class R2WireIntervalEnd : uint8_t {
+    DrainedAckCheckpoint,
+    RecoveryConfirmed,
+    PhysicalLinkRetired,
+    WindowPressure,
+};
+
+struct R2WireJobInterval {
+    R2WireAccountingKey key{};
+    R2WireLinkIdentity link{};
+    uint64_t c_to_f_bundle_bytes = 0;
+    uint64_t f_to_c_receipt_bytes = 0;
+    uint32_t bundle_attempts = 0;
+    uint32_t replay_attempts = 0;
+    bool valid = true;
+};
+
+struct R2WireControlSnapshot {
+    R2WireLinkIdentity link{};
+    // Deltas since the preceding emitted checkpoint for this link identity.
+    // Job rows and shared totals are disjoint classifications of `total_*`.
+    uint64_t interval_sequence = 0;
+    // Highest cumulative ACK prefix whose write completed before this
+    // checkpoint; zero for non-ACK boundaries such as WindowPressure.
+    uint64_t drained_ack_prefix = 0;
+    // F-confirmed recovery prefix at a RESET_CONFIRM boundary. This is not a
+    // COMMIT_ACK write and must never be merged into drained_ack_prefix.
+    uint64_t recovery_confirmed_prefix = 0;
+    R2WireIntervalEnd end = R2WireIntervalEnd::DrainedAckCheckpoint;
+    uint64_t total_c_to_f_bytes = 0;
+    uint64_t total_f_to_c_bytes = 0;
+    uint64_t shared_c_to_f_bytes = 0;
+    uint64_t shared_f_to_c_bytes = 0;
+    std::vector<R2WireJobInterval> jobs;
+    bool valid = true;
 };
 
 // The endpoint identity derived from current product state after an asynchronous
@@ -131,7 +204,21 @@ public:
     explicit CompletionLog(StorageMode mode)
         : mode_(mode) {}
 
+    void enable_r2_accounting() noexcept {
+        r2_accounting_enabled_ = true;
+    }
+
+    bool r2_accounting_enabled() const noexcept {
+        return r2_accounting_enabled_;
+    }
+
+    bool r2_accounting_available() const noexcept {
+        return !r2_accounting_poisoned_.load(std::memory_order_acquire);
+    }
+
     void record(AsyncCompletion completion) noexcept {
+        if (r2_accounting_enabled_)
+            record_r2_accounting(completion);
         if (!valid_)
             return;
         if (mode_ == StorageMode::ClientByteTotals) {
@@ -176,8 +263,68 @@ public:
         valid_ = true;
     }
 
+    // R2 job rows are bounded by the negotiated window (maximum 30). A
+    // transaction keeps the same key through physical reconnect/reindex.
+    bool begin_r2_job(const R2WireAccountingKey& key) noexcept;
+    void begin_r2_bundle_attempt(const CompletionStamp& stamp) noexcept;
+    void begin_r2_receipt_read(const R2WireAccountingKey& key,
+                               R2WireLinkIdentity link) noexcept;
+    void confirm_r2_receipt(const R2WireAccountingKey& key) noexcept;
+    void reject_r2_receipt(const R2WireAccountingKey& key) noexcept;
+    R2WireAccountingSnapshot finish_r2_job(
+        const R2WireAccountingKey& key) noexcept;
+    void request_r2_interval_checkpoint(R2WireLinkIdentity link,
+                                        R2WireIntervalEnd end,
+                                        uint64_t drained_ack_prefix = 0,
+                                        uint64_t recovery_confirmed_prefix = 0) noexcept;
+    std::vector<R2WireControlSnapshot> drain_r2_interval_snapshots() noexcept;
+    void mark_r2_accounting_unavailable() noexcept {
+        r2_accounting_poisoned_.store(true, std::memory_order_release);
+    }
+
 private:
+    struct R2ActiveJob {
+        R2WireAccountingSnapshot totals{};
+        R2WireJobInterval interval{};
+        std::optional<R2WireLinkIdentity> interval_link;
+        uint64_t provisional_receipt_bytes = 0;
+        bool receipt_read_active = false;
+        R2WireLinkIdentity provisional_link{};
+    };
+    struct R2PendingCheckpoint {
+        R2WireLinkIdentity link{};
+        R2WireIntervalEnd end = R2WireIntervalEnd::DrainedAckCheckpoint;
+        uint64_t drained_ack_prefix = 0;
+        uint64_t recovery_confirmed_prefix = 0;
+    };
+    void record_r2_accounting(const AsyncCompletion& completion) noexcept;
+    void record_r2_unattributed_locked(uint64_t bytes, bool write,
+                                      R2WireLinkIdentity link) noexcept;
+    bool snapshot_r2_interval_locked(R2WireLinkIdentity link,
+                                    R2WireIntervalEnd end,
+                                    uint64_t drained_ack_prefix,
+                                    uint64_t recovery_confirmed_prefix) noexcept;
+    void service_r2_checkpoints_locked() noexcept;
+    bool set_r2_interval_link_locked(R2WireLinkIdentity link) noexcept;
+    void record_r2_interval_bytes_locked(uint64_t bytes, bool write,
+                                        R2WireLinkIdentity link) noexcept;
+    static bool add_r2_count(uint64_t amount, uint64_t& total) noexcept;
+    mutable std::mutex r2_mutex_;
+    std::map<R2WireAccountingKey, R2ActiveJob> r2_active_jobs_;
+    uint64_t r2_unattributed_write_bytes_ = 0;
+    uint64_t r2_unattributed_read_bytes_ = 0;
+    uint64_t r2_interval_write_bytes_ = 0;
+    uint64_t r2_interval_read_bytes_ = 0;
+    bool r2_unattributed_valid_ = true;
+    std::atomic<bool> r2_accounting_poisoned_{false};
+    std::optional<R2WireLinkIdentity> r2_unattributed_link_;
+    std::optional<R2WireLinkIdentity> r2_interval_link_;
+    uint64_t r2_unattributed_sequence_ = 0;
+    std::vector<R2WireJobInterval> r2_finished_interval_jobs_;
+    std::deque<R2PendingCheckpoint> r2_pending_checkpoints_;
+    std::deque<R2WireControlSnapshot> r2_ready_interval_snapshots_;
     StorageMode mode_ = StorageMode::Detailed;
+    bool r2_accounting_enabled_ = false;
     size_t max_records_ = std::numeric_limits<size_t>::max();
     bool valid_ = true;
     uint64_t c_to_f_bytes_ = 0;
@@ -711,7 +858,7 @@ public:
         boost::asio::ip::tcp::socket& socket, JobBind binding,
         PreparedTuHandle prepared,
         std::chrono::steady_clock::time_point deadline,
-        EndpointIoControl control = {});
+        EndpointIoControl control = {}, bool replay_attempt = false);
     boost::asio::awaitable<ClientRunResult> read_r2_receipt(
         boost::asio::ip::tcp::socket& socket, const R2SentBundle& sent,
         std::chrono::steady_clock::time_point deadline);
@@ -723,6 +870,7 @@ public:
         std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] bool r2_window_available() const noexcept;
     [[nodiscard]] uint64_t r2_confirmed_prefix() const noexcept;
+    [[nodiscard]] uint64_t r2_ack_written_prefix() const noexcept;
     [[nodiscard]] std::vector<R2SentBundle> r2_pending_witnesses(
         uint64_t after_ordinal) const;
 
