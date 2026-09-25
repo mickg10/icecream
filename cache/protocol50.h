@@ -121,6 +121,7 @@ constexpr uint32_t kR2ReceiptsEndPayloadBytes = 77;
 constexpr uint32_t kR2ResetPayloadBytes = 80;
 constexpr uint32_t kR2ResetAckPayloadBytes = 104;
 constexpr uint32_t kR2ResetConfirmPayloadBytes = 64;
+constexpr uint32_t kR2LinkRejectPayloadBytes = 18;
 constexpr uint32_t kR2MandatoryControlFramePayload =
     kR2LinkStatePayloadBytes;
 constexpr uint64_t kInitialMaxFillRecordBytes = uint64_t{1} << 32;
@@ -150,6 +151,12 @@ enum class MessageType : uint8_t {
     RESET_ACK = 22,
     RESET_CONFIRM = 23,
     CLOSE = 24,
+    R2_LINK_REJECT = 25,
+};
+
+enum class LinkRejectReason : uint16_t {
+    StoreReplaced = 1,
+    ReservationMissing = 2,
 };
 
 enum class LinkStartMode : uint8_t { Initial = 0, Reconnect = 1 };
@@ -294,6 +301,18 @@ struct LinkHello {
     uint64_t verified_receipt_floor = 0;
     LinkStartMode start_mode = LinkStartMode::Initial;
     auto operator<=>(const LinkHello&) const = default;
+};
+
+// Terminal, non-positive response to one structurally valid R2 LINK_HELLO.
+// offered_hello_digest binds the complete exact 181-byte canonical hello.
+struct LinkRejectMessage {
+    LinkRejectReason reason = LinkRejectReason::ReservationMissing;
+    Digest128 offered_hello_digest{};
+    [[nodiscard]] bool valid() const noexcept {
+        return reason == LinkRejectReason::StoreReplaced ||
+               reason == LinkRejectReason::ReservationMissing;
+    }
+    auto operator<=>(const LinkRejectMessage&) const = default;
 };
 
 struct LinkState {
@@ -501,7 +520,7 @@ using Message = std::variant<SessionHello, SessionState, HistoryReset, ErrorMess
                              R2BodyMessage, R2FillMessage, CloseMessage,
                              RecoverBegin, RecoverWitness, RecoverEnd,
                              ReceiptRow, ReceiptsEnd, ResetRequest, ResetAck,
-                             ResetConfirm>;
+                             ResetConfirm, LinkRejectMessage>;
 
 struct Frame {
     MessageType type = MessageType::ERROR;
@@ -525,6 +544,7 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload);
     std::span<const R2FillMessage> fills);
 [[nodiscard]] Digest128 compute_r2_recovery_transcript_digest(
     const RecoverBegin& begin, std::span<const RecoverWitness> witnesses);
+[[nodiscard]] Digest128 compute_r2_link_offer_digest(const LinkHello& hello);
 std::array<uint8_t, 4> encode_frame_header(MessageType type, uint32_t payload_bytes);
 FrameHeader decode_frame_header(std::span<const uint8_t> header,
                                 uint32_t max_payload = kInitialMaxFramePayload);

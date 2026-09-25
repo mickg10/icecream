@@ -80,7 +80,7 @@ void test_revision_one_registry() {
     static_assert(kKnownProfileMask == 7);
     static_assert(CACHE_ADVERTISABLE_PROFILE_MASK == 7);
     static_assert(kMandatoryControlFramePayload == 116);
-    static_assert(std::variant_size_v<Message> == 27);
+    static_assert(std::variant_size_v<Message> == 28);
     static_assert(static_cast<uint8_t>(MessageType::BODY) == 6);
     static_assert(static_cast<uint8_t>(MessageType::FILL) == 8);
     static_assert(static_cast<uint8_t>(MessageType::LINK_HELLO) == 10);
@@ -93,6 +93,7 @@ void test_revision_one_registry() {
     static_assert(static_cast<uint8_t>(MessageType::RESET_ACK) == 22);
     static_assert(static_cast<uint8_t>(MessageType::RESET_CONFIRM) == 23);
     static_assert(static_cast<uint8_t>(MessageType::CLOSE) == 24);
+    static_assert(static_cast<uint8_t>(MessageType::R2_LINK_REJECT) == 25);
 
     require(profile_name(ProfileId::P29V1) == "p29_v1" &&
                 profile_name(ProfileId::ZSTD_TU) == "zstd_tu" &&
@@ -298,6 +299,97 @@ void test_r2_fixed_wire_shapes_and_negative_cases() {
     }
 
     const auto hello_wire = encode_payload(Message{hello});
+    Digest128 expected_offer_digest{};
+    {
+        std::vector<uint8_t> transcript = bytes("R2-link-offer-v1");
+        transcript.insert(transcript.end(), hello_wire.begin(), hello_wire.end());
+        expected_offer_digest = icecc::digest128(transcript);
+    }
+    const Digest128 offer_digest = compute_r2_link_offer_digest(hello);
+    require(offer_digest == expected_offer_digest,
+            "R2 offer digest differs from domain+canonical LINK_HELLO transcript");
+    require(icecc::digest128_hex(offer_digest) ==
+                "eca876283a11f86fec8efac86d6631ea",
+            "R2_LINK_REJECT canonical offer digest golden changed");
+    const LinkRejectMessage link_reject{
+        LinkRejectReason::StoreReplaced, offer_digest};
+    const Message link_reject_message{link_reject};
+    const auto reject_payload = encode_payload(link_reject_message);
+    require(reject_payload.size() == kR2LinkRejectPayloadBytes,
+            "R2_LINK_REJECT payload length changed");
+    require_be16(reject_payload, 0,
+                 static_cast<uint16_t>(LinkRejectReason::StoreReplaced),
+                 "R2_LINK_REJECT reason byte order changed");
+    require(std::equal(offer_digest.bytes.begin(), offer_digest.bytes.end(),
+                       reject_payload.begin() + 2),
+            "R2_LINK_REJECT digest offset changed");
+    require(message_type(link_reject_message) == MessageType::R2_LINK_REJECT &&
+                decode_payload(MessageType::R2_LINK_REJECT, reject_payload) ==
+                    link_reject_message,
+            "R2_LINK_REJECT did not round-trip");
+    const auto reject_frame = encode_frame(link_reject_message);
+    require(decode_frame_header(
+                std::span<const uint8_t>(reject_frame).first(4),
+                kInitialMaxFramePayload).type == MessageType::R2_LINK_REJECT,
+            "R2_LINK_REJECT frame discriminator changed");
+    for (const size_t size : {size_t{0}, size_t{1}, size_t{17}}) {
+        const std::vector<uint8_t> malformed(
+            reject_payload.begin(), reject_payload.begin() + size);
+        require_throws<std::exception>(
+            [&] { (void)decode_payload(MessageType::R2_LINK_REJECT, malformed); },
+            "R2_LINK_REJECT accepted a malformed exact length");
+    }
+    std::vector<uint8_t> trailing_reject = reject_payload;
+    trailing_reject.push_back(0);
+    require_throws<std::exception>(
+        [&] {
+            (void)decode_payload(MessageType::R2_LINK_REJECT, trailing_reject);
+        },
+        "R2_LINK_REJECT accepted trailing bytes");
+    const LinkRejectMessage missing_reservation{
+        LinkRejectReason::ReservationMissing, offer_digest};
+    const auto missing_payload = encode_payload(Message{missing_reservation});
+    require(decode_payload(MessageType::R2_LINK_REJECT, missing_payload) ==
+                Message{missing_reservation},
+            "ReservationMissing R2_LINK_REJECT did not round-trip");
+    for (const uint16_t reason : {uint16_t{0}, uint16_t{3}, uint16_t{0xffff}}) {
+        std::vector<uint8_t> malformed(reject_payload);
+        malformed[0] = static_cast<uint8_t>(reason >> 8);
+        malformed[1] = static_cast<uint8_t>(reason);
+        require_throws<std::exception>(
+            [&] { (void)decode_payload(MessageType::R2_LINK_REJECT, malformed); },
+            "R2_LINK_REJECT accepted an unknown reason");
+    }
+    require_throws<std::exception>(
+        [&] {
+            (void)encode_payload(Message{LinkRejectMessage{
+                static_cast<LinkRejectReason>(3), offer_digest}});
+        },
+        "R2_LINK_REJECT encoder accepted an unknown reason");
+    LinkHello replaced_f = hello;
+    ++replaced_f.f_store_generation;
+    require(compute_r2_link_offer_digest(replaced_f) != offer_digest,
+            "R2 offer digest omitted F store generation");
+    LinkHello replaced_link = hello;
+    ++replaced_link.physical_link_generation;
+    require(compute_r2_link_offer_digest(replaced_link) != offer_digest,
+            "R2 offer digest omitted physical link generation");
+    LinkHello changed_control = hello;
+    ++changed_control.c_control_attempt;
+    require(compute_r2_link_offer_digest(changed_control) != offer_digest,
+            "R2 offer digest omitted C control incarnation");
+    LinkHello changed_reservation = hello;
+    changed_reservation.reservation_id = Id128::from_u64(0x99);
+    require(compute_r2_link_offer_digest(changed_reservation) != offer_digest,
+            "R2 offer digest omitted reservation identity");
+    LinkHello changed_relationship = hello;
+    ++changed_relationship.relationship_epoch;
+    require(compute_r2_link_offer_digest(changed_relationship) != offer_digest,
+            "R2 offer digest omitted relationship epoch");
+    LinkHello changed_profile = hello;
+    changed_profile.profile = ProfileId::ZSTD_TU;
+    require(compute_r2_link_offer_digest(changed_profile) != offer_digest,
+            "R2 offer digest omitted selected profile");
     require_be16(hello_wire, 0, 2, "LINK_HELLO revision offset changed");
     require_be16(hello_wire, 2, static_cast<uint16_t>(hello.profile),
                  "LINK_HELLO profile offset changed");

@@ -103,8 +103,8 @@ R1 records and bytes remain unchanged.
 The outer frame remains `type:u8, payload_length:u24, payload`,
 all record integers are big-endian, and GUIDs/digests/reservation IDs are 16
 raw bytes. Revisions and profiles are u16; windows and frame caps are u32.
-Payloads have no padding or reserved extensibility bytes. Type 25 remains
-reserved for error records.
+Payloads have no padding or reserved extensibility bytes. Type 25 has a
+qualified codec; endpoint emission and sender handling remain pending.
 
 | Type | Record | Exact payload fields / byte offsets | Bytes |
 |---:|---|---|---:|
@@ -126,6 +126,16 @@ reserved for error records.
 | 22 | RESET_ACK | exact RESET payload@0..79; fresh initial state digest@80; next REL_SEQ u64@96 | 104 |
 | 23 | RESET_CONFIRM | relationship ID@0; new relationship epoch u64@16; physical generation u64@24; operation ID@32; new history nonce u64@48; settled prefix K u64@56 | 64 |
 | 24 | CLOSE | empty payload; closes only an idle bound link and settles no receipt | 0 |
+| 25 | R2_LINK_REJECT | reason u16@0 (`1` StoreReplaced, `2` ReservationMissing); exact offered-HELLO digest@2 | 18 |
+
+The rejection digest is XXH3-128 over ASCII `R2-link-offer-v1` without a NUL,
+followed by the canonical 181-byte LINK_HELLO payload (no outer frame header).
+Unknown reasons, truncated payloads and trailing bytes are invalid. Neither
+reason grants commit or compiler-admission credit. Planned emission and
+retirement rules, including the distinction between definite absence and
+invalid/stale lookup, are specified in
+[the implementation plan](../doc/p50-transfer-concurrency.md#741-planned-link-rejection-completion).
+Codec availability alone does not qualify that behavior.
 
 LINK_HELLO starts revision 2 and pins one profile/window to a physical link.
 R1 transaction bytes are nested at TU_BEGIN and R2_TX_COMMIT but do not by

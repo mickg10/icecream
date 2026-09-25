@@ -648,12 +648,12 @@ publication. No successful compiler reply is inferred from a source prefix.
 
 #### 7.4.1 Planned link-rejection completion
 
-This extension is pending implementation and qualification; it is not a claim
-about the current wire codec. Real F-process restart testing exposed silent
+The record codec is implemented and wire-tested; endpoint emission, sender
+handling and lifecycle qualification remain pending. Real F-process restart testing exposed silent
 rejection of an old F identity followed by excessive reconnect attempts.
 Land shared retry pacing first, independently of this wire extension.
 
-Proposed frame 25, `R2_LINK_REJECT`, has exactly 18 payload bytes: a big-endian
+Frame 25, `R2_LINK_REJECT`, has exactly 18 payload bytes: a big-endian
 u16 reason at offset 0 and a Digest128 at offset 2. Reasons are `1` StoreReplaced
 and `2` ReservationMissing; other values, truncation and trailing bytes are
 invalid. The digest is XXH3-128 over ASCII `R2-link-offer-v1` (no NUL), followed

@@ -320,6 +320,16 @@ These runs use the private build snapshot with the exact sender overlay,
 not a clean final combined candidate. Retry pacing is not a repair for the
 separate old-route retirement failure below and does not add typed rejection.
 
+The type-25 R2 link-rejection codec passes `p50wire`: exact 18-byte shape,
+both reasons, golden domain-bound HELLO digest, identity sensitivity and
+malformed/trailing-byte rejection. Evidence: `logs/link-reject-codec-r2.log`
+under the sender build root above (SHA256
+`43c54a68ea739a6af92fd2dcf26c590ea2ad5207bf856e7c02c4422e95c489ac`),
+container exit 0; test binary SHA256
+`a0f2eefca1d71db084ce76ab531a20cf816ff138376f74e76fbcdc81a53c74a7`.
+This is codec-only evidence: endpoint emission and sender retirement on a
+validated rejection are not yet implemented or qualified.
+
 The in-development real C2F1/C-cache restart fixture passes for ZSTD_TU:
 the independent C2/F1 link attaches exact input while C1's parent is stopped,
 the C1 sidecar PID changes, the discarded old receipt is not reported as a

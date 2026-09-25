@@ -34,7 +34,7 @@ bool known_object_type(ObjectType type) {
 bool known_message_type(MessageType type) {
     const uint8_t value = static_cast<uint8_t>(type);
     return value >= static_cast<uint8_t>(MessageType::SESSION_HELLO) &&
-           (value <= static_cast<uint8_t>(MessageType::RESET_CONFIRM) ||
+           (value <= static_cast<uint8_t>(MessageType::R2_LINK_REJECT) ||
             type == MessageType::CLOSE);
 }
 
@@ -665,6 +665,8 @@ MessageType message_type(const Message& message) {
         if constexpr (std::is_same_v<T, ResetAck>) return MessageType::RESET_ACK;
         if constexpr (std::is_same_v<T, ResetConfirm>) return MessageType::RESET_CONFIRM;
         if constexpr (std::is_same_v<T, CloseMessage>) return MessageType::CLOSE;
+        if constexpr (std::is_same_v<T, LinkRejectMessage>)
+            return MessageType::R2_LINK_REJECT;
         return MessageType::COMMIT_ACK;
     }, message);
 }
@@ -900,6 +902,11 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.u64(value.settled_prefix_k);
         } else if constexpr (std::is_same_v<T, CloseMessage>) {
             // CLOSE has an exact empty payload.
+        } else if constexpr (std::is_same_v<T, LinkRejectMessage>) {
+            if (!value.valid())
+                throw std::invalid_argument("R2_LINK_REJECT reason is invalid");
+            out.u16(static_cast<uint16_t>(value.reason));
+            out.digest(value.offered_hello_digest);
         }
     }, message);
     return out.take();
@@ -1232,6 +1239,15 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
     case MessageType::CLOSE:
         in.exact_end();
         return CloseMessage{};
+    case MessageType::R2_LINK_REJECT: {
+        LinkRejectMessage value;
+        value.reason = static_cast<LinkRejectReason>(in.u16());
+        value.offered_hello_digest = in.digest();
+        in.exact_end();
+        if (!value.valid())
+            throw std::invalid_argument("R2_LINK_REJECT reason is invalid");
+        return value;
+    }
     }
     throw std::invalid_argument("unknown message type");
 }
@@ -1310,6 +1326,16 @@ Digest128 compute_r2_recovery_transcript_digest(
     }
     if (ordinal != begin.prepared_prefix_p)
         throw std::invalid_argument("RECOVER witness interval is incomplete");
+    return digest.finish();
+}
+
+Digest128 compute_r2_link_offer_digest(const LinkHello& hello) {
+    const std::vector<uint8_t> canonical = encode_payload(Message{hello});
+    if (canonical.size() != kR2LinkHelloPayloadBytes)
+        throw std::logic_error("canonical R2 LINK_HELLO size changed");
+    icecc::Digest128Builder digest;
+    digest.append("R2-link-offer-v1");
+    digest.append(canonical);
     return digest.finish();
 }
 
