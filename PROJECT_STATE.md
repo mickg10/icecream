@@ -42,8 +42,12 @@ The corrected daemon source hash is
 derived runtime image ID is
 `sha256:700edb9e1d3ca7bd0f49361e27a99a5350e2dc2885d704d1a550a40ac0b1c55e`.
 This proves ordinary remote fallback without R2 selection for that pinned
-peer; the current-R2 recheck on this same image and scheduler-transition
-regressions remain pending. It is not a combined recovery qualification.
+peer. The same image also passes current-scheduler R2 remote compilation
+for all three profiles, each with R2 selection, source lease and link adoption:
+`current51-r2/summary.json` under the same evidence root, SHA256
+`2afa36c916b64b8e50471ce050475770e4d803f7fe06e3f69461b0b96dfef404`.
+Scheduler-transition regressions remain pending. These separate runs do not
+prove simultaneous coexistence or qualify the combined recovery changes.
 The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
