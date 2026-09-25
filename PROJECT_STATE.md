@@ -461,9 +461,12 @@ failure is not a source-phase diagnostic test. The corrected short-path run
 reaches F's deliberately shortened source deadline: the first phase record
 reports `f_arm_to_armed`, exception, original error 5, and null unreached
 control/result intervals. Exit 100 is the expected strict remote-only compile
-failure, not a successful compile. The subsequent retry independently fails
-with preprocessed-input retention error 11; this does not qualify successful
-retry recovery. Earlier negative runs either omitted opt-in or exposed the
+failure, not a successful compile. The subsequent retry's error 11 is an
+opt-in fixture capture collision: the first attempt already created
+`ICECC_P50_PREPROCESSED_CAPTURE`, and retry's `O_EXCL` creation refuses the
+same destination. Without that capture variable the normal retry does not
+take this branch. This run does not qualify successful retry recovery.
+Earlier negative runs either omitted opt-in or exposed the
 outer exception overwriting the original error with 106. The final client
 build and negative rerun qualify the error-preservation correction; the
 enabled/disabled successful compiles preceded that catch-only correction.
