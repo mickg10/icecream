@@ -373,6 +373,7 @@ private:
         std::chrono::steady_clock::time_point deadline,
         const sidecar::LifecycleObservation& observation,
         std::chrono::steady_clock::time_point now) noexcept;
+    void note_own_teardown() noexcept;
     void report_retirement(std::chrono::steady_clock::time_point now) noexcept;
 
     Config config_;

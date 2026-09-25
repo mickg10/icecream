@@ -916,6 +916,20 @@ void DaemonSidecarAdapter::note_reducer_retirement(
     note_retirement(cause, sidecar::lifecycle_state_name(prior));
 }
 
+void DaemonSidecarAdapter::note_own_teardown() noexcept
+{
+    // From our first TERM/KILL on, an exit may be our own cleanup and is no
+    // cause -- unless the child had already exited, which its pidfd shows.
+    // The central reaper polls that pidfd, so our turn's pollfds may not.
+    RetirementDiag& record = outer_retirement_;
+    if (!record.signalled && !record.exited_unsignalled && outer_pidfd_ >= 0) {
+        pollfd probe{outer_pidfd_, POLLIN, 0};
+        record.exited_unsignalled =
+            ::poll(&probe, 1, 0) == 1 && (probe.revents & POLLIN) != 0;
+    }
+    record.signalled = true;
+}
+
 void DaemonSidecarAdapter::report_retirement(
     std::chrono::steady_clock::time_point now) noexcept
 {
@@ -2566,13 +2580,12 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_observe(pending_advertisement_update_);
         break;
     case sidecar::LifecycleAction::SendTerm:
-        // From here on an exit may be our own cleanup; it is never a cause.
-        outer_retirement_.signalled = true;
+        note_own_teardown();
         if (outer_group_action(SIGTERM))
             outer_action_taken_ = true;
         break;
     case sidecar::LifecycleAction::SendKill:
-        outer_retirement_.signalled = true;
+        note_own_teardown();
         if (outer_group_action(SIGKILL))
             outer_action_taken_ = true;
         break;
