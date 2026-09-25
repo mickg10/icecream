@@ -28,7 +28,7 @@ All six entries in `test-statuses.txt` are zero, SHA256
 `10d990347707be7d6015fbe51471f4ad199aeccb38e589e94e572a0be26b3f6c`;
 `source-hashes.txt` identifies the nine tested source files. Earlier compile
 failures in this and prior scratch snapshots are excluded. The endpoint used
-was the published product (`27d67566…`), not the pending worker repair.
+was product `27d67566…`, before the worker repair.
 
 ### Endpoint mutation gate
 
@@ -2021,7 +2021,7 @@ The recovery runner now passes 26 rows, including six explicit reduced-action
 staged-unsent cancellation/reindex witnesses for C2/3/4F1 and C1F2/3/4, and a
 double-release mutant rejected by its exact invariant. Each new witness
 requires committed work on every sibling link. These are reachability checks,
-not exhaustive active-cancellation safety or proof of the pending C++ repair.
+not exhaustive active-cancellation safety or proof of the C++ repair.
 The ordinary specification retains its full action relation. Final log:
 `/tanksmall/scratch/tmp/pipeline-cancel-reindex-spec.RFAWnp/run.log`, SHA256
 `08c08c0fe54dc93108a20c09c1d0c8594a477935d673f281390540d410c2758b`;
@@ -2043,7 +2043,9 @@ retention, not another complete wire recovery. Aggregate evidence:
 SHA256 `cc15de6356af65cf622b25ac864653faae5416bf8a940b4c73026ae6b132fc04`;
 active model SHA256
 `6c1251c1e3d2b7e9725923db54f248b3725375709fa01cf37096afa29f4d900f`.
-The product repair still requires real C/F runtime qualification.
+The candidate repair's real C/F evidence and remaining runtime gaps are
+recorded above under active cancellation; the model does not replace those
+tests or complete the broader W30 qualification.
 
 [TLA+/TLC documentation](cache/formal/README.md) describes the selected bounded
 models and expected-failure controls. Native/Python/Docker success is not a
