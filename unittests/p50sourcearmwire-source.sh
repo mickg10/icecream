@@ -13,7 +13,7 @@ for file in "$header" "$impl" "$identity" "$makefile" "$test" "$lease_test"; do
 done
 
 for needle in \
-    '#define PROTOCOL_VERSION 50' \
+    '#define PROTOCOL_VERSION 51' \
     '#define PROTOCOL_VERSION_CACHE_R2_NEGOTIATION 51' \
     'inline constexpr uint32_t CACHE_WIRE_REVISION_R1 = 1;' \
     '#define PROTOCOL_VERSION_P50_SOURCE_ARM_R1 50' \
@@ -87,6 +87,30 @@ sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h
 grep -F 'store_identity_guid_valid_for_role' "$header" >/dev/null
 grep -F '!icecc::p50::store_identity_file_guid_matches_client' "$header" >/dev/null
 
+# Keep each R1 source-arm message class bound to the bridge predicate; a call
+# elsewhere in comm.h must not mask a deleted guard on either actual message.
+check_source_arm_protocol_guards() {
+    candidate_header=$1
+    arm_msg=$(sed -n '/^class P50SourceArmMsg/,/^};/p' "$candidate_header")
+    armed_msg=$(sed -n '/^class P50SourceArmedMsg/,/^};/p' "$candidate_header")
+    bridge=$(sed -n \
+        '/^inline constexpr bool protocol_supports_p50_r1_bridge/,/^}/p' \
+        "$candidate_header")
+    test -n "$arm_msg" && test -n "$armed_msg" && test -n "$bridge" || return 1
+    printf '%s\n' "$arm_msg" | \
+        grep -F 'protocol_supports_p50_r1_bridge(negotiated_protocol)' \
+        >/dev/null || return 1
+    printf '%s\n' "$armed_msg" | \
+        grep -F 'protocol_supports_p50_r1_bridge(negotiated_protocol)' \
+        >/dev/null || return 1
+    printf '%s\n' "$bridge" | \
+        grep -F 'protocol >= PROTOCOL_VERSION_P50_CACHE_SESSION_R1' \
+        >/dev/null || return 1
+    printf '%s\n' "$bridge" | \
+        grep -F 'protocol <= PROTOCOL_VERSION_SUPPORTED_MAX' >/dev/null
+}
+check_source_arm_protocol_guards "$header"
+
 # The ACK must not transmit or model raw CSPRNG entropy/root state.
 if grep -F 'f_store_identity_root' "$header" "$impl" "$identity" "$test" >/dev/null; then
     echo 'FAIL: raw StoreIdentity root leaked into ordinary source ACK' >&2
@@ -100,7 +124,22 @@ fi
 # Removing the exact trailing-byte check must be visible to this gate.
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearmwire-mutant.XXXXXX")
 identity_mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearmwire-identity-mutant.XXXXXX")
-trap 'rm -f "$mutant" "$identity_mutant"' EXIT HUP INT TERM
+protocol_mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearmwire-protocol-mutant.XXXXXX")
+armed_protocol_mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearmwire-armed-protocol-mutant.XXXXXX")
+trap 'rm -f "$mutant" "$identity_mutant" "$protocol_mutant" "$armed_protocol_mutant"' EXIT HUP INT TERM
+
+sed '/^class P50SourceArmMsg/,/^};/s/protocol_supports_p50_r1_bridge(negotiated_protocol)/true/' \
+    "$header" >"$protocol_mutant"
+if check_source_arm_protocol_guards "$protocol_mutant"; then
+    echo 'FAIL: R1 bridge protocol-guard deletion mutant survived' >&2
+    exit 1
+fi
+sed '/^class P50SourceArmedMsg/,/^};/s/protocol_supports_p50_r1_bridge(negotiated_protocol)/true/' \
+    "$header" >"$armed_protocol_mutant"
+if check_source_arm_protocol_guards "$armed_protocol_mutant"; then
+    echo 'FAIL: R1 ARMED bridge protocol-guard deletion mutant survived' >&2
+    exit 1
+fi
 sed 's/channel->current_message_bytes_remaining() != 0/false/' "$impl" > "$mutant"
 if grep -F 'channel->current_message_bytes_remaining() != 0' "$mutant" >/dev/null; then
     echo 'FAIL: trailing-byte deletion mutant was accepted' >&2

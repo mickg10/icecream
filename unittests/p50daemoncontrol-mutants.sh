@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+top_build=${ICECC_TEST_TOP_BUILDDIR:?ICECC_TEST_TOP_BUILDDIR is required}
 impl="$src/cache/p50_daemon_control.cpp"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/p50daemoncontrol-mutants.XXXXXX")
 build=$(mktemp -d "${TMPDIR:-/tmp}/p50daemoncontrol-semantic.XXXXXX")
@@ -38,9 +39,13 @@ run_true_mutant() {
     # focused runtime row.
     perl -0pe "$expression" "$impl" >"$mutant"
     "$cxx" "$standard" -pthread -I"$src" -I"$src/cache" \
+        -I"$src/services" -I"$top_build" \
         "$src/unittests/p50_daemon_control_test.cpp" "$mutant" \
         "$src/cache/p50_local_transport.cpp" "$src/cache/p50_fd_handoff.cpp" \
         "$src/cache/p50_control_operation.cpp" \
+        "$top_build/services/.libs/libicecc.a" \
+        ${ICECC_TEST_LIBCAP_NG_LIBS:-} -llzo2 -ldl \
+        ${ICECC_TEST_LIBZSTD_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:-} \
         -o "$binary"
     if timeout 30 "$binary" >/dev/null 2>&1; then
         echo "FAIL: $label survived runtime" >&2

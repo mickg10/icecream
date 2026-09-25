@@ -4,14 +4,22 @@
  * relationship is available.  Login advertisement is not involved. */
 #include "comm.h"
 
+#include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
+#include <cstring>
+#include <cstdint>
+#include <poll.h>
 #include <string>
 #include <vector>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <pwd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -48,6 +56,185 @@ static bool wait_eof(MsgChannel *channel, int timeout_msec)
         if (channel->at_eof()) return true;
     }
     return channel && channel->at_eof();
+}
+
+static bool raw_io_exact_until(int fd, unsigned char *bytes, size_t length,
+                               bool writing, Clock::time_point deadline)
+{
+    size_t offset = 0;
+    while (offset != length) {
+        const auto now = Clock::now();
+        if (now >= deadline)
+            return false;
+        const int timeout = static_cast<int>(std::clamp<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count(), 0, INT_MAX));
+        pollfd descriptor{fd, static_cast<short>(writing ? POLLOUT : POLLIN), 0};
+        const int ready = ::poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 || (descriptor.revents & POLLNVAL) != 0)
+            return false;
+        if (writing &&
+            (descriptor.revents & (POLLERR | POLLHUP)) != 0)
+            return false;
+        if (!writing &&
+            (descriptor.revents & (POLLIN | POLLHUP | POLLERR)) == 0)
+            continue;
+        const ssize_t count = writing
+            ? ::send(fd, bytes + offset, length - offset,
+                     MSG_DONTWAIT | MSG_NOSIGNAL)
+            : ::recv(fd, bytes + offset, length - offset, MSG_DONTWAIT);
+        if (count > 0) {
+            offset += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && (errno == EINTR || errno == EAGAIN ||
+                          errno == EWOULDBLOCK))
+            continue;
+        return false;
+    }
+    return true;
+}
+
+static uint32_t protocol_word(const std::array<unsigned char, 4> &bytes)
+{
+    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+           (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+}
+
+struct Protocol50DispatchProbe {
+    uint32_t server_offer = 0;
+    uint32_t selected_protocol = 0;
+    bool handshake_complete = false;
+    bool cache_session_sent = false;
+    bool peer_closed = false;
+};
+
+static Protocol50DispatchProbe send_protocol50_cache_session(
+    const std::string &socket_path)
+{
+    Protocol50DispatchProbe result;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                            0);
+    if (fd < 0)
+        return result;
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (socket_path.size() >= sizeof(address.sun_path)) {
+        ::close(fd);
+        return result;
+    }
+    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
+    const int connected = ::connect(
+        fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    if (connected != 0) {
+        if (errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ::close(fd);
+            return result;
+        }
+        for (;;) {
+            const auto now = Clock::now();
+            if (now >= deadline) {
+                ::close(fd);
+                return result;
+            }
+            pollfd descriptor{fd, POLLOUT, 0};
+            const int timeout = static_cast<int>(std::clamp<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now).count(), 0, INT_MAX));
+            const int ready = ::poll(&descriptor, 1, timeout);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready <= 0 ||
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                ::close(fd);
+                return result;
+            }
+            if ((descriptor.revents & POLLOUT) == 0)
+                continue;
+            int connect_error = 0;
+            socklen_t connect_error_size = sizeof(connect_error);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &connect_error,
+                             &connect_error_size) != 0 || connect_error != 0) {
+                ::close(fd);
+                return result;
+            }
+            break;
+        }
+    }
+
+    std::array<unsigned char, 4> offer{};
+    std::array<unsigned char, 4> client_max{50, 0, 0, 0};
+    if (!raw_io_exact_until(fd, offer.data(), offer.size(), false, deadline)) {
+        ::close(fd);
+        return result;
+    }
+    result.server_offer = protocol_word(offer);
+    if (!raw_io_exact_until(fd, client_max.data(), client_max.size(), true,
+                            deadline)) {
+        ::close(fd);
+        return result;
+    }
+
+    std::array<unsigned char, 4> selected{};
+    if (!raw_io_exact_until(fd, selected.data(), selected.size(), false, deadline)) {
+        ::close(fd);
+        return result;
+    }
+    result.selected_protocol = protocol_word(selected);
+    if (result.selected_protocol != 50 || result.server_offer < 50) {
+        ::close(fd);
+        return result;
+    }
+    if (!raw_io_exact_until(fd, selected.data(), selected.size(), true, deadline)) {
+        ::close(fd);
+        return result;
+    }
+    result.handshake_complete = true;
+
+    uint32_t frame_length = htonl(sizeof(uint32_t));
+    uint32_t message_type = htonl(static_cast<uint32_t>(Msg::CACHE_SESSION));
+    std::array<unsigned char, 8> frame{};
+    std::memcpy(frame.data(), &frame_length, sizeof(frame_length));
+    std::memcpy(frame.data() + sizeof(frame_length), &message_type,
+                sizeof(message_type));
+    result.cache_session_sent = raw_io_exact_until(
+        fd, frame.data(), frame.size(), true, deadline);
+
+    if (result.cache_session_sent) {
+        size_t response_bytes = 0;
+        while (Clock::now() < deadline) {
+            pollfd descriptor{fd, static_cast<short>(POLLIN | POLLHUP), 0};
+            const int timeout = static_cast<int>(std::clamp<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - Clock::now()).count(), 0, INT_MAX));
+            const int ready = ::poll(&descriptor, 1, timeout);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready <= 0 || (descriptor.revents & POLLNVAL) != 0)
+                break;
+            unsigned char response[256];
+            const ssize_t count = ::recv(fd, response, sizeof(response),
+                                         MSG_DONTWAIT);
+            if (count == 0) {
+                result.peer_closed = true;
+                break;
+            }
+            if (count > 0) {
+                response_bytes += static_cast<size_t>(count);
+                if (response_bytes > 4096)
+                    break;
+                continue;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            break;
+        }
+    }
+    ::close(fd);
+    return result;
 }
 
 static int reserve_port()
@@ -126,8 +313,8 @@ int main(int argc, char **argv)
     MsgChannel *client = connect_unix_bounded(socket_path, 10000);
     REQUIRE(client != nullptr, "client reached the real public iceccd listener");
     if (client) {
-        REQUIRE(client->protocol == 50 || client->protocol == 0,
-                "ordinary link negotiated without changing legacy setup");
+        REQUIRE(client->protocol == 51,
+                "ordinary link negotiated the current Protocol-51 maximum");
         // The production dispatcher is unavailable until a reviewed READY
         // adapter supplies an authenticated sidecar, so this must terminate
         // through the normal client teardown and never advertise cache.
@@ -137,6 +324,16 @@ int main(int argc, char **argv)
                 "real iceccd classified CACHE_SESSION and failed closed boundedly");
         delete client;
     }
+
+    const Protocol50DispatchProbe legacy50 =
+        send_protocol50_cache_session(socket_path);
+    REQUIRE(legacy50.handshake_complete && legacy50.server_offer >= 50 &&
+                legacy50.selected_protocol == 50,
+            "raw legacy client negotiated exactly Protocol-50 with current iceccd");
+    REQUIRE(legacy50.cache_session_sent,
+            "raw Protocol-50 client sent the exact CACHE_SESSION frame");
+    REQUIRE(legacy50.peer_closed,
+            "real iceccd classified legacy Protocol-50 CACHE_SESSION and failed closed boundedly");
 
     ::kill(child, SIGTERM);
     int status = 0;

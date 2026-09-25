@@ -12,6 +12,54 @@ retained artifact directories.
 
 ## Developer QA
 
+### Canonical QA baseline and remaining native repairs
+
+The frozen `422932c9` canonical `make qa` run completed with overall exit 1:
+native checks reported 176 total, 158 passed, 12 failed, six skipped (exit 2);
+Python reported 1,589 passed, seven skipped in 660.35 seconds (exit 0).
+Artifacts are under
+`/tanksmall/scratch/tmp/p51-422932c-fullqa/icecream-qa-bjv8fovy/current/`.
+Native `build/unittests/test-suite.log` SHA256:
+`eae5dc779409863a5a46504842f7bc3c0700dedc870a81f6dfc170321eff9984`.
+Python `artifacts/python-pytest.log` SHA256:
+`d09546052c9ea89a6352ea3a860cf3fbd7a190ec9af5296714793e8b873b34ba`.
+This is a passing full Python suite, not passing full QA or current-tip QA.
+
+Three native failures have the source-check repairs documented below.
+The other nine were stale ordinary-protocol/trace-placement assertions,
+incorrect P50-handler extraction, stale protocol mutation anchors, and
+missing libraries in manually linked tests. The consolidated repair keeps
+R1 ARM/ARMED protocol predicates independently checked, requires the current
+R2 trace call and exact identity ordering, and links the configured service
+dependencies. The daemon fixture separately exercises an exact protocol-51
+client and a raw client negotiating protocol 50; both retain bounded close
+checks. Protocol deletion controls must fail their intended runtime assertion,
+not compilation or setup. All focused repair gates pass on the private
+`f23c1a85`-based nine-file candidate: source checks, the real-daemon fixture,
+cache-session protocol mutants, six daemon-control runtime mutants, and
+input-lifecycle/daemon-control ASan, UBSan and LSan runs. The manual links use
+the frozen 422 SDK build's service library; this is not a fresh whole-product
+sanitizer build. Earlier missing-link-flag and unused-parameter mutation
+attempts were setup/control failures, not product failures.
+
+Final cache-session mutation log:
+`/tanksmall/scratch/tmp/p51-qagates.3dtjD3/artifacts/p50cachesessionwire-mutants.log`,
+exit 0, SHA256
+`72c18228ff91b97642d8184bb3d887d73a0c94bd7286681585b988c6177679f2`.
+Raw protocol-50/51 daemon fixture:
+`/tanksmall/scratch/tmp/p51-daemon50-case/run.log`, all checks pass, SHA256
+`30d0d84f7a9cc9967a638c63140d3173c04820c469b6bb24a76b1c6ec92d85ee`.
+The remaining four-script group exited 0 in the SDK execution transcript
+(session 35337); no separate durable group-log hash is claimed here.
+These repairs do not reclassify the frozen canonical run as passing.
+
+Native skipped coverage still needs separate execution: `remoteice-quick`
+and `p50assignment-remote` require CAP_SYS_CHROOT; source-arm and positive
+daemon runs require their explicit opt-ins; compile/completion end-to-end
+runs require a non-loopback worker/scheduler address. Source checks are not
+substitutes for those process tests. Final combined-image QA and mixed
+P43/R1/R2 runs remain required.
+
 ### R2 output-cap publication cleanup
 
 An F output-cap refusal after publication authorization could leave its

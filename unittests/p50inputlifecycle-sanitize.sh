@@ -17,7 +17,8 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
     "$root/cache/p50_control_operation.cpp" \
     "$root/cache/p50_local_transport.cpp" \
     "$build/cache/libprotocol50.a" \
-    "$build/services/.libs/libicecc.a" -llzo2 \
+    "$build/services/.libs/libicecc.a" \
+    ${ICECC_TEST_LIBCAP_NG_LIBS:-} -llzo2 \
     ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
     ${ICECC_TEST_XXHASH_LIBS:--lxxhash} ${ICECC_TEST_LDFLAGS:-} \
     -o "$work/p50inputlifecycle"

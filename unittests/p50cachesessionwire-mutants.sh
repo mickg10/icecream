@@ -43,6 +43,7 @@ require_red() {
     name=$1
     file=$2
     expression=$3
+    expected_failure=${4:-}
     reset_tree
     target="$build/tree/$file"
     before="$build/$name.before"
@@ -59,6 +60,12 @@ require_red() {
     fi
     if "$build/$name" >"$build/$name.run" 2>&1; then
         echo "FAIL: semantic deletion mutant survived: $name" >&2
+        exit 1
+    fi
+    if [ -n "$expected_failure" ] &&
+       ! grep -F -- "$expected_failure" "$build/$name.run" >/dev/null; then
+        cat "$build/$name.run" >&2
+        echo "FAIL: $name did not hit its intended assertion" >&2
         exit 1
     fi
 }
@@ -92,8 +99,10 @@ require_red refused_exact_operation services/p50_cache_session_wire.cpp \
 require_red refusal_reason_range services/p50_cache_session_wire.cpp \
     's/refusal_reason_valid(\*refusal_reason)/(refusal_reason_valid(*refusal_reason) || true)/'
 require_red claim_exact_protocol services/comm.h \
-    '/class P50CacheSessionClaimMsg/,/class P50CacheSessionOutcomeMsg/ s/return negotiated_protocol == PROTOCOL_VERSION;/return negotiated_protocol >= PROTOCOL_VERSION;/'
+    '/class P50CacheSessionClaimMsg/,/class P50CacheSessionOutcomeMsg/ s/return protocol_supports_p50_r1_bridge(negotiated_protocol);/(void)negotiated_protocol; return true;/' \
+    'FAILED - R1 claim message is valid on Protocol 50 and 51 only'
 require_red outcome_exact_protocol services/comm.h \
-    '/class P50CacheSessionOutcomeMsg/,/struct P50SourceArmFields/ s/return negotiated_protocol == PROTOCOL_VERSION;/return negotiated_protocol >= PROTOCOL_VERSION;/'
+    '/class P50CacheSessionOutcomeMsg/,/struct P50SourceArmFields/ s/return protocol_supports_p50_r1_bridge(negotiated_protocol);/(void)negotiated_protocol; return true;/' \
+    'FAILED - R1 outcome message is valid on Protocol 50 and 51 only'
 
 echo 'ok - P50 claim/outcome foundation semantic mutants red'

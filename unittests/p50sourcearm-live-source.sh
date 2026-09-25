@@ -83,9 +83,13 @@ check_contract() {
     # The complete arm installer owns the sole UNKNOWN -> WAIT transition.
     # Moving to WAIT immediately after the scheduler claim makes the installer
     # reject every production request before it can emit the armed ACK.
-    claim_to_install=$(sed -n \
-        '/if (!authorize_source_arm_claim(/,/!client->arm_p50_source(/p' \
+    # Scope both anchors to the P50 handler first: an earlier P51 arm path
+    # legitimately sets WAIT, but it is not the P50 atomic-install transition.
+    source_arm_handler=$(sed -n \
+        '/^bool Daemon::handle_p50_source_arm(/,/^bool Daemon::handle_activity/p' \
         "$candidate")
+    claim_to_install=$(printf '%s\n' "$source_arm_handler" | sed -n \
+        '/if (!authorize_source_arm_claim(/,/!client->arm_p50_source(/p')
     if printf '%s\n' "$claim_to_install" | \
         grep -F 'set_status(Client::WAITP50INPUT' >/dev/null; then
         return 1
@@ -107,7 +111,16 @@ check_contract "$daemon"
 # proving that a string substitution happened.  This keeps the gate sensitive
 # to the old ignored-fd and no-deadline implementations.
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearm-live-mutant.XXXXXX")
-trap 'rm -f "$mutant" "${live_root_mutant-}"' EXIT HUP INT TERM
+trap 'rm -f "$mutant" "${claim_wait_mutant-}" "${live_root_mutant-}"' EXIT HUP INT TERM
+
+# The guard must reject an early WAIT transition in this exact P50 handler.
+claim_wait_mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearm-live-claim-wait.XXXXXX")
+sed '/client->last_known_job_id = arm.wire_job_id;/a\
+    client->set_status(Client::WAITP50INPUT, "mutant");' "$daemon" >"$claim_wait_mutant"
+if check_contract "$claim_wait_mutant"; then
+    echo 'FAIL: P50 pre-installer WAIT transition mutant survived' >&2
+    exit 1
+fi
 
 sed 's/? (POLLIN | POLLHUP | POLLERR)/? POLLIN/' "$daemon" >"$mutant"
 if check_contract "$mutant"; then

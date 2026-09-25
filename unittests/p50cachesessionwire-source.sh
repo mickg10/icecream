@@ -149,8 +149,8 @@ for witness in \
     'kernel-queued byte refuses client ADOPTED release' \
     'empty CACHE_SESSION creates zero positive claim/outcome stamp' \
     'unissued P5CO cannot send on a clean Protocol-50 channel' \
-    'claim message is valid for exactly Protocol 50' \
-    'outcome message is valid for exactly Protocol 50'; do
+    'R1 claim message is valid on Protocol 50 and 51 only' \
+    'R1 outcome message is valid on Protocol 50 and 51 only'; do
     grep -F "$witness" "$test_cpp" >/dev/null
 done
 
