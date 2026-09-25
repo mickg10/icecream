@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -16,6 +17,8 @@
 #include <vector>
 
 namespace icecc::p50 {
+
+struct R2WireControlSnapshot;
 
 // The complete identity of one C-cache to F-cache source relationship.  F's
 // generation is part of the key so a restarted F cannot inherit route history
@@ -48,6 +51,9 @@ struct P50RouteOwnerConfig {
     // lifetime-fenced callback which posts route reaping onto the owner
     // executor; tests may leave it empty.
     std::function<void()> post_retired_reap;
+    // Optional diagnostics-only sink for every drained R2 control interval.
+    // The callback is copied to the sender and must not capture this owner.
+    std::function<bool(const R2WireControlSnapshot&)> r2_interval_observer;
     // Narrow observation seams for proving that a pump-triggered idle reap
     // retires exact route state without a subsequent transfer.
     std::function<bool()> hold_r2_receipt_reader_for_test;

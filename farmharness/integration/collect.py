@@ -31,6 +31,12 @@ try:
     from .netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from .remote import PlannedCommand, RemoteError, docker_argv
     from .retry_decision import same_endpoint_decision_valid
+    from .r2_wire_trace import (
+        R2_INTERVAL_EVENT_SCHEMA,
+        R2WireTraceError,
+        canonical_r2_job_key,
+        validate_r2_wire_trace,
+    )
     from .scenario_spec import ScenarioSpec
     from .schema_validation import canonical_bytes
     from .verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
@@ -51,6 +57,12 @@ except ImportError:  # Direct execution from this directory.
     from netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from remote import PlannedCommand, RemoteError, docker_argv
     from retry_decision import same_endpoint_decision_valid
+    from r2_wire_trace import (
+        R2_INTERVAL_EVENT_SCHEMA,
+        R2WireTraceError,
+        canonical_r2_job_key,
+        validate_r2_wire_trace,
+    )
     from scenario_spec import ScenarioSpec
     from schema_validation import canonical_bytes
     from verdict import BUNDLE_SCHEMA, ROW_SCHEMA, S70_B5_ENGAGEMENT
@@ -61,6 +73,7 @@ SOURCE_RESULT_SCHEMAS = frozenset(
         "icecream-p50-source-result-v2",
         "icecream-p50-source-result-v3",
         "icecream-p50-source-result-v4",
+        "icecream-p50-source-result-v5",
     }
 )
 # v2/v3 are kept byte-for-byte compatible. Older rows do not identify the
@@ -227,6 +240,15 @@ SOURCE_RESULT_FIELDS_V4 = SOURCE_RESULT_FIELDS | frozenset(
         "source_mutex_timing_measured",
         "stage",
         "wire_bytes_measured",
+    }
+)
+SOURCE_RESULT_FIELDS_V5 = SOURCE_RESULT_FIELDS_V4 | frozenset(
+    {
+        "r2_accounting_key",
+        "r2_accounting_reference",
+        "r2_link_intervals_valid",
+        "r2_link_intervals_external",
+        "r2_wire_accounting",
     }
 )
 PROFILE_LABELS = {
@@ -763,11 +785,26 @@ def _checkpoint_result_path(
     return path
 
 
-def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
+def _source_results(
+    path: Path,
+    *,
+    r2_interval_events: list[dict[str, Any]] | None = None,
+) -> dict[tuple[int, int, int], dict[str, Any]]:
     records: dict[tuple[int, int, int], dict[str, Any]] = {}
+    r2_v5_records: list[dict[str, Any]] = []
     for index, item in enumerate(_read_jsonl(path), start=1):
         schema = item.get("schema") if isinstance(item, Mapping) else None
+        if schema == R2_INTERVAL_EVENT_SCHEMA:
+            if r2_interval_events is None:
+                raise CollectError(
+                    f"{path}:{index}: standalone R2 interval event has no collector sink"
+                )
+            r2_interval_events.append(dict(item))
+            continue
         expected_fields = (
+            SOURCE_RESULT_FIELDS_V5
+            if schema == "icecream-p50-source-result-v5"
+            else
             SOURCE_RESULT_FIELDS_V4
             if schema == "icecream-p50-source-result-v4"
             else SOURCE_RESULT_FIELDS
@@ -779,7 +816,11 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
             or schema not in SOURCE_RESULT_SCHEMAS
         ):
             raise CollectError(f"{path}:{index}: source-result schema mismatch")
-        v4 = schema == "icecream-p50-source-result-v4"
+        v4 = schema in (
+            "icecream-p50-source-result-v4",
+            "icecream-p50-source-result-v5",
+        )
+        v5 = schema == "icecream-p50-source-result-v5"
         attempts_measured = item.get("attempts_measured", True)
         wire_bytes_measured = item.get("wire_bytes_measured", True)
         source_mutex_measured = item.get("source_mutex_timing_measured", True)
@@ -837,6 +878,69 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
             raise CollectError(
                 f"{path}:{index}: source-result accounting availability disagrees with values"
             )
+        r2_accounting = item.get("r2_wire_accounting") if v5 else None
+        if v5:
+            reference = item.get("r2_accounting_reference")
+            intervals_valid = item.get("r2_link_intervals_valid")
+            intervals_external = item.get("r2_link_intervals_external")
+            key_value = item.get("r2_accounting_key")
+            if (
+                type(reference) is not bool
+                or type(intervals_valid) is not bool
+                or type(intervals_external) is not bool
+            ):
+                raise CollectError(
+                    f"{path}:{index}: source-result v5 R2 availability flags are invalid"
+                )
+            if r2_accounting is not None and not isinstance(r2_accounting, Mapping):
+                raise CollectError(
+                    f"{path}:{index}: source-result v5 R2 payload must be an object or null"
+                )
+            if key_value is not None:
+                try:
+                    canonical_r2_job_key(key_value)
+                except R2WireTraceError as exc:
+                    raise CollectError(
+                        f"{path}:{index}: source-result v5 R2 key is invalid: {exc}"
+                    ) from exc
+            if mode == "R1_SERIAL" and (
+                r2_accounting is not None
+                or key_value is not None
+                or reference
+                or not intervals_valid
+                or intervals_external
+            ):
+                raise CollectError(
+                    f"{path}:{index}: R1 source result carries R2-only availability evidence"
+                )
+            if mode == "R2_LINK" and reference and r2_accounting is not None:
+                raise CollectError(
+                    f"{path}:{index}: R2 reference must not duplicate its accounting payload"
+                )
+            if mode == "R2_LINK" and isinstance(r2_accounting, Mapping):
+                if key_value is None:
+                    raise CollectError(
+                        f"{path}:{index}: measured R2 accounting lacks its exact key"
+                    )
+                try:
+                    if canonical_r2_job_key(key_value) != canonical_r2_job_key(
+                        r2_accounting.get("job_key")
+                    ):
+                        raise CollectError(
+                            f"{path}:{index}: outer R2 key differs from its accounting payload"
+                        )
+                except R2WireTraceError as exc:
+                    raise CollectError(
+                        f"{path}:{index}: source-result v5 accounting key is invalid: {exc}"
+                    ) from exc
+                if intervals_external and r2_accounting.get("intervals") != []:
+                    raise CollectError(
+                        f"{path}:{index}: externally delivered R2 intervals must not be duplicated inline"
+                    )
+            if mode == "R2_LINK" and key_value is None and r2_accounting is not None:
+                raise CollectError(
+                    f"{path}:{index}: measured R2 row lacks canonical identity"
+                )
         integers = (
             "wire_job_id",
             "logical_job",
@@ -933,7 +1037,11 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
                 raise CollectError(
                     f"{path}:{index}: committed source-result has no wire bytes"
                 )
-            if item["profile"] == "P29V1" and type(reuse) is not bool:
+            if (
+                item["profile"] == "P29V1"
+                and (not v5 or mode != "R2_LINK")
+                and type(reuse) is not bool
+            ):
                 raise CollectError(
                     f"{path}:{index}: committed P29V1 result has no reuse witness"
                 )
@@ -945,16 +1053,286 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
         if key in records:
             raise CollectError(f"{path}: duplicate source result for assignment {key}")
         records[key] = item
+        if (
+            v5
+            and mode == "R2_LINK"
+            and isinstance(r2_accounting, Mapping)
+            and r2_accounting.get("valid") is True
+            and item.get("r2_link_intervals_valid") is True
+        ):
+            r2_v5_records.append(item)
+    if r2_v5_records:
+        try:
+            validate_r2_wire_trace(
+                r2_v5_records,
+                c_interval_events=r2_interval_events or (),
+            )
+        except R2WireTraceError as exc:
+            raise CollectError(f"{path}: invalid R2 source accounting trace: {exc}") from exc
     return records
+
+
+def _r2_accounting_for_source(
+    source: Mapping[str, Any],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    """Resolve a v5 reference row only through its full canonical R2 key."""
+
+    if (
+        source.get("schema") != "icecream-p50-source-result-v5"
+        or source.get("mode") != "R2_LINK"
+    ):
+        return None
+    payload = source.get("r2_wire_accounting")
+    if isinstance(payload, Mapping):
+        return payload
+    if source.get("r2_accounting_reference") is not True:
+        return None
+    try:
+        key = canonical_r2_job_key(source.get("r2_accounting_key"))
+    except R2WireTraceError:
+        return None
+    candidates = [
+        record["r2_wire_accounting"]
+        for record in source_results.values()
+        if record is not source
+        and record.get("schema") == "icecream-p50-source-result-v5"
+        and record.get("mode") == "R2_LINK"
+        and isinstance(record.get("r2_wire_accounting"), Mapping)
+        and record["r2_wire_accounting"].get("valid") is True
+        and record.get("r2_link_intervals_valid") is True
+        and canonical_r2_job_key(record.get("r2_accounting_key")) == key
+    ]
+    if not candidates:
+        return None
+    # The validator already checked the cumulative sequence for the whole
+    # source trace. Select the componentwise greatest exact-key snapshot.
+    return max(
+        candidates,
+        key=lambda candidate: sum(
+            candidate["job"][field]
+            for field in (
+                "c_to_f_bundle_bytes",
+                "f_to_c_receipt_bytes",
+                "bundle_attempts",
+                "replay_attempts",
+            )
+        ),
+    )
+
+
+def _source_r2_counters(
+    source: Mapping[str, Any],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+) -> tuple[int, int, int, int] | None:
+    accounting = _r2_accounting_for_source(source, source_results)
+    if accounting is None or accounting.get("valid") is not True:
+        return None
+    job = accounting.get("job")
+    if not isinstance(job, Mapping):
+        return None
+    values = tuple(
+        job.get(field)
+        for field in (
+            "c_to_f_bundle_bytes",
+            "f_to_c_receipt_bytes",
+            "bundle_attempts",
+            "replay_attempts",
+        )
+    )
+    if any(type(value) is not int or value < 0 for value in values):
+        return None
+    return values  # type: ignore[return-value]
+
+
+def _source_attempts_for_accounting(
+    source: Mapping[str, Any],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+) -> int | None:
+    if (
+        source.get("schema") == "icecream-p50-source-result-v5"
+        and source.get("mode") == "R2_LINK"
+    ):
+        counters = _source_r2_counters(source, source_results)
+        # replay_attempts is a subset of bundle_attempts, not an additional
+        # physical attempt count.
+        return None if counters is None else counters[2]
+    attempts = source.get("attempts")
+    return attempts if type(attempts) is int else None
+
+
+def _source_wire_bytes_for_accounting(
+    source: Mapping[str, Any],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+) -> tuple[int, int] | None:
+    if (
+        source.get("schema") == "icecream-p50-source-result-v5"
+        and source.get("mode") == "R2_LINK"
+    ):
+        counters = _source_r2_counters(source, source_results)
+        return None if counters is None else counters[:2]
+    c_to_f = source.get("c_to_f_bytes")
+    f_to_c = source.get("f_to_c_bytes")
+    if type(c_to_f) is not int or type(f_to_c) is not int:
+        return None
+    return c_to_f, f_to_c
+
+
+def _sum_turn_source_bytes(rows: list[Mapping[str, Any]], field: str) -> int:
+    """Sum source-result counters once per exact R2 job key.
+
+    R2 source snapshots may be repeated as reference rows. Their cumulative
+    per-job values are useful but are not link totals (shared/control records
+    live in the additive interval summary). Multiple assignments may also
+    report increasing snapshots for the same immutable job key; after trace
+    validation those counters are componentwise monotone, so retain the
+    greatest value for this field independent of row order.
+    """
+    total = 0
+    r2_by_key: dict[tuple[str, str, str, int, str], int] = {}
+    for row in rows:
+        key_value = row.get("r2_accounting_key")
+        if key_value is not None:
+            try:
+                key = canonical_r2_job_key(key_value)
+            except R2WireTraceError as exc:
+                raise CollectError(f"turn row has an invalid R2 accounting key: {exc}") from exc
+            r2_by_key[key] = max(r2_by_key.get(key, 0), row[field])
+        else:
+            total += row[field]
+    return total + sum(r2_by_key.values())
+
+
+def _r2_trace_report(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert validator tuple keys to bounded, JSON-native report rows."""
+    def job_key_row(key: tuple[str, str, str, int, str]) -> dict[str, Any]:
+        return {
+            "c_store_guid": key[0],
+            "f_store_guid": key[1],
+            "logical_link_id": key[2],
+            "tu_seq": key[3],
+            "raw_digest": key[4],
+        }
+
+    def link_row(link: tuple[str, str, str, int, int]) -> dict[str, Any]:
+        return {
+            "c_store_guid": link[0],
+            "f_store_guid": link[1],
+            "logical_link_id": link[2],
+            "relationship_epoch": link[3],
+            "physical_link_generation": link[4],
+        }
+
+    jobs = summary.get("jobs", {})
+    links = summary.get("links", [])
+    if not isinstance(jobs, Mapping) or not isinstance(links, list):
+        raise CollectError("R2 validator returned a malformed report summary")
+    return {
+        "closed_relationships": [
+            {
+                "c_store_guid": key[0],
+                "f_store_guid": key[1],
+                "logical_link_id": key[2],
+            }
+            for key in summary.get("closed_relationships", [])
+        ],
+        "duplicate_intervals_reference_only": summary.get(
+            "duplicate_intervals_reference_only", 0
+        ),
+        "duplicate_job_snapshots_reference_only": summary.get(
+            "duplicate_job_snapshots_reference_only", 0
+        ),
+        "jobs": [
+            {
+                "counters": list(value["counters"]),
+                "key": job_key_row(key),
+            }
+            for key, value in sorted(jobs.items())
+        ],
+        "links": [
+            {
+                field: item[field]
+                for field in (
+                    "ack_write_prefix",
+                    "c_to_f_bytes",
+                    "f_to_c_bytes",
+                    "interval_count",
+                    "physical_complete",
+                    "relationship_settled",
+                    "sequence_start",
+                    "sequence_end",
+                    "shared_c_to_f_bytes",
+                    "shared_f_to_c_bytes",
+                )
+            }
+            | {"link": link_row(item["link"])}
+            for item in links
+        ],
+        "settled_relationships": [
+            {
+                "c_store_guid": key[0],
+                "f_store_guid": key[1],
+                "logical_link_id": key[2],
+            }
+            for key in summary.get("settled_relationships", [])
+        ],
+        "unavailable_job_snapshots": summary.get("unavailable_job_snapshots", 0),
+    }
 
 
 def _require_collectable_source_accounting(
     source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
-) -> None:
+    c_interval_events: list[Mapping[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     """Refuse to synthesize numeric acceptance metrics from unavailable data."""
 
+    measured_r2_keys = {
+        canonical_r2_job_key(record["r2_wire_accounting"]["job_key"])
+        for record in source_results.values()
+        if record.get("schema") == "icecream-p50-source-result-v5"
+        and record.get("mode") == "R2_LINK"
+        and isinstance(record.get("r2_wire_accounting"), Mapping)
+        and record["r2_wire_accounting"].get("valid") is True
+        and record.get("r2_link_intervals_valid") is True
+    }
+    has_numeric_r2 = False
     for identity, record in source_results.items():
-        if record.get("schema") != "icecream-p50-source-result-v4":
+        if record.get("schema") == "icecream-p50-source-result-v5":
+            if record.get("mode") == "R2_LINK":
+                if record.get("status") != 0:
+                    continue
+                accounting = record.get("r2_wire_accounting")
+                if record.get("r2_accounting_reference") is True:
+                    try:
+                        key = canonical_r2_job_key(record.get("r2_accounting_key"))
+                    except R2WireTraceError as exc:
+                        raise CollectError(
+                            f"source-result v5 reference identity is invalid for assignment {identity}"
+                        ) from exc
+                    if key in measured_r2_keys:
+                        continue
+                    raise CollectError(
+                        "source-result v5 reference has no exact measured R2 accounting "
+                        f"target for assignment {identity}"
+                    )
+                if (
+                    not isinstance(accounting, Mapping)
+                    or accounting.get("valid") is not True
+                    or record.get("r2_link_intervals_valid") is not True
+                ):
+                    raise CollectError(
+                        "source-result v5 R2 measurements are unavailable or invalid for "
+                        f"numeric accounting on assignment {identity}"
+                    )
+                has_numeric_r2 = True
+                # R2 uses link intervals and cumulative snapshots; its path has
+                # no R1 source-mutex timing requirement.
+                continue
+            if record.get("mode") != "R1_SERIAL":
+                raise CollectError(
+                    f"source-result v5 has unknown mode for assignment {identity}"
+                )
+        elif record.get("schema") != "icecream-p50-source-result-v4":
             continue
         if (
             record.get("attempts_measured") is not True
@@ -966,6 +1344,24 @@ def _require_collectable_source_accounting(
                 f"unavailable for assignment {identity}; numeric acceptance "
                 "metrics cannot be formed from this trace"
             )
+    if has_numeric_r2:
+        try:
+            return validate_r2_wire_trace(
+                [
+                    record
+                    for record in source_results.values()
+                    if record.get("schema") == "icecream-p50-source-result-v5"
+                    and record.get("mode") == "R2_LINK"
+                    and isinstance(record.get("r2_wire_accounting"), Mapping)
+                    and record["r2_wire_accounting"].get("valid") is True
+                    and record.get("r2_link_intervals_valid") is True
+                ],
+                c_interval_events=c_interval_events or (),
+                require_job_conservation=True,
+            )
+        except R2WireTraceError as exc:
+            raise CollectError(f"numeric R2 trace is incomplete or inconsistent: {exc}") from exc
+    return None
 
 
 def _source_result_status(
@@ -5944,11 +6340,14 @@ def _source_transfer_is_exact(
     worker_name: str,
     c_commits: set[tuple[str, int]],
     f_commits: Mapping[str, set[tuple[str, int]]],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]] | None = None,
 ) -> bool:
     key = (source["c_store_guid"], source["tu_seq"])
+    attempts = _source_attempts_for_accounting(source, source_results or {})
     return (
         source["status"] == 0
-        and source["attempts"] >= 1
+        and attempts is not None
+        and attempts >= 1
         and marker["profile"] == source["profile"]
         and marker["raw_bytes"] == source["raw_bytes"]
         and marker["tu_seq"] == source["tu_seq"]
@@ -5966,6 +6365,7 @@ def _source_commit_is_exact(
     c_commits: set[tuple[str, int]],
     f_commits: Mapping[str, set[tuple[str, int]]],
     attachments: Mapping[tuple[str, int], str],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]] | None = None,
 ) -> bool:
     return _source_transfer_is_exact(
         source,
@@ -5973,6 +6373,7 @@ def _source_commit_is_exact(
         worker_name=worker_name,
         c_commits=c_commits,
         f_commits=f_commits,
+        source_results=source_results,
     ) and attachments.get((worker_name, scheduler_job)) == source["profile"]
 
 
@@ -5990,6 +6391,7 @@ def _missing_compile_result_identity_reason(
     marker: Mapping[str, Any],
     c_commits: set[tuple[str, int]],
     f_commits: Mapping[str, set[tuple[str, int]]],
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]] | None = None,
 ) -> str | None:
     """Classify a committed P50 attempt for which no result frame exists.
 
@@ -6010,6 +6412,7 @@ def _missing_compile_result_identity_reason(
             worker_name=str(assignment["worker"]),
             c_commits=c_commits,
             f_commits=f_commits,
+            source_results=source_results,
         )
     ):
         return None
@@ -6273,6 +6676,8 @@ def _parse_rows(
     error106: list[str] = []
     source_mutex_records: list[dict[str, Any]] = []
     source_route_records: list[dict[str, Any]] = []
+    r2_link_accounting_records: list[dict[str, Any]] = []
+    r2_job_key_by_row: dict[str, Mapping[str, Any]] = {}
     p29_action_lineage_records: list[dict[str, Any]] = []
     failed_result_identity_records: list[dict[str, Any]] = []
     failed_source_transfer_records: list[dict[str, Any]] = []
@@ -6310,8 +6715,22 @@ def _parse_rows(
     for client_name in scenario.data["workload"]["clients"]:
         client = by_name[client_name]
         results = _instance_results(evidence, client_name)
-        source_results = _source_results(results / "source-result.jsonl")
-        _require_collectable_source_accounting(source_results)
+        r2_interval_events: list[dict[str, Any]] = []
+        source_results = _source_results(
+            results / "source-result.jsonl",
+            r2_interval_events=r2_interval_events,
+        )
+        r2_trace_summary = _require_collectable_source_accounting(
+            source_results, r2_interval_events
+        )
+        if r2_trace_summary is not None:
+            r2_link_accounting_records.append(
+                {
+                    "client_instance": client_name,
+                    "schema": "icefarm-p50-r2-link-accounting-v1",
+                    "trace": _r2_trace_report(r2_trace_summary),
+                }
+            )
         compile_identities = _compile_identities(results / "compile-identity.jsonl")
         c_legacy_wires = _legacy_wire_results(results / "c-legacy-wire.jsonl", "C")
         c_commits = _action_commits(
@@ -6567,6 +6986,7 @@ def _parse_rows(
                     marker=attempt_marker,
                     c_commits=c_commits,
                     f_commits=f_commits,
+                    source_results=source_results,
                 )
                 if reason is None:
                     raise CollectError(
@@ -6632,6 +7052,7 @@ def _parse_rows(
                             marker=marker,
                             c_commits=c_commits,
                             f_commits=f_commits,
+                            source_results=source_results,
                         )
                     )
                     if failed_result_identity_reason is not None:
@@ -6718,6 +7139,7 @@ def _parse_rows(
                         c_commits=c_commits,
                         f_commits=f_commits,
                         attachments=attachments,
+                        source_results=source_results,
                     )
                     outcome = (
                         "failed"
@@ -6727,20 +7149,26 @@ def _parse_rows(
                         else "refused"
                     )
                 reuse = source["system_source_reuse"] if profile == "P29V1" else None
-                c_to_f = source["c_to_f_bytes"]
-                f_to_c = source["f_to_c_bytes"]
-                transfer_retries = max(0, source["attempts"] - 1)
-                source_mutex_records.append(
-                    {
-                        "client_instance": client_name,
-                        "job_id": job_id,
-                        "outcome": outcome,
-                        "profile": profile,
-                        "service_ns": source["source_mutex_service_ns"],
-                        "turn": raw["turn"],
-                        "wait_ns": source["source_mutex_wait_ns"],
-                    }
-                )
+                wire_bytes = _source_wire_bytes_for_accounting(source, source_results)
+                attempts = _source_attempts_for_accounting(source, source_results)
+                if wire_bytes is None or attempts is None:
+                    raise CollectError(
+                        f"{job_id}: exact source result has no collectable wire accounting"
+                    )
+                c_to_f, f_to_c = wire_bytes
+                transfer_retries = max(0, attempts - 1)
+                if source.get("mode") != "R2_LINK":
+                    source_mutex_records.append(
+                        {
+                            "client_instance": client_name,
+                            "job_id": job_id,
+                            "outcome": outcome,
+                            "profile": profile,
+                            "service_ns": source["source_mutex_service_ns"],
+                            "turn": raw["turn"],
+                            "wait_ns": source["source_mutex_wait_ns"],
+                        }
+                    )
                 source_route_records.append(
                     {
                         "c_store_guid": source["c_store_guid"],
@@ -6899,6 +7327,10 @@ def _parse_rows(
                 local_fallbacks.append(job_id)
             if "Error 106" in log_text or "Error106" in log_text:
                 error106.append(job_id)
+            if source is not None and source.get("mode") == "R2_LINK":
+                key_value = source.get("r2_accounting_key")
+                if isinstance(key_value, Mapping):
+                    r2_job_key_by_row[job_id] = key_value
             rows.append(
                 {
                     "c_to_f_bytes": c_to_f,
@@ -6976,6 +7408,7 @@ def _parse_rows(
             "records": sorted(legacy_wire_records, key=lambda item: item["job_id"]),
             "record_count": len(legacy_wire_records),
         },
+        "r2_row_accounting_keys": r2_job_key_by_row,
         "source_mutex": {
             "records": sorted(source_mutex_records, key=lambda item: item["job_id"]),
             "record_count": len(source_mutex_records),
@@ -6990,6 +7423,12 @@ def _parse_rows(
         "p50_source_routes": {
             "record_count": len(source_route_records),
             "records": sorted(source_route_records, key=lambda item: item["job_id"]),
+        },
+        "r2_link_accounting": {
+            "records": r2_link_accounting_records,
+            "record_count": len(r2_link_accounting_records),
+            "schema": "icefarm-p50-r2-link-accounting-v1",
+            "scope": "unique additive C interval deltas, including shared/control bytes",
         },
         "p29_action_lineage": {
             "record_count": len(p29_action_lineage_records),
@@ -8046,6 +8485,7 @@ def _observations(
         }
     raw_jobs = row_facts.pop("raw_jobs")
     assignment_claims = row_facts.pop("assignment_claims")
+    r2_job_key_by_row = row_facts.pop("r2_row_accounting_keys", {})
     canary_claims = _canary_assignment_claims(scenario, plan, evidence)
     reconciliation = _reconcile_scheduler_dispatches(
         evidence,
@@ -8514,13 +8954,21 @@ def _observations(
         if any(type(value) is not int for value in terminal_times):
             raise CollectError(f"turn {turn!r} has no terminal timestamp")
         turn_mutex = [item for item in source_mutex["records"] if item["turn"] == turn]
+        turn_byte_rows = [
+            {**row, "r2_accounting_key": r2_job_key_by_row.get(row["job_id"])}
+            for row in turn_rows
+        ]
         first_dispatch_ms = min(item["dispatch_ms"] for item in turn_lifecycle)
         last_terminal_ms = max(terminal_times)
         job_walls = [row["wall_ms"] for row in turn_rows]
         turn_observations[turn] = {
-            "c_to_f_bytes": sum(row["c_to_f_bytes"] for row in turn_rows),
+            "c_to_f_bytes": _sum_turn_source_bytes(turn_byte_rows, "c_to_f_bytes"),
+            "byte_accounting_scope": (
+                "sum of exact-key per-job R2 snapshots; excludes shared/control bytes; "
+                "see r2_link_accounting for unique additive link intervals"
+            ),
             "exact_objects": sum(row["exact"] is True for row in turn_rows),
-            "f_to_c_bytes": sum(row["f_to_c_bytes"] for row in turn_rows),
+            "f_to_c_bytes": _sum_turn_source_bytes(turn_byte_rows, "f_to_c_bytes"),
             "first_dispatch_ms": first_dispatch_ms,
             "jobs": len(turn_rows),
             "job_wall_p95_ms": _nearest_rank(job_walls, 95),

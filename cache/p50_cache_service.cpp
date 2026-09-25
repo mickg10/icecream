@@ -23,6 +23,8 @@
 #include <boost/asio/use_future.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <string_view>
+#include <sstream>
+#include <mutex>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -187,6 +189,132 @@ bool source_result_trace_enabled() noexcept {
   return path != nullptr && *path != '\0';
 }
 
+struct R2IntervalTraceSink {
+  explicit R2IntervalTraceSink(std::string trace_path)
+      : path(std::move(trace_path)) {}
+
+  std::string path;
+};
+
+std::mutex& p50_source_trace_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+bool append_p50_source_trace_line(const char* path,
+                                  std::string_view line) noexcept {
+  if (path == nullptr || *path == '\0' || line.empty())
+    return false;
+  try {
+    std::lock_guard lock(p50_source_trace_mutex());
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                     O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+      return false;
+    size_t offset = 0;
+    while (offset < line.size()) {
+      const ssize_t written =
+          ::write(fd, line.data() + offset, line.size() - offset);
+      if (written > 0) {
+        offset += static_cast<size_t>(written);
+        continue;
+      }
+      if (written < 0 && errno == EINTR)
+        continue;
+      (void)::close(fd);
+      return false;
+    }
+    return ::close(fd) == 0;
+  } catch (...) {
+    return false;
+  }
+}
+
+const char* r2_interval_end_name(R2WireIntervalEnd end) noexcept {
+  switch (end) {
+  case R2WireIntervalEnd::DrainedAckCheckpoint:
+    return "DrainedAckCheckpoint";
+  case R2WireIntervalEnd::RecoveryConfirmed:
+    return "RecoveryConfirmed";
+  case R2WireIntervalEnd::PhysicalLinkRetired:
+    return "PhysicalLinkRetired";
+  case R2WireIntervalEnd::WindowPressure:
+    return "WindowPressure";
+  }
+  return nullptr;
+}
+
+bool write_r2_interval_json(std::ostream& out,
+                            const R2WireControlSnapshot& snapshot) {
+  const auto guid = [](const auto& value) {
+    return bytes_hex(std::span<const uint8_t>(
+        value.bytes.data(), value.bytes.size()));
+  };
+  const char* end_name = r2_interval_end_name(snapshot.end);
+  if (end_name == nullptr)
+    return false;
+  out << "{\"link\":{\"c_store_guid\":\""
+      << guid(snapshot.link.c_store_guid)
+      << "\",\"f_store_guid\":\"" << guid(snapshot.link.f_store_guid)
+      << "\",\"logical_link_id\":\""
+      << guid(snapshot.link.logical_link_id)
+      << "\",\"relationship_epoch\":"
+      << snapshot.link.relationship_epoch
+      << ",\"physical_link_generation\":"
+      << snapshot.link.physical_link_generation << "},"
+      << "\"interval_sequence\":" << snapshot.interval_sequence
+      << ",\"end\":\"" << end_name << "\","
+      << "\"total_c_to_f_bytes\":" << snapshot.total_c_to_f_bytes
+      << ",\"total_f_to_c_bytes\":" << snapshot.total_f_to_c_bytes
+      << ",\"shared_c_to_f_bytes\":" << snapshot.shared_c_to_f_bytes
+      << ",\"shared_f_to_c_bytes\":" << snapshot.shared_f_to_c_bytes
+      << ",\"drained_ack_prefix\":" << snapshot.drained_ack_prefix
+      << ",\"recovery_confirmed_prefix\":"
+      << snapshot.recovery_confirmed_prefix << ",\"jobs\":[";
+  bool first = true;
+  for (const auto& job : snapshot.jobs) {
+    if (!first)
+      out << ',';
+    first = false;
+    out << "{\"key\":{\"c_store_guid\":\""
+        << guid(job.key.c_store_guid)
+        << "\",\"f_store_guid\":\"" << guid(job.key.f_store_guid)
+        << "\",\"logical_link_id\":\""
+        << guid(job.key.logical_link_id)
+        << "\",\"tu_seq\":" << job.key.tu_seq.value
+        << ",\"raw_digest\":\""
+        << icecc::digest128_hex(job.key.raw_digest) << "\"},"
+        << "\"c_to_f_bundle_bytes\":" << job.c_to_f_bundle_bytes
+        << ",\"f_to_c_receipt_bytes\":" << job.f_to_c_receipt_bytes
+        << ",\"bundle_attempts\":" << job.bundle_attempts
+        << ",\"replay_attempts\":" << job.replay_attempts
+        << ",\"valid\":" << (job.valid ? "true" : "false") << '}';
+  }
+  out << "],\"valid\":" << (snapshot.valid ? "true" : "false") << '}';
+  return static_cast<bool>(out);
+}
+
+bool append_r2_interval_trace(
+    const std::shared_ptr<R2IntervalTraceSink>& sink,
+    const R2WireControlSnapshot& snapshot) noexcept {
+  if (!sink || sink->path.empty())
+    return false;
+  try {
+    std::ostringstream line;
+    line << "{\"schema\":\"icecream-p50-r2-interval-event-v1\",\"interval\":";
+    if (!write_r2_interval_json(line, snapshot))
+      return false;
+    line << "}\n";
+    std::string bytes = line.str();
+    if (bytes.size() > 64 * 1024)
+      return false;
+    return append_p50_source_trace_line(sink->path.c_str(), bytes);
+  } catch (...) {
+    return false;
+  }
+}
+
 void append_source_result_trace(
     uint64_t wire_job_id, uint64_t logical_job, uint64_t assignment_epoch,
     uint64_t assignment_nonce, CStoreGuid c_store_guid, ProfileId profile,
@@ -295,25 +423,130 @@ void append_source_result_trace(
         static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
       return;
-    const int fd = ::open(
-        path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0)
-      return;
-    size_t offset = 0;
-    while (offset < static_cast<size_t>(length)) {
-      const ssize_t written =
-          ::write(fd, line + offset, static_cast<size_t>(length) - offset);
-      if (written > 0) {
-        offset += static_cast<size_t>(written);
-        continue;
-      }
-      if (written < 0 && errno == EINTR)
-        continue;
-      break;
-    }
-    (void)::close(fd);
+    (void)append_p50_source_trace_line(
+        path, std::string_view(line, static_cast<size_t>(length)));
   } catch (...) {
     // Trace collection is best-effort and must not alter transfer results.
+  }
+}
+
+void append_source_result_trace_v5(
+    uint64_t wire_job_id, uint64_t logical_job, uint64_t assignment_epoch,
+    uint64_t assignment_nonce, CStoreGuid c_store_guid, ProfileId profile,
+    const ZstdSourceTransferResult& transfer) noexcept {
+  const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+  if (path == nullptr || *path == '\0')
+    return;
+  try {
+    const auto guid = [](const auto& value) {
+      return bytes_hex(std::span<const uint8_t>(value.data(), value.size()));
+    };
+    const std::string c_guid = bytes_hex(std::span<const uint8_t>(
+        c_store_guid.bytes.data(), c_store_guid.bytes.size()));
+    const bool has_job_key = transfer.r2_wire_accounting_key.has_value();
+    const auto& key = transfer.r2_wire_accounting_key;
+    const std::string f_guid = has_job_key ? guid(key->f_store_guid.bytes) : "";
+    const std::string logical_link_id =
+        has_job_key ? guid(key->logical_link_id.bytes) : "";
+    const std::string raw_digest = has_job_key
+        ? icecc::digest128_hex(key->raw_digest)
+        : icecc::digest128_hex(transfer.raw_digest);
+    const uint64_t trace_tu_seq = transfer.committed_input.has_value()
+        ? transfer.committed_input->tu_seq.value
+        : has_job_key ? key->tu_seq.value : 0;
+    const std::string_view profile_label =
+        profile == ProfileId::P29V1 ? std::string_view("P29V1")
+        : profile == ProfileId::ZSTD_TU ? std::string_view("ZSTD_TU")
+        : profile == ProfileId::ZSTD_ROUTE ? std::string_view("ZSTD_ROUTE")
+                                           : std::string_view("UNKNOWN");
+    std::ostringstream line;
+    line << "{\"schema\":\"icecream-p50-source-result-v5\","
+         << "\"mode\":\"R2_LINK\","
+         << "\"stage\":\"post_read_dispatch_completion\","
+         << "\"wire_job_id\":" << wire_job_id
+         << ",\"logical_job\":" << logical_job
+         << ",\"assignment_epoch\":" << assignment_epoch
+         << ",\"assignment_nonce\":" << assignment_nonce
+         << ",\"c_store_guid\":\"" << c_guid << "\","
+         << "\"profile\":\"" << profile_label << "\","
+         << "\"status\":" << static_cast<unsigned>(transfer.status)
+         << ",\"attempts\":null,\"attempts_measured\":false,"
+         << "\"tu_seq\":" << trace_tu_seq
+         << ",\"raw_bytes\":" << transfer.raw_bytes
+         << ",\"raw_digest\":\"" << raw_digest << "\","
+         << "\"c_to_f_bytes\":null,\"f_to_c_bytes\":null,"
+         << "\"wire_bytes_measured\":false,"
+         << "\"source_mutex_wait_ns\":null,"
+         << "\"source_mutex_service_ns\":null,"
+         << "\"source_mutex_timing_measured\":false,"
+         << "\"terminal_error_code\":"
+         << (transfer.terminal_error.has_value()
+                 ? transfer.terminal_error->code : 0)
+         << ",\"terminal_error_name\":";
+    if (transfer.terminal_error.has_value() &&
+        transfer.terminal_error->code ==
+            static_cast<uint16_t>(ErrorCode::WIRE_REVISION_MISMATCH))
+      line << "\"WIRE_REVISION_MISMATCH\"";
+    else
+      line << "null";
+    line << ",\"system_source_reuse\":";
+    if (transfer.system_source_reuse.has_value())
+      line << (*transfer.system_source_reuse ? "true" : "false");
+    else
+      line << "null";
+    line << ','
+         << "\"r2_accounting_key\":";
+    if (has_job_key) {
+      line << "{\"c_store_guid\":\"" << c_guid
+           << "\",\"f_store_guid\":\"" << f_guid
+           << "\",\"logical_link_id\":\"" << logical_link_id
+           << "\",\"tu_seq\":" << key->tu_seq.value
+           << ",\"raw_digest\":\"" << raw_digest << "\"}";
+    } else {
+      line << "null";
+    }
+    line << ",\"r2_accounting_reference\":"
+         << (transfer.r2_accounting_reference ? "true" : "false")
+         << ",\"r2_link_intervals_valid\":"
+         << (transfer.r2_link_intervals_valid ? "true" : "false")
+         << ",\"r2_link_intervals_external\":"
+         << (transfer.r2_link_intervals_external ? "true" : "false")
+         << ",\"r2_wire_accounting\":";
+    if (transfer.r2_wire_accounting.has_value() && has_job_key) {
+      const auto& accounting = *transfer.r2_wire_accounting;
+      line << "{\"schema\":\"icecream-p50-r2-wire-accounting-v1\","
+           << "\"valid\":" << (accounting.valid ? "true" : "false")
+           << ",\"job_key\":{\"c_store_guid\":\"" << c_guid
+           << "\",\"f_store_guid\":\"" << f_guid
+           << "\",\"logical_link_id\":\"" << logical_link_id
+           << "\",\"tu_seq\":" << key->tu_seq.value
+           << ",\"raw_digest\":\"" << raw_digest << "\"},"
+           << "\"job\":{\"c_to_f_bundle_bytes\":"
+           << accounting.c_to_f_bundle_bytes
+           << ",\"f_to_c_receipt_bytes\":"
+           << accounting.f_to_c_receipt_bytes
+           << ",\"bundle_attempts\":" << accounting.bundle_attempts
+           << ",\"replay_attempts\":" << accounting.replay_attempts
+           << "},\"intervals\":[";
+      bool first_interval = true;
+      for (const auto& interval : transfer.r2_link_intervals) {
+        if (!first_interval)
+          line << ',';
+        first_interval = false;
+        if (!write_r2_interval_json(line, interval))
+          return;
+      }
+      line << "]}";
+    } else {
+      line << "null";
+    }
+    line << "}\n";
+    const std::string bytes = line.str();
+    if (bytes.size() > 64 * 1024)
+      return;
+    (void)append_p50_source_trace_line(path, bytes);
+  } catch (...) {
+    // Diagnostics are best-effort and must not alter transfer results.
   }
 }
 
@@ -1861,6 +2094,16 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.compression_level = 3;
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
+    const char* source_trace_path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+    if (p51_metrics_requested() && source_trace_path != nullptr &&
+        *source_trace_path != '\0') {
+        auto interval_sink = std::make_shared<R2IntervalTraceSink>(
+            std::string(source_trace_path));
+        route_config.r2_interval_observer =
+            [interval_sink](const R2WireControlSnapshot& snapshot) {
+                return append_r2_interval_trace(interval_sink, snapshot);
+            };
+    }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.disconnect_r2_after_bundle_for_test =
         config_.disconnect_r2_after_bundle_for_test;
@@ -3170,12 +3413,11 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                                 std::span<const uint8_t>(*raw));
                         const auto& source =
                             pending->request.armed.arm.source;
-                        append_source_result_trace(
+                        append_source_result_trace_v5(
                             source.wire_job_id, source.logical_job,
                             source.assignment_epoch, source.assignment_nonce,
                             config_.c_store_guid, relationship.profile,
-                            trace_result, "R2_LINK", std::nullopt,
-                            std::nullopt);
+                            trace_result);
                     } catch (...) {
                         // Optional trace work cannot block the result reply.
                     }

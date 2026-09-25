@@ -38,6 +38,7 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
     result.deadline = deadline;
     result.maximum_duration = owner_config.maximum_duration;
     result.compression_level = owner_config.compression_level;
+    result.r2_interval_observer = owner_config.r2_interval_observer;
     result.before_prepare_for_route_for_test =
         owner_config.before_prepare_for_route_for_test;
     result.on_r2_background_quiescent = owner_config.post_retired_reap;

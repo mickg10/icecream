@@ -11,6 +11,7 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest, report
+from farmharness.integration.r2_wire_trace import validate_r2_wire_trace
 from farmharness.integration.collect import (
     CollectError,
     _authenticated_rejoin_line,
@@ -40,9 +41,12 @@ from farmharness.integration.collect import (
     _scheduler_dispatch_epoch,
     _snapshot_live_evidence,
     _source_candidates_for_assignment,
+    _source_attempts_for_accounting,
     _source_results,
     _require_collectable_source_accounting,
     _source_transfer_failure_observation,
+    _r2_trace_report,
+    _sum_turn_source_bytes,
     _uncommitted_transport_failure_observation,
     _successful_strict_p50_late_result_binding,
     _transition_target_env,
@@ -247,6 +251,90 @@ def _source_result_record() -> dict[str, object]:
     }
 
 
+def _r2_v5_source_result_record() -> dict[str, object]:
+    record = _source_result_record()
+    c_guid = "1" * 32
+    f_guid = "2" * 32
+    logical_link = "3" * 32
+    raw_digest = "a" * 32
+    job_key = {
+        "c_store_guid": c_guid,
+        "f_store_guid": f_guid,
+        "logical_link_id": logical_link,
+        "tu_seq": 9,
+        "raw_digest": raw_digest,
+    }
+    record.update(
+        {
+            "schema": "icecream-p50-source-result-v5",
+            "mode": "R2_LINK",
+            "stage": "post_read_dispatch_completion",
+            "status": 0,
+            "attempts": None,
+            "attempts_measured": False,
+            "wire_bytes_measured": False,
+            "source_mutex_timing_measured": False,
+            "source_mutex_wait_ns": None,
+            "source_mutex_service_ns": None,
+            "tu_seq": 9,
+            "raw_bytes": 512,
+            "raw_digest": raw_digest,
+            "c_store_guid": c_guid,
+            "c_to_f_bytes": None,
+            "f_to_c_bytes": None,
+            "system_source_reuse": False,
+            "terminal_error_code": 0,
+            "terminal_error_name": None,
+            "r2_accounting_key": job_key,
+            "r2_accounting_reference": False,
+            "r2_link_intervals_valid": True,
+            "r2_link_intervals_external": False,
+            "r2_wire_accounting": {
+                "schema": "icecream-p50-r2-wire-accounting-v1",
+                "valid": True,
+                "job_key": job_key,
+                "job": {
+                    "c_to_f_bundle_bytes": 8,
+                    "f_to_c_receipt_bytes": 5,
+                    "bundle_attempts": 1,
+                    "replay_attempts": 0,
+                },
+                "intervals": [
+                    {
+                        "link": {
+                            "c_store_guid": c_guid,
+                            "f_store_guid": f_guid,
+                            "logical_link_id": logical_link,
+                            "relationship_epoch": 7,
+                            "physical_link_generation": 2,
+                        },
+                        "interval_sequence": 1,
+                        "end": "DrainedAckCheckpoint",
+                        "total_c_to_f_bytes": 10,
+                        "total_f_to_c_bytes": 6,
+                        "shared_c_to_f_bytes": 2,
+                        "shared_f_to_c_bytes": 1,
+                        "drained_ack_prefix": 1,
+                        "recovery_confirmed_prefix": 0,
+                        "jobs": [
+                            {
+                                "key": job_key,
+                                "c_to_f_bundle_bytes": 8,
+                                "f_to_c_receipt_bytes": 5,
+                                "bundle_attempts": 1,
+                                "replay_attempts": 0,
+                                "valid": True,
+                            }
+                        ],
+                        "valid": True,
+                    }
+                ],
+            },
+        }
+    )
+    return record
+
+
 def test_source_result_authenticates_named_wire_revision_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -343,6 +431,276 @@ def test_source_result_v4_measured_r1_accounting_remains_collectable(
     parsed = _source_results(path)
     assert parsed[(2, 1, 1)] == record
     _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v5_r2_uses_nested_trace_without_r1_mutex_metrics(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)] == record
+    _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v5_r2_p29_does_not_require_r1_reuse_witness(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    record["system_source_reuse"] = None
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)] == record
+    _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v5_r2_committed_without_accounting_fails_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    record["r2_wire_accounting"] = None
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    with pytest.raises(CollectError, match="unavailable or invalid"):
+        _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v5_r2_unavailable_payload_is_parseable_but_not_numeric(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    record["r2_wire_accounting"] = None
+    record["r2_accounting_key"] = None
+    record["r2_link_intervals_valid"] = False
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)]["r2_wire_accounting"] is None
+    with pytest.raises(CollectError, match="unavailable or invalid"):
+        _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v5_r2_reference_joins_exact_key_without_duplicate_payload(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    measured = _r2_v5_source_result_record()
+    reference = _r2_v5_source_result_record()
+    reference.update(
+        {
+            "wire_job_id": 3,
+            "logical_job": 3,
+            "assignment_nonce": 2,
+            "r2_wire_accounting": None,
+            "r2_accounting_reference": True,
+        }
+    )
+    _write_jsonl(path, [measured, reference])
+
+    parsed = _source_results(path)
+    _require_collectable_source_accounting(parsed)
+    assert parsed[(3, 1, 2)]["r2_wire_accounting"] is None
+
+
+def test_source_result_v5_r2_unmeasured_reference_without_key_is_parseable_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    record.update(
+        {
+            "r2_wire_accounting": None,
+            "r2_accounting_key": None,
+            "r2_accounting_reference": True,
+            "r2_link_intervals_valid": False,
+            "r2_link_intervals_external": False,
+        }
+    )
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)]["r2_wire_accounting"] is None
+    with pytest.raises(CollectError, match="reference identity is invalid"):
+        _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v5_r2_rejects_invalid_interval_conservation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    interval = record["r2_wire_accounting"]["intervals"][0]  # type: ignore[index]
+    interval["shared_c_to_f_bytes"] = 3
+    _write_jsonl(path, [record])
+
+    with pytest.raises(CollectError, match="interval bytes do not conserve"):
+        _source_results(path)
+
+
+def test_source_result_v5_r2_reads_standalone_interval_sink(tmp_path: Path) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    accounting = record["r2_wire_accounting"]
+    assert isinstance(accounting, dict)
+    interval = accounting["intervals"][0]
+    accounting["intervals"] = []
+    record["r2_link_intervals_external"] = True
+    _write_jsonl(
+        path,
+        [
+            record,
+            {"schema": "icecream-p50-r2-interval-event-v1", "interval": interval},
+        ],
+    )
+
+    interval_events: list[dict[str, object]] = []
+    records = _source_results(path, r2_interval_events=interval_events)
+
+    assert len(records) == 1
+    assert len(interval_events) == 1
+    assert interval_events[0]["interval"] == interval
+
+
+def test_source_result_external_r2_intervals_cannot_be_duplicated_inline(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    record["r2_link_intervals_external"] = True
+    _write_jsonl(path, [record])
+
+    with pytest.raises(CollectError, match="must not be duplicated inline"):
+        _source_results(path, r2_interval_events=[])
+
+
+def test_source_result_v5_r2_standalone_sink_must_reconcile_snapshot(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    accounting = record["r2_wire_accounting"]
+    assert isinstance(accounting, dict)
+    interval = accounting["intervals"][0]
+    accounting["intervals"] = []
+    interval["jobs"][0]["c_to_f_bundle_bytes"] = 7
+    interval["total_c_to_f_bytes"] = 9
+    _write_jsonl(
+        path,
+        [
+            record,
+            {"schema": "icecream-p50-r2-interval-event-v1", "interval": interval},
+        ],
+    )
+
+    interval_events: list[dict[str, object]] = []
+    parsed = _source_results(path, r2_interval_events=interval_events)
+    with pytest.raises(CollectError, match="cumulative per-job snapshot"):
+        _require_collectable_source_accounting(parsed, interval_events)
+
+
+def test_source_result_v5_replay_attempts_are_subset_of_bundle_attempts(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    accounting = record["r2_wire_accounting"]
+    assert isinstance(accounting, dict)
+    accounting["job"]["bundle_attempts"] = 3
+    accounting["job"]["replay_attempts"] = 2
+    interval = accounting["intervals"][0]
+    interval["jobs"][0]["bundle_attempts"] = 3
+    interval["jobs"][0]["replay_attempts"] = 2
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    _require_collectable_source_accounting(parsed)
+    source = next(iter(parsed.values()))
+
+    assert _source_attempts_for_accounting(source, parsed) == 3
+
+
+def test_turn_r2_source_snapshot_duplicates_are_deduplicated() -> None:
+    key = {
+        "c_store_guid": "1" * 32,
+        "f_store_guid": "2" * 32,
+        "logical_link_id": "3" * 32,
+        "tu_seq": 0,
+        "raw_digest": "0" * 32,
+    }
+    rows = [
+        {"c_to_f_bytes": 8, "r2_accounting_key": key},
+        {"c_to_f_bytes": 8, "r2_accounting_key": key},
+        {"c_to_f_bytes": 4, "r2_accounting_key": None},
+    ]
+
+    assert _sum_turn_source_bytes(rows, "c_to_f_bytes") == 12
+
+
+def test_turn_r2_increasing_snapshots_use_greatest_value_per_exact_key() -> None:
+    key = {
+        "c_store_guid": "1" * 32,
+        "f_store_guid": "2" * 32,
+        "logical_link_id": "3" * 32,
+        "tu_seq": 0,
+        "raw_digest": "0" * 32,
+    }
+    earlier_assignment = {
+        "assignment": (7, 11, 13),
+        "c_to_f_bytes": 8,
+        "f_to_c_bytes": 3,
+        "r2_accounting_key": key,
+    }
+    later_assignment = {
+        "assignment": (8, 12, 14),
+        "c_to_f_bytes": 12,
+        "f_to_c_bytes": 5,
+        "r2_accounting_key": key,
+    }
+    legacy = {
+        "c_to_f_bytes": 4,
+        "f_to_c_bytes": 9,
+        "r2_accounting_key": None,
+    }
+
+    # Assignment rows are distinct, but both report cumulative measurements
+    # for the same immutable R2 job. Neither source order may undercount them.
+    assert earlier_assignment["assignment"] != later_assignment["assignment"]
+    for rows in (
+        [earlier_assignment, later_assignment, legacy],
+        [later_assignment, earlier_assignment, legacy],
+    ):
+        assert _sum_turn_source_bytes(rows, "c_to_f_bytes") == 16
+        assert _sum_turn_source_bytes(rows, "f_to_c_bytes") == 14
+
+
+def test_r2_validator_summary_is_json_native() -> None:
+    source = _r2_v5_source_result_record()
+    summary = validate_r2_wire_trace([source])
+
+    # The report serializer is used in immutable bundle observations; tuple
+    # keys stay internal to validation and never leak into JSON output.
+    json.dumps(_r2_trace_report(summary), sort_keys=True)
+
+
+def test_source_result_v5_invalid_accounting_is_preserved_but_not_collectable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    record["r2_wire_accounting"]["valid"] = False  # type: ignore[index]
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)]["r2_wire_accounting"]["valid"] is False  # type: ignore[index]
+    with pytest.raises(CollectError, match="unavailable or invalid"):
+        _require_collectable_source_accounting(parsed)
 
 
 @pytest.mark.parametrize(

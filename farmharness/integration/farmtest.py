@@ -446,6 +446,25 @@ def _env_args(environment: dict[str, str]) -> list[str]:
     return result
 
 
+def _r2_diagnostics_requested(
+    topology: dict[str, Any], client_name: str, client_version: int
+) -> bool:
+    """Opt in to expensive wire attribution only for accepted CacheWire-R2."""
+
+    if client_version < 50:
+        return False
+    revision_by_name = {
+        item["name"]: item.get("cache_wire_revision")
+        for item in topology.get("instances", [])
+    }
+    return any(
+        relationship["c"] == client_name
+        and relationship["cache_expected"]
+        and revision_by_name.get(relationship["f"]) == 2
+        for relationship in topology.get("relationships", [])
+    )
+
+
 def _assignment_fence_mode(
     topology: dict[str, Any],
     scenario: ScenarioSpec | None = None,
@@ -726,6 +745,15 @@ def _planned_commands(
                     "ICECC_SCHEDULER": scheduler_addr,
                 }
             )
+            # R2 wire attribution is opt-in because it adds per-fragment
+            # accounting. Enable the existing diagnostics switch only for a
+            # P50 client with a declared positive CacheWire revision-2
+            # relationship; R1, legacy, and negative-control farms keep the
+            # production hot path off.
+            if _r2_diagnostics_requested(
+                topology, instance["name"], instance["version"]
+            ):
+                environment["ICECC_P50_DIAGNOSTICS"] = "1"
         elif instance["role"] == "F":
             environment.update(
                 {

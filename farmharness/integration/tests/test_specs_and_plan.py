@@ -425,6 +425,41 @@ def test_plan_commands_are_argv_only_and_label_scoped() -> None:
     assert all("icefarm.run=argv-check" in item["argv"] for item in starts)
 
 
+def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    legacy = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S00-smoke.json", farm
+    )
+    legacy_plan = farmtest.build_plan(farm, legacy, run_id="legacy-diag-check")
+    legacy_start = next(
+        item for item in legacy_plan["commands"]
+        if item["phase"] == "up.start-c" and item["instance"] == "C1"
+    )
+    assert "ICECC_P50_DIAGNOSTICS=1" not in legacy_start["argv"]
+
+    topology = {
+        "instances": [
+            {"name": "C2", "role": "C", "cache_wire_revision": 2},
+            {"name": "F2", "role": "F", "cache_wire_revision": 2},
+            {"name": "F1", "role": "F", "cache_wire_revision": 1},
+        ],
+        "relationships": [
+            {"c": "C2", "f": "F2", "cache_expected": True},
+            {"c": "C2", "f": "F1", "cache_expected": True},
+        ],
+    }
+    assert farmtest._r2_diagnostics_requested(topology, "C2", 50)
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 43)
+    topology["relationships"] = [
+        {"c": "C2", "f": "F1", "cache_expected": True}
+    ]
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+    topology["relationships"] = [
+        {"c": "C2", "f": "F2", "cache_expected": False}
+    ]
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+
+
 def test_only_f_starts_have_the_fixed_nofile_contract() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)

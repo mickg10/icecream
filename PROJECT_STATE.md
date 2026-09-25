@@ -26,10 +26,32 @@ The observer delivers traffic after the caller's result, including delayed
 ACKs. False returns/exceptions invalidate interval measurements without
 changing transfer outcomes. Duplicate completed results retain their exact
 key but omit duplicate measurement payloads. Retirement is per physical
-link, not a global completeness flag. Normal-stop terminal-event coverage
-and actual service JSONL/collector integration remain separate work; this
-commit alone does not install a production service observer or prove complete
-farm bandwidth accounting. No performance improvement is claimed.
+link, not a global completeness flag. The service now installs this observer
+when diagnostics and `ICECC_P50_SOURCE_RESULT_TRACE` are both configured.
+R2 emits v5 source results and additive interval events; R1 retains its prior
+format. The collector distinguishes unavailable data, repeated references,
+cumulative job snapshots and shared link traffic. Increasing snapshots are
+aggregated once per exact key using their greatest value, independent of row
+order. This does not prove complete farm bandwidth accounting or a performance
+improvement: ordinary-stop terminal events and independent F settlement
+witnesses remain missing.
+
+The emitter's focused ZSTD_TU cancellation/recovery selector passed after
+factoring both interval forms through one serializer. Retained log:
+`/tanksmall/scratch/tmp/p51-v5-trace-private/interval-factor-r2.log`, SHA256
+`86bb6097a3909ec070baab3f2f43c3f16d3824480afd918daa9a21a05749d3bf`.
+Trace: `/tanksmall/scratch/tmp/p51-v5-trace-isolated-r1/work/tmp/r2-interval-factor-r2.jsonl`,
+SHA256 `fc3f92e70751cd91b76adf7964517c7bd5f2e780b22a637ab76b9cfcd083eca6`.
+The earlier actual trace conserved 29,537 C-to-F and 4,321 F-to-C bytes across
+16 intervals and 32 job keys, including cancellation; closed/settled remained
+false. These are small fixture measurements, not farm results. The imported
+emitter preserves the newer receipt-ledger test hook; combined qualification
+with the recovery fix is still required.
+The focused Python group passed 474 tests before the final cumulative-snapshot
+aggregation correction. After that correction, the collector/report module
+passed all 307 tests, including both snapshot orders and legacy additive rows.
+Collector SHA256: `0ea7dd0ced12e8094484361c5c12230f01fdc1976221061a5f7ddf5d1388c6fa`;
+collector test SHA256: `19bf7cf067b46e8bc7391f3bc67f18ee3de97973ffa97c5ebb29d159ff16c9cc`.
 
 Frozen endpoint and sender full suites pass. Focused runs also cover all
 three profiles at W30, lost-COMMIT and repeated replay, failed-terminal keys,

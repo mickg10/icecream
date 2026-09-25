@@ -436,25 +436,54 @@ Setup, reading and network service are included in service; intervals may
 overlap across relationships. A pre-attempt R1 failure may have unavailable
 attempt accounting even though its source-mutex timings are measured.
 
-V4 `R2_LINK` rows are currently emitted only at
-`post_read_dispatch_completion`, after the post-read dispatch coroutine has
-started and constructed a result. This does not prove a route link was opened
-or a transfer attempt began: endpoint-identity binding can refuse before
-`transfer_p51`. Pre-read/admission refusals, peer-close/read failures, and
-stop/deadline/invalid-connection exits before that coroutine starts are not
-represented. R2 attempts, exact wire-byte totals, and R1 source-mutex timings
-are marked unavailable and null. The collector parses those rows but fails
-closed before producing numeric acceptance or performance metrics if any
-required accounting field is unavailable. Exact R2 per-job/replay attempt and
-wire-byte accounting remains pending; these rows must not be interpreted as
-zero traffic or complete transfer measurements.
+V4 `R2_LINK` rows are emitted at `post_read_dispatch_completion`, after the
+post-read dispatch coroutine has started and constructed a result. This does
+not prove a route link was opened or a transfer attempt began: endpoint
+identity binding can refuse before `transfer_p51`. Pre-read/admission
+refusals, peer-close/read failures, and stop/deadline/invalid-connection
+exits before that coroutine starts are not represented by that result row.
 
-The collector accepts exact v2, v3 and v4 field layouts and rejects unknown
-versions. V2's `source_mutex_wait_ns` reflects the former global-gate wait;
-v3 reuses the field for the current admission-wait intervals described above.
-Since v2/v3 carry no mode field, old ambiguous rows cannot be retroactively
-classified as R1 or R2. No version's sum of service durations is aggregate CPU
-time or build wall time.
+Opt-in V5 adds exact R2 wire accounting when the process is started with
+`ICECC_P50_DIAGNOSTICS=1` and `ICECC_P50_SOURCE_RESULT_TRACE` set to a writable
+JSONL destination.
+`r2_wire_accounting` is a cumulative per-job snapshot, keyed by the exact
+`(C GUID, F GUID, logical link ID, TU sequence, raw digest)` identity. It is a
+consistency witness, not an additive quantity. `r2_link_intervals` (or the
+standalone `icecream-p50-r2-interval-event-v1` JSONL records when external
+interval delivery is enabled) contains bounded interval deltas scoped by
+logical/physical link identity and sequence. Per-job interval rows are
+disjoint byte/attempt deltas; `bundle_attempts` includes replay starts while
+`replay_attempts` is a subset, so they must not be added together. The interval
+directional totals also include shared protocol traffic and are the basis for
+whole-link byte totals; summing per-job rows omits that shared traffic.
+
+V5 reference rows carry the full canonical job key but no duplicate cumulative
+measurement payload. Failed terminal rows may carry their frozen exact key
+and partial measurements; rows that fail before accounting starts truthfully
+have unavailable/null measurements. Diagnostics-off R2 rows likewise remain
+parseable with unavailable accounting; they are not zero-byte observations.
+R2 has no R1 source-mutex timing metric, so those fields remain unavailable
+and null. V2-v4 layouts and their historical interpretations are unchanged.
+
+The collector validates structure separately from numeric completeness. A
+partial/open-link trace can be parsed and can support numeric claims only when
+its requested scope has complete contiguous interval coverage, exact-key job
+snapshot/interval conservation, and all required measurements. Missing first
+intervals, sequence gaps, conflicting duplicate identities, unavailable
+payloads, or inconsistent byte totals fail closed for numeric acceptance.
+An interval `PhysicalLinkRetired` records the C-side physical stream boundary;
+it does not independently prove that F processed the final ACK or that the
+logical relationship is settled. Closed/settled claims require independent
+F-side ACK/link evidence. The qualified D17 service samples in this candidate
+conserve C-side bytes but lack that independent F-side terminal evidence, so
+they report `closed=0, settled=0`; they do not establish terminal completeness.
+
+The collector accepts exact v2, v3, v4 and v5 field layouts and rejects
+unknown versions. V2's `source_mutex_wait_ns` reflects the former global-gate
+wait; v3 reuses the field for the current admission-wait intervals described
+above. Since v2/v3 carry no mode field, old ambiguous rows cannot be
+retroactively classified as R1 or R2. No version's sum of service durations
+is aggregate CPU time or build wall time.
 Measure baseline and candidate on identical input order, profiles, machine,
 compiler slots, link shaping and cache state. Use Firefox, RocksDB and a third
 available corpus, each cold/warm/edited, with input manifests/digests retained.
