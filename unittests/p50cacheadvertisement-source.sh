@@ -41,6 +41,67 @@ require_absent() {
     echo "ok - $label"
 }
 
+require_one_shot_p50_retry_flow() {
+    source_file=$1
+    label=$2
+    if ! awk '
+        index($0, "catch (const remote_error &error)") { in_retry = 1 }
+        in_retry && index($0, "if (error.errorCode != 106)") {
+            wrong_error_count++
+            wrong_error_line = NR
+            next
+        }
+        in_retry && wrong_error_line && !wrong_error_throw && index($0, "throw;") {
+            wrong_error_throw = NR
+        }
+        in_retry && index($0, "if (p50_retry_attempted)") {
+            repeated_count++
+            repeated_line = NR
+            repeated_active = 1
+        }
+        in_retry && repeated_active {
+            line = $0
+            opens = gsub(/\{/, "{", line)
+            closes = gsub(/\}/, "}", line)
+            repeated_depth += opens - closes
+            if (index($0, "suppressed_one_shot"))
+                suppression_line = NR
+            if (suppression_line && repeated_depth > 0 && index($0, "throw;"))
+                repeated_throw = NR
+            if (repeated_depth == 0) {
+                repeated_end = NR
+                repeated_active = 0
+            }
+        }
+        in_retry && index($0, "p50_retry_attempted = true;") {
+            budget_count++
+            budget_line = NR
+            exit
+        }
+        END {
+            if (wrong_error_count != 1 || repeated_count != 1 || budget_count != 1 ||
+                !wrong_error_throw || !suppression_line || !repeated_throw ||
+                !(wrong_error_line < wrong_error_throw &&
+                  wrong_error_throw < repeated_line &&
+                  repeated_line < suppression_line &&
+                  suppression_line < repeated_throw &&
+                  repeated_throw < repeated_end &&
+                  repeated_end < budget_line))
+                exit 1
+        }
+    ' "$source_file"; then
+        echo "FAIL: $label (retry control flow must reject non-106 errors and suppress a second 106 retry)" >&2
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
+if [ "${P50_CACHE_ADVERTISEMENT_RETRY_FLOW_ONLY:-0}" = 1 ]; then
+    require_one_shot_p50_retry_flow "$src/client/main.cpp" \
+        'only Error 106 can request reassignment, and only once'
+    exit 0
+fi
+
 require_count 8 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
     services/comm.cpp \
     'Login, GetCS, UseCS, and CompileFile P50 tails each gate read and write at protocol 50'
@@ -290,8 +351,8 @@ require_count 1 'ret = build_remote(job, local_daemon, envs, rate,' client/main.
     'the wrapper owns one bounded P50 reassignment loop'
 require_count 1 'bool p50_retry_attempted = false;' client/main.cpp \
     'the fresh P50 reassignment has one wrapper-global retry budget'
-require_count 1 'error.errorCode != 106 || p50_retry_attempted' client/main.cpp \
-    'only the first authenticated P50 loss can request reassignment'
+require_one_shot_p50_retry_flow "$src/client/main.cpp" \
+    'only Error 106 can request reassignment, and only once'
 require_count 1 '!p50_retry_attempted || strict_p50,' client/main.cpp \
     'a normal retry sends canonical absence while a strict retry requests P50 again'
 require_count 1 'strict_p50 && !error.hasRetryAvoidEndpoint()' client/main.cpp \
@@ -340,8 +401,10 @@ require_count 1 'Service::createChannel(hostname, port, 10)' client/remote.cpp \
     'legacy compiler connections retain the historical ten-second connector'
 require_count 1 'p50_zstd_selected_profile(' client/remote.cpp \
     'the production client has one exact P50 profile selection/admission site'
-require_count 1 'assignment.cache_endpoint_port' client/remote.cpp \
-    'the cache connection reads the selected UseCS endpoint exactly once'
+require_count 1 'request.selected_f_cache_port = assignment.cache_endpoint_port;' \
+    client/remote.cpp 'the R1 source request binds its exact selected UseCS endpoint'
+require_count 1 'source_arm.selected_f_cache_port = assignment.cache_endpoint_port;' \
+    client/remote.cpp 'the R2 source arm binds its exact selected UseCS endpoint'
 require_count 1 'job.setCompileInputIdentity(*identity);' client/remote.cpp \
     'a validated committed InputRecord binds CompileFile before it is sent'
 require_absent \
