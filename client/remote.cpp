@@ -283,17 +283,24 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
         return icecc::p50::OwnedSourceFd(fd);
     }
 
-    // Use memfd to avoid disk writeback throttling under memory pressure.
-    int memfd = ::memfd_create("icecc-p50", MFD_CLOEXEC);
+    // Use memfd to avoid disk writeback throttling under memory pressure.  A
+    // configured capture copies from the temp file path, so it keeps that path.
+    int memfd = -1;
+#ifdef MFD_CLOEXEC
+    if (::getenv("ICECC_P50_PREPROCESSED_CAPTURE") == nullptr)
+        memfd = ::memfd_create("icecc-p50", MFD_CLOEXEC);
+#endif
     const bool use_memfd = memfd >= 0;
     int read_fd = -1;
     int write_fd = -1;
     std::unique_ptr<TempSourceFile> temporary;
     if (use_memfd) {
-        // Dup before call_cpp: it closes write_fd in the parent after fork.
-        write_fd = ::dup(memfd);
-        read_fd = ::dup(memfd);
-        ::lseek(read_fd, 0, SEEK_SET);
+        // call_cpp closes write_fd in the parent after fork; memfd is the read side.
+        write_fd = ::fcntl(memfd, F_DUPFD_CLOEXEC, 0);
+        if (write_fd < 0) {
+            (void)::close(memfd);
+            throw client_error(10, "Error 10 - unable to open preprocessor output");
+        }
     } else {
         char *temporary_path = nullptr;
         if (dcc_make_tmpnam("icecc-p50", ".ix", &temporary_path, 0) != 0 ||
@@ -307,7 +314,9 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
 
     const pid_t cpp_pid = call_cpp(job, write_fd);
     if (cpp_pid == -1) {
-        if (use_memfd) { ::close(memfd); ::close(read_fd); }
+        (void)::close(write_fd); // call_cpp closes it only after a successful fork.
+        if (use_memfd)
+            (void)::close(memfd);
         throw client_error(18, "Error 18 - (fork error?)");
     }
 
@@ -317,7 +326,8 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
         waited = ::waitpid(cpp_pid, &wait_status, 0);
     } while (waited < 0 && errno == EINTR);
     if (waited != cpp_pid) {
-        if (use_memfd) { ::close(memfd); ::close(read_fd); }
+        if (use_memfd)
+            (void)::close(memfd);
         throw client_error(18, "Error 18 - unable to wait for local cpp");
     }
 
@@ -325,7 +335,8 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     if (cpp_status != 0) {
         log_warning() << "call_cpp process failed with exit status "
                       << cpp_status << std::endl;
-        if (use_memfd) { ::close(memfd); ::close(read_fd); }
+        if (use_memfd)
+            (void)::close(memfd);
         if (!compiler_is_clang(job) && compiler_only_rewrite_includes(job))
             throw remote_error(
                 103,
@@ -334,8 +345,12 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     }
 
     if (use_memfd) {
-        ::close(memfd);
-        return icecc::p50::OwnedSourceFd(read_fd);
+        // The child's writes moved the shared offset; readers start at 0.
+        if (::lseek(memfd, 0, SEEK_SET) != 0) {
+            (void)::close(memfd);
+            throw client_error(11, "Error 11 - unable to rewind preprocessed output");
+        }
+        return icecc::p50::OwnedSourceFd(memfd);
     }
 
     if (!retain_p50_preprocessed_capture(temporary->path()))
