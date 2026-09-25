@@ -41,7 +41,7 @@ require_count 1 'job->dispatchMatchedJobId(), job->assignmentEpoch(),' \
 # row on Client A, and at the source level by
 # p50cacheadvertisement-source.sh's anchor on the copy-construction text
 # itself.
-require_count 8 'msg->assignmentEpoch()' daemon/main.cpp \
+require_count 8 'msg->assignmentEpoch(), msg->assignmentNonce(),' daemon/main.cpp \
     'submitter daemon preserves assignment identity in relay, cache-handoff, and terminal paths'
 require_count 2 'usecs->applyAssignmentTo(&job)' client/remote.cpp \
     'client remote/local-via-daemon paths copy the production UseCS identity'

@@ -12,6 +12,27 @@ retained artifact directories.
 
 ## Developer QA
 
+### R1/R2 source-check repairs
+
+Canonical QA on `422932c9` exposed three stale supplemental source checks:
+assignment identity matching counted a longer identifier, CACHE_SESSION
+still expected a single ordinary protocol instead of the R1 bridge range,
+and dispatch still expected the pre-R2 discriminator spelling. The repaired
+scripts check the current R1/R2 admission predicates, keep descriptor transfer
+checks scoped to their functions, and retain a separate destructor ownership
+check. All three scripts pass; deletion controls reject missing assignment
+identity, protocol bounds, destructor clearing, either protocol helper and
+the combined dispatch rejection. These source checks supplement, not replace,
+behavioral tests. The original full QA run remains separate and unqualified.
+
+Evidence: `/tanksmall/scratch/tmp/p51-422-sourcefix/logs/`.
+Passing logs: `assignment.log` SHA256
+`70df45b2969f2484f32dddacce7ff6fc50ddde72f42ab5d4aed08999e61a6d6b`;
+`cachesession.log`
+`ab40b318682d6932e8e659e02ae1a713fb113afafdd042b11911854624c6117b`;
+`daemon.log`
+`2cb671ddcdb04f2127e829f3d1815da6bb9725519bf1b3d3b2c21ae15e8705a1`.
+
 ### Full Python integration follow-up
 
 The unfiltered integration suite on runtime `a93b7595` completed with

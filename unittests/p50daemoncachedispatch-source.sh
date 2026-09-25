@@ -12,7 +12,15 @@ test="$src/unittests/p50_daemon_cache_dispatch_test.cpp"
 real_test="$src/unittests/daemoncachedispatch.cpp"
 
 grep -F 'release_fd_if_input_empty' "$impl" >/dev/null
-grep -F 'decoded_type != kCacheSession' "$impl" >/dev/null
+grep -F 'const bool r1_session = decoded_type == kCacheSession &&' "$impl" >/dev/null
+grep -F 'const bool r2_link = decoded_type == kP51CacheLinkSession &&' "$impl" >/dev/null
+grep -F 'if (!r1_session && !r2_link)' "$impl" >/dev/null
+dispatch_slice=$(sed -n \
+    '/^CacheDispatchOutcome CacheSessionDispatcher::dispatch(/,/^}/p' "$impl")
+printf '%s\n' "$dispatch_slice" \
+    | grep -F 'protocol_supports_p50_r1_bridge(' >/dev/null
+printf '%s\n' "$dispatch_slice" \
+    | grep -F 'protocol_supports_cache_r2(negotiated_protocol)' >/dev/null
 grep -F 'verify_peer_credentials' "$impl" >/dev/null
 grep -F 'validate_handshake' "$impl" >/dev/null
 grep -F 'relationship.send_until' "$impl" >/dev/null
@@ -29,7 +37,7 @@ grep -F 'kStoreIdentityFileRole' "$impl" >/dev/null
 grep -F 'c_store_guid != f_store_guid' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
-grep -Fx '    if (!on_demand_->current_path_matches())' "$impl" >/dev/null
+grep -Fx '    if (!on_demand_->current_path_matches()) {' "$impl" >/dev/null
 
 # The dispatcher owns only an immutable on-demand lease.  A cached control
 # relationship or the removed attach API would bypass fresh accept,
@@ -114,9 +122,9 @@ echo 'ok - HELLO bounded-send deletion/bypass mutant is rejected'
 # runtime row replaces the pathname after HELLO and before release; this source
 # witness prevents a build configuration from silently omitting that guard.
 post_connect_identity_guard() {
-    grep -Fx '    if (!on_demand_->current_path_matches())' "$1" >/dev/null
+    grep -Fx '    if (!on_demand_->current_path_matches()) {' "$1" >/dev/null
 }
-sed '/^    if (!on_demand_->current_path_matches())$/,+2d' "$impl" >"$mutant_identity"
+sed '/^    if (!on_demand_->current_path_matches()) {$/,+2d' "$impl" >"$mutant_identity"
 if post_connect_identity_guard "$mutant_identity"; then
     echo 'FAIL: post-connect endpoint identity deletion mutant was accepted' >&2
     exit 1
