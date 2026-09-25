@@ -4017,6 +4017,17 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
                      static_cast<unsigned>(endpoint_result.status),
                      endpoint_result.completed_input.has_value() ? 1u : 0u,
                      endpoint_result.committed_input.has_value() ? 1u : 0u);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (endpoint_result.terminal_error.has_value()) {
+            const std::string& detail = endpoint_result.terminal_error->detail;
+            const int detail_length = detail.size() > 192
+                ? 192 : static_cast<int>(detail.size());
+            std::fprintf(stderr,
+                         "P50_CACHE_SESSION_ENDPOINT_ERROR code=%u detail=%.*s\n",
+                         static_cast<unsigned>(endpoint_result.terminal_error->code),
+                         detail_length, detail.data());
+        }
+#endif
         std::fflush(stderr);
         if (endpoint_result.candidate_input.has_value() &&
             !endpoint_result.completed_input.has_value())
@@ -5136,6 +5147,8 @@ bool SidecarRuntime::settle_p51_interrupted_job_on_owner(
         return false;
     P51SourceRelationship& relationship = position->second;
     if (!relationship.link_active ||
+        relationship.logical_id != link.relationship_id.bytes ||
+        relationship.epoch != link.relationship_epoch ||
         relationship.physical_link_generation !=
             link.physical_link_generation)
         return false;
@@ -5157,19 +5170,28 @@ bool SidecarRuntime::settle_p51_interrupted_job_on_owner(
     for (auto reservation = p51_source_reservations_.begin();
          reservation != p51_source_reservations_.end(); ++reservation) {
         auto& row = reservation->second;
-        if (!row.consumed || row.consumed_ordinal != interrupted_ordinal ||
+        if (!row.consumed ||
+            row.armed.arm.source.c_store_guid != link.c_store_guid.bytes ||
+            row.armed.logical_relationship_id != relationship.logical_id ||
+            row.armed.relationship_epoch != relationship.epoch ||
+            row.consumed_ordinal != interrupted_ordinal ||
             row.consumed_physical_link_generation != interrupted_generation)
             continue;
         if (row.cancel_requested && !row.publishing) {
-            if (endpoint_)
-                (void)endpoint_->retire_p51_recovery_install(
-                    Id128{row.armed.reservation_id});
+            const Id128 id{row.armed.reservation_id};
+            [[maybe_unused]] const bool marker_retired = endpoint_ &&
+                endpoint_->retire_p51_recovery_install(id);
             p51_source_reservations_.erase(reservation);
-        } else {
-            row.consumed_binding.reset();
-            row.consumed_ordinal = 0;
-            row.consumed_physical_link_generation = 0;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            notify_p51_reservation_retired_for_test(id, marker_retired);
+#endif
         }
+        // Preserve the frozen original JOB_BIND as the recovery witness.
+        // Clearing only this proof while leaving row.consumed set makes
+        // recover_p51_receipts_on_owner reject the live survivor after an
+        // interrupted decode. RESET commit, not interruption settlement,
+        // rebinds the row and restores its outstanding reservation credit
+        // exactly once.
         break;
     }
     schedule_p51_reservation_sweep_on_owner();
@@ -5285,7 +5307,7 @@ SidecarRuntime::recover_p51_receipts_on_owner(
                           row.consumed_ordinal != ordinal ||
                           row.consumed_physical_link_generation !=
                               witness.binding.physical_link_generation)))
-                        return std::nullopt;
+                    return std::nullopt;
                 }
             } else {
                 const size_t row_index = static_cast<size_t>(

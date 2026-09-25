@@ -70,17 +70,35 @@ The retained combined log is
 SHA256 `f6411136f01a25fa80e1feae9934dcc27c614d815032375b45b062781bac072e`.
 Use that preserved copy: later executions overwrite the build-directory log.
 
-Source review identified a pre-existing recovery inconsistency in
+The recovery fix addresses a pre-existing inconsistency in
 `settle_p51_interrupted_job_on_owner`: a surviving consumed reservation loses
 its binding/ordinal/generation, but RECOVER requires that proof while it is
 still consumed. The same global scan also lacks C/relationship/epoch filtering.
-Both branches are present before accounting (`017dd68f`). Deterministic
-regressions and a minimal fix are in progress; the intermittent runtime
-failure's exact causal path is not yet proven. Required fix invariants are
-preservation of survivor proof until RESET, no mutation of another C's
-reservation, and exactly-once restoration of consumed admission credit by
-RESET. Old-generation publication must remain rejected. A later passing
-repetition does not clear the retained failing run.
+Both defects are present before accounting (`017dd68f`). Deterministic
+pre-fix regressions reproduce cleared survivor proof and acceptance of a
+mismatched relationship identity. The fix preserves survivor proof until
+RESET, checks exact link and reservation ownership, and leaves credit rearming
+to RESET. The cross-C test observes exact cancelled-row retirement and one
+outstanding survivor reservation after RESET/CONFIRM.
+
+On base `1232033d` plus this fix, both focused regressions and the full default
+service suite pass, including all nine repeated W30 cycles and receipt-cap
+cases. Full log SHA256 `104b1ee85e5368b88e85ef7c74e93fd30a3080b06c5cc7ff48f94318fa39e12e`;
+service source `b0d9fdcdfd1054f91b0e5eb174b3928fc6bce6209f2a9e52094a320508c8571a`;
+test source `151ec52c101253f6883972349e8657fba84f2b55d989f3e71866dcee49bf9898`;
+test binary `ff6da433ca39625adfbc17ceab39d4d60cbc8a9272b0d69b7f21cd7ace9cac5e`.
+Evidence root is `/tanksmall/scratch/tmp/p51-service-combined.7PdVFL/`.
+Removing only the reservation ownership filters makes the cross-C test fail
+at its no-early-retirement assertion, with survivor-proof preservation still
+enabled. Mutant log SHA256:
+`adc77db9cecf8923bc81264493b9471892f96fa9c1baa7a17bd107cfc1c828b6`.
+The qualified binary is preserved as `tmp/p50cacheservice-qualified-fix`;
+the build-directory binary was subsequently used for the negative control
+and must not be mistaken for the passing binary.
+This is not yet qualification of the combined trace-emitter-plus-fix tip,
+nor does it close the rest of the W30 plan. The original intermittent failure
+remains retained separately; these deterministic regressions establish real
+defects without claiming every earlier timeout had the same cause.
 
 Evidence root: `/tanksmall/scratch/tmp/p51-r2-accounting-6faf9b21/`.
 SDK `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, image

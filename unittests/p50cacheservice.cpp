@@ -5714,6 +5714,185 @@ void test_p51_d11_real_receipt_ledger(ProfileId profile, uint32_t window) {
                 profile_name, window, window, window + 1);
 }
 
+void test_p51_interrupted_reservation_relationship_isolation(
+    bool wrong_link_identity_only = false) {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x3c;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_roots[2]{};
+    remote_roots[0].bytes[15] = 0xa1;
+    remote_roots[1].bytes[15] = 0xa2;
+    const auto owner_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(2);
+
+    struct Reservation {
+        local::P51SourceReservationRequest request;
+        P51SourceArmedFields armed;
+        LinkHello initial;
+        LinkHello reconnect;
+        JobBind binding;
+    } reservations[2];
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_route_relationships = 4;
+    std::vector<Id128> retired_ids;
+    config.p51_reservation_retired_for_test =
+        [&](Id128 id, bool) { retired_ids.push_back(id); };
+    service::SidecarRuntime runtime(std::move(config));
+
+    for (size_t index = 0; index != 2; ++index) {
+        const CStoreGuid c_guid = c_store_guid_for_root(remote_roots[index]);
+        reservations[index].request = test_p51_reservation_request(
+            c_guid, 51, launch.identity.generation, launch.identity.attempt,
+            8101 + index, CACHE_PROFILE_ZSTD_TU, 30);
+        const auto result = runtime.reserve_p51_source_on_owner(
+            reservations[index].request);
+        CHECK(result.error_code == 0 && result.armed.has_value());
+        reservations[index].armed = *result.armed;
+        reservations[index].initial = test_p51_link_hello(
+            reservations[index].armed, 1,
+            HistoryNonce{0x810001 + index});
+        reservations[index].binding = test_p51_job_binding(
+            reservations[index].armed, 1, 1, 9101 + index,
+            index == 0 ? "isolated-survivor" : "isolated-cancelled");
+        runtime.run_owner_callback_for_test([&, index] {
+            CHECK(runtime.lookup_p51_link_reservation_on_owner(
+                      reservations[index].initial)
+                      .has_value());
+            CHECK(runtime.consume_p51_job_reservation_on_owner(
+                      reservations[index].initial,
+                      reservations[index].binding)
+                      .has_value());
+        });
+    }
+
+    const auto less_id = [](const Reservation& left,
+                            const Reservation& right) {
+        return left.armed.reservation_id < right.armed.reservation_id;
+    };
+    Reservation* survivor = &reservations[0];
+    Reservation* cancelled = &reservations[1];
+    if (less_id(*survivor, *cancelled))
+        std::swap(survivor, cancelled);
+    CHECK(cancelled->armed.reservation_id < survivor->armed.reservation_id);
+    CHECK(runtime.cancel_p51_source_on_owner(
+        cancelled->request.arm, cancelled->armed.reservation_id,
+        owner_deadline));
+
+    bool wrong_link_rejected = false;
+    runtime.run_owner_callback_for_test([&] {
+        for (Reservation* reservation : {survivor, cancelled}) {
+            runtime.release_p51_link_on_owner(reservation->initial);
+            reservation->reconnect = test_p51_link_hello(
+                reservation->armed, 2, reservation->initial.history_nonce,
+                LinkStartMode::Reconnect);
+            CHECK(runtime.lookup_p51_link_reservation_on_owner(
+                      reservation->reconnect)
+                      .has_value());
+        }
+
+        if (wrong_link_identity_only) {
+            // A link carrying the right C/generation but wrong relationship
+            // identity must not settle the consumed survivor proof.
+            LinkHello wrong_relationship = survivor->reconnect;
+            wrong_relationship.relationship_id = Id128::from_u64(0xdeadbeef);
+            wrong_link_rejected =
+                !runtime.settle_p51_interrupted_job_on_owner(
+                    wrong_relationship);
+            return;
+        }
+
+        // The canceled ARM sorts first in the global map. Settling the
+        // survivor's relationship must neither retire it early nor clear its
+        // frozen proof merely because both rows have ordinal 1/generation 1.
+        CHECK(runtime.settle_p51_interrupted_job_on_owner(
+            survivor->reconnect));
+        CHECK(retired_ids.empty());
+        CHECK(runtime.settle_p51_interrupted_job_on_owner(
+            cancelled->reconnect));
+        CHECK(retired_ids.size() == 1 &&
+              retired_ids.front() ==
+                  Id128{cancelled->armed.reservation_id});
+    });
+
+    if (wrong_link_identity_only) {
+        CHECK(wrong_link_rejected);
+        std::puts("P51_INTERRUPTED_RESERVATION stale-link identity: PASS");
+        return;
+    }
+
+    const Id128 operation_id{
+        icecc::digest128("interrupted reservation isolation").bytes};
+    const RecoverBegin begin = test_p51_recover_begin(
+        survivor->reconnect, 0, 1, 1, operation_id);
+    RecoverWitness witness;
+    witness.relationship_id = begin.relationship_id;
+    witness.relationship_epoch = begin.relationship_epoch;
+    witness.physical_link_generation = begin.physical_link_generation;
+    witness.operation_id = begin.operation_id;
+    witness.relationship_ordinal = 1;
+    witness.binding_digest = compute_r2_binding_digest(survivor->binding);
+    witness.transaction_digest =
+        icecc::digest128("pending interrupted transfer");
+    witness.inner.history_nonce = survivor->initial.history_nonce;
+    witness.inner.rel_seq = RelSeq{0};
+    witness.inner.tu_seq = survivor->binding.tu_seq;
+    witness.inner.profile = survivor->binding.profile;
+    witness.inner.raw_bytes = survivor->binding.raw_bytes;
+    witness.inner.raw_digest = survivor->binding.raw_digest;
+    witness.inner.transaction_digest = witness.transaction_digest;
+    witness.binding = survivor->binding;
+    const std::array<RecoverWitness, 1> witnesses{witness};
+    std::optional<P51RecoveryReceiptInterval> recovered;
+    runtime.run_owner_callback_for_test([&] {
+        recovered = runtime.recover_p51_receipts_on_owner(
+            survivor->reconnect, begin, witnesses,
+            test_p51_recover_end(begin, witnesses));
+    });
+    CHECK(recovered.has_value() && recovered->rows.empty() &&
+          recovered->end.committed_prefix_k == 0 &&
+          recovered->end.acknowledged_prefix_q == 0);
+
+    ResetRequest reset;
+    reset.relationship_id = survivor->reconnect.relationship_id;
+    reset.old_relationship_epoch = survivor->reconnect.relationship_epoch;
+    reset.new_relationship_epoch = reset.old_relationship_epoch + 1;
+    reset.physical_link_generation =
+        survivor->reconnect.physical_link_generation;
+    reset.operation_id = operation_id;
+    reset.settled_prefix_k = 0;
+    reset.old_history_nonce = survivor->reconnect.history_nonce;
+    reset.new_history_nonce =
+        HistoryNonce{reset.old_history_nonce.value + 1};
+    std::optional<ResetAck> ack;
+    runtime.run_owner_callback_for_test([&] {
+        ack = runtime.validate_p51_reset_on_owner(survivor->reconnect, reset);
+        CHECK(ack.has_value());
+        CHECK(runtime.commit_p51_reset_on_owner(
+            survivor->reconnect, reset, *ack));
+        ResetConfirm confirm;
+        confirm.relationship_id = reset.relationship_id;
+        confirm.new_relationship_epoch = reset.new_relationship_epoch;
+        confirm.physical_link_generation = reset.physical_link_generation;
+        confirm.operation_id = reset.operation_id;
+        confirm.new_history_nonce = reset.new_history_nonce;
+        confirm.settled_prefix_k = reset.settled_prefix_k;
+        CHECK(runtime.confirm_p51_reset_on_owner(
+            survivor->reconnect, confirm));
+    });
+    LinkHello reset_link = survivor->reconnect;
+    reset_link.relationship_epoch = reset.new_relationship_epoch;
+    reset_link.history_nonce = reset.new_history_nonce;
+    const auto ledger = runtime.p51_receipt_ledger_for_test(reset_link);
+    CHECK(ledger.has_value() && ledger->pending_ordinal == 0 &&
+          ledger->committed_prefix_k == 0 &&
+          ledger->outstanding_reservations == 1);
+    std::puts("P51_INTERRUPTED_RESERVATION exact-C/relationship/epoch: PASS");
+}
+
 void test_p51_cancel_publication_and_reset_lifecycle() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x39;
@@ -11200,6 +11379,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--p51-interrupted-reservation-isolation") == 0) {
+            test_p51_interrupted_reservation_relationship_isolation();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--p51-interrupted-reservation-stale-link") == 0) {
+            test_p51_interrupted_reservation_relationship_isolation(true);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--read-peer-close") == 0) {
             test_p51_peer_close_during_active_read_cancels_before_route();
             return 0;
@@ -11342,6 +11533,8 @@ int main(int argc, char** argv) {
             test_p51_d11_real_receipt_ledger(profile, 30);
         }
         test_p51_cancel_publication_and_reset_lifecycle();
+        test_p51_interrupted_reservation_relationship_isolation();
+        test_p51_interrupted_reservation_relationship_isolation(true);
         test_p51_reservation_expiry_before_bind_no_late_arm();
         test_p51_reservation_profile_mask_mapping();
         test_replacement_trigger_latches_once_and_is_opt_in();
