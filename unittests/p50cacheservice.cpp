@@ -5396,7 +5396,9 @@ boost::asio::awaitable<void> d11_receipt_client(
     hello.system_source_fingerprint = profile == ProfileId::P29V1
         ? authority->p29v1_system_source_fingerprint(prepared)
         : icecc::digest128("D11 real F receipt ledger");
-    (void)co_await client.open_r2_link(socket, hello, deadline);
+    const LinkState link_state =
+        co_await client.open_r2_link(socket, hello, deadline);
+    CHECK(link_state.window == window && link_state.profile == profile);
 
     const auto make_binding = [&](size_t index,
                                   PreparedTuHandle handle) {

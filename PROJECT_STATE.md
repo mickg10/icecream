@@ -50,6 +50,14 @@ The retained initial focused failure sampled Q immediately after C wrote
 the ACK, before F necessarily processed it. It is not a product failure or
 a passing gate; the corrected test observes F's bounded eventual Q instead.
 
+A test-only follow-up also checks the client's negotiated LinkState window
+and profile. Its six-cell selector passes on test source
+`25c63cf22d226053f476899aa2ede43e14f4a0b87f264eae6dabfd6feca51947`,
+binary `b21026d6ef6a141fbd23aed51aa8d71c205370f84b6c75d8d84c08f818982f83`.
+The selector log has the same SHA256 above. This follow-up did not rerun the
+full service suite; that full-suite result belongs to the preceding frozen
+source. One failed launcher invocation (exit 126) is retained separately.
+
 ### Repeated W30 recovery on persistent runtimes
 
 The default service suite now runs three cancellation/reset cycles for each
