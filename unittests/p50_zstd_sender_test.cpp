@@ -1042,10 +1042,10 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
         capacity_waiter_registered.store(true, std::memory_order_release);
         progress_cv.notify_all();
     };
+    asio::io_context c_context;
     auto sender = std::make_shared<P50ZstdSourceSender>(
         authority, PreparationRouteKey{f_guid, 23, profile},
         PrepareRequestKey{3, 18201}, sender_config);
-    asio::io_context c_context;
     auto c_work = asio::make_work_guard(c_context);
     const tcp::endpoint remote = acceptor.local_endpoint();
     AsyncConnectedFdFactory connector =
@@ -1740,16 +1740,18 @@ sender_r2_accept_shared_failure(
     co_return results;
 }
 
-void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
-    bool fail_first_connector = false) {
-    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
-                                    ProfileId::ZSTD_ROUTE}) {
+void run_p51_sender_window_concurrent_callers(
+    ProfileId profile, size_t kWindow, size_t kJobs,
+    size_t required_occupancy, bool fail_first_connector = false,
+    bool expect_underfilled_witness = false) {
+    CHECK(kWindow != 0 && kWindow <= 30);
+    CHECK(kJobs > kWindow && kJobs <= 31);
+    CHECK(required_occupancy != 0);
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
                                     : profile == ProfileId::ZSTD_ROUTE ? "ZSTD_ROUTE"
                                     : "ZSTD_TU";
-    std::cerr << "P51_SENDER_W30_PROFILE_START=" << profile_name << "\n";
-    constexpr size_t kJobs = 31;
-    constexpr size_t kWindow = 30;
+    std::cerr << "P51_SENDER_WINDOW_PROFILE_START=" << profile_name
+              << " selected_window=" << kWindow << " jobs=" << kJobs << "\n";
     const auto [c_guid, f_guid] = sender_r2_store_guids();
     const Id128 relationship_id = Id128::from_u64(0x5102);
     asio::io_context f_context;
@@ -1789,21 +1791,46 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
     std::atomic<unsigned> committed{0};
     std::atomic<unsigned> acknowledged{0};
     std::atomic<unsigned> exact_input_mismatches{0};
+    std::atomic<bool> mismatch_detail_logged{false};
     std::vector<bool> reservation_consumed(kJobs, false);
+    std::vector<size_t> input_index_by_tu(kJobs, kJobs);
     std::mutex consumed_mutex;
     P50ServerEndpointConfig server_config;
     EndpointCaps server_caps;
     server_caps.profile = profile;
     server_caps.supported_profiles = profile_bit(profile);
-    server_config.input_job_state = [&, profile](CStoreGuid, const TxBegin& begin,
+    server_config.input_job_state = [&, profile](CStoreGuid observed_c,
+                                                  const TxBegin& begin,
                                                   const TxCommit& commit,
                                                   std::span<const uint8_t> bytes) {
-        if (begin.profile != profile || begin.tu_seq.value >= input.size() ||
-            bytes.size() != input[begin.tu_seq.value].size() ||
-            !std::equal(bytes.begin(), bytes.end(),
-                        input[begin.tu_seq.value].begin()) ||
-            commit.raw_digest != icecc::digest128(input[begin.tu_seq.value]))
+        size_t input_index = kJobs;
+        if (begin.tu_seq.value < input_index_by_tu.size()) {
+            std::lock_guard lock(consumed_mutex);
+            input_index = input_index_by_tu[begin.tu_seq.value];
+        }
+        const bool in_range = input_index < input.size();
+        const bool same_bytes = in_range &&
+            bytes.size() == input[input_index].size() &&
+            std::equal(bytes.begin(), bytes.end(),
+                       input[input_index].begin());
+        const bool same_digest = in_range &&
+            commit.raw_digest == icecc::digest128(input[input_index]);
+        if (observed_c != c_guid || begin.profile != profile || !in_range ||
+            !same_bytes || !same_digest) {
             exact_input_mismatches.fetch_add(1, std::memory_order_relaxed);
+            if (!mismatch_detail_logged.exchange(true, std::memory_order_relaxed))
+                std::cerr << "P51_SENDER_WINDOW_INPUT_MISMATCH profile="
+                          << profile_name << " tu=" << begin.tu_seq.value
+                          << " in_range=" << in_range
+                          << " begin_profile="
+                          << static_cast<unsigned>(begin.profile)
+                          << " begin_raw=" << begin.raw_bytes
+                          << " actual_size=" << bytes.size()
+                          << " expected_size="
+                          << (in_range ? input[input_index].size() : 0)
+                          << " same_bytes=" << same_bytes
+                          << " same_digest=" << same_digest << "\n";
+        }
         return InputJobState::Open;
     };
     server_config.lookup_p51_link_reservation =
@@ -1837,7 +1864,8 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
                 break;
             }
         }
-        if (index == kJobs || binding.raw_bytes != input[index].size() ||
+        if (index == kJobs || binding.tu_seq.value >= kJobs ||
+            binding.raw_bytes != input[index].size() ||
             binding.raw_digest != icecc::digest128(input[index]) ||
             binding.wire_job_id != armed[index].arm.source.wire_job_id ||
             binding.assignment_nonce != armed[index].arm.source.assignment_nonce ||
@@ -1845,8 +1873,11 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
             return std::nullopt;
         {
             std::lock_guard lock(consumed_mutex);
-            if (reservation_consumed[index]) return std::nullopt;
+            if (reservation_consumed[index] ||
+                input_index_by_tu[binding.tu_seq.value] != kJobs)
+                return std::nullopt;
             reservation_consumed[index] = true;
+            input_index_by_tu[binding.tu_seq.value] = index;
         }
         P51SourceJobLease lease;
         lease.armed = armed[index];
@@ -2012,6 +2043,13 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
                 PrepareRequestKey{3, 100 + index}, deadline.as_steady_time_point(),
                 input[index]), asio::use_future));
     }
+    std::promise<void> submissions_started;
+    std::future<void> submissions_started_future = submissions_started.get_future();
+    asio::post(c_context, [&submissions_started] {
+        submissions_started.set_value();
+    });
+    CHECK(submissions_started_future.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
     {
         std::unique_lock lock(progress_mutex);
         const auto progress_deadline = deadline.as_steady_time_point();
@@ -2026,7 +2064,45 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
                 std::chrono::steady_clock::now() + std::chrono::seconds(1)));
         CHECK(reached_window());
     }
-    CHECK(acknowledged.load(std::memory_order_acquire) == 0);
+    const unsigned sent_before_first_receipt =
+        bundles_sent.load(std::memory_order_acquire);
+    const unsigned ack_before_first_receipt =
+        acknowledged.load(std::memory_order_acquire);
+    size_t unsettled_job_calls = 0;
+    for (size_t index = 0; index != results.size(); ++index) {
+        if (index != 0 && index < 3) continue;
+        if (results[index].wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready)
+            ++unsettled_job_calls;
+    }
+    const bool occupancy_witness_met =
+        sent_before_first_receipt >= required_occupancy &&
+        ack_before_first_receipt == 0;
+    CHECK(unsettled_job_calls == kJobs);
+    if (expect_underfilled_witness) {
+        CHECK(required_occupancy == 30);
+        CHECK(kWindow == 1 && kJobs == 31);
+        CHECK(sent_before_first_receipt == 1);
+        CHECK(ack_before_first_receipt == 0);
+        CHECK(!occupancy_witness_met);
+        std::cerr << "P51_SENDER_SERIAL_CONTROL profile=" << profile_name
+                  << " selected_window=" << kWindow
+                  << " queued_jobs=" << kJobs
+                  << " unsettled_calls=" << unsettled_job_calls
+                  << " demanded_peak=30 observed_peak="
+                  << sent_before_first_receipt
+                  << " witness=underfilled-as-expected\n";
+    } else {
+        CHECK(occupancy_witness_met);
+        CHECK(sent_before_first_receipt == kWindow);
+        CHECK(ack_before_first_receipt == 0);
+        std::cerr << "P51_SENDER_WINDOW profile=" << profile_name
+                  << " selected_window=" << kWindow
+                  << " jobs=" << kJobs
+                  << " unsettled_calls=" << unsettled_job_calls
+                  << " before_first_receipt=" << sent_before_first_receipt
+                  << " PASS\n";
+    }
     hold_receipt_reader.store(false, std::memory_order_release);
     progress_cv.notify_all();
 
@@ -2035,11 +2111,36 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
     const auto duplicate_result = results[1].get();
     CHECK(duplicate_result.status == ZstdSourceTransferStatus::Committed ||
           duplicate_result.status == ZstdSourceTransferStatus::InvalidRequest);
+    if (duplicate_result.status == ZstdSourceTransferStatus::Committed)
+        CHECK(duplicate_result.committed_input == first_result.committed_input);
     CHECK(results[2].get().status == ZstdSourceTransferStatus::InvalidRequest);
-    for (size_t index = 3; index != results.size(); ++index)
-        CHECK(results[index].get().status == ZstdSourceTransferStatus::Committed);
+    std::vector<bool> result_tu_seen(kJobs, false);
+    const auto validate_committed_result = [&](const ZstdSourceTransferResult& result,
+                                               size_t job_index) {
+        CHECK(result.status == ZstdSourceTransferStatus::Committed);
+        CHECK(result.committed_input.has_value());
+        CHECK(result.committed_input->c_store_guid == c_guid);
+        CHECK(result.committed_input->tu_seq.value < kJobs);
+        CHECK(!result_tu_seen[result.committed_input->tu_seq.value]);
+        result_tu_seen[result.committed_input->tu_seq.value] = true;
+        CHECK(result.raw_bytes == input[job_index].size());
+        CHECK(result.raw_digest == icecc::digest128(input[job_index]));
+    };
+    validate_committed_result(first_result, 0);
+    for (size_t job_index = 1; job_index != kJobs; ++job_index)
+        validate_committed_result(results[job_index + 2].get(), job_index);
+    CHECK(std::all_of(result_tu_seen.begin(), result_tu_seen.end(),
+                      [](bool seen) { return seen; }));
     CHECK(committed.load(std::memory_order_acquire) == kJobs);
     CHECK(exact_input_mismatches.load(std::memory_order_relaxed) == 0);
+    std::vector<bool> mapped_job_seen(kJobs, false);
+    for (const size_t job_index : input_index_by_tu) {
+        CHECK(job_index < kJobs);
+        CHECK(!mapped_job_seen[job_index]);
+        mapped_job_seen[job_index] = true;
+    }
+    CHECK(std::all_of(mapped_job_seen.begin(), mapped_job_seen.end(),
+                      [](bool seen) { return seen; }));
     {
         std::unique_lock lock(ack_mutex);
         CHECK(ack_cv.wait_for(lock, std::chrono::seconds(5), [&] {
@@ -2066,8 +2167,42 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
     CHECK(server_result.status == ServerRunStatus::Disconnected);
     f_context.stop();
     f_thread.join();
-    std::cerr << "P51_SENDER_W30_PROFILE=" << profile_name << " PASS\n";
+    if (kWindow == 30 && !expect_underfilled_witness)
+        std::cerr << "P51_SENDER_W30_PROFILE=" << profile_name << " PASS\n";
+}
+
+void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
+    bool fail_first_connector = false) {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        run_p51_sender_window_concurrent_callers(
+            profile, 30, 31, 30, fail_first_connector);
+}
+
+void test_p51_sender_window_matrix() {
+    constexpr std::array<size_t, 6> windows{1, 2, 4, 8, 16, 30};
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        for (const size_t window : windows)
+            run_p51_sender_window_concurrent_callers(
+                profile, window, window + 1, window);
     }
+}
+
+void test_p51_sender_serial_w1_control_fails_w30_witness() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        run_p51_sender_window_concurrent_callers(
+            profile, 1, 31, 30, false, true);
+}
+
+void test_p51_sender_window_matrix_and_serial_control() {
+    test_p51_sender_window_matrix();
+    test_p51_sender_serial_w1_control_fails_w30_witness();
+}
+
+void test_p51_sender_serial_control_only() {
+    test_p51_sender_serial_w1_control_fails_w30_witness();
 }
 
 void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
@@ -4206,6 +4341,18 @@ void test_factory_cannot_extend_absolute_deadline() {
 
 int main(int argc, char** argv) {
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--window-matrix") {
+        test_p51_sender_window_matrix_and_serial_control();
+        std::cerr << "P51_SENDER_WINDOW_MATRIX_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--serial-w1-control") {
+        test_p51_sender_serial_control_only();
+        std::cerr << "P51_SENDER_SERIAL_W1_CONTROL_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--connector-first-failure-w30") {
         test_p51_sender_w30_concurrent_callers_refill_and_duplicate(true);
         std::cerr << "P51_SENDER_CONNECTOR_FIRST_FAILURE_W30_SELECTOR PASS\n";
@@ -4325,9 +4472,8 @@ int main(int argc, char** argv) {
         test_p51_completed_ledger_reserves_live_capacity);
     run("completed_ledger_expired_witness",
         test_p51_expired_retained_witness_retires_capacity_waiters);
-    run("w30_profiles", [] {
-        test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
-    });
+    run("window_matrix_and_serial_control",
+        test_p51_sender_window_matrix_and_serial_control);
     run("connector_first_failure_w30", [] {
         test_p51_sender_w30_concurrent_callers_refill_and_duplicate(true);
     });

@@ -90,6 +90,63 @@ Final helper binary SHA256:
 The published runner differs from that older successful test copy only by
 one wording-only correction to a failure message.
 
+### Sender window matrix and serial control
+
+The real sender passes W1/2/4/8/16/30 across P29V1, ZSTD_TU and
+ZSTD_ROUTE (18 cells). Each queues W+1 jobs, holds receipt processing,
+observes exactly W complete bundles before the first receipt, then drains
+and verifies every source digest and unique committed TU. Reservation-to-TU
+mapping permits legitimate admission reordering rather than assuming
+submission order equals wire order. One connection serves each normal cell.
+
+The serial negative control queues 31 jobs with W1 across all three profiles:
+it observes only one complete bundle while all 31 callers remain unsettled,
+so the same demanded-W30 occupancy witness is false. It then drains all jobs
+and checks exact results. This is an occupancy control, not a speed claim.
+Both `p50zstdsender --window-matrix` and the full sender suite pass (exit 0)
+on the same binary; the matrix is also included in the default suite.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-window-matrix-fdf.1A9DCS/`.
+Test source SHA256:
+`4d2d5194d7c9c84d32b7e5025c1f3dc7794511c949a3724398de315b8815ecd5`.
+Binary SHA256:
+`2fa21a149e0e6a767e269effda87f1f45152e472c07820b85c1a4974336a36bc`.
+
+| Log | SHA256 |
+| --- | --- |
+| `window-matrix-r2.log` | `ba82922475809f95e576f663a1a635714abf14a40ad87338e852d577ca9e8190` |
+| `full-sender.log` | `d4dfdb6c2e1bf9cb7e147e53ff72666a5125ee8bde6562dd99610224c2f8c367` |
+
+This covers sender occupancy/refill, not all D03 fragmentation offsets,
+multiple lost receipts, concurrent mixed-version load or farm speedup.
+
+### Focused sender sanitizer qualification
+
+The completion-ledger capacity and expired-witness selectors, incorrect
+RESET_CONFIRM echo selector, and first-connector-failure W30 selector pass
+with address, undefined-behavior and leak sanitizers (each exit 0). The last
+two selectors cover all three profiles. Sender, route-owner, endpoint and
+test translation units were instrumented; static protocol, local-transport
+and icecc dependencies were not. This is not whole-product instrumentation.
+
+The first expiry run found a test teardown lifetime error: its I/O context
+was destroyed before a sender retaining a pending timer. Declaring the
+context before the sender fixes that fixture. The failing run is retained;
+this finding is not evidence of a reproduced production teardown defect.
+The passing private test source predates the window-matrix additions:
+SHA256 `46ba531698b3fea2740d53d71a8c74aa5cb172c77b0f83a35ecce71d6634d236`.
+Instrumented binary SHA256:
+`4f4c8d79aad7b3106ed38406a9f31661c8f76c33985e6fcec203e7b1b040b2cc`.
+
+Logs under `/tanksmall/scratch/tmp/p51-ledger-cap-green.PNHvSI/sanitize-logs/`:
+
+| `sender-asan-r2-` log suffix | SHA256 |
+| --- | --- |
+| `completed-ledger-cap-w2.log` | `549d80d08350ab50557e836819ce4fe3b3547a36c7424b4aaf4e4911f9a86f60` |
+| `completed-ledger-expired-witness.log` | `3f854d6e4064770f9294b3e3a73e2e6eceeefe83d581a0156405fdb066de15e8` |
+| `mismatched-reset-confirm-echo.log` | `b0165c784022586e2e38cf266d454a32be87722574b9904852ed61092cd4f97c` |
+| `connector-first-failure-w30.log` | `9ec0f3f276998b1ffd04e523885a2449374593e62ec063e89f3057231430b18b` |
+
 ### Bounded sender completion ledger
 
 R2 reserves completion-ledger capacity before admitting a bundle, counting
