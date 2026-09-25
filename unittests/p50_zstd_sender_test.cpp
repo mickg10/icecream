@@ -1097,7 +1097,8 @@ sender_r2_accept_shared_failure(
     co_return results;
 }
 
-void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
+void test_p51_sender_w30_concurrent_callers_refill_and_duplicate(
+    bool fail_first_connector = false) {
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
     const char* const profile_name = profile == ProfileId::P29V1 ? "P29V1"
@@ -1269,7 +1270,12 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
     const tcp::endpoint remote = acceptor.local_endpoint();
     std::atomic<unsigned> connector_calls{0};
     AsyncConnectedFdFactory connector = [&](auto, auto completion) {
-        connector_calls.fetch_add(1, std::memory_order_relaxed);
+        const unsigned call = connector_calls.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (fail_first_connector && call == 1) {
+            completion(-1);
+            return;
+        }
         const int fd = connect_fd(remote);
         if (fd >= 0) {
             const int tiny_send_buffer = 4096;
@@ -1324,6 +1330,12 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
                           << (first.terminal_error
                                   ? first.terminal_error->detail : "none")
                           << "\n";
+                if (fail_first_connector) {
+                    // This selector intentionally checks that the original
+                    // caller survives a connector failure before any R2
+                    // socket, pending receipt, or bundle exists.
+                    CHECK(first.status == ZstdSourceTransferStatus::Committed);
+                }
             }
             if (server_future.wait_for(std::chrono::milliseconds(0)) ==
                 std::future_status::ready) {
@@ -1392,7 +1404,8 @@ void test_p51_sender_w30_concurrent_callers_refill_and_duplicate() {
         }));
     }
     CHECK(acknowledged.load(std::memory_order_acquire) == kJobs);
-    CHECK(connector_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(connector_calls.load(std::memory_order_relaxed) ==
+          (fail_first_connector ? 2U : 1U));
     std::promise<void> retirement_posted;
     auto retirement_done = retirement_posted.get_future();
     asio::post(c_context, [&sender, &retirement_posted] {
@@ -2665,6 +2678,121 @@ void test_p51_sender_deadline_during_recovery_and_ack() {
         1, ProfileId::ZSTD_TU, false, false, true);
 }
 
+void test_p51_sender_initial_connector_retry_is_bounded_and_cancellable() {
+    const auto [c_guid, f_guid] = sender_r2_store_guids();
+    const auto profile = ProfileId::ZSTD_TU;
+    const auto armed = sender_r2_armed(
+        sender_r2_arm(c_guid, 5701, 5702, 1, profile), f_guid, 5703, 1);
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = 1;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    limits.max_live_entries = 4;
+    const PreparationRouteKey route{f_guid, 23, profile};
+    const std::vector<uint8_t> source{'s', 'e', 't', 'u', 'p'};
+
+    {
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            c_guid, caps.zstd, limits, 1, profile);
+        ZstdSourceTransferConfig sender_config = config();
+        sender_config.endpoint_caps = caps;
+        sender_config.authority_limits = limits;
+        std::atomic<unsigned> prepares{0};
+        sender_config.before_prepare_for_route_for_test = [&] {
+            prepares.fetch_add(1, std::memory_order_relaxed);
+        };
+        auto sender = std::make_shared<P50ZstdSourceSender>(
+            authority, route, PrepareRequestKey{3, 5701}, sender_config);
+        asio::io_context context;
+        std::atomic<unsigned> connectors{0};
+        AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+            connectors.fetch_add(1, std::memory_order_relaxed);
+            completion(-1);
+        };
+        const auto start = std::chrono::steady_clock::now();
+        auto result = asio::co_spawn(context,
+            sender->transfer_p51_route(
+                armed, 27, connector, PrepareRequestKey{3, 5701},
+                start + std::chrono::milliseconds(180), source),
+            asio::use_future);
+        context.run();
+        const auto transfer = result.get();
+        CHECK(transfer.status == ZstdSourceTransferStatus::DeadlineExceeded);
+        CHECK(transfer.route_local_failure);
+        CHECK(!transfer.committed_input);
+        CHECK(connectors.load(std::memory_order_relaxed) >= 2);
+        CHECK(connectors.load(std::memory_order_relaxed) < 20);
+        CHECK(prepares.load(std::memory_order_relaxed) == 1);
+        CHECK(std::chrono::steady_clock::now() - start <
+              std::chrono::seconds(2));
+        std::cerr << "P51_SENDER_INITIAL_CONNECTOR_DEADLINE attempts="
+                  << connectors.load() << " prepares=" << prepares.load()
+                  << " PASS\n";
+    }
+
+    {
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            c_guid, caps.zstd, limits, 1, profile);
+        const auto retirement_armed = sender_r2_armed(
+            sender_r2_arm(c_guid, 5711, 5712, 1, profile), f_guid, 5713, 1);
+        ZstdSourceTransferConfig sender_config = config();
+        sender_config.endpoint_caps = caps;
+        sender_config.authority_limits = limits;
+        asio::io_context context;
+        auto work = asio::make_work_guard(context);
+        std::atomic<unsigned> connectors{0};
+        std::atomic<bool> waiter_registered{false};
+        std::weak_ptr<P50ZstdSourceSender> sender_weak;
+        sender_config.after_r2_recovery_waiter_registered_for_test =
+            [&](std::chrono::steady_clock::duration) {
+                waiter_registered.store(true, std::memory_order_release);
+                if (const auto active = sender_weak.lock())
+                    active->retire_for_replacement();
+            };
+        auto sender = std::make_shared<P50ZstdSourceSender>(
+            authority, route, PrepareRequestKey{3, 5711}, sender_config);
+        sender_weak = sender;
+        AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+            connectors.fetch_add(1, std::memory_order_relaxed);
+            completion(-1);
+        };
+        const auto start = std::chrono::steady_clock::now();
+        auto result = asio::co_spawn(context,
+            sender->transfer_p51_route(
+                retirement_armed, 27, connector, PrepareRequestKey{3, 5711},
+                start + std::chrono::seconds(5), source),
+            asio::use_future);
+        std::thread runner([&] { context.run(); });
+        struct RunnerCleanup {
+            asio::io_context& context;
+            std::thread& runner;
+            ~RunnerCleanup() {
+                context.stop();
+                if (runner.joinable()) runner.join();
+            }
+        } runner_cleanup{context, runner};
+        CHECK(result.wait_for(std::chrono::seconds(2)) ==
+              std::future_status::ready);
+        const auto transfer = result.get();
+        CHECK(waiter_registered.load(std::memory_order_acquire));
+        CHECK(transfer.status == ZstdSourceTransferStatus::Unavailable);
+        CHECK(transfer.route_local_failure);
+        CHECK(!transfer.committed_input);
+        CHECK(connectors.load(std::memory_order_relaxed) == 1);
+        CHECK(std::chrono::steady_clock::now() - start <
+              std::chrono::seconds(2));
+        work.reset();
+        context.stop();
+        runner.join();
+        std::cerr << "P51_SENDER_INITIAL_CONNECTOR_RETIRE attempts="
+                  << connectors.load() << " PASS\n";
+    }
+}
+
 void test_route_failure_requires_cold_replacement() {
     ZstdSourceTransferConfig bounded = route_config();
     bounded.authority_limits.max_live_entries = 1;
@@ -3025,6 +3153,18 @@ void test_factory_cannot_extend_absolute_deadline() {
 
 int main(int argc, char** argv) {
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--connector-first-failure-w30") {
+        test_p51_sender_w30_concurrent_callers_refill_and_duplicate(true);
+        std::cerr << "P51_SENDER_CONNECTOR_FIRST_FAILURE_W30_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--initial-connector-bounds") {
+        test_p51_sender_initial_connector_retry_is_bounded_and_cancellable();
+        std::cerr << "P51_SENDER_INITIAL_CONNECTOR_BOUNDS_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--recovery-lost-commit") {
         test_p51_sender_recovers_lost_commit_reply_after_connector_failure();
         std::cerr << "P51_SENDER_RECOVERY_SELECTOR PASS\n";
@@ -3094,7 +3234,14 @@ int main(int argc, char** argv) {
     run("exact_network", test_exact_network_transfer);
     run("route_reuse", test_route_sender_reuses_relationship_for_two_transfers);
     run("route_ledger", test_route_completed_ledger_releases_live_entry);
-    run("w30_profiles", test_p51_sender_w30_concurrent_callers_refill_and_duplicate);
+    run("w30_profiles", [] {
+        test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
+    });
+    run("connector_first_failure_w30", [] {
+        test_p51_sender_w30_concurrent_callers_refill_and_duplicate(true);
+    });
+    run("initial_connector_bounds",
+        test_p51_sender_initial_connector_retry_is_bounded_and_cancellable);
     run("typed_link_rejection", test_p51_sender_typed_link_rejection_is_terminal_and_exact);
     run("shared_typed_rejection", test_p51_sender_typed_rejection_is_shared_route_local);
     run("bad_link_reject_echo", test_p51_client_reject_echo_must_match_current_offer);

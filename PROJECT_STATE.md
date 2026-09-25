@@ -52,6 +52,22 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+The R2 sender now retries failed initial connection setup for the original
+caller, retaining its prepared TU, assignment, and absolute deadline. It uses
+the shared bounded backoff, checks retirement before using a returned fd,
+and does not invoke recovery for a link that never opened. First-attempt
+failure followed by W30 and refill passes for all three profiles with two
+connector calls. Always-failing setup expires with bounded attempts and one
+preparation; retirement wakes the retry wait. The full sender suite passes:
+`/tanksmall/scratch/tmp/p51-connect-retry-r0/build/p51-connect-retry-full-r2.log`,
+SHA256 `e417952ea5423d56901020fb583c90042253845b8f25fe3a7a7bac66a1c438de`,
+`SENDER_FULL_EXIT=0` and retained container exit 0. Binary:
+`9327ac45d9436675db13a9af2369d72c0d1610603d1e0040d31e289e4c1c6c05`;
+sender source: `60b7981db89d4eac4d855a9fa33b06a9762046a1a7257534ef28633f46d22c20`;
+test source: `d383676b5a861cc2cc7976293c4b6959fca3a9da352d985a32e29de74c1a8157`.
+This qualifies the sender change, not the pending daemon multi-link matrix,
+admission-queue refactor, or same-F idle-history retirement changes.
+
 The production C sender passes its W30 regression against the direct F
 endpoint for ZSTD_TU, P29V1 and ZSTD_ROUTE: 30 complete bundles and 30 F commits before C processes
 receipts, then cumulative ACK and ordinal-31 refill on one connection. Exact

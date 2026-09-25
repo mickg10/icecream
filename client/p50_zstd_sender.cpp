@@ -591,6 +591,11 @@ void P50ZstdSourceSender::retire_for_replacement() noexcept {
     }
 }
 
+uint64_t P50ZstdSourceSender::current_r2_physical_generation() const noexcept {
+    return std::max(impl_->r2_physical_link_generation,
+                    impl_->r2_attempted_physical_generation);
+}
+
 boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
     Clock::time_point deadline) {
     const auto executor = co_await boost::asio::this_coro::executor;
@@ -624,6 +629,16 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::acquire_r2_writer(
 
 boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_recovery_retry(
     Clock::time_point deadline) {
+    co_return co_await wait_for_r2_retry_not_before(deadline, true);
+}
+
+boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_connect_retry(
+    Clock::time_point deadline) {
+    co_return co_await wait_for_r2_retry_not_before(deadline, false);
+}
+
+boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_retry_not_before(
+    Clock::time_point deadline, bool require_recovery) {
     const auto executor = co_await boost::asio::this_coro::executor;
     for (;;) {
         if (Clock::now() >= deadline)
@@ -634,7 +649,7 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_recovery_retry(
             std::lock_guard lock(impl_->r2_transfer_mutex);
             if (impl_->route_replacement_required)
                 co_return false;
-            if (!impl_->r2_recovery_required ||
+            if ((require_recovery && !impl_->r2_recovery_required) ||
                 impl_->r2_recovery_retry_not_before <= Clock::now())
                 co_return true;
             waiter = std::make_shared<boost::asio::steady_timer>(executor);
@@ -1472,6 +1487,8 @@ P50ZstdSourceSender::transfer_p51_route(
 
     PreparedTuHandle prepared;
     try {
+        if (impl_->config.before_prepare_for_route_for_test)
+            impl_->config.before_prepare_for_route_for_test();
         prepared = impl_->authority->prepare_for_route(
             impl_->route, request, source);
     } catch (const P29V1CapabilityUnavailable&) {
@@ -1523,6 +1540,7 @@ P50ZstdSourceSender::transfer_p51_route(
     std::shared_ptr<Impl::PendingReceipt> pending;
     bool bundle_complete = false;
     bool recovery_needed = false;
+    bool connector_succeeded = impl_->r2_socket.has_value();
     bool exact_commit_preserved = false;
     std::optional<ZstdSourceRouteRejection> terminal_rejection;
     uint64_t observed_failure_generation = 0;
@@ -1536,9 +1554,39 @@ P50ZstdSourceSender::transfer_p51_route(
              impl_->r2_relationship_epoch != hello.relationship_epoch))
             throw std::invalid_argument("R2 relationship changed on retained socket");
         if (!impl_->r2_socket) {
-            const int fd = co_await await_connected_fd(connection, deadline);
-            if (fd < 0)
-                throw std::runtime_error("R2 link connector failed");
+            int fd = -1;
+            for (;;) {
+                if (!co_await wait_for_r2_connect_retry(deadline))
+                    throw boost::system::system_error(
+                        Clock::now() >= deadline
+                            ? boost::asio::error::timed_out
+                            : boost::asio::error::operation_aborted);
+                if (impl_->route_replacement_required)
+                    throw boost::system::system_error(
+                        boost::asio::error::operation_aborted);
+                fd = co_await await_connected_fd(connection, deadline);
+                if (fd >= 0) {
+                    if (impl_->route_replacement_required ||
+                        Clock::now() >= deadline) {
+                        (void)::close(fd);
+                        throw boost::system::system_error(
+                            impl_->route_replacement_required
+                                ? boost::asio::error::operation_aborted
+                                : boost::asio::error::timed_out);
+                    }
+                    connector_succeeded = true;
+                    break;
+                }
+                if (Clock::now() >= deadline)
+                    throw boost::system::system_error(
+                        boost::asio::error::timed_out);
+                // No LINK_HELLO escaped and no F state exists yet. Retry the
+                // connector under this same writer lease and absolute job
+                // deadline; do not invoke RECOVER or ask the authority to
+                // prepare another TU. The shared timer/backoff is also woken
+                // by retire_for_replacement().
+                impl_->note_r2_recovery_failure();
+            }
             boost::system::error_code error;
             auto socket = P50ClientEndpoint::adopt_connected_fd(executor, fd, error);
             if (!socket) {
@@ -1550,6 +1598,7 @@ P50ZstdSourceSender::transfer_p51_route(
             impl_->r2_relationship_id = hello.relationship_id;
             impl_->r2_relationship_epoch = hello.relationship_epoch;
             impl_->r2_attempted_offer = hello;
+            impl_->reset_r2_recovery_backoff();
             const LinkState state = co_await impl_->endpoint->open_r2_link(
                 *impl_->r2_socket, hello, deadline);
             impl_->r2_hello = hello;
@@ -1752,90 +1801,99 @@ P50ZstdSourceSender::transfer_p51_route(
         } catch (...) {
         }
         if (!exact_commit_preserved) {
-        const uint64_t error_generation = observed_failure_generation != 0
-            ? observed_failure_generation
-            : (pending && pending->sent.binding.physical_link_generation != 0
-                   ? pending->sent.binding.physical_link_generation
-                   : physical_link_generation);
-        bool stale_generation = false;
-        {
+          const uint64_t error_generation =
+              observed_failure_generation != 0
+                  ? observed_failure_generation
+                  : (pending &&
+                             pending->sent.binding.physical_link_generation != 0
+                         ? pending->sent.binding.physical_link_generation
+                         : physical_link_generation);
+          bool stale_generation = false;
+          {
             std::lock_guard lock(impl_->r2_transfer_mutex);
             stale_generation =
                 impl_->r2_physical_link_generation != error_generation;
-        }
-        if (stale_generation && pending && !terminal_rejection) {
+          }
+          if (stale_generation && pending && !terminal_rejection) {
             // Another caller already advanced this relationship to a newer
             // physical link. This waiter's old socket error must not remove,
             // reset, or release the shared pending row. Join it after leaving
             // this handler, since coroutine awaits are not legal in a catch.
             recovery_needed = true;
-        } else {
-        bool has_staged_witness = pending && bundle_complete &&
-            !terminal_rejection.has_value();
-        if (pending && !bundle_complete && impl_->r2_socket &&
-            !terminal_rejection.has_value()) {
-            try {
+          } else {
+            bool has_staged_witness =
+                pending && bundle_complete && !terminal_rejection.has_value();
+            if (pending && !bundle_complete && impl_->r2_socket &&
+                !terminal_rejection.has_value()) {
+              try {
                 auto witnesses = impl_->endpoint->r2_pending_witnesses(
                     impl_->r2_relationship_ordinal - 1);
                 if (witnesses.size() == 1) {
-                    pending->sent = std::move(witnesses.front());
-                    has_staged_witness = true;
+                  pending->sent = std::move(witnesses.front());
+                  has_staged_witness = true;
                 }
-            } catch (...) {}
-        }
-        if (pending && !has_staged_witness) {
-            std::lock_guard lock(impl_->r2_transfer_mutex);
-            auto position = std::find(impl_->r2_receipt_queue.begin(),
-                                      impl_->r2_receipt_queue.end(), pending);
-            if (position != impl_->r2_receipt_queue.end())
+              } catch (...) {
+              }
+            }
+            if (pending && !has_staged_witness) {
+              std::lock_guard lock(impl_->r2_transfer_mutex);
+              auto position = std::find(impl_->r2_receipt_queue.begin(),
+                                        impl_->r2_receipt_queue.end(), pending);
+              if (position != impl_->r2_receipt_queue.end())
                 impl_->r2_receipt_queue.erase(position);
-            if (pending->sent.binding.relationship_ordinal != 0)
+              if (pending->sent.binding.relationship_ordinal != 0)
                 impl_->r2_retained_jobs.erase(
                     pending->sent.binding.relationship_ordinal);
-            pending->failure = transfer_failure;
-            pending->done = true;
-            pending->notification.expires_at(Clock::now());
-        }
-        if (pending && has_staged_witness) {
-            {
-                std::lock_guard lock(impl_->r2_transfer_mutex);
-                auto position = std::find(impl_->r2_receipt_queue.begin(),
-                                          impl_->r2_receipt_queue.end(), pending);
-                if (position != impl_->r2_receipt_queue.end())
-                    impl_->r2_receipt_queue.erase(position);
+              pending->failure = transfer_failure;
+              pending->done = true;
+              pending->notification.expires_at(Clock::now());
             }
-            pending->failure = nullptr;
-            pending->done = false;
-            pending->ready = false;
-        }
-        if (!has_staged_witness) {
-            try {
+            if (pending && has_staged_witness) {
+              {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                auto position =
+                    std::find(impl_->r2_receipt_queue.begin(),
+                              impl_->r2_receipt_queue.end(), pending);
+                if (position != impl_->r2_receipt_queue.end())
+                  impl_->r2_receipt_queue.erase(position);
+              }
+              pending->failure = nullptr;
+              pending->done = false;
+              pending->ready = false;
+            }
+            if (!has_staged_witness) {
+              try {
                 if (impl_->authority->contains(prepared)) {
-                    const auto release_count = impl_->authority->release(prepared);
-                    (void)release_count;
+                  const auto release_count =
+                      impl_->authority->release(prepared);
+                  (void)release_count;
                 }
-            } catch (...) {}
-        }
-        const uint64_t confirmed_floor =
-            impl_->endpoint->r2_confirmed_prefix();
-        {
-            std::lock_guard lock(impl_->r2_transfer_mutex);
-            if (!terminal_rejection.has_value() &&
-                impl_->r2_physical_link_generation == error_generation) {
-                impl_->r2_recovery_required = true;
-                impl_->r2_failed_physical_generation = error_generation;
-                impl_->r2_recovery_floor = confirmed_floor;
-                impl_->route_transport_quarantined = true;
-                if (impl_->r2_socket) {
+              } catch (...) {
+              }
+            }
+            if (connector_succeeded) {
+              const uint64_t confirmed_floor =
+                  impl_->endpoint->r2_confirmed_prefix();
+              {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                if (!terminal_rejection.has_value() &&
+                    impl_->r2_physical_link_generation == error_generation) {
+                  impl_->r2_recovery_required = true;
+                  impl_->r2_failed_physical_generation = error_generation;
+                  impl_->r2_recovery_floor = confirmed_floor;
+                  impl_->route_transport_quarantined = true;
+                  if (impl_->r2_socket) {
                     boost::system::error_code ignored;
                     impl_->r2_socket->close(ignored);
+                  }
                 }
+              }
+              recovery_needed =
+                  !terminal_rejection.has_value() && pending &&
+                  has_staged_witness &&
+                  impl_->r2_physical_link_generation == error_generation;
             }
-        }
-        recovery_needed = !terminal_rejection.has_value() && pending &&
-            has_staged_witness &&
-            impl_->r2_physical_link_generation == error_generation;
-        }
+          }
         }
     }
 

@@ -215,6 +215,9 @@ public:
     // F-incarnation retirement fences the old physical link. Shared owner
     // references held by active calls/pumps keep this sender alive to drain.
     void retire_for_replacement() noexcept;
+    // Owner-affine generation floor used when a strictly newer logical
+    // relationship replaces an idle same-key relationship.
+    [[nodiscard]] uint64_t current_r2_physical_generation() const noexcept;
 
 private:
     using ConnectionTarget =
@@ -237,6 +240,11 @@ private:
         std::chrono::steady_clock::time_point deadline);
     boost::asio::awaitable<bool> wait_for_r2_recovery_retry(
         std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<bool> wait_for_r2_connect_retry(
+        std::chrono::steady_clock::time_point deadline);
+    boost::asio::awaitable<bool> wait_for_r2_retry_not_before(
+        std::chrono::steady_clock::time_point deadline,
+        bool require_recovery);
     boost::asio::awaitable<bool> acquire_r2_writer(
         std::chrono::steady_clock::time_point deadline);
 
