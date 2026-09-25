@@ -187,6 +187,11 @@ struct EndpointIoControl {
     // written successfully. It receives an immutable message copy and cannot
     // change product framing or endpoint state.
     std::function<void(ActorSide, const Message&)> outbound_message_observer;
+    // Test-only copy transform for an F endpoint's RESET_CONFIRM echo. The
+    // server applies and retains the received confirmation before this echo
+    // copy is transformed; product callers leave it unset.
+    std::function<ResetConfirm(const ResetConfirm&)>
+        r2_reset_confirm_echo_transform_for_test;
     // Test-only observation fired after an R2 setup socket is registered for
     // incarnation cancellation and before the first protocol read starts.
     // Product callers leave it unset.

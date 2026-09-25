@@ -761,6 +761,13 @@ asio::awaitable<void> async_write_message(tcp::socket& socket, Message message,
     }
 }
 
+ResetConfirm r2_reset_confirm_echo_for_test(
+    EndpointIoControl& control, const ResetConfirm& applied_confirm) {
+    if (!control.r2_reset_confirm_echo_transform_for_test)
+        return applied_confirm;
+    return control.r2_reset_confirm_echo_transform_for_test(applied_confirm);
+}
+
 template <class Verify>
 asio::awaitable<void> async_report_client_terminal(
     tcp::socket& socket, ErrorMessage terminal, uint32_t max_payload,
@@ -6132,7 +6139,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     throw std::invalid_argument(
                         "R2 RESET_CONFIRM does not match retained reset result");
                 co_await async_write_message(
-                    socket, Message{confirm}, frame_cap,
+                    socket, Message{r2_reset_confirm_echo_for_test(
+                                control, confirm)}, frame_cap,
                     stamp(AsyncOperationKind::WriteFragment),
                     impl_->completions, control, verify);
                 hello.relationship_epoch = confirm.new_relationship_epoch;
@@ -6280,7 +6288,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     throw std::invalid_argument(
                         "R2 RESET_CONFIRM does not match RESET_ACK");
                 co_await async_write_message(
-                    socket, Message{confirm}, frame_cap,
+                    socket, Message{r2_reset_confirm_echo_for_test(
+                                control, confirm)}, frame_cap,
                     stamp(AsyncOperationKind::WriteFragment),
                     impl_->completions, control, verify);
                 hello.relationship_epoch = confirm.new_relationship_epoch;
@@ -6306,7 +6315,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     throw std::invalid_argument(
                         "R2 duplicate RESET_CONFIRM does not match cached outcome");
                 co_await async_write_message(
-                    socket, Message{confirm}, frame_cap,
+                    socket, Message{r2_reset_confirm_echo_for_test(
+                                control, confirm)}, frame_cap,
                     stamp(AsyncOperationKind::WriteFragment),
                     impl_->completions, control, verify);
                 continue;

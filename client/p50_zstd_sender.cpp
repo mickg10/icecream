@@ -234,11 +234,7 @@ struct P50ZstdSourceSender::Impl {
             : owner(value), request(request_value) {}
         R2RequestGuard(const R2RequestGuard&) = delete;
         R2RequestGuard& operator=(const R2RequestGuard&) = delete;
-        ~R2RequestGuard() {
-            if (!owner) return;
-            std::lock_guard lock(owner->r2_transfer_mutex);
-            owner->r2_active_requests.erase(request);
-        }
+        ~R2RequestGuard() { if (owner) owner->finish_r2_request(request); }
         Impl* owner;
         PrepareRequestKey request;
     };
@@ -308,6 +304,7 @@ struct P50ZstdSourceSender::Impl {
             return;
         route_replacement_required = true;
         wake_r2_recovery_waiters();
+        wake_r2_completed_capacity_waiters();
         result.replacement_required = true;
     }
 
@@ -365,6 +362,7 @@ struct P50ZstdSourceSender::Impl {
             r2_recovery_required = false;
         }
         wake_r2_recovery_waiters();
+        wake_r2_completed_capacity_waiters();
         if (r2_socket) {
             boost::system::error_code ignored;
             r2_socket->close(ignored);
@@ -393,6 +391,7 @@ struct P50ZstdSourceSender::Impl {
     std::optional<ZstdSourceTransferResult> completed_for(
         PrepareRequestKey key, std::span<const uint8_t> source,
         Digest128 raw_digest) const {
+        std::lock_guard lock(r2_transfer_mutex);
         const auto position = completed.find(key);
         if (position == completed.end())
             return std::nullopt;
@@ -413,13 +412,24 @@ struct P50ZstdSourceSender::Impl {
     void remember_completed_witness(PrepareRequestKey key, uint64_t raw_bytes,
                                     Digest128 raw_digest,
                                     const ZstdSourceTransferResult& result) {
-        if (completed.size() >= config.max_completed_requests)
-            throw std::length_error("sender completed-request ledger is full");
-        const auto [position, inserted] = completed.emplace(
-            key, CompletedRequest{raw_bytes, raw_digest, result});
-        if (!inserted)
-            throw std::logic_error("sender completed request was admitted twice");
-        (void)position;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            const bool has_reservation =
+                r2_completed_slot_reservations.contains(key);
+            if (!has_reservation &&
+                completed.size() + r2_completed_slot_reservations.size() >=
+                    config.max_completed_requests)
+                throw std::length_error("sender completed-request ledger is full");
+            const auto [position, inserted] = completed.emplace(
+                key, CompletedRequest{raw_bytes, raw_digest, result});
+            if (!inserted)
+                throw std::logic_error(
+                    "sender completed request was admitted twice");
+            (void)position;
+            if (has_reservation)
+                r2_completed_slot_reservations.erase(key);
+        }
+        wake_r2_completed_capacity_waiters();
     }
 
     void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
@@ -469,10 +479,12 @@ struct P50ZstdSourceSender::Impl {
     CompletionLog wire_completions;
     std::unique_ptr<P50ClientEndpoint> endpoint;
     std::optional<boost::asio::ip::tcp::socket> r2_socket;
-    std::mutex r2_transfer_mutex;
+    mutable std::mutex r2_transfer_mutex;
     bool r2_transfer_active = false;
     std::deque<std::shared_ptr<WriterWaiter>> r2_transfer_waiters;
     std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_window_waiters;
+    std::vector<std::shared_ptr<boost::asio::steady_timer>>
+        r2_completed_capacity_waiters;
     // One relationship-wide reconnect gate. All transfer callers observe the
     // same deadline so a W30 suffix cannot multiply immediate reconnects.
     std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_recovery_waiters;
@@ -484,6 +496,10 @@ struct P50ZstdSourceSender::Impl {
     // witness, and PreparedTuHandle/raw source needed by RECOVER/RESET.
     std::map<uint64_t, std::shared_ptr<PendingReceipt>> r2_retained_jobs;
     std::set<PrepareRequestKey> r2_active_requests;
+    // One bounded completed-ledger slot is reserved before an R2 caller can
+    // stage a bundle. A fully-sent unresolved witness keeps its reservation
+    // after the caller returns, until exact commit or terminal cleanup.
+    std::set<PrepareRequestKey> r2_completed_slot_reservations;
     bool r2_reader_running = false;
     uint64_t r2_reader_generation = 0;
     bool r2_ack_pump_running = false;
@@ -510,6 +526,152 @@ struct P50ZstdSourceSender::Impl {
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
 
+    void wake_r2_completed_capacity_waiters() noexcept {
+        std::vector<std::shared_ptr<boost::asio::steady_timer>> wake;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            wake.swap(r2_completed_capacity_waiters);
+        }
+        for (const auto& timer : wake) {
+            boost::system::error_code ignored;
+            timer->expires_at(Clock::now(), ignored);
+        }
+    }
+
+    void finish_r2_request(PrepareRequestKey key) noexcept {
+        bool released_slot = false;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            r2_active_requests.erase(key);
+            const bool retained = std::any_of(
+                r2_retained_jobs.begin(), r2_retained_jobs.end(),
+                [key](const auto& entry) {
+                    return entry.second && entry.second->request == key;
+                });
+            if (!retained)
+                released_slot = r2_completed_slot_reservations.erase(key) != 0;
+        }
+        if (released_slot)
+            wake_r2_completed_capacity_waiters();
+    }
+
+    bool retire_expired_r2_witnesses() noexcept {
+        bool expired = false;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            const auto now = Clock::now();
+            expired = std::any_of(
+                r2_retained_jobs.begin(), r2_retained_jobs.end(),
+                [now](const auto& entry) {
+                    const auto& pending = entry.second;
+                    if (!pending || pending->deadline > now)
+                        return false;
+                    return !(pending->done && !pending->failure &&
+                             pending->client_result.status ==
+                                 ClientRunStatus::Committed &&
+                             pending->client_result.committed_commit.has_value());
+                });
+            if (expired && !route_replacement_required) {
+                // An unresolved exact witness cannot be replayed once its
+                // original ARM deadline has elapsed. Cold-retire this sender
+                // instead of allowing repeated fresh callers to spin through
+                // failed recovery attempts or extending that deadline.
+                route_replacement_required = true;
+                route_transport_quarantined = true;
+            } else {
+                expired = false;
+            }
+        }
+        if (expired) {
+            if (r2_socket) {
+                boost::system::error_code ignored;
+                r2_socket->close(ignored);
+            }
+            wake_r2_recovery_waiters();
+            wake_r2_completed_capacity_waiters();
+        }
+        return expired;
+    }
+
+    bool completed_ledger_full() const noexcept {
+        std::lock_guard lock(r2_transfer_mutex);
+        return completed.size() >= config.max_completed_requests;
+    }
+
+    boost::asio::awaitable<bool> reserve_r2_completed_slot(
+        PrepareRequestKey key, Clock::time_point deadline,
+        bool& permanently_full, bool& recovery_required) {
+        const auto executor = co_await boost::asio::this_coro::executor;
+        permanently_full = false;
+        recovery_required = false;
+        for (;;) {
+            if (Clock::now() >= deadline)
+                co_return false;
+            if (retire_expired_r2_witnesses())
+                co_return false;
+            std::shared_ptr<boost::asio::steady_timer> waiter;
+            Clock::time_point wait_deadline = deadline;
+            {
+                std::lock_guard lock(r2_transfer_mutex);
+                if (route_replacement_required)
+                    co_return false;
+                if (r2_completed_slot_reservations.contains(key))
+                    co_return true;  // The unresolved exact witness owns it.
+                if (r2_recovery_required) {
+                    recovery_required = true;
+                    co_return false;
+                }
+                if (completed.size() >= config.max_completed_requests) {
+                    permanently_full = true;
+                    co_return false;
+                }
+                if (completed.size() + r2_completed_slot_reservations.size() <
+                    config.max_completed_requests) {
+                    r2_completed_slot_reservations.insert(key);
+                    co_return true;
+                }
+                for (const auto& [ordinal, pending] : r2_retained_jobs) {
+                    (void)ordinal;
+                    const bool positive = pending && pending->done &&
+                        !pending->failure &&
+                        pending->client_result.status ==
+                            ClientRunStatus::Committed &&
+                        pending->client_result.committed_commit.has_value();
+                    if (pending && !positive)
+                        wait_deadline = std::min(wait_deadline,
+                                                 pending->deadline);
+                }
+                if (r2_completed_capacity_waiters.size() >=
+                    config.max_completed_requests)
+                    co_return false;
+                try {
+                    waiter = std::make_shared<boost::asio::steady_timer>(executor);
+                    waiter->expires_at(wait_deadline);
+                    r2_completed_capacity_waiters.push_back(waiter);
+                } catch (...) {
+                    co_return false;
+                }
+            }
+            if (config.after_r2_completed_capacity_waiter_registered_for_test) {
+                try {
+                    config.after_r2_completed_capacity_waiter_registered_for_test(key);
+                } catch (...) {
+                    std::lock_guard lock(r2_transfer_mutex);
+                    std::erase(r2_completed_capacity_waiters, waiter);
+                    co_return false;
+                }
+            }
+            boost::system::error_code wait_error;
+            co_await waiter->async_wait(
+                boost::asio::redirect_error(boost::asio::use_awaitable,
+                                            wait_error));
+            {
+                std::lock_guard lock(r2_transfer_mutex);
+                std::erase(r2_completed_capacity_waiters, waiter);
+            }
+        }
+    }
+
     void wake_r2_recovery_waiters() noexcept {
         std::vector<std::shared_ptr<boost::asio::steady_timer>> wake;
         {
@@ -523,14 +685,17 @@ struct P50ZstdSourceSender::Impl {
     }
 
     void note_r2_recovery_failure() noexcept {
-        std::lock_guard lock(r2_transfer_mutex);
-        constexpr auto kBase = std::chrono::milliseconds(5);
-        constexpr auto kMaximum = std::chrono::milliseconds(500);
-        const unsigned exponent = std::min(r2_recovery_failures, 7U);
-        const auto delay = std::min(kMaximum, kBase * (1U << exponent));
-        if (r2_recovery_failures < 7U)
-            ++r2_recovery_failures;
-        r2_recovery_retry_not_before = Clock::now() + delay;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            constexpr auto kBase = std::chrono::milliseconds(5);
+            constexpr auto kMaximum = std::chrono::milliseconds(500);
+            const unsigned exponent = std::min(r2_recovery_failures, 7U);
+            const auto delay = std::min(kMaximum, kBase * (1U << exponent));
+            if (r2_recovery_failures < 7U)
+                ++r2_recovery_failures;
+            r2_recovery_retry_not_before = Clock::now() + delay;
+        }
+        wake_r2_completed_capacity_waiters();
     }
 
     void reset_r2_recovery_backoff() noexcept {
@@ -585,6 +750,7 @@ P50ZstdSourceSender::~P50ZstdSourceSender() = default;
 void P50ZstdSourceSender::retire_for_replacement() noexcept {
     impl_->route_replacement_required = true;
     impl_->wake_r2_recovery_waiters();
+    impl_->wake_r2_completed_capacity_waiters();
     if (impl_->r2_socket) {
         boost::system::error_code ignored;
         impl_->r2_socket->close(ignored);
@@ -892,6 +1058,8 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
             boost::system::error_code ignored;
             timer->expires_at(Clock::now(), ignored);
         }
+        if (!receipt_validated)
+            impl_->wake_r2_completed_capacity_waiters();
         if (start_ack_pump) {
             auto keepalive = shared_from_this();
             boost::asio::co_spawn(
@@ -983,22 +1151,25 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
         } catch (...) {
             const uint64_t confirmed_floor =
                 impl_->endpoint->r2_confirmed_prefix();
-            std::lock_guard lock(impl_->r2_transfer_mutex);
-            if (!impl_->route_replacement_required &&
-                impl_->r2_physical_link_generation == physical_link_generation &&
-                impl_->r2_ack_pump_generation == physical_link_generation) {
-                impl_->r2_recovery_required = true;
-                impl_->r2_failed_physical_generation =
-                    physical_link_generation;
-                impl_->r2_recovery_floor = confirmed_floor;
-                impl_->route_transport_quarantined = true;
-                if (impl_->r2_socket) {
-                    boost::system::error_code ignored;
-                    impl_->r2_socket->close(ignored);
+            {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                if (!impl_->route_replacement_required &&
+                    impl_->r2_physical_link_generation == physical_link_generation &&
+                    impl_->r2_ack_pump_generation == physical_link_generation) {
+                    impl_->r2_recovery_required = true;
+                    impl_->r2_failed_physical_generation =
+                        physical_link_generation;
+                    impl_->r2_recovery_floor = confirmed_floor;
+                    impl_->route_transport_quarantined = true;
+                    if (impl_->r2_socket) {
+                        boost::system::error_code ignored;
+                        impl_->r2_socket->close(ignored);
+                    }
                 }
+                if (impl_->r2_ack_pump_generation == physical_link_generation)
+                    impl_->r2_ack_pump_running = false;
             }
-            if (impl_->r2_ack_pump_generation == physical_link_generation)
-                impl_->r2_ack_pump_running = false;
+            impl_->wake_r2_completed_capacity_waiters();
             co_return;
         }
         {
@@ -1408,11 +1579,13 @@ P50ZstdSourceSender::transfer_p51_route(
     }
     Impl::R2RequestGuard request_guard{impl_.get(), request};
     const auto executor = co_await boost::asio::this_coro::executor;
+    bool completed_slot_reserved = false;
     std::unique_ptr<Impl::R2TransferGuard> writer_guard;
     for (;;) {
         if (!co_await acquire_r2_writer(deadline))
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
         writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
+        (void)impl_->retire_expired_r2_witnesses();
         if (impl_->route_replacement_required)
             co_return impl_->r2_route_replacement_result(
                 ZstdSourceTransferStatus::Unavailable);
@@ -1494,18 +1667,54 @@ P50ZstdSourceSender::transfer_p51_route(
                     failed.r2_link_rejection = std::move(route_rejection);
                     co_return failed;
                 }
+                if (impl_->retire_expired_r2_witnesses() ||
+                    impl_->route_replacement_required)
+                    co_return impl_->r2_route_replacement_result(
+                        ZstdSourceTransferStatus::Unavailable);
                 impl_->note_r2_recovery_failure();
                 ZstdSourceTransferResult failed =
                     impl_->invalid(ZstdSourceTransferStatus::Unavailable);
                 failed.route_local_failure = true;
                 co_return failed;
             } catch (...) {
+                if (impl_->retire_expired_r2_witnesses() ||
+                    impl_->route_replacement_required)
+                    co_return impl_->r2_route_replacement_result(
+                        ZstdSourceTransferStatus::Unavailable);
                 impl_->note_r2_recovery_failure();
                 ZstdSourceTransferResult failed =
                     impl_->invalid(ZstdSourceTransferStatus::Unavailable);
                 failed.route_local_failure = true;
                 co_return failed;
             }
+        }
+        // Recover existing retained witnesses before waiting for capacity.
+        // Those witnesses may own every ledger slot; a fresh caller must be
+        // able to drive their receipt reconciliation, without admitting its
+        // own bundle, rather than waiting forever for a slot it cannot free.
+        if (!completed_slot_reserved) {
+            writer_guard.reset();
+            bool permanently_full = false;
+            bool recovery_required = false;
+            if (!co_await impl_->reserve_r2_completed_slot(
+                    request, deadline, permanently_full, recovery_required)) {
+                if (recovery_required)
+                    continue;
+                if (impl_->route_replacement_required)
+                    co_return impl_->r2_route_replacement_result(
+                        ZstdSourceTransferStatus::Unavailable);
+                if (permanently_full)
+                    co_return impl_->replacement(
+                        ZstdSourceTransferStatus::Unavailable, true);
+                ZstdSourceTransferResult unavailable = impl_->invalid(
+                    Clock::now() >= deadline
+                        ? ZstdSourceTransferStatus::DeadlineExceeded
+                        : ZstdSourceTransferStatus::Unavailable);
+                unavailable.route_local_failure = true;
+                co_return unavailable;
+            }
+            completed_slot_reserved = true;
+            continue;
         }
         if (!impl_->r2_socket)
             break;
@@ -1521,6 +1730,7 @@ P50ZstdSourceSender::transfer_p51_route(
             ZstdSourceTransferResult failed =
                 impl_->invalid(ZstdSourceTransferStatus::Unavailable);
             failed.route_local_failure = true;
+            impl_->wake_r2_completed_capacity_waiters();
             co_return failed;
         }
         if (impl_->endpoint->r2_window_available())
@@ -1551,9 +1761,6 @@ P50ZstdSourceSender::transfer_p51_route(
     if (impl_->route_replacement_required)
         co_return impl_->r2_route_replacement_result(
             ZstdSourceTransferStatus::Unavailable);
-    if (impl_->completed.size() >= impl_->config.max_completed_requests)
-        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable, true);
-
     PreparedTuHandle prepared;
     try {
         if (impl_->config.before_prepare_for_route_for_test)
@@ -1660,6 +1867,7 @@ P50ZstdSourceSender::transfer_p51_route(
             auto socket = P50ClientEndpoint::adopt_connected_fd(executor, fd, error);
             if (!socket) {
                 impl_->route_replacement_required = true;
+                impl_->wake_r2_completed_capacity_waiters();
                 throw std::runtime_error("R2 link socket adoption failed");
             }
             impl_->r2_socket = std::move(*socket);
@@ -2221,7 +2429,7 @@ P50ZstdSourceSender::transfer_bytes(
         result.route_local_failure = impl_->route_transport_quarantined;
         co_return result;
     }
-    if (impl_->completed.size() >= impl_->config.max_completed_requests)
+    if (impl_->completed_ledger_full())
         co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
                                      explicit_route);
 

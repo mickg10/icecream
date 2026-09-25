@@ -12,6 +12,46 @@ retained artifact directories.
 
 ## Developer QA
 
+### Bounded sender completion ledger
+
+R2 reserves completion-ledger capacity before admitting a bundle, counting
+both completed entries and outstanding reservations. An unresolved retained
+request keeps its slot until reconciliation or route retirement. Expired
+unresolved requests cause explicit replacement-required results rather than
+extending the original deadline or leaving fresh callers on an unusable route.
+Validated positive results remain available for exact replay.
+
+The W2/one-entry regression passes: only one bundle commits and is acknowledged;
+its caller receives Committed, while the other receives replacement-required
+Unavailable with zero transfer attempts. Exact replay opens no new connection.
+The expiry regression covers both an already-waiting and a later caller,
+observes completion after the original deadline, and verifies zero connection
+attempts after expiry. The incorrect RESET_CONFIRM echo regression passes for
+all three profiles: callers remain pending until the exact echo is received.
+
+Focused checks and the full `p50zstdsender`, `p50routeowner`, and `p50endpoint`
+executables pass on the same frozen source; each runtime log records exit 0.
+Evidence root: `/tanksmall/scratch/tmp/p51-ledger-cap-green.PNHvSI/logs/`.
+
+| Evidence file | SHA256 |
+| --- | --- |
+| `completed-ledger-expiry-r9.log` | `b960592e68bea2c968cc28f943666264aa024de2a725f6edecd3f53f97efbffd` |
+| `completed-ledger-cap-r10.log` | `3f527b68dcaa27c84e2faa0248d1aa876c1967553a429845c20e148a3f9cf7c3` |
+| `completed-ledger-full-r11-build.log` | `6fd152f607e97b340f01b0c0efa6349068ebcf4d74e9d19a1171fb6aa7a06369` |
+| `completed-ledger-full-r11-p50zstdsender.log` | `520ccc76353dd17b75a7e31e1101aa7d03f2e1935fdbdffaba94126c49506ed0` |
+| `completed-ledger-full-r11-p50routeowner.log` | `0fd9f9d5702ab20a17ce848b69311edb602a70a7420fd3a952e09f3a84d4425b` |
+| `completed-ledger-full-r11-p50endpoint.log` | `6a57fa491804b8908db482ea9e46ce6c09c7d8615b2097b74d77dad891ebf2fe` |
+
+Frozen sender source SHA256 is
+`4abc800fb0bc10f8de1824edc7bbcab2417604700b6189bd2505d3c81b7d046e`;
+endpoint source is
+`c29acf56492ea57ee946203632e96edc4ddc5191c1827a761bb9c5cc6a25c906`;
+sender test source is
+`cbbb1c59bd7339bbeb4596e2037ff3b167e5a934de93e548e9229112d85ba271`.
+This qualifies the sender/endpoint change, not the final daemon-restart,
+mixed-version farm, or performance matrix. It does not establish the cause
+of the separately observed farm delivery backlog.
+
 ### Opt-in source-free diagnostics
 
 `ICECC_P50_DIAGNOSTICS=1` enables bounded retry-decision records and service

@@ -113,6 +113,10 @@ struct ZstdSourceTransferConfig {
     // Test-only observation after the independent reader validated the exact
     // cumulative receipt, before waking callers or starting ACK output.
     std::function<void(uint64_t)> after_r2_receipt_validated_for_test;
+    // Test-only observation after a distinct R2 caller is parked waiting for
+    // completed-ledger capacity; the callback does not affect admission.
+    std::function<void(PrepareRequestKey)>
+        after_r2_completed_capacity_waiter_registered_for_test;
     // Deterministic fault seam: after a complete bundle is on the wire, the
     // callback may request a transport close before the independent receipt
     // reader begins. Product callers leave this empty.
