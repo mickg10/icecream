@@ -12,6 +12,23 @@ retained artifact directories.
 
 ## Developer QA
 
+### Current full-QA failure
+
+Canonical QA on frozen `f0049371` has a confirmed service-fixture failure;
+the overall run is still in progress. AddressSanitizer reports
+`stack-use-after-scope` in `d11_output_cap_client`: its `capped_armed` reference
+binds a temporary array at the coroutine call, which expires before
+`io_context::run()` resumes the coroutine. This is a test-helper lifetime bug,
+not evidence of a production endpoint defect. Earlier ordinary service passes
+do not establish sanitizer qualification. An owning-argument fix and focused
+plus full service sanitizer reruns are pending in an isolated tree.
+
+Retained log:
+`/tanksmall/scratch/tmp/p51-f004-qa-scratch.bxOlfG/icecream-qa-vjyj7uml/current/build/unittests/p50cacheservice-sanitize.log`,
+SHA256 `9370973a6739d6f4328e8672c647841989af3a689db029474e20e0aff2ae1f88`.
+The original full-QA snapshot remains unchanged to collect its remaining
+results. It must not be reported as passing.
+
 ### Compiler fingerprint validation speed
 
 Root-header corpus promotion now hashes each distinct resolved compiler once
