@@ -442,8 +442,16 @@ and `typed-missing-service-complete.log` (SHA256
 `15778027ffb7d6be70629e69af497a0157cc64de6807cf79d8b1417979233320`).
 Earlier incomplete invocations omitted required test environment settings;
 they are not passes. This does not yet prove a real same-F missing-reservation
-followed by fresh assignment and healthy sibling progress. The real multi-link
-daemon fixture remains separate work.
+followed by fresh assignment and healthy sibling progress. An additional
+owner/lifecycle unit now checks that an evicted idle relationship can be
+reassigned on the same F incarnation, a live sibling keeps its relationship,
+and a mismatched logical offer is Invalid. It directly records synthetic
+commit/ACK state: it does not transfer or materialize source bytes. Full
+service-suite evidence: `logs/same-f-owner-rerun-r2.log` under that root
+(SHA256 `73bfc5bcbb6b06e6a3987b5d251edcc60712b5ae3e58f02642d1007fcf1e1382`),
+exit 0. Test source: `7d396847bcf882b060b493827a80db4f511bdd046ed2ae0c0b9e000de6764759`;
+binary: `9af5ccdc625da05076e4046bd4b55c609f98a5d9bd1604133aec11a1becffa01`.
+The real multi-link daemon fixture remains separate work.
 
 The current recovery service passes the scoped ZSTD_TU restart rerun for
 C1F2/F-cache and C2F1/C-cache: an established healthy sibling attaches while

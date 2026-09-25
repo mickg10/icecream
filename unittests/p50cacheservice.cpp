@@ -2157,6 +2157,159 @@ void test_p51_reservation_profile_mask_mapping() {
     std::puts("P51_RESERVATION_OWNER profile-mask-mapping/all-three: ok");
 }
 
+void test_p51_same_f_missing_relationship_reassignment_keeps_sibling() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x4b;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    auto remote_c = [](uint8_t tag) {
+        StoreIdentityRoot root{};
+        root.bytes[15] = tag;
+        return c_store_guid_for_root(root);
+    };
+    const CStoreGuid old_c = remote_c(0x4c);
+    const CStoreGuid sibling_c = remote_c(0x4d);
+    const CStoreGuid pressure_c = remote_c(0x4e);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_route_relationships = 2;
+    config.max_pending_p51_source_reservations = 8;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto reserve = [&](const CStoreGuid& c_guid, uint64_t c_generation,
+                       uint64_t request_id) {
+        return test_p51_reservation_request(
+            c_guid, c_generation, launch.identity.generation,
+            launch.identity.attempt, request_id, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::seconds(20));
+    };
+    auto old_request = reserve(old_c, 81, 8101);
+    const auto old_result = runtime.reserve_p51_source_on_owner(old_request);
+    CHECK(old_result.error_code == 0 && old_result.armed.has_value());
+    const P51SourceArmedFields old_armed = *old_result.armed;
+
+    auto sibling_request = reserve(sibling_c, 82, 8201);
+    const auto sibling_result = runtime.reserve_p51_source_on_owner(
+        sibling_request);
+    CHECK(sibling_result.error_code == 0 && sibling_result.armed.has_value());
+    const P51SourceArmedFields sibling_armed = *sibling_result.armed;
+    LinkHello sibling_link = test_p51_link_hello(
+        sibling_armed, 81, HistoryNonce{0x810001});
+    runtime.run_owner_callback_for_test([&] {
+        const auto link = runtime.lookup_p51_link_reservation_on_owner(
+            sibling_link);
+        CHECK(link.status == P51SourceLinkLookupStatus::Found &&
+              link.lease.has_value());
+    });
+
+    auto make_commit = [](const LinkHello& link, const JobBind& binding) {
+        R2TxCommit commit;
+        commit.relationship_ordinal = binding.relationship_ordinal;
+        commit.binding_digest = compute_r2_binding_digest(binding);
+        commit.transaction_digest = icecc::digest128(
+            "same-f-retirement/" +
+            std::to_string(binding.relationship_ordinal));
+        commit.inner.history_nonce = link.history_nonce;
+        commit.inner.rel_seq = RelSeq{binding.relationship_ordinal - 1};
+        commit.inner.tu_seq = binding.tu_seq;
+        commit.inner.transaction_digest = commit.transaction_digest;
+        commit.inner.raw_digest = binding.raw_digest;
+        return commit;
+    };
+    auto commit_exact = [&](const LinkHello& link,
+                            const P51SourceArmedFields& armed,
+                            uint64_t ordinal, uint64_t tu_seq,
+                            std::string_view raw) {
+        const JobBind binding = test_p51_job_binding(
+            armed, link.physical_link_generation, ordinal, tu_seq, raw);
+        bool committed = false;
+        runtime.run_owner_callback_for_test([&] {
+            const auto lease = runtime.consume_p51_job_reservation_on_owner(
+                link, binding);
+            CHECK(lease.has_value());
+            CHECK(runtime.authorize_p51_job_publication_on_owner(link, binding));
+            const auto commit = make_commit(link, binding);
+            CHECK(runtime.record_p51_job_commit_on_owner(
+                link, binding, commit));
+            CommitAck ack{link.relationship_id, link.relationship_epoch,
+                          link.physical_link_generation, ordinal};
+            CHECK(runtime.acknowledge_p51_receipt_on_owner(link, ack));
+            committed = true;
+        });
+        return committed;
+    };
+
+    // Establish a live sibling link and commit once before the missing
+    // relationship is retired. Its second job below proves the exact sibling
+    // relationship remains usable after old-C eviction and fresh assignment.
+    CHECK(commit_exact(sibling_link, sibling_armed, 1, 0,
+                       "healthy sibling before miss"));
+
+    CHECK(runtime.cancel_p51_source_on_owner(
+        old_request.arm, old_armed.reservation_id,
+        old_request.absolute_deadline.as_steady_time_point()));
+    auto pressure_request = reserve(pressure_c, 83, 8301);
+    const auto pressure_result = runtime.reserve_p51_source_on_owner(
+        pressure_request);
+    CHECK(pressure_result.error_code == 0 && pressure_result.armed.has_value());
+    const P51SourceArmedFields pressure_armed = *pressure_result.armed;
+    CHECK(runtime.cancel_p51_source_on_owner(
+        pressure_request.arm, pressure_armed.reservation_id,
+        pressure_request.absolute_deadline.as_steady_time_point()));
+
+    LinkHello old_reconnect = test_p51_link_hello(
+        old_armed, 82, HistoryNonce{0x820001}, LinkStartMode::Reconnect);
+    old_reconnect.physical_link_generation = 82;
+    P51SourceLinkLookupResult stale_lookup;
+    runtime.run_owner_callback_for_test([&] {
+        stale_lookup = runtime.lookup_p51_link_reservation_on_owner(
+            old_reconnect);
+    });
+    CHECK(stale_lookup.status ==
+          P51SourceLinkLookupStatus::ReservationMissing);
+
+    auto fresh_request = reserve(old_c, 81, 8102);
+    const auto fresh_result = runtime.reserve_p51_source_on_owner(fresh_request);
+    CHECK(fresh_result.error_code == 0 && fresh_result.armed.has_value());
+    const P51SourceArmedFields fresh_armed = *fresh_result.armed;
+    CHECK(fresh_armed.f_store_guid == old_armed.f_store_guid &&
+          fresh_armed.f_store_generation == old_armed.f_store_generation &&
+          fresh_armed.logical_relationship_id != old_armed.logical_relationship_id &&
+          fresh_armed.relationship_epoch > old_armed.relationship_epoch);
+    LinkHello fresh_link = test_p51_link_hello(
+        fresh_armed, 83, HistoryNonce{0x830001});
+    auto sibling_next_request = reserve(sibling_c, 82, 8202);
+    const auto sibling_next_result = runtime.reserve_p51_source_on_owner(
+        sibling_next_request);
+    CHECK(sibling_next_result.error_code == 0 &&
+          sibling_next_result.armed.has_value());
+    const P51SourceArmedFields sibling_next = *sibling_next_result.armed;
+    CHECK(sibling_next.logical_relationship_id ==
+          sibling_armed.logical_relationship_id);
+    runtime.run_owner_callback_for_test([&] {
+        const auto fresh_lookup =
+            runtime.lookup_p51_link_reservation_on_owner(fresh_link);
+        CHECK(fresh_lookup.status == P51SourceLinkLookupStatus::Found &&
+              fresh_lookup.lease.has_value());
+        auto stale_logical_offer = sibling_link;
+        stale_logical_offer.relationship_id = Id128::from_u64(0xdeadbeef);
+        stale_logical_offer.reservation_id =
+            Id128{sibling_next.reservation_id};
+        const auto stale = runtime.lookup_p51_link_reservation_on_owner(
+            stale_logical_offer);
+        CHECK(stale.status == P51SourceLinkLookupStatus::Invalid);
+    });
+
+    CHECK(commit_exact(sibling_link, sibling_next, 2, 1,
+                       "healthy sibling after miss"));
+    CHECK(commit_exact(fresh_link, fresh_armed, 1, 0,
+                       "fresh same-F relationship assignment"));
+    std::puts("P51_RESERVATION_OWNER same-F missing/reassignment preserves sibling: ok");
+}
+
 void test_route_endpoint_cap_refuses_before_f_open() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 9;
@@ -6551,6 +6704,7 @@ int main(int argc, char** argv) {
         test_p51_reservation_capacity_120_cancel_and_expiry();
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_reservation_profile_mask_mapping();
+        test_p51_same_f_missing_relationship_reassignment_keeps_sibling();
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();
