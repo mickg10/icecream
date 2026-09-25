@@ -862,6 +862,19 @@ eight outstanding materializations remain distinct constraints to reconcile,
 not constants to increase blindly. Stage A's default four active operations
 also must not silently prevent the W30 gate from reaching thirty.
 
+Scheduler dispatch credit is a separate end-to-end bound. The current default
+is 32 unconfirmed assignments per submitter, further clamped to one fewer
+than the advertised remote farm slots (minimum one). Credit returns on
+JobBegin or terminal settlement, not on source-bundle transmission. Thus a
+receipt-held C1F1/W30 fixture needs at least 31 advertised worker slots even
+though it launches only 30 jobs. A real C1F4 fixture demanding 30 held
+transfers on every link needs dispatch credit at least 120 and advertised
+remote capacity at least 121, in addition to sufficient per-worker capacity
+and the source-stage budgets. Record configured and effective dispatch credit
+with measured per-link occupancy. Do not infer end-to-end 4xW30 occupancy
+from isolated cache-link tests or raise production dispatch bounds without
+measuring their effects on queued work and recovery.
+
 Initial rollout keeps R2 opt-in and W1. For R2 tests expose validated window,
 raw-byte, encoded-byte, F-output-byte and metadata-count settings through one
 configuration path; reject zero/overflow/inconsistent budgets at startup.
