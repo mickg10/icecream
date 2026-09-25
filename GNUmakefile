@@ -17,7 +17,7 @@ ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
 
-.PHONY: python-sync dev-bootstrap qa
+.PHONY: python-sync dev-bootstrap dev-gate qa
 python-sync:
 	@sh "$(CURDIR)/dev/python.sh" --sync
 
@@ -30,6 +30,13 @@ dev-bootstrap qa:
 	@$(ICEFARM_SCRATCH_GUARD)
 	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B dev/bootstrap.py \
 		$(if $(filter qa,$@),qa,bootstrap) \
+		--farm "$(if $(ICEFARM_USER_FARM),$(FARM),$(CURDIR)/farm.json)"
+
+dev-gate:
+	@$(ICEFARM_SCRATCH_GUARD)
+	@test -n "$(strip $(GATE))" || { echo "set GATE to a supported opt-in gate" >&2; exit 2; }
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B dev/bootstrap.py \
+		gate --gate "$(GATE)" \
 		--farm "$(if $(ICEFARM_USER_FARM),$(FARM),$(CURDIR)/farm.json)"
 
 .PHONY: integration_source_archives integration_images integration_smoke integration_controls \

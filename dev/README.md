@@ -15,6 +15,10 @@ The default is two CPU jobs and an 8 GiB build-container limit. Every invocation
 retains its unique run directory; remove selected old results when no longer
 needed. `make dev-bootstrap` builds/installs without running QA. `make qa`
 performs the build itself; no preliminary bootstrap command is required.
+For a supported opt-in process gate, run (for example)
+`ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p51-arm-expiry`; the command
+builds this checkout in a unique scratch run and invokes the bounded gate in a
+separate disposable root container.
 On normal exit, build output ownership returns to the invoking host user.
 The container's `/tmp` also maps into the selected run directory, covering
 older tests that ignore `TMPDIR`.
@@ -55,14 +59,24 @@ ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
 inside the container, an unprivileged `icecc` account, usable `iptables` with
 Docker `NET_ADMIN`, and writable scratch-backed `ICEFARM_TMPDIR`. The daemon
 account must be able to traverse the build path and temporary directory.
-The current SDK image does not create the `icecc` account; prepare that test
-identity in the disposable image before invoking these targets.
-Mount scratch at a short container path such as `/work/tmp`: these fixtures
-create Unix-domain sockets with a limited path length.
+Direct invocations of the unit-test targets require an `icecc` account in the
+test container. The supported `dev-gate` entrypoint creates that test-only
+identity inside its disposable container; it never changes the host account
+database.
+The supported runner bind-mounts the selected host scratch directory at
+container `/tmp` (and sets `ICEFARM_TMPDIR=/tmp` there); these fixtures create
+Unix-domain sockets with a limited path length, so do not substitute a longer
+container path.
 Use a private Docker bridge network, never `--network=host`; do not run these
 network-redirection fixtures directly on the host. The scheduler-restart gate
 requires the explicit private-namespace opt-in shown above because its receipt
 helper installs a temporary namespace-local OUTPUT redirection rule.
+`dev-gate GATE=...` currently allowlists `p51-arm-expiry`, `p51-restart-w30`,
+and `p51-scheduler-restart-w30`; it creates a private internal bridge, grants
+only `NET_ADMIN`, and retains uniquely named logs under the run's
+`/work/artifacts`. A missing prerequisite or skip result is a failure, not a
+pass. Build outputs are reused only inside the same unique source snapshot and
+SDK run; no configured objects are reused across checkouts.
 
 The multi-link gate covers C1F2/3/4 and C2/3/4F1 for all three profiles, with
 30 outstanding jobs per link (at most 120 total). It checks exact input

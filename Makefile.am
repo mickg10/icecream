@@ -12,6 +12,8 @@ EXTRA_DIST = README.md \
 	dev/Dockerfile \
 	dev/Dockerfile.runtime \
 	dev/run-qa.sh \
+	dev/run-gate.sh \
+	dev/gate-result.py \
 	dev/mixed.py \
 	dev/README.md \
 	PROJECT_STATE.md \
@@ -63,7 +65,7 @@ ICEFARM_SOURCE_LABELS = $(ICEFARM_SEALED_LABELS)
 ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
 
-.PHONY: python-sync dev-bootstrap qa
+.PHONY: python-sync dev-bootstrap dev-gate qa
 python-sync:
 	sh "$(abs_top_srcdir)/dev/python.sh" --sync
 
@@ -71,6 +73,15 @@ dev-bootstrap qa:
 	$(ICEFARM_SCRATCH_GUARD)
 	$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B "$(abs_top_srcdir)/dev/bootstrap.py" \
 		$(if $(filter qa,$@),qa,bootstrap) \
+		--farm "$(if $(ICEFARM_USER_FARM),$(FARM),$(abs_top_srcdir)/farm.json)"
+
+# Build this checkout in a unique scratch run, then execute one allowlisted
+# process gate in a separate root container on a private bridge network.
+dev-gate:
+	$(ICEFARM_SCRATCH_GUARD)
+	@test -n "$(strip $(GATE))" || { echo "set GATE to a supported opt-in gate" >&2; exit 2; }
+	$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -B "$(abs_top_srcdir)/dev/bootstrap.py" \
+		gate --gate "$(GATE)" \
 		--farm "$(if $(ICEFARM_USER_FARM),$(FARM),$(abs_top_srcdir)/farm.json)"
 
 .PHONY: integration_source_archives integration_images integration_smoke integration_controls \

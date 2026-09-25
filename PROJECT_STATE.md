@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### Supported Docker process-gate entrypoint
+
+`ICEFARM_TMPDIR=/existing/scratch make dev-gate GATE=p51-arm-expiry`
+now builds a unique checkout snapshot and runs an allowlisted process gate
+inside a bounded disposable container. The runner supplies the `icecc` test
+identity, private bridge, NET_ADMIN, offline locked Python environment and
+short scratch-backed `/tmp`. It rejects skips and incomplete pass markers,
+retains artifacts, and removes only its labeled container/network. Selectors
+also exist for W30 cache restart and scheduler restart; this qualification
+does not claim those selectors have run through the new entrypoint yet.
+
+Luna's 40 focused bootstrap tests pass, including cleanup timeouts and the
+runtime result policy. On nas642, direct `dev/bootstrap.py gate --gate
+p51-arm-expiry --farm farm.json` passes: build 186.04 seconds, three-profile
+gate 52.10 seconds, both exit 0, with no remaining owned gate resources.
+The unconfigured `make dev-gate` route was checked by dry-run, not a second
+full build. Evidence: `/tanksmall/scratch/tmp/icecream-qa-_n481ial/result.json`,
+SHA256 `21219676658d615ecbdfaf443e2c749c9f0eafd461541a6f19aac35648877368`;
+source snapshot `b36f1b3d3b4ca13163208cd00b24bab728a20a7b1f52be946ecb0d349e0efced`.
+Outer gate log SHA256
+`f936e4d695c63fb042add6be78a137b1bc1bd2718404cc7e98ee35b503960a5a`.
+The SDK is `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, with 2 CPUs/8 GiB;
+later README-only wording clarifies the required short mount path.
+
 ### R2 source-trace measurement gap
 
 Source audit of both `ef29049c` and product `03d108a3` finds that R2 results

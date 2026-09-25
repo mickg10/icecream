@@ -372,7 +372,7 @@ p50daemonpositive-p51-restart-check: p50daemonpositive
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
 	$(SHELL) '$(srcdir)/p50daemonpositive-p51-restart.sh'
 .PHONY: p50daemonpositive-p51-restart-w30-check
-p50daemonpositive-p51-restart-w30-check: p50daemonpositive
+p50daemonpositive-p51-restart-w30-check: p50daemonpositive ../daemon/iceccd ../cache/icecc-cache-service
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
 	$(SHELL) '$(srcdir)/p50daemonpositive-p51-restart-w30.sh'

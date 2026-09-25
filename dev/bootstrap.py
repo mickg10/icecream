@@ -21,6 +21,19 @@ LEGACY_COMMIT = "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89"
 BASES = {"ubuntu24.04": "ubuntu:24.04", "ubuntu22.04": "ubuntu:22.04"}
 FIELDS = {"version", "profile", "image_repository", "jobs", "memory_gb",
           "base_image", "http_proxy", "image_bundle", "offline"}
+GATE_TARGETS = {
+    "p51-arm-expiry": ("p50daemonpositive-p51-arm-expiry-check", 240),
+    "p51-restart-w30": ("p50daemonpositive-p51-restart-w30-check", 4200),
+    "p51-scheduler-restart-w30": ("p51schedulerrestart-w30-check", 1800),
+}
+GATE_OFFLINE_ENV = (
+    "UV_OFFLINE=1",
+    "UV_PYTHON_DOWNLOADS=never",
+    "UV_PYTHON_INSTALL_DIR=/opt/uv-python",
+    "UV_CACHE_DIR=/work/uv-cache",
+    "UV_PROJECT_ENVIRONMENT=/work/python-env",
+    "VIRTUAL_ENV=/work/python-env",
+)
 
 
 class BootstrapError(RuntimeError):
@@ -239,6 +252,108 @@ def build_source(run: Run, image: str, source: Path, spec: dict, name: str, mode
     return work
 
 
+def gate_spec(name: str) -> tuple[str, int]:
+    try:
+        return GATE_TARGETS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(GATE_TARGETS))
+        raise BootstrapError(f"unsupported opt-in gate {name!r}; choose one of: {choices}") from exc
+
+
+def _cleanup_gate_resource(kind: str, name: str, run_id: str) -> str | None:
+    if kind == "container":
+        template = "{{json .Config.Labels}}"
+        label_key = "icecream.dev.gate.id"
+        remove = ["docker", "container", "rm", "-f", name]
+    elif kind == "network":
+        template = "{{json .Labels}}"
+        label_key = "icecream.dev.gate.id"
+        remove = ["docker", "network", "rm", name]
+    else:
+        raise AssertionError(kind)
+    try:
+        inspected = subprocess.run(
+            ["docker", kind, "inspect", "--format", template, name],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not inspect owned {kind} {name}: {exc}"
+    if inspected.returncode != 0:
+        if "no such" in inspected.stderr.lower() or "not found" in inspected.stderr.lower():
+            return None
+        return f"could not inspect owned {kind} {name}: {inspected.stderr.strip()}"
+    try:
+        labels = json.loads(inspected.stdout)
+    except json.JSONDecodeError:
+        return f"could not parse labels for owned {kind} {name}"
+    if not isinstance(labels, dict) or labels.get(label_key) != run_id:
+        return f"refusing to remove {kind} {name}: ownership label does not match"
+    try:
+        removed = subprocess.run(remove, capture_output=True, text=True,
+                                 timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not remove owned {kind} {name}: {exc}"
+    if removed.returncode != 0:
+        return f"could not remove owned {kind} {name}: {removed.stderr.strip()}"
+    return None
+
+
+def run_gate(run: Run, image: str, source: Path, work: Path,
+             spec: dict, name: str) -> dict:
+    target, timeout_s = gate_spec(name)
+    run_id = uuid.uuid4().hex
+    suffix = run_id[:12]
+    network = f"icecream-gate-{suffix}"
+    container = f"icecream-gate-{suffix}"
+    ownership_label = f"icecream.dev.run={run.root.name}"
+    gate_label = f"icecream.dev.gate.id={run_id}"
+    temp = work / "tmp"
+    if not temp.is_dir():
+        raise BootstrapError("gate build scratch is missing; refusing an implicit /tmp fallback")
+
+    failure: Exception | None = None
+    cleanup_errors: list[str] = []
+    try:
+        run.command("gate-network-create", [
+            "docker", "network", "create", "--driver", "bridge", "--internal",
+            "--label", ownership_label, "--label", gate_label, network,
+        ], timeout=30)
+        argv = [
+            "docker", "run", "--name", container, "--pull=never",
+            "--label", ownership_label, "--label", gate_label,
+            "--network", network, "--cap-add", "NET_ADMIN",
+            "--cpus", str(spec["jobs"]), "--memory", f"{spec['memory_gb']}g",
+            "--env", f"ICEFARM_OUTPUT_UID={os.getuid()}",
+            "--env", f"ICEFARM_OUTPUT_GID={os.getgid()}",
+            "--env", f"ICECREAM_GATE_RUN_ID={run_id}",
+            *[item for value in GATE_OFFLINE_ENV for item in ("--env", value)],
+            "--mount", f"type=bind,src={source},dst=/source,readonly",
+            "--mount", f"type=bind,src={work},dst=/work",
+            "--mount", f"type=bind,src={temp},dst=/tmp",
+            "--workdir", "/work", "--entrypoint", "/bin/bash", image,
+            "/source/dev/run-gate.sh", name,
+        ]
+        # The outer deadline leaves time for Docker to return and our finally
+        # block to remove only the uniquely labeled container/network.
+        run.command(f"gate-{name}", argv, timeout=timeout_s + 60)
+    except Exception as exc:
+        failure = exc
+    finally:
+        for kind, resource in (("container", container), ("network", network)):
+            problem = _cleanup_gate_resource(kind, resource, run_id)
+            if problem is not None:
+                cleanup_errors.append(problem)
+
+    if failure is not None:
+        if cleanup_errors:
+            raise BootstrapError(f"{failure}; cleanup errors: {'; '.join(cleanup_errors)}") from failure
+        raise failure
+    if cleanup_errors:
+        raise BootstrapError("opt-in gate cleanup failed: " + "; ".join(cleanup_errors))
+    return {"name": name, "target": target, "timeout_s": timeout_s,
+            "container": container, "network": network}
+
+
 def product_image(run: Run, sdk: str, work: Path, name: str, identity: str) -> str:
     reference = f"icecream-dev:{name}-{identity[:16]}"
     # Dockerfile FROM needs a named image, not the sha256 image ID returned by
@@ -272,12 +387,17 @@ def legacy_source(run: Run) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("bootstrap", "qa"))
+    parser.add_argument("action", choices=("bootstrap", "qa", "gate"))
+    parser.add_argument("--gate", choices=tuple(sorted(GATE_TARGETS)))
     parser.add_argument("--farm", type=Path, default=ROOT / "farm.json")
     parser.add_argument("--image-repo", default=os.environ.get("IMAGE_REPO"))
     args = parser.parse_args(argv)
+    if args.action == "gate" and args.gate is None:
+        parser.error("gate action requires --gate")
+    if args.action != "gate" and args.gate is not None:
+        parser.error("--gate is valid only with the gate action")
     run = None
-    report = {"status": "FAIL", "action": args.action}
+    report = {"status": "FAIL", "action": args.action, "gate": args.gate}
     try:
         spec = load_spec(args.farm, args.image_repo)
         scratch = scratch_root()
@@ -301,8 +421,13 @@ def main(argv: list[str] | None = None) -> int:
                       sdk_reference=run.sdk_reference,
                       image_repository=spec["image_repository"], docker_root=str(storage),
                       docker_host=info.get("Name"), architecture=info.get("Architecture"))
-        current = build_source(run, sdk, source, spec, "current", args.action)
-        if args.action == "qa":
+        build_mode = "bootstrap" if args.action == "gate" else args.action
+        current = build_source(run, sdk, source, spec, "current", build_mode)
+        if args.action == "gate":
+            assert args.gate is not None
+            report["gate_result"] = run_gate(run, sdk, source, current,
+                                             spec, args.gate)
+        elif args.action == "qa":
             current_image = product_image(run, sdk, current, "current", identity)
             report["current_image"] = current_image
             old_source = legacy_source(run)
