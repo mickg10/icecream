@@ -398,8 +398,19 @@ Evidence: `logs/rejection-expanded-r3.log` under the typed-reject root above
 `f20ba1e76cdfcf522a94c78c2c327cc9be61d2cd48b097ecac285f22ff4f5ebb`;
 binary: `f0962b18b36238fc33591a74ad71cee801106389c4f95ea3b7028cc55ed85103`.
 These focused selectors use the preceding committed product snapshot, not
-the subsequent typed lookup. Rejection during the same original caller's
-ACK/recovery after a validated receipt remains under qualification.
+the subsequent typed lookup. The ZSTD_TU positive-result gate now also passes
+for the same original caller: F waits for C to validate COMMIT, then resets
+the socket before C can send its ACK. The reconnect receives a typed
+ReservationMissing, but the original result and exact replay stay Committed
+and retain that rejection for route cleanup. The sibling-rejection case is
+retained and also passes. Evidence under the same typed-reject logs root:
+`same-caller-barrier-runtime-r3.log`, SHA256
+`76473bf6db529f2d2695a7720b5e1e006ca6be48edea918c72bcc548c9ab1a17`,
+`DOCKER_EXIT=0`. Test source SHA256:
+`0d78c2e18a965a18320ba883cff4d994d898e3768e6b5f1e7fdfce6b641781a7`;
+binary: `94b1fcfbae8defe700156708cf838b47e1d7f45ee5b1c5764ed08ab13a5f78fe`.
+This focused sender test is not a real service missing-reservation recovery
+or an all-profile qualification of this specific failure boundary.
 
 The runtime now distinguishes definite reservation absence from an invalid
 offer in one owner-thread lookup. Only an absent initial reservation or

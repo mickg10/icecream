@@ -961,7 +961,9 @@ sender_r2_accept_shared_failure(
     std::atomic<bool>* stop_reconnect_listener = nullptr,
     std::atomic<unsigned>* rejected_reconnects = nullptr,
     bool close_reconnect_after_hello = false,
-    bool reject_after_positive_receipt = false) {
+    bool reject_after_positive_receipt = false,
+    std::atomic<bool>* positive_receipt_validated = nullptr,
+    std::atomic<bool>* server_reset_complete = nullptr) {
     const size_t connection_count =
         (reject_stale_reconnect || close_reconnect_after_hello ||
          reject_after_positive_receipt) ? 1
@@ -974,7 +976,24 @@ sender_r2_accept_shared_failure(
         socket.set_option(tcp::socket::receive_buffer_size(4096));
         EndpointIoControl control;
         if (index == 0 && reject_after_positive_receipt) {
+            socket.set_option(asio::socket_base::linger(true, 0));
             control.close_after_write = MessageType::R2_TX_COMMIT;
+            control.outbound_message_observer =
+                [positive_receipt_validated](ActorSide, const Message& message) {
+                if (!std::holds_alternative<R2TxCommit>(message)) return;
+                const auto until = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(5);
+                while (positive_receipt_validated != nullptr &&
+                       !positive_receipt_validated->load(
+                           std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (positive_receipt_validated == nullptr ||
+                    !positive_receipt_validated->load(
+                        std::memory_order_acquire))
+                    throw std::runtime_error(
+                        "C did not validate positive R2 receipt before reset");
+            };
             control.before_materialize_on_worker = [&] {
                 std::unique_lock lock(gate_mutex);
                 if (!gate_cv.wait_for(lock, std::chrono::seconds(15), [&] {
@@ -1001,6 +1020,9 @@ sender_r2_accept_shared_failure(
         }
         results[index] = co_await endpoint.run_adopted_r2(
             std::move(socket), std::move(control));
+        if (index == 0 && reject_after_positive_receipt &&
+            server_reset_complete != nullptr)
+            server_reset_complete->store(true, std::memory_order_release);
         if (results[index].terminal_error)
             std::fprintf(stderr, "R2 shared-failure server[%zu]: %s\n", index,
                          results[index].terminal_error->detail.c_str());
@@ -1926,6 +1948,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::atomic<unsigned> connector_calls{0};
     std::atomic<bool> stop_reconnect_listener{false};
     std::atomic<unsigned> rejected_reconnects{0};
+    std::atomic<bool> positive_receipt_validated{false};
+    std::atomic<bool> server_reset_complete{false};
     std::atomic<bool> retry_wait_registered{false};
     std::atomic<int64_t> retry_wait_registered_ns{0};
     std::atomic<unsigned> retry_wait_count{0};
@@ -2199,7 +2223,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             repeat_recovery_loss, retire_after_positive_receipt,
             expire_after_positive_receipt, reject_stale_reconnect,
             &stop_reconnect_listener, &rejected_reconnects,
-            close_reconnect_after_hello, reject_after_positive_receipt),
+            close_reconnect_after_hello, reject_after_positive_receipt,
+            &positive_receipt_validated, &server_reset_complete),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -2247,6 +2272,21 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                     receipt_hook_cv.wait_until(
                         lock, deadline.as_steady_time_point());
             };
+    } else if (reject_after_positive_receipt) {
+        sender_config.after_r2_receipt_validated_for_test =
+            [&](uint64_t ordinal) {
+                if (ordinal != 1) return;
+                positive_receipt_validated.store(true,
+                                                 std::memory_order_release);
+                const auto reset_deadline = std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(5);
+                while (!server_reset_complete.load(std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < reset_deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!server_reset_complete.load(std::memory_order_acquire))
+                    throw std::runtime_error(
+                        "F did not reset after C validated positive R2 receipt");
+            };
     } else if (retire_during_retry_wait) {
         sender_config.after_r2_recovery_waiter_registered_for_test =
             [&](std::chrono::steady_clock::duration retry_delay) {
@@ -2289,26 +2329,34 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::vector<ZstdSourceTransferResult> outcomes(kJobs);
     for (size_t index = 0; index != kJobs; ++index) outcomes[index] = results[index].get();
     if (reject_after_positive_receipt) {
-        CHECK(kJobs == 2);
+        CHECK(kJobs == 1 || kJobs == 2);
+        CHECK(positive_receipt_validated.load(std::memory_order_acquire));
+        if (kJobs == 2) {
+            CHECK(outcomes[1].status == ZstdSourceTransferStatus::TerminalError);
+            CHECK(outcomes[1].route_local_failure);
+            CHECK(!outcomes[1].replacement_required);
+            CHECK(outcomes[1].r2_link_rejection.has_value());
+            CHECK(outcomes[1].r2_link_rejection->reason ==
+                  LinkRejectReason::ReservationMissing);
+        }
         CHECK(outcomes[0].status == ZstdSourceTransferStatus::Committed);
         CHECK(outcomes[0].committed_input.has_value());
         CHECK((outcomes[0].committed_input ==
                InputRecordKey{c_guid, TuSeq{0}}));
         CHECK(outcomes[0].raw_digest == icecc::digest128(input[0]));
-        CHECK(outcomes[1].status == ZstdSourceTransferStatus::TerminalError);
-        CHECK(outcomes[1].route_local_failure);
-        CHECK(!outcomes[1].replacement_required);
-        CHECK(outcomes[1].r2_link_rejection.has_value());
-        CHECK(outcomes[1].r2_link_rejection->reason ==
-              LinkRejectReason::ReservationMissing);
+        if (kJobs == 1) {
+            CHECK(outcomes[0].r2_link_rejection.has_value());
+            CHECK(outcomes[0].r2_link_rejection->reason ==
+                  LinkRejectReason::ReservationMissing);
+        }
         CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
               std::future_status::ready);
         const auto server_runs = server_future.get();
         CHECK(server_runs.size() == 1);
         CHECK(server_runs[0].status == ServerRunStatus::Disconnected);
         CHECK(rejected_reconnects.load(std::memory_order_acquire) == 1);
-        // The validated first positive remains in the exact-result cache after
-        // the later route-local rejection fences this link.
+        // The same caller's validated exact commit survives a typed rejection
+        // while its ACK/recovery phase is reconciling the closed link.
         const ZstdSourceTransferResult replay = asio::co_spawn(c_context,
             sender->transfer_p51_route(
                 armed[0], 41, connector, PrepareRequestKey{3, 921},
@@ -2317,6 +2365,11 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         CHECK(replay.status == ZstdSourceTransferStatus::Committed);
         CHECK(replay.committed_input == outcomes[0].committed_input);
         CHECK(replay.raw_digest == outcomes[0].raw_digest);
+        if (kJobs == 1) {
+            CHECK(replay.r2_link_rejection.has_value());
+            CHECK(replay.r2_link_rejection->reason ==
+                  LinkRejectReason::ReservationMissing);
+        }
         CHECK(connector_calls.load(std::memory_order_acquire) == 2);
         c_work.reset();
         c_context.stop();
@@ -2580,6 +2633,8 @@ void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
 }
 
 void test_p51_sender_positive_commit_survives_later_typed_rejection() {
+    run_p51_sender_shared_failure_case(
+        1, ProfileId::ZSTD_TU, false, false, false, false, false, false, true);
     run_p51_sender_shared_failure_case(
         2, ProfileId::ZSTD_TU, false, false, false, false, false, false, true);
 }
