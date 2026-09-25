@@ -14,10 +14,17 @@ retained artifact directories.
 
 ### Full-QA failures and focused corrections
 
-Canonical QA on frozen `f0049371` completed its native stage: 176 tests,
+Canonical QA on frozen `f0049371` is terminal with overall FAIL: 176 native tests,
 168 passed, two failed, six skipped, zero errors. Both failures are the
-service-fixture issues detailed below. The Python stage is still running;
-the overall run cannot pass because its snapshot predates both corrections.
+service-fixture issues detailed below. Python completed with 1,595 passed and
+eight skipped in 655.40 seconds. The current QA step took 3,219.2 seconds and
+returned 1 (the outer make returned 2). This snapshot predates both corrections;
+passing focused repairs do not reclassify the frozen full run as passing.
+Under the retained run, `current/artifacts/python-pytest.log` SHA256 is
+`8b305d178e2c325cd0db99793649bf5127716ed1eeaa0864307fae32762952fe`;
+`result.json` SHA256 is
+`f4d7926f79ef34ebcfd6e9174b4f806e5a0c7f97cfe55d4637a6c2d69cd9d819`.
+This run also predates the compiler-fingerprint QA speedup in `e2c11349`.
 Native-stage log SHA256 is
 `ce7c49fb7714be2acb9d59a74e0240f8fe0553cd39db75a884d405c7f14b6e9a`
 at `current/artifacts/native-check.log` beneath the retained full-QA run below.
@@ -36,8 +43,8 @@ isolated c6fce0e7-based overlay described below.
 Retained log:
 `/tanksmall/scratch/tmp/p51-f004-qa-scratch.bxOlfG/icecream-qa-vjyj7uml/current/build/unittests/p50cacheservice-sanitize.log`,
 SHA256 `9370973a6739d6f4328e8672c647841989af3a689db029474e20e0aff2ae1f88`.
-The original full-QA snapshot remains unchanged to collect its remaining
-results. It must not be reported as passing.
+The original full-QA snapshot and terminal failure evidence are retained
+unchanged. It must not be reported as passing.
 
 The lifetime correction passes all six output-cap cases (three profiles,
 W1/W30) and the full service suite under the repository's ASan/UBSan/LSan
