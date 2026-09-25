@@ -83,6 +83,46 @@ Both `SLICE0_EXIT` and `D06_FOCUS_EXIT` are zero. This is not yet evidence
 for real P29/ZSTD_ROUTE held-worker reset/disconnect recovery, healthy
 successor progress, full regression closure, or concurrent-memory checks.
 
+A later development-build test reaches a real second materialization worker
+after an exact first commit for both P29V1 and ZSTD_ROUTE, resets F while that
+worker is held, and observes no second publication. Pending raw/encoded/window
+credits remain charged across reset; P29 retains 65536 detached resident bytes,
+while ZSTD_ROUTE retains 65536 separately charged history bytes. All measured
+credits and namespace/input counts drain to zero after worker release.
+Evidence: `/tanksmall/scratch/tmp/p51-held-worker.Y4GvlM/logs/focused-r10-o0.log`,
+SHA256 `94be1b9831384688729f459d6f878b8b07fb4323fc70f4793657665500197d8a`.
+This used an O0 development build and an older sender/owner baseline, with
+endpoint SHA256 `63d5cf58b009859dda5404be0e72cce0f3ebf596b770a61965e7aa65c8f0b11e`.
+It does not qualify disconnect or overlapping healthy-successor behavior, nor
+the final combined normal-flags build. Earlier fixture failures are excluded.
+
+The refreshed O0 successor case additionally proves reset-induced old-peer
+EOF and a fresh-link commit with exact input attachment while the old worker
+remains held, for both profiles. After release, all transient byte charges
+drain; the successor's namespace, revision, and input record remain intact.
+Evidence: `/tanksmall/scratch/tmp/p51-held-worker-final.6pP4qv/logs/focused-successor-r7-o0.log`,
+SHA256 `362462d34cbfa087fbc6dc97183dcab1b2fcfeed292b8662720cbb321630c997`.
+This snapshot uses published `5199ed83` plus the worker repair and test
+overlays, including shared callback-completion lifetime handling. It does
+not prove independent peer-close-only recovery or optimized full-suite
+qualification; the latter is still running.
+
+### Active cancellation and mixed-load evidence gaps
+
+Queued cancellation is being tested through actual C raw-credit admission,
+not by removing requests before submission. It does not substitute for
+partial/full-transfer cancellation. Code review identifies a recovery mismatch
+requiring a deterministic regression: F reset removes cancelled reservations,
+but C's sender currently replays every unresolved suffix witness using its
+old relationship ordinal. The required behavior is exact settlement followed
+by contiguous rebuilding of still-live jobs, preserving their TU identities.
+Global TU sequence values are not proof of relationship-ordinal contiguity.
+
+The concurrent local P43/R1/R2 gate is also not yet qualified. Warmup log
+records must not satisfy measured-cohort source-commit, input-attachment,
+or completion assertions. Actual overlapping compiler identities alone do
+not prove that each measured job used its required transfer path.
+
 ### Clean-checkout build and mixed-version compatibility
 
 Published `fdf03e25520d9db25746b29da7847e935b747b7f` builds and installs
