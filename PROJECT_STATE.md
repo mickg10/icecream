@@ -391,8 +391,25 @@ the same endpoint/owner sources plus the shared-caller rejection fix.
 These are not final combined service/restart qualification. Runtime emission
 of ReservationMissing, W30 shared rejection, wrong/stale-offer rejection
 negatives, and rejection after a validated positive receipt still need their
-dedicated gates. The service restart rerun and real multi-link daemon fixture
-remain separate work.
+dedicated gates. The real multi-link daemon fixture remains separate work.
+
+The current recovery service passes the scoped ZSTD_TU restart rerun for
+C1F2/F-cache and C2F1/C-cache: an established healthy sibling attaches while
+the affected parent is stopped, the unobserved old receipt is not reported
+as committed, and a fresh assignment attaches on the replacement incarnation.
+Evidence: `/tanksmall/scratch/tmp/p51-route-reap.6Pp7wd/restart-final.log`
+(SHA256 `0c171ee36f1b6ddf7cfe53ede08ab8df44e8d66d199b04edef961d7b884e322c`),
+`RESTART_GATE_EXIT=0`. Service binary SHA256:
+`fbb662685cfaba230551ed6d7907ef9ea29ab4a16071a3582d87899720cd2a1f`;
+fixture binary: `6aa9a4d2f706f1a8d6a4ec52eb535fcbd255712b1828634b5a81d4384967944c`.
+The private fixture source is
+`fbccf0a1233dd3f76f9191897e3c927c1fd7f7962a857fea3e27840d12667750`;
+the private adapter adds configuration diagnostics only. Initial runs failed
+before exercising restart because the daemon's unprivileged identity could
+not traverse the private build root; the successful run corrected that
+directory's traversal permission. This is one affected job plus sibling
+progress, not W30 restart occupancy, all profiles, scheduler restart, or
+qualification of the in-development multi-link fixture.
 
 The in-development real C2F1/C-cache restart fixture passes for ZSTD_TU:
 the independent C2/F1 link attaches exact input while C1's parent is stopped,
