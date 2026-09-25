@@ -150,7 +150,35 @@ gate is not a qualified fix. Resolving that dependency and rerunning the
 gate's behavioral mutants remain open. Native-suite success is not a claim
 that every source gate passes.
 
-### Interrupted R2 BODY recovery
+### Interrupted R2 frame recovery
+
+The default endpoint suite now extends the BODY relay to 25 interruption
+cases across P29V1/ZSTD_TU/ZSTD_ROUTE: one payload-prefix cut each in JOB_BIND,
+TU_BEGIN and TU_END; BODY header offsets 1/2/3 and early/middle payload cuts;
+and one P29-only R2_FILL payload cut. HELLO remains intact. Each case checks
+the exact fully forwarded frame sequence (no complete END), no initial
+publication, retained-witness RESET/rebuild/replay, exact attached input and
+one final commit/ACK. Truncated JOB_BIND consumes no initial reservation;
+the replay consumes one, versus two total when the first binding was complete.
+
+Focused and full endpoint runs both exit 0 on the same frozen binary. This
+snapshot predates the completion-accounting change; combined qualification
+is running separately. These 25 cases are not exhaustive D03 byte offsets,
+HELLO/recovery/ACK interruption, or actual EAGAIN coverage.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d03-frame-cuts-r2/`.
+Test source SHA256:
+`3435b3d0d181ef7bf7677c0f801690eecbb48713c5d56a8fb22acae5245ddcbc`.
+Binary SHA256:
+`fb484a40bab20889fe7ccb6e1020c569a492693316a13b2e990619511e83af5f`.
+Focused build/run log `logs/container-r2.log` SHA256:
+`6474f220652aafaa9390a2185d4fe40603f0a753f65b9b6ea680966a6d05fb26`.
+Full log `logs/full-endpoint-r2.log` SHA256:
+`9c920e93126c383a0cedbfb9a89145f84ab6c5113df950eda0181ba5d02731db`.
+The earlier six-BODY-only qualification below records its own product and
+binary identities; inherited scratch logs are not evidence for the new run.
+
+#### Earlier BODY-only qualification
 
 A test-only TCP relay cuts the first R2 BODY after an early or middle payload
 prefix. All six combinations with P29V1/ZSTD_TU/ZSTD_ROUTE pass: no partial
