@@ -522,6 +522,40 @@ real Docker runs for all three profiles remain required.
 
 ### Clean-checkout build and mixed-version compatibility
 
+Exact candidate `03d108a3cc70d7e17f91ad06457ecde05d7fb63a` now builds
+through the supported Docker bootstrap and passes local concurrent P43/R1/R2
+QA separately for P29V1, ZSTD_TU and ZSTD_ROUTE. Luna ran the profiles
+sequentially with `--concurrent-mixed --jobs 3 --memory-gb 8` and distinct
+output directories/bridge networks. Each case requires three distinct remote
+compiler PID/start-time identities surviving an overlap bracket, exact
+compiled-program outputs, and measured-job R1/R2 input attachments. This
+qualifies local coexistence, not W30 occupancy or external mixed-farm load.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d18-final-03d108a3/`.
+Bootstrap `icecream-qa-vgud5l6a/result.json` reports PASS and build exit 0
+(182.317 s), SHA256
+`9797370cf12303359a669089a18aa88472e517f04086733f42412ab07fa1734d`.
+Source snapshot `da71b6c3eee83b696bf2fb3494b674c1d27d5633535777c6faf61d114fb5c4ec`;
+runtime image `sha256:f11625d02b85b6cbf15c7abb2d263b0269a43f88aa7b6a3a65890cb2996af515`.
+Pinned P43 source `cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`, image
+`sha256:9140ad2c1a1afb2086bdfcc483d0b0d5d98bf1954168e0889d2e3ee05bc45050`.
+
+| Concurrent profile | Summary under evidence root | SHA256 |
+| --- | --- | --- |
+| P29V1 | `d18-p29v1/summary.json` | `81859d97aed4adc8c8b1b2ff9268c49b140d76557f2767fb5cbf4c4968c53100` |
+| ZSTD_TU | `d18-zstd-tu/summary.json` | `f8df424cdf2d3e13c04e641ba2caae03e413c6f6b05f690f51c89e6fc2551cb2` |
+| ZSTD_ROUTE | `d18-zstd-route/summary.json` | `8480cb3aa31d97134adabf09627988c860e93c495dad196b9e04b0e19793615c` |
+
+These retained summaries contain legacy `r1_remote_p29v1` and
+`r2_remote_p29v1` field names even for ZSTD. The actual selected-profile
+checks and attachment/commit assertions are profile-sensitive; the names
+are a reporting defect, not evidence that the ZSTD runs used P29. A separate
+metadata correction is pending. Source-commit log events lack job IDs, so
+their correlation remains limited to the measured per-role log.
+
+Earlier sequential compatibility evidence follows; it is not evidence for
+the newer candidate's other gates.
+
 Published `fdf03e25520d9db25746b29da7847e935b747b7f` builds and installs
 successfully from a clean detached worktree using the normal bootstrap
 workflow (two jobs, 8 GiB). Source snapshot SHA256:
