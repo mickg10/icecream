@@ -32,6 +32,31 @@ claimed from the earlier run whose outer exit status was not retained.
 
 ### Opt-in R2 sender wire accounting
 
+The combined runtime at `a93b7595` passes the full default service suite from
+a clean build, including the repeated W30 recovery cases. Later `2847508c`
+changes only formal files/docs. Clean suite log SHA256:
+`6e53bf55002a5e0ee79affcbaf4eb341f94f62d3c1900e31ac110ea9e74d1c3d`;
+test binary `98148a9c04fe1b0a8934ba180def6f983d33d02bb695cb89d7c98afa27d051d2`;
+service source `4ea97c7e106e45a949bdc01597b91b8970d70f8dc174bff739b3b2f322aa1713`.
+
+The same clean binary passes the diagnostics-on ZSTD_TU W30 cancellation/
+recovery selector and actual collector conservation: 32 source rows, 30
+interval events, 30,153 C-to-F bytes (18,727 job / 11,426 shared), and 4,321
+F-to-C bytes (3,596 job / 725 shared). Zero unavailable job snapshots; C raw
+credits return to zero and FDs to baseline 16. Physical completeness remains
+false and settled relationships zero. Final trace:
+`/tanksmall/scratch/tmp/p51-a93-combined-qa/tmp/d17-zstd-tu-final.jsonl`, SHA256
+`f28d18700b9c0cc06832445aec11f19f4ea222d3c8be6f7750ddd6149a8ce50a`;
+the adjacent `.exit` records 0. Collector/tracing Python modules pass 332 tests.
+This qualifies these gates, not the entire W30 plan or farm deployment.
+
+Earlier combined attempts are retained separately: an archive-mtime/reused-
+object mismatch linked an old service object with a new route-owner layout
+and aborted; the clean build then exposed a dedicated scratch-directory
+permission error after UID drop. Cleaning the build and setting only that
+scratch directory to mode 1777 preceded the passing run. Neither failed run
+is counted as product qualification.
+
 The sender now supports a bounded interval observer, enabled only when the
 existing `ICECC_P50_DIAGNOSTICS=1` setting and an observer are both present.
 The normal disabled path does not allocate the R2 accounting maps. Frozen
@@ -63,8 +88,8 @@ SHA256 `fc3f92e70751cd91b76adf7964517c7bd5f2e780b22a637ab76b9cfcd083eca6`.
 The earlier actual trace conserved 29,537 C-to-F and 4,321 F-to-C bytes across
 16 intervals and 32 job keys, including cancellation; closed/settled remained
 false. These are small fixture measurements, not farm results. The imported
-emitter preserves the newer receipt-ledger test hook; combined qualification
-with the recovery fix is still required.
+emitter preserves the newer receipt-ledger test hook; its combined service
+qualification with the recovery fix is recorded above.
 The focused Python group passed 474 tests before the final cumulative-snapshot
 aggregation correction. After that correction, the collector/report module
 passed all 307 tests, including both snapshot orders and legacy additive rows.
@@ -113,8 +138,8 @@ enabled. Mutant log SHA256:
 The qualified binary is preserved as `tmp/p50cacheservice-qualified-fix`;
 the build-directory binary was subsequently used for the negative control
 and must not be mistaken for the passing binary.
-This is not yet qualification of the combined trace-emitter-plus-fix tip,
-nor does it close the rest of the W30 plan. The original intermittent failure
+This pre-integration evidence does not close the rest of the W30 plan;
+combined service qualification is recorded above. The original intermittent failure
 remains retained separately; these deterministic regressions establish real
 defects without claiming every earlier timeout had the same cause.
 
