@@ -6,12 +6,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
 
 def _fake_docker(tmp_path: Path, *, failure: str = "", remote: bool = True,
-                 wrong_profile: bool = False) -> tuple[Path, Path]:
+                 wrong_profile: bool = False, strip_measured_role: str = "",
+                 reuse_pid: bool = False, wrong_job_prefix: bool = False
+                 ) -> tuple[Path, Path]:
     path = tmp_path / "docker"
     calls = tmp_path / "docker-calls.jsonl"
     code = f"""#!{sys.executable}
@@ -20,6 +23,9 @@ args = sys.argv[1:]
 with open(os.environ['FAKE_DOCKER_CALLS'], 'a', encoding='utf-8') as out:
     out.write(json.dumps(args) + '\\n')
 fail = os.environ.get('FAKE_DOCKER_FAILURE')
+strip_measured = os.environ.get('FAKE_DOCKER_STRIP_MEASURED')
+reuse_pid = os.environ.get('FAKE_DOCKER_REUSE_PID') == '1'
+wrong_job_prefix = os.environ.get('FAKE_DOCKER_WRONG_JOB_PREFIX') == '1'
 if fail and ((fail == 'scheduler-start' and args[:1] == ['run'] and '--network-alias' in args and 'scheduler' in args) or
              (fail == 'client-compile' and args[:1] == ['run'] and '--network-alias' not in args)):
     print('injected docker failure', file=sys.stderr)
@@ -29,13 +35,39 @@ if args[:1] == ['exec'] and args[1].endswith('-scheduler'):
         raise SystemExit(0)
     if 'p51-old50-scheduler-fallback' in args[1]:
         print(' qa-worker (172.18.0.2:10245) 1 1 cache=off')
+    elif 'd18-' in args[1]:
+        print(' qa-d18-r1 (172.18.0.2:10245) 1 1 cache=127.0.0.1:11001 cache_wire=v1 cache_protocol=1 cache_profiles=p29v1')
+        print(' qa-d18-r2 (172.18.0.3:10245) 1 1 cache=127.0.0.1:11001 cache_wire=v1 cache_protocol=2 cache_profiles=p29v1')
     else:
         print(' qa-worker (172.18.0.2:10245) 1 1')
     raise SystemExit(0)
 if args[:2] == ['inspect', '--format']:
-    print('172.18.0.2')
+    print('172.18.0.3' if '-r2-worker' in args[-1] else '172.18.0.2')
+    raise SystemExit(0)
+if args[:2] == ['image', 'inspect']:
+    image_id = 'sha256:' + ('a' * 64 if 'p43' not in args[-1] else 'b' * 64)
+    labels = {{'icecream.source.identity': 'fake-source',
+              'org.icecream.dev.recipe': 'fake-recipe',
+              'org.icecream.dev.profile': 'ubuntu24.04'}}
+    print(image_id + ' ' + json.dumps(labels))
     raise SystemExit(0)
 if args[:1] == ['logs'] and any(arg.endswith('-worker') for arg in args):
+    if 'd18-' in ' '.join(args):
+        joined = ' '.join(args)
+        if '-r2-worker' in joined:
+            attachment_job = '30' if wrong_job_prefix else '3'
+            print('[81] remote compile for file /source/r2.cpp' + chr(10) +
+                  '[81] Remote compilation completed with exit code 0' + chr(10) +
+                  '[1] P50 CompileFile attached exact P29V1 input for job ' + attachment_job + chr(10) +
+                  'P51 cache-link descriptor adopted by sidecar')
+        else:
+            print(('[39] remote compile for file /source/p43.cpp' + chr(10) +
+                   '[39] Remote compilation completed with exit code 0' + chr(10) +
+                   '[157] remote compile for file /source/r1.cpp' + chr(10) +
+                   '[157] Remote compilation completed with exit code 0' + chr(10) +
+                   '[1] P50 CompileFile attached exact P29V1 input for job 20' + chr(10) +
+                   '[1] P50 CompileFile attached exact P29V1 input for job 2'))
+        raise SystemExit(0)
     print('Remote compilation completed with exit code 0')
     joined = ' '.join(args)
     profile = ('ZSTD_TU' if {str(wrong_profile)} else
@@ -55,7 +87,49 @@ if args[:1] == ['logs'] and any(arg.endswith('-scheduler') for arg in args):
     else:
         print('RELOGIN qa-worker(x86_64): [] cache=127.0.0.1:11001 cache_wire=v1 cache_protocol=1 cache_profiles=p29v1 zstd_tu zstd_route')
     raise SystemExit(0)
+if args[:1] == ['logs'] and any(arg.endswith(('-p43', '-r1', '-r2')) for arg in args):
+    role = next(arg.rsplit('-', 1)[1] for arg in args if arg.endswith(('-p43', '-r1', '-r2')))
+    output = dict(p43='ICECREAM_D18_P43_OK', r1='ICECREAM_D18_R1_OK',
+                  r2='ICECREAM_D18_R2_OK')[role]
+    print('D18_RESULT role=' + role + ' output=' + output)
+    raise SystemExit(0)
+if args[:1] == ['exec'] and args[1].endswith('-worker'):
+    joined = ' '.join(args)
+    standard = next((std for std in ('11', '14', '17')
+                     if f'gnu++{{std}}' in joined or f'c++{{std}}' in joined), '11')
+    pid = {{'11': '123', '14': '124', '17': '125'}}[standard]
+    start = '999' if reuse_pid and ('wanted=' + pid) in joined else '100' + pid
+    print(pid + '|' + start + '|cc1plus -std=gnu++' + standard + ' /source/probe.cpp')
+    raise SystemExit(0)
 if args[:1] == ['run'] and '--network-alias' not in args:
+    if '--detach' in args and 'd18-' in ' '.join(args):
+        name = args[args.index('--name') + 1]
+        role = name.rsplit('-', 1)[1]
+        mounts = [a for a in args if a.startswith('type=bind,src=')]
+        log_mount = next(a for a in mounts if ',dst=/qa-logs' in a)
+        log_dir = pathlib.Path(log_mount.split('src=', 1)[1].split(',dst=', 1)[0])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        output = dict(p43='ICECREAM_D18_P43_OK', r1='ICECREAM_D18_R1_OK',
+                      r2='ICECREAM_D18_R2_OK')[role]
+        host = '172.18.0.3' if role == 'r2' else '172.18.0.2'
+        job_id = dict(p43='1', r1='2', r2='3')[role]
+        profile_log = ('P50 assignment identity bound for job ' + job_id + chr(10) +
+                       'P29V1 source committed for P50 CompileFile' + chr(10)) if role != 'p43' else ''
+        if strip_measured == role:
+            profile_log = ''
+        (log_dir / 'icecc.log').write_text(
+            'Have to use host ' + host + ':10245 - Job ID: ' + job_id + '\\n' + profile_log)
+        (log_dir / 'warm-icecc.log').write_text(
+            'P50 assignment identity bound for job ' + job_id + chr(10) +
+            'P29V1 source committed for P50 CompileFile' + chr(10))
+        (log_dir / 'client-daemon.log').write_text(
+            'P51 C-cache source-control lease delivered for assignment 3 profile 1 window 30' + chr(10)
+            if role == 'r2' else '')
+        control_mount = next(a for a in mounts if ',dst=/qa-control' in a)
+        control_dir = pathlib.Path(control_mount.split('src=', 1)[1].split(',dst=', 1)[0])
+        control_dir.mkdir(parents=True, exist_ok=True)
+        (control_dir / ('ready-' + role)).touch()
+        raise SystemExit(0)
     mounts = [a for a in args if a.startswith('type=bind,src=') and ',dst=/qa-logs' in a]
     assert mounts, args
     log_dir = pathlib.Path(mounts[-1].split('src=', 1)[1].split(',dst=', 1)[0])
@@ -75,6 +149,9 @@ if args[:1] == ['run'] and '--network-alias' not in args:
     raise SystemExit(0)
 if args[:1] == ['network'] and len(args) > 1 and args[1] == 'create':
     print(args[-1])
+if args[:1] == ['wait']:
+    print('0')
+    raise SystemExit(0)
 raise SystemExit(0)
 """
     path.write_text(code, encoding="utf-8")
@@ -84,21 +161,35 @@ raise SystemExit(0)
 
 def _run_cli(tmp_path: Path, *, failure: str = "", remote: bool = True,
              wrong_profile: bool = False, p51_r2: bool = False,
+             concurrent_mixed: bool = False,
+             strip_measured_role: str = "", reuse_pid: bool = False,
+             wrong_job_prefix: bool = False,
              only_p51_r2: bool = False,
              only_old50_scheduler_fallback: bool = False,
              old50_binary: Path | None = None,
              old50_sha256: str | None = None) -> tuple[subprocess.CompletedProcess[str], Path, list[list[str]]]:
     docker, calls = _fake_docker(tmp_path, failure=failure, remote=remote,
-                                 wrong_profile=wrong_profile)
+                                 wrong_profile=wrong_profile,
+                                 strip_measured_role=strip_measured_role,
+                                 reuse_pid=reuse_pid,
+                                 wrong_job_prefix=wrong_job_prefix)
     output = tmp_path / "mixed-results"
     env = os.environ.copy()
     env.update(ICEFARM_DOCKER=str(docker), FAKE_DOCKER_CALLS=str(calls),
-               FAKE_DOCKER_FAILURE=failure, PYTHONDONTWRITEBYTECODE="1")
+               FAKE_DOCKER_FAILURE=failure,
+               FAKE_DOCKER_STRIP_MEASURED=strip_measured_role,
+               FAKE_DOCKER_REUSE_PID="1" if reuse_pid else "0",
+               FAKE_DOCKER_WRONG_JOB_PREFIX="1" if wrong_job_prefix else "0",
+               PYTHONDONTWRITEBYTECODE="1")
+    if concurrent_mixed:
+        env["ICEFARM_TMPDIR"] = str(tmp_path)
     command = [
         sys.executable, str(ROOT / "dev/mixed.py"),
         "--current-image", "icecream-dev:current", "--legacy-image", "icecream-dev:p43",
-        "--output", str(output), "--jobs", "2",
+        "--output", str(output), "--jobs", "3" if concurrent_mixed else "2",
     ]
+    if concurrent_mixed:
+        command += ["--memory-gb", "4", "--concurrent-mixed"]
     if p51_r2:
         command.append("--p51-r2")
     if only_p51_r2:
@@ -278,6 +369,101 @@ def test_p51_only_selector_skips_unchanged_legacy_rows(tmp_path: Path) -> None:
     ]
     assert all(case["r2_selected"] for case in summary["cases"])
     assert len([command for command in commands if command[:2] == ["network", "create"]]) == 3
+
+
+def test_concurrent_mixed_uses_one_scheduler_and_observes_all_role_compilers(
+    tmp_path: Path,
+) -> None:
+    result, output, commands = _run_cli(tmp_path, concurrent_mixed=True)
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert summary["concurrent_mixed_requested"] is True
+    assert len(summary["cases"]) == 1
+    case = summary["cases"][0]
+    assert case["status"] == "PASS"
+    assert case["assignment_policy"] == "enforcing-compat"
+    assert case["image_provenance"]["current"]["image_id"].startswith("sha256:")
+    assert case["image_provenance"]["current"]["source_identity"]
+    assert case["image_provenance"]["p43"]["image_id"].startswith("sha256:")
+    assert case["worker_modes"] == {"r1": "P29V1/R1", "r2": "P29V1/R2"}
+    assert set(case["concurrent_role_cc1plus"]) == {"p43", "r1", "r2"}
+    assert all(item["revalidated"] == "true"
+               for item in case["concurrent_role_cc1plus"].values())
+    assert case["concurrent_role_cc1plus"]["p43"]["worker"] == "r1"
+    assert case["concurrent_role_cc1plus"]["r1"]["worker"] == "r1"
+    assert case["concurrent_role_cc1plus"]["r2"]["worker"] == "r2"
+    assert case["p43_remote"] and case["r1_remote_p29v1"] and case["r2_remote_p29v1"]
+    assert case["r2_source_lease"] and case["r2_link_adopted"]
+    assert len([command for command in commands
+                if command[:2] == ["network", "create"]]) == 1
+    scheduler_runs = [command for command in commands
+                      if command[:1] == ["run"] and "--network-alias" in command
+                      and command[command.index("--network-alias") + 1] == "scheduler"]
+    worker_runs = [command for command in commands
+                   if command[:1] == ["run"] and "--network-alias" in command
+                   and command[command.index("--network-alias") + 1].startswith("worker-")]
+    client_runs = [command for command in commands
+                   if command[:1] == ["run"] and "--network-alias" not in command]
+    assert len(scheduler_runs) == 1 and len(worker_runs) == 2
+    assert len(client_runs) == 3
+    assert all("--detach" in command for command in client_runs)
+    assert all("--network" in command and command[command.index("--network") + 1]
+               == scheduler_runs[0][scheduler_runs[0].index("--network") + 1]
+               for command in [*worker_runs, *client_runs])
+    assert any("ICECC_D18_ROLE_P43=1" in " ".join(command) for command in client_runs)
+    assert any("ICECC_D18_ROLE_R1=1" in " ".join(command) for command in client_runs)
+    assert any("ICECC_D18_ROLE_R2=1" in " ".join(command) for command in client_runs)
+    worker_env = [" ".join(command) for command in worker_runs]
+    assert any("ICECC_P51_MODE=off" in command for command in worker_env)
+    assert any("ICECC_P51_MODE=on" in command for command in worker_env)
+
+
+def test_concurrent_mixed_requires_bounded_parallel_worker_and_scratch(
+    tmp_path: Path,
+) -> None:
+    docker, calls = _fake_docker(tmp_path)
+    output = tmp_path / "mixed-results"
+    env = os.environ.copy()
+    env.update(ICEFARM_DOCKER=str(docker), FAKE_DOCKER_CALLS=str(calls),
+               PYTHONDONTWRITEBYTECODE="1")
+    command = [sys.executable, str(ROOT / "dev/mixed.py"),
+               "--current-image", "icecream-dev:current",
+               "--legacy-image", "icecream-dev:p43", "--output", str(output),
+               "--jobs", "2", "--memory-gb", "4", "--concurrent-mixed"]
+    result = subprocess.run(command, cwd=ROOT, env=env, text=True,
+                            capture_output=True, timeout=20)
+    assert result.returncode != 0
+    assert "--jobs >= 3" in result.stderr
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize("role", ["r1", "r2"])
+def test_concurrent_mixed_rejects_warmup_only_p50_evidence(
+    tmp_path: Path, role: str,
+) -> None:
+    result, output, _ = _run_cli(
+        tmp_path, concurrent_mixed=True, strip_measured_role=role,
+    )
+    assert result.returncode != 0
+    summary = json.loads((output / "summary.json").read_text())
+    assert "lacks P50 assignment identity" in summary["cases"][0]["error"]
+
+
+def test_concurrent_mixed_rejects_reused_compiler_pid_identity(tmp_path: Path) -> None:
+    result, output, _ = _run_cli(tmp_path, concurrent_mixed=True, reuse_pid=True)
+    assert result.returncode != 0
+    summary = json.loads((output / "summary.json").read_text())
+    assert "PID/starttime did not survive overlap bracket" in summary["cases"][0]["error"]
+
+
+def test_concurrent_mixed_rejects_job_id_prefix_collision(tmp_path: Path) -> None:
+    result, output, _ = _run_cli(
+        tmp_path, concurrent_mixed=True, wrong_job_prefix=True,
+    )
+    assert result.returncode != 0
+    summary = json.loads((output / "summary.json").read_text())
+    assert "measured job 3 lacks exact F input attachment" in summary["cases"][0]["error"]
 
 
 def test_old50_only_selector_runs_pinned_fallback_row(tmp_path: Path) -> None:

@@ -187,6 +187,31 @@ and worker-side cache-link adoption. A negotiated window of 30 does not
 prove 30 simultaneous transfers or persistent-link reuse: those require the
 separate pipeline tests.
 
+To check simultaneous P43, R1 and R2 compilation on a single Docker host:
+
+```sh
+sh dev/python.sh dev/mixed.py \
+  --current-image YOUR_CURRENT_PRODUCT_IMAGE \
+  --legacy-image YOUR_P43_PRODUCT_IMAGE \
+  --output "$ICEFARM_TMPDIR/mixed-concurrent-new-run" \
+  --concurrent-mixed --jobs 3 --memory-gb 8
+```
+
+This standalone selector cannot be combined with the R2 row selectors. It
+requires at least three CPU quota units and 4 GiB aggregate container memory;
+the example allows 8 GiB. The output must be beneath `ICEFARM_TMPDIR` and
+must not already exist. One current scheduler uses `enforcing-compat` policy,
+with separate current R1 and R2 workers and three client containers. P43 and
+R1 use the R1 worker; R2 uses the R2 worker. Toolchain warmup precedes a common
+start barrier, so this is a warm-environment compatibility test, not a cold
+build benchmark.
+
+The gate checks overlapping compiler process identities, measured-job remote
+execution, exact program output, and the required P29V1 source/attachment
+evidence. It retains logs and image provenance, and removes its own containers
+and network afterward. This is not a W30 occupancy test, a multi-host farm
+test, or coverage of the ZSTD_TU and ZSTD_ROUTE mixed-load combinations.
+
 The old-scheduler fallback case additionally requires
 `--ordinary50-scheduler-binary`, `--ordinary50-scheduler-sha256`, and
 `--ordinary50-scheduler-source-commit`. The gate accepts only source commit

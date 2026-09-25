@@ -150,10 +150,28 @@ old relationship ordinal. The required behavior is exact settlement followed
 by contiguous rebuilding of still-live jobs, preserving their TU identities.
 Global TU sequence values are not proof of relationship-ordinal contiguity.
 
-The concurrent local P43/R1/R2 gate is also not yet qualified. Warmup log
-records must not satisfy measured-cohort source-commit, input-attachment,
-or completion assertions. Actual overlapping compiler identities alone do
-not prove that each measured job used its required transfer path.
+The concurrent local P43/R1/R2 P29V1 gate has a passing real Docker run:
+`/tanksmall/scratch/tmp/p51-d18-measured.lhh4dw/run/summary.json`, SHA256
+`f8f424b4ef3b25271b9d9c934cdfa16355bf794d3c90ad50c596286c10e93dd8`.
+One enforcing-compat scheduler serves separate R1 and R2 workers. Measured
+jobs P43=5, R1=4, R2=6 overlap as distinct PID/starttime identities; each
+compiled program produces its expected output. R1/R2 exact input attachments
+and R2 source lease are matched to those jobs, excluding warmup records.
+Final parsing adds exact numeric boundaries and same-worker child-PID
+completion checks, validated against retained logs and fake-Docker negatives.
+The live run precedes that parsing-only tightening.
+The final harness suite passes 16 tests; retained output is
+`logs/final-fake-pytest.log` beneath the same run root, SHA256
+`f7bc33a514baf72434f389df4733d2317a625dae8ec47a9f0fcd67f77fa6e818`.
+`logs/retained-log-parser-validation.json` records the final parser's checks
+against the real logs; `logs/image-provenance.txt` retains full image labels.
+
+Tested image IDs: current
+`sha256:e7a6a390c406a67257ae44fc06ba4c79ccd3dc9409f0784bd5090ec54c955595`,
+P43 `sha256:9140ad2c1a1afb2086bdfcc483d0b0d5d98bf1954168e0889d2e3ee05bc45050`.
+The current image predates worker repair `ef29049c`; this run does not qualify
+that newer product. Scope is warm-environment, same-host, P29V1 compatibility,
+not W30 occupancy, all-profile mixed traffic, or external-farm performance.
 
 ### Clean-checkout build and mixed-version compatibility
 
