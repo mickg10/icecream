@@ -12,6 +12,39 @@ retained artifact directories.
 
 ## Developer QA
 
+### Current-runtime local R2 and concurrent mixed process checks
+
+Exact `645977c868e9ddc6429b2c0f7d266cf00508f251` built and installed through
+the supported bootstrap (exit 0). Product image
+`icecream-dev:current-513e258c70a86593`, image ID
+`255a28bc27928a3ec346cf0ded510bacf6692ed1d1d14892256bb312c5799943`,
+binds source snapshot
+`513e258c70a865936763804b2c2395603861a55e20cb7410e2f9493d7c748138`.
+The three `dev/mixed.py --p51-r2 --only-p51-r2` cases pass for P29V1,
+ZSTD_TU and ZSTD_ROUTE, with remote output, selected profile, source lease
+and R2 link adoption checked.
+
+Three separate `--concurrent-mixed --concurrent-profile PROFILE` runs also
+pass. Each uses three client roles (P43, R1, R2), one shared current scheduler,
+separate R1/R2 workers, a private local Docker network, jobs=3 and memory=8
+GiB. They verify distinct overlapping remote compiler processes and exact
+role outputs. The P43 image is pinned to `cd74801e0fa4e83e` with image ID
+`9140ad2c1a1afb2086bdfcc483d0b0d5d98bf1954168e0889d2e3ee05bc45050`.
+Artifacts under `/tanksmall/scratch/tmp/p51-645977c8-mixed-build/mixed-runs/`
+have these `summary.json` SHA256 values:
+
+| Run | SHA256 |
+| --- | --- |
+| `r2-all` | `92ed86afe43e518f61516ccf38eaaa6e3b771750641717a6b7dad7566524ff0c` |
+| `concurrent-p29` | `c4bdbda0c2f5ccbbb55f02deecd622ab6c227c2a701b92c8f8d8f9aa4f4a6a20` |
+| `concurrent-zstd-tu` | `2883adc66b1de24217ebd15db015f6b2bb5ff9f88d5bd4353d474c1a289639a6` |
+| `concurrent-zstd-route` | `30fa648462fb3b679835575c49ba1d95e02bb7c4e75e2839be193be2af7ab938` |
+
+This closes those local process cases for the 645 runtime, not cross-host
+farm qualification, every legacy scheduler direction, full W30 saturation,
+or the full C01/D18 grids. Later encoded-cap additions are test-only;
+unpublished F accounting changes are not included in these images.
+
 ### Independent R2 encoded-byte cap
 
 The real F service fixture now covers aggregate pending encoded-byte admission
