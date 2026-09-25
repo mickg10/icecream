@@ -55,6 +55,9 @@ struct P50RouteOwnerConfig {
     std::function<void()> after_r2_rebind_wait_for_test;
     std::function<void()> after_retired_route_reaped_for_test;
     std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;
+    // Observes each complete R2 source bundle written by the sender. This is
+    // test-only evidence of C-side wire occupancy, not proof that F parsed it.
+    std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
     // Request-scoped observation of the caller that enters shared R2 recovery.
     // Test-only; it does not participate in admission or recovery decisions.
     std::function<void(PrepareRequestKey)> before_r2_recovery_for_test;

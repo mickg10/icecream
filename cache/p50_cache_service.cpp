@@ -1864,6 +1864,8 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.disconnect_r2_after_bundle_for_test =
         config_.disconnect_r2_after_bundle_for_test;
+    route_config.after_r2_bundle_sent_for_test =
+        config_.after_r2_bundle_sent_for_test;
     route_config.before_r2_recovery_for_test =
         config_.before_r2_recovery_for_test;
     route_config.before_r2_recovery_attempt_for_test =

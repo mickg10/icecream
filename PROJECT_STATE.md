@@ -12,6 +12,47 @@ retained artifact directories.
 
 ## Developer QA
 
+### Repeated W30 recovery on persistent runtimes
+
+The default service suite now runs three cancellation/reset cycles for each
+of P29V1, ZSTD_TU and ZSTD_ROUTE, retaining the same C/F runtimes and route
+owner across each profile's cycles. At every cut it requires 30 active source
+operations, 30 distinct complete C bundle writes, exact held raw credits
+(1,045 bytes), and a held materializer. Each cycle verifies the selected
+caller fails, 29 survivors attach exact inputs, and a fresh transfer succeeds.
+Cancellation positions are submission indices, not claimed wire ordinals.
+Source operation/raw credits return to zero and descriptors return to the
+warmed baseline of 16; connections progress from two to four per profile.
+
+The focused nine-cell run, full default service suite, and full sanitizer
+service suite pass. Only the existing sender observation hook is forwarded;
+the patch changes no wire framing or production admission limits. This is
+small-input source-transfer coverage, not compiled-output, bulk-RSS, or full
+F-side retained-memory proof; the broader D17 requirement remains open.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d17-fd-repeat-r1/artifacts/`.
+`repeated-r1.log` SHA256:
+`4391bda37a254f48f460acbe239fe2814d80e5b1b8b15257558a30f27db988cc`.
+`defaultservice-r3.test.log` SHA256:
+`9ffae07802bfc2fa4c868c6737f6da92411d029d846acc458c7be6b026acd5a0`.
+Sanitizer log SHA256:
+`bc17a489f71ddd406836a4dd74835bfaee500754651950064907034a3ba4f2a4`.
+Both default and sanitizer Automake results are PASS/exit 0. Test TU SHA256:
+`67891838fe3b315c14125948df7f205d7093cbe0f6c580b709e75d31749739ca`;
+ordinary binary SHA256:
+`1accce4b61cd01528c93a80b9705a3a79c91615d2a21043adb4576012f781bc6`.
+SDK image: `sha256:7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`,
+limited to two CPUs/8 GiB with scratch-backed temporary storage.
+
+ASan/UBSan/LSan instrument the test TU, service, route owner and sender;
+linked endpoint/protocol/transport/service archives are not instrumented.
+The successful sanitizer script deletes its temporary executable, so no
+sanitizer-binary hash is retained. Script SHA256:
+`9ecbd66389dda492eec120bdf08b2bf5598c448c9e7ce46d67b090cb2fc4e5c2`.
+Earlier fixture-identity failures and the combined prerequisite-build/test
+timeout are retained but excluded. Focused reruns use the individual
+Automake `.log` target: `check-TESTS` builds all `check_PROGRAMS` first.
+
 ### Task-count test after thread exit
 
 The daemon task-count test now allows up to two monotonic seconds for the

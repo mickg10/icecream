@@ -4,13 +4,16 @@
 #include "../services/digest128.h"
 
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -44,6 +47,32 @@ using namespace icecc::p50;
 namespace {
 
 constexpr int kStartupReadyTimeoutMilliseconds = 5000;
+
+size_t process_open_fd_count() {
+    DIR* directory = ::opendir("/proc/self/fd");
+    if (directory == nullptr)
+        throw std::runtime_error("cannot enumerate /proc/self/fd");
+    size_t count = 0;
+    int read_error = 0;
+    for (;;) {
+        errno = 0;
+        dirent* entry = ::readdir(directory);
+        if (entry == nullptr) {
+            read_error = errno;
+            break;
+        }
+        if (entry->d_name[0] == '.')
+            continue;
+        char* end = nullptr;
+        (void)std::strtol(entry->d_name, &end, 10);
+        if (end != entry->d_name && *end == '\0')
+            ++count;
+    }
+    (void)::closedir(directory);
+    if (read_error != 0)
+        throw std::runtime_error("cannot read /proc/self/fd");
+    return count;
+}
 
 void check(bool condition, const char* expression) {
     if (!condition)
@@ -3234,6 +3263,601 @@ void test_p51_d07_committed_attempt_replacement_all_profiles() {
              ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
         test_p51_d07_active_cancel_recovery(
             profile, D07Scenario::CommittedAttemptReplacement);
+}
+
+void test_p51_d17_repeated_window_cancel(ProfileId profile,
+                                         size_t cycle_count) {
+    constexpr size_t kWindow = 30;
+    CHECK(cycle_count > 0 && cycle_count <= 3);
+    uint32_t cache_profile = 0;
+    const char* profile_name = "unknown";
+    switch (profile) {
+    case ProfileId::P29V1:
+        cache_profile = CACHE_PROFILE_P29V1;
+        profile_name = "P29V1";
+        break;
+    case ProfileId::ZSTD_TU:
+        cache_profile = CACHE_PROFILE_ZSTD_TU;
+        profile_name = "ZSTD_TU";
+        break;
+    case ProfileId::ZSTD_ROUTE:
+        cache_profile = CACHE_PROFILE_ZSTD_ROUTE;
+        profile_name = "ZSTD_ROUTE";
+        break;
+    }
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0x37;
+    const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = 0x47;
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+    uint16_t f_port = 0;
+    const int listener = loopback_listener(f_port);
+    CHECK(listener >= 0 && f_port != 0);
+
+    std::mutex materialize_mutex;
+    std::condition_variable materialize_changed;
+    bool gate_armed = false;
+    bool gate_entered = false;
+    bool release_gate = true;
+    size_t gate_waiters = 0;
+    std::atomic<size_t> materialize_calls{0};
+    std::mutex materialized_mutex;
+    struct MaterializedInput {
+        uint64_t raw_bytes = 0;
+        Digest128 raw_digest{};
+        bool bytes_match_digest = false;
+    };
+    std::vector<MaterializedInput> materialized_inputs;
+    std::mutex ack_mutex;
+    std::vector<ResetAck> reset_acks;
+    std::mutex sent_mutex;
+    std::condition_variable sent_changed;
+    std::vector<uint64_t> sent_ordinals;
+    std::mutex retired_mutex;
+    std::vector<Id128> retired_reservations;
+
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.c_store_guid = f_launch.c_store_guid;
+    f_config.f_store_guid = f_launch.f_store_guid;
+    f_config.f_store_generation = f_launch.store_generation;
+    f_config.sidecar_launch = f_launch;
+    f_config.endpoint_caps.profile = profile;
+    f_config.endpoint_caps.supported_profiles = profile_bit(profile);
+    f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+    f_config.max_pending_p51_source_reservations = 128;
+    f_config.endpoint_config.input_job_state =
+        [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
+            std::span<const uint8_t> bytes) {
+            {
+                std::lock_guard lock(materialized_mutex);
+                materialized_inputs.push_back(MaterializedInput{
+                    begin.raw_bytes, begin.raw_digest,
+                    begin.raw_bytes == bytes.size() &&
+                        begin.raw_digest == icecc::digest128(bytes)});
+            }
+            return InputJobState::Open;
+        };
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    f_config.p51_reservation_retired_for_test =
+        [&](Id128 id, bool) {
+            std::lock_guard lock(retired_mutex);
+            retired_reservations.push_back(id);
+        };
+#endif
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = c_launch.c_store_guid;
+    c_config.f_store_guid = c_launch.f_store_guid;
+    c_config.f_store_generation = c_launch.store_generation;
+    c_config.sidecar_launch = c_launch;
+    c_config.endpoint_caps.profile = profile;
+    c_config.endpoint_caps.supported_profiles = profile_bit(profile);
+    c_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+    c_config.max_active_source_transfers = 4;
+    c_config.max_active_p51_source_transfers = 128;
+    c_config.max_pending_p51_source_operations = 128;
+    c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+    c_config.after_r2_bundle_sent_for_test = [&](uint64_t ordinal) {
+        {
+            std::lock_guard lock(sent_mutex);
+            sent_ordinals.push_back(ordinal);
+        }
+        sent_changed.notify_all();
+    };
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<size_t> accepted_connections{0};
+    std::atomic<int> probe_fd{-1};
+    std::thread acceptor([&] {
+        const auto end = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(150);
+        while (!stop_accepting.load(std::memory_order_acquire) &&
+               accepted_connections.load(std::memory_order_acquire) < 8 &&
+               std::chrono::steady_clock::now() < end) {
+            pollfd ready{listener, POLLIN, 0};
+            int polled;
+            do {
+                polled = ::poll(&ready, 1, 100);
+            } while (polled < 0 && errno == EINTR);
+            if (polled <= 0 || (ready.revents & POLLIN) == 0)
+                continue;
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            int fd;
+            do {
+                fd = ::accept(listener,
+                    reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            } while (fd < 0 && errno == EINTR);
+            if (fd < 0)
+                continue;
+            std::unique_ptr<MsgChannel> channel(
+                Service::createChannelAccepted(
+                    fd, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                continue;
+            const auto handshake_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            bool protocol_ready = true;
+            while (channel->protocol_admission_state() ==
+                       MsgChannel::ProtocolAdmissionState::Pending &&
+                   std::chrono::steady_clock::now() < handshake_deadline) {
+                short events = POLLIN;
+                if (channel->has_pending_write())
+                    events = static_cast<short>(events | POLLOUT);
+                pollfd socket{channel->fd, events, 0};
+                int result;
+                do {
+                    result = ::poll(&socket, 1, 50);
+                } while (result < 0 && errno == EINTR);
+                if (result < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLOUT) && !channel->flush_pending()) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLIN) && !channel->read_a_bit()) {
+                    protocol_ready = false;
+                    break;
+                }
+            }
+            if (!protocol_ready ||
+                channel->protocol_admission_state() !=
+                    MsgChannel::ProtocolAdmissionState::Ready ||
+                !channel->finish_protocol_admission())
+                continue;
+            std::unique_ptr<Msg> link_request(
+                channel->get_msg_until(handshake_deadline));
+            if (dynamic_cast<P51CacheLinkSessionMsg*>(link_request.get()) ==
+                nullptr)
+                continue;
+            const int adopted_fd =
+                channel->send_p51_cache_link_session_ready_and_release(
+                    handshake_deadline);
+            if (adopted_fd < 0)
+                continue;
+            const int duplicate = ::dup(adopted_fd);
+            if (duplicate < 0) {
+                (void)::close(adopted_fd);
+                continue;
+            }
+            const int old_probe = probe_fd.exchange(
+                duplicate, std::memory_order_acq_rel);
+            if (old_probe >= 0)
+                (void)::close(old_probe);
+            EndpointIoControl control;
+            control.before_materialize_on_worker = [&] {
+                materialize_calls.fetch_add(1, std::memory_order_relaxed);
+                std::unique_lock lock(materialize_mutex);
+                if (!gate_armed)
+                    return;
+                ++gate_waiters;
+                gate_entered = true;
+                materialize_changed.notify_all();
+                materialize_changed.wait(lock, [&] { return release_gate; });
+                --gate_waiters;
+            };
+            control.outbound_message_observer =
+                [&](ActorSide actor, const Message& message) {
+                    if (actor != ActorSide::F)
+                        return;
+                    if (const auto* ack = std::get_if<ResetAck>(&message)) {
+                        std::lock_guard lock(ack_mutex);
+                        reset_acks.push_back(*ack);
+                    }
+                };
+            accepted_connections.fetch_add(1, std::memory_order_acq_rel);
+            f_runtime.start_adopted_r2_endpoint(
+                adopted_fd, std::move(control));
+        }
+    });
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            {
+                std::lock_guard lock(materialize_mutex);
+                gate_armed = false;
+                release_gate = true;
+            }
+            materialize_changed.notify_all();
+            stop_accepting.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (acceptor.joinable())
+                acceptor.join();
+            (void)::close(listener);
+            const int descriptor = probe_fd.exchange(
+                -1, std::memory_order_acq_rel);
+            if (descriptor >= 0)
+                (void)::close(descriptor);
+            c_runtime.stop();
+            f_runtime.stop();
+        });
+
+    struct RequestRow {
+        local::P51SourceTransferRequest request;
+        RuntimeCase pair{local::Connection(-1), local::Connection(-1)};
+        std::vector<uint8_t> bytes;
+        uint64_t request_id = 0;
+    };
+    auto make_request = [&](uint64_t request_id, size_t raw_bytes,
+                            uint8_t fill) {
+        auto reservation = test_p51_reservation_request(
+            c_launch.c_store_guid, c_launch.store_generation,
+            c_launch.identity.generation, c_launch.identity.attempt,
+            request_id, cache_profile, 30, std::chrono::seconds(30));
+        reservation.arm.source.assignment_nonce = request_id;
+        reservation.arm.source.logical_job = 500000 + request_id;
+        reservation.arm.source.compiler_attempt = 1;
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = f_port;
+        const auto armed = f_runtime.reserve_p51_source_on_owner(reservation);
+        CHECK(armed.error_code == 0 && armed.armed.has_value());
+        RequestRow row;
+        row.request = local::P51SourceTransferRequest{
+            *armed.armed, reservation.absolute_deadline};
+        row.pair = authenticated_runtime_pair();
+        row.bytes.assign(raw_bytes, fill);
+        row.request_id = request_id;
+        return row;
+    };
+    auto enqueue = [&](RequestRow& row) {
+        const auto operation = local::make_p51_source_transfer_operation(
+            c_launch.identity, row.request, row.request_id);
+        return c_runtime.enqueue_p51_source_transfer(
+            std::move(row.pair.sender), c_launch.identity, operation,
+            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+    };
+    auto attach_exact = [&](RequestRow& row,
+                            const local::P50SourceTransferResult& result) {
+        if (result.code != local::SourceTransferResultCode::Committed ||
+            !result.valid() || result.c_store_guid != c_launch.c_store_guid ||
+            result.raw_bytes != row.bytes.size() ||
+            result.raw_digest != icecc::digest128(row.bytes))
+            return false;
+        const InputLeaseOwner owner{
+            row.request.armed.arm.source.logical_job,
+            row.request.armed.arm.source.assignment_epoch,
+            row.request.armed.arm.source.assignment_nonce};
+        const InputFdRequest request{
+            f_launch.identity,
+            InputRecordKey{result.c_store_guid, TuSeq{result.tu_seq}}, owner,
+            row.request_id + 900000};
+        const auto deadline =
+            row.request.absolute_deadline.as_steady_time_point();
+        auto cursor = f_runtime.attach_input_on_owner(request, deadline);
+        bool exact = cursor.has_value() &&
+                     cursor->remaining() == row.bytes.size() &&
+                     cursor->raw_digest() == icecc::digest128(row.bytes);
+        if (exact) {
+            std::vector<uint8_t> actual(row.bytes.size());
+            exact = cursor->read(actual) == actual.size() && actual == row.bytes;
+        }
+        f_runtime.finish_input_attachment_on_owner(request, exact, deadline);
+        return exact;
+    };
+
+    auto run_fresh = [&](uint64_t request_id, uint8_t fill) {
+        RequestRow fresh = make_request(request_id, 73, fill);
+        CHECK(enqueue(fresh));
+        const auto result = receive_p51_transfer_result(
+            fresh.pair.receiver, c_launch.identity, fresh.request_id,
+            fresh.request.absolute_deadline.as_steady_time_point(), true);
+        if (result.code != local::SourceTransferResultCode::Committed) {
+            std::fprintf(stderr,
+                         "P51_D17 fresh-failed request=%llu code=%u error=%u "
+                         "attempts=%u accepted-links=%zu active=%zu raw=%llu\n",
+                         static_cast<unsigned long long>(fresh.request_id),
+                         static_cast<unsigned>(result.code), result.error_code,
+                         static_cast<unsigned>(result.attempts),
+                         accepted_connections.load(std::memory_order_acquire),
+                         c_runtime.pending_p51_source_operations_for_test(),
+                         static_cast<unsigned long long>(
+                             c_runtime.active_source_raw_bytes_for_test()));
+            std::fflush(stderr);
+        }
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+        CHECK(attach_exact(fresh, result));
+    };
+
+    // Warm the persistent relationship and establish a post-start descriptor
+    // baseline; intentionally retained dictionary/history state is outside the
+    // live-operation and FD leak checks below.
+    run_fresh(490001, 0x21);
+    CHECK(wait_for_source_operation_count(c_runtime, 0, std::chrono::seconds(2)));
+    CHECK(wait_for_source_raw_bytes(c_runtime, 0, std::chrono::seconds(2)));
+    {
+        std::lock_guard lock(sent_mutex);
+        sent_ordinals.clear();
+    }
+    const size_t warmed_fd_baseline = process_open_fd_count();
+    const std::array<size_t, 3> cancel_positions{0, 14, 29};
+    uint64_t confirmed_prefix = 1;
+
+    for (size_t cycle = 0; cycle < cycle_count; ++cycle) {
+        const size_t cancel_index = cancel_positions[cycle];
+        const uint64_t request_base = 500000 + cycle * 100;
+        {
+            std::lock_guard lock(materialize_mutex);
+            gate_entered = false;
+            gate_waiters = 0;
+            release_gate = false;
+            gate_armed = true;
+        }
+        std::vector<RequestRow> cohort;
+        cohort.reserve(kWindow);
+        for (size_t index = 0; index < kWindow; ++index) {
+            cohort.push_back(make_request(
+                request_base + index,
+                32 + (index % 7),
+                static_cast<uint8_t>(0x20 + cycle * 31 + index)));
+        }
+        bool all_enqueued = true;
+        for (auto& row : cohort)
+            all_enqueued = enqueue(row) && all_enqueued;
+        uint64_t expected_active_raw_bytes = 0;
+        for (const auto& row : cohort)
+            expected_active_raw_bytes += row.bytes.size();
+
+        bool gate_waited = false;
+        {
+            std::unique_lock lock(materialize_mutex);
+            gate_waited = materialize_changed.wait_for(
+                lock, std::chrono::seconds(5), [&] { return gate_entered; });
+        }
+        const bool all_active = all_enqueued && gate_waited &&
+            wait_for_source_operation_count(
+                c_runtime, kWindow, std::chrono::seconds(5)) &&
+            wait_for_source_raw_bytes(
+                c_runtime, expected_active_raw_bytes,
+                std::chrono::seconds(5));
+        bool all_sent = false;
+        {
+            std::unique_lock lock(sent_mutex);
+            const auto sent_deadline = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(5);
+            all_sent = sent_changed.wait_until(lock, sent_deadline, [&] {
+                return sent_ordinals.size() >= kWindow;
+            });
+        }
+        std::vector<uint64_t> cycle_sent_ordinals;
+        {
+            std::lock_guard lock(sent_mutex);
+            cycle_sent_ordinals = sent_ordinals;
+        }
+        const size_t cut_operations =
+            c_runtime.pending_p51_source_operations_for_test();
+        const uint64_t cut_raw_bytes =
+            c_runtime.active_source_raw_bytes_for_test();
+        size_t held_materializers_at_cut = 0;
+        {
+            std::lock_guard lock(materialize_mutex);
+            held_materializers_at_cut = gate_waiters;
+        }
+        const bool occupancy_at_cut = all_active && all_sent &&
+            cut_operations == kWindow &&
+            cut_raw_bytes == expected_active_raw_bytes &&
+            held_materializers_at_cut > 0;
+        const Id128 cancelled_id{cohort[cancel_index].request.armed.reservation_id};
+        const bool cancelled = occupancy_at_cut &&
+            f_runtime.cancel_p51_source_on_owner(
+                cohort[cancel_index].request.armed.arm,
+                cohort[cancel_index].request.armed.reservation_id,
+                cohort[cancel_index].request.absolute_deadline.as_steady_time_point());
+        const int current_probe = probe_fd.load(std::memory_order_acquire);
+        const bool disconnected = current_probe >= 0 &&
+            ::shutdown(current_probe, SHUT_RDWR) == 0;
+        {
+            std::lock_guard lock(materialize_mutex);
+            gate_armed = false;
+            release_gate = true;
+        }
+        materialize_changed.notify_all();
+
+        struct Observation {
+            std::optional<local::P50SourceTransferResult> result;
+            bool exact_attachment = false;
+            std::string error;
+        };
+        std::vector<Observation> observations(kWindow);
+        std::vector<std::thread> waiters;
+        waiters.reserve(kWindow);
+        for (size_t index = 0; index < kWindow; ++index) {
+            waiters.emplace_back([&, index] {
+                try {
+                    RequestRow& row = cohort[index];
+                    observations[index].result = receive_p51_transfer_result(
+                        row.pair.receiver, c_launch.identity, row.request_id,
+                        row.request.absolute_deadline.as_steady_time_point(),
+                        true);
+                    if (index != cancel_index &&
+                        observations[index].result->code ==
+                            local::SourceTransferResultCode::Committed)
+                        observations[index].exact_attachment =
+                            attach_exact(row, *observations[index].result);
+                } catch (const std::exception& error) {
+                    observations[index].error = error.what();
+                } catch (...) {
+                    observations[index].error = "unknown exception";
+                }
+            });
+        }
+        for (auto& waiter : waiters)
+            waiter.join();
+
+        size_t exact_successes = 0;
+        size_t exact_errors = 0;
+        size_t matching_reset_acks = 0;
+        bool reset_prefix_exact = false;
+        bool one_unavailable_bit_in_range = false;
+        uint64_t observed_reset_p = 0;
+        uint64_t observed_reset_k = 0;
+        {
+            std::lock_guard lock(ack_mutex);
+            for (const ResetAck& ack : reset_acks) {
+                if (ack.recovery_prepared_prefix_p < confirmed_prefix +
+                                                        kWindow)
+                    continue;
+                ++matching_reset_acks;
+                observed_reset_p = ack.recovery_prepared_prefix_p;
+                observed_reset_k = ack.request.settled_prefix_k;
+                reset_prefix_exact =
+                    ack.recovery_prepared_prefix_p == confirmed_prefix +
+                                                          kWindow &&
+                    ack.request.settled_prefix_k >= confirmed_prefix &&
+                    ack.request.settled_prefix_k <
+                        ack.recovery_prepared_prefix_p;
+                one_unavailable_bit_in_range =
+                    ack.unavailable_suffix_mask != 0 &&
+                    std::popcount(ack.unavailable_suffix_mask) == 1 &&
+                    (ack.unavailable_suffix_mask >> kWindow) == 0;
+                if (reset_prefix_exact && one_unavailable_bit_in_range)
+                    break;
+            }
+        }
+        bool cancelled_once = false;
+        {
+            std::lock_guard lock(retired_mutex);
+            cancelled_once = std::count(
+                retired_reservations.begin(), retired_reservations.end(),
+                cancelled_id) == 1;
+        }
+        for (size_t index = 0; index < kWindow; ++index) {
+            const auto& observation = observations[index];
+            if (index == cancel_index) {
+                if (observation.result &&
+                    observation.result->code ==
+                        local::SourceTransferResultCode::Error &&
+                    observation.result->error_code != 0)
+                    ++exact_errors;
+            } else if (observation.result &&
+                       observation.result->code ==
+                           local::SourceTransferResultCode::Committed &&
+                       observation.result->valid() &&
+                       observation.result->c_store_guid ==
+                           c_launch.c_store_guid &&
+                       observation.result->raw_bytes == cohort[index].bytes.size() &&
+                       observation.result->raw_digest ==
+                           icecc::digest128(cohort[index].bytes) &&
+                       observation.exact_attachment) {
+                ++exact_successes;
+            }
+        }
+        if (exact_successes != kWindow - 1 || exact_errors != 1) {
+            std::fprintf(stderr,
+                         "P51_D17 cohort-outcomes profile=%s cycle=%zu "
+                         "cancel-index=%zu sent=%zu active-before=%d "
+                         "cancelled=%d disconnected=%d successes=%zu "
+                         "errors=%zu\n",
+                         profile_name, cycle, cancel_index,
+                         cycle_sent_ordinals.size(), all_active ? 1 : 0,
+                         cancelled ? 1 : 0, disconnected ? 1 : 0,
+                         exact_successes, exact_errors);
+            for (size_t index = 0; index < kWindow; ++index) {
+                if (!observations[index].error.empty())
+                    std::fprintf(stderr,
+                                 "P51_D17 outcome-error index=%zu %s\n",
+                                 index, observations[index].error.c_str());
+            }
+            std::fflush(stderr);
+        }
+        const bool operations_zero = wait_for_source_operation_count(
+            c_runtime, 0, std::chrono::seconds(5));
+        const bool raw_credit_zero = wait_for_source_raw_bytes(
+            c_runtime, 0, std::chrono::seconds(5));
+
+        CHECK(all_enqueued);
+        CHECK(gate_waited);
+        CHECK(all_active);
+        CHECK(all_sent);
+        CHECK(occupancy_at_cut);
+        CHECK(cancelled);
+        CHECK(disconnected);
+        CHECK(exact_errors == 1);
+        CHECK(exact_successes == kWindow - 1);
+        CHECK(cancelled_once);
+        CHECK(matching_reset_acks >= 1);
+        CHECK(reset_prefix_exact);
+        CHECK(one_unavailable_bit_in_range);
+        CHECK(operations_zero);
+        CHECK(raw_credit_zero);
+
+        {
+            std::lock_guard lock(sent_mutex);
+            std::set<uint64_t> cycle_ordinals;
+            for (uint64_t ordinal : cycle_sent_ordinals)
+                cycle_ordinals.insert(ordinal);
+            CHECK(cycle_sent_ordinals.size() == kWindow);
+            CHECK(cycle_ordinals.size() == kWindow);
+            CHECK(*cycle_ordinals.begin() == confirmed_prefix + 1);
+            CHECK(*cycle_ordinals.rbegin() == confirmed_prefix + kWindow);
+        }
+        cohort.clear();
+        {
+            std::lock_guard lock(sent_mutex);
+            sent_ordinals.clear();
+        }
+        run_fresh(request_base + kWindow, static_cast<uint8_t>(0xe0 + cycle));
+        {
+            std::lock_guard lock(sent_mutex);
+            CHECK(sent_ordinals.size() == 1);
+            confirmed_prefix = sent_ordinals.front();
+            sent_ordinals.clear();
+        }
+        {
+            std::lock_guard lock(sent_mutex);
+            sent_ordinals.clear();
+        }
+        CHECK(wait_for_source_operation_count(c_runtime, 0, std::chrono::seconds(2)));
+        CHECK(wait_for_source_raw_bytes(c_runtime, 0, std::chrono::seconds(2)));
+        const size_t quiescent_fds = process_open_fd_count();
+        CHECK(quiescent_fds == warmed_fd_baseline);
+        std::printf("P51_D17 cycle profile=%s index=%zu jobs=30 "
+                    "cancel-submission-index=%zu "
+                    "survivors=29 fresh=1 accepted-links=%zu "
+                    "active-held-at-cut=%zu materializers-held=%zu "
+                    "raw-held-at-cut=%llu "
+                    "raw-expected=%llu "
+                    "raw-bytes=0 fds=%zu baseline=%zu reset-K=%llu "
+                    "reset-P=%llu fresh-ordinal=%llu sent=30\n",
+                    profile_name, cycle, cancel_index,
+                    accepted_connections.load(std::memory_order_acquire),
+                    cut_operations,
+                    held_materializers_at_cut,
+                    static_cast<unsigned long long>(cut_raw_bytes),
+                    static_cast<unsigned long long>(expected_active_raw_bytes),
+                    quiescent_fds, warmed_fd_baseline,
+                    static_cast<unsigned long long>(observed_reset_k),
+                    static_cast<unsigned long long>(observed_reset_p),
+                    static_cast<unsigned long long>(confirmed_prefix));
+        std::fflush(stdout);
+    }
+    CHECK(accepted_connections.load(std::memory_order_acquire) ==
+          cycle_count + 1);
 }
 
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
@@ -10260,6 +10884,19 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d17-window-cancel-zstd-tu") == 0) {
+            test_p51_d17_repeated_window_cancel(ProfileId::ZSTD_TU, 1);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d17-repeated-window-cancel") == 0) {
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE})
+                test_p51_d17_repeated_window_cancel(profile, 3);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--credit-admission-hol-witness") == 0) {
             test_p51_credit_admission_bypasses_blocked_workers();
             return 0;
@@ -10294,6 +10931,10 @@ int main(int argc, char** argv) {
         test_p51_d07_active_cancel_replay_interrupt_all_profiles();
         test_p51_d07_positive_recovery_owner_all_profiles();
         test_p51_d07_committed_attempt_replacement_all_profiles();
+        for (const ProfileId profile : {
+                 ProfileId::P29V1, ProfileId::ZSTD_TU,
+                 ProfileId::ZSTD_ROUTE})
+            test_p51_d17_repeated_window_cancel(profile, 3);
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_credit_admission_bypasses_blocked_workers();

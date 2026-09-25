@@ -113,6 +113,9 @@ struct RuntimeConfig {
     // Test-only cut after a complete R2 replayed bundle. Production leaves
     // this unset; the sender stops before advancing to the next replay row.
     std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;
+    // Test-only observation of complete C-side bundle writes; distinct from
+    // F-side materialization/receipt evidence.
+    std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
     // Observes which assignment caller first enters shared R2 recovery.
     // Production builds expose no callback and this never changes outcomes.
     std::function<void(p50::PrepareRequestKey)> before_r2_recovery_for_test;
