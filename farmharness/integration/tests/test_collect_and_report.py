@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,7 +13,10 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest, report
-from farmharness.integration.r2_wire_trace import validate_r2_wire_trace
+from farmharness.integration.r2_wire_trace import (
+    R2_LINK_EVENT_SCHEMA,
+    validate_r2_wire_trace,
+)
 from farmharness.integration.collect import (
     CollectError,
     _authenticated_rejoin_line,
@@ -22,6 +27,7 @@ from farmharness.integration.collect import (
     _assignment_preference,
     _control_observations,
     _event_log,
+    _f_r2_events_for_client,
     _instance_version_at,
     _legacy_wire_binding_marker,
     _legacy_wire_candidates_for_assignment,
@@ -566,6 +572,333 @@ def test_source_result_v5_r2_reads_standalone_interval_sink(tmp_path: Path) -> N
     assert len(records) == 1
     assert len(interval_events) == 1
     assert interval_events[0]["interval"] == interval
+
+
+def test_source_result_v5_reads_f_link_events_and_collects_terminal_trace(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _r2_v5_source_result_record()
+    accounting = record["r2_wire_accounting"]
+    assert isinstance(accounting, dict)
+    first = accounting["intervals"][0]
+    first["end"] = "DrainedAckCheckpoint"
+    first["drained_ack_prefix"] = 1
+    retired = copy.deepcopy(first)
+    retired["interval_sequence"] = 2
+    retired["end"] = "PhysicalLinkRetired"
+    retired["total_c_to_f_bytes"] = 0
+    retired["total_f_to_c_bytes"] = 0
+    retired["shared_c_to_f_bytes"] = 0
+    retired["shared_f_to_c_bytes"] = 0
+    retired["drained_ack_prefix"] = 0
+    retired["jobs"] = []
+    retired["link"] = dict(retired["link"])
+    retired["link"]["relationship_epoch"] += 1
+    accounting["intervals"].append(retired)
+    job_key = accounting["job_key"]
+    link = {
+        key: job_key[key]
+        for key in ("c_store_guid", "f_store_guid", "logical_link_id")
+    }
+    link.update(
+        relationship_epoch=first["link"]["relationship_epoch"],
+        physical_link_generation=first["link"]["physical_link_generation"],
+    )
+    ack = {
+        "schema": R2_LINK_EVENT_SCHEMA,
+        "event": "ack_validated",
+        "link": link,
+        "acknowledged_prefix": 1,
+        "valid": True,
+    }
+    release_link = dict(link)
+    release_link["relationship_epoch"] += 1
+    release = {
+        "schema": R2_LINK_EVENT_SCHEMA,
+        "event": "link_released",
+        "link": release_link,
+        "committed_prefix": 1,
+        "acknowledged_prefix": 1,
+        "valid": True,
+    }
+    _write_jsonl(path, [record, ack, release])
+
+    interval_events: list[dict[str, object]] = []
+    link_events: list[dict[str, object]] = []
+    parsed = _source_results(
+        path,
+        r2_interval_events=interval_events,
+        r2_link_events=link_events,
+    )
+    summary = _require_collectable_source_accounting(
+        parsed, interval_events, link_events
+    )
+
+    assert summary is not None
+    assert len(link_events) == 2
+    assert summary["links"][0]["physical_complete"] is True  # type: ignore[index]
+    assert summary["links"][0]["relationship_settled"] is True  # type: ignore[index]
+
+
+def test_source_result_v5_joins_f_terminal_events_from_worker_file(
+    tmp_path: Path,
+) -> None:
+    c_path = tmp_path / "C1" / "source-result.jsonl"
+    f_path = tmp_path / "F1" / "source-result.jsonl"
+    c_path.parent.mkdir()
+    f_path.parent.mkdir()
+    record = _r2_v5_source_result_record()
+    accounting = record["r2_wire_accounting"]
+    assert isinstance(accounting, dict)
+    first = accounting["intervals"][0]
+    first["end"] = "DrainedAckCheckpoint"
+    first["drained_ack_prefix"] = 1
+    retired = copy.deepcopy(first)
+    retired["interval_sequence"] = 2
+    retired["end"] = "PhysicalLinkRetired"
+    retired["total_c_to_f_bytes"] = 0
+    retired["total_f_to_c_bytes"] = 0
+    retired["shared_c_to_f_bytes"] = 0
+    retired["shared_f_to_c_bytes"] = 0
+    retired["drained_ack_prefix"] = 0
+    retired["jobs"] = []
+    retired["link"] = dict(retired["link"])
+    retired["link"]["relationship_epoch"] += 1
+    accounting["intervals"].append(retired)
+    job_key = accounting["job_key"]
+    link = {
+        key: job_key[key]
+        for key in ("c_store_guid", "f_store_guid", "logical_link_id")
+    }
+    link.update(
+        relationship_epoch=first["link"]["relationship_epoch"],
+        physical_link_generation=first["link"]["physical_link_generation"],
+    )
+    ack = {
+        "schema": R2_LINK_EVENT_SCHEMA,
+        "event": "ack_validated",
+        "link": link,
+        "acknowledged_prefix": 1,
+        "valid": True,
+    }
+    release_link = dict(link)
+    release_link["relationship_epoch"] += 1
+    release = {
+        "schema": R2_LINK_EVENT_SCHEMA,
+        "event": "link_released",
+        "link": release_link,
+        "committed_prefix": 1,
+        "acknowledged_prefix": 1,
+        "valid": True,
+    }
+    _write_jsonl(c_path, [record])
+    _write_jsonl(f_path, [ack, release])
+
+    c_intervals: list[dict[str, object]] = []
+    c_link_events: list[dict[str, object]] = []
+    f_link_events: list[dict[str, object]] = []
+    parsed = _source_results(
+        c_path,
+        r2_interval_events=c_intervals,
+        r2_link_events=c_link_events,
+    )
+    assert not c_link_events
+    f_rows = _source_results(f_path, r2_link_events=f_link_events)
+    assert not f_rows and len(f_link_events) == 2
+    claimed: dict[tuple[str, int], str] = {}
+    joined_f_events = _f_r2_events_for_client(
+        "C1",
+        parsed,
+        c_intervals,
+        [("F1", index, event) for index, event in enumerate(f_link_events)],
+        claimed,
+    )
+    summary = _require_collectable_source_accounting(
+        parsed, c_intervals, joined_f_events
+    )
+    assert summary is not None
+    assert [event["event"] for event in joined_f_events] == [
+        "ack_validated",
+        "link_released",
+    ]
+    # F observed RESET on the same physical socket, advancing the epoch after
+    # C's checkpoint. The separate-worker join must match socket identity,
+    # not require epoch equality.
+    assert joined_f_events[0]["link"]["relationship_epoch"] == first["link"]["relationship_epoch"]
+    assert joined_f_events[1]["link"]["relationship_epoch"] == retired["link"]["relationship_epoch"]
+    assert claimed == {("F1", 0): "C1", ("F1", 1): "C1"}
+    assert summary["links"][0]["physical_complete"] is True  # type: ignore[index]
+    assert summary["links"][0]["relationship_settled"] is True  # type: ignore[index]
+
+
+def test_worker_event_partition_keeps_interleaved_same_ordinal_c_links_separate() -> None:
+    first = _r2_v5_source_result_record()
+    second = copy.deepcopy(first)
+    second_c, second_link = "5" * 32, "6" * 32
+    second["wire_job_id"] = 3
+    second["logical_job"] = 3
+    second["c_store_guid"] = second_c
+    second["r2_accounting_key"]["c_store_guid"] = second_c
+    second["r2_accounting_key"]["logical_link_id"] = second_link
+    accounting = second["r2_wire_accounting"]
+    accounting["job_key"]["c_store_guid"] = second_c
+    accounting["job_key"]["logical_link_id"] = second_link
+    for interval in accounting["intervals"]:
+        interval["link"]["c_store_guid"] = second_c
+        interval["link"]["logical_link_id"] = second_link
+        for job in interval["jobs"]:
+            job["key"]["c_store_guid"] = second_c
+            job["key"]["logical_link_id"] = second_link
+    key2 = dict(accounting["job_key"])
+    first_link = first["r2_wire_accounting"]["intervals"][0]["link"]
+    second_interval = accounting["intervals"][0]
+    identities = (first_link, second_interval["link"])
+    events: list[tuple[str, int, dict[str, object]]] = []
+    for ordinal, link in enumerate(identities):
+        key = first["r2_wire_accounting"]["job_key"] if ordinal == 0 else key2
+        c_guid, logical = key["c_store_guid"], key["logical_link_id"]
+        event_link = {
+            "c_store_guid": c_guid,
+            "f_store_guid": key["f_store_guid"],
+            "logical_link_id": logical,
+            "relationship_epoch": link["relationship_epoch"],
+            "physical_link_generation": link["physical_link_generation"],
+        }
+        ack = {"schema": R2_LINK_EVENT_SCHEMA, "event": "ack_validated",
+               "link": event_link, "acknowledged_prefix": 1, "valid": True}
+        release = {"schema": R2_LINK_EVENT_SCHEMA, "event": "link_released",
+                   "link": event_link, "committed_prefix": 1,
+                   "acknowledged_prefix": 1, "valid": True}
+        events.extend((("F1", ordinal * 2, ack), ("F1", ordinal * 2 + 1, release)))
+    first_rows = {(1, 1, 1): first}
+    second_rows = {(3, 1, 1): second}
+    claimed: dict[tuple[str, int], str] = {}
+    first_events = _f_r2_events_for_client(
+        "C1", first_rows, [], events, claimed
+    )
+    second_events = _f_r2_events_for_client(
+        "C2", second_rows, [], events, claimed
+    )
+    assert [row["event"] for row in first_events] == ["ack_validated", "link_released"]
+    assert [row["event"] for row in second_events] == ["ack_validated", "link_released"]
+    assert {row["link"]["c_store_guid"] for row in first_events} == {"1" * 32}
+    assert {row["link"]["c_store_guid"] for row in second_events} == {second_c}
+    assert len(claimed) == 4
+
+
+def test_live_two_c_one_f_service_trace_reconciles_with_collector(
+    tmp_path: Path,
+) -> None:
+    """Run the real concurrent service fixture when its built binary is supplied.
+
+    The selector owns two independent C runtimes/owner threads and one F
+    runtime. This opt-in integration test ensures its emitted JSONL, rather
+    than synthesized DTO rows, remains consumable by the production collector.
+    """
+
+    binary = os.environ.get("ICECC_P50CACHESERVICE_BIN")
+    if not binary:
+        pytest.skip("set ICECC_P50CACHESERVICE_BIN to run the live service trace")
+    executable = Path(binary)
+    assert executable.is_file() and os.access(executable, os.X_OK)
+
+    trace_path = tmp_path / "two-c-one-f-source-trace.jsonl"
+    child_env = os.environ.copy()
+    child_env["ICECC_P50_DIAGNOSTICS"] = "1"
+    child_env["ICECC_P50_SOURCE_RESULT_TRACE"] = str(trace_path)
+    completed = subprocess.run(
+        [str(executable), "--r2-trace-two-c-interleaved"],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "P51_R2_TRACE two-C/one-F concurrent bundle rendezvous: PASS" in completed.stdout
+
+    c_intervals: list[dict[str, object]] = []
+    f_link_events: list[dict[str, object]] = []
+    source_results = _source_results(
+        trace_path,
+        r2_interval_events=c_intervals,
+        r2_link_events=f_link_events,
+    )
+    assert len(source_results) == 2
+    assert len(c_intervals) >= 4
+    assert len(f_link_events) == 4
+
+    by_c: dict[str, dict[tuple[int, int, int], dict[str, object]]] = {}
+    for identity, record in source_results.items():
+        key = record.get("r2_accounting_key")
+        assert isinstance(key, dict)
+        c_guid = key.get("c_store_guid")
+        assert isinstance(c_guid, str)
+        by_c.setdefault(c_guid, {})[identity] = record
+    assert len(by_c) == 2
+    assert all(len(rows) == 1 for rows in by_c.values())
+
+    client_events: dict[str, list[dict[str, object]]] = {}
+    for event in c_intervals:
+        interval = event.get("interval")
+        assert isinstance(interval, dict)
+        link = interval.get("link")
+        assert isinstance(link, dict)
+        c_guid = link.get("c_store_guid")
+        assert isinstance(c_guid, str)
+        client_events.setdefault(c_guid, []).append(event)
+    assert set(client_events) == set(by_c)
+
+    claims: dict[tuple[str, int], str] = {}
+    joined_worker_events: list[dict[str, object]] = []
+    all_source_records: dict[tuple[int, int, int], dict[str, object]] = {}
+    for client_index, (c_guid, rows) in enumerate(sorted(by_c.items()), start=1):
+        record = next(iter(rows.values()))
+        all_source_records.update(rows)
+        joined = _f_r2_events_for_client(
+            f"C{client_index}",
+            rows,
+            client_events[c_guid],
+            [("F1", index, event) for index, event in enumerate(f_link_events)],
+            claims,
+        )
+        assert [event["event"] for event in joined] == [
+            "ack_validated",
+            "link_released",
+        ]
+        assert joined[0]["acknowledged_prefix"] == 1
+        assert joined[1]["committed_prefix"] == 1
+        assert joined[1]["acknowledged_prefix"] == 1
+        joined_worker_events.extend(joined)
+        key = record["r2_accounting_key"]
+        assert isinstance(key, dict)
+        assert key["tu_seq"] == 0
+
+    logical_ids = {
+        event["interval"]["link"]["logical_link_id"] for event in c_intervals
+    }
+    assert len(logical_ids) == 2
+    assert {
+        event["interval"]["link"]["physical_link_generation"]
+        for event in c_intervals
+        if event["interval"]["end"] == "PhysicalLinkRetired"
+    } == {1}
+    assert len(claims) == 4
+    summary = _require_collectable_source_accounting(
+        all_source_records, c_intervals, joined_worker_events
+    )
+    assert summary is not None
+    fully_checked = validate_r2_wire_trace(
+        all_source_records.values(),
+        f_link_events=joined_worker_events,
+        c_interval_events=c_intervals,
+        require_terminal=True,
+        require_settled=True,
+        require_job_conservation=True,
+    )
+    assert len(fully_checked["closed_relationships"]) == 2
+    assert len(fully_checked["settled_relationships"]) == 2
 
 
 def test_source_result_external_r2_intervals_cannot_be_duplicated_inline(

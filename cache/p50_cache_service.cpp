@@ -315,6 +315,65 @@ bool append_r2_interval_trace(
   }
 }
 
+void write_r2_link_identity_json(std::ostream& out,
+                                 const LinkHello& link) {
+  const auto guid = [](const auto& value) {
+    return bytes_hex(std::span<const uint8_t>(
+        value.bytes.data(), value.bytes.size()));
+  };
+  out << "{\"c_store_guid\":\"" << guid(link.c_store_guid)
+      << "\",\"f_store_guid\":\"" << guid(link.f_store_guid)
+      << "\",\"logical_link_id\":\""
+      << bytes_hex(std::span<const uint8_t>(
+             link.relationship_id.bytes.data(),
+             link.relationship_id.bytes.size()))
+      << "\",\"relationship_epoch\":" << link.relationship_epoch
+      << ",\"physical_link_generation\":"
+      << link.physical_link_generation << '}';
+}
+
+bool append_r2_ack_validated_trace(
+    const std::shared_ptr<const std::string>& path,
+    const LinkHello& link, uint64_t acknowledged_prefix) noexcept {
+  if (!path || path->empty())
+    return false;
+  try {
+    std::ostringstream line;
+    line << "{\"schema\":\"icecream-p50-r2-link-event-v1\","
+         << "\"event\":\"ack_validated\",\"link\":";
+    write_r2_link_identity_json(line, link);
+    line << ",\"acknowledged_prefix\":" << acknowledged_prefix
+         << ",\"valid\":true}\n";
+    const std::string bytes = line.str();
+    return bytes.size() <= 4096 &&
+           append_p50_source_trace_line(path->c_str(), bytes);
+  } catch (...) {
+    return false;
+  }
+}
+
+bool append_r2_link_released_trace(
+    const std::shared_ptr<const std::string>& path,
+    const LinkHello& link, uint64_t committed_prefix,
+    uint64_t acknowledged_prefix) noexcept {
+  if (!path || path->empty() || acknowledged_prefix > committed_prefix)
+    return false;
+  try {
+    std::ostringstream line;
+    line << "{\"schema\":\"icecream-p50-r2-link-event-v1\","
+         << "\"event\":\"link_released\",\"link\":";
+    write_r2_link_identity_json(line, link);
+    line << ",\"committed_prefix\":" << committed_prefix
+         << ",\"acknowledged_prefix\":" << acknowledged_prefix
+         << ",\"valid\":true}\n";
+    const std::string bytes = line.str();
+    return bytes.size() <= 4096 &&
+           append_p50_source_trace_line(path->c_str(), bytes);
+  } catch (...) {
+    return false;
+  }
+}
+
 void append_source_result_trace(
     uint64_t wire_job_id, uint64_t logical_job, uint64_t assignment_epoch,
     uint64_t assignment_nonce, CStoreGuid c_store_guid, ProfileId profile,
@@ -1984,6 +2043,13 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
       // churn during replacement.
       fsession_owner_(64, config_.f_store_generation) {
     config_.endpoint_config.f_store_generation = config_.f_store_generation;
+    const char* configured_trace_path =
+        ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+    if (p51_metrics_requested() && configured_trace_path != nullptr &&
+        *configured_trace_path != '\0') {
+        p51_source_trace_path_ =
+            std::make_shared<const std::string>(configured_trace_path);
+    }
     const auto fsession_ready = fsession::mint_fsession_admission_ready(
         fsession_owner_.service_generation(), 1);
     if (!fsession_owner_.open_admission(fsession_ready))
@@ -2050,9 +2116,15 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
         const R2TxCommit& commit) {
         return record_p51_job_commit_on_owner(link, binding, commit);
     };
-    config_.endpoint_config.acknowledge_p51_receipt = [this](
+    const auto f_link_trace_path = p51_source_trace_path_;
+    config_.endpoint_config.acknowledge_p51_receipt = [this, f_link_trace_path](
         const LinkHello& link, const CommitAck& ack) {
-        return acknowledge_p51_receipt_on_owner(link, ack);
+        const bool accepted = acknowledge_p51_receipt_on_owner(link, ack);
+        if (accepted)
+            (void)append_r2_ack_validated_trace(
+                f_link_trace_path, link,
+                ack.contiguous_verified_ordinal);
+        return accepted;
     };
     config_.endpoint_config.recover_p51_receipts = [this](
         const LinkHello& link, const RecoverBegin& begin,
@@ -2095,11 +2167,9 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.compression_level = 3;
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
-    const char* source_trace_path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
-    if (p51_metrics_requested() && source_trace_path != nullptr &&
-        *source_trace_path != '\0') {
+    if (p51_source_trace_path_) {
         auto interval_sink = std::make_shared<R2IntervalTraceSink>(
-            std::string(source_trace_path));
+            *p51_source_trace_path_);
         route_config.r2_interval_observer =
             [interval_sink](const R2WireControlSnapshot& snapshot) {
                 return append_r2_interval_trace(interval_sink, snapshot);
@@ -4006,6 +4076,27 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
         std::fflush(stderr);
         ServerRunResult endpoint_result;
         if (r2_link) {
+            if (p51_source_trace_path_) {
+                const auto trace_path = p51_source_trace_path_;
+                auto previous_observer =
+                    std::move(endpoint_control.r2_link_io_quiesced_observer);
+                endpoint_control.r2_link_io_quiesced_observer =
+                    [trace_path, previous_observer =
+                                     std::move(previous_observer)](
+                        const LinkHello& link, uint64_t committed_prefix,
+                        uint64_t acknowledged_prefix) {
+                        if (previous_observer) {
+                            try {
+                                previous_observer(link, committed_prefix,
+                                                  acknowledged_prefix);
+                            } catch (...) {
+                            }
+                        }
+                        (void)append_r2_link_released_trace(
+                            trace_path, link, committed_prefix,
+                            acknowledged_prefix);
+                    };
+            }
             endpoint_result = co_await endpoint_->run_adopted_r2(
                 std::move(*socket), std::move(endpoint_control));
         } else {

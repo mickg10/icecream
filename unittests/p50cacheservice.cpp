@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <fstream>
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
@@ -8163,7 +8164,8 @@ void test_p51_same_f_missing_relationship_reassignment_keeps_sibling() {
 }
 
 void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
-    bool established_link_reconnect = false) {
+    bool established_link_reconnect = false,
+    bool interleaved_trace_only = false) {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x5b;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
@@ -8201,16 +8203,276 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                 continue;
             if (polled <= 0)
                 continue;
-            const int fd = ::accept(listener, nullptr, nullptr);
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            const int fd = ::accept(
+                listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
             if (fd < 0) {
                 if (errno == EINTR)
                     continue;
                 break;
             }
+            if (!interleaved_trace_only) {
+                // The original route-owner path already speaks raw R2; keep
+                // its fixture transport exactly as it was before adding the
+                // SidecarRuntime sender branch below.
+                accepted.fetch_add(1, std::memory_order_relaxed);
+                server.start_adopted_r2_endpoint(fd);
+                continue;
+            }
+            // A production SidecarRuntime sender first negotiates the public
+            // MsgChannel protocol and P51 cache-link session. Only the handed-
+            // off descriptor is an R2 byte stream for this endpoint.
+            std::unique_ptr<MsgChannel> channel(
+                Service::createChannelAccepted(
+                    fd, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                continue;
+            const auto handshake_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            bool protocol_ready = true;
+            while (channel->protocol_admission_state() ==
+                       MsgChannel::ProtocolAdmissionState::Pending &&
+                   std::chrono::steady_clock::now() < handshake_deadline) {
+                short events = POLLIN;
+                if (channel->has_pending_write())
+                    events |= POLLOUT;
+                pollfd socket{channel->fd, events, 0};
+                int polled_handshake;
+                do {
+                    polled_handshake = ::poll(&socket, 1, 50);
+                } while (polled_handshake < 0 && errno == EINTR);
+                if (polled_handshake < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLOUT) &&
+                    !channel->flush_pending()) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLIN) && !channel->read_a_bit()) {
+                    protocol_ready = false;
+                    break;
+                }
+            }
+            if (!protocol_ready ||
+                channel->protocol_admission_state() !=
+                    MsgChannel::ProtocolAdmissionState::Ready ||
+                !channel->finish_protocol_admission())
+                continue;
+            std::unique_ptr<Msg> link_request(
+                channel->get_msg_until(handshake_deadline));
+            if (dynamic_cast<P51CacheLinkSessionMsg*>(link_request.get()) ==
+                nullptr)
+                continue;
+            const int adopted_fd =
+                channel->send_p51_cache_link_session_ready_and_release(
+                    handshake_deadline);
+            if (adopted_fd < 0)
+                continue;
             accepted.fetch_add(1, std::memory_order_relaxed);
-            server.start_adopted_r2_endpoint(fd);
+            server.start_adopted_r2_endpoint(adopted_fd);
         }
     });
+
+    if (interleaved_trace_only) {
+        // Exercise two independent C service runtimes against this one F
+        // SidecarRuntime. The bounded rendezvous runs after each complete
+        // C->F bundle write, so both exact links are live simultaneously.
+        // Each client runtime has its own fixed owner thread; this avoids
+        // migrating either sender's thread-affine state.
+        struct BundleRendezvous {
+            std::mutex mutex;
+            std::condition_variable changed;
+            size_t arrivals = 0;
+            bool timed_out = false;
+            std::vector<uint64_t> ordinals;
+
+            void arrive(uint64_t ordinal) {
+                std::unique_lock lock(mutex);
+                ordinals.push_back(ordinal);
+                ++arrivals;
+                changed.notify_all();
+                if (!changed.wait_for(lock, std::chrono::seconds(5), [&] {
+                        return arrivals >= 2;
+                    }))
+                    timed_out = true;
+            }
+        } rendezvous;
+
+        std::unique_ptr<service::SidecarRuntime> first_client;
+        std::unique_ptr<service::SidecarRuntime> second_client;
+        bool clients_stopped = false;
+        const auto stop_clients = [&] {
+            if (clients_stopped)
+                return;
+            if (first_client)
+                first_client->stop();
+            if (second_client)
+                second_client->stop();
+            clients_stopped = true;
+        };
+        auto branch_cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+            reinterpret_cast<int*>(1), [&](int*) {
+                stop_clients();
+                stopping.store(true, std::memory_order_release);
+                (void)::shutdown(listener, SHUT_RDWR);
+                if (accept_thread.joinable())
+                    accept_thread.join();
+                (void)::close(listener);
+                server.stop();
+            });
+
+        auto make_client = [&](uint8_t root_tag) {
+            StoreIdentityRoot root{};
+            root.bytes[15] = root_tag;
+            const SidecarLaunchIdentity client_launch = test_sidecar_launch(root);
+            service::RuntimeConfig config = test_runtime_config();
+            config.c_store_guid = client_launch.c_store_guid;
+            config.f_store_guid = client_launch.f_store_guid;
+            config.f_store_generation = client_launch.store_generation;
+            config.sidecar_launch = client_launch;
+            config.endpoint_caps.profile = ProfileId::ZSTD_TU;
+            config.endpoint_caps.supported_profiles =
+                profile_bit(ProfileId::ZSTD_TU);
+            config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
+            config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
+            config.max_active_p51_source_transfers = 2;
+            config.max_pending_p51_source_operations = 2;
+            config.after_r2_bundle_sent_for_test = [&](uint64_t ordinal) {
+                rendezvous.arrive(ordinal);
+            };
+            return std::pair{client_launch,
+                             std::make_unique<service::SidecarRuntime>(
+                                 std::move(config))};
+        };
+
+        auto [first_launch, first_runtime] = make_client(0x5c);
+        auto [second_launch, second_runtime] = make_client(0x5d);
+        first_client = std::move(first_runtime);
+        second_client = std::move(second_runtime);
+        CHECK(first_launch.c_store_guid != second_launch.c_store_guid);
+        const char* trace_path = std::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+        CHECK(trace_path != nullptr && *trace_path != '\0');
+        struct stat initial_trace_stat{};
+        if (::stat(trace_path, &initial_trace_stat) == 0)
+            CHECK(initial_trace_stat.st_size == 0);
+        else
+            CHECK(errno == ENOENT);
+
+        auto make_armed_request = [&](const SidecarLaunchIdentity& client_launch,
+                                      uint64_t request_id) {
+            auto reservation = test_p51_reservation_request(
+                client_launch.c_store_guid, client_launch.store_generation,
+                client_launch.identity.generation,
+                client_launch.identity.attempt, request_id,
+                CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(20));
+            reservation.arm.source.assignment_nonce = request_id;
+            reservation.arm.source.selected_f_host = "127.0.0.1";
+            reservation.arm.source.selected_f_cache_port = port;
+            const auto reserved = server.reserve_p51_source_on_owner(reservation);
+            CHECK(reserved.error_code == 0 && reserved.armed.has_value());
+            return std::pair{
+                local::P51SourceTransferRequest{
+                    *reserved.armed, reservation.absolute_deadline},
+                request_id};
+        };
+        auto first_request = make_armed_request(first_launch, 9501);
+        auto second_request = make_armed_request(second_launch, 9502);
+        RuntimeCase first_pair = authenticated_runtime_pair();
+        RuntimeCase second_pair = authenticated_runtime_pair();
+        const auto enqueue = [&](service::SidecarRuntime& client,
+                                 const SidecarLaunchIdentity& client_launch,
+                                 RuntimeCase& pair,
+                                 const local::P51SourceTransferRequest& request,
+                                 uint8_t fill) {
+            const auto operation = local::make_p51_source_transfer_operation(
+                client_launch.identity, request,
+                request.armed.arm.source.source_request_id);
+            return client.enqueue_p51_source_transfer(
+                std::move(pair.sender), client_launch.identity, operation,
+                sized_test_source_fd(37, fill));
+        };
+        CHECK(enqueue(*first_client, first_launch, first_pair,
+                      first_request.first, 0xb1));
+        CHECK(enqueue(*second_client, second_launch, second_pair,
+                      second_request.first, 0xb2));
+        const auto first_deadline =
+            first_request.first.absolute_deadline.as_steady_time_point();
+        const auto second_deadline =
+            second_request.first.absolute_deadline.as_steady_time_point();
+        const auto first_result = receive_p51_transfer_result(
+            first_pair.receiver, first_launch.identity, first_request.second,
+            first_deadline, true);
+        const auto second_result = receive_p51_transfer_result(
+            second_pair.receiver, second_launch.identity, second_request.second,
+            second_deadline, true);
+        CHECK(first_result.code == local::SourceTransferResultCode::Committed &&
+              second_result.code == local::SourceTransferResultCode::Committed);
+        CHECK(first_result.c_store_guid == first_launch.c_store_guid &&
+              second_result.c_store_guid == second_launch.c_store_guid &&
+              first_result.tu_seq == second_result.tu_seq);
+        {
+            std::lock_guard lock(rendezvous.mutex);
+            CHECK(!rendezvous.timed_out && rendezvous.arrivals == 2 &&
+                  rendezvous.ordinals.size() == 2 &&
+                  rendezvous.ordinals[0] == rendezvous.ordinals[1]);
+        }
+
+        stop_clients();
+        const auto release_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(3);
+        const auto guid_hex = [](const CStoreGuid& guid) {
+            constexpr char digits[] = "0123456789abcdef";
+            std::string value;
+            value.reserve(guid.bytes.size() * 2);
+            for (const uint8_t byte : guid.bytes) {
+                value.push_back(digits[byte >> 4]);
+                value.push_back(digits[byte & 0xf]);
+            }
+            return value;
+        };
+        const std::string first_c_hex = guid_hex(first_launch.c_store_guid);
+        const std::string second_c_hex = guid_hex(second_launch.c_store_guid);
+        bool both_released = false;
+        std::set<std::string> released_logical_ids;
+        while (std::chrono::steady_clock::now() < release_deadline) {
+            std::ifstream trace(trace_path);
+            std::string line;
+            bool first_release = false;
+            bool second_release = false;
+            released_logical_ids.clear();
+            while (std::getline(trace, line)) {
+                if (line.find("\"event\":\"link_released\"") ==
+                    std::string::npos)
+                    continue;
+                if (line.find(first_c_hex) != std::string::npos)
+                    first_release = true;
+                if (line.find(second_c_hex) != std::string::npos)
+                    second_release = true;
+                const std::string key = "\"logical_link_id\":\"";
+                const size_t start = line.find(key);
+                if (start != std::string::npos) {
+                    const size_t value_start = start + key.size();
+                    const size_t end = line.find('"', value_start);
+                    if (end != std::string::npos)
+                        released_logical_ids.insert(
+                            line.substr(value_start, end - value_start));
+                }
+            }
+            if (first_release && second_release &&
+                released_logical_ids.size() == 2) {
+                both_released = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(both_released && accepted.load(std::memory_order_acquire) == 2);
+        std::puts("P51_R2_TRACE two-C/one-F concurrent bundle rendezvous: PASS");
+        return;
+    }
 
     P50RouteOwnerConfig owner_config;
     owner_config.endpoint_caps = transfer_caps;
@@ -12915,6 +13177,12 @@ int main(int argc, char** argv) {
         if (argc == 2 &&
             std::strcmp(argv[1], "--same-f-established-reconnect") == 0) {
             test_p51_same_f_missing_real_sender_transfer_keeps_sibling(true);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--r2-trace-two-c-interleaved") == 0) {
+            test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+                false, true);
             return 0;
         }
         if (argc == 2 &&

@@ -527,6 +527,74 @@ def test_r2_physical_retirement_can_preserve_unacknowledged_receipt_recovery() -
     assert summary["settled_relationships"] == []
 
 
+def test_r2_link_events_for_interleaved_links_do_not_cross_attribute() -> None:
+    second_c_guid = "5" * 32
+    second_relationship = "6" * 32
+    first_source = _source(
+        accounting=_accounting(
+            intervals=[
+                _interval(1, end="PhysicalLinkRetired", ack_prefix=0)
+            ]
+        )
+    )
+    second_accounting = _accounting()
+    second_accounting["job_key"]["c_store_guid"] = second_c_guid
+    second_accounting["job_key"]["logical_link_id"] = second_relationship
+    second_interval = second_accounting["intervals"][0]
+    second_interval["end"] = "DrainedAckCheckpoint"
+    second_interval["drained_ack_prefix"] = 1
+    second_interval["link"]["c_store_guid"] = second_c_guid
+    second_interval["link"]["logical_link_id"] = second_relationship
+    second_interval["jobs"][0]["key"]["c_store_guid"] = second_c_guid
+    second_interval["jobs"][0]["key"]["logical_link_id"] = second_relationship
+    second_retired = deepcopy(second_interval)
+    second_retired.update(
+        interval_sequence=2,
+        end="PhysicalLinkRetired",
+        total_c_to_f_bytes=0,
+        total_f_to_c_bytes=0,
+        shared_c_to_f_bytes=0,
+        shared_f_to_c_bytes=0,
+        drained_ack_prefix=0,
+        jobs=[],
+    )
+    second_accounting["intervals"].append(second_retired)
+    second_source = _source(2, accounting=second_accounting)
+    second_source["c_store_guid"] = second_c_guid
+
+    first_ack = _ack_event(0)
+    first_release = _release_event(acknowledged=0, committed=1)
+    second_link = dict(
+        LINK, c_store_guid=second_c_guid,
+        logical_link_id=second_relationship,
+    )
+    second_ack = _ack_event(1)
+    second_ack["link"] = second_link
+    second_release = _release_event(1)
+    second_release["link"] = second_link
+    second_source["raw_digest"] = RAW_DIGEST
+
+    summary = validate_r2_wire_trace(
+        [first_source, second_source],
+        [first_ack, second_ack, first_release, second_release],
+        require_terminal=True,
+    )
+
+    assert len(summary["links"]) == 2
+    assert all(link["physical_complete"] for link in summary["links"])
+    assert sorted(link["link"][0] for link in summary["links"]) == sorted(
+        (C_GUID, second_c_guid)
+    )
+    assert summary["links"][0]["relationship_settled"] is False
+    assert summary["links"][1]["relationship_settled"] is True
+
+
+def test_r2_link_release_rejects_acknowledged_prefix_above_committed() -> None:
+    invalid_release = _release_event(acknowledged=2, committed=1)
+    with pytest.raises(R2WireTraceError, match="acknowledged prefix exceeds committed"):
+        validate_r2_wire_trace([], [invalid_release])
+
+
 def test_r2_first_tu_zero_and_zero_digest_are_valid() -> None:
     source = _source()
     accounting = source["r2_wire_accounting"]

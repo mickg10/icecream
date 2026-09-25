@@ -6630,6 +6630,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
     if (control.after_r2_setup_registered)
         control.after_r2_setup_registered();
     std::optional<LinkHello> active_link;
+    // Diagnostics carry their own verified per-link snapshot.  In particular,
+    // do not report the offered epoch/K/Q while recovery is still reconciling.
+    std::optional<LinkHello> trace_link;
+    bool trace_snapshot_valid = false;
     uint32_t frame_cap = std::min(impl_->caps.wire.max_frame_payload,
                                   kInitialMaxFramePayload);
     std::optional<sidecar::AbsoluteMonotonicDeadline> job_deadline;
@@ -6637,6 +6641,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
     bool pending_job = false;
     uint64_t committed_ordinal = 0;
     uint64_t acknowledged_ordinal = 0;
+    uint64_t trace_committed_ordinal = 0;
+    uint64_t trace_acknowledged_ordinal = 0;
+    bool r2_quiesced_observer_fired = false;
     struct EndpointRunLeaseGuard {
         EndpointRunRegistry* registry = nullptr;
         std::optional<EndpointRunIdentity> identity;
@@ -6790,6 +6797,36 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
         if (activated)
             impl_->disconnect(session, pending_job);
     };
+    const auto close_link_socket = [&]() noexcept {
+        close_now(socket);
+        if (!trace_link || !trace_snapshot_valid || r2_quiesced_observer_fired ||
+            socket.is_open() ||
+            !control.r2_link_io_quiesced_observer)
+            return;
+        r2_quiesced_observer_fired = true;
+        if (trace_acknowledged_ordinal > trace_committed_ordinal)
+            return;
+        try {
+            control.r2_link_io_quiesced_observer(
+                *trace_link, trace_committed_ordinal,
+                trace_acknowledged_ordinal);
+        } catch (...) {
+            // Diagnostics are best-effort and may not affect endpoint outcome.
+        }
+    };
+    const auto capture_trace_snapshot = [&](const LinkHello& link,
+                                            uint64_t committed,
+                                            uint64_t acknowledged) {
+        if (!control.r2_link_io_quiesced_observer)
+            return;
+        trace_snapshot_valid = false;
+        if (acknowledged > committed)
+            return;
+        trace_link = link;
+        trace_committed_ordinal = committed;
+        trace_acknowledged_ordinal = acknowledged;
+        trace_snapshot_valid = true;
+    };
 
     try {
         arm_job_deadline(deadline_after(std::chrono::seconds(30)));
@@ -6825,7 +6862,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 socket, Message{rejected}, frame_cap,
                 stamp(AsyncOperationKind::WriteFragment), impl_->completions,
                 control, verify);
-            close_now(socket);
+            close_link_socket();
             impl_->disconnect(session, false);
             result.status = ServerRunStatus::Disconnected;
             co_return result;
@@ -6843,7 +6880,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 socket, Message{rejected}, frame_cap,
                 stamp(AsyncOperationKind::WriteFragment), impl_->completions,
                 control, verify);
-            close_now(socket);
+            close_link_socket();
             impl_->disconnect(session, false);
             result.status = ServerRunStatus::Disconnected;
             co_return result;
@@ -7027,6 +7064,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
         state.acknowledged_prefix_q = link_lease->acknowledged_prefix_q;
         committed_ordinal = link_lease->committed_prefix_k;
         acknowledged_ordinal = link_lease->acknowledged_prefix_q;
+        capture_trace_snapshot(hello, committed_ordinal,
+                               acknowledged_ordinal);
         co_await async_write_message(
             socket, Message{state}, frame_cap,
             stamp(AsyncOperationKind::WriteFragment), impl_->completions,
@@ -7049,6 +7088,15 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     !impl_->config.confirm_p51_reset(hello, confirm))
                     throw std::invalid_argument(
                         "R2 RESET_CONFIRM does not match retained reset result");
+                LinkHello confirmed_link = hello;
+                confirmed_link.relationship_epoch =
+                    confirm.new_relationship_epoch;
+                confirmed_link.history_nonce = confirm.new_history_nonce;
+                confirmed_link.verified_receipt_floor =
+                    confirm.settled_prefix_k;
+                capture_trace_snapshot(confirmed_link,
+                                       confirm.settled_prefix_k,
+                                       confirm.settled_prefix_k);
                 co_await async_write_message(
                     socket, Message{r2_reset_confirm_echo_for_test(
                                 control, confirm)}, frame_cap,
@@ -7141,6 +7189,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     throw std::invalid_argument(
                         "R2 RESET does not match the reconciled prefix");
                 reset_ack = *validated;
+                // A RESET is in flight on this socket.  Until its exact
+                // confirmation is accepted, terminal attribution must not
+                // claim either the old or proposed epoch as settled.
+                trace_snapshot_valid = false;
                 reset_applied = reset_ack.request.new_relationship_epoch ==
                                     link_lease->relationship_epoch &&
                                 reset_ack.request.new_history_nonce ==
@@ -7198,6 +7250,19 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     !impl_->config.confirm_p51_reset(hello, confirm))
                     throw std::invalid_argument(
                         "R2 RESET_CONFIRM does not match RESET_ACK");
+                // F has accepted and validated this confirmation.  Publish
+                // the diagnostic snapshot before the echo write can fail;
+                // leave operational active_link/K/Q updates in their
+                // existing post-write position.
+                LinkHello confirmed_link = hello;
+                confirmed_link.relationship_epoch =
+                    confirm.new_relationship_epoch;
+                confirmed_link.history_nonce = confirm.new_history_nonce;
+                confirmed_link.verified_receipt_floor =
+                    confirm.settled_prefix_k;
+                capture_trace_snapshot(confirmed_link,
+                                       confirm.settled_prefix_k,
+                                       confirm.settled_prefix_k);
                 co_await async_write_message(
                     socket, Message{r2_reset_confirm_echo_for_test(
                                 control, confirm)}, frame_cap,
@@ -7225,6 +7290,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     !impl_->config.confirm_p51_reset(hello, confirm))
                     throw std::invalid_argument(
                         "R2 duplicate RESET_CONFIRM does not match cached outcome");
+                // A duplicate confirmation never rewinds the link's already
+                // progressed prefix; the existing snapshot remains current.
                 co_await async_write_message(
                     socket, Message{r2_reset_confirm_echo_for_test(
                                 control, confirm)}, frame_cap,
@@ -7241,7 +7308,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 result.status = ServerRunStatus::Completed;
                 run_lease.result = EndpointTerminalResult{
                     EndpointTerminalResultState::Committed, 0};
-                close_now(socket);
+                close_link_socket();
                 co_return result;
             }
             if (bind_frame.type == MessageType::COMMIT_ACK) {
@@ -7257,6 +7324,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                     throw std::invalid_argument(
                         "R2 COMMIT_ACK identity or cumulative prefix mismatch");
                 acknowledged_ordinal = ack.contiguous_verified_ordinal;
+                capture_trace_snapshot(hello, committed_ordinal,
+                                       acknowledged_ordinal);
                 continue;
             }
             if (bind_frame.type != MessageType::JOB_BIND)
@@ -7437,6 +7506,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 throw std::logic_error(
                     "F could not retain the exact R2 receipt before delivery");
             committed_ordinal = binding.relationship_ordinal;
+            capture_trace_snapshot(hello, committed_ordinal,
+                                   acknowledged_ordinal);
             co_await async_write_message(
                 socket, Message{r2_commit}, frame_cap,
                 stamp(AsyncOperationKind::WriteFragment, &committed_begin),
@@ -7447,13 +7518,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
         }
     } catch (const StaleCompletion&) {
         clear_link();
-        close_now(socket);
+        close_link_socket();
         result.status = ServerRunStatus::Disconnected;
         co_return result;
     } catch (const boost::system::system_error&) {
         const bool expired = io->expired || deadline_crossed();
         clear_link();
-        close_now(socket);
+        close_link_socket();
         result.status = expired ? ServerRunStatus::DeadlineExceeded
                                 : ServerRunStatus::Disconnected;
         co_return result;
@@ -7466,7 +7537,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
         // Do not send the R1 ERROR control frame on an R2 link.  Until the
         // bounded R2 ERROR codec is enabled, fail closed by closing the link.
     }
-    close_now(socket);
+    close_link_socket();
     result.status = ServerRunStatus::TerminalError;
     co_return result;
 }

@@ -87,7 +87,13 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "#!/bin/sh\n"
         'printf "%s\\n" "$*" >> "$MAKE_LOG"\n'
         'printf "%s|%s\\n" "$TMPDIR" "$ICEFARM_TMPDIR" >> "$TMP_LOG"\n'
-        'case " $* " in *" check "*) exit "$MAKE_CHECK_STATUS" ;; esac\n'
+        'case " $* " in *" check "*)\n'
+        '  if [ "$MAKE_CHECK_STATUS" = 0 ]; then\n'
+        '    mkdir -p "$WORK_ROOT/build/unittests"\n'
+        '    : > "$WORK_ROOT/build/unittests/p50cacheservice"\n'
+        '    chmod +x "$WORK_ROOT/build/unittests/p50cacheservice"\n'
+        '  fi\n'
+        '  exit "$MAKE_CHECK_STATUS" ;; esac\n'
         "exit 0\n",
     )
     _executable(
@@ -101,6 +107,7 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "#!/bin/sh\n"
         'printf "%s\\n" "$*" > "$PYTEST_LOG"\n'
         'printf "%s|%s|%s\\n" "$VIRTUAL_ENV" "$UV_OFFLINE" "$UV_PYTHON_DOWNLOADS" >> "$PYTEST_LOG"\n'
+        'printf "%s\\n" "${ICECC_P50CACHESERVICE_BIN-unset}" >> "$PYTEST_LOG"\n'
         "exit 0\n",
     )
 
@@ -110,6 +117,7 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "WORK_ROOT": str(work_root),
         "MAKE_LOG": str(tmp_path / "make.log"),
         "MAKE_CHECK_STATUS": "9",
+        "ICECC_P50CACHESERVICE_BIN": "/stale/inherited/p50cacheservice",
         "RUNUSER_LOG": str(tmp_path / "runuser.log"),
         "STAT_LOG": str(tmp_path / "stat.log"),
         "PYTEST_LOG": str(tmp_path / "pytest.log"),
@@ -165,6 +173,12 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     assert "-m pytest" in pytest_args
     assert str(work_root / "artifacts" / "pytest.xml") in pytest_args
     assert f"{work_root}/python-env|1|never" in pytest_args
+    expected_live_binary = (
+        f"{work_root}/build/unittests/p50cacheservice"
+        if native_status == 0
+        else ""
+    )
+    assert pytest_args.splitlines()[-1] == expected_live_binary
     assert (tmp_path / "uv.log").read_text().startswith(
         f"sync --locked --offline --managed-python --python metadata|1|"
         f"{work_root}/uv-cache|{work_root}/python-env"

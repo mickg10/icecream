@@ -541,6 +541,10 @@ private:
     size_t active_p51_source_count_ = 0;
     uint64_t active_source_raw_bytes_ = 0;
     bool p51_metrics_enabled_ = false;
+    // Immutable opt-in trace destination shared by the service's result,
+    // interval, and per-link F-side event observers. Null when diagnostics
+    // are disabled or no trace path was configured.
+    std::shared_ptr<const std::string> p51_source_trace_path_;
     std::chrono::steady_clock::time_point p51_metrics_started_at_{};
     std::chrono::steady_clock::time_point p51_metrics_next_emit_{};
     std::atomic<uint64_t> p51_raw_bytes_high_water_{0};

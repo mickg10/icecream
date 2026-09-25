@@ -4627,7 +4627,8 @@ asio::awaitable<ServerRunResult> r2_accept_one(
 
 asio::awaitable<std::array<ServerRunResult, 2>> r2_accept_two(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
-    EndpointIoControl first_control) {
+    EndpointIoControl first_control,
+    EndpointIoControl second_control = {}) {
     const auto executor = co_await asio::this_coro::executor;
     struct CompletionState {
         std::array<std::optional<ServerRunResult>, 2> results;
@@ -4640,7 +4641,7 @@ asio::awaitable<std::array<ServerRunResult, 2>> r2_accept_two(
         co_await acceptor.async_accept(socket, asio::use_awaitable);
         EndpointIoControl control = index == 0
                                          ? first_control
-                                         : EndpointIoControl{};
+                                         : second_control;
         asio::co_spawn(
             executor,
             endpoint.run_adopted_r2(std::move(socket), std::move(control)),
@@ -6999,6 +7000,7 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     const JobBind& initial_binding, PreparedTuHandle prepared,
     R2FrameCutSpec cut, std::chrono::steady_clock::time_point deadline,
     ServerRunResult& first_server_result, bool& first_server_done,
+    uint64_t& observed_reset_epoch,
     unsigned& binding_consumptions,
     std::atomic<unsigned>& materializations,
     std::atomic<unsigned>& commits) {
@@ -7089,6 +7091,7 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     const R2RecoveryResult recovered = co_await client.recover_r2_link(
         recovery_socket, reconnect, witnesses, 0, reset_operation,
         initial_hello.relationship_epoch + 1, replacement_nonce, deadline);
+    observed_reset_epoch = recovered.reset_request.new_relationship_epoch;
     require(recovered.committed_receipts.empty() &&
                 recovered.reset_request.settled_prefix_k == 0 &&
                 recovered.reset_request.operation_id == reset_operation &&
@@ -7124,6 +7127,17 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
                     initial_binding.raw_digest,
             "R2 frame recovery did not return the exact source commit");
     co_await client.write_r2_ack(recovery_socket, 1, deadline);
+    const ResetConfirm duplicate_confirm{
+        reconnect.relationship_id,
+        recovered.reset_request.new_relationship_epoch,
+        reconnect.physical_link_generation,
+        reset_operation,
+        replacement_nonce,
+        recovered.reset_request.settled_prefix_k};
+    co_await raw_write(recovery_socket, Message{duplicate_confirm});
+    require(raw_decode<ResetConfirm>(co_await raw_read(
+                recovery_socket, kInitialMaxFramePayload)) == duplicate_confirm,
+            "R2 duplicate RESET_CONFIRM was not echoed exactly");
     co_await raw_write(recovery_socket, Message{CloseMessage{}});
     recovery_socket.shutdown(tcp::socket::shutdown_both, ignored);
     recovery_socket.close(ignored);
@@ -7135,15 +7149,18 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
 
 asio::awaitable<void> r2_two_accepts(
     tcp::acceptor& acceptor, P50ServerEndpoint& server,
-    ServerRunResult& first, ServerRunResult& second, bool& first_done) {
+    ServerRunResult& first, ServerRunResult& second, bool& first_done,
+    EndpointIoControl first_control, EndpointIoControl second_control) {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket first_socket(executor);
     co_await acceptor.async_accept(first_socket, asio::use_awaitable);
-    first = co_await server.run_adopted_r2(std::move(first_socket));
+    first = co_await server.run_adopted_r2(std::move(first_socket),
+                                           std::move(first_control));
     first_done = true;
     tcp::socket second_socket(executor);
     co_await acceptor.async_accept(second_socket, asio::use_awaitable);
-    second = co_await server.run_adopted_r2(std::move(second_socket));
+    second = co_await server.run_adopted_r2(std::move(second_socket),
+                                            std::move(second_control));
 }
 
 void test_r2_fragmented_frame_interruption_recovery() {
@@ -7443,6 +7460,22 @@ void test_r2_fragmented_frame_interruption_recovery() {
             R2ProxyCutResult proxy_cut_result;
             std::vector<MessageType> proxy_observed_frames;
             std::vector<MessageType> proxy_fully_forwarded_frames;
+            std::vector<std::tuple<LinkHello, uint64_t, uint64_t>>
+                quiesced_links;
+            uint64_t observed_reset_epoch = 0;
+            const auto make_quiesced_observer = [&](bool throw_after) {
+                EndpointIoControl control;
+                control.r2_link_io_quiesced_observer =
+                    [&, throw_after](const LinkHello& observed, uint64_t committed,
+                        uint64_t acknowledged) {
+                        quiesced_links.emplace_back(
+                            observed, committed, acknowledged);
+                        if (throw_after)
+                            throw std::runtime_error(
+                                "injected best-effort R2 trace failure");
+                    };
+                return control;
+            };
             asio::steady_timer watchdog(context);
             watchdog.expires_after(std::chrono::seconds(25));
             watchdog.async_wait([&](const boost::system::error_code& error) {
@@ -7462,7 +7495,9 @@ void test_r2_fragmented_frame_interruption_recovery() {
             };
             asio::co_spawn(
                 context, r2_two_accepts(acceptor, server, first_result,
-                                        second_result, first_done),
+                                        second_result, first_done,
+                                        make_quiesced_observer(true),
+                                        make_quiesced_observer(false)),
                 [&](std::exception_ptr error) {
                     server_error = error;
                     server_done = true;
@@ -7489,7 +7524,8 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     client, *authority, route, hello, binding, prepared,
                     cut,
                     job_deadline.as_steady_time_point(), first_result,
-                    first_done, bind_count, materializations, commit_count),
+                    first_done, observed_reset_epoch, bind_count,
+                    materializations, commit_count),
                 [&](std::exception_ptr error, ClientRunResult result) {
                     client_error = error;
                     if (!error)
@@ -7506,6 +7542,24 @@ void test_r2_fragmented_frame_interruption_recovery() {
                 std::rethrow_exception(client_error);
             if (proxy_error)
                 std::rethrow_exception(proxy_error);
+            require(quiesced_links.size() == 2,
+                    "accepted R2 sockets did not emit exactly one post-close event each");
+            const auto& [first_link, first_k, first_q] = quiesced_links[0];
+            const auto& [second_link, second_k, second_q] = quiesced_links[1];
+            require(first_link.c_store_guid == hello.c_store_guid &&
+                        first_link.f_store_guid == hello.f_store_guid &&
+                        first_link.physical_link_generation ==
+                            hello.physical_link_generation &&
+                        first_link.relationship_id == hello.relationship_id &&
+                        first_k == 0 && first_q == 0 &&
+                        second_link.c_store_guid == hello.c_store_guid &&
+                        second_link.f_store_guid == hello.f_store_guid &&
+                        second_link.physical_link_generation ==
+                            hello.physical_link_generation + 1 &&
+                        observed_reset_epoch != 0 &&
+                        second_link.relationship_epoch == observed_reset_epoch &&
+                        second_k == 1 && second_q == 1,
+                    "post-close R2 events lost exact physical identity or K/Q");
             std::vector<MessageType> expected_completed{
                 MessageType::LINK_HELLO};
             switch (cut.type) {

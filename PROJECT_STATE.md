@@ -12,6 +12,47 @@ retained artifact directories.
 
 ## Developer QA
 
+### Independent F ACK and terminal accounting
+
+The opt-in R2 trace now includes F-validated cumulative ACKs and one terminal
+snapshot per accepted physical link after socket I/O finishes. Diagnostic
+epoch/K/Q state is captured separately from operational state, including
+RESET confirmation and failed echo handling; duplicate confirmations do not
+rewind the snapshot. Observer failures do not change protocol outcomes.
+No new wire record or shutdown wait is introduced. The collector reads worker
+trace files and joins them to exact C/F/logical/physical identities, excluding
+epoch from the physical-link join because RESET keeps the same socket.
+Unmatched or ambiguous worker events are rejected.
+
+Qualification used exact645 plus the 14-file accounting/QA overlay in
+`/tanksmall/scratch/tmp/p51-f-emitter-qa.nWoAgu/`, SDK image
+`7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`:
+
+- Full `p50cacheservice.log` and `p50endpoint.log` targets pass, exit 0.
+  Log SHA256 values are `72500016f3c80a0bc8fafab165a3ddb9d0db45ed1efbc03370dcad3ca7a0357d`
+  and `db39be26649ceb0999017d9db08425397eb697875f059b2846e3911d216290a9`.
+- Actual two-C/one-F producer-to-collector gate passes: distinct C owner
+  threads, concurrent bundle rendezvous, per-link K=Q=1, terminal closure,
+  and byte/job conservation. Retained `artifacts/live-two-c-source-trace.jsonl`
+  SHA256 is `43fde9f7d933d6a53d2a737d5dca51686bd447408ded8f71c49050a8f55a5693`.
+- Final collector/report, R2 trace, specs/plan and developer-runner tests:
+  484 passed in 6.83 seconds, exit 0, including the live service test.
+  The final batch result was returned by execution session 29346; it is not
+  represented as a separately retained hashed batch log.
+- Qualified service binary SHA256:
+  `870dd377170af095889e4234ec7b2ab5188279d84650ce2a1c096bd0d0a5f409`.
+
+Canonical QA supplies its own built service binary to the live Python test
+after successful native checks and clears inherited binary paths otherwise.
+Python-only runs can still skip that live node. The merged service test also
+retains the independently qualified encoded-cap fixture; their combined
+current-tip full QA remains pending. Earlier setup and fixture-framing
+failures remain retained and are not product verdicts.
+
+Tracing uses synchronous file append under the existing trace mutex when
+explicitly enabled. Record tracing mode in performance results; these tests
+do not establish negligible instrumentation overhead or farm performance.
+
 ### Canonical persistent-wrapper gate
 
 `make -C /work/build/unittests p51wrappercompile-check` completed with exit 0

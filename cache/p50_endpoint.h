@@ -369,6 +369,13 @@ struct EndpointIoControl {
     // written successfully. It receives an immutable message copy and cannot
     // change product framing or endpoint state.
     std::function<void(ActorSide, const Message&)> outbound_message_observer;
+    // Optional R2 diagnostics callback. Fired once, after the accepted socket
+    // has been closed and all awaited socket I/O in this link coroutine has
+    // completed. Prefixes are F's final per-link K/Q snapshot; this is not a
+    // wire message and does not participate in protocol state.
+    std::function<void(const LinkHello&, uint64_t committed_prefix_k,
+                       uint64_t acknowledged_prefix_q)>
+        r2_link_io_quiesced_observer;
     // Test-only copy transform for an F endpoint's RESET_CONFIRM echo. The
     // server applies and retains the received confirmation before this echo
     // copy is transformed; product callers leave it unset.

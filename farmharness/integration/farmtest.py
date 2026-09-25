@@ -465,6 +465,29 @@ def _r2_diagnostics_requested(
     )
 
 
+def _r2_worker_diagnostics_requested(
+    topology: dict[str, Any], worker_name: str
+) -> bool:
+    """Opt in to F-side link events only for a declared positive R2 peer."""
+
+    revision_by_name = {
+        item["name"]: item.get("cache_wire_revision")
+        for item in topology.get("instances", [])
+    }
+    version_by_name = {
+        item["name"]: item.get("version")
+        for item in topology.get("instances", [])
+    }
+    return any(
+        relationship["f"] == worker_name
+        and relationship["cache_expected"]
+        and revision_by_name.get(worker_name) == 2
+        and type(version_by_name.get(relationship["c"])) is int
+        and version_by_name[relationship["c"]] >= 50
+        for relationship in topology.get("relationships", [])
+    )
+
+
 def _assignment_fence_mode(
     topology: dict[str, Any],
     scenario: ScenarioSpec | None = None,
@@ -763,6 +786,9 @@ def _planned_commands(
                     "ICECC_P50_TEST_READY_TRACE": "/results/f-ready.trace",
                 }
             )
+            if _r2_worker_diagnostics_requested(topology, instance["name"]):
+                environment["ICECC_P50_SOURCE_RESULT_TRACE"] = "/results/source-result.jsonl"
+                environment["ICECC_P50_DIAGNOSTICS"] = "1"
             if scenario.data.get("id") == "S30-mutant-f-refusal":
                 environment["ICECC_P50_S30_MUTANT_TRACE"] = "/results/s30-mutant-f.jsonl"
         if len(environment["ICECC_TEST_SOCKET"].encode("ascii")) > 107:

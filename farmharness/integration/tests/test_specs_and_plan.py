@@ -439,7 +439,8 @@ def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() ->
 
     topology = {
         "instances": [
-            {"name": "C2", "role": "C", "cache_wire_revision": 2},
+            {"name": "C2", "role": "C", "version": 50,
+             "cache_wire_revision": 2},
             {"name": "F2", "role": "F", "cache_wire_revision": 2},
             {"name": "F1", "role": "F", "cache_wire_revision": 1},
         ],
@@ -458,6 +459,31 @@ def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() ->
         {"c": "C2", "f": "F2", "cache_expected": False}
     ]
     assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+
+
+def test_r2_f_worker_trace_is_opted_in_only_for_positive_r2_peer() -> None:
+    topology = {
+        "instances": [
+            {"name": "C2", "role": "C", "version": 50,
+             "cache_wire_revision": 2},
+            {"name": "C43", "role": "C", "version": 43,
+             "cache_wire_revision": 1},
+            {"name": "F2", "role": "F", "cache_wire_revision": 2},
+            {"name": "F1", "role": "F", "cache_wire_revision": 1},
+        ],
+        "relationships": [
+            {"c": "C2", "f": "F2", "cache_expected": True},
+            {"c": "C43", "f": "F2", "cache_expected": True},
+            {"c": "C2", "f": "F1", "cache_expected": True},
+            {"c": "C2", "f": "F2", "cache_expected": False},
+        ],
+    }
+    assert farmtest._r2_worker_diagnostics_requested(topology, "F2")
+    assert not farmtest._r2_worker_diagnostics_requested(topology, "F1")
+    topology["relationships"] = [
+        {"c": "C43", "f": "F2", "cache_expected": True}
+    ]
+    assert not farmtest._r2_worker_diagnostics_requested(topology, "F2")
 
 
 def test_only_f_starts_have_the_fixed_nofile_contract() -> None:

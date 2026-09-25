@@ -33,8 +33,10 @@ try:
     from .retry_decision import same_endpoint_decision_valid
     from .r2_wire_trace import (
         R2_INTERVAL_EVENT_SCHEMA,
+        R2_LINK_EVENT_SCHEMA,
         R2WireTraceError,
         canonical_r2_job_key,
+        canonical_r2_physical_link_key,
         validate_r2_wire_trace,
     )
     from .scenario_spec import ScenarioSpec
@@ -59,8 +61,10 @@ except ImportError:  # Direct execution from this directory.
     from retry_decision import same_endpoint_decision_valid
     from r2_wire_trace import (
         R2_INTERVAL_EVENT_SCHEMA,
+        R2_LINK_EVENT_SCHEMA,
         R2WireTraceError,
         canonical_r2_job_key,
+        canonical_r2_physical_link_key,
         validate_r2_wire_trace,
     )
     from scenario_spec import ScenarioSpec
@@ -789,6 +793,7 @@ def _source_results(
     path: Path,
     *,
     r2_interval_events: list[dict[str, Any]] | None = None,
+    r2_link_events: list[dict[str, Any]] | None = None,
 ) -> dict[tuple[int, int, int], dict[str, Any]]:
     records: dict[tuple[int, int, int], dict[str, Any]] = {}
     r2_v5_records: list[dict[str, Any]] = []
@@ -800,6 +805,13 @@ def _source_results(
                     f"{path}:{index}: standalone R2 interval event has no collector sink"
                 )
             r2_interval_events.append(dict(item))
+            continue
+        if schema == R2_LINK_EVENT_SCHEMA:
+            if r2_link_events is None:
+                raise CollectError(
+                    f"{path}:{index}: F-side R2 link event has no collector sink"
+                )
+            r2_link_events.append(dict(item))
             continue
         expected_fields = (
             SOURCE_RESULT_FIELDS_V5
@@ -1066,6 +1078,7 @@ def _source_results(
             validate_r2_wire_trace(
                 r2_v5_records,
                 c_interval_events=r2_interval_events or (),
+                f_link_events=r2_link_events or (),
             )
         except R2WireTraceError as exc:
             raise CollectError(f"{path}: invalid R2 source accounting trace: {exc}") from exc
@@ -1283,6 +1296,7 @@ def _r2_trace_report(summary: Mapping[str, Any]) -> dict[str, Any]:
 def _require_collectable_source_accounting(
     source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
     c_interval_events: list[Mapping[str, Any]] | None = None,
+    f_link_events: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Refuse to synthesize numeric acceptance metrics from unavailable data."""
 
@@ -1357,11 +1371,69 @@ def _require_collectable_source_accounting(
                     and record.get("r2_link_intervals_valid") is True
                 ],
                 c_interval_events=c_interval_events or (),
+                f_link_events=f_link_events or (),
                 require_job_conservation=True,
             )
         except R2WireTraceError as exc:
             raise CollectError(f"numeric R2 trace is incomplete or inconsistent: {exc}") from exc
     return None
+
+
+def _f_r2_events_for_client(
+    client_name: str,
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    c_interval_events: list[Mapping[str, Any]],
+    worker_events: list[tuple[str, int, Mapping[str, Any]]],
+    claimed_events: dict[tuple[str, int], str],
+) -> list[Mapping[str, Any]]:
+    """Join worker events to one client by validated physical-link identity."""
+
+    def physical_identity(value: Mapping[str, Any], where: str) -> tuple[Any, ...]:
+        try:
+            return canonical_r2_physical_link_key(value.get("link"))
+        except R2WireTraceError as exc:
+            raise CollectError(f"{where}: R2 link identity is malformed") from exc
+
+    client_links: set[tuple[Any, ...]] = set()
+    for event_index, event in enumerate(c_interval_events):
+        interval = event.get("interval")
+        if not isinstance(interval, Mapping):
+            raise CollectError(
+                f"{client_name}: C-side R2 interval event {event_index} is malformed"
+            )
+        client_links.add(
+            physical_identity(interval, f"{client_name}:interval[{event_index}]")
+        )
+    for result_index, record in enumerate(source_results.values()):
+        accounting = record.get("r2_wire_accounting")
+        if not isinstance(accounting, Mapping):
+            continue
+        for interval_index, interval in enumerate(accounting.get("intervals", [])):
+            if isinstance(interval, Mapping):
+                client_links.add(
+                    physical_identity(
+                        interval,
+                        f"{client_name}:source[{result_index}].interval[{interval_index}]",
+                    )
+                )
+
+    matched: list[Mapping[str, Any]] = []
+    for worker_name, event_index, event in worker_events:
+        identity = physical_identity(
+            event, f"{worker_name}:F-link-event[{event_index}]"
+        )
+        if identity not in client_links:
+            continue
+        token = (worker_name, event_index)
+        previous_client = claimed_events.get(token)
+        if previous_client is not None and previous_client != client_name:
+            raise CollectError(
+                "F-side R2 link event ambiguously matches multiple C clients: "
+                f"{worker_name}[{event_index}] -> {previous_client}, {client_name}"
+            )
+        claimed_events[token] = client_name
+        matched.append(event)
+    return matched
 
 
 def _source_result_status(
@@ -6668,6 +6740,29 @@ def _parse_rows(
         for item in topology
         if item["role"] == "F"
     }
+    # F-side ACK/release records live in the worker's own results mount. Read
+    # each worker file exactly once, then join by validated physical-link
+    # identity. A RESET may advance epoch on the same socket, so the canonical
+    # key deliberately excludes epoch while retaining C/F/logical id and the
+    # physical generation.
+    f_r2_link_events: list[tuple[str, int, dict[str, Any]]] = []
+    for item in topology:
+        if item["role"] != "F":
+            continue
+        worker_events: list[dict[str, Any]] = []
+        worker_source_rows = _source_results(
+            _instance_results(evidence, item["name"]) / "source-result.jsonl",
+            r2_link_events=worker_events,
+        )
+        if worker_source_rows:
+            raise CollectError(
+                f"F-side source-result trace for {item['name']} contains C job rows"
+            )
+        f_r2_link_events.extend(
+            (item["name"], index, event)
+            for index, event in enumerate(worker_events)
+        )
+    claimed_f_r2_events: dict[tuple[str, int], str] = {}
     rows: list[dict[str, Any]] = []
     raw_jobs: list[dict[str, Any]] = []
     assignment_claims: list[dict[str, Any]] = []
@@ -6716,12 +6811,23 @@ def _parse_rows(
         client = by_name[client_name]
         results = _instance_results(evidence, client_name)
         r2_interval_events: list[dict[str, Any]] = []
+        r2_link_events: list[dict[str, Any]] = []
         source_results = _source_results(
             results / "source-result.jsonl",
             r2_interval_events=r2_interval_events,
+            r2_link_events=r2_link_events,
+        )
+        r2_link_events.extend(
+            _f_r2_events_for_client(
+                client_name,
+                source_results,
+                r2_interval_events,
+                f_r2_link_events,
+                claimed_f_r2_events,
+            )
         )
         r2_trace_summary = _require_collectable_source_accounting(
-            source_results, r2_interval_events
+            source_results, r2_interval_events, r2_link_events
         )
         if r2_trace_summary is not None:
             r2_link_accounting_records.append(
@@ -7364,6 +7470,16 @@ def _parse_rows(
             raise CollectError(
                 "S30 mutant refusals do not bind at least one bounded fallback row"
             )
+    unclaimed_f_events = [
+        (worker, index)
+        for worker, index, _event in f_r2_link_events
+        if (worker, index) not in claimed_f_r2_events
+    ]
+    if unclaimed_f_events:
+        raise CollectError(
+            "F-side R2 link events have no exact C interval stream: "
+            + ", ".join(f"{worker}[{index}]" for worker, index in unclaimed_f_events[:8])
+        )
     return rows, {
         "compile_failure_job_ids": sorted(compile_failures),
         "error106_job_ids": sorted(error106),

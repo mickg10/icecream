@@ -206,7 +206,14 @@ else
 
     # This suite is independent of native compilation and still runs on failure.
     if [[ "$python_sync_status" == 0 ]]; then
-        run_stage python-pytest bash -c 'cd "$1" && command -v python3 && python3 -B -m pytest -q -p no:cacheprovider --junitxml="$2/pytest.xml" farmharness/integration/tests' _ "$SRC" "$ARTIFACTS"
+        r2_service_binary=
+        if [[ "$native_check_status" == 0 && -x "$BUILD/unittests/p50cacheservice" ]]; then
+            r2_service_binary="$BUILD/unittests/p50cacheservice"
+        fi
+        # Override any inherited path explicitly. Python-only runs and native
+        # build failures keep the live-service node skipped; successful native
+        # QA gives it the binary built and tested in this exact work tree.
+        run_stage python-pytest bash -c 'cd "$1" && command -v python3 && ICECC_P50CACHESERVICE_BIN="$2" python3 -B -m pytest -q -p no:cacheprovider --junitxml="$3/pytest.xml" farmharness/integration/tests' _ "$SRC" "$r2_service_binary" "$ARTIFACTS"
     else
         echo "Python QA not run because offline uv sync failed; see python-sync stage log." >&2
     fi

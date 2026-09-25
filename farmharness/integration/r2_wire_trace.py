@@ -139,6 +139,16 @@ def canonical_r2_job_key(value: Any) -> tuple[str, str, str, int, str]:
     return _job_key(value, "r2_accounting_key")
 
 
+def canonical_r2_physical_link_key(value: Any) -> tuple[str, str, str, int]:
+    """Validate a link object and return its socket identity, excluding epoch.
+
+    RESET may advance relationship_epoch without replacing the physical
+    connection; ACK/release events and interval rows still join by that same
+    exact physical link generation.
+    """
+    return _physical_link_key(_link(value, "r2_link_identity"))
+
+
 def _link_job_key(link: tuple[str, str, str, int, int], tu_seq: int, raw_digest: str):
     return link[0], link[1], link[2], tu_seq, raw_digest
 
@@ -307,6 +317,10 @@ def _validate_link_event(value: Any, where: str) -> dict[str, Any]:
         return {"event": event, "link": link, "prefix": prefix}
     committed = _uint(row["committed_prefix"], f"{where}.committed_prefix")
     acknowledged = _uint(row["acknowledged_prefix"], f"{where}.acknowledged_prefix")
+    if acknowledged > committed:
+        raise R2WireTraceError(
+            f"{where}: acknowledged prefix exceeds committed prefix"
+        )
     return {
         "acknowledged": acknowledged,
         "committed": committed,
