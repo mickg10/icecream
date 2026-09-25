@@ -37,7 +37,15 @@ duplicate references after recovery, false/throw callbacks, and fresh jobs
 after RESET without fabricated ACK-write checkpoints. The final sender run
 includes the last reference-key correction and narrow GCC13 coroutine warning
 workaround. Endpoint files did not change after their full-suite pass.
-Combined qualification with the current service/D11 files is pending.
+Combined qualification with the current service/D11 files **failed** on
+`1232033d`: the default service suite passed three repeated W30 cycles each
+for P29V1 and ZSTD_TU, then failed ZSTD_ROUTE cycle 1 with repeated F
+TerminalError results and 30 caller receive timeouts. Cause is under
+investigation; this does not establish whether the failure is a pre-existing
+race or a new regression. Do not treat this candidate as deployment-qualified.
+The retained combined log is
+`/tanksmall/scratch/tmp/p51-service-combined.7PdVFL/build/unittests/p50cacheservice.log`,
+SHA256 `f6411136f01a25fa80e1feae9934dcc27c614d815032375b45b062781bac072e`.
 
 Evidence root: `/tanksmall/scratch/tmp/p51-r2-accounting-6faf9b21/`.
 SDK `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, image
