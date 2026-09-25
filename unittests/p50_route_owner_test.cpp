@@ -883,6 +883,17 @@ void test_interned_tu_after_interner_fault_is_typed() {
         reused_typed = true;
     }
     CHECK(reused_typed);
+
+    // A TU begun before the failure keeps its transaction and still writes
+    // FILL and commits, and a ZSTD_TU route is unaffected.
+    authority.pin_p29v1_system_source_reuse(
+        first, authority.p29v1_system_source_fingerprint(first));
+    CHECK(authority.fill_p29v1_before_need(first).has_value());
+    authority.commit(first);
+    const PreparedTuHandle zstd = authority.prepare_for_route(
+        {Id128::from_u64(394), 1, ProfileId::ZSTD_TU}, {7701, 3}, other);
+    CHECK(authority.prepared_profile(zstd) == ProfileId::ZSTD_TU);
+    authority.commit(zstd);
 }
 
 // A HISTORY_RESET rebuilds the route's uncommitted successor at once, so a
