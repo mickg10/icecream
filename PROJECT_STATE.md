@@ -14,8 +14,17 @@ retained artifact directories.
 
 ### Full-QA failures and focused corrections
 
-Canonical QA on frozen `f0049371` has a confirmed service-fixture failure;
-the overall run is still in progress. AddressSanitizer reports
+Canonical QA on frozen `f0049371` completed its native stage: 176 tests,
+168 passed, two failed, six skipped, zero errors. Both failures are the
+service-fixture issues detailed below. The Python stage is still running;
+the overall run cannot pass because its snapshot predates both corrections.
+Native-stage log SHA256 is
+`ce7c49fb7714be2acb9d59a74e0240f8fe0553cd39db75a884d405c7f14b6e9a`
+at `current/artifacts/native-check.log` beneath the retained full-QA run below.
+The six skips remain uncovered by this default run; separate opt-in gate
+evidence must be consulted rather than counting them as passes.
+
+AddressSanitizer reports
 `stack-use-after-scope` in `d11_output_cap_client`: its `capped_armed` reference
 binds a temporary array at the coroutine call, which expires before
 `io_context::run()` resumes the coroutine. This is a test-helper lifetime bug,
