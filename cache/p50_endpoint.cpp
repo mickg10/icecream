@@ -5859,8 +5859,26 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
         }
         if (!impl_->config.lookup_p51_link_reservation)
             throw std::invalid_argument("R2 link reservation lookup is unavailable");
-        const auto link_lease =
+        const auto link_lookup =
             impl_->config.lookup_p51_link_reservation(hello);
+        if (link_lookup.status ==
+            P51SourceLinkLookupStatus::ReservationMissing) {
+            const LinkRejectMessage rejected{
+                LinkRejectReason::ReservationMissing,
+                compute_r2_link_offer_digest(hello)};
+            co_await async_write_message(
+                socket, Message{rejected}, frame_cap,
+                stamp(AsyncOperationKind::WriteFragment), impl_->completions,
+                control, verify);
+            close_now(socket);
+            impl_->disconnect(session, false);
+            result.status = ServerRunStatus::Disconnected;
+            co_return result;
+        }
+        if (link_lookup.status != P51SourceLinkLookupStatus::Found ||
+            !link_lookup.lease)
+            throw std::invalid_argument("R2 LINK_HELLO is not an exact reservation offer");
+        const auto& link_lease = link_lookup.lease;
         if (!link_lease || !link_lease->initial_armed.valid() ||
             link_lease->reconnect !=
                 (hello.start_mode == LinkStartMode::Reconnect) ||

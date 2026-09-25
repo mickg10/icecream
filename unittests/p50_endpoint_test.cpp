@@ -4344,7 +4344,8 @@ asio::awaitable<bool> r2_silent_peer(tcp::endpoint endpoint) {
 }
 
 asio::awaitable<bool> r2_expect_typed_reject(
-    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello) {
+    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello,
+    LinkRejectReason expected_reason = LinkRejectReason::StoreReplaced) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await socket.async_connect(endpoint, asio::use_awaitable);
     try {
@@ -4352,12 +4353,28 @@ asio::awaitable<bool> r2_expect_typed_reject(
             socket, hello, std::chrono::steady_clock::now() +
                                std::chrono::seconds(5));
     } catch (const R2LinkRejected& rejected) {
-        co_return rejected.rejection.reason == LinkRejectReason::StoreReplaced &&
+        co_return rejected.rejection.reason == expected_reason &&
                   rejected.rejection.offered_hello_digest ==
                       compute_r2_link_offer_digest(hello) &&
                   rejected.offered == hello;
     } catch (...) {
         co_return false;
+    }
+    co_return false;
+}
+
+asio::awaitable<bool> r2_expect_untyped_hello_failure(
+    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(endpoint, asio::use_awaitable);
+    try {
+        (void)co_await client.open_r2_link(
+            socket, hello, std::chrono::steady_clock::now() +
+                               std::chrono::seconds(5));
+    } catch (const R2LinkRejected&) {
+        co_return false;
+    } catch (...) {
+        co_return true;
     }
     co_return false;
 }
@@ -4415,6 +4432,93 @@ void test_r2_store_replaced_rejects_same_guid_old_generation() {
                 server_result.status == ServerRunStatus::Disconnected,
             "same-GUID stale-generation LINK_HELLO was not exactly rejected before lease lookup");
     std::puts("P51_R2_ENDPOINT same-GUID stale-generation typed reject: ok");
+}
+
+void test_r2_definite_missing_reservation_is_typed_only_for_absence() {
+    const P5coStoreGuids stores = p5co_store_guids(0x73);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    TestClient client(stores.c, caps);
+
+    auto make_hello = [&] {
+        LinkHello hello;
+        hello.profile = ProfileId::ZSTD_TU;
+        hello.window = 1;
+        hello.max_frame_payload = kInitialMaxFramePayload;
+        hello.max_raw_bytes = 1U << 20;
+        hello.max_encoded_bytes = 1U << 20;
+        hello.max_output_bytes = 1U << 20;
+        hello.reservation_id = Id128::from_u64(0x7301);
+        hello.relationship_id = Id128::from_u64(0x7302);
+        hello.relationship_epoch = 1;
+        hello.physical_link_generation = 1;
+        hello.c_store_guid = stores.c;
+        hello.c_store_generation = 7;
+        hello.f_store_guid = stores.f;
+        hello.f_store_generation = 42;
+        hello.c_control_generation = 8;
+        hello.c_control_attempt = 9;
+        hello.system_source_fingerprint = icecc::digest128("missing lease offer");
+        hello.history_nonce = HistoryNonce{11};
+        return hello;
+    };
+
+    P50ServerEndpointConfig missing_config;
+    missing_config.f_store_generation = 42;
+    missing_config.lookup_p51_link_reservation = [](const LinkHello&) {
+        return P51SourceLinkLookupResult{
+            P51SourceLinkLookupStatus::ReservationMissing, std::nullopt};
+    };
+    P50ServerEndpoint missing_server(stores.f, caps, nullptr, nullptr,
+                                     std::move(missing_config));
+    LinkHello missing_hello = make_hello();
+    asio::io_context missing_context;
+    tcp::acceptor missing_acceptor(
+        missing_context, {asio::ip::address_v4::loopback(), 0});
+    auto missing_server_future = asio::co_spawn(
+        missing_context, r2_accept_one(missing_acceptor, missing_server),
+        asio::use_future);
+    auto missing_client_future = asio::co_spawn(
+        missing_context,
+        r2_expect_typed_reject(missing_acceptor.local_endpoint(),
+                                client.endpoint, missing_hello,
+                                LinkRejectReason::ReservationMissing),
+        asio::use_future);
+    missing_context.run();
+    const auto missing_result = missing_server_future.get();
+    require(missing_client_future.get() &&
+                missing_result.status == ServerRunStatus::Disconnected,
+            "definitely absent initial reservation did not produce exact digest-bound R2_LINK_REJECT");
+
+    P50ServerEndpointConfig invalid_config;
+    invalid_config.f_store_generation = 42;
+    // The compatibility conversion from an empty optional is deliberately
+    // Invalid, not ReservationMissing: it carries no proof that the exact
+    // reservation is absent rather than stale or otherwise mismatched.
+    invalid_config.lookup_p51_link_reservation = [](const LinkHello&) {
+        return std::optional<P51SourceLinkLease>{};
+    };
+    P50ServerEndpoint invalid_server(stores.f, caps, nullptr, nullptr,
+                                     std::move(invalid_config));
+    LinkHello invalid_hello = make_hello();
+    asio::io_context invalid_context;
+    tcp::acceptor invalid_acceptor(
+        invalid_context, {asio::ip::address_v4::loopback(), 0});
+    auto invalid_server_future = asio::co_spawn(
+        invalid_context, r2_accept_one(invalid_acceptor, invalid_server),
+        asio::use_future);
+    auto invalid_client_future = asio::co_spawn(
+        invalid_context,
+        r2_expect_untyped_hello_failure(invalid_acceptor.local_endpoint(),
+                                        client.endpoint, invalid_hello),
+        asio::use_future);
+    invalid_context.run();
+    const auto invalid_result = invalid_server_future.get();
+    require(invalid_client_future.get() &&
+                invalid_result.status == ServerRunStatus::TerminalError,
+            "ambiguous empty lookup was incorrectly promoted to typed ReservationMissing");
+    std::puts("P51_R2_ENDPOINT definite ReservationMissing vs invalid lookup: ok");
 }
 
 void test_r2_endpoint_commits_two_jobs_on_one_link() {
@@ -7208,6 +7312,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused same-GUID stale-generation reject PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_MISSING_RESERVATION_FOCUS") != nullptr) {
+        test_r2_definite_missing_reservation_is_typed_only_for_absence();
+        std::cout << "p50_endpoint_test: focused definite ReservationMissing PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_R2_SETUP_CANCEL_FOCUS") != nullptr) {
         test_r2_silent_setup_cancelled_before_hello();
         std::cout << "p50_endpoint_test: focused R2 pre-HELLO cancellation PASS\n";
@@ -7250,6 +7359,7 @@ int main(int argc, char** argv) {
     test_preparation_authority_window_refill_and_receipts();
     test_zstd_route_recovery_rebuild_cursor();
     test_r2_store_replaced_rejects_same_guid_old_generation();
+    test_r2_definite_missing_reservation_is_typed_only_for_absence();
     test_r2_endpoint_commits_two_jobs_on_one_link();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();

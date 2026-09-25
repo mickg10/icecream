@@ -199,7 +199,7 @@ public:
         const P51SourceArmFields& arm,
         const std::array<uint8_t, 16>& reservation_id,
         std::chrono::steady_clock::time_point deadline) noexcept;
-    [[nodiscard]] std::optional<P51SourceLinkLease>
+    [[nodiscard]] P51SourceLinkLookupResult
     lookup_p51_link_reservation_on_owner(const LinkHello& hello) noexcept;
     [[nodiscard]] std::optional<P51SourceJobLease>
     consume_p51_job_reservation_on_owner(const LinkHello& link,

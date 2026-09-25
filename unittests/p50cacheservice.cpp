@@ -2112,9 +2112,27 @@ void test_p51_reservation_profile_mask_mapping() {
                                           : ProfileId::ZSTD_ROUTE;
         std::optional<P51SourceLinkLease> link_lease;
         runtime.run_owner_callback_for_test([&] {
-            CHECK(!runtime.lookup_p51_link_reservation_on_owner(
-                wrong_profile_hello).has_value());
-            link_lease = runtime.lookup_p51_link_reservation_on_owner(hello);
+            const auto invalid = runtime.lookup_p51_link_reservation_on_owner(
+                wrong_profile_hello);
+            CHECK(invalid.status == P51SourceLinkLookupStatus::Invalid);
+            CHECK(!invalid.has_value());
+            auto absent_initial = hello;
+            absent_initial.reservation_id = Id128::from_u64(0x7fff0000 + index);
+            const auto missing_initial =
+                runtime.lookup_p51_link_reservation_on_owner(absent_initial);
+            CHECK(missing_initial.status ==
+                  P51SourceLinkLookupStatus::ReservationMissing);
+            auto absent_relationship = hello;
+            absent_relationship.start_mode = LinkStartMode::Reconnect;
+            absent_relationship.c_store_guid.bytes[15] ^= 0x80;
+            absent_relationship.physical_link_generation += 1;
+            const auto missing_reconnect =
+                runtime.lookup_p51_link_reservation_on_owner(absent_relationship);
+            CHECK(missing_reconnect.status ==
+                  P51SourceLinkLookupStatus::ReservationMissing);
+            const auto valid = runtime.lookup_p51_link_reservation_on_owner(hello);
+            CHECK(valid.status == P51SourceLinkLookupStatus::Found);
+            link_lease = valid;
         });
         CHECK(link_lease.has_value());
 

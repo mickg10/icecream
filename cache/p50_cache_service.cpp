@@ -4171,18 +4171,18 @@ bool SidecarRuntime::cancel_p51_source_on_owner(
     return completed && removed;
 }
 
-std::optional<P51SourceLinkLease>
+P51SourceLinkLookupResult
 SidecarRuntime::lookup_p51_link_reservation_on_owner(
     const LinkHello& hello) noexcept {
     if (stop_requested_.load(std::memory_order_acquire) ||
         hello.revision != 2 ||
         hello.reservation_id == Id128{} || hello.relationship_id == Id128{} ||
         hello.relationship_epoch == 0 || hello.physical_link_generation == 0)
-        return std::nullopt;
+        return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
     const auto relationship = p51_source_relationships_.find(hello.c_store_guid);
     if (hello.start_mode == LinkStartMode::Reconnect) {
         if (relationship == p51_source_relationships_.end())
-            return std::nullopt;
+            return {P51SourceLinkLookupStatus::ReservationMissing, std::nullopt};
         P51SourceRelationship& row = relationship->second;
         const bool current_epoch = hello.relationship_epoch == row.epoch &&
                                   hello.history_nonce == row.history_nonce;
@@ -4202,7 +4202,7 @@ SidecarRuntime::lookup_p51_link_reservation_on_owner(
             hello.physical_link_generation <=
                 row.highest_physical_link_generation ||
             row.anchor_armed.selected_revision != CACHE_WIRE_REVISION_R2)
-            return std::nullopt;
+            return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
         row.link_active = true;
         row.physical_link_generation = hello.physical_link_generation;
         row.highest_physical_link_generation = hello.physical_link_generation;
@@ -4214,16 +4214,17 @@ SidecarRuntime::lookup_p51_link_reservation_on_owner(
                 clock.clock_domain_id, clock.time_namespace_id);
         P51SourceArmedFields anchor = row.anchor_armed;
         anchor.relationship_epoch = row.epoch;
-        return P51SourceLinkLease{anchor, link_deadline, true, row.epoch,
-                                  row.history_nonce,
-                                  row.committed_prefix_k,
-                                  row.acknowledged_prefix_q};
+        return {P51SourceLinkLookupStatus::Found,
+                P51SourceLinkLease{anchor, link_deadline, true, row.epoch,
+                                   row.history_nonce,
+                                   row.committed_prefix_k,
+                                   row.acknowledged_prefix_q}};
     }
     if (hello.start_mode != LinkStartMode::Initial)
-        return std::nullopt;
+        return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
     const auto position = p51_source_reservations_.find(hello.reservation_id.bytes);
     if (position == p51_source_reservations_.end())
-        return std::nullopt;
+        return {P51SourceLinkLookupStatus::ReservationMissing, std::nullopt};
     const P51SourceArmedFields& armed = position->second.armed;
     const auto selected_profile = profile_from_cache_profile_mask(
         armed.arm.source.cache_profile);
@@ -4244,7 +4245,7 @@ SidecarRuntime::lookup_p51_link_reservation_on_owner(
         hello.window != armed.selected_window ||
         hello.f_store_guid.bytes != armed.f_store_guid ||
         hello.f_store_generation != armed.f_store_generation)
-        return std::nullopt;
+        return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
     if (relationship == p51_source_relationships_.end() ||
         relationship->second.logical_id != armed.logical_relationship_id ||
         relationship->second.epoch != armed.relationship_epoch ||
@@ -4259,7 +4260,7 @@ SidecarRuntime::lookup_p51_link_reservation_on_owner(
             relationship->second.highest_physical_link_generation ||
         (relationship->second.history_nonce.value != 0 &&
          relationship->second.history_nonce != hello.history_nonce))
-        return std::nullopt;
+        return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
     relationship->second.link_active = true;
     relationship->second.physical_link_generation =
         hello.physical_link_generation;
@@ -4268,9 +4269,10 @@ SidecarRuntime::lookup_p51_link_reservation_on_owner(
     relationship->second.history_nonce = hello.history_nonce;
     relationship->second.anchor_armed = armed;
     relationship->second.anchor_reservation_id = hello.reservation_id;
-    return P51SourceLinkLease{armed, position->second.absolute_deadline,
-                              false, relationship->second.epoch,
-                              relationship->second.history_nonce, 0, 0};
+    return {P51SourceLinkLookupStatus::Found,
+            P51SourceLinkLease{armed, position->second.absolute_deadline,
+                               false, relationship->second.epoch,
+                               relationship->second.history_nonce, 0, 0}};
 }
 
 std::optional<P51SourceJobLease>

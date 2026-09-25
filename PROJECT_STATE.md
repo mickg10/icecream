@@ -398,10 +398,25 @@ Evidence: `logs/rejection-expanded-r3.log` under the typed-reject root above
 `f20ba1e76cdfcf522a94c78c2c327cc9be61d2cd48b097ecac285f22ff4f5ebb`;
 binary: `f0962b18b36238fc33591a74ad71cee801106389c4f95ea3b7028cc55ed85103`.
 These focused selectors use the preceding committed product snapshot, not
-the in-development typed lookup. Runtime emission of ReservationMissing and
-rejection during the same original caller's ACK/recovery after a validated
-receipt remain unqualified. The real multi-link daemon fixture remains
-separate work.
+the subsequent typed lookup. Rejection during the same original caller's
+ACK/recovery after a validated receipt remains under qualification.
+
+The runtime now distinguishes definite reservation absence from an invalid
+offer in one owner-thread lookup. Only an absent initial reservation or
+absent reconnect relationship produces ReservationMissing; mismatched fields
+and ambiguous empty fixture lookups remain Invalid. The endpoint emits the
+exact-offer-bound rejection for definite absence. Focused endpoint tests and
+the full service suite pass; direct service assertions cover missing initial
+and reconnect entries, wrong profile, and exact valid lookup for all profiles.
+Evidence under `/tanksmall/scratch/tmp/p51-route-reap.6Pp7wd/logs/`:
+`typed-missing-endpoint.log` (SHA256
+`e7bc950fcc722a5a120da3338f0165caaa2a0a6dde131e465570e6b4d19c3dd7`),
+and `typed-missing-service-complete.log` (SHA256
+`15778027ffb7d6be70629e69af497a0157cc64de6807cf79d8b1417979233320`).
+Earlier incomplete invocations omitted required test environment settings;
+they are not passes. This does not yet prove a real same-F missing-reservation
+followed by fresh assignment and healthy sibling progress. The real multi-link
+daemon fixture remains separate work.
 
 The current recovery service passes the scoped ZSTD_TU restart rerun for
 C1F2/F-cache and C2F1/C-cache: an established healthy sibling attaches while

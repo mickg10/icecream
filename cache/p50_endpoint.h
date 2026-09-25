@@ -511,6 +511,35 @@ struct P51SourceLinkLease {
     uint64_t acknowledged_prefix_q = 0;
 };
 
+enum class P51SourceLinkLookupStatus : uint8_t {
+    Found,
+    ReservationMissing,
+    Invalid,
+};
+
+struct P51SourceLinkLookupResult {
+    P51SourceLinkLookupStatus status = P51SourceLinkLookupStatus::Invalid;
+    std::optional<P51SourceLinkLease> lease;
+
+    P51SourceLinkLookupResult() = default;
+    // Compatibility for endpoint fixtures that return an optional lease:
+    // an empty optional is ambiguous and therefore never means terminal
+    // ReservationMissing.
+    P51SourceLinkLookupResult(std::optional<P51SourceLinkLease> value)
+        : status(value ? P51SourceLinkLookupStatus::Found
+                       : P51SourceLinkLookupStatus::Invalid),
+          lease(std::move(value)) {}
+    P51SourceLinkLookupResult(P51SourceLinkLookupStatus lookup_status,
+                              std::optional<P51SourceLinkLease> value)
+        : status(lookup_status), lease(std::move(value)) {}
+    [[nodiscard]] bool has_value() const noexcept {
+        return status == P51SourceLinkLookupStatus::Found && lease.has_value();
+    }
+    operator std::optional<P51SourceLinkLease>() const {
+        return has_value() ? lease : std::nullopt;
+    }
+};
+
 struct P51RecoveryReceiptInterval {
     ReceiptsEnd end{};
     std::vector<ReceiptRow> rows;
@@ -541,7 +570,9 @@ struct P50ServerEndpointConfig {
     // lookup is non-consuming; each JOB_BIND consumes one exact reservation
     // and returns the immutable input/deadline binding used through commit.
     // No control-worker route-map access is permitted.
-    std::function<std::optional<P51SourceLinkLease>(const LinkHello&)>
+    // Lookup preserves definite absence (terminal R2 reservation miss) from
+    // present-but-invalid/stale offers. Empty optional conversion is Invalid.
+    std::function<P51SourceLinkLookupResult(const LinkHello&)>
         lookup_p51_link_reservation;
     std::function<std::optional<P51SourceJobLease>(const LinkHello&, const JobBind&)>
         consume_p51_job_reservation;
