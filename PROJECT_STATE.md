@@ -20,8 +20,9 @@ inside a bounded disposable container. The runner supplies the `icecc` test
 identity, private bridge, NET_ADMIN, offline locked Python environment and
 short scratch-backed `/tmp`. It rejects skips and incomplete pass markers,
 retains artifacts, and removes only its labeled container/network. Selectors
-also exist for W30 cache restart and scheduler restart; this qualification
-does not claim those selectors have run through the new entrypoint yet.
+also exist for W30 cache restart and scheduler restart. The scheduler and
+ordered-chain qualifications below use this entrypoint; the original
+18-cell cache-restart selector has not been newly qualified through it.
 
 Luna's 40 focused bootstrap tests pass, including cleanup timeouts and the
 runtime result policy. On nas642, direct `dev/bootstrap.py gate --gate
@@ -35,6 +36,42 @@ Outer gate log SHA256
 `f936e4d695c63fb042add6be78a137b1bc1bd2718404cc7e98ee35b503960a5a`.
 The SDK is `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, with 2 CPUs/8 GiB;
 later README-only wording clarifies the required short mount path.
+
+### Active ordered W30 restart chains
+
+The supported selectors `p51-scheduler-f-restart-w30` and
+`p51-restart-chain-w30`, plus the original `p51-scheduler-restart-w30`, pass
+for P29V1, ZSTD_TU and ZSTD_ROUTE on one exact private snapshot:
+`69b03d877d3f7291b1eedad8c0cb5148ad98f0c810d8fad02d18be3d5d8878a5`
+(base `6a28ea27`, prior to the independent source-FD change).
+
+S→F holds 30 old-scheduler receipts, restarts S, then holds the next 30
+receipts while replacing F. The second window is deliberately discarded;
+all 30 callers settle non-success without a harness timeout or signal exit.
+Their measured bound starts before assignment and is conservative relative
+to the 60-second source-arm budget. A fresh window produces 30 exact compiled
+objects joined through assignment epoch/nonce, TU and C/F store identities.
+F→C uses C2F2, holds W30 across each affected restart, proves unaffected
+C2/F2 progress, rejects the old F assignment and retains all 30 valid old-C
+source attachments. All 30 fresh post-C source inputs attach exactly, within
+their original absolute deadlines. This second gate proves source attachment,
+not compiled object output. The S-only selector retains its 30+30 behavior.
+
+All three Docker runs report build/gate exit 0 and PASS; 42 bootstrap tests
+also pass. Retained `result.json` directories and outer gate-log SHA256:
+
+| Gate | Directory under `/tanksmall/scratch/tmp/` | Gate seconds | Log SHA256 |
+| --- | --- | ---: | --- |
+| S→F | `icecream-qa-85db__9o` | 148.493 | `06e270c75c893c7c80f28b58e4917b7c5b47d12a3de0a35ada043fe84df7993a` |
+| F→C | `icecream-qa-vtlbaqk6` | 140.966 | `57f94afe6d9ad9e9389e0f39a820faafc8ff268831c34381c861676b80b78856` |
+| S-only | `icecream-qa-8ggjc_2j` | 136.818 | `c2d06713ed1b6d7cc073abdbf2baa255eaa6c7a6f06e191be08f55608845a6d5` |
+
+Separate clean builds took 193.806, 183.292 and 182.649 seconds respectively
+at 2 CPUs/8 GiB. Earlier failed S→F runs are excluded: one incorrectly applied
+the discarded-F-window assertion to the released S window; another compared
+public/internal profile labels without their explicit mapping. This evidence
+does not close all D09/compiler-loss cases or replace final combined-candidate
+qualification with subsequent product changes.
 
 ### Source descriptor lifetime
 

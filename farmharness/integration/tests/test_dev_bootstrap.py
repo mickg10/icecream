@@ -343,6 +343,8 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
     ("p51-arm-expiry", "p50daemonpositive-p51-arm-expiry-check", 240),
     ("p51-restart-w30", "p50daemonpositive-p51-restart-w30-check", 4200),
     ("p51-scheduler-restart-w30", "p51schedulerrestart-w30-check", 1800),
+    ("p51-scheduler-f-restart-w30", "p51schedulerrestart-w30-check", 1800),
+    ("p51-restart-chain-w30", "p50daemonpositive-p51-restart-chain-w30-check", 1200),
 ])
 def test_opt_in_gate_names_are_fixed_and_bounded(
     gate: str, target: str, timeout_s: int,

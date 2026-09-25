@@ -9,6 +9,11 @@ unset ICECC_TEST_P51_RESTART_W30_TOPOLOGY \
     ICECC_TEST_P51_PAUSE_AFTER_GOODBYE_REQUEST \
     ICECC_TEST_P50_SOURCE_BUDGET_MSEC \
     ICECC_TEST_P51_RESTART_CHAIN_F_C_W30
+chain_f_restart=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
+case "$chain_f_restart" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30 must be 0 or 1" >&2; exit 1 ;;
+esac
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 build=${ICECC_TEST_TOP_BUILDDIR:-$src}
@@ -63,6 +68,9 @@ trap 'echo "real scheduler W30 artifacts retained at $fixture"' EXIT
 chmod 0755 "$fixture"
 mkdir -p "$fixture/sources" "$fixture/predictive"
 rows=60
+if test "$chain_f_restart" = 1; then
+    rows=90
+fi
 
 sh "$src/dev/python.sh" --exec python - "$fixture" "$rows" <<'PY'
 import hashlib
@@ -130,6 +138,7 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         -u ICECC_TEST_P51_RESTART_C_C2F1 \
         -u ICECC_TEST_P51_RESTART_W30_F_C1F2 \
         -u ICECC_TEST_P51_RESTART_W30_C_C2F1 \
+        -u ICECC_TEST_P51_RESTART_CHAIN_F_C_W30 \
         -u ICECC_TEST_P51_SYNTH_SCHEDULER_W30 \
         -u ICECC_TEST_P51_CANCEL_REPLACEMENT \
         -u ICECC_TEST_SCHEDULER_BACKPRESSURE \
@@ -147,10 +156,11 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         ICECC_P50_PROFILE="$profile" \
         ICECC_P50_SUITE=C1F1/100000 \
         ICECC_P50_C1F1_BATCH_MANIFEST="$fixture/batch.jsonl" \
-        ICECC_P50_C1F1_EXPECTED_COUNT=60 \
+        ICECC_P50_C1F1_EXPECTED_COUNT="$rows" \
         ICECC_P50_C1F1_PASSES=1 \
         ICECC_P50_C1F1_WARM=0 \
         ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30=1 \
+        ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30="$chain_f_restart" \
         ICECC_P50_C1F1_WORKDIR="$work" \
         ICECC_P50_C1F1_KEEP_WORK=1 \
         ICECC_P50_C1F1_TIMEOUT=300 \
@@ -163,12 +173,23 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         echo "FAIL: actual scheduler W30 replacement failed for $profile (status $status)" >&2
         exit 1
     }
-    grep -F "S8_REAL_SCHEDULER_RESTART_W30_PASS profile=$profile old_receipts=30 old_callers_settled=30 fresh_receipts=30 fresh_objects_verified=30 c_f_daemons_stable=1" \
-        "$log" >/dev/null || {
-        cat "$log"
-        echo "FAIL: $profile did not produce the complete real-S W30 evidence marker" >&2
-        exit 1
-    }
+    if test "$chain_f_restart" = 1; then
+        grep -F "S8_REAL_SCHEDULER_F_RESTART_CHAIN_W30_PASS profile=$profile" \
+            "$log" >/dev/null && \
+        grep -F 'b_held_receipts=30 f_restarted_while_b_held=1' "$log" >/dev/null && \
+        grep -F 'post_f_receipts=30 post_f_exact_outputs=30' "$log" >/dev/null || {
+            cat "$log"
+            echo "FAIL: $profile did not produce the complete active S-to-F restart-chain W30 evidence marker" >&2
+            exit 1
+        }
+    else
+        grep -F "S8_REAL_SCHEDULER_RESTART_W30_PASS profile=$profile old_receipts=30 old_callers_settled=30 fresh_receipts=30 fresh_objects_verified=30 c_f_daemons_stable=1" \
+            "$log" >/dev/null || {
+            cat "$log"
+            echo "FAIL: $profile did not produce the complete real-S W30 evidence marker" >&2
+            exit 1
+        }
+    fi
     test -f "$work/scheduler-replacement.log" && \
         grep -Fq 'login p50-c protocol version:' "$work/scheduler-replacement.log" && \
         grep -Fq 'login p50-f protocol version:' "$work/scheduler-replacement.log" || {
@@ -176,8 +197,17 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         echo "FAIL: replacement scheduler process log is missing its C/F registrations" >&2
         exit 1
     }
-    printf 'P51_REAL_SCHEDULER_RESTART_W30_PASS profile=%s old_fresh_receipt_windows=30+30 log=%s work=%s replacement_scheduler_log=%s\n' \
-        "$profile" "$log" "$work" "$work/scheduler-replacement.log"
+    if test "$chain_f_restart" = 1; then
+        printf 'P51_REAL_SCHEDULER_F_RESTART_CHAIN_W30_PASS profile=%s receipt_windows=30+30+30 log=%s work=%s replacement_scheduler_log=%s\n' \
+            "$profile" "$log" "$work" "$work/scheduler-replacement.log"
+    else
+        printf 'P51_REAL_SCHEDULER_RESTART_W30_PASS profile=%s old_fresh_receipt_windows=30+30 log=%s work=%s replacement_scheduler_log=%s\n' \
+            "$profile" "$log" "$work" "$work/scheduler-replacement.log"
+    fi
 done
 
-echo "PASS: real scheduler process replacement qualified with held W30 source receipts for all three profiles"
+if test "$chain_f_restart" = 1; then
+    echo "PASS: real scheduler replacement plus active held-W30 F-sidecar restart chain qualified for all three profiles"
+else
+    echo "PASS: real scheduler process replacement qualified with held W30 source receipts for all three profiles"
+fi

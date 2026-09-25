@@ -668,7 +668,8 @@ static bool p51_gate_wait_rearm(P51CommitReceiptGate& gate, size_t expected,
 
 static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
                                        size_t expected, uint64_t first_ordinal,
-                                       const std::string& control_dir)
+                                       const std::string& control_dir,
+                                       bool one_shot = false)
 {
     if (endpoint_port <= 0 || sidecar_uid == 0 || expected == 0 ||
         expected > 30 || control_dir.empty())
@@ -699,9 +700,19 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         if (last - first + 1 != expected || !p51_gate_write_marker(
                 control_dir + "/held-" + std::to_string(stage), summary))
             return false;
-        return p51_gate_wait_for_path(
+        const bool released = p51_gate_wait_for_path(
             control_dir + "/release-" + std::to_string(stage),
             std::chrono::seconds(30));
+        if (!released) {
+            std::error_code error;
+            if (std::filesystem::exists(control_dir + "/abort", error) && !error) {
+                gate.discard_held_commits();
+                (void)p51_gate_write_marker(
+                    control_dir + "/discarded-" + std::to_string(stage),
+                    "explicit abort discarded held COMMIT interval\n");
+            }
+        }
+        return released;
     };
     if (!wait_stage(1)) {
         (void)p51_gate_write_marker(control_dir + "/failed", "first receipt window failed\n");
@@ -712,6 +723,13 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         !p51_gate_write_marker(control_dir + "/released-1")) {
         (void)p51_gate_write_marker(control_dir + "/failed", "first release did not settle\n");
         return 1;
+    }
+    if (one_shot) {
+        if (!p51_gate_wait_for_path(control_dir + "/finish", std::chrono::seconds(180))) {
+            (void)p51_gate_write_marker(control_dir + "/failed", "one-shot batch did not finish before gate shutdown\n");
+            return 1;
+        }
+        return 0;
     }
     if (!p51_gate_wait_for_path(control_dir + "/arm-2", std::chrono::seconds(30)) ||
         !p51_gate_wait_rearm(gate, expected, 0, control_dir + "/abort") ||
@@ -3365,16 +3383,25 @@ static bool attach_p51_restart_job(
     return status_ok && eof_ok;
 }
 
+static bool reject_p51_stale_f_owner_attach(
+    P51RestartRole& f, const P51RestartJob& old_job,
+    const P51SourceArmedFields& old_armed,
+    const P51SourceArmedFields& current_armed,
+    const icecc::p50::R2TxCommit& witness, uint32_t profile_mask);
+
 static int run_p51_process_restart_case(
     const char *daemon_binary, const char *cache_service, passwd *icecc,
     unsigned c_count, unsigned f_count, uint32_t profile_mask,
-    unsigned jobs_per_window = 1)
+    unsigned jobs_per_window = 1, bool restart_chain_f_c = false)
 {
     if (jobs_per_window == 0 || jobs_per_window > 30 ||
         c_count == 0 || c_count > 4 || f_count == 0 || f_count > 4 ||
         c_count * f_count > 4 ||
-        !((c_count == 1 && f_count >= 2) ||
-          (f_count == 1 && c_count >= 2))) {
+        (!restart_chain_f_c &&
+         !((c_count == 1 && f_count >= 2) ||
+           (f_count == 1 && c_count >= 2))) ||
+        (restart_chain_f_c &&
+         !(c_count == 2 && f_count == 2 && jobs_per_window == 30))) {
         std::fprintf(stderr,
             "FAIL: unsupported process-restart topology/window C%uF%u W%u\n",
             c_count, f_count, jobs_per_window);
@@ -3587,6 +3614,9 @@ static int run_p51_process_restart_case(
     REQUIRE(gate->observed_commits() == jobs_per_window,
             "restart gate retains every exact affected COMMIT before store replacement");
     const size_t held_old_commits = gate->observed_commits();
+    const auto held_old_witnesses = gate->commit_witnesses();
+    REQUIRE(held_old_witnesses.size() == jobs_per_window,
+            "held F window exposes exact commit witnesses for the pre-restart owner");
     restart_parent = restart_f ? f_affected.daemon_pid : c_affected.daemon_pid;
     old_sidecar = find_attachment_sidecar(restart_parent, cache_service);
     stop_parent_ok = restart_parent > 1 && ::kill(restart_parent, SIGSTOP) == 0;
@@ -3687,6 +3717,38 @@ static int run_p51_process_restart_case(
         topology.c_str(), profile_mask, affected_cells.size(),
         held_old_commits, affected_noncommitted);
     const P51SourceArmedFields old_armed = affected_cells.front()->armed;
+    std::unique_ptr<P51RestartJob> stale_f_job;
+    P51SourceArmedFields stale_f_armed{};
+    icecc::p50::R2TxCommit stale_f_witness{};
+    if (restart_chain_f_c && !affected_cells.empty() &&
+        held_old_witnesses.size() == jobs_per_window) {
+        const auto matching = std::find_if(held_old_witnesses.begin(),
+            held_old_witnesses.end(), [&](const auto& witness) {
+                return std::any_of(affected_cells.begin(), affected_cells.end(),
+                    [&](const auto& cell) {
+                        return cell->job && icecc::digest128(cell->job->bytes) ==
+                            witness.inner.raw_digest;
+                    });
+            });
+        if (matching != held_old_witnesses.end()) {
+            const auto cell = std::find_if(affected_cells.begin(),
+                affected_cells.end(), [&](const auto& candidate) {
+                    return candidate->job && icecc::digest128(candidate->job->bytes) ==
+                        matching->inner.raw_digest;
+                });
+            if (cell != affected_cells.end()) {
+                stale_f_job = std::make_unique<P51RestartJob>();
+                stale_f_job->wire_id = (*cell)->job->wire_id;
+                stale_f_job->epoch = (*cell)->job->epoch;
+                stale_f_job->nonce = (*cell)->job->nonce;
+                stale_f_job->bytes = (*cell)->job->bytes;
+                stale_f_armed = (*cell)->armed;
+                stale_f_witness = *matching;
+            }
+        }
+        REQUIRE(stale_f_job != nullptr,
+                "a held old-F commit maps to its exact original compiler assignment");
+    }
     affected_cells.clear();
 
     P51RestartRole& refreshed_c = c_affected;
@@ -3719,6 +3781,13 @@ static int run_p51_process_restart_case(
         std::chrono::seconds(jobs_per_window == 1 ? 20 : 30));
     REQUIRE(fresh_window_observed,
             "fresh replacement F commits all W30 before any C receipt is released");
+    uint64_t fresh_last_ordinal = 0;
+    if (fresh_window_observed) {
+        const auto fresh_witnesses = fresh_gate->commit_witnesses();
+        for (const auto& witness : fresh_witnesses)
+            fresh_last_ordinal = std::max(fresh_last_ordinal,
+                                           witness.relationship_ordinal);
+    }
     size_t fresh_pending_before_receipt = 0;
     if (fresh_window_observed) {
         for (const auto& cell : fresh_cells)
@@ -3768,7 +3837,7 @@ static int run_p51_process_restart_case(
                 refreshed_f, *cell->job, profile_mask, cell->armed, result))
             fresh_attached_count++;
     }
-    fresh_gate.reset();
+    if (!restart_chain_f_c) fresh_gate.reset();
     fresh_attached = fresh_prepared && fresh_settled &&
         fresh_committed == jobs_per_window &&
         fresh_attached_count == jobs_per_window;
@@ -3805,6 +3874,222 @@ static int run_p51_process_restart_case(
               old_armed.arm.source.c_store_generation != fresh_armed.arm.source.c_store_generation;
     REQUIRE(fresh_identity && fresh_attached,
             "replacement transfer uses a fresh F store identity or fresh C store identity");
+
+    if (restart_chain_f_c && fresh_gate && !fresh_cells.empty() &&
+        fresh_attached && fresh_identity) {
+        const bool stale_old_f_rejected = stale_f_job && !fresh_cells.empty() &&
+            reject_p51_stale_f_owner_attach(
+                refreshed_f, *stale_f_job, stale_f_armed,
+                fresh_cells.front()->armed, stale_f_witness, profile_mask);
+        REQUIRE(stale_old_f_rejected,
+                "a CompileFile carrying a held old-F commit cannot attach after F store replacement");
+
+        // C2/F2 is independent of the C1/F1 relationship whose sidecar is
+        // restarted below. Prove its progress while C1 is stopped in the
+        // second leg as well as before the stop.
+        const bool healthy_c_sibling_before = run_healthy(
+            c_roles[1], f_roles[1], next_offset++, "before-C-restart");
+        REQUIRE(healthy_c_sibling_before,
+                "unaffected C2/F2 sibling is live before restarting C1's cache owner");
+
+        const P51SourceArmedFields c_before = fresh_cells.front()->armed;
+        auto *c_gate = fresh_gate.get();
+        const uint64_t c_first_ordinal = fresh_last_ordinal == UINT64_MAX
+            ? 0 : fresh_last_ordinal + 1;
+        const bool c_gate_rearmed = c_gate && c_first_ordinal != 0 &&
+            p51_gate_wait_rearm(*c_gate, jobs_per_window, c_first_ordinal,
+                                work + "/c-reset-gate-abort");
+        REQUIRE(c_gate_rearmed,
+                "the live post-F receipt stream rearms for the next C1/F1 ordinal window");
+        std::vector<std::unique_ptr<P51RestartTransferCell>> c_reset_cells;
+        c_reset_cells.reserve(jobs_per_window);
+        bool c_reset_prepared = c_gate_rearmed;
+        for (unsigned index = 0; index < jobs_per_window && c_reset_prepared; ++index) {
+            auto job = make_job(c_affected, refreshed_f, 600 + index);
+            c_reset_prepared &= job != nullptr;
+            if (!job) break;
+            c_reset_cells.emplace_back(
+                std::make_unique<P51RestartTransferCell>(std::move(job)));
+        }
+        REQUIRE(c_reset_prepared && c_reset_cells.size() == jobs_per_window,
+                "same C1/F1 relationship admits a second exact W30 before C restart");
+        const bool c_reset_started = c_reset_prepared &&
+            start_p51_restart_transfers(c_reset_cells, refreshed_f, profile_mask);
+        const bool c_window = c_reset_started && c_gate->wait_for_commits(
+            std::chrono::seconds(30));
+        const auto c_witnesses = c_window ? c_gate->commit_witnesses()
+            : std::vector<icecc::p50::R2TxCommit>{};
+        REQUIRE(c_window && c_witnesses.size() == jobs_per_window,
+                "C-restart leg holds exact F-positive, C-unobserved W30 receipts");
+
+        const pid_t c_parent = c_affected.daemon_pid;
+        const pid_t c_sidecar_before = find_attachment_sidecar(c_parent, cache_service);
+        const bool c_parent_stopped = c_parent > 1 &&
+            ::kill(c_parent, SIGSTOP) == 0;
+        if (c_parent_stopped) c_affected.paused = true;
+        REQUIRE(c_sidecar_before > 1 && c_parent_stopped,
+                "C leg identifies and stops only the affected C daemon before child replacement");
+        const bool c_sidecar_killed = c_sidecar_before > 1 &&
+            ::kill(c_sidecar_before, SIGKILL) == 0;
+        REQUIRE(c_sidecar_killed,
+                "C leg kills the exact old C cache-sidecar after held F commits");
+        c_gate->discard_held_commits();
+
+        const bool healthy_c_sibling_during = c_parent_stopped && run_healthy(
+            c_roles[1], f_roles[1], next_offset++, "during-C-restart");
+        REQUIRE(healthy_c_sibling_during,
+                "unaffected C2/F2 completes and attaches while affected C1 parent remains stopped");
+        const bool c_parent_resumed = c_parent_stopped &&
+            ::kill(c_parent, SIGCONT) == 0;
+        if (c_parent_resumed) c_affected.paused = false;
+        const pid_t c_sidecar_after = c_parent_resumed
+            ? c_affected.wait_for_restarted_cache_sidecar(
+                cache_service, c_sidecar_before) : -1;
+        REQUIRE(c_sidecar_after > 1,
+                "C daemon publishes the replacement sidecar after the second chain leg");
+        const bool c_old_settled = wait_p51_restart_transfers(
+            c_reset_cells, Clock::now() + std::chrono::seconds(35));
+        REQUIRE(c_old_settled,
+                "C-owner callers settle within their original bounded deadlines after C restart");
+        if (!c_old_settled) {
+            for (P51RestartRole *role : all_roles())
+                if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
+            (void)wait_p51_restart_transfers(
+                c_reset_cells, Clock::now() + std::chrono::seconds(5));
+        }
+        join_p51_restart_transfers(c_reset_cells);
+        int64_t c_old_max_deadline_delta_ms = 0;
+        const bool c_old_deadlines_respected = p51_restart_deadlines_respected(
+            c_reset_cells, kSourceDeadlineCleanupGrace,
+            &c_old_max_deadline_delta_ms);
+        REQUIRE(c_old_deadlines_respected,
+                "C-restart callers remain bounded by their original absolute source deadlines");
+        size_t c_old_positive_results = 0;
+        for (const auto& cell : c_reset_cells) {
+            if (cell->settled && cell->result.code ==
+                    icecc::p50::local::SourceTransferResultCode::Committed) {
+                ++c_old_positive_results;
+                REQUIRE(cell->result.raw_bytes == cell->job->bytes.size() &&
+                            cell->result.raw_digest == icecc::digest128(cell->job->bytes) &&
+                            cell->result.tu_seq != UINT64_MAX &&
+                            cell->result.c_store_guid.bytes ==
+                                cell->armed.arm.source.c_store_guid,
+                        "any C-restart caller that remains positive preserves its exact digest, TU, and original C identity");
+            }
+        }
+        size_t old_c_input_attachments = 0;
+        size_t old_c_input_witnesses = 0;
+        for (const auto& witness : c_witnesses) {
+            const auto cell = std::find_if(c_reset_cells.begin(), c_reset_cells.end(),
+                [&](const auto& candidate) {
+                    return candidate->job &&
+                        icecc::digest128(candidate->job->bytes) == witness.inner.raw_digest;
+                });
+            if (cell == c_reset_cells.end() || witness.inner.tu_seq.value == UINT64_MAX)
+                continue;
+            icecc::p50::local::P50SourceTransferResult retained;
+            retained.code = icecc::p50::local::SourceTransferResultCode::Committed;
+            retained.attempts = 1;
+            retained.tu_seq = witness.inner.tu_seq.value;
+            retained.raw_bytes = (*cell)->job->bytes.size();
+            retained.raw_digest = witness.inner.raw_digest;
+            retained.c_store_guid.bytes = (*cell)->armed.arm.source.c_store_guid;
+            if (retained.valid()) {
+                ++old_c_input_witnesses;
+                if (attach_p51_restart_job(
+                        refreshed_f, *(*cell)->job, profile_mask,
+                        (*cell)->armed, retained))
+                    ++old_c_input_attachments;
+            }
+        }
+        REQUIRE(old_c_input_witnesses == jobs_per_window &&
+                    old_c_input_attachments == jobs_per_window,
+                "C-sidecar replacement preserves exact attachment of every live F-positive old-C input");
+        fresh_gate.reset();
+        const bool identities_cycled = !c_reset_cells.empty() &&
+            !fresh_cells.empty() && c_sidecar_after != c_sidecar_before &&
+            c_parent == c_affected.daemon_pid &&
+            refreshed_f.daemon_pid == f_affected.daemon_pid;
+        REQUIRE(identities_cycled,
+                "C sidecar identity changes while C/F daemon processes and F owner survive");
+
+        auto post_c_gate = std::make_unique<P51CommitReceiptGate>(
+            refreshed_f.endpoint_port, sidecar_uid, jobs_per_window);
+        REQUIRE(post_c_gate->ready(),
+                "post-C receipt gate protects the fresh C-owner W30 window");
+        std::vector<std::unique_ptr<P51RestartTransferCell>> post_c_cells;
+        post_c_cells.reserve(jobs_per_window);
+        bool post_c_prepared = post_c_gate->ready();
+        for (unsigned index = 0; index < jobs_per_window && post_c_prepared; ++index) {
+            auto job = make_job(c_affected, refreshed_f, 700 + index);
+            post_c_prepared &= job != nullptr;
+            if (!job) break;
+            post_c_cells.emplace_back(
+                std::make_unique<P51RestartTransferCell>(std::move(job)));
+        }
+        REQUIRE(post_c_prepared && post_c_cells.size() == jobs_per_window,
+                "fresh C identity admits a complete post-chain W30 assignment set");
+        const bool post_c_started = post_c_prepared && start_p51_restart_transfers(
+            post_c_cells, refreshed_f, profile_mask);
+        const bool post_c_held = post_c_started && post_c_gate->wait_for_commits(
+            std::chrono::seconds(30));
+        REQUIRE(post_c_held && post_c_gate->observed_commits() == jobs_per_window,
+                "post-chain F emits the exact fresh W30 commit window");
+        if (post_c_held) post_c_gate->release_commits();
+        else post_c_gate->discard_held_commits();
+        const bool post_c_settled = post_c_started && wait_p51_restart_transfers(
+            post_c_cells, Clock::now() + std::chrono::seconds(35));
+        REQUIRE(post_c_settled,
+                "post-C fresh W30 callers settle before the watchdog");
+        if (!post_c_settled)
+            for (P51RestartRole *role : all_roles())
+                if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
+        join_p51_restart_transfers(post_c_cells);
+        int64_t post_c_max_deadline_delta_ms = 0;
+        const bool post_c_deadlines_respected = p51_restart_deadlines_respected(
+            post_c_cells, kSourceDeadlineCleanupGrace,
+            &post_c_max_deadline_delta_ms);
+        REQUIRE(post_c_deadlines_respected,
+                "fresh post-C callers remain bounded by their original absolute source deadlines");
+        size_t post_c_committed = 0;
+        size_t post_c_attached = 0;
+        for (auto& cell : post_c_cells) {
+            if (!cell->settled || cell->result.code !=
+                    icecc::p50::local::SourceTransferResultCode::Committed)
+                continue;
+            ++post_c_committed;
+            post_c_attached += attach_p51_restart_job(
+                refreshed_f, *cell->job, profile_mask, cell->armed, cell->result);
+        }
+        const bool c_rotated_f_preserved = !post_c_cells.empty() &&
+            c_before.arm.source.c_store_guid !=
+                post_c_cells.front()->armed.arm.source.c_store_guid &&
+            c_before.arm.source.c_store_generation !=
+                post_c_cells.front()->armed.arm.source.c_store_generation &&
+            c_before.f_store_guid == post_c_cells.front()->armed.f_store_guid &&
+            c_before.f_store_generation == post_c_cells.front()->armed.f_store_generation;
+        REQUIRE(c_rotated_f_preserved,
+                "post-C assignments use the new C identity while retaining the restarted F identity");
+        REQUIRE(post_c_committed == jobs_per_window &&
+                    post_c_attached == jobs_per_window,
+                "all fresh post-chain C/F jobs attach exact committed source bytes");
+        std::fprintf(stderr,
+            "P51_PROCESS_RESTART_CHAIN_F_C profile=%u f_old_assignment_rejected=%u c_parent_stopped=%u healthy_c2_f2=%u c_f_commits=%zu c_old_caller_committed=%zu/%zu c_old_attach=%zu c_old_deadline_ms=%lld post_c=%zu/%zu post_c_deadline_ms=%lld c_rotated_f_preserved=%u\n",
+            profile_mask, stale_old_f_rejected ? 1u : 0u,
+            c_parent_stopped ? 1u : 0u, healthy_c_sibling_during ? 1u : 0u,
+            c_witnesses.size(), c_old_positive_results,
+            static_cast<size_t>(jobs_per_window), old_c_input_attachments,
+            static_cast<long long>(c_old_max_deadline_delta_ms),
+            post_c_committed, post_c_attached,
+            static_cast<long long>(post_c_max_deadline_delta_ms),
+            c_rotated_f_preserved ? 1u : 0u);
+        post_c_gate.reset();
+        post_c_cells.clear();
+        c_reset_cells.clear();
+    } else if (restart_chain_f_c) {
+        REQUIRE(false,
+                "the ordered C-restart leg requires a settled fresh F identity and live gate");
+    }
 
     healthy_initial_jobs.clear(); fresh_cells.clear();
     stop_roles();
@@ -3866,6 +4151,79 @@ static bool reject_p51_stale_epoch_attach(
         attach_started ? 1u : 0u, epoch_assignment_rejected ? 1u : 0u,
         static_cast<unsigned long long>(witness.inner.tu_seq.value));
     return closed && !attach_started && epoch_assignment_rejected;
+}
+
+static bool reject_p51_stale_f_owner_attach(
+    P51RestartRole& f, const P51RestartJob& old_job,
+    const P51SourceArmedFields& old_armed,
+    const P51SourceArmedFields& current_armed,
+    const icecc::p50::R2TxCommit& witness, uint32_t profile_mask)
+{
+    const std::string marker = "P50_INPUT_ATTACH_BEGIN job=" +
+        std::to_string(old_job.wire_id) + " epoch=" +
+        std::to_string(old_job.epoch) + " nonce=" +
+        std::to_string(old_job.nonce);
+    std::error_code error;
+    const uintmax_t offset = std::filesystem::file_size(f.log, error);
+    if (error) return false;
+    std::unique_ptr<MsgChannel> stale(connect_tcp_bounded(f.endpoint_port, 5000));
+    if (!stale) return false;
+
+    CompileJob compile_job = attachment_compile_job(
+        old_job.wire_id, old_job.epoch, old_job.nonce,
+        old_armed.arm.source, nullptr);
+    CompileInputIdentity identity;
+    identity.profile = profile_mask == CACHE_PROFILE_P29V1
+        ? CompileInputIdentity::P29V1Profile
+        : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+            ? CompileInputIdentity::ZstdRouteProfile
+            : CompileInputIdentity::ZstdTuProfile;
+    identity.c_store_guid = old_armed.arm.source.c_store_guid;
+    identity.tu_seq = witness.inner.tu_seq.value;
+    identity.raw_bytes = old_job.bytes.size();
+    identity.raw_digest = witness.inner.raw_digest.bytes;
+    identity.attempt_id = old_job.nonce;
+    identity.request_id = old_job.nonce;
+    compile_job.setCompileInputIdentity(identity);
+    if (!stale->send_msg(CompileFileMsg(&compile_job))) return false;
+    const bool closed = wait_eof(stale.get(), 5000);
+    const std::string suffix = read_file_suffix(f.log, offset);
+    const bool old_attach_started = suffix.find(marker) != std::string::npos;
+    const std::string owner_rejected =
+        "P50 CompileFile did not match one live source owner for job " +
+        std::to_string(old_job.wire_id) + "\n";
+    const std::string revoked_assignment =
+        "rejecting unprepared/revoked assignment claim " +
+        std::to_string(old_job.wire_id) + "\n";
+    const bool retired_old_assignment_rejected =
+        suffix.find(owner_rejected) != std::string::npos ||
+        suffix.find(revoked_assignment) != std::string::npos;
+    const std::string attach_end = "P50_INPUT_ATTACH_END job=" +
+        std::to_string(old_job.wire_id) + " epoch=" +
+        std::to_string(old_job.epoch) + " nonce=" +
+        std::to_string(old_job.nonce) + " request=" +
+        std::to_string(old_job.nonce) + " elapsed_ms=";
+    const size_t attach_end_at = suffix.find(attach_end);
+    const size_t attach_end_line_end = attach_end_at == std::string::npos
+        ? attach_end_at : suffix.find('\n', attach_end_at);
+    const std::string_view attach_end_line =
+        attach_end_at == std::string::npos ? std::string_view{} :
+        std::string_view(suffix.data() + attach_end_at,
+            (attach_end_line_end == std::string::npos ? suffix.size() :
+             attach_end_line_end) - attach_end_at);
+    const bool any_successful_attach =
+        attach_end_line.find(" status=0") != std::string_view::npos;
+    std::fprintf(stderr,
+        "P51_STALE_F_ASSIGNMENT_ATTACH job=%u old_f_gen=%llu new_f_gen=%llu closed=%u attach_started=%u retired_assignment_rejected=%u success=%u witness_tu=%llu\n",
+        old_job.wire_id,
+        static_cast<unsigned long long>(old_armed.f_store_generation),
+        static_cast<unsigned long long>(current_armed.f_store_generation),
+        closed ? 1u : 0u,
+        old_attach_started ? 1u : 0u, retired_old_assignment_rejected ? 1u : 0u,
+        any_successful_attach ? 1u : 0u,
+        static_cast<unsigned long long>(witness.inner.tu_seq.value));
+    return closed && !old_attach_started && retired_old_assignment_rejected &&
+        !any_successful_attach;
 }
 
 static int run_p51_synthetic_scheduler_epoch_w30(
@@ -4192,7 +4550,10 @@ static constexpr uint64_t kExpiredArmWireBudgetMsec = 2000;
 int main(int argc, char **argv)
 {
     const bool receipt_gate_mode = argc == 7 &&
-        std::strcmp(argv[1], "--p51-commit-receipt-gate") == 0;
+        (std::strcmp(argv[1], "--p51-commit-receipt-gate") == 0 ||
+         std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0);
+    const bool receipt_gate_once = receipt_gate_mode &&
+        std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0;
     const bool p51_expired_arm_wire_case =
         ::getenv("ICECC_TEST_P51_EXPIRED_ARM_WIRE") != nullptr;
     const char *other_p51_modes[] = {
@@ -4261,7 +4622,8 @@ int main(int argc, char **argv)
         if (errno != 0 || end == argv[5] || *end != '\0') return 2;
         return run_p51_commit_receipt_gate(
             static_cast<int>(endpoint_port), static_cast<uid_t>(sidecar_uid),
-            static_cast<size_t>(expected), static_cast<uint64_t>(first), argv[6]);
+            static_cast<size_t>(expected), static_cast<uint64_t>(first), argv[6],
+            receipt_gate_once);
     }
 
     const bool restart_f_c1f2 =
@@ -4276,6 +4638,8 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_RESTART_W30_TOPOLOGY");
     const bool restart_w30_topology_selected =
         restart_w30_topology != nullptr;
+    const bool restart_chain_f_c_w30 =
+        ::getenv("ICECC_TEST_P51_RESTART_CHAIN_F_C_W30") != nullptr;
     const bool synthetic_scheduler_w30 =
         ::getenv("ICECC_TEST_P51_SYNTH_SCHEDULER_W30") != nullptr;
     const char *lost_receipts_value =
@@ -4286,6 +4650,7 @@ int main(int argc, char **argv)
         static_cast<unsigned>(restart_w30_f_c1f2) +
         static_cast<unsigned>(restart_w30_c_c2f1) +
         static_cast<unsigned>(restart_w30_topology_selected) +
+        static_cast<unsigned>(restart_chain_f_c_w30) +
         static_cast<unsigned>(synthetic_scheduler_w30) +
         static_cast<unsigned>(lost_receipts);
     if (restart_selectors != 0) {
@@ -4317,6 +4682,9 @@ int main(int argc, char **argv)
                                     static_cast<unsigned>(count),
                                     profile_mask, true);
         }
+        if (restart_chain_f_c_w30)
+            return run_p51_process_restart_case(
+                argv[1], argv[2], icecc, 2, 2, profile_mask, 30, true);
         unsigned c_count = 0;
         unsigned f_count = 0;
         unsigned jobs_per_window = 1;

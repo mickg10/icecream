@@ -25,6 +25,8 @@ GATE_TARGETS = {
     "p51-arm-expiry": ("p50daemonpositive-p51-arm-expiry-check", 240),
     "p51-restart-w30": ("p50daemonpositive-p51-restart-w30-check", 4200),
     "p51-scheduler-restart-w30": ("p51schedulerrestart-w30-check", 1800),
+    "p51-scheduler-f-restart-w30": ("p51schedulerrestart-w30-check", 1800),
+    "p51-restart-chain-w30": ("p50daemonpositive-p51-restart-chain-w30-check", 1200),
 }
 GATE_OFFLINE_ENV = (
     "UV_OFFLINE=1",

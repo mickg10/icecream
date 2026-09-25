@@ -72,7 +72,9 @@ network-redirection fixtures directly on the host. The scheduler-restart gate
 requires the explicit private-namespace opt-in shown above because its receipt
 helper installs a temporary namespace-local OUTPUT redirection rule.
 `dev-gate GATE=...` currently allowlists `p51-arm-expiry`, `p51-restart-w30`,
-and `p51-scheduler-restart-w30`; it creates a private internal bridge, grants
+`p51-scheduler-restart-w30`, `p51-scheduler-f-restart-w30` (active scheduler→F
+restart chain), and `p51-restart-chain-w30` (active F→C restart chain).
+It creates a private internal bridge, grants
 only `NET_ADMIN`, and retains uniquely named logs under the run's
 `/work/artifacts`. A missing prerequisite or skip result is a failure, not a
 pass. Build outputs are reused only inside the same unique source snapshot and

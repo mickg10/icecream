@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30}" >&2
+    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30}" >&2
 }
 
 if [[ $# -ne 1 ]]; then
@@ -30,6 +30,20 @@ case "$1" in
         target=p51schedulerrestart-w30-check
         timeout_s=1800
         marker=P51_REAL_SCHEDULER_RESTART_W30_PASS\ profile=
+        expected_markers=3
+        ;;
+    p51-scheduler-f-restart-w30)
+        gate=$1
+        target=p51schedulerrestart-w30-check
+        timeout_s=1800
+        marker=P51_REAL_SCHEDULER_F_RESTART_CHAIN_W30_PASS\ profile=
+        expected_markers=3
+        ;;
+    p51-restart-chain-w30)
+        gate=$1
+        target=p50daemonpositive-p51-restart-chain-w30-check
+        timeout_s=1200
+        marker=P51_RESTART_CHAIN_PASS=F_then_C/
         expected_markers=3
         ;;
     *)
@@ -118,7 +132,12 @@ log="$run_dir/$gate.log"
 status_file="$run_dir/$gate.exit"
 echo "GATE_START name=$gate target=$target timeout_s=$timeout_s run_id=$ICECREAM_GATE_RUN_ID"
 set +e
-if [[ "$gate" == p51-scheduler-restart-w30 ]]; then
+if [[ "$gate" == p51-scheduler-restart-w30 || "$gate" == p51-scheduler-f-restart-w30 ]]; then
+    if [[ "$gate" == p51-scheduler-f-restart-w30 ]]; then
+        export ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30=1
+    else
+        unset ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30
+    fi
     ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
         ICECC_TEST_DAEMON_GID=icecc \
         timeout --signal=TERM --kill-after=20s "${timeout_s}s" \
