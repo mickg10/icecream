@@ -130,7 +130,44 @@ them as coverage of active-work cancellation. `CancelReindexSpec` uses a small
 ordered action subset to make the witness tractable; ordinary `Spec` always
 uses `GeneralNext`.
 The standard clean topology rows therefore still use the full pipeline action
-relation. The runner has 28 rows total.
+relation. The runner has 43 rows total, including the 15-row consumed-binding
+companion described next.
+
+`Protocol50ConsumedProof.tla` is a bounded companion for the service-side
+consumed-reservation proof that must survive interrupted materialization and
+settlement until RECOVER validation and RESET commit. It models the target and
+one colliding sibling with full reservation rows; all other configured links
+have progress witnesses only. The target begins with committed prefix `K=1`
+and a consumed reservation at ordinal 2 / physical generation 1. Settlement
+happens before RECOVER: decode/pending work can be fenced, but the exact
+consumed binding (reservation, C/F owner, logical relationship ID and epoch,
+ordinal, and old physical generation) remains available for recovery
+validation. RESET commit consumes that proof, advances the relationship epoch,
+and rearms the reservation credit once; a retry of the cached reset result
+does not rearm it again. The model also allows a later consume only with the
+new epoch/generation binding.
+
+The six safety configurations and six directed reachability witnesses use
+C2F1/C3F1/C4F1 and C1F2/C1F3/C1F4. Three state-derived mutants check clearing
+the proof at settlement, selecting a canceled same-F row with colliding
+ordinal/generation but the wrong C relationship, and double credit rearm on
+reset retry. The F reservation table is process-local: the wrong-C selection
+mutant applies only to the shared-F C2F1 case and does not imply a cross-F
+reservation-map collision. Only the target and one sibling have full row
+state, so these are bounded topology checks, not exhaustive four-client or
+W30 product proofs. The model abstracts wire decoding, actual codec workers,
+deadlines, and implementation refinement. Runtime correspondence is limited
+to the ordering and predicates around `settle_p51_interrupted_job_on_owner`,
+`recover_p51_receipts_on_owner`, and the owner-affine RESET commit path; it is
+not a proof that the C++ implementation refines every model transition.
+
+The companion adds 15 rows to `run_pipeline_recovery_tlc.sh`; its focused
+reproducer is `run_consumed_proof_tlc.sh` with the same pinned TLC jar and a
+fresh absolute state root. Its three mutant cfgs are
+`Protocol50ConsumedProofClearMutantC2F1.cfg`,
+`Protocol50ConsumedProofCrossCMutantC2F1.cfg`, and
+`Protocol50ConsumedProofDoubleCreditMutantC1F2.cfg`. There is deliberately no
+cross-F mutation configuration.
 
 The model separates relationship incarnation, physical link generation,
 codec/history epoch, the C-verified receipt floor `A`, F-published input floor

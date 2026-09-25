@@ -107,4 +107,22 @@ run_row witness-w30-full-window Protocol50PipelineWindowWitnessW30.cfg FullWindo
 run_row witness-active-cancel-reset-replay Protocol50ActiveCancelWitness.cfg ActiveCancelRecoveryWitnessNotReached Protocol50ActiveCancel.tla
 run_row mutant-active-cancel-replay-backlog Protocol50ActiveCancelBacklogMutant.cfg InterruptedReplayRetainsFullBacklog Protocol50ActiveCancel.tla
 
-printf 'PIPELINE-RECOVERY-TLC PASS rows=28\n'
+run_row consumed-proof-safety-c2f1 Protocol50ConsumedProofC2F1.cfg clean Protocol50ConsumedProof.tla
+run_row consumed-proof-safety-c3f1 Protocol50ConsumedProofC3F1.cfg clean Protocol50ConsumedProof.tla
+run_row consumed-proof-safety-c4f1 Protocol50ConsumedProofC4F1.cfg clean Protocol50ConsumedProof.tla
+run_row consumed-proof-safety-c1f2 Protocol50ConsumedProofC1F2.cfg clean Protocol50ConsumedProof.tla
+run_row consumed-proof-safety-c1f3 Protocol50ConsumedProofC1F3.cfg clean Protocol50ConsumedProof.tla
+run_row consumed-proof-safety-c1f4 Protocol50ConsumedProofC1F4.cfg clean Protocol50ConsumedProof.tla
+
+run_row consumed-proof-witness-c2f1 Protocol50ConsumedProofC2F1Witness.cfg ConsumedProofResetWitnessNotReached Protocol50ConsumedProof.tla
+run_row consumed-proof-witness-c3f1 Protocol50ConsumedProofC3F1Witness.cfg ConsumedProofResetWitnessNotReached Protocol50ConsumedProof.tla
+run_row consumed-proof-witness-c4f1 Protocol50ConsumedProofC4F1Witness.cfg ConsumedProofResetWitnessNotReached Protocol50ConsumedProof.tla
+run_row consumed-proof-witness-c1f2 Protocol50ConsumedProofC1F2Witness.cfg ConsumedProofResetWitnessNotReached Protocol50ConsumedProof.tla
+run_row consumed-proof-witness-c1f3 Protocol50ConsumedProofC1F3Witness.cfg ConsumedProofResetWitnessNotReached Protocol50ConsumedProof.tla
+run_row consumed-proof-witness-c1f4 Protocol50ConsumedProofC1F4Witness.cfg ConsumedProofResetWitnessNotReached Protocol50ConsumedProof.tla
+
+run_row mutant-clear-consumed-proof Protocol50ConsumedProofClearMutantC2F1.cfg EveryConsumedReservationRetainsItsProof Protocol50ConsumedProof.tla
+run_row mutant-cross-c-relationship Protocol50ConsumedProofCrossCMutantC2F1.cfg OtherRelationshipUntouchedByTargetSettlement Protocol50ConsumedProof.tla
+run_row mutant-reset-retry-double-credit Protocol50ConsumedProofDoubleCreditMutantC1F2.cfg ResetCreditRearmedAtMostOnce Protocol50ConsumedProof.tla
+
+printf 'PIPELINE-RECOVERY-TLC PASS rows=43\n'

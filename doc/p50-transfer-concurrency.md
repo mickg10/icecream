@@ -848,12 +848,18 @@ from blocking the very ACK that frees it.
 2. Reconnect only to the same verified F incarnation for recovery. Send
    C's A and retained exact suffix identities; F returns every receipt in
    `(A, K]`, bounded by W, including individual job/raw/transaction identity.
+   Before validating RECOVER, F fences the old decode and settles its pending
+   execution state. This must not discard a surviving consumed reservation's
+   original binding, ordinal or physical generation.
 3. Validate the entire interval for contiguous order and exact identity
    before advancing A. A last receipt or a numeric prefix alone is not enough.
    Preserve already-published input records and do not compile twice.
 4. F settles or explicitly aborts the remaining interrupted pending decode
    and fences late materialization callbacks. Current `reset_history` rejects
    pending/interrupted work: do not bypass that check with a blind reset.
+   The surviving consumed proof remains available through RECOVER validation;
+   only RESET commit rearms its admission credit. Settlement selects an exact
+   C/logical relationship/epoch, never ordinal and physical generation alone.
 5. Once both sides agree on the settled prefix, execute idempotent RESET.
    Retain the recovery operation/result until C confirms the new epoch.
    If RESET_ACK is lost, repeating RESET returns that same result instead of

@@ -12,6 +12,24 @@ retained artifact directories.
 
 ## Developer QA
 
+### Consumed-reservation recovery model
+
+The focused `cache/formal/run_consumed_proof_tlc.sh` gate passes 15 rows:
+six bounded topology safety checks (both 2/3/4-to-1 directions), six directed
+recovery/reset witnesses, and three expected invariant failures for clearing
+consumed proof, selecting another C's row on the same F, and rearming credit
+twice. Only the target and one sibling have full reservation state; other
+links have abstract progress witnesses. This is not exhaustive W30 execution
+or a proof of C++ refinement. Cross-F reservation tables are separate.
+
+Model SHA256 `5ef74df6bdcb48d391ec9768db24d5ec2fc0f6c35a04dd1dcbaed38026533277`.
+Retained focused log:
+`/tanksmall/scratch/tmp/pipeline-consumed-proof.9yrVeS/consumed-proof-focused-r1.log`,
+SHA256 `21dbde965884f06bf33f17f0322b164b9bcbba61c270208ebb93fe0f19698cd9`.
+It records `CONSUMED-PROOF-TLC PASS rows=15`, exit 0. The aggregate recovery
+runner now includes these cases (43 rows), but no final aggregate pass is
+claimed from the earlier run whose outer exit status was not retained.
+
 ### Opt-in R2 sender wire accounting
 
 The sender now supports a bounded interval observer, enabled only when the
