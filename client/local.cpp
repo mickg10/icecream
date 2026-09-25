@@ -40,6 +40,8 @@
 
 #include <fcntl.h>
 #include <pwd.h>
+#include <dirent.h>
+#include <algorithm>
 
 using namespace std;
 
@@ -69,7 +71,42 @@ static bool valid_target(const string &s)
 // Cache -dumpmachine per compiler invocation path: clang picks its default
 // target from its program name, so target-prefixed links to one binary differ.
 // A record is valid only for the same dev/ino/mtime/size of the resolved
-// binary.  Written via per-process atomic rename; any I/O problem is a miss.
+// binary and of the *.cfg files next to it (clang's default config files can set
+// the target; those in its build-configured user/system directories are not
+// tracked).  Written via per-process atomic rename; any I/O problem is a miss.
+static string stat_key(const struct stat &st)
+{
+#if defined(__APPLE__)
+    const struct timespec &mt = st.st_mtimespec;
+#else
+    const struct timespec &mt = st.st_mtim;
+#endif
+    return to_string(st.st_dev) + ' ' + to_string(st.st_ino) + ' ' + to_string(mt.tv_sec) + ' ' +
+        to_string(mt.tv_nsec) + ' ' + to_string(st.st_size) + '\n';
+}
+
+static bool append_cfg_keys(const string &bindir, string &key)
+{
+    DIR *d = opendir(bindir.c_str());
+    if (!d)
+        return false;
+    vector<string> names;
+    while (const struct dirent *e = readdir(d)) {
+        const size_t n = strlen(e->d_name);
+        if (n > 4 && strcmp(e->d_name + n - 4, ".cfg") == 0)
+            names.push_back(e->d_name);
+    }
+    closedir(d);
+    sort(names.begin(), names.end());
+    for (const string &name : names) {
+        struct stat cst{};
+        if (stat((bindir + '/' + name).c_str(), &cst) != 0)
+            return false;
+        key += name + ' ' + stat_key(cst);
+    }
+    return true;
+}
+
 static string cached_dumpmachine(const string &compiler)
 {
     char rp[PATH_MAX];
@@ -87,9 +124,10 @@ static string cached_dumpmachine(const string &compiler)
     if ((mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) || !safe_cache_dir(dir))
         return read_command_line(compiler, {"-dumpmachine"});
 
-    const string key = to_string(st.st_dev) + ' ' + to_string(st.st_ino) + ' ' +
-        to_string(st.st_mtim.tv_sec) + ' ' + to_string(st.st_mtim.tv_nsec) + ' ' +
-        to_string(st.st_size) + '\n' + compiler + '\n' + resolved + '\n';
+    string key = stat_key(st) + compiler + '\n' + resolved + '\n';
+    const char *slash = strrchr(resolved, '/');
+    if (!append_cfg_keys(slash == resolved ? string("/") : string(resolved, slash - resolved), key))
+        return read_command_line(compiler, {"-dumpmachine"});
     uint64_t h = 1469598103934665603ULL; // FNV-1a of the invocation path
     for (char c : compiler) {
         h ^= static_cast<unsigned char>(c);

@@ -1,6 +1,6 @@
 // Regressions for the client's cached `clang -dumpmachine` probe: the cache is
-// keyed by invocation name (target-prefixed links to one binary differ) and a
-// replaced compiler binary is probed again.
+// keyed by invocation name (target-prefixed links to one binary differ), and a
+// replaced compiler binary or a new or edited config file next to it is probed again.
 #include "client.h"
 #include <cstdlib>
 #include <fstream>
@@ -14,11 +14,13 @@ using namespace std;
 static string dir;
 
 // Installs a fake compiler via rename (a new inode, like a package upgrade).
-// It counts its runs and answers by its invocation name, as clang does.
+// It counts its runs and answers by its invocation name, as clang does, unless
+// a clang.cfg next to it sets the target.
 static void install_compiler(const string &answer_for_plain_name)
 {
     const string path = dir + "/real-clang", tmp = path + ".new";
     ofstream(tmp) << "#!/bin/sh\necho >> '" << dir << "/runs'\n"
+                  << "[ -s '" << dir << "/clang.cfg' ] && exec sed 's/^--target=//' '" << dir << "/clang.cfg'\n"
                   << "case \"$0\" in *aarch64-linux-gnu-*) echo aarch64-unknown-linux-gnu ;;"
                   << " *) echo " << answer_for_plain_name << " ;; esac\n";
     if (chmod(tmp.c_str(), 0755) != 0 || rename(tmp.c_str(), path.c_str()) != 0)
@@ -70,6 +72,11 @@ int main()
     expect("plain name, cached", "clang", "x86_64-pc-linux-gnu", 2);
     install_compiler("riscv64-unknown-linux-gnu");
     expect("replaced compiler", "clang", "riscv64-unknown-linux-gnu", 3);
+    ofstream(dir + "/clang.cfg") << "--target=armv7-unknown-linux-gnueabihf\n";
+    expect("new config file", "clang", "armv7-unknown-linux-gnueabihf", 4);
+    // Same inode; a new size, since two writes can share a coarse mtime.
+    ofstream(dir + "/clang.cfg") << "--target=powerpc64le-linux-gnu\n";
+    expect("edited config file", "clang", "powerpc64le-linux-gnu", 5);
 
     return system(("rm -rf '" + dir + "'").c_str()) == 0 ? 0 : 2;
 }
