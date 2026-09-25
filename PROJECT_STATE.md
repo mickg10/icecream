@@ -44,8 +44,21 @@ TerminalError results and 30 caller receive timeouts. Cause is under
 investigation; this does not establish whether the failure is a pre-existing
 race or a new regression. Do not treat this candidate as deployment-qualified.
 The retained combined log is
-`/tanksmall/scratch/tmp/p51-service-combined.7PdVFL/build/unittests/p50cacheservice.log`,
+`/tanksmall/scratch/tmp/p51-service-combined.7PdVFL/tmp/service-default-1232033d-r1-test.log`,
 SHA256 `f6411136f01a25fa80e1feae9934dcc27c614d815032375b45b062781bac072e`.
+Use that preserved copy: later executions overwrite the build-directory log.
+
+Source review identified a pre-existing recovery inconsistency in
+`settle_p51_interrupted_job_on_owner`: a surviving consumed reservation loses
+its binding/ordinal/generation, but RECOVER requires that proof while it is
+still consumed. The same global scan also lacks C/relationship/epoch filtering.
+Both branches are present before accounting (`017dd68f`). Deterministic
+regressions and a minimal fix are in progress; the intermittent runtime
+failure's exact causal path is not yet proven. Required fix invariants are
+preservation of survivor proof until RESET, no mutation of another C's
+reservation, and exactly-once restoration of consumed admission credit by
+RESET. Old-generation publication must remain rejected. A later passing
+repetition does not clear the retained failing run.
 
 Evidence root: `/tanksmall/scratch/tmp/p51-r2-accounting-6faf9b21/`.
 SDK `icecream-dev:sdk-ubuntu24.04-be1f3d5a7160`, image
