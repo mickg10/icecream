@@ -1022,6 +1022,24 @@ from a local lock cycle using trace events and a bounded outer watchdog.
 Resource assertions use both exact internal accounting and peak process/
 cgroup memory; equality between raw-vector counters and RSS is not expected.
 
+For D09 ordered active-work coverage, establish and observe the affected W30
+cohort before each restart in the sequence. A restart between completed
+batches proves continuity, not interruption of active work. Retain exact
+assignment/store identities and original deadlines for each cohort, and
+prove a fresh W30 cohort succeeds after the final restart. A wrapper retry
+may succeed under a fresh valid assignment; that does not authorize an old
+attempt to attach to a replacement owner. Distinguish such retries from
+settlement of the original attempt in the evidence.
+
+The D09 stale-identity requirement is not blanket deletion of cached inputs.
+Replacing F invalidates attachment to the old F store; replacing S invalidates
+affected assignments. Replacing C alone does not revoke an otherwise live
+F-positive input or its valid compiler owner. The F→C test must therefore
+check both old-F rejection and preservation of exact old-C input attachment
+when F ownership remains valid, independently of C caller success. Healthy
+sibling progress must be observed while the affected parent is stopped,
+with the sibling's actual C/F pair identified.
+
 #### D07 cancellation observations
 
 Run first, middle, and last cancellation positions as separate cases. For a
