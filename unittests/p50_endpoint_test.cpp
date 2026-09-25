@@ -35,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -2570,6 +2571,21 @@ asio::awaitable<void> raw_write(tcp::socket& socket, Message message) {
     co_return;
 }
 
+asio::awaitable<void> raw_write_fragmented(tcp::socket& socket,
+                                           Message message,
+                                           size_t max_fragment) {
+    if (max_fragment == 0)
+        throw std::invalid_argument("raw fragment size is zero");
+    const std::vector<uint8_t> frame = encode_frame(message);
+    for (size_t offset = 0; offset < frame.size();) {
+        const size_t count = std::min(max_fragment, frame.size() - offset);
+        co_await asio::async_write(
+            socket, asio::buffer(frame.data() + offset, count),
+            asio::use_awaitable);
+        offset += count;
+    }
+}
+
 asio::awaitable<void> raw_write_bytes(tcp::socket& socket,
                                       std::span<const uint8_t> bytes_to_write) {
     co_await asio::async_write(socket, asio::buffer(bytes_to_write.data(), bytes_to_write.size()),
@@ -4913,6 +4929,316 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
     }
     std::cout << "P51_R2_ENDPOINT W30 commits-before-receipts + ACK/refill profile="
               << static_cast<unsigned>(profile) << ": ok\n";
+}
+
+asio::awaitable<ClientRunResult> r2_fragmented_single_job_client(
+    tcp::endpoint remote, P50ClientEndpoint& client, LinkHello hello,
+    JobBind binding, PreparedTuHandle prepared,
+    std::chrono::steady_clock::time_point deadline,
+    EndpointIoControl bundle_control,
+    std::vector<std::pair<MessageType, size_t>>& observed) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    (void)co_await client.open_r2_link(socket, hello, deadline);
+    bundle_control.outbound_message_observer =
+        [&](ActorSide actor, const Message& message) {
+            if (actor == ActorSide::C)
+                observed.emplace_back(message_type(message),
+                                      encode_frame(message).size());
+        };
+    const R2SentBundle sent = co_await client.write_r2_bundle(
+        socket, binding, prepared, deadline, std::move(bundle_control));
+    const ClientRunResult receipt = co_await client.read_r2_receipt(
+        socket, sent, deadline);
+    co_await client.write_r2_ack(socket, binding.relationship_ordinal,
+                                 deadline);
+    co_await raw_write_fragmented(socket, Message{CloseMessage{}}, 1);
+    boost::system::error_code ignored;
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
+    co_return receipt;
+}
+
+void test_r2_fragmented_one_job_each_profile() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        const P5coStoreGuids stores = p5co_store_guids(
+            0x7b + static_cast<uint64_t>(profile));
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        PreparationAuthorityLimits authority_limits;
+        authority_limits.max_speculative_tus = 1;
+        authority_limits.max_speculative_raw_bytes = 1U << 20;
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            stores.c, caps.zstd, authority_limits, 1, profile);
+        const PreparationRouteKey route{stores.f, 23, profile};
+        const std::string text = "int r2_fragmented_profile = 17;\n";
+        const std::vector<uint8_t> input(text.begin(), text.end());
+        const P51SourceArmFields arm{
+            r2_test_arm(stores.c, 6100 + static_cast<uint64_t>(profile),
+                        7100 + static_cast<uint32_t>(profile), profile),
+            1};
+        const P51SourceArmedFields armed =
+            r2_test_armed(arm, stores.f,
+                          0x7100 + static_cast<uint64_t>(profile), 1);
+        const PreparedTuHandle prepared = authority->prepare_for_route(
+            route, PrepareRequestKey{6100, 7100}, input);
+        const PreparedInputPtr prepared_input =
+            P50PreparationAuthorityTestAccess::resolve(*authority, prepared);
+        const sidecar::AbsoluteMonotonicDeadline job_deadline =
+            r2_test_deadline(std::chrono::seconds(20));
+
+        LinkHello hello;
+        hello.profile = profile;
+        hello.window = 1;
+        hello.max_frame_payload = kInitialMaxFramePayload;
+        hello.max_raw_bytes = 1U << 20;
+        hello.max_encoded_bytes = 1U << 20;
+        hello.max_output_bytes = 1U << 20;
+        hello.reservation_id = Id128{armed.reservation_id};
+        hello.relationship_id = Id128{armed.logical_relationship_id};
+        hello.relationship_epoch = armed.relationship_epoch;
+        hello.physical_link_generation = 27;
+        hello.c_store_guid = stores.c;
+        hello.c_store_generation = arm.source.c_store_generation;
+        hello.f_store_guid = stores.f;
+        hello.f_store_generation = armed.f_store_generation;
+        hello.c_control_generation = arm.source.c_control_generation;
+        hello.c_control_attempt = arm.source.c_control_attempt;
+        hello.system_source_fingerprint = profile == ProfileId::P29V1
+            ? authority->p29v1_system_source_fingerprint(prepared)
+            : icecc::digest128("R2 fragmented one-job fixture");
+        hello.history_nonce = prepared_input->begin.history_nonce;
+        hello.start_mode = LinkStartMode::Initial;
+
+        JobBind binding;
+        binding.reservation_id = Id128{armed.reservation_id};
+        binding.physical_link_generation = hello.physical_link_generation;
+        binding.relationship_ordinal = 1;
+        binding.wire_job_id = arm.source.wire_job_id;
+        binding.assignment_epoch = arm.source.assignment_epoch;
+        binding.assignment_nonce = arm.source.assignment_nonce;
+        binding.logical_job = arm.source.logical_job;
+        binding.compiler_attempt = arm.source.compiler_attempt;
+        binding.source_request_id = arm.source.source_request_id;
+        binding.tu_seq = prepared_input->begin.tu_seq;
+        binding.profile = profile;
+        binding.raw_bytes = prepared_input->begin.raw_bytes;
+        binding.raw_digest = prepared_input->begin.raw_digest;
+
+        P51SourceJobLease job_lease;
+        job_lease.armed = armed;
+        job_lease.absolute_deadline = job_deadline;
+        job_lease.binding = binding;
+        job_lease.binding_digest = compute_r2_binding_digest(binding);
+        job_lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+        std::atomic<unsigned> link_lookups{0};
+        std::atomic<unsigned> job_consumes{0};
+        std::atomic<unsigned> commits{0};
+        std::atomic<unsigned> acknowledgements{0};
+        std::atomic<unsigned> materializations{0};
+        std::vector<std::pair<MessageType, size_t>> f_messages;
+        P50ServerEndpointConfig server_config;
+        server_config.lookup_p51_link_reservation =
+            [&](const LinkHello& observed)
+                -> std::optional<P51SourceLinkLease> {
+                ++link_lookups;
+                if (observed != hello)
+                    return std::nullopt;
+                P51SourceLinkLease lease{armed, job_deadline};
+                lease.relationship_epoch = hello.relationship_epoch;
+                lease.history_nonce = hello.history_nonce;
+                return lease;
+            };
+        server_config.consume_p51_job_reservation =
+            [&](const LinkHello& observed, const JobBind& offered)
+                -> std::optional<P51SourceJobLease> {
+                if (observed != hello || offered != binding ||
+                    job_consumes.fetch_add(1) != 0)
+                    return std::nullopt;
+                return job_lease;
+            };
+        server_config.input_job_state =
+            [&](CStoreGuid c_guid, const TxBegin&, const TxCommit& commit,
+                std::span<const uint8_t> exact) {
+                if (c_guid != stores.c || commit.tu_seq != binding.tu_seq ||
+                    !std::ranges::equal(exact, input) ||
+                    commit.raw_digest != icecc::digest128(input))
+                    throw std::runtime_error(
+                        "fragmented R2 materialization changed exact input");
+                ++materializations;
+                return InputJobState::Open;
+            };
+        server_config.record_p51_job_commit =
+            [&](const LinkHello& observed, const JobBind& committed_binding,
+                const R2TxCommit& commit) {
+                if (observed != hello || committed_binding != binding ||
+                    commit.relationship_ordinal != 1 ||
+                    commit.binding_digest != job_lease.binding_digest ||
+                    commit.inner.tu_seq != binding.tu_seq ||
+                    commit.inner.raw_digest != binding.raw_digest)
+                    return false;
+                ++commits;
+                return true;
+            };
+        server_config.acknowledge_p51_receipt =
+            [&](const LinkHello& observed, const CommitAck& ack) {
+                if (observed != hello ||
+                    ack.relationship_id != hello.relationship_id ||
+                    ack.relationship_epoch != hello.relationship_epoch ||
+                    ack.physical_link_generation !=
+                        hello.physical_link_generation ||
+                    ack.contiguous_verified_ordinal != 1)
+                    return false;
+                ++acknowledgements;
+                return true;
+            };
+
+        CompletionLog c_completions;
+        CompletionLog f_completions;
+        P50ServerEndpoint server(stores.f, caps, &f_completions, nullptr,
+                                 std::move(server_config));
+        P50ClientEndpoint client(authority, caps, hello.history_nonce,
+                                 &c_completions, nullptr, std::nullopt, {}, {},
+                                 route);
+        EndpointIoControl server_control;
+        server_control.max_write_fragment = 1;
+        server_control.outbound_message_observer =
+            [&](ActorSide actor, const Message& message) {
+                if (actor == ActorSide::F)
+                    f_messages.emplace_back(message_type(message),
+                                            encode_frame(message).size());
+            };
+        EndpointIoControl bundle_control;
+        bundle_control.max_write_fragment = 1;
+        std::vector<std::pair<MessageType, size_t>> c_messages;
+        asio::io_context context;
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        asio::steady_timer watchdog(context);
+        bool timed_out = false;
+        watchdog.expires_after(std::chrono::seconds(25));
+        watchdog.async_wait([&](const boost::system::error_code& error) {
+            if (!error) {
+                timed_out = true;
+                boost::system::error_code ignored;
+                acceptor.close(ignored);
+                context.stop();
+            }
+        });
+        std::optional<ServerRunResult> server_result;
+        std::optional<ClientRunResult> client_result;
+        std::exception_ptr server_error;
+        std::exception_ptr client_error;
+        bool server_done = false;
+        bool client_done = false;
+        const auto finish_if_done = [&] {
+            if (server_done && client_done) {
+                boost::system::error_code ignored;
+                watchdog.cancel(ignored);
+            }
+        };
+        asio::co_spawn(
+            context, r2_accept_one(acceptor, server, server_control),
+            [&](std::exception_ptr error, ServerRunResult result) {
+                server_error = error;
+                if (!error)
+                    server_result = std::move(result);
+                server_done = true;
+                finish_if_done();
+            });
+        asio::co_spawn(
+            context, r2_fragmented_single_job_client(
+                         acceptor.local_endpoint(), client, hello, binding,
+                         prepared, job_deadline.as_steady_time_point(),
+                         bundle_control, c_messages),
+            [&](std::exception_ptr error, ClientRunResult result) {
+                client_error = error;
+                if (!error)
+                    client_result = std::move(result);
+                client_done = true;
+                finish_if_done();
+            });
+        context.run();
+        boost::system::error_code ignored;
+        require(!timed_out && server_done && client_done,
+                "fragmented R2 one-job dialogue exceeded its watchdog");
+        if (server_error)
+            std::rethrow_exception(server_error);
+        if (client_error)
+            std::rethrow_exception(client_error);
+        require(server_result->status == ServerRunStatus::Completed &&
+                    client_result->status == ClientRunStatus::Committed &&
+                    link_lookups == 1 && job_consumes == 1 && commits == 1 &&
+                    acknowledgements == 1 && materializations == 1,
+                "fragmented R2 one-job dialogue did not commit exactly once");
+
+        std::vector<MessageType> client_types;
+        for (const auto& [type, size] : c_messages) {
+            (void)size;
+            client_types.push_back(type);
+        }
+        require(client_types.size() >= 4 &&
+                    client_types.front() == MessageType::JOB_BIND &&
+                    client_types[1] == MessageType::TU_BEGIN &&
+                    client_types.back() == MessageType::TU_END &&
+                    std::ranges::find(client_types, MessageType::R2_BODY) !=
+                        client_types.end(),
+                "fragmented R2 C bundle omitted a mandatory record");
+        const size_t fill_records = static_cast<size_t>(std::ranges::count(
+            client_types, MessageType::R2_FILL));
+        require((profile == ProfileId::P29V1) == (fill_records != 0),
+                "fragmented R2 profile emitted an unexpected FILL sequence");
+        std::vector<MessageType> server_types;
+        for (const auto& [type, size] : f_messages) {
+            (void)size;
+            server_types.push_back(type);
+        }
+        require(server_types.size() == 2 &&
+                    server_types[0] == MessageType::LINK_STATE &&
+                    server_types[1] == MessageType::R2_TX_COMMIT,
+                "fragmented R2 F output did not include exact STATE and COMMIT");
+        uint64_t c_fragment_bytes = 0;
+        for (const AsyncCompletion& completion : c_completions.completions()) {
+            if (completion.stamp.actor == ActorSide::C &&
+                completion.stamp.operation == AsyncOperationKind::WriteFragment &&
+                completion.stamp.transaction_bound) {
+                require(completion.transferred_bytes == 1,
+                        "R2 bundle fragment completion exceeded one byte");
+                c_fragment_bytes += completion.transferred_bytes;
+            }
+        }
+        const uint64_t expected_c_bytes = std::accumulate(
+            c_messages.begin(), c_messages.end(), uint64_t{0},
+            [](uint64_t total, const auto& item) { return total + item.second; });
+        require(c_fragment_bytes == expected_c_bytes,
+                "R2 C transaction records were not all written bytewise");
+        uint64_t f_commit_fragment_bytes = 0;
+        for (const AsyncCompletion& completion : f_completions.completions()) {
+            if (completion.stamp.actor == ActorSide::F &&
+                completion.stamp.operation == AsyncOperationKind::WriteFragment &&
+                completion.stamp.transaction_bound) {
+                require(completion.transferred_bytes == 1,
+                        "R2 COMMIT fragment completion exceeded one byte");
+                f_commit_fragment_bytes += completion.transferred_bytes;
+            }
+        }
+        require(f_commit_fragment_bytes == f_messages.back().second,
+                "R2 F TX_COMMIT was not completely written bytewise");
+        InputCursor cursor = server.attach_input(
+            InputRecordKey{stores.c, binding.tu_seq});
+        std::vector<uint8_t> recovered(input.size());
+        require(cursor && cursor.read(recovered) == recovered.size() &&
+                    recovered == input,
+                "fragmented R2 exact input attachment changed bytes");
+        std::cout << "P51_R2_FRAGMENTED profile="
+                  << static_cast<unsigned>(profile)
+                  << " C-records=JOB_BIND,TU_BEGIN,R2_BODY"
+                  << (fill_records ? ",R2_FILL" : "")
+                  << ",TU_END F-records=LINK_STATE,R2_TX_COMMIT"
+                  << " one-byte-write-completions: ok\n";
+    }
 }
 
 void test_r2_silent_setup_cancelled_before_hello() {
@@ -7322,6 +7648,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused R2 pre-HELLO cancellation PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_FRAGMENT_SUCCESS_FOCUS") != nullptr) {
+        test_r2_fragmented_one_job_each_profile();
+        std::cout << "p50_endpoint_test: focused fragmented R2 success all profiles PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_R2_ROUTE_RECOVERY_FOCUS") != nullptr) {
         test_zstd_route_recovery_rebuild_cursor();
         std::cout << "p50_endpoint_test: focused ZSTD_ROUTE recovery rebuild PASS\n";
@@ -7361,6 +7692,7 @@ int main(int argc, char** argv) {
     test_r2_store_replaced_rejects_same_guid_old_generation();
     test_r2_definite_missing_reservation_is_typed_only_for_absence();
     test_r2_endpoint_commits_two_jobs_on_one_link();
+    test_r2_fragmented_one_job_each_profile();
     test_candidate_stage_has_no_revision_residue();
     test_input_record_owner_and_aggregate_limits();
     test_fragmentation_at_every_control_and_body_boundary();

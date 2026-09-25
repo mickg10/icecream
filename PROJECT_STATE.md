@@ -90,6 +90,32 @@ Final helper binary SHA256:
 The published runner differs from that older successful test copy only by
 one wording-only correction to a failure message.
 
+### Successful R2 bytewise fragmentation
+
+The real client/server R2 fixture passes P29V1, ZSTD_TU and ZSTD_ROUTE
+with one-byte writes for C's JOB_BIND/BEGIN/BODY/FILL/END bundle and F's
+LINK_STATE/TX_COMMIT. It verifies exact attached bytes, one publication and
+acknowledgment, complete record ordering, and transaction-fragment byte totals.
+Both the focused selector and full endpoint suite exit 0 on the same binary.
+Run `ICECC_P50_R2_FRAGMENT_SUCCESS_FOCUS=1 "$BUILD/unittests/p50endpoint"`.
+
+This is successful fragmentation, not D03 completion: HELLO/ACK fragmentation,
+interrupted frames, recovery at each boundary, and actual EAGAIN remain separate.
+The fixture cancels its watchdog after both coroutines finish rather than
+adding a fixed delay to each profile.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d03-fragment-success.Us1E3p/`.
+Test source SHA256:
+`a86c9a435cef8ecb4a4164c15f414fda172f9e7de258c0c9732c2b2e38b454e2`.
+Binary SHA256:
+`cd54fe2ed02bb6ceb6e791367d95debccd4bde828aaebc14fec94cfb1ec1ce11`.
+Focused build/run log `logs/container-r2.log` SHA256:
+`bfe7095113495479c97c99f80d831ade5db7353154e693c9176c3992fb306a78`.
+Full suite log `logs/full-container.log` SHA256:
+`3f4cbba461c06ba9793022c53c933421fb34c49e660b67a0393eea7d032445af`.
+The earlier compile failure was an unqualified test-only `digest128` name;
+its original log is retained.
+
 ### Lost committed receipts with F kept alive
 
 The D04 integration fixture passes all nine cells: drop 1, 2 or 30 fully
