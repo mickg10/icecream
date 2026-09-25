@@ -110,6 +110,32 @@ SHA256 `41ad7ecfd4d0ff57c9174334651d5ec8283dd03460132fd6751c3e1653210b13`.
 This checks that the added opt-in fixture modes do not replace the default
 daemon tests; it is not a full native/farm suite result.
 
+The expanded cache-replacement gate now passes all six W30 cells:
+C1F2/F-cache and C2F1/C-cache, each with P29V1, ZSTD_TU and ZSTD_ROUTE.
+Each holds exactly 30 old commits before C observes them, replaces only the
+affected cache process, checks that all 30 original callers settle without
+accepting the discarded receipts, and preserves healthy-sibling progress.
+A fresh window then reaches 30 held commits before receipt release and
+attaches all 30 exact inputs on the replacement store identity. Evidence:
+`/tanksmall/scratch/tmp/p51-restart-w30-r0/tmp/restart-w30-r0-matrix.log`,
+SHA256 `55a1c7a88b31090d33f49970eb0f9a1a33d7962460580f01f1e8d66b218999dd`;
+the adjacent exit file records `RESTART_W30_MATRIX_EXIT=0`.
+Fixture source SHA256:
+`5b29ed1a6c7cf6c2847afe309fd0e4b4a5d62a7a57410647e4ba120ab4200bbd`;
+fixture binary:
+`f6307c11f33d5cf1c2a30ec6773f057d5c0464aeb4f9f15d0a95245b949b91d5`.
+This uses the frozen r6 product binaries described above, not the pending
+admission/history/recovery changes. It proves bounded caller settlement,
+not a measured per-caller finish-time comparison against the original
+deadline. Scheduler/ordinary-daemon/compiler replacement and final combined
+qualification remain separate obligations.
+The existing two-case, one-job restart mode also passes with this generalized
+fixture (`restart-w30-r0-focused.log` in the same directory). Its `set -e`
+command then failed on an outdated source guard copied into the private tree;
+the current guard and shell syntax checks pass separately in
+`restart-w30-source-guard.log`, SHA256
+`d26a269dd2f5e49571a6c3eb67127c5d1cc4d1ece08dc5e3f37a6cb12a457b36`.
+
 The production C sender passes its W30 regression against the direct F
 endpoint for ZSTD_TU, P29V1 and ZSTD_ROUTE: 30 complete bundles and 30 F commits before C processes
 receipts, then cumulative ACK and ordinal-31 refill on one connection. Exact

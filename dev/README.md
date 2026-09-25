@@ -45,21 +45,29 @@ Inside an already built, disposable Linux test container, run:
 ```sh
 make -C "$BUILD/unittests" p50daemonpositive-p51-multilink-check
 make -C "$BUILD/unittests" p50daemonpositive-p51-restart-check
+make -C "$BUILD/unittests" p50daemonpositive-p51-restart-w30-check
 ```
 
 `BUILD` is the absolute configured build directory. These gates require root
 inside the container, an unprivileged `icecc` account, usable `iptables` with
 Docker `NET_ADMIN`, and writable scratch-backed `ICEFARM_TMPDIR`. The daemon
 account must be able to traverse the build path and temporary directory.
+Mount scratch at a short container path such as `/work/tmp`: these fixtures
+create Unix-domain sockets with a limited path length.
 Do not run these network-redirection fixtures directly on the host.
 
 The multi-link gate covers C1F2/3/4 and C2/3/4F1 for all three profiles, with
 30 outstanding jobs per link (at most 120 total). It checks exact input
 attachments and progress on healthy links while one link's receipts are held.
 The restart gate currently covers ZSTD_TU C1F2/F-cache and C2F1/C-cache
-replacement, one affected transfer plus a healthy sibling—not W30 restart
-occupancy. Neither target is automatically included in the default `make qa`
-workflow, and neither is a throughput benchmark or cross-host farm test.
+replacement, one affected transfer plus a healthy sibling. The separate
+`restart-w30` gate covers both replacements for all three profiles: 30 held
+old commits, all original callers settling without accepting the discarded
+receipts, healthy-sibling progress, and 30 fresh commits and exact input
+attachments on the replacement identity. It checks bounded settlement; direct
+per-caller completion-time comparison with the original deadline remains
+pending. These targets are not automatically included in the default
+`make qa` workflow and are not throughput benchmarks or cross-host farm tests.
 
 ### Repository and offline inputs
 

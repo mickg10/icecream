@@ -2675,6 +2675,26 @@ struct P51RestartJob {
     }
 };
 
+struct P51RestartTransferCell {
+    using Result = icecc::p50::local::P50SourceTransferResult;
+
+    std::unique_ptr<P51RestartJob> job;
+    P51SourceArmedFields armed{};
+    std::promise<Result> promise;
+    std::future<Result> future;
+    std::thread worker;
+    Result result{};
+    bool settled = false;
+
+    explicit P51RestartTransferCell(std::unique_ptr<P51RestartJob> value)
+        : job(std::move(value)), future(promise.get_future()) {}
+
+    ~P51RestartTransferCell()
+    {
+        if (worker.joinable()) worker.join();
+    }
+};
+
 static std::unique_ptr<P51RestartJob> prepare_p51_restart_job(
     P51RestartRole& c, P51RestartRole& f, const std::string& source_root,
     uint32_t wire_id, uint64_t nonce, uint64_t epoch, uint32_t profile_mask)
@@ -2738,6 +2758,56 @@ static icecc::p50::local::P50SourceTransferResult run_p51_restart_job(
         job.epoch, job.nonce,
         static_cast<uint32_t>(f.endpoint_port), source_fd,
         profile_mask, armed);
+}
+
+static bool start_p51_restart_transfers(
+    std::vector<std::unique_ptr<P51RestartTransferCell>>& cells,
+    P51RestartRole& f, uint32_t profile_mask)
+{
+    try {
+        for (auto& owned : cells) {
+            P51RestartTransferCell *cell = owned.get();
+            cell->worker = std::thread([cell, &f, profile_mask] {
+                P51RestartTransferCell::Result result{};
+                try {
+                    result = run_p51_restart_job(
+                        f, *cell->job, profile_mask, &cell->armed);
+                } catch (...) {
+                    std::fprintf(stderr,
+                        "P51_RESTART_TRANSFER exception job=%u\n",
+                        cell->job ? cell->job->wire_id : 0u);
+                }
+                cell->promise.set_value(std::move(result));
+            });
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+static bool wait_p51_restart_transfers(
+    std::vector<std::unique_ptr<P51RestartTransferCell>>& cells,
+    Clock::time_point deadline)
+{
+    bool all_settled = true;
+    for (auto& cell : cells) {
+        if (cell->settled) continue;
+        if (cell->future.wait_until(deadline) != std::future_status::ready) {
+            all_settled = false;
+            continue;
+        }
+        cell->result = cell->future.get();
+        cell->settled = true;
+    }
+    return all_settled;
+}
+
+static void join_p51_restart_transfers(
+    std::vector<std::unique_ptr<P51RestartTransferCell>>& cells)
+{
+    for (auto& cell : cells)
+        if (cell->worker.joinable()) cell->worker.join();
 }
 
 static bool attach_p51_restart_job(
@@ -2811,11 +2881,16 @@ static bool attach_p51_restart_job(
 
 static int run_p51_process_restart_case(
     const char *daemon_binary, const char *cache_service, passwd *icecc,
-    bool restart_f, uint32_t profile_mask)
+    bool restart_f, uint32_t profile_mask, unsigned jobs_per_window = 1)
 {
+    if (jobs_per_window == 0 || jobs_per_window > 30) {
+        std::fprintf(stderr,
+            "FAIL: process-restart window must contain 1..30 jobs\n");
+        return 2;
+    }
     const char *temporary_root = ::getenv("TMPDIR");
     const std::string prefix = temporary_root && *temporary_root ? temporary_root : "/tmp";
-    std::string pattern = prefix + "/p51-process-restart.XXXXXX";
+    std::string pattern = prefix + "/p51r.XXXXXX";
     std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
     mutable_pattern.push_back('\0');
     char *created = ::mkdtemp(mutable_pattern.data());
@@ -2848,9 +2923,12 @@ static int run_p51_process_restart_case(
     }
     if (failures) return 2;
 
-    const bool roles_ready = primary.start(daemon_binary, cache_service, epoch, 6) &&
-        sibling.start(daemon_binary, cache_service, epoch, 4) &&
-        target.start(daemon_binary, cache_service, epoch, 6);
+    const unsigned role_job_limit = jobs_per_window == 1
+        ? 6u : jobs_per_window * 2u + 4u;
+    const bool roles_ready = primary.start(
+            daemon_binary, cache_service, epoch, role_job_limit) &&
+        sibling.start(daemon_binary, cache_service, epoch, role_job_limit) &&
+        target.start(daemon_binary, cache_service, epoch, role_job_limit);
     REQUIRE(roles_ready, restart_f
         ? "C1F2 starts one C cache and two independent F caches"
         : "C2F1 starts two independent C caches and one F cache");
@@ -2902,47 +2980,67 @@ static int run_p51_process_restart_case(
         return 1;
     }
 
-    const uint32_t failed_wire = wire_base + 2;
-    const uint64_t failed_nonce = (static_cast<uint64_t>(failed_wire) << 32) | 2;
     const uid_t sidecar_uid = icecc->pw_uid;
     auto gate = std::make_unique<P51CommitReceiptGate>(
-        f_affected.endpoint_port, sidecar_uid, 1);
-    REQUIRE(gate->ready(), "restart gate can hold one exact COMMIT under NET_ADMIN");
+        f_affected.endpoint_port, sidecar_uid, jobs_per_window);
+    REQUIRE(gate->ready(), "restart gate can hold the affected COMMIT window under NET_ADMIN");
     if (!gate->ready()) {
         primary.stop(); sibling.stop(); target.stop();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 2;
     }
-    auto affected_job = prepare_p51_restart_job(
-        c_affected, f_affected, work, failed_wire, failed_nonce, epoch,
-        profile_mask);
-    REQUIRE(affected_job != nullptr,
-            "affected topology assignment and original-channel P51 ARM are installed");
-    if (!affected_job) {
-        gate.reset(); primary.stop(); sibling.stop(); target.stop();
-        std::filesystem::remove_all(work);
-        return 1;
+    std::vector<std::unique_ptr<P51RestartTransferCell>> affected_cells;
+    affected_cells.reserve(jobs_per_window);
+    bool affected_prepared = true;
+    for (unsigned index = 0; index < jobs_per_window; ++index) {
+        const uint32_t offset = 2 + index;
+        const uint32_t wire = wire_base + offset;
+        const uint64_t nonce = (static_cast<uint64_t>(wire) << 32) | offset;
+        auto job = prepare_p51_restart_job(
+            c_affected, f_affected, work, wire, nonce, epoch, profile_mask);
+        affected_prepared &= job != nullptr;
+        if (!job) break;
+        affected_cells.emplace_back(
+            std::make_unique<P51RestartTransferCell>(std::move(job)));
     }
-    std::promise<icecc::p50::local::P50SourceTransferResult> affected_promise;
-    auto affected_future = affected_promise.get_future();
-    P51SourceArmedFields old_armed{};
-    std::thread affected_thread([&] {
-        affected_promise.set_value(run_p51_restart_job(
-            f_affected, *affected_job, profile_mask, &old_armed));
-    });
-    const bool observed_commit = gate->wait_for_commits(std::chrono::seconds(20));
-    REQUIRE(observed_commit,
-            "affected relationship reaches an exact F-committed/C-unobserved boundary");
-    if (!observed_commit) {
-        gate->discard_held_commits();
-        gate.reset();
-        if (affected_future.wait_for(std::chrono::seconds(35)) == std::future_status::ready)
-            (void)affected_future.get();
-        if (affected_thread.joinable()) affected_thread.join();
-        primary.stop(); sibling.stop(); target.stop();
+    REQUIRE(affected_prepared && affected_cells.size() == jobs_per_window,
+            "affected original compiler assignments and P51 ARMs cover the restart window");
+    if (!affected_prepared || affected_cells.size() != jobs_per_window) {
+        gate.reset(); primary.stop(); sibling.stop(); target.stop();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 1;
     }
+    const bool callers_started = start_p51_restart_transfers(
+        affected_cells, f_affected, profile_mask);
+    REQUIRE(callers_started,
+            "all affected original source callers enter one bounded R2 window");
+    if (!callers_started) {
+        gate->discard_held_commits();
+        gate.reset();
+        primary.stop(); sibling.stop(); target.stop();
+        (void)wait_p51_restart_transfers(
+            affected_cells, Clock::now() + std::chrono::seconds(5));
+        join_p51_restart_transfers(affected_cells);
+        std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
+        return 1;
+    }
+    const bool observed_commit = gate->wait_for_commits(
+        std::chrono::seconds(jobs_per_window == 1 ? 20 : 30));
+    REQUIRE(observed_commit,
+            "affected relationship reaches the exact held F-committed/C-unobserved COMMIT window");
+    if (!observed_commit) {
+        gate->discard_held_commits();
+        gate.reset();
+        primary.stop(); sibling.stop(); target.stop();
+        (void)wait_p51_restart_transfers(
+            affected_cells, Clock::now() + std::chrono::seconds(5));
+        join_p51_restart_transfers(affected_cells);
+        std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
+        return 1;
+    }
+    REQUIRE(gate->observed_commits() == jobs_per_window,
+            "restart gate retains every exact affected COMMIT before store replacement");
+    const size_t held_old_commits = gate->observed_commits();
     restart_parent = restart_f ? f_affected.daemon_pid : c_affected.daemon_pid;
     old_sidecar = find_attachment_sidecar(restart_parent, cache_service);
     stop_parent_ok = restart_parent > 1 && ::kill(restart_parent, SIGSTOP) == 0;
@@ -2959,7 +3057,8 @@ static int run_p51_process_restart_case(
     // proxy so the test does not confuse local positive evidence with restart.
     gate->discard_held_commits();
     gate.reset();
-    auto healthy_during_job = make_job(healthy_c, healthy_f, 3);
+    auto healthy_during_job = make_job(
+        healthy_c, healthy_f, jobs_per_window + 2);
     P51SourceArmedFields healthy_during_armed{};
     const auto healthy_during_result = healthy_during_job
         ? run_p51_restart_job(healthy_f, *healthy_during_job,
@@ -2987,68 +3086,134 @@ static int run_p51_process_restart_case(
     REQUIRE(restarted_sidecar > 1,
             "the affected daemon publishes a fresh sidecar process/incarnation");
 
-    const auto affected_deadline = Clock::now() + std::chrono::seconds(35);
-    while (Clock::now() < affected_deadline &&
-           affected_future.wait_for(std::chrono::milliseconds(50)) !=
-               std::future_status::ready) {}
-    bool affected_settled = affected_future.wait_for(std::chrono::milliseconds(0)) ==
-        std::future_status::ready;
-    if (!affected_settled) {
-        std::fprintf(stderr, "P51_PROCESS_RESTART affected source did not settle by its bounded wait\n");
-        // Force the underlying channels closed before joining; never detach a
-        // thread that still refers to this stack-owned job/role state.
-        for (P51RestartRole *role : {&primary, &sibling, &target}) {
-            if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
-        }
-        affected_settled = affected_future.wait_for(std::chrono::seconds(5)) ==
-            std::future_status::ready;
-    }
+    const bool affected_settled = wait_p51_restart_transfers(
+        affected_cells, Clock::now() + std::chrono::seconds(35));
     REQUIRE(affected_settled,
-            "affected transfer settles within its original deadline plus bounded teardown");
+            "all original W30 callers settle under their unchanged source deadlines");
     if (!affected_settled) {
-        // The script applies an outer process watchdog. Join before returning so
-        // this stack-owned fixture state can never be reclaimed under the worker.
-        if (affected_thread.joinable()) affected_thread.join();
+        std::fprintf(stderr,
+            "P51_PROCESS_RESTART affected W30 callers did not settle by bounded wait\n");
+        for (P51RestartRole *role : {&primary, &sibling, &target})
+            if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
+        const bool settled_after_close = wait_p51_restart_transfers(
+            affected_cells, Clock::now() + std::chrono::seconds(5));
+        join_p51_restart_transfers(affected_cells);
+        REQUIRE(settled_after_close,
+                "closing the three test daemons releases every original transfer worker");
         primary.stop(); sibling.stop(); target.stop();
         std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
         return 1;
     }
-    const auto affected_result = affected_future.get();
-    if (affected_thread.joinable()) affected_thread.join();
-    const bool affected_not_committed = affected_result.code !=
-                icecc::p50::local::SourceTransferResultCode::Committed;
-    REQUIRE(affected_not_committed,
-            "discarded, unobserved old-incarnation COMMIT is not reported as committed");
+    join_p51_restart_transfers(affected_cells);
+    size_t affected_noncommitted = 0;
+    for (const auto& cell : affected_cells)
+        affected_noncommitted += cell->result.code !=
+            icecc::p50::local::SourceTransferResultCode::Committed;
+    REQUIRE(affected_noncommitted == jobs_per_window,
+            "discarded old-incarnation COMMITs never become positive C receipts for any original caller");
+    std::fprintf(stderr,
+        "P51_RESTART_OLD_WINDOW topology=%s profile=%u callers=%zu held_commits=%zu noncommitted=%zu\n",
+        restart_f ? "C1F2" : "C2F1", profile_mask, affected_cells.size(),
+        held_old_commits, affected_noncommitted);
+    const P51SourceArmedFields old_armed = affected_cells.front()->armed;
+    affected_cells.clear();
 
     P51RestartRole& refreshed_c = restart_f ? primary : c_affected;
     P51RestartRole& refreshed_f = restart_f ? f_affected : target;
-    auto fresh_job = make_job(refreshed_c, refreshed_f, 4);
-    P51SourceArmedFields fresh_armed{};
-    const auto fresh_result = fresh_job
-        ? run_p51_restart_job(refreshed_f, *fresh_job,
-                              profile_mask, &fresh_armed)
-        : icecc::p50::local::P50SourceTransferResult{};
+    auto fresh_gate = std::make_unique<P51CommitReceiptGate>(
+        refreshed_f.endpoint_port, sidecar_uid, jobs_per_window);
+    REQUIRE(fresh_gate->ready(),
+            "fresh replacement relationship has an independent bounded receipt gate");
+    std::vector<std::unique_ptr<P51RestartTransferCell>> fresh_cells;
+    fresh_cells.reserve(jobs_per_window);
+    bool fresh_prepared = fresh_gate->ready();
+    for (unsigned index = 0; index < jobs_per_window && fresh_prepared; ++index) {
+        const uint32_t offset = jobs_per_window + 3 + index;
+        const uint32_t wire = wire_base + offset;
+        const uint64_t nonce = (static_cast<uint64_t>(wire) << 32) | offset;
+        auto job = prepare_p51_restart_job(
+            refreshed_c, refreshed_f, work, wire, nonce, epoch, profile_mask);
+        fresh_prepared &= job != nullptr;
+        if (!job) break;
+        fresh_cells.emplace_back(
+            std::make_unique<P51RestartTransferCell>(std::move(job)));
+    }
+    REQUIRE(fresh_prepared && fresh_cells.size() == jobs_per_window,
+            "fresh replacement identity admits 30 distinct original compiler assignments");
+    const bool fresh_started = fresh_prepared && start_p51_restart_transfers(
+        fresh_cells, refreshed_f, profile_mask);
+    REQUIRE(fresh_started,
+            "fresh replacement jobs enter the full bounded W30 transfer window");
+    const bool fresh_window_observed = fresh_started && fresh_gate->wait_for_commits(
+        std::chrono::seconds(jobs_per_window == 1 ? 20 : 30));
+    REQUIRE(fresh_window_observed,
+            "fresh replacement F commits all W30 before any C receipt is released");
+    size_t fresh_pending_before_receipt = 0;
+    if (fresh_window_observed) {
+        for (const auto& cell : fresh_cells)
+            fresh_pending_before_receipt += cell->future.wait_for(
+                std::chrono::milliseconds(0)) != std::future_status::ready;
+    }
+    REQUIRE(fresh_pending_before_receipt == jobs_per_window,
+            "fresh W30 source callers remain pending until cumulative receipt delivery");
+    if (fresh_window_observed) fresh_gate->release_commits();
+    else fresh_gate->discard_held_commits();
+    bool fresh_settled = fresh_started && wait_p51_restart_transfers(
+        fresh_cells, Clock::now() + std::chrono::seconds(35));
+    REQUIRE(fresh_settled,
+            "fresh replacement W30 callers settle within their original deadlines");
+    if (!fresh_settled) {
+        for (P51RestartRole *role : {&primary, &sibling, &target})
+            if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
+        fresh_settled = wait_p51_restart_transfers(
+            fresh_cells, Clock::now() + std::chrono::seconds(5));
+    }
+    REQUIRE(fresh_settled,
+            "closing the restarted roles releases every fresh transfer worker");
+    join_p51_restart_transfers(fresh_cells);
+    P51SourceArmedFields fresh_armed = fresh_cells.empty()
+        ? P51SourceArmedFields{} : fresh_cells.front()->armed;
+    size_t fresh_committed = 0;
+    size_t fresh_attached_count = 0;
+    for (auto& cell : fresh_cells) {
+        const auto& result = cell->result;
+        const bool committed = cell->settled && result.code ==
+            icecc::p50::local::SourceTransferResultCode::Committed;
+        fresh_committed += committed;
+        if (committed && attach_p51_restart_job(
+                refreshed_f, *cell->job, profile_mask, cell->armed, result))
+            fresh_attached_count++;
+    }
+    fresh_gate.reset();
+    fresh_attached = fresh_prepared && fresh_settled &&
+        fresh_committed == jobs_per_window &&
+        fresh_attached_count == jobs_per_window;
+    std::fprintf(stderr,
+        "P51_RESTART_FRESH_WINDOW topology=%s profile=%u callers=%zu commits=%zu attached=%zu held_commits=%zu\n",
+        restart_f ? "C1F2" : "C2F1", profile_mask, fresh_cells.size(),
+        fresh_committed, fresh_attached_count,
+        fresh_window_observed ? static_cast<size_t>(jobs_per_window) : 0u);
+    const auto& fresh_result = fresh_cells.empty()
+        ? icecc::p50::local::P50SourceTransferResult{}
+        : fresh_cells.front()->result;
     std::fprintf(stderr,
         "P51_RESTART_FRESH job=%u code=%u error=%u attempts=%u raw=%llu expected=%zu digest_match=%u f_guid_prefix=%02x%02x f_gen=%llu c_guid_prefix=%02x%02x tu=%llu\n",
-        fresh_job ? fresh_job->wire_id : 0u,
+        fresh_cells.empty() ? 0u : fresh_cells.front()->job->wire_id,
         static_cast<unsigned>(fresh_result.code),
         static_cast<unsigned>(fresh_result.error_code),
         static_cast<unsigned>(fresh_result.attempts),
         static_cast<unsigned long long>(fresh_result.raw_bytes),
-        fresh_job ? fresh_job->bytes.size() : 0u,
-        fresh_job && fresh_result.raw_digest == icecc::digest128(fresh_job->bytes) ? 1u : 0u,
+        fresh_cells.empty() ? 0u : fresh_cells.front()->job->bytes.size(),
+        !fresh_cells.empty() && fresh_result.raw_digest ==
+            icecc::digest128(fresh_cells.front()->job->bytes) ? 1u : 0u,
         static_cast<unsigned>(fresh_armed.f_store_guid[0]),
         static_cast<unsigned>(fresh_armed.f_store_guid[1]),
         static_cast<unsigned long long>(fresh_armed.f_store_generation),
         static_cast<unsigned>(fresh_result.c_store_guid.bytes[0]),
         static_cast<unsigned>(fresh_result.c_store_guid.bytes[1]),
         static_cast<unsigned long long>(fresh_result.tu_seq));
-    const bool fresh_committed = fresh_job && fresh_result.code ==
-                icecc::p50::local::SourceTransferResultCode::Committed;
-    fresh_attached = fresh_committed && attach_p51_restart_job(
-        refreshed_f, *fresh_job, profile_mask, fresh_armed, fresh_result);
     REQUIRE(fresh_attached,
-            "a new assignment after restart commits and exact CompileFile attaches on the replacement incarnation");
+            "fresh W30 assignments commit and exact CompileFile inputs attach on the replacement incarnation");
     const bool fresh_identity = restart_f
         ? old_armed.f_store_guid != fresh_armed.f_store_guid ||
               old_armed.f_store_generation != fresh_armed.f_store_generation
@@ -3057,12 +3222,14 @@ static int run_p51_process_restart_case(
     REQUIRE(fresh_identity && fresh_attached,
             "replacement transfer uses a fresh F store identity or fresh C store identity");
 
-    affected_job.reset(); healthy_initial.reset(); healthy_during_job.reset(); fresh_job.reset();
+    healthy_initial.reset(); healthy_during_job.reset(); fresh_cells.clear();
     primary.stop(); sibling.stop(); target.stop();
     std::fprintf(stderr, "retained process-restart work directory: %s\n", work.c_str());
-    std::fprintf(stderr, "P51_PROCESS_RESTART topology=%s affected=%s fresh_attached=%u healthy_attached=%u\n",
+    std::fprintf(stderr, "P51_PROCESS_RESTART%s topology=%s affected=%s profile=%u jobs=%u fresh_attached=%u healthy_attached=%u\n",
+        jobs_per_window == 30 ? "_W30" : "",
         restart_f ? "C1F2" : "C2F1", restart_f ? "F-cache" : "C-cache",
-        fresh_attached ? 1u : 0u, healthy_during ? 1u : 0u);
+        profile_mask, jobs_per_window, fresh_attached ? 1u : 0u,
+        healthy_during ? 1u : 0u);
     return failures ? 1 : 0;
 }
 #endif
@@ -3107,19 +3274,31 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_RESTART_F_C1F2") != nullptr;
     const bool restart_c_c2f1 =
         ::getenv("ICECC_TEST_P51_RESTART_C_C2F1") != nullptr;
-    if (restart_f_c1f2 || restart_c_c2f1) {
+    const bool restart_w30_f_c1f2 =
+        ::getenv("ICECC_TEST_P51_RESTART_W30_F_C1F2") != nullptr;
+    const bool restart_w30_c_c2f1 =
+        ::getenv("ICECC_TEST_P51_RESTART_W30_C_C2F1") != nullptr;
+    const unsigned restart_selectors = static_cast<unsigned>(restart_f_c1f2) +
+        static_cast<unsigned>(restart_c_c2f1) +
+        static_cast<unsigned>(restart_w30_f_c1f2) +
+        static_cast<unsigned>(restart_w30_c_c2f1);
+    if (restart_selectors != 0) {
         const uint32_t profile_mask = selected_vertical_profile();
         if (profile_mask == 0) {
             std::fprintf(stderr,
                 "FAIL: ICECC_TEST_P51_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE\n");
             return 2;
         }
-        if (restart_f_c1f2 && restart_c_c2f1) {
+        if (restart_selectors != 1) {
             std::fprintf(stderr, "FAIL: select one P51 process-restart topology\n");
             return 2;
         }
+        const bool restart_f = restart_f_c1f2 || restart_w30_f_c1f2;
+        const unsigned jobs_per_window =
+            restart_w30_f_c1f2 || restart_w30_c_c2f1 ? 30u : 1u;
         return run_p51_process_restart_case(
-            argv[1], argv[2], icecc, restart_f_c1f2, profile_mask);
+            argv[1], argv[2], icecc, restart_f, profile_mask,
+            jobs_per_window);
     }
 
     if (const char *topology = ::getenv("ICECC_TEST_P51_MULTILINK");
