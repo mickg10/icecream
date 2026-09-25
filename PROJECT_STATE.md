@@ -293,9 +293,27 @@ dry-run validation passes in `/tanksmall/scratch/tmp/p51-wrapper-make-dryrun.log
 The entry point itself has not yet been executed end-to-end; the underlying
 script runs above provide runtime evidence, and the dry run checks invocation.
 
-Real C1F2/F-cache and C2F1/C-cache restart fixtures are not yet qualified.
-The F-cache restart case exposed excessive retries of the obsolete F identity;
-bounded shared retry backoff and typed R2 rejection are being investigated.
+The in-development real C2F1/C-cache restart fixture passes for ZSTD_TU:
+the independent C2/F1 link attaches exact input while C1's parent is stopped,
+the C1 sidecar PID changes, the discarded old receipt is not reported as a
+commit, and a fresh assignment attaches exact input under the new C identity.
+Evidence: `/tanksmall/scratch/tmp/p51-restart-review.Blc6Qk/restart-C2F1.raw.log`
+(SHA256 `ae54386653f5034a45a786ee9a214f6b96eac59364fd5adf7eab8b061f2c6d76`).
+The diagnostic fixture source hash is
+`c83b5cbba6dc3f3100159f6d30c5bff0b55708b2da3adebeb087f06330d559c7`;
+test binary hash is
+`56cb2ea9aca1c6a617cad94399e458a27033fe1fa04b66e07900830ffb6d26f8`.
+This is not a clean upstream qualification, W30 restart test, or all-profile
+restart result; the fixture remains under review.
+
+The corresponding C1F2/F-cache restart fixture **fails**: healthy sibling
+progress succeeds, but the obsolete F identity triggers thousands of retries
+and the fresh assignment returns Error without input identity or attachment.
+Evidence: `restart-attach-diagnostic4.raw.log` under the same root
+(SHA256 `2cb1fd3a7cdf28e5fa3b4e39c599849e958fd302ef5f585dbf32a00df4c197f1`).
+Its final summary's `fresh=1` indicates the selected scenario, not a passing
+fresh-transfer assertion; the log contains explicit FAILED assertions.
+Bounded shared retry backoff and typed R2 rejection are in progress.
 Fresh replacement attachment still needs diagnosis. The observed cancellation
 withdrawal refers to the dead old incarnation, not its successor. Next: finish
 wrapper C01, real C/F/S restart gates, and mixed-version qualification. Do not
