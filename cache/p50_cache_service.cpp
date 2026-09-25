@@ -1813,6 +1813,10 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.compression_level = 3;
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    route_config.disconnect_r2_after_bundle_for_test =
+        config_.disconnect_r2_after_bundle_for_test;
+#endif
     const std::weak_ptr<std::atomic<bool>> route_owner_alive =
         route_owner_callback_alive_;
     route_config.post_retired_reap = [this, route_owner_alive] {

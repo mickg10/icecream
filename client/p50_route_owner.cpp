@@ -44,6 +44,8 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
     result.hold_r2_receipt_reader_for_test =
         owner_config.hold_r2_receipt_reader_for_test;
     result.hold_r2_ack_pump_for_test = owner_config.hold_r2_ack_pump_for_test;
+    result.disconnect_r2_after_bundle_for_test =
+        owner_config.disconnect_r2_after_bundle_for_test;
     return result;
 }
 

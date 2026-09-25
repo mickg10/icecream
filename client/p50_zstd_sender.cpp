@@ -1482,6 +1482,19 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
                 [keepalive = std::move(keepalive)](std::exception_ptr) {});
             reader_started = false;
         }
+        if (impl_->config.disconnect_r2_after_bundle_for_test &&
+            impl_->config.disconnect_r2_after_bundle_for_test(ordinal)) {
+            // This seam exercises an interruption after the current replay
+            // row is queued for receipt but before the next retained row can
+            // be staged on the endpoint. Keep the full sender backlog so the
+            // next reset can prove that the omitted suffix row is not lost.
+            if (impl_->r2_socket) {
+                boost::system::error_code ignored;
+                impl_->r2_socket->close(ignored);
+            }
+            throw std::runtime_error(
+                "test requested R2 disconnect during replay suffix");
+        }
     }
     if (!impl_->r2_socket || !impl_->r2_socket->is_open() ||
         impl_->r2_failed_physical_generation == physical_generation) {

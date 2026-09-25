@@ -1998,7 +1998,8 @@ void test_p51_d07_queued_cancel_first_middle_last() {
 // the second reservation is cancelled. The canceled reservation must settle
 // non-successfully without publication, while the exact successor still
 // commits on the same logical relationship and within its original deadline.
-void test_p51_d07_active_cancel_recovery(ProfileId profile) {
+void test_p51_d07_active_cancel_recovery(ProfileId profile,
+                                         bool interrupt_replay = false) {
     uint32_t cache_profile = 0;
     switch (profile) {
     case ProfileId::P29V1: cache_profile = CACHE_PROFILE_P29V1; break;
@@ -2043,6 +2044,9 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     f_config.endpoint_caps.supported_profiles = profile_bit(profile);
     f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
     f_config.max_pending_p51_source_reservations = 8;
+    std::mutex reset_ack_mutex;
+    std::condition_variable reset_ack_changed;
+    std::vector<std::pair<size_t, ResetAck>> reset_acks;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     f_config.p51_reservation_retired_for_test =
         [&](Id128 id, bool marker_retired) {
@@ -2067,6 +2071,24 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     c_config.max_active_p51_source_transfers = 8;
     c_config.max_pending_p51_source_operations = 8;
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+    auto replay_bundle_calls = std::make_shared<std::atomic<size_t>>(0);
+    auto interrupted_ordinal = std::make_shared<std::atomic<uint64_t>>(0);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (interrupt_replay) {
+        c_config.disconnect_r2_after_bundle_for_test =
+            [replay_bundle_calls, interrupted_ordinal](uint64_t ordinal) {
+                const size_t call = replay_bundle_calls->fetch_add(
+                    1, std::memory_order_acq_rel) + 1;
+                // The first four callbacks are the original jobs. Interrupt
+                // after the first survivor is sent during the first replay.
+                if (call != 5)
+                    return false;
+                interrupted_ordinal->store(ordinal,
+                    std::memory_order_release);
+                return true;
+            };
+    }
+#endif
     service::SidecarRuntime c_runtime(std::move(c_config));
 
     std::atomic<bool> stop_accepting{false};
@@ -2150,7 +2172,21 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
                 (void)::close(duplicate);
             EndpointIoControl control;
             control.before_materialize_on_worker = before_materialize;
-            accepted_connections.fetch_add(1, std::memory_order_release);
+            const size_t connection_number =
+                accepted_connections.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (interrupt_replay && connection_number >= 3) {
+                control.outbound_message_observer =
+                    [&, connection_number](ActorSide, const Message& message) {
+                        const auto* ack = std::get_if<ResetAck>(&message);
+                        if (!ack)
+                            return;
+                        {
+                            std::lock_guard lock(reset_ack_mutex);
+                            reset_acks.emplace_back(connection_number, *ack);
+                        }
+                        reset_ack_changed.notify_all();
+                    };
+            }
             f_runtime.start_adopted_r2_endpoint(adopted_fd,
                                                  std::move(control));
         }
@@ -2244,6 +2280,9 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     RequestRow first = make_request(9101, 512, 0x31);
     RequestRow cancelled = make_request(9102, 1024, 0x42);
     RequestRow successor = make_request(9103, 2048, 0x53);
+    std::optional<RequestRow> fourth;
+    if (interrupt_replay)
+        fourth.emplace(make_request(9104, 4096, 0x64));
     CHECK(enqueue(first));
     const auto first_result = receive_p51_transfer_result(
         first.pair.receiver, c_launch.identity, first.request_id,
@@ -2261,89 +2300,111 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     }
     CHECK(second_materialization_waiting);
     CHECK(enqueue(successor));
-    const bool two_active_operations = wait_for_source_operation_count(
+    const bool successor_operation_active = wait_for_source_operation_count(
         c_runtime, 2, std::chrono::seconds(3));
-
     JobBind observed_successor_binding{};
-    bool successor_bundle_buffered = false;
+    JobBind observed_fourth_binding{};
     const auto probe_deadline = std::chrono::steady_clock::now() +
                                 std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < probe_deadline &&
-           !successor_bundle_buffered) {
-        const int descriptor = probe_fd.load(std::memory_order_acquire);
-        if (descriptor < 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
-        std::array<uint8_t, 65536> buffered{};
-        const ssize_t received = ::recv(descriptor, buffered.data(),
-                                        buffered.size(),
-                                        MSG_PEEK | MSG_DONTWAIT);
-        if (received < 4) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
-        size_t offset = 0;
-        bool target_binding_seen = false;
-        bool target_end_seen = false;
-        while (offset + 4 <= static_cast<size_t>(received)) {
-            FrameHeader header;
-            try {
-                header = decode_frame_header(std::span<const uint8_t>(
-                    buffered.data() + offset, 4));
-            } catch (...) {
-                break;
+    auto observe_buffered_bundle = [&](Id128 reservation_id,
+                                       JobBind& observed) {
+        while (std::chrono::steady_clock::now() < probe_deadline) {
+            const int descriptor = probe_fd.load(std::memory_order_acquire);
+            if (descriptor < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
             }
-            const size_t frame_bytes = 4 + header.payload_bytes;
-            if (frame_bytes > static_cast<size_t>(received) - offset)
-                break;
-            const std::span<const uint8_t> payload(
-                buffered.data() + offset + 4, header.payload_bytes);
-            if (header.type == MessageType::JOB_BIND) {
-                const Message decoded = decode_payload(header.type, payload);
-                const JobBind binding = std::get<JobBind>(decoded);
-                if (binding.reservation_id == Id128{
-                        cancelled.request.armed.reservation_id}) {
-                    // F already consumed this exact bundle before entering
-                    // the second materialization hook.
-                } else if (binding.reservation_id == Id128{
-                               successor.request.armed.reservation_id}) {
-                    observed_successor_binding = binding;
-                    target_binding_seen = true;
+            std::array<uint8_t, 65536> buffered{};
+            const ssize_t received = ::recv(descriptor, buffered.data(),
+                                            buffered.size(),
+                                            MSG_PEEK | MSG_DONTWAIT);
+            if (received < 4) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            size_t offset = 0;
+            bool target_binding_seen = false;
+            bool target_end_seen = false;
+            while (offset + 4 <= static_cast<size_t>(received)) {
+                FrameHeader header;
+                try {
+                    header = decode_frame_header(std::span<const uint8_t>(
+                        buffered.data() + offset, 4));
+                } catch (...) {
+                    break;
                 }
-            } else if (header.type == MessageType::TU_END &&
-                       target_binding_seen) {
-                const Message decoded = decode_payload(header.type, payload);
-                const TuEnd end = std::get<TuEnd>(decoded);
-                target_end_seen = end.relationship_ordinal ==
-                                  observed_successor_binding.relationship_ordinal;
+                const size_t frame_bytes = 4 + header.payload_bytes;
+                if (frame_bytes > static_cast<size_t>(received) - offset)
+                    break;
+                const std::span<const uint8_t> payload(
+                    buffered.data() + offset + 4, header.payload_bytes);
+                if (header.type == MessageType::JOB_BIND) {
+                    const Message decoded = decode_payload(header.type, payload);
+                    const JobBind binding = std::get<JobBind>(decoded);
+                    if (binding.reservation_id == reservation_id) {
+                        observed = binding;
+                        target_binding_seen = true;
+                    }
+                } else if (header.type == MessageType::TU_END &&
+                           target_binding_seen) {
+                    const Message decoded = decode_payload(header.type, payload);
+                    const TuEnd end = std::get<TuEnd>(decoded);
+                    target_end_seen = end.relationship_ordinal ==
+                                      observed.relationship_ordinal;
+                }
+                offset += frame_bytes;
             }
-            offset += frame_bytes;
-        }
-        successor_bundle_buffered = target_binding_seen && target_end_seen;
-        if (!successor_bundle_buffered)
+            if (target_binding_seen && target_end_seen)
+                return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    CHECK(two_active_operations);
+        }
+        return false;
+    };
+    const bool successor_bundle_buffered = successor_operation_active &&
+        observe_buffered_bundle(
+            Id128{successor.request.armed.reservation_id},
+            observed_successor_binding);
+    // Queue job 4 only after observing job 3's complete original bundle. This
+    // gives the replay-cut negative control a later, still-retained caller.
+    if (fourth && successor_bundle_buffered)
+        CHECK(enqueue(*fourth));
+    const bool fourth_bundle_buffered = !fourth ||
+        observe_buffered_bundle(Id128{fourth->request.armed.reservation_id},
+                                observed_fourth_binding);
+    const bool all_survivor_operations_active = wait_for_source_operation_count(
+        c_runtime, interrupt_replay ? 3 : 2, std::chrono::seconds(3));
+    const bool required_operations_active = successor_operation_active &&
+                                            all_survivor_operations_active;
+    CHECK(required_operations_active);
     std::fprintf(stderr,
                  "P51_D07 active-cancel precondition second-materializing=1 "
-                 "active-operations=2 successor-full-bundle-buffered=%d "
+                 "active-operations=%zu successor-full-bundle-buffered=%d "
+                 "fourth-full-bundle-buffered=%d "
                  "successor-ordinal=%llu\n",
+                 interrupt_replay ? size_t{3} : size_t{2},
                  successor_bundle_buffered ? 1 : 0,
+                 fourth_bundle_buffered ? 1 : 0,
                  static_cast<unsigned long long>(
                      observed_successor_binding.relationship_ordinal));
     std::fflush(stderr);
     CHECK(successor_bundle_buffered);
+    CHECK(fourth_bundle_buffered);
     CHECK(observed_successor_binding.source_request_id == successor.request_id);
     CHECK(observed_successor_binding.relationship_ordinal == 3);
-    // This isolated C runtime submitted only these three jobs, so the checked
-    // contiguous sequence makes the middle TU key exact without guessing a
-    // globally arbitrary sequence number.
-    CHECK(first_result.tu_seq <=
-          std::numeric_limits<uint64_t>::max() - 2);
+    if (fourth) {
+        CHECK(observed_fourth_binding.source_request_id == fourth->request_id);
+        CHECK(observed_fourth_binding.relationship_ordinal == 4);
+    }
+    // The isolated C runtime submitted these jobs in observed wire order, so
+    // their contiguous TU sequence makes the middle key exact without
+    // guessing a globally arbitrary sequence number.
+    CHECK(first_result.tu_seq <= std::numeric_limits<uint64_t>::max() -
+          (fourth ? uint64_t{3} : uint64_t{2}));
     const TuSeq cancelled_tu_seq{first_result.tu_seq + 1};
     CHECK(observed_successor_binding.tu_seq.value ==
           first_result.tu_seq + 2);
+    if (fourth)
+        CHECK(observed_fourth_binding.tu_seq.value == first_result.tu_seq + 3);
     const auto cancellation_time = std::chrono::steady_clock::now();
     const auto second_deadline =
         cancelled.request.absolute_deadline.as_steady_time_point();
@@ -2366,7 +2427,9 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
         std::optional<local::P50SourceTransferResult> result;
         std::string error;
         std::chrono::steady_clock::time_point finished{};
-    } second_observation, successor_observation;
+        bool exact_attachment = false;
+        bool cancelled_input_absent = false;
+    } second_observation, successor_observation, fourth_observation;
     auto observe_result = [&](RequestRow& row,
                               std::chrono::steady_clock::time_point deadline,
                               TransferObservation& observation) {
@@ -2374,6 +2437,33 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
             observation.result = receive_p51_transfer_result(
                 row.pair.receiver, c_launch.identity, row.request_id,
                 deadline, true);
+            if (row.request_id == successor.request_id &&
+                observation.result->code ==
+                    local::SourceTransferResultCode::Committed)
+                observation.exact_attachment =
+                    attach_exact(row, *observation.result);
+            if (fourth && row.request_id == fourth->request_id &&
+                observation.result->code ==
+                    local::SourceTransferResultCode::Committed)
+                observation.exact_attachment =
+                    attach_exact(row, *observation.result);
+            if (row.request_id == cancelled.request_id &&
+                observation.result->code ==
+                    local::SourceTransferResultCode::Error) {
+                const InputLeaseOwner owner{
+                    cancelled.request.armed.arm.source.logical_job,
+                    cancelled.request.armed.arm.source.assignment_epoch,
+                    cancelled.request.armed.arm.source.assignment_nonce};
+                const InputFdRequest request{
+                    f_launch.identity,
+                    InputRecordKey{c_launch.c_store_guid, cancelled_tu_seq},
+                    owner, cancelled.request_id + 70000};
+                auto cursor = f_runtime.attach_input_on_owner(request, deadline);
+                observation.cancelled_input_absent = !cursor.has_value();
+                if (cursor)
+                    f_runtime.finish_input_attachment_on_owner(
+                        request, false, deadline);
+            }
         } catch (const std::exception& error) {
             observation.error = error.what();
         } catch (...) {
@@ -2395,8 +2485,18 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     std::thread successor_waiter([&] {
         observe_result(successor, successor_deadline, successor_observation);
     });
+    std::thread fourth_waiter;
+    if (fourth) {
+        fourth_waiter = std::thread([&] {
+            observe_result(*fourth,
+                fourth->request.absolute_deadline.as_steady_time_point(),
+                fourth_observation);
+        });
+    }
     second_waiter.join();
     successor_waiter.join();
+    if (fourth_waiter.joinable())
+        fourth_waiter.join();
     const auto second_result = second_observation.result;
     const auto successor_result = successor_observation.result;
     bool exact_cancel_retirement = false;
@@ -2421,27 +2521,17 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     const bool successor_committed = successor_result.has_value() &&
         successor_result->code == local::SourceTransferResultCode::Committed;
     const bool successor_exact = successor_committed &&
-        attach_exact(successor, *successor_result);
-    const InputLeaseOwner cancelled_owner{
-        cancelled.request.armed.arm.source.logical_job,
-        cancelled.request.armed.arm.source.assignment_epoch,
-        cancelled.request.armed.arm.source.assignment_nonce};
-    const InputFdRequest cancelled_attach_request{
-        f_launch.identity,
-        InputRecordKey{c_launch.c_store_guid,
-                       cancelled_tu_seq},
-        cancelled_owner, cancelled.request_id + 70000};
-    auto cancelled_cursor = f_runtime.attach_input_on_owner(
-        cancelled_attach_request,
-        cancelled.request.absolute_deadline.as_steady_time_point());
-    const bool cancelled_input_absent = !cancelled_cursor.has_value();
-    if (cancelled_cursor) {
-        f_runtime.finish_input_attachment_on_owner(
-            cancelled_attach_request, false,
-            cancelled.request.absolute_deadline.as_steady_time_point());
-    }
-    const bool exactly_two_links =
-        accepted_connections.load(std::memory_order_acquire) == 2;
+        successor_observation.exact_attachment;
+    const auto fourth_result = fourth_observation.result;
+    const bool fourth_committed = fourth_result.has_value() &&
+        fourth_result->code == local::SourceTransferResultCode::Committed;
+    const bool fourth_exact = fourth && fourth_committed &&
+        fourth_observation.exact_attachment;
+    const bool cancelled_input_absent =
+        second_observation.cancelled_input_absent;
+    const size_t expected_links = interrupt_replay ? 3 : 2;
+    const bool exact_link_count =
+        accepted_connections.load(std::memory_order_acquire) == expected_links;
     const bool original_deadlines_live = cancellation_time < second_deadline &&
                                          cancellation_time < successor_deadline;
     const bool all_operations_released = wait_for_source_operation_count(
@@ -2450,17 +2540,20 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
         c_runtime, 0, std::chrono::seconds(3));
     std::printf(
         "P51_D07 active-cancel profile=%u stage=F-materialization after-full-TU "
+        "replay-interrupt=%d "
         "successor-full-bundle-buffered=1 accepted-links=%zu cancel=%d "
-        "exactly-two-links=%d duplicate-cancel=%d second-received=%d second-code=%u "
+        "exact-link-count=%d duplicate-cancel=%d second-received=%d second-code=%u "
         "second-error=%u successor-received=%d successor-code=%u "
-        "successor-error=%u successor-exact=%d cancelled-input-absent=%d "
+        "successor-error=%u successor-exact=%d fourth-received=%d fourth-code=%u "
+        "fourth-exact=%d cancelled-input-absent=%d "
         "exact-cancel-retirement=%d "
         "finished-after-cancel-ms=%lld/%lld "
         "deadline-remains-ms=%lld/%lld C-operations-released=%d "
         "C-raw-credit-released=%d\n",
         static_cast<unsigned>(profile),
+        interrupt_replay ? 1 : 0,
         accepted_connections.load(std::memory_order_acquire),
-        f_cancelled ? 1 : 0, exactly_two_links ? 1 : 0,
+        f_cancelled ? 1 : 0, exact_link_count ? 1 : 0,
         duplicate_f_cancelled ? 1 : 0,
         second_result.has_value() ? 1 : 0,
         second_result.has_value()
@@ -2473,6 +2566,10 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
         successor_result.has_value()
             ? static_cast<unsigned>(successor_result->error_code) : 0,
         successor_exact ? 1 : 0,
+        fourth_result.has_value() ? 1 : 0,
+        fourth_result.has_value()
+            ? static_cast<unsigned>(fourth_result->code) : 0,
+        fourth_exact ? 1 : 0,
         cancelled_input_absent ? 1 : 0,
         exact_cancel_retirement ? 1 : 0,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2488,7 +2585,7 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     CHECK(f_cancelled);
     CHECK(duplicate_f_cancelled);
     CHECK(exact_cancel_retirement);
-    CHECK(exactly_two_links);
+    CHECK(exact_link_count);
     CHECK(second_result.has_value());
     CHECK(second_result->code == local::SourceTransferResultCode::Error);
     CHECK(second_result->error_code != 0);
@@ -2500,14 +2597,61 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile) {
     CHECK(successor_exact);
     CHECK(second_observation.finished <= second_deadline);
     CHECK(successor_observation.finished <= successor_deadline);
+    if (interrupt_replay) {
+        CHECK(replay_bundle_calls->load(std::memory_order_acquire) >= 5);
+        CHECK(interrupted_ordinal->load(std::memory_order_acquire) == 2);
+        std::unique_lock lock(reset_ack_mutex);
+        const bool observed_third_reset = reset_ack_changed.wait_for(
+            lock, std::chrono::seconds(2), [&] {
+                return std::any_of(reset_acks.begin(), reset_acks.end(),
+                    [](const auto& item) { return item.first == 3; });
+            });
+        CHECK(observed_third_reset);
+        const auto ack = std::find_if(reset_acks.begin(), reset_acks.end(),
+            [](const auto& item) { return item.first == 3; });
+        CHECK(ack != reset_acks.end());
+        if (ack != reset_acks.end()) {
+            std::fprintf(stderr,
+                "P51_D07 replay-cut cut-callbacks=%zu cut-ordinal=%llu "
+                "third-reset-ack A=%llu K=%llu P=%llu unavailable-mask=%u\n",
+                replay_bundle_calls->load(std::memory_order_acquire),
+                static_cast<unsigned long long>(
+                    interrupted_ordinal->load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(
+                    ack->second.recovery_verified_floor_a),
+                static_cast<unsigned long long>(
+                    ack->second.request.settled_prefix_k),
+                static_cast<unsigned long long>(
+                    ack->second.recovery_prepared_prefix_p),
+                ack->second.unavailable_suffix_mask);
+            std::fflush(stderr);
+            CHECK(ack->second.recovery_verified_floor_a == 1);
+            CHECK(ack->second.recovery_prepared_prefix_p == 2);
+            CHECK(ack->second.request.settled_prefix_k == 1 ||
+                  ack->second.request.settled_prefix_k == 2);
+        }
+    }
     CHECK(all_operations_released);
     CHECK(all_raw_credits_released);
+    if (fourth) {
+        CHECK(fourth_result.has_value());
+        CHECK(fourth_committed);
+        CHECK(fourth_exact);
+        CHECK(fourth_observation.finished <=
+              fourth->request.absolute_deadline.as_steady_time_point());
+    }
 }
 
 void test_p51_d07_active_cancel_all_profiles() {
     for (const ProfileId profile : {
              ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
         test_p51_d07_active_cancel_recovery(profile);
+}
+
+void test_p51_d07_active_cancel_replay_interrupt_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+        test_p51_d07_active_cancel_recovery(profile, true);
 }
 
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
@@ -9258,6 +9402,16 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt-p29") == 0) {
+            test_p51_d07_active_cancel_recovery(ProfileId::P29V1, true);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt") == 0) {
+            test_p51_d07_active_cancel_replay_interrupt_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d07-queued-cancel-first") == 0) {
             test_p51_d07_queued_cancel_position(0);
             return 0;
@@ -9308,6 +9462,7 @@ int main(int argc, char** argv) {
         test_p51_peer_close_during_active_read_cancels_before_route();
         test_p51_d07_queued_cancel_first_middle_last();
         test_p51_d07_active_cancel_all_profiles();
+        test_p51_d07_active_cancel_replay_interrupt_all_profiles();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_credit_admission_bypasses_blocked_workers();

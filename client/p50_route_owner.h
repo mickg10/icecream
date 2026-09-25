@@ -54,6 +54,7 @@ struct P50RouteOwnerConfig {
     std::function<bool()> hold_r2_ack_pump_for_test;
     std::function<void()> after_r2_rebind_wait_for_test;
     std::function<void()> after_retired_route_reaped_for_test;
+    std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;
     // Forwarded only to the sender's deterministic route-poison unit seam.
     // Production callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;

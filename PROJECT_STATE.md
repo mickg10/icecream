@@ -294,7 +294,39 @@ drain. Endpoint log under the same root:
 `f40e07600d2e6aab4508bdbb9d3b879f08bc0e9286f88c57df90cae46d2bb1d9`.
 The same uninstrumented services-library limitation applies.
 
-Real multi-survivor replay interruption, all D07 cancellation positions/stages,
+The real C/F four-job interrupted-replay regression now passes all three
+profiles and is registered in the default service suite. It observes the
+complete original bundles in order, cancels the held second job, and cuts
+the recovered link immediately after replaying job 3, before job 4 is staged.
+The third connection reports recovery A=1/P=2 (observed K=2); both surviving
+inputs attach with exact bytes within their original deadlines, the canceled
+input remains absent, three links are accepted, and tracked credits drain.
+W30 is configured; this four-job test does not prove W30 occupancy.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d07-replay-2pwjOp/`.
+
+| Gate | Log beneath that root | SHA256 |
+|---|---|---|
+| Restored-source all-profile focused run, exit 0 | `tmp/replay-interrupt-release-all.log` | `71eecb234fc6ed87f0b8ca676f0d77d7df940789fc6d2bc2e5bbbd13d5006fb9` |
+| Full service, Automake PASS | `build/unittests/p50cacheservice.log` | `1e84070559d2f6a28fe897636ccebe2491f9ad774c6f430a8d8afccbc98ee5a0` |
+| Deliberate witnesses-only backlog truncation, exit 1 | `tmp/replay-interrupt-negcontrol-final.log` | `c44582edfbcb227e00a066649351183948fe4b7789554f8dd8e4b3c41fd19709` |
+
+The negative control passes its setup, exact first-survivor attachment,
+cancellation, reset and credit assertions, then fails specifically because
+job 4 has no result by its original deadline. The normal sender was restored
+and rebuilt before the passing runs. Earlier negative probes with delayed
+attachments, and full-suite scratch-permission setup failures, are retained
+but excluded. Final service test source SHA256 is
+`89fcf9ab16050666c50484a22f4ec640a75f31d3fa062d0230839c54c80dfe3f`;
+sender SHA256 is
+`e9a2a386f5abb7b6eb496fdf0e6b4a59009e4073ba84cffdd07726930244f300`.
+The sender change extends the existing optional disconnect test callback to
+replayed bundles; normal callers leave it unset. No wire layout changes.
+This does not establish recovery when the coordinating caller is already
+positively committed before a later replay failure; that schedule remains
+under investigation. Sanitizer results above predate this test extension.
+
+All D07 cancellation positions/stages,
 compiler-process quiescence, and the broader external/performance gates remain
 open. This qualification is not completion of the full W30 plan. The candidate
 R2 recovery layout changes require upgrading both ends and draining old links;
