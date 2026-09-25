@@ -60,7 +60,7 @@ All integers below use network byte order, with no struct padding.
 | P51_SOURCE_LEASE_REQUEST | `0x51f00000` | Exactly 32 bytes: job u32, assignment epoch u64, assignment nonce u64, profile u32, requested cache revision u32, requested window u32 |
 | P51_SOURCE_ARM | `0x51f00010` | Existing source-arm field ordering with cache revision 2, followed by requested window u32; separate validation from R1 |
 | P51_SOURCE_ARMED | `0x51f00011` | Exact P51 ARM echo, existing F identity/observation/budget/two-attempt-value fields, then reservation ID 16 bytes, logical relationship ID 16 bytes, relationship epoch u64, selected revision u32 and selected window u32 |
-| P51_CACHE_LINK_SESSION | `0x51f00012` | Empty link-setup request and empty READY echo; production transition remains under implementation |
+| P51_CACHE_LINK_SESSION | `0x51f00012` | Empty link-setup request and empty READY echo before R2 descriptor handoff |
 
 Requested revision is 2; requested window is 1–30. ARMED must select revision
 2 and a nonzero window no larger than requested. Reservation and relationship
@@ -163,10 +163,12 @@ TU_END is excluded from its own digest. F independently derives the expected
 P29 NEED and validates FILL; there is no R2 NEED frame. F validates job,
 physical generation, ordinal, inner TX_BEGIN identity and both digests before
 publishing. COMMIT_ACK advances only a contiguous ordinal and is checked
-against F's committed prefix K. This codec checkpoint does not qualify the
-development persistent receive loop, receipt recovery/reset, or ordinary
-daemon selection/adoption. These records are not a production end-to-end
-capability and no R2 advertisement is made.
+against F's committed prefix K. The opt-in R2 implementation integrates
+persistent transfer, ordinary daemon selection/adoption, and receipt
+recovery/reset. Codec validity alone does not establish end-to-end correctness;
+qualified test scope and remaining gates are recorded in
+[PROJECT_STATE.md](../PROJECT_STATE.md). R2 is not yet fully qualified for
+release.
 
 RECOVER is a three-part request stream: Begin, exactly `P-A` contiguous
 Witness records for ordinals `A+1..P` (`P-A <= W`), then End. Its transcript
@@ -197,8 +199,10 @@ On a new physical connection a duplicate RESET carries that connection's
 current generation; the echoed RESET_ACK envelope uses that generation while
 the operation ID, epochs, prefix, nonces, and reset state remain identical.
 RESET may settle a reconciled prefix even when the previous COMMIT_ACK was lost; it does
-not delete immutable committed input records. These recovery codecs remain
-dormant until the F and C recovery lifecycles pass their runtime gates.
+not delete immutable committed input records. These records are used by the
+R2 recovery lifecycle. Current recovery reports exact committed receipts,
+not per-job cancellation dispositions for the uncommitted suffix; active-job
+cancellation and survivor rebuilding remain an open qualification gap.
 
 ## Selection and advertisement
 
