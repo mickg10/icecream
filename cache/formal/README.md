@@ -130,7 +130,7 @@ them as coverage of active-work cancellation. `CancelReindexSpec` uses a small
 ordered action subset to make the witness tractable; ordinary `Spec` always
 uses `GeneralNext`.
 The standard clean topology rows therefore still use the full pipeline action
-relation. The runner has 26 rows total.
+relation. The runner has 28 rows total.
 
 The model separates relationship incarnation, physical link generation,
 codec/history epoch, the C-verified receipt floor `A`, F-published input floor
@@ -153,6 +153,29 @@ of a replacement relationship incarnation or unbounded reconnects. Reset
 operation identity/count remains in the bounded state, but prior-result replay
 semantics and a lost `RESET_CONFIRM` are covered by the separate focused model
 below.
+
+`Protocol50ActiveCancel.tla` is a separate directed four-job, one-link
+reachability witness for the active materialization-cancel/reset path. Job 1
+is committed and observed first; job 2 loses its caller while an F worker is
+active, then receives an explicit F-accepted prepublication cancellation.
+That cancellation removes its exact reservation but retains the late worker's
+physical charge until stale completion. At reset linearization, the model
+stores one immutable ACK snapshot with the committed prefix, stable full-job
+witness, and the exact `Replay={3,4}` / `Unavailable={2}` disposition. The
+focused path exercises a lost RESET_ACK and retry of the cached snapshot, an
+applied RESET_CONFIRM whose echo is lost and replayed, contiguous reindexing,
+and interruption of the first replay while preserving the still-unemitted
+successor. Jobs 3 and 4 commit under their stable identities while the old
+worker charge is still held. Its backlog mutant drops job 4 at the interruption
+and must violate the state-derived pending-replay invariant.
+
+This is a bounded directed witness, not exhaustive validation of arbitrary
+RESET snapshots, deadlines, all cancel timings, or multi-link concurrency. In
+particular, the replay interruption abstracts retained C backlog across the
+disconnect; it does not model a second complete RECOVER/RESET wire exchange.
+The existing full-action pipeline topology rows remain separate. The
+active-cancel witness and its backlog mutant are the two added rows in
+`run_pipeline_recovery_tlc.sh`.
 
 `Protocol50ReplacementReplay.tla` is an auxiliary, focused single-link
 lifecycle model with abstract sibling-progress tokens rather than a full

@@ -104,5 +104,7 @@ run_row mutant-double-cancel-release Protocol50PipelineDoubleCancelReleaseMutant
 
 run_row accounting-w30 Protocol50PipelineWindowAccountingW30.cfg clean Protocol50PipelineWindowAccounting.tla
 run_row witness-w30-full-window Protocol50PipelineWindowWitnessW30.cfg FullWindowNotReached Protocol50PipelineWindowAccounting.tla
+run_row witness-active-cancel-reset-replay Protocol50ActiveCancelWitness.cfg ActiveCancelRecoveryWitnessNotReached Protocol50ActiveCancel.tla
+run_row mutant-active-cancel-replay-backlog Protocol50ActiveCancelBacklogMutant.cfg InterruptedReplayRetainsFullBacklog Protocol50ActiveCancel.tla
 
-printf 'PIPELINE-RECOVERY-TLC PASS rows=26\n'
+printf 'PIPELINE-RECOVERY-TLC PASS rows=28\n'

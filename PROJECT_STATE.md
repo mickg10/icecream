@@ -199,8 +199,16 @@ and raw credits eventually drain, but successor liveness fails. Evidence:
 `/tanksmall/scratch/tmp/p51-d07-active-head.DkM6x9/tmp/active-r1.log`, SHA256
 `3afa9c86129243af332a39753998bbd57edb745f11e8e535b67133d7220e985d`.
 The observational probe exits zero because it verifies setup and records
-outcomes, not because cancellation recovery passes; a success-asserting
-regression and product repair remain required.
+outcomes, not because cancellation recovery passes. Its sequential receives
+could conceal a successor response behind the other job's deadline.
+The corrected regression receives both results independently and fails
+specifically at `successor_result.has_value()` (exit 1): both results are
+absent at their original deadlines, eight links are accepted, and the exact
+cancelled reservation retires once. Log in the same directory:
+`active-concurrent-red-r1.log`, SHA256
+`200242364ecedb15c819ccb187da39c87ed2d2357db477d2c77437313429987a`.
+This supersedes the observational probe for the successor-liveness finding.
+The product repair remains unqualified.
 
 F reset removes cancelled reservations,
 but C's sender currently replays every unresolved suffix witness using its
@@ -1954,6 +1962,20 @@ recovery model SHA256
 Earlier model bookkeeping/parser failures and timed-out searches are not
 passing evidence. Active sent/working cancellation and immutable unavailable
 results across lost reset replies remain separate model work.
+
+A subsequent 28-row run adds a directed four-job active-cancel witness and
+an un-emitted-backlog-loss mutant. The witness preserves the positive prefix,
+accepts F cancellation while an old worker remains charged, loses/retries
+RESET_ACK and the confirmation echo, reindexes two survivors and retains them
+through a replay interruption. The mutant loses the un-emitted survivor and
+fails the intended invariant. This is a one-link scenario model, not general
+snapshot/deadline validation; the second disconnect abstracts backlog
+retention, not another complete wire recovery. Aggregate evidence:
+`/tanksmall/scratch/tmp/pipeline-active-cancel-aggregate.4WcR1I/aggregate.log`,
+SHA256 `cc15de6356af65cf622b25ac864653faae5416bf8a940b4c73026ae6b132fc04`;
+active model SHA256
+`6c1251c1e3d2b7e9725923db54f248b3725375709fa01cf37096afa29f4d900f`.
+The product repair still requires real C/F runtime qualification.
 
 [TLA+/TLC documentation](cache/formal/README.md) describes the selected bounded
 models and expected-failure controls. Native/Python/Docker success is not a

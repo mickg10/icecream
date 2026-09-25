@@ -127,6 +127,9 @@ formal/Protocol50PipelineRecoveryC2F1.cfg
 formal/Protocol50PipelineRecoveryC3F1.cfg
 formal/Protocol50PipelineRecoveryC4F1.cfg
 formal/Protocol50PipelineRecoveryFaults.cfg
+formal/Protocol50ActiveCancel.tla
+formal/Protocol50ActiveCancelWitness.cfg
+formal/Protocol50ActiveCancelBacklogMutant.cfg
 formal/Protocol50ReplacementReplay.tla
 formal/Protocol50ReplacementC1F2.cfg
 formal/Protocol50ReplacementC1F2Witness.cfg
