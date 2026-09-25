@@ -73,6 +73,15 @@ The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 
+The full sender suite also passes on the `e2080067` product source, including
+the request-scoped recovery observation and its deterministic regression:
+`/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50zstdsender.log`,
+SHA256 `923e7cfe506a4aba524e98ffea2c27a5066e633733ebbd4ecf846b7eca05a94c`,
+Automake PASS / exit 0. Binary SHA256:
+`ae8ecfe8e01dcd6a3b9748857c2385f77e4f8b566a48f6e73ab0a519cd48164c`.
+Source/test hashes match the `35ba9dd9` regression recorded below. This is
+native test coverage, not sanitizer or farm performance evidence.
+
 Combined service/route-owner qualification passes in
 `/tanksmall/scratch/tmp/p51-admission-combined-r2/build/unittests/`:
 `p50cacheservice.log` SHA256
