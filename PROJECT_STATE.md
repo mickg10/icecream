@@ -180,6 +180,18 @@ Binary SHA256:
 This covers sender occupancy/refill, not all D03 fragmentation offsets,
 multiple lost receipts, concurrent mixed-version load or farm speedup.
 
+The fixture now bounds result waits by each cohort's original deadline.
+The focused matrix passes on this updated test source, SHA256
+`341aa8af3683144f605928f87472bb316658059147b186bf0c71ea775effa716`;
+binary SHA256 `8479e1059b194e6821e70fce949ab8e9a50f7f4802d62245db338b5946e67e3e`.
+Evidence: `/tanksmall/scratch/tmp/p51-source-gate.p9YKIe/window-matrix-updated-r4.log`,
+SHA256 `e4ba3ef8340aa589e4fb158d9e20b5164c736a67b34b3e9dbb96d1d3062af59c`,
+exit 0. Timestamped test execution took about 179 seconds with a 360-second
+outer watchdog; per-job deadlines were unchanged. The preceding 180-second
+outer-watchdog run timed out and is not a pass. Two earlier command/setup
+failures and that timeout remain alongside the successful log. The full-suite
+result above belongs to the previous test source, not this focused rerun.
+
 ### Focused sender sanitizer qualification
 
 The completion-ledger capacity and expired-witness selectors, incorrect

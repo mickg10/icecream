@@ -2106,14 +2106,20 @@ void run_p51_sender_window_concurrent_callers(
     hold_receipt_reader.store(false, std::memory_order_release);
     progress_cv.notify_all();
 
-    const auto first_result = results.front().get();
+    const auto result_deadline = deadline.as_steady_time_point();
+    const auto get_result_by_deadline = [&](auto& future) {
+        CHECK(future.wait_until(result_deadline) == std::future_status::ready);
+        return future.get();
+    };
+    const auto first_result = get_result_by_deadline(results.front());
     CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
-    const auto duplicate_result = results[1].get();
+    const auto duplicate_result = get_result_by_deadline(results[1]);
     CHECK(duplicate_result.status == ZstdSourceTransferStatus::Committed ||
           duplicate_result.status == ZstdSourceTransferStatus::InvalidRequest);
     if (duplicate_result.status == ZstdSourceTransferStatus::Committed)
         CHECK(duplicate_result.committed_input == first_result.committed_input);
-    CHECK(results[2].get().status == ZstdSourceTransferStatus::InvalidRequest);
+    CHECK(get_result_by_deadline(results[2]).status ==
+          ZstdSourceTransferStatus::InvalidRequest);
     std::vector<bool> result_tu_seen(kJobs, false);
     const auto validate_committed_result = [&](const ZstdSourceTransferResult& result,
                                                size_t job_index) {
@@ -2128,7 +2134,8 @@ void run_p51_sender_window_concurrent_callers(
     };
     validate_committed_result(first_result, 0);
     for (size_t job_index = 1; job_index != kJobs; ++job_index)
-        validate_committed_result(results[job_index + 2].get(), job_index);
+        validate_committed_result(get_result_by_deadline(results[job_index + 2]),
+                                  job_index);
     CHECK(std::all_of(result_tu_seen.begin(), result_tu_seen.end(),
                       [](bool seen) { return seen; }));
     CHECK(committed.load(std::memory_order_acquire) == kJobs);
