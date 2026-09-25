@@ -555,9 +555,11 @@ def _run_case(
 
 def _run_concurrent_mixed(
     run: DockerRun, current: str, legacy: str, jobs: int, memory_gb: int,
-    run_id: str,
+    run_id: str, profile: str = "P29V1",
 ) -> dict[str, object]:
     """Exercise P43, R1 and R2 jobs concurrently on one local scheduler/pool."""
+    if profile not in ("P29V1", "ZSTD_TU", "ZSTD_ROUTE"):
+        raise MixedError("unsupported concurrent cache profile")
     if jobs < 3:
         raise MixedError("--concurrent-mixed requires --jobs >= 3")
     if memory_gb < 4:
@@ -608,9 +610,10 @@ def _run_concurrent_mixed(
     case: dict[str, object] = {
         "name": "concurrent-p43-r1-r2",
         "status": "FAIL",
-        "scope": "local shared scheduler; P43 client with separate P29V1 protocol-1 and protocol-2 workers",
+        "scope": f"local shared scheduler; P43 client with separate {profile} protocol-1 and protocol-2 workers",
+        "selected_profile": profile,
         "assignment_policy": "enforcing-compat",
-        "worker_modes": {"r1": "P29V1/R1", "r2": "P29V1/R2"},
+        "worker_modes": {"r1": f"{profile}/R1", "r2": f"{profile}/R2"},
     }
     total_mb = memory_gb * 1024
     scheduler_mb = max(256, total_mb // 10)
@@ -653,7 +656,7 @@ def _run_concurrent_mixed(
             "d18-scheduler-start",
             ["run", "--detach", "--pull=never", "--name", scheduler,
              "--cpus", "0.5", "--memory", f"{scheduler_mb}m",
-             "--env", "ICECC_P50_PROFILE=P29V1", "--env", "ICECC_P51_MODE=on",
+             "--env", f"ICECC_P50_PROFILE={profile}", "--env", "ICECC_P51_MODE=on",
              "--label", label, "--network", network, "--network-alias", "scheduler",
              "--mount", f"type=bind,src={scheduler_logs},dst=/qa-logs",
              current, "/bin/bash", "-c", scheduler_command, "_", network],
@@ -689,7 +692,7 @@ def _run_concurrent_mixed(
                 f"d18-{role}-worker-start",
                 ["run", "--detach", "--pull=never", "--name", name,
                  "--cpus", str(worker_cpu), "--memory", f"{worker_mb}m",
-                 "--env", "ICECC_P50_PROFILE=P29V1", "--env", f"ICECC_P51_MODE={p51_mode}",
+                 "--env", f"ICECC_P50_PROFILE={profile}", "--env", f"ICECC_P51_MODE={p51_mode}",
                  "--label", label, "--network", network,
                  "--network-alias", f"worker-{role}",
                  "--cap-add", "SYS_CHROOT", "--mount",
@@ -755,7 +758,7 @@ def _run_concurrent_mixed(
                 f"export ICECC_PREFERRED_HOST={preferred_worker[role]}",
                 "export ICECC_DEBUG=debug ICECC_LOGFILE=/qa-logs/warm-icecc.log",
                 *( ["export ICECC_REMOTE_REQUIRED=1"] if current_client else [] ),
-                *( [f"export ICECC_P50_PROFILE=P29V1 ICECC_P50_C1F1_REQUIRED=1 ICECC_P50_C1F1_WORKER_SCHEDULER_HOST={scheduler_ip}"] if current_client else [] ),
+                *( [f"export ICECC_P50_PROFILE={profile} ICECC_P50_C1F1_REQUIRED=1 ICECC_P50_C1F1_WORKER_SCHEDULER_HOST={scheduler_ip}"] if current_client else [] ),
                 *( ["export ICECC_P51_MODE=off"] if role == "r1" else [] ),
                 *( ["export ICECC_P51_MODE=on"] if role == "r2" else [] ),
                 f"icecc /usr/bin/g++ -std={standards[role]} -O0 -c /source/warm.cpp -o /qa-logs/warm-{role}.o",
@@ -774,7 +777,7 @@ def _run_concurrent_mixed(
             env = ["--env", f"ICECC_NETNAME={network}"]
             env += ["--env", f"ICECC_PREFERRED_HOST={preferred_worker[role]}"]
             if current_client:
-                env += ["--env", "ICECC_P50_PROFILE=P29V1"]
+                env += ["--env", f"ICECC_P50_PROFILE={profile}"]
             if role == "r1":
                 env += ["--env", "ICECC_P51_MODE=off"]
             if role == "r2":
@@ -881,7 +884,7 @@ def _run_concurrent_mixed(
             if role in ("r1", "r2"):
                 if not _d18_exact_job_line(
                     worker_text,
-                    "P50 CompileFile attached exact P29V1 input for job ",
+                    f"P50 CompileFile attached exact {profile} input for job ",
                     job_id,
                 ):
                     raise MixedError(f"{role}: measured job {job_id} lacks exact F input attachment")
@@ -893,7 +896,7 @@ def _run_concurrent_mixed(
                     raise MixedError(f"{role}: measured job {job_id} lacks P50 assignment identity")
                 # The source-commit line currently lacks a job field; it is
                 # corroborative only within this post-barrier per-role log.
-                if "P29V1 source committed for P50 CompileFile" not in measured_icecc:
+                if f"{profile} source committed for P50 CompileFile" not in measured_icecc:
                     raise MixedError(f"{role}: measured job {job_id} lacks exact source commit")
         r2_client = (client_logs["r2"] / "client-daemon.log").read_text(
             encoding="utf-8", errors="replace")
@@ -973,6 +976,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="run only the pinned protocol-50 fallback row")
     parser.add_argument("--concurrent-mixed", action="store_true",
                         help="run concurrent P43, R1 and R2 jobs on one local scheduler/pool")
+    parser.add_argument("--concurrent-profile", choices=("P29V1", "ZSTD_TU", "ZSTD_ROUTE"),
+                        help="cache profile for --concurrent-mixed (default: P29V1)")
     parser.add_argument("--ordinary50-scheduler-binary", type=Path,
                         help="pinned protocol-50 scheduler executable for the R2 fallback row")
     parser.add_argument("--ordinary50-scheduler-sha256",
@@ -980,6 +985,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ordinary50-scheduler-source-commit",
                         help="required source commit for the pinned protocol-50 scheduler")
     args = parser.parse_args(argv)
+    if args.concurrent_profile and not args.concurrent_mixed:
+        parser.error("--concurrent-profile requires --concurrent-mixed")
     if not 1 <= args.jobs <= 8:
         parser.error("--jobs must be between 1 and 8")
     if not 1 <= args.memory_gb <= 256:
@@ -1042,7 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             results.append(_run_concurrent_mixed(
                 run, args.current_image, args.legacy_image, args.jobs,
-                args.memory_gb, run_id))
+                args.memory_gb, run_id, args.concurrent_profile or "P29V1"))
         except (MixedError, OSError) as exc:
             results.append({"name": "concurrent-p43-r1-r2", "status": "FAIL",
                             "error": str(exc)})
@@ -1067,6 +1074,8 @@ def main(argv: list[str] | None = None) -> int:
                "status": "PASS" if status == 0 and len(results) == expected_cases else "FAIL",
                "jobs": args.jobs, "p51_r2_requested": args.p51_r2,
                "concurrent_mixed_requested": args.concurrent_mixed,
+               "concurrent_profile": (args.concurrent_profile or "P29V1")
+                   if args.concurrent_mixed else None,
                "only_p51_r2": args.only_p51_r2,
                "only_old50_scheduler_fallback": args.only_old50_scheduler_fallback,
                "ordinary50_scheduler": old50_scheduler,

@@ -26,6 +26,7 @@ fail = os.environ.get('FAKE_DOCKER_FAILURE')
 strip_measured = os.environ.get('FAKE_DOCKER_STRIP_MEASURED')
 reuse_pid = os.environ.get('FAKE_DOCKER_REUSE_PID') == '1'
 wrong_job_prefix = os.environ.get('FAKE_DOCKER_WRONG_JOB_PREFIX') == '1'
+d18_profile = os.environ.get('FAKE_D18_PROFILE', 'P29V1')
 if fail and ((fail == 'scheduler-start' and args[:1] == ['run'] and '--network-alias' in args and 'scheduler' in args) or
              (fail == 'client-compile' and args[:1] == ['run'] and '--network-alias' not in args)):
     print('injected docker failure', file=sys.stderr)
@@ -58,15 +59,15 @@ if args[:1] == ['logs'] and any(arg.endswith('-worker') for arg in args):
             attachment_job = '30' if wrong_job_prefix else '3'
             print('[81] remote compile for file /source/r2.cpp' + chr(10) +
                   '[81] Remote compilation completed with exit code 0' + chr(10) +
-                  '[1] P50 CompileFile attached exact P29V1 input for job ' + attachment_job + chr(10) +
+                  '[1] P50 CompileFile attached exact ' + d18_profile + ' input for job ' + attachment_job + chr(10) +
                   'P51 cache-link descriptor adopted by sidecar')
         else:
             print(('[39] remote compile for file /source/p43.cpp' + chr(10) +
                    '[39] Remote compilation completed with exit code 0' + chr(10) +
                    '[157] remote compile for file /source/r1.cpp' + chr(10) +
                    '[157] Remote compilation completed with exit code 0' + chr(10) +
-                   '[1] P50 CompileFile attached exact P29V1 input for job 20' + chr(10) +
-                   '[1] P50 CompileFile attached exact P29V1 input for job 2'))
+                   '[1] P50 CompileFile attached exact ' + d18_profile + ' input for job 20' + chr(10) +
+                   '[1] P50 CompileFile attached exact ' + d18_profile + ' input for job 2'))
         raise SystemExit(0)
     print('Remote compilation completed with exit code 0')
     joined = ' '.join(args)
@@ -114,7 +115,7 @@ if args[:1] == ['run'] and '--network-alias' not in args:
         host = '172.18.0.3' if role == 'r2' else '172.18.0.2'
         job_id = dict(p43='1', r1='2', r2='3')[role]
         profile_log = ('P50 assignment identity bound for job ' + job_id + chr(10) +
-                       'P29V1 source committed for P50 CompileFile' + chr(10)) if role != 'p43' else ''
+                       d18_profile + ' source committed for P50 CompileFile' + chr(10)) if role != 'p43' else ''
         if strip_measured == role:
             profile_log = ''
         (log_dir / 'icecc.log').write_text(
@@ -162,6 +163,8 @@ raise SystemExit(0)
 def _run_cli(tmp_path: Path, *, failure: str = "", remote: bool = True,
              wrong_profile: bool = False, p51_r2: bool = False,
              concurrent_mixed: bool = False,
+             concurrent_profile: str | None = None,
+             d18_reported_profile: str = "P29V1",
              strip_measured_role: str = "", reuse_pid: bool = False,
              wrong_job_prefix: bool = False,
              only_p51_r2: bool = False,
@@ -180,6 +183,7 @@ def _run_cli(tmp_path: Path, *, failure: str = "", remote: bool = True,
                FAKE_DOCKER_STRIP_MEASURED=strip_measured_role,
                FAKE_DOCKER_REUSE_PID="1" if reuse_pid else "0",
                FAKE_DOCKER_WRONG_JOB_PREFIX="1" if wrong_job_prefix else "0",
+               FAKE_D18_PROFILE=d18_reported_profile,
                PYTHONDONTWRITEBYTECODE="1")
     if concurrent_mixed:
         env["ICEFARM_TMPDIR"] = str(tmp_path)
@@ -190,6 +194,8 @@ def _run_cli(tmp_path: Path, *, failure: str = "", remote: bool = True,
     ]
     if concurrent_mixed:
         command += ["--memory-gb", "4", "--concurrent-mixed"]
+    if concurrent_profile is not None:
+        command += ["--concurrent-profile", concurrent_profile]
     if p51_r2:
         command.append("--p51-r2")
     if only_p51_r2:
@@ -417,6 +423,69 @@ def test_concurrent_mixed_uses_one_scheduler_and_observes_all_role_compilers(
     worker_env = [" ".join(command) for command in worker_runs]
     assert any("ICECC_P51_MODE=off" in command for command in worker_env)
     assert any("ICECC_P51_MODE=on" in command for command in worker_env)
+
+
+@pytest.mark.parametrize("profile", ["ZSTD_TU", "ZSTD_ROUTE"])
+def test_concurrent_profile_rejects_p29_attachment_evidence(
+    tmp_path: Path, profile: str,
+) -> None:
+    # This fake worker deliberately still reports P29V1. Selecting a different
+    # profile must change the evidence check, not just the container environment.
+    result, output, commands = _run_cli(
+        tmp_path, concurrent_mixed=True, concurrent_profile=profile,
+    )
+    assert result.returncode != 0
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["concurrent_profile"] == profile
+    assert "lacks exact F input attachment" in summary["cases"][0]["error"]
+    workers = [command for command in commands
+               if command[:1] == ["run"] and "--name" in command
+               and command[command.index("--name") + 1].endswith("-worker")]
+    assert len(workers) == 2
+    assert all(f"ICECC_P50_PROFILE={profile}" in command for command in workers)
+
+
+@pytest.mark.parametrize("profile", ["P29V1", "ZSTD_TU", "ZSTD_ROUTE"])
+def test_concurrent_profile_selects_matching_evidence(tmp_path: Path, profile: str) -> None:
+    result, output, commands = _run_cli(
+        tmp_path, concurrent_mixed=True, concurrent_profile=profile,
+        d18_reported_profile=profile,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert summary["concurrent_profile"] == profile
+    case = summary["cases"][0]
+    assert case["selected_profile"] == profile
+    assert case["worker_modes"] == {"r1": f"{profile}/R1", "r2": f"{profile}/R2"}
+    for command in commands:
+        if command[:1] != ["run"] or "--name" not in command:
+            continue
+        name = command[command.index("--name") + 1]
+        if name.endswith("-p43"):
+            assert not any(arg.startswith("ICECC_P50_PROFILE=") for arg in command)
+        else:
+            assert f"ICECC_P50_PROFILE={profile}" in command
+        if name.endswith(("-r1", "-r2")):
+            assert f"export ICECC_P50_PROFILE={profile} " in " ".join(command)
+
+
+def test_concurrent_profile_requires_concurrent_gate(tmp_path: Path) -> None:
+    result, output, commands = _run_cli(tmp_path, concurrent_profile="P29V1")
+    assert result.returncode != 0
+    assert "--concurrent-profile requires --concurrent-mixed" in result.stderr
+    assert not commands
+    assert not output.exists()
+
+
+def test_concurrent_profile_rejects_unknown_profile(tmp_path: Path) -> None:
+    result, output, commands = _run_cli(
+        tmp_path, concurrent_mixed=True, concurrent_profile="ZSTD_UNKNOWN",
+    )
+    assert result.returncode != 0
+    assert "invalid choice" in result.stderr
+    assert not commands
+    assert not output.exists()
 
 
 def test_concurrent_mixed_requires_bounded_parallel_worker_and_scratch(

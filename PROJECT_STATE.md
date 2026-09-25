@@ -361,6 +361,23 @@ The current image predates worker repair `ef29049c`; this run does not qualify
 that newer product. Scope is warm-environment, same-host, P29V1 compatibility,
 not W30 occupancy, all-profile mixed traffic, or external-farm performance.
 
+The concurrent harness now accepts `--concurrent-profile` with P29V1
+(default), ZSTD_TU or ZSTD_ROUTE. The selected profile controls both worker
+and current-client configuration and the exact attachment/commit evidence
+checks; P43 remains unchanged. Run profiles sequentially in distinct output
+directories under the same resource limit. The 23-test fake-Docker suite
+passes (agent-observed terminal exit 0, 100.73 s), including matching-profile
+positives, mismatched-profile rejection and invalid CLI combinations.
+Command in private snapshot `/tanksmall/scratch/tmp/p51-restart-w30.RWA5X5`:
+`ICEFARM_TMPDIR=/tanksmall/scratch/tmp/p51-restart-w30.RWA5X5/uvtmp sh dev/python.sh --exec pytest -q -p no:cacheprovider farmharness/integration/tests/test_dev_mixed.py`.
+The run's stdout was not saved to a file; no log hash is claimed.
+Tested harness SHA256:
+`e0763fe3b02705f22e45bcdd925f3fe9b637802b63902109f4a8ab44ecbb6e57`;
+test source SHA256:
+`ab5c1dd7f952f700fae80cbc4416084c8b255d1a32f57ca162392468f86367e7`.
+This qualifies harness behavior, not live ZSTD mixed traffic. Current-image
+real Docker runs for all three profiles remain required.
+
 ### Clean-checkout build and mixed-version compatibility
 
 Published `fdf03e25520d9db25746b29da7847e935b747b7f` builds and installs

@@ -198,7 +198,11 @@ sh dev/python.sh dev/mixed.py \
 ```
 
 This standalone selector cannot be combined with the R2 row selectors. It
-requires at least three CPU quota units and 4 GiB aggregate container memory;
+defaults to P29V1; select `--concurrent-profile ZSTD_TU` or
+`--concurrent-profile ZSTD_ROUTE` to exercise those profiles. Run each profile
+sequentially with a distinct output directory to keep the same resource cap.
+The profile selector requires `--concurrent-mixed`.
+The gate requires at least three CPU quota units and 4 GiB aggregate container memory;
 the example allows 8 GiB. The output must be beneath `ICEFARM_TMPDIR` and
 must not already exist. One current scheduler uses `enforcing-compat` policy,
 with separate current R1 and R2 workers and three client containers. P43 and
@@ -207,10 +211,11 @@ start barrier, so this is a warm-environment compatibility test, not a cold
 build benchmark.
 
 The gate checks overlapping compiler process identities, measured-job remote
-execution, exact program output, and the required P29V1 source/attachment
+execution, exact program output, and the selected profile's source/attachment
 evidence. It retains logs and image provenance, and removes its own containers
 and network afterward. This is not a W30 occupancy test, a multi-host farm
-test, or coverage of the ZSTD_TU and ZSTD_ROUTE mixed-load combinations.
+test, or evidence for profiles not selected in that run. Available selectors
+are not qualification results; see `PROJECT_STATE.md` for recorded runs.
 
 The old-scheduler fallback case additionally requires
 `--ordinary50-scheduler-binary`, `--ordinary50-scheduler-sha256`, and
