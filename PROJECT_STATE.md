@@ -81,6 +81,33 @@ test; the following make invocation did not rerun the test and is excluded.
 The passing run used corrected task-owned scratch permissions and an actual
 test execution. No product deadlines or limits changed.
 
+The opt-in `p50daemonpositive-p51-arm-expiry-check` additionally exercises
+the daemon's final ARM validation on the actual wire, for all three profiles.
+A test-only, exact-request pause stops the daemon after Goodbye has been
+written and before final validation, following a successful reservation.
+The fixture observes the stopped process before its original two-second
+budget expires, resumes it after expiry, requires End followed by EOF with
+no ARMED, and then proves a fresh ARM succeeds on the same daemon. This
+covers that expiry boundary, not every Client/READY replacement race.
+
+The named gate passes against private base `6ff64c41` with these changes.
+Evidence root: `/tanksmall/scratch/tmp/p51-c03-wire-arm-r1/tmp/`;
+`arm-expiry-target-r3.exit` records 0; its log SHA256 is
+`31558b8e383e69a0e15d25dcdd92ae7d42ccbad8630d3e5d7c1fb6477d2dd712`.
+Daemon source SHA256
+`0effbc06a96df2d6c8bc40e379e224b293ade6c8a45ef123a75d669580ee57cf`;
+test TU `e39ecfb75706aefdf64852a14f82136585a43fc95564c7353b95cf7ec848bbb0`.
+The runner requires a disposable root container, an `icecc` account and
+explicit scratch; each profile has a 45-second timeout plus ten-second kill
+grace and unique retained logs. Missing-scratch and missing-opt-in attempts
+are excluded, including a default-wrapper skip (77), not counted as passes.
+The corrected default daemon wrapper also exits 0 on the same binaries:
+`default-positive-r3.log` SHA256
+`cbe0d6fe7eb5644291d7711cb2ff402387e657a2e8dd731022b8ccbc80ff166d`.
+Daemon binary SHA256
+`8127cd31311f7f44a933a6808fa4b64dec733dc64b08bb9aff02780cd8532b09`;
+test binary `cae2b77cf12c44afbaa77d219faa1c806a8059f07f06591ba28b79121558975d`.
+
 ### Shared recovery failure handling
 
 A failed recovery attempt now marks its current physical generation unusable

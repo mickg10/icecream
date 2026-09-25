@@ -10616,6 +10616,7 @@ bool Daemon::advance_p51_source_leases(const std::vector<pollfd> &pollfds)
 
 bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
 {
+    static bool test_pause_after_goodbye_used = false;
     for (const auto &entry : clients) {
         Client *client = entry.second;
         auto &pending = client->pending_p51_source_arm;
@@ -10632,6 +10633,8 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
         auto fail = [&](const char *reason) {
             log_warning() << "P51 source arm setup failed: " << reason
                           << " stage=" << static_cast<unsigned>(pending->stage)
+                          << " reservation_error_code="
+                          << pending->reservation_error_code
                           << " fd=" << operation_fd
                           << " frame_status="
                           << (pending->frame
@@ -10786,6 +10789,33 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
                 break;
             }
             case Client::PendingP51SourceArm::Stage::GoodbyeSend: {
+                /*
+                 * A process-level test can stop one specifically identified,
+                 * successfully reserved ARM after the daemon has written
+                 * Goodbye to the sidecar but before final deadline/READY/assignment
+                 * checks below.  This makes the otherwise narrow deadline
+                 * race deterministic without changing the request deadline.
+                 */
+                const char *pause_request = std::getenv(
+                    "ICECC_TEST_P51_PAUSE_AFTER_GOODBYE_REQUEST");
+                if (!test_pause_after_goodbye_used &&
+                    std::getenv("ICECC_TESTS") != nullptr &&
+                    pause_request != nullptr && *pause_request != '\0' &&
+                    pending->armed.has_value() &&
+                    pending->reservation_error_code == 0 &&
+                    pending->armed->acknowledges(P51SourceArmMsg{pending->arm})) {
+                    char *end = nullptr;
+                    errno = 0;
+                    const unsigned long long request_id =
+                        std::strtoull(pause_request, &end, 10);
+                    if (errno == 0 && end != pause_request && *end == '\0' &&
+                        request_id == pending->arm.source.source_request_id) {
+                        test_pause_after_goodbye_used = true;
+                        log_warning() << "test-only P51 ARM pause after Goodbye"
+                                      << " request_id=" << request_id << endl;
+                        (void)::raise(SIGSTOP);
+                    }
+                }
                 const auto current_lease = cache_adapter != nullptr
                     ? cache_adapter->outer_current_ready_lease()
                     : std::optional<icecc::p50::sidecar::ReadyLease>{};

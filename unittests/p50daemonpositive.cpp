@@ -125,6 +125,18 @@ static Msg *wait_for_type(MsgChannel *channel, Msg::Value type, int timeout_msec
     return nullptr;
 }
 
+static Msg *wait_for_any_type(MsgChannel *channel, int timeout_msec)
+{
+    if (!channel) return nullptr;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    while (Clock::now() < deadline) {
+        Msg *message = channel->get_msg(1, true);
+        if (message != nullptr) return message;
+        if (channel->at_eof()) return nullptr;
+    }
+    return nullptr;
+}
+
 static MsgChannel *connect_tcp_bounded(int port, int timeout_msec)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
@@ -4164,10 +4176,49 @@ static uint32_t selected_vertical_profile()
     return 0;
 }
 
+static uint32_t source_mode_for_profile(uint32_t profile_mask)
+{
+    return profile_mask == CACHE_PROFILE_P29V1 ? P50_SOURCE_MODE_P29V1
+        : profile_mask == CACHE_PROFILE_ZSTD_ROUTE ? P50_SOURCE_MODE_ZSTD_ROUTE
+        : P50_SOURCE_MODE_ZSTD_TU;
+}
+
+static constexpr uint32_t kExpiredArmWireJob = 0x7a710701;
+static constexpr uint64_t kExpiredArmWireNonce = UINT64_C(0x7a71070100000001);
+static constexpr uint32_t kFreshArmWireJob = 0x7a710702;
+static constexpr uint64_t kFreshArmWireNonce = UINT64_C(0x7a71070200000001);
+static constexpr uint64_t kExpiredArmWireBudgetMsec = 2000;
+
 int main(int argc, char **argv)
 {
     const bool receipt_gate_mode = argc == 7 &&
         std::strcmp(argv[1], "--p51-commit-receipt-gate") == 0;
+    const bool p51_expired_arm_wire_case =
+        ::getenv("ICECC_TEST_P51_EXPIRED_ARM_WIRE") != nullptr;
+    const char *other_p51_modes[] = {
+        "ICECC_TEST_P51_CANCEL_REPLACEMENT",
+        "ICECC_TEST_P51_MULTILINK",
+        "ICECC_TEST_P51_VERTICAL",
+        "ICECC_TEST_P51_VERTICAL_W30",
+        "ICECC_TEST_P51_RESTART_F_C1F2",
+        "ICECC_TEST_P51_RESTART_C_C2F1",
+        "ICECC_TEST_P51_RESTART_W30_F_C1F2",
+        "ICECC_TEST_P51_RESTART_W30_C_C2F1",
+        "ICECC_TEST_P51_RESTART_W30_TOPOLOGY",
+        "ICECC_TEST_P51_SYNTH_SCHEDULER_W30",
+        "ICECC_TEST_P51_LOST_RECEIPTS",
+        "ICECC_TEST_P51_RESTART_CHAIN_F_C_W30",
+    };
+    bool conflicting_p51_mode = false;
+    for (const char *name : other_p51_modes)
+        conflicting_p51_mode = conflicting_p51_mode ||
+            ::getenv(name) != nullptr;
+    if (p51_expired_arm_wire_case &&
+        (receipt_gate_mode || conflicting_p51_mode)) {
+        std::fprintf(stderr,
+            "FAIL: P51 expired-ARM wire gate cannot be combined with another mode\n");
+        return 2;
+    }
     if (!receipt_gate_mode && argc != 3) {
         std::fprintf(stderr, "usage: %s <iceccd> <icecc-cache-service>\n", argv[0]);
         return 2;
@@ -4360,6 +4411,19 @@ int main(int argc, char **argv)
     int scheduler_port = 0;
     const int scheduler_listener = listen_ephemeral(&scheduler_port);
     const int daemon_port = reserve_port();
+    if (p51_expired_arm_wire_case) {
+        const uint32_t profile = selected_vertical_profile();
+        if (profile == 0) {
+            std::fprintf(stderr,
+                "FAIL: ICECC_TEST_P51_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE\n");
+            return 2;
+        }
+        const std::string request_id = std::to_string(kExpiredArmWireNonce);
+        const std::string budget = std::to_string(kExpiredArmWireBudgetMsec);
+        ::setenv("ICECC_TEST_P51_PAUSE_AFTER_GOODBYE_REQUEST",
+                 request_id.c_str(), 1);
+        ::setenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC", budget.c_str(), 1);
+    }
     REQUIRE(scheduler_listener >= 0 && scheduler_port > 0,
             "fake scheduler listens on an ephemeral port");
     REQUIRE(daemon_port > 0, "real daemon public port reserved");
@@ -4414,12 +4478,143 @@ int main(int argc, char **argv)
     LoginMsg *positive = dynamic_cast<LoginMsg *>(positive_message);
     const bool p51_cancel_case =
         std::getenv("ICECC_TEST_P51_CANCEL_REPLACEMENT") != nullptr;
+    const bool p51_r2_positive_case =
+        p51_cancel_case || p51_expired_arm_wire_case;
     REQUIRE(present_revision(
                 positive, static_cast<uint32_t>(daemon_port),
-                p51_cancel_case ? CACHE_WIRE_REVISION_R2
-                                : CACHE_WIRE_REVISION_R1),
+                p51_r2_positive_case ? CACHE_WIRE_REVISION_R2
+                                     : CACHE_WIRE_REVISION_R1),
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
+
+    if (p51_expired_arm_wire_case) {
+        const uint32_t profile = selected_vertical_profile();
+        auto prepare = [&](uint32_t wire_id, uint64_t nonce) {
+            const bool sent = scheduler && scheduler->send_msg(
+                AssignPrepareMsg(epoch, wire_id, nonce, 1));
+            Msg *reply = sent
+                ? wait_for_type(scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
+            const auto *ready = dynamic_cast<const AssignReadyMsg *>(reply);
+            const bool exact = ready && ready->wire_id == wire_id &&
+                ready->epoch() == epoch && ready->nonce() == nonce;
+            delete reply;
+            return exact;
+        };
+        auto make_arm = [&](uint32_t wire_id, uint64_t nonce) {
+            P50SourceArmFields source = source_arm(
+                wire_id, epoch, nonce, static_cast<uint32_t>(daemon_port),
+                static_cast<uint32_t>(daemon_port));
+            source.cache_protocol = CACHE_WIRE_REVISION_R2;
+            source.cache_profile = profile;
+            source.source_mode = source_mode_for_profile(profile);
+            source.c_control_attempt = kExpiredArmWireNonce;
+            return P51SourceArmFields{source, 30};
+        };
+
+        const bool first_ready = prepare(kExpiredArmWireJob,
+                                         kExpiredArmWireNonce);
+        MsgChannel *first_wrapper = first_ready
+            ? connect_tcp_bounded(daemon_port, 5000) : nullptr;
+        const auto arm_sent_at = Clock::now();
+        const P51SourceArmMsg expired_request{
+            make_arm(kExpiredArmWireJob, kExpiredArmWireNonce)};
+        const bool first_sent = first_wrapper &&
+            first_wrapper->send_msg(expired_request);
+        int stopped_status = 0;
+        bool daemon_stopped = false;
+        const auto stop_deadline = Clock::now() + std::chrono::seconds(5);
+        while (first_sent && Clock::now() < stop_deadline) {
+            const pid_t waited = ::waitpid(
+                daemon_pid, &stopped_status, WNOHANG | WUNTRACED);
+            if (waited == daemon_pid) {
+                daemon_stopped = WIFSTOPPED(stopped_status);
+                break;
+            }
+            if (waited < 0 && errno != EINTR) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto stopped_at = Clock::now();
+        const bool stopped_before_deadline = daemon_stopped &&
+            stopped_at - arm_sent_at <
+                std::chrono::milliseconds(kExpiredArmWireBudgetMsec);
+        REQUIRE(first_ready && first_sent && daemon_stopped &&
+                    stopped_before_deadline,
+                "daemon reached post-Goodbye pause for the exact successful reservation before its deadline");
+
+        if (daemon_stopped) {
+            std::this_thread::sleep_until(
+                stopped_at + std::chrono::milliseconds(
+                    kExpiredArmWireBudgetMsec + 250));
+            const bool resumed = ::kill(daemon_pid, SIGCONT) == 0;
+            daemon_stopped = !resumed;
+            REQUIRE(resumed,
+                    "stopped daemon resumed only after the unchanged original ARM deadline elapsed");
+        }
+
+        Msg *expired_response = first_wrapper
+            ? wait_for_any_type(first_wrapper, 5000) : nullptr;
+        const bool terminal_end = expired_response &&
+            *expired_response == Msg::END;
+        delete expired_response;
+        bool eof_after_end = false;
+        if (terminal_end && first_wrapper != nullptr) {
+            bool unexpected_trailing_message = false;
+            const auto response_deadline = Clock::now() + std::chrono::seconds(5);
+            while (Clock::now() < response_deadline) {
+                Msg *trailing = first_wrapper->get_msg(1, true);
+                if (trailing != nullptr) {
+                    unexpected_trailing_message = true;
+                    delete trailing;
+                    break;
+                }
+                if (first_wrapper->at_eof()) {
+                    eof_after_end = true;
+                    break;
+                }
+            }
+            eof_after_end = eof_after_end && !unexpected_trailing_message;
+        }
+        REQUIRE(terminal_end && eof_after_end,
+                "expired exact R2 reservation produced End then EOF, with no wire P51_SOURCE_ARMED");
+        delete first_wrapper;
+
+        const bool fresh_ready = prepare(kFreshArmWireJob, kFreshArmWireNonce);
+        MsgChannel *fresh_wrapper = fresh_ready
+            ? connect_tcp_bounded(daemon_port, 5000) : nullptr;
+        const P51SourceArmMsg fresh_request{
+            make_arm(kFreshArmWireJob, kFreshArmWireNonce)};
+        const bool fresh_sent = fresh_wrapper &&
+            fresh_wrapper->send_msg(fresh_request);
+        Msg *fresh_message = fresh_sent
+            ? wait_for_type(fresh_wrapper, Msg::P51_SOURCE_ARMED, 5000) : nullptr;
+        const auto *fresh_armed =
+            dynamic_cast<const P51SourceArmedMsg *>(fresh_message);
+        const bool fresh_success = fresh_armed &&
+            fresh_armed->acknowledges(fresh_request) &&
+            fresh_armed->selected_window == 30 &&
+            fresh_armed->f_store_generation != 0;
+        delete fresh_message;
+        REQUIRE(fresh_ready && fresh_sent && fresh_success,
+                "fresh exact ARM succeeds on the same healthy daemon after late ARM rejection");
+        delete fresh_wrapper;
+
+        if (daemon_stopped) (void)::kill(daemon_pid, SIGCONT);
+        (void)::kill(daemon_pid, SIGTERM);
+        int status = 0;
+        bool reaped = wait_child(daemon_pid, 10000, &status);
+        if (!reaped) {
+            (void)::kill(daemon_pid, SIGKILL);
+            (void)::waitpid(daemon_pid, &status, 0);
+        }
+        REQUIRE(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "wire deadline fixture daemon exits cleanly under bounded cleanup");
+        delete scheduler;
+        ::close(scheduler_listener);
+        if (failures == 0) std::filesystem::remove_all(work);
+        else std::fprintf(stderr,
+                          "retained failing work directory: %s\n", work.c_str());
+        return failures ? 1 : 0;
+    }
 
     if (p51_cancel_case) {
         const uint32_t wire_id = 0x7a710301;

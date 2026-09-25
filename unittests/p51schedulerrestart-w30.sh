@@ -4,7 +4,11 @@
 # stay alive; this is deliberately distinct from synthetic scheduler-epoch
 # fixtures.
 set -eu
-unset ICECC_TEST_P51_RESTART_W30_TOPOLOGY
+unset ICECC_TEST_P51_RESTART_W30_TOPOLOGY \
+    ICECC_TEST_P51_EXPIRED_ARM_WIRE \
+    ICECC_TEST_P51_PAUSE_AFTER_GOODBYE_REQUEST \
+    ICECC_TEST_P50_SOURCE_BUDGET_MSEC \
+    ICECC_TEST_P51_RESTART_CHAIN_F_C_W30
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 build=${ICECC_TEST_TOP_BUILDDIR:-$src}

@@ -46,6 +46,7 @@ Inside an already built, disposable Linux test container, run:
 make -C "$BUILD/unittests" p50daemonpositive-p51-multilink-check
 make -C "$BUILD/unittests" p50daemonpositive-p51-restart-check
 make -C "$BUILD/unittests" p50daemonpositive-p51-restart-w30-check
+make -C "$BUILD/unittests" p50daemonpositive-p51-arm-expiry-check
 ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
   make -C "$BUILD/unittests" p51schedulerrestart-w30-check
 ```
@@ -54,6 +55,8 @@ ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
 inside the container, an unprivileged `icecc` account, usable `iptables` with
 Docker `NET_ADMIN`, and writable scratch-backed `ICEFARM_TMPDIR`. The daemon
 account must be able to traverse the build path and temporary directory.
+The current SDK image does not create the `icecc` account; prepare that test
+identity in the disposable image before invoking these targets.
 Mount scratch at a short container path such as `/work/tmp`: these fixtures
 create Unix-domain sockets with a limited path length.
 Use a private Docker bridge network, never `--network=host`; do not run these
@@ -69,9 +72,12 @@ replacement, one affected transfer plus a healthy sibling. The separate
 `restart-w30` gate covers both replacements for all three profiles: 30 held
 old commits, all original callers settling without accepting the discarded
 receipts, healthy-sibling progress, and 30 fresh commits and exact input
-attachments on the replacement identity. It checks bounded settlement; direct
-per-caller completion-time comparison with the original deadline remains
-pending. These targets are not automatically included in the default
+attachments on the replacement identity. It checks each caller against its
+original deadline with a bounded cleanup grace. The `arm-expiry` gate pauses
+each daemon after it writes Goodbye but before final ARM validation, waits
+beyond the unchanged request deadline, and checks the real wire ends without
+ARMED before a fresh ARM succeeds. It covers this final-validation expiry
+boundary, not every READY/Client race. These targets are not automatically included in the default
 `make qa` workflow and are not throughput benchmarks or cross-host farm tests.
 
 The `p51schedulerrestart-w30-check` target replaces the actual scheduler
