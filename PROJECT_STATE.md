@@ -38,6 +38,27 @@ checkout or a substitute for its successful result.
 
 ### Actual scheduler-process W30 restart harness
 
+The clean published `fdf03e25` build now also passes the combined local
+integration checks, each with exit 0:
+
+| Gate | Passing scope | Log SHA256 |
+| --- | --- | --- |
+| Multi-link W30 | C1F2/3/4 and C2/3/4F1, all three profiles: 18 cells | `62ccb660064ac05dc704c0aee63835bb22b3d9104b219021d6974c826acdfc6f` |
+| C/F and S restart W30 | C1F2 F-cache and C2F1 C-cache replacement, all profiles: six cells; actual S replacement, all profiles: three cells | `164644e6b7393e23572ff2ca966e5c16d70f8571048c8bc71dbcc397f2d6e4c6` |
+
+Logs are `multilink-fdf03e25.log` and `restarts-fdf03e25.log` under
+`/tanksmall/scratch/tmp/p51-combined-qa/`. Test executable SHA256:
+`268b3a208e4fa5e0a918d12d20ffc076ed737dbeec646c00a39ccef25d209824`.
+All runs use private bridge containers with two CPUs and 8 GiB.
+Restart checks verify old-call settlement, fresh W30 commits and exact input
+attachment; C/F replacement also checks an unaffected sibling. This qualifies
+the current ledger/recovery product with the harness. It does not cover the
+external-farm matrix, every larger-topology restart combination, arbitrary
+interleavings, or the remaining fragmentation/multiple-lost-receipt cases.
+
+The following older-snapshot evidence separately establishes the harness
+and its timeout-cleanup behavior:
+
 The opt-in `p51schedulerrestart-w30-check` harness passes C1F1/W30 for
 P29V1, ZSTD_TU and ZSTD_ROUTE. It holds 30 old receipts, replaces the actual
 scheduler process while C/F daemon and cache PIDs remain stable, verifies
@@ -66,8 +87,8 @@ service source:
 `54640beb7759d7e02124a661808539431b6163b873ce95fc7417724b2616e8b9`.
 Final helper binary SHA256:
 `aadee66274bbbf36bed4fab9ba521c82e295d857e0222479ff157a83200e3ec9`.
-The published runner differs from the successful test copy only by changing
-one failure-message word from "authenticated" to "validated".
+The published runner differs from that older successful test copy only by
+one wording-only correction to a failure message.
 
 ### Bounded sender completion ledger
 
