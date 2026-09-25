@@ -428,6 +428,16 @@ The private fixture is still under qualification. This result does not prove
 the full 18-cell matrix, 120-job cancellation bursts, or runtime overflow
 handling; compile-time predicate checks only cover the 119/120 boundary.
 
+An isolated C4F1/P29V1 rerun also passes: four physical links, 120 jobs,
+30 unique commits per link, healthy-link progress while one receipt stream
+is held, and exact input attachments. Retained container
+`p51-c4f1-p29-diag3` exited 0 with all recorded cgroup memory events zero.
+Evidence: `tmp/diag-run/test.log` under the same multi-link evidence root,
+SHA256 `3fe091d9aad6a8fbd8a589e499a6206935cf300a6b9815f1241120f608aade8b`.
+This used the same daemon binary listed above, without the new handoff
+diagnostics. It does not explain the earlier C4F1 setup disconnect after
+15 passing matrix cells, nor qualify the complete matrix or repeated runs.
+
 The runtime now distinguishes definite reservation absence from an invalid
 offer in one owner-thread lookup. Only an absent initial reservation or
 absent reconnect relationship produces ReservationMissing; mismatched fields
