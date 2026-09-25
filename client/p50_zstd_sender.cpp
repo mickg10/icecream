@@ -521,6 +521,10 @@ P50ZstdSourceSender::transfer_bytes(
                         connected_fd, prepared, {}, deadline);
                 }
             }
+        } catch (const P29V1CapabilityUnavailable&) {
+            // A HISTORY_RESET found the interner non-runnable: the capability
+            // is gone for this READY lease, which is not a route ambiguity.
+            throw;
         } catch (...) {
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::TerminalError);

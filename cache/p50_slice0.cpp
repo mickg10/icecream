@@ -1701,14 +1701,18 @@ struct CAuthority::P29V1State {
               budget, std::numeric_limits<size_t>::max()))),
           layout(select_layout(budget)), interner(provider, layout),
           max_tu_bytes(max_tu),
-          inject_failure_once(
-              fault_injection == P29InternerFaultInjection::FailOnce) {}
+          inject_failure_after(
+              fault_injection == P29InternerFaultInjection::FailOnce     ? 0
+              : fault_injection == P29InternerFaultInjection::FailSecond ? 1
+                                                                         : kNoInjectedFailure) {}
 
     P29MmapInternProvider provider;
     codec::P29InternLayout layout;
     codec::P29Interner<P29MmapInternProvider> interner;
     uint64_t max_tu_bytes = 0;
-    bool inject_failure_once = false;
+    // The injected failure fires on the prepare after this many successful ones.
+    static constexpr uint64_t kNoInjectedFailure = std::numeric_limits<uint64_t>::max();
+    uint64_t inject_failure_after = kNoInjectedFailure;
     // Cleared by a failed prepare, possibly off the owner thread.
     std::atomic<bool> runnable{true};
     uint64_t prepares = 0;
@@ -1765,13 +1769,13 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
         auto prepared = std::make_shared<PreparedTU>();
         prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
         p29v1_->interner.process(exact_input, prepared->dense_regions);
-        if (p29v1_->inject_failure_once) {
-            p29v1_->inject_failure_once = false;
-            std::fputs(
-                "{\"schema\":\"icecream-p50-fault-v1\","
-                "\"fault\":\"p29-interner-fail-once\","
-                "\"outcome\":\"fired\"}\n",
-                stderr);
+        if (p29v1_->prepares == p29v1_->inject_failure_after) {
+            std::fprintf(stderr,
+                         "{\"schema\":\"icecream-p50-fault-v1\","
+                         "\"fault\":\"p29-interner-fail-%s\","
+                         "\"outcome\":\"fired\"}\n",
+                         p29v1_->inject_failure_after == 0 ? "once" : "second");
+            p29v1_->inject_failure_after = P29V1State::kNoInjectedFailure;
             std::fflush(stderr);
             throw std::runtime_error("injected P29V1 interner failure");
         }

@@ -1164,6 +1164,12 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             }
             if (shared->p29_source->tu_seq != tu_seq)
                 throw std::logic_error("P29V1 shared TU identity changed");
+            // A TU interned before another TU's failure cannot begin either:
+            // the same typed failure, not a route logic error (which the
+            // sender would escalate to a sticky sidecar replacement).
+            if (!impl_->p29_authority->p29v1_runnable())
+                throw P29V1CapabilityUnavailable(
+                    "P29V1 interner is not runnable until READY lease replacement");
             const CActiveTx& active = route.p29_route->begin_v1(
                 shared->p29_source,
                 impl_->authority_limits.max_route_state_bytes);
@@ -1402,6 +1408,9 @@ PreparedInputPtr P50PreparationAuthority::reset_p29v1_route(
         throw std::logic_error(
             "P29V1 route reset does not identify its prepared successor");
 
+    if (!impl_->p29_authority->p29v1_runnable())
+        throw P29V1CapabilityUnavailable(
+            "P29V1 interner is not runnable until READY lease replacement");
     route.p29_route->reset_v1_route(f_store_guid, history_nonce);
     const CActiveTx& active = route.p29_route->begin_v1(
         entry.shared->p29_source,

@@ -848,6 +848,43 @@ void test_p29v1_relationship_owner() {
     CHECK(owner.owner_count() == 1 && owner.owns(route));
 }
 
+// A TU interned before another TU's interner failure must not begin on a new
+// route with a route logic error, which the sender escalates to a sticky
+// sidecar replacement: it gets the same typed capability failure.
+void test_interned_tu_after_interner_fault_is_typed() {
+    P50RouteOwnerConfig owner_config = config(ProfileId::P29V1);
+    P50PreparationAuthority authority(
+        Id128::from_u64(193), owner_config.endpoint_caps.zstd,
+        owner_config.authority_limits, owner_config.compression_level,
+        ProfileId::P29V1, TuSeq{}, P29InternerFaultInjection::FailSecond);
+    const std::vector<uint8_t> source{
+        '#', ' ', '1', ' ', '"', 'k', 'e', 'p', 't', '"', '\n', 'o', 'n', 'e', '\n'};
+    const std::vector<uint8_t> other{
+        '#', ' ', '1', ' ', '"', 'l', 'o', 's', 't', '"', '\n', 't', 'w', 'o', '\n'};
+    const PreparedTuHandle first = authority.prepare_for_route(
+        {Id128::from_u64(391), 1, ProfileId::P29V1}, {7701, 1}, source);
+    CHECK(authority.prepared_profile(first) == ProfileId::P29V1);
+
+    bool failed_typed = false;
+    try {
+        (void)authority.prepare_for_route(
+            {Id128::from_u64(392), 1, ProfileId::P29V1}, {7701, 2}, other);
+    } catch (const P29V1CapabilityUnavailable&) {
+        failed_typed = true;
+    }
+    CHECK(failed_typed);
+
+    // The first TU's interned source is shared with a new route.
+    bool reused_typed = false;
+    try {
+        (void)authority.prepare_for_route(
+            {Id128::from_u64(393), 1, ProfileId::P29V1}, {7701, 1}, source);
+    } catch (const P29V1CapabilityUnavailable&) {
+        reused_typed = true;
+    }
+    CHECK(reused_typed);
+}
+
 void test_interner_fault_is_sticky_only_for_p29v1() {
     P50RouteOwnerConfig owner_config = config(ProfileId::P29V1);
     P50PreparationAuthority authority(
@@ -901,4 +938,5 @@ int main() {
     test_transport_loss_does_not_reject_another_worker();
     test_typed_poison_catch_is_owner_wide();
     test_interner_fault_is_sticky_only_for_p29v1();
+    test_interned_tu_after_interner_fault_is_typed();
 }

@@ -271,6 +271,8 @@ using PreparedTUPtr = std::shared_ptr<const PreparedTU>;
 enum class P29InternerFaultInjection : uint8_t {
     Disabled = 0,
     FailOnce,
+    // Tests only: the second prepare fails, after one TU is already interned.
+    FailSecond,
 };
 
 class CAuthority {
