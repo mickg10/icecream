@@ -35,7 +35,7 @@ contract() {
     require "$candidate" 'pending_remote_admission_limit' &&
     require "$candidate" 'RLIMIT_NOFILE' &&
     require "$candidate" 'Service::createChannelAccepted' &&
-    require "$candidate" 'service_pending_client_admissions(pollfds)' &&
+    require "$candidate" 'service_pending_client_admissions(poll_ready)' &&
     require "$candidate" 'service_pending_client_admissions_now()' &&
     require "$candidate" 'current_remote_client_admission_capacity' &&
     require "$candidate" 'finish_protocol_admission()' &&
@@ -162,7 +162,7 @@ for needle in \
     'pending_remote_admission_limit' \
     'RLIMIT_NOFILE' \
     'Service::createChannelAccepted' \
-    'service_pending_client_admissions(pollfds)' \
+    'service_pending_client_admissions(poll_ready)' \
     'service_pending_client_admissions_now()' \
     'current_remote_client_admission_capacity' \
     'finish_protocol_admission()' \

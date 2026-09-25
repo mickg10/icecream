@@ -59,6 +59,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 	p50endpoint-sanitize.sh
 TESTS += codec_parity codec_provider codec_intern codec_wire
 TESTS += daemonqueue
+TESTS += pollreadiness
 # Native executables and shell/Python helpers inherit the same locked Python.
 # Reference reducers are exercised here, never linked into shipped programs.
 check_LIBRARIES = libp50reference.a
@@ -232,6 +233,9 @@ check_PROGRAMS += assignment_identity_test
 check_PROGRAMS += codec_parity codec_provider codec_intern codec_wire
 check_PROGRAMS += daemonqueue
 daemonqueue_SOURCES = daemonqueue.cpp
+check_PROGRAMS += pollreadiness
+pollreadiness_SOURCES = pollreadiness.cpp
+pollreadiness_LDADD = ../services/libicecc.la
 assignment_identity_test_SOURCES = assignment_identity_test.cpp
 assignment_identity_test_LDADD = ../services/libicecc.la
 codec_parity_SOURCES = codec_parity_test.cpp

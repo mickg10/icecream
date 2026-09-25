@@ -474,8 +474,8 @@ def check_compiler_quiescence(source: str, helper: str, test_source: str,
                   "release_slot_once(rec.slot)"):
         require(token in source, f"compiler lifecycle omits {token}")
     compiler_pipe_events = (
-        "pollfd_is_set(pollfds, client->pipe_from_child,\n"
-        "                                         POLLIN | POLLHUP | POLLERR)")
+        "poll_ready.is_set(client->pipe_from_child,\n"
+        "                                             POLLIN | POLLHUP | POLLERR)")
     require(compiler_pipe_events in source,
             "compiler completion ignores EOF/HUP and can strand descendants")
 
@@ -947,9 +947,9 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "return true;"),
         ("compiler_signal", "case SIGALRM:", "case SIGSEGV:"),
         ("main",
-         "pollfd_is_set(pollfds, client->pipe_from_child,\n"
-         "                                         POLLIN | POLLHUP | POLLERR)",
-         "pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)"),
+         "poll_ready.is_set(client->pipe_from_child,\n"
+         "                                             POLLIN | POLLHUP | POLLERR)",
+         "poll_ready.is_set(client->pipe_from_child, POLLIN)"),
         ("compiler_signal", "release_slot_once(SlotAccounting& accounting)",
          "release_slot_deleted(SlotAccounting& accounting)"),
         ("compiler_signal", "CleanupAdvance advance_exited_group_cleanup(",

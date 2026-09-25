@@ -104,6 +104,7 @@
 #include "utf8.h"
 #include "statewriter.h"
 #include "client_queue_order.h"
+#include "poll_readiness.h"
 #include <comm.h>
 #include "load.h"
 #include "environment.h"
@@ -1593,7 +1594,8 @@ struct Daemon {
     void answer_client_requests();
     bool expire_pending_client_admissions() noexcept;
     uint64_t next_pending_client_admission_deadline_msec() const noexcept;
-    void service_pending_client_admissions(const vector<pollfd> &pollfds);
+    void service_pending_client_admissions(
+        const icecc::daemon_poll::PollReadiness &poll_ready);
     void service_pending_client_admissions_now();
     void clear_pending_client_admissions() noexcept;
     bool handle_transfer_env(Client *client, EnvTransferMsg *msg) __attribute_warn_unused_result__;
@@ -1612,7 +1614,7 @@ struct Daemon {
         return max_kids ? max_kids : (unsigned int)std::max(1, num_cpus);
     }
     bool handle_compile_file(Client *client, Msg *msg) __attribute_warn_unused_result__;
-    bool advance_p50_attachments(const std::vector<pollfd>& pollfds);
+    bool advance_p50_attachments(const icecc::daemon_poll::PollReadiness& poll_ready);
     bool handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         __attribute_warn_unused_result__;
     bool handle_activity(Client *client) __attribute_warn_unused_result__;
@@ -8327,16 +8329,12 @@ static int p50_attachment_failure_exit_code(
     return 152;
 }
 
-bool Daemon::advance_p50_attachments(const std::vector<pollfd>& pollfds)
+bool Daemon::advance_p50_attachments(const icecc::daemon_poll::PollReadiness& poll_ready)
 {
     for (const auto& entry : clients) {
         Client *client = entry.second;
         if (!client->p50_attachment) continue;
-        short revents = 0;
-        for (const auto& descriptor : pollfds)
-            if (descriptor.fd == client->p50_attachment->poll_fd())
-                revents |= descriptor.revents;
-        client->p50_attachment->advance(revents);
+        client->p50_attachment->advance(poll_ready.any(client->p50_attachment->poll_fd()));
         if (!client->p50_attachment->done()) continue;
         client->p50_attachment_result = client->p50_attachment->take_result();
         client->p50_attachment.reset();
@@ -10153,7 +10151,7 @@ bool Daemon::expire_pending_client_admissions() noexcept
 }
 
 void Daemon::service_pending_client_admissions(
-    const vector<pollfd> &pollfds)
+    const icecc::daemon_poll::PollReadiness &poll_ready)
 {
     for (auto it = pending_client_admissions.begin();
          it != pending_client_admissions.end();) {
@@ -10161,13 +10159,7 @@ void Daemon::service_pending_client_admissions(
         const int fd = current->first;
         PendingClientAdmission &admission = current->second;
         MsgChannel *channel = admission.channel.get();
-        short revents = 0;
-        for (const pollfd &descriptor : pollfds) {
-            if (descriptor.fd == fd) {
-                revents = descriptor.revents;
-                break;
-            }
-        }
+        const short revents = poll_ready.first(fd);
         if (revents == 0)
             continue;
 
@@ -10245,7 +10237,8 @@ void Daemon::service_pending_client_admissions_now()
         return;
     }
     if (result != 0)
-        service_pending_client_admissions(pollfds);
+        service_pending_client_admissions(
+            icecc::daemon_poll::PollReadiness(pollfds));
 }
 
 void Daemon::answer_client_requests()
@@ -10755,7 +10748,8 @@ void Daemon::answer_client_requests()
             return;
         reconcile_cache_route_state();
     }
-    if (advance_p50_attachments(pollfds)) {
+    const icecc::daemon_poll::PollReadiness poll_ready(pollfds);
+    if (advance_p50_attachments(poll_ready)) {
         finish_scheduler_loss_if_needed();
         return;
     }
@@ -10766,14 +10760,8 @@ void Daemon::answer_client_requests()
     if (cache_adapter != nullptr && cache_adapter_start_attempted &&
         cache_adapter->outer_pidfd() >= 0 && cache_adapter->outer_child_pid() > 1) {
         const int sidecar_pidfd = cache_adapter->outer_pidfd();
-        bool pidfd_ready = false;
-        for (const pollfd& descriptor : pollfds) {
-            if (descriptor.fd == sidecar_pidfd &&
-                (descriptor.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
-                pidfd_ready = true;
-                break;
-            }
-        }
+        const bool pidfd_ready = (poll_ready.any(sidecar_pidfd) &
+                                  (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0;
         bool delivered = false;
         if (pidfd_ready) {
             const std::optional<icecc::p50::sidecar::ReapEvent> event =
@@ -10802,13 +10790,13 @@ void Daemon::answer_client_requests()
     }
 
     if (ret > 0) {
-        if (scheduler && pollfd_is_set(pollfds, scheduler->fd, POLLOUT) &&
+        if (scheduler && poll_ready.is_set(scheduler->fd, POLLOUT) &&
             !scheduler->flush_pending()) {
             close_scheduler();
             (void)finish_scheduler_loss_if_needed();
             return;
         }
-        if (scheduler && pollfd_is_set(pollfds, scheduler->fd, POLLIN)) {
+        if (scheduler && poll_ready.is_set(scheduler->fd, POLLIN)) {
             /* A handler in this loop (e.g. scheduler_use_cs -> handle_end ->
                a failed compensating send_scheduler) can call close_scheduler()
                and null `scheduler` mid-iteration while still returning 0.  The
@@ -10878,7 +10866,7 @@ void Daemon::answer_client_requests()
             return;
         }
 
-        if (web_listen_fd != -1 && pollfd_is_set(pollfds, web_listen_fd, POLLIN)) {
+        if (web_listen_fd != -1 && poll_ready.is_set(web_listen_fd, POLLIN)) {
             handle_web_accept();
         }
 
@@ -10886,13 +10874,7 @@ void Daemon::answer_client_requests()
             const int fd = it->first;
             ++it;
 
-            short revents = 0;
-            for (const auto &pollfd : pollfds) {
-                if (pollfd.fd == fd) {
-                    revents = pollfd.revents;
-                    break;
-                }
-            }
+            const short revents = poll_ready.first(fd);
             if (revents) {
                 handle_web_connection(fd, revents);
             }
@@ -10902,7 +10884,7 @@ void Daemon::answer_client_requests()
         // another batch. This phase performs bounded nonblocking handshake IO
         // and promotion only; ordinary messages remain below the listener
         // phase, preserving admission-before-activity ordering.
-        service_pending_client_admissions(pollfds);
+        service_pending_client_admissions(poll_ready);
 
         auto accept_client_admissions_now = [&]() {
             /* Pending handshakes above can free admission capacity after the outer
@@ -11054,8 +11036,8 @@ void Daemon::answer_client_requests()
 
                 if (client->status == Client::WAITFORCHILD
                         && client->pipe_from_child >= 0
-                        && pollfd_is_set(pollfds, client->pipe_from_child,
-                                         POLLIN | POLLHUP | POLLERR)) {
+                        && poll_ready.is_set(client->pipe_from_child,
+                                             POLLIN | POLLHUP | POLLERR)) {
                     if (!handle_compile_done(client)) {
                         finish_scheduler_loss_if_needed();
                         return;
@@ -11063,7 +11045,7 @@ void Daemon::answer_client_requests()
                 }
                 if ((client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL)
                         && client->pipe_from_child >= 0
-                        && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
+                        && poll_ready.is_set(client->pipe_from_child, POLLIN)) {
                     if (!handle_env_install_child_done(client)) {
                         finish_scheduler_loss_if_needed();
                         return;
@@ -11071,8 +11053,8 @@ void Daemon::answer_client_requests()
                 }
 
                 const bool client_event = client->status == Client::WAITP50INPUT
-                    ? pollfd_is_set(pollfds, i, POLLIN | POLLHUP | POLLERR)
-                    : pollfd_is_set(pollfds, i, POLLIN);
+                    ? poll_ready.is_set(i, POLLIN | POLLHUP | POLLERR)
+                    : poll_ready.is_set(i, POLLIN);
                 if (client_event) {
                     if( client->status == Client::TOCOMPILE )
                     {
@@ -11143,7 +11125,7 @@ void Daemon::answer_client_requests()
 
             for (map<string, NativeEnvironment>::iterator it = native_environments.begin();
                  it != native_environments.end(); ) {
-                if (it->second.create_env_pipe && pollfd_is_set(pollfds, it->second.create_env_pipe, POLLIN)) {
+                if (it->second.create_env_pipe && poll_ready.is_set(it->second.create_env_pipe, POLLIN)) {
                     if(!create_env_finished(it->first))
                     {
                         native_environments.erase(it++);
