@@ -208,10 +208,20 @@ cancelled reservation retires once. Log in the same directory:
 `active-concurrent-red-r1.log`, SHA256
 `200242364ecedb15c819ccb187da39c87ed2d2357db477d2c77437313429987a`.
 This supersedes the observational probe for the successor-liveness finding.
-The product repair remains unqualified.
+The unpublished repair now passes this focused real C/F regression with
+ZSTD_TU and W30 configured: the cancelled caller receives a non-success result,
+the exact successor commits within 3 ms, two physical links are accepted,
+and C operation/raw credits drain. Explicit process status is zero. Evidence:
+`/tanksmall/scratch/tmp/p51-d07-active-current.n5c5bZ/tmp/active-cancel-recovery-r2.log`,
+SHA256 `7a376f0f9db6dae84122ec81c534071070aba509c55ce165b0bbf43d2691a9fb`.
+This establishes recovery for the three-job scenario, not actual W30
+occupancy, all profiles, or interrupted replay of multiple survivors.
+The repair remains unpublished pending broader recovery qualification;
+independent lost-confirmation and changed-reset-result tests currently fail
+in their retained-witness fixture checks and are under investigation.
 
-F reset removes cancelled reservations,
-but C's sender currently replays every unresolved suffix witness using its
+In the failing published product, F reset removes cancelled reservations,
+but C's sender replays every unresolved suffix witness using its
 old relationship ordinal. The required behavior is exact settlement followed
 by contiguous rebuilding of still-live jobs, preserving their TU identities.
 Global TU sequence values are not proof of relationship-ordinal contiguity.
