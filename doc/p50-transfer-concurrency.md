@@ -15,10 +15,10 @@ record of successful execution. Current wire definitions remain in
 The deployment clarification supersedes this plan's earlier requirements to
 preserve experimental ordinary-50/CacheWire R1 interoperability: P50 has not
 been deployed and its format remains changeable. The release obligation is
-compatibility with the user's deployed legacy P40, whose exact build must be
-identified and tested. The existing harness pins commit
-`cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`, which declares ordinary protocol 43;
-that evidence must not be relabeled as P40 coverage.
+compatibility with the user's deployed legacy P43 (corrected from P40).
+The existing harness pins commit
+`cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`, which declares ordinary protocol 43
+and matches that protocol target; qualify the final candidate against it.
 
 R2/W30 names the pipeline work; ordinary protocol 51 is its current discovery
 and selection discriminator, not the package version. Do not renumber the
