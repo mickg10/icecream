@@ -12,6 +12,33 @@ retained artifact directories.
 
 ## Developer QA
 
+### Canonical persistent-wrapper gate
+
+`make -C /work/build/unittests p51wrappercompile-check` completed with exit 0
+on the exact645 bootstrap source/build pair. All six cells pass:
+P29V1/ZSTD_TU/ZSTD_ROUTE with 2 and 100 distinct compiler invocations. Every
+remote object is compared byte-for-byte with the local reference; each cell
+observes exactly one adopted persistent R2 link and no R1 session-ready event.
+This proves wrapper-path persistence and object parity, not 30 simultaneously
+active transfers (this fixture uses one execution slot).
+
+Retained root: `/tanksmall/scratch/tmp/p51-645977c8-mixed-build/c01-run/`.
+`outer-r5.log` SHA256:
+`6dee114cf1e933bc0b30b040cc6275f4710384903228b6e98c9e96309a5e24e3`.
+The 100-job profile logs under `p51-wrapper-fixture.esX52X/` are:
+
+| Profile | Log SHA256 |
+| --- | --- |
+| P29V1 | `ee95adbe635c01c4a474c8af15c4ceed959a8f4b8573e8a0d746648d55565ea3` |
+| ZSTD_TU | `34de02517dacd7610bb4b93072b0529f62e32bd2034c37169048343d7258add8` |
+| ZSTD_ROUTE | `2df67ceb3ea885d102f70c5d4ba127412aef4753eff24256c0370891e406f721` |
+
+The SDK was `7fb2663633c0557ebc8efdc5e9fffff4a8e727ab7899ce5209753f6c30f1bfd0`,
+with a private Docker bridge, 2 CPUs/8 GiB, and the named `nobody`/`nogroup`
+test account. Authored files were unchanged against the saved513e source
+snapshot; only generated Autotools support differed. Earlier account/mount
+setup failures remain retained and are not passing or failing product tests.
+
 ### Current-runtime local R2 and concurrent mixed process checks
 
 Exact `645977c868e9ddc6429b2c0f7d266cf00508f251` built and installed through
