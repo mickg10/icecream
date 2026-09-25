@@ -2,6 +2,7 @@
 #include "cache/p50_adopted_outcome_writer.h"
 #include "unittests/support/p50_adopted_socket_lease.h"
 #include "cache/p50_slice0.h"
+#include "cache/codec/p29_wire.h"
 
 #include <zstd.h>
 
@@ -1972,6 +1973,163 @@ void test_p5co_worker_completion_is_stale_after_deadline_or_cancel() {
     }
     require(open_fd_count() == descriptor_baseline,
             "cancel-abandoned worker leaked eventfd/timerfd authority");
+}
+
+void test_p5co_cancel_keeps_materializing_bytes_charged() {
+    const P5coStoreGuids guids = p5co_store_guids(213);
+    const daemon::P50CacheSessionOutcome outcome =
+        p5co_adopted_outcome(guids, 9603);
+    const sidecar::AbsoluteMonotonicDeadline deadline =
+        p5co_deadline_after(std::chrono::seconds(2));
+    P50ServerEndpointConfig server_config;
+    server_config.owner_limits.max_pending_encoded_bytes = 2 * 1024 * 1024;
+    server_config.owner_limits.max_pending_raw_bytes = 2 * 1024 * 1024;
+    server_config.owner_limits.max_decoder_window_bytes = uint64_t{128} << 20;
+    P50ServerEndpoint server(guids.f, {}, nullptr, nullptr,
+                             std::move(server_config));
+    TestClient client(guids.c);
+    constexpr size_t raw_size = 64 * 1024;
+    const PreparedTuHandle prepared =
+        admit(client, pseudo_random_bytes(raw_size));
+    P5coTcpPair pair;
+    sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+        pair.take_server(), pair.client, outcome, deadline);
+
+    struct WorkerGate {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool entered = false;
+        bool released = false;
+        bool hook_exited = false;
+    };
+    const auto gate = std::make_shared<WorkerGate>();
+    const auto release_gate = [gate] {
+        {
+            std::lock_guard lock(gate->mutex);
+            gate->released = true;
+        }
+        gate->changed.notify_all();
+    };
+    struct ReleaseGateOnExit {
+        std::function<void()> release;
+        ~ReleaseGateOnExit() { release(); }
+    } release_on_exit{release_gate};
+    EndpointIoControl server_control;
+    server_control.before_materialize_on_worker = [gate] {
+        std::unique_lock lock(gate->mutex);
+        gate->entered = true;
+        gate->changed.notify_all();
+        gate->changed.wait(lock, [&] { return gate->released; });
+        gate->hook_exited = true;
+        gate->changed.notify_all();
+    };
+
+    asio::io_context context;
+    boost::system::error_code adoption_error;
+    std::optional<tcp::socket> client_socket =
+        P50ClientEndpoint::adopt_connected_fd(
+            context.get_executor(), pair.take_client(), adoption_error);
+    require(client_socket.has_value() && !adoption_error,
+            "credit-pin client descriptor adoption failed");
+    bool cancel_saw_worker = false;
+    bool worker_entry_timed_out = false;
+    const auto worker_entry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto poll_worker_entry = [&]() -> asio::awaitable<void> {
+        const auto executor = co_await asio::this_coro::executor;
+        asio::steady_timer poll(executor);
+        bool entered = false;
+        while (!entered && std::chrono::steady_clock::now() <
+                               worker_entry_deadline) {
+            {
+                std::lock_guard lock(gate->mutex);
+                entered = gate->entered;
+            }
+            if (entered)
+                break;
+            poll.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code error;
+            co_await poll.async_wait(
+                asio::redirect_error(asio::use_awaitable, error));
+            if (error)
+                break;
+        }
+        {
+            std::lock_guard lock(gate->mutex);
+            entered = entered || gate->entered;
+        }
+        worker_entry_timed_out = !entered;
+        cancel_saw_worker = entered;
+        server.request_cancel_for_test();
+        co_return;
+    };
+    std::future<void> poll_worker = asio::co_spawn(
+        context, poll_worker_entry(), asio::use_future);
+    std::future<ServerRunResult> server_result = asio::co_spawn(
+        context,
+        server.run_adopted(std::move(handoff), std::move(server_control)),
+        asio::use_future);
+    std::future<ClientRunResult> client_result = asio::co_spawn(
+        context,
+        client.endpoint.run(std::move(*client_socket), prepared, {},
+                            deadline.as_steady_time_point()),
+        asio::use_future);
+    context.run();
+    poll_worker.get();
+
+    bool worker_is_still_held = false;
+    {
+        std::lock_guard lock(gate->mutex);
+        worker_is_still_held = gate->entered && !gate->released;
+    }
+    const P50ServerOwnerUsage usage_while_worker_held = server.owner_usage();
+    std::cerr << "D06_CREDIT_PIN held=" << worker_is_still_held
+              << " pending_encoded=" << usage_while_worker_held.pending_encoded_bytes
+              << " pending_raw=" << usage_while_worker_held.pending_raw_bytes
+              << " decoder_window=" << usage_while_worker_held.decoder_window_bytes
+              << '\n';
+    // Always release the global codec worker before assertions, including the
+    // expected red assertion on the unfixed implementation.
+    release_gate();
+    {
+        std::unique_lock lock(gate->mutex);
+        require(gate->changed.wait_for(lock, std::chrono::seconds(2),
+                                       [&] { return gate->hook_exited; }),
+                "credit-pin worker did not leave its test barrier");
+    }
+    const ServerRunResult server_value = server_result.get();
+    const ClientRunResult client_value = client_result.get();
+    auto wait_for_worker_budget_release = [&]() -> asio::awaitable<bool> {
+        const auto executor = co_await asio::this_coro::executor;
+        asio::steady_timer poll(executor);
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (server.owner_usage().pending_raw_bytes != 0 &&
+               std::chrono::steady_clock::now() < until) {
+            poll.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code error;
+            co_await poll.async_wait(
+                asio::redirect_error(asio::use_awaitable, error));
+            if (error)
+                co_return false;
+        }
+        co_return server.owner_usage().pending_raw_bytes == 0;
+    };
+    context.restart();
+    std::future<bool> budget_drained = asio::co_spawn(
+        context, wait_for_worker_budget_release(), asio::use_future);
+    context.run();
+    const bool worker_budget_released = budget_drained.get();
+    require(!worker_entry_timed_out && cancel_saw_worker &&
+                worker_is_still_held &&
+                server_value.status == ServerRunStatus::Disconnected &&
+                client_value.status == ClientRunStatus::Disconnected &&
+                worker_budget_released,
+            "credit-pin fixture did not cancel with materialization held");
+    require(usage_while_worker_held.pending_raw_bytes >= raw_size &&
+                usage_while_worker_held.pending_encoded_bytes != 0 &&
+                usage_while_worker_held.decoder_window_bytes != 0,
+            "disconnect released pending-byte budget before worker ownership ended");
 }
 
 void test_p5co_codec_queue_is_bounded() {
@@ -4143,6 +4301,7 @@ struct R2EndpointTestJob {
     JobBind binding;
     P51SourceJobLease lease;
     PreparedInputPtr prepared;
+    std::vector<R2FillMessage> fills;
 };
 
 sidecar::AbsoluteMonotonicDeadline r2_test_deadline(
@@ -4317,14 +4476,15 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
         const Digest128 binding_digest =
             compute_r2_binding_digest(job.binding);
         const Digest128 transaction_digest = compute_r2_transaction_digest(
-            job.binding, begin, bodies,
-            std::span<const R2FillMessage>{});
+            job.binding, begin, bodies, job.fills);
         const TuEnd end{job.binding.relationship_ordinal, binding_digest,
                         transaction_digest};
 
         co_await raw_write(socket, Message{job.binding});
         co_await raw_write(socket, Message{begin});
         co_await raw_write(socket, Message{bodies.front()});
+        for (const R2FillMessage& fill : job.fills)
+            co_await raw_write(socket, Message{fill});
         co_await raw_write(socket, Message{end});
         const Frame commit_frame =
             co_await raw_read(socket, hello.max_frame_payload);
@@ -4364,6 +4524,56 @@ asio::awaitable<ServerRunResult> r2_accept_one(
     co_await acceptor.async_accept(socket, asio::use_awaitable);
     co_return co_await endpoint.run_adopted_r2(std::move(socket),
                                                 std::move(control));
+}
+
+asio::awaitable<std::array<ServerRunResult, 2>> r2_accept_two(
+    tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
+    EndpointIoControl first_control) {
+    const auto executor = co_await asio::this_coro::executor;
+    struct CompletionState {
+        std::array<std::optional<ServerRunResult>, 2> results;
+        std::array<std::exception_ptr, 2> errors;
+        size_t completed = 0;
+    };
+    const auto completion = std::make_shared<CompletionState>();
+    for (size_t index = 0; index != completion->results.size(); ++index) {
+        tcp::socket socket(executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        EndpointIoControl control = index == 0
+                                         ? first_control
+                                         : EndpointIoControl{};
+        asio::co_spawn(
+            executor,
+            endpoint.run_adopted_r2(std::move(socket), std::move(control)),
+            [completion, index](std::exception_ptr error,
+                                ServerRunResult result) {
+                completion->errors[index] = error;
+                if (!error)
+                    completion->results[index] = std::move(result);
+                ++completion->completed;
+            });
+    }
+    asio::steady_timer timer(executor);
+    const auto finish_by = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(20);
+    while (completion->completed != completion->results.size() &&
+           std::chrono::steady_clock::now() < finish_by) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        boost::system::error_code ignored;
+        co_await timer.async_wait(
+            asio::redirect_error(asio::use_awaitable, ignored));
+    }
+    require(completion->completed == completion->results.size(),
+            "two-link endpoint fixture exceeded its completion watchdog");
+    for (const std::exception_ptr& error : completion->errors)
+        if (error)
+            std::rethrow_exception(error);
+    require(completion->results[0].has_value() &&
+                completion->results[1].has_value(),
+            "two-link endpoint fixture lost one server result");
+    co_return std::array<ServerRunResult, 2>{
+        std::move(*completion->results[0]),
+        std::move(*completion->results[1])};
 }
 
 asio::awaitable<bool> r2_silent_peer(tcp::endpoint endpoint) {
@@ -4640,7 +4850,7 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
         lease.binding = binding;
         lease.binding_digest = compute_r2_binding_digest(binding);
         lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
-        jobs.push_back(R2EndpointTestJob{binding, lease, prepared[index]});
+        jobs.push_back(R2EndpointTestJob{binding, lease, prepared[index], {}});
     }
 
     std::atomic<unsigned> lookup_calls{0};
@@ -4732,6 +4942,538 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
                 "R2 F endpoint materialized different source bytes");
     }
     std::puts("P51_R2_ENDPOINT two-jobs-one-link exact-input: ok");
+}
+
+struct R2WorkerHistoryGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    size_t entered_count = 0;
+    bool release_second = false;
+    bool second_exited = false;
+};
+
+void release_r2_worker_history_gate(
+    const std::shared_ptr<R2WorkerHistoryGate>& gate) noexcept {
+    {
+        std::lock_guard lock(gate->mutex);
+        gate->release_second = true;
+    }
+    gate->changed.notify_all();
+}
+
+asio::awaitable<bool> r2_peer_observes_reset_during_second_worker(
+    tcp::endpoint endpoint, LinkHello hello,
+    std::vector<R2EndpointTestJob> jobs, std::string& failure) {
+    try {
+        (void)co_await r2_two_job_peer(endpoint, std::move(hello),
+                                      std::move(jobs));
+        co_return false;
+    } catch (const std::exception& error) {
+        // The peer must see the reset fence after submitting the complete
+        // second BODY/END; a normal two-commit CLOSE is the wrong outcome.
+        failure = error.what();
+        co_return true;
+    } catch (...) {
+        failure = "unknown peer exception";
+        co_return true;
+    }
+}
+
+void test_r2_persistent_history_charge_survives_worker_reset(ProfileId profile) {
+    require(profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_ROUTE,
+            "worker history reset fixture requires a persistent profile");
+    const P5coStoreGuids stores = p5co_store_guids(
+        0x5900 + static_cast<uint64_t>(profile));
+    const FStoreGuid replacement_f = p5co_store_guids(
+        static_cast<uint8_t>(0x90 + static_cast<unsigned>(profile))).f;
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    caps.zstd.max_history_bytes = 1U << 20;
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_speculative_tus = 3;
+    authority_limits.max_speculative_raw_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        stores.c, caps.zstd, authority_limits, 1, profile);
+    const PreparationRouteKey route{stores.f, 23, profile};
+    const sidecar::AbsoluteMonotonicDeadline deadline =
+        r2_test_deadline(std::chrono::seconds(15));
+    const std::array<std::vector<uint8_t>, 2> inputs{
+        std::vector<uint8_t>(64U << 10, static_cast<uint8_t>('A')),
+        std::vector<uint8_t>(64U << 10, static_cast<uint8_t>('A'))};
+    std::array<PreparedTuHandle, 2> handles;
+    std::array<PreparedInputPtr, 2> prepared;
+    std::array<std::vector<R2FillMessage>, 2> prepared_fills;
+    std::array<P51SourceArmFields, 2> arms;
+    std::array<P51SourceArmedFields, 2> armed;
+    for (size_t index = 0; index != inputs.size(); ++index) {
+        arms[index] = P51SourceArmFields{
+            r2_test_arm(stores.c, 5900 + index, 6900 + index, profile), 1};
+        armed[index] = r2_test_armed(
+            arms[index], stores.f, 0x5901 + index);
+        handles[index] = authority->prepare_for_route(
+            route, PrepareRequestKey{5900 + index, 6900 + index}, inputs[index]);
+        if (profile == ProfileId::P29V1) {
+            authority->pin_p29v1_system_source_reuse(handles[index], Digest128{});
+            const std::vector<uint8_t> need =
+                authority->predicted_p29v1_need(handles[index]);
+            const std::span<const uint8_t> fill =
+                authority->answer_p29v1_need(handles[index], need);
+            icecc::codec::P29WireLimits wire_limits;
+            wire_limits.max_tu_bytes =
+                static_cast<size_t>(caps.zstd.max_raw_bytes);
+            wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+            const std::vector<FillMessage> encoded =
+                encode_p29v1_fill_messages(
+                    fill, kInitialMaxFramePayload,
+                    icecc::codec::p29v1_fill_inner_bound(wire_limits));
+            prepared_fills[index].reserve(encoded.size());
+            for (const FillMessage& message : encoded)
+                prepared_fills[index].push_back(R2FillMessage{message.bytes});
+            authority->advance_p29v1_speculative(handles[index]);
+        } else {
+            authority->advance_speculative(handles[index]);
+        }
+        prepared[index] = P50PreparationAuthorityTestAccess::resolve(
+            *authority, handles[index]);
+    }
+
+    LinkHello hello;
+    hello.profile = profile;
+    hello.window = 1;
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128{armed[0].reservation_id};
+    hello.relationship_id = Id128{armed[0].logical_relationship_id};
+    hello.relationship_epoch = armed[0].relationship_epoch;
+    hello.physical_link_generation = 59;
+    hello.c_store_guid = stores.c;
+    hello.c_store_generation = arms[0].source.c_store_generation;
+    hello.f_store_guid = stores.f;
+    hello.f_store_generation = armed[0].f_store_generation;
+    hello.c_control_generation = arms[0].source.c_control_generation;
+    hello.c_control_attempt = arms[0].source.c_control_attempt;
+    hello.system_source_fingerprint = profile == ProfileId::P29V1
+        ? authority->p29v1_system_source_fingerprint(
+              handles[0])
+        : icecc::digest128("R2 held-worker ZSTD_ROUTE history fixture");
+    hello.history_nonce = prepared[0]->begin.history_nonce;
+    hello.start_mode = LinkStartMode::Initial;
+
+    std::vector<R2EndpointTestJob> jobs;
+    jobs.reserve(2);
+    for (size_t index = 0; index != inputs.size(); ++index) {
+        JobBind binding;
+        binding.reservation_id = Id128{armed[index].reservation_id};
+        binding.physical_link_generation = hello.physical_link_generation;
+        binding.relationship_ordinal = index + 1;
+        binding.wire_job_id = arms[index].source.wire_job_id;
+        binding.assignment_epoch = arms[index].source.assignment_epoch;
+        binding.assignment_nonce = arms[index].source.assignment_nonce;
+        binding.logical_job = arms[index].source.logical_job;
+        binding.compiler_attempt = arms[index].source.compiler_attempt;
+        binding.source_request_id = arms[index].source.source_request_id;
+        binding.tu_seq = prepared[index]->begin.tu_seq;
+        binding.profile = profile;
+        binding.raw_bytes = prepared[index]->begin.raw_bytes;
+        binding.raw_digest = prepared[index]->begin.raw_digest;
+        P51SourceJobLease lease;
+        lease.armed = armed[index];
+        lease.absolute_deadline = deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+        jobs.push_back(R2EndpointTestJob{
+            binding, lease, prepared[index], prepared_fills[index]});
+    }
+
+    const std::vector<uint8_t> successor_input(
+        48U << 10, static_cast<uint8_t>('B'));
+    const P51SourceArmFields successor_arm{
+        r2_test_arm(stores.c, 5902, 6902, profile), 1};
+    P51SourceArmedFields successor_armed = r2_test_armed(
+        successor_arm, replacement_f, 0x5910);
+    successor_armed.logical_relationship_id =
+        Id128::from_u64(0x5911).bytes;
+    successor_armed.relationship_epoch = armed[0].relationship_epoch + 1;
+    successor_armed.f_store_generation = armed[0].f_store_generation + 1;
+    require(successor_armed.valid(),
+            "fresh-F successor assignment is invalid after identity advance");
+    const PreparationRouteKey successor_route{
+        replacement_f, successor_armed.f_store_generation, profile};
+    const PreparedTuHandle successor_handle = authority->prepare_for_route(
+        successor_route, PrepareRequestKey{5902, 6902}, successor_input);
+    std::vector<R2FillMessage> successor_fills;
+    if (profile == ProfileId::P29V1) {
+        authority->pin_p29v1_system_source_reuse(
+            successor_handle, Digest128{});
+        const std::vector<uint8_t> need =
+            authority->predicted_p29v1_need(successor_handle);
+        const std::span<const uint8_t> fill =
+            authority->answer_p29v1_need(successor_handle, need);
+        icecc::codec::P29WireLimits wire_limits;
+        wire_limits.max_tu_bytes =
+            static_cast<size_t>(caps.zstd.max_raw_bytes);
+        wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+        const std::vector<FillMessage> encoded =
+            encode_p29v1_fill_messages(
+                fill, kInitialMaxFramePayload,
+                icecc::codec::p29v1_fill_inner_bound(wire_limits));
+        successor_fills.reserve(encoded.size());
+        for (const FillMessage& message : encoded)
+            successor_fills.push_back(R2FillMessage{message.bytes});
+        authority->advance_p29v1_speculative(successor_handle);
+    } else {
+        authority->advance_speculative(successor_handle);
+    }
+    const PreparedInputPtr successor_prepared =
+        P50PreparationAuthorityTestAccess::resolve(
+            *authority, successor_handle);
+    LinkHello successor_hello = hello;
+    successor_hello.reservation_id =
+        Id128{successor_armed.reservation_id};
+    successor_hello.relationship_id =
+        Id128{successor_armed.logical_relationship_id};
+    successor_hello.relationship_epoch = successor_armed.relationship_epoch;
+    successor_hello.physical_link_generation =
+        hello.physical_link_generation + 1;
+    successor_hello.f_store_guid = replacement_f;
+    successor_hello.f_store_generation = successor_armed.f_store_generation;
+    successor_hello.c_control_generation =
+        successor_arm.source.c_control_generation;
+    successor_hello.c_control_attempt = successor_arm.source.c_control_attempt;
+    successor_hello.system_source_fingerprint = profile == ProfileId::P29V1
+        ? authority->p29v1_system_source_fingerprint(successor_handle)
+        : icecc::digest128("R2 held-worker ZSTD_ROUTE successor fixture");
+    successor_hello.history_nonce = successor_prepared->begin.history_nonce;
+    successor_hello.start_mode = LinkStartMode::Initial;
+    JobBind successor_binding;
+    successor_binding.reservation_id = successor_hello.reservation_id;
+    successor_binding.physical_link_generation =
+        successor_hello.physical_link_generation;
+    successor_binding.relationship_ordinal = 1;
+    successor_binding.wire_job_id = successor_arm.source.wire_job_id;
+    successor_binding.assignment_epoch = successor_arm.source.assignment_epoch;
+    successor_binding.assignment_nonce = successor_arm.source.assignment_nonce;
+    successor_binding.logical_job = successor_arm.source.logical_job;
+    successor_binding.compiler_attempt = successor_arm.source.compiler_attempt;
+    successor_binding.source_request_id = successor_arm.source.source_request_id;
+    successor_binding.tu_seq = successor_prepared->begin.tu_seq;
+    successor_binding.profile = profile;
+    successor_binding.raw_bytes = successor_prepared->begin.raw_bytes;
+    successor_binding.raw_digest = successor_prepared->begin.raw_digest;
+    P51SourceJobLease successor_lease;
+    successor_lease.armed = successor_armed;
+    successor_lease.absolute_deadline = deadline;
+    successor_lease.binding = successor_binding;
+    successor_lease.binding_digest =
+        compute_r2_binding_digest(successor_binding);
+    successor_lease.input_key =
+        InputRecordKey{stores.c, successor_binding.tu_seq};
+    R2EndpointTestJob successor_job{
+        successor_binding, successor_lease, successor_prepared,
+        std::move(successor_fills)};
+
+    auto gate = std::make_shared<R2WorkerHistoryGate>();
+    struct ReleaseWorkerHistoryOnExit {
+        std::shared_ptr<R2WorkerHistoryGate> gate;
+        ~ReleaseWorkerHistoryOnExit() {
+            release_r2_worker_history_gate(gate);
+        }
+    } release_worker_on_exit{gate};
+    std::array<bool, 2> consumed{};
+    bool successor_consumed = false;
+    std::string peer_failure;
+    std::atomic<unsigned> commits{0};
+    std::atomic<unsigned> input_state_calls{0};
+    std::atomic<unsigned> unexpected_input_state_calls{0};
+    std::atomic<unsigned> acknowledged_receipts{0};
+    P50ServerEndpointConfig config;
+    config.lookup_p51_link_reservation =
+        [&](const LinkHello& observed) -> std::optional<P51SourceLinkLease> {
+            if (observed == hello) {
+                P51SourceLinkLease link{armed[0], deadline};
+                link.relationship_epoch = hello.relationship_epoch;
+                link.history_nonce = hello.history_nonce;
+                return link;
+            }
+            if (observed == successor_hello) {
+                P51SourceLinkLease link{successor_armed, deadline};
+                link.relationship_epoch = successor_hello.relationship_epoch;
+                link.history_nonce = successor_hello.history_nonce;
+                return link;
+            }
+            return std::nullopt;
+        };
+    config.consume_p51_job_reservation =
+        [&](const LinkHello& observed, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+            if (observed == hello) {
+                for (size_t index = 0; index != jobs.size(); ++index) {
+                    if (!consumed[index] && jobs[index].binding == binding) {
+                        consumed[index] = true;
+                        return jobs[index].lease;
+                    }
+                }
+                return std::nullopt;
+            }
+            if (observed == successor_hello && !successor_consumed &&
+                binding == successor_job.binding) {
+                successor_consumed = true;
+                return successor_job.lease;
+            }
+            return std::nullopt;
+        };
+    config.input_job_state =
+        [&](CStoreGuid c_guid, const TxBegin&, const TxCommit& commit,
+            std::span<const uint8_t> exact) {
+            ++input_state_calls;
+            if (c_guid == stores.c && commits.load() == 0 &&
+                commit.tu_seq == jobs[0].binding.tu_seq &&
+                std::ranges::equal(exact, inputs[0]))
+                return InputJobState::Open;
+            if (c_guid == stores.c && commits.load() == 1 &&
+                commit.tu_seq == successor_binding.tu_seq &&
+                std::ranges::equal(exact, successor_input))
+                return InputJobState::Open;
+            ++unexpected_input_state_calls;
+            return InputJobState::Closed;
+        };
+    config.record_p51_job_commit =
+        [&](const LinkHello& observed, const JobBind& binding,
+            const R2TxCommit& commit) {
+            const bool original = observed == hello &&
+                binding == jobs[0].binding &&
+                commit.relationship_ordinal == 1 &&
+                commit.inner.raw_digest == jobs[0].binding.raw_digest;
+            const bool successor = observed == successor_hello &&
+                binding == successor_job.binding &&
+                commit.relationship_ordinal == 1 &&
+                commit.inner.raw_digest == successor_job.binding.raw_digest;
+            if (!original && !successor)
+                return false;
+            ++commits;
+            return true;
+        };
+    config.acknowledge_p51_receipt =
+        [&](const LinkHello& observed, const CommitAck& ack) {
+            if ((observed != hello && observed != successor_hello) ||
+                ack.relationship_id != observed.relationship_id ||
+                ack.relationship_epoch != observed.relationship_epoch ||
+                ack.physical_link_generation != observed.physical_link_generation ||
+                ack.contiguous_verified_ordinal != 1)
+                return false;
+            ++acknowledged_receipts;
+            return true;
+        };
+    P50ServerEndpoint server(stores.f, caps, nullptr, nullptr,
+                             std::move(config));
+    EndpointIoControl server_control;
+    server_control.before_materialize_on_worker = [gate] {
+        std::unique_lock lock(gate->mutex);
+        ++gate->entered_count;
+        gate->changed.notify_all();
+        if (gate->entered_count == 2) {
+            gate->changed.wait(lock, [&] { return gate->release_second; });
+            gate->second_exited = true;
+            gate->changed.notify_all();
+        }
+    };
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           {asio::ip::address_v4::loopback(), 0});
+
+    P50ServerOwnerUsage usage_while_held;
+    P50ServerOwnerUsage usage_after_reset;
+    bool reset_observed_worker = false;
+    bool predecessor_input_exact = false;
+    bool successor_completed_while_worker_held = false;
+    bool successor_result_exact = false;
+    bool successor_attachment_exact = false;
+    bool detached_usage_drained = false;
+    std::vector<R2TxCommit> successor_commits;
+    auto reset_when_worker_held = [&]() -> asio::awaitable<void> {
+        ReleaseWorkerHistoryOnExit release_on_coroutine_exit{gate};
+        const auto executor = co_await asio::this_coro::executor;
+        asio::steady_timer poll(executor);
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(5);
+        bool held = false;
+        while (!held && std::chrono::steady_clock::now() < until) {
+            {
+                std::lock_guard lock(gate->mutex);
+                held = gate->entered_count >= 2;
+            }
+            if (held)
+                break;
+            poll.expires_after(std::chrono::milliseconds(2));
+            boost::system::error_code error;
+            co_await poll.async_wait(
+                asio::redirect_error(asio::use_awaitable, error));
+            if (error)
+                break;
+        }
+        reset_observed_worker = held;
+        if (held) {
+            usage_while_held = server.owner_usage();
+            const auto first_key = server.last_committed_input(stores.c);
+            if (first_key && first_key->tu_seq == jobs[0].binding.tu_seq) {
+                InputCursor first = server.attach_input(*first_key);
+                std::vector<uint8_t> recovered(inputs[0].size());
+                predecessor_input_exact =
+                    first.read(recovered) == recovered.size() &&
+                    recovered == inputs[0];
+            }
+            server.reset_store(replacement_f);
+            usage_after_reset = server.owner_usage();
+            std::vector<R2EndpointTestJob> successor_peer_jobs;
+            successor_peer_jobs.push_back(successor_job);
+            successor_commits = co_await r2_two_job_peer(
+                acceptor.local_endpoint(), successor_hello,
+                std::move(successor_peer_jobs));
+            successor_completed_while_worker_held = true;
+            successor_result_exact = successor_commits.size() == 1 &&
+                successor_commits[0].relationship_ordinal == 1 &&
+                successor_commits[0].inner.tu_seq ==
+                    successor_binding.tu_seq &&
+                successor_commits[0].inner.raw_digest ==
+                    successor_binding.raw_digest;
+        }
+        release_r2_worker_history_gate(gate);
+        if (held) {
+            const auto drain_until = std::chrono::steady_clock::now() +
+                                     std::chrono::seconds(3);
+            auto charges_are_zero = [&] {
+                const P50ServerOwnerUsage usage = server.owner_usage();
+                return usage.pending_raw_bytes == 0 &&
+                       usage.pending_encoded_bytes == 0 &&
+                       usage.decoder_window_bytes == 0 &&
+                       usage.detached_history_bytes == 0 &&
+                       usage.global_detached_resident_bytes == 0;
+            };
+            while (!charges_are_zero() &&
+                   std::chrono::steady_clock::now() < drain_until) {
+                poll.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code error;
+                co_await poll.async_wait(
+                    asio::redirect_error(asio::use_awaitable, error));
+                if (error)
+                    break;
+            }
+            detached_usage_drained = charges_are_zero();
+        }
+    };
+    auto reset_future = asio::co_spawn(context, reset_when_worker_held(),
+                                        asio::use_future);
+    auto server_future = asio::co_spawn(
+        context, r2_accept_two(acceptor, server, std::move(server_control)),
+        asio::use_future);
+    auto peer_future = asio::co_spawn(
+        context, r2_peer_observes_reset_during_second_worker(
+                     acceptor.local_endpoint(), hello, jobs, peer_failure),
+        asio::use_future);
+    context.run();
+    reset_future.get();
+    const std::array<ServerRunResult, 2> server_results = server_future.get();
+    const bool peer_saw_reset = peer_future.get();
+    const P50ServerOwnerUsage final_usage = server.owner_usage();
+    const auto invariant = server.global_resource_invariant_for_test();
+    {
+        InputCursor successor = server.attach_input(
+            InputRecordKey{stores.c, successor_binding.tu_seq});
+        std::vector<uint8_t> recovered(successor_input.size());
+        successor_attachment_exact =
+            successor.read(recovered) == recovered.size() &&
+            recovered == successor_input;
+    }
+    const bool charges_held_by_profile = profile == ProfileId::P29V1
+        ? usage_after_reset.global_detached_resident_bytes != 0 &&
+              usage_after_reset.detached_history_bytes == 0
+        : usage_after_reset.detached_history_bytes != 0 &&
+              usage_after_reset.global_detached_resident_bytes == 0;
+    std::cerr << "P51_R2_ENDPOINT held-worker details profile="
+              << static_cast<unsigned>(profile)
+              << " reset_observed=" << reset_observed_worker
+              << " predecessor_exact=" << predecessor_input_exact
+              << " held(raw,enc,window)=" << usage_while_held.pending_raw_bytes
+              << ',' << usage_while_held.pending_encoded_bytes << ','
+              << usage_while_held.decoder_window_bytes
+              << " reset(raw,enc,window,detached,global)="
+              << usage_after_reset.pending_raw_bytes << ','
+              << usage_after_reset.pending_encoded_bytes << ','
+              << usage_after_reset.decoder_window_bytes << ','
+              << usage_after_reset.detached_history_bytes << ','
+              << usage_after_reset.global_detached_resident_bytes
+              << " profile_charge=" << charges_held_by_profile
+              << " peer_reset=" << peer_saw_reset
+              << " peer_error=" << peer_failure
+              << " server_status(old,new)="
+              << static_cast<unsigned>(server_results[0].status) << ','
+              << static_cast<unsigned>(server_results[1].status)
+              << " commits=" << commits.load()
+              << " acked=" << acknowledged_receipts.load()
+              << " state_calls=" << input_state_calls.load()
+              << " unexpected_state_calls="
+              << unexpected_input_state_calls.load()
+              << " successor(held,exact,attach)="
+              << successor_completed_while_worker_held << ','
+              << successor_result_exact << ',' << successor_attachment_exact
+              << " consumed=" << consumed[0] << ',' << consumed[1]
+              << ',' << successor_consumed
+              << " drained=" << detached_usage_drained
+              << " final(raw,enc,window,detached,global,namespaces,revisions,records)="
+              << final_usage.pending_raw_bytes << ','
+              << final_usage.pending_encoded_bytes << ','
+              << final_usage.decoder_window_bytes << ','
+              << final_usage.detached_history_bytes << ','
+              << final_usage.global_detached_resident_bytes << ','
+              << final_usage.namespaces << ',' << final_usage.revisions << ','
+              << final_usage.retained_input_records
+              << " invariant=" << invariant.value_or("none")
+              << " terminal_detail="
+              << (server_results[0].terminal_error
+                      ? server_results[0].terminal_error->detail
+                      : std::string("none"))
+              << '\n';
+    require(reset_observed_worker && predecessor_input_exact &&
+                usage_while_held.pending_raw_bytes != 0 &&
+                usage_while_held.pending_encoded_bytes != 0 &&
+                usage_while_held.decoder_window_bytes != 0 &&
+                usage_after_reset.pending_raw_bytes != 0 &&
+                usage_after_reset.pending_encoded_bytes != 0 &&
+                usage_after_reset.decoder_window_bytes != 0 &&
+                charges_held_by_profile && peer_saw_reset &&
+                server_results[0].status != ServerRunStatus::Completed &&
+                server_results[1].status == ServerRunStatus::Completed &&
+                successor_completed_while_worker_held &&
+                successor_result_exact && successor_attachment_exact &&
+                commits.load() == 2 && acknowledged_receipts.load() == 2 &&
+                input_state_calls.load() == 2 &&
+                unexpected_input_state_calls.load() == 0 &&
+                consumed[0] && consumed[1] && successor_consumed &&
+                detached_usage_drained &&
+                final_usage.pending_raw_bytes == 0 &&
+                final_usage.pending_encoded_bytes == 0 &&
+                final_usage.decoder_window_bytes == 0 &&
+                final_usage.detached_history_bytes == 0 &&
+                final_usage.global_detached_resident_bytes == 0 &&
+                final_usage.namespaces == 1 && final_usage.revisions == 1 &&
+                final_usage.retained_input_records == 1 && !invariant,
+            std::string(profile_name(profile)) +
+                " reset did not retain and drain detached worker history exactly");
+    std::cout << "P51_R2_ENDPOINT held-worker reset/successor profile="
+              << static_cast<unsigned>(profile) << ": ok\n";
+}
+
+void test_r2_persistent_history_charge_survives_worker_reset() {
+    for (const ProfileId profile : {ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        test_r2_persistent_history_charge_survives_worker_reset(profile);
 }
 
 void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
@@ -4847,7 +5589,7 @@ void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
         lease.binding = binding;
         lease.binding_digest = compute_r2_binding_digest(binding);
         lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
-        jobs.push_back(R2EndpointTestJob{binding, lease, input});
+        jobs.push_back(R2EndpointTestJob{binding, lease, input, {}});
         consumed.push_back(false);
         return std::pair{binding, handle};
     };
@@ -8337,6 +9079,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused codec queue PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_P5CO_WORKER_CREDIT_PIN_FOCUS") != nullptr) {
+        test_p5co_cancel_keeps_materializing_bytes_charged();
+        std::cout << "p50_endpoint_test: focused materialization worker credit pin PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_ENDPOINT_MUTANT_FOCUS") != nullptr) {
         test_complete_p5co_endpoint_handoff();
         test_p5co_endpoint_absolute_deadline_and_binding();
@@ -8362,6 +9109,11 @@ int main(int argc, char** argv) {
     if (std::getenv("ICECC_P50_R2_ENDPOINT_FOCUS") != nullptr) {
         test_r2_endpoint_commits_two_jobs_on_one_link();
         std::cout << "p50_endpoint_test: focused R2 persistent-link PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_P5CO_WORKER_HISTORY_PIN_FOCUS") != nullptr) {
+        test_r2_persistent_history_charge_survives_worker_reset();
+        std::cout << "p50_endpoint_test: focused P29/ROUTE held-worker reset PASS\n";
         return 0;
     }
     if (std::getenv("ICECC_P50_R2_REPLACED_GENERATION_FOCUS") != nullptr) {
@@ -8429,6 +9181,7 @@ int main(int argc, char** argv) {
     test_r2_store_replaced_rejects_same_guid_old_generation();
     test_r2_definite_missing_reservation_is_typed_only_for_absence();
     test_r2_endpoint_commits_two_jobs_on_one_link();
+    test_r2_persistent_history_charge_survives_worker_reset();
     test_r2_fragmented_one_job_each_profile();
     test_r2_fragmented_frame_interruption_recovery();
     test_candidate_stage_has_no_revision_residue();
@@ -8455,6 +9208,7 @@ int main(int argc, char** argv) {
     test_server_completion_rechecks_after_live_callback();
     test_p5co_endpoint_fences_post_transfer_failures();
     test_p5co_worker_completion_is_stale_after_deadline_or_cancel();
+    test_p5co_cancel_keeps_materializing_bytes_charged();
     test_p5co_codec_queue_is_bounded();
     test_p5co_deadline_wins_after_owner_job_selector();
     test_adopted_endpoint_exact_zstd_and_ownership();

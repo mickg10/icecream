@@ -395,7 +395,146 @@ bool arm_absolute_deadline_timer(
     return true;
 }
 
+class ServerPendingBudgetTracker {
+public:
+    explicit ServerPendingBudgetTracker(P50ServerOwnerLimits limits,
+                                        uint64_t history_limit) noexcept
+        : limits_(limits), history_limit_(history_limit) {}
+
+    bool try_reserve(uint64_t encoded, uint64_t raw,
+                     uint64_t window) noexcept {
+        if (!try_add(encoded_, encoded, limits_.max_pending_encoded_bytes))
+            return false;
+        if (!try_add(raw_, raw, limits_.max_pending_raw_bytes)) {
+            encoded_.fetch_sub(encoded, std::memory_order_acq_rel);
+            return false;
+        }
+        if (!try_add(window_, window, limits_.max_decoder_window_bytes)) {
+            raw_.fetch_sub(raw, std::memory_order_acq_rel);
+            encoded_.fetch_sub(encoded, std::memory_order_acq_rel);
+            return false;
+        }
+        return true;
+    }
+
+    void release(uint64_t encoded, uint64_t raw,
+                 uint64_t window) noexcept {
+        encoded_.fetch_sub(encoded, std::memory_order_acq_rel);
+        raw_.fetch_sub(raw, std::memory_order_acq_rel);
+        window_.fetch_sub(window, std::memory_order_acq_rel);
+    }
+
+    P50ServerOwnerUsage usage() const noexcept {
+        return {.pending_encoded_bytes =
+                    encoded_.load(std::memory_order_acquire),
+                .pending_raw_bytes = raw_.load(std::memory_order_acquire),
+                .decoder_window_bytes =
+                    window_.load(std::memory_order_acquire),
+                .detached_history_bytes =
+                    detached_history_.load(std::memory_order_acquire)};
+    }
+
+    bool try_reserve_detached_history(uint64_t bytes) noexcept {
+        return try_add(detached_history_, bytes, history_limit_);
+    }
+
+    void release_detached_history(uint64_t bytes) noexcept {
+        detached_history_.fetch_sub(bytes, std::memory_order_acq_rel);
+    }
+
+private:
+    static bool try_add(std::atomic<uint64_t>& current, uint64_t amount,
+                        uint64_t limit) noexcept {
+        uint64_t observed = current.load(std::memory_order_acquire);
+        for (;;) {
+            if (amount > limit || observed > limit - amount)
+                return false;
+            if (current.compare_exchange_weak(
+                    observed, observed + amount, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+                return true;
+        }
+    }
+
+    const P50ServerOwnerLimits limits_;
+    const uint64_t history_limit_;
+    std::atomic<uint64_t> encoded_{0};
+    std::atomic<uint64_t> raw_{0};
+    std::atomic<uint64_t> window_{0};
+    std::atomic<uint64_t> detached_history_{0};
+};
+
+class ServerPendingBudgetLease {
+public:
+    ServerPendingBudgetLease(
+        std::shared_ptr<ServerPendingBudgetTracker> tracker,
+        uint64_t encoded, uint64_t raw, uint64_t window) noexcept
+        : tracker_(std::move(tracker)), encoded_(encoded), raw_(raw),
+          window_(window) {}
+    ServerPendingBudgetLease(const ServerPendingBudgetLease&) = delete;
+    ServerPendingBudgetLease& operator=(const ServerPendingBudgetLease&) = delete;
+
+    ~ServerPendingBudgetLease() {
+        if (reserved_)
+            tracker_->release(encoded_, raw_, window_);
+    }
+
+    bool reserve() noexcept {
+        if (reserved_ || !tracker_->try_reserve(encoded_, raw_, window_))
+            return false;
+        reserved_ = true;
+        return true;
+    }
+
+private:
+    std::shared_ptr<ServerPendingBudgetTracker> tracker_;
+    const uint64_t encoded_;
+    const uint64_t raw_;
+    const uint64_t window_;
+    bool reserved_ = false;
+};
+
+class ServerDetachedCodecHistoryLease {
+public:
+    ServerDetachedCodecHistoryLease(
+        std::shared_ptr<ServerPendingBudgetTracker> tracker,
+        uint64_t bytes) noexcept
+        : tracker_(std::move(tracker)), bytes_(bytes) {}
+    ServerDetachedCodecHistoryLease(
+        const ServerDetachedCodecHistoryLease&) = delete;
+    ServerDetachedCodecHistoryLease& operator=(
+        const ServerDetachedCodecHistoryLease&) = delete;
+    ~ServerDetachedCodecHistoryLease() {
+        if (reserved_)
+            tracker_->release_detached_history(bytes_);
+    }
+    bool reserve() noexcept {
+        if (reserved_ ||
+            !tracker_->try_reserve_detached_history(bytes_))
+            return false;
+        reserved_ = true;
+        return true;
+    }
+
+private:
+    std::shared_ptr<ServerPendingBudgetTracker> tracker_;
+    const uint64_t bytes_;
+    bool reserved_ = false;
+};
+
+struct ServerDetachedHistoryCharge {
+    std::shared_ptr<GlobalResourceModel::DetachedResidentLease>
+        p29_resident_lease;
+    std::shared_ptr<ServerDetachedCodecHistoryLease> route_history_lease;
+};
+
 struct ServerMaterializationJob {
+    // Declare the lease before worker-owned buffers so reverse member
+    // destruction releases the budget only after those buffers are gone.
+    std::shared_ptr<ServerPendingBudgetLease> budget_lease;
+    // Declared before the dialogue: reverse member destruction destroys
+    // codec/history storage before releasing either detached history charge.
+    std::shared_ptr<ServerDetachedHistoryCharge> history_charge;
     CStoreGuid c_store_guid;
     TxBegin begin;
     TxCommit commit;
@@ -404,6 +543,10 @@ struct ServerMaterializationJob {
 };
 
 struct ServerMaterializationCompletion {
+    // Keep the byte pin alive through destruction of every materialized
+    // worker-owned buffer, including PreparedPublish on stale completion.
+    std::shared_ptr<ServerPendingBudgetLease> budget_lease;
+    std::shared_ptr<ServerDetachedHistoryCharge> history_charge;
     TxBegin begin;
     TxCommit commit;
     std::shared_ptr<ProfileDialogue> dialogue;
@@ -563,9 +706,11 @@ async_materialize(ServerMaterializationJob job,
     EndpointCodecPool* const codec_pool_owner = &codec_pool;
     try {
         asio::post(codec_pool.executor(),
-               [state, codec_pool_owner, job = std::move(job)]() mutable {
+                  [state, codec_pool_owner, job = std::move(job)]() mutable {
                    EndpointCodecSlotGuard slot{codec_pool_owner};
-                   ServerMaterializationCompletion completion{
+                  ServerMaterializationCompletion completion{
+                       .budget_lease = std::move(job.budget_lease),
+                       .history_charge = std::move(job.history_charge),
                        .begin = job.begin,
                        .commit = job.commit,
                        .dialogue = std::move(job.dialogue),
@@ -2379,6 +2524,7 @@ struct P50ServerEndpoint::Impl {
     struct Pending {
         TxBegin begin;
         std::optional<JobBind> p51_binding;
+        std::shared_ptr<ServerPendingBudgetLease> budget_lease;
         std::shared_ptr<ProfileDialogue> dialogue;
         bool materializing = false;
         bool global_tu_started = false;
@@ -2389,9 +2535,6 @@ struct P50ServerEndpoint::Impl {
         Key64 global_segment_key{};
         size_t global_slot = 0;
         size_t global_segment_slot = 0;
-        uint64_t reserved_encoded_bytes = 0;
-        uint64_t reserved_raw_bytes = 0;
-        uint64_t reserved_window_bytes = 0;
         uint64_t fill_apply_ns = 0;
     };
 
@@ -2432,6 +2575,7 @@ struct P50ServerEndpoint::Impl {
         std::optional<Pending> pending;
         std::shared_ptr<ProfileDialogue> dialogue;
         std::optional<ProfileId> dialogue_profile;
+        std::shared_ptr<ServerDetachedHistoryCharge> history_charge;
         // The authenticated Protocol-50 cursor survives payload eviction, but
         // a discarded continuing codec cannot honestly mirror that cursor.
         // Advertise no route until HISTORY_RESET replaces it.
@@ -2486,8 +2630,11 @@ struct P50ServerEndpoint::Impl {
 
     Impl(FStoreGuid f_guid_value, EndpointCaps cap_value, CompletionLog* completion_log,
          ActionTrace* action_trace, P50ServerEndpointConfig config_value)
-        : f_guid(f_guid_value), caps(cap_value), completions(completion_log),
-          actions(action_trace),
+        : f_guid(f_guid_value), caps(cap_value),
+          pending_budget(std::make_shared<ServerPendingBudgetTracker>(
+              config_value.owner_limits,
+              config_value.owner_limits.max_retained_input_bytes)),
+          completions(completion_log), actions(action_trace),
           input_records(config_value.owner_limits.max_retained_input_records,
                         config_value.owner_limits.max_retained_input_bytes),
           global_resources(std::make_unique<GlobalResourceModel>(
@@ -2642,11 +2789,23 @@ struct P50ServerEndpoint::Impl {
         if (route == nullptr ||
             route->dialogue_profile != ProfileId::P29V1)
             return;
-        release_p29v1_segments(c_guid, space);
+        const bool worker_owns_dialogue =
+            !route->dialogue && route->history_charge != nullptr;
         if (route->dialogue) {
             route->dialogue->reset();
             route->dialogue.reset();
         }
+        if (worker_owns_dialogue && !space.p29v1_segments.empty()) {
+            auto charge = global_resources->retire_resident_to_detached(
+                c_guid, space.p29v1_segments);
+            route->history_charge->p29_resident_lease = std::move(charge);
+            space.p29v1_segments.clear();
+        } else {
+            release_p29v1_segments(c_guid, space);
+        }
+        // The detached job/completion keeps this small charge holder alive;
+        // dropping the route's reference lets the charge end with the worker.
+        route->history_charge.reset();
         route->dialogue_profile.reset();
         route->codec_history_reset_required = true;
     }
@@ -2804,34 +2963,18 @@ struct P50ServerEndpoint::Impl {
         const uint64_t encoded_bytes = pending.begin.body.encoded_bytes;
         const uint64_t raw_bytes = pending.begin.raw_bytes;
         const uint64_t window_bytes = uint64_t{1} << caps.zstd.max_window_log;
-        const P50ServerOwnerLimits& limits = config.owner_limits;
-        if (exceeds(pending_encoded_bytes, encoded_bytes,
-                    limits.max_pending_encoded_bytes) ||
-            exceeds(pending_raw_bytes, raw_bytes,
-                    limits.max_pending_raw_bytes) ||
-            exceeds(decoder_window_bytes, window_bytes,
-                    limits.max_decoder_window_bytes))
+        auto lease = std::make_shared<ServerPendingBudgetLease>(
+            pending_budget, encoded_bytes, raw_bytes, window_bytes);
+        if (!lease->reserve())
             throw std::length_error("F endpoint reached an aggregate pending-input bound");
-        pending_encoded_bytes += encoded_bytes;
-        pending_raw_bytes += raw_bytes;
-        decoder_window_bytes += window_bytes;
-        pending.reserved_encoded_bytes = encoded_bytes;
-        pending.reserved_raw_bytes = raw_bytes;
-        pending.reserved_window_bytes = window_bytes;
+        pending.budget_lease = std::move(lease);
     }
 
     void release_pending(Pending& pending) {
         finish_global_pending(pending, true);
-        if (pending.reserved_encoded_bytes > pending_encoded_bytes ||
-            pending.reserved_raw_bytes > pending_raw_bytes ||
-            pending.reserved_window_bytes > decoder_window_bytes)
-            throw std::logic_error("F endpoint pending-input accounting underflow");
-        pending_encoded_bytes -= pending.reserved_encoded_bytes;
-        pending_raw_bytes -= pending.reserved_raw_bytes;
-        decoder_window_bytes -= pending.reserved_window_bytes;
-        pending.reserved_encoded_bytes = 0;
-        pending.reserved_raw_bytes = 0;
-        pending.reserved_window_bytes = 0;
+        // The Pending and any dispatched materialization job share this RAII
+        // pin.  Let the Pending member release it only after its dialogue is
+        // destroyed; a worker's own reference can extend it beyond Impl/io.
     }
 
     static bool same_recovery_binding(const JobBind& left,
@@ -3220,6 +3363,13 @@ struct P50ServerEndpoint::Impl {
                 replaced_route->pending->dialogue->discard_tentative();
             release_pending(*replaced_route->pending);
             replaced_route->pending.reset();
+            if (!replaced_route->dialogue &&
+                replaced_route->history_charge) {
+                if (replaced_route->dialogue_profile == ProfileId::P29V1)
+                    invalidate_p29v1_codec(*session.c_guid, space);
+                else
+                    replaced_route->history_charge.reset();
+            }
         }
         space.active_session = session.serial;
         space.last_touch = touch;
@@ -3253,8 +3403,12 @@ struct P50ServerEndpoint::Impl {
         }
         if (route != nullptr && *session.profile == ProfileId::P29V1 &&
             route->dialogue_profile == ProfileId::P29V1 &&
-            route->dialogue && route->dialogue->terminal())
+            (!route->dialogue || route->dialogue->terminal()))
             invalidate_p29v1_codec(*session.c_guid, space);
+        else if (route != nullptr &&
+                 *session.profile == ProfileId::ZSTD_ROUTE &&
+                 !route->dialogue && route->history_charge)
+            route->history_charge.reset();
         record(ActionType::SESSION_DISCONNECTED, session);
         space.active_session = 0;
         touch_namespace_on_disconnect(*session.c_guid, space);
@@ -3352,6 +3506,7 @@ struct P50ServerEndpoint::Impl {
                             .pending = std::nullopt,
                             .dialogue = nullptr,
                             .dialogue_profile = std::nullopt,
+                            .history_charge = nullptr,
                             .codec_history_reset_required = false});
         record(ActionType::HISTORY_RESET, session);
     }
@@ -3551,13 +3706,57 @@ struct P50ServerEndpoint::Impl {
                                       begin.history_nonce, begin.rel_seq,
                                       begin.tu_seq,
                                       begin.transaction_digest)};
-        pending.materializing = true;
-        return ServerMaterializationJob{
+        const bool persistent_route =
+            begin.profile == ProfileId::P29V1 ||
+            begin.profile == ProfileId::ZSTD_ROUTE;
+        std::shared_ptr<ServerDetachedHistoryCharge> history_charge;
+        std::shared_ptr<ServerDetachedCodecHistoryLease> route_history_lease;
+        if (persistent_route && route.dialogue == pending.dialogue) {
+            history_charge = route.history_charge;
+            if (!history_charge)
+                history_charge =
+                    std::make_shared<ServerDetachedHistoryCharge>();
+            if (begin.profile == ProfileId::ZSTD_ROUTE) {
+                if (history_charge->route_history_lease)
+                    throw std::logic_error(
+                        "ZSTD_ROUTE history is already detached");
+                const uint64_t retained =
+                    pending.dialogue->retained_history_bytes();
+                if (retained != 0) {
+                    route_history_lease =
+                        std::make_shared<ServerDetachedCodecHistoryLease>(
+                            pending_budget, retained);
+                    if (!route_history_lease->reserve())
+                        throw std::length_error(
+                            "F endpoint detached route-history bound exceeded");
+                }
+            }
+        }
+        ServerMaterializationJob job{
+            .budget_lease = pending.budget_lease,
+            .history_charge = history_charge,
             .c_store_guid = *session.c_guid,
             .begin = begin,
             .commit = commit,
-            .dialogue = pending.dialogue,
+            .dialogue = std::move(pending.dialogue),
             .before_materialize = std::move(before_materialize)};
+        if (!job.dialogue)
+            throw std::logic_error(
+                "materialization dispatch lost its codec dialogue");
+        if (history_charge && route_history_lease) {
+            history_charge->route_history_lease =
+                std::move(route_history_lease);
+        }
+        pending.materializing = true;
+        if (route.dialogue == job.dialogue) {
+            // The mutable codec is worker-exclusive from this point. Clear
+            // the persistent route alias before dispatch, and require a fresh
+            // HISTORY_RESET if this operation is abandoned before restoration.
+            route.dialogue.reset();
+            route.history_charge = std::move(history_charge);
+            route.codec_history_reset_required = true;
+        }
+        return job;
     }
 
     MaterializedInput finish_materialization(
@@ -3568,18 +3767,31 @@ struct P50ServerEndpoint::Impl {
         if (!route.pending)
             throw StaleCompletion();
         Pending& pending = *route.pending;
-        if (!pending.materializing || !pending.dialogue ||
-            pending.begin != completion.begin)
+        if (!pending.materializing || pending.dialogue ||
+            !completion.dialogue || pending.begin != completion.begin)
             throw StaleCompletion();
         pending.materializing = false;
+        pending.dialogue = std::move(completion.dialogue);
         if (completion.failure)
             std::rethrow_exception(completion.failure);
-        if (!pending.dialogue ||
-            pending.dialogue->state() != ProfileDialogueState::Materialized ||
+        if (pending.dialogue->state() != ProfileDialogueState::Materialized ||
             !completion.prepared_input.valid() ||
             completion.prepared_input.key() !=
                 InputRecordKey{*session.c_guid, pending.begin.tu_seq})
             throw StaleCompletion();
+        if (pending.begin.profile == ProfileId::P29V1 ||
+            pending.begin.profile == ProfileId::ZSTD_ROUTE) {
+            if (completion.history_charge &&
+                route.history_charge != completion.history_charge)
+                throw StaleCompletion();
+            if (!route.history_charge)
+                route.history_charge =
+                    std::make_shared<ServerDetachedHistoryCharge>();
+            route.history_charge->route_history_lease.reset();
+            route.dialogue = pending.dialogue;
+            route.dialogue_profile = pending.begin.profile;
+            route.codec_history_reset_required = false;
+        }
         if (pending.begin.profile == ProfileId::P29V1) {
             const uint64_t segment_bytes =
                 pending.dialogue->pending_segment_bytes();
@@ -3750,9 +3962,7 @@ struct P50ServerEndpoint::Impl {
     std::map<uint64_t, LiveSession> live_sessions;
     std::map<CStoreGuid, Namespace> namespaces;
     std::map<CStoreGuid, Revision> revisions;
-    uint64_t pending_encoded_bytes = 0;
-    uint64_t pending_raw_bytes = 0;
-    uint64_t decoder_window_bytes = 0;
+    std::shared_ptr<ServerPendingBudgetTracker> pending_budget;
     CompletionLog* completions = nullptr;
     std::unique_ptr<ActionTrace> owned_actions;
     ActionTrace* actions = nullptr;
@@ -6489,7 +6699,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
 
             ServerMaterializationJob materialization =
                 impl_->begin_materialization(
-                    session, std::move(control.before_materialize_on_worker));
+                    session, control.before_materialize_on_worker);
             ServerMaterializationCompletion materialization_completion =
                 co_await async_materialize(std::move(materialization), io);
             require_operation();
@@ -6615,6 +6825,11 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
             impl_->release_pending(*route.pending);
         }
         impl_->invalidate_p29v1_codec(guid, space);
+        for (auto& [profile, route] : space.routes) {
+            (void)profile;
+            if (!route.dialogue && route.history_charge)
+                route.history_charge.reset();
+        }
         if (space.active_session != 0) {
             const auto live = impl_->live_sessions.find(space.active_session);
             Impl::Session invalidated{.serial = space.active_session,
@@ -6686,12 +6901,16 @@ void P50ServerEndpoint::collect_input_garbage() {
 
 P50ServerOwnerUsage P50ServerEndpoint::owner_usage() const {
     impl_->owner.check();
+    const P50ServerOwnerUsage pending = impl_->pending_budget->usage();
     return {.live_sessions = impl_->live_sessions.size(),
             .namespaces = impl_->namespaces.size(),
             .revisions = impl_->revisions.size(),
-            .pending_encoded_bytes = impl_->pending_encoded_bytes,
-            .pending_raw_bytes = impl_->pending_raw_bytes,
-            .decoder_window_bytes = impl_->decoder_window_bytes,
+            .pending_encoded_bytes = pending.pending_encoded_bytes,
+            .pending_raw_bytes = pending.pending_raw_bytes,
+            .decoder_window_bytes = pending.decoder_window_bytes,
+            .detached_history_bytes = pending.detached_history_bytes,
+            .global_detached_resident_bytes =
+                impl_->global_resources->detached_resident_bytes(),
             .retained_input_records = impl_->input_records.record_count(),
             .retained_input_bytes = impl_->input_records.retained_bytes()};
 }

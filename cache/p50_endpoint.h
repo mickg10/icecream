@@ -525,6 +525,8 @@ struct P50ServerOwnerUsage {
     uint64_t pending_encoded_bytes = 0;
     uint64_t pending_raw_bytes = 0;
     uint64_t decoder_window_bytes = 0;
+    uint64_t detached_history_bytes = 0;
+    uint64_t global_detached_resident_bytes = 0;
     size_t retained_input_records = 0;
     uint64_t retained_input_bytes = 0;
     auto operator<=>(const P50ServerOwnerUsage&) const = default;

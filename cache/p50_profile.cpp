@@ -466,6 +466,10 @@ uint64_t window_limit_bytes_route(const void* object) noexcept {
     return static_cast<const ZstdRouteDialogue*>(object)->window_limit_bytes();
 }
 
+uint64_t retained_history_bytes_route(const void* object) noexcept {
+    return static_cast<const ZstdRouteDialogue*>(object)->retained_history_bytes();
+}
+
 const TxBegin* active_begin_route(const void* object) noexcept {
     const auto& active = static_cast<const ZstdRouteDialogue*>(object)->active_begin();
     return active ? &*active : nullptr;
@@ -597,6 +601,7 @@ const ProfileDialogueVTable kZstdRouteVTable{
     .terminal = terminal_route,
     .commit_state = commit_state_route,
     .pending_body_bytes = pending_body_bytes_route,
+    .retained_history_bytes = retained_history_bytes_route,
     .window_limit_bytes = window_limit_bytes_route,
     .active_begin = active_begin_route,
 };

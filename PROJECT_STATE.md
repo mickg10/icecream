@@ -50,9 +50,9 @@ This qualifies the repaired gate against the published endpoint, not the
 in-progress worker/history repair. The earlier permissive runner's apparent
 pass did not prove intended assertions and is superseded by this evidence.
 
-### Open worker-lifetime correctness defect
+### Worker-lifetime repair and qualification
 
-Current endpoint code shares a mutable codec dialogue between the codec pool
+The earlier endpoint code shared a mutable codec dialogue between the codec pool
 worker and owner-side cancellation/replacement/reset. The completion-state
 mutex does not protect codec state; rejecting an old completion after decode
 cannot prevent an earlier concurrent mutation. This affects the common
@@ -68,10 +68,10 @@ Log: `/tanksmall/scratch/tmp/p51-d06-credit-red.TqMBA5/logs/credit-pin-red-r3.lo
 SHA256 `9fbad87a3ded117f4c295c55fad261579d3f5c855b9e1de27990b710b88537e2`.
 Earlier compile and too-small-window fixture failures are not product evidence.
 
-The repair is in progress: exclusive worker codec ownership, exact-current
+The repair implements exclusive worker codec ownership, exact-current
 completion restoration, and byte reservations that outlive the endpoint and
-its io_context when necessary. The published branch is not qualified against
-this defect. Its connection to measured farm time or F RSS is unproven.
+its io_context when necessary. Its connection to measured farm time or F RSS
+is unproven.
 
 The repair candidate passes the focused pending-credit regression and
 detached-resident model tests, including same-C eviction/re-admission,
@@ -104,8 +104,18 @@ Evidence: `/tanksmall/scratch/tmp/p51-held-worker-final.6pP4qv/logs/focused-succ
 SHA256 `362462d34cbfa087fbc6dc97183dcab1b2fcfeed292b8662720cbb321630c997`.
 This snapshot uses published `5199ed83` plus the worker repair and test
 overlays, including shared callback-completion lifetime handling. It does
-not prove independent peer-close-only recovery or optimized full-suite
-qualification; the latter is still running.
+not prove independent peer-close-only recovery.
+
+The subsequent optimized rebuild and combined endpoint, sender, route-owner,
+and resource-model suites all exited zero under a strict sequential runner.
+The endpoint suite includes both held-worker reset/successor profiles; the
+sender and route-owner suites include existing W30 recovery and both-direction
+topology cases. All eight authored repair/test files match the tested snapshot.
+Evidence: `/tanksmall/scratch/tmp/p51-held-worker-final.6pP4qv/logs/full-normal-r1.log`,
+SHA256 `2e15ccc1331e74f92a7f35d1b9b47622c0824c2aa776d3db189fdaef99bc84b2`.
+Build flags include `-O2 -std=c++23`; protocol and endpoint archives were rebuilt.
+This qualifies the worker repair against these suites, not the entire W30
+plan, independent peer-close-only coverage, or concurrent-memory checking.
 
 ### Active cancellation and mixed-load evidence gaps
 

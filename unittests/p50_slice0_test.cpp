@@ -155,6 +155,133 @@ void test_global_resource_owner() {
             "global release left resident bytes behind");
 }
 
+void test_detached_resident_history_charge() {
+    const GlobalResourceLimits limits{
+        .max_aggregate_bytes = 10,
+        .max_namespace_bytes = 8,
+        .max_staging_bytes = 8,
+        .max_total_bytes = 12,
+        .max_generation = 1,
+        .max_staging_slots = 4,
+    };
+    const CStoreGuid first = CStoreGuid::from_u64(101);
+    const CStoreGuid second = CStoreGuid::from_u64(102);
+    const Key64 first_key = *Key64::make(ObjectType::P29Segment, 0, 1);
+    const Key64 second_key = *Key64::make(ObjectType::P29Segment, 0, 2);
+    GlobalResourceModel model(limits);
+    model.admit(first);
+    model.admit(second);
+
+    const auto publish_segment = [&](CStoreGuid c_guid, Key64 segment,
+                                     uint64_t bytes, size_t slot) {
+        const Key64 input = *Key64::make(ObjectType::Blob,
+                                         segment.generation(),
+                                         segment.ordinal());
+        const Digest128 input_digest = tagged_digest(segment.ordinal() + 20);
+        const Digest128 segment_digest = tagged_digest(segment.ordinal());
+        model.start_tu(c_guid);
+        model.begin_install(c_guid, input, input_digest, 1, slot);
+        model.begin_install(c_guid, segment, segment_digest, bytes, slot + 1);
+        model.preflight_publish_pair(c_guid, segment, slot + 1,
+                                     segment_digest, input, slot,
+                                     input_digest);
+        model.publish(c_guid, segment, slot + 1, segment_digest);
+        model.publish(c_guid, input, slot, input_digest);
+        model.finish_tu(c_guid);
+        model.release(c_guid, input);
+    };
+    publish_segment(first, first_key, 4, 0);
+    publish_segment(second, second_key, 2, 2);
+    model.start_tu(first);
+    model.pin(first, first_key);
+    const std::array<Key64, 1> retired_keys{first_key};
+    require_throws<std::logic_error>(
+        [&] { (void)model.retire_resident_to_detached(first, retired_keys); },
+        "detached history discarded a live pin obligation");
+    model.unpin(first, first_key);
+    model.finish_tu(first);
+    auto detached = model.retire_resident_to_detached(first, retired_keys);
+    require(model.resident_bytes() == 6 && !model.check_invariants(),
+            "detached history disappeared from global resident accounting");
+    model.evict(first);
+    require(model.resident_bytes() == 6 && !model.check_invariants(),
+            "logical eviction dropped an outstanding detached charge");
+    model.admit(first);
+    require(model.resident_bytes() == 6 && !model.check_invariants(),
+            "same-C re-admission lost an outstanding detached charge");
+    require_throws<std::logic_error>(
+        [&] { (void)model.retire_resident_to_detached(first, retired_keys); },
+        "detached history transferred an already retired key twice");
+    const std::array<Key64, 2> duplicate_keys{second_key, second_key};
+    require_throws<std::invalid_argument>(
+        [&] { (void)model.retire_resident_to_detached(second, duplicate_keys); },
+        "detached history accepted duplicate resident keys");
+    require(model.resident_bytes() == 6 && !model.check_invariants(),
+            "rejected detached transfer mutated resource accounting");
+
+    const Key64 over_namespace = *Key64::make(ObjectType::Blob, 0, 11);
+    model.start_tu(first);
+    model.begin_install(first, over_namespace, tagged_digest(11), 5, 2);
+    require_throws<std::length_error>(
+        [&] {
+            model.publish(first, over_namespace, 2, tagged_digest(11));
+        },
+        "detached history did not count against its namespace cap");
+    model.crash_install(first, over_namespace, 2);
+    model.finish_tu(first);
+
+    const Key64 over_aggregate = *Key64::make(ObjectType::Blob, 0, 12);
+    model.start_tu(second);
+    model.begin_install(second, over_aggregate, tagged_digest(12), 5, 2);
+    require_throws<std::length_error>(
+        [&] {
+            model.publish(second, over_aggregate, 2, tagged_digest(12));
+        },
+        "detached history did not count against aggregate resident cap");
+    model.crash_install(second, over_aggregate, 2);
+    model.finish_tu(second);
+    require(model.resident_bytes() == 6 && !model.check_invariants(),
+            "failed cap checks changed detached resident charge");
+
+    const Key64 over_total = *Key64::make(ObjectType::Blob, 0, 14);
+    model.start_tu(second);
+    require_throws<std::length_error>(
+        [&] {
+            model.begin_install(second, over_total, tagged_digest(14), 7, 2);
+        },
+        "detached resident charge was omitted from total-byte admission");
+    model.finish_tu(second);
+
+    detached.reset();
+    require(model.resident_bytes() == 2 &&
+                model.detached_resident_bytes() == 0 &&
+                !model.check_invariants(),
+            "detached history charge survived its final lease");
+    const Key64 after_release = *Key64::make(ObjectType::Blob, 0, 13);
+    model.start_tu(first);
+    model.begin_install(first, after_release, tagged_digest(13), 5, 0);
+    model.publish(first, after_release, 0, tagged_digest(13));
+    model.finish_tu(first);
+    require(model.resident_bytes() == 7 && !model.check_invariants(),
+            "released detached history did not restore admission capacity");
+
+    std::shared_ptr<GlobalResourceModel::DetachedResidentLease> outliving_lease;
+    {
+        GlobalResourceModel short_lived(limits);
+        const CStoreGuid guid = CStoreGuid::from_u64(103);
+        const Key64 key = *Key64::make(ObjectType::Blob, 0, 3);
+        short_lived.admit(guid);
+        const Digest128 digest = tagged_digest(33);
+        short_lived.start_tu(guid);
+        short_lived.begin_install(guid, key, digest, 3, 0);
+        short_lived.publish(guid, key, 0, digest);
+        short_lived.finish_tu(guid);
+        const std::array<Key64, 1> keys{key};
+        outliving_lease = short_lived.retire_resident_to_detached(guid, keys);
+    }
+    outliving_lease.reset();
+}
+
 void test_interrupted_install_retry_preserves_exact_identity() {
     const GlobalResourceLimits limits{
         .max_aggregate_bytes = 64,
@@ -648,6 +775,7 @@ void test_terminal_session_serial() {
 int main() {
     test_object_arena_and_canonical_records();
     test_global_resource_owner();
+    test_detached_resident_history_charge();
     test_interrupted_install_retry_preserves_exact_identity();
     test_atomic_p29v1_pair_preflight();
     test_global_reverse_invariants_catch_mutants();

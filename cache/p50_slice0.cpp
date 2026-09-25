@@ -1119,6 +1119,35 @@ struct GlobalResourceModel::Namespace {
     std::map<Key64, Object> objects;
 };
 
+struct GlobalResourceModel::DetachedResidentBudget {
+    mutable std::mutex mutex;
+    uint64_t aggregate_bytes = 0;
+    std::map<CStoreGuid, uint64_t> namespace_bytes;
+};
+
+struct GlobalResourceModel::DetachedResidentLease::State {
+    std::shared_ptr<DetachedResidentBudget> budget;
+    CStoreGuid c_store_guid{};
+    uint64_t bytes = 0;
+    bool active = false;
+};
+
+GlobalResourceModel::DetachedResidentLease::~DetachedResidentLease() {
+    if (!state_ || !state_->active)
+        return;
+    std::lock_guard lock(state_->budget->mutex);
+    const auto position =
+        state_->budget->namespace_bytes.find(state_->c_store_guid);
+    if (position == state_->budget->namespace_bytes.end() ||
+        position->second < state_->bytes ||
+        state_->budget->aggregate_bytes < state_->bytes)
+        std::terminate();
+    position->second -= state_->bytes;
+    state_->budget->aggregate_bytes -= state_->bytes;
+    if (position->second == 0)
+        state_->budget->namespace_bytes.erase(position);
+}
+
 namespace {
 
 using GlobalObjectState = GlobalResourceModel::Object::State;
@@ -1189,7 +1218,8 @@ void write_global_trace(const GlobalResourceTrace& trace, const std::string& pat
 GlobalResourceModel::GlobalResourceModel(GlobalResourceLimits limits,
                                          GlobalResourceFaults faults,
                                          GlobalResourceTrace* trace)
-    : limits_(limits), faults_(faults), trace_(trace) {
+    : limits_(limits), faults_(faults), trace_(trace),
+      detached_budget_(std::make_shared<DetachedResidentBudget>()) {
     if (limits_.max_aggregate_bytes == 0 || limits_.max_namespace_bytes == 0 ||
         limits_.max_staging_bytes == 0 || limits_.max_total_bytes == 0 ||
         limits_.max_staging_slots == 0 ||
@@ -1385,8 +1415,22 @@ void GlobalResourceModel::preflight_publish_pair(
             namespace_bytes += candidate.bytes;
         }
     }
+    uint64_t detached_namespace_bytes = 0;
+    {
+        std::lock_guard lock(detached_budget_->mutex);
+        const auto position =
+            detached_budget_->namespace_bytes.find(c_store_guid);
+        if (position != detached_budget_->namespace_bytes.end())
+            detached_namespace_bytes = position->second;
+    }
+    if (!checked_add(namespace_bytes, detached_namespace_bytes,
+                     std::numeric_limits<uint64_t>::max()))
+        throw std::length_error(
+            "global namespace resident byte count overflows");
+    namespace_bytes += detached_namespace_bytes;
     if (!faults_.ignore_namespace_cap &&
-        !checked_add(namespace_bytes, addition, limits_.max_namespace_bytes))
+        !checked_add(namespace_bytes, addition,
+                     limits_.max_namespace_bytes))
         throw std::length_error("global namespace byte cap exceeded");
     if (!faults_.ignore_aggregate_cap &&
         !checked_add(resident_bytes(), addition, limits_.max_aggregate_bytes))
@@ -1411,6 +1455,13 @@ void GlobalResourceModel::publish(CStoreGuid c_store_guid, Key64 key, size_t slo
         if (candidate.state == GlobalObjectState::Present ||
             candidate.state == GlobalObjectState::Pinned)
             namespace_bytes += candidate.bytes;
+    {
+        std::lock_guard lock(detached_budget_->mutex);
+        const auto position =
+            detached_budget_->namespace_bytes.find(c_store_guid);
+        if (position != detached_budget_->namespace_bytes.end())
+            namespace_bytes += position->second;
+    }
     if (!faults_.ignore_namespace_cap &&
         (object.bytes > limits_.max_namespace_bytes ||
          namespace_bytes > limits_.max_namespace_bytes - object.bytes))
@@ -1481,7 +1532,8 @@ void GlobalResourceModel::crash_install(CStoreGuid c_store_guid, Key64 key, size
 
 void GlobalResourceModel::evict(CStoreGuid c_store_guid) {
     Namespace& victim = require_namespace(c_store_guid);
-    if (!victim.live || victim.active) throw std::logic_error("global eviction requires idle namespace");
+    if (!victim.live || victim.active)
+        throw std::logic_error("global eviction requires idle namespace");
     for (const auto& [key, object] : victim.objects)
         if (object.state == GlobalObjectState::Installing || object.state == GlobalObjectState::Pinned)
             throw std::logic_error("global eviction crossed a namespace lease");
@@ -1547,15 +1599,32 @@ void GlobalResourceModel::flip_guid(CStoreGuid old_guid, CStoreGuid new_guid) {
 }
 
 std::optional<std::string> GlobalResourceModel::check_invariants() const {
-    const uint64_t resident = resident_bytes();
-    const uint64_t staging = staging_bytes();
+    // Hold one coherent detached-budget snapshot for the entire invariant
+    // check. Worker lease destruction only needs this small mutex; it never
+    // calls back into the model or waits for an owner/executor.
+    std::lock_guard budget_lock(detached_budget_->mutex);
+    std::map<CStoreGuid, uint64_t> detached_by_namespace;
+    detached_by_namespace = detached_budget_->namespace_bytes;
+    const uint64_t detached_aggregate = detached_budget_->aggregate_bytes;
+    uint64_t resident = detached_aggregate;
+    uint64_t staging = 0;
+    for (const auto& [guid, space] : namespaces_)
+        for (const auto& [key, object] : space->objects) {
+            (void)guid;
+            (void)key;
+            if (object.state == GlobalObjectState::Present ||
+                object.state == GlobalObjectState::Pinned)
+                resident += object.bytes;
+            else if (object.state == GlobalObjectState::Installing)
+                staging += object.bytes;
+        }
     if (resident > limits_.max_aggregate_bytes) return "aggregate resident byte cap exceeded";
     if (staging > limits_.max_staging_bytes) return "aggregate staging byte cap exceeded";
     if (!checked_add(resident, staging, limits_.max_total_bytes))
         return "total simultaneous byte cap exceeded";
     std::map<size_t, std::pair<CStoreGuid, Key64>> reverse;
     for (const auto& [guid, space] : namespaces_) {
-        uint64_t namespace_bytes = 0;
+        uint64_t namespace_bytes = detached_by_namespace[guid];
         size_t installing_objects = 0;
         for (const auto& [key, object] : space->objects) {
             if (object.state == GlobalObjectState::Present || object.state == GlobalObjectState::Pinned)
@@ -1583,6 +1652,21 @@ std::optional<std::string> GlobalResourceModel::check_invariants() const {
             return "namespace has more than two staged objects";
         if (namespace_bytes > limits_.max_namespace_bytes) return "namespace byte cap exceeded";
     }
+    uint64_t detached_sum = 0;
+    for (const auto& [guid, detached] : detached_by_namespace) {
+        (void)guid;
+        // A detached lease can outlive logical namespace eviction. Its
+        // per-C bound must therefore be checked from the shared budget map,
+        // not only while a live Namespace node exists.
+        if (detached > limits_.max_namespace_bytes)
+            return "detached namespace byte cap exceeded";
+        if (!checked_add(detached_sum, detached,
+                         std::numeric_limits<uint64_t>::max()))
+            return "detached resident byte accounting overflows";
+        detached_sum += detached;
+    }
+    if (detached_sum != detached_aggregate)
+        return "detached resident aggregate does not match namespaces";
     if (reverse.size() != slots_.size()) return "staging slot has no INSTALLING owner";
     for (const auto& [slot, owner] : slots_)
         if (!reverse.contains(slot) || reverse.at(slot) != owner)
@@ -1595,12 +1679,17 @@ std::optional<std::string> GlobalResourceModel::check_invariants() const {
 }
 
 uint64_t GlobalResourceModel::resident_bytes() const {
-    uint64_t total = 0;
+    uint64_t total = detached_resident_bytes();
     for (const auto& [guid, space] : namespaces_)
         for (const auto& [key, object] : space->objects)
             if (object.state == GlobalObjectState::Present || object.state == GlobalObjectState::Pinned)
                 total += object.bytes;
     return total;
+}
+
+uint64_t GlobalResourceModel::detached_resident_bytes() const {
+    std::lock_guard lock(detached_budget_->mutex);
+    return detached_budget_->aggregate_bytes;
 }
 
 uint64_t GlobalResourceModel::staging_bytes() const {
@@ -1662,6 +1751,77 @@ void GlobalResourceModel::release(CStoreGuid c_store_guid, Key64 key) {
     space.objects.erase(position);
     emit({GlobalActionType::ARENA_RELEASED, c_store_guid, {}, space.generation,
           key, 0, bytes});
+}
+
+std::shared_ptr<GlobalResourceModel::DetachedResidentLease>
+GlobalResourceModel::retire_resident_to_detached(
+    CStoreGuid c_store_guid, std::span<const Key64> keys) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (keys.empty())
+        throw std::invalid_argument(
+            "detached resident transfer requires at least one object");
+
+    uint64_t bytes = 0;
+    for (size_t index = 0; index < keys.size(); ++index) {
+        for (size_t prior = 0; prior < index; ++prior)
+            if (keys[prior] == keys[index])
+                throw std::invalid_argument(
+                    "detached resident transfer contains a duplicate key");
+        const auto position = space.objects.find(keys[index]);
+        // A Pinned entry represents a separate live pin/unpin obligation.
+        // Detached worker history owns only immutable resident segment
+        // bytes; transferring a pin would silently discard that obligation.
+        if (position == space.objects.end() ||
+            position->second.state != GlobalObjectState::Present)
+            throw std::logic_error(
+                "detached resident transfer requires exact unpinned keys");
+        if (!checked_add(bytes, position->second.bytes,
+                         std::numeric_limits<uint64_t>::max()))
+            throw std::length_error(
+                "detached resident byte count overflows");
+        bytes += position->second.bytes;
+    }
+    // Complete every potentially allocating operation before changing the
+    // model. Reserving trace capacity makes the erase/record phase non-allocating.
+    auto state = std::make_shared<DetachedResidentLease::State>();
+    state->budget = detached_budget_;
+    state->c_store_guid = c_store_guid;
+    state->bytes = bytes;
+    auto lease = std::shared_ptr<DetachedResidentLease>(
+        new DetachedResidentLease(std::move(state)));
+    if (trace_ != nullptr)
+        trace_->reserve_additional(keys.size());
+
+    {
+        std::lock_guard lock(detached_budget_->mutex);
+        const auto existing =
+            detached_budget_->namespace_bytes.find(c_store_guid);
+        const uint64_t prior_namespace =
+            existing == detached_budget_->namespace_bytes.end()
+                ? 0
+                : existing->second;
+        if (detached_budget_->aggregate_bytes >
+                std::numeric_limits<uint64_t>::max() - bytes ||
+            prior_namespace > std::numeric_limits<uint64_t>::max() - bytes)
+            throw std::length_error(
+                "detached resident accounting overflows");
+        auto position = existing;
+        if (position == detached_budget_->namespace_bytes.end())
+            position = detached_budget_->namespace_bytes
+                           .try_emplace(c_store_guid, 0)
+                           .first;
+        position->second += bytes;
+        detached_budget_->aggregate_bytes += bytes;
+        lease->state_->active = true;
+    }
+    for (const Key64 key : keys) {
+        const auto position = space.objects.find(key);
+        const uint64_t object_bytes = position->second.bytes;
+        space.objects.erase(position);
+        emit({GlobalActionType::ARENA_RELEASED, c_store_guid, {},
+              space.generation, key, 0, object_bytes});
+    }
+    return lease;
 }
 
 const ImmutableObject& CObjectArena::object(Key64 key) const {

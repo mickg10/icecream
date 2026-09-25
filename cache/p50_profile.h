@@ -89,6 +89,7 @@ struct ProfileDialogueVTable {
     size_t (*pending_body_bytes)(const void*) noexcept = nullptr;
     uint64_t (*pending_segment_bytes)(const void*) noexcept = nullptr;
     Digest128 (*pending_segment_digest)(const void*) noexcept = nullptr;
+    uint64_t (*retained_history_bytes)(const void*) noexcept = nullptr;
     uint64_t (*window_limit_bytes)(const void*) noexcept = nullptr;
     const TxBegin* (*active_begin)(const void*) noexcept = nullptr;
 };
@@ -153,6 +154,11 @@ public:
         return table_->pending_segment_digest
                    ? table_->pending_segment_digest(object_)
                    : Digest128{};
+    }
+    [[nodiscard]] uint64_t retained_history_bytes() const noexcept {
+        return table_->retained_history_bytes
+                   ? table_->retained_history_bytes(object_)
+                   : 0;
     }
     [[nodiscard]] uint64_t window_limit_bytes() const noexcept {
         return table_->window_limit_bytes(object_);

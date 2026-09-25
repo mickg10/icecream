@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -154,6 +155,11 @@ struct GlobalActionRecord {
 class GlobalResourceTrace {
 public:
     void record(GlobalActionRecord action) { records_.push_back(std::move(action)); }
+    void reserve_additional(size_t count) {
+        if (count > records_.max_size() - records_.size())
+            throw std::length_error("global trace record count overflows");
+        records_.reserve(records_.size() + count);
+    }
     [[nodiscard]] const std::vector<GlobalActionRecord>& records() const { return records_; }
     void clear() { records_.clear(); }
 
@@ -189,6 +195,20 @@ struct GlobalResourceFaults {
 
 class GlobalResourceModel {
 public:
+    class DetachedResidentLease {
+    public:
+        ~DetachedResidentLease();
+        DetachedResidentLease(const DetachedResidentLease&) = delete;
+        DetachedResidentLease& operator=(const DetachedResidentLease&) = delete;
+
+    private:
+        struct State;
+        explicit DetachedResidentLease(std::shared_ptr<State> state) noexcept
+            : state_(std::move(state)) {}
+        std::shared_ptr<State> state_;
+        friend class GlobalResourceModel;
+    };
+
     explicit GlobalResourceModel(GlobalResourceLimits limits = {},
                                  GlobalResourceFaults faults = {},
                                  GlobalResourceTrace* trace = nullptr);
@@ -226,6 +246,7 @@ public:
 
     [[nodiscard]] std::optional<std::string> check_invariants() const;
     [[nodiscard]] uint64_t resident_bytes() const;
+    [[nodiscard]] uint64_t detached_resident_bytes() const;
     [[nodiscard]] uint64_t staging_bytes() const;
     [[nodiscard]] size_t live_namespace_count() const;
     [[nodiscard]] size_t free_staging_slots() const;
@@ -237,6 +258,13 @@ public:
     [[nodiscard]] bool discard_crashed_install(CStoreGuid c_store_guid,
                                                Key64 key);
     void release(CStoreGuid c_store_guid, Key64 key);
+    // Move exact unpinned resident objects into a detached lifetime charge.
+    // The model forgets the objects, but their bytes remain part of aggregate and
+    // per-namespace resident limits until the returned lease is destroyed.
+    // This is used when a codec worker outlives its endpoint owner.
+    [[nodiscard]] std::shared_ptr<DetachedResidentLease>
+    retire_resident_to_detached(CStoreGuid c_store_guid,
+                                std::span<const Key64> keys);
 
     // Exposed only so the out-of-line implementation can keep the model's
     // state opaque to callers while remaining C++23-library friendly.
@@ -244,6 +272,7 @@ public:
     struct Namespace;
 
 private:
+    struct DetachedResidentBudget;
     Namespace& require_namespace(CStoreGuid c_store_guid);
     const Namespace& require_namespace(CStoreGuid c_store_guid) const;
     void emit(GlobalActionRecord action);
@@ -251,6 +280,7 @@ private:
     GlobalResourceLimits limits_;
     GlobalResourceFaults faults_;
     GlobalResourceTrace* trace_ = nullptr;
+    std::shared_ptr<DetachedResidentBudget> detached_budget_;
     uint64_t clock_ = 0;
     std::map<CStoreGuid, std::unique_ptr<Namespace>> namespaces_;
     std::map<size_t, std::pair<CStoreGuid, Key64>> slots_;
