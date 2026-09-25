@@ -18,13 +18,17 @@ Source audit of both `ef29049c` and product `03d108a3` finds that R2 results
 leave `c_to_f_bytes`/`f_to_c_bytes` at their default zero and assign
 `attempts=1` even on recovery paths. `bind_wire_evidence()` is used only by
 the serialized R1 sender; its `ClientByteTotals` log explicitly excludes R2
-completions. The v3 service trace prints these R2 defaults without an
-availability marker. Do not interpret them as zero traffic or absence of
-replay, and do not use them to qualify R2 bandwidth acceptance.
+completions. Follow-up call-path inspection and a trace-enabled R2 run show
+that the v3 service emitter is called only by the R1 transfer path: actual
+R2 queued completion emits no source-result row. The earlier claim that it
+prints R2 defaults was incorrect. Neither missing R2 rows nor internal zero
+defaults prove zero traffic or absence of replay; they cannot qualify R2
+bandwidth acceptance.
 
-R1 accounting is separate. R2 status, identity and reuse observations are
-not byte measurements. Repair requires explicit unavailable values first,
-then measured per-job traffic plus separately identified shared recovery/
+R1 accounting is separate. R2 source-result status/identity/reuse rows also
+need an emitter on the actual queued completion path. Repair requires that
+emitter with explicit unavailable values first, then measured per-job traffic
+plus separately identified shared recovery/
 control traffic, with conservation tests. Overlapping per-job differences
 of shared counters would double count. The Implementer has been notified
 before interpreting queued W30 trace runs; existing farm runs need not be
