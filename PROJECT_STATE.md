@@ -388,10 +388,20 @@ cover StoreReplaced emission and exact-offer rejection handling:
 
 The owner run used the preceding sender snapshot; the full sender run used
 the same endpoint/owner sources plus the shared-caller rejection fix.
-These are not final combined service/restart qualification. Runtime emission
-of ReservationMissing, W30 shared rejection, wrong/stale-offer rejection
-negatives, and rejection after a validated positive receipt still need their
-dedicated gates. The real multi-link daemon fixture remains separate work.
+These are not final combined service/restart qualification. The expanded
+sender gates now pass with 30 callers sharing one rejection/connector,
+wrong-digest and stale-physical-offer rejection negatives, and preservation
+of a prior committed result plus exact replay after a sibling's rejection.
+Evidence: `logs/rejection-expanded-r3.log` under the typed-reject root above
+(SHA256 `d196519b077efdb8b3fadadf2b199b62556bc48351bf07a74bddafbd4c0d3ef7`),
+`DOCKER_EXIT=0`. Test source SHA256:
+`f20ba1e76cdfcf522a94c78c2c327cc9be61d2cd48b097ecac285f22ff4f5ebb`;
+binary: `f0962b18b36238fc33591a74ad71cee801106389c4f95ea3b7028cc55ed85103`.
+These focused selectors use the preceding committed product snapshot, not
+the in-development typed lookup. Runtime emission of ReservationMissing and
+rejection during the same original caller's ACK/recovery after a validated
+receipt remain unqualified. The real multi-link daemon fixture remains
+separate work.
 
 The current recovery service passes the scoped ZSTD_TU restart rerun for
 C1F2/F-cache and C2F1/C-cache: an established healthy sibling attaches while
