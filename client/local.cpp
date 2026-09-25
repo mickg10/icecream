@@ -71,9 +71,14 @@ static bool valid_target(const string &s)
 // Cache -dumpmachine per compiler invocation path: clang picks its default
 // target from its program name, so target-prefixed links to one binary differ.
 // A record is valid only for the same dev/ino/mtime/size of the resolved
-// binary and of the *.cfg files next to it (clang's default config files can set
-// the target; those in its build-configured user/system directories are not
-// tracked).  Written via per-process atomic rename; any I/O problem is a miss.
+// binary and of the *.cfg files next to it and in its build-configured user and
+// system config directories (default config files can set the target).  Only
+// clang can name those directories (-v lists the ones it was built with), so a
+// miss asks it and the record keeps them; an incomplete -v answer is no proof
+// that there are none and bypasses the cache, as do an @include in a tracked
+// config file and an environment override of the config (CLANG_NO_DEFAULT_CONFIG,
+// CCC_OVERRIDE_OPTIONS).
+// Written via per-process atomic rename; any I/O problem is a miss.
 static string stat_key(const struct stat &st)
 {
 #if defined(__APPLE__)
@@ -85,11 +90,16 @@ static string stat_key(const struct stat &st)
         to_string(mt.tv_nsec) + ' ' + to_string(st.st_size) + '\n';
 }
 
-static bool append_cfg_keys(const string &bindir, string &key)
+// A missing directory is keyed as such when absent_ok: a user directory need not exist.
+static bool append_cfg_keys(const string &bindir, string &key, bool absent_ok = false)
 {
     DIR *d = opendir(bindir.c_str());
-    if (!d)
-        return false;
+    if (!d) {
+        if (!absent_ok || errno != ENOENT)
+            return false;
+        key += "absent\n";
+        return true;
+    }
     vector<string> names;
     while (const struct dirent *e = readdir(d)) {
         const size_t n = strlen(e->d_name);
@@ -107,8 +117,94 @@ static bool append_cfg_keys(const string &bindir, string &key)
     return true;
 }
 
+// The record's directory section: "dirs N\n" and one line per directory.
+static string dirs_section(const vector<string> &dirs)
+{
+    string section = "dirs " + to_string(dirs.size()) + '\n';
+    for (const string &d : dirs)
+        section += d + '\n';
+    return section;
+}
+
+// Parses a directory section at pos; returns its end, or npos if malformed.
+static size_t parse_dirs(const string &text, size_t pos, vector<string> &dirs)
+{
+    size_t eol = text.find('\n', pos);
+    if (text.compare(pos, 5, "dirs ") != 0 || eol == string::npos)
+        return string::npos;
+    const unsigned long n = strtoul(text.c_str() + pos + 5, nullptr, 10);
+    for (pos = eol + 1; dirs.size() < n && n <= 2; pos = eol + 1) {
+        eol = text.find('\n', pos);
+        if (eol == string::npos || eol == pos || text[pos] != '/')
+            return string::npos;
+        dirs.push_back(text.substr(pos, eol - pos));
+    }
+    return dirs.size() == n ? pos : string::npos;
+}
+
+// clang -v (on stderr) prints its version block, then each configured config
+// directory; false unless that block is there (clang version, InstalledDir).
+static bool config_dirs(const string &compiler, vector<string> &dirs)
+{
+    static const char *const labels[] = {"System configuration file directory: ",
+                                         "User configuration file directory: "};
+    const string out = read_command_output(compiler, {"-v"}, STDERR_FILENO);
+    bool version = false, installed = false;
+    for (size_t pos = 0, eol; pos < out.size(); pos = eol + 1) {
+        eol = out.find('\n', pos);
+        if (eol == string::npos)
+            eol = out.size();
+        const string line = out.substr(pos, eol - pos);
+        version = version || line.find("clang version ") != string::npos;
+        installed = installed || line.compare(0, 14, "InstalledDir: ") == 0;
+        for (const char *label : labels) {
+            const size_t n = strlen(label);
+            if (line.size() > n && line.compare(0, n, label) == 0)
+                dirs.push_back(line.substr(n));
+        }
+    }
+    return version && installed;
+}
+
+static bool append_dir_keys(const vector<string> &dirs, string &key)
+{
+    for (const string &d : dirs) {
+        if (d.empty() || d[0] != '/')
+            return false;
+        key += "cfgs " + d + '\n';
+        if (!append_cfg_keys(d, key, true))
+            return false;
+    }
+    return true;
+}
+
+// A config file can @include a file anywhere, which no key covers: a tracked *.cfg with
+// any '@' (or one that cannot be read whole) makes a miss uncacheable.
+static bool cfg_may_include(const string &dir)
+{
+    DIR *d = opendir(dir.c_str());
+    if (!d)
+        return errno != ENOENT;
+    bool found = false;
+    while (const struct dirent *e = readdir(d)) {
+        const size_t n = strlen(e->d_name);
+        if (found || n <= 4 || strcmp(e->d_name + n - 4, ".cfg") != 0)
+            continue;
+        char buf[65536];
+        const int fd = open((dir + '/' + e->d_name).c_str(), O_RDONLY | O_CLOEXEC);
+        const ssize_t len = fd < 0 ? -1 : read(fd, buf, sizeof(buf));
+        if (fd >= 0)
+            close(fd);
+        found = len < 0 || len == static_cast<ssize_t>(sizeof(buf)) || memchr(buf, '@', len) != nullptr;
+    }
+    closedir(d);
+    return found;
+}
+
 static string cached_dumpmachine(const string &compiler)
 {
+    if (getenv("CLANG_NO_DEFAULT_CONFIG") || getenv("CCC_OVERRIDE_OPTIONS"))
+        return read_command_line(compiler, {"-dumpmachine"});
     char rp[PATH_MAX];
     struct stat st{};
     const char *resolved = realpath(compiler.c_str(), rp);
@@ -126,7 +222,8 @@ static string cached_dumpmachine(const string &compiler)
 
     string key = stat_key(st) + compiler + '\n' + resolved + '\n';
     const char *slash = strrchr(resolved, '/');
-    if (!append_cfg_keys(slash == resolved ? string("/") : string(resolved, slash - resolved), key))
+    const string bindir = slash == resolved ? string("/") : string(resolved, slash - resolved);
+    if (!append_cfg_keys(bindir, key))
         return read_command_line(compiler, {"-dumpmachine"});
     uint64_t h = 1469598103934665603ULL; // FNV-1a of the invocation path
     for (char c : compiler) {
@@ -137,24 +234,37 @@ static string cached_dumpmachine(const string &compiler)
     snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(h));
     const string cache_path = dir + "/dm-" + hex;
 
-    // Hit: the record is exactly key + target + '\n', and a target is <= 64 bytes.
+    // Hit: the record is exactly key + dirs section + the dirs' keys + target + '\n'.
     int fd = open(cache_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
-        string buf(key.size() + 66, '\0');
+        string buf(key.size() + 8192, '\0');
         size_t len = 0;
         ssize_t n = 0;
         while (len < buf.size() && (n = read(fd, &buf[len], buf.size() - len)) > 0)
             len += n;
         close(fd);
-        if (n >= 0 && len > key.size() + 1 && len < buf.size() && buf[len - 1] == '\n' &&
-            buf.compare(0, key.size(), key) == 0) {
-            string target = buf.substr(key.size(), len - key.size() - 1);
+        buf.resize(len);
+        vector<string> dirs;
+        size_t end = string::npos;
+        if (n >= 0 && len < key.size() + 8192 && buf.compare(0, key.size(), key) == 0)
+            end = parse_dirs(buf, key.size(), dirs);
+        string full = key + dirs_section(dirs);
+        if (end != string::npos && append_dir_keys(dirs, full) && len > full.size() + 1 &&
+            buf[len - 1] == '\n' && buf.compare(0, full.size(), full) == 0) {
+            string target = buf.substr(full.size(), len - full.size() - 1);
             if (valid_target(target))
                 return target;
         }
     }
 
-    // Miss: probe and cache.
+    // Miss: find clang's config directories, probe and cache.
+    vector<string> dirs;
+    if (!config_dirs(compiler, dirs))
+        return read_command_line(compiler, {"-dumpmachine"});
+    key += dirs_section(dirs);
+    if (!append_dir_keys(dirs, key) || cfg_may_include(bindir) ||
+        any_of(dirs.begin(), dirs.end(), cfg_may_include))
+        return read_command_line(compiler, {"-dumpmachine"});
     string target = read_command_line(compiler, {"-dumpmachine"});
     if (!valid_target(target))
         return target;
