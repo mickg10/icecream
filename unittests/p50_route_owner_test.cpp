@@ -885,6 +885,34 @@ void test_interned_tu_after_interner_fault_is_typed() {
     CHECK(reused_typed);
 }
 
+// A HISTORY_RESET rebuilds the route's uncommitted successor at once, so a
+// second reset of the same successor (its rebuilt TU was cut off before it
+// reached F) still finds an active P29V1 transaction; a repeated nonce is no
+// fresh history, and the successor still commits afterwards.
+void test_consecutive_history_resets_of_one_successor() {
+    P50PreparationAuthority authority(
+        Id128::from_u64(210), config().endpoint_caps.zstd,
+        config().authority_limits, config().compression_level, ProfileId::P29V1);
+    const PreparationRouteKey route{Id128::from_u64(211), 1, ProfileId::P29V1};
+    const std::vector<uint8_t> source{
+        '#', ' ', '1', ' ', '"', 'r', '"', '\n', 'x', '\n'};
+    const PreparedTuHandle successor =
+        authority.prepare_for_route(route, {8101, 1}, source);
+    CHECK(authority.reset_p29v1_route(successor, route.f_store_guid, HistoryNonce{501}) != nullptr);
+    CHECK(authority.reset_p29v1_route(successor, route.f_store_guid, HistoryNonce{502}) != nullptr);
+    bool repeated_rejected = false;
+    try {
+        (void)authority.reset_p29v1_route(successor, route.f_store_guid, HistoryNonce{502});
+    } catch (const std::invalid_argument&) {
+        repeated_rejected = true;
+    }
+    CHECK(repeated_rejected);
+    authority.pin_p29v1_system_source_reuse(
+        successor, authority.p29v1_system_source_fingerprint(successor));
+    CHECK(authority.fill_p29v1_before_need(successor).has_value());
+    authority.commit(successor);
+}
+
 void test_interner_fault_is_sticky_only_for_p29v1() {
     P50RouteOwnerConfig owner_config = config(ProfileId::P29V1);
     P50PreparationAuthority authority(
@@ -939,4 +967,5 @@ int main() {
     test_typed_poison_catch_is_owner_wide();
     test_interner_fault_is_sticky_only_for_p29v1();
     test_interned_tu_after_interner_fault_is_typed();
+    test_consecutive_history_resets_of_one_successor();
 }
