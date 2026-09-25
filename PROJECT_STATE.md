@@ -2528,7 +2528,7 @@ No Chromium build/download has been started for this implementation step.
 The separate async-service candidate passes the full `p50cacheservice` suite
 against the committed sender/endpoint. Added cases cover local reply deadline
 and peer closure, slot reuse, the global 120-reservation limit, cancellation
-and idle expiry, publication/reset lifecycle, and shutdown while an accepted
+and post-deadline slot reuse, publication/reset lifecycle, and shutdown while an accepted
 connection stalls before ordinary protocol admission completes. That last
 case verifies both operation and raw-byte credits return to zero. A second
 case completes ordinary protocol admission, observes the link-session request,
@@ -2537,7 +2537,12 @@ The optional cancellation-aware handshake polls do not extend the original deadl
 A third case observes R2 LINK_HELLO and withholds LINK_STATE. Whole-runtime
 shutdown retires the C sender on its owner executor and returns both credits.
 These tests do not yet prove cancellation during body/recovery or 120 active
-transfers. This service snapshot still uses the earlier committed sender and
+transfers. The 120-reservation test does not prove autonomous timer expiry:
+its post-wait reservation request itself calls the owner sweep. A non-sweeping
+observation before any new request, with a timer-disabled negative control,
+remains necessary for that metadata claim. This does not invalidate the
+separate unpublished-job expiry callback evidence documented above.
+This service snapshot still uses the earlier committed sender and
 endpoint, so combined qualification with the latest recovery changes remains open.
 Evidence: `/tanksmall/scratch/tmp/p51-service-own.ntIYnn/service-posthello-pass-r3.log`
 (SHA256 `5904a3ee47fb2f57d1d79a31a65ab2240072f2771bb824b4a6991b4575b3c930`);
