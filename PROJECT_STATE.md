@@ -272,6 +272,20 @@ that boundary are codec checks, not an execution of astronomical job counts.
 Earlier fixture failures and the read-only-source Automake refresh setup
 failure remain preserved and are not counted as passes.
 
+Focused repeated active-cancellation recovery on product `832ad154` passes
+ASan/UBSan/LSan (Automake PASS, exit 0). A private test wrapper warms up all
+three profiles, then repeats the all-profile batch twice in one process.
+Each measured batch returns to the warmed file-descriptor baseline of 5;
+each scenario drains tracked operation and raw-byte credits. Evidence:
+`/tanksmall/scratch/tmp/p51-d07-asan.r1/build/unittests/p50cacheservice-sanitize.log`,
+SHA256 `16c433b6ac4b4608f6aa4bfb2789fdaa7d83e46cc7a83c631434f3081dbaa176`.
+The service, sender, route owner and endpoint/protocol closure are instrumented;
+the prebuilt `services/libicecc` dependency is not. This is neither whole-program
+instrumentation nor a measured RSS/heap plateau or complete D17 qualification.
+The first build stopped on a range-loop-copy warning promoted to an error;
+the successful build retains the warning with only that warning exempted from
+`-Werror`. Its failed build log is preserved, not counted as a runtime result.
+
 Real multi-survivor replay interruption, all D07 cancellation positions/stages,
 compiler-process quiescence, and the broader external/performance gates remain
 open. This qualification is not completion of the full W30 plan. The candidate
