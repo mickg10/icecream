@@ -90,6 +90,36 @@ Final helper binary SHA256:
 The published runner differs from that older successful test copy only by
 one wording-only correction to a failure message.
 
+### Interrupted R2 BODY recovery
+
+A test-only TCP relay cuts the first R2 BODY after an early or middle payload
+prefix. All six combinations with P29V1/ZSTD_TU/ZSTD_ROUTE pass: no partial
+input is published, the original witness survives, RECOVER/RESET/CONFIRM
+reconciles the empty committed prefix, and replay produces exactly one
+materialization, commit and acknowledgment with exact attached bytes.
+The focused selector and full endpoint suite both exit 0 on the same binary.
+No production fault-injection hook was added.
+
+The relay forwards HELLO/JOB_BIND/BEGIN before the partial BODY; its trace
+checks that exact sequence. Cut counts are payload-relative, with the
+four-byte header offset reported separately. This is not exhaustive D03:
+other record boundaries, HELLO/ACK fragmentation and actual EAGAIN remain
+separate. These results use the published product, not the pending accounting
+change; combined accounting qualification is still in progress.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d03-body-recovery-r3/`.
+Test source SHA256:
+`57499065ad567cb7b41e89df4a28570f08fbf7cfe477685bb4b8e433b7357f17`.
+Binary SHA256:
+`fd09467d27ab7f51533e736c5f8ed3b02b22ef3a6e8fbd990313d1f77d5536b9`.
+Focused build/run log SHA256:
+`91c8402b188b7db2d0e6f3eea85d732f901b435ece7c76ee8959818c737cf5ac`.
+Full log `logs/full-endpoint-r3.log` SHA256:
+`b8fac637e6649a14497839cf22ff5f7da7501926824c272fe9e90ea9dbfe50d0`.
+Earlier retained failures were fixture issues: the expected proxy trace omitted
+HELLO, then a diagnostic tried to stream an optional value directly. The
+passing build still emits existing compiler/aggregate-initializer warnings.
+
 ### Successful R2 bytewise fragmentation
 
 The real client/server R2 fixture passes P29V1, ZSTD_TU and ZSTD_ROUTE
