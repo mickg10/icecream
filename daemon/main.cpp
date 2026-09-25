@@ -8331,27 +8331,47 @@ static int p50_attachment_failure_exit_code(
 
 bool Daemon::advance_p50_attachments(const icecc::daemon_poll::PollReadiness& poll_ready)
 {
+    // Advance every attachment against this snapshot before any completion
+    // handler can erase a client or close and reuse a descriptor.
+    struct FinishedAttachment {
+        MsgChannel *channel;
+        int client_id;
+        const icecc::p50::InputFdAttachmentOperation *attachment;
+    };
+    std::vector<FinishedAttachment> finished;
     for (const auto& entry : clients) {
         Client *client = entry.second;
         if (!client->p50_attachment) continue;
         client->p50_attachment->advance(poll_ready.any(client->p50_attachment->poll_fd()));
-        if (!client->p50_attachment->done()) continue;
+        if (client->p50_attachment->done())
+            finished.push_back(FinishedAttachment{entry.first, client->client_id,
+                                                  client->p50_attachment.get()});
+    }
+    for (const FinishedAttachment& completed : finished) {
+        const auto found = clients.find(completed.channel);
+        if (found == clients.end() || found->second->client_id != completed.client_id ||
+            found->second->p50_attachment.get() != completed.attachment)
+            continue;
+        Client *client = found->second;
         client->p50_attachment_result = client->p50_attachment->take_result();
         client->p50_attachment.reset();
         if (!client->p50_attachment_result || !client->p50_attachment_job) {
             handle_end(client, 146);
-            return true;
+        } else {
+            CompileFileMsg resume(client->p50_attachment_job.release(), true);
+            // Re-enter the exact ownership/ReadyLease checks before publishing
+            // the returned descriptor. The message owns the job until takeJob().
+            const bool alive = handle_compile_file(client, &resume);
+            (void)alive;
         }
-        CompileFileMsg resume(client->p50_attachment_job.release(), true);
-        // Re-enter the exact ownership/ReadyLease checks before publishing
-        // the returned descriptor. The message owns the job until takeJob().
-        const bool alive = handle_compile_file(client, &resume);
-        (void)alive;
-        // Completion may erase a client or settle the scheduler; rebuild the
-        // poll snapshot rather than reusing references from this turn.
-        return true;
+        // The caller settles a lost scheduler session before any other
+        // completion runs against it.
+        if (scheduler_loss_pending)
+            break;
     }
-    return false;
+    // Completion may erase a client or settle the scheduler; rebuild the
+    // poll snapshot rather than reusing references from this turn.
+    return !finished.empty();
 }
 
 bool Daemon::handle_compile_file(Client *client, Msg *msg)
