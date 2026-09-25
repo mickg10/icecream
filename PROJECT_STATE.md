@@ -12,7 +12,7 @@ retained artifact directories.
 
 ## Developer QA
 
-### Current full-QA failure
+### Full-QA failures and focused corrections
 
 Canonical QA on frozen `f0049371` has a confirmed service-fixture failure;
 the overall run is still in progress. AddressSanitizer reports
@@ -20,14 +20,40 @@ the overall run is still in progress. AddressSanitizer reports
 binds a temporary array at the coroutine call, which expires before
 `io_context::run()` resumes the coroutine. This is a test-helper lifetime bug,
 not evidence of a production endpoint defect. Earlier ordinary service passes
-do not establish sanitizer qualification. An owning-argument fix and focused
-plus full service sanitizer reruns are pending in an isolated tree.
+do not establish sanitizer qualification. The helper now owns the array in
+its coroutine frame. Focused and full service sanitizer reruns pass on the
+isolated c6fce0e7-based overlay described below.
 
 Retained log:
 `/tanksmall/scratch/tmp/p51-f004-qa-scratch.bxOlfG/icecream-qa-vjyj7uml/current/build/unittests/p50cacheservice-sanitize.log`,
 SHA256 `9370973a6739d6f4328e8672c647841989af3a689db029474e20e0aff2ae1f88`.
 The original full-QA snapshot remains unchanged to collect its remaining
 results. It must not be reported as passing.
+
+The lifetime correction passes all six output-cap cases (three profiles,
+W1/W30) and the full service suite under the repository's ASan/UBSan/LSan
+script compile configuration. Both test exits are zero and the generated
+`.trs` reports PASS. The private script runs the selector and full suite
+against the same instrumented binary; its compile block is unchanged and
+the generated Automake environment supplies dependencies. Prebuilt linked
+libraries retain their original build configuration; this is not a claim
+that every linked object is instrumented.
+Artifacts are under
+`/tanksmall/scratch/tmp/p51-d11-metadata-expiry-c6fce0e7/work/build/unittests/`:
+
+- `p50cacheservice-sanitize-output-cap.log`: SHA256
+  `ce26188d74d07f7254e62c1bf1ace088f824f794f49ab2e9d57f224cd463e2f2`.
+- `p50cacheservice-sanitize-full.log`: SHA256
+  `3a3d1bc9530cb26a5a6070568af508fec36ddf2e4f592cfdad908a1f4fd33a53`.
+- Instrumented binary SHA256:
+  `05cf41866a42263d89c1f37ce1592a6035c419147f17bd2c56f67308938fc66b`.
+- Qualified test-source SHA256:
+  `34b6990fb1db0884d205404c0b7aabbb412f2b17b6d42e0df9387ebb02b79d0b`.
+
+This overlay also contains the pending metadata-expiry test and predates the
+recovery-ordering correction below. Combined current-tip qualification and
+the metadata timer-deletion control remain separate work. Earlier private
+invocation/compile/link setup failures did not execute tests and are retained.
 
 The same run also fails the ordinary service suite at
 `duplicate_f_cancelled == !positive_recovery_owner`. The positive-recovery

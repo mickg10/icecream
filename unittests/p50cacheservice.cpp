@@ -5971,7 +5971,7 @@ boost::asio::awaitable<void> d11_output_cap_client(
     const SidecarLaunchIdentity& blocked_c_launch,
     const SidecarLaunchIdentity& fresh_c_launch,
     const SidecarLaunchIdentity& f_launch,
-    const std::array<P51SourceArmedFields, 3>& capped_armed,
+    std::array<P51SourceArmedFields, 3> capped_armed,
     const P51SourceArmedFields& blocked_armed,
     const P51SourceArmedFields& refill_armed,
     const std::array<std::vector<uint8_t>, 3>& capped_inputs,
