@@ -149,7 +149,19 @@ Preserved logs in the same directory:
 `asan-peer-close-selector-r1.log`, SHA256
 `3a885437919d42c510198ea207c8cadbc915273c83c07331e21fb64f0083469c`.
 An earlier invocation missing `ICEFARM_TMPDIR` failed setup and is not runtime
-evidence. Concurrent data-race checking remains separate.
+evidence.
+
+Focused TSAN executions also exit zero for reset/successor and peer-close,
+each covering P29V1 and ZSTD_ROUTE with no reported data race. Intentional-race
+preflights on host and SDK container first confirmed the runtime detects a
+race. Endpoint/test sources and protocol50/localtransport were instrumented;
+`services/libicecc.a` was not. GCC warns that `atomic_thread_fence` is not
+supported by TSAN, limiting happens-before modeling. These executions are
+not proof of whole-service race freedom. Logs in the same directory:
+`tsan-reset-build-run-r1.log`, SHA256
+`04b63d11b1e773164c400b484fdf772273b8fbd0b39ea076cb42922207fc98e8`;
+`tsan-peer-close-run-r1.log`, SHA256
+`6c101ca1426433b8482513d648567f4c56b4dc8671e93b10610eeeedb626eb07`.
 
 ### Active cancellation and mixed-load evidence gaps
 
