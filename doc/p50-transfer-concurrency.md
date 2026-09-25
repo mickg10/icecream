@@ -1099,6 +1099,19 @@ alone does not prove F cancellation. Ordinary compiler cancellation and
 quiescence require a separate real-compile observation, not a sender-only
 assertion. Work already executed cannot be retroactively described as absent.
 
+Keep the real-compiler observations distinct in the evidence. In the current
+client, `ResultDisposition::DefinitiveCancel` follows receipt of
+`CompileResult`; it rejects a completed result, not a running child. The
+daemon does not process that client's socket while in `WAITFORCHILD`.
+Therefore neither this disposition nor closing the submitter socket proves
+in-flight compiler cancellation. Test exact pre-publication cancellation
+with a real compiler-start observation. Test active child-group termination
+through the supported worker/scheduler-session-loss path separately, recording
+the old attempt, process identities, reaping, retry and unaffected sibling
+output. Label that result worker-loss quiescence, not per-job cancellation;
+it does not replace any D07 source-stage/position case or close D09's other
+restart combinations.
+
 For every case, prove surviving outputs and receipt identities, contiguous
 accepted ordinals after any required suffix rebuild, once-only settlement,
 unchanged original deadlines, and actual relevant credit drainage. F-only
