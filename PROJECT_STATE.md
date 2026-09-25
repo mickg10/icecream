@@ -12,6 +12,27 @@ retained artifact directories.
 
 ## Developer QA
 
+### Opt-in source-free diagnostics
+
+`ICECC_P50_DIAGNOSTICS=1` enables bounded retry-decision records and service
+timing/resource summaries; see [the schema and timing scope](doc/p50-cache-diagnostics.md).
+The strict SDK build, real completion-flow loss/retry gate with JSON assertions,
+full service executable, and metrics opt-in/off gate pass. Evidence directory:
+`/tanksmall/scratch/tmp/p51-diagnostics-qa.r1/logs/`.
+
+| Evidence file | SHA256 |
+| --- | --- |
+| `strict-build-r1.log` | `ea821d8cb2251dba43f773e67adb332c17156a71a7d41e5585baf00bc4e890f0` |
+| `completionflow-diagnostics-r3.log` | `50f257bb95046462cfd8659bd69436426ca2b5c998ab7f2bc1785b8e280861d7` |
+| `full-service-diagnostics-r1.log` | `9dad4e03a5bcba2bfe247d1baf624670fa3866e41d242e2157b32faec9af89dc` |
+| `service-metrics-assert-r2.log` | `dda8f831108c817eb328f1154364b10b280cf1f1b81e268d3de354396114df18` |
+
+The three runtime logs terminate with `INNER_EXIT=0`; the service check invokes
+the full executable, not an Automake result wrapper. Completion-flow ran in a
+private Docker bridge namespace. The built service source differs from the
+published source only by a timing-scope comment. This qualifies the diagnostics
+change, not later sender-ledger changes or the full W30 restart matrix.
+
 ### Pipeline formal entry point
 
 The previously qualified `make protocol50-pipeline-formal` aggregate used

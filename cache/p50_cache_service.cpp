@@ -78,6 +78,30 @@ constexpr std::string_view kExpectedSocketDigestEnvironment =
 constexpr std::string_view kReadyMessage = "READY\n";
 constexpr int kPollMilliseconds = 100;
 constexpr int kHandshakeMilliseconds = 500;
+constexpr auto kP51MetricsInterval = std::chrono::seconds(10);
+
+bool p51_metrics_requested() noexcept {
+    const char* value = std::getenv("ICECC_P50_DIAGNOSTICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+void update_atomic_max(std::atomic<uint64_t>& target,
+                       uint64_t value) noexcept {
+    uint64_t current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+           !target.compare_exchange_weak(current, value,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {}
+}
+
+uint64_t elapsed_ns(std::chrono::steady_clock::time_point start,
+                    std::chrono::steady_clock::time_point end) noexcept {
+    if (end <= start)
+        return 0;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end - start).count();
+    return elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0;
+}
 // The cache service has a five-second pre-READY budget.  Keep fingerprint
 // startup well inside it so SIGTERM cannot strand the daemon in an unbounded
 // flock/hash wait before it can retire without publishing READY.
@@ -1437,10 +1461,14 @@ struct PendingP51Transfer {
                        local::ControlOperation control_operation,
                        local::P51SourceTransferRequest source_request,
                        local::HandoffFd source_fd,
-                       std::atomic<size_t>* operation_count)
+                       std::atomic<size_t>* operation_count,
+                       bool collect_metrics)
         : connection(std::move(socket)), identity(daemon_identity),
           operation(std::move(control_operation)), request(std::move(source_request)),
-          source(std::move(source_fd)), operation_count(operation_count) {}
+          source(std::move(source_fd)), operation_count(operation_count),
+          accepted_at(collect_metrics ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{}),
+          collect_metrics(collect_metrics) {}
     ~PendingP51Transfer() { release_slot(); }
     void release_slot() noexcept {
         if (!slot_released.exchange(true, std::memory_order_acq_rel) &&
@@ -1456,6 +1484,13 @@ struct PendingP51Transfer {
     std::atomic<size_t>* operation_count = nullptr;
     std::atomic<bool> slot_released{false};
     std::atomic<bool> cancel_requested{false};
+    std::chrono::steady_clock::time_point accepted_at{};
+    std::chrono::steady_clock::time_point credit_granted_at{};
+    std::chrono::steady_clock::time_point read_started_at{};
+    std::chrono::steady_clock::time_point delivery_started_at{};
+    bool credit_granted = false;
+    bool delivery_started = false;
+    bool collect_metrics = false;
 };
 
 struct PendingP51Admission {
@@ -1805,6 +1840,15 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
             "production sidecar cannot install the route-poison test hook");
 #endif
     route_owner_ = std::make_unique<P50CRouteOwner>(std::move(route_config));
+    p51_metrics_enabled_ = p51_metrics_requested();
+    if (p51_metrics_enabled_) {
+        p51_metrics_started_at_ = std::chrono::steady_clock::now();
+        p51_metrics_next_emit_ = p51_metrics_started_at_ +
+                                 kP51MetricsInterval;
+        asio::post(context_, [this] {
+            schedule_p51_reservation_sweep_on_owner();
+        });
+    }
     endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
 }
 
@@ -2467,7 +2511,8 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
         const local::P51SourceTransferRequest request_copy = *configured;
         pending_transfer = std::make_shared<PendingP51Transfer>(
             std::move(connection), identity, std::move(operation), request_copy,
-            std::move(source), &p51_source_operation_count_);
+            std::move(source), &p51_source_operation_count_,
+            p51_metrics_enabled_);
         asio::post(p51_source_prepare_pool_, [this, pending_transfer] {
             constexpr uint16_t kInvalid = 1;
             constexpr uint16_t kExpired = 7;
@@ -2582,7 +2627,14 @@ void SidecarRuntime::post_p51_source_transfer_reply(
                 return;
             }
             const local::Identity identity = pending->identity;
-            auto settled = [pending] { pending->release_slot(); };
+            auto settled = [this, pending] {
+                if (pending->delivery_started)
+                    record_p51_timing(
+                        p51_delivery_metrics_,
+                        elapsed_ns(pending->delivery_started_at,
+                                   std::chrono::steady_clock::now()));
+                pending->release_slot();
+            };
             start_p51_transfer_reply(
                 std::move(pending->connection), identity,
                 std::move(pending->operation), std::move(result),
@@ -2740,6 +2792,15 @@ void SidecarRuntime::drain_p51_source_admissions() noexcept {
         pending_p51_source_admissions_.erase(
             pending_p51_source_admissions_.begin() +
             static_cast<std::ptrdiff_t>(*selected));
+        if (admission->transfer->collect_metrics) {
+            admission->transfer->credit_granted_at =
+                std::chrono::steady_clock::now();
+            admission->transfer->credit_granted = true;
+            record_p51_timing(
+                p51_admission_wait_metrics_,
+                elapsed_ns(admission->transfer->accepted_at,
+                           admission->transfer->credit_granted_at));
+        }
         std::shared_ptr<P51RawCredit> raw_credit;
         try {
             raw_credit = std::make_shared<P51RawCredit>(
@@ -2775,6 +2836,9 @@ bool SidecarRuntime::try_acquire_p51_source_credit(
             return false;
         ++active_p51_source_count_;
         active_source_raw_bytes_ += raw_bytes;
+        if (p51_metrics_enabled_)
+            update_atomic_max(p51_raw_bytes_high_water_,
+                              active_source_raw_bytes_);
         return true;
     } catch (...) {
         return false;
@@ -2790,6 +2854,14 @@ void SidecarRuntime::prepare_p51_source_read(
     try {
         asio::post(p51_source_prepare_pool_,
             [this, pending, profile, raw_bytes, raw_credit]() mutable {
+                if (pending->collect_metrics) {
+                    pending->read_started_at = std::chrono::steady_clock::now();
+                }
+                if (pending->collect_metrics && pending->credit_granted)
+                    record_p51_timing(
+                        p51_read_queue_metrics_,
+                        elapsed_ns(pending->credit_granted_at,
+                                   pending->read_started_at));
                 const auto deadline = pending->request.absolute_deadline
                                           .as_steady_time_point();
                 const auto raw = read_source_fd(
@@ -2803,15 +2875,26 @@ void SidecarRuntime::prepare_p51_source_read(
 #else
                     {}, {});
 #endif
+                std::chrono::steady_clock::time_point read_finished{};
+                if (pending->collect_metrics) {
+                    read_finished = std::chrono::steady_clock::now();
+                    record_p51_timing(
+                        p51_read_metrics_,
+                        elapsed_ns(pending->read_started_at, read_finished));
+                }
                 try {
                     asio::post(context_,
                         [this, pending, profile, raw_bytes, raw_credit,
-                         raw = raw]() mutable {
+                         raw = raw, read_finished]() mutable {
                             if (pending->cancel_requested.load(
                                     std::memory_order_acquire) ||
                                 p51_source_peer_closed(*pending)) {
                                 pending->release_slot();
                                 return;
+                            }
+                            if (pending->collect_metrics) {
+                                pending->delivery_started_at = read_finished;
+                                pending->delivery_started = true;
                             }
                             if (!raw.has_value()) {
                                 const uint16_t code =
@@ -3330,6 +3413,9 @@ bool SidecarRuntime::acquire_source_credit(
             return false;
         ++active_source_count_;
         active_source_raw_bytes_ += raw_bytes;
+        if (p51_metrics_enabled_)
+            update_atomic_max(p51_raw_bytes_high_water_,
+                              active_source_raw_bytes_);
         return true;
     } catch (...) {
         return false;
@@ -3486,6 +3572,7 @@ SidecarRuntime::~SidecarRuntime() {
     endpoint_work_guard_.reset();
     if (endpoint_owner_thread_.joinable())
         endpoint_owner_thread_.join();
+    emit_p51_metrics(true);
 }
 
 void SidecarRuntime::endpoint_owner_loop() noexcept {
@@ -4152,6 +4239,9 @@ void SidecarRuntime::schedule_p51_reservation_sweep_on_owner() noexcept {
         if (!next_expiry || expiry < *next_expiry)
             next_expiry = expiry;
     }
+    if (p51_metrics_enabled_ &&
+        (!next_expiry || p51_metrics_next_emit_ < *next_expiry))
+        next_expiry = p51_metrics_next_emit_;
     boost::system::error_code ignored;
     if (!next_expiry) {
         p51_reservation_sweep_timer_.cancel(ignored);
@@ -4164,6 +4254,13 @@ void SidecarRuntime::schedule_p51_reservation_sweep_on_owner() noexcept {
         if (error || stop_requested_.load(std::memory_order_acquire))
             return;
         sweep_p51_reservations_on_owner();
+        const auto now = std::chrono::steady_clock::now();
+        if (p51_metrics_enabled_ && now >= p51_metrics_next_emit_) {
+            emit_p51_metrics(false);
+            do {
+                p51_metrics_next_emit_ += kP51MetricsInterval;
+            } while (p51_metrics_next_emit_ <= now);
+        }
         schedule_p51_reservation_sweep_on_owner();
     });
 }
@@ -5657,6 +5754,86 @@ void SidecarRuntime::stop() noexcept {
 
 size_t SidecarRuntime::live_session_count() const {
     return live_sessions_.load(std::memory_order_acquire);
+}
+
+void SidecarRuntime::record_p51_timing(
+    P51TimingCounters& counters, uint64_t elapsed_ns) noexcept {
+    if (!p51_metrics_enabled_)
+        return;
+    counters.count.fetch_add(1, std::memory_order_relaxed);
+    counters.total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+    uint64_t current = counters.max_ns.load(std::memory_order_relaxed);
+    while (current < elapsed_ns &&
+           !counters.max_ns.compare_exchange_weak(
+               current, elapsed_ns, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {}
+}
+
+void SidecarRuntime::emit_p51_metrics(bool final_snapshot) noexcept {
+    if (!p51_metrics_enabled_)
+        return;
+    /* Timing populations cover accepted P51/R2 source operations only;
+       delivery includes owner-executor queuing and transfer/reply settlement,
+       not codec-only work. Operations cancelled before reply settlement are
+       absent from delivery. Raw-byte current/high-water fields report the
+       shared source budget, including legacy R1 users. Periodic atomic
+       snapshots are best-effort; the stop snapshot follows runtime joins. */
+    uint64_t raw_current = 0;
+    size_t credit_count = 0;
+    {
+        std::lock_guard lock(source_admission_mutex_);
+        raw_current = active_source_raw_bytes_;
+        credit_count = active_p51_source_count_;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - p51_metrics_started_at_).count();
+    const auto series_values = [](const P51TimingCounters& counters) {
+        return std::array<uint64_t, 3>{
+            counters.count.load(std::memory_order_relaxed),
+            counters.total_ns.load(std::memory_order_relaxed),
+            counters.max_ns.load(std::memory_order_relaxed)};
+    };
+    const auto admission = series_values(p51_admission_wait_metrics_);
+    const auto read_queue = series_values(p51_read_queue_metrics_);
+    const auto read = series_values(p51_read_metrics_);
+    const auto delivery = series_values(p51_delivery_metrics_);
+    char line[1024];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "P51_SERVICE_METRICS {\"v\":1,\"pid\":%ld,\"elapsed_ms\":%lld,"
+        "\"snapshot\":\"%s\",\"consistency\":\"%s\","
+        "\"raw_bytes_current\":%llu,\"raw_bytes_high_water\":%llu,"
+        "\"raw_bytes_limit\":%llu,\"active_p51_credit_count\":%llu,"
+        "\"admission_wait\":{\"count\":%llu,\"total_ns\":%llu,\"max_ns\":%llu},"
+        "\"read_queue\":{\"count\":%llu,\"total_ns\":%llu,\"max_ns\":%llu},"
+        "\"read\":{\"count\":%llu,\"total_ns\":%llu,\"max_ns\":%llu},"
+        "\"delivery\":{\"count\":%llu,\"total_ns\":%llu,\"max_ns\":%llu}}\n",
+        static_cast<long>(::getpid()), static_cast<long long>(elapsed_ms),
+        final_snapshot ? "stop" : "periodic",
+        final_snapshot ? "final" : "best_effort",
+        static_cast<unsigned long long>(raw_current),
+        static_cast<unsigned long long>(
+            p51_raw_bytes_high_water_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(config_.max_aggregate_source_raw_bytes),
+        static_cast<unsigned long long>(credit_count),
+        static_cast<unsigned long long>(admission[0]),
+        static_cast<unsigned long long>(admission[1]),
+        static_cast<unsigned long long>(admission[2]),
+        static_cast<unsigned long long>(read_queue[0]),
+        static_cast<unsigned long long>(read_queue[1]),
+        static_cast<unsigned long long>(read_queue[2]),
+        static_cast<unsigned long long>(read[0]),
+        static_cast<unsigned long long>(read[1]),
+        static_cast<unsigned long long>(read[2]),
+        static_cast<unsigned long long>(delivery[0]),
+        static_cast<unsigned long long>(delivery[1]),
+        static_cast<unsigned long long>(delivery[2]));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    flockfile(stderr);
+    (void)std::fwrite(line, 1, static_cast<size_t>(length), stderr);
+    funlockfile(stderr);
 }
 
 bool parse_options(int argc, char* const argv[], Options& options, bool& show_help) noexcept {

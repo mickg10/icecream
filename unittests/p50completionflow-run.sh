@@ -1691,6 +1691,67 @@ if grep -E 'building myself, but telling localhost|requesting one fresh strict-P
     exit 1
 fi
 
+# Retry diagnostics are opt-in and contain fixed classifications only.  The
+# completion-flow gate exercises the worker-transport classification and the
+# production one-shot retry/suppression decisions.
+python3 - "$work/fresh-retry.out" \
+    "$work/bounded-strict-retry.out" \
+    "$work/scheduler-loss-retry.out" \
+    "${ICECC_P50_DIAGNOSTICS:-0}" <<'PY'
+import json
+import sys
+
+paths = sys.argv[1:4]
+enabled = sys.argv[4] == "1"
+prefix = "P50_RETRY_DIAG "
+records = []
+for path in paths:
+    parsed = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if line.startswith(prefix):
+            row = json.loads(line[len(prefix):])
+            if set(row) != {"v", "event", "decision", "reason", "stage",
+                            "original_code", "strict"}:
+                raise SystemExit("FAIL: retry diagnostic schema is not bounded")
+            if row["v"] != 1 or row["event"] != "retry_decision" or \
+                    row["reason"] not in {"source_transfer", "worker_resource",
+                                          "worker_transport", "unknown"} or \
+                    row["stage"] not in {"source_transfer", "compile_result",
+                                         "remote_assignment", "unknown"} or \
+                    type(row["original_code"]) is not int or \
+                    row["strict"] not in (0, 1):
+                raise SystemExit("FAIL: retry diagnostic values are invalid")
+            parsed.append(row)
+    records.append(parsed)
+
+if not enabled:
+    if any(records):
+        raise SystemExit("FAIL: opt-out wrapper emitted P50_RETRY_DIAG")
+else:
+    fresh, bounded, scheduler_loss = records
+    if not any(row["decision"] == "retry_requested" and
+               row["reason"] == "worker_transport" and
+               row["stage"] == "remote_assignment" and
+               row["original_code"] == 107 and row["strict"] == 0
+               for row in fresh):
+        raise SystemExit("FAIL: source-loss retry diagnostic is missing")
+    if sum(row["decision"] == "retry_requested" for row in bounded) != 1 or \
+            sum(row["decision"] == "suppressed_one_shot" for row in bounded) != 1:
+        raise SystemExit("FAIL: bounded retry diagnostics omit retry/suppression")
+    if not all(row["reason"] == "worker_transport" and
+               row["stage"] == "remote_assignment" and
+               row["original_code"] == 107 and row["strict"] == 1
+               for row in bounded):
+        raise SystemExit("FAIL: bounded retry diagnostics changed classification")
+    if not any(row["decision"] == "retry_requested" and
+               row["reason"] == "worker_transport" and
+               row["stage"] == "remote_assignment" and
+               row["original_code"] == 14 and row["strict"] == 0
+               for row in scheduler_loss):
+        raise SystemExit("FAIL: scheduler-loss retry diagnostic is missing")
+    print("PASS: opt-in P50_RETRY_DIAG schema/classification/retry bound")
+PY
+
 # The fault/barrier seams remain absent from the shipped wrapper.
 for selector in \
     ICECC_P50_TEST_FRESH_STRICT_RETRY \

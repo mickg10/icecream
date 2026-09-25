@@ -1329,7 +1329,11 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                                   << ")" << endl;
                     throw remote_error(
                         106,
-                        "Error 106 - P50 cache source transfer did not commit exactly");
+                        "Error 106 - P50 cache source transfer did not commit exactly",
+                        P50RetryDiagnostic{
+                            P50RetryReason::SourceTransfer,
+                            P50RetryStage::SourceTransfer,
+                            static_cast<int>(transfer.error_code)});
                 }
                 job.setCompileInputIdentity(*identity);
                 trace() << p50_profile_name
@@ -1930,7 +1934,10 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                 throw remote_error(
                     106,
                     "Error 106 - P50 worker resource failure before exact completion",
-                    failed_host, failed_port);
+                    failed_host, failed_port,
+                    P50RetryDiagnostic{
+                        P50RetryReason::WorkerResource,
+                        P50RetryStage::CompileResult, error.errorCode});
             }
             publish_p50_observation();
             delete usecs;
@@ -1938,7 +1945,8 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                 p50_cache_retry_avoid_is_present(
                     failed_port, failed_host)) {
                 throw remote_error(
-                    error.errorCode, error.what(), failed_host, failed_port);
+                    error.errorCode, error.what(), failed_host, failed_port,
+                    error.p50RetryDiagnostic);
             }
             throw;
         } catch (const client_error &error) {
@@ -1966,7 +1974,10 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                 throw remote_error(
                     106,
                     "Error 106 - P50 worker transport failed before exact completion",
-                    failed_host, failed_port);
+                    failed_host, failed_port,
+                    P50RetryDiagnostic{
+                        P50RetryReason::WorkerTransport,
+                        P50RetryStage::RemoteAssignment, error.errorCode});
             }
             throw;
         } catch(...) {

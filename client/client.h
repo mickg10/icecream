@@ -168,20 +168,47 @@ class client_error :  public std::runtime_error
     const int errorCode;
 };
 
+enum class P50RetryReason : uint8_t
+{
+    Unknown = 0,
+    SourceTransfer = 1,
+    WorkerResource = 2,
+    WorkerTransport = 3
+};
+
+enum class P50RetryStage : uint8_t
+{
+    Unknown = 0,
+    SourceTransfer = 1,
+    CompileResult = 2,
+    RemoteAssignment = 3
+};
+
+struct P50RetryDiagnostic
+{
+    P50RetryReason reason = P50RetryReason::Unknown;
+    P50RetryStage stage = P50RetryStage::Unknown;
+    int original_code = 0;
+};
+
 class remote_error : public client_error
 {
     public:
-    remote_error(int code, const std::string& what)
+    remote_error(int code, const std::string& what,
+                 P50RetryDiagnostic retry_diagnostic = {})
     : client_error(code, what)
     , retryAvoidPort(0)
+    , p50RetryDiagnostic(retry_diagnostic)
     {}
 
     remote_error(int code, const std::string& what,
                  std::string retry_avoid_host,
-                 uint32_t retry_avoid_port)
+                 uint32_t retry_avoid_port,
+                 P50RetryDiagnostic retry_diagnostic = {})
     : client_error(code, what)
     , retryAvoidHost(std::move(retry_avoid_host))
     , retryAvoidPort(retry_avoid_port)
+    , p50RetryDiagnostic(retry_diagnostic)
     {}
 
     [[nodiscard]] bool hasRetryAvoidEndpoint() const noexcept
@@ -192,6 +219,7 @@ class remote_error : public client_error
 
     const std::string retryAvoidHost;
     const uint32_t retryAvoidPort;
+    const P50RetryDiagnostic p50RetryDiagnostic;
 };
 
 

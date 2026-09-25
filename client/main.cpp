@@ -49,6 +49,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -66,6 +69,54 @@
 using namespace std;
 
 extern const char *rs_program_name;
+
+namespace {
+
+bool p50_retry_diagnostics_enabled() noexcept
+{
+    const char *value = std::getenv("ICECC_P50_DIAGNOSTICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+const char *p50_retry_reason_name(P50RetryReason reason) noexcept
+{
+    switch (reason) {
+    case P50RetryReason::SourceTransfer: return "source_transfer";
+    case P50RetryReason::WorkerResource: return "worker_resource";
+    case P50RetryReason::WorkerTransport: return "worker_transport";
+    case P50RetryReason::Unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+const char *p50_retry_stage_name(P50RetryStage stage) noexcept
+{
+    switch (stage) {
+    case P50RetryStage::SourceTransfer: return "source_transfer";
+    case P50RetryStage::CompileResult: return "compile_result";
+    case P50RetryStage::RemoteAssignment: return "remote_assignment";
+    case P50RetryStage::Unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+void emit_p50_retry_diagnostic(
+    const P50RetryDiagnostic& diagnostic, const char *decision,
+    bool strict) noexcept
+{
+    if (!p50_retry_diagnostics_enabled())
+        return;
+    std::fprintf(stderr,
+        "P50_RETRY_DIAG {\"v\":1,\"event\":\"retry_decision\","
+        "\"decision\":\"%s\",\"reason\":\"%s\","
+        "\"stage\":\"%s\",\"original_code\":%d,\"strict\":%u}\n",
+        decision, p50_retry_reason_name(diagnostic.reason),
+        p50_retry_stage_name(diagnostic.stage), diagnostic.original_code,
+        strict ? 1u : 0u);
+    std::fflush(stderr);
+}
+
+} // namespace
 
 #ifdef ICECC_P50_COMPLETION_TEST_HOOKS
 /* Pause only the isolated completion-flow wrapper after production has
@@ -737,8 +788,15 @@ int main(int argc, char **argv)
                                        p50_retry_avoid_port);
                     break;
                 } catch (const remote_error &error) {
-                    if (error.errorCode != 106 || p50_retry_attempted)
+                    if (error.errorCode != 106)
                         throw;
+                    const P50RetryDiagnostic& diagnostic =
+                        error.p50RetryDiagnostic;
+                    if (p50_retry_attempted) {
+                        emit_p50_retry_diagnostic(
+                            diagnostic, "suppressed_one_shot", strict_p50);
+                        throw;
+                    }
 
                     /* A strict retry may remain P50 only when its failed F
                        endpoint is exact.  Without that value a second GetCS
@@ -746,8 +804,12 @@ int main(int argc, char **argv)
                        loss; fail closed instead.  The normal legacy retry has
                        no P50 selection input and does not consume the value. */
                     if (strict_p50 && !error.hasRetryAvoidEndpoint()) {
+                        emit_p50_retry_diagnostic(
+                            diagnostic, "rejected_missing_endpoint", strict_p50);
                         throw;
                     }
+                    emit_p50_retry_diagnostic(
+                        diagnostic, "retry_requested", strict_p50);
 
                     /* The failed cache attempt has already published its exact
                        local observation.  C converts that failure into an

@@ -295,6 +295,11 @@ public:
 
 private:
     struct P51RawCredit;
+    struct P51TimingCounters {
+        std::atomic<uint64_t> count{0};
+        std::atomic<uint64_t> total_ns{0};
+        std::atomic<uint64_t> max_ns{0};
+    };
     struct RouteEndpointKey {
         std::string host;
         uint32_t cache_port = 0;
@@ -408,6 +413,9 @@ private:
         ProfileId profile, uint64_t raw_bytes) noexcept;
     void drain_p51_source_admissions() noexcept;
     void schedule_p51_source_admission_timer() noexcept;
+    void record_p51_timing(P51TimingCounters& counters,
+                           uint64_t elapsed_ns) noexcept;
+    void emit_p51_metrics(bool final_snapshot) noexcept;
     void prepare_p51_source_read(
         std::shared_ptr<PendingP51Transfer> pending, ProfileId profile,
         uint64_t raw_bytes,
@@ -482,6 +490,17 @@ private:
     size_t active_source_count_ = 0;
     size_t active_p51_source_count_ = 0;
     uint64_t active_source_raw_bytes_ = 0;
+    bool p51_metrics_enabled_ = false;
+    std::chrono::steady_clock::time_point p51_metrics_started_at_{};
+    std::chrono::steady_clock::time_point p51_metrics_next_emit_{};
+    std::atomic<uint64_t> p51_raw_bytes_high_water_{0};
+    // Times are accepted->credit, credit->reader start, pread span, and
+    // pread completion->local reply/Goodbye settlement. The last includes
+    // owner-executor queueing and route transfer; it is not codec-only time.
+    P51TimingCounters p51_admission_wait_metrics_;
+    P51TimingCounters p51_read_queue_metrics_;
+    P51TimingCounters p51_read_metrics_;
+    P51TimingCounters p51_delivery_metrics_;
     // This is the outermost opener fence.  P50CRouteOwner also retains its
     // own latch, but transfer_source_on_owner must refuse before it connects
     // to or arms any F after whole-sidecar replacement becomes necessary.
