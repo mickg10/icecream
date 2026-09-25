@@ -965,6 +965,40 @@ from a local lock cycle using trace events and a bounded outer watchdog.
 Resource assertions use both exact internal accounting and peak process/
 cgroup memory; equality between raw-vector counters and RSS is not expected.
 
+#### D07 cancellation observations
+
+Run first, middle, and last cancellation positions as separate cases. For a
+31-request W30 cohort, use submission indices 0, 15, and 30; submission order
+is not an assigned wire ordinal. Record the selected request's exact identity,
+the observed stage, cancellation disposition, and every survivor's outcome.
+Do not remove a request before submission and call that queued cancellation.
+
+| Stage | Required observation before cancellation |
+| --- | --- |
+| Queued | The request has entered the real C admission/read or sender window queue, but has not acquired its next required credit |
+| Staged | Preparation exists and the writer is gated before this request's first wire byte |
+| Partial | The peer has observed a strict prefix of this request's frame/bundle, not merely a pending write call |
+| Full, receipt unresolved | The complete bundle reached F; no positive receipt has yet been validated at C |
+| Committed | C has validated the exact positive receipt; cancellation must not erase that fact |
+
+An acknowledged exact F cancellation before publication must prevent input
+publication and subsequent compiler admission. Private decoding may finish,
+but its bytes remain charged until actually released. If publication wins,
+retain the committed witness and report that disposition; local caller loss
+alone does not prove F cancellation. Ordinary compiler cancellation and
+quiescence require a separate real-compile observation, not a sender-only
+assertion. Work already executed cannot be retroactively described as absent.
+
+For every case, prove surviving outputs and receipt identities, contiguous
+accepted ordinals after any required suffix rebuild, once-only settlement,
+unchanged original deadlines, and actual relevant credit drainage. F-only
+reservation tests do not prove C admission/read-queue behavior. Cancellation
+must not be substituted with retirement of all relationships. In recovery,
+skipping a request requires exact cancellation evidence and correct suffix
+reindexing; never discard an unresolved request merely to close an ordinal
+hole. Duplicate cancellation follows the existing idempotent API disposition;
+it must not release resources twice.
+
 ### 9.3 Formal gate
 
 Extend the focused model with logical relationship and physical generations,
