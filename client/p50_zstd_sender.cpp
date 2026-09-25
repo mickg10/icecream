@@ -445,10 +445,14 @@ struct P50ZstdSourceSender::Impl {
     }
 
     void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
-        if (!wire_completions.valid())
-            return;
-        result.c_to_f_bytes = wire_completions.c_to_f_bytes();
-        result.f_to_c_bytes = wire_completions.f_to_c_bytes();
+        // The R1 caller invokes this only after its serialized attempt loop.
+        // Counts remain meaningful even if the byte observer overflowed.
+        result.attempts_measured = true;
+        if (wire_completions.valid()) {
+            result.c_to_f_bytes = wire_completions.c_to_f_bytes();
+            result.f_to_c_bytes = wire_completions.f_to_c_bytes();
+            result.wire_bytes_measured = true;
+        }
     }
 
     PrepareRequestKey begin_transfer() {

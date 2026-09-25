@@ -25,14 +25,35 @@ prints R2 defaults was incorrect. Neither missing R2 rows nor internal zero
 defaults prove zero traffic or absence of replay; they cannot qualify R2
 bandwidth acceptance.
 
-R1 accounting is separate. R2 source-result status/identity/reuse rows also
-need an emitter on the actual queued completion path. Repair requires that
-emitter with explicit unavailable values first, then measured per-job traffic
-plus separately identified shared recovery/
-control traffic, with conservation tests. Overlapping per-job differences
-of shared counters would double count. The Implementer has been notified
-before interpreting queued W30 trace runs; existing farm runs need not be
-interrupted. This measurement gap remains open.
+The v4 repair now emits explicit R1/R2 mode and completion-stage labels.
+R2 post-read dispatch completion produces a row, with unmeasured attempts,
+wire bytes and R1-only timing fields set to null, not zero. Pre-dispatch
+refusals remain outside this trace. Availability flags are independent; an
+early R1 failure can lack attempt counts while retaining measured timing.
+The collector validates these rows but refuses numeric acceptance when
+required measurements are unavailable. Trace formatting cannot affect the
+reply, and optional fallback hashing runs only with tracing enabled.
+
+Luna's full collector module passes 292 tests; the production-flow source
+guard and deletion controls pass. The full service suite, including the
+current Runtime expiry tests, reports PASS in the clean private build at
+`/tanksmall/scratch/tmp/p51-r2-accounting-6faf9b21/build-clean/unittests/`.
+`p50cacheservice.log` SHA256
+`3b4989353566846488d73d3cbac40af72ce4ebfbe70ed572c7c36a5b5c2d18bc`.
+Actual emitted R2 JSON was parsed and correctly refused as numeric evidence;
+JSONL SHA256 `ebeb0a7c9a9434549d9fada50672d4709d01023d3e66866244b7f18a80dd85f8`.
+The full synthetic suite reuses assignment IDs across independent fixtures,
+so its combined trace correctly fails duplicate-ID validation. Unchanged
+R1 row 174 was separately parsed and accepted with measured counters:
+`tmp-clean/source-result-r1-positive.jsonl` SHA256
+`9c049b4833dcc342e72039cb40085d3cbf9013983b57b513618b2fcf5e793a51`.
+The post-suite combined-trace parser failure is not a service-suite failure;
+duplicate validation was not weakened.
+
+Exact R2 per-job traffic/replay counts and separately identified shared
+recovery/control traffic still require implementation and conservation
+tests. Overlapping per-job differences of shared counters would double count.
+The emitter repair does not close bandwidth acceptance or the W30 goal.
 
 ### R2 source-deadline expiry coverage
 

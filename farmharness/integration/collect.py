@@ -60,8 +60,11 @@ SOURCE_RESULT_SCHEMAS = frozenset(
     {
         "icecream-p50-source-result-v2",
         "icecream-p50-source-result-v3",
+        "icecream-p50-source-result-v4",
     }
 )
+# v2/v3 are kept byte-for-byte compatible. Older rows do not identify the
+# transport mode, so their historical accounting cannot be reclassified here.
 P29_INTERNER_FAULT_SCHEMA = "icecream-p50-fault-v1"
 P29_INTERNER_FAULT = "p29-interner-fail-once"
 P29_INTERNER_FAULT_OUTCOME = "fired"
@@ -215,6 +218,15 @@ SOURCE_RESULT_FIELDS = frozenset(
         "terminal_error_code",
         "terminal_error_name",
         "system_source_reuse",
+    }
+)
+SOURCE_RESULT_FIELDS_V4 = SOURCE_RESULT_FIELDS | frozenset(
+    {
+        "attempts_measured",
+        "mode",
+        "source_mutex_timing_measured",
+        "stage",
+        "wire_bytes_measured",
     }
 )
 PROFILE_LABELS = {
@@ -754,12 +766,77 @@ def _checkpoint_result_path(
 def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
     records: dict[tuple[int, int, int], dict[str, Any]] = {}
     for index, item in enumerate(_read_jsonl(path), start=1):
+        schema = item.get("schema") if isinstance(item, Mapping) else None
+        expected_fields = (
+            SOURCE_RESULT_FIELDS_V4
+            if schema == "icecream-p50-source-result-v4"
+            else SOURCE_RESULT_FIELDS
+        )
         if (
-            frozenset(item) != SOURCE_RESULT_FIELDS
-            or not isinstance(item.get("schema"), str)
-            or item.get("schema") not in SOURCE_RESULT_SCHEMAS
+            not isinstance(item, Mapping)
+            or frozenset(item) != expected_fields
+            or not isinstance(schema, str)
+            or schema not in SOURCE_RESULT_SCHEMAS
         ):
             raise CollectError(f"{path}:{index}: source-result schema mismatch")
+        v4 = schema == "icecream-p50-source-result-v4"
+        attempts_measured = item.get("attempts_measured", True)
+        wire_bytes_measured = item.get("wire_bytes_measured", True)
+        source_mutex_measured = item.get("source_mutex_timing_measured", True)
+        mode = item.get("mode") if v4 else None
+        stage = item.get("stage") if v4 else None
+        if v4 and (
+            type(attempts_measured) is not bool
+            or type(wire_bytes_measured) is not bool
+            or type(source_mutex_measured) is not bool
+            or mode not in ("R1_SERIAL", "R2_LINK")
+            or stage not in (
+                "serialized_transfer_completion",
+                "post_read_dispatch_completion",
+            )
+            or (mode == "R1_SERIAL" and
+                stage != "serialized_transfer_completion")
+            or (mode == "R1_SERIAL" and not source_mutex_measured)
+            or (mode == "R2_LINK" and
+                stage != "post_read_dispatch_completion")
+            # Availability is per metric: an R2 trace may eventually gain
+            # exact wire counters before attempt accounting is available.
+            # Source-mutex timing is R1-only because R2 bypasses that path.
+            or (mode == "R2_LINK" and source_mutex_measured)
+            or (attempts_measured and type(item.get("attempts")) is not int)
+            or (not attempts_measured and item.get("attempts") is not None)
+            or (
+                wire_bytes_measured
+                and (
+                    type(item.get("c_to_f_bytes")) is not int
+                    or type(item.get("f_to_c_bytes")) is not int
+                )
+            )
+            or (
+                not wire_bytes_measured
+                and (
+                    item.get("c_to_f_bytes") is not None
+                    or item.get("f_to_c_bytes") is not None
+                )
+            )
+            or (
+                source_mutex_measured
+                and (
+                    type(item.get("source_mutex_wait_ns")) is not int
+                    or type(item.get("source_mutex_service_ns")) is not int
+                )
+            )
+            or (
+                not source_mutex_measured
+                and (
+                    item.get("source_mutex_wait_ns") is not None
+                    or item.get("source_mutex_service_ns") is not None
+                )
+            )
+        ):
+            raise CollectError(
+                f"{path}:{index}: source-result accounting availability disagrees with values"
+            )
         integers = (
             "wire_job_id",
             "logical_job",
@@ -775,13 +852,28 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
             "source_mutex_service_ns",
             "terminal_error_code",
         )
-        if any(
-            type(item.get(field)) is not int or item[field] < 0 for field in integers
-        ):
+        measured_integers = tuple(
+            field for field in integers
+            if not (
+                v4
+                and (
+                    (field == "attempts" and not attempts_measured)
+                    or (field in ("c_to_f_bytes", "f_to_c_bytes")
+                        and not wire_bytes_measured)
+                    or (field in ("source_mutex_wait_ns",
+                                  "source_mutex_service_ns")
+                        and not source_mutex_measured)
+                )
+            )
+        )
+        if any(type(item.get(field)) is not int or item[field] < 0
+               for field in measured_integers):
             raise CollectError(f"{path}:{index}: source-result integer is invalid")
         if item["wire_job_id"] == 0 or item["logical_job"] == 0:
             raise CollectError(f"{path}:{index}: source-result job identity is zero")
-        if item["status"] > 7 or item["attempts"] > 2:
+        if item["status"] > 7 or (
+            attempts_measured and item["attempts"] > 2
+        ):
             raise CollectError(
                 f"{path}:{index}: source-result status/attempt count is invalid"
             )
@@ -823,7 +915,7 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
                 raise CollectError(
                     f"{path}:{index}: committed source-result has a terminal error"
                 )
-            if item["attempts"] == 0:
+            if attempts_measured and item["attempts"] == 0:
                 raise CollectError(
                     f"{path}:{index}: committed source-result has no attempt"
                 )
@@ -831,11 +923,13 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
                 raise CollectError(
                     f"{path}:{index}: committed source-result has no raw digest"
                 )
-            if item["source_mutex_service_ns"] == 0:
+            if source_mutex_measured and item["source_mutex_service_ns"] == 0:
                 raise CollectError(
                     f"{path}:{index}: committed source-result has no mutex service time"
                 )
-            if item["c_to_f_bytes"] == 0 or item["f_to_c_bytes"] == 0:
+            if wire_bytes_measured and (
+                item["c_to_f_bytes"] == 0 or item["f_to_c_bytes"] == 0
+            ):
                 raise CollectError(
                     f"{path}:{index}: committed source-result has no wire bytes"
                 )
@@ -852,6 +946,26 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
             raise CollectError(f"{path}: duplicate source result for assignment {key}")
         records[key] = item
     return records
+
+
+def _require_collectable_source_accounting(
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+) -> None:
+    """Refuse to synthesize numeric acceptance metrics from unavailable data."""
+
+    for identity, record in source_results.items():
+        if record.get("schema") != "icecream-p50-source-result-v4":
+            continue
+        if (
+            record.get("attempts_measured") is not True
+            or record.get("wire_bytes_measured") is not True
+            or record.get("source_mutex_timing_measured") is not True
+        ):
+            raise CollectError(
+                "source-result v4 marks attempts, wire bytes, or source-mutex timing "
+                f"unavailable for assignment {identity}; numeric acceptance "
+                "metrics cannot be formed from this trace"
+            )
 
 
 def _source_result_status(
@@ -6197,6 +6311,7 @@ def _parse_rows(
         client = by_name[client_name]
         results = _instance_results(evidence, client_name)
         source_results = _source_results(results / "source-result.jsonl")
+        _require_collectable_source_accounting(source_results)
         compile_identities = _compile_identities(results / "compile-identity.jsonl")
         c_legacy_wires = _legacy_wire_results(results / "c-legacy-wire.jsonl", "C")
         c_commits = _action_commits(

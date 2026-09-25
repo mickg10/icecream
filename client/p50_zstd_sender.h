@@ -97,6 +97,10 @@ struct ZstdSourceTransferResult {
     uint64_t raw_bytes = 0;
     Digest128 raw_digest{};
     uint8_t attempts = 0;
+    // Trace-only availability witnesses. R1 binds its serialized retry count
+    // and byte totals; R2 must not present default zeroes as measured values.
+    bool attempts_measured = false;
+    bool wire_bytes_measured = false;
     std::optional<ErrorMessage> terminal_error;
     // Exact CacheWire bytes observed by the C endpoint, including frame
     // headers and bounded retries. These diagnostic witnesses do not grant

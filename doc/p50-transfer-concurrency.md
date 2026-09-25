@@ -421,15 +421,40 @@ repeated command duration as total test time.
 Use the existing source-result trace to measure admission wait/service; add
 separate source-read, setup/retry, preparation, NEED wait and F materialization
 durations if needed. Do not silently relabel old `source_mutex_*` fields.
-Stage A emits `icecream-p50-source-result-v3` with the existing field layout:
-`source_mutex_wait_ns` is the sum of address/incarnation/credit admission wait
-intervals, and `source_mutex_service_ns` is total operation elapsed time minus
-those intervals. The historical field names are compatibility labels, not
-claims that a global mutex is still held. Setup, reading and network service
-are included in service. The collector accepts exact v2 and v3 layouts and
-rejects unknown versions; v2 retains its original global-gate interpretation.
-Neither version's sum of service durations is aggregate CPU time or build wall
-time. In particular, v3 service intervals can overlap across relationships.
+`icecream-p50-source-result-v2` and `-v3` retain their historical layouts and
+interpretations. V4 adds explicit `mode` and `stage` plus independent
+`attempts_measured`, `wire_bytes_measured`, and
+`source_mutex_timing_measured` booleans. A false availability flag requires
+the corresponding numeric fields to be JSON `null`, never a fabricated zero.
+
+V4 `R1_SERIAL` rows are emitted at serialized-transfer completion and preserve
+the existing `source_mutex_wait_ns`/`source_mutex_service_ns` semantics:
+admission wait is the sum of address/incarnation/credit wait intervals, while
+service is total operation elapsed time minus those intervals. The old field
+names are compatibility labels, not claims that a global mutex remains held.
+Setup, reading and network service are included in service; intervals may
+overlap across relationships. A pre-attempt R1 failure may have unavailable
+attempt accounting even though its source-mutex timings are measured.
+
+V4 `R2_LINK` rows are currently emitted only at
+`post_read_dispatch_completion`, after the post-read dispatch coroutine has
+started and constructed a result. This does not prove a route link was opened
+or a transfer attempt began: endpoint-identity binding can refuse before
+`transfer_p51`. Pre-read/admission refusals, peer-close/read failures, and
+stop/deadline/invalid-connection exits before that coroutine starts are not
+represented. R2 attempts, exact wire-byte totals, and R1 source-mutex timings
+are marked unavailable and null. The collector parses those rows but fails
+closed before producing numeric acceptance or performance metrics if any
+required accounting field is unavailable. Exact R2 per-job/replay attempt and
+wire-byte accounting remains pending; these rows must not be interpreted as
+zero traffic or complete transfer measurements.
+
+The collector accepts exact v2, v3 and v4 field layouts and rejects unknown
+versions. V2's `source_mutex_wait_ns` reflects the former global-gate wait;
+v3 reuses the field for the current admission-wait intervals described above.
+Since v2/v3 carry no mode field, old ambiguous rows cannot be retroactively
+classified as R1 or R2. No version's sum of service durations is aggregate CPU
+time or build wall time.
 Measure baseline and candidate on identical input order, profiles, machine,
 compiler slots, link shaping and cache state. Use Firefox, RocksDB and a third
 available corpus, each cold/warm/edited, with input manifests/digests retained.

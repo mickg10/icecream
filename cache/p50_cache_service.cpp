@@ -182,91 +182,139 @@ void append_fingerprint_test_trace(std::string_view message) noexcept {
     append_test_trace("ICECC_P50_TEST_FINGERPRINT_TRACE", message);
 }
 
+bool source_result_trace_enabled() noexcept {
+  const char *path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+  return path != nullptr && *path != '\0';
+}
+
 void append_source_result_trace(
-    const local::P50SourceTransferRequest& request,
-    CStoreGuid c_store_guid,
-    ProfileId profile,
-    const ZstdSourceTransferResult& transfer,
-    uint64_t admission_wait_ns,
-    uint64_t admitted_service_ns) noexcept {
-    const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
-    if (path == nullptr || *path == '\0')
-        return;
+    uint64_t wire_job_id, uint64_t logical_job, uint64_t assignment_epoch,
+    uint64_t assignment_nonce, CStoreGuid c_store_guid, ProfileId profile,
+    const ZstdSourceTransferResult &transfer, const char *mode,
+    std::optional<uint64_t> source_mutex_wait_ns,
+    std::optional<uint64_t> source_mutex_service_ns) noexcept {
+  const char *path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+  if (path == nullptr || *path == '\0')
+    return;
+  try {
     const std::string_view label =
-        profile == ProfileId::P29V1
-            ? std::string_view("P29V1")
-            : profile == ProfileId::ZSTD_TU
-                  ? std::string_view("ZSTD_TU")
-                  : profile == ProfileId::ZSTD_ROUTE
-                        ? std::string_view("ZSTD_ROUTE")
-                        : std::string_view("UNKNOWN");
-    const char* reuse = "null";
+        profile == ProfileId::P29V1        ? std::string_view("P29V1")
+        : profile == ProfileId::ZSTD_TU    ? std::string_view("ZSTD_TU")
+        : profile == ProfileId::ZSTD_ROUTE ? std::string_view("ZSTD_ROUTE")
+                                           : std::string_view("UNKNOWN");
+    const char *reuse = "null";
     if (transfer.system_source_reuse.has_value())
-        reuse = *transfer.system_source_reuse ? "true" : "false";
+      reuse = *transfer.system_source_reuse ? "true" : "false";
     const uint16_t terminal_error_code =
         transfer.terminal_error.has_value() ? transfer.terminal_error->code : 0;
-    const char* terminal_error_name =
-        terminal_error_code == static_cast<uint16_t>(ErrorCode::WIRE_REVISION_MISMATCH)
+    const char *terminal_error_name =
+        terminal_error_code ==
+                static_cast<uint16_t>(ErrorCode::WIRE_REVISION_MISMATCH)
             ? "\"WIRE_REVISION_MISMATCH\""
             : "null";
     const std::string c_guid = bytes_hex(std::span<const uint8_t>(
         c_store_guid.bytes.data(), c_store_guid.bytes.size()));
     const std::string raw_digest = icecc::digest128_hex(transfer.raw_digest);
+    const char *attempts_measured =
+        transfer.attempts_measured ? "true" : "false";
+    char attempts_value[16];
+    if (transfer.attempts_measured)
+      std::snprintf(attempts_value, sizeof(attempts_value), "%u",
+                    static_cast<unsigned>(transfer.attempts));
+    else
+      std::snprintf(attempts_value, sizeof(attempts_value), "null");
+    char c_to_f_value[32];
+    char f_to_c_value[32];
+    if (transfer.wire_bytes_measured) {
+      std::snprintf(c_to_f_value, sizeof(c_to_f_value), "%llu",
+                    static_cast<unsigned long long>(transfer.c_to_f_bytes));
+      std::snprintf(f_to_c_value, sizeof(f_to_c_value), "%llu",
+                    static_cast<unsigned long long>(transfer.f_to_c_bytes));
+    } else {
+      std::snprintf(c_to_f_value, sizeof(c_to_f_value), "null");
+      std::snprintf(f_to_c_value, sizeof(f_to_c_value), "null");
+    }
+    char source_mutex_wait_value[32];
+    char source_mutex_service_value[32];
+    if (source_mutex_wait_ns.has_value() &&
+        source_mutex_service_ns.has_value()) {
+      std::snprintf(source_mutex_wait_value, sizeof(source_mutex_wait_value),
+                    "%llu",
+                    static_cast<unsigned long long>(*source_mutex_wait_ns));
+      std::snprintf(source_mutex_service_value,
+                    sizeof(source_mutex_service_value), "%llu",
+                    static_cast<unsigned long long>(*source_mutex_service_ns));
+    } else {
+      std::snprintf(source_mutex_wait_value, sizeof(source_mutex_wait_value),
+                    "null");
+      std::snprintf(source_mutex_service_value,
+                    sizeof(source_mutex_service_value), "null");
+    }
     char line[1024];
     const int length = std::snprintf(
         line, sizeof(line),
-        "{\"schema\":\"icecream-p50-source-result-v3\","
+        "{\"schema\":\"icecream-p50-source-result-v4\","
+        "\"mode\":\"%s\","
+        "\"stage\":\"%s\","
         "\"wire_job_id\":%llu,\"logical_job\":%llu,"
         "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
         "\"c_store_guid\":\"%s\","
-        "\"profile\":\"%.*s\",\"status\":%u,\"attempts\":%u,"
+        "\"profile\":\"%.*s\",\"status\":%u,"
+        "\"attempts\":%s,\"attempts_measured\":%s,"
         "\"tu_seq\":%llu,\"raw_bytes\":%llu,"
         "\"raw_digest\":\"%s\","
-        "\"c_to_f_bytes\":%llu,\"f_to_c_bytes\":%llu,"
-        "\"source_mutex_wait_ns\":%llu,"
-        "\"source_mutex_service_ns\":%llu,"
+        "\"c_to_f_bytes\":%s,\"f_to_c_bytes\":%s,"
+        "\"wire_bytes_measured\":%s,"
+        "\"source_mutex_wait_ns\":%s,"
+        "\"source_mutex_service_ns\":%s,"
+        "\"source_mutex_timing_measured\":%s,"
         "\"terminal_error_code\":%u,"
         "\"terminal_error_name\":%s,"
         "\"system_source_reuse\":%s}\n",
-        static_cast<unsigned long long>(request.wire_job_id),
-        static_cast<unsigned long long>(request.logical_job),
-        static_cast<unsigned long long>(request.assignment_epoch),
-        static_cast<unsigned long long>(request.assignment_nonce),
-        c_guid.c_str(),
+        mode,
+        std::strcmp(mode, "R2_LINK") == 0 ? "post_read_dispatch_completion"
+                                          : "serialized_transfer_completion",
+        static_cast<unsigned long long>(wire_job_id),
+        static_cast<unsigned long long>(logical_job),
+        static_cast<unsigned long long>(assignment_epoch),
+        static_cast<unsigned long long>(assignment_nonce), c_guid.c_str(),
         static_cast<int>(label.size()), label.data(),
-        static_cast<unsigned>(transfer.status),
-        static_cast<unsigned>(transfer.attempts),
+        static_cast<unsigned>(transfer.status), attempts_value,
+        attempts_measured,
         static_cast<unsigned long long>(
             transfer.committed_input.has_value()
                 ? transfer.committed_input->tu_seq.value
                 : 0),
-        static_cast<unsigned long long>(transfer.raw_bytes),
-        raw_digest.c_str(),
-        static_cast<unsigned long long>(transfer.c_to_f_bytes),
-        static_cast<unsigned long long>(transfer.f_to_c_bytes),
-        static_cast<unsigned long long>(admission_wait_ns),
-        static_cast<unsigned long long>(admitted_service_ns),
+        static_cast<unsigned long long>(transfer.raw_bytes), raw_digest.c_str(),
+        c_to_f_value, f_to_c_value,
+        transfer.wire_bytes_measured ? "true" : "false",
+        source_mutex_wait_value, source_mutex_service_value,
+        source_mutex_wait_ns.has_value() && source_mutex_service_ns.has_value()
+            ? "true"
+            : "false",
         static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
-        return;
-    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
-                                   O_NOFOLLOW,
-                          0600);
+      return;
+    const int fd = ::open(
+        path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0)
-        return;
+      return;
     size_t offset = 0;
     while (offset < static_cast<size_t>(length)) {
-        const ssize_t written = ::write(
-            fd, line + offset, static_cast<size_t>(length) - offset);
-        if (written > 0) {
-            offset += static_cast<size_t>(written);
-            continue;
-        }
-        if (written < 0 && errno == EINTR)
-            continue;
-        break;
+      const ssize_t written =
+          ::write(fd, line + offset, static_cast<size_t>(length) - offset);
+      if (written > 0) {
+        offset += static_cast<size_t>(written);
+        continue;
+      }
+      if (written < 0 && errno == EINTR)
+        continue;
+      break;
     }
     (void)::close(fd);
+  } catch (...) {
+    // Trace collection is best-effort and must not alter transfer results.
+  }
 }
 
 void append_terminal_lifecycle_test_trace(
@@ -2462,8 +2510,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     source_elapsed_ns > admission_wait_ns
                         ? source_elapsed_ns - admission_wait_ns : 0;
                 append_source_result_trace(
-                    request, expected_c_guid, relationship.profile, observed,
-                    admission_wait_ns, source_service_ns);
+                    request.wire_job_id, request.logical_job,
+                    request.assignment_epoch, request.assignment_nonce,
+                    expected_c_guid, relationship.profile, observed,
+                    "R1_SERIAL", admission_wait_ns, source_service_ns);
                 completion->set_value(value);
                 co_return;
             },
@@ -3091,6 +3141,29 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                     latch_route_replacement(observed.replacement_trigger);
                     result = source_transfer_result(
                         observed, config_.c_store_guid, true);
+                }
+                // This row records a post-read R2 dispatch result; it does
+                // not prove that transfer_p51 opened a link (endpoint binding
+                // can still refuse it). Raw-input identity is known here, but
+                // R2 attempt/byte and R1 source-mutex metrics are not.
+                if (source_result_trace_enabled()) {
+                    try {
+                        ZstdSourceTransferResult trace_result = observed;
+                        trace_result.raw_bytes = raw->size();
+                        if (trace_result.raw_digest == Digest128{})
+                            trace_result.raw_digest = icecc::digest128(
+                                std::span<const uint8_t>(*raw));
+                        const auto& source =
+                            pending->request.armed.arm.source;
+                        append_source_result_trace(
+                            source.wire_job_id, source.logical_job,
+                            source.assignment_epoch, source.assignment_nonce,
+                            config_.c_store_guid, relationship.profile,
+                            trace_result, "R2_LINK", std::nullopt,
+                            std::nullopt);
+                    } catch (...) {
+                        // Optional trace work cannot block the result reply.
+                    }
                 }
                 post_p51_source_transfer_reply(std::move(pending),
                                               std::move(result));

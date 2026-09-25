@@ -41,6 +41,7 @@ from farmharness.integration.collect import (
     _snapshot_live_evidence,
     _source_candidates_for_assignment,
     _source_results,
+    _require_collectable_source_accounting,
     _source_transfer_failure_observation,
     _uncommitted_transport_failure_observation,
     _successful_strict_p50_late_result_binding,
@@ -273,6 +274,185 @@ def test_source_results_accept_v2_and_v3_rows_in_one_stream(
         (20, 1, 1): v2,
         (30, 1, 1): v3,
     }
+
+
+def test_source_result_v4_preserves_unavailable_r2_accounting_as_null(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    record.update(
+        {
+            "schema": "icecream-p50-source-result-v4",
+            "mode": "R2_LINK",
+            "stage": "post_read_dispatch_completion",
+            "status": 0,
+            "attempts": None,
+            "attempts_measured": False,
+            "wire_bytes_measured": False,
+            "source_mutex_wait_ns": None,
+            "source_mutex_service_ns": None,
+            "source_mutex_timing_measured": False,
+            "tu_seq": 9,
+            "raw_bytes": 512,
+            "raw_digest": "a" * 32,
+            "c_to_f_bytes": None,
+            "f_to_c_bytes": None,
+            "system_source_reuse": False,
+            "terminal_error_code": 0,
+            "terminal_error_name": None,
+        }
+    )
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)] == record
+    with pytest.raises(CollectError, match="attempts, wire bytes, or source-mutex timing unavailable"):
+        _require_collectable_source_accounting(parsed)
+
+
+def test_source_result_v4_measured_r1_accounting_remains_collectable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    record.update(
+        {
+            "schema": "icecream-p50-source-result-v4",
+            "mode": "R1_SERIAL",
+            "stage": "serialized_transfer_completion",
+            "status": 0,
+            "attempts": 2,
+            "attempts_measured": True,
+            "wire_bytes_measured": True,
+            "source_mutex_timing_measured": True,
+            "tu_seq": 9,
+            "raw_bytes": 512,
+            "raw_digest": "a" * 32,
+            "c_to_f_bytes": 812,
+            "f_to_c_bytes": 231,
+            "system_source_reuse": False,
+            "source_mutex_wait_ns": 23,
+            "source_mutex_service_ns": 17,
+            "terminal_error_code": 0,
+            "terminal_error_name": None,
+        }
+    )
+    _write_jsonl(path, [record])
+
+    parsed = _source_results(path)
+    assert parsed[(2, 1, 1)] == record
+    _require_collectable_source_accounting(parsed)
+
+
+@pytest.mark.parametrize(
+    ("attempts_measured", "attempts", "wire_bytes_measured", "c_to_f_bytes", "f_to_c_bytes"),
+    (
+        (True, 2, False, None, None),
+        (False, None, True, 812, 231),
+    ),
+)
+def test_source_result_v4_keeps_accounting_availability_independent(
+    tmp_path: Path,
+    attempts_measured: bool,
+    attempts: object,
+    wire_bytes_measured: bool,
+    c_to_f_bytes: object,
+    f_to_c_bytes: object,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    record.update(
+        {
+            "schema": "icecream-p50-source-result-v4",
+            "mode": "R1_SERIAL",
+            "stage": "serialized_transfer_completion",
+            "status": 0,
+            "attempts": attempts,
+            "attempts_measured": attempts_measured,
+            "wire_bytes_measured": wire_bytes_measured,
+            "source_mutex_timing_measured": True,
+            "tu_seq": 9,
+            "raw_bytes": 512,
+            "raw_digest": "a" * 32,
+            "c_to_f_bytes": c_to_f_bytes,
+            "f_to_c_bytes": f_to_c_bytes,
+            "system_source_reuse": False,
+            "source_mutex_wait_ns": 23,
+            "source_mutex_service_ns": 17,
+            "terminal_error_code": 0,
+            "terminal_error_name": None,
+        }
+    )
+    _write_jsonl(path, [record])
+
+    assert _source_results(path)[(2, 1, 1)] == record
+    with pytest.raises(CollectError, match="attempts, wire bytes, or source-mutex timing unavailable"):
+        _require_collectable_source_accounting({(2, 1, 1): record})
+
+
+@pytest.mark.parametrize(
+    ("attempts_measured", "attempts", "wire_bytes_measured", "c_to_f_bytes"),
+    ((False, 1, False, None), (True, None, False, None),
+     (False, None, False, 0)),
+)
+def test_source_result_v4_rejects_availability_value_disagreement(
+    tmp_path: Path,
+    attempts_measured: bool,
+    attempts: object,
+    wire_bytes_measured: bool,
+    c_to_f_bytes: object,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    record.update(
+        {
+            "schema": "icecream-p50-source-result-v4",
+            "mode": "R1_SERIAL",
+            "stage": "serialized_transfer_completion",
+            "attempts_measured": attempts_measured,
+            "attempts": attempts,
+            "wire_bytes_measured": wire_bytes_measured,
+            "source_mutex_timing_measured": True,
+            "c_to_f_bytes": c_to_f_bytes,
+            "f_to_c_bytes": None if not wire_bytes_measured else 8,
+        }
+    )
+    _write_jsonl(path, [record])
+    with pytest.raises(CollectError, match="accounting availability disagrees"):
+        _source_results(path)
+
+
+@pytest.mark.parametrize(
+    ("mode", "stage"),
+    (("UNKNOWN", "post_read_dispatch_completion"),
+     ("R2_LINK", "serialized_transfer_completion")),
+)
+def test_source_result_v4_rejects_unknown_or_mismatched_mode(
+    tmp_path: Path,
+    mode: str,
+    stage: str,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    record.update(
+        {
+            "schema": "icecream-p50-source-result-v4",
+            "mode": mode,
+            "stage": stage,
+            "attempts": None,
+            "attempts_measured": False,
+            "wire_bytes_measured": False,
+            "source_mutex_timing_measured": False,
+            "source_mutex_wait_ns": None,
+            "source_mutex_service_ns": None,
+            "c_to_f_bytes": None,
+            "f_to_c_bytes": None,
+        }
+    )
+    _write_jsonl(path, [record])
+    with pytest.raises(CollectError, match="accounting availability disagrees"):
+        _source_results(path)
 
 
 @pytest.mark.parametrize(

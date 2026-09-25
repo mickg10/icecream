@@ -577,14 +577,36 @@ def check_cache_service(source: str) -> None:
                            "void append_terminal_lifecycle_test_trace(")
     for token in ("transfer.raw_digest", "digest128_hex",
                   '"raw_digest\\\":\\\"%s',
-                  'icecream-p50-source-result-v3',
-                  '"source_mutex_wait_ns\\\":%llu',
-                  '"source_mutex_service_ns\\\":%llu',
+                  'icecream-p50-source-result-v4',
+                  '"mode\\\":\\\"%s',
+                  'post_read_dispatch_completion',
+                  '"attempts_measured\\\":%s',
+                  '"wire_bytes_measured\\\":%s',
+                  '"source_mutex_timing_measured\\\":%s',
+                  'attempts_value', 'c_to_f_value', 'f_to_c_value',
+                  '"source_mutex_wait_ns\\\":%s',
+                  '"source_mutex_service_ns\\\":%s',
                   '"terminal_error_code\\\":%u',
                   '"terminal_error_name\\\":%s',
                   "ErrorCode::WIRE_REVISION_MISMATCH"):
         require(token in source_trace,
                 f"C-side source-result trace omits {token}")
+    require("try {" in source_trace and "catch (...)" in source_trace,
+            "trace formatting/allocation failure can escape its noexcept boundary")
+    r2_trace = section(
+        source,
+        "// This row records a post-read R2 dispatch result;",
+        "                co_return;\n            }, asio::detached);")
+    ordered(r2_trace,
+            "if (source_result_trace_enabled())",
+            "trace_result.raw_bytes = raw->size();",
+            "if (trace_result.raw_digest == Digest128{})",
+            "icecc::digest128(",
+            "append_source_result_trace(",
+            "catch (...) {",
+            "post_p51_source_transfer_reply(std::move(pending)")
+    require(r2_trace.count("icecc::digest128(") == 1,
+            "R2 fallback source hashing is not confined to the opt-in trace guard")
     transfer = section(source, "SidecarRuntime::transfer_source_on_owner(",
                        "bool SidecarRuntime::bind_route_endpoint_identity(")
     for token in (
@@ -991,10 +1013,10 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("cache_service", "c_store_guid=%s", "c_store_guid=deleted"),
         ("cache_service", '"raw_digest\\\":\\\"%s',
          '"raw_digest_deleted\\\":\\\"%s'),
-        ("cache_service", '"source_mutex_wait_ns\\\":%llu',
-         '"source_mutex_wait_deleted\\\":%llu'),
-        ("cache_service", '"source_mutex_service_ns\\\":%llu',
-         '"source_mutex_service_deleted\\\":%llu'),
+        ("cache_service", '"source_mutex_wait_ns\\\":%s',
+         '"source_mutex_wait_deleted\\\":%s'),
+        ("cache_service", '"source_mutex_service_ns\\\":%s',
+         '"source_mutex_service_deleted\\\":%s'),
         ("cache_service", "ICECC_P50_TEST_READY_TRACE", "READY_TRACE_DELETED"),
         ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
          "if (mutated && decision.collect_record)\n                    collect_deleted();"),
