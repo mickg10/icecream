@@ -41,6 +41,7 @@
 #include <fstream>
 #include <iterator>
 #include <future>
+#include <limits>
 #include <condition_variable>
 #include <map>
 #include <mutex>
@@ -1324,7 +1325,8 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
     uint32_t wire_id, uint64_t epoch, uint64_t nonce,
     uint32_t f_port, int source_fd, uint32_t profile_mask,
     P51SourceArmedFields *observed_armed = nullptr,
-    std::atomic<bool> *observed_armed_ready = nullptr)
+    std::atomic<bool> *observed_armed_ready = nullptr,
+    Clock::time_point *source_deadline_out = nullptr)
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
@@ -1335,6 +1337,7 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
         return failed;
     };
     const auto deadline = Clock::now() + std::chrono::seconds(30);
+    if (source_deadline_out != nullptr) *source_deadline_out = deadline;
     if (!protocol_supports_cache_r2(local.protocol)) {
         ::close(source_fd);
         return fail_at(stage);
@@ -2684,7 +2687,10 @@ struct P51RestartTransferCell {
     std::future<Result> future;
     std::thread worker;
     Result result{};
+    Clock::time_point source_deadline{};
+    Clock::time_point finished_at{};
     bool settled = false;
+    bool source_deadline_captured = false;
 
     explicit P51RestartTransferCell(std::unique_ptr<P51RestartJob> value)
         : job(std::move(value)), future(promise.get_future()) {}
@@ -2750,14 +2756,15 @@ static std::unique_ptr<P51RestartJob> prepare_p51_restart_job(
 
 static icecc::p50::local::P50SourceTransferResult run_p51_restart_job(
     P51RestartRole& f, P51RestartJob& job,
-    uint32_t profile_mask, P51SourceArmedFields *armed = nullptr)
+    uint32_t profile_mask, P51SourceArmedFields *armed = nullptr,
+    Clock::time_point *source_deadline = nullptr)
 {
     const int source_fd = std::exchange(job.source_fd, -1);
     return execute_p51_kind8(
         *job.wrapper, *job.compiler, job.wire_id,
         job.epoch, job.nonce,
         static_cast<uint32_t>(f.endpoint_port), source_fd,
-        profile_mask, armed);
+        profile_mask, armed, nullptr, source_deadline);
 }
 
 static bool start_p51_restart_transfers(
@@ -2771,12 +2778,15 @@ static bool start_p51_restart_transfers(
                 P51RestartTransferCell::Result result{};
                 try {
                     result = run_p51_restart_job(
-                        f, *cell->job, profile_mask, &cell->armed);
+                        f, *cell->job, profile_mask, &cell->armed,
+                        &cell->source_deadline);
+                    cell->source_deadline_captured = true;
                 } catch (...) {
                     std::fprintf(stderr,
                         "P51_RESTART_TRANSFER exception job=%u\n",
                         cell->job ? cell->job->wire_id : 0u);
                 }
+                cell->finished_at = Clock::now();
                 cell->promise.set_value(std::move(result));
             });
         }
@@ -2801,6 +2811,30 @@ static bool wait_p51_restart_transfers(
         cell->settled = true;
     }
     return all_settled;
+}
+
+static bool p51_restart_deadlines_respected(
+    const std::vector<std::unique_ptr<P51RestartTransferCell>>& cells,
+    std::chrono::milliseconds cleanup_grace,
+    int64_t *max_completion_delta_ms = nullptr)
+{
+    bool respected = true;
+    int64_t max_delta_ms = std::numeric_limits<int64_t>::min();
+    for (const auto& cell : cells) {
+        if (!cell->settled || !cell->source_deadline_captured) {
+            respected = false;
+            continue;
+        }
+        const int64_t delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            cell->finished_at - cell->source_deadline).count();
+        max_delta_ms = std::max(max_delta_ms, delta_ms);
+        if (cell->finished_at > cell->source_deadline + cleanup_grace)
+            respected = false;
+    }
+    if (max_completion_delta_ms != nullptr)
+        *max_completion_delta_ms = max_delta_ms == std::numeric_limits<int64_t>::min()
+            ? 0 : max_delta_ms;
+    return respected;
 }
 
 static void join_p51_restart_transfers(
@@ -3089,7 +3123,7 @@ static int run_p51_process_restart_case(
     const bool affected_settled = wait_p51_restart_transfers(
         affected_cells, Clock::now() + std::chrono::seconds(35));
     REQUIRE(affected_settled,
-            "all original W30 callers settle under their unchanged source deadlines");
+            "all original W30 callers settle before the outer cleanup watchdog");
     if (!affected_settled) {
         std::fprintf(stderr,
             "P51_PROCESS_RESTART affected W30 callers did not settle by bounded wait\n");
@@ -3105,6 +3139,20 @@ static int run_p51_process_restart_case(
         return 1;
     }
     join_p51_restart_transfers(affected_cells);
+    constexpr auto kSourceDeadlineCleanupGrace = std::chrono::seconds(2);
+    int64_t affected_max_deadline_delta_ms = 0;
+    const bool affected_deadlines_respected = p51_restart_deadlines_respected(
+        affected_cells, kSourceDeadlineCleanupGrace,
+        &affected_max_deadline_delta_ms);
+    std::fprintf(stderr,
+        "P51_RESTART_DEADLINES topology=%s profile=%u phase=old callers=%zu max_completion_delta_ms=%lld grace_ms=%lld respected=%u\n",
+        restart_f ? "C1F2" : "C2F1", profile_mask, affected_cells.size(),
+        static_cast<long long>(affected_max_deadline_delta_ms),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            kSourceDeadlineCleanupGrace).count()),
+        affected_deadlines_respected ? 1u : 0u);
+    REQUIRE(affected_deadlines_respected,
+            "every original source caller completes by its original 30-second deadline plus 2-second cleanup grace");
     size_t affected_noncommitted = 0;
     for (const auto& cell : affected_cells)
         affected_noncommitted += cell->result.code !=
@@ -3161,7 +3209,7 @@ static int run_p51_process_restart_case(
     bool fresh_settled = fresh_started && wait_p51_restart_transfers(
         fresh_cells, Clock::now() + std::chrono::seconds(35));
     REQUIRE(fresh_settled,
-            "fresh replacement W30 callers settle within their original deadlines");
+            "fresh replacement W30 callers settle before the outer cleanup watchdog");
     if (!fresh_settled) {
         for (P51RestartRole *role : {&primary, &sibling, &target})
             if (role->daemon_pid > 1) (void)::kill(role->daemon_pid, SIGKILL);
@@ -3171,6 +3219,19 @@ static int run_p51_process_restart_case(
     REQUIRE(fresh_settled,
             "closing the restarted roles releases every fresh transfer worker");
     join_p51_restart_transfers(fresh_cells);
+    int64_t fresh_max_deadline_delta_ms = 0;
+    const bool fresh_deadlines_respected = p51_restart_deadlines_respected(
+        fresh_cells, kSourceDeadlineCleanupGrace,
+        &fresh_max_deadline_delta_ms);
+    std::fprintf(stderr,
+        "P51_RESTART_DEADLINES topology=%s profile=%u phase=fresh callers=%zu max_completion_delta_ms=%lld grace_ms=%lld respected=%u\n",
+        restart_f ? "C1F2" : "C2F1", profile_mask, fresh_cells.size(),
+        static_cast<long long>(fresh_max_deadline_delta_ms),
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            kSourceDeadlineCleanupGrace).count()),
+        fresh_deadlines_respected ? 1u : 0u);
+    REQUIRE(fresh_deadlines_respected,
+            "every fresh source caller completes by its original 30-second deadline plus 2-second cleanup grace");
     P51SourceArmedFields fresh_armed = fresh_cells.empty()
         ? P51SourceArmedFields{} : fresh_cells.front()->armed;
     size_t fresh_committed = 0;

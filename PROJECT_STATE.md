@@ -129,6 +129,19 @@ admission/history/recovery changes. It proves bounded caller settlement,
 not a measured per-caller finish-time comparison against the original
 deadline. Scheduler/ordinary-daemon/compiler replacement and final combined
 qualification remain separate obligations.
+The follow-up timing-instrumented fixture also passes all six cells. It
+records each caller's actual original deadline and completion time, rather
+than treating the outer watchdog as its deadline. All 360 old/fresh callers
+finish before their original deadlines (the assertion permits 2 seconds of
+cleanup grace). Evidence:
+`/tanksmall/scratch/tmp/p51-restart-w30-r1/tmp/restart-w30-r1-matrix-deadlines.log`,
+SHA256 `14e7299400eb26c267f4fcb9caf29a478b68938c62670d0a4db0718ae1fc7c752`;
+the adjacent exit file records `RESTART_W30_DEADLINE_MATRIX_EXIT=0`.
+Fixture source SHA256:
+`bb08a7c00df4b9a3e0490742d9250cd3d05750ff36671a7af6259dd54a88ee53`;
+binary: `d78391f71e30ab12c4b149985b736b29daa8ff8c4e98bc04d867f27af5ecc148`.
+This still uses the same frozen product binaries, not the pending combined
+implementation; it measures prompt restart settlement, not deadline expiry.
 The existing two-case, one-job restart mode also passes with this generalized
 fixture (`restart-w30-r0-focused.log` in the same directory). Its `set -e`
 command then failed on an outdated source guard copied into the private tree;
