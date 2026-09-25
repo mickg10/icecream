@@ -90,16 +90,20 @@ def _snapshot_farm() -> FarmSpec:
     return FarmSpec(path=farm.path, data=data)
 
 
-def _snapshot_scenario(farm: FarmSpec, filename: str = "S80-p29v1.json") -> ScenarioSpec:
+def _snapshot_scenario(
+    farm: FarmSpec,
+    tmp_path: Path,
+    filename: str = "S80-p29v1.json",
+) -> ScenarioSpec:
     value = json.loads(
         (INTEGRATION / "scenarios" / filename).read_text(encoding="utf-8")
     )
     for instance in value["instances"]:
         if instance["role"] == "C":
             instance["system_source_snapshot"] = "stable-f-source"
-    path = INTEGRATION / "scenarios" / filename
-    # The loader validates against the in-memory farm; no scenario file is written.
-    temporary = path.with_name(".unit-snapshot-s80.json")
+    # Keep the temporary scenario outside the immutable source checkout and
+    # isolate each pytest invocation from concurrent workers.
+    temporary = tmp_path / ".unit-snapshot-s80.json"
     temporary.write_text(json.dumps(value), encoding="utf-8")
     try:
         return load_scenario_spec(temporary, farm)
@@ -107,9 +111,11 @@ def _snapshot_scenario(farm: FarmSpec, filename: str = "S80-p29v1.json") -> Scen
         temporary.unlink()
 
 
-def test_snapshot_is_authority_bound_and_mounts_are_in_topology_digest() -> None:
+def test_snapshot_is_authority_bound_and_mounts_are_in_topology_digest(
+    tmp_path: Path,
+) -> None:
     farm = _snapshot_farm()
-    scenario = _snapshot_scenario(farm)
+    scenario = _snapshot_scenario(farm, tmp_path)
     plan = farmtest.build_plan(farm, scenario, run_id="snapshot-unit")
     client = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
     assert client["system_source_snapshot"]["manifest_sha256"] == "a" * 64
@@ -125,7 +131,7 @@ def test_snapshot_is_authority_bound_and_mounts_are_in_topology_digest() -> None
     altered = copy.deepcopy(farm.data)
     altered["system_source_snapshots"]["stable-f-source"]["manifest_sha256"] = "b" * 64
     altered_farm = FarmSpec(path=farm.path, data=altered)
-    altered_scenario = _snapshot_scenario(altered_farm)
+    altered_scenario = _snapshot_scenario(altered_farm, tmp_path)
     altered_plan = farmtest.build_plan(altered_farm, altered_scenario, run_id="snapshot-unit")
     assert altered_plan["topology_digest"] != plan["topology_digest"]
 
@@ -234,7 +240,7 @@ class _SnapshotRecorder:
 @pytest.mark.parametrize("role", ["C", "F"])
 def test_snapshot_preflight_syncs_and_materializes_from_derived_paths(tmp_path: Path, role: str) -> None:
     farm = _snapshot_farm()
-    scenario = _snapshot_scenario(farm)
+    scenario = _snapshot_scenario(farm, tmp_path)
     plan = farmtest.build_plan(farm, scenario, run_id="snapshot-preflight")
     instance = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
     instance = copy.deepcopy(instance)
@@ -436,7 +442,7 @@ def test_snapshot_remote_verifier_refuses_non_absent_states_without_sync(
     tmp_path: Path, statuses, message: str
 ) -> None:
     farm = _snapshot_farm()
-    scenario = _snapshot_scenario(farm)
+    scenario = _snapshot_scenario(farm, tmp_path)
     plan = farmtest.build_plan(farm, scenario, run_id="snapshot-status")
     instance = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
     snapshot = farm.data["system_source_snapshots"]["stable-f-source"]
@@ -456,7 +462,7 @@ def test_snapshot_remote_verifier_refuses_non_absent_states_without_sync(
 
 def test_snapshot_materializer_receipt_requires_exact_keyset_and_types(tmp_path: Path) -> None:
     farm = _snapshot_farm()
-    scenario = _snapshot_scenario(farm)
+    scenario = _snapshot_scenario(farm, tmp_path)
     plan = farmtest.build_plan(farm, scenario, run_id="snapshot-receipt")
     instance = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
     snapshot = farm.data["system_source_snapshots"]["stable-f-source"]

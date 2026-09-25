@@ -12,6 +12,26 @@ retained artifact directories.
 
 ## Developer QA
 
+### Full Python integration follow-up
+
+The unfiltered integration suite on runtime `a93b7595` completed with
+1,579 passed, ten failed and seven skipped in 655.74 seconds (exit 1).
+Nine failures came from a snapshot fixture writing a fixed filename inside
+the read-only checkout; one came from an unsorted formal distribution
+manifest. The fixture now uses pytest's per-test temporary directory, and
+the manifest is sorted without changing membership. The two affected modules
+pass all 47 tests against the `96733809` source plus these corrections, using
+the same read-only source mount (4.57 seconds, exit 0).
+
+Retained logs under `/tanksmall/scratch/tmp/p51-a93-combined-qa/tmp/`:
+`integration-python-tests.log`, SHA256
+`33698ec375fab14153ab32db0cd3fbeba454d58fcd7f747f20cdf167b8cee1a8`;
+`967-python-fixture-fixes-r2.log`, SHA256
+`aead754f45c88346a4f78d225eb05606491bb78555accf780b47da7c82ebc20c`.
+The focused rerun is not a full-suite pass. Full supported QA and mixed R2
+qualification remain pending. The unfiltered suite includes thorough tests;
+the retained-header authority test's runtime is being measured separately.
+
 ### Consumed-reservation recovery model
 
 The focused `cache/formal/run_consumed_proof_tlc.sh` gate passes 15 rows:
