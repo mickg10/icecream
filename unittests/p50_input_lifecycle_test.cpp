@@ -360,6 +360,61 @@ void replacement_cycle_and_bounds() {
             "failed commit reservation leaked capacity");
 }
 
+void prepared_retirement_fences_attachment_until_replacement_commit() {
+    const local::Identity identity{91, 92};
+    const InputRecordKey input = key(19);
+    const InputLeaseOwner old_owner{1901, 1902, 1903};
+    const InputLeaseOwner replacement{1901, 1904, 1905};
+    const FStoreGuid f_store = Id128::from_u64(0xf500000000000017ULL);
+    InputLifecycleRegistry registry(4, 8);
+    registry.bind_store_identity(17, f_store);
+    require(registry.prepare_route_commit(input) ==
+                InputLifecycleCommitDecision::Open &&
+                registry.observe_route_commit(input, true) &&
+                registry.begin_attachment(input, old_owner, 1),
+            "prepared-retirement setup failed");
+    registry.finish_attachment(input, old_owner, 1, false);
+
+    auto retirement_request = request(
+        identity, input, old_owner, 1910,
+        InputLifecycleAction::PrepareAttemptRetirement);
+    retirement_request.f_store_generation = 17;
+    retirement_request.f_store_guid = f_store;
+    retirement_request.immutable_size = 23;
+    retirement_request.immutable_digest =
+        icecc::digest128("prepared-retirement-retained-input");
+    retirement_request.retirement_id = 1911;
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    retirement_request.absolute_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            clock.clock_domain_id, clock.time_namespace_id);
+    retirement_request.deadline =
+        retirement_request.absolute_deadline.as_steady_time_point();
+    require(registry.begin_apply(retirement_request).status ==
+                InputLifecycleApplyStatus::Applied &&
+                registry.finish_apply(retirement_request, true),
+            "PREPARE did not quiesce the exact retained attempt");
+    require(!registry.begin_attachment(input, old_owner, 2),
+            "PREPARE left the retiring owner attachable before COMMIT");
+    require(!registry.begin_attachment(input, replacement, 2),
+            "uncommitted replacement owner attached before COMMIT");
+
+    InputLifecycleRequest commit = retirement_request;
+    commit.operation_id = 1912;
+    commit.action = InputLifecycleAction::CommitAttemptReplacement;
+    commit.replacement_owner = replacement;
+    require(registry.begin_apply(commit).status ==
+                InputLifecycleApplyStatus::Applied &&
+                registry.finish_apply(commit, true),
+            "replacement COMMIT failed after PREPARE");
+    require(!registry.begin_attachment(input, old_owner, 3),
+            "retired owner reattached after replacement COMMIT");
+    require(registry.begin_attachment(input, replacement, 3),
+            "committed replacement owner could not attach retained input");
+    registry.finish_attachment(input, replacement, 3, false);
+}
+
 void cancellation_racing_attachment_finalization_revokes_exact_owner() {
     for (const bool begin_before_cancel : {false, true}) {
     for (const bool acknowledged : {false, true}) {
@@ -665,6 +720,7 @@ int main() {
     commit_attachment_cancel_replace_close();
     close_before_commit_and_attach_close_race();
     replacement_cycle_and_bounds();
+    prepared_retirement_fences_attachment_until_replacement_commit();
     cancellation_racing_attachment_finalization_revokes_exact_owner();
     refinement_cancel_commit_ordering();
     lifecycle_transport_round_trip();
