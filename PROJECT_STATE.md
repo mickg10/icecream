@@ -274,8 +274,24 @@ changes and private diagnostic logging. Client/daemon/service binary SHA256:
 `967a582c54a40079d927abd1d1fac74d416af7da0c353f21493ce6f6070aaedb`,
 `007c22e2f6aa206dc8bed5c5fd81b2fadc02d28de66a19b26adcdfdf449e3fac`.
 This proves sequential link reuse, not 30 simultaneous wrapper invocations;
-the separate receipt gate proves W30 concurrency. C01's 2/100-job cells and
-the opt-in Make entry point remain in progress.
+the separate receipt gate proves W30 concurrency.
+
+The same coherent snapshot also passes C01's 2-job and 100-job batches for
+all three profiles, each with one measured persistent link and exact remote
+objects. Logs: `/tanksmall/scratch/tmp/p51-wrapper-2.log` (container exit 0,
+SHA256 `eb29c28332dbdd2489540772a21eec5fd49b601db675cd34fb4afdbcbba7140c`)
+and `/tanksmall/scratch/tmp/p51-wrapper-100.log` (all required per-profile and
+final PASS markers; numeric container exit was not retained, SHA256
+`d69ba781b3e6d790b1e27cd980aad0697244b6c8732d5391187b73e7abe56b4e`).
+Their artifact roots are `/tanksmall/scratch/tmp/p51-wrapper-2.CfxV3i/evidence-2`
+and `/tanksmall/scratch/tmp/p51-wrapper-100.ZL1Fq1/evidence-100`.
+The opt-in `make -C unittests p51wrappercompile-check` runs both counts across
+all profiles, requiring a built tree, disposable test container, writable
+`ICEFARM_TMPDIR` and `ICECC_P50_C1F1_WORKER_SCHEDULER_HOST`. Generated-Makefile
+dry-run validation passes in `/tanksmall/scratch/tmp/p51-wrapper-make-dryrun.log`
+(SHA256 `a7c4b81fb6363b5c18e17a582d325823b329fb8c74e80d9e9af0435606c87919`).
+The entry point itself has not yet been executed end-to-end; the underlying
+script runs above provide runtime evidence, and the dry run checks invocation.
 
 Real C1F2/F-cache and C2F1/C-cache restart fixtures are not yet qualified.
 The F-cache restart case exposed excessive retries of the obsolete F identity;

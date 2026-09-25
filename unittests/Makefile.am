@@ -363,6 +363,17 @@ p50daemonpositive-p51-w30-check: p50daemonpositive
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+
+# Opt-in real compiler/link-reuse gate. Requires the normal build, task scratch
+# and ICECC_P50_C1F1_WORKER_SCHEDULER_HOST; run only in a disposable test container.
+.PHONY: p51wrappercompile-check
+p51wrappercompile-check:
+	@set -e; for jobs in 2 100; do \
+	  ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)' \
+	  ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
+	  ICECC_P51_WRAPPER_JOBS=$$jobs \
+	  $(SHELL) '$(srcdir)/p51wrappercompile-run.sh'; \
+	done
 lockexec_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 
 schedpolicy_SOURCES = schedpolicy.cpp
@@ -537,6 +548,7 @@ connectivity_DEPENDENCIES = conn_shim.so
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log
 EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 EXTRA_DIST += codec_golden_compare.h
+EXTRA_DIST += p51wrappercompile-run.sh
 
 EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50daemonpositive-p51-w30.sh p50zstdsender-source.sh
 EXTRA_DIST += releaseidentity-source.sh

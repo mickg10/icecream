@@ -1,7 +1,7 @@
 #!/bin/sh
-# Real wrapper-to-compiler P51 persistence gate.  One C/F relationship handles
-# 31 separate compiler invocations per profile; the production runner compares
-# every remote object byte-for-byte with a local g++ build.
+# Real wrapper-to-compiler P51 persistence gate. One C/F relationship handles
+# a bounded configurable number of separate compiler invocations per profile;
+# the production runner compares every remote object byte-for-byte with local g++.
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -114,7 +114,7 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         exit 1
     }
     grep -F "S8_BATCH_COMPLETE run=full-1 count=$jobs" "$log" >/dev/null || {
-        echo "FAIL: $profile did not complete all 31 compiler jobs" >&2
+        echo "FAIL: $profile did not complete all $jobs compiler jobs" >&2
         exit 1
     }
     grep -F "PASS: all-P50 C1F1 $profile compile is remote and byte-identical" \
