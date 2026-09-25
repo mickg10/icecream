@@ -28,11 +28,23 @@ simultaneous mixed-version coexistence tests. Subsequent harness refinements
 (old-scheduler-only selection and scheduler logfile ownership) passed the
 10 focused harness tests; their stdout was not separately retained.
 
-The pinned old protocol-50 scheduler fallback currently **fails**: its
-log reports `invalid message payload (GET_CS)`. The candidate must correct
-peer-version encoding and pass this real fallback case before compatibility
-is claimed. The harness supports isolating that case without repeating
-the passing profile cases; see [dev/README.md](dev/README.md).
+The pinned old protocol-50 scheduler fallback initially failed with
+`invalid message payload (GET_CS)`. The corrected daemon now projects R2
+requests and advertisements to cache absence on that older scheduler hop,
+while retaining the original wrapper request during deferred scheduling.
+Its strict SDK build and actual old-scheduler remote compile pass. Evidence:
+`/tanksmall/scratch/tmp/p51-old50-compat-20260925T005555Z/old50-rerun/summary.json`
+(SHA256 `945989e7bc8fa86428835072174f6571b2bf0833b064add4c7e68ec197821610`).
+The scheduler is from commit `94e9b44025887412c70c1c46c35fc588d6dec776`,
+binary SHA256 `ecb988d58ba66ee176512b5065ab03352b994da6cd8adf2846ca5db2f2d73da2`.
+The corrected daemon source hash is
+`c2421f21416cf153d89e1b39246afec74e68a93194a30fa5905f199aba0883aa`;
+derived runtime image ID is
+`sha256:700edb9e1d3ca7bd0f49361e27a99a5350e2dc2885d704d1a550a40ac0b1c55e`.
+This proves ordinary remote fallback without R2 selection for that pinned
+peer; the current-R2 recheck on this same image and scheduler-transition
+regressions remain pending. It is not a combined recovery qualification.
+The harness can isolate this case; see [dev/README.md](dev/README.md).
 
 ### Persistent-link implementation in progress
 

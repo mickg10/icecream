@@ -1659,6 +1659,7 @@ struct Daemon {
         const icecc::p50::advertisement::Snapshot *cache_transition = nullptr)
         __attribute_warn_unused_result__;
     icecc::p50::advertisement::Snapshot cache_advertisement_snapshot() const noexcept;
+    icecc::p50::advertisement::Snapshot scheduler_cache_advertisement_snapshot() const noexcept;
     void reconcile_cache_route_state() noexcept;
     bool cache_client_sidecar_ready() noexcept;
     bool cache_client_service_ready() noexcept;
@@ -1678,7 +1679,9 @@ struct Daemon {
     bool finish_transfer_env(Client *client, bool cancel = false);
     bool handle_get_native_env(Client *client, GetNativeEnvMsg *msg) __attribute_warn_unused_result__;
     bool finish_get_native_env(Client *client, string env_key);
-    void project_getcs_cache_route(
+    P50CacheClientCapability cache_capability_for_scheduler(
+        P50CacheClientCapability capability) const noexcept;
+    P50CacheClientCapability project_getcs_cache_route(
         GetCSMsg *request,
         P50CacheClientCapability capability);
     void handle_old_request();
@@ -4697,6 +4700,17 @@ Daemon::cache_advertisement_snapshot() const noexcept
         : icecc::p50::advertisement::Snapshot{};
 }
 
+icecc::p50::advertisement::Snapshot
+Daemon::scheduler_cache_advertisement_snapshot() const noexcept
+{
+    auto snapshot = cache_advertisement_snapshot();
+    if (scheduler != nullptr &&
+        snapshot.protocol == CACHE_WIRE_REVISION_R2 &&
+        !protocol_supports_cache_r2(scheduler->protocol))
+        return {};
+    return snapshot;
+}
+
 void Daemon::reconcile_cache_route_state() noexcept
 {
     const icecc::p50::sidecar::ReadyLease *current = nullptr;
@@ -4793,7 +4807,11 @@ bool Daemon::reannounce_environments(
     if (scheduler_session_active) {
         snapshot = cache_transition != nullptr
             ? canonical_cache_snapshot(*cache_transition)
-            : cache_advertisement_snapshot();
+            : scheduler_cache_advertisement_snapshot();
+        if (scheduler != nullptr &&
+            snapshot.protocol == CACHE_WIRE_REVISION_R2 &&
+            !protocol_supports_cache_r2(scheduler->protocol))
+            snapshot = {};
     }
 
     log_info() << "reannounce_environments cache=" << snapshot.endpoint_port
@@ -5634,14 +5652,15 @@ void Daemon::poll_cache_adapter() noexcept
     // already present may emit no new transition, so reconcile its level after
     // activation rather than relying only on edges.
     const auto current = cache_advertisement_snapshot();
+    const auto scheduler_visible = scheduler_cache_advertisement_snapshot();
     // Keep the snapshot comparison tied to an active adapter.  This is an
     // actual production predicate (and not a source-gate marker): a stale
     // scheduler snapshot is never treated as authoritative while the outer
     // sidecar owner is absent.
     const bool snapshot_valid_for_adapter =
         scheduler_cache_snapshot_valid && cache_adapter != nullptr;
-    if ((!snapshot_valid_for_adapter || scheduler_cache_snapshot != current)
-            && !reannounce_environments(&current))
+    if ((!snapshot_valid_for_adapter || scheduler_cache_snapshot != scheduler_visible)
+            && !reannounce_environments(&scheduler_visible))
         return;
 
     /* Complete strict PREPAREs held during sidecar startup only after the
@@ -7858,11 +7877,19 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
     return send_scheduler(*msg);
 }
 
-void Daemon::project_getcs_cache_route(
+P50CacheClientCapability Daemon::project_getcs_cache_route(
     GetCSMsg *request, P50CacheClientCapability capability)
 {
     assert(request != nullptr);
 
+    capability = cache_capability_for_scheduler(capability);
+
+    /* Cache revision 2 is carried inside the protocol-50 GetCS tail, but the
+       scheduler's protocol-50 decoder only accepts revision 1. Keep the
+       wrapper's local channel and sidecar opted into R2; project canonical
+       cache absence only on this older scheduler hop. This preserves ordinary
+       remote scheduling without sending an R2-shaped GetCS to a peer that
+       cannot validate it. */
     /* The wrapper may contribute exactly one routing restriction: a failed
        ordinary F endpoint for its bounded strict retry.  C still owns the
        capability/kill-switch decision.  Preserve the restriction only when
@@ -7889,7 +7916,7 @@ void Daemon::project_getcs_cache_route(
         trace() << "P50 retry exclusion forwarded endpoint="
                 << requested_avoid_host << ":" << requested_avoid_port
                 << endl;
-        return;
+        return capability;
     }
 
     if (capability.profile_mask != 0 &&
@@ -7901,6 +7928,20 @@ void Daemon::project_getcs_cache_route(
         request->cache_affinity_port = cache_affinity_port;
         request->cache_affinity_host = cache_affinity_host;
     }
+    return capability;
+}
+
+P50CacheClientCapability Daemon::cache_capability_for_scheduler(
+    P50CacheClientCapability capability) const noexcept
+{
+    if (scheduler != nullptr &&
+        capability.protocol == CACHE_WIRE_REVISION_R2 &&
+        !protocol_supports_cache_r2(scheduler->protocol)) {
+        trace() << "P51 cache request withheld from ordinary protocol-"
+                << scheduler->protocol << " scheduler" << endl;
+        return {};
+    }
+    return capability;
 }
 
 void Daemon::handle_old_request()
@@ -7975,11 +8016,11 @@ void Daemon::handle_old_request()
                         revalidated = {};
                 }
             }
+            revalidated = project_getcs_cache_route(g, revalidated);
             c->cache_offer = revalidated;
             if (revalidated.profile_mask == 0)
                 c->cache_offer_lease.reset();
             c->deferred_getcs_waits_for_cache = false;
-            project_getcs_cache_route(g, revalidated);
             g->client_count = clients.size();
             g->command_summary.clear();
             const bool sent = send_scheduler(*g);
@@ -9379,6 +9420,8 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
                 requested_cache_capability = {};
         }
     }
+    const P50CacheClientCapability scheduler_requested_capability =
+        cache_capability_for_scheduler(requested_cache_capability);
     const bool sidecar_ready = cache_client_sidecar_ready();
     /* P50 strictness is intentionally not inferred from remote_required.
        ICECC_P50_C1F1_REQUIRED is a wrapper policy and its one fresh strict
@@ -9387,10 +9430,6 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
        capability as canonical absence races the successor lease and produces
        Error 105.  Hold every one-job cache-capable request across this finite
        recovery; cache-absent/legacy requests remain immediately publishable. */
-    const bool wait_for_cache_recovery =
-        icecc::p50::daemon::should_defer_cache_capable_getcs(
-            umsg->count, requested_cache_capability.profile_mask,
-            sidecar_ready, cache_sidecar_recovery_in_progress());
     P50CacheClientCapability cache_capability =
         sidecar_ready ? requested_cache_capability
                       : P50CacheClientCapability{};
@@ -9399,6 +9438,10 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         if (cache_capability.profile_mask == 0)
             cache_capability = {};
     }
+    const bool wait_for_cache_recovery =
+        icecc::p50::daemon::should_defer_cache_capable_getcs(
+            umsg->count, scheduler_requested_capability.profile_mask,
+            sidecar_ready, cache_sidecar_recovery_in_progress());
     client->cache_offer = cache_capability;
     client->cache_offer_generation = 0;
     client->cache_offer_lease.reset();
@@ -9437,8 +9480,6 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
             "handle_get_cs: holding P50 cache-capable request for cache recovery");
         return true;
     }
-
-    project_getcs_cache_route(umsg, cache_capability);
 
     if (scheduler && !scheduler_session_active) {
         /* G4 LOGIN_ATTEMPT: the channel is up but the session is not committed
@@ -9498,6 +9539,11 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         client->last_known_job_id = umsg->client_id;
         return true;
     }
+
+    cache_capability = project_getcs_cache_route(umsg, cache_capability);
+    client->cache_offer = cache_capability;
+    if (cache_capability.profile_mask == 0)
+        client->cache_offer_lease.reset();
 
     umsg->client_count = clients.size();
     umsg->command_summary.clear();
@@ -11068,15 +11114,17 @@ bool Daemon::handle_p51_cache_link_session(
     const bool public_tcp_cache_link =
         provenance.listener == ListenerKind::TcpLoopback ||
         provenance.listener == ListenerKind::TcpRemote;
-    if (client->status != Client::UNKNOWN || client->job != nullptr ||
-        client->usecsmsg != nullptr ||
-        client->p50_source_arm_fields.has_value() ||
+    if (client->status != Client::UNKNOWN)
+        return refuse("link channel is not in UNKNOWN state");
+    if (client->job != nullptr || client->usecsmsg != nullptr)
+        return refuse("link channel already owns a compiler assignment");
+    if (client->p50_source_arm_fields.has_value() ||
         client->p51_source_arm_fields.has_value() ||
         client->p51_source_armed_fields.has_value() ||
-        client->pending_p51_source_lease || client->p50_attachment ||
-        client->pending_p51_source_arm ||
-        client->p50_attachment_lease.has_value())
-        return refuse("link channel is not a pristine live public TCP connection");
+        client->pending_p51_source_lease || client->pending_p51_source_arm)
+        return refuse("link channel already owns source-arm state");
+    if (client->p50_attachment || client->p50_attachment_lease.has_value())
+        return refuse("link channel already owns input attachment state");
     if (!public_tcp_cache_link)
         return refuse("link channel did not arrive on a public TCP listener");
     // Public TCP sockets have no Unix peer credentials by design. The
