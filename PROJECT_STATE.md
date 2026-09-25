@@ -314,8 +314,17 @@ Evidence: `restart-attach-diagnostic4.raw.log` under the same root
 Its final summary's `fresh=1` indicates the selected scenario, not a passing
 fresh-transfer assertion; the log contains explicit FAILED assertions.
 Bounded shared retry backoff and typed R2 rejection are in progress.
-Fresh replacement attachment still needs diagnosis. The observed cancellation
-withdrawal refers to the dead old incarnation, not its successor. Next: finish
+Fresh replacement attachment now has a confirmed failure path: the old F route
+retains one preparation; `reset_f_store_exact` cannot reset that live route,
+so endpoint-identity binding rejects the fresh assignment with error 4 and
+zero transfer attempts. Diagnostic evidence: `restart-reset-diagnostic.raw.log`
+under the same root (SHA256
+`ea84ba3e0a41f9859e1e946ee3b50d206d1202f3470725b3f4858ba53972264e`).
+The fix remains pending: old-incarnation retirement must safely settle retained
+preparations without globally disabling C or disturbing its healthy sibling.
+Retry backoff alone cannot repair this admission failure. The observed
+cancellation withdrawal refers to the dead old incarnation, not its successor.
+Next: finish
 wrapper C01, real C/F/S restart gates, and mixed-version qualification. Do not
 count same-process socket recovery as a process-restart test.
 
