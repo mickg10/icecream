@@ -170,6 +170,17 @@ struct ZstdSourceTransferConfig {
     // Request-scoped observation used to prove that a queued ARM reaches the
     // recovery-required branch before a shared reconnect completes.
     std::function<void(PrepareRequestKey)> before_r2_recovery_for_test;
+    // Observes the request selected as the writer/coordinator immediately
+    // before it attempts the shared recovery operation.
+    std::function<void(PrepareRequestKey)> before_r2_recovery_attempt_for_test;
+    // Observes an exact positive receipt settled from the RECOVER transcript.
+    // Test-only; the callback cannot modify sender state.
+    std::function<void(PrepareRequestKey, uint64_t)>
+        after_r2_recovery_receipt_settled_for_test;
+    // Deterministic disconnect immediately before one replay row is emitted.
+    // This seam is used only to probe recovery-owner failure handling.
+    std::function<bool(uint64_t, size_t, bool, bool)>
+        disconnect_r2_before_replay_bundle_for_test;
     // Called as a detached R2 receipt/ACK pump completes. The route owner
     // uses this only to post an owner-affine deferred-retirement reap; it
     // must not mutate sender or route state inline from the coroutine.

@@ -38,31 +38,47 @@ binary `47b0e0e00e39a3107857834809ceb4e35f9f22bf164c76e2119d30b966168cdf`.
 SDK image `icecream-dev:sdk-ubuntu24.04-a9fa596a15e7`, 2 CPUs/8 GiB.
 This adds regression coverage, not a product change or full D08/C03 closure.
 
-### Shared recovery repair: qualification incomplete
+### Shared recovery failure handling
 
-The uncommitted centralized failed-recovery cleanup is not qualified.
-Its private production build and slice0 suite pass. A sender run failed at
-`lost_commit_recovery`: status 6 (DeadlineExceeded), five connector calls,
-one consumed/committed input and one reset. Snapshot audit found that this
-run used a stale sender fixture, with acknowledged prefix fixed at zero
-after RESET; the current upstream fixture already uses the settled prefix.
-This failure is excluded as evidence of a product regression. The private
-snapshot also predates the retirement guard and other test updates, so it
-must be synchronized before combined qualification. No deadline or connector
-allowance was raised.
-Failure evidence:
-`/tanksmall/scratch/tmp/p51-d07-positive-owner.PfF4BU/tmp/final-sender.log`,
-SHA256 `4d630f53a69ae0959f21e3e8b915a8f2aee4f135c2888ae507eda1f410e6fd18`.
-The chained route-owner and final service runs were not reached.
+A failed recovery attempt now marks its current physical generation unusable
+and closes its socket even when the coordinating caller has already recovered
+an exact positive result. Cleanup belongs to the shared recovery routine,
+so admission, receipt-wait and credit-recovery callers use the same rule.
+It preserves positive results, retained suffixes, original deadlines and the
+stable recovery floor; it does not increase retry limits or change the wire.
 
-After synchronizing the sender fixture, lost-COMMIT and shared-recovery
-cases pass. The next full sender attempt fails the existing future-ARM
-observer assertion: moving `before_r2_recovery_for_test` from branch entry
-to actual recovery ownership changed the test seam's meaning. Restore that
-observer and use a separate attempt-ownership observer for the new fixture;
-do not weaken the existing assertion. Evidence: `final-sender-r2.log` in
-the same directory, SHA256
-`577194bc5e888143315183017b4ff28d9087d80e3a9c536dc5b91f1e7495d1ed`.
+The default service suite includes four named cancellation/recovery scenarios
+across all three profiles. The positive-coordinator case loses the first
+COMMIT reply, cancels a middle reservation, then disconnects before survivor
+replay. It checks the exact coordinator/receipt, both RESET snapshots, three
+connections, exact survivor attachments, original deadlines and released C
+operation/raw credits. The committed-attempt case verifies retirement and
+replacement admission without claiming real compiler-process quiescence.
+Branch-entry and actual recovery-owner test observations are separate hooks.
+
+Luna's ordinary production build, full sender (37 named cases), full route
+owner (including W30 topology cells), and full service suite pass. Sender and
+route-owner exit files explicitly record 0 under
+`/tanksmall/scratch/tmp/p51-d07-positive-owner.PfF4BU/tmp/`:
+`final-sender-hook-r2.log` SHA256
+`0d8e964c6710b72270eb3ce89190220cba5edfe402cd9334cd4cda220fbf54ec`;
+`final-routeowner-hook-r2.log` SHA256
+`a107b00f7c09c646f5e8145bff1710d8134507dcb4dd595eb3dab600e66c8e06`.
+Full service Automake PASS/exit 0:
+`/tanksmall/scratch/tmp/p51-d07-active-current.n5c5bZ/build/unittests/p50cacheservice.log`,
+SHA256 `a041296f9ce70a44e48b3eae7be3d70ee714342def4349f7beb5755840550326`.
+Service test source SHA256
+`2d38ed7a4ddaca821760e678ccc5c6fafcfcbe3dab30ba276071a3a76aef59f3`.
+Tested sender source `27f5980cbfc61e31f4bc48b3160cf1ace0f526f1d1e1b8851c6ca9c2b6797033`
+differs from published `1ad6d998a2fa0749420358c636b545a9e2c9b01743306b48cd88890f81be5a95`
+only in the two preserved R1 explanatory comments.
+
+Excluded earlier attempts remain in the same artifact roots: stale sender
+fixture (`final-sender.log`), changed observer semantics (`final-sender-r2.log`),
+and missing uv before service execution. The fixtures were synchronized,
+the original observer assertion retained, and pinned uv supplied before the
+passing runs. Mixed-version/current-image QA, restart chains and the broader
+W30 acceptance matrix remain open; these passes do not close the whole plan.
 
 ### Consecutive P29 recovery resets
 
@@ -80,12 +96,12 @@ SHA256 `00ccd965068d1462a75009dd842069a4b60435bec2e99eee0f3a73692c3f6240`.
 Product source SHA256:
 `6ddb4fba49f07351fc7ee4ee5d11aee35684aebff5b3e8961a5e9cffc7d7e0dd`;
 test source `9c115067c354957874e891280c28246b36edb9b6b06db7c898ad3dcdd38fde0f`.
-The private positive-coordinator service case also passes all three profiles,
-but it includes a separate unpublished sender repair. Its log is
+The earlier private positive-coordinator service case passed all three profiles
+with the sender repair subsequently qualified above. Its diagnostic log is
 `positive-owner-allprofiles-r1.log` in that directory, SHA256
 `6276413c24540853548e0f31d29bc69d25f30ddbf7a476c01168e5fc048beec5`.
-This commit alone does not fix every interrupted-replay entry path; central
-sender failure-state repair and combined service qualification remain open.
+The standalone P29 reset repair did not fix every interrupted-replay entry
+path; shared sender failure handling and combined qualification are recorded above.
 
 ### W30 cache restart topology expansion
 
@@ -134,8 +150,8 @@ Published registry source SHA256
 `7b5c3bd6690edee2a947eb82880c4737558f28bae041bd26c7c62008abe439ec`;
 registry test SHA256
 `2550e2c68aae19a1d86a871a9c1184a0edabdd7b4dfc4cf9f6bb81d8bbfc0cca`.
-The larger service fixture is not yet integrated with the newer replay-test
-variants; combined candidate qualification remains open. This establishes
+The larger service fixture is now integrated with the newer replay variants
+and passes the combined default service suite described above. This establishes
 input-attachment admission, not real compiler-process quiescence.
 
 ### Replacement-trigger diagnostics

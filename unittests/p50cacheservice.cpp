@@ -1992,14 +1992,29 @@ void test_p51_d07_queued_cancel_first_middle_last() {
     test_p51_d07_queued_cancel_position(30);
 }
 
-// Active-cancel recovery regression: the first request commits, the second
-// complete bundle is paused on F's materialization worker, and the third
-// request's exact JOB_BIND..TU_END is observed in the TCP receive queue before
-// the second reservation is cancelled. The canceled reservation must settle
-// non-successfully without publication, while the exact successor still
+// Active-cancel recovery regression: a complete bundle is paused on F's
+// materialization worker, and a later request's complete bundle is observed
+// in the TCP receive queue before the canceled reservation is retired. The
+// canceled reservation must settle non-successfully without materialization,
+// while the exact successor still
 // commits on the same logical relationship and within its original deadline.
+enum class D07Scenario : uint8_t {
+    ActiveCancel,
+    InterruptedReplay,
+    PositiveRecoveryOwner,
+    CommittedAttemptReplacement,
+};
+
 void test_p51_d07_active_cancel_recovery(ProfileId profile,
-                                         bool interrupt_replay = false) {
+                                         D07Scenario scenario =
+                                             D07Scenario::ActiveCancel) {
+    const bool interrupt_replay =
+        scenario == D07Scenario::InterruptedReplay ||
+        scenario == D07Scenario::PositiveRecoveryOwner;
+    const bool positive_recovery_owner =
+        scenario == D07Scenario::PositiveRecoveryOwner;
+    const bool committed_attempt_replacement =
+        scenario == D07Scenario::CommittedAttemptReplacement;
     uint32_t cache_profile = 0;
     switch (profile) {
     case ProfileId::P29V1: cache_profile = CACHE_PROFILE_P29V1; break;
@@ -2019,14 +2034,14 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     std::mutex materialize_mutex;
     std::condition_variable materialize_changed;
     unsigned materialize_calls = 0;
-    bool second_bundle_waiting = false;
+    bool materialization_waiting = false;
     bool release_second_bundle = false;
     auto before_materialize = [&] {
         std::unique_lock lock(materialize_mutex);
         ++materialize_calls;
-        if (materialize_calls != 2)
+        if (materialize_calls != (positive_recovery_owner ? 1u : 2u))
             return;
-        second_bundle_waiting = true;
+        materialization_waiting = true;
         materialize_changed.notify_all();
         materialize_changed.wait(lock, [&] { return release_second_bundle; });
     };
@@ -2034,6 +2049,19 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     std::mutex retired_mutex;
     std::condition_variable retired_changed;
     std::vector<std::pair<Id128, bool>> retired_rows;
+    struct MaterializedObservation {
+        CStoreGuid c_guid{};
+        uint64_t tu_seq = 0;
+        uint64_t raw_bytes = 0;
+        Digest128 raw_digest{};
+        Digest128 transaction_digest{};
+        bool payload_matches = false;
+    };
+    std::mutex materialized_mutex;
+    std::vector<MaterializedObservation> materialized_inputs;
+    std::vector<R2TxCommit> wire_receipts;
+    std::vector<ResetAck> wire_reset_acks;
+    std::mutex wire_observation_mutex;
 
     service::RuntimeConfig f_config = test_runtime_config();
     f_config.c_store_guid = f_launch.c_store_guid;
@@ -2044,9 +2072,23 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     f_config.endpoint_caps.supported_profiles = profile_bit(profile);
     f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
     f_config.max_pending_p51_source_reservations = 8;
+    f_config.endpoint_config.input_job_state =
+        [&](CStoreGuid c_guid, const TxBegin& begin, const TxCommit& commit,
+            std::span<const uint8_t> bytes) {
+            {
+                std::lock_guard lock(materialized_mutex);
+                materialized_inputs.push_back(MaterializedObservation{
+                    c_guid, begin.tu_seq.value, begin.raw_bytes,
+                    begin.raw_digest, commit.transaction_digest,
+                    begin.raw_bytes == bytes.size() &&
+                        begin.raw_digest == icecc::digest128(bytes)});
+            }
+            return InputJobState::Open;
+        };
     std::mutex reset_ack_mutex;
     std::condition_variable reset_ack_changed;
     std::vector<std::pair<size_t, ResetAck>> reset_acks;
+    std::vector<std::pair<size_t, ReceiptRow>> recovery_receipts;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     f_config.p51_reservation_retired_for_test =
         [&](Id128 id, bool marker_retired) {
@@ -2073,8 +2115,16 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
     auto replay_bundle_calls = std::make_shared<std::atomic<size_t>>(0);
     auto interrupted_ordinal = std::make_shared<std::atomic<uint64_t>>(0);
+    std::atomic<bool> first_recovered_positive{false};
+    std::atomic<bool> cut_after_positive_recovery{false};
+    std::atomic<bool> pre_replay_state_valid{false};
+    std::atomic<uint64_t> pre_replay_ordinal{0};
+    std::atomic<bool> pre_replay_cut_requested{false};
+    const PrepareRequestKey first_request_key{3, 9101};
+    std::mutex recovery_owner_mutex;
+    std::vector<PrepareRequestKey> recovery_callers;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
-    if (interrupt_replay) {
+    if (interrupt_replay && !positive_recovery_owner) {
         c_config.disconnect_r2_after_bundle_for_test =
             [replay_bundle_calls, interrupted_ordinal](uint64_t ordinal) {
                 const size_t call = replay_bundle_calls->fetch_add(
@@ -2084,6 +2134,35 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 if (call != 5)
                     return false;
                 interrupted_ordinal->store(ordinal,
+                    std::memory_order_release);
+                return true;
+            };
+    }
+    if (positive_recovery_owner) {
+        c_config.before_r2_recovery_attempt_for_test = [&](PrepareRequestKey key) {
+            std::lock_guard lock(recovery_owner_mutex);
+            recovery_callers.push_back(key);
+        };
+        c_config.after_r2_recovery_receipt_settled_for_test =
+            [&](PrepareRequestKey key, uint64_t ordinal) {
+                if (key == first_request_key && ordinal == 1)
+                    first_recovered_positive.store(true,
+                        std::memory_order_release);
+            };
+        c_config.disconnect_r2_before_replay_bundle_for_test =
+            [&](uint64_t ordinal, size_t retained_rows, bool reader_running,
+                bool ack_pump_running) {
+                if (pre_replay_cut_requested.exchange(
+                        true, std::memory_order_acq_rel))
+                    return false;
+                pre_replay_ordinal.store(ordinal, std::memory_order_release);
+                const bool positive = first_recovered_positive.load(
+                    std::memory_order_acquire);
+                pre_replay_state_valid.store(
+                    ordinal == 2 && retained_rows == 2 &&
+                    !reader_running && !ack_pump_running && positive,
+                    std::memory_order_release);
+                cut_after_positive_recovery.store(positive,
                     std::memory_order_release);
                 return true;
             };
@@ -2172,8 +2251,20 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 (void)::close(duplicate);
             EndpointIoControl control;
             control.before_materialize_on_worker = before_materialize;
+            control.outbound_message_observer =
+                [&](ActorSide actor, const Message& message) {
+                    if (actor != ActorSide::F)
+                        return;
+                    std::lock_guard lock(wire_observation_mutex);
+                    if (const auto* commit = std::get_if<R2TxCommit>(&message))
+                        wire_receipts.push_back(*commit);
+                    else if (const auto* ack = std::get_if<ResetAck>(&message))
+                        wire_reset_acks.push_back(*ack);
+                };
             const size_t connection_number =
                 accepted_connections.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (positive_recovery_owner && connection_number == 1)
+                control.close_before_write = MessageType::R2_TX_COMMIT;
             if (interrupt_replay && connection_number >= 3) {
                 control.outbound_message_observer =
                     [&, connection_number](ActorSide, const Message& message) {
@@ -2184,6 +2275,18 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                             std::lock_guard lock(reset_ack_mutex);
                             reset_acks.emplace_back(connection_number, *ack);
                         }
+                        reset_ack_changed.notify_all();
+                    };
+            } else if (positive_recovery_owner && connection_number >= 2) {
+                control.outbound_message_observer =
+                    [&, connection_number](ActorSide, const Message& message) {
+                        std::lock_guard lock(reset_ack_mutex);
+                        if (const auto* receipt =
+                                std::get_if<ReceiptRow>(&message))
+                            recovery_receipts.emplace_back(
+                                connection_number, *receipt);
+                        if (const auto* ack = std::get_if<ResetAck>(&message))
+                            reset_acks.emplace_back(connection_number, *ack);
                         reset_ack_changed.notify_all();
                     };
             }
@@ -2219,11 +2322,13 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     };
     auto make_request = [&](uint64_t request_id, size_t raw_bytes,
                             uint8_t fill) {
+        const auto source_deadline = positive_recovery_owner
+            ? std::chrono::seconds(12) : std::chrono::seconds(30);
         auto reservation = test_p51_reservation_request(
             c_launch.c_store_guid, c_launch.store_generation,
             c_launch.identity.generation, c_launch.identity.attempt,
             request_id, cache_profile, 30,
-            std::chrono::seconds(30));
+            source_deadline);
         reservation.arm.source.assignment_nonce = request_id;
         reservation.arm.source.logical_job = 130000 + request_id;
         reservation.arm.source.compiler_attempt = 1;
@@ -2247,16 +2352,14 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             sized_test_source_fd(row.bytes.size(), row.bytes.front()));
     };
     auto attach_exact = [&](RequestRow& row,
-                            const local::P50SourceTransferResult& result) {
+                            const local::P50SourceTransferResult& result,
+                            const InputLeaseOwner& owner,
+                            bool authorize_attachment) {
         if (result.code != local::SourceTransferResultCode::Committed ||
             !result.valid() || result.c_store_guid != c_launch.c_store_guid ||
             result.raw_bytes != row.bytes.size() ||
             result.raw_digest != icecc::digest128(row.bytes))
             return false;
-        const InputLeaseOwner owner{
-            row.request.armed.arm.source.logical_job,
-            row.request.armed.arm.source.assignment_epoch,
-            row.request.armed.arm.source.assignment_nonce};
         const InputFdRequest attach_request{
             f_launch.identity,
             InputRecordKey{result.c_store_guid, TuSeq{result.tu_seq}}, owner,
@@ -2272,9 +2375,36 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             exact = cursor->read(actual) == actual.size() && actual == row.bytes;
         }
         f_runtime.finish_input_attachment_on_owner(
-            attach_request, exact,
+            attach_request, exact && authorize_attachment,
             row.request.absolute_deadline.as_steady_time_point());
         return exact;
+    };
+    auto attachment_is_denied = [&](RequestRow& row,
+                                    const local::P50SourceTransferResult& result,
+                                    const InputLeaseOwner& owner,
+                                    uint64_t request_id) {
+        if (result.code != local::SourceTransferResultCode::Committed ||
+            !result.valid() || result.c_store_guid != c_launch.c_store_guid)
+            return false;
+        const InputFdRequest request{
+            f_launch.identity,
+            InputRecordKey{result.c_store_guid, TuSeq{result.tu_seq}},
+            owner, request_id};
+        auto cursor = f_runtime.attach_input_on_owner(
+            request, row.request.absolute_deadline.as_steady_time_point());
+        const bool denied = !cursor.has_value();
+        if (cursor) {
+            f_runtime.finish_input_attachment_on_owner(
+                request, false,
+                row.request.absolute_deadline.as_steady_time_point());
+        }
+        return denied;
+    };
+    auto owner_for = [](const RequestRow& row) {
+        return InputLeaseOwner{
+            row.request.armed.arm.source.logical_job,
+            row.request.armed.arm.source.assignment_epoch,
+            row.request.armed.arm.source.assignment_nonce};
     };
 
     RequestRow first = make_request(9101, 512, 0x31);
@@ -2284,10 +2414,92 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     if (interrupt_replay)
         fourth.emplace(make_request(9104, 4096, 0x64));
     CHECK(enqueue(first));
-    const auto first_result = receive_p51_transfer_result(
-        first.pair.receiver, c_launch.identity, first.request_id,
-        first.request.absolute_deadline.as_steady_time_point(), true);
-    const bool first_exact = attach_exact(first, first_result);
+    std::optional<local::P50SourceTransferResult> first_result;
+    bool first_exact = false;
+    std::chrono::steady_clock::time_point first_finished{};
+    std::thread first_waiter;
+    if (positive_recovery_owner) {
+        first_waiter = std::thread([&] {
+            try {
+                first_result = receive_p51_transfer_result(
+                    first.pair.receiver, c_launch.identity, first.request_id,
+                    first.request.absolute_deadline.as_steady_time_point(), true);
+                first_exact = attach_exact(
+                    first, *first_result, owner_for(first), true);
+            } catch (...) {
+                // Assert the absence/failure after joining the result waiter.
+            }
+            first_finished = std::chrono::steady_clock::now();
+        });
+    } else {
+        first_result = receive_p51_transfer_result(
+            first.pair.receiver, c_launch.identity, first.request_id,
+            first.request.absolute_deadline.as_steady_time_point(), true);
+        first_exact = attach_exact(
+            first, *first_result, owner_for(first),
+            !committed_attempt_replacement);
+        first_finished = std::chrono::steady_clock::now();
+    }
+    const InputLeaseOwner first_owner = owner_for(first);
+    bool old_owner_rejected_during_prepare = true;
+    bool replacement_rejected_before_commit = true;
+    bool old_owner_rejected_after_commit = true;
+    bool replacement_exact_after_commit = true;
+    bool lifecycle_prepare_retained = true;
+    bool lifecycle_commit_retained = true;
+    Digest128 first_materialized_transaction_digest{};
+    InputLeaseOwner replacement_owner = first_owner;
+    if (committed_attempt_replacement) {
+        CHECK(first_result.has_value());
+        CHECK(first_result->code == local::SourceTransferResultCode::Committed);
+        replacement_owner.assignment_epoch += 1;
+        replacement_owner.assignment_nonce += 1;
+        const auto retirement_deadline =
+            first.request.absolute_deadline.as_steady_time_point();
+        const InputRecordKey first_key{
+            first_result->c_store_guid, TuSeq{first_result->tu_seq}};
+        const uint64_t retirement_id = first.request_id + 0x200000;
+        auto lifecycle_request = [&](InputLifecycleAction action,
+                                     uint64_t operation_id) {
+            InputLifecycleRequest request;
+            request.identity = f_launch.identity;
+            request.key = first_key;
+            request.owner = first_owner;
+            request.operation_id = operation_id;
+            request.action = action;
+            request.f_store_generation = f_launch.store_generation;
+            request.f_store_guid = f_launch.f_store_guid;
+            request.immutable_size = first_result->raw_bytes;
+            request.immutable_digest = first_result->raw_digest;
+            request.retirement_id = retirement_id;
+            request.absolute_deadline = first.request.absolute_deadline;
+            request.deadline = retirement_deadline;
+            if (action == InputLifecycleAction::CommitAttemptReplacement)
+                request.replacement_owner = replacement_owner;
+            return request;
+        };
+        const auto prepare = lifecycle_request(
+            InputLifecycleAction::PrepareAttemptRetirement,
+            first.request_id + 0x300000);
+        const auto prepared = f_runtime.apply_input_lifecycle_on_owner(
+            prepare, retirement_deadline);
+        lifecycle_prepare_retained = prepared ==
+            InputLifecycleApplyStatus::AttemptQuiescedRecordRetained;
+        old_owner_rejected_during_prepare = attachment_is_denied(
+            first, *first_result, first_owner, first.request_id + 71001);
+        replacement_rejected_before_commit = attachment_is_denied(
+            first, *first_result, replacement_owner, first.request_id + 71002);
+        const auto commit_replacement = lifecycle_request(
+            InputLifecycleAction::CommitAttemptReplacement,
+            first.request_id + 0x300001);
+        const auto committed_replacement =
+            f_runtime.apply_input_lifecycle_on_owner(
+                commit_replacement, retirement_deadline);
+        lifecycle_commit_retained = committed_replacement ==
+            InputLifecycleApplyStatus::ReplacementInstalledRecordRetained;
+        old_owner_rejected_after_commit = attachment_is_denied(
+            first, *first_result, first_owner, first.request_id + 71003);
+    }
 
     CHECK(enqueue(cancelled));
     bool second_materialization_waiting = false;
@@ -2295,13 +2507,14 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         std::unique_lock lock(materialize_mutex);
         second_materialization_waiting = materialize_changed.wait_for(
             lock, std::chrono::seconds(8), [&] {
-                return second_bundle_waiting;
+                return materialization_waiting;
             });
     }
     CHECK(second_materialization_waiting);
     CHECK(enqueue(successor));
     const bool successor_operation_active = wait_for_source_operation_count(
-        c_runtime, 2, std::chrono::seconds(3));
+        c_runtime, positive_recovery_owner ? 3 : 2,
+        std::chrono::seconds(3));
     JobBind observed_successor_binding{};
     JobBind observed_fourth_binding{};
     const auto probe_deadline = std::chrono::steady_clock::now() +
@@ -2372,16 +2585,19 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         observe_buffered_bundle(Id128{fourth->request.armed.reservation_id},
                                 observed_fourth_binding);
     const bool all_survivor_operations_active = wait_for_source_operation_count(
-        c_runtime, interrupt_replay ? 3 : 2, std::chrono::seconds(3));
+        c_runtime, (interrupt_replay ? 3 : 2) +
+                       (positive_recovery_owner ? 1 : 0),
+        std::chrono::seconds(3));
     const bool required_operations_active = successor_operation_active &&
                                             all_survivor_operations_active;
     CHECK(required_operations_active);
     std::fprintf(stderr,
-                 "P51_D07 active-cancel precondition second-materializing=1 "
+                 "P51_D07 active-cancel precondition worker-materializing=1 "
                  "active-operations=%zu successor-full-bundle-buffered=%d "
                  "fourth-full-bundle-buffered=%d "
                  "successor-ordinal=%llu\n",
-                 interrupt_replay ? size_t{3} : size_t{2},
+                 (interrupt_replay ? size_t{3} : size_t{2}) +
+                     (positive_recovery_owner ? size_t{1} : size_t{0}),
                  successor_bundle_buffered ? 1 : 0,
                  fourth_bundle_buffered ? 1 : 0,
                  static_cast<unsigned long long>(
@@ -2398,13 +2614,18 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     // The isolated C runtime submitted these jobs in observed wire order, so
     // their contiguous TU sequence makes the middle key exact without
     // guessing a globally arbitrary sequence number.
-    CHECK(first_result.tu_seq <= std::numeric_limits<uint64_t>::max() -
-          (fourth ? uint64_t{3} : uint64_t{2}));
-    const TuSeq cancelled_tu_seq{first_result.tu_seq + 1};
-    CHECK(observed_successor_binding.tu_seq.value ==
-          first_result.tu_seq + 2);
-    if (fourth)
-        CHECK(observed_fourth_binding.tu_seq.value == first_result.tu_seq + 3);
+    const TuSeq cancelled_tu_seq{
+        observed_successor_binding.tu_seq.value - 1};
+    if (!positive_recovery_owner) {
+        CHECK(first_result.has_value());
+        CHECK(first_result->tu_seq <= std::numeric_limits<uint64_t>::max() -
+              (fourth ? uint64_t{3} : uint64_t{2}));
+        CHECK(observed_successor_binding.tu_seq.value ==
+              first_result->tu_seq + 2);
+        if (fourth)
+            CHECK(observed_fourth_binding.tu_seq.value ==
+                  first_result->tu_seq + 3);
+    }
     const auto cancellation_time = std::chrono::steady_clock::now();
     const auto second_deadline =
         cancelled.request.absolute_deadline.as_steady_time_point();
@@ -2441,12 +2662,12 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 observation.result->code ==
                     local::SourceTransferResultCode::Committed)
                 observation.exact_attachment =
-                    attach_exact(row, *observation.result);
+                    attach_exact(row, *observation.result, owner_for(row), true);
             if (fourth && row.request_id == fourth->request_id &&
                 observation.result->code ==
                     local::SourceTransferResultCode::Committed)
                 observation.exact_attachment =
-                    attach_exact(row, *observation.result);
+                    attach_exact(row, *observation.result, owner_for(row), true);
             if (row.request_id == cancelled.request_id &&
                 observation.result->code ==
                     local::SourceTransferResultCode::Error) {
@@ -2497,6 +2718,8 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     successor_waiter.join();
     if (fourth_waiter.joinable())
         fourth_waiter.join();
+    if (first_waiter.joinable())
+        first_waiter.join();
     const auto second_result = second_observation.result;
     const auto successor_result = successor_observation.result;
     bool exact_cancel_retirement = false;
@@ -2522,6 +2745,11 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         successor_result->code == local::SourceTransferResultCode::Committed;
     const bool successor_exact = successor_committed &&
         successor_observation.exact_attachment;
+    const bool first_committed = first_result.has_value() &&
+        first_result->code == local::SourceTransferResultCode::Committed;
+    if (committed_attempt_replacement && successor_committed)
+        replacement_exact_after_commit = attach_exact(
+            first, *first_result, replacement_owner, true);
     const auto fourth_result = fourth_observation.result;
     const bool fourth_committed = fourth_result.has_value() &&
         fourth_result->code == local::SourceTransferResultCode::Committed;
@@ -2538,6 +2766,110 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         c_runtime, 0, std::chrono::seconds(3));
     const bool all_raw_credits_released = wait_for_source_raw_bytes(
         c_runtime, 0, std::chrono::seconds(3));
+    size_t exact_materializations = 0;
+    size_t exact_wire_receipts = 0;
+    size_t matching_reset_acks = 0;
+    bool reset_ack_exact = false;
+    if (committed_attempt_replacement || positive_recovery_owner) {
+        CHECK(first_result.has_value());
+        std::lock_guard lock(materialized_mutex);
+        const auto matches_first = [&](const MaterializedObservation& observed) {
+            return observed.c_guid == first_result->c_store_guid &&
+                   observed.tu_seq == first_result->tu_seq &&
+                   observed.raw_bytes == first_result->raw_bytes &&
+                   observed.raw_digest == first_result->raw_digest &&
+                   observed.payload_matches;
+        };
+        const auto first_materialization = std::find_if(
+            materialized_inputs.begin(), materialized_inputs.end(),
+            matches_first);
+        if (first_materialization != materialized_inputs.end())
+            first_materialized_transaction_digest =
+                first_materialization->transaction_digest;
+        exact_materializations = static_cast<size_t>(std::count_if(
+            materialized_inputs.begin(), materialized_inputs.end(),
+            matches_first));
+    }
+    PrepareRequestKey first_recovery_owner{};
+    {
+        std::lock_guard lock(recovery_owner_mutex);
+        if (!recovery_callers.empty())
+            first_recovery_owner = recovery_callers.front();
+    }
+    bool recovered_first_receipt_row = false;
+    size_t recovered_first_receipt_count = 0;
+    bool first_reset_ack_exact = false;
+    bool post_cut_reset_ack_exact = false;
+    {
+        std::lock_guard lock(reset_ack_mutex);
+        const auto matches_first_receipt = [&](const auto& row) {
+            return row.first == 2 && row.second.relationship_id.bytes ==
+                       first.request.armed.logical_relationship_id &&
+                   first_result.has_value() &&
+                   row.second.receipt.relationship_ordinal == 1 &&
+                   row.second.receipt.inner.tu_seq.value ==
+                       first_result->tu_seq &&
+                   row.second.receipt.inner.raw_digest ==
+                       first_result->raw_digest &&
+                   row.second.receipt.inner.transaction_digest ==
+                       first_materialized_transaction_digest;
+        };
+        recovered_first_receipt_row = std::any_of(
+            recovery_receipts.begin(), recovery_receipts.end(),
+            matches_first_receipt);
+        recovered_first_receipt_count = static_cast<size_t>(std::count_if(
+            recovery_receipts.begin(), recovery_receipts.end(),
+            matches_first_receipt));
+        first_reset_ack_exact = std::any_of(
+            reset_acks.begin(), reset_acks.end(), [&](const auto& item) {
+                return item.first == 2 &&
+                       item.second.request.relationship_id.bytes ==
+                           first.request.armed.logical_relationship_id &&
+                       item.second.recovery_verified_floor_a == 0 &&
+                       item.second.request.settled_prefix_k == 1 &&
+                       item.second.recovery_prepared_prefix_p == 4 &&
+                       item.second.unavailable_suffix_mask == 1 &&
+                       item.second.recovery_witness_digest != Digest128{};
+            });
+        post_cut_reset_ack_exact = std::any_of(
+            reset_acks.begin(), reset_acks.end(), [&](const auto& item) {
+                return item.first == 3 &&
+                       item.second.request.relationship_id.bytes ==
+                           first.request.armed.logical_relationship_id &&
+                       item.second.recovery_verified_floor_a == 1 &&
+                       item.second.request.settled_prefix_k == 1 &&
+                       item.second.recovery_prepared_prefix_p == 1 &&
+                       item.second.unavailable_suffix_mask == 0 &&
+                       item.second.recovery_witness_digest != Digest128{};
+            });
+    }
+    if (committed_attempt_replacement) {
+        std::lock_guard lock(wire_observation_mutex);
+        exact_wire_receipts = static_cast<size_t>(std::count_if(
+            wire_receipts.begin(), wire_receipts.end(),
+            [&](const R2TxCommit& receipt) {
+                return first_result.has_value() &&
+                       receipt.inner.tu_seq.value == first_result->tu_seq &&
+                       receipt.inner.raw_digest == first_result->raw_digest &&
+                       receipt.relationship_ordinal == 1 &&
+                       receipt.inner.transaction_digest ==
+                           first_materialized_transaction_digest;
+            }));
+        const auto matches_reset = [&](const ResetAck& candidate) {
+            return candidate.request.relationship_id.bytes ==
+                       first.request.armed.logical_relationship_id &&
+                   candidate.request.settled_prefix_k >= 1;
+        };
+        matching_reset_acks = static_cast<size_t>(std::count_if(
+            wire_reset_acks.begin(), wire_reset_acks.end(), matches_reset));
+        const auto ack = std::find_if(
+            wire_reset_acks.begin(), wire_reset_acks.end(), matches_reset);
+        if (ack != wire_reset_acks.end())
+            reset_ack_exact = ack->recovery_verified_floor_a >= 1 &&
+                ack->recovery_prepared_prefix_p >=
+                    ack->request.settled_prefix_k &&
+                ack->recovery_witness_digest != Digest128{};
+    }
     std::printf(
         "P51_D07 active-cancel profile=%u stage=F-materialization after-full-TU "
         "replay-interrupt=%d "
@@ -2546,10 +2878,20 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         "second-error=%u successor-received=%d successor-code=%u "
         "successor-error=%u successor-exact=%d fourth-received=%d fourth-code=%u "
         "fourth-exact=%d cancelled-input-absent=%d "
+        "first-positive-recovered=%d positive-cut=%d pre-replay-valid=%d "
+        "pre-replay-ordinal=%llu first-result=%d first-exact=%d "
+        "recovery-owner=%llu/%llu recovered-first-receipt=%d "
+        "recovered-first-receipt-count=%zu exact-materializations=%zu "
+        "first-reset-ack-exact=%d post-cut-reset-ack-exact=%d "
         "exact-cancel-retirement=%d "
         "finished-after-cancel-ms=%lld/%lld "
         "deadline-remains-ms=%lld/%lld C-operations-released=%d "
-        "C-raw-credit-released=%d\n",
+        "C-raw-credit-released=%d committed-attempt-replacement=%d "
+        "prepare-retained=%d "
+        "commit-retained=%d old-denied-prep=%d successor-denied-precommit=%d "
+        "old-denied-commit=%d replacement-exact-after-commit=%d "
+        "exact-wire-receipts=%zu reset-ack-count=%zu "
+        "reset-ack-exact=%d\n",
         static_cast<unsigned>(profile),
         interrupt_replay ? 1 : 0,
         accepted_connections.load(std::memory_order_acquire),
@@ -2571,6 +2913,19 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             ? static_cast<unsigned>(fourth_result->code) : 0,
         fourth_exact ? 1 : 0,
         cancelled_input_absent ? 1 : 0,
+        first_recovered_positive.load(std::memory_order_acquire) ? 1 : 0,
+        cut_after_positive_recovery.load(std::memory_order_acquire) ? 1 : 0,
+        pre_replay_state_valid.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(
+            pre_replay_ordinal.load(std::memory_order_acquire)),
+        first_result.has_value() ? 1 : 0,
+        first_exact ? 1 : 0,
+        static_cast<unsigned long long>(first_recovery_owner.producer_session),
+        static_cast<unsigned long long>(first_recovery_owner.request_token),
+        recovered_first_receipt_row ? 1 : 0,
+        recovered_first_receipt_count, exact_materializations,
+        first_reset_ack_exact ? 1 : 0,
+        post_cut_reset_ack_exact ? 1 : 0,
         exact_cancel_retirement ? 1 : 0,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             second_observation.finished - cancellation_time).count()),
@@ -2580,10 +2935,19 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             second_deadline - cancellation_time).count()),
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             successor_deadline - cancellation_time).count()),
-        all_operations_released ? 1 : 0, all_raw_credits_released ? 1 : 0);
+        all_operations_released ? 1 : 0, all_raw_credits_released ? 1 : 0,
+        committed_attempt_replacement ? 1 : 0,
+        lifecycle_prepare_retained ? 1 : 0,
+        lifecycle_commit_retained ? 1 : 0,
+        old_owner_rejected_during_prepare ? 1 : 0,
+        replacement_rejected_before_commit ? 1 : 0,
+        old_owner_rejected_after_commit ? 1 : 0,
+        replacement_exact_after_commit ? 1 : 0,
+        exact_wire_receipts, matching_reset_acks,
+        reset_ack_exact ? 1 : 0);
     CHECK(first_exact);
     CHECK(f_cancelled);
-    CHECK(duplicate_f_cancelled);
+    CHECK(duplicate_f_cancelled == !positive_recovery_owner);
     CHECK(exact_cancel_retirement);
     CHECK(exact_link_count);
     CHECK(second_result.has_value());
@@ -2597,7 +2961,21 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     CHECK(successor_exact);
     CHECK(second_observation.finished <= second_deadline);
     CHECK(successor_observation.finished <= successor_deadline);
-    if (interrupt_replay) {
+    if (positive_recovery_owner) {
+        CHECK(first_committed);
+        CHECK(first_finished <=
+              first.request.absolute_deadline.as_steady_time_point());
+        CHECK(first_recovered_positive.load(std::memory_order_acquire));
+        CHECK(cut_after_positive_recovery.load(std::memory_order_acquire));
+        CHECK(pre_replay_state_valid.load(std::memory_order_acquire));
+        CHECK(pre_replay_ordinal.load(std::memory_order_acquire) == 2);
+        CHECK(first_recovery_owner == first_request_key);
+        CHECK(recovered_first_receipt_row);
+        CHECK(recovered_first_receipt_count == 1);
+        CHECK(exact_materializations == 1);
+        CHECK(first_reset_ack_exact);
+        CHECK(post_cut_reset_ack_exact);
+    } else if (interrupt_replay) {
         CHECK(replay_bundle_calls->load(std::memory_order_acquire) >= 5);
         CHECK(interrupted_ordinal->load(std::memory_order_acquire) == 2);
         std::unique_lock lock(reset_ack_mutex);
@@ -2633,6 +3011,21 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     }
     CHECK(all_operations_released);
     CHECK(all_raw_credits_released);
+    if (committed_attempt_replacement) {
+        CHECK(first_result.has_value());
+        CHECK(first_result->code == local::SourceTransferResultCode::Committed);
+        CHECK(lifecycle_prepare_retained);
+        CHECK(old_owner_rejected_during_prepare);
+        CHECK(replacement_rejected_before_commit);
+        CHECK(lifecycle_commit_retained);
+        CHECK(old_owner_rejected_after_commit);
+        CHECK(successor_committed);
+        CHECK(replacement_exact_after_commit);
+        CHECK(exact_materializations == 1);
+        CHECK(exact_wire_receipts == 1);
+        CHECK(matching_reset_acks >= 1);
+        CHECK(reset_ack_exact);
+    }
     if (fourth) {
         CHECK(fourth_result.has_value());
         CHECK(fourth_committed);
@@ -2651,7 +3044,22 @@ void test_p51_d07_active_cancel_all_profiles() {
 void test_p51_d07_active_cancel_replay_interrupt_all_profiles() {
     for (const ProfileId profile : {
              ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
-        test_p51_d07_active_cancel_recovery(profile, true);
+        test_p51_d07_active_cancel_recovery(
+            profile, D07Scenario::InterruptedReplay);
+}
+
+void test_p51_d07_positive_recovery_owner_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+        test_p51_d07_active_cancel_recovery(
+            profile, D07Scenario::PositiveRecoveryOwner);
+}
+
+void test_p51_d07_committed_attempt_replacement_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+        test_p51_d07_active_cancel_recovery(
+            profile, D07Scenario::CommittedAttemptReplacement);
 }
 
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
@@ -9403,12 +9811,29 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt-p29") == 0) {
-            test_p51_d07_active_cancel_recovery(ProfileId::P29V1, true);
+            test_p51_d07_active_cancel_recovery(
+                ProfileId::P29V1, D07Scenario::InterruptedReplay);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-positive-recovery-owner-p29") == 0) {
+            test_p51_d07_active_cancel_recovery(
+                ProfileId::P29V1, D07Scenario::PositiveRecoveryOwner);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-positive-recovery-owner") == 0) {
+            test_p51_d07_positive_recovery_owner_all_profiles();
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt") == 0) {
             test_p51_d07_active_cancel_replay_interrupt_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-committed-attempt-replacement") == 0) {
+            test_p51_d07_committed_attempt_replacement_all_profiles();
             return 0;
         }
         if (argc == 2 &&
@@ -9463,6 +9888,8 @@ int main(int argc, char** argv) {
         test_p51_d07_queued_cancel_first_middle_last();
         test_p51_d07_active_cancel_all_profiles();
         test_p51_d07_active_cancel_replay_interrupt_all_profiles();
+        test_p51_d07_positive_recovery_owner_all_profiles();
+        test_p51_d07_committed_attempt_replacement_all_profiles();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_credit_admission_bypasses_blocked_workers();

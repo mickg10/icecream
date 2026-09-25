@@ -1816,6 +1816,14 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.disconnect_r2_after_bundle_for_test =
         config_.disconnect_r2_after_bundle_for_test;
+    route_config.before_r2_recovery_for_test =
+        config_.before_r2_recovery_for_test;
+    route_config.before_r2_recovery_attempt_for_test =
+        config_.before_r2_recovery_attempt_for_test;
+    route_config.after_r2_recovery_receipt_settled_for_test =
+        config_.after_r2_recovery_receipt_settled_for_test;
+    route_config.disconnect_r2_before_replay_bundle_for_test =
+        config_.disconnect_r2_before_replay_bundle_for_test;
 #endif
     const std::weak_ptr<std::atomic<bool>> route_owner_alive =
         route_owner_callback_alive_;

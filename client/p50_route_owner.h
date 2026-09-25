@@ -55,6 +55,16 @@ struct P50RouteOwnerConfig {
     std::function<void()> after_r2_rebind_wait_for_test;
     std::function<void()> after_retired_route_reaped_for_test;
     std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;
+    // Request-scoped observation of the caller that enters shared R2 recovery.
+    // Test-only; it does not participate in admission or recovery decisions.
+    std::function<void(PrepareRequestKey)> before_r2_recovery_for_test;
+    // Observes the assignment selected as the shared recovery coordinator.
+    std::function<void(PrepareRequestKey)>
+        before_r2_recovery_attempt_for_test;
+    std::function<void(PrepareRequestKey, uint64_t)>
+        after_r2_recovery_receipt_settled_for_test;
+    std::function<bool(uint64_t, size_t, bool, bool)>
+        disconnect_r2_before_replay_bundle_for_test;
     // Forwarded only to the sender's deterministic route-poison unit seam.
     // Production callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;

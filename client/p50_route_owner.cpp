@@ -46,6 +46,14 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
     result.hold_r2_ack_pump_for_test = owner_config.hold_r2_ack_pump_for_test;
     result.disconnect_r2_after_bundle_for_test =
         owner_config.disconnect_r2_after_bundle_for_test;
+    result.before_r2_recovery_for_test =
+        owner_config.before_r2_recovery_for_test;
+    result.before_r2_recovery_attempt_for_test =
+        owner_config.before_r2_recovery_attempt_for_test;
+    result.after_r2_recovery_receipt_settled_for_test =
+        owner_config.after_r2_recovery_receipt_settled_for_test;
+    result.disconnect_r2_before_replay_bundle_for_test =
+        owner_config.disconnect_r2_before_replay_bundle_for_test;
     return result;
 }
 

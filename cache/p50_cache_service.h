@@ -110,6 +110,16 @@ struct RuntimeConfig {
     // Test-only cut after a complete R2 replayed bundle. Production leaves
     // this unset; the sender stops before advancing to the next replay row.
     std::function<bool(uint64_t)> disconnect_r2_after_bundle_for_test;
+    // Observes which assignment caller first enters shared R2 recovery.
+    // Production builds expose no callback and this never changes outcomes.
+    std::function<void(p50::PrepareRequestKey)> before_r2_recovery_for_test;
+    // Observes the assignment selected as the shared recovery coordinator.
+    std::function<void(p50::PrepareRequestKey)>
+        before_r2_recovery_attempt_for_test;
+    std::function<void(p50::PrepareRequestKey, uint64_t)>
+        after_r2_recovery_receipt_settled_for_test;
+    std::function<bool(uint64_t, size_t, bool, bool)>
+        disconnect_r2_before_replay_bundle_for_test;
 #endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like
