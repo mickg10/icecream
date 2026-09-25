@@ -29,6 +29,39 @@ SHA256 `9370973a6739d6f4328e8672c647841989af3a689db029474e20e0aff2ae1f88`.
 The original full-QA snapshot remains unchanged to collect its remaining
 results. It must not be reported as passing.
 
+The same run also fails the ordinary service suite at
+`duplicate_f_cancelled == !positive_recovery_owner`. The positive-recovery
+fixture submits its first two requests before proving which reached F's first
+worker gate. Its trace is consistent with asynchronous preparation reversing
+those requests (`recovery-owner=3/9102`, `pre-replay-ordinal=1`, no recovered
+positive first receipt). The fixture now waits for the sole first submission
+to reach F's worker gate and C's complete ordinal-1 write before submitting
+siblings; all existing outcome assertions are retained.
+The adjacent `p50cacheservice.log` has SHA256
+`78fad9576fef2f048d1d4358a59dd2d82c90cda2f3056d5b6c9cb7d1eaf8882d`.
+
+The corrected `--d07-positive-recovery-owner` selector passes three runs of
+all three profiles on an isolated f004 product build. Each run reports the
+exact first recovery owner, one recovered first receipt, matching resets,
+exact survivor inputs and released credits. Build and all three test exits
+are zero. This qualifies the fixture ordering correction, not full QA or D14.
+Artifacts are in
+`/tanksmall/scratch/tmp/p51-d14-f004-scratch.yDlJDu/icecream-qa-h514rgg9/current/artifacts/`:
+
+- `d07-positive-r4-run-1.log`: SHA256
+  `fbd529f9da535cc71a5861a69fafb6242fe18ffc4e46c412eb20c00790d7a6d6`.
+- `d07-positive-r4-run-2.log`: SHA256
+  `0e6f19753865346b83e62eb11e1a0900083870574a8f8c82d1ae0a9105b3a6ff`.
+- `d07-positive-r4-run-3.log`: SHA256
+  `5ab44dabfbea7692bf36a3c64c9bd2d31b73e1c013a961d1d16a309e874d131d`.
+
+Qualified test-source SHA256:
+`a23efa0f5d96b0c5bc373401068896bac471f799790663ebecaae183c2b9c158`;
+binary SHA256:
+`f3e1d35a47a5506a95d478bbe7078f7978928a372b0945d12f71b332acf9d9fa`.
+Earlier private build failures (ownership, unrelated experimental D14 code,
+missing generated build files) are retained separately and are not test results.
+
 ### Compiler fingerprint validation speed
 
 Root-header corpus promotion now hashes each distinct resolved compiler once

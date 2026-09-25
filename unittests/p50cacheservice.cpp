@@ -2321,6 +2321,16 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     c_config.max_active_p51_source_transfers = 8;
     c_config.max_pending_p51_source_operations = 8;
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+    std::mutex first_bundle_mutex;
+    std::condition_variable first_bundle_changed;
+    std::vector<uint64_t> c_bundle_ordinals;
+    c_config.after_r2_bundle_sent_for_test = [&](uint64_t ordinal) {
+        {
+            std::lock_guard lock(first_bundle_mutex);
+            c_bundle_ordinals.push_back(ordinal);
+        }
+        first_bundle_changed.notify_all();
+    };
     auto replay_bundle_calls = std::make_shared<std::atomic<size_t>>(0);
     auto interrupted_ordinal = std::make_shared<std::atomic<uint64_t>>(0);
     std::atomic<bool> first_recovered_positive{false};
@@ -2627,6 +2637,35 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     std::chrono::steady_clock::time_point first_finished{};
     std::thread first_waiter;
     if (positive_recovery_owner) {
+        // In the positive-owner case the first request must be the exact
+        // request paused by materialize-call #1. Do not enqueue any sibling
+        // until that sole outstanding request has reached F's worker gate
+        // and its complete ordinal-1 bundle has been written on C's socket.
+        bool first_materialization_waiting = false;
+        {
+            std::unique_lock lock(materialize_mutex);
+            first_materialization_waiting = materialize_changed.wait_for(
+                lock, std::chrono::seconds(8), [&] {
+                    return materialization_waiting;
+                });
+        }
+        bool first_bundle_sent = false;
+        {
+            std::unique_lock lock(first_bundle_mutex);
+            first_bundle_sent = first_bundle_changed.wait_for(
+                lock, std::chrono::seconds(8), [&] {
+                    return std::find(c_bundle_ordinals.begin(),
+                                     c_bundle_ordinals.end(), 1) !=
+                           c_bundle_ordinals.end();
+                });
+        }
+        CHECK(first_materialization_waiting);
+        CHECK(first_bundle_sent);
+        {
+            std::lock_guard lock(first_bundle_mutex);
+            CHECK(c_bundle_ordinals.size() == 1);
+            CHECK(c_bundle_ordinals.front() == 1);
+        }
         first_waiter = std::thread([&] {
             try {
                 first_result = receive_p51_transfer_result(
