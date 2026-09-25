@@ -412,6 +412,22 @@ binary: `94b1fcfbae8defe700156708cf838b47e1d7f45ee5b1c5764ed08ab13a5f78fe`.
 This focused sender test is not a real service missing-reservation recovery
 or an all-profile qualification of this specific failure boundary.
 
+The real multi-link matrix exposed a daemon admission mismatch: C1F3/P29V1
+delivered only 65 of 90 source leases, explicitly refusing 25 at the old
+64-pending-setup cap. Its three links reached 30/30/5 receipts. The daemon
+now uses a named 120-entry bound for P51 lease/ARM setup and orphan/cancel
+cleanup queues; the separate 64 control-worker limit is unchanged. The
+previously failing C1F3/P29V1 case now passes with 90 jobs, W30 per link,
+healthy-link progress while one link is held, and all exact input attachments.
+Evidence: `/tanksmall/scratch/tmp/p51-multilink.WhiHmZ/c1f3-cap-r1.log`
+(SHA256 `1b732880eb8019a76f5e55a6d1510690ee7d8cf9951991bdc039dfdac52f9fd4`),
+`C1F3_CAP_EXIT=0`. Daemon source:
+`6b7b9b908548fafde2189762019076cfe50283115a6fc57b71c3458a6d796ddf`;
+binary: `8d1671d6fc7ea20831c33d4d07079b5c763a79e52c9ac3329cb107b895930d8f`.
+The private fixture is still under qualification. This result does not prove
+the full 18-cell matrix, 120-job cancellation bursts, or runtime overflow
+handling; compile-time predicate checks only cover the 119/120 boundary.
+
 The runtime now distinguishes definite reservation absence from an invalid
 offer in one owner-thread lookup. Only an absent initial reservation or
 absent reconnect relationship produces ReservationMissing; mismatched fields

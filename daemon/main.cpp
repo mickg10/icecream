@@ -139,6 +139,21 @@ static uint64_t monotonic_msec()
 // sidecar lease never extend it.
 static constexpr uint64_t kP50SourceArmBudgetMsec = 60000;
 
+/* The qualified topology supports four persistent relationships with up to
+   thirty live jobs each. These pending poll records do not consume
+   control-worker threads; keep their bound aligned with that 120-job topology
+   while leaving worker admission separate. */
+static constexpr size_t kMaxPendingP51SourceOperations = 120;
+
+static constexpr bool p51_source_operation_capacity_available(
+    size_t pending) noexcept
+{
+    return pending < kMaxPendingP51SourceOperations;
+}
+
+static_assert(p51_source_operation_capacity_available(119));
+static_assert(!p51_source_operation_capacity_available(120));
+
 static uint64_t p50_source_arm_budget_msec() noexcept
 {
     uint64_t budget = kP50SourceArmBudgetMsec;
@@ -9016,7 +9031,8 @@ void Daemon::handle_end(Client *client, int exitcode)
         const auto stage = static_cast<uint8_t>(pending->stage);
         if (stage >= static_cast<uint8_t>(
                          Client::PendingP51SourceArm::Stage::ReservationSend) &&
-            orphaned_p51_source_arms.size() < 64) {
+            p51_source_operation_capacity_available(
+                orphaned_p51_source_arms.size())) {
             try {
                 orphaned_p51_source_arms.push_back(std::move(pending));
             } catch (...) {
@@ -10023,7 +10039,7 @@ bool Daemon::handle_p51_source_lease_request(
     size_t pending_count = 0;
     for (const auto &entry : clients)
         pending_count += entry.second->pending_p51_source_lease ? 1u : 0u;
-    if (pending_count >= 64)
+    if (!p51_source_operation_capacity_available(pending_count))
         return refuse("bounded source-lease setup capacity is full");
     if (!handoff.readyLease.has_value() || !handoff.readyLease->valid())
         return refuse("assignment has no retained READY lease");
@@ -10122,7 +10138,7 @@ bool Daemon::handle_p51_source_arm(Client *client, P51SourceArmMsg *msg)
         size_t pending_count = 0;
         for (const auto &entry : clients)
             pending_count += entry.second->pending_p51_source_arm ? 1u : 0u;
-        if (pending_count >= 64) {
+        if (!p51_source_operation_capacity_available(pending_count)) {
             finish_assignment_claim(source.wire_job_id);
             return refuse("bounded reservation setup capacity is full");
         }
@@ -10180,8 +10196,10 @@ void Daemon::queue_p51_source_cancel(
     if (!arm.valid() || !armed.valid() ||
         !armed.acknowledges(P51SourceArmMsg{arm}) ||
         !absolute_deadline.valid() || !ready_lease.valid() ||
-        pending_p51_source_cancels.size() >= 64) {
-        if (pending_p51_source_cancels.size() >= 64)
+        !p51_source_operation_capacity_available(
+            pending_p51_source_cancels.size())) {
+        if (!p51_source_operation_capacity_available(
+                pending_p51_source_cancels.size()))
             withdraw_p51_source_incarnation(
                 ready_lease, "reservation-cancel queue saturation");
         return;
