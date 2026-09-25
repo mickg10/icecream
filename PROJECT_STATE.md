@@ -60,6 +60,17 @@ select `ICECC_TEST_POSITIVE_DAEMON=1`, `ICECC_P51_MODE=on`,
 `cache/icecc-cache-service` paths. Supply the scratch environment used by the
 normal positive-daemon harness. This focused qualification is not full-tip QA.
 
+The existing opt-in `p50daemonpositive-run.sh` now includes all three
+prepublication cases after its baseline, pending-disconnect, replacement and
+vertical cases. That complete wrapper exits zero against the qualified
+binary above. Wrapper SHA256:
+`7abcb90b282088bbe4e492b83e78d790f44f6657312d53e2e1b1cc48c9a43db9`;
+retained `positive-wrapper-r2.log` in the same scratch directory:
+`7aa99730213955782774470a73743e66e27cc70a535a5849b2c77a18d1b740f2`.
+Specialized positive-daemon wrappers clear the new selector so inherited
+settings cannot silently replace their intended test. Those cleanup edits
+were shell-syntax checked; their individual runtime matrices were not rerun.
+
 ### Full-QA failures and focused corrections
 
 Canonical QA on frozen `f0049371` is terminal with overall FAIL: 176 native tests,

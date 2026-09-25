@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+unset ICECC_TEST_P51_CANCEL_BEFORE_START
 
 build_dir=${ICECC_TEST_BUILDDIR:?ICECC_TEST_BUILDDIR is required}
 top_build_dir=${ICECC_TEST_TOP_BUILDDIR:?ICECC_TEST_TOP_BUILDDIR is required}
