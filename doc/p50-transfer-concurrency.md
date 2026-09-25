@@ -837,6 +837,33 @@ extend a job deadline. A cleanup grace period must not publish expired work.
 
 ### 7.7 Cancellation and capacity ownership
 
+Recovery implementation requirements for unavailable suffix jobs:
+
+- A positive receipt and an unavailable reservation are distinct outcomes.
+  Validate and preserve the entire positive committed prefix before settling
+  any uncommitted job as unavailable. Absence of a receipt is not cancellation.
+- F's replayability decision must identify the exact retained job/reservation
+  witness. A contradictory identity rejects recovery; it must not silently
+  remove another job. Original absolute deadlines remain authoritative.
+- Bind the suffix decision to the stable reset operation and exact witness
+  interval. Retain its result across lost RESET_ACK and confirmation replies.
+  A cancellation concurrent with reset cannot change a previously returned
+  result for that same operation. Later cancellation is a new recovery event.
+- Rebuild live survivors contiguously from K+1, preserving TU and job identity.
+  Updating a sender map alone is insufficient: every survivor must remain
+  owned and recoverable if the connection fails during the first replay.
+  Prepared-but-not-yet-emitted survivors cannot disappear when the endpoint
+  clears its old-epoch witness ledger. Release removed-job credits exactly once.
+
+These are required repair properties, not a claim that the current wire
+records implement suffix disposition. The active-cancellation regression must
+receive cancelled-job and survivor results independently: waiting for one
+until its deadline must not conceal a response already delivered to the other.
+Add a second interruption during the first survivor replay with at least two
+survivors, and loss of reset replies on either side of cancellation. Require
+exact surviving inputs before their original deadlines, unchanged committed
+prefix outcomes, no cancelled publication, and bounded connection attempts.
+
 | Cancellation point | Required action |
 | --- | --- |
 | Queued, no route ordinal/state yet | Remove request and release its reservations |
