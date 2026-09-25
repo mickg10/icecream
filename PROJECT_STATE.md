@@ -119,9 +119,31 @@ plan, independent peer-close-only coverage, or concurrent-memory checking.
 
 ### Active cancellation and mixed-load evidence gaps
 
-Queued cancellation is being tested through actual C raw-credit admission,
-not by removing requests before submission. It does not substitute for
-partial/full-transfer cancellation. Code review identifies a recovery mismatch
+Queued cancellation now passes first/middle/last submission positions 0/15/30
+through actual C raw-credit admission. Each case cancels one of 31 waiting
+requests, separately releases its admission-blocking holder, and commits and
+attaches the other 30 exact inputs over one persistent connection. The exact
+F reservation retires once; no endpoint recovery marker exists at this stage.
+Duplicate cancellation does not retire it again, and C operation/raw credits
+drain to zero. The test uses ZSTD_TU with W30 configured; it does not establish
+simultaneous W30 occupancy, compiler quiescence, or wire-ordinal contiguity
+from the fresh global TU sequence assertion.
+
+Evidence root: `/tanksmall/scratch/tmp/p51-d07-queued-r0.1HJjqY/tmp/`.
+All three selectors exit zero against the replacement-trigger product snapshot
+(before the worker repair); test TU SHA256
+`b5b4466ac36da8dbac3e6682e4a4ef11a348fff8d687482a51851d1e256f9b2a`.
+Logs: `d07-first-handshake-r2.log` SHA256
+`b0cf86d385a406ae40aaccae7fc6fa5d37e0b34d168832df22596fd9effa39fe`,
+`d07-middle-handshake-r1.log` SHA256
+`6c8bdbd6e384c24998ffc13408f10c1eecc627d7c3214123504205ff0800c531`,
+and `d07-last-handshake-r1.log` SHA256
+`1d1e1c71d32d91ede83bd73f068cf925029efe2ef4d5d6ce42dd32f7b286c2d2`.
+Earlier runs omitted the ordinary connection handshake or required a recovery
+marker for an unbound request; those fixture failures are excluded.
+
+This does not substitute for partial/full-transfer cancellation.
+Code review identifies a recovery mismatch
 requiring a deterministic regression: F reset removes cancelled reservations,
 but C's sender currently replays every unresolved suffix witness using its
 old relationship ordinal. The required behavior is exact settlement followed

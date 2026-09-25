@@ -1589,6 +1589,409 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
     std::puts("P51_ASYNC_TRANSFER active-read peer-close cancels before F connect: ok");
 }
 
+void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
+    constexpr size_t kSurvivors = 30;
+    constexpr size_t kCohort = kSurvivors + 1;
+    constexpr uint64_t kHeldRawBytes = 4096;
+    CHECK(cancelled_index < kCohort);
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = static_cast<uint8_t>(0x61 + cancelled_index);
+    const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = static_cast<uint8_t>(0x71 + cancelled_index);
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+
+    uint16_t f_port = 0;
+    const int listener = loopback_listener(f_port);
+    CHECK(listener >= 0 && f_port != 0);
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool holder_read_entered = false;
+    bool release_holder_read = false;
+    std::atomic<unsigned> holder_peer_closed{0};
+    std::array<std::atomic<unsigned>, kCohort + 1> queued_size_observations{};
+    for (auto& count : queued_size_observations)
+        count.store(0, std::memory_order_relaxed);
+    std::mutex retired_mutex;
+    std::vector<std::pair<Id128, bool>> retired_rows;
+
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.c_store_guid = f_launch.c_store_guid;
+    f_config.f_store_guid = f_launch.f_store_guid;
+    f_config.f_store_generation = f_launch.store_generation;
+    f_config.sidecar_launch = f_launch;
+    f_config.endpoint_caps.profile = ProfileId::ZSTD_TU;
+    f_config.endpoint_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    f_config.endpoint_caps.zstd.max_raw_bytes = 8192;
+    f_config.max_pending_p51_source_reservations = 64;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    f_config.p51_reservation_retired_for_test =
+        [&](Id128 id, bool marker_retired) {
+            std::lock_guard lock(retired_mutex);
+            retired_rows.emplace_back(id, marker_retired);
+        };
+#endif
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = c_launch.c_store_guid;
+    c_config.f_store_guid = c_launch.f_store_guid;
+    c_config.f_store_generation = c_launch.store_generation;
+    c_config.sidecar_launch = c_launch;
+    c_config.endpoint_caps.profile = ProfileId::ZSTD_TU;
+    c_config.endpoint_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    c_config.endpoint_caps.zstd.max_raw_bytes = 8192;
+    c_config.max_active_source_transfers = 4;
+    c_config.max_active_p51_source_transfers = kCohort + 1;
+    c_config.max_pending_p51_source_operations = kCohort + 1;
+    c_config.max_aggregate_source_raw_bytes = kHeldRawBytes;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    c_config.p51_source_read_chunk_for_test = [&] {
+        std::unique_lock lock(gate_mutex);
+        if (holder_read_entered)
+            return;
+        holder_read_entered = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [&] { return release_holder_read; });
+    };
+    c_config.p51_source_read_peer_closed_for_test = [&] {
+        holder_peer_closed.fetch_add(1, std::memory_order_release);
+    };
+    c_config.p51_source_credit_waiting_for_test = [&](uint64_t bytes) {
+        if (bytes <= kCohort)
+            queued_size_observations[static_cast<size_t>(bytes)].fetch_add(
+                1, std::memory_order_release);
+    };
+#endif
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<size_t> accepted_connections{0};
+    std::thread acceptor([&] {
+        const auto end = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(20);
+        while (!stop_accepting.load(std::memory_order_acquire) &&
+               accepted_connections.load(std::memory_order_acquire) <
+                   kSurvivors &&
+               std::chrono::steady_clock::now() < end) {
+            pollfd ready{listener, POLLIN, 0};
+            int polled;
+            do {
+                polled = ::poll(&ready, 1, 100);
+            } while (polled < 0 && errno == EINTR);
+            if (polled <= 0 || !(ready.revents & POLLIN))
+                continue;
+            int fd;
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            do {
+                fd = ::accept(listener,
+                    reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            } while (fd < 0 && errno == EINTR);
+            if (fd < 0)
+                continue;
+
+            // The C runtime's production connector first negotiates the
+            // ordinary public protocol, then exchanges CACHE_LINK_SESSION
+            // before it hands the same socket to the R2 endpoint. Mirror that
+            // boundary here; a raw accepted socket is not yet an R2 stream.
+            std::unique_ptr<MsgChannel> channel(
+                Service::createChannelAccepted(
+                    fd, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                continue;
+            const auto handshake_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            bool protocol_ready = true;
+            while (channel->protocol_admission_state() ==
+                       MsgChannel::ProtocolAdmissionState::Pending &&
+                   std::chrono::steady_clock::now() < handshake_deadline) {
+                short events = POLLIN;
+                if (channel->has_pending_write())
+                    events |= POLLOUT;
+                pollfd socket{channel->fd, events, 0};
+                int polled;
+                do {
+                    polled = ::poll(&socket, 1, 50);
+                } while (polled < 0 && errno == EINTR);
+                if (polled < 0 ||
+                    (socket.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLOUT) && !channel->flush_pending()) {
+                    protocol_ready = false;
+                    break;
+                }
+                if ((socket.revents & POLLIN) && !channel->read_a_bit()) {
+                    protocol_ready = false;
+                    break;
+                }
+            }
+            if (!protocol_ready ||
+                channel->protocol_admission_state() !=
+                    MsgChannel::ProtocolAdmissionState::Ready ||
+                !channel->finish_protocol_admission())
+                continue;
+
+            std::unique_ptr<Msg> link_request(
+                channel->get_msg_until(handshake_deadline));
+            if (dynamic_cast<P51CacheLinkSessionMsg*>(link_request.get()) ==
+                nullptr)
+                continue;
+            const int adopted_fd =
+                channel->send_p51_cache_link_session_ready_and_release(
+                    handshake_deadline);
+            if (adopted_fd < 0)
+                continue;
+            accepted_connections.fetch_add(1, std::memory_order_release);
+            f_runtime.start_adopted_r2_endpoint(adopted_fd);
+        }
+    });
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            stop_accepting.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (acceptor.joinable())
+                acceptor.join();
+            (void)::close(listener);
+            {
+                std::lock_guard lock(gate_mutex);
+                release_holder_read = true;
+            }
+            gate_changed.notify_all();
+            c_runtime.stop();
+            f_runtime.stop();
+        });
+
+    struct RequestRow {
+        local::P51SourceTransferRequest request;
+        local::P51SourceReservationRequest reservation;
+        RuntimeCase pair{local::Connection(-1), local::Connection(-1)};
+        std::vector<uint8_t> bytes;
+        uint64_t request_id = 0;
+    };
+    auto reserve_request = [&](uint64_t request_id, size_t raw_bytes,
+                               uint8_t fill) {
+        auto reservation = test_p51_reservation_request(
+            c_launch.c_store_guid, c_launch.store_generation,
+            c_launch.identity.generation, c_launch.identity.attempt,
+            request_id, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::seconds(30));
+        reservation.arm.source.assignment_nonce = request_id;
+        reservation.arm.source.logical_job = 100000 + request_id;
+        reservation.arm.source.compiler_attempt = 1;
+        reservation.arm.source.selected_f_host = "127.0.0.1";
+        reservation.arm.source.selected_f_cache_port = f_port;
+        const auto reserved = f_runtime.reserve_p51_source_on_owner(reservation);
+        CHECK(reserved.error_code == 0 && reserved.armed.has_value());
+        RequestRow row;
+        row.request = local::P51SourceTransferRequest{
+            *reserved.armed, reservation.absolute_deadline};
+        row.reservation = reservation;
+        row.pair = authenticated_runtime_pair();
+        row.bytes.assign(raw_bytes, fill);
+        row.request_id = request_id;
+        return row;
+    };
+    auto enqueue = [&](RequestRow& row) {
+        const auto operation = local::make_p51_source_transfer_operation(
+            c_launch.identity, row.request, row.request_id);
+        return c_runtime.enqueue_p51_source_transfer(
+            std::move(row.pair.sender), c_launch.identity, operation,
+            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+    };
+
+    const uint64_t base = 8200 + static_cast<uint64_t>(cancelled_index) * 100;
+    RequestRow holder = reserve_request(base, kHeldRawBytes, 0xe1);
+    std::vector<RequestRow> cohort;
+    cohort.reserve(kCohort);
+    for (size_t index = 0; index < kCohort; ++index) {
+        const size_t size = index + 1;
+        cohort.push_back(reserve_request(
+            base + 1 + index, size, static_cast<uint8_t>(0x20 + index)));
+    }
+
+    const bool holder_enqueued = enqueue(holder);
+    bool holder_gate_reached = false;
+    {
+        std::unique_lock lock(gate_mutex);
+        holder_gate_reached = gate_changed.wait_for(
+            lock, std::chrono::seconds(3), [&] { return holder_read_entered; });
+    }
+    const bool holder_credit_held = holder_gate_reached &&
+        wait_for_source_raw_bytes(c_runtime, kHeldRawBytes,
+                                  std::chrono::seconds(1));
+
+    bool all_cohort_enqueued = holder_credit_held;
+    for (RequestRow& row : cohort)
+        all_cohort_enqueued = enqueue(row) && all_cohort_enqueued;
+    const bool all_operations_admitted = all_cohort_enqueued &&
+        wait_for_source_operation_count(
+            c_runtime, kCohort + 1, std::chrono::seconds(3));
+
+    const auto queue_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < queue_deadline) {
+        bool all_observed = true;
+        for (size_t index = 0; index < kCohort; ++index) {
+            all_observed = all_observed &&
+                queued_size_observations[index + 1].load(
+                    std::memory_order_acquire) == 1;
+        }
+        if (all_observed)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    bool all_exact_requests_waiting = true;
+    for (size_t index = 0; index < kCohort; ++index) {
+        all_exact_requests_waiting = all_exact_requests_waiting &&
+            queued_size_observations[index + 1].load(
+                std::memory_order_acquire) == 1;
+    }
+    const bool selected_request_waiting =
+        queued_size_observations[cancelled_index + 1].load(
+            std::memory_order_acquire) == 1;
+
+    RequestRow& cancelled = cohort[cancelled_index];
+    const bool f_cancelled = selected_request_waiting &&
+        f_runtime.cancel_p51_source_on_owner(
+            cancelled.request.armed.arm,
+            cancelled.request.armed.reservation_id,
+            cancelled.request.absolute_deadline.as_steady_time_point());
+    const bool duplicate_f_cancelled = f_cancelled &&
+        f_runtime.cancel_p51_source_on_owner(
+            cancelled.request.armed.arm,
+            cancelled.request.armed.reservation_id,
+            cancelled.request.absolute_deadline.as_steady_time_point());
+    cancelled.pair.receiver = local::Connection(-1);
+    const bool selected_c_operation_released = f_cancelled &&
+        wait_for_source_operation_count(
+            c_runtime, kCohort, std::chrono::seconds(3));
+
+    const bool holder_f_cancelled =
+        f_runtime.cancel_p51_source_on_owner(
+            holder.request.armed.arm, holder.request.armed.reservation_id,
+            holder.request.absolute_deadline.as_steady_time_point());
+    holder.pair.receiver = local::Connection(-1);
+    {
+        std::lock_guard lock(gate_mutex);
+        release_holder_read = true;
+    }
+    gate_changed.notify_all();
+
+    const auto peer_closed_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(3);
+    while (holder_peer_closed.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < peer_closed_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const bool holder_observed_peer_close =
+        holder_peer_closed.load(std::memory_order_acquire) == 1;
+
+    std::vector<bool> settled(kCohort, false);
+    std::vector<uint64_t> survivor_tu_seqs;
+    survivor_tu_seqs.reserve(kSurvivors);
+    bool all_survivors_committed_and_attached = true;
+    for (size_t index = 0; index < kCohort; ++index) {
+        if (index == cancelled_index)
+            continue;
+        RequestRow& row = cohort[index];
+        const auto deadline = row.request.absolute_deadline.as_steady_time_point();
+        const auto result = receive_p51_transfer_result(
+            row.pair.receiver, c_launch.identity, row.request_id, deadline, true);
+        bool attached = result.code == local::SourceTransferResultCode::Committed &&
+            result.valid() &&
+            result.c_store_guid == c_launch.c_store_guid &&
+            result.raw_bytes == row.bytes.size() &&
+            result.raw_digest == icecc::digest128(row.bytes);
+        if (attached) {
+            const InputLeaseOwner owner{
+                row.request.armed.arm.source.logical_job,
+                row.request.armed.arm.source.assignment_epoch,
+                row.request.armed.arm.source.assignment_nonce};
+            const InputFdRequest attach_request{
+                f_launch.identity,
+                InputRecordKey{result.c_store_guid, TuSeq{result.tu_seq}}, owner,
+                row.request_id + 50000};
+            auto cursor = f_runtime.attach_input_on_owner(
+                attach_request, deadline);
+            attached = cursor.has_value() &&
+                cursor->remaining() == row.bytes.size() &&
+                cursor->raw_digest() == icecc::digest128(row.bytes);
+            if (attached) {
+                std::vector<uint8_t> actual(row.bytes.size());
+                attached = cursor->read(actual) == actual.size() &&
+                           actual == row.bytes;
+            }
+            f_runtime.finish_input_attachment_on_owner(
+                attach_request, attached, deadline);
+        }
+        settled[index] = attached;
+        all_survivors_committed_and_attached =
+            all_survivors_committed_and_attached && attached;
+        survivor_tu_seqs.push_back(result.tu_seq);
+    }
+
+    std::sort(survivor_tu_seqs.begin(), survivor_tu_seqs.end());
+    bool contiguous_tu_seqs = survivor_tu_seqs.size() == kSurvivors;
+    for (size_t seq = 0; seq < survivor_tu_seqs.size(); ++seq)
+        contiguous_tu_seqs = contiguous_tu_seqs &&
+                             survivor_tu_seqs[seq] == seq;
+    const bool one_persistent_connection =
+        accepted_connections.load(std::memory_order_acquire) == 1;
+    const bool all_operations_released = wait_for_source_operation_count(
+        c_runtime, 0, std::chrono::seconds(3));
+    const bool all_raw_credits_released =
+        wait_for_source_raw_bytes(c_runtime, 0, std::chrono::seconds(3));
+    bool exact_target_retired_once = false;
+    const Id128 cancelled_reservation_id{
+        cancelled.request.armed.reservation_id};
+    {
+        std::lock_guard lock(retired_mutex);
+        const auto target = std::find_if(
+            retired_rows.begin(), retired_rows.end(), [&](const auto& retired) {
+                return retired.first == cancelled_reservation_id;
+            });
+        exact_target_retired_once = target != retired_rows.end() &&
+            !target->second &&
+            std::count_if(retired_rows.begin(), retired_rows.end(),
+                          [&](const auto& retired) {
+                              return retired.first == cancelled_reservation_id;
+                          }) == 1;
+    }
+
+    CHECK(holder_enqueued);
+    CHECK(holder_credit_held);
+    CHECK(all_cohort_enqueued);
+    CHECK(all_operations_admitted);
+    CHECK(all_exact_requests_waiting);
+    CHECK(selected_request_waiting);
+    CHECK(f_cancelled);
+    CHECK(!duplicate_f_cancelled);
+    CHECK(selected_c_operation_released);
+    CHECK(holder_f_cancelled);
+    CHECK(holder_observed_peer_close);
+    CHECK(static_cast<size_t>(
+              std::count(settled.begin(), settled.end(), true)) == kSurvivors);
+    CHECK(all_survivors_committed_and_attached);
+    CHECK(contiguous_tu_seqs);
+    CHECK(one_persistent_connection);
+    CHECK(all_operations_released);
+    CHECK(all_raw_credits_released);
+    CHECK(exact_target_retired_once);
+    std::printf("P51_D07 queued cancel submission=%zu survivors=30 exact-inputs=30 "
+                "fresh-tu-seq=0..29 C-raw-credit=0 scope=no-compiler\n",
+                cancelled_index);
+}
+
+void test_p51_d07_queued_cancel_first_middle_last() {
+    test_p51_d07_queued_cancel_position(0);
+    test_p51_d07_queued_cancel_position(15);
+    test_p51_d07_queued_cancel_position(30);
+}
+
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x4b;
@@ -8304,6 +8707,26 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-queued-cancel-first") == 0) {
+            test_p51_d07_queued_cancel_position(0);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-queued-cancel-middle") == 0) {
+            test_p51_d07_queued_cancel_position(15);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-queued-cancel-last") == 0) {
+            test_p51_d07_queued_cancel_position(30);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-queued-cancel") == 0) {
+            test_p51_d07_queued_cancel_first_middle_last();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--credit-admission-hol-witness") == 0) {
             test_p51_credit_admission_bypasses_blocked_workers();
             return 0;
@@ -8332,6 +8755,7 @@ int main(int argc, char** argv) {
         test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
         test_p51_admitted_transfer_stop_releases_raw_credit();
         test_p51_peer_close_during_active_read_cancels_before_route();
+        test_p51_d07_queued_cancel_first_middle_last();
         test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup();
         test_p51_aggregate_raw_budget_fitting_commit_is_exact();
         test_p51_credit_admission_bypasses_blocked_workers();
