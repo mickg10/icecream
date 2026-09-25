@@ -59,9 +59,9 @@ Artifacts are under
 - Qualified test-source SHA256:
   `34b6990fb1db0884d205404c0b7aabbb412f2b17b6d42e0df9387ebb02b79d0b`.
 
-This overlay also contains the pending metadata-expiry test and predates the
-recovery-ordering correction below. Combined current-tip qualification and
-the metadata timer-deletion control remain separate work. Earlier private
+This sanitizer overlay also contains the metadata-expiry test and predates
+the recovery-ordering correction below. The later combined ordinary service
+qualification is documented under autonomous metadata expiry. Earlier private
 invocation/compile/link setup failures did not execute tests and are retained.
 
 The same run also fails the ordinary service suite at
@@ -96,6 +96,32 @@ binary SHA256:
 `f3e1d35a47a5506a95d478bbe7078f7978928a372b0945d12f71b332acf9d9fa`.
 Earlier private build failures (ownership, unrelated experimental D14 code,
 missing generated build files) are retained separately and are not test results.
+
+### Autonomous metadata expiry
+
+The 120-reservation test now observes retirement of the exact expiring ID
+before making another owner request. It distinguishes explicit cancellation,
+checks only those two rows retire, refills both slots and rejects overflow at
+120 again. ZSTD_TU/W30 is the configured profile/window; this is metadata
+capacity and timer coverage, not 120 active transfers or process-memory proof.
+
+The focused test passes. Deleting only the timer callback's sweep (leaving
+request-side sweeping intact) fails with exit 1 at the exact expiry-observation
+wait, not an outer timeout. Restoring that call and combining both fixture
+corrections above yields a passing full ordinary service suite: actual exit 0,
+`.trs` PASS. Production source is unchanged.
+Artifacts are below `/tanksmall/scratch/tmp/p51-d11-metadata-expiry-c6fce0e7/work/`:
+
+- `artifacts/metadata-expiry-positive-r1.log`: SHA256
+  `bb76ebbd39d00763069eb0dd50ec3ff54463e7f5bc784037980d964d9c13c038`.
+- `artifacts/metadata-expiry-timer-mutant-r1.log`: SHA256
+  `d3ad93f483658fade9d5a9001dc86b7ae72dd64e698f5dfca3fbdd3d865c63cf`.
+- `build/unittests/p50cacheservice.log`: SHA256
+  `a32f095f7524179dc29384a82d053e5e9bb5b4bdd392951f314af6ebf492fa32`.
+- Qualified test-source SHA256:
+  `aa2a170e610b38e50da6642e9dbc3403a7467ed2f03976124ba0f032f97bf381`.
+- Binary SHA256:
+  `d3f3174e629f97160fc346781d0961b185ddd6f9916aa4d1c6afffc4a9c89479`.
 
 ### Compiler fingerprint validation speed
 
@@ -2753,10 +2779,10 @@ The optional cancellation-aware handshake polls do not extend the original deadl
 A third case observes R2 LINK_HELLO and withholds LINK_STATE. Whole-runtime
 shutdown retires the C sender on its owner executor and returns both credits.
 These tests do not yet prove cancellation during body/recovery or 120 active
-transfers. The 120-reservation test does not prove autonomous timer expiry:
+transfers. This older 120-reservation test did not prove autonomous timer expiry:
 its post-wait reservation request itself calls the owner sweep. A non-sweeping
 observation before any new request, with a timer-disabled negative control,
-remains necessary for that metadata claim. This does not invalidate the
+is now qualified under "Autonomous metadata expiry" above. This does not invalidate the
 separate unpublished-job expiry callback evidence documented above.
 This service snapshot still uses the earlier committed sender and
 endpoint, so combined qualification with the latest recovery changes remains open.

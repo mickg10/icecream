@@ -5247,12 +5247,25 @@ void test_p51_reservation_capacity_120_cancel_and_expiry() {
     StoreIdentityRoot remote_root{};
     remote_root.bytes[15] = 0x38;
     const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+    std::mutex retired_mutex;
+    std::condition_variable retired_changed;
+    std::vector<std::pair<Id128, bool>> retired_rows;
     service::RuntimeConfig config = test_runtime_config();
     config.c_store_guid = launch.c_store_guid;
     config.f_store_guid = launch.f_store_guid;
     config.f_store_generation = launch.store_generation;
     config.sidecar_launch = launch;
     config.max_pending_p51_source_reservations = 120;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    config.p51_reservation_retired_for_test =
+        [&](Id128 id, bool marker_retired) {
+            {
+                std::lock_guard lock(retired_mutex);
+                retired_rows.emplace_back(id, marker_retired);
+            }
+            retired_changed.notify_all();
+        };
+#endif
     service::SidecarRuntime runtime(std::move(config));
 
     std::vector<local::P51SourceReservationRequest> requests;
@@ -5263,7 +5276,7 @@ void test_p51_reservation_capacity_120_cancel_and_expiry() {
         auto request = test_p51_reservation_request(
             remote_c, 41, launch.identity.generation, launch.identity.attempt,
             7200 + index, CACHE_PROFILE_ZSTD_TU, 30,
-            index == 119 ? std::chrono::seconds(2) : std::chrono::seconds(10));
+            index == 119 ? std::chrono::seconds(6) : std::chrono::seconds(30));
         const local::P51SourceReservationResult result =
             runtime.reserve_p51_source_on_owner(request);
         CHECK(result.error_code == 0 && result.armed.has_value());
@@ -5275,22 +5288,57 @@ void test_p51_reservation_capacity_120_cancel_and_expiry() {
         7320, CACHE_PROFILE_ZSTD_TU, 30);
     CHECK(!runtime.reserve_p51_source_on_owner(overflow).armed.has_value());
 
+    const Id128 cancelled_id{armed[1].reservation_id};
+    const Id128 expiring_id{armed[119].reservation_id};
+    CHECK(cancelled_id != expiring_id);
     CHECK(runtime.cancel_p51_source_on_owner(
         requests[1].arm, armed[1].reservation_id,
         std::chrono::steady_clock::now() + std::chrono::seconds(1)));
+
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    const auto find_retired = [&](Id128 id) {
+        return std::find_if(retired_rows.begin(), retired_rows.end(),
+                            [&](const auto& row) { return row.first == id; });
+    };
+    {
+        std::unique_lock lock(retired_mutex);
+        CHECK(retired_changed.wait_for(lock, std::chrono::seconds(1), [&] {
+            return find_retired(cancelled_id) != retired_rows.end();
+        }));
+        const auto cancelled = find_retired(cancelled_id);
+        CHECK(cancelled != retired_rows.end() && !cancelled->second);
+    }
+
+    // Observe autonomous timer retirement of this exact ARM before making any
+    // new owner request (which would itself sweep expired reservations).
+    {
+        std::unique_lock lock(retired_mutex);
+        CHECK(retired_changed.wait_for(lock, std::chrono::seconds(8), [&] {
+            return find_retired(expiring_id) != retired_rows.end();
+        }));
+        CHECK(retired_rows.size() == 2);
+        const auto cancelled = find_retired(cancelled_id);
+        const auto expired = find_retired(expiring_id);
+        CHECK(cancelled != retired_rows.end() && !cancelled->second);
+        CHECK(expired != retired_rows.end() && !expired->second);
+    }
+#else
+    CHECK(false);
+#endif
+
     auto after_cancel = test_p51_reservation_request(
         remote_c, 41, launch.identity.generation, launch.identity.attempt,
         7321, CACHE_PROFILE_ZSTD_TU, 30);
     CHECK(runtime.reserve_p51_source_on_owner(after_cancel).armed.has_value());
-
-    // No further owner request is issued while the first row expires; the
-    // timer sweep itself must release its exact global metadata slot.
-    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
     auto after_expiry = test_p51_reservation_request(
         remote_c, 41, launch.identity.generation, launch.identity.attempt,
         7322, CACHE_PROFILE_ZSTD_TU, 30);
     CHECK(runtime.reserve_p51_source_on_owner(after_expiry).armed.has_value());
-    std::puts("P51_RESERVATION_CAP global120/cancel/idle-expiry: ok");
+    auto full_again = test_p51_reservation_request(
+        remote_c, 41, launch.identity.generation, launch.identity.attempt,
+        7323, CACHE_PROFILE_ZSTD_TU, 30);
+    CHECK(!runtime.reserve_p51_source_on_owner(full_again).armed.has_value());
+    std::puts("P51_RESERVATION_CAP global120/cancel/exact-timer-expiry: ok");
 }
 
 LinkHello test_p51_link_hello(const P51SourceArmedFields& armed,
@@ -13434,6 +13482,11 @@ int main(int argc, char** argv) {
                      ProfileId::P29V1, ProfileId::ZSTD_TU,
                      ProfileId::ZSTD_ROUTE})
                 test_p51_d17_repeated_window_cancel(profile, 3);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--p51-reservation-capacity-120-timer-expiry") == 0) {
+            test_p51_reservation_capacity_120_cancel_and_expiry();
             return 0;
         }
         if (argc == 2 &&
