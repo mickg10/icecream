@@ -595,7 +595,7 @@ void test_route_completed_ledger_releases_live_entry() {
 
 asio::awaitable<ServerRunResult> sender_r2_accept(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
-    EndpointIoControl control = {});
+    EndpointIoControl control = {}, bool small_receive_buffer = true);
 
 void test_p51_completed_ledger_reserves_live_capacity() {
     constexpr size_t kJobs = 2;
@@ -1188,10 +1188,11 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
 
 asio::awaitable<ServerRunResult> sender_r2_accept(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
-    EndpointIoControl control) {
+    EndpointIoControl control, bool small_receive_buffer) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await acceptor.async_accept(socket, asio::use_awaitable);
-    socket.set_option(tcp::socket::receive_buffer_size(4096));
+    if (small_receive_buffer)
+        socket.set_option(tcp::socket::receive_buffer_size(4096));
     co_return co_await endpoint.run_adopted_r2(std::move(socket),
                                                std::move(control));
 }
@@ -1917,7 +1918,8 @@ void run_p51_sender_window_concurrent_callers(
     P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
                              std::move(server_config));
     auto server_future = asio::co_spawn(f_context,
-        sender_r2_accept(acceptor, server), asio::use_future);
+        sender_r2_accept(acceptor, server, EndpointIoControl{}, false),
+        asio::use_future);
     std::thread f_thread([&] { f_context.run(); });
 
     PreparationAuthorityLimits limits;
@@ -1959,11 +1961,6 @@ void run_p51_sender_window_concurrent_callers(
             return;
         }
         const int fd = connect_fd(remote);
-        if (fd >= 0) {
-            const int tiny_send_buffer = 4096;
-            (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &tiny_send_buffer,
-                               sizeof(tiny_send_buffer));
-        }
         completion(fd);
     };
     std::vector<std::future<ZstdSourceTransferResult>> results;

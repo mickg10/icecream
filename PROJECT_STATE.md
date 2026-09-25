@@ -92,6 +92,27 @@ one wording-only correction to a failure message.
 
 ### Blocked writer with concurrent receipt processing
 
+The ordinary window/connector fixtures now use default socket buffers;
+dedicated blocked-writer coverage below retains its 4096-byte settings.
+No input sizes, occupancy assertions or serial-negative controls changed.
+Measured on frozen accounting-product snapshots:
+
+| Fixture | Both buffers restricted | Sender default only | Both default |
+| --- | ---: | ---: | ---: |
+| 18 window cells + three serial controls | 179.80 s | 178.79 s | 0.40 s |
+| Three W30 connector-failure cells | 63.83 s | 62.49 s | 0.13 s |
+| Full sender suite, including blocked writer | 288.01 s | not measured | 44.91 s |
+
+All reported runs exit 0. This is test-runtime improvement, not product/farm
+throughput evidence. Evidence root:
+`/tanksmall/scratch/tmp/p51-wbuf-both-default.uxKAJJ/`.
+Full log `logs/sender-full-both-default.log` SHA256:
+`cd2cdc84002acbace4ae6801cea46a40f04ece272653e2e5f51247dc17ac830b`.
+Test source SHA256:
+`77e1bb18660a4bd7aa8ddb1b04eeb17d82b5d15b1fe8da1e131a936a41821a1c`.
+Binary SHA256:
+`735de2163a4f0c923d9b4837cbe39d11594e39f9ecad19d22395428f44707103`.
+
 The Linux default sender suite now includes a kernel-backpressure fixture
 for P29V1/ZSTD_TU/ZSTD_ROUTE. With W2, F publishes the first input then pauses
 its reader. A 512 KiB second input fills C's small send buffer. The test
@@ -105,8 +126,8 @@ This is partial D16 evidence: kernel backpressure, not an observed `send()`
 EAGAIN return, complete service-process shutdown, or a worker/descriptor/credit
 leak matrix. The focused selector passes all three profiles. The full default
 sender suite also exits 0 on the accounting product snapshot, taking 288.01 s
-wall time (1.46 s user, 1.76 s system). Tiny-buffer drain and deadline fixtures
-dominate this runtime; timing reduction remains separate from correctness.
+wall time (1.46 s user, 1.76 s system). This older timing includes the
+ordinary window fixtures' tiny-buffer delay, removed by the comparison above.
 
 Evidence root: `/tanksmall/scratch/tmp/p51-d16-qa.WkgfTa/`.
 Full log `logs/sender-full-r1.log` SHA256:
