@@ -4978,10 +4978,19 @@ void release_r2_peer_close_worker_gate(
     gate->changed.notify_all();
 }
 
+enum class R2DeadlineStage {
+    PeerClose,
+    BeforeBind,
+    ReturnedExpiredLease,
+    DuringDecode,
+    BeforePublication,
+};
+
 asio::awaitable<bool> r2_peer_close_after_worker_entered(
     tcp::endpoint endpoint, LinkHello hello, R2EndpointTestJob job,
     std::shared_ptr<R2PeerCloseWorkerGate> gate,
-    std::atomic<bool>& peer_closed) {
+    std::atomic<bool>& peer_closed,
+    R2DeadlineStage stage) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await socket.async_connect(endpoint, asio::use_awaitable);
     co_await raw_write(socket, Message{hello});
@@ -4995,6 +5004,15 @@ asio::awaitable<bool> r2_peer_close_after_worker_entered(
                 state.physical_link_generation ==
                     hello.physical_link_generation,
             "peer-close fixture received a mismatched R2 LINK_STATE");
+
+    if (stage == R2DeadlineStage::BeforeBind) {
+        const auto source_deadline =
+            job.lease.absolute_deadline.as_steady_time_point();
+        if (std::chrono::steady_clock::now() >= source_deadline)
+            co_return false;
+        std::this_thread::sleep_until(
+            source_deadline + std::chrono::milliseconds(2));
+    }
 
     TuBegin begin;
     begin.relationship_ordinal = job.binding.relationship_ordinal;
@@ -5012,18 +5030,26 @@ asio::awaitable<bool> r2_peer_close_after_worker_entered(
     const TuEnd end{job.binding.relationship_ordinal, binding_digest,
                     transaction_digest};
     co_await raw_write(socket, Message{job.binding});
-    co_await raw_write(socket, Message{begin});
-    co_await raw_write(socket, Message{bodies.front()});
-    for (const R2FillMessage& fill : job.fills)
-        co_await raw_write(socket, Message{fill});
-    co_await raw_write(socket, Message{end});
+    if (stage != R2DeadlineStage::BeforeBind &&
+        stage != R2DeadlineStage::ReturnedExpiredLease) {
+        co_await raw_write(socket, Message{begin});
+        co_await raw_write(socket, Message{bodies.front()});
+        for (const R2FillMessage& fill : job.fills)
+            co_await raw_write(socket, Message{fill});
+        co_await raw_write(socket, Message{end});
+    }
 
     const auto executor = co_await asio::this_coro::executor;
     asio::steady_timer poll(executor);
     const auto until = std::chrono::steady_clock::now() +
                        std::chrono::seconds(5);
     bool entered = false;
-    while (!entered && std::chrono::steady_clock::now() < until) {
+    const bool expect_worker_entry =
+        stage == R2DeadlineStage::PeerClose ||
+        stage == R2DeadlineStage::DuringDecode ||
+        stage == R2DeadlineStage::BeforePublication;
+    while (expect_worker_entry && !entered &&
+           std::chrono::steady_clock::now() < until) {
         {
             std::lock_guard lock(gate->mutex);
             entered = gate->entered;
@@ -5036,6 +5062,16 @@ asio::awaitable<bool> r2_peer_close_after_worker_entered(
             asio::redirect_error(asio::use_awaitable, error));
         if (error)
             break;
+    }
+    if (stage != R2DeadlineStage::PeerClose) {
+        try {
+            const Frame response = co_await raw_read(
+                socket, hello.max_frame_payload);
+            if (response.type == MessageType::R2_TX_COMMIT)
+                co_return false;
+        } catch (...) {
+            // Expiry closes the stream without an R2 receipt.
+        }
     }
     boost::system::error_code ignored;
     socket.shutdown(tcp::socket::shutdown_both, ignored);
@@ -5559,9 +5595,7 @@ void test_r2_persistent_history_charge_survives_worker_reset() {
         test_r2_persistent_history_charge_survives_worker_reset(profile);
 }
 
-void test_r2_peer_close_during_materialization(ProfileId profile) {
-    require(profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_ROUTE,
-            "peer-close worker fixture requires a persistent profile");
+void test_r2_deadline_stage(ProfileId profile, R2DeadlineStage stage) {
     const P5coStoreGuids stores = p5co_store_guids(
         0x5b00 + static_cast<uint64_t>(profile));
     EndpointCaps caps;
@@ -5580,8 +5614,9 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
     const P51SourceArmFields arm{
         r2_test_arm(stores.c, 8801, 9801, profile), 1};
     const P51SourceArmedFields armed = r2_test_armed(arm, stores.f, 0x5b01);
-    const sidecar::AbsoluteMonotonicDeadline deadline =
-        r2_test_deadline(std::chrono::seconds(8));
+    const sidecar::AbsoluteMonotonicDeadline deadline = r2_test_deadline(
+        stage == R2DeadlineStage::PeerClose ? std::chrono::seconds(8)
+                                            : std::chrono::seconds(2));
     const PreparedTuHandle handle = authority->prepare_for_route(
         route, PrepareRequestKey{8801, 9801}, input);
     std::vector<R2FillMessage> fills;
@@ -5656,6 +5691,7 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
     link_lease.relationship_epoch = hello.relationship_epoch;
 
     std::atomic<bool> consumed{false};
+    std::atomic<unsigned> consume_calls{0};
     std::atomic<bool> peer_closed{false};
     std::atomic<unsigned> state_calls{0};
     std::atomic<unsigned> commit_calls{0};
@@ -5671,22 +5707,45 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
         [&](const LinkHello& observed,
             const JobBind& observed_binding)
             -> std::optional<P51SourceJobLease> {
+            ++consume_calls;
+            if (stage == R2DeadlineStage::BeforeBind &&
+                std::chrono::steady_clock::now() >=
+                    deadline.as_steady_time_point())
+                return std::nullopt;
             bool expected = false;
             if (observed != hello || observed_binding != binding ||
                 !consumed.compare_exchange_strong(expected, true))
                 return std::nullopt;
+            if (stage == R2DeadlineStage::ReturnedExpiredLease) {
+                P51SourceJobLease expired = job_lease;
+                expired.absolute_deadline =
+                    r2_test_deadline(std::chrono::seconds(-1));
+                return expired;
+            }
             return job_lease;
         };
     config.input_job_state =
-        [&](CStoreGuid c_guid, const TxBegin&,
+        [&, deadline](CStoreGuid c_guid, const TxBegin&,
             const TxCommit& commit, std::span<const uint8_t> exact) {
             ++state_calls;
+            if (stage == R2DeadlineStage::BeforePublication)
+                std::this_thread::sleep_until(
+                    deadline.as_steady_time_point() +
+                    std::chrono::milliseconds(2));
             return c_guid == stores.c &&
                    commit.tu_seq == binding.tu_seq &&
                    commit.raw_digest == binding.raw_digest &&
                    std::ranges::equal(exact, input)
                        ? InputJobState::Open
                        : InputJobState::Closed;
+        };
+    std::atomic<unsigned> authorize_calls{0};
+    config.authorize_p51_job_publication =
+        [&](const LinkHello& observed, const JobBind& observed_binding) {
+            if (observed != hello || observed_binding != binding)
+                return false;
+            ++authorize_calls;
+            return true;
         };
     config.record_p51_job_commit =
         [&](const LinkHello& observed, const JobBind& observed_binding,
@@ -5715,10 +5774,12 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
                              std::move(config));
     auto gate = std::make_shared<R2PeerCloseWorkerGate>();
     EndpointIoControl control;
-    control.before_materialize_on_worker = [gate] {
+    control.before_materialize_on_worker = [gate, stage] {
         std::unique_lock lock(gate->mutex);
         gate->entered = true;
         gate->changed.notify_all();
+        if (stage == R2DeadlineStage::BeforePublication)
+            return;
         gate->changed.wait(lock, [&] { return gate->release; });
         gate->exited = true;
         gate->changed.notify_all();
@@ -5738,6 +5799,8 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
     unsigned owner_timer_ticks_while_held = 0;
     bool usage_drained_after_release = false;
     auto observe_close_and_release = [&]() -> asio::awaitable<void> {
+        if (stage == R2DeadlineStage::BeforePublication)
+            co_return;
         const auto executor = co_await asio::this_coro::executor;
         asio::steady_timer timer(executor);
         const auto until = std::chrono::steady_clock::now() +
@@ -5794,7 +5857,7 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
     auto peer_future = asio::co_spawn(
         context, r2_peer_close_after_worker_entered(
                      acceptor.local_endpoint(), hello, std::move(job), gate,
-                     peer_closed),
+                     peer_closed, stage),
         asio::use_future);
     auto observer_future = asio::co_spawn(
         context, observe_close_and_release(), asio::use_future);
@@ -5802,6 +5865,8 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
     const bool closed_after_worker = peer_future.get();
     observer_future.get();
     const ServerRunResult server_result = server_future.get();
+    if (stage == R2DeadlineStage::BeforePublication)
+        usage_drained_after_release = true;
     const P50ServerOwnerUsage final_usage = server.owner_usage();
     bool committed_input_exact = false;
     if (commit_calls.load() == 1) {
@@ -5847,23 +5912,97 @@ void test_r2_peer_close_during_materialization(ProfileId profile) {
               << final_usage.detached_history_bytes << ','
               << final_usage.global_detached_resident_bytes
               << " invariant=" << invariant.value_or("none") << '\n';
-    require(closed_after_worker && peer_closed.load() &&
-                worker_held_at_observation && owner_timer_ticks_while_held > 0 &&
-                charge_retained_while_closed &&
-                server_result.status == ServerRunStatus::Disconnected &&
-                consumed.load() && commit_calls.load() <= 1 &&
-                state_calls.load() <= 1 && ack_calls.load() == 0 &&
-                committed_input_exact && charges_drained && !invariant,
+    if (stage == R2DeadlineStage::PeerClose) {
+        require(closed_after_worker && peer_closed.load() &&
+                    worker_held_at_observation && owner_timer_ticks_while_held > 0 &&
+                    charge_retained_while_closed &&
+                    server_result.status == ServerRunStatus::Disconnected &&
+                    consumed.load() && commit_calls.load() <= 1 &&
+                    state_calls.load() <= 1 && authorize_calls.load() <= 1 &&
+                    ack_calls.load() == 0 && committed_input_exact &&
+                    charges_drained && !invariant,
+                std::string(profile_name(profile)) +
+                    " peer close while R2 materialization was held lost owner progress or exact settlement");
+        std::cout << "P51_R2_ENDPOINT peer-close worker profile="
+                  << static_cast<unsigned>(profile) << ": ok\n";
+        return;
+    }
+    if (stage == R2DeadlineStage::BeforeBind) {
+        require(!closed_after_worker && peer_closed.load() &&
+                    consume_calls.load() == 1 && !consumed.load() &&
+                    server_result.status == ServerRunStatus::TerminalError &&
+                    state_calls.load() == 0 && authorize_calls.load() == 0 &&
+                    commit_calls.load() == 0 && ack_calls.load() == 0 &&
+                    committed_input_exact && charges_drained && !invariant,
+                std::string(profile_name(profile)) +
+                    " expired source reservation was consumed or published before bind");
+        std::cout << "P51_R2_DEADLINE stage=before_bind profile="
+                  << static_cast<unsigned>(profile)
+                  << " consume_attempts=" << consume_calls.load()
+                  << " consumed=" << consumed.load()
+                  << " commits=" << commit_calls.load() << ": ok\n";
+        return;
+    }
+    if (stage == R2DeadlineStage::ReturnedExpiredLease) {
+        require(!closed_after_worker && peer_closed.load() &&
+                    consume_calls.load() == 1 && consumed.load() &&
+                    server_result.status == ServerRunStatus::DeadlineExceeded &&
+                    state_calls.load() == 0 && authorize_calls.load() == 0 &&
+                    commit_calls.load() == 0 && ack_calls.load() == 0 &&
+                    committed_input_exact && charges_drained && !invariant,
+                std::string(profile_name(profile)) +
+                    " endpoint admitted a JOB_BIND with an already-expired lease");
+        std::cout << "P51_R2_DEADLINE stage=returned_expired_lease profile="
+                  << static_cast<unsigned>(profile)
+                  << " consume_attempts=" << consume_calls.load()
+                  << " consumed=" << consumed.load()
+                  << " commits=" << commit_calls.load() << ": ok\n";
+        return;
+    }
+    const unsigned expected_state_calls =
+        stage == R2DeadlineStage::BeforePublication ? 1 : 0;
+    require(closed_after_worker && peer_closed.load() && consumed.load() &&
+                server_result.status == ServerRunStatus::DeadlineExceeded &&
+                state_calls.load() == expected_state_calls &&
+                authorize_calls.load() == 0 && commit_calls.load() == 0 &&
+                ack_calls.load() == 0 && committed_input_exact &&
+                charges_drained && !invariant &&
+                (stage != R2DeadlineStage::DuringDecode ||
+                 (worker_held_at_observation &&
+                  owner_timer_ticks_while_held > 0 &&
+                  charge_retained_while_closed)),
             std::string(profile_name(profile)) +
-                " peer close while R2 materialization was held lost owner progress or exact settlement");
-    std::cout << "P51_R2_ENDPOINT peer-close worker profile="
-              << static_cast<unsigned>(profile) << ": ok\n";
+                " R2 source deadline expired at the requested stage but publication or cleanup was incorrect");
+    std::cout << "P51_R2_DEADLINE stage="
+              << (stage == R2DeadlineStage::DuringDecode ? "decode" : "before_publication")
+              << " profile=" << static_cast<unsigned>(profile)
+              << " consumed=" << consumed.load()
+              << " state=" << state_calls.load()
+              << " authorize=" << authorize_calls.load()
+              << " commits=" << commit_calls.load()
+              << " status=" << static_cast<unsigned>(server_result.status)
+              << ": ok\n";
+}
+
+void test_r2_peer_close_during_materialization(ProfileId profile) {
+    test_r2_deadline_stage(profile, R2DeadlineStage::PeerClose);
 }
 
 void test_r2_peer_close_during_materialization() {
     for (const ProfileId profile : {ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE})
         test_r2_peer_close_during_materialization(profile);
+}
+
+void test_r2_deadline_expiry_stages() {
+    for (const ProfileId profile : {ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE,
+                                    ProfileId::ZSTD_TU}) {
+        test_r2_deadline_stage(profile, R2DeadlineStage::BeforeBind);
+        test_r2_deadline_stage(profile, R2DeadlineStage::ReturnedExpiredLease);
+        test_r2_deadline_stage(profile, R2DeadlineStage::DuringDecode);
+        test_r2_deadline_stage(profile, R2DeadlineStage::BeforePublication);
+    }
 }
 
 void test_r2_endpoint_window30_receipts_and_refill(ProfileId profile) {
@@ -9555,6 +9694,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused P29/ROUTE peer-close worker PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_R2_DEADLINE_STAGES_FOCUS") != nullptr) {
+        test_r2_deadline_expiry_stages();
+        std::cout << "p50_endpoint_test: focused R2 deadline stages PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_R2_REPLACED_GENERATION_FOCUS") != nullptr) {
         test_r2_store_replaced_rejects_same_guid_old_generation();
         std::cout << "p50_endpoint_test: focused same-GUID stale-generation reject PASS\n";
@@ -9622,6 +9766,7 @@ int main(int argc, char** argv) {
     test_r2_endpoint_commits_two_jobs_on_one_link();
     test_r2_persistent_history_charge_survives_worker_reset();
     test_r2_peer_close_during_materialization();
+    test_r2_deadline_expiry_stages();
     test_r2_fragmented_one_job_each_profile();
     test_r2_fragmented_frame_interruption_recovery();
     test_candidate_stage_has_no_revision_residue();

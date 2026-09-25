@@ -12,6 +12,58 @@ retained artifact directories.
 
 ## Developer QA
 
+### R2 source-deadline expiry coverage
+
+The default endpoint suite now exercises four expiry stages for each of
+P29V1, ZSTD_TU and ZSTD_ROUTE: a mocked consumer rejecting an expired
+reservation before bind; an already-expired returned lease rejected by the
+endpoint; expiry while the decode worker is held; and expiry immediately
+before publication authorization. Assertions require no committed input or
+receipt, no publication authorization, and drained raw/encoded/decoder and
+detached-history accounting. Held-worker coverage also checks owner-loop
+progress and retained charges until the worker releases. The before-bind
+mock does not prove real service reservation expiry or absence of late ARMED.
+Publication already authorized before expiry is outside these rejection cases.
+
+Luna's focused 12-cell run and default endpoint suite both exit 0 on the
+same binary, based on `36ee0fe0` with only the endpoint test TU changed.
+Evidence root: `/tanksmall/scratch/tmp/d08-expiry-private/logs/`.
+`d08-r2-deadline-stages.log` SHA256
+`981379dfa1eb2f7d46409aa2d5470c1006a9cf0d521728e24bf91fb90424b60a`;
+`d08-r2-default-endpoint.log` SHA256
+`21266fbcadf3d7a6430c561221e178580d4fb70bf8ebc44f865ba3466df0455b`.
+Test source SHA256
+`0d6c34730ad0acd7816cfa38132579be859b3587a7de2333e3d346094d8f9773`;
+binary `47b0e0e00e39a3107857834809ceb4e35f9f22bf164c76e2119d30b966168cdf`.
+SDK image `icecream-dev:sdk-ubuntu24.04-a9fa596a15e7`, 2 CPUs/8 GiB.
+This adds regression coverage, not a product change or full D08/C03 closure.
+
+### Shared recovery repair: qualification incomplete
+
+The uncommitted centralized failed-recovery cleanup is not qualified.
+Its private production build and slice0 suite pass. A sender run failed at
+`lost_commit_recovery`: status 6 (DeadlineExceeded), five connector calls,
+one consumed/committed input and one reset. Snapshot audit found that this
+run used a stale sender fixture, with acknowledged prefix fixed at zero
+after RESET; the current upstream fixture already uses the settled prefix.
+This failure is excluded as evidence of a product regression. The private
+snapshot also predates the retirement guard and other test updates, so it
+must be synchronized before combined qualification. No deadline or connector
+allowance was raised.
+Failure evidence:
+`/tanksmall/scratch/tmp/p51-d07-positive-owner.PfF4BU/tmp/final-sender.log`,
+SHA256 `4d630f53a69ae0959f21e3e8b915a8f2aee4f135c2888ae507eda1f410e6fd18`.
+The chained route-owner and final service runs were not reached.
+
+After synchronizing the sender fixture, lost-COMMIT and shared-recovery
+cases pass. The next full sender attempt fails the existing future-ARM
+observer assertion: moving `before_r2_recovery_for_test` from branch entry
+to actual recovery ownership changed the test seam's meaning. Restore that
+observer and use a separate attempt-ownership observer for the new fixture;
+do not weaken the existing assertion. Evidence: `final-sender-r2.log` in
+the same directory, SHA256
+`577194bc5e888143315183017b4ff28d9087d80e3a9c536dc5b91f1e7495d1ed`.
+
 ### Consecutive P29 recovery resets
 
 `CRoute::reset_v1_route` now permits a fresh-nonce reset when its codec state
