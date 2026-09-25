@@ -1605,6 +1605,12 @@ struct Daemon {
         GetCSMsg *request,
         P50CacheClientCapability capability);
     void handle_old_request();
+    /* Local jobs run at once.  -m 0 offers the farm no compile slots, but the
+       jobs that can only run here (links above all) still do: bound them by the
+       CPUs rather than running them one at a time. */
+    unsigned int local_job_limit() const {
+        return max_kids ? max_kids : (unsigned int)std::max(1, num_cpus);
+    }
     bool handle_compile_file(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool advance_p50_attachments(const std::vector<pollfd>& pollfds);
     bool handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
@@ -7719,7 +7725,7 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
             }
             cl->running_preprocess = false;
         } else if(cl->fulljob) {
-            clients.active_processes -= std::max((unsigned int)1, max_kids);
+            clients.active_processes -= local_job_limit();
             if (fulljob_active > 0) {
                 --fulljob_active;
             }
@@ -7801,7 +7807,7 @@ void Daemon::project_getcs_cache_route(
 
 void Daemon::handle_old_request()
 {
-    const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
+    const unsigned int compile_limit = local_job_limit();
     const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
     /* G4 (18:21): a LOGIN_ATTEMPT no longer freezes the local lane.  The
@@ -8933,7 +8939,7 @@ void Daemon::handle_end(Client *client, int exitcode)
             }
             client->running_preprocess = false;
         } else if(client->fulljob) {
-            clients.active_processes -= std::max((unsigned int)1, max_kids);
+            clients.active_processes -= local_job_limit();
             if (fulljob_active > 0) {
                 --fulljob_active;
             }
