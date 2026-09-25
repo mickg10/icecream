@@ -1841,6 +1841,7 @@ void run_p51_sender_window_concurrent_callers(
     std::atomic<unsigned> exact_input_mismatches{0};
     std::atomic<bool> mismatch_detail_logged{false};
     std::mutex interval_observer_mutex;
+    std::condition_variable interval_observer_cv;
     std::vector<R2WireControlSnapshot> observed_intervals;
     std::vector<bool> reservation_consumed(kJobs, false);
     std::vector<size_t> input_index_by_tu(kJobs, kJobs);
@@ -2007,8 +2008,11 @@ void run_p51_sender_window_concurrent_callers(
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
     sender_config.r2_interval_observer = [&](const R2WireControlSnapshot& interval) {
-        std::lock_guard lock(interval_observer_mutex);
-        observed_intervals.push_back(interval);
+        {
+            std::lock_guard lock(interval_observer_mutex);
+            observed_intervals.push_back(interval);
+        }
+        interval_observer_cv.notify_all();
         return true;
     };
     if (profile == ProfileId::ZSTD_ROUTE)
@@ -2308,9 +2312,17 @@ void run_p51_sender_window_concurrent_callers(
     CHECK(sender->retained_completion_records_for_test() == 0);
     CHECK(connector_calls.load(std::memory_order_relaxed) ==
           (fail_first_connector ? 2U : 1U));
+    {
+        std::lock_guard lock(interval_observer_mutex);
+        CHECK(std::none_of(observed_intervals.begin(), observed_intervals.end(),
+                           [](const R2WireControlSnapshot& interval) {
+            return interval.end == R2WireIntervalEnd::PhysicalLinkRetired;
+        }));
+    }
     std::promise<void> retirement_posted;
     auto retirement_done = retirement_posted.get_future();
     asio::post(c_context, [&sender, &retirement_posted] {
+        sender->retire_for_replacement();
         sender->retire_for_replacement();
         retirement_posted.set_value();
     });
@@ -2319,10 +2331,60 @@ void run_p51_sender_window_concurrent_callers(
     CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
           std::future_status::ready);
     c_work.reset();
-    c_context.stop();
-    c_thread.join();
     const ServerRunResult server_result = server_future.get();
     CHECK(server_result.status == ServerRunStatus::Disconnected);
+    {
+        std::unique_lock lock(interval_observer_mutex);
+        CHECK(interval_observer_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return std::any_of(observed_intervals.begin(), observed_intervals.end(),
+                               [](const R2WireControlSnapshot& interval) {
+                return interval.end == R2WireIntervalEnd::PhysicalLinkRetired;
+            });
+        }));
+        const size_t terminal_count = static_cast<size_t>(std::count_if(
+            observed_intervals.begin(), observed_intervals.end(),
+            [](const R2WireControlSnapshot& interval) {
+                return interval.end == R2WireIntervalEnd::PhysicalLinkRetired;
+            }));
+        CHECK(terminal_count == 1);
+        CHECK(observed_intervals.back().end ==
+              R2WireIntervalEnd::PhysicalLinkRetired);
+        CHECK(observed_intervals.back().link.c_store_guid == c_guid);
+        CHECK(observed_intervals.back().link.f_store_guid == f_guid);
+        CHECK(observed_intervals.back().link.logical_link_id == relationship_id);
+        CHECK(observed_intervals.back().link.relationship_epoch ==
+              armed.front().relationship_epoch);
+        CHECK(observed_intervals.back().link.physical_link_generation == 27);
+        interval_c_to_f = 0;
+        interval_f_to_c = 0;
+        for (const R2WireControlSnapshot& interval : observed_intervals) {
+            CHECK(interval.valid);
+            CHECK(interval.total_c_to_f_bytes <=
+                  std::numeric_limits<uint64_t>::max() - interval_c_to_f);
+            CHECK(interval.total_f_to_c_bytes <=
+                  std::numeric_limits<uint64_t>::max() - interval_f_to_c);
+            interval_c_to_f += interval.total_c_to_f_bytes;
+            interval_f_to_c += interval.total_f_to_c_bytes;
+        }
+    }
+    uint64_t final_f_c_to_f = 0;
+    uint64_t final_f_f_to_c = 0;
+    for (const AsyncCompletion& completion : f_socket_observations.completions()) {
+        if (!completion.stamp.r2_traffic ||
+            completion.stamp.actor != ActorSide::F)
+            continue;
+        if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+            completion.stamp.operation == AsyncOperationKind::ReadPayload)
+            final_f_c_to_f += completion.transferred_bytes;
+        else if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
+            final_f_f_to_c += completion.transferred_bytes;
+    }
+    CHECK(interval_c_to_f == final_f_c_to_f);
+    CHECK(interval_f_to_c == final_f_f_to_c);
+    // The retirement observer is delivered by the C executor itself; leave
+    // it running until that final snapshot has been observed above.
+    c_context.stop();
+    c_thread.join();
     f_context.stop();
     f_thread.join();
     if (kWindow == 30 && !expect_underfilled_witness)
@@ -2409,7 +2471,9 @@ asio::awaitable<void> sender_test_heartbeat(
     }
 }
 
-void run_p51_sender_writer_backpressure_case(ProfileId profile) {
+void run_p51_sender_writer_backpressure_case(
+    ProfileId profile, bool retire_while_reader_and_writer_held = false) {
+    ScopedP50Diagnostics diagnostics;
     constexpr size_t kLargeRawBytes = 512U << 10;
     constexpr uint64_t kPhysicalGeneration = 27;
     const auto [c_guid, f_guid] = sender_r2_store_guids();
@@ -2453,6 +2517,13 @@ void run_p51_sender_writer_backpressure_case(ProfileId profile) {
     std::atomic<int> observed_f_fd{-1};
     std::atomic<unsigned> commit_count{0};
     std::atomic<unsigned> input_mismatches{0};
+    CompletionLog f_socket_observations;
+    std::mutex interval_mutex;
+    std::condition_variable interval_cv;
+    std::vector<R2WireControlSnapshot> observed_intervals;
+    std::atomic<unsigned> terminal_intervals{0};
+    std::atomic<int> terminal_count_during_retire{-1};
+    std::atomic<bool> observer_delivery_valid{true};
 
     P50ServerEndpointConfig server_config;
     server_config.input_job_state = [&](CStoreGuid observed_c,
@@ -2523,7 +2594,7 @@ void run_p51_sender_writer_backpressure_case(ProfileId profile) {
     server_caps.supported_profiles = profile_bit(profile);
     server_caps.zstd.max_raw_bytes = 1U << 20;
     server_caps.zstd.max_encoded_body_bytes = 1U << 20;
-    P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
+    P50ServerEndpoint server(f_guid, server_caps, &f_socket_observations, nullptr,
                              std::move(server_config));
     auto server_future = asio::co_spawn(
         f_context, sender_r2_accept_with_first_commit_gate(
@@ -2546,6 +2617,18 @@ void run_p51_sender_writer_backpressure_case(ProfileId profile) {
     sender_config.deadline = deadline.as_steady_time_point();
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
+    sender_config.r2_interval_observer = [&](const R2WireControlSnapshot& interval) {
+        {
+            std::lock_guard lock(interval_mutex);
+            observed_intervals.push_back(interval);
+        }
+        if (!interval.valid)
+            observer_delivery_valid.store(false, std::memory_order_release);
+        if (interval.end == R2WireIntervalEnd::PhysicalLinkRetired)
+            terminal_intervals.fetch_add(1, std::memory_order_release);
+        interval_cv.notify_all();
+        return true;
+    };
     if (profile == ProfileId::ZSTD_ROUTE)
         sender_config.compression_level = 3;
     std::atomic<unsigned> complete_bundles{0};
@@ -2709,39 +2792,65 @@ void run_p51_sender_writer_backpressure_case(ProfileId profile) {
     }
     CHECK(kernel_backpressure_witness);
     CHECK(heartbeat_ticks.load(std::memory_order_acquire) > heartbeat_before);
+    // The peer gate and receipt reader are held and the second C write is
+    // demonstrably blocked; no physical-retirement event is valid yet.
+    CHECK(terminal_intervals.load(std::memory_order_acquire) == 0);
     std::cerr << "P51_D16_BLOCKED_WRITE profile=" << profile_name
               << " outq=" << queued_bytes << " sndbuf=" << effective_send_buffer
               << " not_writable=" << socket_not_writable
               << " receipt1=held heartbeat=" << heartbeat_ticks.load()
               << " bundles_completed=" << complete_bundles.load() << "\n";
 
-    hold_receipt_reader.store(false, std::memory_order_release);
-    progress_cv.notify_all();
-    CHECK(wait_for_progress([&] {
-        return first_receipt_validated.load(std::memory_order_acquire);
-    }, std::chrono::seconds(2)));
-    CHECK(complete_bundles.load(std::memory_order_acquire) == 1);
-    CHECK(second.wait_for(std::chrono::milliseconds(0)) ==
-          std::future_status::timeout);
-    CHECK(heartbeat_ticks.load(std::memory_order_acquire) > heartbeat_before);
-    {
-        const int fd = observed_c_fd.load(std::memory_order_acquire);
-        CHECK(fd >= 0);
-        pollfd descriptor{fd, POLLOUT, 0};
-        const int ready = ::poll(&descriptor, 1, 0);
-        int after_receipt_queue = 0;
-        CHECK(::ioctl(fd, SIOCOUTQ, &after_receipt_queue) == 0);
-        const bool still_blocked = (ready == 0 ||
-            (ready > 0 && (descriptor.revents & POLLOUT) == 0)) &&
-            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
-        CHECK(still_blocked);
-        CHECK(after_receipt_queue >= std::max(4096, effective_send_buffer / 2));
-        queued_bytes = after_receipt_queue;
+    if (retire_while_reader_and_writer_held) {
+        std::promise<void> retirement_posted;
+        auto retirement_done = retirement_posted.get_future();
+        asio::post(c_context, [&sender, &retirement_posted,
+                               &terminal_count_during_retire,
+                               &terminal_intervals] {
+            sender->retire_for_replacement();
+            sender->retire_for_replacement();
+            terminal_count_during_retire.store(
+                static_cast<int>(terminal_intervals.load(
+                    std::memory_order_acquire)), std::memory_order_release);
+            retirement_posted.set_value();
+        });
+        CHECK(retirement_done.wait_for(std::chrono::seconds(2)) ==
+              std::future_status::ready);
+        // The stop request executes while this context is still inside the
+        // held reader/writer state; their completion handlers cannot run
+        // until this callback returns.
+        CHECK(terminal_count_during_retire.load(std::memory_order_acquire) == 0);
+        hold_receipt_reader.store(false, std::memory_order_release);
+        progress_cv.notify_all();
+    } else {
+        hold_receipt_reader.store(false, std::memory_order_release);
+        progress_cv.notify_all();
+        CHECK(wait_for_progress([&] {
+            return first_receipt_validated.load(std::memory_order_acquire);
+        }, std::chrono::seconds(2)));
+        CHECK(complete_bundles.load(std::memory_order_acquire) == 1);
+        CHECK(second.wait_for(std::chrono::milliseconds(0)) ==
+              std::future_status::timeout);
+        CHECK(heartbeat_ticks.load(std::memory_order_acquire) > heartbeat_before);
+        {
+            const int fd = observed_c_fd.load(std::memory_order_acquire);
+            CHECK(fd >= 0);
+            pollfd descriptor{fd, POLLOUT, 0};
+            const int ready = ::poll(&descriptor, 1, 0);
+            int after_receipt_queue = 0;
+            CHECK(::ioctl(fd, SIOCOUTQ, &after_receipt_queue) == 0);
+            const bool still_blocked = (ready == 0 ||
+                (ready > 0 && (descriptor.revents & POLLOUT) == 0)) &&
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+            CHECK(still_blocked);
+            CHECK(after_receipt_queue >= std::max(4096, effective_send_buffer / 2));
+            queued_bytes = after_receipt_queue;
+        }
+        std::cerr << "P51_D16_READER_PROGRESS profile=" << profile_name
+                  << " receipt1=validated still_blocked=1 outq=" << queued_bytes
+                  << " heartbeat=" << heartbeat_ticks.load()
+                  << " second_bundle_complete=0\n";
     }
-    std::cerr << "P51_D16_READER_PROGRESS profile=" << profile_name
-              << " receipt1=validated still_blocked=1 outq=" << queued_bytes
-              << " heartbeat=" << heartbeat_ticks.load()
-              << " second_bundle_complete=0\n";
 
     const int peer_fd = observed_f_fd.exchange(-1, std::memory_order_acq_rel);
     CHECK(peer_fd >= 0);
@@ -2752,21 +2861,54 @@ void run_p51_sender_writer_backpressure_case(ProfileId profile) {
         release_f_gate = true;
     }
     f_gate_cv.notify_all();
-    std::promise<void> retirement_posted;
-    auto retirement_done = retirement_posted.get_future();
-    asio::post(c_context, [&sender, &retirement_posted] {
-        sender->retire_for_replacement();
-        retirement_posted.set_value();
-    });
-    CHECK(retirement_done.wait_for(std::chrono::seconds(2)) ==
-          std::future_status::ready);
+    if (!retire_while_reader_and_writer_held) {
+        std::promise<void> retirement_posted;
+        auto retirement_done = retirement_posted.get_future();
+        asio::post(c_context, [&sender, &retirement_posted] {
+            sender->retire_for_replacement();
+            sender->retire_for_replacement();
+            retirement_posted.set_value();
+        });
+        CHECK(retirement_done.wait_for(std::chrono::seconds(2)) ==
+              std::future_status::ready);
+    }
     CHECK(second.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
     CHECK(second.get().status != ZstdSourceTransferStatus::Committed);
     CHECK(first.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
-    CHECK(first.get().status == ZstdSourceTransferStatus::Committed);
+    const ZstdSourceTransferResult first_result = first.get();
+    if (retire_while_reader_and_writer_held)
+        CHECK(first_result.status != ZstdSourceTransferStatus::Committed);
+    else
+        CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
     CHECK(server_future.wait_for(std::chrono::seconds(2)) ==
           std::future_status::ready);
     CHECK(server_future.get().status == ServerRunStatus::Disconnected);
+    {
+        std::unique_lock lock(interval_mutex);
+        CHECK(interval_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return terminal_intervals.load(std::memory_order_acquire) == 1;
+        }));
+    }
+    CHECK(terminal_intervals.load(std::memory_order_acquire) == 1);
+    CHECK(observer_delivery_valid.load(std::memory_order_acquire));
+    {
+        std::lock_guard lock(interval_mutex);
+        CHECK(!observed_intervals.empty());
+        CHECK(observed_intervals.back().end ==
+              R2WireIntervalEnd::PhysicalLinkRetired);
+        CHECK(observed_intervals.back().link.c_store_guid == c_guid);
+        CHECK(observed_intervals.back().link.f_store_guid == f_guid);
+        CHECK(observed_intervals.back().link.logical_link_id == relationship_id);
+        CHECK(observed_intervals.back().link.relationship_epoch ==
+              armed[0].relationship_epoch);
+        CHECK(observed_intervals.back().link.physical_link_generation ==
+              kPhysicalGeneration);
+        uint64_t prior_sequence = 0;
+        for (const R2WireControlSnapshot& interval : observed_intervals) {
+            CHECK(interval.interval_sequence > prior_sequence);
+            prior_sequence = interval.interval_sequence;
+        }
+    }
     CHECK(commit_count.load(std::memory_order_acquire) == 1);
     CHECK(input_mismatches.load(std::memory_order_relaxed) == 0);
     CHECK(connector_calls.load(std::memory_order_acquire) <= 2);
@@ -2778,13 +2920,19 @@ void run_p51_sender_writer_backpressure_case(ProfileId profile) {
     f_context.stop();
     if (f_thread.joinable()) f_thread.join();
     std::cerr << "P51_D16_BACKPRESSURE_ACK_SHUTDOWN profile=" << profile_name
-              << " first_committed=1 blocked_write=1 receipt_reader_progress=1 bounded=1 PASS\n";
+              << " first_committed="
+              << (!retire_while_reader_and_writer_held)
+              << " blocked_write=1 receipt_reader_progress="
+              << (!retire_while_reader_and_writer_held)
+              << " held_io_retirement=" << retire_while_reader_and_writer_held
+              << " bounded=1 PASS\n";
 }
 
 void test_p51_sender_writer_backpressure_ack_and_shutdown() {
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE})
         run_p51_sender_writer_backpressure_case(profile);
+    run_p51_sender_writer_backpressure_case(ProfileId::ZSTD_TU, true);
 }
 #endif
 
@@ -5505,6 +5653,15 @@ int main(int argc, char** argv) {
         std::string_view(argv[1]) == "--r2-wire-accounting-w30") {
         test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
         std::cerr << "P51_SENDER_R2_WIRE_ACCOUNTING_W30_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--r2-physical-retirement") {
+        test_p51_sender_w30_concurrent_callers_refill_and_duplicate();
+#if defined(__linux__)
+        test_p51_sender_writer_backpressure_ack_and_shutdown();
+#endif
+        std::cerr << "P51_SENDER_R2_PHYSICAL_RETIREMENT_SELECTOR PASS\n";
         return 0;
     }
     if (argc == 2 &&

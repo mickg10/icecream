@@ -518,6 +518,108 @@ struct P50ZstdSourceSender::Impl {
         }
     }
 
+    static R2WireLinkIdentity interval_identity(
+        const LinkHello& hello) noexcept {
+        return R2WireLinkIdentity{
+            CStoreGuid{hello.c_store_guid}, FStoreGuid{hello.f_store_guid},
+            hello.relationship_id, hello.relationship_epoch,
+            hello.physical_link_generation};
+    }
+
+    void emit_r2_physical_retirement(
+        R2WireLinkIdentity identity) noexcept {
+        if (!wire_completions.r2_accounting_enabled() ||
+            !config.r2_interval_observer)
+            return;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            if (r2_last_retired_link && *r2_last_retired_link == identity)
+                return;
+            r2_last_retired_link = identity;
+            if (r2_active_socket_link &&
+                *r2_active_socket_link == identity)
+                r2_active_socket_link.reset();
+        }
+        // The observer can perform file I/O or re-enter sender diagnostics;
+        // never invoke it under r2_transfer_mutex.
+        queue_r2_link_interval(identity,
+                               R2WireIntervalEnd::PhysicalLinkRetired);
+        publish_r2_interval_snapshots();
+    }
+
+    void try_finalize_r2_physical_retirement() noexcept {
+        if (!wire_completions.r2_accounting_enabled() ||
+            !config.r2_interval_observer)
+            return;
+        std::optional<R2WireLinkIdentity> identity;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            if (!r2_pending_retirement_link || !route_replacement_required ||
+                r2_transfer_active || !r2_transfer_waiters.empty() ||
+                !r2_active_requests.empty() || r2_reader_running ||
+                r2_ack_pump_running || r2_retirement_readers != 0 ||
+                r2_retirement_ack_pumps != 0 ||
+                (r2_socket && r2_socket->is_open()))
+                return;
+            identity = r2_pending_retirement_link;
+            r2_pending_retirement_link.reset();
+            if (r2_last_retired_link && *r2_last_retired_link == *identity) {
+                if (r2_active_socket_link &&
+                    *r2_active_socket_link == *identity)
+                    r2_active_socket_link.reset();
+                return;
+            }
+            // Claim before publishing so repeated stop calls cannot create a
+            // second terminal interval for this physical identity.
+            r2_last_retired_link = identity;
+            if (r2_active_socket_link &&
+                *r2_active_socket_link == *identity)
+                r2_active_socket_link.reset();
+        }
+        queue_r2_link_interval(*identity,
+                               R2WireIntervalEnd::PhysicalLinkRetired);
+        publish_r2_interval_snapshots();
+    }
+
+    bool r2_retirement_tracking_enabled() const noexcept {
+        return wire_completions.r2_accounting_enabled() &&
+               static_cast<bool>(config.r2_interval_observer);
+    }
+
+    bool r2_background_task_started(bool receipt_reader) noexcept {
+        if (!r2_retirement_tracking_enabled())
+            return false;
+        std::lock_guard lock(r2_transfer_mutex);
+        unsigned& count = receipt_reader ? r2_retirement_readers
+                                         : r2_retirement_ack_pumps;
+        if (count == std::numeric_limits<unsigned>::max()) {
+            r2_interval_delivery_valid.store(false, std::memory_order_release);
+            wire_completions.mark_r2_accounting_unavailable();
+            return false;
+        }
+        ++count;
+        return true;
+    }
+
+    void r2_background_task_exited(bool receipt_reader,
+                                   bool tracked) noexcept {
+        if (!tracked || !r2_retirement_tracking_enabled())
+            return;
+        {
+            std::lock_guard lock(r2_transfer_mutex);
+            unsigned& count = receipt_reader ? r2_retirement_readers
+                                             : r2_retirement_ack_pumps;
+            if (count == 0) {
+                r2_interval_delivery_valid.store(
+                    false, std::memory_order_release);
+                wire_completions.mark_r2_accounting_unavailable();
+            } else {
+                --count;
+            }
+        }
+        try_finalize_r2_physical_retirement();
+    }
+
     void collect_r2_link_intervals(
         ZstdSourceTransferResult& result) noexcept {
         if (!wire_completions.r2_accounting_enabled() ||
@@ -572,6 +674,13 @@ struct P50ZstdSourceSender::Impl {
     std::atomic<bool> r2_interval_delivery_valid{true};
     std::optional<R2WireLinkIdentity> r2_accounted_ack_link;
     uint64_t r2_accounted_ack_prefix = 0;
+    // Tracks the exact offer installed on the current socket. A normal-stop
+    // terminal interval waits for all sender I/O completion paths to exit.
+    std::optional<R2WireLinkIdentity> r2_active_socket_link;
+    std::optional<R2WireLinkIdentity> r2_pending_retirement_link;
+    std::optional<R2WireLinkIdentity> r2_last_retired_link;
+    unsigned r2_retirement_readers = 0;
+    unsigned r2_retirement_ack_pumps = 0;
     std::set<PrepareRequestKey> r2_active_requests;
     // One bounded completed-ledger slot is reserved before an R2 caller can
     // stage a bundle. A fully-sent unresolved witness keeps its reservation
@@ -632,6 +741,7 @@ struct P50ZstdSourceSender::Impl {
         }
         if (released_slot)
             wake_r2_completed_capacity_waiters();
+        try_finalize_r2_physical_retirement();
     }
 
     bool retire_expired_r2_witnesses() noexcept {
@@ -811,6 +921,7 @@ struct P50ZstdSourceSender::Impl {
             boost::system::error_code ignored;
             wake->notification.expires_at(Clock::now(), ignored);
         }
+        try_finalize_r2_physical_retirement();
     }
 };
 
@@ -832,10 +943,29 @@ void P50ZstdSourceSender::retire_for_replacement() noexcept {
     impl_->route_replacement_required = true;
     impl_->wake_r2_recovery_waiters();
     impl_->wake_r2_completed_capacity_waiters();
+    if (impl_->wire_completions.r2_accounting_enabled() &&
+        impl_->config.r2_interval_observer) {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        if (impl_->r2_active_socket_link) {
+            if ((!impl_->r2_last_retired_link ||
+                 *impl_->r2_last_retired_link !=
+                     *impl_->r2_active_socket_link) &&
+                !impl_->r2_pending_retirement_link)
+                impl_->r2_pending_retirement_link =
+                    impl_->r2_active_socket_link;
+        } else if (impl_->r2_socket && impl_->r2_socket->is_open()) {
+            // A live socket without its exact physical offer cannot be
+            // represented as a complete interval; keep diagnostics fail-closed.
+            impl_->r2_interval_delivery_valid.store(
+                false, std::memory_order_release);
+            impl_->wire_completions.mark_r2_accounting_unavailable();
+        }
+    }
     if (impl_->r2_socket) {
         boost::system::error_code ignored;
         impl_->r2_socket->close(ignored);
     }
+    impl_->try_finalize_r2_physical_retirement();
 }
 
 size_t P50ZstdSourceSender::retained_completion_records_for_test() const noexcept {
@@ -974,6 +1104,14 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
             }
         }
     } notify{&impl_->config.on_r2_background_quiescent};
+    struct RetirementFinalize {
+        Impl* owner;
+        bool tracked;
+        ~RetirementFinalize() noexcept {
+            owner->r2_background_task_exited(true, tracked);
+        }
+    } retirement_finalize{impl_.get(),
+                          impl_->r2_background_task_started(true)};
     if (impl_->config.hold_r2_receipt_reader_for_test) {
         boost::asio::steady_timer test_gate(executor);
         while (impl_->config.hold_r2_receipt_reader_for_test()) {
@@ -1180,6 +1318,14 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
             }
         }
     } notify{&impl_->config.on_r2_background_quiescent};
+    struct RetirementFinalize {
+        Impl* owner;
+        bool tracked;
+        ~RetirementFinalize() noexcept {
+            owner->r2_background_task_exited(false, tracked);
+        }
+    } retirement_finalize{impl_.get(),
+                          impl_->r2_background_task_started(false)};
     const auto executor = co_await boost::asio::this_coro::executor;
     for (;;) {
         uint64_t target = 0;
@@ -1369,13 +1515,15 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
         impl_->r2_socket->close(ignored);
         impl_->r2_socket.reset();
       }
+      if (impl_->r2_retirement_tracking_enabled()) {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        impl_->r2_active_socket_link.reset();
+      }
       if (retired_link) {
         // Writer ownership is held and the receipt reader/ACK pump were
         // already quiescent at entry, so the close is now a true terminal
         // boundary for this physical incarnation.
-        impl_->queue_r2_link_interval(*retired_link,
-            R2WireIntervalEnd::PhysicalLinkRetired);
-        impl_->publish_r2_interval_snapshots();
+        impl_->emit_r2_physical_retirement(*retired_link);
       }
       const int fd = co_await await_connected_fd(connection, deadline);
       if (fd < 0)
@@ -1392,6 +1540,10 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
       if (!socket)
         throw boost::system::system_error(socket_error);
       impl_->r2_socket = std::move(*socket);
+      if (impl_->r2_retirement_tracking_enabled()) {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        impl_->r2_active_socket_link = Impl::interval_identity(hello);
+      }
       impl_->r2_failed_physical_generation = 0;
 
       impl_->r2_attempted_offer = hello;
@@ -1560,6 +1712,11 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
       // this physical connection. Use the confirmed identity when retiring
       // it on a later recovery attempt.
       impl_->r2_attempted_offer = *impl_->r2_hello;
+      if (impl_->r2_retirement_tracking_enabled()) {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        impl_->r2_active_socket_link =
+            Impl::interval_identity(*impl_->r2_hello);
+      }
       impl_->r2_accounted_ack_link = R2WireLinkIdentity{
           CStoreGuid{impl_->r2_hello->c_store_guid},
           FStoreGuid{impl_->r2_hello->f_store_guid},
@@ -2181,6 +2338,11 @@ P50ZstdSourceSender::transfer_p51_route(
                 throw std::runtime_error("R2 link socket adoption failed");
             }
             impl_->r2_socket = std::move(*socket);
+            if (impl_->r2_retirement_tracking_enabled()) {
+                std::lock_guard lock(impl_->r2_transfer_mutex);
+                impl_->r2_active_socket_link =
+                    Impl::interval_identity(hello);
+            }
             impl_->r2_physical_link_generation = physical_link_generation;
             impl_->r2_relationship_id = hello.relationship_id;
             impl_->r2_relationship_epoch = hello.relationship_epoch;

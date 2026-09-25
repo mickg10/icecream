@@ -52,6 +52,29 @@ claimed from the earlier run whose outer exit status was not retained.
 
 ### Opt-in R2 sender wire accounting
 
+Normal sender retirement now emits its final interval only after the socket
+is closed and writer ownership, active requests, receipt readers and ACK
+pumps have quiesced. Diagnostic-only task counters do not change operational
+reader/pump flags. Repeated retirement is idempotent; observer delivery occurs
+outside the transfer mutex. No extra ACK, shutdown protocol or blocking
+destructor was added, and disabled diagnostics skip this tracking.
+
+The final full sender suite passes on sender SHA256
+`66316a6c888523f89f778c2043310939e097ebf21d2bc0a5d8d993ad17afaa5b`
+and test SHA256
+`71ee09dc8fb1cb0131628895a3b19fc62856ad21eaad82786593aa064a493f05`.
+Evidence root: `/tanksmall/scratch/tmp/p51-physical-retire-build-r1/`.
+Full log `work/artifacts/sender-full-r2.log`, SHA256
+`36f1ba06baf87dfd00721f33f031ce5b113e0074dfed40bcf509b1fd7e31bb8c`.
+Tests cover all three W30 profiles, final interval totals against F socket
+observations, repeated retirement, and a held-reader/blocked-writer case
+that forbids a terminal interval immediately after retirement is requested.
+Removing finalization calls fails at the bounded terminal-event assertion
+(expected exit 134): `work/artifacts/retirement-delete-mutant.log`, SHA256
+`a32312d55b936f88ffd147965fbba14ea29cd35f3f97e06314449d83d848f6e6`.
+This is sender qualification, not independent F ACK/release evidence or
+combined service/farm qualification of the new change.
+
 The combined runtime at `a93b7595` passes the full default service suite from
 a clean build, including the repeated W30 recovery cases. Later `2847508c`
 changes only formal files/docs. Clean suite log SHA256:
@@ -96,8 +119,9 @@ format. The collector distinguishes unavailable data, repeated references,
 cumulative job snapshots and shared link traffic. Increasing snapshots are
 aggregated once per exact key using their greatest value, independent of row
 order. This does not prove complete farm bandwidth accounting or a performance
-improvement: ordinary-stop terminal events and independent F settlement
-witnesses remain missing.
+improvement. Sender ordinary-stop terminal events are now qualified above;
+combined service qualification and independent F settlement witnesses remain
+pending.
 
 The emitter's focused ZSTD_TU cancellation/recovery selector passed after
 factoring both interval forms through one serializer. Retained log:
