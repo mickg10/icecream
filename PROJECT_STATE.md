@@ -82,8 +82,13 @@ suite pass; log SHA256 `ae29bf3deb0a93e45c3618af47f3c63b9e04a0ee40c310a37de8ed5b
 at `/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50cacheservice.log`.
 The non-test-hook standalone service builds too (binary SHA256
 `4384ea3d6dd1ffb657610df03f9b68a30f6db1dd618249eb5532494863c0c89c`).
-Updated sanitizer execution is pending; an up-to-date Make result reused the
-earlier sanitizer log and is not evidence for this change.
+Updated ASan/UBSan/leak execution also passes after explicitly forcing the
+Make target; its log includes the active-read cancellation witness:
+`/tanksmall/scratch/tmp/p51-e208-qualification/build/unittests/p50cacheservice-sanitize.log`,
+SHA256 `c153b289ddfccf3c0fcfd00c8f2f85dbb46c0ff129dc680bebae95b09b67a65c`.
+The instrumentation boundary remains service/test/owner/sender, not the
+endpoint/protocol static libraries or standalone cache process. An earlier
+up-to-date Make result reused the old log and was not counted for this change.
 
 The `e2080067` service sanitizer suite passes (Automake exit 0):
 `/tanksmall/scratch/tmp/p51-e208-qualification/logs/service-sanitize-before-read-cancel.log`,
