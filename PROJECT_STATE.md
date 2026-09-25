@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### Clean-checkout build and mixed-version compatibility
+
+Published `fdf03e25520d9db25746b29da7847e935b747b7f` builds and installs
+successfully from a clean detached worktree using the normal bootstrap
+workflow (two jobs, 8 GiB). Source snapshot SHA256:
+`9b896e4827e30ede3e95968b05bad32c1f962bf362635745022e69f75c5b986d`.
+Result: `/tanksmall/scratch/tmp/p51-combined-qa/icecream-qa-ij9l89uh/result.json`,
+SHA256 `e1bf4fdc409c7311fab336b9ad15517ab2f68160b98a87c90b5fbd9f8d60f116`.
+
+The resulting runtime image
+`sha256:e7a6a390c406a67257ae44fc06ba4c79ccd3dc9409f0784bd5090ec54c955595`
+passes all eight local mixed-version cases: R1 P29V1/ZSTD_TU/ZSTD_ROUTE,
+P43 worker, P43 client, and R2 P29V1/ZSTD_TU/ZSTD_ROUTE. Each case verifies
+actual remote compilation. The old image uses pinned source
+`cd74801e0fa4e83e3ae254ca1d7fe98642f36b89`.
+Summary: `/tanksmall/scratch/tmp/p51-combined-qa/mixed-fdf03e25-r2/summary.json`,
+SHA256 `45f8ad6d289c21cc834a85bb5dcce1ab7e2afb8e092ca643ed124d4e7474469c`.
+
+These are sequential compatibility cases, not simultaneous mixed-load,
+W30 occupancy, restart, sanitizer, or cross-host qualification. Earlier
+source-copy bootstrap failures omitted tracked files from a synthetic Git
+index; they are retained failures and are not evidence against this clean
+checkout or a substitute for its successful result.
+
 ### Actual scheduler-process W30 restart harness
 
 The opt-in `p51schedulerrestart-w30-check` harness passes C1F1/W30 for
