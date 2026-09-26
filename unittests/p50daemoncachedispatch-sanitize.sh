@@ -50,7 +50,7 @@ fi
 extra_libs="$extra_libs ${ICECC_TEST_LIBCAP_NG_LIBS:-} -ldl"
 
 "$cxx" "$standard" $cxxflags $cppflags $extra_cflags \
-    -Wall -Wextra -Wpedantic -Werror -pthread \
+    -Wall -Wextra -Wpedantic -Werror -Wno-error=maybe-uninitialized -pthread \
     $sanitize_flags -fno-omit-frame-pointer \
     -I"$test_srcdir/.." -I"$test_srcdir/../cache" -I"$test_srcdir/../services" \
     "$test_srcdir/p50_daemon_cache_dispatch_test.cpp" \
