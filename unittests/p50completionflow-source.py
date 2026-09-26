@@ -305,8 +305,11 @@ def check_parent(source: str) -> None:
             "P50CompletionPumpResult::Pending",
             "return true;",
             "complete_child_registration(client->child_pid)")
-    child_completion = section(source, "static bool complete_child_registration(",
-                               "/* The exact quiescence barrier")
+    child_completion = section(
+        source,
+        "static bool complete_child_registration(",
+        "bool Daemon::session_quiescence_pending() const noexcept",
+    )
     require("waitpid(" not in child_completion and
             "record->second.completion_observed" in child_completion and
             "record->second.completion_observed = true;" in child_completion and
@@ -453,7 +456,7 @@ def check_cache_fd_replacement(main_source: str, comm_header: str,
 def check_compiler_quiescence(source: str, helper: str, test_source: str,
                               workit: str, workit_header: str,
                               makefile: str, daemon_makefile: str) -> None:
-    flow = section(source, "/* The exact quiescence barrier",
+    flow = section(source, "void Daemon::begin_session_quiescence()",
                    "void Daemon::handle_old_request")
     require('#include "compiler_group_signal.h"' in source,
             "daemon does not use the shared compiler signal-authority primitive")

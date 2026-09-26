@@ -4,14 +4,45 @@ set -eu
 
 tmp_root=${ICEFARM_TMPDIR:-${TMPDIR:-/tmp}}
 work=$(mktemp -d "$tmp_root/p50-service-metrics.XXXXXX")
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+src=${ICECC_TEST_TOP_SRCDIR:-$(cd "$(dirname "$0")/.." && pwd)}
+cleanup() {
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        rm -rf "$work"
+    else
+        echo "p50 service metrics diagnostics retained at $work" >&2
+        for output in enabled.out enabled.err disabled.out disabled.err; do
+            if [ -f "$work/$output" ]; then
+                echo "--- $output ---" >&2
+                cat "$work/$output" >&2
+            fi
+        done
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-ICECC_P50_DIAGNOSTICS=1 ./p50cacheservice --aggregate-fit-exact \
-    >"$work/enabled.out" 2>"$work/enabled.err"
-env -u ICECC_P50_DIAGNOSTICS ./p50cacheservice --aggregate-fit-exact \
-    >"$work/disabled.out" 2>"$work/disabled.err"
+if ICECC_P50_DIAGNOSTICS=1 ./p50cacheservice --aggregate-fit-exact \
+        >"$work/enabled.out" 2>"$work/enabled.err"; then
+    :
+else
+    result=$?
+    echo "opt-in aggregate-fit-exact exited $result" >&2
+    exit 1
+fi
+if env -u ICECC_P50_DIAGNOSTICS ./p50cacheservice --aggregate-fit-exact \
+        >"$work/disabled.out" 2>"$work/disabled.err"; then
+    :
+else
+    result=$?
+    echo "opt-out aggregate-fit-exact exited $result" >&2
+    exit 1
+fi
 
-python3 - "$work/enabled.err" "$work/disabled.err" <<'PY'
+sh "$src/dev/python.sh" --exec python3 - \
+    "$work/enabled.err" "$work/disabled.err" <<'PY'
 import json
 import sys
 
