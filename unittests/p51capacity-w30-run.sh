@@ -32,6 +32,16 @@ case "$profile" in
     P29V1|ZSTD_TU|ZSTD_ROUTE) ;;
     *) echo "FAIL: unsupported capacity W30 profile: $profile" >&2; exit 2 ;;
 esac
+cache_service=${ICECC_TEST_P51_CAPACITY_SERVICE:-$top_build_dir/cache/icecc-cache-service-test}
+if [ ! -x "$cache_service" ]; then
+    echo "FAIL: dedicated capacity test service is missing: $cache_service" >&2
+    exit 2
+fi
+if ! command -v strings >/dev/null 2>&1 ||
+   ! strings "$cache_service" | grep -q 'P51_CAPACITY_TEST_SETTLEMENT_HELD'; then
+    echo "FAIL: capacity test service lacks settlement-hook marker" >&2
+    exit 2
+fi
 unset ICECC_TEST_P51_MULTILINK ICECC_TEST_P51_MULTILINK_CAPACITY_OVERLAP \
     ICECC_TEST_P51_VERTICAL ICECC_TEST_P51_VERTICAL_W30 \
     ICECC_TEST_P51_RESTART_F_C1F2 ICECC_TEST_P51_RESTART_C_C2F1 \
@@ -46,5 +56,5 @@ ICECC_TEST_P51_MULTILINK_CAPACITY_OVERLAP=1 \
 ICECC_TEST_P51_PROFILE="$profile" \
     timeout --signal=TERM --kill-after=5s 90s "$build_dir/p50daemonpositive" \
         "$top_build_dir/daemon/iceccd" \
-        "$top_build_dir/cache/icecc-cache-service"
+        "$cache_service"
 echo "P51_CAPACITY_W30_PASS topology=C1F4 profile=$profile"

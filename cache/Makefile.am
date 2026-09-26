@@ -4,6 +4,7 @@ noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 check_LIBRARIES = libp50endpointtesthooks.a
 
 sbin_PROGRAMS = icecc-cache-service
+check_PROGRAMS = icecc-cache-service-test
 
 icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h \
 	../client/p50_route_owner.cpp ../client/p50_route_owner.h \
@@ -16,6 +17,17 @@ icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 icecc_cache_service_CXXFLAGS = -O2 -Werror -pthread
 icecc_cache_service_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+
+# The four-link capacity gate needs deterministic settlement/ARM hooks. Keep
+# this separate from the installed production service and compile distinct
+# target-prefixed objects so its test macro never contaminates product code.
+icecc_cache_service_test_SOURCES = $(icecc_cache_service_SOURCES)
+icecc_cache_service_test_LDADD = libp50endpointtesthooks.a \
+	$(icecc_cache_service_LDADD)
+icecc_cache_service_test_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_ENDPOINT_TEST_HOOKS
+icecc_cache_service_test_CXXFLAGS = -O2 -Werror -pthread
+icecc_cache_service_test_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 
 libprotocol50_a_SOURCES = \
 	protocol50.cpp \

@@ -93,7 +93,10 @@ the sibling work remains held. By default it runs P29V1, ZSTD_TU, and
 ZSTD_ROUTE; to select one profile, set
 `ICECC_TEST_P51_CAPACITY_W30_PROFILE=P29V1` (or `ZSTD_TU` / `ZSTD_ROUTE`) on
 the `make dev-gate` invocation. This opt-in gate is not part of `make qa` and
-does not change the service's production capacity.
+does not change the service's production capacity. Its runner uses the
+non-installed hook-enabled `cache/icecc-cache-service-test`; set
+`ICECC_TEST_P51_CAPACITY_SERVICE` only to override that binary with another
+dedicated test service. The installed `icecc-cache-service` stays hook-free.
 The restart gate currently covers ZSTD_TU C1F2/F-cache and C2F1/C-cache
 replacement, one affected transfer plus a healthy sibling. The separate
 `restart-w30` gate covers both replacements for all three profiles: 30 held

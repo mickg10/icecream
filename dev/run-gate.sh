@@ -151,19 +151,31 @@ if [[ "$gate" == p51-capacity-w30 ]]; then
         profiles=("$capacity_profile")
     fi
     status=0
-    for profile in "${profiles[@]}"; do
-        echo "CAPACITY_W30_PROFILE_START profile=$profile" >>"$log"
-        if ICECC_TEST_BUILDDIR=/work/build/unittests \
-           ICECC_TEST_TOP_BUILDDIR=/work/build \
-           ICECC_TEST_P51_CAPACITY_W30_PROFILE="$profile" \
-           timeout --signal=TERM --kill-after=5s 90s \
-               /bin/bash /source/unittests/p51capacity-w30-run.sh >>"$log" 2>&1; then
-            :
-        else
-            status=$?
-            break
-        fi
-    done
+    # Automake check_PROGRAMS are intentionally not part of `make all` or
+    # `make install`; build the helper and its dedicated hook-enabled service
+    # explicitly. The latter uses distinct objects and is never installed.
+    if timeout --signal=TERM --kill-after=5s 120s \
+         make -C /work/build/cache icecc-cache-service-test >>"$log" 2>&1 && \
+         make -C /work/build/unittests p50daemonpositive >>"$log" 2>&1; then
+        :
+    else
+        status=$?
+    fi
+    if [[ $status -eq 0 ]]; then
+        for profile in "${profiles[@]}"; do
+            echo "CAPACITY_W30_PROFILE_START profile=$profile" >>"$log"
+            if ICECC_TEST_BUILDDIR=/work/build/unittests \
+               ICECC_TEST_TOP_BUILDDIR=/work/build \
+               ICECC_TEST_P51_CAPACITY_W30_PROFILE="$profile" \
+               timeout --signal=TERM --kill-after=5s 90s \
+                   /bin/bash /source/unittests/p51capacity-w30-run.sh >>"$log" 2>&1; then
+                :
+            else
+                status=$?
+                break
+            fi
+        done
+    fi
 elif [[ "$gate" == p51-scheduler-restart-w30 || "$gate" == p51-scheduler-f-restart-w30 ]]; then
     if [[ "$gate" == p51-scheduler-f-restart-w30 ]]; then
         export ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30=1
