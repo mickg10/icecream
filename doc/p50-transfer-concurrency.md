@@ -967,13 +967,13 @@ with measured per-link occupancy. Do not infer end-to-end 4xW30 occupancy
 from isolated cache-link tests or raise production dispatch bounds without
 measuring their effects on queued work and recovery.
 
-#### Pending implementation: source-operation capacity response
+#### Implemented capacity response; remaining qualification
 
 The current C-side operation cap is 120 and includes reply/Goodbye settlement,
 not just pending wire receipts. Four W30 links can therefore overlap with
-settling operations and reach this cap. A cap refusal currently closes the
-local control connection after source-FD handoff. Increasing the cap alone
-does not resolve this outcome. The required change is:
+settling operations and reach this cap. Commit `983c64ab` replaces an
+undifferentiated cap refusal with typed CapacityBusy (0x5004) and bounded
+wrapper retry. The cap remains 120. The implemented contract is:
 
 - Distinguish accepted, capacity-full, and other rejected enqueue outcomes.
   Validate the request, clock/deadline and C incarnation before reporting
@@ -999,7 +999,11 @@ does not resolve this outcome. The required change is:
   Real four-link W30 plus reply-settlement overlap remains a separate gate.
   Assert exactly one F ARM and unchanged operation/deadline across retries.
 
-This subsection specifies work in progress, not a qualified capacity fix.
+Cap-one service and real 16-TU wrapper tests pass, including changed-C
+identity rejection and no retry for a non-Busy error. They do not establish
+four-link W30 occupancy. End-to-end retry expiry/no late publication,
+repeated-retry resource plateau and four-link settlement overlap remain
+qualification requirements; see PROJECT_STATE.md for artifact evidence.
 
 Initial rollout keeps R2 opt-in and W1. For R2 tests expose validated window,
 raw-byte, encoded-byte, F-output-byte and metadata-count settings through one

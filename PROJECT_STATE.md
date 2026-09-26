@@ -12,7 +12,46 @@ retained artifact directories.
 
 ## Developer QA
 
+### Source admission pressure
+
+Commit `983c64ab` implements typed CapacityBusy before source read/route work,
+with a response budget of at most 100 ms clipped to the original deadline.
+The compiler wrapper retries only completed, validated Busy responses using
+the retained immutable source, fresh control leases with the same C identity,
+the original request/deadline and one F ARM. The operation cap remains 120.
+
+The registered cache-service test passed; bounded wrapper tests exercise a
+cap of one, not W30 occupancy. After integration, the merged wrapper passed
+syntax, adoption fixtures, incompatible-mode rejection, a 16-TU exact-output
+positive batch (six Busy responses for one job), changed-C identity rejection,
+and terminal non-Busy/no-retry behavior. Compiled product sources matched the
+tested donor. Logs in `/tanksmall/scratch/tmp/p51-w30-capacity-runtime/`:
+
+- `p50cacheservice-registered-target.log`: `5afeafe7d3636ee88257bc6c63836cea38a69599630ee83e43e0c89fdc7d5d31`
+- `merged-wrapper-adoption-selftest.log`: `da18cf0f6767cb9e33757b84c542d07bc64da2a76258dd6a07b1868d0aef3080`
+- `merged-wrapper-capacity-positive.log`: `34bd63456d9f68fefc8701c36a77379bcf696d4ca20014dd2316e7b07b9c4a3b`
+- `merged-wrapper-capacity-identity-negative.log`: `e92bcd6f9dda1dd5d8a910ab5974d0884b36926c1b13b9985289e1e0410c4f63`
+- `merged-wrapper-capacity-nonbusy-negative.log`: `4718d13c388c4b11b887d78832cdfb87a04ca819e61167f9d53946e97c37e028`
+
+The registered service pass preceded the final default-off terminal-error
+hook; focused service and wrapper checks passed afterward. End-to-end
+retry expiry/no late publication, repeated-retry resource plateau, actual
+four-link W30/reply-settlement overlap and latest-candidate full QA remain open.
+
 ### Lost RECOVER response retry
+
+Commit `880fb9c8` extends the scenario below to both W2 and W30 for all three
+profiles. It verifies A=0/P=30 witnesses at W30, retained K=1, the exact
+normalized response and committed row, successful remaining 29 callers,
+RESET confirmation and zero preparation credits. The W30 sanitizer fixture
+uses a 60-second absolute deadline; this is not a performance measurement.
+The focused selector and neighboring changed-RESET_ACK selector pass under
+ASAN/UBSAN. W30 log:
+`/tanksmall/scratch/tmp/p51-d05-recover-w30-build/runtime/lost-recover-response-w2-w30-asan.log`,
+SHA256 `950b21f90b61847a6005b8f498611ab46506bdf25d482962d90a26bbb8ab75a7`.
+This extends the explicit response-loss coverage, not the entire D05 matrix.
+
+The original W2 evidence follows:
 
 The registered sender suite now includes `--lost-recover-response` and the
 same case in its default run. For each of P29V1, ZSTD_TU and ZSTD_ROUTE, the
