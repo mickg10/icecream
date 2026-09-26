@@ -37,6 +37,18 @@ The source-expiry recovery fix is integrated locally at `22b06a59`, awaiting
 merged service-suite qualification before publication. Independent daemon
 cancellation cleanup remains in its private donor worktree.
 
+Local candidate `34f2e409` integrates QA donor `bb7d3615`: the completion
+source gate now uses function boundaries, retaining its behavioral assertions,
+and the metrics runner uses the locked Python environment and preserves
+stdout/stderr on failure. Donor qualification passes the registered completion
+gate and three consecutive registered metrics runs. A deliberately failing
+command confirms nonzero outcome and retained stderr. Invoked staged-script
+hashes match the donor files. Evidence is in the same QA run's
+`current/artifacts/focused-metrics-{1,2,3}.{log,trs}` and registered completion
+log/`.trs`. The original metrics failure is unexplained/non-reproduced because
+its runner deleted the underlying diagnostics; passing targeted reruns do not
+establish its cause or replace the final combined-candidate QA gate.
+
 ### Bounded recovery after an unresolved source expires
 
 Donor `f32fb132` retains the expired witness for exact F RESET disposition,
