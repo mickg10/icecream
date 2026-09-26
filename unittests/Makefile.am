@@ -417,12 +417,14 @@ lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 # and ICECC_P50_C1F1_WORKER_SCHEDULER_HOST; run only in a disposable test container.
 .PHONY: p51wrappercompile-check
 p51wrappercompile-check:
-	@set -e; for jobs in 2 100; do \
-	  ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)' \
-	  ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
-	  ICECC_P51_WRAPPER_JOBS=$$jobs \
-	  $(SHELL) '$(srcdir)/p51wrappercompile-run.sh'; \
-	done
+	@ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)' \
+	 ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
+	 timeout --signal=TERM --kill-after=15s 1800s \
+	 $(SHELL) -c 'set -eu; for jobs in 2 100; do \
+	   ICECC_P51_WRAPPER_PROFILES="P29V1 ZSTD_TU ZSTD_ROUTE" \
+	   ICECC_P51_WRAPPER_JOBS="$$jobs" \
+	   $(SHELL) "$(srcdir)/p51wrappercompile-run.sh"; \
+	 done'
 lockexec_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 
 schedpolicy_SOURCES = schedpolicy.cpp

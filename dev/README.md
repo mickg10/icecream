@@ -19,6 +19,12 @@ For a supported opt-in process gate, run (for example)
 `ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p51-arm-expiry`; the command
 builds this checkout in a unique scratch run and invokes the bounded gate in a
 separate disposable root container.
+To run the persistent wrapper C01 gate as one bounded command, use
+`ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p51-wrapper-compile`. It
+requires the two- and 100-job batches for all three profiles, verifies all six
+profile/count pass markers, and is bounded to 1,800 seconds. It uses the same
+private bridge, root container, named `icecc` account, and scratch-backed `/tmp`
+as the other process gates.
 To rerun the six root/live P50 checks intentionally skipped by an
 unprivileged `make qa`, use
 `ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p50-live-core`.
@@ -74,7 +80,7 @@ Use a private Docker bridge network, never `--network=host`; do not run these
 network-redirection fixtures directly on the host. The scheduler-restart gate
 requires the explicit private-namespace opt-in shown above because its receipt
 helper installs a temporary namespace-local OUTPUT redirection rule.
-`dev-gate GATE=...` currently allowlists `p51-arm-expiry`, `p51-restart-w30`,
+`dev-gate GATE=...` currently allowlists `p51-wrapper-compile`, `p51-arm-expiry`, `p51-restart-w30`,
 `p51-scheduler-restart-w30`, `p51-scheduler-f-restart-w30` (active scheduler→F
 restart chain), `p51-restart-chain-w30` (active F→C restart chain),
 `p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap), and

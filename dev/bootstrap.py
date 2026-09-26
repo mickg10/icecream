@@ -22,6 +22,7 @@ BASES = {"ubuntu24.04": "ubuntu:24.04", "ubuntu22.04": "ubuntu:22.04"}
 FIELDS = {"version", "profile", "image_repository", "jobs", "memory_gb",
           "base_image", "http_proxy", "image_bundle", "offline"}
 GATE_TARGETS = {
+    "p51-wrapper-compile": ("p51wrappercompile-check", 1800),
     "p51-arm-expiry": ("p50daemonpositive-p51-arm-expiry-check", 240),
     "p51-restart-w30": ("p50daemonpositive-p51-restart-w30-check", 4200),
     "p51-scheduler-restart-w30": ("p51schedulerrestart-w30-check", 1800),

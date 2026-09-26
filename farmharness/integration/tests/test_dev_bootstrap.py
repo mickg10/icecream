@@ -340,6 +340,7 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
 
 
 @pytest.mark.parametrize("gate,target,timeout_s", [
+    ("p51-wrapper-compile", "p51wrappercompile-check", 1800),
     ("p51-arm-expiry", "p50daemonpositive-p51-arm-expiry-check", 240),
     ("p51-restart-w30", "p50daemonpositive-p51-restart-w30-check", 4200),
     ("p51-scheduler-restart-w30", "p51schedulerrestart-w30-check", 1800),
@@ -529,6 +530,100 @@ def test_p50_live_core_routes_through_the_private_gate_lifecycle(
     assert gate_argv[gate_argv.index("--memory") + 1] == "8g"
     assert result["target"] == "six required root/live P50 gates"
     assert result["timeout_s"] == 1200
+
+
+def test_wrapper_compile_gate_uses_private_bridge_named_daemon_and_exact_six_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    run = GateCommandRun(tmp_path)
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    work = tmp_path / "current"
+    (work / "tmp").mkdir(parents=True)
+
+    def fake_subprocess_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        labels = {"icecream.dev.gate.id": run.gate_id}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(labels))
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_subprocess_run)
+    result = bootstrap.run_gate(
+        run, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+        "p51-wrapper-compile",
+    )
+    network_name, network_argv = run.commands[0]
+    gate_name, gate_argv = run.commands[1]
+    assert network_argv[1:5] == ["network", "create", "--driver", "bridge"]
+    assert "--internal" in network_argv
+    assert gate_name == "gate-p51-wrapper-compile"
+    assert gate_argv[gate_argv.index("--network") + 1] == result["network"]
+    assert gate_argv[gate_argv.index("--cap-add") + 1] == "NET_ADMIN"
+    assert gate_argv[gate_argv.index("--cpus") + 1] == "2"
+    assert gate_argv[gate_argv.index("--memory") + 1] == "8g"
+    assert f"type=bind,src={work / 'tmp'},dst=/tmp" in gate_argv
+    assert gate_argv[-2:] == ["/source/dev/run-gate.sh", "p51-wrapper-compile"]
+    assert result["target"] == "p51wrappercompile-check"
+    assert result["timeout_s"] == 1800
+
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    wrapper_branch = script.split('elif [[ "$gate" == p51-wrapper-compile ]]; then', 1)[1]
+    assert "ICECC_P50_C1F1_WORKER_SCHEDULER_HOST" in wrapper_branch
+    assert "ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc" in wrapper_branch
+    assert "1800s" in wrapper_branch
+    assert 'expected_markers=6' in script.split('p51-wrapper-compile)', 1)[1].split(';;', 1)[0]
+    makefile = (bootstrap.ROOT / "unittests/Makefile.am").read_text()
+    assert 'for jobs in 2 100' in makefile
+    assert 'ICECC_P51_WRAPPER_PROFILES="P29V1 ZSTD_TU ZSTD_ROUTE"' in makefile
+    assert '1800s' in makefile
+
+
+def test_wrapper_compile_marker_validator_requires_all_six_exact_cells(
+    tmp_path: Path,
+) -> None:
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    start = script.index("require_wrapper_compile_cells() {")
+    end = script.index("\n}", start) + 2
+    function = script[start:end]
+    valid = tmp_path / "valid.log"
+    valid.write_text("".join(
+        f"P51_WRAPPER_COMPILE_PASS profile={profile} jobs={jobs} "
+        "persistent_links=1\n"
+        for jobs in (2, 100)
+        for profile in ("P29V1", "ZSTD_TU", "ZSTD_ROUTE")
+    ), encoding="utf-8")
+    checked = subprocess.run(
+        ["bash", "-c", function + "\nrequire_wrapper_compile_cells \"$1\"", "test", str(valid)],
+        check=False, capture_output=True, text=True,
+    )
+    assert checked.returncode == 0, checked.stderr
+
+    duplicated = tmp_path / "duplicated.log"
+    duplicated.write_text(
+        "".join(
+            f"P51_WRAPPER_COMPILE_PASS profile=P29V1 jobs={jobs} persistent_links=1\n"
+            for jobs in (2, 100) for _ in range(3)
+        ),
+        encoding="utf-8",
+    )
+    rejected = subprocess.run(
+        ["bash", "-c", function + "\nrequire_wrapper_compile_cells \"$1\"", "test", str(duplicated)],
+        check=False, capture_output=True, text=True,
+    )
+    assert rejected.returncode != 0
+    assert "profile=P29V1 jobs=2, found 3" in rejected.stderr
+
+    missing = tmp_path / "missing.log"
+    missing.write_text("".join(
+        f"P51_WRAPPER_COMPILE_PASS profile={profile} jobs={jobs} "
+        "persistent_links=1\n"
+        for jobs in (2, 100)
+        for profile in ("P29V1", "ZSTD_TU")
+    ), encoding="utf-8")
+    missing_result = subprocess.run(
+        ["bash", "-c", function + "\nrequire_wrapper_compile_cells \"$1\"", "test", str(missing)],
+        check=False, capture_output=True, text=True,
+    )
+    assert missing_result.returncode != 0
+    assert "profile=ZSTD_ROUTE jobs=2, found 0" in missing_result.stderr
 
 
 def test_p50_live_core_builds_check_only_completion_helper_before_tests() -> None:

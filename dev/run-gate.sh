@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p50-live-core}" >&2
+    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p50-live-core}" >&2
 }
 
 capture_gate_status() {
@@ -13,12 +13,33 @@ capture_gate_status() {
     fi
 }
 
+require_wrapper_compile_cells() {
+    local log=$1 jobs profile exact count
+    for jobs in 2 100; do
+        for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
+            exact="P51_WRAPPER_COMPILE_PASS profile=$profile jobs=$jobs "
+            count=$(grep -F -c "$exact" "$log" || true)
+            if [[ $count -ne 1 ]]; then
+                echo "FAIL: expected exactly one wrapper C01 marker for profile=$profile jobs=$jobs, found $count; retained log=$log" >&2
+                return 1
+            fi
+        done
+    done
+}
+
 if [[ $# -ne 1 ]]; then
     usage
     exit 2
 fi
 
 case "$1" in
+    p51-wrapper-compile)
+        gate=$1
+        target=p51wrappercompile-check
+        timeout_s=1800
+        marker='P51_WRAPPER_COMPILE_PASS profile='
+        expected_markers=6
+        ;;
     p51-arm-expiry)
         gate=$1
         target=p50daemonpositive-p51-arm-expiry-check
@@ -264,6 +285,29 @@ PY
             echo "P50_LIVE_CORE_PASS=1 worker_scheduler_host=$worker_scheduler_host tests=${#live_tests[@]}" >>"$log"
         fi
     fi
+elif [[ "$gate" == p51-wrapper-compile ]]; then
+    worker_scheduler_host=$(hostname -I | awk '{print $1}')
+    if ! python3 - "$worker_scheduler_host" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except (ipaddress.AddressValueError, IndexError):
+    raise SystemExit(1)
+if (address.is_loopback or address.is_unspecified or address.is_multicast or
+        address.is_reserved or address.is_link_local):
+    raise SystemExit(1)
+PY
+    then
+        echo "FAIL: could not derive an ordinary bridge IPv4 for the wrapper worker scheduler: $worker_scheduler_host" >>"$log"
+        status=2
+    else
+        export ICECC_P50_C1F1_WORKER_SCHEDULER_HOST="$worker_scheduler_host"
+        export ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc
+        capture_gate_status timeout --signal=TERM --kill-after=15s 1800s \
+            make -C /work/build/unittests "$target" >"$log" 2>&1
+    fi
 elif [[ "$gate" == p51-capacity-w30 ]]; then
     profiles=(P29V1 ZSTD_TU ZSTD_ROUTE)
     if [[ -n "$capacity_profile" ]]; then
@@ -316,4 +360,7 @@ python3 /source/dev/gate-result.py "$status" "$log" "$marker" "$expected_markers
     echo "FAIL: gate result rejected; retained log=$log" >&2
     exit 1
 }
+if [[ "$gate" == p51-wrapper-compile ]]; then
+    require_wrapper_compile_cells "$log" || exit 1
+fi
 echo "GATE_PASS name=$gate log=$log"
