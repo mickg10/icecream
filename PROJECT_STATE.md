@@ -166,6 +166,35 @@ Isolated-root and later mixed-image stages are not yet qualified by this result.
 The following older run explains the repaired harness failures, not the current
 native-stage outcome.
 
+All six skipped native/live gates were subsequently rerun on rebuilt
+`0dc29331` and have actual PASS `.trs` results. Logs below are under
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/build/unittests/`:
+
+| Gate log | SHA256 |
+|---|---|
+| `remoteice-quick.log` | `f16e44562903594ef8ace50d745a7b51a6f17b562aafcb65d1451b7b4bf015c8` |
+| `p50assignment-remote.log` | `9255e41ccdc4d3e2b09f42dc8b7239c3a35785f9e292ccb8ba53d21315293956` |
+| `p50completionflow-run.log` | `614ca5ef358641cdf7aded11f1c99701c435bfe431d038bfd8ff1e889fd387c6` |
+| `p50compilee2e-run.log` | `89e093d3ec87356ddb2900353c7ca91194c6aedb58daa1ad4dad2282e8340823` |
+| `p50daemonpositive-run.log` | `12db58d98479e66f34fd6ca8dcca2b5d7ec831992a4e7fe7e6327a1c842ea36e` |
+| `p50sourcearm-live-run.log` | `a25edd0a93b90503e77374c18e94b3fe189d8f6945d6f279753ea5be31e8f720` |
+
+Runs use isolated root SDK containers capped at two CPUs/eight GiB, appropriate
+SYS_CHROOT/SYS_PTRACE capabilities, and mode-1777 task scratch. Daemon-specific
+gates use the container-local named `icecc` account (4103:3513); daemon user/group
+arguments must be names, not numeric strings. Completion-flow and compile-e2e
+use the container's non-loopback worker-scheduler address (172.17.0.2 in these
+runs). Remote/assignment gates require actual remote execution. Script source
+prerequisites were forced into their base `.log` targets and fresh `.trs`
+results checked; an up-to-date old log was not counted as a rerun.
+
+Earlier launcher failures are retained: missing named account and numeric
+`-u` argument attempts did not establish daemon registration. Successful
+completion-flow and compile-e2e workdirs are respectively `tmp/p5c.9D1D2s`
+and `tmp/p5e.b0n7hm` under the same qualification root. This closes the six
+specific skipped gates on `0dc29331`, not a fresh full-suite run on every
+later commit or qualification of the still-private new deadline fixture.
+
 Public `make qa` on clean candidate `293a1367`, in a two-CPU/8-GiB SDK
 container, completed its native suite with **178 tests: 170 PASS, 6 SKIP,
 2 FAIL, 0 ERROR**. The registered cache-service suite and sanitizer gates
