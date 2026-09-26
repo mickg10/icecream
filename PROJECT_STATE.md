@@ -42,7 +42,21 @@ Logs under `/tanksmall/scratch/tmp/p51-d03-hello-ack-cuts-runtime/tmp/`:
 `81492d99925452796302c477f90b14f6c11d0192dfb03d06ec335cac07784d7b`;
 `commit-qualified-final.log` SHA256
 `1f0065da05f5cb8e51867e7acc97a8fc5338d5998f38e7bd9fa04f67067421c9`.
-Remaining D03 work includes LINK_STATE, COMMIT_ACK, recovery/reset record
+`37cb95f7` extends the same opt-in commit selector with all 43 positive
+partial offsets of the 44-byte COMMIT_ACK, across three profiles. The updated
+499-case selector passes (166 ZSTD_TU, 167 P29V1, 166 ZSTD_ROUTE), taking
+about 71s. After an observed receipt and lost ACK, the first link has K/Q=1/0;
+recovery has an empty witness suffix, settles to 1/1 and performs no replay,
+with one materialization and one commit. The default 25-case scope remains.
+Donor `82b76a01` used the same frozen endpoint-library build described above.
+Log `record-run-r2.log` under the same artifact directory has SHA256
+`c54578c1da12433215db2f08a3453403573cc395710843d30697b1408137b062`;
+updated test source SHA256
+`6f1ce54fae4d7344d4befec71baec428948360e8dd137724e8c9d8a695d535a4`;
+updated binary SHA256
+`48b09120a86c4ff722639fdf80a81bf7985add3cbd0c685245e63374b06ff1c3`.
+
+Remaining D03 work includes LINK_STATE, recovery/reset record
 interruptions and deterministic short-write/EAGAIN coverage. Bytewise
 successful writes are not evidence of those missing interruption cases.
 
