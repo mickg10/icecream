@@ -35,11 +35,25 @@ Artifacts are under
   six live-test PASS markers and the terminal marker; SHA256
   `e9991fc2892794bd4427e46546ef9dba1d45ec93e7e634a51db56fed7921cf31`.
 
-The entry point and its reviewed failure-status follow-up are pending
-integration. This result qualifies the named private snapshot, not a future
-runner revision or the remaining W30 restart/capacity and external-farm gates.
+The entry point is integrated through `189f63bc`, including the reviewed
+failure-status follow-up: explicit branch failures are no longer overwritten
+by a shell conditional's exit status. The donor's 48 pinned-UV bootstrap tests
+pass, including an executed nonzero-status control; the merged `189f63bc`
+tree also passes all 48 tests (0.97 seconds, exit 0). Reproduce with
+`ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p50-live-core` (use an existing
+writable scratch directory). The live result qualifies the named pre-follow-up
+snapshot, not the remaining W30 restart/capacity and external-farm gates.
 The two preceding bootstrap attempts failed on missing check-only build
 prerequisites; their artifacts remain retained, not counted as product passes.
+
+Candidate `f15b1561` also integrates the GCC 11 build workaround, donor
+`c3da4617`: only the production/test cache-service targets demote
+`-Wmismatched-new-delete`; other warnings remain errors and frame recycling
+is unchanged. Both targets link with GCC 11.4 and Boost 1.83; the warning
+remains visible. GCC 13.3 configures with no override, and a separate
+unused-variable warning still fails under `-Werror`. Exact GCC 11.3 from the
+original report is not yet verified. Build evidence is retained in
+`/tanksmall/scratch/tmp/p51-gcc11-build-fix/logs/build2.log`.
 
 ### Independent caller/reservation expiry recovery
 
