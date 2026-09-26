@@ -2709,7 +2709,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             c_launch.identity, row.transfer, row.id);
         return c_runtime.enqueue_p51_source_transfer(
             std::move(row.pair.sender), c_launch.identity, operation,
-            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+            sized_test_source_fd(row.bytes.size(), row.bytes.front())) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
     size_t first_concurrent_index = 0;
     if (hold_predecessor_receipt) {
@@ -2879,7 +2880,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         c_launch.identity, probe.transfer, probe.id);
     CHECK(c_runtime.enqueue_p51_source_transfer(
         std::move(probe.pair.sender), c_launch.identity, probe_operation,
-        sized_test_source_fd(probe.bytes.size(), probe.bytes.front())));
+        sized_test_source_fd(probe.bytes.size(), probe.bytes.front())) ==
+        service::P51SourceEnqueueResult::Accepted);
     const auto probe_result = receive_p51_transfer_result(
         probe.pair.receiver, c_launch.identity, probe.id,
         probe.transfer.absolute_deadline.as_steady_time_point(), true);
