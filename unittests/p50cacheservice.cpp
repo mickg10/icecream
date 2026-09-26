@@ -2422,7 +2422,8 @@ void test_p51_d07_queued_cancel_first_middle_last() {
 }
 
 void test_p51_d07_staged_cancel_case(ProfileId profile,
-                                    size_t cancelled_index) {
+                                    size_t cancelled_index,
+                                    bool fail_predecessor = false) {
     constexpr size_t kCohort = 31;
     constexpr size_t kSurvivors = 30;
     CHECK(cancelled_index < kCohort);
@@ -2459,8 +2460,13 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::atomic<bool> cancelled_hook_exact{false};
     const bool hold_predecessor_receipt =
         profile == ProfileId::P29V1 && cancelled_index == 15;
+    CHECK(!fail_predecessor || hold_predecessor_receipt);
     bool predecessor_worker_entered = false;
     bool release_predecessor_worker = !hold_predecessor_receipt;
+    std::atomic<bool> fail_predecessor_worker{false};
+    std::atomic<bool> predecessor_failure_injected{false};
+    std::atomic<uint64_t> failed_predecessor_request{0};
+    std::atomic<uint64_t> failed_predecessor_ordinal{0};
     std::vector<uint64_t> f_commit_ordinals;
     std::atomic<bool> stop_accepting{false};
     std::atomic<size_t> accepted_connections{0};
@@ -2565,8 +2571,10 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::thread acceptor([&] {
         const auto end = std::chrono::steady_clock::now() +
                          std::chrono::seconds(40);
+        const size_t max_connections = fail_predecessor ? 2 : 1;
         while (!stop_accepting.load(std::memory_order_acquire) &&
-               accepted_connections.load(std::memory_order_acquire) == 0 &&
+               accepted_connections.load(std::memory_order_acquire) <
+                   max_connections &&
                std::chrono::steady_clock::now() < end) {
             pollfd ready{listener, POLLIN, 0};
             int polled;
@@ -2627,7 +2635,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                     deadline);
             if (adopted < 0)
                 continue;
-            accepted_connections.store(1, std::memory_order_release);
+            accepted_connections.fetch_add(1, std::memory_order_acq_rel);
             EndpointIoControl control;
             control.before_materialize_on_worker = [&] {
                 if (!hold_predecessor_receipt)
@@ -2641,6 +2649,29 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                     return release_predecessor_worker;
                 });
             };
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            control.before_materialize_identified_for_test =
+                [&](const JobBind& binding, const TxBegin&, const TxCommit&) {
+                    const uint64_t predecessor_id = 120000 +
+                        static_cast<uint64_t>(profile) * 100;
+                    if (!fail_predecessor_worker.load(
+                            std::memory_order_acquire) ||
+                        binding.source_request_id != predecessor_id ||
+                        binding.relationship_ordinal != 1)
+                        return;
+                    bool expected = false;
+                    if (!predecessor_failure_injected.compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel))
+                        return;
+                    failed_predecessor_request.store(
+                        binding.source_request_id, std::memory_order_release);
+                    failed_predecessor_ordinal.store(
+                        binding.relationship_ordinal, std::memory_order_release);
+                    event_changed.notify_all();
+                    throw std::runtime_error(
+                        "injected exact staged D07 predecessor failure");
+                };
+#endif
             control.outbound_message_observer =
                 [&](ActorSide actor, const Message& message) {
                     if (actor != ActorSide::F)
@@ -2807,15 +2838,40 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 rows[cancelled_index].transfer.absolute_deadline
                     .as_steady_time_point());
         }
-        {
-            std::lock_guard lock(event_mutex);
-            release_target = true;
-            release_predecessor_worker = true;
+        if (fail_predecessor) {
+            {
+                std::lock_guard lock(event_mutex);
+                fail_predecessor_worker.store(true,
+                                              std::memory_order_release);
+                release_predecessor_worker = true;
+            }
+            event_changed.notify_all();
+            bool failed_while_target_gated = false;
+            {
+                std::unique_lock lock(event_mutex);
+                failed_while_target_gated = event_changed.wait_for(
+                    lock, std::chrono::seconds(5), [&] {
+                        return predecessor_failure_injected.load(
+                            std::memory_order_acquire);
+                    });
+                CHECK(!release_target);
+                release_target = true;
+            }
+            CHECK(failed_while_target_gated);
+        } else {
+            {
+                std::lock_guard lock(event_mutex);
+                release_target = true;
+                release_predecessor_worker = true;
+            }
+            event_changed.notify_all();
         }
-        event_changed.notify_all();
     }
 
     size_t exact_survivors = 0;
+    size_t typed_replacement_outcomes = 0;
+    uint8_t predecessor_transfer_attempts = 0;
+    std::vector<bool> survivor_attached(kCohort, false);
     std::vector<uint64_t> survivor_tu_seqs;
     for (size_t index = 0; index < kCohort; ++index) {
         if (index == cancelled_index)
@@ -2824,6 +2880,15 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         const auto result = receive_p51_transfer_result(
             row.pair.receiver, c_launch.identity, row.id,
             row.transfer.absolute_deadline.as_steady_time_point(), true);
+        if (fail_predecessor &&
+            result.code == local::SourceTransferResultCode::Error) {
+            CHECK(result.error_code == static_cast<uint16_t>(
+                local::SourceTransferErrorCode::RouteReplacementRequired));
+            ++typed_replacement_outcomes;
+            continue;
+        }
+        if (row.id == rows[0].id)
+            predecessor_transfer_attempts = result.attempts;
         bool exact = result.code == local::SourceTransferResultCode::Committed &&
             result.valid() && result.c_store_guid == c_launch.c_store_guid &&
             result.raw_bytes == row.bytes.size() &&
@@ -2849,8 +2914,10 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             }
             f_runtime.finish_input_attachment_on_owner(attach, exact, deadline);
         }
-        if (exact)
+        if (exact) {
             ++exact_survivors;
+            survivor_attached[index] = true;
+        }
         survivor_tu_seqs.push_back(result.tu_seq);
     }
 
@@ -2958,14 +3025,13 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             candidate_reused = candidate_reused &&
                 count == (ordinal == target_binding.relationship_ordinal ? 2 : 1);
         }
-        CHECK(materialized.size() == kSurvivors + 1);
+        CHECK(materialized.size() == exact_survivors + 1);
         for (size_t index = 0; index < kCohort; ++index) {
             const std::vector<uint8_t> expected(
                 128 + index, static_cast<uint8_t>(index + 1));
             const auto match = std::find_if(materialized.begin(), materialized.end(),
                 [&](const auto& row) { return row.second == expected; });
-            CHECK((index == cancelled_index) ==
-                  (match == materialized.end()));
+            CHECK((match != materialized.end()) == survivor_attached[index]);
         }
         CHECK(std::any_of(materialized.begin(), materialized.end(),
             [&](const auto& row) { return row.second == probe.bytes; }));
@@ -2974,7 +3040,9 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         c_runtime, 0, std::chrono::seconds(4));
     const bool raw_credit_released = wait_for_source_raw_bytes(
         c_runtime, 0, std::chrono::seconds(4));
-    const bool one_link = accepted_connections.load(std::memory_order_acquire) == 1;
+    const size_t connection_count =
+        accepted_connections.load(std::memory_order_acquire);
+    const bool one_link = connection_count == (fail_predecessor ? 2 : 1);
 
     CHECK(all_submitted);
     CHECK(staged);
@@ -2982,7 +3050,15 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     CHECK(cancelled_hook_exact.load(std::memory_order_acquire));
     CHECK(exact_f_cancelled);
     CHECK(!duplicate_f_cancelled);
-    CHECK(exact_survivors == kSurvivors);
+    if (!fail_predecessor)
+        CHECK(exact_survivors == kSurvivors);
+    else
+        CHECK(exact_survivors == kSurvivors &&
+              typed_replacement_outcomes == 0 &&
+              predecessor_failure_injected.load(std::memory_order_acquire) &&
+              failed_predecessor_request.load(std::memory_order_acquire) ==
+                  rows[0].id &&
+              failed_predecessor_ordinal.load(std::memory_order_acquire) == 1);
     CHECK(probe_exact);
     CHECK(unique_tu_seqs);
     CHECK(exact_ordinals);
@@ -2993,8 +3069,18 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     CHECK(one_link);
     std::printf("P51_D07 staged-cancel profile=%u position=%zu submitted=31 "
                 "survivors=30 probe=1 exact-ordinals=1..31 "
-                "target-no-bind=1 same-ordinal-reused=1\n",
-                static_cast<unsigned>(profile), cancelled_index);
+                "target-no-bind=1 same-ordinal-reused=1 "
+                "predecessor-failure=%u failure-request=%llu "
+                "failure-ordinal=%llu predecessor-attempts=%u "
+                "replacement-outcomes=%zu\n",
+                static_cast<unsigned>(profile), cancelled_index,
+                fail_predecessor,
+                static_cast<unsigned long long>(
+                    failed_predecessor_request.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(
+                    failed_predecessor_ordinal.load(std::memory_order_acquire)),
+                static_cast<unsigned>(predecessor_transfer_attempts),
+                typed_replacement_outcomes);
 }
 
 void test_p51_d07_staged_cancel_all_profiles() {
@@ -3003,6 +3089,7 @@ void test_p51_d07_staged_cancel_all_profiles() {
         for (const size_t index : {size_t{0}, size_t{15}, size_t{30}})
             test_p51_d07_staged_cancel_case(profile, index);
     }
+    test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, true);
 }
 
 // Active-cancel recovery regression: a complete bundle is paused on F's
@@ -16497,6 +16584,12 @@ int main(int argc, char** argv) {
         if (argc == 2 &&
             std::strcmp(argv[1], "--d07-staged-cancel") == 0) {
             test_p51_d07_staged_cancel_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--d07-staged-cancel-predecessor-failure") == 0) {
+            test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, true);
             return 0;
         }
         if (argc == 2 &&
