@@ -1,0 +1,18 @@
+{
+  "schema": "icefarm-scenario-v1",
+  "id": "D18-ZSTD-TU",
+  "shape": "mixed",
+  "images": {"p43": "p43-1.4.0", "new": "p50s4-diag-b269fad9"},
+  "instances": [
+    {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "ZSTD_TU"}},
+    {"name": "F_R1", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 2, "env": {"ICECC_P51_MODE": "off"}},
+    {"name": "F_R2", "role": "F", "host": "tt-quietbox5", "image": "new", "slots": 1, "env": {"ICECC_P51_MODE": "on"}},
+    {"name": "C_P43", "role": "C", "host": "tt-quietbox2", "image": "p43", "client_environment": "debian-gcc"},
+    {"name": "C_R1", "role": "C", "host": "tt-quietbox3", "image": "new", "client_environment": "debian-gcc", "env": {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "off"}},
+    {"name": "C_R2", "role": "C", "host": "tt-quietbox2", "image": "new", "client_environment": "debian-gcc", "env": {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on"}}
+  ],
+  "workload": {"driver": "d18-role-mix", "corpus": "fmt-100", "turns": ["A"], "jobs": 1, "clients": ["C_P43", "C_R1", "C_R2"], "repeat": 1, "oracle": "local-sha", "d18_roles": {"clients": {"P43": "C_P43", "R1": "C_R1", "R2": "C_R2"}, "workers": {"R1": "F_R1", "R2": "F_R2"}}},
+  "network": {"shaping": []}, "timeline": [],
+  "expect": {"exact": "all", "engagement": "expected(c,f)", "wedges": 0, "error106_max": 0, "tail_to_incapable": 0, "reuse": "none-when-legacy", "wall_s_max": null},
+  "controls": [], "timeouts": {"images_s": 1800, "up_s": 300, "turn_s": 1800, "collect_s": 600, "down_s": 300}
+}

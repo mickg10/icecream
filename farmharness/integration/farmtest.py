@@ -345,6 +345,14 @@ def _resolver_environment(farm: FarmSpec, scenario: ScenarioSpec) -> dict[str, s
 def resolve_topology(farm: FarmSpec, scenario: ScenarioSpec) -> dict[str, Any]:
     """Resolve through the normative v2 boundary; never fork digest logic."""
 
+    if scenario.data["workload"].get("driver") == "d18-role-mix":
+        if "C3F2" not in farm.data["authority"]["topologies"]:
+            raise PlanError(
+                "D18 role-mix requires an explicit authority.topologies.C3F2 "
+                "entry (f_relationships=2, slots_per_f=2); add it only to an "
+                "authorized farm configuration"
+            )
+
     try:
         topology = newgen_farm_env.resolve(
             _resolver_environment(farm, scenario),
@@ -735,6 +743,24 @@ def _planned_commands(
             "TMP": CONTAINER_TEMP_ROOT,
             "TMPDIR": CONTAINER_TEMP_ROOT,
         }
+        d18_roles = scenario.data["workload"].get("d18_roles")
+        if instance["role"] == "C" and isinstance(d18_roles, dict):
+            role_by_client = {
+                client: role
+                for role, client in d18_roles["clients"].items()
+            }
+            d18_role = role_by_client.get(instance["name"])
+            if d18_role is not None:
+                target_role = "R1" if d18_role in ("P43", "R1") else "R2"
+                target_name = d18_roles["workers"][target_role]
+                environment["ICECC_PREFERRED_HOST"] = target_name
+                environment["ICECC_REMOTE_REQUIRED"] = "1"
+                if d18_role != "P43":
+                    environment["ICECC_P50_PROFILE"] = next(
+                        item.get("env", {}).get("ICECC_P50_PROFILE")
+                        for item in topology["instances"]
+                        if item["role"] == "S"
+                    )
         if (
             scenario.data.get("id") == "S70-b4-scheduler-active-loss"
             and instance["role"] == "F"

@@ -25,6 +25,7 @@ from farmharness.integration.workload import (
     WORKLOAD_SCHEMA,
     WorkloadError,
     _active_loss_serial_through,
+    _d18_concurrent_witness,
     _driver_command,
     _parse_summary,
     _strict_p50_required,
@@ -40,8 +41,61 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "9d4c72674c3957109ec383c94d5e384b1846975ef199d0c4a0e887239bf2bf40"
+        "9c2ec61c288c718d726af9e7e560f96bc8f2fc2cfe4244647e95bc6936a40980"
     )
+
+
+def test_d18_overlap_requires_exact_persistent_worker_process_sets() -> None:
+    expected = {"F_R1": 2, "F_R2": 1}
+    first = {"F_R1": {101: 9001, 102: 9002}, "F_R2": {201: 9010}}
+    second = {"F_R1": {101: 9001, 102: 9002}, "F_R2": {201: 9010}}
+
+    witness = _d18_concurrent_witness(first, second, expected)
+    assert witness is not None
+    assert len(witness["F_R1"]) == 2
+    assert len(witness["F_R2"]) == 1
+
+    # Sequential-only activity cannot pass merely because every worker was
+    # observed during some part of the collection window.
+    sequential_first = {"F_R1": {101: 9001, 102: 9002}, "F_R2": {}}
+    sequential_second = {"F_R1": {}, "F_R2": {201: 9010}}
+    assert _d18_concurrent_witness(sequential_first, sequential_second, expected) is None
+
+    # Unattributed compiler work is rejected rather than selecting an arbitrary
+    # subset of PIDs to make the expected topology fit.
+    extra = {"F_R1": {101: 9001, 102: 9002, 103: 9003}, "F_R2": {201: 9010}}
+    assert _d18_concurrent_witness(extra, extra, expected) is None
+
+
+def test_d18_driver_uses_shared_barrier_without_changing_compiler_identity(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "D18-P29V1.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="d18-driver-workload-unit")
+    r1_name = scenario.data["workload"]["d18_roles"]["clients"]["R1"]
+    client = next(item for item in plan["topology"]["instances"] if item["name"] == r1_name)
+
+    command = _driver_command(
+        farm, scenario, plan, client, "A", CommandFactory()
+    )
+    assert "ICEFARM_D18_BARRIER=1" in command.argv
+    assert not any("ICEFARM_D18_ROLE_" in argument for argument in command.argv)
+    assert "-O2" in command.argv
+
+
+def test_d18_r2_adoption_evidence_requires_sidecar_handoff() -> None:
+    from farmharness.integration.workload import D18_R2_ADOPTION_RE
+
+    log = (
+        "ordinary worker startup\n"
+        "P51 cache-link descriptor adopted by sidecar (generation 7/2)\n"
+    )
+    assert D18_R2_ADOPTION_RE.findall(log) == [("7", "2")]
+    assert not D18_R2_ADOPTION_RE.findall("P51 cache-link setup refused: unavailable\n")
 
 
 def _farm_scenario_plan(tmp_path: Path):

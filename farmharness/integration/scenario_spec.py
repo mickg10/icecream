@@ -26,6 +26,8 @@ P29_FAULT_VALUE = "P29_INTERNER_FAIL_ONCE"
 RUNNER_ENV = frozenset(
     (
         "ICECC_NETNAME",
+        "ICECC_PREFERRED_HOST",
+        "ICECC_REMOTE_REQUIRED",
         "ICECC_P50_COMPILE_IDENTITY_TRACE",
         "ICECC_P50_C_ACTION_TRACE",
         "ICECC_P50_C_LEGACY_WIRE_TRACE",
@@ -42,6 +44,7 @@ RUNNER_ENV = frozenset(
         "ICECC_SCHEDULER",
         "ICECC_TEST_SOCKET",
         "ICECC_VERSION",
+        "ICEFARM_D18_BARRIER",
         "TEMP",
         "TEMPDIR",
         "TMP",
@@ -176,6 +179,71 @@ class ScenarioSpec:
     @property
     def digest(self) -> str:
         return hashlib.sha256(canonical_bytes(self.data)).hexdigest()
+
+
+def _validate_d18_role_mix(
+    value: dict[str, Any],
+    workload: dict[str, Any],
+    role_instances: dict[str, list[dict[str, Any]]],
+    generations: dict[str, int],
+    wire_revisions: dict[str, int | None],
+) -> None:
+    """Fail closed on the specific three-client P43/R1/R2 external gate."""
+    if (
+        workload["jobs"] != 1
+        or workload["repeat"] != 1
+        or workload["turns"] != ["A"]
+        or value["timeline"]
+        or value["controls"]
+    ):
+        raise ScenarioSpecError(
+            "$.workload: D18 uses one bounded, single-turn client workload without transitions"
+        )
+    mapping = workload["d18_roles"]
+    clients = mapping["clients"]
+    workers = mapping["workers"]
+    if len(set(clients.values())) != 3 or set(clients.values()) != set(workload["clients"]):
+        raise ScenarioSpecError(
+            "$.workload.d18_roles.clients: must name exactly the three selected clients"
+        )
+    if set(workers) != {"R1", "R2"} or workers["R1"] == workers["R2"]:
+        raise ScenarioSpecError(
+            "$.workload.d18_roles.workers: R1 and R2 require distinct F instances"
+        )
+    by_name = {item["name"]: item for role in ("S", "F", "C") for item in role_instances[role]}
+    if any(name not in by_name or by_name[name]["role"] != "C" for name in clients.values()):
+        raise ScenarioSpecError("$.workload.d18_roles.clients: every target must be a C instance")
+    if any(name not in by_name or by_name[name]["role"] != "F" for name in workers.values()):
+        raise ScenarioSpecError("$.workload.d18_roles.workers: every target must be an F instance")
+    scheduler = role_instances["S"][0]
+    if (
+        generations[scheduler["image"]] != 50
+        or scheduler.get("env", {}).get("ICECC_P50_PROFILE") not in PROFILES
+    ):
+        raise ScenarioSpecError("$.workload: D18 requires a P50 scheduler with a selected profile")
+
+    p43 = by_name[clients["P43"]]
+    r1 = by_name[clients["R1"]]
+    r2 = by_name[clients["R2"]]
+    f1 = by_name[workers["R1"]]
+    f2 = by_name[workers["R2"]]
+    if generations[p43["image"]] != 43:
+        raise ScenarioSpecError("$.workload.d18_roles.clients.P43: requires a pinned P43 image")
+    for label, instance in (
+        ("R1 client", r1), ("R1 worker", f1),
+        ("R2 client", r2), ("R2 worker", f2),
+    ):
+        if generations[instance["image"]] != 50 or wire_revisions[instance["image"]] != 1:
+            raise ScenarioSpecError(
+                f"$.workload.d18_roles: {label} must use a pinned P50 image "
+                "with CacheWire revision 1"
+            )
+    if r1.get("env", {}).get("ICECC_P50_MODE") != "on" or r1.get("env", {}).get("ICECC_P51_MODE") != "off":
+        raise ScenarioSpecError("$.workload.d18_roles.clients.R1: requires P50 on and R2 off")
+    if r2.get("env", {}).get("ICECC_P50_MODE") != "on" or r2.get("env", {}).get("ICECC_P51_MODE") != "on":
+        raise ScenarioSpecError("$.workload.d18_roles.clients.R2: requires P50 and persistent R2 on")
+    if f1.get("env", {}).get("ICECC_P51_MODE") != "off" or f2.get("env", {}).get("ICECC_P51_MODE") != "on":
+        raise ScenarioSpecError("$.workload.d18_roles.workers: worker protocol modes do not match R1/R2")
 
 
 def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
@@ -342,9 +410,20 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
         raise ScenarioSpecError(
             f"$.workload.corpus: undeclared corpus {workload['corpus']!r}"
         )
-    if workload["driver"] != corpus["kind"]:
+    d18_roles = workload.get("d18_roles")
+    is_d18 = workload["driver"] == "d18-role-mix"
+    if is_d18 != (d18_roles is not None):
+        raise ScenarioSpecError(
+            "$.workload.d18_roles: required only for d18-role-mix workloads"
+        )
+    expected_driver_corpus = "tu-manifest" if is_d18 else corpus["kind"]
+    if expected_driver_corpus != corpus["kind"]:
         raise ScenarioSpecError(
             "$.workload.driver: does not match the declared corpus kind"
+        )
+    if is_d18:
+        _validate_d18_role_mix(
+            value, workload, role_instances, generations, wire_revisions
         )
     allowed_turns = {"A"} if "manifest" in corpus else {"A", "B"}
     unknown_turns = sorted(set(workload["turns"]) - allowed_turns)

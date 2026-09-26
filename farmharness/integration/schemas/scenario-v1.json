@@ -143,7 +143,7 @@
       "additionalProperties": false,
       "required": ["driver", "corpus", "turns", "jobs", "clients", "repeat", "oracle"],
       "properties": {
-        "driver": {"enum": ["cmake-project", "ii-manifest", "tu-manifest"]},
+        "driver": {"enum": ["cmake-project", "ii-manifest", "tu-manifest", "d18-role-mix"]},
         "corpus": {"$ref": "#/$defs/name"},
         "turns": {
           "type": "array",
@@ -159,7 +159,33 @@
           "items": {"$ref": "#/$defs/name"}
         },
         "repeat": {"type": "integer", "minimum": 1},
-        "oracle": {"const": "local-sha"}
+        "oracle": {"const": "local-sha"},
+        "d18_roles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["clients", "workers"],
+          "properties": {
+            "clients": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["P43", "R1", "R2"],
+              "properties": {
+                "P43": {"$ref": "#/$defs/name"},
+                "R1": {"$ref": "#/$defs/name"},
+                "R2": {"$ref": "#/$defs/name"}
+              }
+            },
+            "workers": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["R1", "R2"],
+              "properties": {
+                "R1": {"$ref": "#/$defs/name"},
+                "R2": {"$ref": "#/$defs/name"}
+              }
+            }
+          }
+        }
       }
     },
     "shaping": {

@@ -839,6 +839,10 @@
         "f_relationships": 2,
         "slots_per_f": 24
       },
+      "C3F2": {
+        "f_relationships": 2,
+        "slots_per_f": 2
+      },
       "C2F9": {
         "f_relationships": 9,
         "slots_per_f": 4

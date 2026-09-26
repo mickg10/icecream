@@ -144,6 +144,64 @@ def test_committed_s50_mixed_pool_resolves_every_pair_stably() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "scenario_name",
+    ("D18-P29V1.json", "D18-ZSTD_TU.json", "D18-ZSTD_ROUTE.json"),
+)
+def test_d18_role_mix_plans_exact_three_role_routes(scenario_name: str) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / scenario_name, farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="d18-plan-test")
+
+    assert plan["topology"]["topology"] == "C3F2"
+    assert plan["topology"]["topology_slots"] == {
+        "f_relationships": 2,
+        "slots_per_f": 2,
+    }
+    instances = {item["name"]: item for item in plan["topology"]["instances"]}
+    roles = scenario.data["workload"]["d18_roles"]
+    profile = next(
+        item["env"]["ICECC_P50_PROFILE"]
+        for item in instances.values()
+        if item["role"] == "S"
+    )
+    assert instances[roles["clients"]["R1"]]["env"]["ICECC_P51_MODE"] == "off"
+    assert instances[roles["clients"]["R2"]]["env"]["ICECC_P51_MODE"] == "on"
+    starts = {
+        item["instance"]: item
+        for item in plan["commands"]
+        if item["phase"] == "up.start-c"
+    }
+    for role, client in roles["clients"].items():
+        start = starts[client]
+        argv = (
+            decode_ssh_payload(start["argv"])
+            if start["transport"] in ("ssh-docker", "ssh")
+            else tuple(start["argv"])
+        )
+        expected_worker = roles["workers"]["R2" if role == "R2" else "R1"]
+        assert f"ICECC_PREFERRED_HOST={expected_worker}" in argv
+        assert "ICECC_REMOTE_REQUIRED=1" in argv
+        if role != "P43":
+            assert f"ICECC_P50_PROFILE={profile}" in argv
+
+
+def test_d18_requires_explicit_c3f2_farm_authority(tmp_path: Path) -> None:
+    farm, scenario = _documents()
+    scenario = json.loads(
+        (INTEGRATION / "scenarios" / "D18-P29V1.json").read_text(encoding="utf-8")
+    )
+    del farm["authority"]["topologies"]["C3F2"]
+    farm_path, scenario_path = _write(tmp_path, farm, scenario)
+    loaded_farm = load_farm_spec(farm_path)
+    loaded_scenario = load_scenario_spec(scenario_path, loaded_farm)
+
+    with pytest.raises(farmtest.PlanError, match="explicit authority.topologies.C3F2"):
+        farmtest.build_plan(loaded_farm, loaded_scenario, run_id="d18-missing-authority")
+
+
 def test_missing_scratch_root_is_refused(tmp_path: Path) -> None:
     farm, scenario = _documents()
     del farm["hosts"][0]["scratch_root"]

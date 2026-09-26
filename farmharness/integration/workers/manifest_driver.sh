@@ -854,6 +854,22 @@ export disk_fill_worker disk_fill_trigger
 export resume_mode resume_indices
 
 set +e
+if test "${ICEFARM_D18_BARRIER:-0}" = 1
+then
+    d18_root="$result_root/d18"
+    mkdir -p "$d18_root"
+    : >"$d18_root/ready"
+    d18_deadline=$((SECONDS + 60))
+    while test ! -f "$d18_root/go"
+    do
+        if test "$SECONDS" -ge "$d18_deadline"
+        then
+            echo "D18 concurrent start barrier timed out" >&2
+            exit 75
+        fi
+        sleep 0.05
+    done
+fi
 xargs -0 -n 5 -P "$jobs" /bin/bash -c 'compile_one "$@"' icefarm-job <"$worklist"
 xargs_rc=$?
 set -e

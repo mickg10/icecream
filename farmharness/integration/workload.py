@@ -36,6 +36,9 @@ SUMMARY_RE = re.compile(
     r"^ICEFARM_WORKLOAD jobs=([0-9]+) failures=([0-9]+) samples=([0-9]+)$",
     re.MULTILINE,
 )
+D18_R2_ADOPTION_RE = re.compile(
+    r"P51 cache-link descriptor adopted by sidecar \(generation ([1-9][0-9]*)/([1-9][0-9]*)\)"
+)
 IMAGE_GENERATION_RE = re.compile(
     r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE
 )
@@ -250,6 +253,16 @@ def _driver_command(
             raise WorkloadError("S95 disk fill needs a positive job trigger")
         disk_fill_trigger = int(match.group(1))
     container = f"icefarm-{plan['run_id']}-{client['name']}"
+    d18_roles = workload.get("d18_roles")
+    d18_role = (
+        next(
+            (role for role, name in d18_roles["clients"].items() if name == client["name"]),
+            None,
+        )
+        if isinstance(d18_roles, dict)
+        else None
+    )
+    compiler_args = list(client["compiler_recipe"]["arguments"])
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300
     argv = docker_argv(
@@ -271,6 +284,7 @@ def _driver_command(
                 ("--env", f"ICEFARM_S60_ADMIT_THROUGH={s60_admit_through}")
                 if s60_admit_through else ()
             ),
+            *(("--env", "ICEFARM_D18_BARRIER=1") if d18_role is not None else ()),
             *(
                 (
                     "--env",
@@ -300,8 +314,8 @@ def _driver_command(
             client["compiler_recipe"]["executable"],
             client["compiler_recipe"]["binary_sha256"],
             compiler_identity_digest(client),
-            str(len(client["compiler_recipe"]["arguments"])),
-            *client["compiler_recipe"]["arguments"],
+            str(len(compiler_args)),
+            *compiler_args,
             turn,
             fault.get("kind", ""),
             fault.get("client", ""),
@@ -322,6 +336,264 @@ def _driver_command(
         timeout_s=timeout_s,
         argv=argv,
     )
+
+
+def _d18_docker_call(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    instance: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    suffix: str,
+    argv: tuple[str, ...],
+    *,
+    user: str = "0",
+) -> CommandResult:
+    command = factory.make(
+        phase=f"run.d18.{suffix}",
+        host=instance["host"],
+        instance=instance["name"],
+        transport=_docker_transport(farm, instance["host"]),
+        timeout_s=20,
+        argv=docker_argv(
+            farm,
+            instance["host"],
+            (
+                "exec", "--user", user,
+                f"icefarm-{plan['run_id']}-{instance['name']}", *argv,
+            ),
+        ),
+    )
+    result = transport.invoke(command)
+    if result.returncode != 0:
+        raise WorkloadError(
+            f"D18 {suffix} failed for {instance['name']}: "
+            f"{result.stderr.strip() or result.stdout.strip() or result.returncode}"
+        )
+    return result
+
+
+def _d18_processes(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    worker: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+) -> dict[int, int]:
+    script = r'''
+for statfile in /proc/[0-9]*/stat
+do
+    pid=${statfile#/proc/}
+    pid=${pid%/stat}
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    case "$cmd" in *cc1plus*) ;;
+        *) continue;;
+    esac
+    statline=$(cat "$statfile" 2>/dev/null || true)
+    rest=${statline##*) }
+    set -- $rest
+    test "$#" -ge 20 || continue
+    printf '%s %s\n' "$pid" "${20}"
+done'''
+    result = _d18_docker_call(
+        farm,
+        plan,
+        worker,
+        factory,
+        transport,
+        "observe-cc1plus",
+        (
+            "/bin/bash", "-c", script,
+            "d18-observer",
+        ),
+    )
+    observed: dict[int, int] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(field.isdecimal() for field in fields):
+            continue
+        pid, starttime = map(int, fields)
+        if pid > 0 and starttime > 0:
+            observed[pid] = starttime
+    return observed
+
+
+def _d18_concurrent_witness(
+    first: dict[str, dict[int, int]],
+    second: dict[str, dict[int, int]],
+    expected_by_worker: dict[str, int],
+) -> dict[str, list[dict[str, int]]] | None:
+    """Require exact process counts and the same live identities in two sweeps."""
+    if set(first) != set(expected_by_worker) or set(second) != set(expected_by_worker):
+        return None
+    if any(
+        len(first[worker]) != count
+        or len(second[worker]) != count
+        or first[worker] != second[worker]
+        for worker, count in expected_by_worker.items()
+    ):
+        return None
+    return {
+        worker: [
+            {"pid": pid, "starttime_ticks": starttime}
+            for pid, starttime in sorted(identities.items())
+        ]
+        for worker, identities in first.items()
+    }
+
+
+def _d18_barrier_and_observe(
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    clients: list[dict[str, Any]],
+    futures: list[Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    deadline_s: int,
+) -> dict[str, dict[str, Any]]:
+    roles = scenario.data["workload"]["d18_roles"]
+    by_name = {item["name"]: item for item in plan["topology"]["instances"]}
+    worker_names = roles["workers"]
+    expected_by_worker = {worker_names["R1"]: 2, worker_names["R2"]: 1}
+    client_by_role = {role: by_name[name] for role, name in roles["clients"].items()}
+    expected_ready = set(roles["clients"].values())
+    ready_deadline = time.monotonic() + min(60, deadline_s)
+    while True:
+        ready = set()
+        for client in clients:
+            if client["name"] not in expected_ready:
+                continue
+            result = _d18_docker_call(
+                farm, plan, client, factory, transport, "barrier-ready",
+                ("/bin/bash", "-c", "test ! -f /results/workload/A/d18/ready || echo D18_READY"),
+            )
+            if "D18_READY" in result.stdout:
+                ready.add(client["name"])
+        if ready == expected_ready:
+            break
+        if any(future.done() for future in futures):
+            for future in futures:
+                if future.done():
+                    future.result()
+            raise WorkloadError("D18 client exited before the shared measured-start barrier")
+        if time.monotonic() >= ready_deadline:
+            raise WorkloadError("D18 clients did not all reach the measured-start barrier")
+        time.sleep(0.1)
+
+    # Release all three client-side gates concurrently only after each has
+    # completed oracle warmup and published its ready marker.
+    with ThreadPoolExecutor(max_workers=3) as release_pool:
+        release_futures = [
+            release_pool.submit(
+                _d18_docker_call,
+                farm, plan, client_by_role[role], factory, transport,
+                f"barrier-release-{role}",
+                ("/usr/bin/touch", "/results/workload/A/d18/go"),
+            )
+            for role in ("P43", "R1", "R2")
+        ]
+        for future in release_futures:
+            future.result()
+
+    deadline = time.monotonic() + min(60, deadline_s)
+    while True:
+        first: dict[str, dict[int, int]] = {}
+        for worker_name in expected_by_worker:
+            worker = by_name[worker_name]
+            snapshots = _d18_processes(farm, plan, worker, factory, transport)
+            if snapshots:
+                first[worker_name] = snapshots
+        second: dict[str, dict[int, int]] = {}
+        if set(first) == set(expected_by_worker):
+            for worker_name in expected_by_worker:
+                worker = by_name[worker_name]
+                second[worker_name] = _d18_processes(
+                    farm, plan, worker, factory, transport
+                )
+            witness = _d18_concurrent_witness(first, second, expected_by_worker)
+            if witness is not None:
+                return {"workers": witness}
+        if all(future.done() for future in futures):
+            for future in futures:
+                future.result()
+            raise WorkloadError(
+                "D18 jobs completed without simultaneous two-process R1-worker "
+                "and one-process R2-worker evidence"
+            )
+        if time.monotonic() >= deadline:
+            raise WorkloadError("D18 simultaneous three-role process witness timed out")
+        time.sleep(0.05)
+
+
+def _d18_verify_remote_rows(
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    client: dict[str, Any],
+    role: str,
+    worker_name: str,
+    factory: CommandFactory,
+    transport: RecordingTransport,
+) -> dict[str, Any]:
+    script = r'''python3 - "$1" "$2" "$3" <<'PY'
+import json, pathlib, sys
+root, worker, expected = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+rows = []
+for path in sorted(root.glob("*/result.tsv")):
+    values = path.read_text(encoding="ascii").splitlines()
+    if len(values) != 1 or len(values[0].split("\t")) != 14:
+        raise SystemExit("malformed measured result row")
+    row = values[0].split("\t")
+    if row[5] != worker or row[8] != "0" or row[11] != "1" or row[12] != "1":
+        raise SystemExit("role job was not exact remote work on its required F")
+    rows.append({"job_id": row[4], "worker": row[5], "index": int(row[0])})
+if len(rows) != expected:
+    raise SystemExit(f"expected {expected} measured rows, observed {len(rows)}")
+print(json.dumps({"jobs": rows, "count": len(rows)}, sort_keys=True))
+PY'''
+    expected = farm.data["corpora"][scenario.data["workload"]["corpus"]]["tus"]
+    expected *= farm.data["corpora"][scenario.data["workload"]["corpus"]].get("repeat", 1)
+    expected *= scenario.data["workload"]["repeat"]
+    result = _d18_docker_call(
+        farm, plan, client, factory, transport, f"verify-remote-{role}",
+        ("/bin/bash", "-c", script, "d18-verify",
+         "/results/workload/A/jobs", worker_name, str(expected)),
+    )
+    try:
+        receipt = json.loads(result.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkloadError(f"D18 {role} remote-row receipt is malformed") from exc
+    if not isinstance(receipt, dict) or receipt.get("count") != expected:
+        raise WorkloadError(f"D18 {role} lacks complete exact remote-job evidence")
+    return receipt
+
+
+def _d18_verify_r2_link_adoption(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    worker: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+) -> dict[str, Any]:
+    result = _d18_docker_call(
+        farm,
+        plan,
+        worker,
+        factory,
+        transport,
+        "verify-r2-link-adoption",
+        ("/bin/bash", "-c", "cat /var/log/icecream/iceccd.log"),
+    )
+    matches = [
+        {"generation": int(generation), "attempt": int(attempt)}
+        for generation, attempt in D18_R2_ADOPTION_RE.findall(result.stdout)
+    ]
+    if not matches:
+        raise WorkloadError(
+            "D18 R2 worker has no cache-link descriptor adoption evidence"
+        )
+    return {"adoptions": matches, "worker": worker["name"]}
 
 
 def _parse_summary(result: CommandResult, client: str) -> dict[str, int | str]:
@@ -384,6 +656,7 @@ def run_workload(
         "ready": None,
     }
     turn_overrides: dict[str, list[CommandResult]] = {}
+    d18_roles = scenario.data["workload"].get("d18_roles")
     checkpointed_client_events = [
         event
         for event in scenario.data.get("timeline", [])
@@ -532,6 +805,7 @@ def run_workload(
             executor = ThreadPoolExecutor(max_workers=len(commands))
             dispatch_ready = threading.Event()
             futures = []
+            d18_evidence: dict[str, Any] | None = None
             try:
                 turn_context.update(
                     {
@@ -544,6 +818,17 @@ def run_workload(
                 for command in commands:
                     futures.append(executor.submit(transport.invoke, command))
                 dispatch_ready.set()
+                if isinstance(d18_roles, dict):
+                    d18_evidence = _d18_barrier_and_observe(
+                        farm,
+                        scenario,
+                        plan,
+                        clients,
+                        futures,
+                        factory,
+                        transport,
+                        scenario.data["timeouts"]["turn_s"],
+                    )
                 if _active_loss_serial_through(scenario):
                     events.prepare_active_compiler_boundary(turn)
                 results = [future.result() for future in futures]
@@ -574,9 +859,39 @@ def run_workload(
                 total = totals[str(summary["client"])]
                 for field in ("failures", "jobs", "samples"):
                     total[field] += int(summary[field])
-            turn_receipts.append(
-                {"activation": activation, "clients": summaries, "turn": turn}
-            )
+            turn_receipt: dict[str, Any] = {
+                "activation": activation,
+                "clients": summaries,
+                "turn": turn,
+            }
+            if isinstance(d18_roles, dict):
+                if d18_evidence is None:
+                    raise WorkloadError("D18 workload lacks a live overlap observation")
+                role_jobs: dict[str, Any] = {}
+                for role, client_name in d18_roles["clients"].items():
+                    target_role = "R1" if role in ("P43", "R1") else "R2"
+                    target_worker = d18_roles["workers"][target_role]
+                    role_jobs[role] = _d18_verify_remote_rows(
+                        farm,
+                        scenario,
+                        plan,
+                        next(item for item in clients if item["name"] == client_name),
+                        role,
+                        target_worker,
+                        factory,
+                        transport,
+                    )
+                d18_evidence["measured_remote_jobs"] = role_jobs
+                r2_worker = next(
+                    item
+                    for item in plan["topology"]["instances"]
+                    if item["name"] == d18_roles["workers"]["R2"]
+                )
+                d18_evidence["r2_link_adoption"] = _d18_verify_r2_link_adoption(
+                    farm, plan, r2_worker, factory, transport
+                )
+                turn_receipt["d18_concurrent_processes"] = d18_evidence
+            turn_receipts.append(turn_receipt)
             events.signal_turn_complete(turn)
             events.raise_if_failed()
         # A successful workload cannot cancel still-pending timeline events.
