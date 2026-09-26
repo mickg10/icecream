@@ -13,6 +13,7 @@
 #include <fstream>
 #include <fcntl.h>
 #include <grp.h>
+#include <map>
 #include <poll.h>
 #include <set>
 #include <stdexcept>
@@ -77,6 +78,37 @@ size_t process_open_fd_count() {
     if (read_error != 0)
         throw std::runtime_error("cannot read /proc/self/fd");
     return count;
+}
+
+std::map<int, std::string> process_open_fd_snapshot() {
+    DIR* directory = ::opendir("/proc/self/fd");
+    if (directory == nullptr)
+        throw std::runtime_error("cannot enumerate /proc/self/fd");
+    const int directory_fd = ::dirfd(directory);
+    std::map<int, std::string> snapshot;
+    for (;;) {
+        errno = 0;
+        dirent* entry = ::readdir(directory);
+        if (entry == nullptr)
+            break;
+        if (entry->d_name[0] == '.')
+            continue;
+        char* end = nullptr;
+        const long descriptor = std::strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' ||
+            descriptor == directory_fd)
+            continue;
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/fd/%ld", descriptor);
+        char target[512];
+        const ssize_t target_size = ::readlink(path, target, sizeof(target) - 1);
+        if (target_size < 0)
+            continue;
+        target[target_size] = '\0';
+        snapshot.emplace(static_cast<int>(descriptor), target);
+    }
+    (void)::closedir(directory);
+    return snapshot;
 }
 
 void check(bool condition, const char* expression) {
@@ -1378,7 +1410,8 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
     // a cap+1 request receives a typed, bounded refusal without consuming its
     // source descriptor, incrementing admission, or starting source work.
     RuntimeCase stalled = authenticated_runtime_pair();
-    const auto short_request = make_request(7101, std::chrono::seconds(4));
+    const auto short_request = make_request(7101, std::chrono::seconds(20));
+    const int stalled_sender_fd = stalled.sender.native_handle();
     // Deliberately oversize the admitted source. The normal asynchronous path
     // emits its existing typed SourceRead error without touching the F route;
     // keep that reply held at Goodbye to occupy the only operation slot.
@@ -1389,8 +1422,7 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
     CHECK(wait_for_source_operation_count(runtime, 1, std::chrono::seconds(1)));
     CHECK(source_read_chunks.load(std::memory_order_relaxed) == 0);
 
-    RuntimeCase refused = authenticated_runtime_pair();
-    const auto refused_request = make_request(7102, std::chrono::seconds(2));
+    const auto refused_request = make_request(7102, std::chrono::seconds(20));
     const auto refused_operation = local::make_p51_source_transfer_operation(
         launch.identity, refused_request,
         refused_request.armed.arm.source.source_request_id);
@@ -1398,45 +1430,93 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
     const int refused_source_fd = refused_source.get();
     const size_t reads_before_refusal =
         source_read_chunks.load(std::memory_order_relaxed);
+    const uint64_t raw_bytes_before_refusal =
+        runtime.active_source_raw_bytes_for_test();
+    const auto refused_payload =
+        local::encode_control_operation(refused_operation);
+    const auto retry_fd_snapshot = process_open_fd_snapshot();
+    const size_t retry_fd_baseline = process_open_fd_count();
+    constexpr size_t kBusyRetryCount = 64;
+    const auto retry_loop_started = std::chrono::steady_clock::now();
     uint16_t preflight_error = 0;
-    const auto refused_status = runtime.enqueue_p51_source_transfer(
-        std::move(refused.sender), launch.identity, refused_operation,
-        std::move(refused_source), &preflight_error);
-    CHECK(refused_status == service::P51SourceEnqueueResult::CapacityBusy);
-    CHECK(preflight_error == 0);
-    CHECK(refused.sender.valid() && refused_source.get() == refused_source_fd);
-    CHECK(runtime.pending_p51_source_operations_for_test() == 1);
-    CHECK(source_read_chunks.load(std::memory_order_relaxed) ==
-          reads_before_refusal);
+    const auto run_busy_retry = [&] {
+        RuntimeCase busy_pair = authenticated_runtime_pair();
+        const int duplicate_fd =
+            ::fcntl(refused_source_fd, F_DUPFD_CLOEXEC, 0);
+        CHECK(duplicate_fd >= 0);
+        local::HandoffFd retry_source(duplicate_fd);
+        CHECK(retry_source.cloexec());
+        const int retry_source_fd = retry_source.get();
+        const size_t reads_before_attempt =
+            source_read_chunks.load(std::memory_order_relaxed);
+        CHECK(runtime.enqueue_p51_source_transfer(
+                  std::move(busy_pair.sender), launch.identity,
+                  refused_operation, std::move(retry_source),
+                  &preflight_error) ==
+              service::P51SourceEnqueueResult::CapacityBusy);
+        CHECK(preflight_error == 0);
+        CHECK(busy_pair.sender.valid() && retry_source.valid() &&
+              retry_source.get() == retry_source_fd);
+        CHECK(refused_source.valid() && refused_source.get() == refused_source_fd);
+        CHECK(runtime.pending_p51_source_operations_for_test() == 1);
+        CHECK(runtime.active_source_raw_bytes_for_test() ==
+              raw_bytes_before_refusal);
+        CHECK(source_read_chunks.load(std::memory_order_relaxed) ==
+              reads_before_attempt);
+        CHECK(local::encode_control_operation(refused_operation) ==
+              refused_payload);
 
-    std::promise<local::P50SourceTransferResult> busy_result_promise;
-    auto busy_result_future = busy_result_promise.get_future();
-    std::exception_ptr busy_peer_exception;
-    std::jthread busy_peer([&] {
-        try {
-            busy_result_promise.set_value(receive_p51_transfer_result(
-                refused.receiver, launch.identity, 7102,
-                refused_request.absolute_deadline.as_steady_time_point(), true));
-        } catch (...) {
-            busy_peer_exception = std::current_exception();
-        }
-    });
-    const auto busy_reply_started = std::chrono::steady_clock::now();
-    CHECK(service::send_p51_source_transfer_error_reply(
-        refused.sender, launch.identity, refused_operation,
-        static_cast<uint16_t>(local::SourceTransferErrorCode::CapacityBusy),
-        refused_request.absolute_deadline.as_steady_time_point()));
-    const auto busy_reply_elapsed = std::chrono::steady_clock::now() -
-                                    busy_reply_started;
-    busy_peer.join();
-    if (busy_peer_exception)
-        std::rethrow_exception(busy_peer_exception);
-    const auto busy_result = busy_result_future.get();
-    CHECK(busy_result.error_code == static_cast<uint16_t>(
-        local::SourceTransferErrorCode::CapacityBusy));
-    CHECK(busy_result.attempts == 0 && busy_result.c_store_guid == CStoreGuid{});
-    CHECK(busy_reply_elapsed < std::chrono::milliseconds(250));
+        std::promise<local::P50SourceTransferResult> busy_result_promise;
+        auto busy_result_future = busy_result_promise.get_future();
+        std::exception_ptr busy_peer_exception;
+        std::jthread busy_peer([&] {
+            try {
+                busy_result_promise.set_value(receive_p51_transfer_result(
+                    busy_pair.receiver, launch.identity, 7102,
+                    refused_request.absolute_deadline.as_steady_time_point(),
+                    true));
+            } catch (...) {
+                busy_peer_exception = std::current_exception();
+            }
+        });
+        const auto busy_reply_started = std::chrono::steady_clock::now();
+        CHECK(service::send_p51_source_transfer_error_reply(
+            busy_pair.sender, launch.identity, refused_operation,
+            static_cast<uint16_t>(local::SourceTransferErrorCode::CapacityBusy),
+            refused_request.absolute_deadline.as_steady_time_point()));
+        const auto busy_reply_elapsed = std::chrono::steady_clock::now() -
+                                        busy_reply_started;
+        busy_peer.join();
+        if (busy_peer_exception)
+            std::rethrow_exception(busy_peer_exception);
+        const auto busy_result = busy_result_future.get();
+        CHECK(busy_result.error_code == static_cast<uint16_t>(
+            local::SourceTransferErrorCode::CapacityBusy));
+        CHECK(busy_result.attempts == 0 &&
+              busy_result.c_store_guid == CStoreGuid{});
+        CHECK(busy_reply_elapsed < std::chrono::milliseconds(250));
+        CHECK(runtime.pending_p51_source_operations_for_test() == 1);
+        CHECK(runtime.active_source_raw_bytes_for_test() ==
+              raw_bytes_before_refusal);
+        CHECK(source_read_chunks.load(std::memory_order_relaxed) ==
+              reads_before_refusal);
+        CHECK(refused_source.get() == refused_source_fd);
+        CHECK(process_open_fd_count() == retry_fd_baseline + 3);
+    };
+    for (size_t retry = 0; retry < kBusyRetryCount; ++retry) {
+        run_busy_retry();
+        CHECK(process_open_fd_count() == retry_fd_baseline);
+    }
+    CHECK(std::chrono::steady_clock::now() - retry_loop_started <
+          std::chrono::seconds(10));
     CHECK(runtime.pending_p51_source_operations_for_test() == 1);
+    CHECK(runtime.active_source_raw_bytes_for_test() ==
+          raw_bytes_before_refusal);
+    CHECK(process_open_fd_count() == retry_fd_baseline);
+    std::printf("P51_CAPACITY_BUSY_PLATEAU retries=%zu operations=1 raw_bytes=%llu fd_peak=%zu fd_baseline=%zu PASS\n",
+                kBusyRetryCount,
+                static_cast<unsigned long long>(raw_bytes_before_refusal),
+                retry_fd_baseline + 3, retry_fd_baseline);
 
     RuntimeCase silent = authenticated_runtime_pair();
     const auto silent_operation = local::make_p51_source_transfer_operation(
@@ -1472,6 +1552,19 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
     CHECK(preflight_error == 0);
     normal.receiver = local::Connection(-1);
     CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
+    CHECK(runtime.active_source_raw_bytes_for_test() == 0);
+    CHECK(!refused_source.valid());
+    CHECK(::fcntl(refused_source_fd, F_GETFD) == -1 && errno == EBADF);
+    CHECK(::fcntl(stalled_sender_fd, F_GETFD) == -1 && errno == EBADF);
+    silent.receiver = local::Connection(-1);
+    const auto released_fd_snapshot = process_open_fd_snapshot();
+    for (const auto& [fd, target] : released_fd_snapshot) {
+        const auto before = retry_fd_snapshot.find(fd);
+        CHECK(before != retry_fd_snapshot.end() && before->second == target);
+    }
+    const size_t released_fd_count = process_open_fd_count();
+    std::printf("P51_CAPACITY_BUSY_RELEASE operations=0 raw_bytes=0 fds_before=%zu fds_after=%zu no_new_fds=1 PASS\n",
+                retry_fd_baseline, released_fd_count);
 
     // Peer EOF is also terminal for the local reply pump and releases its
     // bounded queue reservation without waiting out the source deadline.
