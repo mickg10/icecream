@@ -14,6 +14,20 @@ retained artifact directories.
 
 ### Current cleanup and collector qualification
 
+The C03 client-EOF fixture now requires exactly one cancellation queued and
+one successful result for the original job/epoch/nonce/request, with the
+same nonempty reservation ID and queue-before-result ordering. All three
+profiles pass this strengthened assertion against the fresh runtime; a
+separate fresh ARM also succeeds. The script requires the resulting
+`C03_CANCEL_ONCE` marker. A killed sidecar is intentionally not required to
+return a cancellation reply. This focused run does not rerun the other
+C03 modes or establish compiler cancellation at every transfer phase.
+Aggregate log: `current/tmp/c03-cancel-profiles-host.log` under the bootstrap
+run below, SHA256
+`60c5e221e2f747d966a07be008f85527f7b297f6f2def35401ef521fd814c2ae`.
+Test-only overlay binary SHA256:
+`db484a54b48ebad0869b046097954b830acd677f6cae32ec05e1331b3c6e8417`.
+
 On the fresh `173dd1c4` runtime snapshot described below,
 `p50cacheservice --d17-repeated-window-cancel` passes all nine cells:
 P29V1/ZSTD_TU/ZSTD_ROUTE, cancelling submission positions 0/14/29 from
