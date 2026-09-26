@@ -7018,6 +7018,315 @@ void test_r2_fragmented_one_job_each_profile() {
     }
 }
 
+asio::awaitable<void> r2_send_every_partial_hello(
+    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello,
+    JobBind binding, PreparedTuHandle prepared,
+    std::chrono::steady_clock::time_point deadline, size_t frame_bytes,
+    ClientRunResult& client_result, LinkState& final_state) {
+    const auto executor = co_await asio::this_coro::executor;
+    for (size_t prefix = 0; prefix < frame_bytes; ++prefix) {
+        tcp::socket socket(executor);
+        co_await socket.async_connect(endpoint, asio::use_awaitable);
+        if (prefix != 0) {
+            const std::vector<uint8_t> encoded = encode_frame(Message{hello});
+            co_await asio::async_write(
+                socket, asio::buffer(encoded.data(), prefix),
+                asio::use_awaitable);
+        }
+        boost::system::error_code ignored;
+        socket.shutdown(tcp::socket::shutdown_both, ignored);
+        socket.close(ignored);
+    }
+
+    tcp::socket valid_socket(executor);
+    co_await valid_socket.async_connect(endpoint, asio::use_awaitable);
+    final_state = co_await client.open_r2_link(valid_socket, hello, deadline);
+    const R2SentBundle sent = co_await client.write_r2_bundle(
+        valid_socket, binding, prepared, deadline);
+    client_result = co_await client.read_r2_receipt(
+        valid_socket, sent, deadline);
+    co_await client.write_r2_ack(valid_socket, 1, deadline);
+    co_await raw_write(valid_socket, Message{CloseMessage{}});
+    boost::system::error_code ignored;
+    valid_socket.shutdown(tcp::socket::shutdown_both, ignored);
+    valid_socket.close(ignored);
+    co_return;
+}
+
+asio::awaitable<void> r2_accept_every_partial_hello(
+    tcp::acceptor& acceptor, P50ServerEndpoint& server, size_t cut_count,
+    std::vector<ServerRunStatus>& cut_statuses,
+    ServerRunResult& final_result) {
+    const auto executor = co_await asio::this_coro::executor;
+    cut_statuses.reserve(cut_count);
+    for (size_t index = 0; index != cut_count; ++index) {
+        tcp::socket socket(executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        try {
+            const ServerRunResult result =
+                co_await server.run_adopted_r2(std::move(socket));
+            cut_statuses.push_back(result.status);
+        } catch (const boost::system::system_error& error) {
+            if (error.code() != asio::error::eof &&
+                error.code() != asio::error::connection_reset)
+                throw;
+            cut_statuses.push_back(ServerRunStatus::Disconnected);
+        }
+    }
+    tcp::socket socket(executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    final_result = co_await server.run_adopted_r2(std::move(socket));
+}
+
+void test_r2_partial_hello_exhaustive_offsets() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        const P5coStoreGuids stores = p5co_store_guids(
+            0x8a + static_cast<uint64_t>(profile));
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        PreparationAuthorityLimits limits;
+        limits.max_speculative_tus = 1;
+        limits.max_speculative_raw_bytes = 1U << 20;
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            stores.c, caps.zstd, limits, 1, profile);
+        const PreparationRouteKey route{stores.f, 23, profile};
+        const std::string source = "int d03_hello_cut = 42;\n";
+        const std::vector<uint8_t> input(source.begin(), source.end());
+        const P51SourceArmFields arm{
+            r2_test_arm(stores.c, 8800 + static_cast<uint64_t>(profile),
+                        9800 + static_cast<uint32_t>(profile), profile),
+            1};
+        const P51SourceArmedFields armed = r2_test_armed(
+            arm, stores.f, 0xd080 + static_cast<uint64_t>(profile));
+        const PreparedTuHandle prepared = authority->prepare_for_route(
+            route, PrepareRequestKey{8800, 9800}, input);
+        const PreparedInputPtr retained =
+            P50PreparationAuthorityTestAccess::resolve(*authority, prepared);
+        const auto deadline = r2_test_deadline(std::chrono::seconds(30));
+        LinkHello hello;
+        hello.profile = profile;
+        hello.window = 1;
+        hello.max_frame_payload = kInitialMaxFramePayload;
+        hello.max_raw_bytes = 1U << 20;
+        hello.max_encoded_bytes = 1U << 20;
+        hello.max_output_bytes = 1U << 20;
+        hello.reservation_id = Id128{armed.reservation_id};
+        hello.relationship_id = Id128{armed.logical_relationship_id};
+        hello.relationship_epoch = armed.relationship_epoch;
+        hello.physical_link_generation = 81;
+        hello.c_store_guid = stores.c;
+        hello.c_store_generation = arm.source.c_store_generation;
+        hello.f_store_guid = stores.f;
+        hello.f_store_generation = armed.f_store_generation;
+        hello.c_control_generation = arm.source.c_control_generation;
+        hello.c_control_attempt = arm.source.c_control_attempt;
+        hello.system_source_fingerprint = profile == ProfileId::P29V1
+            ? authority->p29v1_system_source_fingerprint(prepared)
+            : icecc::digest128("D03 exhaustive partial HELLO");
+        hello.history_nonce = retained->begin.history_nonce;
+        hello.start_mode = LinkStartMode::Initial;
+        const std::vector<uint8_t> encoded_hello =
+            encode_frame(Message{hello});
+        require(encoded_hello.size() > 5,
+                "D03 LINK_HELLO fixture unexpectedly small");
+
+        JobBind binding;
+        binding.reservation_id = hello.reservation_id;
+        binding.physical_link_generation = hello.physical_link_generation;
+        binding.relationship_ordinal = 1;
+        binding.wire_job_id = arm.source.wire_job_id;
+        binding.assignment_epoch = arm.source.assignment_epoch;
+        binding.assignment_nonce = arm.source.assignment_nonce;
+        binding.logical_job = arm.source.logical_job;
+        binding.compiler_attempt = arm.source.compiler_attempt;
+        binding.source_request_id = arm.source.source_request_id;
+        binding.tu_seq = retained->begin.tu_seq;
+        binding.profile = profile;
+        binding.raw_bytes = retained->begin.raw_bytes;
+        binding.raw_digest = retained->begin.raw_digest;
+        P51SourceJobLease job_lease;
+        job_lease.armed = armed;
+        job_lease.absolute_deadline = deadline;
+        job_lease.binding = binding;
+        job_lease.binding_digest = compute_r2_binding_digest(binding);
+        job_lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+
+        std::atomic<unsigned> link_lookups{0};
+        std::atomic<unsigned> job_consumptions{0};
+        std::atomic<unsigned> materializations{0};
+        P50ServerEndpointConfig config;
+        config.lookup_p51_link_reservation =
+            [&](const LinkHello& observed)
+                -> std::optional<P51SourceLinkLease> {
+            if (observed != hello)
+                return std::nullopt;
+            ++link_lookups;
+            P51SourceLinkLease lease{armed, deadline};
+            lease.relationship_epoch = hello.relationship_epoch;
+            lease.history_nonce = hello.history_nonce;
+            return lease;
+        };
+        config.consume_p51_job_reservation =
+            [&](const LinkHello& observed, const JobBind& offered)
+                -> std::optional<P51SourceJobLease> {
+            if (observed != hello || offered != binding ||
+                job_consumptions.fetch_add(1) != 0)
+                return std::nullopt;
+            return job_lease;
+        };
+        config.input_job_state =
+            [&](CStoreGuid c_guid, const TxBegin&, const TxCommit& commit,
+                std::span<const uint8_t> bytes) {
+            if (c_guid != stores.c || commit.tu_seq != binding.tu_seq ||
+                commit.raw_digest != icecc::digest128(input) ||
+                !std::ranges::equal(bytes, input))
+                throw std::runtime_error(
+                    "post-HELLO-cut job differs from exact source bytes");
+            ++materializations;
+            return InputJobState::Open;
+        };
+        std::atomic<unsigned> commits{0};
+        std::atomic<unsigned> acknowledgements{0};
+        config.record_p51_job_commit =
+            [&](const LinkHello& observed, const JobBind& offered,
+                const R2TxCommit& commit) {
+            if (observed != hello || offered != binding ||
+                commit.relationship_ordinal != 1 ||
+                commit.binding_digest != job_lease.binding_digest ||
+                commit.inner.raw_digest != binding.raw_digest)
+                return false;
+            ++commits;
+            return true;
+        };
+        config.acknowledge_p51_receipt =
+            [&](const LinkHello& observed, const CommitAck& ack) {
+            if (observed != hello ||
+                ack.relationship_id != hello.relationship_id ||
+                ack.relationship_epoch != hello.relationship_epoch ||
+                ack.physical_link_generation !=
+                    hello.physical_link_generation ||
+                ack.contiguous_verified_ordinal != 1)
+                return false;
+            ++acknowledgements;
+            return true;
+        };
+        EndpointCaps server_caps = caps;
+        P50ServerEndpoint server(stores.f, server_caps, nullptr, nullptr,
+                                 std::move(config));
+        P50ClientEndpoint client(authority, caps, hello.history_nonce,
+                                 nullptr, nullptr, std::nullopt, {}, {}, route);
+        asio::io_context context;
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        std::vector<ServerRunStatus> cut_statuses;
+        ServerRunResult final_result;
+        ClientRunResult client_result;
+        LinkState final_state;
+        std::exception_ptr server_error;
+        std::exception_ptr peer_error;
+        bool server_done = false;
+        bool peer_done = false;
+        asio::steady_timer watchdog(context);
+        watchdog.expires_after(std::chrono::seconds(30));
+        bool timed_out = false;
+        watchdog.async_wait([&](const boost::system::error_code& error) {
+            if (!error) {
+                timed_out = true;
+                boost::system::error_code ignored;
+                acceptor.close(ignored);
+                context.stop();
+            }
+        });
+        const auto started = std::chrono::steady_clock::now();
+        asio::co_spawn(
+            context,
+            r2_accept_every_partial_hello(
+                acceptor, server, encoded_hello.size(),
+                cut_statuses, final_result),
+            [&](std::exception_ptr error) {
+                server_error = error;
+                server_done = true;
+                if (peer_done) {
+                    boost::system::error_code ignored;
+                    watchdog.cancel(ignored);
+                }
+            });
+        asio::co_spawn(
+            context,
+            r2_send_every_partial_hello(
+                acceptor.local_endpoint(), client, hello, binding, prepared,
+                deadline.as_steady_time_point(), encoded_hello.size(),
+                client_result, final_state),
+            [&](std::exception_ptr error) {
+                peer_error = error;
+                peer_done = true;
+                if (server_done) {
+                    boost::system::error_code ignored;
+                    watchdog.cancel(ignored);
+                }
+            });
+        context.run();
+        require(!timed_out && server_done && peer_done,
+                "D03 exhaustive partial HELLO fixture timed out");
+        if (server_error) {
+            try {
+                std::rethrow_exception(server_error);
+            } catch (const std::exception& error) {
+                std::cerr << "D03 HELLO server exception profile="
+                          << static_cast<unsigned>(profile)
+                          << " cuts=" << cut_statuses.size()
+                          << " detail=" << error.what() << '\n';
+            }
+            std::rethrow_exception(server_error);
+        }
+        if (peer_error) {
+            try {
+                std::rethrow_exception(peer_error);
+            } catch (const std::exception& error) {
+                std::cerr << "D03 HELLO peer exception profile="
+                          << static_cast<unsigned>(profile)
+                          << " cuts=" << cut_statuses.size()
+                          << " detail=" << error.what() << '\n';
+            }
+            std::rethrow_exception(peer_error);
+        }
+        require(cut_statuses.size() == encoded_hello.size() &&
+                    std::ranges::all_of(cut_statuses, [](ServerRunStatus status) {
+                        return status == ServerRunStatus::Disconnected;
+                    }) &&
+                    final_result.status == ServerRunStatus::Completed &&
+                    final_state.relationship_id == hello.relationship_id &&
+                    final_state.physical_link_generation ==
+                        hello.physical_link_generation &&
+                    client_result.status == ClientRunStatus::Committed &&
+                    client_result.committed_input &&
+                    client_result.committed_input->tu_seq == binding.tu_seq &&
+                    client_result.committed_commit &&
+                    client_result.committed_commit->raw_digest ==
+                        binding.raw_digest &&
+                    link_lookups == 1 && job_consumptions == 1 &&
+                    materializations == 1 && commits == 1 &&
+                    acknowledgements == 1,
+                "partial LINK_HELLO published early or blocked exact one-time retry");
+        InputCursor cursor = server.attach_input(
+            InputRecordKey{stores.c, binding.tu_seq});
+        std::vector<uint8_t> attached(input.size());
+        require(cursor && cursor.read(attached) == attached.size() &&
+                    attached == input,
+                "partial LINK_HELLO retry changed exact attached bytes");
+        std::cout << "P51_R2_HELLO_CUTS profile="
+                  << static_cast<unsigned>(profile)
+                  << " prefixes=" << cut_statuses.size()
+                  << " bytes=" << encoded_hello.size()
+                  << " elapsed-ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started).count()
+                  << " no-partial-publication exact-one-job: ok\n" << std::flush;
+    }
+}
+
 struct InjectedR2BodyFragmentCut {};
 
 asio::awaitable<void> r2_proxy_reverse_frames(
@@ -7056,11 +7365,14 @@ asio::awaitable<void> r2_proxy_reverse_frames(
     }
 }
 
+enum class R2FrameDirection { ClientToF, FToClient };
+
 struct R2FrameCutSpec {
     MessageType type;
     size_t occurrence;
     size_t frame_prefix_bytes;
     std::string_view label;
+    R2FrameDirection direction = R2FrameDirection::ClientToF;
 };
 
 struct R2ProxyCutResult {
@@ -7071,11 +7383,20 @@ struct R2ProxyCutResult {
 
 const char* r2_cut_message_name(MessageType type) {
     switch (type) {
+    case MessageType::LINK_HELLO: return "LINK_HELLO";
+    case MessageType::LINK_STATE: return "LINK_STATE";
     case MessageType::JOB_BIND: return "JOB_BIND";
     case MessageType::TU_BEGIN: return "TU_BEGIN";
     case MessageType::R2_BODY: return "R2_BODY";
     case MessageType::R2_FILL: return "R2_FILL";
     case MessageType::TU_END: return "TU_END";
+    case MessageType::R2_TX_COMMIT: return "R2_TX_COMMIT";
+    case MessageType::COMMIT_ACK: return "COMMIT_ACK";
+    case MessageType::RECOVER: return "RECOVER";
+    case MessageType::RECEIPTS: return "RECEIPTS";
+    case MessageType::RESET: return "RESET";
+    case MessageType::RESET_ACK: return "RESET_ACK";
+    case MessageType::RESET_CONFIRM: return "RESET_CONFIRM";
     default: return "unexpected";
     }
 }
@@ -7089,14 +7410,20 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
     co_await proxy_acceptor.async_accept(*c_socket, asio::use_awaitable);
     auto f_socket = std::make_shared<tcp::socket>(executor);
     co_await f_socket->async_connect(f_endpoint, asio::use_awaitable);
-    asio::co_spawn(executor, r2_proxy_reverse_frames(f_socket, c_socket),
+    const bool client_to_f = cut.direction == R2FrameDirection::ClientToF;
+    asio::co_spawn(executor,
+                   client_to_f
+                       ? r2_proxy_reverse_frames(f_socket, c_socket)
+                       : r2_proxy_reverse_frames(c_socket, f_socket),
                    [](std::exception_ptr) {});
+    const auto& source = client_to_f ? c_socket : f_socket;
+    const auto& destination = client_to_f ? f_socket : c_socket;
 
     R2ProxyCutResult result;
     size_t matching_occurrences = 0;
     for (;;) {
         std::array<uint8_t, 4> header_bytes{};
-        co_await asio::async_read(*c_socket, asio::buffer(header_bytes),
+        co_await asio::async_read(*source, asio::buffer(header_bytes),
                                   asio::use_awaitable);
         const FrameHeader header =
             decode_frame_header(header_bytes, kInitialMaxFramePayload);
@@ -7113,16 +7440,16 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
             const size_t header_prefix =
                 std::min(cut.frame_prefix_bytes, header_bytes.size());
             co_await asio::async_write(
-                *f_socket,
+                *destination,
                 asio::buffer(header_bytes.data(), header_prefix),
                 asio::use_awaitable);
             if (cut.frame_prefix_bytes > header_bytes.size()) {
                 const size_t payload_prefix =
                     cut.frame_prefix_bytes - header_bytes.size();
                 std::vector<uint8_t> prefix(payload_prefix);
-                co_await asio::async_read(*c_socket, asio::buffer(prefix),
+                co_await asio::async_read(*source, asio::buffer(prefix),
                                           asio::use_awaitable);
-                co_await asio::async_write(*f_socket, asio::buffer(prefix),
+                co_await asio::async_write(*destination, asio::buffer(prefix),
                                            asio::use_awaitable);
             }
             result.cut_frame_type = header.type;
@@ -7130,13 +7457,13 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
             result.cut_frame_bytes = frame_bytes;
             break;
         }
-        co_await asio::async_write(*f_socket, asio::buffer(header_bytes),
+        co_await asio::async_write(*destination, asio::buffer(header_bytes),
                                    asio::use_awaitable);
         std::vector<uint8_t> payload(header.payload_bytes);
         if (!payload.empty()) {
-            co_await asio::async_read(*c_socket, asio::buffer(payload),
+            co_await asio::async_read(*source, asio::buffer(payload),
                                       asio::use_awaitable);
-            co_await asio::async_write(*f_socket, asio::buffer(payload),
+            co_await asio::async_write(*destination, asio::buffer(payload),
                                        asio::use_awaitable);
         }
         fully_forwarded_frames.push_back(header.type);
@@ -7156,19 +7483,24 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     const JobBind& initial_binding, PreparedTuHandle prepared,
     R2FrameCutSpec cut, std::chrono::steady_clock::time_point deadline,
     ServerRunResult& first_server_result, bool& first_server_done,
+    std::string& phase,
     uint64_t& observed_reset_epoch,
     unsigned& binding_consumptions,
     std::atomic<unsigned>& materializations,
     std::atomic<unsigned>& commits) {
     tcp::socket interrupted_socket(co_await asio::this_coro::executor);
+    phase = "initial-connect";
     co_await interrupted_socket.async_connect(proxy, asio::use_awaitable);
+    phase = "initial-open";
     (void)co_await client.open_r2_link(interrupted_socket, initial_hello,
                                       deadline);
     bool writer_observed_disconnect = false;
     try {
+        phase = "initial-write";
         const R2SentBundle sent = co_await client.write_r2_bundle(
             interrupted_socket, initial_binding, prepared, deadline);
         try {
+            phase = "initial-receipt";
             (void)co_await client.read_r2_receipt(
                 interrupted_socket, sent, deadline);
             throw std::logic_error(
@@ -7186,6 +7518,8 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
             "R2 sender did not observe the proxy frame interruption");
 
     const auto executor = co_await asio::this_coro::executor;
+    const bool committed_cut =
+        cut.direction == R2FrameDirection::FToClient;
     asio::steady_timer first_result_wait(executor);
     for (size_t attempt = 0; attempt != 2000 && !first_server_done; ++attempt) {
         first_result_wait.expires_after(std::chrono::milliseconds(1));
@@ -7193,9 +7527,11 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     }
     require(first_server_done &&
                 first_server_result.status == ServerRunStatus::Disconnected &&
-                materializations.load(std::memory_order_acquire) == 0 &&
-                commits.load(std::memory_order_acquire) == 0,
-            "partial R2 frame became visible or failed to disconnect cleanly");
+                materializations.load(std::memory_order_acquire) ==
+                    static_cast<unsigned>(committed_cut) &&
+                commits.load(std::memory_order_acquire) ==
+                    static_cast<unsigned>(committed_cut),
+            "interrupted R2 frame had the wrong pre-recovery publication state");
     const unsigned expected_before_replay =
         cut.type == MessageType::JOB_BIND ? 0 : 1;
     require(binding_consumptions == expected_before_replay,
@@ -7213,6 +7549,7 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     reconnect.verified_receipt_floor = 0;
     const uint64_t cut_identity =
         static_cast<uint64_t>(cut.type) * 100000 +
+        static_cast<uint64_t>(cut.direction) * 10000000 +
         cut.occurrence * 10000 + cut.frame_prefix_bytes;
     const Id128 reset_operation = Id128::from_u64(
         0xd0300000ULL + static_cast<uint64_t>(initial_hello.profile) * 1000000 +
@@ -7221,6 +7558,7 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
         0xd0400000ULL + static_cast<uint64_t>(initial_hello.profile) * 1000000 +
         cut_identity};
     tcp::socket recovery_socket(executor);
+    phase = "recovery-connect";
     co_await recovery_socket.async_connect(remote, asio::use_awaitable);
     const RecoverBegin expected_recovery_begin{
         reconnect.relationship_id, reconnect.relationship_epoch,
@@ -7244,12 +7582,16 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     const Digest128 expected_recovery_witness_digest =
         compute_r2_recovery_witness_digest(
             expected_recovery_begin, expected_recovery_witnesses);
+    phase = "recover-r2-link";
     const R2RecoveryResult recovered = co_await client.recover_r2_link(
         recovery_socket, reconnect, witnesses, 0, reset_operation,
         initial_hello.relationship_epoch + 1, replacement_nonce, deadline);
     observed_reset_epoch = recovered.reset_request.new_relationship_epoch;
-    require(recovered.committed_receipts.empty() &&
-                recovered.reset_request.settled_prefix_k == 0 &&
+    const uint64_t expected_settled_prefix = committed_cut ? 1 : 0;
+    require(recovered.committed_receipts.size() ==
+                    static_cast<size_t>(committed_cut) &&
+                recovered.reset_request.settled_prefix_k ==
+                    expected_settled_prefix &&
                 recovered.reset_request.operation_id == reset_operation &&
                 recovered.reset_request.new_history_nonce == replacement_nonce &&
                 recovered.reset_ack.request == recovered.reset_request &&
@@ -7261,28 +7603,57 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
                 recovered.reset_ack.recovery_witness_digest ==
                     expected_recovery_witness_digest &&
                 recovered.reset_ack.unavailable_suffix_mask == 0,
-            "partial R2 frame recovery did not settle the exact empty prefix");
+            "partial R2 frame recovery did not settle the exact witnessed prefix");
 
     authority.reset_r2_route_for_recovery(
         route, recovered.link_state.f_store_guid, replacement_nonce);
-    authority.rebuild_r2_entry_for_recovery(
-        prepared, recovered.link_state.f_system_source_fingerprint);
-    JobBind replay_binding = initial_binding;
-    replay_binding.physical_link_generation =
-        reconnect.physical_link_generation;
-    const R2SentBundle replayed = co_await client.write_r2_bundle(
-        recovery_socket, replay_binding, prepared, deadline,
-        EndpointIoControl{.max_write_fragment = 1});
-    ClientRunResult receipt = co_await client.read_r2_receipt(
-        recovery_socket, replayed, deadline);
-    require(receipt.status == ClientRunStatus::Committed &&
-                receipt.committed_input.has_value() &&
-                receipt.committed_input->tu_seq == initial_binding.tu_seq &&
-                receipt.committed_commit &&
-                receipt.committed_commit->raw_digest ==
-                    initial_binding.raw_digest,
-            "R2 frame recovery did not return the exact source commit");
-    co_await client.write_r2_ack(recovery_socket, 1, deadline);
+    ClientRunResult receipt;
+    if (committed_cut) {
+        require(recovered.committed_receipts.front().relationship_ordinal == 1 &&
+                    recovered.committed_receipts.front().binding_digest ==
+                        witnesses.front().binding_digest &&
+                    recovered.committed_receipts.front().transaction_digest ==
+                        witnesses.front().transaction_digest &&
+                    recovered.committed_receipts.front().inner.history_nonce ==
+                        witnesses.front().begin.inner.history_nonce &&
+                    recovered.committed_receipts.front().inner.rel_seq ==
+                        witnesses.front().begin.inner.rel_seq &&
+                    recovered.committed_receipts.front().inner.tu_seq ==
+                        witnesses.front().begin.inner.tu_seq &&
+                    recovered.committed_receipts.front().inner.transaction_digest ==
+                        witnesses.front().begin.inner.transaction_digest &&
+                    recovered.committed_receipts.front().inner.raw_digest ==
+                        witnesses.front().begin.inner.raw_digest,
+                "recovery did not return the exact unobserved TX_COMMIT");
+        receipt.status = ClientRunStatus::Committed;
+        receipt.committed_input =
+            InputRecordKey{initial_hello.c_store_guid,
+                           initial_binding.tu_seq};
+        receipt.committed_commit = recovered.committed_receipts.front().inner;
+    } else {
+        phase = "replay-bundle";
+        authority.rebuild_r2_entry_for_recovery(
+            prepared, recovered.link_state.f_system_source_fingerprint);
+        JobBind replay_binding = initial_binding;
+        replay_binding.physical_link_generation =
+            reconnect.physical_link_generation;
+        const R2SentBundle replayed = co_await client.write_r2_bundle(
+            recovery_socket, replay_binding, prepared, deadline,
+            EndpointIoControl{.max_write_fragment = 1});
+        phase = "replay-receipt";
+        receipt = co_await client.read_r2_receipt(
+            recovery_socket, replayed, deadline);
+        require(receipt.status == ClientRunStatus::Committed &&
+                    receipt.committed_input.has_value() &&
+                    receipt.committed_input->tu_seq ==
+                        initial_binding.tu_seq &&
+                    receipt.committed_commit &&
+                    receipt.committed_commit->raw_digest ==
+                        initial_binding.raw_digest,
+                "R2 frame recovery did not return the exact source commit");
+        phase = "replay-ack";
+        co_await client.write_r2_ack(recovery_socket, 1, deadline);
+    }
     const ResetConfirm duplicate_confirm{
         reconnect.relationship_id,
         recovered.reset_request.new_relationship_epoch,
@@ -7290,6 +7661,7 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
         reset_operation,
         replacement_nonce,
         recovered.reset_request.settled_prefix_k};
+    phase = "duplicate-confirm";
     co_await raw_write(recovery_socket, Message{duplicate_confirm});
     require(raw_decode<ResetConfirm>(co_await raw_read(
                 recovery_socket, kInitialMaxFramePayload)) == duplicate_confirm,
@@ -7310,8 +7682,15 @@ asio::awaitable<void> r2_two_accepts(
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket first_socket(executor);
     co_await acceptor.async_accept(first_socket, asio::use_awaitable);
-    first = co_await server.run_adopted_r2(std::move(first_socket),
-                                           std::move(first_control));
+    try {
+        first = co_await server.run_adopted_r2(std::move(first_socket),
+                                               std::move(first_control));
+    } catch (const boost::system::system_error& error) {
+        if (error.code() != asio::error::eof &&
+            error.code() != asio::error::connection_reset)
+            throw;
+        first.status = ServerRunStatus::Disconnected;
+    }
     first_done = true;
     tcp::socket second_socket(executor);
     co_await acceptor.async_accept(second_socket, asio::use_awaitable);
@@ -7319,10 +7698,25 @@ asio::awaitable<void> r2_two_accepts(
                                             std::move(second_control));
 }
 
-void test_r2_fragmented_frame_interruption_recovery() {
+void test_r2_fragmented_frame_interruption_recovery(
+    bool exhaustive_f_to_c_commit_cuts = false) {
+    R2TxCommit commit_frame_shape;
+    commit_frame_shape.relationship_ordinal = 1;
+    commit_frame_shape.binding_digest = icecc::digest128("D03 binding");
+    commit_frame_shape.transaction_digest =
+        icecc::digest128("D03 transaction");
+    commit_frame_shape.inner.history_nonce = HistoryNonce{1};
+    const size_t r2_commit_frame_bytes =
+        encode_frame(Message{commit_frame_shape}).size();
+    require(r2_commit_frame_bytes > 5,
+            "D03 R2_TX_COMMIT frame unexpectedly small");
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
-        const size_t case_count = profile == ProfileId::P29V1 ? 9 : 8;
+        const auto profile_started = std::chrono::steady_clock::now();
+        const size_t base_case_count = profile == ProfileId::P29V1 ? 9 : 8;
+        const size_t commit_cut_count = exhaustive_f_to_c_commit_cuts
+            ? r2_commit_frame_bytes - 1 : 0;
+        const size_t case_count = base_case_count + commit_cut_count;
         for (size_t case_index = 0; case_index != case_count; ++case_index) {
             const uint64_t case_number = case_index + 1;
             const P5coStoreGuids stores = p5co_store_guids(
@@ -7360,6 +7754,13 @@ void test_r2_fragmented_frame_interruption_recovery() {
             if (profile == ProfileId::P29V1)
                 cut_cases.push_back(
                     {MessageType::R2_FILL, 0, 5, "R2_FILL payload"});
+            if (exhaustive_f_to_c_commit_cuts) {
+                for (size_t prefix = 1; prefix < r2_commit_frame_bytes; ++prefix)
+                    cut_cases.push_back(
+                        {MessageType::R2_TX_COMMIT, 0, prefix,
+                         "F-to-C R2_TX_COMMIT byte offset",
+                         R2FrameDirection::FToClient});
+            }
             require(cut_cases.size() == case_count &&
                         case_index < cut_cases.size(),
                     "R2 frame cut case count diverged from its plan");
@@ -7419,6 +7820,7 @@ void test_r2_fragmented_frame_interruption_recovery() {
             unsigned bind_count = 0;
             bool reset_committed = false;
             std::optional<ResetRequest> retained_reset;
+            std::optional<R2TxCommit> committed_receipt;
             uint64_t recovery_floor_a = 0;
             uint64_t recovery_prefix_p = 0;
             Digest128 recovery_witness_digest{};
@@ -7438,7 +7840,7 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     observed.start_mode == LinkStartMode::Reconnect;
                 lease.relationship_epoch = hello.relationship_epoch;
                 lease.history_nonce = hello.history_nonce;
-                lease.committed_prefix_k = 0;
+                lease.committed_prefix_k = committed_receipt ? 1 : 0;
                 lease.acknowledged_prefix_q = 0;
                 return {P51SourceLinkLookupStatus::Found, std::move(lease)};
             };
@@ -7513,9 +7915,19 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     begin.physical_link_generation;
                 interval.end.operation_id = begin.operation_id;
                 interval.end.verified_floor_a = 0;
-                interval.end.committed_prefix_k = 0;
+                interval.end.committed_prefix_k = committed_receipt ? 1 : 0;
                 interval.end.acknowledged_prefix_q = 0;
-                interval.end.receipt_count = 0;
+                interval.end.receipt_count = committed_receipt ? 1 : 0;
+                if (committed_receipt) {
+                    ReceiptRow row;
+                    row.relationship_id = begin.relationship_id;
+                    row.relationship_epoch = begin.relationship_epoch;
+                    row.physical_link_generation =
+                        begin.physical_link_generation;
+                    row.operation_id = begin.operation_id;
+                    row.receipt = *committed_receipt;
+                    interval.rows.push_back(std::move(row));
+                }
                 return interval;
             };
             config.validate_p51_reset =
@@ -7528,7 +7940,8 @@ void test_r2_fragmented_frame_interruption_recovery() {
                         hello.relationship_epoch + 1 ||
                     request.physical_link_generation !=
                         observed.physical_link_generation ||
-                    request.settled_prefix_k != 0 ||
+                    request.settled_prefix_k !=
+                        static_cast<uint64_t>(committed_receipt.has_value()) ||
                     request.old_history_nonce != hello.history_nonce ||
                     request.operation_id == Id128{} ||
                     (retained_reset && *retained_reset != request))
@@ -7552,7 +7965,7 @@ void test_r2_fragmented_frame_interruption_recovery() {
             };
             config.confirm_p51_reset =
                 [&](const LinkHello& observed, const ResetConfirm& confirm) {
-                return reset_committed &&
+                const bool accepted = reset_committed &&
                        observed.start_mode == LinkStartMode::Reconnect &&
                        retained_reset &&
                        confirm.relationship_id == hello.relationship_id &&
@@ -7563,7 +7976,9 @@ void test_r2_fragmented_frame_interruption_recovery() {
                        confirm.operation_id == retained_reset->operation_id &&
                        confirm.new_history_nonce ==
                            retained_reset->new_history_nonce &&
-                       confirm.settled_prefix_k == 0;
+                       confirm.settled_prefix_k ==
+                           retained_reset->settled_prefix_k;
+                return accepted;
             };
             config.record_p51_job_commit =
                 [&](const LinkHello& observed, const JobBind& offered,
@@ -7577,6 +7992,7 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     commit.inner.tu_seq != binding.tu_seq ||
                     commit.inner.raw_digest != binding.raw_digest)
                     return false;
+                committed_receipt = commit;
                 ++commit_count;
                 return true;
             };
@@ -7612,6 +8028,7 @@ void test_r2_fragmented_frame_interruption_recovery() {
             std::optional<ClientRunResult> client_result;
             std::exception_ptr server_error;
             std::exception_ptr client_error;
+            std::string client_phase = "scheduled";
             std::exception_ptr proxy_error;
             R2ProxyCutResult proxy_cut_result;
             std::vector<MessageType> proxy_observed_frames;
@@ -7680,7 +8097,7 @@ void test_r2_fragmented_frame_interruption_recovery() {
                     client, *authority, route, hello, binding, prepared,
                     cut,
                     job_deadline.as_steady_time_point(), first_result,
-                    first_done, observed_reset_epoch, bind_count,
+                    first_done, client_phase, observed_reset_epoch, bind_count,
                     materializations, commit_count),
                 [&](std::exception_ptr error, ClientRunResult result) {
                     client_error = error;
@@ -7692,6 +8109,45 @@ void test_r2_fragmented_frame_interruption_recovery() {
             context.run();
             require(!timed_out && server_done && client_done && proxy_done,
                     "fragmented R2 frame recovery exceeded the watchdog");
+            const auto report_error = [&](const char* who,
+                                          const std::exception_ptr& error) {
+                if (!error)
+                    return;
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& detail) {
+                    std::cerr << "FRAME_RECOVERY_EXCEPTION profile="
+                              << static_cast<unsigned>(profile)
+                              << " cut=" << r2_cut_message_name(cut.type)
+                              << " direction="
+                              << (cut.direction == R2FrameDirection::ClientToF
+                                      ? "C-F" : "F-C")
+                              << " who=" << who
+                              << (std::string_view(who) == "client"
+                                      ? " phase=" + client_phase : "")
+                              << " detail=" << detail.what() << '\n';
+                }
+            };
+            report_error("server", server_error);
+            report_error("client", client_error);
+            report_error("proxy", proxy_error);
+            if (server_error || client_error || proxy_error) {
+                std::cerr << "FRAME_RECOVERY_STATE first="
+                          << static_cast<unsigned>(first_result.status)
+                          << " second="
+                          << static_cast<unsigned>(second_result.status)
+                          << " cut-type="
+                          << r2_cut_message_name(proxy_cut_result.cut_frame_type)
+                          << " cut-prefix=" << proxy_cut_result.cut_prefix_bytes
+                          << '/' << proxy_cut_result.cut_frame_bytes
+                          << " observed=";
+                for (const MessageType type : proxy_observed_frames)
+                    std::cerr << r2_cut_message_name(type) << ',';
+                std::cerr << " forwarded=";
+                for (const MessageType type : proxy_fully_forwarded_frames)
+                    std::cerr << r2_cut_message_name(type) << ',';
+                std::cerr << '\n';
+            }
             if (server_error)
                 std::rethrow_exception(server_error);
             if (client_error)
@@ -7707,7 +8163,9 @@ void test_r2_fragmented_frame_interruption_recovery() {
                         first_link.physical_link_generation ==
                             hello.physical_link_generation &&
                         first_link.relationship_id == hello.relationship_id &&
-                        first_k == 0 && first_q == 0 &&
+                        first_k == static_cast<uint64_t>(
+                            cut.direction == R2FrameDirection::FToClient) &&
+                        first_q == 0 &&
                         second_link.c_store_guid == hello.c_store_guid &&
                         second_link.f_store_guid == hello.f_store_guid &&
                         second_link.physical_link_generation ==
@@ -7716,9 +8174,13 @@ void test_r2_fragmented_frame_interruption_recovery() {
                         second_link.relationship_epoch == observed_reset_epoch &&
                         second_k == 1 && second_q == 1,
                     "post-close R2 events lost exact physical identity or K/Q");
-            std::vector<MessageType> expected_completed{
-                MessageType::LINK_HELLO};
-            switch (cut.type) {
+            std::vector<MessageType> expected_completed;
+            if (cut.direction == R2FrameDirection::FToClient) {
+                expected_completed.push_back(MessageType::LINK_STATE);
+            } else {
+                expected_completed.push_back(MessageType::LINK_HELLO);
+            }
+            if (cut.direction == R2FrameDirection::ClientToF) switch (cut.type) {
             case MessageType::JOB_BIND:
                 break;
             case MessageType::TU_BEGIN:
@@ -7739,6 +8201,8 @@ void test_r2_fragmented_frame_interruption_recovery() {
                 break;
             default:
                 throw std::logic_error("unexpected R2 frame cut target");
+            } else if (cut.type != MessageType::R2_TX_COMMIT) {
+                throw std::logic_error("unexpected F-to-C R2 frame cut target");
             }
             std::vector<MessageType> expected_observed = expected_completed;
             expected_observed.push_back(cut.type);
@@ -7749,7 +8213,8 @@ void test_r2_fragmented_frame_interruption_recovery() {
                                   MessageType::TU_END) ==
                     proxy_fully_forwarded_frames.end();
             const unsigned expected_bind_count =
-                cut.type == MessageType::JOB_BIND ? 1 : 2;
+                (cut.direction == R2FrameDirection::FToClient ||
+                 cut.type == MessageType::JOB_BIND) ? 1 : 2;
             if (first_result.status != ServerRunStatus::Disconnected ||
                 second_result.status != ServerRunStatus::Completed ||
                 proxy_cut_result.cut_frame_type != cut.type ||
@@ -7758,7 +8223,9 @@ void test_r2_fragmented_frame_interruption_recovery() {
                 !expected_prefix || !client_result ||
                 client_result->status != ClientRunStatus::Committed ||
                 !retained_reset || bind_count != expected_bind_count ||
-                materializations != 1 || commit_count != 1 || ack_count != 1) {
+                materializations != 1 || commit_count != 1 ||
+                ack_count != (cut.direction == R2FrameDirection::FToClient
+                                  ? 0U : 1U)) {
                 std::cerr << "FRAME_RECOVERY_DIAG profile="
                           << static_cast<unsigned>(profile)
                           << " case=" << case_index
@@ -7795,7 +8262,9 @@ void test_r2_fragmented_frame_interruption_recovery() {
                         client_result->status == ClientRunStatus::Committed &&
                         retained_reset && bind_count == expected_bind_count &&
                         materializations == 1 && commit_count == 1 &&
-                        ack_count == 1 &&
+                        ack_count == (cut.direction ==
+                                              R2FrameDirection::FToClient
+                                          ? 0U : 1U) &&
                         std::chrono::steady_clock::now() - started <
                             std::chrono::seconds(20),
                     "fragmented R2 frame interruption did not recover exactly once");
@@ -7816,7 +8285,22 @@ void test_r2_fragmented_frame_interruption_recovery() {
                       << " fwd-complete="
                       << proxy_fully_forwarded_frames.size()
                       << " bind-consumes=" << bind_count
-                      << " exact-replay-once: ok\n";
+                      << (cut.direction == R2FrameDirection::FToClient
+                              ? " recovered-commit-no-replay: ok\n"
+                              : " exact-replay-once: ok\n")
+                      << std::flush;
+        }
+        if (exhaustive_f_to_c_commit_cuts) {
+            const auto elapsed = std::chrono::duration_cast<
+                std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                           profile_started).count();
+            std::cout << "P51_R2_D03_COMMIT_CUTS profile="
+                      << static_cast<unsigned>(profile)
+                      << " partial-offsets=" << r2_commit_frame_bytes - 1
+                      << " cases=" << case_count
+                      << " frame-bytes=" << r2_commit_frame_bytes
+                      << " elapsed-ms=" << elapsed
+                      << " recovery-KQ=1/1 no-replay: ok\n" << std::flush;
         }
     }
 }
@@ -10266,6 +10750,22 @@ int main(int argc, char** argv) {
     if (std::getenv("ICECC_P50_R2_FRAGMENT_SUCCESS_FOCUS") != nullptr) {
         test_r2_fragmented_one_job_each_profile();
         std::cout << "p50_endpoint_test: focused fragmented R2 success all profiles PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_R2_D03_HELLO_CUTS_FOCUS") != nullptr) {
+        test_r2_partial_hello_exhaustive_offsets();
+        std::cout << "p50_endpoint_test: focused D03 HELLO cuts all profiles PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_R2_D03_COMMIT_CUTS_FOCUS") != nullptr) {
+        test_r2_fragmented_frame_interruption_recovery(true);
+        std::cout << "p50_endpoint_test: focused D03 COMMIT cut recovery all profiles PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_R2_D03_HELLO_ACK_CUTS_FOCUS") != nullptr) {
+        test_r2_partial_hello_exhaustive_offsets();
+        test_r2_fragmented_frame_interruption_recovery(true);
+        std::cout << "p50_endpoint_test: focused D03 HELLO/COMMIT cut recovery all profiles PASS\n";
         return 0;
     }
     if (std::getenv("ICECC_P50_R2_FRAGMENT_FRAME_RECOVERY_FOCUS") != nullptr ||
