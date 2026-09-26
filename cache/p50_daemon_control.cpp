@@ -17,6 +17,7 @@ constexpr uint16_t kHandoffVersion = 1;
 constexpr uint16_t kRequest = 1;
 constexpr uint16_t kAck = 2;
 constexpr uint32_t kAckCode = 1;
+constexpr auto kConnectRetryDelay = std::chrono::milliseconds(5);
 constexpr std::array<uint8_t, 4> kMagic{'P', '5', '0', 'F'};
 
 void put16(uint8_t* p, uint16_t v) noexcept { p[0] = v >> 8; p[1] = v; }
@@ -96,6 +97,8 @@ DaemonControlOperation::DaemonControlOperation(DaemonControlOperation&& other) n
       phase_(other.phase_), status_(other.status_), deadline_(other.deadline_),
       limits_(other.limits_), credentials_(other.credentials_), operation_(other.operation_),
       connect_path_(std::move(other.connect_path_)),
+      connect_retry_at_(other.connect_retry_at_),
+      connect_retry_waiting_(other.connect_retry_waiting_),
       hello_(std::move(other.hello_)),
       control_(std::move(other.control_)), handoff_(other.handoff_), ack_(other.ack_),
       frame_read_(std::move(other.frame_read_)), frame_expected_(other.frame_expected_),
@@ -106,6 +109,7 @@ DaemonControlOperation::DaemonControlOperation(DaemonControlOperation&& other) n
       lifecycle_result_(other.lifecycle_result_),
       source_transfer_result_(other.source_transfer_result_) {
     other.fd_ = -1; other.transfer_fd_ = -1; other.own_fd_ = false;
+    other.connect_retry_waiting_ = false;
     other.status_ = DaemonControlStatus::Idle;
 }
 
@@ -117,6 +121,8 @@ DaemonControlOperation& DaemonControlOperation::operator=(DaemonControlOperation
     phase_ = other.phase_; status_ = other.status_; deadline_ = other.deadline_;
     limits_ = other.limits_; credentials_ = other.credentials_; operation_ = other.operation_;
     connect_path_ = std::move(other.connect_path_);
+    connect_retry_at_ = other.connect_retry_at_;
+    connect_retry_waiting_ = other.connect_retry_waiting_;
     hello_ = std::move(other.hello_);
     control_ = std::move(other.control_); handoff_ = other.handoff_; ack_ = other.ack_;
     frame_read_ = std::move(other.frame_read_); frame_expected_ = other.frame_expected_;
@@ -127,6 +133,7 @@ DaemonControlOperation& DaemonControlOperation::operator=(DaemonControlOperation
     lifecycle_result_ = other.lifecycle_result_;
     source_transfer_result_ = other.source_transfer_result_;
     other.fd_ = -1; other.transfer_fd_ = -1; other.own_fd_ = false;
+    other.connect_retry_waiting_ = false;
     other.status_ = DaemonControlStatus::Idle;
     return *this;
 }
@@ -137,6 +144,8 @@ void DaemonControlOperation::close_fd() noexcept {
     if (transfer_fd_ >= 0) ::close(transfer_fd_);
     transfer_fd_ = -1;
     connect_path_.clear();
+    connect_retry_at_ = {};
+    connect_retry_waiting_ = false;
 }
 
 void DaemonControlOperation::fail(DaemonControlStatus status) noexcept {
@@ -192,9 +201,16 @@ DaemonControlStatus DaemonControlOperation::begin(
     if (started != DaemonControlStatus::InProgress) return started;
     if (result == 0) phase_ = Phase::WriteHello;
     else if (connect_errno == EINPROGRESS || connect_errno == EALREADY ||
-             connect_errno == EAGAIN || connect_errno == EINTR)
+             connect_errno == EINTR)
         phase_ = Phase::Connecting;
-    else { fail(DaemonControlStatus::Disconnected); }
+    else if (connect_errno == EAGAIN) {
+        connect_path_ = path;
+        phase_ = Phase::ConnectPending;
+        connect_retry_waiting_ = true;
+        connect_retry_at_ = std::chrono::steady_clock::now() + kConnectRetryDelay;
+    } else {
+        fail(DaemonControlStatus::Disconnected);
+    }
     return status_;
 }
 
@@ -249,6 +265,8 @@ DaemonControlStatus DaemonControlOperation::begin_connected(
     // frame and checked against expected_ on the receiving side.
     handoff_ = handoff_wire(kRequest, operation, 0);
     connect_path_.clear();
+    connect_retry_at_ = {};
+    connect_retry_waiting_ = false;
     phase_ = Phase::WriteHello; status_ = DaemonControlStatus::InProgress;
     offset_ = ack_offset_ = 0; frame_read_.clear(); frame_expected_ = 0;
     rights_sent_ = false; peer_queried_ = false; peer_.reset();
@@ -355,6 +373,8 @@ DaemonControlStatus DaemonControlOperation::begin_connecting(
     // owns exactly one connect completion action and enters WriteHello only
     // after that action succeeds.
     connect_path_ = path;
+    connect_retry_at_ = {};
+    connect_retry_waiting_ = false;
     phase_ = Phase::ConnectPending;
     return status_;
 }
@@ -371,6 +391,22 @@ short DaemonControlOperation::desired_events() const noexcept {
         phase_ == Phase::WriteLifecycleGoodbye)
         return POLLOUT;
     return POLLIN;
+}
+
+std::chrono::steady_clock::time_point DaemonControlOperation::next_wakeup() const noexcept {
+    if (status_ != DaemonControlStatus::InProgress) return {};
+    if (connect_retry_waiting_ && connect_retry_at_ < deadline_) return connect_retry_at_;
+    return deadline_;
+}
+
+bool DaemonControlOperation::timer_due(
+    std::chrono::steady_clock::time_point now) const noexcept {
+    return status_ == DaemonControlStatus::InProgress &&
+           ((connect_retry_waiting_ && now >= connect_retry_at_) || now >= deadline_);
+}
+
+bool DaemonControlOperation::wants_poll() const noexcept {
+    return status_ == DaemonControlStatus::InProgress && !connect_retry_waiting_;
 }
 
 bool DaemonControlOperation::write_bytes(size_t& offset, const std::vector<uint8_t>& bytes,
@@ -729,6 +765,15 @@ DaemonControlStatus DaemonControlOperation::advance(
     if (status_ != DaemonControlStatus::InProgress) return status_;
     last_calls_ = last_bytes_ = 0;
     if (now >= deadline_) { fail(DaemonControlStatus::Timeout); return status_; }
+    if (phase_ == Phase::ConnectPending && connect_retry_waiting_) {
+        if ((revents & POLLNVAL) != 0) {
+            fail(DaemonControlStatus::Disconnected);
+            return status_;
+        }
+        if (now < connect_retry_at_) return status_;
+        connect_retry_waiting_ = false;
+        connect_retry_at_ = {};
+    }
     // POLLHUP/ERR may be reported together with readable bytes.  Consume
     // those bytes first so a coalesced final frame is not discarded; only a
     // wake with no readable payload is an immediate disconnect.
@@ -765,7 +810,10 @@ DaemonControlStatus DaemonControlOperation::advance(
         if (result == 0) {
             connect_path_.clear();
             phase_ = Phase::WriteHello;
-        } else if (errno == EINPROGRESS || errno == EALREADY || errno == EAGAIN) {
+        } else if (errno == EAGAIN) {
+            connect_retry_waiting_ = true;
+            connect_retry_at_ = now + kConnectRetryDelay;
+        } else if (errno == EINPROGRESS || errno == EALREADY) {
             connect_path_.clear();
             phase_ = Phase::Connecting;
         } else if (errno != EINTR) {
@@ -1117,11 +1165,11 @@ size_t DaemonControlPollAdapter::advance_ready(
         DaemonControlOperation& operation = *operations_[index].operation;
         const short requested = operation.desired_events();
         const short terminal = POLLERR | POLLHUP | POLLNVAL;
-        const bool ready = index < revents.size() &&
+        const bool ready = index < revents.size() && operation.wants_poll() &&
                            ((revents[index] & requested) != 0 ||
                             (revents[index] & terminal) != 0);
         if (operation.status() == DaemonControlStatus::InProgress &&
-            (ready || operation.deadline_expired(now))) {
+            (ready || operation.timer_due(now))) {
             operation.advance(now, ready ? revents[index] : 0); ++advanced;
         }
     }

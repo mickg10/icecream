@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### Local control connection backlog recovery
+
+AF_UNIX connect EAGAIN now preserves the pathname and schedules a 5 ms retry,
+rather than treating an unconnected socket as an in-progress connection.
+The poll owner omits that descriptor during the wait, including ERR/HUP,
+and wakes at the earlier of retry time and the original absolute deadline.
+Both initial connection entry points are covered; connected operation paths
+retain their existing behavior. There is no new wire message or backlog-size
+workaround.
+
+The daemon-control suite passes with the fix. Its regression fills the accept
+queue, checks an early turn performs no retry, drains the queue and completes
+HELLO/control/descriptor handoff/ACK on the same operation. A never-drained
+case expires at the original deadline. Restoring the old EAGAIN branch makes
+the new regression fail at `!sender.wants_poll()`. The changed sidecar adapter
+translation unit also compiles; broader adapter runtime qualification is
+still pending, and the combined service failure below remains open.
+
+Qualified donor: `536dc696`. Test binary SHA256:
+`8ddc058a9675cdeaf0312740efd841cb174ad8246176bec2c56396ab822047d5`.
+Retained log: `/tanksmall/scratch/tmp/p51-w30-backlog-luna/p50daemoncontrol-88b339e2.log`
+(filename retained across the final test-only hardening), SHA256
+`f62010246ac009cb99e2eb8bec6d87ea28bce14f32b8ff729aaf0854e45f48ee`.
+
 ### Reset boundaries and terminal reconnect
 
 The default service suite now includes all 93 profile × K=0..30 boundary

@@ -937,7 +937,7 @@ std::chrono::steady_clock::time_point
 DaemonSidecarAdapter::outer_input_next_deadline() const noexcept
 {
     return outer_input_operation_ != nullptr
-               ? outer_input_operation_->deadline()
+               ? outer_input_operation_->next_wakeup()
                : std::chrono::steady_clock::time_point{};
 }
 
@@ -2715,7 +2715,7 @@ void DaemonSidecarAdapter::outer_append_pollfds(
             outer_auth_phase_ == 4 || outer_auth_phase_ == 5)
                ? static_cast<short>(POLLOUT | POLLERR | POLLHUP)
                                   : static_cast<short>(POLLIN | POLLERR | POLLHUP));
-    if (outer_input_operation_ != nullptr)
+    if (outer_input_operation_ != nullptr && outer_input_operation_->wants_poll())
         append(outer_input_operation_->native_handle(),
                outer_input_operation_->desired_events() | POLLERR | POLLHUP);
 }
@@ -2741,8 +2741,8 @@ DaemonSidecarAdapter::outer_next_deadline() const noexcept
         deadline = outer_auth_deadline_;
     if (outer_input_operation_ != nullptr &&
         (deadline == std::chrono::steady_clock::time_point{} ||
-         outer_input_operation_->deadline() < deadline))
-        deadline = outer_input_operation_->deadline();
+         outer_input_operation_->next_wakeup() < deadline))
+        deadline = outer_input_operation_->next_wakeup();
     if (outer_input_operation_ == nullptr && !pending_input_lifecycle_.empty() &&
         pending_input_lifecycle_.front().deadline !=
             std::chrono::steady_clock::time_point{} &&
