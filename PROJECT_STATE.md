@@ -55,6 +55,29 @@ adoptions. Run `5bfecb2a670d4e48a884b5f5ef81b0c0` under
 Executed runner matches the fresh source snapshot at SHA256
 `494f59f23639813949b2e8ffb77e2035d27df5ffe05b2bee7ece8df4c8024ebc`.
 
+The same private fresh-build closure also passes both ordered chain gates,
+three profiles each: F→C (`p51-restart-chain-w30`) and scheduler→F
+(`p51-scheduler-f-restart-w30`). The latter observes 30+30+30 receipt windows
+per profile. Under the same `opt-in-gates/` artifact root:
+F→C run `ec481f8406be4c29ab3c15a5712e92e6`, log SHA256
+`6ea5c3ce23d9825d1d2ca01b941b6c38acf3c4c7124de356942b9d98bd8a161f`;
+scheduler→F run `da8aa6f6db2243a6b890c0a32e91be7e`, log SHA256
+`5108ec373db1ed7ff378f360d33fe0f257e9b1f79e9c90948c44f2e519c14d0b`.
+Both exit 0. The scheduler→F container's actual mounted source and binary
+hashes were checked during execution. This supersedes the earlier
+source-attribution uncertainty for qualification of that scenario, without
+retroactively changing the older run's evidence.
+
+On exact `173dd1c4`, `make protocol50-pipeline-formal` also exits 0 with
+pinned TLC 1.7.4 (jar SHA256
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`):
+recovery lane 44 rows; replacement lane six safety rows, six witnesses,
+two reset-confirm witnesses and four expected counterexamples.
+Log `/tanksmall/scratch/tmp/p51-c03-public-173dd1c4-scratch/formal-pipeline-1/run.log`
+SHA256 `bfa65f798103c04cc9c8259fd32242e0a2ded2f20c5376723ece0858577c6a29`.
+This is the bounded two-lane pipeline target, not the broader formal
+aggregate, an unbounded liveness proof or a proof of C++ refinement.
+
 ### Partial HELLO and commit-reply interruption coverage
 
 The D03 endpoint tests now cover 555 incomplete HELLO prefixes across the
@@ -117,8 +140,8 @@ invalid deadline-input rejection. The later S→F run also passes all three
 profiles against frozen product binaries, but its exact executed source
 mount/hash has not been independently recovered. Do not treat its reported
 `b270a223` identity as qualified combined-tree evidence. Fresh combined-source
-verification of S→F remains pending; the corrected compiler-loss rerun is
-qualified separately above.
+verification of S→F is provided by the later fresh-build run above; the
+corrected compiler-loss rerun is also qualified separately above.
 
 Run `b5968616788f4e668025ec13fbfe84d3` retains its gate log under
 `repair-gate-work/artifacts/opt-in-gates/` in the artifact root below, SHA256
