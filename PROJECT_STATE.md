@@ -97,6 +97,27 @@ This run uses the cancellation checkpoint plus the endpoint const-reference
 fix `923924bb`, not the later four-link test hook. Prior compile/link setup
 failures are retained as `staged-cancel-asan.log`, `-r2.log` and `-r3.log`.
 
+### Full-bundle cancellation cohort
+
+Commit `47bfeb64` adds a default-registered 31-request cohort with cancellation
+at submission indices 0/15/30 for each profile. The focused
+`p50cacheservice --d07-full-cancel` run passed all nine cases, exit 0. An exact
+F-side request/reservation/TU observation proves the complete selected bundle
+has reached the materializer before publication and before a positive receipt.
+The test checks one accepted cancellation/retirement, absent target input under
+a still-live deadline, 30 exact survivors, receipt identities, contiguous
+logical ordinals, unique TUs and operation/raw credit drainage.
+
+Log `/tanksmall/scratch/tmp/p51-d07-full31-923924bb-logs/full31-focused-r4.log`
+SHA256 `93c5321b957305ae140c433b372860b4d84e22a58a5fdee9ce633636bc8c4ee4`;
+binary SHA256 `b8db791717f9ffc0b67a73cc7b7f8d606f0887461fadee91a8e9ae345eb3808b`.
+Earlier attempts exposed fixture cleanup that could leave a worker held on
+assertion failure and an invalid comparison of logical ordinal with the
+separate codec sequence number. Both were corrected without extending the
+original transfer deadlines. Full registered-suite regression remains pending;
+partial-byte and already-committed 31-request cancellation are not covered by
+this result.
+
 ### Source admission pressure
 
 The four-link overlap gate is integrated in `6d6276f6` from donor `321302e1`.
