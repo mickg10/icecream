@@ -57,6 +57,12 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
         owner_config.after_r2_recovery_receipt_settled_for_test;
     result.disconnect_r2_before_replay_bundle_for_test =
         owner_config.disconnect_r2_before_replay_bundle_for_test;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    result.before_r2_first_bundle_write_for_test =
+        owner_config.before_r2_first_bundle_write_for_test;
+    result.r2_prewrite_cancelled_for_test =
+        owner_config.r2_prewrite_cancelled_for_test;
+#endif
     return result;
 }
 
@@ -333,7 +339,8 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
     P50RouteRelationship relationship, P51SourceArmedFields armed,
     AsyncConnectedFdFactory connection, PrepareRequestKey request,
     std::chrono::steady_clock::time_point deadline,
-    std::span<const uint8_t> source) {
+    std::span<const uint8_t> source,
+    std::shared_ptr<P51RequestCancellation> cancellation) {
     if (!relationship.valid() || !armed.valid() || !connection ||
         request.producer_session != armed.arm.source.assignment_epoch ||
         request.request_token != armed.arm.source.assignment_nonce ||
@@ -538,7 +545,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer_p51(
     }
     ZstdSourceTransferResult result = co_await sender->transfer_p51_route(
         std::move(armed), physical_generation, std::move(connection), request,
-        deadline, source);
+        deadline, source, std::move(cancellation));
     const auto current = owners_.find(relationship);
     bool still_current = current != owners_.end() &&
                          current->second == sender;

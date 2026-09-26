@@ -19,7 +19,9 @@
 #include <grp.h>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/use_future.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <string_view>
@@ -1838,6 +1840,7 @@ struct PendingP51Transfer {
         : connection(std::move(socket)), identity(daemon_identity),
           operation(std::move(control_operation)), request(std::move(source_request)),
           source(std::move(source_fd)), operation_count(operation_count),
+          cancellation(std::make_shared<P51RequestCancellation>()),
           accepted_at(collect_metrics ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{}),
           collect_metrics(collect_metrics) {}
@@ -1856,6 +1859,7 @@ struct PendingP51Transfer {
     std::atomic<size_t>* operation_count = nullptr;
     std::atomic<bool> slot_released{false};
     std::atomic<bool> cancel_requested{false};
+    std::shared_ptr<P51RequestCancellation> cancellation;
     std::chrono::steady_clock::time_point accepted_at{};
     std::chrono::steady_clock::time_point credit_granted_at{};
     std::chrono::steady_clock::time_point read_started_at{};
@@ -2314,6 +2318,10 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
         config_.after_r2_recovery_receipt_settled_for_test;
     route_config.disconnect_r2_before_replay_bundle_for_test =
         config_.disconnect_r2_before_replay_bundle_for_test;
+    route_config.before_r2_first_bundle_write_for_test =
+        config_.before_r2_first_bundle_write_for_test;
+    route_config.r2_prewrite_cancelled_for_test =
+        config_.r2_prewrite_cancelled_for_test;
 #endif
     const std::weak_ptr<std::atomic<bool>> route_owner_alive =
         route_owner_callback_alive_;
@@ -3548,6 +3556,60 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                 local::P50SourceTransferResult result =
                     source_transfer_error(kInvalid);
                 ZstdSourceTransferResult observed;
+                std::shared_ptr<boost::asio::posix::stream_descriptor>
+                    cancellation_watch;
+                bool cancellation_watch_ready = false;
+                int cancellation_fd = -1;
+                try {
+                    cancellation_fd = ::fcntl(
+                        pending->connection.native_handle(), F_DUPFD_CLOEXEC, 0);
+                    if (cancellation_fd >= 0) {
+                        cancellation_watch =
+                            std::make_shared<boost::asio::posix::stream_descriptor>(
+                                context_);
+                        boost::system::error_code assign_error;
+                        cancellation_watch->assign(cancellation_fd, assign_error);
+                        if (!assign_error) {
+                            cancellation_fd = -1; // Descriptor owns the duplicate.
+                            const auto cancellation = pending->cancellation;
+                            const uint64_t request_id = pending->operation.request_id;
+                            const auto cancel_observed =
+                                config_.p51_source_cancel_observed_for_test;
+                            boost::asio::co_spawn(
+                                context_,
+                                [cancellation_watch, cancellation, request_id,
+                                 cancel_observed]()
+                                    -> boost::asio::awaitable<void> {
+                                    boost::system::error_code wait_error;
+                                    co_await cancellation_watch->async_wait(
+                                        boost::asio::posix::stream_descriptor::wait_read,
+                                        boost::asio::redirect_error(
+                                            boost::asio::use_awaitable, wait_error));
+                                    // This dedicated source-transfer control
+                                    // peer has no inbound protocol messages
+                                    // before the result; EOF or unexpected
+                                    // inbound bytes both terminate the request.
+                                    if (!wait_error &&
+                                        cancellation->request_cancel() &&
+                                        cancel_observed) {
+                                        try {
+                                            cancel_observed(request_id);
+                                        } catch (...) {
+                                        }
+                                    }
+                                },
+                                boost::asio::detached);
+                            cancellation_watch_ready = true;
+                        } else {
+                            (void)::close(cancellation_fd);
+                            cancellation_fd = -1;
+                        }
+                    }
+                } catch (...) {
+                    cancellation_watch_ready = false;
+                }
+                if (cancellation_fd >= 0)
+                    (void)::close(cancellation_fd);
                 try {
                     const auto& request = pending->request;
                     const RouteEndpointKey endpoint_key{
@@ -3557,14 +3619,18 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                     const RouteStoreIdentity store_identity{
                         relationship.f_store_guid,
                         relationship.f_store_generation};
-                    if (!stop_requested_.load(std::memory_order_acquire) &&
+                    if (!cancellation_watch_ready) {
+                        observed.status = ZstdSourceTransferStatus::SourceError;
+                        observed.profile = relationship.profile;
+                    } else if (!stop_requested_.load(std::memory_order_acquire) &&
                         !route_replacement_required_.load(
                             std::memory_order_acquire) &&
                         bind_route_endpoint_identity(endpoint_key,
                                                      store_identity, true)) {
                         observed = co_await route_owner_->transfer_p51(
                             relationship, request.armed, connector, route_request,
-                            deadline, std::span<const uint8_t>(*raw));
+                            deadline, std::span<const uint8_t>(*raw),
+                            pending->cancellation);
                     } else {
                         observed.status = ZstdSourceTransferStatus::Unavailable;
                         observed.profile = relationship.profile;
@@ -3587,6 +3653,11 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                     latch_route_replacement(observed.replacement_trigger);
                     result = source_transfer_result(
                         observed, config_.c_store_guid, true);
+                }
+                boost::system::error_code cancel_monitor_error;
+                if (cancellation_watch) {
+                    cancellation_watch->cancel(cancel_monitor_error);
+                    cancellation_watch->close(cancel_monitor_error);
                 }
                 // This row records a post-read R2 dispatch result; it does
                 // not prove that transfer_p51 opened a link (endpoint binding

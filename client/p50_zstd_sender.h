@@ -5,6 +5,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -15,6 +16,34 @@
 #include <vector>
 
 namespace icecc::p50 {
+
+// Per-source-request cancellation is linearized against the first R2 bundle
+// write.  A cancellation accepted while Prepared suppresses JOB_BIND; once
+// the writer advances to WireStarted, the exact retained witness must instead
+// follow normal R2 reconciliation.
+class P51RequestCancellation {
+public:
+    enum class State : uint8_t { Active, Cancelled, WireStarted };
+
+    [[nodiscard]] bool request_cancel() noexcept {
+        State expected = State::Active;
+        return state_.compare_exchange_strong(
+            expected, State::Cancelled, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    [[nodiscard]] bool try_start_wire() noexcept {
+        State expected = State::Active;
+        return state_.compare_exchange_strong(
+            expected, State::WireStarted, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    [[nodiscard]] State state() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<State> state_{State::Active};
+};
 
 // A sender owns the source descriptor.  It accepts only a regular, complete
 // file so that a short read cannot silently turn into a different TU.
@@ -50,6 +79,7 @@ enum class ZstdSourceTransferStatus : uint8_t {
     RetryExhausted,
     DeadlineExceeded,
     CommittedIdentityUnavailable,
+    Cancelled,
 };
 
 // Local-only first-cause attribution for whole-route replacement. This enum
@@ -162,6 +192,15 @@ struct ZstdSourceTransferConfig {
     // Deterministic unit-test seam for the typed route-poison boundary.
     // Product callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Awaits immediately before the first JOB_BIND write for this exact
+    // prepared request. Used to synchronize staged-cancellation tests.
+    std::function<boost::asio::awaitable<void>(PrepareRequestKey,
+                                               const JobBind&)>
+        before_r2_first_bundle_write_for_test;
+    std::function<void(PrepareRequestKey, const JobBind&)>
+        r2_prewrite_cancelled_for_test;
+#endif
     // Test-only observation after the complete R2 TU bundle is on the socket;
     // it does not participate in admission or receipt handling.
     std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
@@ -293,7 +332,8 @@ public:
         P51SourceArmedFields armed, uint64_t physical_link_generation,
         AsyncConnectedFdFactory connection, PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
-        std::span<const uint8_t> source);
+        std::span<const uint8_t> source,
+        std::shared_ptr<P51RequestCancellation> cancellation = {});
 
     // F-incarnation retirement fences the old physical link. Shared owner
     // references held by active calls/pumps keep this sender alive to drain.

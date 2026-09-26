@@ -2010,7 +2010,8 @@ boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_p51_route(
     P51SourceArmedFields armed, uint64_t physical_link_generation,
     AsyncConnectedFdFactory connection, PrepareRequestKey request,
-    Clock::time_point deadline, std::span<const uint8_t> source) {
+    Clock::time_point deadline, std::span<const uint8_t> source,
+    std::shared_ptr<P51RequestCancellation> cancellation) {
     const std::optional<ProfileId> armed_profile =
         profile_from_cache_mask(armed.arm.source.cache_profile);
     if (!impl_->route_bound || !armed.valid() || !armed_profile || !connection ||
@@ -2257,8 +2258,8 @@ P50ZstdSourceSender::transfer_p51_route(
     binding.source_request_id = armed.arm.source.source_request_id;
     binding.tu_seq = tu_seq;
     binding.profile = *armed_profile;
-    binding.raw_bytes = source.size();
-    binding.raw_digest = raw_digest;
+        binding.raw_bytes = source.size();
+        binding.raw_digest = raw_digest;
 
     LinkHello hello;
     hello.profile = binding.profile;
@@ -2284,6 +2285,7 @@ P50ZstdSourceSender::transfer_p51_route(
 
     std::shared_ptr<Impl::PendingReceipt> pending;
     bool bundle_complete = false;
+    bool endpoint_bundle_call_started = false;
     bool recovery_needed = false;
     bool connector_succeeded = impl_->r2_socket.has_value();
     bool exact_commit_preserved = false;
@@ -2401,11 +2403,49 @@ P50ZstdSourceSender::transfer_p51_route(
         impl_->checkpoint_r2_ack_drained();
         if (!impl_->endpoint->r2_window_available())
             throw std::logic_error("R2 window was consumed during writer turn");
-
         if (impl_->r2_relationship_ordinal ==
             std::numeric_limits<uint64_t>::max())
             throw std::overflow_error("R2 relationship ordinal space exhausted");
         binding.relationship_ordinal = impl_->r2_relationship_ordinal;
+
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (impl_->config.before_r2_first_bundle_write_for_test)
+            co_await impl_->config.before_r2_first_bundle_write_for_test(
+                request, binding);
+#endif
+        if (Clock::now() >= deadline || impl_->route_replacement_required ||
+            !impl_->r2_socket ||
+            impl_->r2_physical_link_generation != physical_link_generation ||
+            impl_->r2_relationship_id != hello.relationship_id ||
+            impl_->r2_relationship_epoch != hello.relationship_epoch)
+            throw boost::system::system_error(
+                Clock::now() >= deadline
+                    ? boost::asio::error::timed_out
+                    : boost::asio::error::operation_aborted);
+        if (cancellation && !cancellation->try_start_wire()) {
+            if (cancellation->state() !=
+                P51RequestCancellation::State::Cancelled)
+                throw std::logic_error(
+                    "R2 cancellation state is not active before first write");
+            impl_->authority->cancel_unwritten_tail(prepared);
+            ZstdSourceTransferResult cancelled =
+                impl_->invalid(ZstdSourceTransferStatus::Cancelled);
+            cancelled.profile = binding.profile;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            if (impl_->config.r2_prewrite_cancelled_for_test) {
+                try {
+                    impl_->config.r2_prewrite_cancelled_for_test(
+                        request, binding);
+                } catch (...) {
+                    // Test observation cannot change the no-write disposition.
+                }
+            }
+#endif
+            cancelled.raw_bytes = binding.raw_bytes;
+            cancelled.raw_digest = binding.raw_digest;
+            co_return cancelled;
+        }
+
         pending = std::make_shared<Impl::PendingReceipt>(executor);
         wire_accounting_retirement.pending = pending;
         pending->armed = armed;
@@ -2446,6 +2486,7 @@ P50ZstdSourceSender::transfer_p51_route(
         // the first JOB_BIND byte is made visible on the stream.
         EndpointIoControl bundle_control = std::exchange(
             impl_->config.r2_bundle_io_control_for_test, EndpointIoControl{});
+        endpoint_bundle_call_started = true;
         pending->sent = co_await impl_->endpoint->write_r2_bundle(
             *impl_->r2_socket, binding, prepared, deadline,
             std::move(bundle_control));
@@ -2693,9 +2734,13 @@ P50ZstdSourceSender::transfer_p51_route(
             if (!has_staged_witness) {
               try {
                 if (impl_->authority->contains(prepared)) {
-                  const auto release_count =
-                      impl_->authority->release(prepared);
-                  (void)release_count;
+                  if (!endpoint_bundle_call_started)
+                    impl_->authority->cancel_unwritten_tail(prepared);
+                  else {
+                    const auto release_count =
+                        impl_->authority->release(prepared);
+                    (void)release_count;
+                  }
                 }
               } catch (...) {
               }

@@ -77,6 +77,13 @@ struct P50RouteOwnerConfig {
     // Forwarded only to the sender's deterministic route-poison unit seam.
     // Production callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    std::function<boost::asio::awaitable<void>(PrepareRequestKey,
+                                               const JobBind&)>
+        before_r2_first_bundle_write_for_test;
+    std::function<void(PrepareRequestKey, const JobBind&)>
+        r2_prewrite_cancelled_for_test;
+#endif
 };
 
 // Long-lived C-side ownership for route source transfers.  One sender is
@@ -112,7 +119,8 @@ public:
         P50RouteRelationship relationship, P51SourceArmedFields armed,
         AsyncConnectedFdFactory connection, PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
-        std::span<const uint8_t> source);
+        std::span<const uint8_t> source,
+        std::shared_ptr<P51RequestCancellation> cancellation = {});
 
     // Drops every profile view for one exact retired F incarnation.  False
     // means at least one route still owns an uncommitted preparation; callers

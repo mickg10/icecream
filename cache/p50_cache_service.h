@@ -135,6 +135,9 @@ struct RuntimeConfig {
     // the second is called when the non-consuming peer probe observes EOF.
     std::function<void()> p51_source_read_chunk_for_test;
     std::function<void()> p51_source_read_peer_closed_for_test;
+    // Exact accepted source-control EOF which won the per-request cancellation
+    // race while the sender was still before its first R2 bundle write.
+    std::function<void(uint64_t)> p51_source_cancel_observed_for_test;
     // Called after the source read ends and its original FD is closed,
     // whether the raw copy succeeded or failed, before owner-executor delivery.
     std::function<void(bool)> p51_source_read_complete_for_test;
@@ -154,6 +157,11 @@ struct RuntimeConfig {
         after_r2_recovery_receipt_settled_for_test;
     std::function<bool(uint64_t, size_t, bool, bool)>
         disconnect_r2_before_replay_bundle_for_test;
+    std::function<boost::asio::awaitable<void>(p50::PrepareRequestKey,
+                                               const JobBind&)>
+        before_r2_first_bundle_write_for_test;
+    std::function<void(p50::PrepareRequestKey, const JobBind&)>
+        r2_prewrite_cancelled_for_test;
 #endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like
