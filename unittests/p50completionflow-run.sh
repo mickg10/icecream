@@ -1552,8 +1552,7 @@ test -n "$service_pid" || {
 }
 
 scheduler_loss_log_offset=$(stat -c %s "$work/f-loss.log")
-scheduler_loss_clears_before=$(grep -F -c 'cleared children' \
-    "$work/c.log" 2>/dev/null || true)
+scheduler_loss_c_log_offset=$(stat -c %s "$work/c.log")
 scheduler_loss_client_log="$work/scheduler-loss-retry-client.log"
 scheduler_loss_remote_obj="$work/out/scheduler-loss-retry-remote.o"
 scheduler_loss_local_obj="$work/out/scheduler-loss-retry-local.o"
@@ -1594,10 +1593,13 @@ sched_pid=
 
 scheduler_loss_cleared=0
 for _ in $(seq 1 600); do
-    scheduler_loss_clears_now=$(grep -F -c 'cleared children' \
-        "$work/c.log" 2>/dev/null || true)
-    if test "${scheduler_loss_clears_now:-0}" -gt \
-        "${scheduler_loss_clears_before:-0}"; then
+    if tail -c +$((scheduler_loss_c_log_offset + 1)) "$work/c.log" | \
+        awk '
+            /scheduler closed connection/ { closed = NR }
+            /session quiescence state phase=SETTLED targets=0 current_kids=0 ownership_failed=0 ownership_faulted=0 identity_failed=0 scheduler_generation=[1-9][0-9]*/ &&
+                closed && NR > closed { settled = 1 }
+            END { exit !settled }
+        '; then
         scheduler_loss_cleared=1
         break
     fi
