@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### Lost RECOVER response retry
+
+The registered sender suite now includes `--lost-recover-response` and the
+same case in its default run. For each of P29V1, ZSTD_TU and ZSTD_ROUTE, the
+fixture commits one of two jobs, constructs the recovery interval, and drops
+the first RECEIPTS response before C receives it. The next connection must
+repeat the logical recovery request and witness, preserve the exact receipt
+interval, commit only the remaining suffix, and release preparation entries.
+Physical transport generation changes; the normalized logical state must not.
+
+Donor `ae2e4507`, imported as `1aa64b41`, changes only the test fixture.
+Both the new selector and the neighboring changed-RESET_ACK selector exit 0
+under ASAN/UBSAN on the same binary. Logs under
+`/tanksmall/scratch/tmp/p51-d05-recover-loss-build/`:
+
+- `lost-recover-response-asan-r5.log`: `380c62507d2152c013b57a80a680476dfcedb5f71317f65945c07a9835a2c90e`
+- `changed-reset-ack-asan-r1.log`: `831589a20c5885fc7d32b38616c6d9771cbccf7b9f3f0dbac26eef0901bbc5ea`
+
+Test source SHA256 `f9c2f154f1127b829b65f13f19083052d75def1cf63b6c2e3ae8ffd2138df825`;
+binary SHA256 `bfbdfcdec2ccbeb8478b9a0e1b2e04bff111779a886d53d9beedeb86250642bc`.
+Earlier selector-wiring and fixture-assertion failures are not passing evidence.
+This closes the explicit two-job lost-response scenario across profiles, not
+the full D05 window/topology matrix or a new response-corruption test.
+
 ### QA snapshot and library portability
 
 Generated `*.a` and `*.so` files are now ignored so QA's untracked-file
