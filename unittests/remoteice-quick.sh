@@ -61,12 +61,21 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/iceremote.XXXXXX") || exit 99
 SCHED_PORT=${ICECC_TEST_SCHED_PORT:-$((21000 + $$ % 9000))}
 REMOTE_PORT=${ICECC_TEST_REMOTE_PORT:-$((11000 + $$ % 9000))}
 NETNAME=remoteq$$
+REMOTE_SCHED_HOST=${ICECC_P50_C1F1_WORKER_SCHEDULER_HOST:-127.0.0.1}
 ASSIGNMENT_FENCE_MODE=${ICECC_TEST_ASSIGNMENT_FENCE_MODE:-legacy}
 case "$ASSIGNMENT_FENCE_MODE" in
     legacy) ;;
     strict-nonce) ;;
     *) echo "FAIL: unsupported assignment fence mode $ASSIGNMENT_FENCE_MODE" >&2; exit 1 ;;
 esac
+if [ "$ASSIGNMENT_FENCE_MODE" = strict-nonce ] && [ "$REQUIRE_REMOTE" = 1 ]; then
+    case "$REMOTE_SCHED_HOST" in
+        ""|localhost|127.*|0.0.0.0|::1)
+            echo "FAIL (required mode): strict remote assignment needs an explicit non-loopback worker scheduler host" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 fail() {
     echo "FAIL: $1" >&2
@@ -190,7 +199,7 @@ fi
 SCHED_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/remote" \
-"$top/daemon/iceccd" -p "$REMOTE_PORT" -m 2 -s "127.0.0.1:$SCHED_PORT" \
+"$top/daemon/iceccd" -p "$REMOTE_PORT" -m 2 -s "$REMOTE_SCHED_HOST:$SCHED_PORT" \
     -n "$NETNAME" -N remoteq -b "$work/envs-remote" $USERFLAG \
     "${REMOTE_CACHE_ARGS[@]}" \
     -l "$work/remote.log" -vvv &
