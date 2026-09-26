@@ -384,7 +384,9 @@ std::vector<P29FingerprintFile> enumerate_p29_system_sources(
             check_p29_cancellation(cancelled);
             const fs::directory_entry entry = *current;
             const bool regular = entry.is_regular_file(error);
-            if (error)
+            // A dangling symlink is not a regular file; skip it rather than void the fingerprint.
+            if (error && error != std::errc::no_such_file_or_directory &&
+                error != std::errc::not_a_directory)
                 throw std::runtime_error("cannot stat P29 system source");
             if (regular) {
                 const std::string path =
