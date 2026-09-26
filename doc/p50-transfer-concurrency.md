@@ -1129,6 +1129,16 @@ Do not remove a request before submission and call that queued cancellation.
 | Full, receipt unresolved | The complete bundle reached F; no positive receipt has yet been validated at C |
 | Committed | C has validated the exact positive receipt; cancellation must not erase that fact |
 
+For staged cancellation, include a previously emitted P29V1 predecessor whose
+receipt is still withheld when cancellation arrives. Finishing NEED/FILL
+advancement clears the active preparation slot, but does not commit/remove
+that predecessor. The production cancellation path must preserve its witness
+and settle or reconcile it under the original deadline before any release
+that requires a sole speculative entry. Do not drain predecessors in a
+test-only gate before signalling cancellation. Verify the next surviving
+request reuses the route with contiguous wire ordinals and exact output;
+also cover a predecessor failure/deadline while cancellation is pending.
+
 An acknowledged exact F cancellation before publication must prevent input
 publication and subsequent compiler admission. Private decoding may finish,
 but its bytes remain charged until actually released. If publication wins,
