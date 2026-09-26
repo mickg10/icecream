@@ -28,7 +28,7 @@ W30 gate; it does not itself qualify that recovery scenario or full QA.
 
 ### Scoped two-worker W30 recovery
 
-The local C1F2 gate passes P29V1 and ZSTD_TU with the rebuilt capture-safe
+The local C1F2 gate passes P29V1, ZSTD_TU and ZSTD_ROUTE with the rebuilt capture-safe
 client. It holds exactly 30 decoded A receipts after one active committed
 compiler, stops A and closes only A's scheduler connection, and verifies an
 exact B output with B's socket/store unchanged while A remains stopped.
@@ -36,8 +36,8 @@ After A resumes, its old group settles before readmission. All 30 held
 callers and the active victim succeed with fresh assignment identities and
 byte-identical independent local objects; a separate fresh A probe also passes.
 This is scoped F-A session loss with an injected reconnect hold, not an
-ordinary-loss latency result or the complete restart matrix. ZSTD_ROUTE is
-still running. Earlier capture-failing C1F2 pass markers are not qualification.
+ordinary-loss latency result or the complete restart matrix.
+Earlier capture-failing C1F2 pass markers are not qualification.
 
 Select `ICECC_P50_SUITE=C1F2/31` and `ICECC_P50_C1F2_F_LOSS_W30=1` in
 `unittests/p50compilee2e-run.sh`, with its 31-input batch manifest, WARM=0 and
@@ -49,8 +49,9 @@ Logs under `/tanksmall/scratch/tmp/p51-d07-compile.YLS0NG/tmp`:
 
 - `c1f2-current-P29V1-r2.log`: `cd969fcd934a3e6b63a8f58cc5687d5dd2d7f65bca6116f1da9d69a49d4fc0af`
 - `c1f2-current-ZSTD_TU.log`: `cc12c0b8716bdcca08afc94f38833b789b4524a3ea72886aeb2a2824e1a43e16`
+- `c1f2-current-ZSTD_ROUTE.log`: `b7ee9715b24b2d3208b8596ea1fa2a0b0e2e5767a2a7850f42473a63f9966238`
 
-Both executed runner SHA256
+P29V1 and ZSTD_TU executed runner SHA256
 `93edd4b0fe2e4245926cce1c627c3fce1a95e41566e0326965867a313bc4f048`,
 client `c50e5d67c267ecff4e1e057939913a95e92760c0724ebbb2cfa1e84aa1ce646c`,
 and daemon `85da3cf6261cf830852861181f8ecea582f2864df6c94a76d803c32238754069`.
@@ -59,6 +60,11 @@ only tightens the unobserved active-failure branch and factors the exact
 Error24 classifier, with a passing Error11-negative fixture. Fixture log
 `/tanksmall/scratch/tmp/p51-capture-observer-tests/w30-terminal-classifier-test.log`
 has SHA256 `fc5567af25f59b94eccc415ab3ddccde211be71995ead3d95b42bf42c0addaca`.
+ZSTD_ROUTE executed the imported `567a68d0…` runner with the same client and
+daemon binaries and exited 0. Its log records all 30 held callers completing,
+an exact fresh-assignment object for the active victim, and exact fresh A
+recovery after the old group is gone. Root independently checked the retained
+log and its hash. A generated-input wrapper entry is still being qualified.
 This evidence does not establish a complete current-candidate build closure.
 
 ### Active compiler loss and fresh-job recovery
