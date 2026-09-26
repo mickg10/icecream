@@ -46,6 +46,20 @@ snapshot, not the remaining W30 restart/capacity and external-farm gates.
 The two preceding bootstrap attempts failed on missing check-only build
 prerequisites; their artifacts remain retained, not counted as product passes.
 
+The same frozen build also passes the current-runtime `p51-arm-expiry`
+selector (three profile markers) and `p51-restart-w30` (18 profile/topology
+markers, recorded exit 0). Runner source is frozen at SHA256
+`792f5b6e5b09d588ea02cf6cdd85d0f9072d87e6111e2ee0bbe467ba97d6c643`;
+product binaries are reused from the successful bootstrap above, not rebuilt
+for each selector. Logs under
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/reuse-build-gates/logs/`:
+`01-gate-p51-arm-expiry.log` SHA256
+`f7bba5c0a1d6f809edaf1a0b8f0c6963f4f93c8fcafd9d564856a139a813a34d`;
+`03-gate-p51-restart-w30.log` SHA256
+`a871444f7ac035d4b572fb29f7d99df9a68ff209b4ae69b220c30133a04ef476`.
+These qualify the existing C/F replacement matrix and ARM-expiry assertions,
+not all compiler-loss, chained restart or external-farm cases.
+
 Candidate `f15b1561` also integrates the GCC 11 build workaround, donor
 `c3da4617`: only the production/test cache-service targets demote
 `-Wmismatched-new-delete`; other warnings remain errors and frame recycling
