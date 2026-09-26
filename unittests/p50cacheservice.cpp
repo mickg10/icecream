@@ -4464,20 +4464,22 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             observed_commit.raw_digest == target_digest;
         std::fprintf(stderr,
             "P51_D07 full-cancel-identity profile=%u target-index=%zu "
-            "req=%llu binding={request:%d,reservation:%d,tu:%d,ordinal:%d,"
-            "profile:%d,bytes:%d,digest:%d} begin={profile:%d,bytes:%d,"
-            "digest:%d} commit={tu:%d,ordinal:%d,digest:%d}\n",
+            "req=%llu binding={request:%d,reservation:%d,tu:%d,"
+            "logical-ordinal:%llu,profile:%d,bytes:%d,digest:%d} "
+            "begin={rel-seq:%llu,profile:%d,bytes:%d,digest:%d} "
+            "commit={tu:%d,rel-seq:%d,digest:%d}\n",
             static_cast<unsigned>(profile), target_index,
             static_cast<unsigned long long>(target.request_id),
             observed_binding.source_request_id == target.request_id,
             observed_binding.reservation_id ==
                 Id128{target.request.armed.reservation_id},
             observed_binding.tu_seq == observed_begin.tu_seq,
-            observed_binding.relationship_ordinal ==
-                observed_begin.rel_seq.value,
+            static_cast<unsigned long long>(
+                observed_binding.relationship_ordinal),
             observed_binding.profile == profile,
             observed_binding.raw_bytes == target.bytes.size(),
             observed_binding.raw_digest == target_digest,
+            static_cast<unsigned long long>(observed_begin.rel_seq.value),
             observed_begin.profile == profile,
             observed_begin.raw_bytes == target.bytes.size(),
             observed_begin.raw_digest == target_digest,
