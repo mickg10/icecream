@@ -345,6 +345,7 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
     ("p51-scheduler-restart-w30", "p51schedulerrestart-w30-check", 1800),
     ("p51-scheduler-f-restart-w30", "p51schedulerrestart-w30-check", 1800),
     ("p51-restart-chain-w30", "p50daemonpositive-p51-restart-chain-w30-check", 1200),
+    ("p51-capacity-w30", "p51capacity-w30-run.sh", 600),
 ])
 def test_opt_in_gate_names_are_fixed_and_bounded(
     gate: str, target: str, timeout_s: int,
@@ -440,6 +441,64 @@ def test_scheduler_gate_gets_locked_offline_python_environment(
     assert gate_argv[-2:] == [
         "/source/dev/run-gate.sh", "p51-scheduler-restart-w30",
     ]
+
+
+def test_capacity_gate_forwards_optional_profile_filter_and_defaults_in_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    run = GateCommandRun(tmp_path)
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    work = tmp_path / "current"
+    (work / "tmp").mkdir(parents=True)
+
+    def fake_subprocess_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        labels = {"icecream.dev.gate.id": run.gate_id}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(labels))
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_subprocess_run)
+    monkeypatch.delenv("ICECC_TEST_P51_CAPACITY_W30_PROFILE", raising=False)
+    result = bootstrap.run_gate(
+        run, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+        "p51-capacity-w30",
+    )
+    gate_argv = run.commands[-1][1]
+    env_values = {
+        gate_argv[index + 1]
+        for index, value in enumerate(gate_argv[:-1]) if value == "--env"
+    }
+    assert result["target"] == "p51capacity-w30-run.sh"
+    assert result["timeout_s"] == 600
+    assert "ICECC_TEST_P51_CAPACITY_W30_PROFILE=P29V1" not in env_values
+    assert gate_argv[-2:] == ["/source/dev/run-gate.sh", "p51-capacity-w30"]
+
+    monkeypatch.setenv("ICECC_TEST_P51_CAPACITY_W30_PROFILE", "ZSTD_TU")
+    filtered = GateCommandRun(tmp_path)
+    def fake_filtered_subprocess_run(
+        argv: list[str], **_kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        labels = {"icecream.dev.gate.id": filtered.gate_id}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(labels))
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_filtered_subprocess_run)
+    bootstrap.run_gate(
+        filtered, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+        "p51-capacity-w30",
+    )
+    filtered_argv = filtered.commands[-1][1]
+    assert "ICECC_TEST_P51_CAPACITY_W30_PROFILE=ZSTD_TU" in {
+        filtered_argv[index + 1]
+        for index, value in enumerate(filtered_argv[:-1]) if value == "--env"
+    }
+
+    monkeypatch.setenv("ICECC_TEST_P51_CAPACITY_W30_PROFILE", "ZSTD_TU; bad")
+    rejected = GateCommandRun(tmp_path)
+    with pytest.raises(bootstrap.BootstrapError, match="must be P29V1"):
+        bootstrap.run_gate(
+            rejected, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+            "p51-capacity-w30",
+        )
+    assert rejected.commands == []
 
 
 @pytest.mark.parametrize("cleanup_failure", ["inspect-timeout", "remove-timeout"])

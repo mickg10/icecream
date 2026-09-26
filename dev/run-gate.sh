@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30}" >&2
+    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30}" >&2
 }
 
 if [[ $# -ne 1 ]]; then
@@ -45,6 +45,19 @@ case "$1" in
         timeout_s=1200
         marker=P51_RESTART_CHAIN_PASS=F_then_C/
         expected_markers=3
+        ;;
+    p51-capacity-w30)
+        gate=$1
+        target=p51capacity-w30-run.sh
+        timeout_s=600
+        marker='P51_CAPACITY_W30_PASS topology=C1F4 profile='
+        expected_markers=3
+        capacity_profile=${ICECC_TEST_P51_CAPACITY_W30_PROFILE:-}
+        case "$capacity_profile" in
+            '') ;;
+            P29V1|ZSTD_TU|ZSTD_ROUTE) expected_markers=1 ;;
+            *) echo "FAIL: unsupported capacity W30 profile filter: $capacity_profile" >&2; exit 2 ;;
+        esac
         ;;
     *)
         echo "FAIL: unsupported opt-in gate: $1" >&2
@@ -132,7 +145,26 @@ log="$run_dir/$gate.log"
 status_file="$run_dir/$gate.exit"
 echo "GATE_START name=$gate target=$target timeout_s=$timeout_s run_id=$ICECREAM_GATE_RUN_ID"
 set +e
-if [[ "$gate" == p51-scheduler-restart-w30 || "$gate" == p51-scheduler-f-restart-w30 ]]; then
+if [[ "$gate" == p51-capacity-w30 ]]; then
+    profiles=(P29V1 ZSTD_TU ZSTD_ROUTE)
+    if [[ -n "$capacity_profile" ]]; then
+        profiles=("$capacity_profile")
+    fi
+    status=0
+    for profile in "${profiles[@]}"; do
+        echo "CAPACITY_W30_PROFILE_START profile=$profile" >>"$log"
+        if ICECC_TEST_BUILDDIR=/work/build/unittests \
+           ICECC_TEST_TOP_BUILDDIR=/work/build \
+           ICECC_TEST_P51_CAPACITY_W30_PROFILE="$profile" \
+           timeout --signal=TERM --kill-after=5s 90s \
+               /bin/bash /source/unittests/p51capacity-w30-run.sh >>"$log" 2>&1; then
+            :
+        else
+            status=$?
+            break
+        fi
+    done
+elif [[ "$gate" == p51-scheduler-restart-w30 || "$gate" == p51-scheduler-f-restart-w30 ]]; then
     if [[ "$gate" == p51-scheduler-f-restart-w30 ]]; then
         export ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30=1
     else

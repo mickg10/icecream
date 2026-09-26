@@ -73,7 +73,8 @@ requires the explicit private-namespace opt-in shown above because its receipt
 helper installs a temporary namespace-local OUTPUT redirection rule.
 `dev-gate GATE=...` currently allowlists `p51-arm-expiry`, `p51-restart-w30`,
 `p51-scheduler-restart-w30`, `p51-scheduler-f-restart-w30` (active scheduler→F
-restart chain), and `p51-restart-chain-w30` (active F→C restart chain).
+restart chain), `p51-restart-chain-w30` (active F→C restart chain), and
+`p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap).
 It creates a private internal bridge, grants
 only `NET_ADMIN`, and retains uniquely named logs under the run's
 `/work/artifacts`. A missing prerequisite or skip result is a failure, not a
@@ -83,6 +84,16 @@ SDK run; no configured objects are reused across checkouts.
 The multi-link gate covers C1F2/3/4 and C2/3/4F1 for all three profiles, with
 30 outstanding jobs per link (at most 120 total). It checks exact input
 attachments and progress on healthy links while one link's receipts are held.
+The `p51-capacity-w30` gate exercises the C1F4 boundary at the existing
+120-operation cap: 30 real operations per F, then 90 wire-pending operations
+overlapped with 30 accepted operations whose Goodbye settlement is held. It
+requires a typed Busy refusal for operation 121, then releases exactly one
+settlement and proves the same assignment/ARM/source/deadline succeeds while
+the sibling work remains held. By default it runs P29V1, ZSTD_TU, and
+ZSTD_ROUTE; to select one profile, set
+`ICECC_TEST_P51_CAPACITY_W30_PROFILE=P29V1` (or `ZSTD_TU` / `ZSTD_ROUTE`) on
+the `make dev-gate` invocation. This opt-in gate is not part of `make qa` and
+does not change the service's production capacity.
 The restart gate currently covers ZSTD_TU C1F2/F-cache and C2F1/C-cache
 replacement, one affected transfer plus a healthy sibling. The separate
 `restart-w30` gate covers both replacements for all three profiles: 30 held

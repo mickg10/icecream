@@ -27,6 +27,7 @@ GATE_TARGETS = {
     "p51-scheduler-restart-w30": ("p51schedulerrestart-w30-check", 1800),
     "p51-scheduler-f-restart-w30": ("p51schedulerrestart-w30-check", 1800),
     "p51-restart-chain-w30": ("p50daemonpositive-p51-restart-chain-w30-check", 1200),
+    "p51-capacity-w30": ("p51capacity-w30-run.sh", 600),
 }
 GATE_OFFLINE_ENV = (
     "UV_OFFLINE=1",
@@ -315,6 +316,15 @@ def run_gate(run: Run, image: str, source: Path, work: Path,
 
     failure: Exception | None = None
     cleanup_errors: list[str] = []
+    gate_profile_env: list[str] = []
+    if name == "p51-capacity-w30":
+        profile = os.environ.get("ICECC_TEST_P51_CAPACITY_W30_PROFILE", "")
+        if profile and profile not in {"P29V1", "ZSTD_TU", "ZSTD_ROUTE"}:
+            raise BootstrapError(
+                "ICECC_TEST_P51_CAPACITY_W30_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE")
+        if profile:
+            gate_profile_env = ["--env",
+                f"ICECC_TEST_P51_CAPACITY_W30_PROFILE={profile}"]
     try:
         run.command("gate-network-create", [
             "docker", "network", "create", "--driver", "bridge", "--internal",
@@ -329,6 +339,7 @@ def run_gate(run: Run, image: str, source: Path, work: Path,
             "--env", f"ICEFARM_OUTPUT_GID={os.getgid()}",
             "--env", f"ICECREAM_GATE_RUN_ID={run_id}",
             *[item for value in GATE_OFFLINE_ENV for item in ("--env", value)],
+            *gate_profile_env,
             "--mount", f"type=bind,src={source},dst=/source,readonly",
             "--mount", f"type=bind,src={work},dst=/work",
             "--mount", f"type=bind,src={temp},dst=/tmp",
