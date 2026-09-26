@@ -33,8 +33,37 @@ reruns are pending. This failed native stage does not qualify the later Python
 or mixed-image QA stages.
 Evidence is retained under
 `/tanksmall/scratch/tmp/p51-qa-293a/scratch/icecream-qa-kiyex8p9/current/`.
-The source-expiry recovery and independent cancellation-cleanup fixes remain
-in private donor worktrees pending review and combined qualification.
+The source-expiry recovery fix is integrated locally at `22b06a59`, awaiting
+merged service-suite qualification before publication. Independent daemon
+cancellation cleanup remains in its private donor worktree.
+
+### Bounded recovery after an unresolved source expires
+
+Donor `f32fb132` retains the expired witness for exact F RESET disposition,
+without replaying its input or clipping healthy recovery to an already-expired
+caller deadline. Reader/ACK-worker running flags now clear on every coroutine
+exit, with physical-generation checks. Previously an early return could leave
+recovery permanently waiting for a worker that had exited.
+
+An unresolved-expiry episode has one cleanup deadline anchored to the earliest
+unresolved expired caller deadline plus the configured maximum duration.
+Recovery I/O and retry waits respect that bound and each caller's deadline.
+Fresh callers and successful RESETs with unresolved expired rows cannot renew
+it. Backoff resets only after successful replay; unresolved expiry eventually
+requires terminal route replacement.
+
+The frozen donor passes the full sender suite and full registered service
+suite (actual exit 0 and test/global `.trs` PASS), plus three predecessor-expiry
+runs. Each expiry run verifies 29 healthy survivors and a fresh probe, no expired
+input publication, and exact F unavailable disposition. Evidence under
+`/tanksmall/scratch/tmp/p51-d07-predecessor-failure-build/tmp/`:
+`p51-d07-full-sender.log` SHA256
+`d475dc5c5e117b6b5584a6a71b6e727c3f6e0c33aa51f250db73b981ab1d8613`;
+`p51-d07-full-service-canonical-r2.log` SHA256
+`94b4a01c3cdeb4b735c87edfa4508d108484fc0f94142c01fbfd697e4d9a2888`.
+These donor results do not yet qualify the merge with the later reply-lifetime
+fix. C-expired/F-still-live RESET followed by delayed exact cancellation and
+healthy-suffix progress remains a separate runtime/formal follow-up.
 
 ### Bounded P29V1 transfer-window pilot
 
@@ -121,11 +150,11 @@ The focused `--d07-staged-cancel-predecessor-failure` run passed, exit 0.
 Log `/tanksmall/scratch/tmp/p51-d07-predecessor-failure-build/tmp/p51-d07-staged-predecessor-failure-r4.log`,
 SHA256 `8cd596aea18f7036354e296e36938a4f2bda3b50dfdf7b32740a857edc8424fe`.
 The merged full-suite regression passes on `b5578e77` as recorded above.
-The predecessor-deadline variant remains open; this failure injection is not
-evidence for deadline expiry. The original-deadline diagnostic currently
-observes clean EOF for the expired predecessor, then a live successor timing
-out without a replacement link. Recovery's retained-job deadline handling is
-under investigation; do not classify this case as passing.
+This failure injection is not evidence for deadline expiry. The earlier
+deadline diagnostic observed clean EOF for the expired predecessor, then a
+live successor timing out without a replacement link. The bounded-recovery
+donor described above now passes that expiry regression; merged qualification
+and the independent C-expired/F-live case remain outstanding.
 
 ### P29 pre-FILL cancellation foundation
 
