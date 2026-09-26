@@ -64,7 +64,14 @@ results. The donor benchmark was linked with the earlier `db508d7b` runtime;
 the integrated recovery runtime still needs a fresh benchmark build.
 OS page-cache state is explicitly inherited/uncontrolled, and CPU accounting
 covers the combined process, not separately measured C/F processes.
-Routine synthetic paired coverage and the full performance matrix remain pending.
+Donor `c13c8a9a` adds synthetic paired coverage to the default benchmark gate:
+eight inputs, four changed/four unchanged, R1 and R2 across all three profiles,
+plus an ordered-ID mismatch negative. The no-argument executable exits 0 against
+the refreshed `0dc29331` runtime archives; the explicit delayed-finalizer-only
+selector is unchanged. Log:
+`/tanksmall/scratch/tmp/p51-bench-paired-current-build/results/paired-default-gate.log`,
+SHA256 `dc52214251fae89e375b99e290dac9406ca22f5777519d2c0d84671bb88b1a2e`.
+The full performance matrix remains pending.
 
 ### External mixed-client harness (live run pending)
 
