@@ -29,6 +29,7 @@ GATE_TARGETS = {
     "p51-scheduler-f-restart-w30": ("p51schedulerrestart-w30-check", 1800),
     "p51-restart-chain-w30": ("p50daemonpositive-p51-restart-chain-w30-check", 1200),
     "p51-capacity-w30": ("p51capacity-w30-run.sh", 600),
+    "p51-compiler-loss-w30": ("p51wrappercompile-compiler-loss-w30-check", 960),
     "p50-live-core": ("six required root/live P50 gates", 1200),
 }
 GATE_OFFLINE_ENV = (

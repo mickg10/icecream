@@ -347,6 +347,7 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
     ("p51-scheduler-f-restart-w30", "p51schedulerrestart-w30-check", 1800),
     ("p51-restart-chain-w30", "p50daemonpositive-p51-restart-chain-w30-check", 1200),
     ("p51-capacity-w30", "p51capacity-w30-run.sh", 600),
+    ("p51-compiler-loss-w30", "p51wrappercompile-compiler-loss-w30-check", 960),
     ("p50-live-core", "six required root/live P50 gates", 1200),
 ])
 def test_opt_in_gate_names_are_fixed_and_bounded(
@@ -707,6 +708,61 @@ def test_gate_result_policy_rejects_skip_and_incomplete_logs(
         capture_output=True, text=True, check=False,
     )
     assert (result.returncode == 0) is accepted
+
+
+def test_compiler_loss_gate_requires_exactly_three_profile_markers(tmp_path: Path) -> None:
+    marker = "P51_WRAPPER_COMPILER_LOSS_W30_PASS profile="
+    cases = (
+        ("positive", [marker + "P29V1 held=30", marker + "ZSTD_TU held=30", marker + "ZSTD_ROUTE held=30"], 0, 0),
+        ("missing", [marker + "P29V1 held=30", marker + "ZSTD_TU held=30"], 1, 1),
+        ("duplicate", [marker + "P29V1 held=30", marker + "P29V1 held=30", marker + "ZSTD_TU held=30"], 0, 1),
+    )
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    start = script.index("require_compiler_loss_w30_profiles() {")
+    end = script.index("\n}", start) + 2
+    validator = script[start:end]
+    for name, lines, expected_gate_status, expected_profile_status in cases:
+        log = tmp_path / f"{name}.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            ["python3", str(bootstrap.ROOT / "dev/gate-result.py"), "0",
+             str(log), marker, "3"],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == expected_gate_status, (name, result.stdout, result.stderr)
+        profiles = subprocess.run(
+            ["bash", "-c", validator + "\nrequire_compiler_loss_w30_profiles \"$1\"", "test", str(log)],
+            capture_output=True, text=True, check=False,
+        )
+        assert (profiles.returncode == 0) is (expected_profile_status == 0), (
+            name, profiles.stdout, profiles.stderr)
+
+
+def test_compiler_loss_gate_entrypoint_is_bounded_and_identity_scoped() -> None:
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    case = script.split('    p51-compiler-loss-w30)', 1)[1].split(';;', 1)[0]
+    assert "timeout_s=960" in case
+    assert "expected_markers=3" in case
+    assert "P51_WRAPPER_COMPILER_LOSS_W30_PASS profile=" in case
+
+    branch = script.split('elif [[ "$gate" == p51-compiler-loss-w30 ]]; then', 1)[1]
+    assert "runuser" in branch
+    assert "client_uid" in branch and "daemon_uid" in branch
+    assert '"${timeout_s}s"' in branch
+    cache_build = "make -C /work/build/cache icecc-cache-service-test"
+    helper_build = 'make -C /work/build/unittests "$target"'
+    assert cache_build in branch
+    assert helper_build in branch
+    assert branch.index(cache_build) < branch.index(helper_build)
+    assert "require_compiler_loss_w30_profiles" in script
+    makefile = (bootstrap.ROOT / "unittests/Makefile.am").read_text(encoding="utf-8")
+    target = makefile.split("p51wrappercompile-compiler-loss-w30-check:", 1)[1].split("\n\n", 1)[0]
+    assert "p50daemonpositive ../daemon/iceccd ../cache/icecc-cache-service" in target
+    assert "ICECC_TEST_POSITIVE_DAEMON=1" in target
+    assert "ICECC_TEST_WRAPPER_USER=icecc-client" in target
+    assert "ICECC_P51_WRAPPER_COMPILER_LOSS_W30=1" in target
+    assert "P29V1 ZSTD_TU ZSTD_ROUTE" in target
+    assert "960s" in target
 
 
 def test_product_image_build_uses_installed_tree_and_sdk_without_network(

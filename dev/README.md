@@ -83,7 +83,9 @@ helper installs a temporary namespace-local OUTPUT redirection rule.
 `dev-gate GATE=...` currently allowlists `p51-wrapper-compile`, `p51-arm-expiry`, `p51-restart-w30`,
 `p51-scheduler-restart-w30`, `p51-scheduler-f-restart-w30` (active scheduler→F
 restart chain), `p51-restart-chain-w30` (active F→C restart chain),
-`p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap), and
+`p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap),
+`p51-compiler-loss-w30` (real compiler-owner loss while 30 source receipts are
+held, with an already-admitted C2 sibling required to finish before release), and
 `p50-live-core` (the two remote assignment gates, completion flow, compile
 end-to-end, daemon-positive, and live source-arm gates).
 It creates a private internal bridge, grants

@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p50-live-core}" >&2
+    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p51-compiler-loss-w30|p50-live-core}" >&2
 }
 
 capture_gate_status() {
@@ -24,6 +24,18 @@ require_wrapper_compile_cells() {
                 return 1
             fi
         done
+    done
+}
+
+require_compiler_loss_w30_profiles() {
+    local log=$1 profile exact count
+    for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
+        exact="P51_WRAPPER_COMPILER_LOSS_W30_PASS profile=$profile "
+        count=$(grep -F -c "$exact" "$log" || true)
+        if [[ $count -ne 1 ]]; then
+            echo "FAIL: expected exactly one compiler-loss W30 marker for profile=$profile, found $count; retained log=$log" >&2
+            return 1
+        fi
     done
 }
 
@@ -87,6 +99,13 @@ case "$1" in
             P29V1|ZSTD_TU|ZSTD_ROUTE) expected_markers=1 ;;
             *) echo "FAIL: unsupported capacity W30 profile filter: $capacity_profile" >&2; exit 2 ;;
         esac
+        ;;
+    p51-compiler-loss-w30)
+        gate=$1
+        target=p51wrappercompile-compiler-loss-w30-check
+        timeout_s=960
+        marker='P51_WRAPPER_COMPILER_LOSS_W30_PASS profile='
+        expected_markers=3
         ;;
     p50-live-core)
         gate=$1
@@ -339,6 +358,56 @@ elif [[ "$gate" == p51-capacity-w30 ]]; then
             fi
         done
     fi
+elif [[ "$gate" == p51-compiler-loss-w30 ]]; then
+    worker_scheduler_host=$(hostname -I | awk '{print $1}')
+    if ! python3 - "$worker_scheduler_host" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except (ipaddress.AddressValueError, IndexError):
+    raise SystemExit(1)
+if (address.is_loopback or address.is_unspecified or address.is_multicast or
+        address.is_reserved or address.is_link_local):
+    raise SystemExit(1)
+PY
+    then
+        echo "FAIL: could not derive an ordinary bridge IPv4 for compiler-loss worker scheduler: $worker_scheduler_host" >>"$log"
+        status=2
+    elif ! command -v runuser >/dev/null 2>&1; then
+        echo "FAIL: compiler-loss W30 gate requires runuser for the separate wrapper client identity" >>"$log"
+        status=2
+    else
+        if ! getent passwd icecc-client >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir /nonexistent \
+                --shell /usr/sbin/nologin --gid icecc icecc-client || status=$?
+        fi
+        client_uid=$(id -u icecc-client 2>/dev/null || true)
+        daemon_uid=$(id -u icecc 2>/dev/null || true)
+        if [[ -z "$client_uid" || -z "$daemon_uid" || "$client_uid" == 0 ||
+              "$client_uid" == "$daemon_uid" ]]; then
+            echo "FAIL: compiler-loss gate requires distinct non-root icecc-client and icecc UIDs" >>"$log"
+            status=2
+        fi
+        if [[ $status -eq 0 ]]; then
+            export ICECC_P50_C1F1_WORKER_SCHEDULER_HOST="$worker_scheduler_host"
+            export ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc
+            # This check-only Automake helper has no cross-directory rule in
+            # the unittests Makefile. Build it from its owning directory first.
+            build_status=0
+            timeout --signal=TERM --kill-after=15s 300s \
+                make -C /work/build/cache icecc-cache-service-test \
+                >>"$log" 2>&1 || build_status=$?
+            if [[ $build_status -eq 0 ]]; then
+                capture_gate_status timeout --signal=TERM --kill-after=20s "${timeout_s}s" \
+                    make -C /work/build/unittests "$target" >>"$log" 2>&1
+            else
+                status=$build_status
+                echo "FAIL: could not build required hook-enabled cache service (exit=$build_status)" >>"$log"
+            fi
+        fi
+    fi
 elif [[ "$gate" == p51-scheduler-restart-w30 || "$gate" == p51-scheduler-f-restart-w30 ]]; then
     if [[ "$gate" == p51-scheduler-f-restart-w30 ]]; then
         export ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30=1
@@ -362,5 +431,8 @@ python3 /source/dev/gate-result.py "$status" "$log" "$marker" "$expected_markers
 }
 if [[ "$gate" == p51-wrapper-compile ]]; then
     require_wrapper_compile_cells "$log" || exit 1
+fi
+if [[ "$gate" == p51-compiler-loss-w30 ]]; then
+    require_compiler_loss_w30_profiles "$log" || exit 1
 fi
 echo "GATE_PASS name=$gate log=$log"

@@ -428,6 +428,18 @@ p51wrappercompile-check:
 	   ICECC_P51_WRAPPER_JOBS="$$jobs" \
 	   $(SHELL) "$(srcdir)/p51wrappercompile-run.sh"; \
 	 done'
+
+.PHONY: p51wrappercompile-compiler-loss-w30-check
+p51wrappercompile-compiler-loss-w30-check: p50daemonpositive ../daemon/iceccd ../cache/icecc-cache-service
+	@ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)' \
+	 ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
+	 ICECC_TEST_POSITIVE_DAEMON=1 \
+	 ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc \
+	 ICECC_TEST_WRAPPER_USER=icecc-client \
+	 ICECC_P51_WRAPPER_COMPILER_LOSS_W30=1 \
+	 ICECC_P51_WRAPPER_PROFILES='P29V1 ZSTD_TU ZSTD_ROUTE' \
+	 timeout --signal=TERM --kill-after=20s 960s \
+	 $(SHELL) '$(srcdir)/p51wrappercompile-run.sh'
 lockexec_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 
 schedpolicy_SOURCES = schedpolicy.cpp
