@@ -357,13 +357,11 @@ std::vector<std::string> read_manifest(const std::string& path, size_t count) {
     return paths;
 }
 
-std::vector<std::string> read_and_validate_pair(const std::string& a_manifest,
-                                                const std::string& b_manifest,
-                                                const std::string& a_root,
-                                                const std::string& b_root,
-                                                size_t count) {
-    auto a = read_manifest(a_manifest, count);
-    auto b = read_manifest(b_manifest, count);
+void validate_pair_paths(const std::vector<std::string>& a,
+                         const std::vector<std::string>& b,
+                         const std::string& a_root,
+                         const std::string& b_root) {
+    require(a.size() == b.size(), "paired manifests have different entry counts");
     require(!a_root.empty() && !b_root.empty(), "paired path roots must be explicit");
     auto relative_id = [](const std::string& path, const std::string& root) {
         auto has_dot_component = [](const std::filesystem::path& value) {
@@ -385,7 +383,7 @@ std::vector<std::string> read_and_validate_pair(const std::string& a_manifest,
         return id;
     };
     std::set<std::string> unique_ids;
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < a.size(); ++i) {
         const std::string a_id = relative_id(a[i], a_root);
         const std::string b_id = relative_id(b[i], b_root);
         require(unique_ids.insert(a_id).second, "paired manifest repeats a TU identity");
@@ -393,6 +391,16 @@ std::vector<std::string> read_and_validate_pair(const std::string& a_manifest,
                 "paired manifests have different translation-unit identity/order at index " +
                     std::to_string(i));
     }
+}
+
+std::vector<std::string> read_and_validate_pair(const std::string& a_manifest,
+                                                const std::string& b_manifest,
+                                                const std::string& a_root,
+                                                const std::string& b_root,
+                                                size_t count) {
+    auto a = read_manifest(a_manifest, count);
+    auto b = read_manifest(b_manifest, count);
+    validate_pair_paths(a, b, a_root, b_root);
     return b;
 }
 
@@ -1107,13 +1115,51 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile,
               << " raw_decoded_bytes_verified=" << raw_total << '\n';
 }
 
+void verify_paired_default_smoke() {
+    const std::vector<std::string> a_ids = {
+        "/bench/A/src/one.cpp.ii", "/bench/A/src/two.cpp.ii"};
+    const std::vector<std::string> b_ids = {
+        "/bench/B/src/one.cpp.ii", "/bench/B/src/two.cpp.ii"};
+    validate_pair_paths(a_ids, b_ids, "/bench/A", "/bench/B");
+    bool mismatch_rejected = false;
+    try {
+        validate_pair_paths(a_ids,
+                            {"/bench/B/src/two.cpp.ii", "/bench/B/src/one.cpp.ii"},
+                            "/bench/A", "/bench/B");
+    } catch (const std::runtime_error&) {
+        mismatch_rejected = true;
+    }
+    require(mismatch_rejected, "paired identity/order mismatch was accepted");
+
+    const auto generated = make_finalizer_regression_inputs();
+    const std::vector<std::vector<uint8_t>> a(generated.begin(), generated.begin() + 8);
+    auto b = a;
+    for (size_t i = 0; i < b.size(); i += 2) b[i][0] ^= 0x5a;
+    size_t changed = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        changed += icecc::digest128(a[i]) != icecc::digest128(b[i]);
+    require(changed == 4, "paired deterministic fixture has unexpected digest changes");
+
+    constexpr ProfileId profiles[] = {
+        ProfileId::ZSTD_TU, ProfileId::P29V1, ProfileId::ZSTD_ROUTE};
+    for (ProfileId profile : profiles) {
+        smoke_r1(a, profile, &b);
+        smoke_r2(a, profile, 2, std::chrono::seconds(20), false, &b);
+        std::cout << "paired_default_smoke=PASS profile="
+                  << static_cast<unsigned>(profile)
+                  << " protocols=R1,R2 jobs=8 changed_raw_digests=4 "
+                     "unchanged_raw_digests=4 order_negative=PASS\n";
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         require(::setenv("ICECC_P50_DIAGNOSTICS", "1", 1) == 0,
                 "could not enable exact CacheWire accounting");
-        if (argc == 1 ||
+        const bool default_gate = argc == 1;
+        if (default_gate ||
             (argc == 2 &&
              std::string_view(argv[1]) == "--delayed-finalizer-regression")) {
             verify_missing_gate_participant_times_out();
@@ -1125,6 +1171,7 @@ int main(int argc, char** argv) {
                 smoke_r2(inputs, profile, 4, std::chrono::seconds(20), true);
             std::cout << "delayed_finalizer_regression=PASS profiles=3 jobs=32 "
                          "passes=2 window=4\n";
+            if (default_gate) verify_paired_default_smoke();
             return 0;
         }
         if (argc == 10 && std::string_view(argv[1]) == "--paired") {
