@@ -16,6 +16,8 @@ EXTRA_DIST = README.md \
 	dev/gate-result.py \
 	dev/mixed.py \
 	dev/README.md \
+	tools/__init__.py \
+	tools/p50_regenerate_paired_corpus.py \
 	PROJECT_STATE.md \
 	research/README.md \
 	pytest.ini \

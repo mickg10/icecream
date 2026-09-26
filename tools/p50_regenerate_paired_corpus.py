@@ -179,6 +179,30 @@ def validate_source_roots(original_root: Path, source_a: Path, source_b: Path) -
         )
 
 
+def validate_overlay_sources(
+    overlay_root: Path | None,
+    selected: list[tuple[int, str, dict[str, Any]]],
+    original_root: Path,
+) -> None:
+    if overlay_root is None:
+        return
+    if not overlay_root.is_dir():
+        raise ValueError(f"B overlay root does not exist or is not a directory: {overlay_root}")
+    selected_sources = {
+        resolve_from(Path(entry["directory"]), entry["file"]).relative_to(original_root)
+        for _, _, entry in selected
+    }
+    for path in overlay_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(overlay_root)
+        if relative not in selected_sources:
+            raise ValueError(
+                f"B overlay contains a non-selected TU or unsupported header edit: {relative}; "
+                "only selected translation-unit source files may be overlaid"
+            )
+
+
 def preprocess(command: list[str], cwd: str, label: str, identity: str) -> None:
     result = subprocess.run(
         command,
@@ -319,6 +343,7 @@ def main() -> int:
     selected, total = select_candidates(
         archive_files, by_identity, pattern, args.count, args.max_bytes
     )
+    validate_overlay_sources(overlay_b, selected, original_root)
 
     compiler = compiler_identity([entry for _, _, entry in selected])
     output_dir.mkdir(parents=True)

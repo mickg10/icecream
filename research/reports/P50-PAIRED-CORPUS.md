@@ -12,8 +12,11 @@ the original relative source paths. Clang's VFS overlay maps the edited bytes
 to the original virtual filename, preserving `__FILE__`, line markers, and
 quoted-include lookup. The generated preprocessor output is never rewritten.
 The generator rejects a different A/B source root rather than silently mixing
-include trees. Its byte cap is checked during selection and after each output;
-both manifests are published only after both complete corpora fit.
+include trees. Only selected translation-unit source files may appear in the
+sparse overlay; header edits and non-selected source edits are unsupported and
+rejected, not silently ignored. Its byte cap is checked during selection and
+after each output; both manifests are published only after both complete
+corpora fit.
 
 Example (paths should be fresh, task-owned paths; an existing output directory
 is rejected):
