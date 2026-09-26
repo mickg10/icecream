@@ -22,7 +22,29 @@ link and bounded shutdown. The full r6 gate passes all three profiles with
 observed 30+30+30 receipt windows and exact object checks. Product binaries
 were unchanged. The executed runner was based on `98fa7aa`; the integrated
 runner additionally preserves current compiler-loss cleanup and strengthens
-invalid deadline-input rejection. Combined-tree live verification is pending.
+invalid deadline-input rejection. The combined `b270a223` S→F runner now
+also passes all three profiles against the same frozen product binaries;
+the independent compiler-loss rerun is still pending.
+
+Combined run `b5968616788f4e668025ec13fbfe84d3` retains its gate log under
+`repair-gate-work/artifacts/opt-in-gates/` in the artifact root below, SHA256
+`9c2fc4ea4b3c14e6d5ff6ad8805449ba852ea114018e4c530344df11a9d8c66e`.
+Outer `repair-gate-logs/scheduler-f-gate-b270-r2.log` SHA256:
+`174cf36f012ea44615784130e22a0234462ea918e76f9094b05ed7db480cc4bb`.
+The first combined attempt stopped before the test because the fresh private
+source lacked generated autotools `missing`; its setup-failure log is retained.
+
+`40e5ebb8` adds 14 generated-log regression cases that execute the real shell
+deadline checker, including per-attempt, F-arm and aggregate limits, missing
+timestamps/transitions and reused retry identity. The full pinned-UV Python
+harness suite on this donor with integrated `b270a223` content passes
+**1,652 tests, one skipped**, in 231.04s. The skipped
+`test_live_two_c_one_f_service_trace_reconciles_with_collector` requires
+`ICECC_P50CACHESERVICE_BIN`; this run does not qualify that live-service cell.
+`repair-gate-logs/p51-python-combined.log` SHA256:
+`0504f0b2fdf3d82a0bbb61c813933fb64e51a402202510c41407e8d54435ccfe`.
+`repair-gate-work/artifacts/p51-python-combined.xml` SHA256:
+`e76028a3c42952492298e41ee0c636bdfff51e7c5ae81497215de6f43f388233`.
 
 Artifacts under `/tanksmall/scratch/tmp/p51-current-0dc-qualified/`:
 `repair-gate-logs/scheduler-f-gate-r6.log` SHA256
@@ -79,7 +101,7 @@ through pinned `dev/python.sh`; retained log:
 An earlier offline environment-setup attempt failed on an uncached wheel;
 that retained failure is not counted as a test pass.
 Neither this harness fix nor the focused idle test establishes full combined
-candidate qualification; scheduler-to-F recovery remains open.
+candidate qualification; the independent ARM invalidation defect remains open.
 
 ### Persistent wrapper gate entry point
 
