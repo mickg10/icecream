@@ -11,9 +11,11 @@ trap 'rm -rf "$build"' EXIT HUP INT TERM
 
 test -f "$archive"
 
-# Put the instrumented comm/codec objects before the existing static archive;
-# the linker then extracts only the remaining libicecc objects and cannot hide
-# this test behind uninstrumented duplicate definitions.
+# Copy the archive and remove the members we compile instrumented, so the
+# linker sees no duplicate definitions whether or not the archive is LTO.
+cp "$archive" "$build/libicecc.a"
+ar d "$build/libicecc.a" libicecc_la-comm.o libicecc_la-p50_cache_session_wire.o
+
 # shellcheck disable=SC2086
 "$cxx" "$standard" -O1 -g -Wall -Wextra -Wpedantic -Werror \
     -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -21,7 +23,7 @@ test -f "$archive"
     -I"$src" -I"$src/services" -I"$top_build" \
     "$src/unittests/p50_cache_session_wire_test.cpp" \
     "$src/services/comm.cpp" "$src/services/p50_cache_session_wire.cpp" \
-    "$archive" ${ICECC_TEST_LDFLAGS:-} \
+    "$build/libicecc.a" ${ICECC_TEST_LDFLAGS:-} \
     ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
     ${ICECC_TEST_LIBS:--llzo2} \
     ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \

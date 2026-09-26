@@ -49,8 +49,12 @@ else
 fi
 extra_libs="$extra_libs ${ICECC_TEST_LIBCAP_NG_LIBS:-} -ldl"
 
+# GCC 16 false positive on the optional destructor; clang lacks the option
+"$cxx" -Werror -Wno-error=maybe-uninitialized -fsyntax-only -x c++ /dev/null 2>/dev/null \
+    && extra_cflags="$extra_cflags -Wno-error=maybe-uninitialized"
+
 "$cxx" "$standard" $cxxflags $cppflags $extra_cflags \
-    -Wall -Wextra -Wpedantic -Werror -Wno-error=maybe-uninitialized -pthread \
+    -Wall -Wextra -Wpedantic -Werror -pthread \
     $sanitize_flags -fno-omit-frame-pointer \
     -I"$test_srcdir/.." -I"$test_srcdir/../cache" -I"$test_srcdir/../services" \
     "$test_srcdir/p50_daemon_cache_dispatch_test.cpp" \
