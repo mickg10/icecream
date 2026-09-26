@@ -3572,13 +3572,18 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                         if (!assign_error) {
                             cancellation_fd = -1; // Descriptor owns the duplicate.
                             const auto cancellation = pending->cancellation;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
                             const uint64_t request_id = pending->operation.request_id;
                             const auto cancel_observed =
                                 config_.p51_source_cancel_observed_for_test;
+#endif
                             boost::asio::co_spawn(
                                 context_,
-                                [cancellation_watch, cancellation, request_id,
-                                 cancel_observed]()
+                                [cancellation_watch, cancellation
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                                 , request_id, cancel_observed
+#endif
+                                ]()
                                     -> boost::asio::awaitable<void> {
                                     boost::system::error_code wait_error;
                                     co_await cancellation_watch->async_wait(
@@ -3590,12 +3595,15 @@ void SidecarRuntime::start_p51_source_transfer_after_read(
                                     // before the result; EOF or unexpected
                                     // inbound bytes both terminate the request.
                                     if (!wait_error &&
-                                        cancellation->request_cancel() &&
-                                        cancel_observed) {
-                                        try {
-                                            cancel_observed(request_id);
-                                        } catch (...) {
+                                        cancellation->request_cancel()) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                                        if (cancel_observed) {
+                                            try {
+                                                cancel_observed(request_id);
+                                            } catch (...) {
+                                            }
                                         }
+#endif
                                     }
                                 },
                                 boost::asio::detached);
