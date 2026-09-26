@@ -104,6 +104,14 @@ Runtime replay-loss regression qualification remains required.
 
 ### Current broad candidate qualification
 
+Default local mixed-image testing now passes all five rows on rebuilt
+`0dc29331` current and pinned `cd74801e` P43 images: three R1 profiles,
+P43 worker and P43 client, with actual remote results. Summary:
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/mixed-default-r2/summary.json`,
+SHA256 `1065ecaa1e9c01d45731639ceff307980cae020025a6c63a6d58f7f9519abeeb`.
+This does not qualify the separate R2 or concurrent mixed-profile gates.
+The first launcher attempt lacked Docker and is retained as a setup failure.
+
 Public QA on `1d87b3aa` later passes its two isolated-root service/sanitizer
 checks, then stops at Python with 1,597 PASS, 7 SKIP and one unsorted formal
 distribution-manifest failure. It does not reach image construction or default
