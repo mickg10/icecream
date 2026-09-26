@@ -70,7 +70,8 @@ retained as `p50daemonsidecaradapter-source.log` in the donor directory below.
 The separate direct adapter binary run against the prebuilt service exits 30:
 absent cancellation returns Applied rather than UnknownRecord. A stale service
 is suspected, not established; a matched rebuilt-service rerun is pending.
-That run and the combined service failure below are not counted as passes.
+That direct adapter run is not counted as a pass. The combined service run
+below now passes after its fixture ordering correction.
 
 Qualified donor: `536dc696`. Test binary SHA256:
 `8ddc058a9675cdeaf0312740efd841cb174ad8246176bec2c56396ab822047d5`.
@@ -116,13 +117,35 @@ Evidence under
 | `d14-matrix-drain-r1.log` | `8ddc27a69766cd4f8868b6cf62d2dc32bca5a862491dc9f17666693042408452` |
 | `d14-terminal-drain-r1.log` | `c772a8cdfde60b0bc5c1d96a7a5f6f555c95402b5172720dc42b9ad6db725006` |
 
-The combined generated service-test target is **not passing**: it aborts
-with exit 134 in D07 cancellation/recovery, before reaching this matrix.
-Its `.trs` reports FAIL even though the make invocation returns zero.
-The focused D07 positive-owner selector passes on the same binary; the
-combined abort still needs diagnosis. Earlier manual full runs also failed
-on missing harness environment and are not counted as passes. These results
-do not qualify arbitrary restart combinations or real compiler cleanup.
+The combined generated service-test target now **passes**, including all
+93 matrix rows and three terminal reconnect rows, on the updated backlog-fix
+production files plus a D07 fixture correction. The positive-owner scenario
+previously mistook a flag still set by held request 1 for request 2 readiness;
+four preparation workers could then give the successor ordinal 2. It now
+observes the second complete bundle and exact ordinals [1,2] before submitting
+the successor. A scope guard releases the materializer gate and joins the
+waiter during assertion unwinding. No production ordering rule was changed.
+
+Final source SHA256:
+`de30d6be6fb1f876cdddd5eb20e550b3fcaf9260ad4cd89f99797786b36a1987`;
+test binary SHA256:
+`7a038ce2da19f72b4f2bf0b189d34d41bca715014b6a80ab83241fbde26a71e0`.
+Evidence under
+`/tanksmall/scratch/tmp/p51-d11-metadata-expiry-c6fce0e7/work/artifacts/`:
+`p50cacheservice-full-eb3-d07-r1.log` SHA256
+`2232e7d5d36b009fab9be967aa4fbc9d0b96ea78f997b74da5277dc8259bd2ef`;
+matching `.trs` SHA256
+`7f175f2f5d04511903d382671ba96ca623e127f57730d53966587cf2c2689229`.
+The focused positive-owner selector also passes twice across all profiles.
+Production control/adapter sources were persisted and verified inside the
+container before rebuilding affected archives and service/test binaries.
+
+The earlier exit-134 abort remains retained: its exact failing assertion was
+not captured, so the demonstrated fixture race is not claimed as a proven
+explanation of that particular historical abort. Reused-source diagnostic
+runs and manual runs missing harness environment are not substituted for
+the final result. This gate does not qualify arbitrary restart combinations
+or real compiler cleanup.
 
 ### Concurrent source-credit admission
 

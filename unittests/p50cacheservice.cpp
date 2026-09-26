@@ -3532,6 +3532,21 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     bool first_exact = false;
     std::chrono::steady_clock::time_point first_finished{};
     std::thread first_waiter;
+    // The positive-owner scenario starts this waiter before several checked
+    // preconditions below. If any CHECK throws before the normal join point,
+    // open the materializer gate and join before the std::thread destructor;
+    // otherwise that destructor calls std::terminate and hides the assertion.
+    auto first_waiter_unwind = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            if (!first_waiter.joinable())
+                return;
+            {
+                std::lock_guard lock(materialize_mutex);
+                release_second_bundle = true;
+            }
+            materialize_changed.notify_all();
+            first_waiter.join();
+        });
     if (positive_recovery_owner) {
         // In the positive-owner case the first request must be the exact
         // request paused by materialize-call #1. Do not enqueue any sibling
@@ -3645,15 +3660,37 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     }
 
     CHECK(enqueue(cancelled));
-    bool second_materialization_waiting = false;
-    {
+    bool cancelled_predecessor_ready = false;
+    if (positive_recovery_owner) {
+        // The first F materializer is still held, so materialization_waiting
+        // remains true from request 1 and cannot prove request 2 has reached
+        // the wire. With four C workers, the successor could otherwise race
+        // request 2 for relationship ordinal 2. Wait until request 2's full
+        // bundle is observed before submitting its successor.
+        std::unique_lock lock(first_bundle_mutex);
+        cancelled_predecessor_ready = first_bundle_changed.wait_for(
+            lock, std::chrono::seconds(8), [&] {
+                return std::find(c_bundle_ordinals.begin(),
+                                 c_bundle_ordinals.end(), 2) !=
+                       c_bundle_ordinals.end();
+            });
+        if (cancelled_predecessor_ready) {
+            CHECK(c_bundle_ordinals.size() == 2);
+            CHECK(c_bundle_ordinals[0] == 1);
+            CHECK(c_bundle_ordinals[1] == 2);
+            std::fprintf(stderr,
+                         "P51_D07 positive-owner predecessor-ordinal=2 "
+                         "observed-before-successor=1\n");
+            std::fflush(stderr);
+        }
+    } else {
         std::unique_lock lock(materialize_mutex);
-        second_materialization_waiting = materialize_changed.wait_for(
+        cancelled_predecessor_ready = materialize_changed.wait_for(
             lock, std::chrono::seconds(8), [&] {
                 return materialization_waiting;
             });
     }
-    CHECK(second_materialization_waiting);
+    CHECK(cancelled_predecessor_ready);
     CHECK(enqueue(successor));
     const bool successor_operation_active = wait_for_source_operation_count(
         c_runtime, positive_recovery_owner ? 3 : 2,
