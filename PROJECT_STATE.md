@@ -33,8 +33,27 @@ Under `/tanksmall/scratch/tmp/p51-d07-c-expired-f-live-build/build/unittests/`:
 
 The positive-receipt path has no suspension between endpoint acceptance and
 sender queue reconciliation on the required single-owner thread; no artificial
-interleaving was added. Final counterfactual controls, current mixed images and
-daemon end-to-end C-expired/F-live qualification remain pending.
+interleaving was added. Disabling local-expired retirement in a disposable
+variant makes the first healthy survivor fail with clean EOF (actual exit 1),
+proving this fixture detects the missing progress. Log:
+`/tanksmall/scratch/tmp/p51-d07-counterfact-retire-runtime/no-retirement-counterfactual.log`,
+SHA256 `de9df31e1fe7058ef5a13ea6cc2bb43f43d87a90a8641372042e582a6ff2f033`.
+Restoring the old failed-read front guard also fails (exit 125), but its exact
+runtime termination site is not yet classified; that result is not reported as
+a specific assertion failure. Current mixed images and daemon end-to-end
+C-expired/F-live qualification remain pending.
+
+### Paired edited-input benchmark
+
+Candidates `ff76e234` and `be7cf3b2` add explicit ordered A/B input pairing for
+R1 and R2, measuring fresh A, retained A and edited B separately. All six
+eight-input Firefox profile/mode smoke cases and invalid-pair controls pass;
+legacy CLI smoke also passes. These are functional checks, not performance
+results. The donor benchmark was linked with the earlier `db508d7b` runtime;
+the integrated recovery runtime still needs a fresh benchmark build.
+OS page-cache state is explicitly inherited/uncontrolled, and CPU accounting
+covers the combined process, not separately measured C/F processes.
+Routine synthetic paired coverage and the full performance matrix remain pending.
 
 ### External mixed-client harness (live run pending)
 
