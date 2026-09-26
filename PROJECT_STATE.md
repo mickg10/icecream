@@ -12,6 +12,40 @@ retained artifact directories.
 
 ## Developer QA
 
+### Scheduler-to-F recovery and open ARM invalidation defect
+
+`b270a223` integrates the repaired S→F receipt interceptor: install before F
+replacement, forward a valid initial LINK_REJECT, permit bounded pre-arm
+replacement candidates, and stop retrying after LINK_STATE/arming. Its focused
+test exercises stale EOF, exact StoreReplaced rejection, a subsequent valid
+link and bounded shutdown. The full r6 gate passes all three profiles with
+observed 30+30+30 receipt windows and exact object checks. Product binaries
+were unchanged. The executed runner was based on `98fa7aa`; the integrated
+runner additionally preserves current compiler-loss cleanup and strengthens
+invalid deadline-input rejection. Combined-tree live verification is pending.
+
+Artifacts under `/tanksmall/scratch/tmp/p51-current-0dc-qualified/`:
+`repair-gate-logs/scheduler-f-gate-r6.log` SHA256
+`f5a086e3dcd49790aec78768916a0d411faa1cbfae3e9b7cba251094c5330240`;
+inner log at `repair-gate-work/artifacts/opt-in-gates/76a6da524c98484eb7ea930f1ab4c27b/`
+has SHA256 `5c05f0a2a87bc876a9ca045b2b56d257d95b7d3b94e387af859996b851a73e9b`.
+Final helper binary SHA256:
+`a91072164b46ae5c4e872a46cb0dc518480897097633c1a273f4f32cb8bec990`.
+Deadline parser checks include historical failed wrappers and negative inputs;
+truncated r6 first-attempt logs are derived parser fixtures, not complete
+one-attempt wrapper outcomes.
+
+**Open runtime defect (C03):** controlled post-Goodbye tests on unchanged
+production code reproduce stale P51_SOURCE_ARMED after either client
+half-close or exact F-sidecar death. Responses arrived 5/10 ms after ARM send,
+inside the unchanged 2,000 ms test budget. This establishes stale cached-owner
+publication, not a same-poll ordering proof. Client-half-close permits a later
+healthy ARM; the sidecar-death recovery check is also not yet green. Fix and
+regression qualification remain pending. Red logs:
+`/tanksmall/scratch/tmp/p51-c03-discriminator-run/tmp/c03-client-eof-r2.log`
+and `c03-sidecar-death-r2.log`. Do not interpret the restart-gate pass as
+closing this independent invalidation race or the overall W30 gate matrix.
+
 ### Idle reconnect and batch verdict propagation
 
 `cdb13e0e` adds the opt-in `make -C unittests p50zstdsender-idle-check`
