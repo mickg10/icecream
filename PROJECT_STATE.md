@@ -12,6 +12,37 @@ retained artifact directories.
 
 ## Developer QA
 
+### Current cleanup and collector qualification
+
+On the fresh `173dd1c4` runtime snapshot described below,
+`p50cacheservice --d17-repeated-window-cancel` passes all nine cells:
+P29V1/ZSTD_TU/ZSTD_ROUTE, cancelling submission positions 0/14/29 from
+30 held jobs. Each cell observes 29 survivors and one fresh completion,
+zero transient raw bytes after cleanup, restored descriptor baseline, and
+retained input records/bytes matching the expected completed-input inventory.
+RSS is diagnostic, not a proof of an unbounded memory plateau. The current
+sanitizer rerun remains pending; its first invocation failed at link time
+because the configured libcap-ng link flag was omitted, before any test ran.
+Native log: `current/tmp/d17-repeated-window-cancel.log` under the fresh
+bootstrap run below, SHA256
+`e9ece46770454621174300b68a582f5b00c2cbbe1f225bf1bbe90cf8814ed8eb`.
+
+The earlier Python suite's skipped live collector cell now passes separately:
+`test_live_two_c_one_f_service_trace_reconciles_with_collector`, 1 passed in
+0.69s, with `ICECC_P50CACHESERVICE_BIN` pointing to the fresh helper inside
+the Ubuntu SDK container. Helper SHA256:
+`c748720531b1a8aa571526f171c2b43349c0744f316593ed72f05edd430ca382`.
+Log: `/tanksmall/scratch/tmp/p51-f-disconnect-173dd/artifacts/collector/live-collector-r2.log`,
+SHA256 `4d0e3083f4a1688874433e2dedc77fa1e676a8589caa587704917d0e6886bd01`.
+This is a focused skip closure, not a new full-suite run.
+
+An outstanding D03 regression cuts the initial LINK_STATE reply. Repeating
+Initial on that exact relationship reaches retained history and is rejected;
+switching the fixture to Reconnect is not sufficient because the client
+retains its initial link state only after receiving the complete reply.
+The production sender retry path and same-assignment recovery remain under
+investigation. No successful all-offset LINK_STATE qualification is claimed.
+
 ### Fresh integrated runtime: six core live gates pass
 
 Fresh public `make dev-gate GATE=p50-live-core` on `173dd1c4` passes all six
