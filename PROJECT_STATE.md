@@ -12,6 +12,23 @@ retained artifact directories.
 
 ## Developer QA
 
+### Current broad candidate qualification
+
+Public `make qa` on clean candidate `293a1367`, in a two-CPU/8-GiB SDK
+container, is still running. Its registered cache-service suite and
+cache-service sanitizer gate pass, but `p50service-metrics-run.sh` has an
+actual test/global `.trs` FAIL. The candidate is **not broadly qualified**;
+the metrics failure remains under investigation.
+
+The native run also skips `remoteice-quick.sh` and
+`p50assignment-remote.sh` because its daemon lacks `CAP_SYS_CHROOT`, and
+`p50sourcearm-live-run.sh` requires an explicit isolated-root opt-in.
+These skips are not passes; separate isolated-container reruns are pending.
+Evidence is retained under
+`/tanksmall/scratch/tmp/p51-qa-293a/scratch/icecream-qa-kiyex8p9/current/`.
+The source-expiry recovery and independent cancellation-cleanup fixes remain
+in private donor worktrees pending review and combined qualification.
+
 ### Bounded P29V1 transfer-window pilot
 
 [Machine-readable measurements](research/measurements/p50-window-pilot-corpus2-20260926.json)
