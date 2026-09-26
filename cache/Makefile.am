@@ -15,7 +15,7 @@ icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
 	libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
-icecc_cache_service_CXXFLAGS = -O2 -Werror -pthread
+icecc_cache_service_CXXFLAGS = -O2 -Werror $(GCC11_ASIO_FRAME_MISMATCH_CXXFLAG) -pthread
 icecc_cache_service_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 
 # The four-link capacity gate needs deterministic settlement/ARM hooks. Keep
@@ -26,7 +26,7 @@ icecc_cache_service_test_LDADD = libp50endpointtesthooks.a \
 	$(icecc_cache_service_LDADD)
 icecc_cache_service_test_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
 	-DICECC_P50_ENDPOINT_TEST_HOOKS
-icecc_cache_service_test_CXXFLAGS = -O2 -Werror -pthread
+icecc_cache_service_test_CXXFLAGS = -O2 -Werror $(GCC11_ASIO_FRAME_MISMATCH_CXXFLAG) -pthread
 icecc_cache_service_test_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 
 libprotocol50_a_SOURCES = \

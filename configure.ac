@@ -31,6 +31,25 @@ AC_LANG([C++])
 AC_PROG_CC
 AC_PROG_CXX
 
+# GCC 11's -Wmismatched-new-delete produces a false positive for Boost.Asio
+# awaitable frames whose matching allocator pair routes through aligned_alloc
+# and free. Keep this demotion limited to the cache-service targets that compile
+# those coroutine translation units; the warning remains visible and every
+# other -Werror diagnostic stays fatal.
+GCC11_ASIO_FRAME_MISMATCH_CXXFLAG=
+AC_MSG_CHECKING([whether the C++ compiler is GCC 11])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+        #if !defined(__GNUC__) || defined(__clang__) || __GNUC__ != 11
+        # error not GCC 11
+        #endif
+    ]], [[]])], [
+        GCC11_ASIO_FRAME_MISMATCH_CXXFLAG=-Wno-error=mismatched-new-delete
+        AC_MSG_RESULT([yes])
+    ], [
+        AC_MSG_RESULT([no])
+    ])
+AC_SUBST([GCC11_ASIO_FRAME_MISMATCH_CXXFLAG])
+
 AC_ARG_VAR([ICE_CXX_STANDARD_FLAG],
     [compiler flag selecting C++23 mode (default: -std=c++23)])
 AS_IF([test -z "$ICE_CXX_STANDARD_FLAG"], [ICE_CXX_STANDARD_FLAG=-std=c++23])
