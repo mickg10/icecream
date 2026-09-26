@@ -3762,7 +3762,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
            !future_offer_during_recovery && !lose_reset_confirm &&
            !lose_reset_confirm_echo && !mismatch_reset_confirm_echo));
     CHECK(!lose_recover_response ||
-          (kJobs == 2 && !repeat_recovery_loss && !post_reset_offer_probe &&
+          ((kJobs == 2 || kJobs == 30) && !repeat_recovery_loss &&
+           !post_reset_offer_probe &&
            !future_offer_during_recovery && !lose_reset_confirm &&
            !lose_reset_confirm_echo && !mismatch_reset_confirm_echo &&
            !change_reset_ack_on_replay));
@@ -3819,11 +3820,15 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     }
     const PrepareRequestKey future_offer_request{3, 921 + kJobs};
     const auto clock = sidecar::process_monotonic_clock_identity();
+    // Keep the source lease's absolute deadline at its 60-second ceiling for
+    // the W30 sanitizer case; W2 recovery checks retain their tighter budget.
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
         std::chrono::steady_clock::now() +
-             ((lose_reset_confirm || lose_reset_confirm_echo ||
-               lose_recover_response ||
-              mismatch_reset_confirm_echo || change_reset_ack_on_replay)
+             ((lose_recover_response && kJobs == 30)
+                  ? std::chrono::seconds(60)
+             : (lose_reset_confirm || lose_reset_confirm_echo ||
+                lose_recover_response || mismatch_reset_confirm_echo ||
+                change_reset_ack_on_replay)
                  ? std::chrono::seconds(10)
              : reject_after_positive_receipt
                  ? std::chrono::seconds(8)
@@ -4904,6 +4909,9 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         CHECK(retried.request.verified_floor_a == lost.request.verified_floor_a);
         CHECK(retried.request.prepared_prefix_p == lost.request.prepared_prefix_p);
         CHECK(retried.request.witness_count == lost.request.witness_count);
+        CHECK(lost.request.verified_floor_a == 0);
+        CHECK(lost.request.prepared_prefix_p == kJobs);
+        CHECK(lost.request.witness_count == kJobs);
         CHECK(retried.witness_digest == lost.witness_digest);
         CHECK(retried.request.physical_link_generation >
               lost.request.physical_link_generation);
@@ -4927,6 +4935,9 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         normalized_lost_response.physical_link_generation = 1;
         normalized_retry_response.physical_link_generation = 1;
         CHECK(normalized_lost_response == normalized_retry_response);
+        CHECK(lost.end.verified_floor_a == 0);
+        CHECK(lost.end.committed_prefix_k == 1);
+        CHECK(lost.end.receipt_count == 1);
         CHECK(lost.rows.size() == 1 && retried.rows.size() == 1);
         CHECK(lost.rows.front().relationship_id == relationship_id);
         CHECK(retried.rows.front().relationship_id == relationship_id);
@@ -4959,6 +4970,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         CHECK(retained_reset->settled_prefix_k == 1);
         CHECK(retained_reset_confirmed);
         std::cerr << "P51_SENDER_LOST_RECOVER_RESPONSE profile=" << profile_name
+                  << " callers=" << kJobs
                   << " response_attempts=" << recovery_reply_evidence.size()
                   << " same_operation=1 same_witness=1 committed_prefix=1"
                   << " suffix=" << (kJobs - 1) << " credits=0 PASS\n";
@@ -5145,10 +5157,11 @@ void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
 void test_p51_sender_retries_lost_recover_response_all_profiles() {
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
-        run_p51_sender_shared_failure_case(
-            2, profile, false, false, false, false, false, false, false,
-            false, false, false, false, false, false,
-            RecoverResponseLoss::FirstResponse);
+        for (const size_t window : {2U, 30U})
+            run_p51_sender_shared_failure_case(
+                window, profile, false, false, false, false, false, false,
+                false, false, false, false, false, false, false,
+                RecoverResponseLoss::FirstResponse);
     }
 }
 
