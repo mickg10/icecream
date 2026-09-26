@@ -51,8 +51,8 @@ with source setup still in flight after the bounded cleanup deadline, rather
 than an unrelated exit site. Backtrace log:
 `/tanksmall/scratch/tmp/p51-d07-counterfact-front-runtime/front-guard-backtrace.log`,
 SHA256 `4fc927fc59d0e971174d5af755542bfe5e3bb614e54ed62285e5effce3592b88`.
-Current mixed images and daemon end-to-end C-expired/F-live qualification
-remain pending.
+Current mixed-image results are recorded below; daemon end-to-end
+C-expired/F-live qualification remains pending.
 
 ### Paired edited-input benchmark
 
@@ -109,8 +109,19 @@ Default local mixed-image testing now passes all five rows on rebuilt
 P43 worker and P43 client, with actual remote results. Summary:
 `/tanksmall/scratch/tmp/p51-current-0dc-qualified/mixed-default-r2/summary.json`,
 SHA256 `1065ecaa1e9c01d45731639ceff307980cae020025a6c63a6d58f7f9519abeeb`.
-This does not qualify the separate R2 or concurrent mixed-profile gates.
+This does not qualify the separate concurrent mixed-profile gates.
 The first launcher attempt lacked Docker and is retained as a setup failure.
+
+The explicit R2-only local image gate also passes all three profiles on the
+same rebuilt current image: P29V1, ZSTD_TU and ZSTD_ROUTE. Each records an
+actual remote result (`ICECREAM_MIXED_OK`), strict assignment checks, source
+transfer, R2 selection, source lease and link adoption. Host orchestration uses
+the project's pinned UV environment, with `--jobs 2 --memory-gb 8 --p51-r2
+--only-p51-r2`. Summary:
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/mixed-r2-only/summary.json`,
+SHA256 `3e878160099d8f850bc2768718a74addb7ea20056d1355ea77ac377c22d24cfc`.
+This is three single-client profile cases, not concurrent P43/R1/R2 traffic
+or a thirty-outstanding-transfer witness. Those gates remain separate.
 
 Public QA on `1d87b3aa` later passes its two isolated-root service/sanitizer
 checks, then stops at Python with 1,597 PASS, 7 SKIP and one unsorted formal
