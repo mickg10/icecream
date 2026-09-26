@@ -21,6 +21,8 @@ install-sh
 ltmain.sh
 missing
 *.o
+*.a
+*.so
 *.lo
 .deps
 .libs

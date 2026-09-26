@@ -38,7 +38,7 @@ trap 'exit 1' HUP INT TERM
     "$test_srcdir/support/p50_sidecar_supervisor.cpp" \
     "$test_srcdir/../cache/p50_sidecar_identity.cpp" \
     $ldflags "$transport_lib" "$protocol_lib" "$services_lib" \
-    /lib/x86_64-linux-gnu/libxxhash.so.0 -lzstd -ldl $libs -o "$binary"
+    -lxxhash -lzstd -ldl $libs -o "$binary"
 # The test intentionally exercises fail-closed lease leaks and uses fork/exec
 # children; LeakSanitizer reports inherited allocator state from those child
 # boundaries rather than a supervisor leak. ASan/UBSan remain enabled.

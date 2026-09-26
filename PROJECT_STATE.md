@@ -12,6 +12,17 @@ retained artifact directories.
 
 ## Developer QA
 
+### QA snapshot and library portability
+
+Generated `*.a` and `*.so` files are now ignored so QA's untracked-file
+snapshot cannot import stale build libraries through VPATH. The supervisor
+sanitizer script links `-lxxhash` rather than a Debian-specific absolute path.
+These two files match the corresponding changes in donor `43451abf`.
+Luna verified both ignore patterns and successful sanitizer compilation/linking.
+The subsequent supervisor runtime still fails its `gone` assertion in the
+isolated run; this is not a passing sanitizer gate. The proposed Bash trap
+fix is held separately pending the full interruption test.
+
 ### Sender sanitizer lifetime correction and clean candidate build
 
 The R2 recovery and shared-failure test fixtures now declare their sender
