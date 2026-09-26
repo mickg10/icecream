@@ -38,6 +38,12 @@ tests execute the extracted real shell function with success/failure stubs.
 The donor's focused tests plus distribution checks pass 14 tests; log:
 `/tanksmall/scratch/tmp/p51-finish-batch-status-guard/pytest-verify.log`,
 SHA256 `f622c9f0e936ba275637fd440925c6075acef59a55b19ddcdf44dda5c5826f1a`.
+The same 14 focused tests pass on integrated candidate `5488dfee` in 1.00s
+through pinned `dev/python.sh`; retained log:
+`/tanksmall/scratch/tmp/p51-c06-python.qnbmdD/focused14-retry.log`, SHA256
+`69b4a6e86e672aa4fe610e79220dbad2d913faeb5f1458d22b30ab5fa344cc84`.
+An earlier offline environment-setup attempt failed on an uncached wheel;
+that retained failure is not counted as a test pass.
 Neither this harness fix nor the focused idle test establishes full combined
 candidate qualification; scheduler-to-F recovery remains open.
 
