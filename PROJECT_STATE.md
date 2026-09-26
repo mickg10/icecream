@@ -12,6 +12,35 @@ retained artifact directories.
 
 ## Developer QA
 
+### Fresh-bootstrap live-core qualification
+
+The private gate candidate `871cc921` passes a fresh source-snapshot bootstrap
+on nas642 with the Ubuntu 24.04 SDK: configure/build exit 0, then all six
+required live script results are freshly produced PASS (remote assignment,
+P50 assignment, completion flow, compile end-to-end, daemon-positive and live
+source-arm). This includes the independent-deadline daemon regression.
+Build time is 176.8 seconds; the live gate, including check-only prerequisite
+builds, is 433.294 seconds. These are QA durations, not workload benchmarks.
+
+Source snapshot SHA256:
+`fb56f2c430417c7dc2efc73ca7913a4d73b1e29458b5e0093a7262cced14c6e5`.
+Artifacts are under
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/bootstrap-runs/icecream-qa-3u00ylxo`:
+
+- `result.json`: PASS, all recorded step exits 0; SHA256
+  `d27fd64c357693aed000ec8721f14ef4d3321cf114d8ba849bbec24e911b4ec6`.
+- `logs/03-gate-p50-live-core.log`: SHA256
+  `93659f2fb83fb8c41d8ed189bee6a8282cc41d0e6553f9f00a5831761a1c059b`.
+- `current/artifacts/opt-in-gates/b8fa9cce00d8497a97d905742cf47816/p50-live-core.log`:
+  six live-test PASS markers and the terminal marker; SHA256
+  `e9991fc2892794bd4427e46546ef9dba1d45ec93e7e634a51db56fed7921cf31`.
+
+The entry point and its reviewed failure-status follow-up are pending
+integration. This result qualifies the named private snapshot, not a future
+runner revision or the remaining W30 restart/capacity and external-farm gates.
+The two preceding bootstrap attempts failed on missing check-only build
+prerequisites; their artifacts remain retained, not counted as product passes.
+
 ### Independent caller/reservation expiry recovery
 
 Candidate `928d9955` integrates runtime donor `d39e227a`. A failed receipt
