@@ -38,10 +38,14 @@ variant makes the first healthy survivor fail with clean EOF (actual exit 1),
 proving this fixture detects the missing progress. Log:
 `/tanksmall/scratch/tmp/p51-d07-counterfact-retire-runtime/no-retirement-counterfactual.log`,
 SHA256 `de9df31e1fe7058ef5a13ea6cc2bb43f43d87a90a8641372042e582a6ff2f033`.
-Restoring the old failed-read front guard also fails (exit 125), but its exact
-runtime termination site is not yet classified; that result is not reported as
-a specific assertion failure. Current mixed images and daemon end-to-end
-C-expired/F-live qualification remain pending.
+Restoring the old failed-read front guard also fails (exit 125). A disposable
+diagnostic variant resolves the termination to `SidecarRuntime` destruction
+with source setup still in flight after the bounded cleanup deadline, rather
+than an unrelated exit site. Backtrace log:
+`/tanksmall/scratch/tmp/p51-d07-counterfact-front-runtime/front-guard-backtrace.log`,
+SHA256 `4fc927fc59d0e971174d5af755542bfe5e3bb614e54ed62285e5effce3592b88`.
+Current mixed images and daemon end-to-end C-expired/F-live qualification
+remain pending.
 
 ### Paired edited-input benchmark
 
