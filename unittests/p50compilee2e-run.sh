@@ -570,7 +570,32 @@ EOF_CLEANUP_COMPILER_LOSS_KILL
         wait "$receipt_gate_pid" 2>/dev/null || :
         receipt_gate_pid=
     fi
-    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${w30_active_wrapper_pid:-} ${compiler_loss_c2_wrapper:-} ${compiler_loss_victim_wrapper:-} ${s2_compile_pid:-} ${service_pid:-} ${service_b_pid:-} ${client_service_pid:-} ${client2_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    if test -n "${receipt_gate_delayed_pid:-}" && kill -0 "$receipt_gate_delayed_pid" 2>/dev/null; then
+        if test -n "${receipt_gate_delayed_dir:-}" && test -d "$receipt_gate_delayed_dir"; then
+            delayed_abort_tmp="$receipt_gate_delayed_dir/.abort-$$"
+            printf 'abort\n' >"$delayed_abort_tmp" && mv -f "$delayed_abort_tmp" "$receipt_gate_delayed_dir/abort" || {
+                rm -f "$delayed_abort_tmp"
+                echo "WARN: could not publish delayed receipt-gate abort marker" >&2
+            }
+            for _ in $(seq 1 50); do
+                kill -0 "$receipt_gate_delayed_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+        fi
+        if kill -0 "$receipt_gate_delayed_pid" 2>/dev/null; then
+            kill "$receipt_gate_delayed_pid" 2>/dev/null || :
+            for _ in $(seq 1 20); do
+                kill -0 "$receipt_gate_delayed_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+        fi
+        if kill -0 "$receipt_gate_delayed_pid" 2>/dev/null; then
+            kill -9 "$receipt_gate_delayed_pid" 2>/dev/null || :
+        fi
+        wait "$receipt_gate_delayed_pid" 2>/dev/null || :
+        receipt_gate_delayed_pid=
+    fi
+    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${receipt_gate_delayed_pid:-} ${w30_active_wrapper_pid:-} ${compiler_loss_c2_wrapper:-} ${compiler_loss_victim_wrapper:-} ${s2_compile_pid:-} ${service_pid:-} ${service_b_pid:-} ${client_service_pid:-} ${client2_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
     for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
@@ -2272,6 +2297,154 @@ if test -n "$batch_manifest"; then
             >"$work/result-$run_label-$ordinal.tsv"
         printf '%s\n' "$((wait_ms * 1000000))" >"$work/wait-$run_label-$ordinal.ns"
     }
+    verify_f_restart_failure_deadlines() {
+        deadline_client_log=$1
+        deadline_elapsed_ms=$2
+        case "$deadline_elapsed_ms" in
+            ''|*[!0-9]*)
+                echo "FAIL: aggregate F-restart client span must be a nonnegative integer (${deadline_elapsed_ms})" >&2
+                return 1
+                ;;
+        esac
+        deadline_job_ids=$(sed -nE \
+            's/.*P50 assignment identity bound for job ([0-9]+) epoch.*/\1/p' \
+            "$deadline_client_log")
+        deadline_attempts=$(printf '%s\n' "$deadline_job_ids" | sed '/^$/d' | wc -l)
+        case "$deadline_attempts" in
+            1)
+                # A single failed assignment can consume the fixed 120s C
+                # transfer operation deadline; do not misclassify it as a
+                # 60s F source-arm overrun.
+                deadline_failure_stamp=$(sed -nE \
+                    's/.*(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}).*cache source transfer failed closed.*/\1/p' \
+                    "$deadline_client_log" | head -n 1)
+                deadline_start_stamp=$(sed -nE \
+                    's/.*(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}).*P50 assignment identity bound for job.*/\1/p' \
+                    "$deadline_client_log" | head -n 1)
+                test -n "$deadline_failure_stamp" && test -n "$deadline_start_stamp" || {
+                    echo "FAIL: single-attempt F-restart failure lacks assignment/terminal timestamps ($deadline_client_log)" >&2
+                    return 1
+                }
+                deadline_failure_epoch=$(date -d "$deadline_failure_stamp" +%s 2>/dev/null) || return 1
+                deadline_start_epoch=$(date -d "$deadline_start_stamp" +%s 2>/dev/null) || return 1
+                test -n "$deadline_failure_epoch" && test -n "$deadline_start_epoch" || {
+                    echo "FAIL: could not parse single-attempt F-restart deadline timestamps ($deadline_client_log)" >&2
+                    return 1
+                }
+                deadline_first_elapsed=$((deadline_failure_epoch - deadline_start_epoch))
+                test "$deadline_first_elapsed" -ge 0 && test "$deadline_first_elapsed" -le 122 || {
+                    echo "FAIL: first F-restart assignment exceeded the fixed 120s source-transfer deadline ($deadline_first_elapsed s)" >&2
+                    return 1
+                }
+                test "$deadline_elapsed_ms" -le 122000 || {
+                    echo "FAIL: single-assignment F-restart client exceeded 120s plus 2s observation grace (${deadline_elapsed_ms}ms)" >&2
+                    return 1
+                }
+                echo "S8_F_RESTART_ATTEMPT_DEADLINE assignments=1 c_transfer_seconds=$deadline_first_elapsed c_budget_ms=120000"
+                ;;
+            2)
+                deadline_first_job=$(printf '%s\n' "$deadline_job_ids" | sed -n '1p')
+                deadline_retry_job=$(printf '%s\n' "$deadline_job_ids" | sed -n '2p')
+                test "$deadline_first_job" != "$deadline_retry_job" || {
+                    echo "FAIL: fresh F-restart assignment reused the original job identity" >&2
+                    return 1
+                }
+                grep -Fq 'assignment failed; requesting one fresh strict-P50 remote assignment' "$deadline_client_log" && \
+                    grep -Eq 'cache source transfer failed closed \(status 2, error [0-9]+, attempts 0\)' "$deadline_client_log" || {
+                    echo "FAIL: two-attempt F-restart failure lacks the exact one-fresh-assignment transition" >&2
+                    return 1
+                }
+                deadline_first_failure_stamp=$(sed -nE \
+                    's/.*(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}).*cache source transfer failed closed.*/\1/p' \
+                    "$deadline_client_log" | head -n 1)
+                deadline_first_start_stamp=$(sed -nE \
+                    's/.*(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}).*P50 assignment identity bound for job.*/\1/p' \
+                    "$deadline_client_log" | head -n 1)
+                test -n "$deadline_first_failure_stamp" && test -n "$deadline_first_start_stamp" || {
+                    echo "FAIL: two-attempt F-restart failure lacks original assignment/terminal timestamps ($deadline_client_log)" >&2
+                    return 1
+                }
+                deadline_first_failure_epoch=$(date -d "$deadline_first_failure_stamp" +%s 2>/dev/null) || return 1
+                deadline_first_start_epoch=$(date -d "$deadline_first_start_stamp" +%s 2>/dev/null) || return 1
+                test -n "$deadline_first_failure_epoch" && test -n "$deadline_first_start_epoch" || {
+                    echo "FAIL: could not parse original assignment deadline timestamps ($deadline_client_log)" >&2
+                    return 1
+                }
+                deadline_first_elapsed=$((deadline_first_failure_epoch - deadline_first_start_epoch))
+                test "$deadline_first_elapsed" -ge 0 && test "$deadline_first_elapsed" -le 122 || {
+                    echo "FAIL: original assignment exceeded fixed 120s C transfer deadline plus timestamp precision ($deadline_first_elapsed s)" >&2
+                    return 1
+                }
+                deadline_second_failure_stamp=$(sed -nE \
+                    's/.*(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}).*cache source transfer failed closed.*/\1/p' \
+                    "$deadline_client_log" | sed -n '2p')
+                deadline_second_start_stamp=$(sed -nE \
+                    's/.*(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}).*P50 assignment identity bound for job.*/\1/p' \
+                    "$deadline_client_log" | sed -n '2p')
+                test -n "$deadline_second_failure_stamp" && test -n "$deadline_second_start_stamp" || {
+                    echo "FAIL: two-attempt F-restart failure lacks retry assignment/terminal timestamps ($deadline_client_log)" >&2
+                    return 1
+                }
+                deadline_second_failure_epoch=$(date -d "$deadline_second_failure_stamp" +%s 2>/dev/null) || return 1
+                deadline_second_start_epoch=$(date -d "$deadline_second_start_stamp" +%s 2>/dev/null) || return 1
+                test -n "$deadline_second_failure_epoch" && test -n "$deadline_second_start_epoch" || {
+                    echo "FAIL: could not parse retry assignment deadline timestamps ($deadline_client_log)" >&2
+                    return 1
+                }
+                deadline_second_elapsed=$((deadline_second_failure_epoch - deadline_second_start_epoch))
+                test "$deadline_second_elapsed" -ge 0 && test "$deadline_second_elapsed" -le 122 || {
+                    echo "FAIL: fresh assignment exceeded fixed 120s C transfer deadline plus timestamp precision ($deadline_second_elapsed s)" >&2
+                    return 1
+                }
+                deadline_attempt_sum_seconds=$((deadline_first_elapsed + deadline_second_elapsed))
+                test "$((deadline_elapsed_ms + 2000))" -ge "$((deadline_attempt_sum_seconds * 1000))" || {
+                    echo "FAIL: aggregate client span is shorter than the two per-attempt spans beyond timestamp precision (${deadline_elapsed_ms}ms vs ${deadline_attempt_sum_seconds}s)" >&2
+                    return 1
+                }
+                deadline_arm_age=$(awk -v wanted="$deadline_retry_job" '
+                    /P50 source arm deadline expired for client/ {
+                        match($0, /client [0-9]+/)
+                        client = substr($0, RSTART + 7, RLENGTH - 7)
+                        expired[client] = 1
+                    }
+                    /JobDoneMsg/ && /waitp50input/ {
+                        match($0, /ClientID: [0-9]+ Job ID: [0-9]+,/)
+                        identity = substr($0, RSTART, RLENGTH)
+                        sub(/^ClientID: /, "", identity)
+                        split(identity, fields, / Job ID: |,/)
+                        if (fields[2] == wanted && expired[fields[1]]) {
+                            match($0, /age_msec=[0-9]+/)
+                            print substr($0, RSTART + 9, RLENGTH - 9)
+                            found++
+                        }
+                    }
+                    END { if (found != 1) exit 1 }
+                ' "$work/f.log") || {
+                    echo "FAIL: fresh retry assignment has no uniquely matched F source-arm expiry ($deadline_retry_job)" >&2
+                    return 1
+                }
+                test "$deadline_arm_age" -le 61000 || {
+                    echo "FAIL: fresh retry F source-arm exceeded 60s plus observation tolerance (${deadline_arm_age}ms)" >&2
+                    return 1
+                }
+                # Each fresh remote source-transfer invocation has its own
+                # fixed 120s C deadline; F's independent 60s arm expiry is
+                # separately observed above. Two seconds of timestamp
+                # precision are allowed per C attempt and five seconds for
+                # dispatch/cleanup after both independently checked bounds.
+                test "$deadline_elapsed_ms" -le 249000 || {
+                    echo "FAIL: two-attempt F-restart client exceeded two 120s C attempts plus bounded dispatch/cleanup (${deadline_elapsed_ms}ms)" >&2
+                    return 1
+                }
+                echo "S8_F_RESTART_ATTEMPT_DEADLINES assignments=2 original_job=$deadline_first_job original_c_elapsed_seconds=$deadline_first_elapsed original_c_budget_ms=120000 retry_job=$deadline_retry_job retry_c_elapsed_seconds=$deadline_second_elapsed retry_c_budget_ms=120000 attempts_sum_seconds=$deadline_attempt_sum_seconds retry_f_arm_age_ms=$deadline_arm_age retry_f_budget_ms=60000 per_attempt_timestamp_tolerance_ms=2000 retry_f_observation_tolerance_ms=1000 cleanup_budget_ms=5000 aggregate_budget_ms=249000"
+                ;;
+            *)
+                echo "FAIL: F-restart failure has unexpected assignment-attempt count=$deadline_attempts" >&2
+                return 1
+                ;;
+        esac
+    }
+
     run_batch() {
         run_label=$1
         emit_rows=${2:-1}
@@ -2399,11 +2572,17 @@ if test -n "$batch_manifest"; then
                         return 1
                     }
                     wrapper_elapsed_ms=$(((job_finished_ns - job_started_ns) / 1000000))
-                    test "$wrapper_elapsed_ms" -ge 0 && \
-                        test "$wrapper_elapsed_ms" -le 62000 || {
-                        echo "FAIL: non-success client exceeded the fixed 60s ARM budget plus 2s cleanup grace ($run_label-$job_ordinal ${wrapper_elapsed_ms}ms)" >&2
-                        return 1
-                    }
+                    if test "$run_label" = f-restart-held; then
+                        verify_f_restart_failure_deadlines \
+                            "$work/client-compile-$run_label-$job_ordinal.log" \
+                            "$wrapper_elapsed_ms" || return 1
+                    else
+                        test "$wrapper_elapsed_ms" -ge 0 && \
+                            test "$wrapper_elapsed_ms" -le 62000 || {
+                            echo "FAIL: non-success client exceeded the fixed 60s ARM budget plus 2s cleanup grace ($run_label-$job_ordinal ${wrapper_elapsed_ms}ms)" >&2
+                            return 1
+                        }
+                    fi
                     client_log="$work/client-compile-$run_label-$job_ordinal.log"
                     if test "$run_label" = old-scheduler; then
                         # This S-only leg deliberately releases an old held
@@ -3025,10 +3204,16 @@ PY
                     echo "FAIL: B wrapper failed although client command returned success ($settle_label-$settle_ordinal wrapper_status=$exit_status)" >&2
                     return 1
                 }
-                test "$wrapper_elapsed_ms" -ge 0 && test "$wrapper_elapsed_ms" -le 62000 || {
-                    echo "FAIL: B failure exceeded the fixed 60s source budget plus 2s cleanup grace ($settle_label-$settle_ordinal ${wrapper_elapsed_ms}ms)" >&2
-                    return 1
-                }
+                if test "$settle_label" = f-restart-held; then
+                    verify_f_restart_failure_deadlines \
+                        "$work/client-compile-$settle_label-$settle_ordinal.log" \
+                        "$wrapper_elapsed_ms" || return 1
+                else
+                    test "$wrapper_elapsed_ms" -ge 0 && test "$wrapper_elapsed_ms" -le 62000 || {
+                        echo "FAIL: B failure exceeded the fixed 60s source budget plus 2s cleanup grace ($settle_label-$settle_ordinal ${wrapper_elapsed_ms}ms)" >&2
+                        return 1
+                    }
+                fi
                 client_log="$work/client-compile-$settle_label-$settle_ordinal.log"
                 if grep -Fq 'source committed for P50 CompileFile' "$client_log" || \
                         ! grep -Eq 'got exception Error [0-9]+' "$client_log"; then
@@ -4273,6 +4458,34 @@ EOF_W30_ACTIVE_NEW
         f_service_before_b_restart=$service_pid
         source_trace_before_b_restart=$(wc -c <"$source_result_trace")
         f_trace_before_b_restart=$(wc -c <"$f_action_trace")
+
+        # Install the replacement listener and put its exact OUTPUT redirect
+        # ahead of the old gate before replacing F.  The replacement
+        # sidecar's persistent R2 connection is created during restart; a
+        # gate installed after READY would miss that connection permanently.
+        receipt_gate_delayed_dir="$work/receipt-gate-c-delayed"
+        mkdir -m 0777 "$receipt_gate_delayed_dir"
+        "$build/unittests/p50daemonpositive" \
+            --p51-commit-receipt-gate-delayed "$port_worker" "$daemon_uid" \
+            30 0 "$receipt_gate_delayed_dir" >"$work/receipt-gate-c-delayed.log" 2>&1 &
+        receipt_gate_delayed_pid=$!
+        delayed_gate_ready=0
+        for _ in $(seq 1 1400); do
+            test ! -e "$receipt_gate_delayed_dir/failed" || break
+            if test -e "$receipt_gate_delayed_dir/ready"; then
+                delayed_gate_ready=1
+                break
+            fi
+            kill -0 "$receipt_gate_delayed_pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        test "$delayed_gate_ready" -eq 1 || {
+            cat "$work/receipt-gate-c-delayed.log" >&2 || true
+            echo "FAIL: replacement delayed receipt gate did not become ready" >&2
+            return 1
+        }
+        echo "S8_REAL_S_F_REPLACEMENT_GATE_READY endpoint=$port_worker sidecar_uid=$daemon_uid expected=30 initial_mode=pass_through precedence=first"
+
         restart_cache_sidecar F 0 "$service_pid" "$worker_pid" "$work/ready-f.trace"
         service_pid=$sidecar_replacement
         f_guid_after_b_restart=$ready_f_guid
@@ -4282,9 +4495,9 @@ EOF_W30_ACTIVE_NEW
         }
         echo "S8_REAL_S_F_RESTARTED_DURING_B before_pid=$f_service_before_b_restart after_pid=$service_pid before_f_store_guid=$f_guid_before_b_restart after_f_store_guid=$f_guid_after_b_restart held_commits=30"
 
-        # The old COMMIT frames are held inside the gate.  Abort deliberately
-        # discards that exact interval and removes the one-shot network rule;
-        # no old-store receipt is released into the new F incarnation.
+        # Discard the old-store interval and remove only its exact rule.  The
+        # already-installed higher-priority gate carries the replacement
+        # sidecar's R2 link and passes any successful B retry receipts.
         publish_gate_marker "$receipt_gate_dir/abort"
         if wait "$receipt_gate_pid"; then
             receipt_gate_pid=
@@ -4309,19 +4522,82 @@ EOF_W30_ACTIVE_NEW
         verify_bounded_batch_settlement f-restart-held 30 || return 1
         echo "S8_REAL_S_F_RESTART_B_SETTLED count=30 outputs=$b_successes bounded_clients=30 settled_ns=$b_settled"
 
-        # A separate gate starts after the F replacement and proves a fresh
-        # scheduler cohort still commits, attaches, and compiles exact output.
-        receipt_gate_dir="$work/receipt-gate-c"
-        mkdir -m 0777 "$receipt_gate_dir"
-        "$build/unittests/p50daemonpositive" \
-            --p51-commit-receipt-gate-once "$port_worker" "$daemon_uid" \
-            30 0 "$receipt_gate_dir" >"$work/receipt-gate-c.log" 2>&1 &
-        receipt_gate_pid=$!
-        wait_gate_marker ready || return 1
+        receipt_gate_pid=$receipt_gate_delayed_pid
+        receipt_gate_delayed_pid=
+        receipt_gate_dir=$receipt_gate_delayed_dir
+        receipt_gate_log="$work/receipt-gate-c-delayed.log"
+        b_replay_tu_seq_file="$work/b-replay-tu-seqs.txt"
+        b_replay_job_id_file="$work/b-replay-job-ids.txt"
+        : >"$b_replay_tu_seq_file"
+        : >"$b_replay_job_id_file"
+        b_replay_count=0
+        for b_ordinal in $(seq 0 29); do
+            b_client_log="$work/client-compile-f-restart-held-$b_ordinal.log"
+            b_commit_line=$(grep -F 'source committed for P50 CompileFile' \
+                "$b_client_log" 2>/dev/null | tail -n 1 || true)
+            b_tu_seq=$(printf '%s\n' "$b_commit_line" | sed -nE \
+                's/.*source committed for P50 CompileFile: .* TU sequence ([0-9]+).*/\1/p' \
+                )
+            b_replay_job=$(sed -nE \
+                's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+                "$b_client_log" | tail -n 1)
+            case "$b_replay_job" in
+                ''|*[!0-9]*) b_replay_job= ;;
+            esac
+            test -n "$b_commit_line" || continue
+            test -n "$b_replay_job" || {
+                echo "FAIL: B source receipt has no exact scheduler job binding ($b_ordinal)" >&2
+                return 1
+            }
+            if test -n "$b_replay_job"; then
+                if grep -Fxq "$b_replay_job" "$b_replay_job_id_file"; then
+                    echo "FAIL: B retry scheduler job identity was duplicated ($b_ordinal)" >&2
+                    return 1
+                fi
+                printf '%s\n' "$b_replay_job" >>"$b_replay_job_id_file"
+            fi
+            case "$b_tu_seq" in
+                ''|*[!0-9]*) echo "FAIL: B retry has malformed source-commit TU sequence ($b_ordinal)" >&2; return 1 ;;
+            esac
+            if grep -Fxq "$b_tu_seq" "$b_replay_tu_seq_file"; then
+                echo "FAIL: B retry source/job identity was duplicated ($b_ordinal)" >&2
+                return 1
+            fi
+            awk -v port="$port_worker" -v seq="$b_tu_seq" \
+                '$1 == "P51_RECEIPT_GATE_PASSTHROUGH" && $2 == "port=" port && $4 == "tu_seq=" seq { n++ } END { exit n != 1 }' \
+                "$receipt_gate_log" || {
+                echo "FAIL: replacement proxy did not witness exact B replay receipt (ordinal=$b_ordinal tu_seq=$b_tu_seq)" >&2
+                return 1
+            }
+            printf '%s\n' "$b_tu_seq" >>"$b_replay_tu_seq_file"
+            b_replay_count=$((b_replay_count + 1))
+            echo "S8_REAL_S_F_REPLAY_PASSTHROUGH ordinal=$b_ordinal job=$b_replay_job tu_seq=$b_tu_seq"
+        done
+        if test "$b_replay_count" -gt 0; then
+            grep -Fq "P51_RECEIPT_GATE_LINK_STATE port=$port_worker" "$receipt_gate_log" || {
+                echo "FAIL: successful B retry receipt witnesses had no decoded R2 LINK_STATE" >&2
+                return 1
+            }
+        fi
+        test "$b_replay_count" -ge "$b_successes" || {
+            echo "FAIL: fewer witnessed B source commits than exact B outputs" >&2
+            return 1
+        }
+        echo "S8_REAL_S_F_REPLAY_WITNESSED count=$b_replay_count distinct_source_tu_sequences=$b_replay_count link_state_required=$((b_replay_count > 0)) bounded_B_outcomes=1"
+
+        # Arm only after the B replacement cohort has settled and its exact
+        # pass-through COMMIT identities have been observed.  C is a distinct
+        # post-F cohort whose receipts are held by this same replacement link.
+        publish_gate_marker "$receipt_gate_dir/arm-1"
+        wait_gate_marker arm-observed || return 1
         source_trace_before_c=$(wc -c <"$source_result_trace")
         f_trace_before_c=$(wc -c <"$f_action_trace")
         run_batch post-f-restart 1 "$work/batch-new-f.tsv" 30 0 1
         wait_gate_marker held-1 || return 1
+        grep -Fq "P51_RECEIPT_GATE_LINK_STATE port=$port_worker" "$receipt_gate_log" || {
+            echo "FAIL: exact C receipt window lacked an observed R2 LINK_STATE" >&2
+            return 1
+        }
         c_fresh_window=$(cat "$receipt_gate_dir/held-1")
         case "$c_fresh_window" in
             count=30\ first_ordinal=*\ last_ordinal=*) ;;
@@ -4349,6 +4625,24 @@ EOF_W30_ACTIVE_NEW
         }
         verify_results_from_f_store post-f-restart "$f_guid_after_b_restart" \
             "$source_trace_before_c" "$f_trace_before_c" 30 || return 1
+        c_replay_job_id_file="$work/c-replay-job-ids.txt"
+        : >"$c_replay_job_id_file"
+        for c_ordinal in $(seq 0 29); do
+            c_client_log="$work/client-compile-post-f-restart-$c_ordinal.log"
+            c_replay_job=$(sed -nE \
+                's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+                "$c_client_log" | tail -n 1)
+            test -n "$c_replay_job" || {
+                echo "FAIL: C post-F compile lacks scheduler job identity ($c_ordinal)" >&2
+                return 1
+            }
+            if grep -Fxq "$c_replay_job" "$b_replay_job_id_file" || \
+                    grep -Fxq "$c_replay_job" "$c_replay_job_id_file"; then
+                echo "FAIL: C post-F job reused a B replay scheduler binding ($c_ordinal job=$c_replay_job)" >&2
+                return 1
+            fi
+            printf '%s\n' "$c_replay_job" >>"$c_replay_job_id_file"
+        done
         echo "S8_REAL_SCHEDULER_F_RESTART_CHAIN_W30_PASS profile=$profile_marker old_scheduler_receipts=30 old_callers_settled=30 b_held_receipts=30 f_restarted_while_b_held=1 b_settled_outputs=$b_successes post_f_receipts=30 post_f_exact_outputs=$c_fresh_results old_f_guid=$f_guid_before_b_restart new_f_guid=$f_guid_after_b_restart c_f_daemons_stable=1"
         else
             run_batch new-scheduler 1 "$work/batch-new-scheduler.tsv" 30 0 1

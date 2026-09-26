@@ -242,9 +242,11 @@ class P51CommitReceiptGate {
 public:
     P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected,
                          uint64_t first_ordinal = 1,
-                         std::string abort_path = {})
+                         std::string abort_path = {},
+                         bool insert_rule_first = false)
         : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected),
-          first_ordinal_(first_ordinal), abort_path_(std::move(abort_path))
+          first_ordinal_(first_ordinal), abort_path_(std::move(abort_path)),
+          delayed_arm_mode_(insert_rule_first)
     {
         listener_fd_ = listen_ephemeral(&proxy_port_);
         if (listener_fd_ < 0 || proxy_port_ <= 0) return;
@@ -254,10 +256,16 @@ public:
                 "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
                 "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
         };
-        rule_installed_ = rule("-A");
+        rule_installed_ = insert_rule_first
+            ? run_iptables_rule({"-t", "nat", "-I", "OUTPUT", "1", "-p", "tcp",
+                "--dport", std::to_string(endpoint_port_),
+                "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
+                "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)})
+            : rule("-A");
         if (rule_installed_) thread_ = std::thread([this] {
             try { run(); }
             catch (...) { fail(); }
+            finished_.store(true, std::memory_order_release);
         });
     }
 
@@ -266,9 +274,10 @@ public:
 
     ~P51CommitReceiptGate()
     {
-        stop_.store(true, std::memory_order_release);
         {
             std::lock_guard lock(mutex_);
+            terminal_stop_.store(true, std::memory_order_release);
+            stop_.store(true, std::memory_order_release);
             release_ = true;
         }
         changed_.notify_all();
@@ -285,6 +294,23 @@ public:
 
     bool ready() const noexcept { return listener_fd_ >= 0 && rule_installed_; }
     int proxy_port() const noexcept { return proxy_port_; }
+    unsigned connection_attempts() const noexcept
+    {
+        return connection_attempts_.load(std::memory_order_acquire);
+    }
+    unsigned prearm_disconnects() const
+    {
+        std::lock_guard lock(mutex_);
+        return prearm_disconnects_;
+    }
+    bool link_state_seen() const noexcept
+    {
+        return link_state_seen_.load(std::memory_order_acquire);
+    }
+    bool finished() const noexcept
+    {
+        return finished_.load(std::memory_order_acquire);
+    }
     size_t observed_commits() const
     {
         std::lock_guard lock(mutex_);
@@ -464,6 +490,10 @@ private:
 
     void run()
     {
+      for (;;) {
+        if (terminal_stop_.load(std::memory_order_acquire)) return;
+        const unsigned attempt = connection_attempts_.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
         pollfd listener{listener_fd_, POLLIN, 0};
         int ready = 0;
         while (!stop_.load(std::memory_order_acquire)) {
@@ -474,8 +504,32 @@ private:
         if (stop_.load(std::memory_order_acquire) || ready <= 0) { fail(); return; }
         client_fd_ = ::accept(listener_fd_, nullptr, nullptr);
         if (client_fd_ < 0) { fail(); return; }
+        sockaddr_storage peer{};
+        socklen_t peer_size = sizeof(peer);
+        char peer_address[INET6_ADDRSTRLEN] = "?";
+        uint16_t peer_port = 0;
+        if (::getpeername(client_fd_, reinterpret_cast<sockaddr *>(&peer),
+                          &peer_size) == 0 && peer.ss_family == AF_INET) {
+            const auto *address = reinterpret_cast<const sockaddr_in *>(&peer);
+            (void)::inet_ntop(AF_INET, &address->sin_addr, peer_address,
+                              sizeof(peer_address));
+            peer_port = ntohs(address->sin_port);
+        }
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_CONNECTION attempt=%u peer=%s:%u\n",
+            attempt, peer_address, static_cast<unsigned>(peer_port));
         server_fd_ = connect_raw_tcp(endpoint_port_);
-        if (server_fd_ < 0) { fail(); return; }
+        if (server_fd_ < 0) {
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_TERMINAL attempt=%u stage=upstream-connect errno=%d\n",
+                attempt, errno);
+            fail();
+            return;
+        }
+        bool link_state_seen = false;
+        bool link_reject_seen = false;
+        bool protocol_error = false;
+        std::string terminal_reason = "server-eof-before-r2";
         std::thread client_to_server([this] {
             char bytes[8192];
             for (;;) {
@@ -504,47 +558,123 @@ private:
         unsigned char header[4];
         if (!read_relay_bytes(server_fd_, header, sizeof(header)) ||
             !write_relay_bytes(client_fd_, header, sizeof(header))) {
+            terminal_reason = "server-disconnected-before-version";
             fail();
         } else {
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_VERSION attempt=%u server_max=%u.%u.%u.%u\n",
+                attempt, header[0], header[1], header[2], header[3]);
             // MsgChannel exchanges both the peer's maximum version and the
             // selected version in each direction before ordinary frames.
-            if (!read_relay_bytes(server_fd_, header, sizeof(header)) ||
-                !(header[0] == 51 && header[1] == 0 &&
-                  header[2] == 0 && header[3] == 0) ||
-                !write_relay_bytes(client_fd_, header, sizeof(header))) {
+            if (!read_relay_bytes(server_fd_, header, sizeof(header))) {
+                terminal_reason = "server-disconnected-before-selected-version";
+                fail();
+            } else if (!(header[0] == 51 && header[1] == 0 &&
+                         header[2] == 0 && header[3] == 0)) {
+                protocol_error = true;
+                terminal_reason = "unexpected-selected-version";
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_VERSION_MISMATCH attempt=%u selected=%u.%u.%u.%u\n",
+                    attempt, header[0], header[1], header[2], header[3]);
+                fail();
+            } else if (!write_relay_bytes(client_fd_, header, sizeof(header))) {
+                terminal_reason = "client-disconnected-after-selected-version";
                 fail();
             }
             bool r2 = false;
             bool link_state_reported = false;
+            bool link_reject_reported = false;
             while (!stop_.load(std::memory_order_acquire) && !failed_) {
-                if (!read_relay_bytes(server_fd_, header, sizeof(header))) break;
+                if (!read_relay_bytes(server_fd_, header, sizeof(header))) {
+                    terminal_reason = link_state_seen
+                        ? "disconnect-after-link-state"
+                        : (link_reject_seen ? "disconnect-after-link-reject"
+                                            : "disconnect-before-link-state");
+                    break;
+                }
                 const uint32_t word = (uint32_t(header[0]) << 24) |
                     (uint32_t(header[1]) << 16) |
                     (uint32_t(header[2]) << 8) | uint32_t(header[3]);
                 const uint8_t type_byte = header[0];
+                bool report_link_state = false;
+                bool report_link_reject = false;
                 if (!r2 && type_byte == static_cast<uint8_t>(
                         icecc::p50::MessageType::LINK_STATE)) {
                     r2 = true;
-                    if (!link_state_reported) {
-                        std::fprintf(stderr,
-                            "P51_RECEIPT_GATE_LINK_STATE port=%d\n",
-                            endpoint_port_);
-                        link_state_reported = true;
-                    }
+                    report_link_state = !link_state_reported;
+                } else if (!r2 && type_byte == static_cast<uint8_t>(
+                               icecc::p50::MessageType::R2_LINK_REJECT)) {
+                    r2 = true;
+                    report_link_reject = !link_reject_reported;
                 }
                 uint32_t payload_bytes = word;
                 if (r2) {
                     try {
                         payload_bytes = icecc::p50::decode_frame_header(
                             std::span<const uint8_t>(header, sizeof(header))).payload_bytes;
-                    } catch (...) { fail(); break; }
-                } else if (payload_bytes > (1u << 20)) { fail(); break; }
+                    } catch (...) {
+                        protocol_error = true;
+                        terminal_reason = "invalid-r2-frame-header";
+                        fail();
+                        break;
+                    }
+                } else if (payload_bytes > (1u << 20)) {
+                    protocol_error = true;
+                    terminal_reason = "oversized-ordinary-frame";
+                    std::fprintf(stderr,
+                        "P51_RECEIPT_GATE_UNEXPECTED_FRAME attempt=%u header=%02x%02x%02x%02x type=%u declared_bytes=%u\n",
+                        attempt, header[0], header[1], header[2], header[3],
+                        static_cast<unsigned>(type_byte), payload_bytes);
+                    fail();
+                    break;
+                }
                 std::vector<uint8_t> frame(header, header + sizeof(header));
                 const size_t payload_offset = frame.size();
                 frame.resize(payload_offset + payload_bytes);
                 if (payload_bytes != 0 && !read_relay_bytes(
-                        server_fd_, frame.data() + payload_offset, payload_bytes))
+                        server_fd_, frame.data() + payload_offset, payload_bytes)) {
+                    if (r2) protocol_error = true;
+                    terminal_reason = "truncated-frame-payload";
                     break;
+                }
+                if (report_link_state) {
+                    try {
+                        const auto decoded = icecc::p50::decode_payload(
+                            icecc::p50::MessageType::LINK_STATE,
+                            std::span<const uint8_t>(frame.data() + payload_offset,
+                                                     payload_bytes));
+                        (void)std::get<icecc::p50::LinkState>(decoded);
+                    } catch (...) {
+                        protocol_error = true;
+                        terminal_reason = "invalid-link-state-payload";
+                        fail();
+                        break;
+                    }
+                    link_state_seen = true;
+                    link_state_seen_.store(true, std::memory_order_release);
+                    std::fprintf(stderr,
+                        "P51_RECEIPT_GATE_LINK_STATE_DECODED attempt=%u\n", attempt);
+                }
+                if (report_link_reject) {
+                    try {
+                        const auto decoded = icecc::p50::decode_payload(
+                            icecc::p50::MessageType::R2_LINK_REJECT,
+                            std::span<const uint8_t>(frame.data() + payload_offset,
+                                                     payload_bytes));
+                        const auto& reject =
+                            std::get<icecc::p50::LinkRejectMessage>(decoded);
+                        link_reject_seen = true;
+                        link_reject_reported = true;
+                        std::fprintf(stderr,
+                            "P51_RECEIPT_GATE_LINK_REJECT_DECODED attempt=%u reason=%u\n",
+                            attempt, static_cast<unsigned>(reject.reason));
+                    } catch (...) {
+                        protocol_error = true;
+                        terminal_reason = "invalid-link-reject-payload";
+                        fail();
+                        break;
+                    }
+                }
                 if (r2 && type_byte == static_cast<uint8_t>(
                         icecc::p50::MessageType::R2_TX_COMMIT)) {
                     try {
@@ -596,10 +726,21 @@ private:
                             changed_.notify_all();
                             if (failed_) break;
                         }
-                    } catch (...) { fail(); break; }
+                    } catch (...) {
+                        protocol_error = true;
+                        terminal_reason = "invalid-r2-commit-payload";
+                        fail();
+                        break;
+                    }
                 } else if (!write_relay_bytes(
                                client_fd_, frame.data(), frame.size())) {
                     break;
+                }
+                if (report_link_state) {
+                    std::fprintf(stderr,
+                        "P51_RECEIPT_GATE_LINK_STATE port=%d\n",
+                        endpoint_port_);
+                    link_state_reported = true;
                 }
             }
         }
@@ -607,7 +748,56 @@ private:
         ::shutdown(client_fd_, SHUT_WR);
         ::shutdown(server_fd_, SHUT_RDWR);
         if (client_to_server.joinable()) client_to_server.join();
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_TERMINAL attempt=%u link_state=%u protocol_error=%u reason=%s\n",
+            attempt, link_state_seen ? 1u : 0u, protocol_error ? 1u : 0u,
+            terminal_reason.c_str());
+        const auto now = Clock::now();
+        if (client_fd_ >= 0) { ::close(client_fd_); client_fd_ = -1; }
+        if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
+        bool retry_prearm = false;
+        {
+            std::lock_guard lock(mutex_);
+            const bool may_retry_prearm = delayed_arm_mode_ && expected_ == 0 &&
+                !link_state_seen && !protocol_error &&
+                !terminal_stop_.load(std::memory_order_acquire) &&
+                !abort_requested();
+            if (may_retry_prearm) {
+                if (prearm_retry_started_ == Clock::time_point{})
+                    prearm_retry_started_ = now;
+                ++prearm_disconnects_;
+                const bool within_count = prearm_disconnects_ < 9;
+                const bool within_time = now - prearm_retry_started_ <
+                    std::chrono::seconds(245);
+                if (within_count && within_time) {
+                    failed_.store(false, std::memory_order_release);
+                    stop_.store(false, std::memory_order_release);
+                    retry_prearm = true;
+                } else {
+                    std::fprintf(stderr,
+                        "P51_RECEIPT_GATE_PREARM_RETRY_EXHAUSTED attempts=%u elapsed_ms=%lld\n",
+                        prearm_disconnects_,
+                        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - prearm_retry_started_).count()));
+                }
+            }
+        }
+        if (retry_prearm) {
+            if (terminal_stop_.load(std::memory_order_acquire)) {
+                fail();
+                return;
+            }
+            {
+                std::lock_guard lock(mutex_);
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_PREARM_RETRY attempt=%u disconnects=%u reason=%s\n",
+                    attempt, prearm_disconnects_, terminal_reason.c_str());
+            }
+            continue;
+        }
         fail();
+        return;
+      }
     }
 
     int endpoint_port_ = 0;
@@ -615,6 +805,10 @@ private:
     size_t expected_ = 0;
     uint64_t first_ordinal_ = 1;
     std::string abort_path_;
+    bool delayed_arm_mode_ = false;
+    std::atomic<unsigned> connection_attempts_{0};
+    unsigned prearm_disconnects_ = 0;
+    Clock::time_point prearm_retry_started_{};
     int proxy_port_ = 0;
     int listener_fd_ = -1;
     int client_fd_ = -1;
@@ -630,7 +824,335 @@ private:
     bool discard_ = false;
     std::atomic<bool> failed_{false};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> terminal_stop_{false};
+    std::atomic<bool> link_state_seen_{false};
+    std::atomic<bool> finished_{false};
 };
+
+static bool p51_read_all_for_gate_test(int fd, void *buffer, size_t size)
+{
+    auto *position = static_cast<unsigned char *>(buffer);
+    while (size != 0) {
+        const ssize_t count = ::recv(fd, position, size, 0);
+        if (count > 0) {
+            position += count;
+            size -= static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+static bool p51_receipt_gate_prearm_retry_selftest(uid_t sidecar_uid,
+                                                    const std::string& work)
+{
+    std::error_code fs_error;
+    std::filesystem::create_directories(work, fs_error);
+    if (fs_error) return false;
+    const std::array<unsigned char, 4> version{51, 0, 0, 0};
+
+    icecc::p50::StoreIdentityRoot c_root{};
+    icecc::p50::StoreIdentityRoot f_root{};
+    if (!icecc::p50::fresh_store_identity_root(c_root) ||
+        !icecc::p50::fresh_store_identity_root(f_root) || c_root == f_root)
+        return false;
+    icecc::p50::LinkHello hello{};
+    hello.profile = icecc::p50::ProfileId::P29V1;
+    hello.window = 1;
+    hello.max_raw_bytes = 4096;
+    hello.max_encoded_bytes = 4096;
+    hello.max_output_bytes = 4096;
+    hello.reservation_id.bytes.fill(0x11);
+    hello.relationship_id.bytes.fill(0x22);
+    hello.relationship_epoch = 1;
+    hello.physical_link_generation = 1;
+    hello.c_store_guid = icecc::p50::c_store_guid_for_root(c_root);
+    hello.c_store_generation = 1;
+    hello.f_store_guid = icecc::p50::f_store_guid_for_root(f_root);
+    hello.f_store_generation = 1;
+    hello.c_control_generation = 1;
+    hello.c_control_attempt = 1;
+    hello.system_source_fingerprint.bytes.fill(0x33);
+    hello.history_nonce.value = 1;
+    const auto hello_frame = icecc::p50::encode_frame(icecc::p50::Message{hello});
+    const auto reject_frame = icecc::p50::encode_frame(
+        icecc::p50::Message{icecc::p50::LinkRejectMessage{
+            icecc::p50::LinkRejectReason::StoreReplaced,
+            icecc::p50::compute_r2_link_offer_digest(hello)}});
+    icecc::p50::LinkState state{};
+    state.profile = hello.profile;
+    state.window = hello.window;
+    state.reservation_id = hello.reservation_id;
+    state.relationship_id = hello.relationship_id;
+    state.relationship_epoch = hello.relationship_epoch;
+    state.physical_link_generation = hello.physical_link_generation;
+    state.c_store_guid = hello.c_store_guid;
+    state.f_store_guid = hello.f_store_guid;
+    state.c_store_generation = hello.c_store_generation;
+    state.f_store_generation = hello.f_store_generation;
+    state.c_control_generation = hello.c_control_generation;
+    state.c_control_attempt = hello.c_control_attempt;
+    state.selected_max_frame_payload = icecc::p50::kR2MandatoryControlFramePayload;
+    state.selected_max_raw_bytes = 4096;
+    state.selected_max_encoded_bytes = 4096;
+    state.selected_max_output_bytes = 4096;
+    state.history_nonce = hello.history_nonce;
+    state.f_system_source_fingerprint.bytes.fill(0x44);
+    const auto state_frame = icecc::p50::encode_frame(icecc::p50::Message{state});
+
+    int upstream_port = 0;
+    const int upstream_listener = listen_ephemeral(&upstream_port);
+    if (upstream_listener < 0) return false;
+    std::atomic<bool> hold_valid_link{true};
+    std::atomic<bool> server_ok{true};
+    std::thread upstream([&] {
+        for (unsigned attempt = 0; attempt != 3; ++attempt) {
+            pollfd listener{upstream_listener, POLLIN, 0};
+            if (::poll(&listener, 1, 5000) <= 0) {
+                server_ok.store(false, std::memory_order_release);
+                return;
+            }
+            const int connection = ::accept(upstream_listener, nullptr, nullptr);
+            if (connection < 0) {
+                std::fprintf(stderr, "P51_RECEIPT_GATE_SELFTEST_ACCEPT_FAIL attempt=%u errno=%d\n",
+                             attempt + 1, errno);
+                server_ok.store(false, std::memory_order_release);
+                return;
+            }
+            if (attempt == 0) {
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_SELFTEST_STALE_CLOSED attempt=1\n");
+                ::close(connection); // stale pre-R2 candidate: EOF, no bytes.
+                continue;
+            }
+            std::array<unsigned char, 4> client_max_version{};
+            std::array<unsigned char, 4> client_selected_version{};
+            const bool got_client_max = p51_read_all_for_gate_test(
+                connection, client_max_version.data(), client_max_version.size());
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_SELFTEST_CLIENT_MAX attempt=%u read=%u bytes=%u.%u.%u.%u\n",
+                attempt + 1, got_client_max ? 1u : 0u, client_max_version[0],
+                client_max_version[1], client_max_version[2], client_max_version[3]);
+            const bool sent_server_max = got_client_max && client_max_version == version &&
+                write_all(connection, version.data(), version.size());
+            const bool got_client_selected = sent_server_max &&
+                p51_read_all_for_gate_test(connection, client_selected_version.data(),
+                                           client_selected_version.size());
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_SELFTEST_CLIENT_SELECTED attempt=%u read=%u bytes=%u.%u.%u.%u\n",
+                attempt + 1, got_client_selected ? 1u : 0u, client_selected_version[0],
+                client_selected_version[1], client_selected_version[2],
+                client_selected_version[3]);
+            if (!got_client_max || client_max_version != version ||
+                !sent_server_max || !got_client_selected ||
+                client_selected_version != version ||
+                !write_all(connection, version.data(), version.size())) {
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_SELFTEST_PROTOCOL_FAIL max=%u sent=%u selected=%u\n",
+                    got_client_max ? 1u : 0u, sent_server_max ? 1u : 0u,
+                    got_client_selected ? 1u : 0u);
+                server_ok.store(false, std::memory_order_release);
+                ::close(connection);
+                return;
+            }
+            std::array<unsigned char, 4> hello_header{};
+            if (!p51_read_all_for_gate_test(connection, hello_header.data(),
+                                            hello_header.size())) {
+                server_ok.store(false, std::memory_order_release);
+                ::close(connection);
+                return;
+            }
+            icecc::p50::FrameHeader decoded_hello_header{};
+            try {
+                decoded_hello_header = icecc::p50::decode_frame_header(
+                    std::span<const uint8_t>(hello_header.data(), hello_header.size()));
+            } catch (...) {
+                server_ok.store(false, std::memory_order_release);
+                ::close(connection);
+                return;
+            }
+            std::vector<uint8_t> hello_payload(decoded_hello_header.payload_bytes);
+            if (decoded_hello_header.type != icecc::p50::MessageType::LINK_HELLO ||
+                !p51_read_all_for_gate_test(connection, hello_payload.data(),
+                                            hello_payload.size())) {
+                server_ok.store(false, std::memory_order_release);
+                ::close(connection);
+                return;
+            }
+            try {
+                const auto decoded = icecc::p50::decode_payload(
+                    icecc::p50::MessageType::LINK_HELLO, hello_payload);
+                if (std::get<icecc::p50::LinkHello>(decoded) != hello)
+                    throw std::invalid_argument("self-test LINK_HELLO identity mismatch");
+            } catch (...) {
+                server_ok.store(false, std::memory_order_release);
+                ::close(connection);
+                return;
+            }
+            const auto& reply = attempt == 1 ? reject_frame : state_frame;
+            if (!write_all(connection, reply.data(), reply.size())) {
+                server_ok.store(false, std::memory_order_release);
+                ::close(connection);
+                return;
+            }
+            if (attempt == 1) {
+                ::close(connection); // exact digest-bound LINK_REJECT before link state.
+                continue;
+            }
+            const auto deadline = Clock::now() + std::chrono::seconds(3);
+            while (hold_valid_link.load(std::memory_order_acquire) &&
+                   Clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            ::close(connection);
+        }
+    });
+
+    bool valid_path = false;
+    {
+        P51CommitReceiptGate gate(upstream_port, sidecar_uid, 0, 0,
+            work + "/abort-valid", true);
+        if (!gate.ready()) {
+            hold_valid_link.store(false, std::memory_order_release);
+            ::close(upstream_listener);
+            if (upstream.joinable()) upstream.join();
+            return false;
+        }
+        const auto connect_candidate = [&](unsigned candidate_kind) {
+            const int client = connect_raw_tcp(gate.proxy_port());
+            const int client_flags = client >= 0 ? ::fcntl(client, F_GETFL, 0) : -1;
+            if (client < 0 || client_flags < 0 ||
+                ::fcntl(client, F_SETFL, client_flags & ~O_NONBLOCK) < 0 ||
+                !write_all(client, version.data(), version.size())) {
+                if (client >= 0) ::close(client);
+                return false;
+            }
+            if (candidate_kind == 0) {
+                const auto deadline = Clock::now() + std::chrono::seconds(2);
+                while (gate.prearm_disconnects() == 0 && Clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                ::close(client);
+                return gate.prearm_disconnects() == 1;
+            }
+            std::array<unsigned char, 4> max_version{};
+            std::array<unsigned char, 4> selected_version{};
+            std::array<unsigned char, 4> header{};
+            const bool got_server_max = p51_read_all_for_gate_test(
+                client, max_version.data(), 4);
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_SELFTEST_PROXY_MAX read=%u bytes=%u.%u.%u.%u\n",
+                got_server_max ? 1u : 0u, max_version[0], max_version[1],
+                max_version[2], max_version[3]);
+            const bool sent_client_selected = got_server_max && max_version == version &&
+                write_all(client, version.data(), version.size());
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_SELFTEST_PROXY_SELECTED sent=%u\n",
+                sent_client_selected ? 1u : 0u);
+            const bool got_server_selected = sent_client_selected &&
+                p51_read_all_for_gate_test(client, selected_version.data(), 4);
+            if (!got_server_max || max_version != version ||
+                !sent_client_selected || !got_server_selected ||
+                selected_version != version ||
+                !write_all(client, hello_frame.data(), hello_frame.size()) ||
+                !p51_read_all_for_gate_test(client, header.data(), 4)) {
+                ::close(client);
+                return false;
+            }
+            icecc::p50::FrameHeader decoded_header{};
+            try {
+                decoded_header = icecc::p50::decode_frame_header(
+                    std::span<const uint8_t>(header.data(), header.size()));
+            } catch (...) {
+                ::close(client);
+                return false;
+            }
+            std::vector<uint8_t> payload(decoded_header.payload_bytes);
+            const auto expected_type = candidate_kind == 1
+                ? icecc::p50::MessageType::R2_LINK_REJECT
+                : icecc::p50::MessageType::LINK_STATE;
+            if (decoded_header.type != expected_type ||
+                !p51_read_all_for_gate_test(client, payload.data(), payload.size())) {
+                ::close(client);
+                return false;
+            }
+            try {
+                const auto decoded = icecc::p50::decode_payload(
+                    expected_type, payload);
+                if (candidate_kind == 1) {
+                    const auto& reject = std::get<icecc::p50::LinkRejectMessage>(decoded);
+                    if (reject.reason != icecc::p50::LinkRejectReason::StoreReplaced ||
+                        reject.offered_hello_digest !=
+                            icecc::p50::compute_r2_link_offer_digest(hello))
+                        throw std::invalid_argument("self-test LINK_REJECT identity mismatch");
+                } else {
+                    (void)std::get<icecc::p50::LinkState>(decoded);
+                }
+            } catch (...) {
+                ::close(client);
+                return false;
+            }
+            if (candidate_kind == 1) {
+                const auto deadline = Clock::now() + std::chrono::seconds(2);
+                while (gate.prearm_disconnects() < 2 && Clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                ::close(client);
+                return gate.prearm_disconnects() == 2;
+            }
+            const bool decoded_by_gate = gate.link_state_seen();
+            const bool rearmed = decoded_by_gate && gate.rearm(30, 1);
+            ::close(client);
+            return rearmed;
+        };
+        const bool stale_retried = connect_candidate(0);
+        const bool rejected_candidate_retried = stale_retried && connect_candidate(1);
+        const bool valid_link = rejected_candidate_retried && connect_candidate(2);
+        hold_valid_link.store(false, std::memory_order_release);
+        const auto finish_deadline = Clock::now() + std::chrono::seconds(2);
+        while (!gate.finished() && Clock::now() < finish_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        valid_path = valid_link && gate.finished() && gate.connection_attempts() == 3 &&
+            gate.prearm_disconnects() == 2 && gate.link_state_seen();
+    }
+    ::close(upstream_listener);
+    if (upstream.joinable()) upstream.join();
+    if (!valid_path || !server_ok.load(std::memory_order_acquire)) return false;
+
+    int shutdown_port = 0;
+    const int shutdown_listener = listen_ephemeral(&shutdown_port);
+    if (shutdown_listener < 0) return false;
+    std::thread stale_upstream([&] {
+        pollfd listener{shutdown_listener, POLLIN, 0};
+        if (::poll(&listener, 1, 3000) <= 0) return;
+        const int connection = ::accept(shutdown_listener, nullptr, nullptr);
+        if (connection >= 0) ::close(connection);
+    });
+    bool stopped_cleanly = false;
+    bool shutdown_retry_seen = false;
+    Clock::time_point destruction_started{};
+    {
+        P51CommitReceiptGate gate(shutdown_port, sidecar_uid, 0, 0,
+            work + "/abort-shutdown", true);
+        if (gate.ready()) {
+            const int client = connect_raw_tcp(gate.proxy_port());
+            if (client >= 0) {
+                (void)write_all(client, version.data(), version.size());
+                const auto deadline = Clock::now() + std::chrono::seconds(2);
+                while (gate.prearm_disconnects() == 0 && Clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                shutdown_retry_seen = gate.prearm_disconnects() == 1;
+                destruction_started = Clock::now();
+                ::close(client);
+            }
+        }
+    }
+    stopped_cleanly = shutdown_retry_seen && destruction_started != Clock::time_point{} &&
+        Clock::now() - destruction_started < std::chrono::seconds(1);
+    if (stale_upstream.joinable()) stale_upstream.join();
+    ::close(shutdown_listener);
+    std::filesystem::remove_all(work, fs_error);
+    return stopped_cleanly && !fs_error;
+}
 
 static bool p51_gate_wait_for_path(const std::string& path,
                                    std::chrono::milliseconds timeout)
@@ -710,7 +1232,8 @@ static bool p51_gate_wait_rearm(P51CommitReceiptGate& gate, size_t expected,
 static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
                                        size_t expected, uint64_t first_ordinal,
                                        const std::string& control_dir,
-                                       bool one_shot = false)
+                                       bool one_shot = false,
+                                       bool delayed_arm = false)
 {
     if (endpoint_port <= 0 || sidecar_uid == 0 || expected == 0 ||
         expected > 30 || control_dir.empty())
@@ -718,11 +1241,31 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
     std::error_code error;
     if (!std::filesystem::create_directories(control_dir, error) && error)
         return 2;
-    P51CommitReceiptGate gate(endpoint_port, sidecar_uid, expected, first_ordinal,
-                              control_dir + "/abort");
+    P51CommitReceiptGate gate(endpoint_port, sidecar_uid,
+                              delayed_arm ? 0 : expected, first_ordinal,
+                              control_dir + "/abort", delayed_arm);
     if (!gate.ready() || !p51_gate_write_marker(control_dir + "/ready")) {
         (void)p51_gate_write_marker(control_dir + "/failed", "gate setup failed\n");
         return 1;
+    }
+    if (delayed_arm) {
+        // This fixture gate is intentionally started before F replacement so
+        // it can observe the new sidecar's first persistent R2 connection.
+        // Each of the original and fresh C source-transfer calls has its own
+        // 120s operation deadline.  The F-side 60s arm is observed separately
+        // by the test, but does not itself guarantee prompt C notification.
+        // Allow two 122s C bounds (whole-second log precision), the bounded
+        // 30s sidecar replacement/READY wait, and 7s for settlement/marker
+        // observation.  This fixture wait does not alter product deadlines.
+        if (!p51_gate_wait_for_path(control_dir + "/arm-1",
+                                    std::chrono::seconds(285)) ||
+            !p51_gate_wait_rearm(gate, expected, first_ordinal,
+                                 control_dir + "/abort") ||
+            !p51_gate_write_marker(control_dir + "/arm-observed")) {
+            (void)p51_gate_write_marker(control_dir + "/failed",
+                                         "delayed first receipt arm request was not observed\n");
+            return 1;
+        }
     }
     const auto wait_stage = [&](unsigned stage) {
         if (!gate.wait_for_commits(std::chrono::seconds(30)))
@@ -6093,11 +6636,16 @@ static constexpr uint64_t kExpiredArmWireBudgetMsec = 2000;
 
 int main(int argc, char **argv)
 {
+    const bool receipt_prearm_selftest = argc == 3 &&
+        std::strcmp(argv[1], "--p51-receipt-prearm-retry-selftest") == 0;
     const bool receipt_gate_mode = argc == 7 &&
         (std::strcmp(argv[1], "--p51-commit-receipt-gate") == 0 ||
-         std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0);
+         std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0 ||
+         std::strcmp(argv[1], "--p51-commit-receipt-gate-delayed") == 0);
     const bool receipt_gate_once = receipt_gate_mode &&
         std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0;
+    const bool receipt_gate_delayed = receipt_gate_mode &&
+        std::strcmp(argv[1], "--p51-commit-receipt-gate-delayed") == 0;
     const bool p51_expired_arm_wire_case =
         ::getenv("ICECC_TEST_P51_EXPIRED_ARM_WIRE") != nullptr;
     const bool p51_cancel_before_start =
@@ -6154,7 +6702,7 @@ int main(int argc, char **argv)
             "FAIL: P51 expired-ARM wire gate cannot be combined with another mode\n");
         return 2;
     }
-    if (!receipt_gate_mode && argc != 3) {
+    if (!receipt_gate_mode && !receipt_prearm_selftest && argc != 3) {
         std::fprintf(stderr, "usage: %s <iceccd> <icecc-cache-service>\n", argv[0]);
         return 2;
     }
@@ -6174,6 +6722,14 @@ int main(int argc, char **argv)
     if (icecc == nullptr || icecc->pw_uid == 0 || icecc->pw_gid == 0) {
         std::fprintf(stderr, "SKIP: isolated image has no unprivileged icecc identity\n");
         return 77;
+    }
+    if (receipt_prearm_selftest) {
+        const bool passed = p51_receipt_gate_prearm_retry_selftest(
+            icecc->pw_uid, argv[2]);
+        std::fprintf(stderr,
+            "%s: P51 receipt prearm stale-candidate retry and shutdown\n",
+            passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
     }
     if (receipt_gate_mode) {
         char *end = nullptr;
@@ -6197,7 +6753,7 @@ int main(int argc, char **argv)
         return run_p51_commit_receipt_gate(
             static_cast<int>(endpoint_port), static_cast<uid_t>(sidecar_uid),
             static_cast<size_t>(expected), static_cast<uint64_t>(first), argv[6],
-            receipt_gate_once);
+            receipt_gate_once || receipt_gate_delayed, receipt_gate_delayed);
     }
 
     if (p51_cancel_scenario != P51CancelScenario::None) {

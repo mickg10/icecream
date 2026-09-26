@@ -114,6 +114,14 @@ with (root / "batch.jsonl").open("w", encoding="utf-8") as stream:
         stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 
+ICECC_TEST_POSITIVE_DAEMON=1 timeout --foreground --signal=TERM --kill-after=2s 15s \
+    "$build/unittests/p50daemonpositive" \
+    --p51-receipt-prearm-retry-selftest "$fixture/receipt-gate-prearm-selftest" || {
+        echo "FAIL: receipt gate did not replace a stale pre-R2 candidate safely" >&2
+        exit 1
+    }
+echo "S8_RECEIPT_GATE_PREARM_RETRY_SELFTEST stale_disconnect=1 typed_link_reject=StoreReplaced offered_hello_digest=verified valid_link_state=1 bounded_replacement=1 destructor_shutdown=1"
+
 fixture_id=${fixture##*.}
 for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
     case "$profile" in
