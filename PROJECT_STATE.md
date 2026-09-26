@@ -126,6 +126,27 @@ This suite used `47bfeb64` plus that diagnostic cleanup, not the later capacity
 bootstrap target changes. Partial-byte and already-committed 31-request
 cancellation are not covered by this result.
 
+### Cancellation after validated commit
+
+Commit `a081c7cd` adds nine committed-state cases: three profiles and target
+submission indices 0/15/30 in a 31-request cohort. The exact F binding/receipt
+is matched to C's validated committed result before cancellation. Cancellation
+returns false while the original deadline is live, after which the sole
+authorized attachment still yields the exact target bytes. All 30 other
+results/attachments and a separate post-cancel probe pass; accepted ordinals
+are contiguous, TU identities unique, operation/raw credits drain and target
+cancel-retirement count remains unchanged (0 to 0). This does not claim a
+sibling was in flight at the instant of cancellation.
+
+Focused selector `--d07-committed-full` passed all nine cases, exit 0, on donor
+`b8608b35`. Log:
+`/tanksmall/scratch/tmp/p51-d07-committed31-logs/committed-full-r2.runtime.log`,
+SHA256 `b51d497e5b65fc1fd4f1e2c4e0aac1685bc45be6e39c30cebeee3d41addfb26a`.
+The earlier `committed-full.runtime.log` is retained as a failed fixture
+attempt: it incorrectly tried to attach twice and expected a cancel-retirement
+after a rejected cancellation. Those expectations were corrected, not product
+cancellation semantics. Combined full-suite qualification remains pending.
+
 ### Source admission pressure
 
 The four-link overlap gate is integrated in `6d6276f6` from donor `321302e1`.
