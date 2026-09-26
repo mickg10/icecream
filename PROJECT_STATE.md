@@ -71,7 +71,14 @@ the refreshed `0dc29331` runtime archives; the explicit delayed-finalizer-only
 selector is unchanged. Log:
 `/tanksmall/scratch/tmp/p51-bench-paired-current-build/results/paired-default-gate.log`,
 SHA256 `dc52214251fae89e375b99e290dac9406ca22f5777519d2c0d84671bb88b1a2e`.
-The full performance matrix remains pending.
+The refreshed binary completes a 63-cell Firefox32 paired loopback matrix:
+R1/W1 and R2/W1/2/4/8/16/30, three profiles, three repetitions. All cells
+pass exact decoded-output checks. Per-profile medians, ranges, wire counts,
+observed occupancy and source/binary identities are published in the
+[Firefox32 evidence report](doc/p50-transfer-window-firefox32-evidence.md).
+Observed outstanding peaks reach at most 16, not 30; this workload is not the
+separate W30 saturation witness. Larger/multiple-corpus and cross-host
+performance qualification remains pending; no whole-build result is implied.
 
 ### External mixed-client harness (live run pending)
 
