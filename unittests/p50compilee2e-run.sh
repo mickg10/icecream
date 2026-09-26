@@ -29,6 +29,11 @@ real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
 worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
 capacity_expiry=${ICECC_P50_C1F1_TEST_CAPACITY_EXPIRY:-0}
+compiler_loss_w30=${ICECC_P50_C1F1_TEST_COMPILER_LOSS_W30:-0}
+case "$compiler_loss_w30" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_TEST_COMPILER_LOSS_W30 must be 0 or 1" >&2; exit 1 ;;
+esac
 case "$capacity_expiry" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_C1F1_TEST_CAPACITY_EXPIRY must be 0 or 1" >&2; exit 1 ;;
@@ -232,6 +237,21 @@ case "$profile_marker" in
         exit 1
         ;;
 esac
+if test "$compiler_loss_w30" = 1; then
+    if test "$external_mode" != 0 || test "$suite" != C1F1/100000 || \
+            test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1 || \
+            test "$worker_session_loss" != 0 || test "$capacity_expiry" != 0; then
+        echo "FAIL: compiler-loss W30 requires local cache-enabled C1F1, WARM=0, PASSES=1" >&2
+        exit 1
+    fi
+    test "${ICECC_P50_C1F1_EXPECTED_COUNT:-0}" -eq 61 || {
+        echo "FAIL: compiler-loss W30 requires victim + 30 held + 30 fresh inputs" >&2
+        exit 1
+    }
+    slots_per_f=30
+    execution_slots=32
+    export ICECC_TESTS=1 ICECC_P50_DEBUG_ATTACH=1
+fi
 if test "$c1f2_baseline" = 1 && { test "$w30_f_loss" = 1 || test "$external_mode" != 0 || \
         test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1; }; then
     echo "FAIL: C1F2 baseline requires local cache-enabled P51 and cannot combine with W30/loss modes" >&2
@@ -284,6 +304,12 @@ if test "$capacity_expiry" = 1; then
     export ICECC_TESTS=1
 fi
 worker_maxjobs=$slots_per_f
+if test "$compiler_loss_w30" = 1; then
+    # The scheduler reserves one slot.  Advertise 33 for 32 effective slots:
+    # victim + healthy C2 compile + 30 simultaneous C1 source operations.
+    worker_maxjobs=33
+    echo "S8_COMPILER_LOSS_W30_CAPACITY advertised=33 effective=32 victim=1 C2_sibling=1 held_source_window=30"
+fi
 if test "$staggered_quiescence" = 1; then
     # The focused barrier probe needs two simultaneous real compiler groups.
     # The scheduler reserves one dispatch credit, so expose one spare slot.
@@ -350,7 +376,8 @@ if test "$cache_enabled" -eq 1 && test ! -x "$build/cache/icecc-cache-service"; 
     echo "SKIP: missing built executable $build/cache/icecc-cache-service" >&2
     exit 77
 fi
-if test "$real_scheduler_restart_w30" = 1 || test "$w30_f_loss" = 1; then
+if test "$real_scheduler_restart_w30" = 1 || test "$w30_f_loss" = 1 || \
+        test "$compiler_loss_w30" = 1; then
     test -x "$build/unittests/p50daemonpositive" || {
         echo "SKIP: missing built P51 receipt-gate helper $build/unittests/p50daemonpositive" >&2
         exit 77
@@ -371,16 +398,16 @@ if test "$real_scheduler_restart_w30" = 1 || test "$w30_f_loss" = 1; then
         exit 1
     }
 fi
-if test "$w30_f_loss" = 1; then
+if test "$w30_f_loss" = 1 || test "$compiler_loss_w30" = 1; then
     test -n "${ICECC_TEST_WRAPPER_USER:-}" || {
-        echo "FAIL: C1F2 W30 requires a separate ICECC_TEST_WRAPPER_USER to scope the sidecar-UID receipt proxy" >&2
+        echo "FAIL: compiler/W30 receipt gate requires a separate ICECC_TEST_WRAPPER_USER to scope the sidecar-UID proxy" >&2
         exit 1
     }
     wrapper_passwd_entry=$(getent passwd "$ICECC_TEST_WRAPPER_USER" || true)
     wrapper_uid=$(printf '%s\n' "$wrapper_passwd_entry" | cut -d: -f3)
     test -n "$wrapper_passwd_entry" && test "$wrapper_uid" -gt 0 && \
             test "$wrapper_uid" -ne "$daemon_uid" || {
-        echo "FAIL: C1F2 wrapper client identity must be a valid non-root UID distinct from the cache-sidecar UID" >&2
+        echo "FAIL: wrapper client identity must be a valid non-root UID distinct from the cache-sidecar UID" >&2
         exit 1
     }
     command -v runuser >/dev/null 2>&1 || {
@@ -469,6 +496,37 @@ cleanup() {
     if test -n "${w30_frozen_worker_pid:-}"; then
         kill -CONT "$w30_frozen_worker_pid" 2>/dev/null || :
     fi
+    for role in c2 victim; do
+        eval "cleanup_pid=\${compiler_loss_${role}_pid:-}"
+        eval "cleanup_pgid=\${compiler_loss_${role}_pgid:-}"
+        eval "cleanup_ticks=\${compiler_loss_${role}_ticks:-}"
+        if test -n "$cleanup_pid" && test -n "$cleanup_pgid" && test -n "$cleanup_ticks"; then
+            cleanup_identity=$(read_compiler_identity "$cleanup_pid" 2>/dev/null || true)
+            if test -n "$cleanup_identity"; then
+                read -r cleanup_seen_pid cleanup_seen_pgid cleanup_seen_ticks cleanup_seen_state <<EOF_CLEANUP_COMPILER_LOSS
+$cleanup_identity
+EOF_CLEANUP_COMPILER_LOSS
+                if test "$cleanup_seen_pid" = "$cleanup_pid" && \
+                        test "$cleanup_seen_pgid" = "$cleanup_pgid" && \
+                        test "$cleanup_seen_ticks" = "$cleanup_ticks"; then
+                    /bin/kill -CONT -- "-$cleanup_pgid" 2>/dev/null || :
+                    /bin/kill -TERM -- "-$cleanup_pgid" 2>/dev/null || :
+                    sleep 0.1
+                    cleanup_identity=$(read_compiler_identity "$cleanup_pid" 2>/dev/null || true)
+                    if test -n "$cleanup_identity"; then
+                        read -r cleanup_seen_pid cleanup_seen_pgid cleanup_seen_ticks cleanup_seen_state <<EOF_CLEANUP_COMPILER_LOSS_KILL
+$cleanup_identity
+EOF_CLEANUP_COMPILER_LOSS_KILL
+                        if test "$cleanup_seen_pid" = "$cleanup_pid" && \
+                                test "$cleanup_seen_pgid" = "$cleanup_pgid" && \
+                                test "$cleanup_seen_ticks" = "$cleanup_ticks"; then
+                            /bin/kill -KILL -- "-$cleanup_pgid" 2>/dev/null || :
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    done
     if test -n "${w30_receipt_gate_dir:-}"; then
         : >"$w30_receipt_gate_dir/abort" 2>/dev/null || :
     fi
@@ -512,7 +570,7 @@ cleanup() {
         wait "$receipt_gate_pid" 2>/dev/null || :
         receipt_gate_pid=
     fi
-    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${w30_active_wrapper_pid:-} ${s2_compile_pid:-} ${service_pid:-} ${service_b_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${w30_active_wrapper_pid:-} ${compiler_loss_c2_wrapper:-} ${compiler_loss_victim_wrapper:-} ${s2_compile_pid:-} ${service_pid:-} ${service_b_pid:-} ${client_service_pid:-} ${client2_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
     for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
@@ -545,6 +603,7 @@ trap 'exit 143' TERM
 
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" "$work/out" \
     "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
+if test "$compiler_loss_w30" = 1; then mkdir -p "$work/cache-runtime-c2"; fi
 if test "$cache_enabled" -eq 1 && test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         mkdir -p "$work/envs-f-$relationship"
@@ -562,7 +621,9 @@ elif test "$suite" = C1F20/40; then
 fi
 chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
-if test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+if test "$compiler_loss_w30" = 1; then chmod 0700 "$work/cache-runtime-c2"; fi
+if { test "$w30_f_loss" = 1 || test "$compiler_loss_w30" = 1; } && \
+        test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
     # Keep the client identity distinct from the authenticated cache sidecar
     # UID so the receipt-gate OUTPUT owner match cannot capture an ordinary
     # compiler connection.  The client only needs these explicit file sinks.
@@ -600,12 +661,13 @@ if test "$s2_process_loss" = 1; then
     }
 fi
 pick_port_pair() {
-    python3 - "$suite" <<'PY'
+    python3 - "$suite" "$compiler_loss_w30" <<'PY'
 import secrets
 import socket
 import sys
 
 suite = sys.argv[1]
+compiler_loss_w30 = sys.argv[2] == "1"
 
 start = 40000 + 2 * secrets.randbelow(9000)
 for offset in range(0, 10000, 2):
@@ -625,6 +687,8 @@ for offset in range(0, 10000, 2):
             ports += (base + 3, base + 4)
         else:
             ports += (base + 3,)
+        if compiler_loss_w30:
+            ports += (base + 4,)
         for port in ports:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -820,6 +884,17 @@ PY
         echo "FAIL: batch manifest count does not match selected depth" >&2
         exit 1
     }
+    if test "$compiler_loss_w30" = 1; then
+        sed -n '1p' "$work/batch.tsv" >"$work/batch-compiler-victim.tsv"
+        sed -n '2,31p' "$work/batch.tsv" >"$work/batch-compiler-window.tsv"
+        sed -n '32,61p' "$work/batch.tsv" >"$work/batch-compiler-fresh.tsv"
+        test "$(wc -l <"$work/batch-compiler-victim.tsv")" -eq 1 && \
+                test "$(wc -l <"$work/batch-compiler-window.tsv")" -eq 30 && \
+                test "$(wc -l <"$work/batch-compiler-fresh.tsv")" -eq 30 || {
+            echo "FAIL: compiler-loss W30 manifest is not 1 victim + 30 held + 30 fresh" >&2
+            exit 1
+        }
+    fi
     if test "$w30_f_loss" = 1; then
         test "$batch_expected_count" -eq 31 || {
             echo "FAIL: C1F2 F-loss W30 requires exactly 31 distinct inputs" >&2
@@ -1220,11 +1295,28 @@ else
         -b "$work/envs-c" -l "$work/c.log" -vvv 2>"$work/c-daemon-startup.stderr" &
 fi
 client_pid=$!
+client2_pid=
+if test "$compiler_loss_w30" = 1; then
+    c2_action_trace="$work/c2-action-trace.jsonl"
+    c2_source_result_trace="$work/c2-source-result-trace.jsonl"
+    ICECC_TEST_SOCKET="$work/client2.sock" ICECC_P50_C1F1_REQUIRED=1 \
+        ICECC_P50_C_ACTION_TRACE="$c2_action_trace" ICECC_P50_F_ACTION_TRACE="$c2_action_trace" \
+        ICECC_P50_SOURCE_RESULT_TRACE="$c2_source_result_trace" \
+        ICECC_P50_TEST_READY_TRACE="$work/ready-c2.trace" \
+        "$build/daemon/iceccd" "$@" --no-remote -m 0 -p "$((port_sched + 4))" \
+        -s "127.0.0.1:$port_sched" -n "$network" -N p50-c2 \
+        -b "$work/envs-c" -l "$work/c2.log" -vvv \
+        --cache-service "$build/cache/icecc-cache-service" \
+        --cache-runtime-dir "$work/cache-runtime-c2" 2>"$work/c2-daemon-startup.stderr" &
+    client2_pid=$!
+fi
 
 logins=0
 for _ in $(seq 1 30); do
     logins=$(grep -c login "$work/scheduler.log" 2>/dev/null || true)
-    if test "$suite" = C1F20/40; then
+    if test "$compiler_loss_w30" = 1; then
+        test "${logins:-0}" -ge 3 && break
+    elif test "$suite" = C1F20/40; then
         test "${logins:-0}" -ge 21 && break
     elif test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
         test "${logins:-0}" -ge 3 && break
@@ -1234,6 +1326,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 required_logins=2
+test "$compiler_loss_w30" = 1 && required_logins=3
 test "$suite" = C1F20/40 && required_logins=21
 if test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then required_logins=3; fi
 test "${logins:-0}" -ge "$required_logins" || {
@@ -1478,7 +1571,8 @@ restart_cache_sidecar() {
 
 preprocessed_capture_path() {
     capture_label=$1
-    if test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+    if { test "$w30_f_loss" = 1 || test "$compiler_loss_w30" = 1; } && \
+            test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
         printf '%s/out/s7-%s-preprocessed.ii\n' "$work" "$capture_label"
     else
         printf '%s/s7-%s-preprocessed.ii\n' "$work" "$capture_label"
@@ -1494,6 +1588,7 @@ compile_once() {
     relationship=${6:-0}
     f_slot=${7:-0}
     timing_path=${8:-}
+    compile_socket=${9:-$work/client.sock}
     preferred_host=p50-f
     if test "$suite" = C1F20/40; then
         preferred_host="p50-f-$relationship"
@@ -1523,7 +1618,8 @@ compile_once() {
     if test "$cache_enabled" -eq 0; then
         cp -- "$input_path" "$preprocessed_capture"
     fi
-    if test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+    if { test "$w30_f_loss" = 1 || test "$compiler_loss_w30" = 1; } && \
+            test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
         : >"$client_log"
         chmod 0666 "$client_log"
     fi
@@ -1536,7 +1632,7 @@ compile_once() {
         # into argv. Export first: assignments before the special builtin
         # `eval` become shell variables, not necessarily the environment seen
         # by the external client called by run_client_with_timeout.
-        ICECC_TEST_SOCKET="$work/client.sock"
+        ICECC_TEST_SOCKET="$compile_socket"
         ICECC_TEST_REMOTEBUILD=1
         ICECC_VERSION="$envtar"
         if test "$cache_enabled" -eq 1; then
@@ -1554,7 +1650,7 @@ compile_once() {
             ICECC_P50_C_LEGACY_WIRE_TRACE ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
         eval "run_client_with_timeout g++ $remote_compile_args"
     elif test "$cache_enabled" -eq 1; then
-        ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+        ICECC_TEST_SOCKET="$compile_socket" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
@@ -1562,7 +1658,7 @@ compile_once() {
             run_client_with_timeout g++ -std=c++17 -O2 -c \
             $compile_include_args "$input_path" -o "$remote_obj"
     else
-        ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+        ICECC_TEST_SOCKET="$compile_socket" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
@@ -1590,6 +1686,13 @@ compile_once() {
         # the generated FILE symbol and command semantics identical.
         g++ -x c++ -std=c++17 -O2 -c -fdirectives-only -fpreprocessed \
             -o "$local_obj" - <"$input_path"
+    elif test "$compiler_loss_w30" = 1 && test "$label" = compiler-loss-c2; then
+        # Compile this reference before opening the W30 receipt gate, so local
+        # compiler work cannot consume the gate's bounded release interval.
+        test -s "$local_obj" || {
+            echo "FAIL: precomputed C2 local-reference object is missing" >&2
+            exit 1
+        }
     elif test -n "$item_compile_db"; then
         eval "g++ $local_compile_args"
     else
@@ -2209,6 +2312,8 @@ if test -n "$batch_manifest"; then
                 else
                     f_slot=$((ordinal % 30))
                 fi
+            elif test "$compiler_loss_w30" = 1; then
+                f_slot=$ordinal
             elif test "$staggered_quiescence" = 1; then
                 f_slot=$((ordinal % 2))
             elif test "$real_scheduler_restart_w30" = 1; then
@@ -2217,6 +2322,7 @@ if test -n "$batch_manifest"; then
             predecessor_file="$work/input-ready/$run_label-$relationship.last"
             predecessor_ordinal=-1
             if test "$real_scheduler_restart_w30" != 1 && test "$w30_f_loss" != 1 && \
+                    test "$compiler_loss_w30" != 1 && \
                     test -e "$predecessor_file"; then
                 predecessor_ordinal=$(cat "$predecessor_file")
                 test "$predecessor_ordinal" -ge 0 2>/dev/null && \
@@ -2425,7 +2531,8 @@ PY
         fi
 if ! batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
                 "$batch_end_ns" "$relationship_count" "$slots_per_f" \
-                "$real_scheduler_restart_w30" "$w30_f_loss" "$work/scheduler.log" <<'PY'
+                "$real_scheduler_restart_w30" "$w30_f_loss" "$work/scheduler.log" \
+                "$compiler_loss_w30" <<'PY'
 import pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -2435,6 +2542,7 @@ relationship_count, slots_per_f = int(sys.argv[6]), int(sys.argv[7])
 c1f2_w30 = sys.argv[9] == "1"
 real_w30 = sys.argv[8] == "1"
 scheduler_lines = pathlib.Path(sys.argv[10]).read_text(encoding="utf-8", errors="replace").splitlines()
+compiler_loss_w30 = sys.argv[11] == "1"
 
 def has_exact_success_witness(job_id, service, lines):
     begin_pattern = re.compile(r"(?:^|\s)BEGIN:?\s+" + re.escape(str(job_id)) + r"(?:\s|$)")
@@ -2521,7 +2629,7 @@ for relationship in range(relationship_count):
     if c1f2_w30 and run == "w30-a-held":
         if not held_retries_have_individual_witnesses(records, scheduler_lines):
             raise SystemExit(f"successful held retry lacks an exact per-job BEGIN/END witness ({run})")
-    elif real_w30:
+    elif real_w30 or (compiler_loss_w30 and run in {"compiler-loss-held", "compiler-loss-fresh"}):
         wire_sequences = sorted(record["tu_seq"] for record in selected)
         if (len(set(wire_sequences)) != len(selected) or
                 any(right != left + 1
@@ -4274,6 +4382,521 @@ EOF_W30_ACTIVE_NEW
             echo "S8_REAL_SCHEDULER_RESTART_W30_PASS profile=$profile_marker old_receipts=30 old_callers_settled=30 fresh_receipts=30 fresh_objects_verified=$fresh_results c_f_daemons_stable=1"
         fi
     }
+    run_real_compiler_loss_w30() {
+        compiler_loss_failed_end() {
+            test "$(grep -E -c ": END $2 status=-?[1-9][0-9]*([[:space:]]|$)" "$1" 2>/dev/null || true)" -eq 1
+        }
+        compiler_loss_success_end() {
+            test "$(grep -E -c ": END $2 status=0 .*server=p50-f$" "$1" 2>/dev/null || true)" -eq 1
+        }
+        terminal_parser_fixture="$work/compiler-loss-terminal-parser.log"
+        printf '%s\n' '[1299] 2026-09-26 21:10:48: END 4 status=-1' \
+            >"$terminal_parser_fixture"
+        compiler_loss_failed_end "$terminal_parser_fixture" 4 || {
+            echo "FAIL: failed-terminal parser rejected the observed signed scheduler END format" >&2
+            return 1
+        }
+        if compiler_loss_failed_end "$terminal_parser_fixture" 40; then
+            echo "FAIL: failed-terminal parser accepted a neighboring job ID" >&2
+            return 1
+        fi
+        printf '%s\n' '[1299] 2026-09-26 21:10:48: END 4 status=0' \
+            >"$terminal_parser_fixture"
+        if compiler_loss_failed_end "$terminal_parser_fixture" 4; then
+            echo "FAIL: failed-terminal parser accepted a successful scheduler END" >&2
+            return 1
+        fi
+        printf '%s\n' '[1299] 2026-09-26 21:10:48: END 4 status=0 in=255(0%%) out=1216(100%%) real=197 user=15 sys=3 pfaults=1749 server=p50-f' \
+            >"$terminal_parser_fixture"
+        compiler_loss_success_end "$terminal_parser_fixture" 4 || {
+            echo "FAIL: successful-terminal parser rejected the prefixed scheduler END format" >&2
+            return 1
+        }
+        sed 's/END 4 status=0/END 4 status=-1/' "$terminal_parser_fixture" \
+            >"$work/compiler-loss-terminal-parser-failed-success.log"
+        if compiler_loss_success_end "$terminal_parser_fixture" 40 || \
+                compiler_loss_success_end "$work/compiler-loss-terminal-parser-failed-success.log" 4; then
+            echo "FAIL: successful-terminal parser accepted a neighboring job or failed status" >&2
+            return 1
+        fi
+        test -n "$client2_pid" || {
+            echo "FAIL: independent C2 daemon did not publish READY" >&2
+            return 1
+        }
+        for _ in $(seq 1 100); do
+            test -s "$work/ready-c2.trace" && break
+            kill -0 "$client2_pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        test -s "$work/ready-c2.trace" || {
+            echo "FAIL: independent C2 daemon did not publish READY within 5s" >&2
+            return 1
+        }
+        ready_snapshot "$work/ready-f.trace" || return 1
+        f_ready_pid_before=$ready_pid
+        f_guid_before=$ready_f_guid
+        ready_snapshot "$work/ready-c.trace" || return 1
+        c1_ready_pid_before=$ready_pid
+        c1_guid_before=$ready_c_guid
+        c1_local_f_guid_before=$ready_f_guid
+        ready_snapshot "$work/ready-c2.trace" || return 1
+        c2_ready_pid_before=$ready_pid
+        c2_guid_before=$ready_c_guid
+        c2_local_f_guid_before=$ready_f_guid
+        test -n "$c1_guid_before" && test -n "$c2_guid_before" && \
+                test "$c2_guid_before" != "$c1_guid_before" || {
+            echo "FAIL: C1 and C2 do not have distinct local store identities" >&2
+            return 1
+        }
+        wc -l <"$work/f.log" >"$work/compiler-loss-w30-f-log-offset"
+
+        compiler_loss_c2_pgid=
+        compiler_loss_c2_pid=
+        compiler_loss_c2_ticks=
+        compiler_loss_c2_job=
+        compiler_loss_victim_pgid=
+        compiler_loss_victim_pid=
+        compiler_loss_victim_ticks=
+        compiler_loss_victim_job=
+        compiler_loss_child() {
+            child_label=$1
+            child_log=$2
+            child_seen_log=$3
+            child_identity_fields=
+            for _ in $(seq 1 600); do
+                child_identity_fields=$(sed -nE \
+                    's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                    "$child_log" 2>/dev/null | tail -n 1)
+                if test -n "$child_identity_fields"; then
+                    read -r child_job child_epoch child_nonce <<EOF_COMPILER_LOSS_JOB
+$child_identity_fields
+EOF_COMPILER_LOSS_JOB
+                    child_marker=$(sed -nE \
+                        "s/.*P50_TEST_COMPILER_CHILD job=$child_job epoch=([0-9]+) nonce=([0-9]+) pid=([0-9]+) pgid=([0-9]+).*/\\1 \\2 \\3 \\4/p" \
+                        "$child_seen_log" 2>/dev/null | tail -n 1)
+                    if test -n "$child_marker"; then
+                        read -r marker_epoch marker_nonce marker_pid marker_pgid <<EOF_COMPILER_LOSS_CHILD
+$child_marker
+EOF_COMPILER_LOSS_CHILD
+                        if test "$marker_epoch" = "$child_epoch" && test "$marker_nonce" = "$child_nonce"; then
+                            exact_identity=$(read_compiler_identity "$marker_pid") || return 1
+                            read -r exact_pid exact_pgid exact_ticks exact_state <<EOF_COMPILER_LOSS_EXACT
+$exact_identity
+EOF_COMPILER_LOSS_EXACT
+                            test "$exact_pid" = "$marker_pid" && test "$exact_pgid" = "$marker_pgid" && \
+                                    test "$exact_pid" = "$exact_pgid" || return 1
+                            eval "compiler_loss_${child_label}_job=\$child_job"
+                            eval "compiler_loss_${child_label}_epoch=\$child_epoch"
+                            eval "compiler_loss_${child_label}_nonce=\$child_nonce"
+                            eval "compiler_loss_${child_label}_pid=\$exact_pid"
+                            eval "compiler_loss_${child_label}_pgid=\$exact_pgid"
+                            eval "compiler_loss_${child_label}_ticks=\$exact_ticks"
+                            return 0
+                        fi
+                    fi
+                fi
+                sleep 0.025
+            done
+            echo "FAIL: no exact P50 compiler child observed for $child_label" >&2
+            return 1
+        }
+        pause_child() {
+            pause_role=$1
+            pause_pid=$2
+            pause_pgid=$3
+            pause_id=$(read_compiler_identity "$pause_pid") || return 1
+            read -r got_pid got_pgid got_ticks got_state <<EOF_COMPILER_LOSS_ID
+$pause_id
+EOF_COMPILER_LOSS_ID
+            test "$got_pid" = "$pause_pid" && test "$got_pgid" = "$pause_pgid" && \
+                    test "$pause_pid" = "$pause_pgid" || return 1
+            eval "pause_expected_ticks=\$compiler_loss_${pause_role}_ticks"
+            test "$got_ticks" = "$pause_expected_ticks" || return 1
+            pause_ticks=$got_ticks
+            eval "compiler_loss_${pause_role}_ticks=\$pause_ticks"
+            /bin/kill -STOP -- "-$pause_pgid" || return 1
+            for _ in $(seq 1 100); do
+                pause_id=$(read_compiler_identity "$pause_pid") || return 1
+                read -r got_pid got_pgid got_ticks got_state <<EOF_COMPILER_LOSS_STOP
+$pause_id
+EOF_COMPILER_LOSS_STOP
+                test "$got_pid" = "$pause_pid" && test "$got_pgid" = "$pause_pgid" && \
+                        test "$got_ticks" = "$pause_ticks" || return 1
+                case "$got_state" in T|t) return 0 ;; esac
+                sleep 0.02
+            done
+            return 1
+        }
+
+        # Establish an already-admitted healthy request on C2's independent
+        # control socket and persistent F link before opening C1's receipt gate.
+        compiler_loss_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler.log")
+        test -n "$compiler_loss_scheduler_epoch" || {
+            echo "FAIL: original strict-nonce scheduler epoch is unavailable" >&2
+            return 1
+        }
+        c2_source=${ICECC_P50_C1F1_COMPILER_LOSS_C2_SOURCE:-}
+        test -s "$c2_source" || { echo "FAIL: C2 sibling source is missing" >&2; return 1; }
+        g++ -std=c++17 -O2 -c "$c2_source" -o "$work/out/local-compiler-loss-c2.o" \
+            >"$work/local-compiler-loss-c2.log" 2>&1 || {
+            cat "$work/local-compiler-loss-c2.log" >&2 || true
+            echo "FAIL: could not precompute C2 local-reference object before opening the W30 gate" >&2
+            return 1
+        }
+        compile_once compiler-loss-c2 "$c2_source" "" "" "" 0 0 "" "$work/client2.sock" \
+            >"$work/compiler-loss-c2-wrapper.out" 2>&1 &
+        compiler_loss_c2_wrapper=$!
+        compiler_loss_child c2 "$work/client-compile-compiler-loss-c2.log" "$work/f.log" || return 1
+        c2_epoch=$compiler_loss_c2_epoch
+        c2_nonce=$compiler_loss_c2_nonce
+        grep -F 'source committed for P50 CompileFile' "$work/client-compile-compiler-loss-c2.log" >/dev/null || {
+            echo "FAIL: C2 sibling lacks a source-commit witness before compiler loss" >&2
+            return 1
+        }
+        grep -F "Have to use host $worker_scheduler_host:$port_worker" \
+                "$work/client-compile-compiler-loss-c2.log" >/dev/null || {
+            echo "FAIL: C2 sibling was not assigned to the exact shared F endpoint" >&2
+            return 1
+        }
+        test "$c2_epoch" = "$compiler_loss_scheduler_epoch" || {
+            echo "FAIL: C2 sibling assignment does not belong to the original scheduler epoch" >&2
+            return 1
+        }
+        pause_child c2 "$compiler_loss_c2_pid" "$compiler_loss_c2_pgid" || {
+            echo "FAIL: could not pause the exact C2 compiler child" >&2
+            return 1
+        }
+        echo "S8_COMPILER_LOSS_W30_C2_ADMITTED job=$compiler_loss_c2_job epoch=$c2_epoch nonce=$c2_nonce pid=$compiler_loss_c2_pid pgid=$compiler_loss_c2_pgid start_ticks=$compiler_loss_c2_ticks C2_READY=$c2_guid_before F_READY=$f_guid_before"
+
+        w30_receipt_gate_dir="$work/receipt-gate-compiler-loss"
+        receipt_gate_dir=$w30_receipt_gate_dir
+        receipt_gate_log="$work/receipt-gate-compiler-loss.log"
+        mkdir -m 0777 "$w30_receipt_gate_dir"
+        "$build/unittests/p50daemonpositive" --p51-commit-receipt-gate-once \
+            "$port_worker" "$daemon_uid" 30 2 "$w30_receipt_gate_dir" \
+            >"$receipt_gate_log" 2>&1 &
+        receipt_gate_pid=$!
+        wait_gate_marker ready || return 1
+
+        victim_source=$(cut -f2 "$work/batch-compiler-victim.tsv")
+        compiler_loss_victim_started_ns=$(date +%s%N)
+        compile_once compiler-loss-victim "$victim_source" "" "" "" 0 0 \
+            >"$work/compiler-loss-victim-wrapper.out" 2>&1 &
+        compiler_loss_victim_wrapper=$!
+        compiler_loss_child victim "$work/client-compile-compiler-loss-victim.log" "$work/f.log" || return 1
+        victim_epoch=$compiler_loss_victim_epoch
+        victim_nonce=$compiler_loss_victim_nonce
+        grep -F 'source committed for P50 CompileFile' "$work/client-compile-compiler-loss-victim.log" >/dev/null || {
+            echo "FAIL: victim compiler child was not preceded by a committed source transfer" >&2
+            return 1
+        }
+        grep -F "Have to use host $worker_scheduler_host:$port_worker" \
+                "$work/client-compile-compiler-loss-victim.log" >/dev/null || {
+            echo "FAIL: C1 victim was not assigned to the same exact F endpoint as C2" >&2
+            return 1
+        }
+        test "$victim_epoch" = "$compiler_loss_scheduler_epoch" || {
+            echo "FAIL: C1 victim assignment does not belong to the original scheduler epoch" >&2
+            return 1
+        }
+        pause_child victim "$compiler_loss_victim_pid" "$compiler_loss_victim_pgid" || {
+            echo "FAIL: could not pause the exact C1 victim compiler child" >&2
+            return 1
+        }
+        victim_tu_seq=$(sed -nE \
+            's/.*source committed for P50 CompileFile: .* TU sequence ([0-9]+).*/\1/p' \
+            "$work/client-compile-compiler-loss-victim.log" | tail -n 1)
+        victim_proxy_line="P51_RECEIPT_GATE_PASSTHROUGH port=$port_worker ordinal=1 tu_seq=$victim_tu_seq"
+        gate_victim_witness=0
+        for _ in $(seq 1 200); do
+            if grep -Fxq "$victim_proxy_line" "$receipt_gate_log"; then gate_victim_witness=1; break; fi
+            sleep 0.025
+        done
+        test "$gate_victim_witness" -eq 1 || {
+            echo "FAIL: C1 victim COMMIT did not pass receipt proxy ordinal 1" >&2
+            cat "$receipt_gate_log" >&2
+            return 1
+        }
+        echo "S8_COMPILER_LOSS_W30_VICTIM_COMMITTED job=$compiler_loss_victim_job epoch=$victim_epoch nonce=$victim_nonce pid=$compiler_loss_victim_pid pgid=$compiler_loss_victim_pgid start_ticks=$compiler_loss_victim_ticks ordinal=1"
+
+        run_batch compiler-loss-held 0 "$work/batch-compiler-window.tsv" 30 0 1 || return 1
+        wait_gate_marker held-1 || return 1
+        w30_window=$(cat "$w30_receipt_gate_dir/held-1")
+        case "$w30_window" in
+            'count=30 first_ordinal=2 last_ordinal=31') ;;
+            *) echo "FAIL: receipt proxy did not hold exactly30 contiguous C1 COMMIT replies: $w30_window" >&2; return 1 ;;
+        esac
+        : >"$work/compiler-loss-window-identities.tsv"
+        for held_ordinal in $(seq 0 29); do
+            held_log="$work/client-compile-compiler-loss-held-$held_ordinal.log"
+            held_identity=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$held_log" | tail -n 1)
+            test -n "$held_identity" && ! grep -Fq 'source committed for P50 CompileFile' "$held_log" || {
+                echo "FAIL: held request $held_ordinal lacks a unique assignment or escaped its held COMMIT reply" >&2
+                return 1
+            }
+            read -r held_job held_epoch held_nonce <<EOF_COMPILER_LOSS_HELD
+$held_identity
+EOF_COMPILER_LOSS_HELD
+            test "$held_epoch" = "$compiler_loss_scheduler_epoch" || {
+                echo "FAIL: held request $held_ordinal left the original scheduler epoch" >&2
+                return 1
+            }
+            if grep -F "P50_INPUT_ATTACH_BEGIN job=$held_job " "$work/f.log" >/dev/null || \
+                    grep -F "P50_TEST_COMPILER_CHILD job=$held_job " "$work/f.log" >/dev/null; then
+                echo "FAIL: held COMMIT was attached/launched before its receipt reply was released" >&2
+                return 1
+            fi
+            printf '%s\t%s\t%s\t%s\n' \
+                "$held_ordinal" "$held_job" "$held_epoch" "$held_nonce" \
+                >>"$work/compiler-loss-window-identities.tsv"
+        done
+        test "$(cut -f2- "$work/compiler-loss-window-identities.tsv" | sort -u | wc -l)" -eq 30 || {
+            echo "FAIL: held C1 requests do not have 30 distinct job/epoch/nonce identities" >&2
+            return 1
+        }
+        active_window_wrappers=0
+        for job_entry in $job_entries; do
+            active_pid=${job_entry#*:}
+            active_state=$(ps -p "$active_pid" -o stat= 2>/dev/null | awk '{print substr($1, 1, 1)}')
+            if test -n "$active_state" && test "$active_state" != Z; then
+                active_window_wrappers=$((active_window_wrappers + 1))
+            fi
+        done
+        test "$active_window_wrappers" -eq 30 || {
+            echo "FAIL: receipt gate held $active_window_wrappers/30 still-outstanding C1 wrappers" >&2
+            return 1
+        }
+        grep -F 'P51_RECEIPT_GATE_LINK_STATE' "$receipt_gate_log" >/dev/null && \
+                test "$(grep -F -c 'P51_RECEIPT_GATE_LINK_STATE' "$receipt_gate_log")" -eq 1 || {
+            echo "FAIL: receipt proxy did not isolate exactly the newly opened C1-F link" >&2
+            return 1
+        }
+        test ! -e "$w30_receipt_gate_dir/released-1" || {
+            echo "FAIL: receipt proxy released before the compiler-loss trigger" >&2
+            return 1
+        }
+        echo "S8_COMPILER_LOSS_W30_WINDOW_HELD $w30_window distinct_assignments=30 victim_committed=1 C2_already_admitted=1"
+
+        # The only destructive event is SIGKILL to the verified original
+        # compiler process group; all scheduler/cache/daemon identities stay up.
+        victim_live_identity=$(read_compiler_identity "$compiler_loss_victim_pid") || return 1
+        read -r live_victim_pid live_victim_pgid live_victim_ticks live_victim_state <<EOF_COMPILER_LOSS_LIVE_VICTIM
+$victim_live_identity
+EOF_COMPILER_LOSS_LIVE_VICTIM
+        test "$live_victim_pid" = "$compiler_loss_victim_pid" && \
+                test "$live_victim_pgid" = "$compiler_loss_victim_pgid" && \
+                test "$live_victim_ticks" = "$compiler_loss_victim_ticks" || {
+            echo "FAIL: exact victim PID/PGID/start-ticks changed before SIGKILL" >&2
+            return 1
+        }
+        case "$live_victim_state" in T|t) ;; *)
+            echo "FAIL: victim compiler was not stopped at the validated loss boundary" >&2
+            return 1 ;;
+        esac
+        /bin/kill -KILL -- "-$compiler_loss_victim_pgid" || return 1
+        victim_terminal=0
+        for _ in $(seq 1 500); do
+            if compiler_loss_failed_end "$work/scheduler.log" "$compiler_loss_victim_job"; then
+                victim_terminal=1
+                break
+            fi
+            sleep 0.05
+        done
+        test "$victim_terminal" -eq 1 || {
+            echo "FAIL: killed victim assignment did not reach a failed scheduler END" >&2
+            return 1
+        }
+        compiler_loss_victim_terminal_ns=$(date +%s%N)
+        victim_elapsed_s=$(( (compiler_loss_victim_terminal_ns - compiler_loss_victim_started_ns) / 1000000000 ))
+        test "$victim_elapsed_s" -lt 120 || {
+            echo "FAIL: killed victim did not settle within the 120s bounded fixture watchdog" >&2
+            return 1
+        }
+        test "$(grep -F -c "P50_INPUT_ATTACH_BEGIN job=$compiler_loss_victim_job " "$work/f.log" || true)" -eq 1 || {
+            echo "FAIL: victim identity was attached again after compiler-owner death" >&2
+            return 1
+        }
+        # A sibling request admitted before the failure must finish while the
+        # 30 C1 receipt replies remain held; this is not a fresh-after-release probe.
+        c2_resume_identity=$(read_compiler_identity "$compiler_loss_c2_pid") || return 1
+        read -r c2_resume_pid c2_resume_pgid c2_resume_ticks c2_resume_state <<EOF_COMPILER_LOSS_C2_RESUME
+$c2_resume_identity
+EOF_COMPILER_LOSS_C2_RESUME
+        test "$c2_resume_pid" = "$compiler_loss_c2_pid" && \
+                test "$c2_resume_pgid" = "$compiler_loss_c2_pgid" && \
+                test "$c2_resume_ticks" = "$compiler_loss_c2_ticks" && \
+                case "$c2_resume_state" in T|t) true ;; *) false ;; esac || {
+            echo "FAIL: C2 compiler identity/state changed before exact resume" >&2
+            return 1
+        }
+        /bin/kill -CONT -- "-$compiler_loss_c2_pgid" || return 1
+        c2_status=0
+        if wait "$compiler_loss_c2_wrapper"; then c2_status=0; else c2_status=$?; fi
+        compiler_loss_c2_wrapper=
+        test "$c2_status" -eq 0 && \
+        cmp -s "$work/out/remote-compiler-loss-c2.o" "$work/out/local-compiler-loss-c2.o" || {
+            cat "$work/client-compile-compiler-loss-c2.log" >&2 || true
+            echo "FAIL: already-admitted C2 sibling did not produce its exact local-reference object while C1 was gated" >&2
+            return 1
+        }
+        test "$(grep -F -c 'P50 assignment identity bound for job ' \
+                "$work/client-compile-compiler-loss-c2.log" || true)" -eq 1 && \
+                test "$(grep -F -c 'source committed for P50 CompileFile:' \
+                "$work/client-compile-compiler-loss-c2.log" || true)" -eq 1 && \
+                grep -F "P50 assignment identity bound for job $compiler_loss_c2_job epoch $c2_epoch nonce $c2_nonce " \
+                    "$work/client-compile-compiler-loss-c2.log" >/dev/null || {
+            echo "FAIL: C2 output is not bound to exactly its originally admitted assignment/source commit" >&2
+            return 1
+        }
+        test ! -e "$w30_receipt_gate_dir/released-1" || return 1
+        compiler_loss_success_end "$work/scheduler.log" "$compiler_loss_c2_job" || {
+            echo "FAIL: C2 sibling lacks successful terminal evidence on the original F" >&2
+            return 1
+        }
+        test "$(grep -F -c "P50_INPUT_ATTACH_BEGIN job=$compiler_loss_c2_job " "$work/f.log" || true)" -eq 1 && \
+                grep -F "P50_TEST_COMPILER_CHILD job=$compiler_loss_c2_job epoch=$c2_epoch nonce=$c2_nonce pid=$compiler_loss_c2_pid pgid=$compiler_loss_c2_pgid" \
+                    "$work/f.log" >/dev/null || {
+            echo "FAIL: C2 progress did not complete on its original exact compiler child" >&2
+            return 1
+        }
+        kill -0 "$receipt_gate_pid" 2>/dev/null && \
+                test ! -e "$w30_receipt_gate_dir/failed" && \
+                test ! -e "$w30_receipt_gate_dir/released-1" || {
+            echo "FAIL: C1 receipt gate was not still actively holding its window through C2 completion" >&2
+            cat "$receipt_gate_log" >&2 || true
+            return 1
+        }
+        while IFS="$(printf '\t')" read -r held_ordinal held_job held_epoch held_nonce; do
+            held_log="$work/client-compile-compiler-loss-held-$held_ordinal.log"
+            if grep -Fq 'source committed for P50 CompileFile:' "$held_log" || \
+                    grep -F "P50_INPUT_ATTACH_BEGIN job=$held_job epoch=$held_epoch nonce=$held_nonce " \
+                        "$work/f.log" >/dev/null; then
+                echo "FAIL: original held C1 source/assignment $held_job progressed before C2 completed" >&2
+                return 1
+            fi
+        done <"$work/compiler-loss-window-identities.tsv"
+        compiler_loss_c2_pgid=
+        echo "S8_COMPILER_LOSS_W30_C2_PROGRESS job=$compiler_loss_c2_job epoch=$c2_epoch nonce=$c2_nonce held_C1_receipts=30 exact_output=1 before_release=1"
+
+        publish_gate_marker "$w30_receipt_gate_dir/release-1"
+        wait_gate_marker released-1 || return 1
+        finish_batch || return 1
+        test "$batch_failed" -eq 0 || return 1
+        compiler_loss_window_results=0
+        for result_file in "$work"/result-compiler-loss-held-*.tsv; do
+            test -f "$result_file" && compiler_loss_window_results=$((compiler_loss_window_results + 1))
+        done
+        test "$compiler_loss_window_results" -eq 30 || {
+            echo "FAIL: only $compiler_loss_window_results/30 held C1 transfers settled with exact output" >&2
+            return 1
+        }
+        while IFS="$(printf '\t')" read -r held_ordinal held_job held_epoch held_nonce; do
+            held_log="$work/client-compile-compiler-loss-held-$held_ordinal.log"
+            result_file="$work/result-compiler-loss-held-$held_ordinal.tsv"
+            result_job=$(cut -f19 "$result_file")
+            result_service=$(cut -f20 "$result_file")
+            remote_obj=$(cut -f6 "$result_file")
+            remote_sha=$(cut -f7 "$result_file")
+            remote_bytes=$(cut -f8 "$result_file")
+            local_obj=$(cut -f9 "$result_file")
+            local_sha=$(cut -f10 "$result_file")
+            local_bytes=$(cut -f11 "$result_file")
+            attach_line="P50_INPUT_ATTACH_BEGIN job=$held_job epoch=$held_epoch nonce=$held_nonce request=$held_nonce"
+            child_prefix="P50_TEST_COMPILER_CHILD job=$held_job epoch=$held_epoch nonce=$held_nonce "
+            test "$result_job" = "$held_job" && test "$result_service" = p50-f && \
+                    test "$(grep -F -c 'P50 assignment identity bound for job ' "$held_log" || true)" -eq 1 && \
+                    grep -F "P50 assignment identity bound for job $held_job epoch $held_epoch nonce $held_nonce " \
+                        "$held_log" >/dev/null && \
+                    test "$(grep -F -c 'source committed for P50 CompileFile:' "$held_log" || true)" -eq 1 && \
+                    test "$(grep -F -c "$attach_line" "$work/f.log" || true)" -eq 1 && \
+                    test "$(grep -F -c "$child_prefix" "$work/f.log" || true)" -eq 1 && \
+                    compiler_loss_success_end "$work/scheduler.log" "$held_job" && \
+                    test -s "$remote_obj" && test -s "$local_obj" && cmp -s "$remote_obj" "$local_obj" && \
+                    test "$(sha256sum "$remote_obj" | awk '{print $1}')" = "$remote_sha" && \
+                    test "$(sha256sum "$local_obj" | awk '{print $1}')" = "$local_sha" && \
+                    test "$(stat -c %s "$remote_obj")" = "$remote_bytes" && \
+                    test "$(stat -c %s "$local_obj")" = "$local_bytes" || {
+                echo "FAIL: held source row $held_ordinal did not produce one exact successful output for its original assignment" >&2
+                return 1
+            }
+        done <"$work/compiler-loss-window-identities.tsv"
+        victim_wrapper_deadline=$(( $(date +%s) + 30 ))
+        victim_wrapper_state=$(ps -p "$compiler_loss_victim_wrapper" -o stat= 2>/dev/null | awk '{print substr($1, 1, 1)}')
+        while test -n "$victim_wrapper_state" && test "$victim_wrapper_state" != Z && \
+                test "$(date +%s)" -lt "$victim_wrapper_deadline"; do
+            sleep 0.05
+            victim_wrapper_state=$(ps -p "$compiler_loss_victim_wrapper" -o stat= 2>/dev/null | awk '{print substr($1, 1, 1)}')
+        done
+        test -n "$victim_wrapper_state" && test "$victim_wrapper_state" != Z && {
+            echo "FAIL: victim wrapper did not settle within 30s after the held receipt gate was released" >&2
+            return 1
+        }
+        victim_wrapper_status=0
+        if wait "$compiler_loss_victim_wrapper"; then victim_wrapper_status=0; else victim_wrapper_status=$?; fi
+        compiler_loss_victim_wrapper=
+        test "$(grep -F -c "P50_INPUT_ATTACH_BEGIN job=$compiler_loss_victim_job " "$work/f.log" || true)" -eq 1 || {
+            echo "FAIL: victim identity was attached again after the compiler-owner death" >&2
+            return 1
+        }
+        if test "$victim_wrapper_status" -eq 0; then
+            victim_final_job=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1/p' \
+                "$work/client-compile-compiler-loss-victim.log" | tail -n 1)
+            test -n "$victim_final_job" && test "$victim_final_job" != "$compiler_loss_victim_job" && \
+                    cmp -s "$work/out/remote-compiler-loss-victim.o" "$work/out/local-compiler-loss-victim.o" || {
+                echo "FAIL: victim succeeded without a distinct fresh assignment and exact output" >&2
+                return 1
+            }
+            victim_disposition=fresh-assignment-output
+        else
+            test ! -e "$work/out/remote-compiler-loss-victim.o" || {
+                echo "FAIL: failed original victim assignment published a remote object" >&2
+                return 1
+            }
+            victim_disposition=terminal-no-output
+        fi
+        echo "S8_COMPILER_LOSS_W30_VICTIM_TERMINAL job=$compiler_loss_victim_job failed_end=1 disposition=$victim_disposition no_stale_attach=1 original_end_watchdog_s=120"
+        run_batch compiler-loss-fresh 1 "$work/batch-compiler-fresh.tsv" 30 0 0 || return 1
+        test "$batch_failed" -eq 0 || return 1
+        compiler_loss_fresh_results=0
+        for result_file in "$work"/result-compiler-loss-fresh-*.tsv; do
+            test -f "$result_file" && compiler_loss_fresh_results=$((compiler_loss_fresh_results + 1))
+        done
+        test "$compiler_loss_fresh_results" -eq 30 || {
+            echo "FAIL: fresh post-loss cohort exact-output count is $compiler_loss_fresh_results/30" >&2
+            return 1
+        }
+        publish_gate_marker "$w30_receipt_gate_dir/finish"
+        if ! wait "$receipt_gate_pid"; then
+            receipt_gate_pid=
+            cat "$receipt_gate_log" >&2 || true
+            echo "FAIL: compiler-loss W30 receipt gate did not finish cleanly" >&2
+            return 1
+        fi
+        receipt_gate_pid=
+
+        kill -0 "$sched_pid" && kill -0 "$worker_pid" && kill -0 "$client_pid" && \
+                kill -0 "$client2_pid" || {
+            echo "FAIL: S/F/C daemon process changed or exited during compiler-only loss" >&2
+            return 1
+        }
+        ready_snapshot "$work/ready-f.trace" || return 1
+        test "$ready_pid" = "$f_ready_pid_before" && test "$ready_f_guid" = "$f_guid_before" || return 1
+        ready_snapshot "$work/ready-c.trace" || return 1
+        test "$ready_pid" = "$c1_ready_pid_before" && test "$ready_c_guid" = "$c1_guid_before" && \
+                test "$ready_f_guid" = "$c1_local_f_guid_before" || return 1
+        ready_snapshot "$work/ready-c2.trace" || return 1
+        test "$ready_pid" = "$c2_ready_pid_before" && test "$ready_c_guid" = "$c2_guid_before" && \
+                test "$ready_f_guid" = "$c2_local_f_guid_before" || return 1
+        test "$(scheduler_epoch_from_log "$work/scheduler.log")" = "$compiler_loss_scheduler_epoch" || {
+            echo "FAIL: strict-nonce scheduler epoch changed during compiler-only loss" >&2
+            return 1
+        }
+        echo "S8_COMPILER_LOSS_W30_IDENTITIES_STABLE S_pid=$sched_pid S_epoch=$compiler_loss_scheduler_epoch F_pid=$worker_pid F_GUID=$f_guid_before C1_pid=$client_pid C1_GUID=$c1_guid_before C2_pid=$client2_pid C2_GUID=$c2_guid_before"
+        echo "S8_COMPILER_LOSS_W30_PASS profile=$profile_marker held_source_ops=30 victim_compiler_killed=1 C2_progress_before_release=1 fresh_outputs=$compiler_loss_fresh_results stable_SCF=1"
+    }
     if test "$warm" = 1 && test "$cache_enabled" -eq 1; then
         echo "S7_WARM_PREWARM_BEGIN"
         run_batch prewarm 0
@@ -4446,6 +5069,9 @@ EOF_W30_ACTIVE_NEW
             exit 1
         fi
         echo "P51_WRAPPER_CAPACITY_EXPIRY_PASS profile=$profile_marker expired_ordinal=$expired_ordinal expired_job=$expiry_job_id fresh_retry_job=$fresh_retry_job_id exact_deadline=1 expired_job_unpublished=1 distinct_deadline_and_ARM=1 fresh_after_release=1 unrelated_after_release=1 elapsed_ms=$expiry_elapsed_ms client_trace=$expiry_client_log daemon_log=$work/c-daemon-startup.stderr fresh_result=$work/result-capacity-expiry-fresh-0.tsv"
+    elif test "$compiler_loss_w30" = 1; then
+        run_real_compiler_loss_w30
+        exit 0
     elif test "$w30_f_loss" = 1; then
         run_real_c1f2_w30_worker_loss
         exit 0

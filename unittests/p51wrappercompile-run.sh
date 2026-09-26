@@ -139,6 +139,7 @@ worker_session_loss=${ICECC_P51_WRAPPER_WORKER_SESSION_LOSS:-0}
 expect_stable_f=${ICECC_P51_WRAPPER_EXPECT_STABLE_F:-0}
 staggered_quiescence=${ICECC_P51_WRAPPER_STAGGERED_QUIESCENCE:-0}
 c1f2_w30=${ICECC_P51_WRAPPER_C1F2_W30:-0}
+compiler_loss_w30=${ICECC_P51_WRAPPER_COMPILER_LOSS_W30:-0}
 capacity_test=${ICECC_P51_WRAPPER_CAPACITY_TEST:-0}
 capacity_identity_negative=${ICECC_P51_WRAPPER_CAPACITY_IDENTITY_NEGATIVE:-0}
 capacity_nonbusy_negative=${ICECC_P51_WRAPPER_CAPACITY_NONBUSY_NEGATIVE:-0}
@@ -163,6 +164,18 @@ case "$c1f2_w30" in
     0|1) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_C1F2_W30 must be 0 or 1" >&2; exit 1 ;;
 esac
+case "$compiler_loss_w30" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_COMPILER_LOSS_W30 must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$compiler_loss_w30" = 1 && \
+        { test "$worker_session_loss" != 0 || test "$staggered_quiescence" != 0 || \
+          test "$c1f2_w30" != 0 || test "$capacity_test" != 0 || \
+          test "$capacity_identity_negative" != 0 || test "$capacity_nonbusy_negative" != 0 || \
+          test "$capacity_expiry" != 0; }; then
+    echo "FAIL: independent compiler-loss W30 mode is standalone" >&2
+    exit 1
+fi
 if test "$c1f2_w30" = 1 && { test "$worker_session_loss" != 0 || \
         test "$expect_stable_f" != 0 || test "$staggered_quiescence" != 0; }; then
     echo "FAIL: C1F2 W30 wrapper mode cannot be combined with C1F1 loss modes" >&2
@@ -199,6 +212,7 @@ if test "$worker_session_loss" = 1; then
 else
     jobs=${ICECC_P51_WRAPPER_JOBS:-100}
 fi
+if test "$compiler_loss_w30" = 1; then jobs=61; fi
 if test "$c1f2_w30" = 1; then
     jobs=31
 fi
@@ -233,7 +247,7 @@ if test "$capacity_expiry" = 1 && \
     exit 1
 fi
 
-sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" "$worker_session_loss" "$staggered_quiescence" <<'PY'
+sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" "$worker_session_loss" "$staggered_quiescence" "$compiler_loss_w30" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -244,6 +258,7 @@ root = pathlib.Path(sys.argv[1])
 count = int(sys.argv[2])
 worker_session_loss = sys.argv[3] == "1"
 staggered_quiescence = sys.argv[4] == "1"
+compiler_loss_w30 = sys.argv[5] == "1"
 rows = []
 for ordinal in range(count):
     stem = f"tu-{ordinal:02d}"
@@ -252,10 +267,19 @@ for ordinal in range(count):
         # to capture exact remote compiler groups. The normal loss gate makes
         # only ordinal zero heavy; staggered mode makes ordinals zero and one
         # active before scheduler-session loss.
+        function_count = 80000
         body = ("\n".join(
             f'extern "C" int p51_worker_loss_{index}(int value) '
             f'{{ return value + {index + 17}; }}'
-            for index in range(80000)) + "\n").encode()
+            for index in range(function_count)) + "\n").encode()
+    elif compiler_loss_w30 and ordinal == 0:
+        # Keep the killed victim real and observable, but make its documented
+        # fresh-assignment retry settle comfortably inside the wrapper watchdog.
+        function_count = 2000
+        body = ("\n".join(
+            f'extern "C" int p51_compiler_loss_{index}(int value) '
+            f'{{ return value + {index + 17}; }}'
+            for index in range(function_count)) + "\n").encode()
     else:
         body = (
             f'extern "C" int p51_w31_{ordinal:02d}() {{ '
@@ -283,6 +307,12 @@ for ordinal in range(count):
             "bytes": predictive.stat().st_size,
         },
     })
+if compiler_loss_w30:
+    source = root / "sources" / "c2-sibling.cpp"
+    source.write_text("\n".join(
+        f'extern "C" int p51_c2_sibling_{index}(int value) '
+        f'{{ return value + {index + 901}; }}'
+        for index in range(2000)) + "\n", encoding="ascii")
 with (root / "batch.jsonl").open("w", encoding="utf-8") as stream:
     for row in rows:
         stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
@@ -333,6 +363,8 @@ for profile in $profiles; do
         ICECC_P50_SUITE="$suite" \
         ICECC_P50_C1F1_BATCH_MANIFEST="$fixture/batch.jsonl" \
         ICECC_P50_C1F1_EXPECTED_COUNT="$jobs" \
+        ICECC_P50_C1F1_TEST_COMPILER_LOSS_W30="$compiler_loss_w30" \
+        ICECC_P50_C1F1_COMPILER_LOSS_C2_SOURCE="$fixture/sources/c2-sibling.cpp" \
         ICECC_P50_C1F1_PASSES=1 \
         ICECC_P50_C1F1_WARM=0 \
         ICECC_P50_C1F1_WORKDIR="$work" \
@@ -354,6 +386,44 @@ for profile in $profiles; do
         "$src/unittests/p50compilee2e-run.sh" >"$log" 2>&1
     status=$?
     set -e
+    if test "$compiler_loss_w30" = 1; then
+        test "$status" -eq 0 || {
+            cat "$log"
+            echo "FAIL: compiler-only W30 recovery gate failed for $profile (status $status)" >&2
+            exit 1
+        }
+        grep -F "S8_COMPILER_LOSS_W30_PASS profile=$profile" "$log" >/dev/null || {
+            cat "$log"
+            echo "FAIL: $profile lacks the compiler-loss W30 pass marker" >&2
+            exit 1
+        }
+        grep -F "S8_COMPILER_LOSS_W30_C2_PROGRESS" "$log" >/dev/null || {
+            cat "$log"
+            echo "FAIL: $profile did not prove the already-admitted C2 sibling progressed under the C1 receipt gate" >&2
+            exit 1
+        }
+        test -s "$work/result-compiler-loss-held-0.tsv" && \
+                test -s "$work/result-compiler-loss-fresh-0.tsv" && \
+                test -s "$work/out/remote-compiler-loss-c2.o" && \
+                test -s "$work/out/local-compiler-loss-c2.o" || {
+            echo "FAIL: $profile is missing exact wrapper output evidence for C2 or the two C1 W30 cohorts" >&2
+            exit 1
+        }
+        test -s "$work/f.log" || { echo "FAIL: F log missing for compiler-loss W30" >&2; exit 1; }
+        f_log_offset=$(cat "$work/compiler-loss-w30-f-log-offset")
+        case "$f_log_offset" in ''|*[!0-9]*) echo "FAIL: measured F log offset is invalid" >&2; exit 1 ;; esac
+        measured_f_log=$(tail -n "+$((f_log_offset + 1))" "$work/f.log")
+        loss_w30_adoptions=$(printf '%s\n' "$measured_f_log" | grep -F -c 'P51 cache-link descriptor adopted by sidecar' || true)
+        loss_w30_r1=$(printf '%s\n' "$measured_f_log" | grep -F -c 'P50_CACHE_SESSION_READY request=' || true)
+        test "$loss_w30_adoptions" -eq 2 && test "$loss_w30_r1" -eq 0 || {
+            cat "$work/f.log" >&2
+            echo "FAIL: compiler-loss W30 did not use exactly two persistent P51 C-F links" >&2
+            exit 1
+        }
+        printf 'P51_WRAPPER_COMPILER_LOSS_W30_PASS profile=%s held_source_window=30 C2_progress_before_release=1 victim_only=1 stable_SCF=1 fresh_cohort=30 adoptions=%s log=%s work=%s f_log=%s\n' \
+            "$profile" "$loss_w30_adoptions" "$log" "$work" "$work/f.log"
+        continue
+    fi
     if test "$capacity_expiry" = 1; then
         test "$status" -eq 0 || {
             cat "$log"
@@ -710,7 +780,9 @@ for profile in $profiles; do
     fi
 done
 
-if test "$c1f2_w30" = 1; then
+if test "$compiler_loss_w30" = 1; then
+    echo "PASS: active compiler-owner loss was isolated to one original job; an admitted C2 sibling progressed while C1 held 30 source receipts"
+elif test "$c1f2_w30" = 1; then
     echo "PASS: actual P51 C1F2 W30 F-specific loss, healthy-B isolation, cleanup, and fresh-A recovery passed per selected profile"
 elif test "$capacity_identity_negative" = 1; then
     echo "PASS: changed C identity after exact Busy is terminal; no source operation was dispatched"
