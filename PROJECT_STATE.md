@@ -12,6 +12,39 @@ retained artifact directories.
 
 ## Developer QA
 
+### Active compiler loss and fresh-job recovery
+
+The opt-in local wrapper gate
+`ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1` passes for P29V1, ZSTD_TU and
+ZSTD_ROUTE. It stops one exact compiler child, identified by job/epoch/nonce,
+PID, process group and process start time, then replaces the global scheduler.
+It observes TERM/KILL and group settlement before F reconnects, independently
+checks group absence, and compares a separate fresh R2 job's object with local
+compilation. The committed victim fails with Error 24 and no object after one
+bounded retry attempt. This is W1 worker-loss cleanup, not transparent victim
+replay, W30 compiler occupancy, or an unaffected-sibling test. Ordinary
+scheduler-restart process-stability requirements remain unchanged.
+
+The stopped compiler consumes the queued input-lifecycle deadline during
+synchronous compiler cleanup; the observed F sidecar replacement is accepted
+only with that job-specific timeout and a distinct replacement READY identity.
+Avoiding this unnecessary replacement remains production work.
+
+Run the existing `unittests/p51wrappercompile-run.sh` with its documented
+source/build, daemon-account and worker-address environment and explicit task
+scratch. The new mode generates only a heavy victim and a fresh probe.
+Reviewed donor: `c4a7cb12`. All-three log:
+`/tanksmall/scratch/tmp/p51-d07-compile.YLS0NG/tmp/p51-wloss-donor-cleanup-all3-run1.log`,
+SHA256 `497d4605f8de458a454ac20c1dbf716ab0fbb7d6a05927f46c495d0b674acaeb`.
+Qualified daemon binary SHA256:
+`8aa26f5256843267a97ae2fcaf5344e3bb57ba2a0a9c8514e7c865c04963d119`.
+Its daemon source matches the imported optional identity marker, but the
+reused build's complete production source closure was not independently
+verified. This evidence qualifies the scenario on that binary, not a combined
+current-candidate regression. The final harness differs from the executed
+cleanup run only in failure wording (bounded observations, not a one-second
+wall-clock promise).
+
 ### Local control connection backlog recovery
 
 AF_UNIX connect EAGAIN now preserves the pathname and schedules a 5 ms retry,

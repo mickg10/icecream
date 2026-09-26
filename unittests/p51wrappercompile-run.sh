@@ -1,7 +1,20 @@
 #!/bin/sh
-# Real wrapper-to-compiler P51 persistence gate. One C/F relationship handles
-# a bounded configurable number of separate compiler invocations per profile;
-# the production runner compares every remote object byte-for-byte with local g++.
+# Real wrapper-to-compiler P51 gate. Ordinary mode checks a persistent link
+# across separate invocations. Worker-session-loss mode (set
+# ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1) is deliberately a focused one-heavy-
+# compile test: it holds the exact victim compiler, loses the global scheduler
+# session, expects strict-P50 Error 24/no victim object if the committed
+# predecessor cannot be settled, then verifies a separate fresh R2 recovery
+# compile against local g++. It does not assert transparent victim replay or
+# unaffected siblings across global scheduler replacement. Select profiles
+# with ICECC_P51_WRAPPER_PROFILES (e.g. "P29V1 ZSTD_TU" or ZSTD_ROUTE).
+# Portable entrypoint (bind task scratch to /tmp, source/build as above, and
+# provide the required non-loopback scheduler address and daemon uid/gid):
+#   ICEFARM_TMPDIR=/tmp ICECC_P50_C1F1_WORKER_SCHEDULER_HOST=<worker-IP> \
+#   ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1 \
+#   ICECC_P51_WRAPPER_PROFILES='P29V1 ZSTD_TU' \
+#   ICECC_TEST_TOP_SRCDIR=<source> ICECC_TEST_TOP_BUILDDIR=<build> \
+#   sh <source>/unittests/p51wrappercompile-run.sh
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -20,12 +33,21 @@ fixture=$(mktemp -d "${scratch%/}/p51-wrapper-fixture.XXXXXX")
 trap 'echo "P51 wrapper artifacts retained at $fixture"' EXIT
 chmod 0755 "$fixture"
 mkdir -p "$fixture/sources" "$fixture/predictive"
-jobs=${ICECC_P51_WRAPPER_JOBS:-100}
+worker_session_loss=${ICECC_P51_WRAPPER_WORKER_SESSION_LOSS:-0}
+case "$worker_session_loss" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$worker_session_loss" = 1; then
+    jobs=2
+else
+    jobs=${ICECC_P51_WRAPPER_JOBS:-100}
+fi
 case "$jobs" in
     ''|*[!0-9]*|0) echo "FAIL: ICECC_P51_WRAPPER_JOBS must be a positive integer" >&2; exit 1 ;;
 esac
 
-sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" <<'PY'
+sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" "$worker_session_loss" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -34,13 +56,23 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 count = int(sys.argv[2])
+worker_session_loss = sys.argv[3] == "1"
 rows = []
 for ordinal in range(count):
     stem = f"tu-{ordinal:02d}"
-    body = (
-        f'extern "C" int p51_w31_{ordinal:02d}() {{ '
-        f'return {ordinal + 17}; }}\n'
-    ).encode()
+    if worker_session_loss and ordinal == 0:
+        # A single deliberately expensive real translation unit gives the
+        # harness time to capture and stop the actual remote compiler child.
+        # The second row is compiled only after scheduler-session recovery.
+        body = ("\n".join(
+            f'extern "C" int p51_worker_loss_{index}(int value) '
+            f'{{ return value + {index + 17}; }}'
+            for index in range(80000)) + "\n").encode()
+    else:
+        body = (
+            f'extern "C" int p51_w31_{ordinal:02d}() {{ '
+            f'return {ordinal + 17}; }}\n'
+        ).encode()
     source = root / "sources" / f"{stem}.cpp"
     predictive = root / "predictive" / f"{stem}.ii"
     source.write_bytes(body)
@@ -68,7 +100,12 @@ with (root / "batch.jsonl").open("w", encoding="utf-8") as stream:
         stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 
-for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
+profiles=${ICECC_P51_WRAPPER_PROFILES:-"P29V1 ZSTD_TU ZSTD_ROUTE"}
+case "$profiles" in
+    "P29V1 ZSTD_TU ZSTD_ROUTE"|"P29V1 ZSTD_TU"|P29V1|ZSTD_TU|ZSTD_ROUTE) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_PROFILES must select one supported profile or the default set" >&2; exit 1 ;;
+esac
+for profile in $profiles; do
     fixture_id=${fixture##*.}
     case "$profile" in
         P29V1) profile_tag=29 ;;
@@ -105,6 +142,7 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         ICECC_P50_C1F1_WORKDIR="$work" \
         ICECC_P50_C1F1_KEEP_WORK=1 \
         ICECC_P50_C1F1_TIMEOUT=300 \
+        ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS="$worker_session_loss" \
         "$src/unittests/p50compilee2e-run.sh" >"$log" 2>&1
     status=$?
     set -e
@@ -113,15 +151,29 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         echo "FAIL: actual P51 wrapper compile failed for $profile (status $status)" >&2
         exit 1
     }
-    grep -F "S8_BATCH_COMPLETE run=full-1 count=$jobs" "$log" >/dev/null || {
-        echo "FAIL: $profile did not complete all $jobs compiler jobs" >&2
-        exit 1
-    }
-    grep -F "PASS: all-P50 C1F1 $profile compile is remote and byte-identical" \
-        "$log" >/dev/null || {
-        echo "FAIL: $profile object-comparison gate did not pass" >&2
-        exit 1
-    }
+    if test "$worker_session_loss" = 1; then
+        grep -F "S8_REAL_WORKER_SESSION_LOSS_PASS profile=$profile committed_victim=1 stopped_and_reaped=1 victim_output=0 recovery_outputs=1 failure_scope=global_scheduler_session" \
+            "$log" >/dev/null || {
+            cat "$log"
+            echo "FAIL: $profile active compiler loss/recovery probe did not pass" >&2
+            exit 1
+        }
+        test ! -e "$work/result-active-worker-loss-0.tsv" && \
+            test -s "$work/result-worker-loss-recovery-probe-0.tsv" || {
+            echo "FAIL: $profile committed victim/Error24 and fresh recovery outputs disagree with worker-loss scope" >&2
+            exit 1
+        }
+    else
+        grep -F "S8_BATCH_COMPLETE run=full-1 count=$jobs" "$log" >/dev/null || {
+            echo "FAIL: $profile did not complete all $jobs compiler jobs" >&2
+            exit 1
+        }
+        grep -F "PASS: all-P50 C1F1 $profile compile is remote and byte-identical" \
+            "$log" >/dev/null || {
+            echo "FAIL: $profile object-comparison gate did not pass" >&2
+            exit 1
+        }
+    fi
     test -f "$work/f.log" && test ! -L "$work/f.log" || {
         cat "$log"
         echo "FAIL: F daemon log is missing for $profile" >&2
@@ -133,15 +185,34 @@ for profile in P29V1 ZSTD_TU ZSTD_ROUTE; do
         grep -F -c 'P51 cache-link descriptor adopted by sidecar' || true)
     legacy_count=$(printf '%s\n' "$measured_f_log" | \
         grep -F -c 'P50_CACHE_SESSION_READY request=' || true)
-    test "$ready_count" -eq 1 && test "$legacy_count" -eq 0 || {
+    if test "$worker_session_loss" = 1; then
+        test "$ready_count" -eq 2 && test "$legacy_count" -eq 0 || {
+            cat "$log"
+            cat "$work/f.log"
+            echo "FAIL: $profile did not use P51 links for active victim and fresh recovery " \
+                 "(P51-ready=$ready_count R1-ready=$legacy_count)" >&2
+            exit 1
+        }
+    elif test "$ready_count" -eq 1 && test "$legacy_count" -eq 0; then
+        :
+    else
         cat "$log"
         cat "$work/f.log"
         echo "FAIL: $profile did not use exactly one persistent P51 link " \
              "(P51-ready=$ready_count R1-ready=$legacy_count)" >&2
         exit 1
-    }
-    printf 'P51_WRAPPER_COMPILE_PASS profile=%s jobs=%s persistent_links=%s log=%s f_log=%s\n' \
-        "$profile" "$jobs" "$ready_count" "$log" "$work/f.log"
+    fi
+    if test "$worker_session_loss" = 1; then
+        printf 'P51_WRAPPER_WORKER_LOSS_PASS profile=%s fixture_tus=%s victim=Error24_no_object fresh_exact_objects=1 P51_adoptions=%s R1_ready=0 log=%s f_log=%s\n' \
+            "$profile" "$jobs" "$ready_count" "$log" "$work/f.log"
+    else
+        printf 'P51_WRAPPER_COMPILE_PASS profile=%s jobs=%s persistent_links=%s log=%s f_log=%s\n' \
+            "$profile" "$jobs" "$ready_count" "$log" "$work/f.log"
+    fi
 done
 
-echo "PASS: actual P51 wrapper compiled $jobs TUs on one persistent link per profile"
+if test "$worker_session_loss" = 1; then
+    echo "PASS: P51 stopped-victim cleanup and fresh-job exact-object recovery passed per selected profile"
+else
+    echo "PASS: actual P51 wrapper compiled $jobs TUs on one persistent link per profile"
+fi

@@ -27,6 +27,7 @@ predictive_plan=${ICECC_P50_PREDICTIVE_PLAN:-}
 s2_process_loss=${ICECC_P50_S2_PROCESS_LOSS:-0}
 real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
+worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
 case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
@@ -54,6 +55,17 @@ case "$real_scheduler_f_restart_w30" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30 must be 0 or 1" >&2; exit 1 ;;
 esac
+case "$worker_session_loss" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$worker_session_loss" = 1; then
+    if test "$real_scheduler_restart_w30" = 1 || \
+            test "$real_scheduler_f_restart_w30" = 1; then
+        echo "FAIL: focused worker-session-loss mode cannot be combined with either scheduler-restart mode" >&2
+        exit 1
+    fi
+fi
 if test "$real_scheduler_f_restart_w30" = 1; then
     real_scheduler_restart_w30=1
 fi
@@ -105,6 +117,17 @@ if test "$real_scheduler_restart_w30" = 1; then
     # per-job deadline remains the limiting bound.
     export ICECC_TESTS=1
 fi
+if test "$worker_session_loss" = 1 && \
+        { test "$external_mode" != 0 || test "$suite" != C1F1/100000 || \
+          test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1; }; then
+    echo "FAIL: focused worker-session-loss requires local P51 C1F1, WARM=0, PASSES=1" >&2
+    exit 1
+fi
+if test "$worker_session_loss" = 1; then
+    # Keep this bounded focused probe on production one-slot capacity; it is
+    # not the separate pending-window W30 scheduler-replacement scenario.
+    export ICECC_TESTS=1
+fi
 worker_maxjobs=$slots_per_f
 if test "$real_scheduler_restart_w30" = 1; then
     # The scheduler reserves one dispatch-credit slot: when the worker's
@@ -114,6 +137,12 @@ if test "$real_scheduler_restart_w30" = 1; then
     # protocol/window assertion.
     worker_maxjobs=$((slots_per_f + 1))
     echo "S8_REAL_SCHEDULER_DISPATCH_CREDIT worker_maxjobs=$worker_maxjobs receipt_window=$slots_per_f"
+fi
+if test "$worker_session_loss" = 1; then
+    # This is test-only child identity evidence; it does not alter the daemon's
+    # compile/retry behavior.  The matching marker is emitted after PGID
+    # ownership has been checked and before the child is registered.
+    export ICECC_P50_DEBUG_ATTACH=1
 fi
 if test "$cache_enabled" -eq 0; then
     unset ICECC_P50_C1F1_REQUIRED
@@ -572,18 +601,27 @@ PY
         echo "FAIL: batch manifest count does not match selected depth" >&2
         exit 1
     }
-    if test "$real_scheduler_restart_w30" = 1; then
-        test "$batch_expected_count" -eq "$real_scheduler_w30_rows" || {
-            echo "FAIL: real scheduler W30 restart requires exactly $real_scheduler_w30_rows distinct TUs" >&2
-            exit 1
-        }
-        sed -n '1,30p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
-        sed -n '31,60p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
-        test "$(wc -l <"$work/batch-old-scheduler.tsv")" -eq 30 && \
-            test "$(wc -l <"$work/batch-new-scheduler.tsv")" -eq 30 || {
-            echo "FAIL: real scheduler W30 batch partition is not exactly 30+30" >&2
-            exit 1
-        }
+    if test "$real_scheduler_restart_w30" = 1 || test "$worker_session_loss" = 1; then
+        if test "$worker_session_loss" = 1; then
+            test "$batch_expected_count" -eq 2 || {
+                echo "FAIL: focused worker-session-loss probe requires exactly two distinct TUs" >&2
+                exit 1
+            }
+            sed -n '1p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
+            sed -n '2p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
+        else
+            test "$batch_expected_count" -eq "$real_scheduler_w30_rows" || {
+                echo "FAIL: real scheduler W30 restart requires exactly $real_scheduler_w30_rows distinct TUs" >&2
+                exit 1
+            }
+            sed -n '1,30p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
+            sed -n '31,60p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
+            test "$(wc -l <"$work/batch-old-scheduler.tsv")" -eq 30 && \
+                test "$(wc -l <"$work/batch-new-scheduler.tsv")" -eq 30 || {
+                echo "FAIL: real scheduler W30 batch partition is not exactly 30+30" >&2
+                exit 1
+            }
+        fi
         if test "$real_scheduler_f_restart_w30" = 1; then
             sed -n '61,90p' "$work/batch.tsv" >"$work/batch-new-f.tsv"
             test "$(wc -l <"$work/batch-new-f.tsv")" -eq 30 || {
@@ -1927,6 +1965,20 @@ if test -n "$batch_manifest"; then
                         # predecessor cannot be retried; verify_old_cohort_retries
                         # below validates the exact Error 24/new-epoch policy.
                         :
+                    elif test "$run_label" = active-worker-loss && \
+                            test "$job_ordinal" = 0; then
+                        # The stopped active compile may already have crossed
+                        # COMMIT when its worker session disappears. Strict
+                        # P50 must not transparently retry that ambiguous
+                        # predecessor; accept only explicit Error 24, then
+                        # test recovery with a fresh job below.
+                        grep -Fq 'source committed for P50 CompileFile' "$client_log" && \
+                            grep -Fq 'got exception Error 24 - local daemon did not settle P50 retry predecessor' "$client_log" && \
+                            grep -Fq 'remote-only policy refuses client-error fallback' "$client_log" || {
+                            echo "FAIL: lost active strict-P50 victim lacks the documented explicit Error 24 policy result" >&2
+                            return 1
+                        }
+                        echo "S8_REAL_WORKER_LOSS_VICTIM_COMMITTED_BUT_NOT_RETRIED ordinal=0 policy=Error24 remote_only=1"
                     elif grep -Fq 'source committed for P50 CompileFile' "$client_log" || \
                             ! grep -Eq 'got exception Error [0-9]+' "$client_log"; then
                         echo "FAIL: discarded B caller lacks an explicit pre-commit protocol error ($run_label-$job_ordinal status=$job_status)" >&2
@@ -2310,6 +2362,9 @@ EOF_FINAL_IDENTITY
             if kill -0 "$process_pid" 2>/dev/null; then
                 process_state=$(ps -p "$process_pid" -o stat=,args= 2>/dev/null || true)
                 echo "S8_REAL_S_PROCESS_CHECK role=$process_name pid=$process_pid state=$process_state"
+            elif test "$process_name" = F_cache && \
+                    test "${worker_loss_allow_f_sidecar_retirement:-0}" = 1; then
+                echo "S8_REAL_S_PROCESS_CHECK role=$process_name pid=$process_pid state=missing cause_pending=worker_loss_handle_end_timeout"
             else
                 echo "S8_REAL_S_PROCESS_CHECK role=$process_name pid=$process_pid state=missing"
                 stable_processes=0
@@ -2472,6 +2527,263 @@ PY
             fi
         done
         echo "S8_REAL_S_BOUNDED_SETTLEMENT label=$settle_label total=$settle_count successes=$success_count failures=$failure_count max_success_client_ms=$max_success_ms max_failure_client_ms=$max_failure_ms arm_budget_ms=60000 failure_cleanup_grace_ms=2000"
+    }
+    read_compiler_identity() {
+        python3 - "$1" <<'PY'
+import pathlib, sys
+pid = int(sys.argv[1])
+text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+fields = text[text.rfind(")") + 2:].split()
+# The tail begins at proc stat field 3 (state); pgrp is field 5 and
+# starttime is field 22, hence tail offsets 2 and 19.
+print(pid, fields[2], fields[19], fields[0])
+PY
+    }
+    run_real_worker_session_loss() {
+        old_worker_pid=$worker_pid
+        old_f_service_pid=$service_pid
+        ready_snapshot "$work/ready-f.trace" || return 1
+        old_f_store_guid=$ready_f_guid
+
+        run_batch active-worker-loss 1 "$work/batch-old-scheduler.tsv" 1 1 1
+        old_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler.log")
+        test -n "$old_scheduler_epoch" || {
+            echo "FAIL: original scheduler strict-nonce epoch was not logged" >&2
+            return 1
+        }
+        echo "S8_REAL_WORKER_LOSS_SCOPE committed_active_victim=1 scheduler_pid=$sched_pid worker_pid=$old_worker_pid f_service_pid=$old_f_service_pid epoch=$old_scheduler_epoch"
+
+        # The heavy ordinal-0 TU is the only deliberately long compile.  The
+        # worker emits an exact job/epoch/nonce/PID/PGID marker after process
+        # group ownership is established.  Stop only that verified child so
+        # scheduler-session loss must exercise the bounded KILL/reap path.
+        victim_client_log="$work/client-compile-active-worker-loss-0.log"
+        victim_assign_deadline=$(( $(date +%s) + 20 ))
+        while test "$(date +%s)" -lt "$victim_assign_deadline"; do
+            victim_job_id=$(sed -nE \
+                's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+                "$victim_client_log" 2>/dev/null | tail -n 1)
+            victim_assignment=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$victim_client_log" 2>/dev/null | tail -n 1)
+            test -n "$victim_job_id" && test -n "$victim_assignment" && break
+            sleep 0.02
+        done
+        read -r victim_bound_job victim_epoch victim_nonce <<EOF_VICTIM_ASSIGNMENT
+$victim_assignment
+EOF_VICTIM_ASSIGNMENT
+        test "$victim_job_id" -gt 0 2>/dev/null && \
+                test "$victim_bound_job" = "$victim_job_id" && \
+                test "$victim_epoch" = "$old_scheduler_epoch" || {
+            echo "FAIL: long compiler victim lacks exact old-session job/epoch binding" >&2
+            return 1
+        }
+        victim_marker=
+        child_deadline=$(( $(date +%s) + 20 ))
+        while test "$(date +%s)" -lt "$child_deadline"; do
+            victim_marker=$(sed -nE \
+                "s/.*P50_TEST_COMPILER_CHILD job=$victim_job_id epoch=$victim_epoch nonce=$victim_nonce pid=([0-9]+) pgid=([0-9]+).*/\\1 \\2/p" \
+                "$work/f.log" | tail -n 1)
+            test -n "$victim_marker" && break
+            if test -f "$work/result-active-worker-loss-0.tsv"; then
+                echo "FAIL: long compiler victim completed before its child identity was observed" >&2
+                return 1
+            fi
+            sleep 0.01
+        done
+        read -r victim_pid victim_pgid <<EOF_VICTIM_CHILD
+$victim_marker
+EOF_VICTIM_CHILD
+        test "$victim_pid" -gt 0 2>/dev/null && test "$victim_pgid" = "$victim_pid" || {
+            echo "FAIL: worker did not expose the exact P50 compiler process group" >&2
+            return 1
+        }
+        victim_before=$(read_compiler_identity "$victim_pid") || {
+            echo "FAIL: exact compiler PID disappeared before the quiescence barrier" >&2
+            return 1
+        }
+        read -r observed_pid observed_pgid victim_start_ticks victim_state <<EOF_VICTIM_ID
+$victim_before
+EOF_VICTIM_ID
+        test "$observed_pid" = "$victim_pid" && \
+                test "$observed_pgid" = "$victim_pgid" && \
+                test "$victim_state" != Z || {
+            echo "FAIL: compiler PID/PGID/starttime witness is not a live owned child" >&2
+            return 1
+        }
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$victim_job_id" "$victim_epoch" "$victim_nonce" "$victim_pid" \
+            "$victim_pgid" "$victim_start_ticks" >"$work/worker-loss-victim.tsv"
+        kill -STOP "$victim_pid" || {
+            echo "FAIL: could not hold exact test-owned compiler child" >&2
+            return 1
+        }
+        victim_stopped=0
+        for _ in $(seq 1 100); do
+            stopped_identity=$(read_compiler_identity "$victim_pid") || {
+                echo "FAIL: stopped compiler PID disappeared before scheduler-session loss" >&2
+                return 1
+            }
+            read -r stopped_pid stopped_pgid stopped_ticks stopped_state <<EOF_VICTIM_STOPPED
+$stopped_identity
+EOF_VICTIM_STOPPED
+            test "$stopped_pid" = "$victim_pid" && \
+                    test "$stopped_pgid" = "$victim_pgid" && \
+                    test "$stopped_ticks" = "$victim_start_ticks" || {
+                echo "FAIL: compiler identity changed while waiting for SIGSTOP delivery" >&2
+                return 1
+            }
+            case "$stopped_state" in
+                T|t) victim_stopped=1; break ;;
+                Z) echo "FAIL: compiler exited before SIGSTOP was observed" >&2; return 1 ;;
+            esac
+            sleep 0.01
+        done
+        test "$victim_stopped" -eq 1 || {
+            echo "FAIL: exact compiler identity did not enter stopped state after bounded observations" >&2
+            return 1
+        }
+        echo "S8_REAL_WORKER_LOSS_VICTIM_STOPPED job=$victim_job_id epoch=$victim_epoch nonce=$victim_nonce pid=$victim_pid pgid=$victim_pgid start_ticks=$victim_start_ticks state=$stopped_state"
+
+        test ! -e "$work/result-active-worker-loss-0.tsv" || {
+            echo "FAIL: stopped victim produced a successful compiler result before session loss" >&2
+            return 1
+        }
+        echo "S8_REAL_WORKER_LOSS_PRE_RESTART_OUTPUTS exact=1 victim_result=absent worker_pid=$old_worker_pid"
+
+        worker_loss_allow_f_sidecar_retirement=1
+        restart_real_scheduler || return 1
+        worker_loss_allow_f_sidecar_retirement=0
+        new_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler-replacement.log")
+        test -n "$new_scheduler_epoch" && test "$new_scheduler_epoch" != "$old_scheduler_epoch" || {
+            echo "FAIL: replacement scheduler did not establish a distinct worker session" >&2
+            return 1
+        }
+        quiescence_deadline=$(( $(date +%s) + 15 ))
+        while test "$(date +%s)" -lt "$quiescence_deadline"; do
+            grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                "$work/f.log" >/dev/null 2>&1 && break
+            sleep 0.05
+        done
+        grep -F "session quiescence TERM compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" >/dev/null 2>&1 || {
+            echo "FAIL: F did not TERM the exact stopped compiler group on scheduler-session loss" >&2
+            return 1
+        }
+        grep -F "session quiescence KILL compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" >/dev/null 2>&1 || {
+            echo "FAIL: F did not escalate against the exact stopped compiler group" >&2
+            return 1
+        }
+        grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" >/dev/null 2>&1 || {
+            echo "FAIL: F did not reap and settle the exact old-session compiler group" >&2
+            return 1
+        }
+        if kill -0 "$victim_pid" 2>/dev/null; then
+            echo "FAIL: settled compiler leader PID remains present after exact reap" >&2
+            return 1
+        fi
+        remaining_group_members=$(ps -eo pid=,pgid=,stat= | awk -v pgid="$victim_pgid" \
+            '$2 == pgid { print $1 "/" $3 }')
+        test -z "$remaining_group_members" || {
+            echo "FAIL: old compiler process group still has members after settlement: $remaining_group_members" >&2
+            return 1
+        }
+        settled_line=$(grep -nF \
+            "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" | tail -n 1 | cut -d: -f1)
+        replacement_connection_line=$(grep -nF 'Connected to scheduler (I am known as ' \
+            "$work/f.log" | tail -n 1 | cut -d: -f1)
+        test -n "$settled_line" && test -n "$replacement_connection_line" && \
+                test "$settled_line" -lt "$replacement_connection_line" || {
+            echo "FAIL: replacement F scheduler session activated before old compiler-group settlement" >&2
+            return 1
+        }
+        echo "S8_REAL_WORKER_LOSS_ORDER exact_group_settled_f_log_line=$settled_line replacement_F_scheduler_connection_line=$replacement_connection_line group_members=0"
+        test "$(kill -0 "$old_worker_pid" 2>/dev/null; printf '%s' "$?")" = 0 || {
+            echo "FAIL: global scheduler-session replacement unexpectedly lost F daemon process" >&2
+            return 1
+        }
+        if ! kill -0 "$old_f_service_pid" 2>/dev/null; then
+            # A stopped compiler makes handle_end wait for exact group
+            # quiescence.  If that bounded wait consumes the input lifecycle
+            # deadline, the adapter must retire A and replace the sidecar.
+            # Accept that *only* with the complete, job-scoped causal trace;
+            # this exception is specific to active compiler loss and does
+            # not relax ordinary scheduler-bounce process stability.
+            grep -F "P50 input settlement job $victim_job_id action 1 status timeout reason handle_end" \
+                    "$work/f.log" >/dev/null 2>&1 && \
+                grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1 || {
+                echo "FAIL: F sidecar disappeared without exact handle_end timeout after compiler quiescence" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_F_SIDECAR_RETIRED cause=handle_end_input_lifecycle_timeout job=$victim_job_id exact_quiescence=1 ordinary_bounce_exception=0"
+        else
+            echo "S8_REAL_WORKER_LOSS_F_SIDECAR_RETAINED pid=$old_f_service_pid"
+        fi
+        echo "S8_REAL_WORKER_LOSS_QUIESCED scope=global_scheduler_session job=$victim_job_id pid=$victim_pid pgid=$victim_pgid start_ticks=$victim_start_ticks old_epoch=$old_scheduler_epoch new_epoch=$new_scheduler_epoch F_daemon_pid=$old_worker_pid F_sidecar_pid_before=$old_f_service_pid exact_TERM=1 exact_KILL=1 exact_reaped=1"
+
+        ready_snapshot "$work/ready-f.trace" || {
+            echo "FAIL: replacement F did not publish a fresh READY identity" >&2
+            return 1
+        }
+        recovery_f_guid=$ready_f_guid
+        if ! kill -0 "$old_f_service_pid" 2>/dev/null; then
+            test "$ready_pid" != "$old_f_service_pid" && \
+                    test "$recovery_f_guid" != "$old_f_store_guid" || {
+                echo "FAIL: F sidecar retirement did not install a distinct READY process/store identity" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_F_READY_REPLACEMENT pid=$ready_pid F_STORE_GUID=$recovery_f_guid prior_pid=$old_f_service_pid prior_F_STORE_GUID=$old_f_store_guid"
+        fi
+        # Worker-loss is not CancelJob.  A committed victim that cannot prove
+        # local predecessor settlement fails closed with Error 24; recovery
+        # is exercised below with a distinct fresh R2 job, not a replay claim.
+        finish_batch
+        test ! -e "$work/result-active-worker-loss-0.tsv" || {
+            echo "FAIL: committed worker-loss victim unexpectedly produced an object" >&2
+            return 1
+        }
+        retry_count=$(grep -F -c \
+            'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+            "$victim_client_log" 2>/dev/null || true)
+        test "$retry_count" -eq 1 && \
+                grep -Fq 'got exception Error 24 - local daemon did not settle P50 retry predecessor' "$victim_client_log" && \
+                grep -Fq 'remote-only policy refuses client-error fallback' "$victim_client_log" || {
+            echo "FAIL: committed victim did not fail closed after exactly one bounded retry attempt" >&2
+            cat "$victim_client_log" >&2 || true
+            return 1
+        }
+        echo "S8_REAL_WORKER_LOSS_SETTLED stopped_attempt=1 retry_attempts=$retry_count victim_policy=Error24_no_object victim_old_epoch=$victim_epoch recovery_epoch=$new_scheduler_epoch old_process_reaped=1"
+
+        recovery_source_offset=$(wc -c <"$source_result_trace")
+        recovery_f_offset=$(wc -c <"$f_action_trace")
+        run_batch worker-loss-recovery-probe 1 "$work/batch-new-scheduler.tsv" 1 0 0
+        recovery_outputs=0
+        for result_row in "$work"/result-worker-loss-recovery-probe-*.tsv; do
+            test -f "$result_row" && recovery_outputs=$((recovery_outputs + 1))
+        done
+        test "$recovery_outputs" -eq 1 || {
+            echo "FAIL: post-replacement recovery probe did not produce exactly one output" >&2
+            return 1
+        }
+        recovery_result_job=$(cut -f19 "$work/result-worker-loss-recovery-probe-0.tsv")
+        replacement_f_login_line=$(grep -nF 'login p50-f protocol version:' \
+            "$work/scheduler-replacement.log" | head -n 1 | cut -d: -f1)
+        recovery_begin_line=$(grep -nF "BEGIN: $recovery_result_job " \
+            "$work/scheduler-replacement.log" | head -n 1 | cut -d: -f1)
+        test -n "$replacement_f_login_line" && test -n "$recovery_begin_line" && \
+                test "$replacement_f_login_line" -lt "$recovery_begin_line" || {
+            echo "FAIL: exact recovery compile began before F registered with replacement scheduler" >&2
+            return 1
+        }
+        echo "S8_REAL_WORKER_LOSS_RECOVERY_ORDER replacement_F_login_line=$replacement_f_login_line recovery_job_begin_line=$recovery_begin_line job=$recovery_result_job"
+        verify_results_from_f_store worker-loss-recovery-probe "$recovery_f_guid" \
+            "$recovery_source_offset" "$recovery_f_offset" 1 || return 1
+        echo "S8_REAL_WORKER_LOSS_RECOVERY_PROBE exact_outputs=$recovery_outputs F_STORE_GUID=$recovery_f_guid fresh_job_not_victim_retry=1"
+        echo "S8_REAL_WORKER_SESSION_LOSS_PASS profile=$profile_marker committed_victim=1 stopped_and_reaped=1 victim_output=0 recovery_outputs=1 failure_scope=global_scheduler_session"
     }
     run_real_scheduler_restart_batches() {
         test ! -e "$work/receipt-gate" || {
@@ -2686,7 +2998,9 @@ PY
         fi
         echo "S7_WARM_PREWARM_COMPLETE"
     fi
-    if test "$real_scheduler_restart_w30" = 1; then
+    if test "$worker_session_loss" = 1; then
+        run_real_worker_session_loss
+    elif test "$real_scheduler_restart_w30" = 1; then
         run_real_scheduler_restart_batches
     else
         run_batch full-1 1
@@ -2830,4 +3144,8 @@ if test -n "$batch_manifest"; then
     done
 fi
 
-echo "PASS: all-P50 C1F1 $profile_marker compile is remote and byte-identical"
+if test "$worker_session_loss" = 1; then
+    echo "PASS: P51 active compiler quiescence and post-session recovery probe passed for $profile_marker"
+else
+    echo "PASS: all-P50 C1F1 $profile_marker compile is remote and byte-identical"
+fi

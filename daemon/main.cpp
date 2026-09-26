@@ -8315,6 +8315,14 @@ void Daemon::handle_old_request()
                     handle_end(client, 144);
                     continue;
                 }
+                if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr
+                        && job->usesP50Input()) {
+                    trace() << "P50_TEST_COMPILER_CHILD job=" << job->jobID()
+                            << " epoch=" << job->assignmentEpoch()
+                            << " nonce=" << job->assignmentNonce()
+                            << " pid=" << pid << " pgid=" << getpgid(pid)
+                            << endl;
+                }
                 register_child(pid, pid, ChildRecord::COMPILER,
                                client->client_id);
                 mark_assignment_claimed_or_later(job->jobID());
