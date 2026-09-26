@@ -4846,6 +4846,19 @@ local::P51SourceReservationResult SidecarRuntime::reserve_p51_source_on_owner(
                     Id128{armed.reservation_id};
             }
             ++committed_relationship.outstanding;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            if (::getenv("ICECC_TEST_P51_ARM_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                    "P51_TEST_ARM_TRACE request=%llu observation=%llu relationship=%02x%02x reservation=%02x%02x\n",
+                    static_cast<unsigned long long>(
+                        armed.arm.source.source_request_id),
+                    static_cast<unsigned long long>(armed.arm_observation_id),
+                    armed.logical_relationship_id[0],
+                    armed.logical_relationship_id[1],
+                    armed.reservation_id[0], armed.reservation_id[1]);
+                std::fflush(stderr);
+            }
+#endif
             result.armed = std::move(armed);
         }, deadline);
     if (!completed && !result.armed.has_value() && result.error_code == 0)
@@ -6213,12 +6226,13 @@ struct SidecarRuntime::P51TransferReplyPump {
                          local::Identity expected_identity,
                          std::chrono::steady_clock::time_point operation_deadline,
                          local::Frame response,
+                         uint64_t transfer_request_id,
                          std::shared_ptr<P51TransferSettlement> completion)
         : connection(std::move(socket)), readiness(context),
           timer(context), identity(expected_identity), deadline(operation_deadline),
           operation(std::make_unique<local::FrameOperation>(
               connection, response, operation_deadline)),
-          settled(std::move(completion)) {}
+          source_request_id(transfer_request_id), settled(std::move(completion)) {}
 
     local::Connection connection;
     boost::asio::posix::stream_descriptor readiness;
@@ -6226,10 +6240,37 @@ struct SidecarRuntime::P51TransferReplyPump {
     local::Identity identity{};
     std::chrono::steady_clock::time_point deadline;
     std::unique_ptr<local::FrameOperation> operation;
+    uint64_t source_request_id = 0;
     std::shared_ptr<P51TransferSettlement> settled;
     bool writing = true;
     bool closed = false;
 };
+
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+namespace {
+struct P51SettlementGatePoll
+    : std::enable_shared_from_this<P51SettlementGatePoll> {
+    boost::asio::steady_timer *timer = nullptr;
+    std::function<bool()> released;
+    std::function<void()> finish;
+    std::chrono::steady_clock::time_point deadline;
+
+    void start() { poll(); }
+    void poll() {
+        if (!timer || !released || !finish) return;
+        if (released() || std::chrono::steady_clock::now() >= deadline) {
+            finish();
+            return;
+        }
+        timer->expires_after(std::chrono::milliseconds(10));
+        auto self = shared_from_this();
+        timer->async_wait([self](const boost::system::error_code& error) {
+            if (!error) self->poll();
+        });
+    }
+};
+} // namespace
+#endif
 
 void SidecarRuntime::start_p51_transfer_reply(
     local::Connection connection, local::Identity identity,
@@ -6281,7 +6322,11 @@ void SidecarRuntime::start_p51_transfer_reply(
         }
         pump = std::make_shared<P51TransferReplyPump>(
             context_, std::move(connection), identity, deadline,
-            response, settlement);
+            response,
+            operation.p51_source_transfer
+                ? operation.p51_source_transfer->armed.arm.source.source_request_id
+                : 0,
+            settlement);
         boost::system::error_code assign_error;
         pump->readiness.assign(readiness_fd, assign_error);
         if (assign_error) {
@@ -6362,6 +6407,116 @@ void SidecarRuntime::advance_p51_transfer_reply(
             local::Status::Ok;
     if (valid) {
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        // Bounded integration hook for the four-link W30/capacity overlap
+        // gate. Hold already-acknowledged local replies asynchronously so
+        // their operation credits overlap with pending sibling transfers.
+        const char *settlement_gate_dir =
+            ::getenv("ICECC_TEST_P51_SETTLEMENT_GATE_DIR");
+        const char *settlement_gate_count_text =
+            ::getenv("ICECC_TEST_P51_SETTLEMENT_GATE_COUNT");
+        if (settlement_gate_dir != nullptr && *settlement_gate_dir != '\0' &&
+            settlement_gate_count_text != nullptr) {
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long gate_count =
+                std::strtoul(settlement_gate_count_text, &end, 10);
+            static std::atomic<unsigned long> settlement_gate_ordinal{0};
+            if (errno == 0 && end != settlement_gate_count_text && *end == '\0' &&
+                gate_count > 0 && gate_count <= 30) {
+                const unsigned long ordinal = settlement_gate_ordinal.fetch_add(
+                    1, std::memory_order_acq_rel) + 1;
+                if (ordinal <= gate_count) {
+                    const std::string held_path = std::string(settlement_gate_dir) +
+                        "/held-" + std::to_string(ordinal);
+                    const std::string released_path = std::string(settlement_gate_dir) +
+                        "/released-" + std::to_string(ordinal);
+                    const std::string release_path = std::string(settlement_gate_dir) +
+                        "/release-" + std::to_string(ordinal);
+                    const std::string held_tmp_path = held_path + ".tmp-" +
+                        std::to_string(::getpid());
+                    const int marker_fd = ::open(held_tmp_path.c_str(),
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+                    if (marker_fd >= 0) {
+                        char marker[160];
+                        const int marker_size = std::snprintf(marker, sizeof(marker),
+                            "ordinal=%lu request=%llu\n", ordinal,
+                            static_cast<unsigned long long>(pump->source_request_id));
+                        if (marker_size > 0) {
+                            const ssize_t written = ::write(marker_fd, marker,
+                                std::min<size_t>(static_cast<size_t>(marker_size),
+                                                 sizeof(marker)));
+                            (void)written;
+                        }
+                        (void)::close(marker_fd);
+                        if (::rename(held_tmp_path.c_str(), held_path.c_str()) != 0)
+                            (void)::unlink(held_tmp_path.c_str());
+                    }
+                    const std::string release_rest_path =
+                        std::string(settlement_gate_dir) + "/release-rest";
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now < pump->deadline) {
+                        std::fprintf(stderr,
+                            "P51_CAPACITY_TEST_SETTLEMENT_HELD ordinal=%lu request=%llu\n",
+                            ordinal,
+                            static_cast<unsigned long long>(pump->source_request_id));
+                        std::fflush(stderr);
+                        auto gate = std::make_shared<P51SettlementGatePoll>();
+                        gate->timer = &pump->timer;
+                        gate->deadline = std::min(pump->deadline,
+                            now + std::chrono::seconds(10));
+                        gate->released = [ordinal, release_path,
+                                          release_rest_path] {
+                            return ::access(release_path.c_str(), F_OK) == 0 ||
+                                (ordinal > 1 &&
+                                 ::access(release_rest_path.c_str(), F_OK) == 0);
+                        };
+                        gate->finish = [this, pump, ordinal, released_path,
+                                        release_path,
+                                        settlement_gate_dir,
+                                        release_rest_path] {
+                            const bool explicit_release =
+                                ::access(release_path.c_str(), F_OK) == 0 ||
+                                (ordinal > 1 &&
+                                 ::access(release_rest_path.c_str(), F_OK) == 0);
+                            const uint64_t request_id = pump->source_request_id;
+                            const std::string ack_path = std::string(
+                                settlement_gate_dir) +
+                                "/released-" + std::to_string(ordinal);
+                            const std::string ack_tmp_path = ack_path + ".tmp-" +
+                                std::to_string(::getpid());
+                            close_p51_transfer_reply(pump);
+                            const int fd = ::open(ack_tmp_path.c_str(),
+                                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+                            if (fd >= 0) {
+                                char marker[128];
+                                const int marker_size = std::snprintf(marker,
+                                    sizeof(marker), "request=%llu explicit=%u\n",
+                                    static_cast<unsigned long long>(request_id),
+                                    explicit_release ? 1u : 0u);
+                                if (marker_size > 0) {
+                                    const ssize_t written = ::write(fd, marker,
+                                        std::min<size_t>(static_cast<size_t>(marker_size),
+                                                         sizeof(marker)));
+                                    (void)written;
+                                }
+                                (void)::close(fd);
+                                if (::rename(ack_tmp_path.c_str(), ack_path.c_str()) != 0)
+                                    (void)::unlink(ack_tmp_path.c_str());
+                            }
+                            std::fprintf(stderr,
+                                "P51_CAPACITY_TEST_SETTLEMENT_RELEASED ordinal=%lu request=%llu explicit=%u\n",
+                                ordinal,
+                                static_cast<unsigned long long>(
+                                    pump->source_request_id),
+                                explicit_release ? 1u : 0u);
+                            std::fflush(stderr);
+                        };
+                        gate->start();
+                        return;
+                    }
+                }
+            }
+        }
         // Deterministically hold one completed reply's capacity credit for
         // the real-wrapper overload fixture. This is deliberately bounded,
         // one-shot, and absent from production builds.

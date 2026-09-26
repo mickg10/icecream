@@ -10,6 +10,7 @@
 #include "config.h"
 #include "comm.h"
 #include "../cache/p50_incarnation_identity.h"
+#include "../cache/p50_sidecar_identity.h"
 #include "../cache/p50_daemon_control.h"
 #include "../cache/p50_control_operation.h"
 #include "../cache/p50_endpoint.h"
@@ -666,6 +667,32 @@ static bool p51_gate_write_marker(const std::string& path,
     return false;
 }
 
+static bool p51_read_settlement_ack(const std::string& path,
+                                    uint64_t expected_request)
+{
+    std::ifstream input(path, std::ios::binary);
+    std::string line;
+    if (!std::getline(input, line)) return false;
+    unsigned long long request = 0;
+    unsigned explicit_release = 0;
+    char trailing = '\0';
+    return std::sscanf(line.c_str(), "request=%llu explicit=%u%c", &request,
+                       &explicit_release, &trailing) == 2 &&
+        request == expected_request && explicit_release == 1;
+}
+
+static bool p51_wait_settlement_ack(const std::string& path,
+                                    uint64_t expected_request,
+                                    std::chrono::milliseconds timeout)
+{
+    const auto deadline = Clock::now() + timeout;
+    do {
+        if (p51_read_settlement_ack(path, expected_request)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (Clock::now() < deadline);
+    return false;
+}
+
 static bool p51_gate_wait_rearm(P51CommitReceiptGate& gate, size_t expected,
                                 uint64_t first_ordinal,
                                 const std::string& abort_path)
@@ -776,10 +803,12 @@ class P51MultiLinkCommitGate {
 public:
     P51MultiLinkCommitGate(int endpoint_port, uid_t sidecar_uid,
                            size_t expected_links, size_t jobs_per_link,
-                           bool hold_one_relationship = true)
+                           bool hold_one_relationship = true,
+                           bool allow_followup_after_release = false)
         : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid),
           expected_links_(expected_links), jobs_per_link_(jobs_per_link),
-          hold_one_relationship_(hold_one_relationship)
+          hold_one_relationship_(hold_one_relationship),
+          allow_followup_after_release_(allow_followup_after_release)
     {
         listener_fd_ = listen_ephemeral(&proxy_port_);
         if (listener_fd_ < 0 || proxy_port_ <= 0 || expected_links_ == 0 ||
@@ -872,6 +901,12 @@ public:
     {
         std::lock_guard lock(mutex_);
         return peak_active_links_;
+    }
+
+    size_t followup_commits() const
+    {
+        std::lock_guard lock(mutex_);
+        return followup_commits_;
     }
 
     bool wait_for_healthy_links(std::chrono::milliseconds timeout)
@@ -1174,12 +1209,19 @@ private:
                         {
                             std::unique_lock lock(mutex_);
                             auto& state = relation_commits_[*relation];
-                            if (!state.ordinals.insert(commit.relationship_ordinal).second ||
-                                state.frames.size() >= jobs_per_link_) {
+                            if (!state.ordinals.insert(commit.relationship_ordinal).second) {
                                 failed_ = true;
                                 changed_.notify_all();
                                 break;
                             }
+                            if (state.released && allow_followup_after_release_) {
+                                ++followup_commits_;
+                                ready_frames.emplace_back(std::move(frame));
+                            } else if (state.frames.size() >= jobs_per_link_) {
+                                failed_ = true;
+                                changed_.notify_all();
+                                break;
+                            } else {
                             state.frames.push_back(std::move(frame));
                             state.peak = std::max(state.peak, state.frames.size());
                             if (state.frames.size() == jobs_per_link_) {
@@ -1200,6 +1242,7 @@ private:
                                 ready_frames = std::move(state.frames);
                                 state.released = true;
                                 changed_.notify_all();
+                            }
                             }
                         }
                         for (const auto& held : ready_frames)
@@ -1242,6 +1285,7 @@ private:
     size_t expected_links_ = 0;
     size_t jobs_per_link_ = 0;
     bool hold_one_relationship_ = true;
+    bool allow_followup_after_release_ = false;
     int proxy_port_ = 0;
     int listener_fd_ = -1;
     bool rule_installed_ = false;
@@ -1260,6 +1304,7 @@ private:
     std::set<size_t> attempt_counted_link_state_;
     std::optional<icecc::p50::Id128> held_relationship_;
     bool release_held_ = false;
+    size_t followup_commits_ = 0;
     std::atomic<bool> failed_{false};
 };
 
@@ -1628,7 +1673,8 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
     std::atomic<bool> *observed_armed_ready = nullptr,
     Clock::time_point *source_deadline_out = nullptr,
     bool stop_after_arm = false,
-    P50SourceArmFields *observed_arm = nullptr)
+    P50SourceArmFields *observed_arm = nullptr,
+    P51CacheControlIdentity *observed_control_identity = nullptr)
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
@@ -1666,6 +1712,8 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
         ::close(source_fd);
         return fail_at(stage);
     }
+    if (observed_control_identity != nullptr)
+        *observed_control_identity = control_identity;
 
     P50SourceArmFields source = source_arm(
         wire_id, epoch, nonce, f_port, f_port);
@@ -1788,6 +1836,93 @@ static icecc::p50::local::P50SourceTransferResult execute_p51_kind8(
             armed ? armed->reservation_id[1] : 0);
     }
     return result;
+}
+
+// Retry only the already-armed source operation on a fresh authenticated C
+// control lease. This fixture intentionally does not arm F again: the exact
+// ARMED reservation, original deadline, and retained source bytes are reused.
+static icecc::p50::local::P50SourceTransferResult retry_p51_kind8_same_arm(
+    MsgChannel& local, uint32_t wire_id, uint64_t epoch, uint64_t nonce,
+    const P51SourceArmedFields& armed, int source_fd, uint32_t profile_mask,
+    Clock::time_point deadline,
+    const P51CacheControlIdentity& expected_control_identity)
+{
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    P50SourceTransferResult failed{};
+    bool source_owned_here = true;
+    const auto fail_at = [&](const char *stage) {
+        std::fprintf(stderr,
+            "P51_CAPACITY_OVERLAP_RETRY_FAIL job=%u stage=%s\n", wire_id, stage);
+        if (source_owned_here && source_fd >= 0) ::close(source_fd);
+        return failed;
+    };
+    if (Clock::now() >= deadline) return fail_at("expired-before-lease");
+
+    P51SourceLeaseRequestFields lease_request;
+    lease_request.wire_job_id = wire_id;
+    lease_request.assignment_epoch = epoch;
+    lease_request.assignment_nonce = nonce;
+    lease_request.profile = profile_mask;
+    lease_request.requested_cache_revision = CACHE_WIRE_REVISION_R2;
+    lease_request.requested_window = 30;
+    if (!lease_request.valid() ||
+        !local.send_msg(P51SourceLeaseRequestMsg(lease_request)))
+        return fail_at("lease-request-send");
+    P51CacheControlIdentity control_identity;
+    const int control_fd = local.receive_p51_cache_fd_reply(
+        lease_request, control_identity, deadline);
+    if (control_fd < 0 || !control_identity.valid()) {
+        if (control_fd >= 0) ::close(control_fd);
+        return fail_at("lease-fd-reply");
+    }
+    if (control_identity != expected_control_identity) {
+        ::close(control_fd);
+        return fail_at("changed-C-identity");
+    }
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        deadline, clock.clock_domain_id, clock.time_namespace_id);
+    const P51SourceTransferRequest request{armed, absolute_deadline};
+    const Identity identity{control_identity.control_generation,
+                            control_identity.control_attempt};
+    const ControlOperation operation = make_p51_source_transfer_operation(
+        identity, request, armed.arm.source.source_request_id);
+    CredentialExpectation credentials;
+    credentials.uid = control_identity.peer_uid;
+    credentials.gid = control_identity.peer_gid;
+    DaemonControlOperation control;
+    source_owned_here = false; // begin_authenticated owns the descriptor argument
+    const DaemonControlStatus started = control.begin_authenticated(
+        control_fd, operation, source_fd, credentials, identity, deadline,
+        DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
+    if (started != DaemonControlStatus::InProgress)
+        return fail_at("kind8-begin");
+
+    while (!control.done()) {
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            (void)control.advance(now, 0);
+            break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        pollfd descriptor{control.native_handle(), control.desired_events(), 0};
+        const int ready = ::poll(&descriptor, 1,
+            static_cast<int>(std::max<int64_t>(1, remaining.count())));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            (void)control.advance(Clock::now(), POLLERR);
+            break;
+        }
+        (void)control.advance(Clock::now(),
+                              ready == 0 ? short{0} : descriptor.revents);
+    }
+    if (control.status() != DaemonControlStatus::Complete ||
+        !control.source_transfer_result().has_value())
+        return fail_at("kind8-reply");
+    return *control.source_transfer_result();
 }
 
 // Publish the exact input into the already-ARMED F store through the native
@@ -2625,11 +2760,19 @@ static int run_p51_multilink_topology(const char *daemon_binary,
     const size_t total_jobs = pair_count * jobs_per_link;
     const std::string topology = "C" + std::to_string(c_count) + "F" +
         std::to_string(f_count);
+    const char *capacity_overlap_env =
+        ::getenv("ICECC_TEST_P51_MULTILINK_CAPACITY_OVERLAP");
+    const bool capacity_overlap = capacity_overlap_env != nullptr &&
+        std::strcmp(capacity_overlap_env, "1") == 0;
     REQUIRE(c_count >= 1 && c_count <= 4 && f_count >= 1 && f_count <= 4 &&
                 pair_count > 1 && total_jobs <= 120,
             "multi-link topology is within the 4-role/120-job bounds");
     if (c_count == 0 || c_count > 4 || f_count == 0 || f_count > 4 ||
         pair_count <= 1 || total_jobs > 120)
+        return 2;
+    REQUIRE(!capacity_overlap || (c_count == 1 && f_count == 4),
+            "capacity-overlap gate uses exactly one C and four independent F roles");
+    if (capacity_overlap && (c_count != 1 || f_count != 4))
         return 2;
     ::signal(SIGPIPE, SIG_IGN);
     const char *temporary_root = ::getenv("TMPDIR");
@@ -2642,6 +2785,7 @@ static int run_p51_multilink_topology(const char *daemon_binary,
     REQUIRE(created != nullptr, "multi-link test temporary root created");
     if (created == nullptr) return 2;
     const std::string work(created);
+    const std::string settlement_gate_dir = work + "/settlement-gate";
 
     struct Role {
         std::string name;
@@ -2688,6 +2832,17 @@ static int run_p51_multilink_topology(const char *daemon_binary,
     REQUIRE(::chown(work.c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
                 ::chmod(work.c_str(), 0700) == 0,
             "multi-link work root has exact icecc ownership");
+    if (capacity_overlap) {
+        const bool gate_ready = ::mkdir(settlement_gate_dir.c_str(), 0700) == 0 &&
+            ::chown(settlement_gate_dir.c_str(), icecc->pw_uid, icecc->pw_gid) == 0 &&
+            ::setenv("ICECC_TEST_P51_SETTLEMENT_GATE_DIR",
+                     settlement_gate_dir.c_str(), 1) == 0 &&
+            ::setenv("ICECC_TEST_P51_SETTLEMENT_GATE_COUNT", "30", 1) == 0 &&
+            ::setenv("ICECC_TEST_P51_ARM_TRACE", "1", 1) == 0;
+        REQUIRE(gate_ready,
+                "bounded test-only 30-Goodbye settlement gate is configured for C");
+        if (!gate_ready) return 2;
+    }
     auto prepare_role = [&](Role& role, const std::string& name) {
         role.name = name;
         role.directory = work + "/" + name;
@@ -2917,7 +3072,8 @@ static int run_p51_multilink_topology(const char *daemon_binary,
     for (size_t f = 0; f < f_roles.size(); ++f) {
         gates.emplace_back(std::make_unique<P51MultiLinkCommitGate>(
             f_roles[f].endpoint_port, icecc->pw_uid, c_count, jobs_per_link,
-            f_count == 1 || f == 0));
+            capacity_overlap || f_count == 1 || f == 0,
+            capacity_overlap));
         gates_ready &= gates.back()->ready();
     }
     REQUIRE(gates_ready,
@@ -3016,6 +3172,415 @@ static int run_p51_multilink_topology(const char *daemon_binary,
     REQUIRE(every_link_reached_w30,
             "each relationship uses one active physical R2 link for its 30 unique COMMITs");
 
+    if (capacity_overlap) {
+        const auto release_and_join = [&] {
+            (void)p51_gate_write_marker(settlement_gate_dir + "/release-1");
+            (void)p51_gate_write_marker(settlement_gate_dir + "/release-rest");
+            for (const auto& gate : gates) gate->release_held();
+            for (auto& transfer : transfers)
+                if (transfer.joinable()) transfer.join();
+        };
+        bool all_four_held = gates.size() == 4;
+        size_t simultaneous_pending = 0;
+        for (size_t f = 0; f < gates.size(); ++f) {
+            const auto relation = gates[f]->held_relationship();
+            all_four_held &= relation.has_value() &&
+                gates[f]->peak_commits(*relation) == 30;
+            for (const Job& job : jobs) {
+                if (job.f_index == f)
+                    all_four_held &= job.armed_ready.load(std::memory_order_acquire) &&
+                        !job.finished.load(std::memory_order_acquire);
+            }
+        }
+        for (const Job& job : jobs)
+            simultaneous_pending +=
+                !job.finished.load(std::memory_order_acquire) ? 1u : 0u;
+        all_four_held &= simultaneous_pending == 120;
+        if (!all_four_held) {
+            std::fprintf(stderr,
+                "FAIL: four-link gate did not prove exact simultaneous 4x30 pending; pending=%zu\n",
+                simultaneous_pending);
+            for (size_t f = 0; f < gates.size(); ++f) gates[f]->dump_state(f);
+            release_and_join();
+            return 1;
+        }
+        std::fprintf(stderr,
+            "P51_CAPACITY_OVERLAP_W30_HELD links=4 per_link=30 pending=120\n");
+
+        // Complete F0's 30 transfers but retain their C operation credits
+        // after the local Goodbyes; F1..F3 remain wire-pending (90 total).
+        gates[0]->release_held();
+        auto wait_until = [](auto predicate, std::chrono::milliseconds timeout) {
+            const auto until = Clock::now() + timeout;
+            while (Clock::now() < until) {
+                if (predicate()) return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            return predicate();
+        };
+        const bool first_link_results = wait_until([&] {
+            for (const Job& job : jobs)
+                if (job.f_index == 0 &&
+                    !job.finished.load(std::memory_order_acquire)) return false;
+            return true;
+        }, std::chrono::seconds(5));
+        bool all_settlements_held = true;
+        for (unsigned settlement = 1; settlement <= 30; ++settlement)
+            all_settlements_held &= p51_gate_wait_for_path(
+                settlement_gate_dir + "/held-" + std::to_string(settlement),
+                std::chrono::seconds(5));
+        bool other_links_pending = true;
+        for (const Job& job : jobs)
+            if (job.f_index != 0)
+                other_links_pending &= !job.finished.load(std::memory_order_acquire);
+        if (!first_link_results || !all_settlements_held || !other_links_pending ||
+            std::filesystem::exists(settlement_gate_dir + "/released-1")) {
+            std::fprintf(stderr,
+                "FAIL: expected exact 90 wire-pending plus 30 Goodbye-settlement credits\n");
+            release_and_join();
+            return 1;
+        }
+        std::fprintf(stderr,
+            "P51_CAPACITY_OVERLAP_CREDITS wire_pending=90 goodbye_settlement=30 total=120\n");
+
+        struct OverflowJobCleanup {
+            Job *job;
+            ~OverflowJobCleanup() {
+                if (job == nullptr) return;
+                if (job->source_fd >= 0) ::close(job->source_fd);
+                job->wrapper.reset();
+                job->compiler.reset();
+            }
+        };
+        Job overflow;
+        OverflowJobCleanup overflow_cleanup{&overflow};
+        overflow.c_index = 0;
+        overflow.f_index = 0;
+        overflow.pair_index = f_roles.size();
+        overflow.wire_id = static_cast<uint32_t>(0x51d001 + total_jobs);
+        overflow.nonce = UINT64_C(0x51d00100000001) + total_jobs;
+        overflow.compiler.reset(connect_tcp_bounded(
+            f_roles[0].endpoint_port, 5000));
+        overflow.wrapper.reset(Service::createChannel(
+            c_roles[0].directory + "/iceccd.sock"));
+        const bool c_prepared = c_roles[0].scheduler->send_msg(
+            AssignPrepareMsg(epoch, overflow.wire_id, overflow.nonce, 1));
+        const bool f_prepared = f_roles[0].scheduler->send_msg(
+            AssignPrepareMsg(epoch, overflow.wire_id, overflow.nonce, 1));
+        std::unique_ptr<Msg> c_ready_msg(c_prepared
+            ? wait_for_type(c_roles[0].scheduler.get(), Msg::ASSIGN_READY, 5000)
+            : nullptr);
+        std::unique_ptr<Msg> f_ready_msg(f_prepared
+            ? wait_for_type(f_roles[0].scheduler.get(), Msg::ASSIGN_READY, 5000)
+            : nullptr);
+        const auto *c_ready = dynamic_cast<const AssignReadyMsg *>(c_ready_msg.get());
+        const auto *f_ready = dynamic_cast<const AssignReadyMsg *>(f_ready_msg.get());
+        const bool overflow_assigned = c_ready && f_ready &&
+            c_ready->wire_id == overflow.wire_id && f_ready->wire_id == overflow.wire_id &&
+            c_ready->epoch() == epoch && f_ready->epoch() == epoch &&
+            c_ready->nonce() == overflow.nonce && f_ready->nonce() == overflow.nonce;
+        Environments overflow_envs;
+        overflow_envs.emplace_back("x86_64", "multilink-env");
+        GetCSMsg overflow_get(overflow_envs, "capacity-overlap.cpp",
+            CompileJob::Lang_CXX, 1, "x86_64", 0, "", PROTOCOL_VERSION, 0, 0);
+        overflow_get.cache_protocol = CACHE_WIRE_REVISION_R2;
+        overflow_get.cache_profile_mask = profile_mask;
+        const bool overflow_get_sent = overflow.wrapper &&
+            overflow.wrapper->send_msg(overflow_get);
+        std::unique_ptr<Msg> overflow_forwarded(overflow_get_sent
+            ? wait_for_type(c_roles[0].scheduler.get(), Msg::GET_CS, 5000)
+            : nullptr);
+        const auto *overflow_forwarded_get =
+            dynamic_cast<const GetCSMsg *>(overflow_forwarded.get());
+        const bool overflow_use_sent = overflow_forwarded_get &&
+            c_roles[0].scheduler->send_msg(UseCSMsg(
+                "x86_64", "127.0.0.1", f_roles[0].endpoint_port,
+                overflow.wire_id, true, overflow_forwarded_get->client_id, 0,
+                epoch, overflow.nonce, f_roles[0].endpoint_port,
+                CACHE_WIRE_REVISION_R2, profile_mask));
+        std::unique_ptr<Msg> overflow_use_reply(overflow_use_sent
+            ? overflow.wrapper->get_msg_until(Clock::now() + std::chrono::seconds(5))
+            : nullptr);
+        const auto *overflow_use =
+            dynamic_cast<const UseCSMsg *>(overflow_use_reply.get());
+        const bool overflow_source_ready = overflow_use &&
+            overflow_use->job_id == overflow.wire_id &&
+            overflow_use->assignmentEpoch() == epoch &&
+            overflow_use->assignmentNonce() == overflow.nonce &&
+            overflow_use->cache_endpoint_port ==
+                static_cast<uint32_t>(f_roles[0].endpoint_port) &&
+            overflow_use->cache_protocol == CACHE_WIRE_REVISION_R2 &&
+            overflow_use->cache_profile_mask == profile_mask;
+        overflow.bytes = "P51 capacity overlap immutable source 121\n";
+        overflow.source_fd = make_vertical_source_fd(work, overflow.bytes);
+        if (!overflow_assigned || !overflow.compiler || !overflow.wrapper ||
+            !overflow_source_ready || overflow.source_fd < 0) {
+            std::fprintf(stderr,
+                "FAIL: exact 121st C/F assignment did not prepare a source request\n");
+            release_and_join();
+            return 1;
+        }
+        struct stat original_source_stat{};
+        const bool source_stat_ok = ::fstat(overflow.source_fd,
+                                            &original_source_stat) == 0;
+        const off_t source_offset_before = ::lseek(overflow.source_fd, 0, SEEK_CUR);
+        const int first_source_fd = ::fcntl(
+            overflow.source_fd, F_DUPFD_CLOEXEC, 0);
+        Clock::time_point overflow_deadline;
+        P50SourceArmFields overflow_arm{};
+        P51CacheControlIdentity overflow_control_identity{};
+        if (first_source_fd < 0) {
+            std::fprintf(stderr, "FAIL: could not duplicate immutable source for first attempt\n");
+            release_and_join();
+            return 1;
+        }
+        overflow.result = execute_p51_kind8(
+            *overflow.wrapper, *overflow.compiler, overflow.wire_id, epoch,
+            overflow.nonce, static_cast<uint32_t>(f_roles[0].endpoint_port),
+            first_source_fd, profile_mask, &overflow.armed,
+            &overflow.armed_ready, &overflow_deadline, false, &overflow_arm,
+            &overflow_control_identity);
+        overflow.finished.store(true, std::memory_order_release);
+        const auto capacity_error = static_cast<uint16_t>(
+            icecc::p50::local::SourceTransferErrorCode::CapacityBusy);
+        const bool exact_busy = overflow.armed_ready.load(std::memory_order_acquire) &&
+            overflow.result.code ==
+                icecc::p50::local::SourceTransferResultCode::Error &&
+            overflow.result.error_code == capacity_error &&
+            overflow.result.attempts == 0 && overflow.result.raw_bytes == 0 &&
+            overflow.result.tu_seq == 0 &&
+            overflow.result.raw_digest == icecc::p50::Digest128{} &&
+            overflow.result.c_store_guid == icecc::p50::CStoreGuid{} && source_stat_ok &&
+            source_offset_before == 0 &&
+            ::lseek(overflow.source_fd, 0, SEEK_CUR) == 0 &&
+            overflow_deadline > Clock::now();
+        if (!exact_busy) {
+            std::fprintf(stderr,
+                "FAIL: request 121 did not receive exact pre-read CapacityBusy code=%u error=%u attempts=%u\n",
+                static_cast<unsigned>(overflow.result.code),
+                overflow.result.error_code, overflow.result.attempts);
+            release_and_join();
+            return 1;
+        }
+        std::fprintf(stderr,
+            "P51_CAPACITY_OVERLAP_121_BUSY job=%u epoch=%llu nonce=%llu request=%llu attempts=0 witness=none source_offset=0\n",
+            overflow.wire_id, static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(overflow.nonce),
+            static_cast<unsigned long long>(overflow_arm.source_request_id));
+
+        std::string first_goodbye;
+        std::array<uint64_t, 31> held_request_ids{};
+        {
+            std::ifstream marker(settlement_gate_dir + "/held-1");
+            std::getline(marker, first_goodbye);
+        }
+        bool one_prior_assignment_released = false;
+        unsigned long first_ordinal = 0;
+        unsigned long long first_request = 0;
+        if (std::sscanf(first_goodbye.c_str(), "ordinal=%lu request=%llu",
+                        &first_ordinal, &first_request) != 2)
+            first_goodbye.clear();
+        held_request_ids[1] = static_cast<uint64_t>(first_request);
+        bool held_markers_valid = !first_goodbye.empty() && first_ordinal == 1;
+        for (unsigned ordinal = 2; ordinal <= 30; ++ordinal) {
+            std::string line;
+            std::ifstream marker(settlement_gate_dir + "/held-" +
+                                 std::to_string(ordinal));
+            unsigned parsed_ordinal = 0;
+            unsigned long long parsed_request = 0;
+            char trailing = '\0';
+            if (!std::getline(marker, line) ||
+                std::sscanf(line.c_str(), "ordinal=%u request=%llu%c",
+                            &parsed_ordinal, &parsed_request, &trailing) != 2 ||
+                parsed_ordinal != ordinal || parsed_request == 0) {
+                held_markers_valid = false;
+                break;
+            }
+            held_request_ids[ordinal] = static_cast<uint64_t>(parsed_request);
+        }
+        for (const Job& job : jobs) {
+            if (job.f_index != 0) continue;
+            if (first_request == job.nonce)
+                one_prior_assignment_released = true;
+        }
+        if (!held_markers_valid || first_goodbye.empty() || first_ordinal != 1 ||
+            !one_prior_assignment_released ||
+            first_request == overflow.nonce) {
+            std::fprintf(stderr,
+                "FAIL: held local Goodbye marker was not one of the original 30 F0 assignments: %s\n",
+                first_goodbye.c_str());
+            release_and_join();
+            return 1;
+        }
+        if (!p51_gate_write_marker(settlement_gate_dir + "/release-1")) {
+            std::fprintf(stderr, "FAIL: could not release exactly one prior Goodbye settlement\n");
+            release_and_join();
+            return 1;
+        }
+        const bool first_goodbye_released = p51_wait_settlement_ack(
+            settlement_gate_dir + "/released-1", held_request_ids[1],
+            std::chrono::seconds(4));
+        const bool other_goodbyes_still_held =
+            !std::filesystem::exists(settlement_gate_dir + "/released-2");
+        if (!first_goodbye_released || !other_goodbyes_still_held ||
+            Clock::now() >= overflow_deadline) {
+            std::fprintf(stderr,
+                "FAIL: one exact prior Goodbye did not release while 29 credits remained held\n");
+            release_and_join();
+            return 1;
+        }
+        const int retry_source_fd = ::fcntl(
+            overflow.source_fd, F_DUPFD_CLOEXEC, 0);
+        if (retry_source_fd < 0) {
+            std::fprintf(stderr, "FAIL: could not duplicate retained 121st source for retry\n");
+            release_and_join();
+            return 1;
+        }
+        struct stat retry_source_stat{};
+        const bool retry_stat_ok = ::fstat(retry_source_fd, &retry_source_stat) == 0;
+        const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
+        const auto original_absolute_deadline =
+            icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                overflow_deadline, clock.clock_domain_id, clock.time_namespace_id);
+        const icecc::p50::local::P51SourceTransferRequest original_request{
+            overflow.armed, original_absolute_deadline};
+        const icecc::p50::local::P51SourceTransferRequest retried_request{
+            overflow.armed,
+            icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                overflow_deadline, clock.clock_domain_id, clock.time_namespace_id)};
+        const bool exact_retry_request = original_request == retried_request &&
+            overflow_control_identity.valid() &&
+            overflow_arm == overflow.armed.arm.source && retry_stat_ok &&
+            retry_source_stat.st_dev == original_source_stat.st_dev &&
+            retry_source_stat.st_ino == original_source_stat.st_ino &&
+            retry_source_stat.st_size == original_source_stat.st_size;
+        if (!exact_retry_request) {
+            ::close(retry_source_fd);
+            std::fprintf(stderr,
+                "FAIL: same-assignment retry changed its immutable source, ARM, or absolute deadline\n");
+            release_and_join();
+            return 1;
+        }
+        const auto retry_result = retry_p51_kind8_same_arm(
+            *overflow.wrapper, overflow.wire_id, epoch, overflow.nonce,
+            overflow.armed, retry_source_fd, profile_mask, overflow_deadline,
+            overflow_control_identity);
+        bool retry_committed = retry_result.code ==
+                icecc::p50::local::SourceTransferResultCode::Committed &&
+            retry_result.error_code == 0 && retry_result.attempts == 1 &&
+            retry_result.raw_bytes == overflow.bytes.size() &&
+            retry_result.raw_digest == icecc::digest128(overflow.bytes) &&
+            retry_result.c_store_guid.bytes ==
+                overflow.armed.arm.source.c_store_guid;
+        bool first_f_arm_once = false;
+        {
+            std::ifstream f_log(f_roles[0].log);
+            const std::string trace((std::istreambuf_iterator<char>(f_log)),
+                                    std::istreambuf_iterator<char>());
+            const std::string marker = "P51_TEST_ARM_TRACE request=" +
+                std::to_string(overflow.nonce) + " ";
+            first_f_arm_once = trace.find(marker) != std::string::npos &&
+                trace.find(marker, trace.find(marker) + marker.size()) ==
+                    std::string::npos;
+        }
+        if (!retry_committed || !first_f_arm_once ||
+            gates[0]->followup_commits() != 1 ||
+            std::filesystem::exists(settlement_gate_dir + "/released-2")) {
+            std::fprintf(stderr,
+                "FAIL: retry was not one same-ARM committed follow-up while 119 credits remained occupied\n");
+            for (const auto& gate : gates) gate->release_held();
+            release_and_join();
+            return 1;
+        }
+        overflow.result = retry_result;
+        std::fprintf(stderr,
+            "P51_CAPACITY_OVERLAP_RETRY_COMMITTED same_assignment=1 same_ARM=1 exact_source=1 exact_deadline=1 c_identity_unchanged=1 followup_commits=%zu\n",
+            gates[0]->followup_commits());
+
+        // All remaining held replies and three 30-receipt batches now settle;
+        // this must not require another ARM or strand a sibling operation.
+        if (!p51_gate_write_marker(settlement_gate_dir + "/release-rest")) {
+            std::fprintf(stderr, "FAIL: could not release remaining settlement acknowledgements\n");
+            for (const auto& gate : gates) gate->release_held();
+            release_and_join();
+            return 1;
+        }
+        for (unsigned ordinal = 2; ordinal <= 30; ++ordinal)
+            all_settlements_held &= p51_wait_settlement_ack(
+                settlement_gate_dir + "/released-" + std::to_string(ordinal),
+                held_request_ids[ordinal], std::chrono::seconds(2));
+        for (size_t f = 1; f < gates.size(); ++f) gates[f]->release_held();
+        const bool all_siblings_finished = wait_until([&] {
+            return std::all_of(jobs.begin(), jobs.end(), [](const Job& job) {
+                return job.finished.load(std::memory_order_acquire);
+            });
+        }, std::chrono::seconds(10));
+        const bool all_siblings_committed = std::all_of(
+            jobs.begin(), jobs.end(), [](const Job& job) {
+                return job.result.code ==
+                        icecc::p50::local::SourceTransferResultCode::Committed &&
+                    job.result.error_code == 0;
+            });
+        if (!all_settlements_held || !all_siblings_finished ||
+            !all_siblings_committed ||
+            gates[0]->followup_commits() != 1) {
+            std::fprintf(stderr,
+                "FAIL: original 120 siblings did not each settle after the bounded release\n");
+            release_and_join();
+            return 1;
+        }
+        std::fprintf(stderr,
+            "P51_CAPACITY_OVERLAP_SETTLED original_operations=120 goodbye_holds=30 goodbye_released=30 siblings_committed=120 retry_committed=1\n");
+
+        const auto attach_offset = std::filesystem::file_size(f_roles[0].log);
+        CompileJob overflow_compile = attachment_compile_job(
+            overflow.wire_id, epoch, overflow.nonce,
+            source_arm(overflow.wire_id, epoch, overflow.nonce,
+                static_cast<uint32_t>(f_roles[0].endpoint_port),
+                static_cast<uint32_t>(f_roles[0].endpoint_port)), nullptr);
+        CompileInputIdentity overflow_identity;
+        overflow_identity.profile = profile_mask == CACHE_PROFILE_P29V1
+            ? CompileInputIdentity::P29V1Profile
+            : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+                ? CompileInputIdentity::ZstdRouteProfile
+                : CompileInputIdentity::ZstdTuProfile;
+        overflow_identity.c_store_guid = retry_result.c_store_guid.bytes;
+        overflow_identity.tu_seq = retry_result.tu_seq;
+        overflow_identity.raw_bytes = retry_result.raw_bytes;
+        overflow_identity.raw_digest = retry_result.raw_digest.bytes;
+        overflow_identity.attempt_id = overflow.nonce;
+        overflow_identity.request_id = overflow.nonce;
+        overflow_compile.setCompileInputIdentity(overflow_identity);
+        const bool overflow_compile_sent = overflow.compiler->send_msg(
+            CompileFileMsg(&overflow_compile));
+        const std::string overflow_attach_marker =
+            "P50_INPUT_ATTACH_END job=" + std::to_string(overflow.wire_id) +
+            " epoch=" + std::to_string(epoch) + " nonce=" +
+            std::to_string(overflow.nonce) + " request=" +
+            std::to_string(overflow.nonce) + " elapsed_ms=";
+        bool overflow_attached = overflow_compile_sent && wait_attachment_log(
+            f_roles[0].log, attach_offset, overflow_attach_marker, 10000);
+        if (overflow_attached) {
+            const auto suffix = read_file_suffix(f_roles[0].log, attach_offset);
+            const size_t marker_at = suffix.find(overflow_attach_marker);
+            const size_t line_end = suffix.find('\n', marker_at);
+            const std::string_view attach_line(suffix.data() + marker_at,
+                (line_end == std::string::npos ? suffix.size() : line_end) - marker_at);
+            overflow_attached = attach_line.find(" status=0") != std::string_view::npos;
+        }
+        const bool overflow_eof = overflow_attached &&
+            wait_eof(overflow.compiler.get(), 10000);
+        if (!overflow_eof) {
+            std::fprintf(stderr,
+                "FAIL: request 121 did not attach exact bytes after same-assignment retry\n");
+            release_and_join();
+            return 1;
+        }
+        std::fprintf(stderr,
+            "P51_MULTILINK_CAPACITY_OVERLAP_PASS topology=C1F4 links=4 per_link=30 initial_operations=120 settlement_overlap=30+90 request121=typed_Busy_then_same_assignment_success one_ARM=1 siblings_progress=1\n");
+    }
+
+    if (!capacity_overlap) {
     const auto held_relation = gates[0]->held_relationship();
     REQUIRE(held_relation.has_value(),
             "one relationship is held at its 30-receipt boundary for cross-link progress");
@@ -3060,6 +3625,7 @@ static int run_p51_multilink_topology(const char *daemon_binary,
     REQUIRE(healthy_links_ready && all_healthy_finished && held_still_pending,
             "healthy C/F link jobs finish while the selected relationship receipts remain held");
     for (const auto& gate : gates) gate->release_held();
+    }
     for (auto& transfer : transfers) if (transfer.joinable()) transfer.join();
 
     std::map<icecc::p50::Id128, std::set<uint64_t>> sequences_by_link;
