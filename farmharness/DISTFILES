@@ -157,6 +157,7 @@ farmharness/integration/tests/test_netem.py
 farmharness/integration/tests/test_node_netem_dependency.py
 farmharness/integration/tests/test_orchestration.py
 farmharness/integration/tests/test_p50_preprocess_pairing.py
+farmharness/integration/tests/test_p51_scheduler_f_restart_deadlines.py
 farmharness/integration/tests/test_performance.py
 farmharness/integration/tests/test_python_environment.py
 farmharness/integration/tests/test_r2_wire_trace.py
