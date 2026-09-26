@@ -51,8 +51,28 @@ with source setup still in flight after the bounded cleanup deadline, rather
 than an unrelated exit site. Backtrace log:
 `/tanksmall/scratch/tmp/p51-d07-counterfact-front-runtime/front-guard-backtrace.log`,
 SHA256 `4fc927fc59d0e971174d5af755542bfe5e3bb614e54ed62285e5effce3592b88`.
-Current mixed-image results are recorded below; daemon end-to-end
-C-expired/F-live qualification remains pending.
+Current mixed-image results are recorded below. Candidate `c71e39dc` integrates
+the separate daemon regression donor `77bd29fa`: two original assignment/ARM
+channels share C/F incarnations; both C operations are admitted before the
+victim's immutable eight-second deadline. The victim times out while its
+original thirty-second F reservation remains live, is cancelled exactly once,
+and the already-admitted successor commits within its own original deadline.
+Only then is its exact CompileFile identity submitted and attached. Both
+sidecar incarnations survive. The new mode uses a noninstalled hook-enabled
+service for the admission witness; installed service behavior is unchanged.
+
+All three direct profile runs pass, followed by the full registered
+`p50daemonpositive-run.sh` (existing and new modes), actual exit 0. Log:
+`/tanksmall/scratch/tmp/p51-d07-c-expired-f-live-build/build/p50daemonpositive-registered-final2.log`,
+SHA256 `32e77d82d944f55412a2ecd3118fcf435d51c42aac3ef65ec814b0e09d8f749d`.
+Frozen daemon/test-service/test-runner SHA256 values are respectively
+`969962a5782afee549e5c6c6c841763ce6d7403a02fd7c6b94ead57d7f926860`,
+`e733a6cec416d79e9f4b6095fff15ed421150c46afe1868d64a3276b37c9370b`,
+and `437ecdc582465ee4136d67f79378cad51e2325213051a6495ab812ab96c2e466`.
+All four integrated files match the tested donor byte-for-byte. This is
+daemon prepublication cancellation/source-attachment coverage, not compiled
+object output or established-link receipt recovery; the live compile gates
+and sender/service recovery tests qualify those separately.
 
 ### Paired edited-input benchmark
 
