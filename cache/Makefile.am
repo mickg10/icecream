@@ -14,7 +14,9 @@ icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
 	libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
-icecc_cache_service_CXXFLAGS = -O2 -Werror -pthread
+# GCC 16 reports asio's awaitable frame deallocation as mismatched (aligned_alloc
+# inside the frame's operator new); p50cacheservice-sanitize.sh already drops it.
+icecc_cache_service_CXXFLAGS = -O2 -Werror -Wno-mismatched-new-delete -pthread
 icecc_cache_service_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 
 libprotocol50_a_SOURCES = \
