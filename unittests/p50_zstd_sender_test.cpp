@@ -1587,6 +1587,8 @@ sender_r2_accept_recovery_with_lost_reset_ack(
     co_return results;
 }
 
+enum class RecoverResponseLoss { None, FirstResponse };
+
 asio::awaitable<std::vector<ServerRunResult>>
 sender_r2_accept_shared_failure(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
@@ -1610,12 +1612,15 @@ sender_r2_accept_shared_failure(
     bool change_reset_ack_on_replay = false,
     std::atomic<unsigned>* mismatched_echoes_sent = nullptr,
     std::atomic<bool>* exact_echo_waiting = nullptr,
-    std::atomic<bool>* release_exact_echo = nullptr) {
+    std::atomic<bool>* release_exact_echo = nullptr,
+    RecoverResponseLoss recover_response_loss = RecoverResponseLoss::None) {
+    const bool lose_recover_response =
+        recover_response_loss == RecoverResponseLoss::FirstResponse;
     const size_t connection_count =
         (reject_stale_reconnect || close_reconnect_after_hello ||
          reject_after_positive_receipt) ? 1
         : change_reset_ack_on_replay ? 4
-        : (repeat_recovery_loss || lose_reset_confirm ||
+        : (repeat_recovery_loss || lose_recover_response || lose_reset_confirm ||
            lose_reset_confirm_echo || mismatch_reset_confirm_echo) ? 3
         : (retire_after_positive_receipt || expire_after_positive_receipt) ? 1
                                                                            : 2;
@@ -1666,6 +1671,10 @@ sender_r2_accept_shared_failure(
             };
         } else if (index == 1 && repeat_recovery_loss) {
             control.close_before_write = MessageType::RESET_ACK;
+        } else if (index == 1 && lose_recover_response) {
+            // The recovery service has already returned its exact interval;
+            // lose the first RECEIPTS frame before C can apply it.
+            control.close_before_write = MessageType::RECEIPTS;
         } else if ((index == 1 && lose_reset_confirm_echo) ||
                    (index == 1 && change_reset_ack_on_replay)) {
             // F processes the exact confirmation, then loses the confirmation
@@ -3731,7 +3740,11 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                         bool lose_reset_confirm = false,
                                         bool lose_reset_confirm_echo = false,
                                         bool mismatch_reset_confirm_echo = false,
-                                        bool change_reset_ack_on_replay = false) {
+                                        bool change_reset_ack_on_replay = false,
+                                        RecoverResponseLoss recover_response_loss =
+                                            RecoverResponseLoss::None) {
+    const bool lose_recover_response =
+        recover_response_loss == RecoverResponseLoss::FirstResponse;
     CHECK(kJobs >= 1 && kJobs <= 30);
     CHECK(!post_reset_offer_probe || kJobs == 2);
     CHECK(!future_offer_during_recovery ||
@@ -3748,6 +3761,11 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
           (kJobs == 2 && !repeat_recovery_loss && !post_reset_offer_probe &&
            !future_offer_during_recovery && !lose_reset_confirm &&
            !lose_reset_confirm_echo && !mismatch_reset_confirm_echo));
+    CHECK(!lose_recover_response ||
+          (kJobs == 2 && !repeat_recovery_loss && !post_reset_offer_probe &&
+           !future_offer_during_recovery && !lose_reset_confirm &&
+           !lose_reset_confirm_echo && !mismatch_reset_confirm_echo &&
+           !change_reset_ack_on_replay));
     const size_t total_jobs = kJobs +
         ((post_reset_offer_probe || future_offer_during_recovery) ? 1 : 0);
     const uint32_t kWindow = static_cast<uint32_t>(kJobs);
@@ -3803,7 +3821,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
         std::chrono::steady_clock::now() +
-            ((lose_reset_confirm || lose_reset_confirm_echo ||
+             ((lose_reset_confirm || lose_reset_confirm_echo ||
+               lose_recover_response ||
               mismatch_reset_confirm_echo || change_reset_ack_on_replay)
                  ? std::chrono::seconds(10)
              : reject_after_positive_receipt
@@ -3862,6 +3881,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     std::vector<ResetRequest> reset_validation_requests;
     std::optional<ResetAck> retained_reset_ack_snapshot;
     std::vector<ResetConfirm> reset_confirm_messages;
+    struct RecoveryReplyEvidence {
+        RecoverBegin request;
+        RecoverEnd request_end;
+        Digest128 witness_digest{};
+        ReceiptsEnd end;
+        std::vector<ReceiptRow> rows;
+    };
+    std::vector<RecoveryReplyEvidence> recovery_reply_evidence;
     bool retained_reset_confirmed = false;
     uint64_t committed_prefix_k = 0;
     uint64_t acknowledged_prefix_q = 0;
@@ -3982,7 +4009,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
         const unsigned prior = binds[index].fetch_add(1, std::memory_order_relaxed);
         if (prior != 0 &&
             (hello.start_mode != LinkStartMode::Reconnect || index != 1 ||
-             (!(lose_reset_confirm || lose_reset_confirm_echo ||
+             (!(lose_recover_response || lose_reset_confirm || lose_reset_confirm_echo ||
                 mismatch_reset_confirm_echo || change_reset_ack_on_replay) &&
               prior != 1)))
             return std::nullopt;
@@ -4057,7 +4084,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                 if (commit) available_commits.push_back(*commit);
             available_bindings = retained_bindings;
         }
-        if (lose_reset_confirm || lose_reset_confirm_echo ||
+        if (lose_recover_response || lose_reset_confirm || lose_reset_confirm_echo ||
             mismatch_reset_confirm_echo || change_reset_ack_on_replay) {
             if (hello.start_mode != LinkStartMode::Reconnect ||
                 begin.relationship_id != relationship_id ||
@@ -4153,6 +4180,16 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                 begin.verified_floor_a, committed_prefix_k,
                 acknowledged_prefix_q,
                 static_cast<uint32_t>(interval.rows.size())};
+            if (lose_recover_response) {
+                RecoveryReplyEvidence evidence;
+                evidence.request = begin;
+                evidence.request_end = end;
+                evidence.witness_digest =
+                    compute_r2_recovery_witness_digest(begin, witnesses);
+                evidence.end = interval.end;
+                evidence.rows = interval.rows;
+                recovery_reply_evidence.push_back(std::move(evidence));
+            }
             return interval;
         }
         std::optional<R2TxCommit> commit = available_commits.empty()
@@ -4198,7 +4235,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     server_config.validate_p51_reset =
         [&](const LinkHello& hello, const ResetRequest& request)
             -> std::optional<ResetAck> {
-        if (lose_reset_confirm || lose_reset_confirm_echo ||
+        if (lose_recover_response || lose_reset_confirm || lose_reset_confirm_echo ||
             mismatch_reset_confirm_echo || change_reset_ack_on_replay) {
             reset_validation_requests.push_back(request);
             if (request.relationship_id != hello.relationship_id ||
@@ -4354,7 +4391,8 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
             lose_reset_confirm, lose_reset_confirm_echo,
             mismatch_reset_confirm_echo, change_reset_ack_on_replay,
             &mismatched_echoes_sent,
-            &exact_reset_echo_waiting, &release_exact_reset_echo),
+            &exact_reset_echo_waiting, &release_exact_reset_echo,
+            recover_response_loss),
         asio::use_future);
     f_thread = std::thread([&] { f_context.run(); });
 
@@ -4841,17 +4879,90 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
                                                                      : kJobs));
     CHECK(connector_calls.load() ==
           ((retire_after_positive_receipt || expire_after_positive_receipt)
-               ? 1U : (repeat_recovery_loss || lose_reset_confirm ||
+               ? 1U : (repeat_recovery_loss || lose_recover_response ||
+                       lose_reset_confirm ||
                        lose_reset_confirm_echo ||
                        mismatch_reset_confirm_echo) ? 3U :
               change_reset_ack_on_replay ? 4U : 2U));
     CHECK(binds[0].load() == 1);
     for (size_t index = 1; index != kJobs; ++index)
-        CHECK((lose_reset_confirm || lose_reset_confirm_echo ||
+        CHECK((lose_recover_response || lose_reset_confirm || lose_reset_confirm_echo ||
                mismatch_reset_confirm_echo || change_reset_ack_on_replay)
                   ? binds[index].load() >= 1 &&
                         binds[index].load() <= (change_reset_ack_on_replay ? 4 : 3)
                   : binds[index].load() == 1); // suffix binds after reset
+
+    if (lose_recover_response) {
+        CHECK(recovery_reply_evidence.size() == 2);
+        const auto& lost = recovery_reply_evidence[0];
+        const auto& retried = recovery_reply_evidence[1];
+        CHECK(lost.request.relationship_id == relationship_id);
+        CHECK(retried.request.relationship_id == lost.request.relationship_id);
+        CHECK(retried.request.relationship_epoch ==
+              lost.request.relationship_epoch);
+        CHECK(retried.request.operation_id == lost.request.operation_id);
+        CHECK(retried.request.verified_floor_a == lost.request.verified_floor_a);
+        CHECK(retried.request.prepared_prefix_p == lost.request.prepared_prefix_p);
+        CHECK(retried.request.witness_count == lost.request.witness_count);
+        CHECK(retried.witness_digest == lost.witness_digest);
+        CHECK(retried.request.physical_link_generation >
+              lost.request.physical_link_generation);
+        RecoverBegin normalized_lost_request = lost.request;
+        RecoverBegin normalized_retry_request = retried.request;
+        normalized_lost_request.physical_link_generation = 1;
+        normalized_retry_request.physical_link_generation = 1;
+        CHECK(normalized_lost_request == normalized_retry_request);
+        RecoverEnd normalized_lost_end = lost.request_end;
+        RecoverEnd normalized_retry_end = retried.request_end;
+        normalized_lost_end.physical_link_generation = 1;
+        normalized_retry_end.physical_link_generation = 1;
+        // The transcript digest intentionally covers the physical generation;
+        // the separately checked normalized witness digest proves the stable
+        // logical input state across these two transports.
+        normalized_lost_end.transcript_digest = {};
+        normalized_retry_end.transcript_digest = {};
+        CHECK(normalized_lost_end == normalized_retry_end);
+        ReceiptsEnd normalized_lost_response = lost.end;
+        ReceiptsEnd normalized_retry_response = retried.end;
+        normalized_lost_response.physical_link_generation = 1;
+        normalized_retry_response.physical_link_generation = 1;
+        CHECK(normalized_lost_response == normalized_retry_response);
+        CHECK(lost.rows.size() == 1 && retried.rows.size() == 1);
+        CHECK(lost.rows.front().relationship_id == relationship_id);
+        CHECK(retried.rows.front().relationship_id == relationship_id);
+        CHECK(lost.rows.front().relationship_epoch == lost.request.relationship_epoch);
+        CHECK(retried.rows.front().relationship_epoch == retried.request.relationship_epoch);
+        CHECK(lost.rows.front().operation_id == lost.request.operation_id);
+        CHECK(retried.rows.front().operation_id == retried.request.operation_id);
+        CHECK(lost.rows.front().physical_link_generation ==
+              lost.request.physical_link_generation);
+        CHECK(retried.rows.front().physical_link_generation ==
+              retried.request.physical_link_generation);
+        CHECK(retried.rows.front().physical_link_generation >
+              lost.rows.front().physical_link_generation);
+        CHECK(lost.rows.front().receipt == retried.rows.front().receipt);
+        CHECK(lost.rows.front().receipt.relationship_ordinal == 1);
+        CHECK(commits[0].load(std::memory_order_acquire) == 1);
+        CHECK(binds[0].load(std::memory_order_acquire) == 1);
+        CHECK(acknowledged.load(std::memory_order_acquire) == kJobs);
+        CHECK(std::chrono::steady_clock::now() < deadline.as_steady_time_point());
+        auto live_entries_promise =
+            std::make_shared<std::promise<size_t>>();
+        auto live_entries_future = live_entries_promise->get_future();
+        asio::post(c_context, [authority, live_entries_promise] {
+            live_entries_promise->set_value(authority->live_entry_count());
+        });
+        CHECK(live_entries_future.wait_until(deadline.as_steady_time_point()) ==
+              std::future_status::ready);
+        CHECK(live_entries_future.get() == 0);
+        CHECK(retained_reset.has_value());
+        CHECK(retained_reset->settled_prefix_k == 1);
+        CHECK(retained_reset_confirmed);
+        std::cerr << "P51_SENDER_LOST_RECOVER_RESPONSE profile=" << profile_name
+                  << " response_attempts=" << recovery_reply_evidence.size()
+                  << " same_operation=1 same_witness=1 committed_prefix=1"
+                  << " suffix=" << (kJobs - 1) << " credits=0 PASS\n";
+    }
 
     if (post_reset_offer_probe) {
         CHECK(retained_reset.has_value());
@@ -4943,7 +5054,7 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
     c_thread.join();
     f_thread.join();
     CHECK(server_runs.size() == (change_reset_ack_on_replay ? 4U :
-        (repeat_recovery_loss || lose_reset_confirm ||
+        (repeat_recovery_loss || lose_recover_response || lose_reset_confirm ||
                                   lose_reset_confirm_echo ||
                                   mismatch_reset_confirm_echo) ? 3U
         : (retire_after_positive_receipt || expire_after_positive_receipt)
@@ -5028,6 +5139,16 @@ void test_p51_sender_repeated_shared_failure_recovers_pending_callers() {
                                     ProfileId::ZSTD_ROUTE}) {
         run_p51_sender_shared_failure_case(2, profile, true);
         run_p51_sender_shared_failure_case(30, profile, true);
+    }
+}
+
+void test_p51_sender_retries_lost_recover_response_all_profiles() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        run_p51_sender_shared_failure_case(
+            2, profile, false, false, false, false, false, false, false,
+            false, false, false, false, false, false,
+            RecoverResponseLoss::FirstResponse);
     }
 }
 
@@ -5732,6 +5853,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--lost-recover-response") {
+        test_p51_sender_retries_lost_recover_response_all_profiles();
+        std::cerr << "P51_SENDER_LOST_RECOVER_RESPONSE_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--changed-reset-ack-replay") {
         test_p51_sender_rejects_changed_reset_ack_snapshot_for_all_profiles();
         std::cerr << "P51_SENDER_CHANGED_RESET_ACK_REPLAY_SELECTOR PASS\n";
@@ -5838,6 +5965,8 @@ int main(int argc, char** argv) {
         test_p51_sender_future_arm_during_lost_reset_ack_is_request_local);
     run("lost_reset_confirm",
         test_p51_sender_replays_lost_reset_confirm_for_all_profiles);
+    run("lost_recover_response",
+        test_p51_sender_retries_lost_recover_response_all_profiles);
     run("mismatched_reset_confirm_echo",
         test_p51_sender_rejects_mismatched_reset_confirm_echo_for_all_profiles);
     run("changed_reset_ack_replay",
