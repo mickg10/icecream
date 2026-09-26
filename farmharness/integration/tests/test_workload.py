@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 
@@ -22,6 +23,7 @@ from farmharness.integration.remote import (
 from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
 from farmharness.integration.workload import (
     MANIFEST_DRIVER,
+    D18_PROCESS_OBSERVER,
     WORKLOAD_SCHEMA,
     WorkloadError,
     _active_loss_serial_through,
@@ -96,6 +98,49 @@ def test_d18_r2_adoption_evidence_requires_sidecar_handoff() -> None:
     )
     assert D18_R2_ADOPTION_RE.findall(log) == [("7", "2")]
     assert not D18_R2_ADOPTION_RE.findall("P51 cache-link setup refused: unavailable\n")
+
+
+def test_d18_process_observer_uses_comm_not_its_script_text() -> None:
+    if not Path("/proc/self/comm").exists():
+        pytest.skip("the D18 process observer inspects Linux /proc")
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import ctypes,time; ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b'cc1plus'), 0, 0, 0); time.sleep(5)",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    observer = None
+    try:
+        deadline = time.monotonic() + 2
+        comm_path = Path(f"/proc/{child.pid}/comm")
+        while time.monotonic() < deadline:
+            if comm_path.exists() and comm_path.read_text().strip() == "cc1plus":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("compiler-named observer fixture did not start")
+
+        observer = subprocess.Popen(
+            ["/bin/bash", "-c", D18_PROCESS_OBSERVER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = observer.communicate(timeout=2)
+        assert observer.returncode == 0, stderr
+        identities = [line.split() for line in stdout.splitlines()]
+        pids = {int(fields[0]) for fields in identities if len(fields) == 2}
+        assert child.pid in pids
+        assert observer.pid not in pids
+    finally:
+        if observer is not None and observer.poll() is None:
+            observer.kill()
+            observer.wait(timeout=2)
+        child.terminate()
+        child.wait(timeout=2)
 
 
 def _farm_scenario_plan(tmp_path: Path):

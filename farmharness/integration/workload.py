@@ -42,6 +42,19 @@ D18_R2_ADOPTION_RE = re.compile(
 IMAGE_GENERATION_RE = re.compile(
     r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE
 )
+D18_PROCESS_OBSERVER = r'''
+for statfile in /proc/[0-9]*/stat
+do
+    pid=${statfile#/proc/}
+    pid=${pid%/stat}
+    IFS= read -r comm <"/proc/$pid/comm" 2>/dev/null || continue
+    test "$comm" = cc1plus || continue
+    IFS= read -r statline <"$statfile" 2>/dev/null || continue
+    rest=${statline##*) }
+    set -- $rest
+    test "$#" -ge 20 || continue
+    printf '%s %s\n' "$pid" "${20}"
+done'''
 
 
 # Values from farm/scenario documents are passed as argv after this fixed
@@ -380,21 +393,6 @@ def _d18_processes(
     factory: CommandFactory,
     transport: RecordingTransport,
 ) -> dict[int, int]:
-    script = r'''
-for statfile in /proc/[0-9]*/stat
-do
-    pid=${statfile#/proc/}
-    pid=${pid%/stat}
-    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-    case "$cmd" in *cc1plus*) ;;
-        *) continue;;
-    esac
-    statline=$(cat "$statfile" 2>/dev/null || true)
-    rest=${statline##*) }
-    set -- $rest
-    test "$#" -ge 20 || continue
-    printf '%s %s\n' "$pid" "${20}"
-done'''
     result = _d18_docker_call(
         farm,
         plan,
@@ -403,7 +401,7 @@ done'''
         transport,
         "observe-cc1plus",
         (
-            "/bin/bash", "-c", script,
+            "/bin/bash", "-c", D18_PROCESS_OBSERVER,
             "d18-observer",
         ),
     )

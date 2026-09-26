@@ -229,6 +229,10 @@ def _validate_d18_role_mix(
     f2 = by_name[workers["R2"]]
     if generations[p43["image"]] != 43:
         raise ScenarioSpecError("$.workload.d18_roles.clients.P43: requires a pinned P43 image")
+    # This authority field describes the image's CacheWire envelope schema
+    # (the current P50 codec is revision 1). R2 selection is a separate
+    # runtime capability: ICECC_P51_MODE=on selects CACHE_WIRE_REVISION_R2.
+    # Do not confuse the two revisions when validating the image metadata.
     for label, instance in (
         ("R1 client", r1), ("R1 worker", f1),
         ("R2 client", r2), ("R2 worker", f2),
@@ -416,7 +420,7 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
         raise ScenarioSpecError(
             "$.workload.d18_roles: required only for d18-role-mix workloads"
         )
-    expected_driver_corpus = "tu-manifest" if is_d18 else corpus["kind"]
+    expected_driver_corpus = "tu-manifest" if is_d18 else workload["driver"]
     if expected_driver_corpus != corpus["kind"]:
         raise ScenarioSpecError(
             "$.workload.driver: does not match the declared corpus kind"

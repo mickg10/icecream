@@ -202,6 +202,14 @@ def test_d18_requires_explicit_c3f2_farm_authority(tmp_path: Path) -> None:
         farmtest.build_plan(loaded_farm, loaded_scenario, run_id="d18-missing-authority")
 
 
+def test_non_d18_driver_must_match_declared_corpus_kind(tmp_path: Path) -> None:
+    farm, scenario = _documents()
+    scenario["workload"]["driver"] = "cmake-project"
+
+    with pytest.raises(ScenarioSpecError, match="driver: does not match"):
+        _load(tmp_path, farm, scenario)
+
+
 def test_missing_scratch_root_is_refused(tmp_path: Path) -> None:
     farm, scenario = _documents()
     del farm["hosts"][0]["scratch_root"]
