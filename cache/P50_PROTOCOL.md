@@ -641,6 +641,18 @@ Login or sidecar launch. ProfileDialogue supplies profile-specific parsing,
 materialization, terminal promotion and bounded state accounting, while the
 endpoint owns routes, reservations and input publication.
 
+On scheduler-session loss, compiler-group cleanup progresses on the daemon's
+ordinary event loop. It must not block delivery of queued input-lifecycle
+requests. The child registry retains exact group identity, signal ownership
+and once-only slot accounting through TERM grace, final KILL and reaping;
+the cleanup snapshot contains identities, not a second copy of ownership.
+Reconnect and new client admission remain blocked until exact settlement.
+A reap timeout retains the records and permits later absence observations,
+not repeated signals or renewed deadlines. Later exact settlement can clear
+that timeout; an accounting or identity fault remains sticky. This compiler
+cleanup is distinct from replacing the cache-service process: session loss
+does not itself require that replacement.
+
 Complete-BODY materialization uses a shared two-worker pool with at most eight
 running-plus-queued jobs. Workers prepare immutable publication nodes; only
 the owner executor can publish after checking current operation, deadline and

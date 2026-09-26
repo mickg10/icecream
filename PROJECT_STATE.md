@@ -48,7 +48,11 @@ gate refactor. Logs under the same directory: `discovery-final-summary.log`
 SHA256 `c750b26f4be91eb29fedcf231e5c3cd636cd86a32dffd7887a6495476d782c15`,
 and `empty-shutdown-final-run2.log`
 SHA256 `e474d8855c9dbb1cebd33538886242b85833c72f4e6b64cb19842938dc4c9223`.
-These are not final-binary reruns or proof of production backoff timing.
+Final-binary reruns also pass: `discovery-commit-summary.log`
+SHA256 `9832b0d77381d39282f82b67d29aa3c935d11b57055ff4e0024306d4c397b30a`,
+and `empty-shutdown-commit.log`
+SHA256 `f3e56299ba3af69af4fab6ab17a14aab8170484b810b287b70e44a1bd6f46187`.
+The latter exits normally in 3 ms. Neither proves production backoff timing.
 Two-group staggered cleanup, admission during grace, broader P43 recovery,
 and the complete W30 matrix remain unqualified. This is not a full-candidate
 regression pass; the reused build's complete source closure is not established.
