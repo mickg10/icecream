@@ -10329,8 +10329,9 @@ void Daemon::queue_p51_source_cancel(
         return;
     }
     try {
+        const auto queued_at = std::chrono::steady_clock::now();
         const auto cleanup_deadline =
-            p51_source_cancel_cleanup_deadline(source_deadline);
+            p51_source_cancel_cleanup_deadline(source_deadline, queued_at);
         if (!cleanup_deadline.has_value()) {
             log_warning() << "cannot queue P51 cancellation with invalid source clock identity"
                           << endl;
@@ -10352,6 +10353,28 @@ void Daemon::queue_p51_source_cancel(
             ready_lease.socket_path, pending->deadline);
         pending->connect->advance();
         pending_p51_source_cancels.push_back(std::move(pending));
+        if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr) {
+            static constexpr char hex_digits[] = "0123456789abcdef";
+            std::string reservation_hex;
+            reservation_hex.reserve(armed.reservation_id.size() * 2);
+            for (const uint8_t byte : armed.reservation_id) {
+                reservation_hex.push_back(hex_digits[byte >> 4]);
+                reservation_hex.push_back(hex_digits[byte & 0x0f]);
+            }
+            const auto& source = arm.source;
+            const auto source_remaining_msec =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    source_deadline.as_steady_time_point() - queued_at).count();
+            trace() << "P51_SOURCE_CANCEL_QUEUED job=" << source.wire_job_id
+                    << " epoch=" << source.assignment_epoch
+                    << " nonce=" << source.assignment_nonce
+                    << " request=" << source.source_request_id
+                    << " reservation=" << reservation_hex
+                    << " source_expired="
+                    << (queued_at >= source_deadline.as_steady_time_point() ? 1 : 0)
+                    << " source_remaining_msec=" << source_remaining_msec
+                    << endl;
+        }
     } catch (...) {
         log_warning() << "cannot queue bounded P51 source-reservation cancellation"
                       << endl;

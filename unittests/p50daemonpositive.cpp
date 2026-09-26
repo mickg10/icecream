@@ -2037,7 +2037,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             ::setenv("ICECC_P50_DEBUG_ATTACH", "1", 1) != 0)
             return 2;
         if (cancel_scenario == P51CancelScenario::AfterSourceDeadline &&
-            ::setenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC", "1200", 1) != 0)
+            ::setenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC", "5000", 1) != 0)
             return 2;
     }
     ::signal(SIGPIPE, SIG_IGN);
@@ -2244,6 +2244,9 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             *victim.wrapper, *victim.compiler, victim.wire_id, epoch,
             victim.nonce, static_cast<uint32_t>(f_port), victim.source_fd,
             profile_mask, &armed, nullptr, nullptr, !retained_committed, &arm);
+        const auto advertised_source_deadline = Clock::now() +
+            std::chrono::milliseconds(armed.source_budget_msec);
+        victim.result = source_result;
         victim.source_fd = -1;
         victim.armed = armed;
         const P51SourceArmMsg arm_message{P51SourceArmFields{arm, 30}};
@@ -2259,18 +2262,18 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
                     ? "committed source is retained before its exact cancellation is attempted"
                     : "source transfer remains unstarted before cancellation");
         if (after_source_deadline)
-            REQUIRE(armed.source_budget_msec >= 1000 &&
-                        armed.source_budget_msec <= 1200,
-                    "expired-source case observes the requested bounded 1200ms F ARM budget");
+            REQUIRE(armed.source_budget_msec >= 4000 &&
+                        armed.source_budget_msec <= 5000,
+                    "expired-source case observes the requested bounded 5000ms F ARM budget");
 
         const pid_t f_sidecar = find_attachment_sidecar(f_pid, cache_service);
         const uint64_t f_sidecar_start_before =
             process_start_time_ticks(f_sidecar);
-        const bool pause_f_sidecar = !retained_committed;
+        const bool pause_f_sidecar = before_publication || after_source_deadline;
         const bool sidecar_stop_sent = pause_f_sidecar && f_sidecar > 1 &&
             ::kill(f_sidecar, SIGSTOP) == 0;
         REQUIRE(!pause_f_sidecar || sidecar_stop_sent,
-                "only the test-owned F sidecar is paused at the prepublication barrier");
+                "only the test-owned F sidecar is paused at the exact cancellation barrier");
         bool sidecar_stopped = false;
         const auto stopped_deadline = Clock::now() + std::chrono::seconds(2);
         while (pause_f_sidecar && f_sidecar > 1 &&
@@ -2293,7 +2296,7 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             }
         } resume_sidecar{f_sidecar, sidecar_stop_sent};
         REQUIRE(!pause_f_sidecar || sidecar_stopped,
-                "F sidecar is stopped before the exact CompileFile attach request");
+                "F sidecar is stopped only for the selected cancellation barrier");
         if (pause_f_sidecar && !sidecar_stopped) {
             if (sidecar_stop_sent) {
                 (void)::kill(f_sidecar, SIGCONT);
@@ -2347,11 +2350,47 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         }
 
         if (after_source_deadline) {
-            const auto expiry_observation = Clock::now() +
-                std::chrono::milliseconds(armed.source_budget_msec + 100);
-            std::this_thread::sleep_until(expiry_observation);
-            REQUIRE(Clock::now() >= expiry_observation,
-                    "original source budget elapses before queueing cleanup");
+            const bool daemon_stop_sent = f_pid > 1 &&
+                ::kill(f_pid, SIGSTOP) == 0;
+            bool daemon_stopped = false;
+            const auto daemon_stopped_deadline =
+                Clock::now() + std::chrono::seconds(2);
+            while (daemon_stop_sent && Clock::now() < daemon_stopped_deadline) {
+                std::ifstream status(std::string("/proc/") +
+                                    std::to_string(f_pid) + "/status");
+                std::string line;
+                while (std::getline(status, line))
+                    if (line.rfind("State:", 0) == 0 &&
+                        line.find('T') != std::string::npos)
+                        daemon_stopped = true;
+                if (daemon_stopped) break;
+                ::usleep(10000);
+            }
+            struct ResumeDaemon {
+                pid_t pid;
+                bool needed;
+                ~ResumeDaemon() {
+                    if (needed && pid > 1) (void)::kill(pid, SIGCONT);
+                }
+            } resume_daemon{f_pid, daemon_stop_sent};
+            REQUIRE(daemon_stopped,
+                    "F daemon is held after WAITP50INPUT before its source deadline");
+            if (daemon_stopped) {
+                std::this_thread::sleep_until(
+                    advertised_source_deadline + std::chrono::milliseconds(100));
+                REQUIRE(Clock::now() > advertised_source_deadline,
+                        "original F source deadline elapses while its owner is held");
+            }
+            // Closing these channels while F is stopped prevents its ordinary
+            // deadline watcher from queueing the cancellation before expiry.
+            delete victim.compiler;
+            victim.compiler = nullptr;
+            delete victim.wrapper;
+            victim.wrapper = nullptr;
+            if (resume_daemon.needed) {
+                (void)::kill(f_pid, SIGCONT);
+                resume_daemon.needed = false;
+            }
         }
         if (before_publication) {
             const auto children_before_cancel = direct_children(f_pid);
@@ -2360,10 +2399,12 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             REQUIRE(sidecar_is_only_child,
                     "no compiler child exists before the prepublication cancel");
         }
-        delete victim.compiler;
-        victim.compiler = nullptr;
-        delete victim.wrapper;
-        victim.wrapper = nullptr;
+        if (!after_source_deadline) {
+            delete victim.wrapper;
+            victim.wrapper = nullptr;
+            delete victim.compiler;
+            victim.compiler = nullptr;
+        }
         if (sidecar_stop_sent) {
             (void)::kill(f_sidecar, SIGCONT);
             resume_sidecar.needed = false;
@@ -2385,6 +2426,20 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             " nonce=" + std::to_string(victim.nonce) +
             " request=" + std::to_string(arm.source_request_id) +
             " reservation=" + hex_id(armed.reservation_id) + " cancelled=";
+        if (after_source_deadline) {
+            const std::string queued_after_expiry =
+                "P51_SOURCE_CANCEL_QUEUED job=" +
+                std::to_string(victim.wire_id) + " epoch=" +
+                std::to_string(epoch) + " nonce=" +
+                std::to_string(victim.nonce) + " request=" +
+                std::to_string(arm.source_request_id) + " reservation=" +
+                hex_id(armed.reservation_id) + " source_expired=1";
+            const bool exact_queue_witness = wait_attachment_log(
+                fdir + "/iceccd.log", cancel_log_offset,
+                queued_after_expiry, 5000);
+            REQUIRE(exact_queue_witness,
+                    "daemon queued exact cancellation after original source deadline");
+        }
         const bool exact_cancel_result_seen = wait_attachment_log(
             fdir + "/iceccd.log", attach_log_offset,
             cancel_result_prefix, 5000);
@@ -2402,14 +2457,15 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
                 "daemon completed one bounded exact cancellation control exchange with the expected disposition");
         const std::string settled_unknown = "P50 input settlement job " +
             std::to_string(victim.wire_id) + " action 1 status unknown-record";
-        const bool attempt_cancelled_before_publication =
-            cancel_log.find(settled_unknown) != std::string::npos;
+        const bool attempt_cancelled_before_publication = before_publication &&
+            wait_attachment_log(fdir + "/iceccd.log", attach_log_offset,
+                                settled_unknown, 5000);
         if (before_publication)
             REQUIRE(attempt_cancelled_before_publication,
                     "exact prepublication InputLifecycle CancelAttempt finds no committed input");
         if (retained_committed)
-            REQUIRE(!attempt_cancelled_before_publication,
-                    "rejected cancellation does not remove the committed input record");
+            REQUIRE(cancel_rejected,
+                    "daemon rejects cancellation after the exact committed transfer");
 
         bool no_victim_child = true;
         if (!retained_committed) {
@@ -2464,29 +2520,39 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         if (c_reaped) daemon_cleanup.c_pid = -1;
         if (f_reaped) daemon_cleanup.f_pid = -1;
         REQUIRE(c_reaped && WIFEXITED(c_status) && WEXITSTATUS(c_status) == 0,
-                "C daemon exits cleanly after the prepublication cancellation");
+                "C daemon exits cleanly after the exact cancellation fixture");
         REQUIRE(f_reaped && WIFEXITED(f_status) && WEXITSTATUS(f_status) == 0,
-                "F daemon exits cleanly after the prepublication cancellation");
+                "F daemon exits cleanly after the exact cancellation fixture");
         delete c_scheduler;
         delete f_scheduler;
         ::close(c_scheduler_listener);
         ::close(f_scheduler_listener);
         if (failures == 0) {
-            std::fprintf(stderr,
-                "P51_D07_PREPUBLICATION_CANCEL_PASS profile=%u job=%u epoch=%llu nonce=%llu request=%llu reservation=%s c_pid=%d c_start=%llu f_pid=%d f_start=%llu f_sidecar_pid=%d f_sidecar_start=%llu no_source_transfer=1 no_compiler_start=1\n",
-                profile_mask, victim.wire_id,
-                static_cast<unsigned long long>(epoch),
-                static_cast<unsigned long long>(victim.nonce),
-                static_cast<unsigned long long>(arm.source_request_id),
-                hex_id(armed.reservation_id).c_str(), c_pid,
-                static_cast<unsigned long long>(c_start_time), f_pid,
-                static_cast<unsigned long long>(f_start_time), f_sidecar,
-                static_cast<unsigned long long>(f_sidecar_start_time));
+            if (retained_committed) {
+                std::fprintf(stderr,
+                    "P51_D07_RETAINED_CANCEL_REJECT_PASS profile=%u job=%u epoch=%llu nonce=%llu request=%llu reservation=%s cancel_accepted=0 source_result=committed byte_preservation=covered_by_service_test\n",
+                    profile_mask, victim.wire_id,
+                    static_cast<unsigned long long>(epoch),
+                    static_cast<unsigned long long>(victim.nonce),
+                    static_cast<unsigned long long>(arm.source_request_id),
+                    hex_id(armed.reservation_id).c_str());
+            } else {
+                std::fprintf(stderr,
+                    "P51_D07_PREPUBLICATION_CANCEL_PASS profile=%u job=%u epoch=%llu nonce=%llu request=%llu reservation=%s c_pid=%d c_start=%llu f_pid=%d f_start=%llu f_sidecar_pid=%d f_sidecar_start=%llu no_source_transfer=1 no_compiler_start=1\n",
+                    profile_mask, victim.wire_id,
+                    static_cast<unsigned long long>(epoch),
+                    static_cast<unsigned long long>(victim.nonce),
+                    static_cast<unsigned long long>(arm.source_request_id),
+                    hex_id(armed.reservation_id).c_str(), c_pid,
+                    static_cast<unsigned long long>(c_start_time), f_pid,
+                    static_cast<unsigned long long>(f_start_time), f_sidecar,
+                    static_cast<unsigned long long>(f_sidecar_start_time));
+            }
             std::filesystem::remove_all(work);
             return 0;
         }
         std::fprintf(stderr,
-            "retained prepublication-cancel work directory: %s\n", work.c_str());
+            "retained exact-cancellation work directory: %s\n", work.c_str());
         return 1;
     }
 
