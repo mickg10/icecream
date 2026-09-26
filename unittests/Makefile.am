@@ -181,6 +181,8 @@ p50readyadvertisement_LDADD = ../cache/libp50sidecar.a
 digest128bench_LDADD = ../services/libicecc.la
 
 check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
+check_PROGRAMS += p50transferwindowbench
+TESTS += p50transferwindowbench
 check_PROGRAMS += s3persistence
 check_PROGRAMS += p50s3realprocess
 p50fsessioncontrol_SOURCES = p50fsessioncontrol.cpp
@@ -307,6 +309,13 @@ p50endpointcancel_LDFLAGS = -pthread
 p50endpointcancel_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50zstdsender_SOURCES = p50_zstd_sender_test.cpp
+p50transferwindowbench_SOURCES = p50_transfer_window_bench.cpp
+p50transferwindowbench_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+p50transferwindowbench_CXXFLAGS = -pthread
+p50transferwindowbench_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+p50transferwindowbench_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
+	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50zstdsender_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50zstdsender_CXXFLAGS = -pthread
 p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread

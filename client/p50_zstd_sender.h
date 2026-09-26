@@ -168,6 +168,11 @@ struct ZstdSourceTransferConfig {
     // Test-only observation after the independent reader validated the exact
     // cumulative receipt, before waking callers or starting ACK output.
     std::function<void(uint64_t)> after_r2_receipt_validated_for_test;
+    // Awaitable regression seam after the receipt reader has made a caller
+    // terminal, but before that caller's final result/ACK path completes.
+    // Production callers leave this empty.
+    std::function<boost::asio::awaitable<void>(PrepareRequestKey)>
+        before_r2_transfer_finalization_for_test;
     // Test-only observation after a distinct R2 caller is parked waiting for
     // completed-ledger capacity; the callback does not affect admission.
     std::function<void(PrepareRequestKey)>

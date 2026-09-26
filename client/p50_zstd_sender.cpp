@@ -208,6 +208,7 @@ struct P50ZstdSourceSender::Impl {
         ClientRunResult client_result{};
         std::optional<bool> system_source_reuse;
         R2WireAccountingKey wire_accounting_key{};
+        std::optional<R2WireAccountingSnapshot> wire_accounting;
         bool wire_accounting_started = false;
         bool wire_accounting_finished = false;
         std::exception_ptr failure;
@@ -456,6 +457,15 @@ struct P50ZstdSourceSender::Impl {
                 r2_completed_slot_reservations.erase(key);
         }
         wake_r2_completed_capacity_waiters();
+    }
+
+    void finish_pending_wire_accounting(PendingReceipt& pending) noexcept {
+        if (!pending.wire_accounting_started ||
+            pending.wire_accounting_finished)
+            return;
+        pending.wire_accounting = wire_completions.finish_r2_job(
+            pending.wire_accounting_key);
+        pending.wire_accounting_finished = true;
     }
 
     void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
@@ -1174,6 +1184,11 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                         pending->sent.prepared);
             if (impl_->authority->contains(pending->sent.prepared))
                 (void)impl_->authority->release(pending->sent.prepared);
+            // Retire job bytes only after the reader matched the exact
+            // receipt to the current generation and retained queue row.
+            // The later window-slot release below is therefore never ahead
+            // of accounting retirement.
+            impl_->finish_pending_wire_accounting(*pending);
             if (pending->replayed_after_reset &&
                 pending->client_result.committed_commit &&
                 pending->client_result.committed_input) {
@@ -1186,9 +1201,11 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                 completed.raw_digest = pending->sent.binding.raw_digest;
                 completed.attempts = 1;
                 completed.system_source_reuse = pending->system_source_reuse;
-                if (pending->wire_accounting_started)
+                if (pending->wire_accounting_started) {
+                    completed.r2_wire_accounting = pending->wire_accounting;
                     completed.r2_wire_accounting_key =
                         pending->wire_accounting_key;
+                }
                 impl_->remember_completed_witness(
                     pending->request, completed.raw_bytes,
                     completed.raw_digest, completed);
@@ -1209,6 +1226,11 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                 impl_->r2_receipt_queue.empty() ||
                 impl_->r2_receipt_queue.front() != pending)
                 co_return;
+            // Retire per-job wire accounting before returning this exact
+            // receipt's K-window slot to another caller. Receipt bytes and
+            // bundle writes are complete here; later ACK/control bytes remain
+            // link-interval accounting, not part of this job row.
+            impl_->finish_pending_wire_accounting(*pending);
             impl_->r2_retained_jobs.erase(
                 pending->sent.binding.relationship_ordinal);
             impl_->r2_pending_ack_ordinal = std::max(
@@ -1574,28 +1596,32 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
                 receipt.relationship_ordinal ||
             !exact_commit_matches(receipt.inner, pending->sent.begin.inner))
           throw std::logic_error("recovery receipt lost its source witness");
-        ZstdSourceTransferResult result;
-        result.status = ZstdSourceTransferStatus::Committed;
-        result.profile = pending->sent.binding.profile;
-        result.raw_bytes = pending->sent.binding.raw_bytes;
-        result.raw_digest = pending->sent.binding.raw_digest;
-        result.committed_input =
-            InputRecordKey{impl_->c_guid, receipt.inner.tu_seq};
-        result.attempts = 1;
-        if (result.profile == ProfileId::P29V1)
-          result.system_source_reuse =
+        if (pending->sent.binding.profile == ProfileId::P29V1)
+          pending->system_source_reuse =
               impl_->authority->p29v1_system_source_reuse(
                   pending->sent.prepared);
-        if (pending->wire_accounting_started)
-          result.r2_wire_accounting_key = pending->wire_accounting_key;
+        impl_->finish_pending_wire_accounting(*pending);
+        ZstdSourceTransferResult completed;
+        completed.status = ZstdSourceTransferStatus::Committed;
+        completed.profile = pending->sent.binding.profile;
+        completed.raw_bytes = pending->sent.binding.raw_bytes;
+        completed.raw_digest = pending->sent.binding.raw_digest;
+        completed.committed_input =
+            InputRecordKey{impl_->c_guid, receipt.inner.tu_seq};
+        completed.attempts = 1;
+        completed.system_source_reuse = pending->system_source_reuse;
+        if (pending->wire_accounting_started) {
+          completed.r2_wire_accounting = pending->wire_accounting;
+          completed.r2_wire_accounting_key = pending->wire_accounting_key;
+        }
         impl_->authority->release(pending->sent.prepared);
-        impl_->remember_completed_witness(pending->request, result.raw_bytes,
-                                          result.raw_digest, result);
+        impl_->remember_completed_witness(pending->request, completed.raw_bytes,
+                                          completed.raw_digest, completed);
         pending->client_result.status = ClientRunStatus::Committed;
         pending->client_result.observation =
             ClientRunObservation::ExactCommitObserved;
         pending->client_result.committed_commit = receipt.inner;
-        pending->client_result.committed_input = result.committed_input;
+        pending->client_result.committed_input = completed.committed_input;
         pending->failure = nullptr;
         pending->replayed_after_reset = true;
         pending->done = true;
@@ -1670,6 +1696,11 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
 
       // All allocating sender-side reconstruction work is complete before the
       // authority changes its retained route ledger.
+      // F's exact RESET disposition has retired these unavailable rows from
+      // the relationship. Retire their per-job accounting before the sender
+      // drops their retained-window reservations and wakes successors.
+      for (const auto &pending : unavailable_pending)
+        impl_->finish_pending_wire_accounting(*pending);
       impl_->authority->reset_r2_route_for_recovery(
           impl_->route, recovered.link_state.f_store_guid,
           recovered.link_state.history_nonce, unavailable_handles);
@@ -2260,10 +2291,13 @@ P50ZstdSourceSender::transfer_p51_route(
     uint64_t observed_failure_generation = 0;
     struct WireAccountingRetirement {
         CompletionLog* log = nullptr;
+        std::weak_ptr<Impl::PendingReceipt> pending;
         R2WireAccountingKey key{};
         bool active = false;
         ~WireAccountingRetirement() noexcept {
-            if (active && log) {
+            const auto row = pending.lock();
+            if (active && log &&
+                (!row || !row->wire_accounting_finished)) {
                 (void)log->finish_r2_job(key);
                 log->mark_r2_accounting_unavailable();
             }
@@ -2272,14 +2306,18 @@ P50ZstdSourceSender::transfer_p51_route(
     auto finish_wire_accounting = [this, &wire_accounting_retirement](
         ZstdSourceTransferResult result,
         const std::shared_ptr<Impl::PendingReceipt>& row) {
-        if (row && row->wire_accounting_started &&
-            !row->wire_accounting_finished) {
-            result.r2_wire_accounting =
-                impl_->wire_completions.finish_r2_job(
-                    row->wire_accounting_key);
-            result.r2_wire_accounting_key = row->wire_accounting_key;
-            row->wire_accounting_finished = true;
-            wire_accounting_retirement.active = false;
+        if (row) {
+            if (row->wire_accounting_started) {
+                impl_->finish_pending_wire_accounting(*row);
+                result.r2_wire_accounting = row->wire_accounting;
+                result.r2_wire_accounting_key = row->wire_accounting_key;
+                wire_accounting_retirement.active = false;
+            }
+            if (result.status == ZstdSourceTransferStatus::Committed &&
+                !row->replayed_after_reset) {
+                impl_->remember_completed_witness(
+                    row->request, result.raw_bytes, result.raw_digest, result);
+            }
         }
         impl_->collect_r2_link_intervals(result);
         return result;
@@ -2369,6 +2407,7 @@ P50ZstdSourceSender::transfer_p51_route(
             throw std::overflow_error("R2 relationship ordinal space exhausted");
         binding.relationship_ordinal = impl_->r2_relationship_ordinal;
         pending = std::make_shared<Impl::PendingReceipt>(executor);
+        wire_accounting_retirement.pending = pending;
         pending->armed = armed;
         pending->deadline = deadline;
         pending->request = request;
@@ -2380,8 +2419,15 @@ P50ZstdSourceSender::transfer_p51_route(
         pending->wire_accounting_started =
             impl_->wire_completions.r2_accounting_enabled();
         if (pending->wire_accounting_started) {
-            (void)impl_->wire_completions.begin_r2_job(
-                pending->wire_accounting_key);
+            const bool accounting_registered =
+                impl_->wire_completions.begin_r2_job(
+                    pending->wire_accounting_key);
+            if (!accounting_registered) {
+                impl_->wire_completions.mark_r2_accounting_unavailable();
+                pending->wire_accounting =
+                    R2WireAccountingSnapshot{0, 0, 0, 0, false};
+                pending->wire_accounting_finished = true;
+            }
             wire_accounting_retirement.log = &impl_->wire_completions;
             wire_accounting_retirement.key = pending->wire_accounting_key;
             wire_accounting_retirement.active = true;
@@ -2464,6 +2510,9 @@ P50ZstdSourceSender::transfer_p51_route(
                   throw boost::system::system_error(boost::asio::error::timed_out);
           }
       }
+      if (impl_->config.before_r2_transfer_finalization_for_test)
+          co_await impl_->config.before_r2_transfer_finalization_for_test(
+              request);
       std::exception_ptr observed_failure;
       bool unavailable_by_reset = false;
       {
@@ -2563,8 +2612,6 @@ P50ZstdSourceSender::transfer_p51_route(
             ? terminal_rejection : impl_->current_r2_route_rejection();
         if (pending->wire_accounting_started)
             result.r2_wire_accounting_key = pending->wire_accounting_key;
-        if (!pending->replayed_after_reset)
-            impl_->remember_completed(request, source, raw_digest, result);
         co_return finish_wire_accounting(std::move(result), pending);
     } catch (...) {
         const std::exception_ptr transfer_failure = std::current_exception();
@@ -2692,8 +2739,6 @@ P50ZstdSourceSender::transfer_p51_route(
             ? terminal_rejection : impl_->current_r2_route_rejection();
         if (pending->wire_accounting_started)
             result.r2_wire_accounting_key = pending->wire_accounting_key;
-        if (!pending->replayed_after_reset)
-            impl_->remember_completed(request, source, raw_digest, result);
         co_return finish_wire_accounting(std::move(result), pending);
     }
 
