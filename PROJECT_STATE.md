@@ -114,9 +114,17 @@ binary SHA256 `b8db791717f9ffc0b67a73cc7b7f8d606f0887461fadee91a8e9ae345eb3808b`
 Earlier attempts exposed fixture cleanup that could leave a worker held on
 assertion failure and an invalid comparison of logical ordinal with the
 separate codec sequence number. Both were corrected without extending the
-original transfer deadlines. Full registered-suite regression remains pending;
-partial-byte and already-committed 31-request cancellation are not covered by
-this result.
+original transfer deadlines. With diagnostic-only cleanup `51cd38fb`, the full
+registered `p50cacheservice` suite also passes (test-driver PASS, `.trs` PASS,
+runner exit 0), including all nine full-bundle cases. Log:
+`/tanksmall/scratch/tmp/p51-d07-full31-923924bb-build/unittests/p50cacheservice.log`,
+SHA256 `32eb8e8d297b7bce3797c5b9af9395cefeb2818b4220c20ec60c491a4c547736`.
+Exit and copied `.trs` are retained under
+`/tanksmall/scratch/tmp/p51-d07-full31-suite-logs/` as
+`p50cacheservice-registered.exit` and `p50cacheservice-registered.trs`.
+This suite used `47bfeb64` plus that diagnostic cleanup, not the later capacity
+bootstrap target changes. Partial-byte and already-committed 31-request
+cancellation are not covered by this result.
 
 ### Source admission pressure
 
