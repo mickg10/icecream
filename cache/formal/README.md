@@ -251,7 +251,8 @@ Run both pipeline-level bounded lanes together with
 `TLC_STATE_ROOT`). This target is intentionally separate from the much larger
 `make protocol50-formal` aggregate.
 
-W30 uses a second, intentionally accounting-only model: it checks the cursor
+The checked-in `Protocol50PipelineWindowAccounting.tla` is an intentionally
+accounting-only model: it checks the cursor
 and symbolic raw/encoded/receipt/speculative-journal caps at `W=30`. Its fixed
 per-slot byte quantities are explicit assumptions, not measured codec output
 or actual dictionary snapshots; history accounting represents metadata for
@@ -262,6 +263,23 @@ particular, it does not qualify a product W2/W30 pipeline or prove production
 memory sizes. The profiles P29V1, ZSTD_TU and ZSTD_ROUTE share the abstract
 ordered-commit skeleton here; codec correctness remains with their own models
 and tests.
+
+The optional `run_pipeline_window_sweep_tlc.sh` checks the same ordered-pipeline
+model at W3 in all six C1F2/3/4 and C2/3/4F1 topologies, with a third finite job
+per relationship enabled, and runs W4/W8/W16/W30 in the accounting projection.
+Each W3 topology has a separate full-window reachability witness; accounting
+windows likewise require a trace reaching the configured outstanding bound.
+This parameterization does not add codec, deadline, cancellation, recovery or
+multi-link transitions to the accounting-only W4/W8/W16/W30 projection. The
+W3 model remains finite (at most three named jobs per relationship), and its
+TLC runs are bounded state-space checks, not an unbounded proof. Existing
+W2 recovery mutants cover missing earlier receipts, sequence/cancel holes,
+stale worker publication, double credit release and ACK beyond K. The pipeline
+model still has no negative-control mutant that deliberately permits RESET
+before pending-worker fencing; its normal `RequestReset` guard excludes that
+ordering. The formal lanes are safety/reachability checks, not fairness-based
+liveness proofs; liveness claims would need explicit peer-response and
+scheduler fairness assumptions.
 
 The boundaries are:
 

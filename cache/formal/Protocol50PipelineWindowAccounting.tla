@@ -2,7 +2,7 @@
 EXTENDS Naturals, TLC
 
 (***************************************************************************
-Accounting-only W30 reachability model.  StageSendOne deliberately abstracts
+Accounting-only bounded-window reachability model.  StageSendOne deliberately abstracts
 the per-job and codec transitions modeled at W2: it represents one complete,
 ordered source bundle entering the bounded speculative window.  It does not
 model P29/ZSTD transforms or prove a W30 codec/worker implementation.
@@ -15,7 +15,9 @@ slot: the proposed design keeps one working codec state and replays retained
 raw suffix bytes after confirmed reset. Per-slot byte sizes are assumptions,
 not measured codec
 output sizes.  The model exists to check cursor arithmetic and cap accounting
-at W30, not the C++ representation.
+for the configured window, not the C++ representation. The checked-in W30
+configuration is retained; W4/W8/W16 configurations exercise the same
+parameterized transition system at smaller bounds.
 ***************************************************************************)
 
 CONSTANTS Window,
@@ -24,7 +26,7 @@ CONSTANTS Window,
           ReceiptBytesPerInput, MaxReceiptBytes,
           JournalBytesPerSpecSlot, MaxJournalBytes
 
-ASSUME /\ Window = 30
+ASSUME /\ Window \in Nat \ {0}
        /\ RawBytesPerJob \in Nat \ {0}
        /\ MaxRawBytes \in Nat \ {0}
        /\ EncodedBytesPerBundle \in Nat \ {0}
