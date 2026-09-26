@@ -26,6 +26,41 @@ Retained log `/tanksmall/scratch/tmp/p51-capture-observer-tests/test.log`, SHA25
 This corrects an observer failure that masked retries in the private C1F2
 W30 gate; it does not itself qualify that recovery scenario or full QA.
 
+### Scoped two-worker W30 recovery
+
+The local C1F2 gate passes P29V1 and ZSTD_TU with the rebuilt capture-safe
+client. It holds exactly 30 decoded A receipts after one active committed
+compiler, stops A and closes only A's scheduler connection, and verifies an
+exact B output with B's socket/store unchanged while A remains stopped.
+After A resumes, its old group settles before readmission. All 30 held
+callers and the active victim succeed with fresh assignment identities and
+byte-identical independent local objects; a separate fresh A probe also passes.
+This is scoped F-A session loss with an injected reconnect hold, not an
+ordinary-loss latency result or the complete restart matrix. ZSTD_ROUTE is
+still running. Earlier capture-failing C1F2 pass markers are not qualification.
+
+Select `ICECC_P50_SUITE=C1F2/31` and `ICECC_P50_C1F2_F_LOSS_W30=1` in
+`unittests/p50compilee2e-run.sh`, with its 31-input batch manifest, WARM=0 and
+PASSES=1. Use an isolated local container with NET_ADMIN, SYS_PTRACE, `ss`,
+and distinct daemon/sidecar and wrapper accounts. The test closes only the
+validated owned scheduler socket. It is not an external-farm test.
+
+Logs under `/tanksmall/scratch/tmp/p51-d07-compile.YLS0NG/tmp`:
+
+- `c1f2-current-P29V1-r2.log`: `cd969fcd934a3e6b63a8f58cc5687d5dd2d7f65bca6116f1da9d69a49d4fc0af`
+- `c1f2-current-ZSTD_TU.log`: `cc12c0b8716bdcca08afc94f38833b789b4524a3ea72886aeb2a2824e1a43e16`
+
+Both executed runner SHA256
+`93edd4b0fe2e4245926cce1c627c3fce1a95e41566e0326965867a313bc4f048`,
+client `c50e5d67c267ecff4e1e057939913a95e92760c0724ebbb2cfa1e84aa1ce646c`,
+and daemon `85da3cf6261cf830852861181f8ecea582f2864df6c94a76d803c32238754069`.
+Imported runner `567a68d02a8d808de52d6180fdd88f11802c251e5b1ab0b54712ab7524bb655b`
+only tightens the unobserved active-failure branch and factors the exact
+Error24 classifier, with a passing Error11-negative fixture. Fixture log
+`/tanksmall/scratch/tmp/p51-capture-observer-tests/w30-terminal-classifier-test.log`
+has SHA256 `fc5567af25f59b94eccc415ab3ddccde211be71995ead3d95b42bf42c0addaca`.
+This evidence does not establish a complete current-candidate build closure.
+
 ### Active compiler loss and fresh-job recovery
 
 The opt-in local wrapper gate

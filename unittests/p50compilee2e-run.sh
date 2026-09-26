@@ -29,6 +29,79 @@ real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
 worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
 expect_stable_f=${ICECC_P50_C1F1_EXPECT_STABLE_F:-0}
+w30_f_loss=${ICECC_P50_C1F2_F_LOSS_W30:-0}
+c1f2_baseline=${ICECC_P50_C1F2_BASELINE:-0}
+w30_successful_assignment() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import pathlib, re, sys
+
+path, job, expected_service, after_line = sys.argv[1:]
+after_line = int(after_line)
+lines = pathlib.Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+begin_re = re.compile(r"(?:^|\s)BEGIN:?\s+" + re.escape(job) + r"(?:\s|$)")
+end_re = re.compile(r"(?:^|\s)END\s+" + re.escape(job) + r"\s+status=0(?:\s|$)")
+begin_line = None
+for index, line in enumerate(lines, 1):
+    if begin_re.search(line) and f"server={expected_service}" in line:
+        begin_line = index
+if begin_line is None or begin_line <= after_line:
+    raise SystemExit(1)
+for index, line in enumerate(lines[begin_line:], begin_line + 1):
+    if end_re.search(line) and f"server={expected_service}" in line:
+        print(f"{begin_line} {index} {expected_service}")
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+w30_typed_predecessor_terminal() {
+    client_log=$1
+    retry_count=$(grep -F -c \
+        'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+        "$client_log" 2>/dev/null || true)
+    test "$retry_count" -eq 1 && \
+        grep -Fq 'got exception Error 24 - local daemon did not settle P50 retry predecessor' "$client_log" && \
+        grep -Fq 'remote-only policy refuses client-error fallback' "$client_log"
+}
+if test "${ICECC_P50_C1F2_W30_PARSER_SELFTEST:-0}" = 1; then
+    fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50-w30-parser.XXXXXX")
+    trap 'rm -rf "$fixture_dir"' EXIT HUP INT TERM
+    printf '%s\n' \
+        '001 login p50-f-a protocol version: 50' \
+        '002 BEGIN: 501 client=x server=p50-f-a (old pre-login assignment)' \
+        '003 END 501 status=0 server=p50-f-a' >"$fixture_dir/scheduler.log"
+    if w30_successful_assignment "$fixture_dir/scheduler.log" 501 p50-f-a 2 >/dev/null 2>&1; then
+        echo "FAIL: W30 assignment parser accepted a pre-login A assignment" >&2
+        exit 1
+    fi
+    printf '%s\n' \
+        '001 old scheduler entry' \
+        '002 login p50-f-a protocol version: 50' \
+        '003 BEGIN: 502 client=x server=p50-f-a (fresh assignment)' \
+        '004 END 502 status=0 server=p50-f-a' >"$fixture_dir/scheduler.log"
+    fixture_result=$(w30_successful_assignment "$fixture_dir/scheduler.log" 502 p50-f-a 2)
+    test "$fixture_result" = '3 4 p50-f-a' || {
+        echo "FAIL: W30 assignment parser rejected a fresh successful A assignment" >&2
+        exit 1
+    }
+    printf '%s\n' \
+        'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+        'got exception Error 24 - local daemon did not settle P50 retry predecessor' \
+        'remote-only policy refuses client-error fallback' >"$fixture_dir/client.log"
+    w30_typed_predecessor_terminal "$fixture_dir/client.log" || {
+        echo "FAIL: exact W30 Error24 terminal fixture was rejected" >&2
+        exit 1
+    }
+    printf '%s\n' \
+        'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+        'got exception Error 11 - unable to retain configured preprocessed input' \
+        'remote-only policy refuses client-error fallback' >"$fixture_dir/client.log"
+    if w30_typed_predecessor_terminal "$fixture_dir/client.log"; then
+        echo "FAIL: W30 terminal classifier accepted observer Error11" >&2
+        exit 1
+    fi
+    echo "S8_C1F2_W30_ASSIGNMENT_PARSER_FIXTURES prelogin_rejected=1 fresh_begin_end_accepted=1 fixtures_only=1"
+    exit 0
+fi
 staggered_quiescence=${ICECC_P50_C1F1_TEST_STAGGERED_QUIESCENCE:-0}
 case "$external_mode" in
     0|1) ;;
@@ -78,6 +151,37 @@ if test "$expect_stable_f" = 1 && test "$worker_session_loss" != 1; then
     echo "FAIL: stable-F expectation requires the worker-session-loss scenario" >&2
     exit 1
 fi
+case "$w30_f_loss" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F2_F_LOSS_W30 must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$c1f2_baseline" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F2_BASELINE must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$w30_f_loss" = 1; then
+    if test "$worker_session_loss" = 1 || test "$real_scheduler_restart_w30" = 1 || \
+            test "$real_scheduler_f_restart_w30" = 1 || test "$external_mode" != 0 || \
+            test "$warm" != 0 || test "$passes" != 1; then
+        echo "FAIL: C1F2 F-loss W30 requires local cache-enabled P51, WARM=0, PASSES=1 and no other loss mode" >&2
+        exit 1
+    fi
+fi
+if { test "$w30_f_loss" = 1 && test "$suite" != C1F2/31; } || \
+        { test "$suite" = C1F2/31 && test "$w30_f_loss" != 1; }; then
+    echo "FAIL: C1F2/31 requires ICECC_P50_C1F2_F_LOSS_W30=1" >&2
+    exit 1
+fi
+if { test "$c1f2_baseline" = 1 && test "$suite" != C1F2/2; } || \
+        { test "$suite" = C1F2/2 && test "$c1f2_baseline" != 1; }; then
+    echo "FAIL: C1F2/2 requires ICECC_P50_C1F2_BASELINE=1" >&2
+    exit 1
+fi
+if test "$c1f2_baseline" = 1 && { test "$worker_session_loss" = 1 || \
+        test "$real_scheduler_restart_w30" = 1 || test "$real_scheduler_f_restart_w30" = 1; }; then
+    echo "FAIL: C1F2 baseline cannot be combined with a loss mode" >&2
+    exit 1
+fi
 if test "$worker_session_loss" = 1; then
     if test "$real_scheduler_restart_w30" = 1 || \
             test "$real_scheduler_f_restart_w30" = 1; then
@@ -91,7 +195,19 @@ fi
 case "$suite" in
     C1F1/100000) relationship_count=1; slots_per_f=1; execution_slots=1 ;;
     C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40 ;;
-    *) echo "FAIL: ICECC_P50_SUITE must be C1F1/100000 or C1F20/40" >&2; exit 1 ;;
+    C1F2/31)
+        test "$w30_f_loss" = 1 || {
+            echo "FAIL: C1F2/31 is reserved for ICECC_P50_C1F2_F_LOSS_W30=1" >&2
+            exit 1
+        }
+        relationship_count=2; slots_per_f=31; execution_slots=32 ;;
+    C1F2/2)
+        test "$c1f2_baseline" = 1 || {
+            echo "FAIL: C1F2/2 is reserved for ICECC_P50_C1F2_BASELINE=1" >&2
+            exit 1
+        }
+        relationship_count=2; slots_per_f=1; execution_slots=2 ;;
+    *) echo "FAIL: ICECC_P50_SUITE must be C1F1/100000, C1F20/40, focused C1F2/31, or C1F2/2 baseline" >&2; exit 1 ;;
 esac
 if test "$suite" = C1F20/40 && test -z "$topology"; then
     echo "FAIL: C1F20/40 requires an authenticated topology" >&2
@@ -111,6 +227,11 @@ case "$profile_marker" in
         exit 1
         ;;
 esac
+if test "$c1f2_baseline" = 1 && { test "$w30_f_loss" = 1 || test "$external_mode" != 0 || \
+        test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1; }; then
+    echo "FAIL: C1F2 baseline requires local cache-enabled P51 and cannot combine with W30/loss modes" >&2
+    exit 1
+fi
 if test "$s2_process_loss" = 1; then
     if test "$external_mode" != 1 || test "$suite" != C1F1/100000 || \
             test "$cache_enabled" -ne 1; then
@@ -162,6 +283,14 @@ if test "$real_scheduler_restart_w30" = 1; then
     worker_maxjobs=$((slots_per_f + 1))
     echo "S8_REAL_SCHEDULER_DISPATCH_CREDIT worker_maxjobs=$worker_maxjobs receipt_window=$slots_per_f"
 fi
+if test "$w30_f_loss" = 1; then
+    test "$cache_enabled" -eq 1 || {
+        echo "FAIL: C1F2 F-loss W30 requires cache-enabled P51" >&2
+        exit 1
+    }
+    worker_maxjobs=32
+    export ICECC_TESTS=1 ICECC_P50_DEBUG_ATTACH=1
+fi
 if test "$worker_session_loss" = 1; then
     # This is test-only child identity evidence; it does not alter the daemon's
     # compile/retry behavior.  The matching marker is emitted after PGID
@@ -205,13 +334,13 @@ if test "$cache_enabled" -eq 1 && test ! -x "$build/cache/icecc-cache-service"; 
     echo "SKIP: missing built executable $build/cache/icecc-cache-service" >&2
     exit 77
 fi
-if test "$real_scheduler_restart_w30" = 1; then
+if test "$real_scheduler_restart_w30" = 1 || test "$w30_f_loss" = 1; then
     test -x "$build/unittests/p50daemonpositive" || {
         echo "SKIP: missing built P51 receipt-gate helper $build/unittests/p50daemonpositive" >&2
         exit 77
     }
     test -n "${ICECC_TEST_DAEMON_UID:-}" || {
-        echo "FAIL: real scheduler W30 gate requires ICECC_TEST_DAEMON_UID account" >&2
+        echo "FAIL: real scheduler/worker W30 gate requires ICECC_TEST_DAEMON_UID account" >&2
         exit 1
     }
     daemon_passwd_entry=$(getent passwd "$ICECC_TEST_DAEMON_UID" || true)
@@ -222,7 +351,24 @@ if test "$real_scheduler_restart_w30" = 1; then
     daemon_account=$(printf '%s\n' "$daemon_passwd_entry" | cut -d: -f1)
     daemon_uid=$(printf '%s\n' "$daemon_passwd_entry" | cut -d: -f3)
     test -n "$daemon_account" && test "$daemon_uid" -gt 0 || {
-        echo "FAIL: real scheduler W30 gate requires a non-root daemon account" >&2
+        echo "FAIL: real scheduler/worker W30 gate requires a non-root daemon account" >&2
+        exit 1
+    }
+fi
+if test "$w30_f_loss" = 1; then
+    test -n "${ICECC_TEST_WRAPPER_USER:-}" || {
+        echo "FAIL: C1F2 W30 requires a separate ICECC_TEST_WRAPPER_USER to scope the sidecar-UID receipt proxy" >&2
+        exit 1
+    }
+    wrapper_passwd_entry=$(getent passwd "$ICECC_TEST_WRAPPER_USER" || true)
+    wrapper_uid=$(printf '%s\n' "$wrapper_passwd_entry" | cut -d: -f3)
+    test -n "$wrapper_passwd_entry" && test "$wrapper_uid" -gt 0 && \
+            test "$wrapper_uid" -ne "$daemon_uid" || {
+        echo "FAIL: C1F2 wrapper client identity must be a valid non-root UID distinct from the cache-sidecar UID" >&2
+        exit 1
+    }
+    command -v runuser >/dev/null 2>&1 || {
+        echo "FAIL: C1F2 W30 separate wrapper identity requires runuser" >&2
         exit 1
     }
 fi
@@ -304,6 +450,21 @@ if test "$external_mode" = 1; then
         "$ICECC_P50_EXTERNAL_AUTHORITY_SHA256" "$ICECC_P50_EXTERNAL_START_UTC"
 fi
 cleanup() {
+    if test -n "${w30_frozen_worker_pid:-}"; then
+        kill -CONT "$w30_frozen_worker_pid" 2>/dev/null || :
+    fi
+    if test -n "${w30_receipt_gate_dir:-}"; then
+        : >"$w30_receipt_gate_dir/abort" 2>/dev/null || :
+    fi
+    if test -n "${w30_victim_pgid:-}"; then
+        /bin/kill -CONT -- "-$w30_victim_pgid" 2>/dev/null || :
+        /bin/kill -TERM -- "-$w30_victim_pgid" 2>/dev/null || :
+        for _ in $(seq 1 50); do
+            /bin/kill -0 -- "-$w30_victim_pgid" 2>/dev/null || break
+            sleep 0.1
+        done
+        /bin/kill -KILL -- "-$w30_victim_pgid" 2>/dev/null || :
+    fi
     # Batch wrappers own their compiler child and remove their planned-lane
     # marker from an EXIT trap.  Stop them before the daemons so an interrupted
     # parallel batch cannot strand a compiler or a lane lease.
@@ -335,7 +496,7 @@ cleanup() {
         wait "$receipt_gate_pid" 2>/dev/null || :
         receipt_gate_pid=
     fi
-    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${s2_compile_pid:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${w30_active_wrapper_pid:-} ${s2_compile_pid:-} ${service_pid:-} ${service_b_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
     for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
@@ -373,6 +534,11 @@ if test "$cache_enabled" -eq 1 && test "$suite" = C1F20/40; then
         mkdir -p "$work/envs-f-$relationship"
         mkdir -p "$work/cache-runtime-f-$relationship"
     done
+elif test "$cache_enabled" -eq 1 && { test "$suite" = C1F2/31 || test "$suite" = C1F2/2; }; then
+    for relationship in 0 1; do
+        mkdir -p "$work/envs-f-$relationship"
+        mkdir -p "$work/cache-runtime-f-$relationship"
+    done
 elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         mkdir -p "$work/envs-f-$relationship"
@@ -380,12 +546,23 @@ elif test "$suite" = C1F20/40; then
 fi
 chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
+if test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+    # Keep the client identity distinct from the authenticated cache sidecar
+    # UID so the receipt-gate OUTPUT owner match cannot capture an ordinary
+    # compiler connection.  The client only needs these explicit file sinks.
+    chmod 0777 "$work/out"
+fi
 if test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         chmod 1777 "$work/envs-f-$relationship"
         if test "$cache_enabled" -eq 1; then
             chmod 0700 "$work/cache-runtime-f-$relationship"
         fi
+    done
+elif test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+    for relationship in 0 1; do
+        chmod 1777 "$work/envs-f-$relationship"
+        chmod 0700 "$work/cache-runtime-f-$relationship"
     done
 fi
 HOME="$work/home"
@@ -428,6 +605,8 @@ for offset in range(0, 10000, 2):
         ports = (base, base + 1, base + 2)
         if suite == "C1F20/40":
             ports += tuple(base + 3 + 2 * relationship for relationship in range(20))
+        elif suite in ("C1F2/31", "C1F2/2"):
+            ports += (base + 3, base + 4)
         else:
             ports += (base + 3,)
         for port in ports:
@@ -625,6 +804,19 @@ PY
         echo "FAIL: batch manifest count does not match selected depth" >&2
         exit 1
     }
+    if test "$w30_f_loss" = 1; then
+        test "$batch_expected_count" -eq 31 || {
+            echo "FAIL: C1F2 F-loss W30 requires exactly 31 distinct inputs" >&2
+            exit 1
+        }
+        sed -n '1,30p' "$work/batch.tsv" >"$work/batch-f-a.tsv"
+        sed -n '31p' "$work/batch.tsv" >"$work/batch-f-b.tsv"
+        test "$(wc -l <"$work/batch-f-a.tsv")" -eq 30 && \
+                test "$(wc -l <"$work/batch-f-b.tsv")" -eq 1 || {
+            echo "FAIL: C1F2 F-loss W30 partition is not 30 A transactions + 1 B probe" >&2
+            exit 1
+        }
+    fi
     if test "$real_scheduler_restart_w30" = 1 || test "$worker_session_loss" = 1; then
         if test "$worker_session_loss" = 1; then
             expected_loss_rows=2
@@ -902,7 +1094,41 @@ kill -0 "$sched_pid" 2>/dev/null || {
 # relationship for every source-stage request.  No fake peer is introduced.
 worker_pids=""
 service_pids=""
-if test "$suite" = C1F20/40; then
+if test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+    for relationship in 0 1; do
+        worker_port=$((port_worker + relationship))
+        worker_name=p50-f-a
+        worker_log="$work/f.log"
+        worker_maxjobs_a=$worker_maxjobs
+        if test "$c1f2_baseline" = 1; then worker_maxjobs_a=2; fi
+        f_trace="$f_action_trace"
+        f_wire_trace="$f_legacy_wire_trace"
+        if test "$relationship" -eq 1; then
+            worker_name=p50-f-b
+            worker_log="$work/f-b.log"
+            worker_maxjobs_a=2
+            f_trace="$work/f-b-action-trace.jsonl"
+            f_wire_trace="$work/f-b-legacy-wire-trace.jsonl"
+        fi
+        ready_trace="$work/ready-f.trace"
+        test "$relationship" -eq 1 && ready_trace="$work/ready-f-b.trace"
+        ICECC_TEST_SOCKET="$work/worker-$relationship.sock" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_P50_C_ACTION_TRACE="$f_trace" ICECC_P50_F_ACTION_TRACE="$f_trace" \
+            ICECC_P50_TEST_READY_TRACE="$ready_trace" \
+            ICECC_P50_F_LEGACY_WIRE_TRACE="$f_wire_trace" \
+            ICECC_P50_RELATIONSHIP="$relationship" \
+            "$build/daemon/iceccd" "$@" -p "$worker_port" -m "$worker_maxjobs_a" \
+            -s "$worker_scheduler_host:$port_sched" -n "$network" -N "$worker_name" \
+            -b "$work/envs-f-$relationship" -l "$worker_log" -vvv \
+            --cache-service "$build/cache/icecc-cache-service" \
+            --cache-runtime-dir "$work/cache-runtime-f-$relationship" \
+            2>"$work/f-$relationship-daemon-startup.stderr" &
+        worker_pid=$!
+        worker_pids="$worker_pids $worker_pid"
+    done
+    worker_pid=$(printf '%s\n' "$worker_pids" | awk '{print $1}')
+    worker_b_pid=$(printf '%s\n' "$worker_pids" | awk '{print $2}')
+elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         worker_port=$((port_worker + relationship * 2))
         test "$worker_port" -lt 60000 || { echo "FAIL: worker port range exhausted" >&2; exit 1; }
@@ -984,6 +1210,8 @@ for _ in $(seq 1 30); do
     logins=$(grep -c login "$work/scheduler.log" 2>/dev/null || true)
     if test "$suite" = C1F20/40; then
         test "${logins:-0}" -ge 21 && break
+    elif test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+        test "${logins:-0}" -ge 3 && break
     else
         test "${logins:-0}" -ge 2 && break
     fi
@@ -991,6 +1219,7 @@ for _ in $(seq 1 30); do
 done
 required_logins=2
 test "$suite" = C1F20/40 && required_logins=21
+if test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then required_logins=3; fi
 test "${logins:-0}" -ge "$required_logins" || {
     echo "FAIL: real C1F1 daemons did not register" >&2
     exit 1
@@ -1008,6 +1237,16 @@ if test "$suite" = C1F20/40; then
             exit 1
         }
     done
+elif test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+    for relationship in 0 1; do
+        worker_log="$work/f.log"
+        if test "$relationship" -eq 1; then worker_log="$work/f-b.log"; fi
+        grep -F "I am known as $worker_scheduler_host" \
+            "$worker_log" >/dev/null || {
+            echo "FAIL: C1F2 F relationship $relationship did not receive ordinary scheduler address" >&2
+            exit 1
+        }
+    done
 else
     grep -F "I am known as $worker_scheduler_host" "$work/f.log" >/dev/null || {
         echo "FAIL: F did not receive the required ordinary address from S" >&2
@@ -1019,8 +1258,10 @@ fi
 # wiring. Merely checking that the file exists would permit a mechanism-only
 # test to masquerade as an end-to-end compile.
 service_pid=
-if test "$cache_enabled" -eq 1 && test "$suite" = C1F20/40; then
-    for relationship in $(seq 0 19); do
+if test "$cache_enabled" -eq 1 && { test "$suite" = C1F20/40 || test "$suite" = C1F2/31 || test "$suite" = C1F2/2; }; then
+    relationship_last=19
+    if test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then relationship_last=1; fi
+    for relationship in $(seq 0 "$relationship_last"); do
         found=
         for _ in $(seq 1 30); do
             found=$(ps -eo pid=,ppid=,args= | \
@@ -1034,6 +1275,9 @@ if test "$cache_enabled" -eq 1 && test "$suite" = C1F20/40; then
         service_pids="$service_pids $found"
     done
     service_pid=$(printf '%s\n' "$service_pids" | awk '{print $1}')
+    if test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+        service_b_pid=$(printf '%s\n' "$service_pids" | awk '{print $2}')
+    fi
 elif test "$cache_enabled" -eq 1; then
     for _ in $(seq 1 30); do
         service_pid=$(ps -eo pid=,ppid=,args= | \
@@ -1086,6 +1330,11 @@ for _ in $(seq 1 30); do
             "$work/scheduler.log" 2>/dev/null |
             grep -oE 'p50-f-[0-9]+' | sort -u | wc -l)
         test "$ready_count" -ge 20 && cache_ready=1 && break
+    elif test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+        if grep -E 'RELOGIN p50-f-a.*cache=.*cache_profiles=.*'"$profile_advertisement" "$work/scheduler.log" >/dev/null 2>&1 && \
+                grep -E 'RELOGIN p50-f-b.*cache=.*cache_profiles=.*'"$profile_advertisement" "$work/scheduler.log" >/dev/null 2>&1; then
+            cache_ready=1; break
+        fi
     elif grep -E "RELOGIN p50-f.*cache=.*cache_profiles=.*$profile_advertisement" \
             "$work/scheduler.log" >/dev/null 2>&1; then
         cache_ready=1; break
@@ -1211,6 +1460,15 @@ restart_cache_sidecar() {
     sidecar_replacement=$replacement
 }
 
+preprocessed_capture_path() {
+    capture_label=$1
+    if test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+        printf '%s/out/s7-%s-preprocessed.ii\n' "$work" "$capture_label"
+    else
+        printf '%s/s7-%s-preprocessed.ii\n' "$work" "$capture_label"
+    fi
+}
+
 compile_once() {
     label=$1
     input_path=${2:-$work/src/main.cpp}
@@ -1223,6 +1481,9 @@ compile_once() {
     preferred_host=p50-f
     if test "$suite" = C1F20/40; then
         preferred_host="p50-f-$relationship"
+    elif test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+        preferred_host=p50-f-a
+        test "$relationship" -eq 1 && preferred_host=p50-f-b
     fi
     remote_obj="$work/out/remote-$label.o"
     local_obj="$work/out/local-$label.o"
@@ -1239,9 +1500,16 @@ compile_once() {
     else
         compile_include_args=""
     fi
-    preprocessed_capture="$work/s7-$label-preprocessed.ii"
+    # In W30 mode this is a new path under the wrapper-writable output dir;
+    # the client creates it with O_EXCL.  Producer and consumer share this
+    # path function to avoid accepting a stale/nonexistent capture location.
+    preprocessed_capture=$(preprocessed_capture_path "$label")
     if test "$cache_enabled" -eq 0; then
         cp -- "$input_path" "$preprocessed_capture"
+    fi
+    if test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}"; then
+        : >"$client_log"
+        chmod 0666 "$client_log"
     fi
     compile_start_ns=$(date +%s%N)
     if test -n "$timing_path"; then
@@ -1298,6 +1566,14 @@ compile_once() {
         # local-object path contract.  The retained object is checked against
         # the remote result at the batch barrier below; no compiler is run.
         cp -- "$remote_obj" "$local_obj"
+    elif test "$w30_f_loss" = 1 && test -n "${ICECC_TEST_WRAPPER_USER:-}" && \
+            test "${input_path##*.}" = ii; then
+        # These independent W30 lanes compile authenticated preprocessed .ii
+        # bytes.  The remote worker receives that input on stdin, so compile
+        # the local reference through stdin with the same GCC mode to keep
+        # the generated FILE symbol and command semantics identical.
+        g++ -x c++ -std=c++17 -O2 -c -fdirectives-only -fpreprocessed \
+            -o "$local_obj" - <"$input_path"
     elif test -n "$item_compile_db"; then
         eval "g++ $local_compile_args"
     else
@@ -1751,7 +2027,7 @@ if test -n "$batch_manifest"; then
             "$item_compile_source" "$item_compile_output" "$relationship" "$f_slot" \
             "$timing_path" &
         compile_pid=$!
-        preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"
+        preprocessed_capture=$(preprocessed_capture_path "$run_label-$ordinal")
         # ICECC_P50_PREPROCESSED_CAPTURE is written immediately before the
         # exact .ii is attached to the live transaction.  Then wait for the
         # product's explicit source-commit witness.  This bounds the C
@@ -1854,10 +2130,19 @@ if test -n "$batch_manifest"; then
         done
         expected_f_service_identity=p50-f
         test "$suite" != C1F20/40 || expected_f_service_identity="p50-f-$relationship"
-        test "$observed_f_service_identity" = "$expected_f_service_identity" || {
+        if test "$suite" = C1F2/31 || test "$suite" = C1F2/2; then
+            expected_f_service_identity=p50-f-a
+            test "$relationship" -eq 1 && expected_f_service_identity=p50-f-b
+        fi
+        if test "$w30_f_loss" = 1 && test "$run_label" = w30-a-held; then
+            case "$observed_f_service_identity" in p50-f-a|p50-f-b) ;; *)
+                echo "FAIL: held request retry was not assigned to an exact F-A/F-B service ($run_label-$ordinal)" >&2
+                return 1 ;;
+            esac
+        elif test "$observed_f_service_identity" != "$expected_f_service_identity"; then
             echo "FAIL: observed F service differs from planned relationship ($run_label-$ordinal)" >&2
             return 1
-        }
+        fi
         witness_end_ns=$(date +%s%N)
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$ordinal" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
@@ -1902,6 +2187,12 @@ if test -n "$batch_manifest"; then
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3
+            elif test "$w30_f_loss" = 1; then
+                if test "$run_label" = w30-b-sibling; then
+                    relationship=1
+                else
+                    f_slot=$((ordinal % 30))
+                fi
             elif test "$staggered_quiescence" = 1; then
                 f_slot=$((ordinal % 2))
             elif test "$real_scheduler_restart_w30" = 1; then
@@ -1909,7 +2200,8 @@ if test -n "$batch_manifest"; then
             fi
             predecessor_file="$work/input-ready/$run_label-$relationship.last"
             predecessor_ordinal=-1
-            if test "$real_scheduler_restart_w30" != 1 && test -e "$predecessor_file"; then
+            if test "$real_scheduler_restart_w30" != 1 && test "$w30_f_loss" != 1 && \
+                    test -e "$predecessor_file"; then
                 predecessor_ordinal=$(cat "$predecessor_file")
                 test "$predecessor_ordinal" -ge 0 2>/dev/null && \
                     test "$predecessor_ordinal" -lt "$ordinal" || {
@@ -2012,6 +2304,12 @@ if test -n "$batch_manifest"; then
                             return 1
                         }
                         echo "S8_REAL_WORKER_LOSS_COMMITTED_BUT_NOT_RETRIED ordinal=$job_ordinal policy=Error24 remote_only=1"
+                    elif test "$w30_f_loss" = 1 && test "$run_label" = w30-a-held; then
+                        w30_typed_predecessor_terminal "$client_log" || {
+                            echo "FAIL: held A caller ended without the exact bounded Error24 predecessor terminal ($job_ordinal status=$job_status)" >&2
+                            return 1
+                        }
+                        echo "S8_C1F2_W30_HELD_TYPED_TERMINAL ordinal=$job_ordinal retry_attempts=1 policy=Error24_unsettled_predecessor remote_only=1"
                     elif grep -Fq 'source committed for P50 CompileFile' "$client_log" || \
                             ! grep -Eq 'got exception Error [0-9]+' "$client_log"; then
                         echo "FAIL: discarded B caller lacks an explicit pre-commit protocol error ($run_label-$job_ordinal status=$job_status)" >&2
@@ -2097,7 +2395,7 @@ PY
                 local_ref_sha=$(sha256sum "$local_ref" | awk '{print $1}')
                 local_ref_bytes=$(stat -c %s "$local_ref")
                 python3 - "$work/result-$run_label-$ordinal_ref.tsv" "$local_ref_sha" "$local_ref_bytes" <<'PY'
-import pathlib, sys
+import pathlib, re, sys
 path = pathlib.Path(sys.argv[1])
 fields = path.read_text(encoding="utf-8").rstrip("\n").split("\t")
 if len(fields) != 21:
@@ -2109,16 +2407,54 @@ PY
                 rm -f "$reference"
             done
         fi
-        batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
+batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
                 "$batch_end_ns" "$relationship_count" "$slots_per_f" \
-                "$real_scheduler_restart_w30" <<'PY'
-import pathlib, sys
+                "$real_scheduler_restart_w30" "$w30_f_loss" "$work/scheduler.log" <<'PY'
+import pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
 run, count = sys.argv[2], int(sys.argv[3])
 batch_start, batch_end = int(sys.argv[4]), int(sys.argv[5])
 relationship_count, slots_per_f = int(sys.argv[6]), int(sys.argv[7])
+c1f2_w30 = sys.argv[9] == "1"
 real_w30 = sys.argv[8] == "1"
+scheduler_lines = pathlib.Path(sys.argv[10]).read_text(encoding="utf-8", errors="replace").splitlines()
+
+def has_exact_success_witness(job_id, service, lines):
+    begin_pattern = re.compile(r"(?:^|\s)BEGIN:?\s+" + re.escape(str(job_id)) + r"(?:\s|$)")
+    end_pattern = re.compile(r"(?:^|\s)END\s+" + re.escape(str(job_id)) + r"\s+status=0(?:\s|$)")
+    begins = [index for index, line in enumerate(lines)
+              if begin_pattern.search(line) and f"server={service}" in line]
+    return any(end_pattern.search(line) and f"server={service}" in line
+               for begin in begins for line in lines[begin + 1:])
+
+def held_retries_have_individual_witnesses(rows, lines):
+    return (all(row["service"] in {"p50-f-a", "p50-f-b"} for row in rows) and
+            len({row["job_id"] for row in rows}) == len(rows) and
+            all(has_exact_success_witness(row["job_id"], row["service"], lines)
+                for row in rows))
+
+if c1f2_w30 and run == "w30-a-held":
+    fixture_lines = [
+        "login p50-f-a protocol version: 50",
+        "BEGIN: 901 client=x server=p50-f-a",
+        "END 901 status=0 server=p50-f-a",
+        "login p50-f-b protocol version: 50",
+        "BEGIN: 905 client=y server=p50-f-b",
+        "END 905 status=0 server=p50-f-b",
+    ]
+    fixture_rows = [
+        {"job_id": 901, "service": "p50-f-a", "tu_seq": 77},
+        {"job_id": 905, "service": "p50-f-b", "tu_seq": 77},
+        {"job_id": 912, "service": "p50-f-a", "tu_seq": 84},
+    ]
+    fixture_lines.extend(("BEGIN: 912 client=z server=p50-f-a", "END 912 status=0 server=p50-f-a"))
+    if not held_retries_have_individual_witnesses(fixture_rows, fixture_lines):
+        raise SystemExit("W30 mixed-service/gapped-TU per-job witness fixture did not pass")
+    fixture_lines = [line for line in fixture_lines if not line.startswith("END 905 ")]
+    if held_retries_have_individual_witnesses(fixture_rows, fixture_lines):
+        raise SystemExit("W30 per-job witness fixture accepted a missing terminal")
+    print("W30_METRICS_FIXTURE mixed_services_shared_tu_and_gaps=accepted missing_end=rejected", file=sys.stderr)
 records = []
 for ordinal in range(count):
     fields = (root / f"result-{run}-{ordinal}.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
@@ -2131,11 +2467,18 @@ for ordinal in range(count):
         "witness_end": int(fields[17]), "job_id": int(fields[18]),
         "service": fields[19], "tu_seq": int(fields[20]),
     }
+    expected_service = (
+        ("p50-f-a" if record["relationship"] == 0 else "p50-f-b")
+        if c1f2_w30 else
+        (f"p50-f-{record['relationship']}" if relationship_count > 1 else "p50-f")
+    )
+    service_matches = (record["service"] in {"p50-f-a", "p50-f-b"}
+                       if c1f2_w30 and run == "w30-a-held"
+                       else record["service"] == expected_service)
     if (record["ordinal"] != ordinal or
             not 0 <= record["relationship"] < relationship_count or
             not 0 <= record["lane"] < slots_per_f or
-            record["service"] != (f"p50-f-{record['relationship']}"
-                                  if relationship_count > 1 else "p50-f") or
+            not service_matches or
             not batch_start <= record["admission_start"] <= record["compile_start"] <=
                 record["input_ready"] <= record["compile_end"] <= record["witness_end"] <= batch_end):
         raise SystemExit(f"result concurrency identity invalid ({run}-{ordinal})")
@@ -2156,23 +2499,29 @@ for relationship in range(relationship_count):
     selected = sorted((record for record in records if record["relationship"] == relationship),
                       key=lambda record: record["ordinal"])
     if not selected:
+        if c1f2_w30:
+            continue
         raise SystemExit(f"relationship {relationship} has no work ({run})")
-    if real_w30:
+    if c1f2_w30 and run == "w30-a-held":
+        if not held_retries_have_individual_witnesses(records, scheduler_lines):
+            raise SystemExit(f"successful held retry lacks an exact per-job BEGIN/END witness ({run})")
+    elif real_w30:
         wire_sequences = sorted(record["tu_seq"] for record in selected)
         if (len(set(wire_sequences)) != len(selected) or
                 any(right != left + 1
                     for left, right in zip(wire_sequences, wire_sequences[1:]))):
             raise SystemExit(f"relationship wire TU sequence is not unique and contiguous ({run}-{relationship})")
-    else:
+    elif not (c1f2_w30 and run == "w30-a-held"):
         for previous, current in zip(selected, selected[1:]):
             if (current["admission_start"] < previous["input_ready"] or
                     current["tu_seq"] != previous["tu_seq"] + 1):
                 raise SystemExit(f"relationship admission order invalid ({run}-{relationship})")
-    for lane in range(slots_per_f):
-        lane_rows = [record for record in selected if record["lane"] == lane]
-        for previous, current in zip(lane_rows, lane_rows[1:]):
-            if current["admission_start"] < previous["compile_end"]:
-                raise SystemExit(f"planned admission lane overlapped ({run}-{relationship}-{lane})")
+    if not (c1f2_w30 and run == "w30-a-held"):
+        for lane in range(slots_per_f):
+            lane_rows = [record for record in selected if record["lane"] == lane]
+            for previous, current in zip(lane_rows, lane_rows[1:]):
+                if current["admission_start"] < previous["compile_end"]:
+                    raise SystemExit(f"planned admission lane overlapped ({run}-{relationship}-{lane})")
     relationship_peak = peak([(record["admission_start"], record["compile_end"])
                               for record in selected])
     if relationship_peak > slots_per_f:
@@ -2340,13 +2689,13 @@ EOF_FINAL_IDENTITY
         while test "$(date +%s)" -lt "$marker_deadline"; do
             test ! -e "$receipt_gate_dir/failed" || {
                 cat "$receipt_gate_dir/failed" >&2
-                cat "$work/receipt-gate.log" >&2 || true
+                cat "${receipt_gate_log:-$work/receipt-gate.log}" >&2 || true
                 echo "FAIL: receipt gate failed while waiting for $marker_name" >&2
                 return 1
             }
             test -e "$receipt_gate_dir/$marker_name" && return 0
             kill -0 "$receipt_gate_pid" 2>/dev/null || {
-                cat "$work/receipt-gate.log" >&2 || true
+                cat "${receipt_gate_log:-$work/receipt-gate.log}" >&2 || true
                 echo "FAIL: receipt gate exited before $marker_name" >&2
                 return 1
             }
@@ -2574,6 +2923,48 @@ fields = text[text.rfind(")") + 2:].split()
 # The tail begins at proc stat field 3 (state); pgrp is field 5 and
 # starttime is field 22, hence tail offsets 2 and 19.
 print(pid, fields[2], fields[19], fields[0])
+PY
+    }
+    read_scheduler_socket_identity() {
+        python3 - "$1" "$2" "$3" <<'PY'
+import os, pathlib, socket, sys
+pid, expected_ip, expected_port = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+owned = set()
+fd_count = 0
+fd_read_errors = []
+for entry in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+    fd_count += 1
+    try:
+        target = os.readlink(entry)
+    except OSError as error:
+        fd_read_errors.append(f"{entry.name}:{error.errno}")
+        continue
+    if target.startswith("socket:[") and target.endswith("]"):
+        owned.add(target[8:-1])
+matches = []
+for table in ("/proc/net/tcp",):
+    try:
+        lines = pathlib.Path(table).read_text().splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 10 or fields[3] != "01" or fields[9] not in owned:
+            continue
+        def endpoint(value):
+            addr, port = value.split(":")
+            return socket.inet_ntoa(bytes.fromhex(addr)[::-1]), int(port, 16)
+        local_ip, local_port = endpoint(fields[1])
+        remote_ip, remote_port = endpoint(fields[2])
+        if remote_ip == expected_ip and remote_port == expected_port:
+            matches.append((local_ip, local_port, remote_ip, remote_port, fields[9]))
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected exactly one owned ESTABLISHED scheduler socket for pid={pid}, "
+        f"found={len(matches)} fd_count={fd_count} owned_socket_fds={len(owned)} "
+        f"fd_read_errors={','.join(fd_read_errors[:8]) or 'none'}"
+    )
+print(*matches[0])
 PY
     }
     run_real_worker_session_loss() {
@@ -2945,6 +3336,7 @@ EOF_SECOND_GRACE_ID
             echo "FAIL: old compiler process group still has members after settlement: $remaining_group_members" >&2
             return 1
         }
+        w30_victim_pgid=
         settled_line=$(grep -nF \
             "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
             "$work/f.log" | tail -n 1 | cut -d: -f1)
@@ -3173,6 +3565,517 @@ EOF_GRACE_ACCEPTS
         echo "S8_REAL_WORKER_LOSS_RECOVERY_PROBE exact_outputs=$recovery_outputs F_STORE_GUID=$recovery_f_guid fresh_job_not_victim_retry=1"
         echo "S8_REAL_WORKER_SESSION_LOSS_PASS profile=$profile_marker committed_victim=1 stopped_and_reaped=1 victim_output=0 recovery_outputs=1 failure_scope=global_scheduler_session"
     }
+    run_real_c1f2_w30_worker_loss() {
+        w30_frozen_worker_pid=
+        w30_victim_pgid=
+        w30_receipt_gate_dir="$work/receipt-gate-w30-f-a"
+        receipt_gate_dir=$w30_receipt_gate_dir
+        receipt_gate_log="$work/receipt-gate-w30-f-a.log"
+        test ! -e "$w30_receipt_gate_dir" || {
+            echo "FAIL: C1F2 W30 receipt gate path already exists" >&2
+            return 1
+        }
+        command -v ss >/dev/null 2>&1 || {
+            echo "FAIL: C1F2 W30 scoped session-loss trigger requires ss -K in the owned test container" >&2
+            return 1
+        }
+        mkdir -m 0777 "$w30_receipt_gate_dir"
+        # Sidecar rotation is complete before this function.  Install the
+        # receipt proxy now, before the first R2 link for this incarnation is
+        # opened.  Ordinal 1 is the committed victim and passes through;
+        # ordinals 2..31 are the held 30-transfer cohort.
+        "$build/unittests/p50daemonpositive" \
+            --p51-commit-receipt-gate "$port_worker" "$daemon_uid" \
+            30 2 "$w30_receipt_gate_dir" >"$receipt_gate_log" 2>&1 &
+        receipt_gate_pid=$!
+        wait_gate_marker ready || return 1
+        echo "S8_C1F2_W30_GATE_READY endpoint=$port_worker sidecar_uid=$daemon_uid expected=30 first_ordinal=2 target=p50-f-a"
+        python3 - "$work/src/w30-active.cpp" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+with path.open("w", encoding="ascii") as stream:
+    for index in range(80000):
+        stream.write(
+            f'extern "C" int p51_w30_active_{index}(int value) '
+            f'{{ return value + {index + 17}; }}\n')
+PY
+        active_client_log="$work/client-compile-w30-active.log"
+        compile_once w30-active "$work/src/w30-active.cpp" "" "" "" 0 0 \
+            >"$work/w30-active-wrapper.out" 2>&1 &
+        w30_active_wrapper_pid=$!
+        victim_job_id=
+        victim_assignment=
+        victim_child=
+        for _ in $(seq 1 400); do
+            victim_job_id=$(sed -nE \
+                's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+                "$active_client_log" 2>/dev/null | tail -n 1)
+            victim_assignment=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$active_client_log" 2>/dev/null | tail -n 1)
+            if test -n "$victim_job_id" && test -n "$victim_assignment"; then
+                victim_child=$(sed -nE \
+                    "s/.*P50_TEST_COMPILER_CHILD job=$victim_job_id epoch=([0-9]+) nonce=([0-9]+) pid=([0-9]+) pgid=([0-9]+).*/\\1 \\2 \\3 \\4/p" \
+                    "$work/f.log" 2>/dev/null | tail -n 1)
+                test -n "$victim_child" && break
+            fi
+            kill -0 "$w30_active_wrapper_pid" 2>/dev/null || break
+            sleep 0.025
+        done
+        test -n "$victim_child" || {
+            echo "FAIL: C1F2 active committed compiler identity was not observed before W30 source stage" >&2
+            return 1
+        }
+        read -r victim_bound_job victim_epoch victim_nonce <<EOF_W30_ASSIGN
+$victim_assignment
+EOF_W30_ASSIGN
+        read -r child_epoch child_nonce victim_pid victim_pgid <<EOF_W30_CHILD
+$victim_child
+EOF_W30_CHILD
+        test "$victim_job_id" = "$victim_bound_job" && \
+                test "$victim_epoch" = "$child_epoch" && \
+                test "$victim_nonce" = "$child_nonce" || {
+            echo "FAIL: C1F2 active compiler marker differs from exact P50 job/session identity" >&2
+            return 1
+        }
+        printf '%s\t%s\t%s\n' "$victim_job_id" "$victim_epoch" "$victim_nonce" \
+            >"$work/w30-active-victim-identity.tsv"
+        grep -Fq 'source committed for P50 CompileFile' "$active_client_log" || {
+            echo "FAIL: C1F2 active compiler was not preceded by a source-commit witness" >&2
+            return 1
+        }
+        active_tu_seq=$(sed -nE \
+            's/.*source committed for P50 CompileFile: .* TU sequence ([0-9]+).*/\1/p' \
+            "$active_client_log" | tail -n 1)
+        case "$active_tu_seq" in
+            ''|*[!0-9]*)
+                echo "FAIL: active victim source TU sequence is not an exact decimal value" >&2
+                return 1 ;;
+        esac
+        victim_proxy_line="P51_RECEIPT_GATE_PASSTHROUGH port=$port_worker ordinal=1 tu_seq=$active_tu_seq"
+        gate_victim_witness=0
+        for _ in $(seq 1 200); do
+            if grep -Fq 'P51_RECEIPT_GATE_LINK_STATE' "$receipt_gate_log" && \
+                    grep -Fxq "$victim_proxy_line" "$receipt_gate_log"; then
+                gate_victim_witness=1
+                break
+            fi
+            sleep 0.025
+        done
+        test "$gate_victim_witness" -eq 1 || {
+            echo "FAIL: preinstalled receipt proxy did not witness R2 LINK_STATE and exact victim ordinal/TU sequence" >&2
+            cat "$receipt_gate_log" >&2 || true
+            return 1
+        }
+        echo "S8_C1F2_W30_VICTIM_PROXY_WITNESS ordinal=1 tu_seq=$active_tu_seq job=$victim_job_id link_state=1 passed_through=1"
+        child_identity=$(read_compiler_identity "$victim_pid") || {
+            echo "FAIL: C1F2 active compiler disappeared before exact stop" >&2
+            return 1
+        }
+        read -r observed_pid observed_pgid victim_start_ticks victim_state <<EOF_W30_ID
+$child_identity
+EOF_W30_ID
+        test "$observed_pid" = "$victim_pid" && test "$observed_pgid" = "$victim_pgid" && \
+                test "$victim_pgid" = "$victim_pid" || {
+            echo "FAIL: C1F2 active compiler PID/PGID identity mismatch" >&2
+            return 1
+        }
+        w30_victim_pgid=$victim_pgid
+        /bin/kill -STOP -- "-$victim_pgid" || {
+            echo "FAIL: could not stop exact active compiler process group" >&2
+            return 1
+        }
+        victim_stopped=0
+        for _ in $(seq 1 150); do
+            stopped_identity=$(read_compiler_identity "$victim_pid") || break
+            read -r stopped_pid stopped_pgid stopped_ticks stopped_state <<EOF_W30_STOPPED
+$stopped_identity
+EOF_W30_STOPPED
+            test "$stopped_pid" = "$victim_pid" && test "$stopped_pgid" = "$victim_pgid" && \
+                    test "$stopped_ticks" = "$victim_start_ticks" || break
+            case "$stopped_state" in T|t) victim_stopped=1; break ;; esac
+            sleep 0.02
+        done
+        test "$victim_stopped" -eq 1 || {
+            echo "FAIL: exact active compiler group did not enter stopped state after bounded observations" >&2
+            return 1
+        }
+        echo "S8_C1F2_W30_ACTIVE_COMMITTED job=$victim_job_id epoch=$victim_epoch nonce=$victim_nonce pid=$victim_pid pgid=$victim_pgid start_ticks=$victim_start_ticks state=$stopped_state"
+
+        run_batch w30-a-held 0 "$work/batch-f-a.tsv" 30 1 1
+        a_held_job_entries=$job_entries
+        a_held_batch_pids=$batch_job_pids
+        a_held_job_pids=$job_pids
+        a_held_ordinal=$ordinal
+        a_held_emit_rows=$emit_rows
+        a_held_active_batch_file=$active_batch_file
+        a_held_active_batch_expected=$active_batch_expected
+        a_held_batch_start_ns=$batch_start_ns
+        wait_gate_marker held-1 || return 1
+        w30_window=$(cat "$w30_receipt_gate_dir/held-1")
+        case "$w30_window" in
+            count=30\ first_ordinal=*\ last_ordinal=*) ;;
+            *) echo "FAIL: target A did not hold exactly 30 contiguous source COMMIT receipts: $w30_window" >&2; return 1 ;;
+        esac
+        : >"$work/w30-held-old-identities.tsv"
+        for held_ordinal in $(seq 0 29); do
+            client_log="$work/client-compile-w30-a-held-$held_ordinal.log"
+            grep -F "Have to use host $worker_scheduler_host:$port_worker" "$client_log" >/dev/null || {
+                echo "FAIL: W30 request $held_ordinal was not assigned to exact F-A endpoint" >&2
+                return 1
+            }
+            held_assignment=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$client_log" | tail -n 1)
+            test -n "$held_assignment" || {
+                echo "FAIL: W30 request $held_ordinal lacks its exact pre-loss job/session identity" >&2
+                return 1
+            }
+            read -r held_job held_epoch held_nonce <<EOF_W30_PRELOSS_ID
+$held_assignment
+EOF_W30_PRELOSS_ID
+            printf '%s\t%s\t%s\t%s\n' "$held_ordinal" "$held_job" "$held_epoch" "$held_nonce" \
+                >>"$work/w30-held-old-identities.tsv"
+            if grep -Fq 'source committed for P50 CompileFile' "$client_log" || \
+                    test -e "$work/input-ready/w30-a-held-0-$held_ordinal"; then
+                echo "FAIL: W30 request $held_ordinal received a C-side commit/input-ready before the loss trigger" >&2
+                return 1
+            fi
+            test ! -e "$work/out/remote-w30-a-held-$held_ordinal.o" || {
+                echo "FAIL: A receipt-gated W30 request produced output before loss ($held_ordinal)" >&2
+                return 1
+            }
+        done
+        echo "S8_C1F2_W30_A_HELD $w30_window active_committed_victim=1 queued_receipt_jobs=30"
+
+        a_socket_before=$(read_scheduler_socket_identity "$worker_pid" \
+            "$worker_scheduler_host" "$port_sched") || {
+            echo "FAIL: could not identify F-A scheduler socket by owned PID and exact endpoint" >&2
+            return 1
+        }
+        b_socket_before=$(read_scheduler_socket_identity "$worker_b_pid" \
+            "$worker_scheduler_host" "$port_sched") || {
+            echo "FAIL: could not identify healthy F-B scheduler socket by owned PID and exact endpoint" >&2
+            return 1
+        }
+        read -r a_local_ip a_local_port a_remote_ip a_remote_port a_socket_inode <<EOF_W30_A_SOCKET
+$a_socket_before
+EOF_W30_A_SOCKET
+        read -r b_local_ip b_local_port b_remote_ip b_remote_port b_socket_inode <<EOF_W30_B_SOCKET
+$b_socket_before
+EOF_W30_B_SOCKET
+        test "$a_local_port" != "$b_local_port" && \
+                test "$a_remote_ip" = "$worker_scheduler_host" && test "$a_remote_port" = "$port_sched" && \
+                test "$b_remote_ip" = "$worker_scheduler_host" && test "$b_remote_port" = "$port_sched" || {
+            echo "FAIL: F-A/F-B scheduler endpoint 4-tuples are not independent and exact" >&2
+            return 1
+        }
+        ready_snapshot "$work/ready-f-b.trace" || return 1
+        b_guid_before_loss=$ready_f_guid
+        old_a_login_count=$(grep -F -c 'login p50-f-a protocol version:' "$work/scheduler.log" 2>/dev/null || true)
+
+        # Revalidate the exact owned socket immediately before the destructive
+        # tuple close, so a reconnect or fd reuse cannot widen the target.
+        a_socket_immediate=$(read_scheduler_socket_identity "$worker_pid" \
+            "$worker_scheduler_host" "$port_sched") || {
+            echo "FAIL: F-A scheduler socket was not uniquely owned immediately before stop" >&2
+            return 1
+        }
+        test "$a_socket_immediate" = "$a_socket_before" || {
+            echo "FAIL: F-A scheduler socket identity changed before scoped loss trigger" >&2
+            return 1
+        }
+        kill -STOP "$worker_pid" || return 1
+        w30_frozen_worker_pid=$worker_pid
+        daemon_stopped=0
+        for _ in $(seq 1 150); do
+            parent_identity=$(read_compiler_identity "$worker_pid") || break
+            read -r daemon_pid daemon_pgid daemon_ticks daemon_state <<EOF_W30_DAEMON
+$parent_identity
+EOF_W30_DAEMON
+            test "$daemon_pid" = "$worker_pid" && test "$daemon_pgid" = "$worker_pid" || break
+            case "$daemon_state" in T|t) daemon_stopped=1; break ;; esac
+            sleep 0.02
+        done
+        test "$daemon_stopped" -eq 1 || {
+            echo "FAIL: F-A daemon did not reach stopped state after bounded identity-preserving observations" >&2
+            return 1
+        }
+        a_socket_stopped=$(read_scheduler_socket_identity "$worker_pid" \
+            "$worker_scheduler_host" "$port_sched") || {
+            echo "FAIL: F-A owned scheduler socket changed before scoped tuple close" >&2
+            return 1
+        }
+        test "$a_socket_stopped" = "$a_socket_before" || {
+            echo "FAIL: F-A tuple no longer matches validated identity immediately before ss -K" >&2
+            return 1
+        }
+        printf 'S8_C1F2_W30_A_SESSION_TUPLE local=%s:%s remote=%s:%s inode=%s pid=%s\n' \
+            "$a_local_ip" "$a_local_port" "$a_remote_ip" "$a_remote_port" \
+            "$a_socket_inode" "$worker_pid" | tee -a "$work/w30-loss-events.log"
+        if ! ss -K state established src "$a_local_ip:$a_local_port" \
+                dst "$a_remote_ip:$a_remote_port" \
+                >"$work/ss-k-f-a.log" 2>&1; then
+            cat "$work/ss-k-f-a.log" >&2 || true
+            echo "FAIL: exact validated F-A scheduler socket could not be closed with ss -K" >&2
+            return 1
+        fi
+        a_removed=0
+        for _ in $(seq 1 150); do
+            if ! read_scheduler_socket_identity "$worker_pid" "$worker_scheduler_host" "$port_sched" \
+                    >"$work/w30-a-socket-after.txt" 2>/dev/null; then
+                if grep -F 'remove daemon p50-f-a' "$work/scheduler.log" >/dev/null 2>&1; then
+                    a_removed=1
+                    break
+                fi
+            fi
+            sleep 0.02
+        done
+        test "$a_removed" -eq 1 || {
+            echo "FAIL: exact F-A socket closure did not produce scheduler removal while A was held" >&2
+            cat "$work/ss-k-f-a.log" >&2 || true
+            return 1
+        }
+        b_socket_after=$(read_scheduler_socket_identity "$worker_b_pid" \
+            "$worker_scheduler_host" "$port_sched") || return 1
+        test "$b_socket_after" = "$b_socket_before" || {
+            echo "FAIL: F-B scheduler socket changed during scoped F-A loss" >&2
+            return 1
+        }
+        kill -0 "$sched_pid" && kill -0 "$worker_b_pid" && \
+                test "$(ps -p "$worker_pid" -o stat= | cut -c1)" = T || {
+            echo "FAIL: S/F-B were not healthy while exact F-A session was unavailable" >&2
+            return 1
+        }
+        echo "S8_C1F2_W30_A_SESSION_LOST old_tuple_closed=1 scheduler_removed_A=1 S_alive=1 B_tuple_unchanged=1 A_daemon_stopped=1"
+
+        source_before_b=$(wc -c <"$source_result_trace")
+        f_before_b=0
+        if test -e "$work/f-b-action-trace.jsonl"; then
+            f_before_b=$(wc -c <"$work/f-b-action-trace.jsonl")
+        fi
+        run_batch w30-b-sibling 1 "$work/batch-f-b.tsv" 1 0 0
+        b_socket_after_progress=$(read_scheduler_socket_identity "$worker_b_pid" \
+            "$worker_scheduler_host" "$port_sched") || return 1
+        test "$b_socket_after_progress" = "$b_socket_before" && \
+                test "$(ps -p "$worker_pid" -o stat= | cut -c1)" = T || {
+            echo "FAIL: B progress changed its scheduler socket or A resumed before B completed" >&2
+            return 1
+        }
+        cmp -s "$work/out/remote-w30-b-sibling-0.o" \
+                "$work/out/local-w30-b-sibling-0.o" || {
+            echo "FAIL: healthy sibling B exact object differs from local reference" >&2
+            return 1
+        }
+        ready_snapshot "$work/ready-f-b.trace" || return 1
+        test "$ready_f_guid" = "$b_guid_before_loss" || {
+            echo "FAIL: healthy sibling B store identity changed during A loss" >&2
+            return 1
+        }
+        b_job_id=$(sed -nE \
+            's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+            "$work/client-compile-w30-b-sibling-0.log" | tail -n 1)
+        grep -F "Have to use host $worker_scheduler_host:$((port_worker + 1))" \
+            "$work/client-compile-w30-b-sibling-0.log" >/dev/null && \
+        grep -E "END $b_job_id status=0 .*server=p50-f-b$" "$work/scheduler.log" >/dev/null || {
+            echo "FAIL: healthy sibling compile lacks exact F-B assignment/terminal evidence" >&2
+            return 1
+        }
+        saved_f_action_trace=$f_action_trace
+        f_action_trace="$work/f-b-action-trace.jsonl"
+        verify_results_from_f_store w30-b-sibling "$b_guid_before_loss" \
+            "$source_before_b" "$f_before_b" 1 || return 1
+        f_action_trace=$saved_f_action_trace
+        echo "S8_C1F2_W30_B_PROGRESS job=$b_job_id F_STORE_GUID=$ready_f_guid A_still_stopped=1 exact_remote_object=1 scheduler_socket_unchanged=1"
+
+        : >"$w30_receipt_gate_dir/abort"
+        if wait "$receipt_gate_pid"; then
+            receipt_gate_pid=
+            echo "FAIL: C1F2 W30 gate did not record the deliberate held-A COMMIT discard" >&2
+            return 1
+        fi
+        receipt_gate_pid=
+        test -f "$w30_receipt_gate_dir/discarded-1" || {
+            cat "$work/receipt-gate-w30-f-a.log" >&2 || true
+            echo "FAIL: held A source cohort was not explicitly discarded at its old endpoint" >&2
+            return 1
+        }
+        kill -CONT "$worker_pid" || return 1
+        w30_frozen_worker_pid=
+        quiescence_deadline=$(( $(date +%s) + 15 ))
+        while test "$(date +%s)" -lt "$quiescence_deadline"; do
+            grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                "$work/f.log" >/dev/null 2>&1 && break
+            sleep 0.05
+        done
+        grep -F "session quiescence TERM compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" >/dev/null 2>&1 && \
+        grep -F "session quiescence KILL compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" >/dev/null 2>&1 && \
+        grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" >/dev/null 2>&1 || {
+            echo "FAIL: resumed F-A did not settle exact old compiler group through TERM/KILL/quiescence" >&2
+            return 1
+        }
+        remaining_group_members=$(ps -eo pid=,pgid=,stat= | awk -v pgid="$victim_pgid" \
+            '$2 == pgid { print $1 "/" $3 }')
+        test -z "$remaining_group_members" || {
+            echo "FAIL: old F-A compiler process group still has members: $remaining_group_members" >&2
+            return 1
+        }
+        settled_line=$(grep -nF "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+            "$work/f.log" | tail -n 1 | cut -d: -f1)
+        reconnect_deadline=$(( $(date +%s) + 15 ))
+        new_a_login_count=$old_a_login_count
+        while test "$new_a_login_count" -le "$old_a_login_count" && \
+                test "$(date +%s)" -lt "$reconnect_deadline"; do
+            new_a_login_count=$(grep -F -c 'login p50-f-a protocol version:' \
+                "$work/scheduler.log" 2>/dev/null || true)
+            sleep 0.05
+        done
+        test "$new_a_login_count" -gt "$old_a_login_count" || {
+            echo "FAIL: F-A did not re-register after its bounded reconnect wait" >&2
+            return 1
+        }
+        new_a_login_scheduler_line=$(grep -nF 'login p50-f-a protocol version:' \
+            "$work/scheduler.log" | tail -n 1 | cut -d: -f1)
+        test -n "$new_a_login_scheduler_line" || {
+            echo "FAIL: F-A reconnect has no scheduler-log registration line" >&2
+            return 1
+        }
+        reconnected_line=$(grep -nF 'Connected to scheduler' "$work/f.log" | tail -n 1 | cut -d: -f1)
+        test -n "$settled_line" && test -n "$reconnected_line" && \
+                test "$settled_line" -lt "$reconnected_line" || {
+            echo "FAIL: F-A reconnected before exact old compiler process-group settlement" >&2
+            return 1
+        }
+        echo "S8_C1F2_W30_A_QUIESCED_BEFORE_READMISSION old_pid=$victim_pid old_pgid=$victim_pgid settled_f_log_line=$settled_line reconnected_f_log_line=$reconnected_line group_members=0 new_A_login_count=$new_a_login_count new_A_scheduler_login_line=$new_a_login_scheduler_line"
+
+        run_label=w30-a-held
+        job_entries=$a_held_job_entries
+        batch_job_pids=$a_held_batch_pids
+        job_pids=$a_held_job_pids
+        ordinal=$a_held_ordinal
+        emit_rows=$a_held_emit_rows
+        active_batch_file=$a_held_active_batch_file
+        active_batch_expected=$a_held_active_batch_expected
+        batch_start_ns=$a_held_batch_start_ns
+        batch_allow_failures=1
+        finish_batch || return 1
+        for held_ordinal in $(seq 0 29); do
+            client_log="$work/client-compile-w30-a-held-$held_ordinal.log"
+            test -s "$client_log" || {
+                echo "FAIL: old A request has no terminal client log ($held_ordinal)" >&2
+                return 1
+            }
+            if test -e "$work/out/remote-w30-a-held-$held_ordinal.o"; then
+                old_identity=$(awk -F '\t' -v ordinal="$held_ordinal" '$1 == ordinal { print $2 " " $3 " " $4 }' \
+                    "$work/w30-held-old-identities.tsv")
+                new_identity=$(sed -nE \
+                    's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                    "$client_log" | tail -n 1)
+                read -r old_job old_epoch old_nonce <<EOF_W30_OLD_ID
+$old_identity
+EOF_W30_OLD_ID
+                read -r new_job new_epoch new_nonce <<EOF_W30_NEW_ID
+$new_identity
+EOF_W30_NEW_ID
+                begin_record=$(grep -nE "BEGIN:? $new_job .*server=p50-f-(a|b)" "$work/scheduler.log" | tail -n 1)
+                test -n "$begin_record" && test "$new_job" != "$old_job" && \
+                        test "$new_epoch" = "$old_epoch" && test "$new_nonce" != "$old_nonce" || {
+                    echo "FAIL: old A request produced an object without a different authorized retry tuple ($held_ordinal)" >&2
+                    return 1
+                }
+                begin_line=${begin_record%%:*}
+                begin_service=$(printf '%s\n' "$begin_record" | sed -nE 's/.*server=(p50-f-(a|b)).*/\1/p')
+                assignment_after=0
+                if test "$begin_service" = p50-f-a; then
+                    assignment_after=$new_a_login_scheduler_line
+                fi
+                assignment_evidence=$(w30_successful_assignment "$work/scheduler.log" \
+                    "$new_job" "$begin_service" "$assignment_after") || {
+                    echo "FAIL: successful old A request lacks an ordered fresh BEGIN and matching status-0 END ($held_ordinal)" >&2
+                    return 1
+                }
+                cmp -s "$work/out/remote-w30-a-held-$held_ordinal.o" \
+                        "$work/out/local-w30-a-held-$held_ordinal.o" || {
+                    echo "FAIL: retried old A request output differs from local reference ($held_ordinal)" >&2
+                    return 1
+                }
+            elif ! grep -Fq 'got exception Error 24 - local daemon did not settle P50 retry predecessor' "$client_log"; then
+                echo "FAIL: old A request neither produced authorized output nor the exact bounded Error24 predecessor terminal ($held_ordinal)" >&2
+                return 1
+            fi
+        done
+        active_client_status=0
+        if wait "$w30_active_wrapper_pid"; then active_client_status=0; else active_client_status=$?; fi
+        if test "$active_client_status" -eq 0 && test -e "$work/out/remote-w30-active.o"; then
+            active_job_id=$(sed -nE \
+                's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' "$active_client_log" | tail -n 1)
+            active_new_identity=$(sed -nE \
+                's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                "$active_client_log" | tail -n 1)
+            read -r active_new_job active_new_epoch active_new_nonce <<EOF_W30_ACTIVE_NEW
+$active_new_identity
+EOF_W30_ACTIVE_NEW
+            IFS="$(printf '\t')" read -r active_old_job active_old_epoch active_old_nonce \
+                <"$work/w30-active-victim-identity.tsv"
+            active_reassignment=$(grep -nE "BEGIN:? $active_new_job .*server=p50-f-(a|b)" \
+                "$work/scheduler.log" | tail -n 1)
+            test -n "$active_reassignment" && test "$active_new_job" != "$active_old_job" && \
+                    test "$active_new_epoch" = "$active_old_epoch" && \
+                    test "$active_new_nonce" != "$active_old_nonce" && \
+                    cmp -s "$work/out/remote-w30-active.o" "$work/out/local-w30-active.o" || {
+                echo "FAIL: active compile succeeded without an exact fresh F assignment and matching object" >&2
+                return 1
+            }
+            active_begin_line=${active_reassignment%%:*}
+            active_begin_service=$(printf '%s\n' "$active_reassignment" | sed -nE 's/.*server=(p50-f-(a|b)).*/\1/p')
+            active_assignment_after=0
+            if test "$active_begin_service" = p50-f-a; then
+                active_assignment_after=$new_a_login_scheduler_line
+            fi
+            active_assignment_evidence=$(w30_successful_assignment "$work/scheduler.log" \
+                "$active_new_job" "$active_begin_service" "$active_assignment_after") || {
+                echo "FAIL: active victim lacks an ordered fresh BEGIN and matching status-0 END" >&2
+                return 1
+            }
+            echo "S8_C1F2_W30_ACTIVE_RESULT fresh_authorized_assignment=1 exact_object=1 prior_group_reaped=1"
+        else
+            if test "$active_client_status" -eq 124 || test "$active_client_status" -eq 137 || \
+                    test "$active_client_status" -ge 128 2>/dev/null; then
+                echo "FAIL: active victim client timed out or was signal-terminated (status=$active_client_status)" >&2
+                return 1
+            fi
+            test "$active_client_status" -ne 0 && \
+                    test ! -e "$work/out/remote-w30-active.o" && \
+                    w30_typed_predecessor_terminal "$active_client_log" || {
+                echo "FAIL: active compile had neither a valid fresh-assignment object nor typed terminal error" >&2
+                return 1
+            }
+            echo "S8_C1F2_W30_ACTIVE_RESULT typed_terminal=1 terminal=Error24_unsettled_predecessor no_victim_object=1 exit_status=$active_client_status"
+        fi
+
+        ready_snapshot "$work/ready-f.trace" || return 1
+        recovery_guid=$ready_f_guid
+        recovery_source_offset=$(wc -c <"$source_result_trace")
+        recovery_f_offset=$(wc -c <"$f_action_trace")
+        sed -n '1p' "$work/batch-f-a.tsv" >"$work/batch-a-recovery.tsv"
+        test "$(wc -l <"$work/batch-a-recovery.tsv")" -eq 1 || return 1
+        run_batch w30-a-fresh-recovery 1 "$work/batch-a-recovery.tsv" 1 0 0
+        recovery_job_id=$(sed -nE \
+            's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+            "$work/client-compile-w30-a-fresh-recovery-0.log" | tail -n 1)
+        test -n "$recovery_job_id" && test "$recovery_job_id" != "$victim_job_id" && \
+                test "$recovery_job_id" != "$b_job_id" || {
+            echo "FAIL: fresh A recovery did not receive a distinct scheduler job identity" >&2
+            return 1
+        }
+        verify_results_from_f_store w30-a-fresh-recovery "$recovery_guid" \
+            "$recovery_source_offset" "$recovery_f_offset" 1 || return 1
+        echo "S8_C1F2_W30_RECOVERY F_STORE_GUID=$recovery_guid exact_remote_object=1 fresh_job_not_victim_replay=1"
+        echo "S8_C1F2_W30_F_SPECIFIC_LOSS_PASS profile=$profile_marker exact_A_commits_held=30 healthy_B_progress=1 old_A_group_reaped_before_A_readmission=1 fresh_A_recovery=1 failure_scope=F_A_scheduler_socket_loss_with_reconnect_hold"
+    }
     run_real_scheduler_restart_batches() {
         test ! -e "$work/receipt-gate" || {
             echo "FAIL: receipt gate control directory already exists" >&2
@@ -3386,7 +4289,10 @@ EOF_GRACE_ACCEPTS
         fi
         echo "S7_WARM_PREWARM_COMPLETE"
     fi
-    if test "$worker_session_loss" = 1; then
+    if test "$w30_f_loss" = 1; then
+        run_real_c1f2_w30_worker_loss
+        exit 0
+    elif test "$worker_session_loss" = 1; then
         run_real_worker_session_loss
     elif test "$real_scheduler_restart_w30" = 1; then
         run_real_scheduler_restart_batches
@@ -3430,6 +4336,20 @@ else
             prewarm_f_lines=0
         fi
         echo "S7_WARM_PREWARM_COMPLETE"
+    fi
+    if test "$c1f2_baseline" = 1; then
+        compile_once c1f2-a-baseline "$work/src/main.cpp" "" "" "" 0 0
+        compile_once c1f2-b-baseline "$work/src/main.cpp" "" "" "" 1 0
+        cmp -s "$work/out/remote-c1f2-a-baseline.o" "$work/out/local-c1f2-a-baseline.o" || {
+            echo "FAIL: C1F2 A baseline output differs from local reference" >&2
+            exit 1
+        }
+        cmp -s "$work/out/remote-c1f2-b-baseline.o" "$work/out/local-c1f2-b-baseline.o" || {
+            echo "FAIL: C1F2 B baseline output differs from local reference" >&2
+            exit 1
+        }
+        echo "S8_C1F2_BASELINE_PASS profile=$profile_marker exact_remote_outputs=2 distinct_F_links=2"
+        exit 0
     fi
     compile_once measured
 fi

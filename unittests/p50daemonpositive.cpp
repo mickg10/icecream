@@ -514,6 +514,7 @@ private:
                 fail();
             }
             bool r2 = false;
+            bool link_state_reported = false;
             while (!stop_.load(std::memory_order_acquire) && !failed_) {
                 if (!read_relay_bytes(server_fd_, header, sizeof(header))) break;
                 const uint32_t word = (uint32_t(header[0]) << 24) |
@@ -521,8 +522,15 @@ private:
                     (uint32_t(header[2]) << 8) | uint32_t(header[3]);
                 const uint8_t type_byte = header[0];
                 if (!r2 && type_byte == static_cast<uint8_t>(
-                        icecc::p50::MessageType::LINK_STATE))
+                        icecc::p50::MessageType::LINK_STATE)) {
                     r2 = true;
+                    if (!link_state_reported) {
+                        std::fprintf(stderr,
+                            "P51_RECEIPT_GATE_LINK_STATE port=%d\n",
+                            endpoint_port_);
+                        link_state_reported = true;
+                    }
+                }
                 uint32_t payload_bytes = word;
                 if (r2) {
                     try {
@@ -548,6 +556,11 @@ private:
                         if (expected_ == 0 ||
                             (first_ordinal_ != 0 &&
                              commit.relationship_ordinal < first_ordinal_)) {
+                            std::fprintf(stderr,
+                                "P51_RECEIPT_GATE_PASSTHROUGH port=%d ordinal=%llu tu_seq=%llu\n",
+                                endpoint_port_,
+                                static_cast<unsigned long long>(commit.relationship_ordinal),
+                                static_cast<unsigned long long>(commit.inner.tu_seq.value));
                             lock.unlock();
                             if (!write_relay_bytes(client_fd_, frame.data(), frame.size()))
                                 break;
