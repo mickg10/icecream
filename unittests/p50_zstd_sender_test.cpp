@@ -1270,6 +1270,512 @@ asio::awaitable<ServerRunResult> sender_r2_accept(
                                                std::move(control));
 }
 
+asio::awaitable<void> sender_r2_accept_after_idle_expiry(
+    tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
+    std::atomic<unsigned>& accepted, std::atomic<int>& first_status,
+    std::atomic<int>& second_status, std::atomic<uint64_t>& idle_committed,
+    std::atomic<uint64_t>& idle_acknowledged,
+    std::atomic<unsigned>& quiesced_links, std::mutex& observed_mutex,
+    std::chrono::steady_clock::time_point& first_quiesced_time) {
+    for (unsigned index = 0; index != 2; ++index) {
+        tcp::socket socket(co_await asio::this_coro::executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        accepted.fetch_add(1, std::memory_order_release);
+        EndpointIoControl control;
+        control.r2_link_io_quiesced_observer =
+            [&](const LinkHello&, uint64_t committed, uint64_t acknowledged) {
+                if (index == 0) {
+                    idle_committed.store(committed, std::memory_order_release);
+                    idle_acknowledged.store(acknowledged,
+                                            std::memory_order_release);
+                    std::lock_guard lock(observed_mutex);
+                    first_quiesced_time = std::chrono::steady_clock::now();
+                }
+                quiesced_links.fetch_add(1, std::memory_order_release);
+            };
+        if (index == 1)
+            control.close_after_write = MessageType::R2_TX_COMMIT;
+        const ServerRunResult result = co_await endpoint.run_adopted_r2(
+            std::move(socket), std::move(control));
+        if (index == 0)
+            first_status.store(static_cast<int>(result.status),
+                               std::memory_order_release);
+        else
+            second_status.store(static_cast<int>(result.status),
+                                std::memory_order_release);
+    }
+}
+
+uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
+    constexpr uint32_t kWindow = 2;
+    constexpr uint64_t kRequestedPhysicalGeneration = 27;
+    constexpr uint64_t kRelationshipPrefix = 0x518600;
+    const auto [c_guid, f_guid] = sender_r2_store_guids();
+    const Id128 relationship_id = Id128::from_u64(0x5102);
+    std::array<P51SourceArmedFields, 2> armed;
+    std::array<std::vector<uint8_t>, 2> inputs;
+    for (size_t index = 0; index != armed.size(); ++index) {
+        const uint64_t request_id = 18601 + index;
+        armed[index] = sender_r2_armed(
+            sender_r2_arm(c_guid, request_id,
+                          static_cast<uint32_t>(19601 + index), kWindow,
+                          profile),
+            f_guid, kRelationshipPrefix + index, kWindow);
+        const std::string text = "int c06_idle_" + std::to_string(index) +
+                                 " = " + std::to_string(index + 1) + ";\n";
+        inputs[index].assign(text.begin(), text.end());
+    }
+
+    asio::io_context c_context;
+    asio::io_context f_context;
+    tcp::acceptor acceptor(
+        f_context, {asio::ip::address_v4::loopback(), 0});
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto first_link_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(90),
+            clock.clock_domain_id, clock.time_namespace_id);
+    const auto first_job_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(8),
+            clock.clock_domain_id, clock.time_namespace_id);
+    std::chrono::steady_clock::time_point second_deadline_tp{};
+    sidecar::AbsoluteMonotonicDeadline second_deadline;
+
+    std::mutex observed_mutex;
+    std::condition_variable acknowledged_cv;
+    std::vector<LinkHello> observed_hellos;
+    std::vector<std::chrono::steady_clock::time_point> connector_deadlines;
+    std::chrono::steady_clock::time_point first_commit_time{};
+    std::chrono::steady_clock::time_point first_quiesced_time{};
+    std::optional<JobBind> second_binding;
+    std::vector<uint64_t> second_binding_generations;
+    std::atomic<unsigned> accepted{0};
+    std::atomic<int> first_server_status{-1};
+    std::atomic<int> second_server_status{-1};
+    std::atomic<uint64_t> idle_committed{0};
+    std::atomic<uint64_t> idle_acknowledged{0};
+    std::atomic<unsigned> quiesced_links{0};
+    std::array<std::atomic<unsigned>, 2> bind_calls{};
+    std::array<std::atomic<unsigned>, 2> commit_calls{};
+    std::atomic<unsigned> acknowledged{0};
+    std::atomic<unsigned> mismatches{0};
+    std::atomic<unsigned> reset_commits{0};
+    std::optional<ResetRequest> retained_reset;
+    uint64_t recovery_floor = 0;
+    uint64_t recovery_prefix = 0;
+    Digest128 recovery_witness_digest{};
+
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [&](CStoreGuid observed_c,
+                                        const TxBegin& begin,
+                                        const TxCommit& commit,
+                                        std::span<const uint8_t> bytes) {
+        const size_t index = static_cast<size_t>(begin.tu_seq.value);
+        if (observed_c != c_guid || index >= inputs.size() ||
+            begin.profile != profile || bytes.size() != inputs[index].size() ||
+            !std::equal(bytes.begin(), bytes.end(), inputs[index].begin()) ||
+            commit.raw_digest != icecc::digest128(inputs[index]))
+            mismatches.fetch_add(1, std::memory_order_relaxed);
+        return InputJobState::Open;
+    };
+    server_config.lookup_p51_link_reservation =
+        [&](const LinkHello& hello) -> std::optional<P51SourceLinkLease> {
+        if (hello.profile != profile || hello.window != kWindow ||
+            hello.relationship_id != relationship_id ||
+            hello.c_store_guid != c_guid || hello.f_store_guid != f_guid ||
+            hello.reservation_id != Id128{armed[0].reservation_id} ||
+            (hello.start_mode != LinkStartMode::Initial &&
+             hello.start_mode != LinkStartMode::Reconnect))
+            return std::nullopt;
+        {
+            std::lock_guard lock(observed_mutex);
+            observed_hellos.push_back(hello);
+        }
+        P51SourceLinkLease lease;
+        lease.initial_armed = armed[0];
+        if (hello.start_mode == LinkStartMode::Initial) {
+            lease.absolute_deadline = first_link_deadline;
+        } else {
+            std::lock_guard lock(observed_mutex);
+            lease.absolute_deadline = second_deadline;
+        }
+        lease.reconnect = hello.start_mode == LinkStartMode::Reconnect;
+        lease.relationship_epoch = hello.relationship_epoch;
+        lease.history_nonce = hello.history_nonce;
+        if (lease.reconnect) {
+            lease.committed_prefix_k = 1;
+            lease.acknowledged_prefix_q = 1;
+        } else if (hello.relationship_epoch != armed[0].relationship_epoch) {
+            return std::nullopt;
+        }
+        return lease;
+    };
+    server_config.consume_p51_job_reservation =
+        [&](const LinkHello& hello, const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        if (hello.relationship_id != relationship_id ||
+            binding.relationship_ordinal == 0 ||
+            binding.relationship_ordinal > inputs.size() ||
+            binding.profile != profile ||
+            binding.physical_link_generation !=
+                hello.physical_link_generation)
+            return std::nullopt;
+        const size_t index = static_cast<size_t>(binding.relationship_ordinal - 1);
+        if (binding.tu_seq.value != index ||
+            binding.reservation_id != Id128{armed[index].reservation_id} ||
+            binding.wire_job_id != armed[index].arm.source.wire_job_id ||
+            binding.assignment_epoch != armed[index].arm.source.assignment_epoch ||
+            binding.assignment_nonce != armed[index].arm.source.assignment_nonce ||
+            binding.source_request_id != armed[index].arm.source.source_request_id ||
+            binding.logical_job != armed[index].arm.source.logical_job ||
+            binding.compiler_attempt != armed[index].arm.source.compiler_attempt ||
+            binding.raw_bytes != inputs[index].size() ||
+            binding.raw_digest != icecc::digest128(inputs[index]))
+            return std::nullopt;
+        if (index == 0) {
+            if (hello.start_mode != LinkStartMode::Initial ||
+                bind_calls[index].fetch_add(1, std::memory_order_relaxed) != 0)
+                return std::nullopt;
+        } else {
+            std::lock_guard lock(observed_mutex);
+            if (second_binding) {
+                const JobBind& prior = *second_binding;
+                if (prior.reservation_id != binding.reservation_id ||
+                    prior.wire_job_id != binding.wire_job_id ||
+                    prior.assignment_epoch != binding.assignment_epoch ||
+                    prior.assignment_nonce != binding.assignment_nonce ||
+                    prior.logical_job != binding.logical_job ||
+                    prior.compiler_attempt != binding.compiler_attempt ||
+                    prior.source_request_id != binding.source_request_id ||
+                    prior.tu_seq != binding.tu_seq ||
+                    prior.profile != binding.profile ||
+                    prior.raw_bytes != binding.raw_bytes ||
+                    prior.raw_digest != binding.raw_digest)
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                second_binding = binding;
+            }
+            second_binding_generations.push_back(
+                binding.physical_link_generation);
+            bind_calls[index].fetch_add(1, std::memory_order_relaxed);
+        }
+        P51SourceJobLease lease;
+        lease.armed = armed[index];
+        lease.armed.relationship_epoch = hello.relationship_epoch;
+        {
+            std::lock_guard lock(observed_mutex);
+            lease.absolute_deadline = index == 0 ? first_job_deadline
+                                                  : second_deadline;
+        }
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+        std::chrono::steady_clock::time_point expected_deadline{};
+        {
+            std::lock_guard lock(observed_mutex);
+            expected_deadline = index == 0
+                ? first_job_deadline.as_steady_time_point()
+                : second_deadline_tp;
+        }
+        if (lease.absolute_deadline.as_steady_time_point() != expected_deadline)
+            mismatches.fetch_add(1, std::memory_order_relaxed);
+        return lease;
+    };
+    server_config.record_p51_job_commit =
+        [&](const LinkHello& hello, const JobBind& binding,
+            const R2TxCommit& commit) {
+        if (hello.relationship_id != relationship_id ||
+            binding.relationship_ordinal == 0 ||
+            binding.relationship_ordinal > inputs.size() ||
+            commit.relationship_ordinal != binding.relationship_ordinal ||
+            commit.inner.tu_seq != binding.tu_seq ||
+            commit.inner.raw_digest != binding.raw_digest)
+            return false;
+        if (binding.relationship_ordinal == 1) {
+            std::lock_guard lock(observed_mutex);
+            first_commit_time = std::chrono::steady_clock::now();
+        }
+        commit_calls[static_cast<size_t>(binding.relationship_ordinal - 1)]
+            .fetch_add(1, std::memory_order_release);
+        return true;
+    };
+    server_config.acknowledge_p51_receipt =
+        [&](const LinkHello& hello, const CommitAck& ack) {
+        if (hello.relationship_id != relationship_id ||
+            ack.relationship_id != relationship_id ||
+            ack.relationship_epoch != hello.relationship_epoch ||
+            ack.physical_link_generation != hello.physical_link_generation ||
+            ack.contiguous_verified_ordinal == 0 ||
+            ack.contiguous_verified_ordinal > 2)
+            return false;
+        acknowledged.store(static_cast<unsigned>(ack.contiguous_verified_ordinal),
+                           std::memory_order_release);
+        acknowledged_cv.notify_all();
+        return true;
+    };
+    server_config.settle_p51_interrupted_job =
+        [](const LinkHello& hello) {
+            return hello.start_mode == LinkStartMode::Reconnect;
+        };
+    server_config.p51_source_reservation_terminal =
+        [](const JobBind&) { return false; };
+    server_config.recover_p51_receipts =
+        [&](const LinkHello& hello, const RecoverBegin& begin,
+            std::span<const RecoverWitness> witnesses, const RecoverEnd& end)
+            -> std::optional<P51RecoveryReceiptInterval> {
+        if (hello.start_mode != LinkStartMode::Reconnect ||
+            begin.relationship_id != relationship_id ||
+            begin.verified_floor_a != 1 || begin.prepared_prefix_p < 1 ||
+            begin.witness_count != witnesses.size() ||
+            end.witness_count != witnesses.size())
+            return std::nullopt;
+        recovery_floor = begin.verified_floor_a;
+        recovery_prefix = begin.prepared_prefix_p;
+        recovery_witness_digest = compute_r2_recovery_witness_digest(
+            begin, witnesses);
+        P51RecoveryReceiptInterval interval;
+        interval.end = ReceiptsEnd{
+            begin.relationship_id, begin.relationship_epoch,
+            begin.physical_link_generation, begin.operation_id,
+            1, 1, 1, 0};
+        return interval;
+    };
+    server_config.validate_p51_reset =
+        [&](const LinkHello& hello, const ResetRequest& request)
+            -> std::optional<ResetAck> {
+        if (hello.start_mode != LinkStartMode::Reconnect ||
+            request.relationship_id != relationship_id ||
+            request.old_relationship_epoch != hello.relationship_epoch ||
+            request.new_relationship_epoch != request.old_relationship_epoch + 1 ||
+            request.settled_prefix_k != 1)
+            return std::nullopt;
+        if (retained_reset &&
+            retained_reset->operation_id != request.operation_id)
+            return std::nullopt;
+        ResetAck ack{request,
+                     initial_route_digest(c_guid, request.new_history_nonce),
+                     RelSeq{}};
+        ack.recovery_verified_floor_a = recovery_floor;
+        ack.recovery_prepared_prefix_p = recovery_prefix;
+        ack.recovery_witness_digest = recovery_witness_digest;
+        ack.unavailable_suffix_mask = 0;
+        return ack;
+    };
+    server_config.commit_p51_reset =
+        [&](const LinkHello&, const ResetRequest& request, const ResetAck&) {
+        retained_reset = request;
+        reset_commits.fetch_add(1, std::memory_order_release);
+        return true;
+    };
+    server_config.confirm_p51_reset =
+        [&](const LinkHello& hello, const ResetConfirm& confirm) {
+        return hello.start_mode == LinkStartMode::Reconnect && retained_reset &&
+               confirm.relationship_id == relationship_id &&
+               confirm.operation_id == retained_reset->operation_id &&
+               confirm.settled_prefix_k == 1 &&
+               confirm.new_relationship_epoch ==
+                   retained_reset->new_relationship_epoch &&
+               confirm.new_history_nonce == retained_reset->new_history_nonce;
+    };
+
+    P50ServerEndpoint server(f_guid, caps, nullptr, nullptr,
+                             std::move(server_config));
+    auto server_future = asio::co_spawn(
+        f_context,
+        sender_r2_accept_after_idle_expiry(
+            acceptor, server, accepted, first_server_status,
+            second_server_status, idle_committed, idle_acknowledged,
+            quiesced_links, observed_mutex, first_quiesced_time),
+        asio::use_future);
+
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = kWindow;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    limits.max_live_entries = 8;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        c_guid, caps.zstd, limits, 1, profile);
+    ZstdSourceTransferConfig sender_config = config();
+    sender_config.maximum_duration = std::chrono::seconds(180);
+    sender_config.endpoint_caps = caps;
+    sender_config.authority_limits = limits;
+    if (profile == ProfileId::ZSTD_ROUTE)
+        sender_config.compression_level = 3;
+    auto sender = std::make_shared<P50ZstdSourceSender>(
+        authority, PreparationRouteKey{f_guid, 23, profile},
+        PrepareRequestKey{3, 18601}, sender_config);
+    auto c_work = asio::make_work_guard(c_context);
+
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    AsyncConnectedFdFactory connector = [&, remote](auto deadline, auto completion) {
+        {
+            std::lock_guard lock(observed_mutex);
+            connector_deadlines.push_back(deadline);
+        }
+        completion(connect_fd(remote));
+    };
+    const auto first_deadline_tp = first_job_deadline.as_steady_time_point();
+    auto first = asio::co_spawn(
+        c_context,
+        sender->transfer_p51_route(
+            armed[0], kRequestedPhysicalGeneration, connector,
+            PrepareRequestKey{3, 18601}, first_deadline_tp, inputs[0]),
+        asio::use_future);
+
+    std::thread c_thread;
+    std::thread f_thread;
+    struct ContextCleanup {
+        asio::io_context& c;
+        asio::io_context& f;
+        std::thread& c_thread;
+        std::thread& f_thread;
+        ~ContextCleanup() {
+            c.stop();
+            f.stop();
+            if (c_thread.joinable()) c_thread.join();
+            if (f_thread.joinable()) f_thread.join();
+        }
+    } cleanup{c_context, f_context, c_thread, f_thread};
+    f_thread = std::thread([&] { f_context.run(); });
+    c_thread = std::thread([&] { c_context.run(); });
+
+    CHECK(first.wait_until(first_deadline_tp) == std::future_status::ready);
+    const ZstdSourceTransferResult first_result = first.get();
+    CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK((first_result.committed_input == std::optional<InputRecordKey>{
+        InputRecordKey{c_guid, TuSeq{0}}}));
+    CHECK(first_result.raw_bytes == inputs[0].size());
+    CHECK(first_result.raw_digest == icecc::digest128(inputs[0]));
+    {
+        std::unique_lock lock(observed_mutex);
+        CHECK(acknowledged_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return acknowledged.load(std::memory_order_acquire) == 1;
+        }));
+    }
+    CHECK(acknowledged.load(std::memory_order_acquire) == 1);
+    CHECK(accepted.load(std::memory_order_acquire) == 1);
+    CHECK(quiesced_links.load(std::memory_order_acquire) == 0);
+    CHECK(first_server_status.load(std::memory_order_acquire) == -1);
+    {
+        std::lock_guard lock(observed_mutex);
+        CHECK(observed_hellos.size() == 1);
+        CHECK(observed_hellos.front().start_mode == LinkStartMode::Initial);
+        CHECK(observed_hellos.front().physical_link_generation ==
+              kRequestedPhysicalGeneration);
+    }
+
+    const auto idle_wait_deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(70);
+    while (first_server_status.load(std::memory_order_acquire) == -1 &&
+           std::chrono::steady_clock::now() < idle_wait_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(first_server_status.load(std::memory_order_acquire) ==
+          static_cast<int>(ServerRunStatus::DeadlineExceeded));
+    CHECK(quiesced_links.load(std::memory_order_acquire) == 1);
+    CHECK(idle_committed.load(std::memory_order_acquire) == 1);
+    CHECK(idle_acknowledged.load(std::memory_order_acquire) == 1);
+    std::chrono::steady_clock::duration actual_idle{};
+    {
+        std::lock_guard lock(observed_mutex);
+        CHECK(first_commit_time != std::chrono::steady_clock::time_point{});
+        CHECK(first_quiesced_time >= first_commit_time);
+        actual_idle = first_quiesced_time - first_commit_time;
+    }
+    CHECK(actual_idle >= std::chrono::seconds(55));
+    CHECK(actual_idle <= std::chrono::seconds(70));
+
+    {
+        std::lock_guard lock(observed_mutex);
+        second_deadline_tp = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(8);
+        second_deadline =
+            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                second_deadline_tp, clock.clock_domain_id,
+                clock.time_namespace_id);
+    }
+    auto second = asio::co_spawn(
+        c_context,
+        sender->transfer_p51_route(
+            armed[1], kRequestedPhysicalGeneration, connector,
+            PrepareRequestKey{3, 18602}, second_deadline_tp, inputs[1]),
+        asio::use_future);
+    CHECK(second.wait_until(second_deadline_tp + std::chrono::seconds(3)) ==
+          std::future_status::ready);
+    const ZstdSourceTransferResult second_result = second.get();
+    CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK((second_result.committed_input == std::optional<InputRecordKey>{
+        InputRecordKey{c_guid, TuSeq{1}}}));
+    CHECK(second_result.raw_bytes == inputs[1].size());
+    CHECK(second_result.raw_digest == icecc::digest128(inputs[1]));
+    CHECK(second_result.attempts >= 1);
+    CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+          std::future_status::ready);
+    server_future.get();
+    CHECK(second_server_status.load(std::memory_order_acquire) ==
+          static_cast<int>(ServerRunStatus::Disconnected));
+    c_work.reset();
+    CHECK(accepted.load(std::memory_order_acquire) == 2);
+    CHECK(quiesced_links.load(std::memory_order_acquire) == 2);
+    CHECK(commit_calls[0].load(std::memory_order_acquire) == 1);
+    CHECK(commit_calls[1].load(std::memory_order_acquire) == 1);
+    CHECK(bind_calls[0].load(std::memory_order_acquire) == 1);
+    CHECK(bind_calls[1].load(std::memory_order_acquire) >= 1);
+    CHECK(reset_commits.load(std::memory_order_acquire) == 1);
+    CHECK(mismatches.load(std::memory_order_relaxed) == 0);
+    {
+        std::lock_guard lock(observed_mutex);
+        CHECK(observed_hellos.size() == 2);
+        CHECK(observed_hellos[0].start_mode == LinkStartMode::Initial);
+        CHECK(observed_hellos[1].start_mode == LinkStartMode::Reconnect);
+        CHECK(observed_hellos[0].physical_link_generation ==
+              kRequestedPhysicalGeneration);
+        CHECK(observed_hellos[1].physical_link_generation >
+              observed_hellos[0].physical_link_generation);
+        CHECK(connector_deadlines.size() == 2);
+        CHECK(connector_deadlines[0] == first_deadline_tp);
+        CHECK(connector_deadlines[1] == second_deadline_tp);
+        CHECK(!second_binding_generations.empty());
+        for (uint64_t generation : second_binding_generations)
+            CHECK(generation == observed_hellos[1].physical_link_generation);
+    }
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(actual_idle).count());
+}
+
+void test_p51_sender_idle_link_reconnect_all_profiles() {
+    const std::array<ProfileId, 3> profiles{
+        ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
+    std::array<std::exception_ptr, profiles.size()> errors{};
+    std::array<uint64_t, profiles.size()> idle_seconds{};
+    std::array<std::thread, profiles.size()> workers;
+    for (size_t index = 0; index != profiles.size(); ++index) {
+        workers[index] = std::thread([&, index] {
+            try {
+                idle_seconds[index] =
+                    run_p51_sender_idle_link_reconnect_case(profiles[index]);
+            } catch (...) {
+                errors[index] = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers)
+        if (worker.joinable()) worker.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+    for (size_t index = 0; index != profiles.size(); ++index)
+        std::cerr << "P51_IDLE_RECONNECT profile="
+                  << static_cast<unsigned>(profiles[index])
+                  << " accepted=2 idle_kq=1/1 connectors=2 commits=2"
+                  << " idle_seconds=" << idle_seconds[index]
+                  << " second_deadline_preserved=1 PASS\n";
+    std::cerr << "P51_SENDER_IDLE_RECONNECT_SELECTOR PASS\n";
+}
+
 asio::awaitable<LinkHello> sender_r2_accept_and_reject(
     tcp::socket socket, LinkRejectReason reason) {
     std::array<uint8_t, 4> header_bytes{};
@@ -5872,6 +6378,10 @@ int main(int argc, char** argv) {
     if (argc == 2 &&
         std::string_view(argv[1]) == "--completed-ledger-cap-w2") {
         test_p51_completed_ledger_reserves_live_capacity();
+        return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--idle-reconnect") {
+        test_p51_sender_idle_link_reconnect_all_profiles();
         return 0;
     }
     if (argc == 2 &&

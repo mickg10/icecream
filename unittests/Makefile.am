@@ -322,6 +322,9 @@ p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50zstdsender_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+.PHONY: p50zstdsender-idle-check
+p50zstdsender-idle-check: p50zstdsender
+	timeout 110s ./p50zstdsender --idle-reconnect
 p50compilebinding_SOURCES = p50_compile_binding_test.cpp
 p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50compilebinding_CXXFLAGS = -pthread

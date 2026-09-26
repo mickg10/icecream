@@ -179,6 +179,20 @@ component-level kernel-backpressure check, not a full service-process shutdown
 or an observed `send()` EAGAIN trace. Non-Linux focused runs exit 77 because
 the queue witness requires Linux `SIOCOUTQ`; Linux failures are not skips.
 
+The real R2 idle-expiry/reconnect check is an opt-in native target because it
+waits for the endpoint's production 60-second idle deadline. Run it from an
+existing configured build:
+
+```sh
+make -C "$BUILD/unittests" p50zstdsender-idle-check
+```
+
+It runs the three wire profiles concurrently over loopback, verifies the first
+job's committed and acknowledged prefix remains on the idle link until the
+actual `DeadlineExceeded` close, then checks one physical reconnect and exact
+second-job identity/deadline/result. It is not part of the fast default sender
+suite and does not shorten the production timeout.
+
 ### Repository and offline inputs
 
 Set `image_repository` to a prepared SDK repository, or override it with
