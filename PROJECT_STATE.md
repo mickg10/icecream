@@ -71,6 +71,15 @@ log `07-gate-p51-scheduler-f-restart-w30.log` has SHA256
 `437896d49f10bc6610a7192f87cf46ab316e8e24bb472c32e040c0570da84d58`.
 The persistent-connection observation must be corrected and the gate rerun.
 
+The independent F-to-C chain and C1F4 capacity selectors also pass on that
+frozen build, three profile markers each. Logs under
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/reuse-build-gates-remaining/logs/`:
+`01-gate-p51-restart-chain-w30.log` SHA256
+`6930fbba497b52ec27f13866668e624de11eaa14b6b827cdc8d55f61e108e1da`;
+`03-gate-p51-capacity-w30.log` SHA256
+`7e89f910d1031c5c9d1019c44ca07c1d46cb71068b53d81b914443ffcc3b3c02`.
+Neither pass substitutes for the failed scheduler-to-F chain.
+
 Candidate `f15b1561` also integrates the GCC 11 build workaround, donor
 `c3da4617`: only the production/test cache-service targets demote
 `-Wmismatched-new-delete`; other warnings remain errors and frame recycling
