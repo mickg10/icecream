@@ -57,7 +57,7 @@ run_row() {
         fi
     else
         diagnostic="Error: Invariant $expected is violated."
-        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] && \
+        if [ "$rc" -eq 12 ] && \
            grep -Fqx "$diagnostic" "$log"; then
             printf 'EXPECTED-COUNTEREXAMPLE %s diagnostic=%s exit=%s log=%s\n' \
                 "$row" "$expected" "$rc" "$log"
@@ -125,4 +125,6 @@ run_row mutant-clear-consumed-proof Protocol50ConsumedProofClearMutantC2F1.cfg E
 run_row mutant-cross-c-relationship Protocol50ConsumedProofCrossCMutantC2F1.cfg OtherRelationshipUntouchedByTargetSettlement Protocol50ConsumedProof.tla
 run_row mutant-reset-retry-double-credit Protocol50ConsumedProofDoubleCreditMutantC1F2.cfg ResetCreditRearmedAtMostOnce Protocol50ConsumedProof.tla
 
-printf 'PIPELINE-RECOVERY-TLC PASS rows=43\n'
+run_row mutant-reset-before-worker-fence Protocol50PipelineResetBeforeWorkerFenceMutant.cfg ResetRequiresPendingWorkerFence
+
+printf 'PIPELINE-RECOVERY-TLC PASS rows=44\n'

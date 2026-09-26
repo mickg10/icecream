@@ -275,9 +275,10 @@ W3 model remains finite (at most three named jobs per relationship), and its
 TLC runs are bounded state-space checks, not an unbounded proof. Existing
 W2 recovery mutants cover missing earlier receipts, sequence/cancel holes,
 stale worker publication, double credit release and ACK beyond K. The pipeline
-model still has no negative-control mutant that deliberately permits RESET
-before pending-worker fencing; its normal `RequestReset` guard excludes that
-ordering. The formal lanes are safety/reachability checks, not fairness-based
+runner also has a dedicated mutant that deliberately permits `RequestReset`
+while a pending worker remains active; it must violate
+`ResetRequiresPendingWorkerFence`. The normal action keeps the worker-fenced
+guard. The formal lanes are safety/reachability checks, not fairness-based
 liveness proofs; liveness claims would need explicit peer-response and
 scheduler fairness assumptions.
 

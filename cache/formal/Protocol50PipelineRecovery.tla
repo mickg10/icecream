@@ -25,7 +25,7 @@ CONSTANTS CStores, FStores, TargetC, TargetF,
           MutantLastReceiptOnly, MutantAckBeyondK,
           MutantStaleWorker, MutantNonIdempotentReset,
           MutantCancelHole, MutantWrongJobReceipt,
-          MutantDoubleCancelRelease
+          MutantDoubleCancelRelease, MutantResetBeforeWorkerFence
 
 ASSUME /\ CStores # {}
        /\ FStores # {}
@@ -43,6 +43,7 @@ ASSUME /\ CStores # {}
        /\ MutantCancelHole \in BOOLEAN
        /\ MutantWrongJobReceipt \in BOOLEAN
        /\ MutantDoubleCancelRelease \in BOOLEAN
+       /\ MutantResetBeforeWorkerFence \in BOOLEAN
 
 Links == CStores \X FStores
 TargetLink == <<TargetC, TargetF>>
@@ -464,7 +465,7 @@ RequestReset(r) ==
     /\ phase[r] = "Recovering"
     /\ A[r] = K[r]
     /\ Q[r] = K[r]
-    /\ worker[r] = NoWorker
+    /\ (worker[r] = NoWorker \/ MutantResetBeforeWorkerFence)
     /\ resetOp[r] < 2
     /\ phase' = [phase EXCEPT ![r] = "ResetRequested"]
     /\ resetOp' = [resetOp EXCEPT ![r] = @ + 1]
@@ -787,6 +788,11 @@ NoIndependentProgressWhileTargetFull ==
         /\ K[other] > 0
 ResetOperationIdempotent ==
     \A r \in Links : historyEpoch[r] <= resetOp[r]
+
+ResetRequiresPendingWorkerFence ==
+    \A r \in Links :
+        phase[r] \in {"ResetRequested", "ResetAckPending", "ResetConfirmPending"}
+        => worker[r] = NoWorker
 
 LastConfirmedResetResult(r) ==
     IF resetOp[r] = 2 /\ resetConfirmed[r] # "Confirmed"
