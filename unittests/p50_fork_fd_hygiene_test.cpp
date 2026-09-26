@@ -769,7 +769,21 @@ void test_kcmp_errors_retire_private_handles() {
 
 } // namespace
 
+static bool kcmp_available() noexcept {
+#if defined(__linux__) && defined(SYS_kcmp)
+    errno = 0;
+    const long r = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), 0, 0, 0);
+    return !(r == -1 && (errno == ENOSYS || errno == EPERM));
+#else
+    return false;
+#endif
+}
+
 int main() {
+    if (!kcmp_available()) {
+        std::cout << "SKIP - kcmp unavailable (seccomp blocks SYS_kcmp)\n";
+        return 77;
+    }
     test_real_sweep_and_residue();
     test_exact_two_and_source_omission();
     test_validation();
