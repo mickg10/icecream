@@ -29,9 +29,20 @@ Source snapshot SHA256:
 `result.json` reports PASS and exit 0 for build/install and the live gate.
 Gate log `current/artifacts/opt-in-gates/24954373f9754237b118144d3583073e/p50-live-core.log`
 SHA256 `30edd3a7d2aeb07e65939c952f2c239eae8cdf427448886b72cdd685dbfd5b2d`.
-The registered C03 Make target, corrected W30 compiler-loss/restart gates,
-remaining interruption coverage and other open acceptance cells are not
-closed by this six-test pass.
+On the same fresh build, `p50daemonpositive-p51-c03-check` also passes all ten
+cases, and `p50daemonpositive-p51-restart-w30-check` passes all 18 cells:
+C1F2/C1F3/C1F4 and C2F1/C3F1/C4F1, each with P29V1/ZSTD_TU/ZSTD_ROUTE.
+These restart tests observe W30 affected work, healthy sibling progress and
+fresh input attachment after replacement; they do not by themselves qualify
+every ordered scheduler/sidecar/compiler-loss chain.
+Logs under the same run root:
+`current/tmp/c03-make-target.log` SHA256
+`3cb65ab2528bef4c302776a9e7d1a8ff931ffdd3936c8d5a9f61c181596b23da`;
+`current/tmp/c03-restart-target.log` SHA256
+`3f29e2301ab8923bcae45b2853cd0bfc93b6250b994ea3450277455545974d2c`.
+Both explicitly record Make exit 0. Corrected compiler-loss/ordered restart
+chains, exact cancellation accounting, remaining interruption coverage and
+other open acceptance cells remain unqualified by these passes.
 
 ### Partial HELLO and commit-reply interruption coverage
 
