@@ -35,7 +35,7 @@ Evidence is retained under
 `/tanksmall/scratch/tmp/p51-qa-293a/scratch/icecream-qa-kiyex8p9/current/`.
 The source-expiry recovery fix is integrated at `22b06a59` and passes its
 merged service-suite gate, as recorded below. Independent daemon cancellation
-cleanup remains in its private donor worktree.
+cleanup is integrated at `3d37e024`; combined-candidate QA remains pending.
 
 Local candidate `34f2e409` integrates QA donor `bb7d3615`: the completion
 source gate now uses function boundaries, retaining its behavioral assertions,
@@ -48,6 +48,34 @@ hashes match the donor files. Evidence is in the same QA run's
 log/`.trs`. The original metrics failure is unexplained/non-reproduced because
 its runner deleted the underlying diagnostics; passing targeted reruns do not
 establish its cause or replace the final combined-candidate QA gate.
+
+### Daemon cancellation cleanup after source expiry
+
+Candidate `3d37e024` integrates donors `0548b240` and `a0b65f20`.
+An exact cancellation exchange receives one fixed two-second local-control
+budget, independent of its immutable original source deadline. It neither
+renews that source deadline nor authorizes replay. Invalid clock identities
+are rejected; retries do not renew the cleanup budget.
+
+All nine donor cells pass: before publication, after source expiry, and rejected
+post-commit cancellation, each for P29V1, ZSTD_TU and ZSTD_ROUTE. The after-expiry
+fixture holds the test-owned daemon and sidecar to observe an exact queue-time
+`source_expired=1` event and a completed control exchange. The daemon test
+asserts post-commit cancellation rejection; the existing service committed-cancel
+matrix separately verifies byte/digest preservation with the same cancellation
+operation. No new attachment probe or protocol entry point was added.
+
+`/tanksmall/scratch/tmp/w30-cancel-runtime-r9/cancel-focused-r10.log` SHA256
+`ce41487ecd3551a9e7327a7a587e2e7ffe363976c9cd4c47fa453d5effbac4c6`
+records nine actual zero exits. Restoring the old expiry early return fails
+the completed-exchange assertion (exit 1), not merely a diagnostic marker:
+`old-cleanup-negative-r11.log` in the same directory, SHA256
+`e5dea9f8b81622233850e119e487103e350ad86d1f677fd4d4879c5d34b552be`.
+After restoration the daemon binary hash again matches the passing run:
+`7c6a7fae57011f288ab17223f694000fb2ea26c02c29aa6eb6b7c648cc88cf1c`.
+Integrated daemon/test source hashes match the tested donor exactly. These
+focused results do not replace combined-candidate QA or the independent
+C-expired/F-live pipeline-recovery case.
 
 ### Bounded recovery after an unresolved source expires
 
