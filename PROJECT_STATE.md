@@ -12,6 +12,31 @@ retained artifact directories.
 
 ## Developer QA
 
+### P29 pre-FILL cancellation foundation
+
+Commit `491fb851` adds explicit serializer/route cancellation before FILL
+starts, preserving continuing entropy state and earlier speculative witnesses.
+The existing broad abandon/release behavior is unchanged. A fill-started flag
+rejects this narrow operation even when FILL throws before becoming ready.
+This is the codec foundation, not yet the integrated source-request cancel path.
+
+Luna ran `p50slice0` and `codec_wire` in the SDK; both exited 0. The route
+test retains an unacknowledged predecessor, cancels the next BODY preparation,
+then checks successor REL_SEQ/history continuity, exact F output and ordered
+receipt drainage. The direct serializer test uses real/predicted NEED parity
+and an injected dictionary exception during FILL. Existing 11-TU golden
+comparison passes (44,745,525 raw bytes, 126,016 regions).
+Logs under `/tanksmall/scratch/tmp/p51-codec-abandon-build/runtime/`:
+`p50slice0-final.log` is empty on success;
+`codec-wire-final.log` SHA256 is
+`4deb001c42d451bf11482ba47d5a1381c2ce159748640ab71eb3322fbbf8d1a2`.
+Final codec test source SHA256:
+`bb01e00543e74301c76e3afec6e4bd89179fe6c476f75138c19a8ee438af6647`;
+binary SHA256:
+`b439fc3b1f7e17565ed552366fcffe8b584d663e57d07e72f6a7d98e9d7f38fc`.
+Authority validation, request-specific monitoring and the 31-request service
+cancellation cases remain separate qualification work.
+
 ### Source admission pressure
 
 Commit `983c64ab` implements typed CapacityBusy before source read/route work,
