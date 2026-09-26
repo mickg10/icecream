@@ -53,9 +53,26 @@ SHA256 `9832b0d77381d39282f82b67d29aa3c935d11b57055ff4e0024306d4c397b30a`,
 and `empty-shutdown-commit.log`
 SHA256 `f3e56299ba3af69af4fab6ab17a14aab8170484b810b287b70e44a1bd6f46187`.
 The latter exits normally in 3 ms. Neither proves production backoff timing.
-Two-group staggered cleanup, admission during grace, broader P43 recovery,
-and the complete W30 matrix remain unqualified. This is not a full-candidate
-regression pass; the reused build's complete source closure is not established.
+The additional `ICECC_P51_WRAPPER_STAGGERED_QUIESCENCE=1` mode passes all three
+profiles on that final daemon binary. It observes two exact compiler groups:
+one stopped and one waitable, retaining both PID/PGID/start-time identities
+until cleanup. Both settle exactly once; all new local socket accept events
+follow the later group settlement. A real ordinary client queued on F during
+grace then completes through local fallback, without P50 input. This proves
+local admission resumes, not remote P43 compilation. The original F sidecar
+remains alive, lifecycle replies precede settlement, and a separate fresh R2
+job still produces the exact object.
+
+Reviewed test-only donors: `62cd0c48` and `6b84c6a2`. Final log under the same
+directory: `staggered-admission-review-final-all3.log`, SHA256
+`e679ba6649a8bfd8be5f38ce649abfe3d8fcfff893a23d0d3b173ef2b684f808`.
+Imported runner SHA256:
+`00697a610c74158ba14c44de09f9efb885cf98f5916e5440122016cb90317dc5`;
+wrapper SHA256:
+`1f5bf728b9ef368a5fe04503d003746a30217e274f2868e420136bc11747eb80`.
+Broader P43 recovery and the complete W30 matrix remain unqualified. This is
+not a full-candidate regression pass; the reused build's complete source
+closure is not established.
 
 Run the existing `unittests/p51wrappercompile-run.sh` with its documented
 source/build, daemon-account and worker-address environment and explicit task

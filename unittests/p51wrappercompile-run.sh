@@ -5,8 +5,9 @@
 # compile test: it holds the exact victim compiler, loses the global scheduler
 # session, expects strict-P50 Error 24/no victim object if the committed
 # predecessor cannot be settled, then verifies a separate fresh R2 recovery
-# compile against local g++. It does not assert transparent victim replay or
-# unaffected siblings across global scheduler replacement. Select profiles
+# compile against local g++. The opt-in staggered-quiescence variant holds two
+# exact compiler groups and sends an ordinary new client through F during the
+# cleanup grace. Neither mode asserts transparent victim replay. Select profiles
 # with ICECC_P51_WRAPPER_PROFILES (e.g. "P29V1 ZSTD_TU" or ZSTD_ROUTE).
 # Portable entrypoint (bind task scratch to /tmp, source/build as above, and
 # provide the required non-loopback scheduler address and daemon uid/gid):
@@ -35,6 +36,7 @@ chmod 0755 "$fixture"
 mkdir -p "$fixture/sources" "$fixture/predictive"
 worker_session_loss=${ICECC_P51_WRAPPER_WORKER_SESSION_LOSS:-0}
 expect_stable_f=${ICECC_P51_WRAPPER_EXPECT_STABLE_F:-0}
+staggered_quiescence=${ICECC_P51_WRAPPER_STAGGERED_QUIESCENCE:-0}
 case "$worker_session_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
@@ -47,8 +49,18 @@ if test "$expect_stable_f" = 1 && test "$worker_session_loss" != 1; then
     echo "FAIL: stable-F expectation requires ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1" >&2
     exit 1
 fi
+case "$staggered_quiescence" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_STAGGERED_QUIESCENCE must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$staggered_quiescence" = 1 && \
+        { test "$worker_session_loss" != 1 || test "$expect_stable_f" != 1; }; then
+    echo "FAIL: staggered quiescence requires worker-session-loss and strict stable-F mode" >&2
+    exit 1
+fi
 if test "$worker_session_loss" = 1; then
     jobs=2
+    test "$staggered_quiescence" = 0 || jobs=3
 else
     jobs=${ICECC_P51_WRAPPER_JOBS:-100}
 fi
@@ -56,7 +68,7 @@ case "$jobs" in
     ''|*[!0-9]*|0) echo "FAIL: ICECC_P51_WRAPPER_JOBS must be a positive integer" >&2; exit 1 ;;
 esac
 
-sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" "$worker_session_loss" <<'PY'
+sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" "$worker_session_loss" "$staggered_quiescence" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -66,13 +78,15 @@ import sys
 root = pathlib.Path(sys.argv[1])
 count = int(sys.argv[2])
 worker_session_loss = sys.argv[3] == "1"
+staggered_quiescence = sys.argv[4] == "1"
 rows = []
 for ordinal in range(count):
     stem = f"tu-{ordinal:02d}"
-    if worker_session_loss and ordinal == 0:
-        # A single deliberately expensive real translation unit gives the
-        # harness time to capture and stop the actual remote compiler child.
-        # The second row is compiled only after scheduler-session recovery.
+    if worker_session_loss and (ordinal == 0 or (staggered_quiescence and ordinal == 1)):
+        # Deliberately expensive real translation units give the harness time
+        # to capture exact remote compiler groups. The normal loss gate makes
+        # only ordinal zero heavy; staggered mode makes ordinals zero and one
+        # active before scheduler-session loss.
         body = ("\n".join(
             f'extern "C" int p51_worker_loss_{index}(int value) '
             f'{{ return value + {index + 17}; }}'
@@ -153,6 +167,7 @@ for profile in $profiles; do
         ICECC_P50_C1F1_TIMEOUT=300 \
         ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS="$worker_session_loss" \
         ICECC_P50_C1F1_EXPECT_STABLE_F="$expect_stable_f" \
+        ICECC_P50_C1F1_TEST_STAGGERED_QUIESCENCE="$staggered_quiescence" \
         "$src/unittests/p50compilee2e-run.sh" >"$log" 2>&1
     status=$?
     set -e
@@ -173,6 +188,18 @@ for profile in $profiles; do
             echo "FAIL: $profile committed victim/Error24 and fresh recovery outputs disagree with worker-loss scope" >&2
             exit 1
         }
+        if test "$staggered_quiescence" = 1; then
+            test ! -e "$work/result-active-worker-loss-1.tsv" && \
+                test -s "$work/out/grace-ordinary.o" || {
+                echo "FAIL: staggered exact groups or grace-period compile did not settle as expected" >&2
+                exit 1
+            }
+            grep -F "S8_REAL_WORKER_LOSS_GRACE_ADMISSION_PASS" "$log" >/dev/null || {
+                cat "$log"
+                echo "FAIL: $profile did not prove queued client admission after exact cleanup" >&2
+                exit 1
+            }
+        fi
         if test "$expect_stable_f" = 1; then
             grep -F "S8_REAL_WORKER_LOSS_F_LIFECYCLE_DELIVERED" "$log" >/dev/null || {
                 cat "$log"

@@ -29,6 +29,7 @@ real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
 worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
 expect_stable_f=${ICECC_P50_C1F1_EXPECT_STABLE_F:-0}
+staggered_quiescence=${ICECC_P50_C1F1_TEST_STAGGERED_QUIESCENCE:-0}
 case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
@@ -64,6 +65,15 @@ case "$expect_stable_f" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_C1F1_EXPECT_STABLE_F must be 0 or 1" >&2; exit 1 ;;
 esac
+case "$staggered_quiescence" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_TEST_STAGGERED_QUIESCENCE must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$staggered_quiescence" = 1 && \
+        { test "$worker_session_loss" != 1 || test "$expect_stable_f" != 1; }; then
+    echo "FAIL: staggered quiescence requires worker-session-loss and strict stable-F mode" >&2
+    exit 1
+fi
 if test "$expect_stable_f" = 1 && test "$worker_session_loss" != 1; then
     echo "FAIL: stable-F expectation requires the worker-session-loss scenario" >&2
     exit 1
@@ -138,6 +148,11 @@ if test "$worker_session_loss" = 1; then
     export ICECC_TESTS=1
 fi
 worker_maxjobs=$slots_per_f
+if test "$staggered_quiescence" = 1; then
+    # The focused barrier probe needs two simultaneous real compiler groups.
+    # The scheduler reserves one dispatch credit, so expose one spare slot.
+    worker_maxjobs=3
+fi
 if test "$real_scheduler_restart_w30" = 1; then
     # The scheduler reserves one dispatch-credit slot: when the worker's
     # advertised farm capacity is N, effective_dispatch_credit() admits at
@@ -320,7 +335,7 @@ cleanup() {
         wait "$receipt_gate_pid" 2>/dev/null || :
         receipt_gate_pid=
     fi
-    cleanup_pids="${batch_job_pids:-} ${receipt_gate_pid:-} ${s2_compile_pid:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    cleanup_pids="${batch_job_pids:-} ${grace_job_pid:-} ${receipt_gate_pid:-} ${s2_compile_pid:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
     for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
@@ -612,12 +627,19 @@ PY
     }
     if test "$real_scheduler_restart_w30" = 1 || test "$worker_session_loss" = 1; then
         if test "$worker_session_loss" = 1; then
-            test "$batch_expected_count" -eq 2 || {
-                echo "FAIL: focused worker-session-loss probe requires exactly two distinct TUs" >&2
+            expected_loss_rows=2
+            test "$staggered_quiescence" = 0 || expected_loss_rows=3
+            test "$batch_expected_count" -eq "$expected_loss_rows" || {
+                echo "FAIL: focused worker-session-loss probe requires exactly $expected_loss_rows distinct TUs" >&2
                 exit 1
             }
-            sed -n '1p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
-            sed -n '2p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
+            if test "$staggered_quiescence" = 1; then
+                sed -n '1,2p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
+                sed -n '3p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
+            else
+                sed -n '1p' "$work/batch.tsv" >"$work/batch-old-scheduler.tsv"
+                sed -n '2p' "$work/batch.tsv" >"$work/batch-new-scheduler.tsv"
+            fi
         else
             test "$batch_expected_count" -eq "$real_scheduler_w30_rows" || {
                 echo "FAIL: real scheduler W30 restart requires exactly $real_scheduler_w30_rows distinct TUs" >&2
@@ -1880,6 +1902,8 @@ if test -n "$batch_manifest"; then
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3
+            elif test "$staggered_quiescence" = 1; then
+                f_slot=$((ordinal % 2))
             elif test "$real_scheduler_restart_w30" = 1; then
                 f_slot=$((ordinal % 30))
             fi
@@ -1975,7 +1999,7 @@ if test -n "$batch_manifest"; then
                         # below validates the exact Error 24/new-epoch policy.
                         :
                     elif test "$run_label" = active-worker-loss && \
-                            test "$job_ordinal" = 0; then
+                            { test "$job_ordinal" = 0 || test "$staggered_quiescence" = 1; }; then
                         # The stopped active compile may already have crossed
                         # COMMIT when its worker session disappears. Strict
                         # P50 must not transparently retry that ambiguous
@@ -1987,7 +2011,7 @@ if test -n "$batch_manifest"; then
                             echo "FAIL: lost active strict-P50 victim lacks the documented explicit Error 24 policy result" >&2
                             return 1
                         }
-                        echo "S8_REAL_WORKER_LOSS_VICTIM_COMMITTED_BUT_NOT_RETRIED ordinal=0 policy=Error24 remote_only=1"
+                        echo "S8_REAL_WORKER_LOSS_COMMITTED_BUT_NOT_RETRIED ordinal=$job_ordinal policy=Error24 remote_only=1"
                     elif grep -Fq 'source committed for P50 CompileFile' "$client_log" || \
                             ! grep -Eq 'got exception Error [0-9]+' "$client_log"; then
                         echo "FAIL: discarded B caller lacks an explicit pre-commit protocol error ($run_label-$job_ordinal status=$job_status)" >&2
@@ -2332,6 +2356,7 @@ EOF_FINAL_IDENTITY
         return 1
     }
     restart_real_scheduler() {
+        c_only_during_barrier=${1:-0}
         scheduler_pid_before=$sched_pid
         f_daemon_pid_before=$worker_pid
         c_daemon_pid_before=$client_pid
@@ -2351,7 +2376,7 @@ EOF_FINAL_IDENTITY
             replacement_c_logins=$(grep -F -c 'login p50-c protocol version:' "$work/scheduler-replacement.log" 2>/dev/null || true)
             replacement_f_logins=$(grep -F -c 'login p50-f protocol version:' "$work/scheduler-replacement.log" 2>/dev/null || true)
             if test "${replacement_c_logins:-0}" -ge 1 && \
-                    test "${replacement_f_logins:-0}" -ge 1; then
+                    { test "$c_only_during_barrier" = 1 || test "${replacement_f_logins:-0}" -ge 1; }; then
                 scheduler_ready=1
                 break
             fi
@@ -2359,7 +2384,7 @@ EOF_FINAL_IDENTITY
             sleep 0.1
         done
         test "$scheduler_ready" -eq 1 || {
-            echo "FAIL: real replacement scheduler did not receive C/F re-logins" >&2
+            echo "FAIL: real replacement scheduler did not receive required C/F re-logins (c_only=$c_only_during_barrier)" >&2
             cat "$work/scheduler-replacement.log" >&2 || true
             return 1
         }
@@ -2383,6 +2408,9 @@ EOF_FINAL_IDENTITY
             echo "FAIL: scheduler restart changed or lost a C/F daemon/cache process" >&2
             return 1
         }
+        if test "$c_only_during_barrier" = 1; then
+            echo "S8_REAL_WORKER_LOSS_REPLACEMENT_C_READY F_login_deferred=1"
+        fi
         echo "S8_REAL_S_RESTART old_scheduler_pid=$scheduler_pid_before new_scheduler_pid=$sched_pid c_daemon_pid=$client_pid f_daemon_pid=$worker_pid c_cache_pid=$client_service_pid f_cache_pid=$service_pid replacement_c_logins=$replacement_c_logins replacement_f_logins=$replacement_f_logins"
     }
     verify_results_from_f_store() {
@@ -2554,7 +2582,19 @@ PY
         ready_snapshot "$work/ready-f.trace" || return 1
         old_f_store_guid=$ready_f_guid
 
-        run_batch active-worker-loss 1 "$work/batch-old-scheduler.tsv" 1 1 1
+        loss_active_count=1
+        test "$staggered_quiescence" = 0 || loss_active_count=2
+        run_batch active-worker-loss 1 "$work/batch-old-scheduler.tsv" "$loss_active_count" 1 1
+        loss_job_entries=$job_entries
+        loss_job_pids=$job_pids
+        loss_batch_job_pids=$batch_job_pids
+        loss_batch_allow_failures=$batch_allow_failures
+        loss_batch_ordinal=$ordinal
+        loss_batch_start_ns=$batch_start_ns
+        loss_active_batch_file=$active_batch_file
+        loss_active_batch_expected=$active_batch_expected
+        loss_emit_rows=$emit_rows
+        loss_topology_input=$topology_input
         old_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler.log")
         test -n "$old_scheduler_epoch" || {
             echo "FAIL: original scheduler strict-nonce epoch was not logged" >&2
@@ -2654,6 +2694,72 @@ EOF_VICTIM_STOPPED
         }
         echo "S8_REAL_WORKER_LOSS_VICTIM_STOPPED job=$victim_job_id epoch=$victim_epoch nonce=$victim_nonce pid=$victim_pid pgid=$victim_pgid start_ticks=$victim_start_ticks state=$stopped_state"
 
+        staggered_job_id= staggered_epoch= staggered_nonce=
+        staggered_pid= staggered_pgid= staggered_start_ticks=
+        if test "$staggered_quiescence" = 1; then
+            staggered_client_log="$work/client-compile-active-worker-loss-1.log"
+            staggered_assign_deadline=$(( $(date +%s) + 20 ))
+            staggered_job_id= staggered_assignment=
+            while test "$(date +%s)" -lt "$staggered_assign_deadline"; do
+                staggered_job_id=$(sed -nE \
+                    's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' \
+                    "$staggered_client_log" 2>/dev/null | tail -n 1)
+                staggered_assignment=$(sed -nE \
+                    's/.*P50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) nonce ([0-9]+).*/\1 \2 \3/p' \
+                    "$staggered_client_log" 2>/dev/null | tail -n 1)
+                test -n "$staggered_job_id" && test -n "$staggered_assignment" && break
+                sleep 0.02
+            done
+            read -r staggered_bound_job staggered_epoch staggered_nonce <<EOF_STAGGER_ASSIGNMENT
+$staggered_assignment
+EOF_STAGGER_ASSIGNMENT
+            test "$staggered_job_id" -gt 0 2>/dev/null && \
+                test "$staggered_bound_job" = "$staggered_job_id" && \
+                test "$staggered_epoch" = "$old_scheduler_epoch" || {
+                echo "FAIL: second active compiler group lacks exact old-session identity" >&2
+                return 1
+            }
+            staggered_marker=
+            staggered_child_deadline=$(( $(date +%s) + 20 ))
+            while test "$(date +%s)" -lt "$staggered_child_deadline"; do
+                staggered_marker=$(sed -nE \
+                    "s/.*P50_TEST_COMPILER_CHILD job=$staggered_job_id epoch=$staggered_epoch nonce=$staggered_nonce pid=([0-9]+) pgid=([0-9]+).*/\\1 \\2/p" \
+                    "$work/f.log" | tail -n 1)
+                test -n "$staggered_marker" && break
+                test ! -e "$work/result-active-worker-loss-1.tsv" || {
+                    echo "FAIL: second heavy compiler completed before its exact child was observed" >&2
+                    return 1
+                }
+                sleep 0.01
+            done
+            read -r staggered_pid staggered_pgid <<EOF_STAGGER_CHILD
+$staggered_marker
+EOF_STAGGER_CHILD
+            test "$staggered_pid" -gt 0 2>/dev/null && \
+                test "$staggered_pgid" = "$staggered_pid" || {
+                echo "FAIL: second active compiler group identity was not exposed" >&2
+                return 1
+            }
+            staggered_before=$(read_compiler_identity "$staggered_pid") || {
+                echo "FAIL: second exact compiler PID disappeared before session loss" >&2
+                return 1
+            }
+            read -r observed_pid observed_pgid staggered_start_ticks staggered_state <<EOF_STAGGER_ID
+$staggered_before
+EOF_STAGGER_ID
+            test "$observed_pid" = "$staggered_pid" && \
+                test "$observed_pgid" = "$staggered_pgid" && \
+                test -n "$staggered_start_ticks" && test "$staggered_state" != Z || {
+                echo "FAIL: second compiler identity is not a live owned group" >&2
+                return 1
+            }
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$staggered_job_id" "$staggered_epoch" "$staggered_nonce" \
+                "$staggered_pid" "$staggered_pgid" "$staggered_start_ticks" \
+                >"$work/worker-loss-staggered-group.tsv"
+            echo "S8_REAL_WORKER_LOSS_SECOND_GROUP_ACTIVE job=$staggered_job_id epoch=$staggered_epoch nonce=$staggered_nonce pid=$staggered_pid pgid=$staggered_pgid start_ticks=$staggered_start_ticks"
+        fi
+
         test ! -e "$work/result-active-worker-loss-0.tsv" || {
             echo "FAIL: stopped victim produced a successful compiler result before session loss" >&2
             return 1
@@ -2661,13 +2767,130 @@ EOF_VICTIM_STOPPED
         echo "S8_REAL_WORKER_LOSS_PRE_RESTART_OUTPUTS exact=1 victim_result=absent worker_pid=$old_worker_pid"
 
         worker_loss_allow_f_sidecar_retirement=1
-        restart_real_scheduler || return 1
+        if test "$staggered_quiescence" = 1; then
+            restart_real_scheduler 1 || return 1
+        else
+            restart_real_scheduler || return 1
+        fi
         worker_loss_allow_f_sidecar_retirement=0
         new_scheduler_epoch=$(scheduler_epoch_from_log "$work/scheduler-replacement.log")
         test -n "$new_scheduler_epoch" && test "$new_scheduler_epoch" != "$old_scheduler_epoch" || {
             echo "FAIL: replacement scheduler did not establish a distinct worker session" >&2
             return 1
         }
+        grace_job_pid=
+        grace_output=
+        if test "$staggered_quiescence" = 1; then
+            staggered_term_deadline=$(( $(date +%s) + 10 ))
+            while test "$(date +%s)" -lt "$staggered_term_deadline"; do
+                grep -F "session quiescence TERM compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1 && \
+                    grep -F "session quiescence TERM compiler pid=$staggered_pid pgid=$staggered_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1 && break
+                sleep 0.02
+            done
+            grep -F "session quiescence TERM compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1 && \
+                grep -F "session quiescence TERM compiler pid=$staggered_pid pgid=$staggered_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1 || {
+                echo "FAIL: daemon did not TERM both exact compiler groups within bounded observation" >&2
+                return 1
+            }
+            victim_identity_now=$(read_compiler_identity "$victim_pid" 2>/dev/null || true)
+            second_identity_now=$(read_compiler_identity "$staggered_pid" 2>/dev/null || true)
+            read -r victim_now_pid victim_now_pgid victim_now_ticks victim_state_now <<EOF_VICTIM_GRACE_ID
+$victim_identity_now
+EOF_VICTIM_GRACE_ID
+            read -r second_now_pid second_now_pgid second_now_ticks second_state_now <<EOF_SECOND_GRACE_ID
+$second_identity_now
+EOF_SECOND_GRACE_ID
+            test "$victim_now_pid" = "$victim_pid" && \
+                    test "$victim_now_pgid" = "$victim_pgid" && \
+                    test "$victim_now_ticks" = "$victim_start_ticks" || {
+                echo "FAIL: first exact compiler identity changed/disappeared during grace" >&2
+                return 1
+            }
+            test "$second_now_pid" = "$staggered_pid" && \
+                    test "$second_now_pgid" = "$staggered_pgid" && \
+                    test "$second_now_ticks" = "$staggered_start_ticks" || {
+                echo "FAIL: second exact compiler identity changed/disappeared during grace" >&2
+                return 1
+            }
+            case "$victim_state_now" in
+                T|t) ;;
+                *) echo "FAIL: first exact compiler group was not still stopped during grace (state=$victim_state_now)" >&2; return 1 ;;
+            esac
+            case "$second_state_now" in
+                Z) ;;
+                *) echo "FAIL: second exact compiler leader was not waitable during grace (state=$second_state_now)" >&2; return 1 ;;
+            esac
+            if grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1 || \
+                    grep -F "session quiescence settled compiler pid=$staggered_pid pgid=$staggered_pgid generation=" \
+                    "$work/f.log" >/dev/null 2>&1; then
+                echo "FAIL: ownership barrier settled before all exact targets were waitable" >&2
+                return 1
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$victim_pid" "$victim_state_now" \
+                "$staggered_pid" "${second_state_now:-gone}" >"$work/worker-loss-staggered-order.tsv"
+            echo "S8_REAL_WORKER_LOSS_STAGGERED_STATES stopped_pid=$victim_pid state=$victim_state_now waitable_pid=$staggered_pid state=${second_state_now:-gone} both_TERM=1 settled=0"
+
+            pre_grace_child_count=$(grep -F -c 'P50_TEST_COMPILER_CHILD job=' "$work/f.log" 2>/dev/null || true)
+            pre_grace_local_accepts=$(grep -F -c 'local unix domain socket as' "$work/f.log" 2>/dev/null || true)
+            pre_grace_f_log_lines=$(wc -l <"$work/f.log")
+            grace_source="$work/src/grace-ordinary.cpp"
+            grace_output="$work/out/grace-ordinary.o"
+            grace_client_log="$work/client-grace-ordinary.log"
+            printf 'extern "C" int grace_ordinary_compile() { return 73; }\n' >"$grace_source"
+            test ! -e "$grace_output" || {
+                echo "FAIL: ordinary grace-probe output already exists" >&2
+                return 1
+            }
+            (
+                unset ICECC_P50_C1F1_REQUIRED ICECC_P50_PREPROCESSED_CAPTURE
+                export ICECC_TEST_SOCKET="$work/worker.sock" ICECC_TEST_REMOTEBUILD=1
+                export ICECC_VERSION="$envtar" ICECC_PREFERRED_HOST=p50-f
+                export ICECC_P51_MODE=off ICECC_DEBUG=debug ICECC_LOGFILE="$grace_client_log"
+                if timeout "$timeout_s" "$build/client/icecc" g++ -std=c++17 -O2 -c \
+                        "$grace_source" -o "$grace_output"; then
+                    grace_status=0
+                else
+                    grace_status=$?
+                fi
+                printf '%s\n' "$grace_status" >"$work/grace-ordinary-status"
+                exit "$grace_status"
+            ) >"$work/grace-ordinary-wrapper.log" 2>&1 &
+            grace_job_pid=$!
+            grace_connect_deadline=$(( $(date +%s) + 5 ))
+            while test "$(date +%s)" -lt "$grace_connect_deadline"; do
+                grep -F "connected to $work/worker.sock" "$grace_client_log" >/dev/null 2>&1 && break
+                kill -0 "$grace_job_pid" 2>/dev/null || break
+                sleep 0.05
+            done
+            grep -F "connected to $work/worker.sock" "$grace_client_log" >/dev/null 2>&1 && \
+                kill -0 "$grace_job_pid" 2>/dev/null && test ! -e "$grace_output" || {
+                echo "FAIL: ordinary compiler client did not remain connected/queued on F during the barrier" >&2
+                return 1
+            }
+            sleep 0.25
+            grace_local_accepts=$(grep -F -c 'local unix domain socket as' "$work/f.log" 2>/dev/null || true)
+            test "$grace_local_accepts" -eq "$pre_grace_local_accepts" && \
+                kill -0 "$grace_job_pid" 2>/dev/null && test ! -e "$grace_output" || {
+                echo "FAIL: F accepted/completed the new client before exact compiler cleanup" >&2
+                return 1
+            }
+            grace_child_count=$(grep -F -c 'P50_TEST_COMPILER_CHILD job=' "$work/f.log" 2>/dev/null || true)
+            test "$grace_child_count" -eq "$pre_grace_child_count" || {
+                echo "FAIL: F admitted a new compiler before exact groups settled (before=$pre_grace_child_count after=$grace_child_count)" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_GRACE_CLIENT_QUEUED client_pid=$grace_job_pid endpoint=F_local_socket F_blocked_by_exact_group=$victim_pid new_compiler_admitted=0 p50_input=0"
+            kill -CONT "$victim_pid" 2>/dev/null || {
+                echo "FAIL: could not release held exact compiler after grace admission observation" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_GRACE_OBSERVED then_released_stopped_pid=$victim_pid"
+        fi
         quiescence_deadline=$(( $(date +%s) + 15 ))
         while test "$(date +%s)" -lt "$quiescence_deadline"; do
             grep -F "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
@@ -2689,6 +2912,29 @@ EOF_VICTIM_STOPPED
             echo "FAIL: F did not reap and settle the exact old-session compiler group" >&2
             return 1
         }
+        if test "$staggered_quiescence" = 1; then
+            grep -F "session quiescence TERM compiler pid=$staggered_pid pgid=$staggered_pgid generation=" \
+                "$work/f.log" >/dev/null 2>&1 && \
+                grep -F "session quiescence settled compiler pid=$staggered_pid pgid=$staggered_pgid generation=" \
+                "$work/f.log" >/dev/null 2>&1 || {
+                echo "FAIL: F did not settle the second exact old-session compiler group" >&2
+                return 1
+            }
+            test "$(grep -F -c "session quiescence settled compiler pid=$staggered_pid pgid=$staggered_pgid generation=" "$work/f.log")" -eq 1 || {
+                echo "FAIL: second exact compiler group was settled more than once" >&2
+                return 1
+            }
+            if kill -0 "$staggered_pid" 2>/dev/null; then
+                echo "FAIL: second compiler leader remains after exact settlement" >&2
+                return 1
+            fi
+            staggered_group_members=$(ps -eo pid=,pgid=,stat= | awk -v pgid="$staggered_pgid" \
+                '$2 == pgid { print $1 "/" $3 }')
+            test -z "$staggered_group_members" || {
+                echo "FAIL: second exact compiler group has members after settlement: $staggered_group_members" >&2
+                return 1
+            }
+        fi
         if kill -0 "$victim_pid" 2>/dev/null; then
             echo "FAIL: settled compiler leader PID remains present after exact reap" >&2
             return 1
@@ -2702,6 +2948,30 @@ EOF_VICTIM_STOPPED
         settled_line=$(grep -nF \
             "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
             "$work/f.log" | tail -n 1 | cut -d: -f1)
+        if test "$staggered_quiescence" = 1; then
+            f_relogin_deadline=$(( $(date +%s) + 15 ))
+            while test "$(date +%s)" -lt "$f_relogin_deadline"; do
+                replacement_f_logins=$(grep -F -c 'login p50-f protocol version:' \
+                    "$work/scheduler-replacement.log" 2>/dev/null || true)
+                replacement_f_connections=$(grep -F -c 'Connected to scheduler (I am known as ' \
+                    "$work/f.log" 2>/dev/null || true)
+                if test "${replacement_f_logins:-0}" -ge 1 && \
+                        test "${replacement_f_connections:-0}" -ge 2; then
+                    break
+                fi
+                kill -0 "$worker_pid" 2>/dev/null || {
+                    echo "FAIL: F daemon exited before replacement scheduler login" >&2
+                    return 1
+                }
+                sleep 0.1
+            done
+            test "${replacement_f_logins:-0}" -ge 1 && \
+                test "${replacement_f_connections:-0}" -ge 2 || {
+                echo "FAIL: F did not reconnect to replacement scheduler within bounded post-cleanup wait" >&2
+                cat "$work/scheduler-replacement.log" >&2 || true
+                return 1
+            }
+        fi
         replacement_connection_line=$(grep -nF 'Connected to scheduler (I am known as ' \
             "$work/f.log" | tail -n 1 | cut -d: -f1)
         test -n "$settled_line" && test -n "$replacement_connection_line" && \
@@ -2783,7 +3053,83 @@ EOF_VICTIM_STOPPED
         # Worker-loss is not CancelJob.  A committed victim that cannot prove
         # local predecessor settlement fails closed with Error 24; recovery
         # is exercised below with a distinct fresh R2 job, not a replay claim.
-        finish_batch
+        if test "$staggered_quiescence" = 1; then
+            job_entries=$loss_job_entries
+            job_pids=$loss_job_pids
+            batch_job_pids=$loss_batch_job_pids
+            batch_allow_failures=$loss_batch_allow_failures
+            run_label=active-worker-loss
+            ordinal=$loss_batch_ordinal
+            batch_start_ns=$loss_batch_start_ns
+            active_batch_file=$loss_active_batch_file
+            active_batch_expected=$loss_active_batch_expected
+            emit_rows=$loss_emit_rows
+            topology_input=$loss_topology_input
+            finish_batch || return 1
+            if wait "$grace_job_pid"; then
+                grace_wait_status=0
+            else
+                grace_wait_status=$?
+            fi
+            grace_job_pid=
+            test "$grace_wait_status" -eq 0 && test -s "$grace_output" && \
+                test "$(cat "$work/grace-ordinary-status")" -eq 0 2>/dev/null || {
+                echo "FAIL: real ordinary compiler client submitted during grace did not progress after cleanup (status=$grace_wait_status)" >&2
+                cat "$work/grace-ordinary-wrapper.log" >&2 || true
+                cat "$grace_client_log" >&2 || true
+                return 1
+            }
+            if grep -F 'P50 assignment identity bound' "$grace_client_log" >/dev/null 2>&1; then
+                echo "FAIL: ordinary grace probe unexpectedly used a P50-assignment client path" >&2
+                return 1
+            fi
+            victim_settled_line=$(grep -nF \
+                "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" \
+                "$work/f.log" | head -n 1 | cut -d: -f1)
+            staggered_settled_line=$(grep -nF \
+                "session quiescence settled compiler pid=$staggered_pid pgid=$staggered_pgid generation=" \
+                "$work/f.log" | head -n 1 | cut -d: -f1)
+            test -n "$victim_settled_line" && test -n "$staggered_settled_line" || {
+                echo "FAIL: one or both exact compiler groups lack a settlement record" >&2
+                return 1
+            }
+            grace_settled_line=$victim_settled_line
+            test "$staggered_settled_line" -gt "$grace_settled_line" && \
+                grace_settled_line=$staggered_settled_line
+            grace_accept_lines=$(tail -n +$((pre_grace_f_log_lines + 1)) "$work/f.log" | \
+                grep -nE 'accepted [0-9]+ local unix domain socket as [0-9]+' || true)
+            grace_accept_line=
+            grace_accepts_after_cleanup=1
+            while IFS=: read -r rel_accept_line _; do
+                test -n "$rel_accept_line" || continue
+                abs_accept_line=$((pre_grace_f_log_lines + rel_accept_line))
+                test -n "$grace_accept_line" || grace_accept_line=$abs_accept_line
+                if test "$abs_accept_line" -le "$grace_settled_line"; then
+                    grace_accepts_after_cleanup=0
+                fi
+            done <<EOF_GRACE_ACCEPTS
+$grace_accept_lines
+EOF_GRACE_ACCEPTS
+            test -n "$victim_settled_line" && test -n "$staggered_settled_line" && \
+                test -n "$grace_accept_line" && test "$grace_accepts_after_cleanup" -eq 1 || {
+                echo "FAIL: F did not defer the real local client connection until exact cleanup" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_GRACE_F_ACCEPT_ORDER max_group_settled_line=$grace_settled_line earliest_new_accept_line=$grace_accept_line all_new_accepts_after_cleanup=1"
+            test "$(grep -F -c "session quiescence settled compiler pid=$victim_pid pgid=$victim_pgid generation=" "$work/f.log")" -eq 1 && \
+                test "$(grep -F -c "session quiescence settled compiler pid=$staggered_pid pgid=$staggered_pgid generation=" "$work/f.log")" -eq 1 || {
+                echo "FAIL: exact staggered compiler groups were not settled exactly once" >&2
+                return 1
+            }
+            grep -F 'phase=SETTLED targets=0 current_kids=0 ownership_failed=0 ownership_faulted=0' "$work/f.log" >/dev/null || {
+                echo "FAIL: final daemon compiler ownership accounting did not settle cleanly" >&2
+                return 1
+            }
+            grace_output_sha=$(sha256sum "$grace_output" | awk '{print $1}')
+            echo "S8_REAL_WORKER_LOSS_GRACE_ADMISSION_PASS old_groups=2 settled_once=2 no_precleanup_admission=1 ordinary_client_progress=1 p50_input=0 output_sha256=$grace_output_sha original_F_pid=$old_f_service_pid"
+        else
+            finish_batch
+        fi
         test ! -e "$work/result-active-worker-loss-0.tsv" || {
             echo "FAIL: committed worker-loss victim unexpectedly produced an object" >&2
             return 1
