@@ -40,9 +40,20 @@ Logs under the same run root:
 `3cb65ab2528bef4c302776a9e7d1a8ff931ffdd3936c8d5a9f61c181596b23da`;
 `current/tmp/c03-restart-target.log` SHA256
 `3f29e2301ab8923bcae45b2853cd0bfc93b6250b994ea3450277455545974d2c`.
-Both explicitly record Make exit 0. Corrected compiler-loss/ordered restart
+Both explicitly record Make exit 0. Ordered restart
 chains, exact cancellation accounting, remaining interruption coverage and
 other open acceptance cells remain unqualified by these passes.
+
+The corrected compiler-loss W30 gate also passes all three profiles on a
+private copy of this fresh build. Each observes a held source window of 30,
+already-admitted C2 progress before release, loss isolated to the exact victim,
+stable scheduler/cache/daemon identities, a fresh 30-job cohort and two link
+adoptions. Run `5bfecb2a670d4e48a884b5f5ef81b0c0` under
+`/tanksmall/scratch/tmp/p51-f-disconnect-173dd/artifacts/opt-in-gates/` has
+`p51-compiler-loss-w30.exit` = 0 and log SHA256
+`b369a271239b44af4816e57e61e414d33e6a2212d4cc0f2f4e9d7ed587c52855`.
+Executed runner matches the fresh source snapshot at SHA256
+`494f59f23639813949b2e8ffb77e2035d27df5ffe05b2bee7ece8df4c8024ebc`.
 
 ### Partial HELLO and commit-reply interruption coverage
 
@@ -106,7 +117,8 @@ invalid deadline-input rejection. The later S→F run also passes all three
 profiles against frozen product binaries, but its exact executed source
 mount/hash has not been independently recovered. Do not treat its reported
 `b270a223` identity as qualified combined-tree evidence. Fresh combined-source
-verification and the corrected compiler-loss rerun remain pending.
+verification of S→F remains pending; the corrected compiler-loss rerun is
+qualified separately above.
 
 Run `b5968616788f4e668025ec13fbfe84d3` retains its gate log under
 `repair-gate-work/artifacts/opt-in-gates/` in the artifact root below, SHA256
@@ -139,7 +151,7 @@ Deadline parser checks include historical failed wrappers and negative inputs;
 truncated r6 first-attempt logs are derived parser fixtures, not complete
 one-attempt wrapper outcomes.
 
-**Runtime defect fixed, combined qualification pending (C03):** controlled post-Goodbye tests on unchanged
+**Runtime defect fixed, fresh C03 target passes:** controlled post-Goodbye tests on unchanged
 production code reproduce stale P51_SOURCE_ARMED after either client
 half-close or exact F-sidecar death. Responses arrived 5/10 ms after ARM send,
 inside the unchanged 2,000 ms test budget. This establishes stale cached-owner
@@ -159,8 +171,8 @@ a new scheduler session had caused an earlier fixture-only failure.
 Run `make -C unittests p50daemonpositive-p51-c03-check` in a configured,
 isolated root container with the `icecc` account, private scratch-backed
 `/tmp` and writable `ICEFARM_TMPDIR`. Qualification executed the identical
-shell runner directly; the new Make target and combined tree await a fresh
-build. Donor daemon SHA256:
+shell runner directly; the subsequent fresh integrated Make-target pass is
+recorded above. Donor daemon SHA256:
 `196a377a03406252c449916c0e684ce1108a5be3f719f9603307a6dcc61f7c25`;
 test binary SHA256:
 `466cfba1a6b56fca596582a6d7b074676610addb64cd0abdd3b013cfd2626b0a`.
@@ -174,7 +186,8 @@ failed a harness assertion: a substring count included both LINK_STATE and
 LINK_STATE_DECODED markers for one connection. `e8ebf4e5` fixes exact event
 counting and adds generated-log regressions (18 focused Python tests pass
 including deadline tests). This failed rerun is not a product failure or a
-qualified combined compiler-loss result; the corrected live rerun is pending.
+qualified combined compiler-loss result; the later corrected live rerun
+passes as recorded above.
 
 ### Idle reconnect and batch verdict propagation
 
@@ -209,7 +222,8 @@ through pinned `dev/python.sh`; retained log:
 An earlier offline environment-setup attempt failed on an uncached wheel;
 that retained failure is not counted as a test pass.
 Neither this harness fix nor the focused idle test establishes full combined
-candidate qualification; combined validation of the ARM fix remains open.
+candidate qualification; the fresh ARM-fix target pass is recorded above,
+with broader acceptance gaps still open.
 
 ### Persistent wrapper gate entry point
 
