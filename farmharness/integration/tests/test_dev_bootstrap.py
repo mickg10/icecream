@@ -536,13 +536,14 @@ def test_p50_live_core_builds_check_only_completion_helper_before_tests() -> Non
     script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
     live_gate = script.split('if [[ "$gate" == p50-live-core ]]; then', 1)[1]
     cache_build = "make -C /work/build/cache icecc-cache-service-test"
-    daemon_build = "make -C /work/build/unittests p50daemonpositive p50sourcearm-live"
     helper_build = "make -C /work/build/client icecc-p50-completion-test"
+    daemon_build = "make -C /work/build/unittests p50daemonpositive p50sourcearm-live"
     assert cache_build in live_gate
     assert daemon_build in live_gate
     assert helper_build in live_gate
     assert live_gate.index(cache_build) < live_gate.index(daemon_build)
-    assert live_gate.index(daemon_build) < live_gate.index(helper_build)
+    assert live_gate.index(cache_build) < live_gate.index(helper_build)
+    assert live_gate.index(helper_build) < live_gate.index(daemon_build)
     assert live_gate.index(helper_build) < live_gate.index("live_tests=(")
 
 

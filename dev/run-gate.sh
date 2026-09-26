@@ -179,11 +179,6 @@ PY
             make -C /work/build/cache icecc-cache-service-test \
             >>"$log" 2>&1 || build_status=$?
         if [[ $build_status -eq 0 ]]; then
-            timeout --signal=TERM --kill-after=15s 300s \
-                make -C /work/build/unittests p50daemonpositive p50sourcearm-live \
-                >>"$log" 2>&1 || build_status=$?
-        fi
-        if [[ $build_status -eq 0 ]]; then
             completion_build_status=0
             timeout --signal=TERM --kill-after=15s 180s \
                 make -C /work/build/client icecc-p50-completion-test \
@@ -192,6 +187,11 @@ PY
                 echo "FAIL: could not build required completion-flow client helper (exit=$completion_build_status)" >>"$log"
                 build_status=$completion_build_status
             fi
+        fi
+        if [[ $build_status -eq 0 ]]; then
+            timeout --signal=TERM --kill-after=15s 300s \
+                make -C /work/build/unittests p50daemonpositive p50sourcearm-live \
+                >>"$log" 2>&1 || build_status=$?
         fi
         live_tests=(
             remoteice-quick
