@@ -12,7 +12,25 @@ retained artifact directories.
 
 ## Developer QA
 
+### Bounded deadline/recovery formal checks
+
+Integrated formal donor `21e0cc2d` passes its pinned 19-row TLC gate: twelve
+deadline-order safety rows, one urgent abstract recovery/admission row, and six
+expected mutant counterexamples. Exact model/config/log hashes are recorded in
+[the evidence index](cache/formal/Protocol50DeadlineRecoveryEvidence.md).
+This overlay models one target relationship and an abstract sibling; topology
+labels do not prove full multi-link resource accounting. Its urgent clock
+assumption is not a real-time recovery guarantee or C++ refinement proof.
+Runtime replay-loss regression qualification remains required.
+
 ### Current broad candidate qualification
+
+The newer public `make qa` run on `1d87b3aa` completes its native stage with
+**178 tests: 172 PASS, 6 SKIP, 0 FAIL, 0 ERROR**, actual native-check exit 0.
+Evidence: `/tanksmall/scratch/tmp/p51-public-qa-1d87b3aa/icecream-qa-1c8se78b/current/artifacts/native-check.log`.
+Isolated-root and later mixed-image stages are not yet qualified by this result.
+The following older run explains the repaired harness failures, not the current
+native-stage outcome.
 
 Public `make qa` on clean candidate `293a1367`, in a two-CPU/8-GiB SDK
 container, completed its native suite with **178 tests: 170 PASS, 6 SKIP,
