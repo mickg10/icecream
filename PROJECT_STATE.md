@@ -26,9 +26,18 @@ The daemon-control suite passes with the fix. Its regression fills the accept
 queue, checks an early turn performs no retry, drains the queue and completes
 HELLO/control/descriptor handoff/ACK on the same operation. A never-drained
 case expires at the original deadline. Restoring the old EAGAIN branch makes
-the new regression fail at `!sender.wants_poll()`. The changed sidecar adapter
-translation unit also compiles; broader adapter runtime qualification is
-still pending, and the combined service failure below remains open.
+the new regression fail at `!sender.wants_poll()`.
+
+Follow-on local-transport and supervisor source/runtime checks pass, as do
+the daemon-control source checks and the complete sidecar-adapter source
+suite, including its freshly linked service lifecycle baseline and executable
+mutants. Adapter source-suite log SHA256:
+`13ba9fbbb01a131f0f9973db27cbea63c64c476ebe798ea6696711067629e2ca`,
+retained as `p50daemonsidecaradapter-source.log` in the donor directory below.
+The separate direct adapter binary run against the prebuilt service exits 30:
+absent cancellation returns Applied rather than UnknownRecord. A stale service
+is suspected, not established; a matched rebuilt-service rerun is pending.
+That run and the combined service failure below are not counted as passes.
 
 Qualified donor: `536dc696`. Test binary SHA256:
 `8ddc058a9675cdeaf0312740efd841cb174ad8246176bec2c56396ab822047d5`.
