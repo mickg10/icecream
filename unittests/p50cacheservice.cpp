@@ -3920,10 +3920,21 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                                              D07Scenario::ActiveCancel,
                                          std::optional<size_t>
                                              full_cohort_target_index =
+                                                 std::nullopt,
+                                         std::optional<size_t>
+                                             committed_cohort_target_index =
                                                  std::nullopt) {
-    const bool full_cohort = full_cohort_target_index.has_value();
+    CHECK(!(full_cohort_target_index.has_value() &&
+            committed_cohort_target_index.has_value()));
+    const bool full_committed_cohort =
+        committed_cohort_target_index.has_value();
+    const bool full_cohort = full_cohort_target_index.has_value() ||
+                             full_committed_cohort;
+    const size_t full_target_index = full_committed_cohort
+        ? *committed_cohort_target_index
+        : full_cohort_target_index.value_or(0);
     if (full_cohort)
-        CHECK(*full_cohort_target_index < 31);
+        CHECK(full_target_index < 31);
     const bool interrupt_replay =
         scenario == D07Scenario::InterruptedReplay ||
         scenario == D07Scenario::PositiveRecoveryOwner;
@@ -3933,9 +3944,10 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         scenario == D07Scenario::CommittedAttemptReplacement;
     const uint64_t full_cohort_base = 140000 +
         static_cast<uint64_t>(profile) * 1000 +
-        static_cast<uint64_t>(full_cohort_target_index.value_or(0)) * 100;
+        static_cast<uint64_t>(full_target_index) * 100;
     const uint64_t full_cohort_target_id =
-        full_cohort_base + full_cohort_target_index.value_or(0);
+        full_cohort_base + full_target_index;
+    const uint64_t full_cohort_probe_id = full_cohort_base + 90;
     uint32_t cache_profile = 0;
     switch (profile) {
     case ProfileId::P29V1: cache_profile = CACHE_PROFILE_P29V1; break;
@@ -3985,13 +3997,18 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     std::vector<R2TxCommit> wire_receipts;
     std::vector<ResetAck> wire_reset_acks;
     std::mutex wire_observation_mutex;
+    std::condition_variable wire_observation_changed;
     std::mutex full_bundle_mutex;
     std::condition_variable full_bundle_changed;
     bool full_target_bundle_reached = false;
     bool release_full_target_worker = false;
+    bool full_followup_bundle_reached = false;
     std::optional<JobBind> full_target_binding;
     std::optional<TxBegin> full_target_begin;
     std::optional<TxCommit> full_target_commit;
+    std::optional<JobBind> full_followup_binding;
+    std::optional<TxBegin> full_followup_begin;
+    std::optional<TxCommit> full_followup_commit;
 
     service::RuntimeConfig f_config = test_runtime_config();
     f_config.c_store_guid = f_launch.c_store_guid;
@@ -4196,19 +4213,32 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 control.before_materialize_identified_for_test =
                     [&](const JobBind& binding, const TxBegin& begin,
                         const TxCommit& commit) {
-                        if (binding.source_request_id != full_cohort_target_id)
+                        if (binding.source_request_id ==
+                            full_cohort_target_id) {
+                            std::unique_lock lock(full_bundle_mutex);
+                            if (!full_target_bundle_reached) {
+                                full_target_binding = binding;
+                                full_target_begin = begin;
+                                full_target_commit = commit;
+                                full_target_bundle_reached = true;
+                                full_bundle_changed.notify_all();
+                            }
+                            if (!full_committed_cohort)
+                                full_bundle_changed.wait(lock, [&] {
+                                    return release_full_target_worker;
+                            });
                             return;
-                        std::unique_lock lock(full_bundle_mutex);
-                        if (full_target_bundle_reached)
-                            return;
-                        full_target_binding = binding;
-                        full_target_begin = begin;
-                        full_target_commit = commit;
-                        full_target_bundle_reached = true;
-                        full_bundle_changed.notify_all();
-                        full_bundle_changed.wait(lock, [&] {
-                            return release_full_target_worker;
-                        });
+                        }
+                        if (full_committed_cohort &&
+                            binding.source_request_id ==
+                                full_cohort_probe_id) {
+                            std::lock_guard lock(full_bundle_mutex);
+                            full_followup_binding = binding;
+                            full_followup_begin = begin;
+                            full_followup_commit = commit;
+                            full_followup_bundle_reached = true;
+                            full_bundle_changed.notify_all();
+                        }
                     };
             }
 #endif
@@ -4221,6 +4251,7 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                         wire_receipts.push_back(*commit);
                     else if (const auto* ack = std::get_if<ResetAck>(&message))
                         wire_reset_acks.push_back(*ack);
+                    wire_observation_changed.notify_all();
                 };
             const size_t connection_number =
                 accepted_connections.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -4372,7 +4403,7 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     if (full_cohort) {
         constexpr size_t kCohort = 31;
         constexpr size_t kSurvivors = kCohort - 1;
-        const size_t target_index = *full_cohort_target_index;
+        const size_t target_index = full_target_index;
         std::vector<RequestRow> rows;
         rows.reserve(kCohort);
         for (size_t index = 0; index < kCohort; ++index) {
@@ -4383,6 +4414,417 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         RequestRow& target = rows[target_index];
         const auto target_deadline =
             target.request.absolute_deadline.as_steady_time_point();
+        if (full_committed_cohort) {
+            struct TargetReleaseGuard {
+                std::mutex& mutex;
+                std::condition_variable& changed;
+                bool& released;
+                ~TargetReleaseGuard() {
+                    {
+                        std::lock_guard lock(mutex);
+                        released = true;
+                    }
+                    changed.notify_all();
+                }
+            } target_release_guard{
+                full_bundle_mutex, full_bundle_changed,
+                release_full_target_worker};
+
+            bool all_submitted = true;
+            for (RequestRow& row : rows)
+                all_submitted = enqueue(row) && all_submitted;
+            CHECK(all_submitted);
+
+            bool target_reached_f = false;
+            {
+                std::unique_lock lock(full_bundle_mutex);
+                target_reached_f = full_bundle_changed.wait_for(
+                    lock, std::chrono::seconds(18), [&] {
+                        return full_target_bundle_reached;
+                    });
+            }
+            CHECK(target_reached_f);
+            JobBind target_binding{};
+            TxBegin target_begin{};
+            TxCommit target_commit{};
+            {
+                std::lock_guard lock(full_bundle_mutex);
+                CHECK(full_target_binding.has_value());
+                CHECK(full_target_begin.has_value());
+                CHECK(full_target_commit.has_value());
+                target_binding = *full_target_binding;
+                target_begin = *full_target_begin;
+                target_commit = *full_target_commit;
+            }
+            const Digest128 target_digest = icecc::digest128(target.bytes);
+            const bool exact_f_target =
+                target_binding.source_request_id == target.request_id &&
+                target_binding.reservation_id ==
+                    Id128{target.request.armed.reservation_id} &&
+                target_binding.tu_seq == target_begin.tu_seq &&
+                target_binding.relationship_ordinal != 0 &&
+                target_binding.profile == profile &&
+                target_binding.raw_bytes == target.bytes.size() &&
+                target_binding.raw_digest == target_digest &&
+                target_begin.profile == profile &&
+                target_begin.raw_bytes == target.bytes.size() &&
+                target_begin.raw_digest == target_digest &&
+                target_commit.tu_seq == target_begin.tu_seq &&
+                target_commit.rel_seq == target_begin.rel_seq &&
+                target_commit.raw_digest == target_digest;
+            CHECK(exact_f_target);
+
+            bool target_bundle_sent = false;
+            {
+                std::unique_lock lock(first_bundle_mutex);
+                target_bundle_sent = first_bundle_changed.wait_for(
+                    lock, std::chrono::seconds(5), [&] {
+                        return std::find(c_bundle_ordinals.begin(),
+                                         c_bundle_ordinals.end(),
+                                         target_binding.relationship_ordinal) !=
+                               c_bundle_ordinals.end();
+                    });
+            }
+            CHECK(target_bundle_sent);
+            const Digest128 target_binding_digest =
+                compute_r2_binding_digest(target_binding);
+            auto target_receipt_matches = [&](const R2TxCommit& receipt) {
+                return receipt.relationship_ordinal ==
+                           target_binding.relationship_ordinal &&
+                       receipt.binding_digest == target_binding_digest &&
+                       receipt.inner.tu_seq == target_begin.tu_seq &&
+                       receipt.inner.raw_digest == target_digest &&
+                       receipt.inner.transaction_digest ==
+                           target_commit.transaction_digest;
+            };
+            bool target_f_receipt_observed = false;
+            {
+                std::unique_lock lock(wire_observation_mutex);
+                target_f_receipt_observed = wire_observation_changed.wait_for(
+                    lock, std::chrono::seconds(8), [&] {
+                        return std::any_of(wire_receipts.begin(),
+                                           wire_receipts.end(),
+                                           target_receipt_matches);
+                    });
+            }
+            CHECK(target_f_receipt_observed);
+
+            const auto target_result = receive_p51_transfer_result(
+                target.pair.receiver, c_launch.identity, target.request_id,
+                target_deadline, true);
+            const auto target_result_time = std::chrono::steady_clock::now();
+            const bool target_committed_exact =
+                target_result.code ==
+                    local::SourceTransferResultCode::Committed &&
+                target_result.valid() &&
+                target_result.c_store_guid == c_launch.c_store_guid &&
+                target_result.tu_seq == target_binding.tu_seq.value &&
+                target_result.raw_bytes == target.bytes.size() &&
+                target_result.raw_digest == target_digest;
+            size_t target_receipts_before_cancel = 0;
+            {
+                std::lock_guard lock(wire_observation_mutex);
+                target_receipts_before_cancel = static_cast<size_t>(
+                    std::count_if(wire_receipts.begin(), wire_receipts.end(),
+                                 target_receipt_matches));
+            }
+            const bool target_deadline_live_before_cancel =
+                std::chrono::steady_clock::now() < target_deadline;
+            CHECK(target_committed_exact);
+            CHECK(target_receipts_before_cancel == 1);
+            CHECK(target_result_time <= target_deadline);
+            CHECK(target_deadline_live_before_cancel);
+
+            size_t target_retirements_before_cancel = 0;
+            {
+                std::lock_guard lock(retired_mutex);
+                target_retirements_before_cancel = static_cast<size_t>(
+                    std::count_if(retired_rows.begin(), retired_rows.end(),
+                                 [&](const auto& row) {
+                        return row.first == Id128{
+                            target.request.armed.reservation_id};
+                    }));
+            }
+
+            const auto cancel_time = std::chrono::steady_clock::now();
+            const bool cancel_after_commit_accepted =
+                f_runtime.cancel_p51_source_on_owner(
+                    target.request.armed.arm,
+                    target.request.armed.reservation_id, target_deadline);
+            const bool cancel_started_before_target_deadline =
+                cancel_time < target_deadline;
+
+            // A rejected post-commit cancel must leave the already-published
+            // exact record attachable to its original owner.
+            const InputFdRequest post_cancel_attach{
+                f_launch.identity,
+                InputRecordKey{target_result.c_store_guid,
+                               TuSeq{target_result.tu_seq}},
+                owner_for(target), target.request_id + 780000};
+            auto target_cursor = f_runtime.attach_input_on_owner(
+                post_cancel_attach, target_deadline);
+            bool target_preserved_after_cancel =
+                target_cursor.has_value() &&
+                target_cursor->remaining() == target.bytes.size() &&
+                target_cursor->raw_digest() == target_digest;
+            if (target_preserved_after_cancel) {
+                std::vector<uint8_t> bytes(target.bytes.size());
+                target_preserved_after_cancel =
+                    target_cursor->read(bytes) == bytes.size() &&
+                    bytes == target.bytes;
+            }
+            target_cursor.reset();
+            f_runtime.finish_input_attachment_on_owner(
+                post_cancel_attach, target_preserved_after_cancel,
+                target_deadline);
+
+            // The post-cancel probe is deliberately submitted after the
+            // committed target's cancellation attempt. It demonstrates the
+            // same C/F route remains usable without claiming sibling overlap
+            // during the cancellation call.
+            RequestRow probe = make_request(
+                full_cohort_base + 90, 192, 0x71);
+            const auto probe_deadline =
+                probe.request.absolute_deadline.as_steady_time_point();
+            const bool probe_submitted = enqueue(probe);
+            bool probe_reached_f = false;
+            if (probe_submitted) {
+                std::unique_lock lock(full_bundle_mutex);
+                probe_reached_f = full_bundle_changed.wait_for(
+                    lock, std::chrono::seconds(8), [&] {
+                        return full_followup_bundle_reached;
+                    });
+            }
+            JobBind probe_binding{};
+            TxBegin probe_begin{};
+            TxCommit probe_commit{};
+            if (probe_reached_f) {
+                std::lock_guard lock(full_bundle_mutex);
+                CHECK(full_followup_binding.has_value());
+                CHECK(full_followup_begin.has_value());
+                CHECK(full_followup_commit.has_value());
+                probe_binding = *full_followup_binding;
+                probe_begin = *full_followup_begin;
+                probe_commit = *full_followup_commit;
+            }
+            const Digest128 probe_digest = icecc::digest128(probe.bytes);
+            const bool exact_f_probe = probe_reached_f &&
+                probe_binding.source_request_id == probe.request_id &&
+                probe_binding.reservation_id ==
+                    Id128{probe.request.armed.reservation_id} &&
+                probe_binding.tu_seq == probe_begin.tu_seq &&
+                probe_binding.relationship_ordinal >
+                    target_binding.relationship_ordinal &&
+                probe_binding.profile == profile &&
+                probe_binding.raw_bytes == probe.bytes.size() &&
+                probe_binding.raw_digest == probe_digest &&
+                probe_begin.profile == profile &&
+                probe_begin.raw_bytes == probe.bytes.size() &&
+                probe_begin.raw_digest == probe_digest &&
+                probe_commit.tu_seq == probe_begin.tu_seq &&
+                probe_commit.rel_seq == probe_begin.rel_seq &&
+                probe_commit.raw_digest == probe_digest;
+            bool probe_bundle_sent = false;
+            if (exact_f_probe) {
+                std::unique_lock lock(first_bundle_mutex);
+                probe_bundle_sent = first_bundle_changed.wait_for(
+                    lock, std::chrono::seconds(5), [&] {
+                        return std::find(c_bundle_ordinals.begin(),
+                                         c_bundle_ordinals.end(),
+                                         probe_binding.relationship_ordinal) !=
+                               c_bundle_ordinals.end();
+                    });
+            }
+            std::optional<local::P50SourceTransferResult> probe_result;
+            bool probe_exact = false;
+            std::chrono::steady_clock::time_point probe_finished{};
+            if (probe_submitted && probe_bundle_sent) {
+                probe_result = receive_p51_transfer_result(
+                    probe.pair.receiver, c_launch.identity, probe.request_id,
+                    probe_deadline, true);
+                probe_finished = std::chrono::steady_clock::now();
+                probe_exact = probe_result->code ==
+                                  local::SourceTransferResultCode::Committed &&
+                              probe_result->valid() &&
+                              probe_result->c_store_guid ==
+                                  c_launch.c_store_guid &&
+                              probe_result->tu_seq ==
+                                  probe_binding.tu_seq.value &&
+                              probe_result->raw_bytes == probe.bytes.size() &&
+                              probe_result->raw_digest ==
+                                  icecc::digest128(probe.bytes) &&
+                              attach_exact(probe, *probe_result,
+                                           owner_for(probe), true);
+            }
+
+            struct Outcome {
+                std::optional<local::P50SourceTransferResult> result;
+                bool exact = false;
+                std::chrono::steady_clock::time_point finished{};
+            };
+            std::vector<Outcome> outcomes(kCohort);
+            outcomes[target_index].result = target_result;
+            outcomes[target_index].exact = target_committed_exact;
+            outcomes[target_index].finished = target_result_time;
+            std::vector<std::thread> waiters;
+            waiters.reserve(kCohort - 1);
+            for (size_t index = 0; index < kCohort; ++index) {
+                if (index == target_index)
+                    continue;
+                waiters.emplace_back([&, index] {
+                    try {
+                        RequestRow& row = rows[index];
+                        outcomes[index].result = receive_p51_transfer_result(
+                            row.pair.receiver, c_launch.identity,
+                            row.request_id,
+                            row.request.absolute_deadline.as_steady_time_point(),
+                            true);
+                        outcomes[index].exact =
+                            outcomes[index].result->code ==
+                                local::SourceTransferResultCode::Committed &&
+                            outcomes[index].result->valid() &&
+                            outcomes[index].result->c_store_guid ==
+                                c_launch.c_store_guid &&
+                            outcomes[index].result->raw_bytes ==
+                                row.bytes.size() &&
+                            outcomes[index].result->raw_digest ==
+                                icecc::digest128(row.bytes) &&
+                            attach_exact(row, *outcomes[index].result,
+                                         owner_for(row), true);
+                    } catch (...) {
+                        outcomes[index].exact = false;
+                    }
+                    outcomes[index].finished =
+                        std::chrono::steady_clock::now();
+                });
+            }
+            for (auto& waiter : waiters)
+                waiter.join();
+
+            bool all_committed_exact = true;
+            bool all_before_original_deadlines = true;
+            std::vector<uint64_t> accepted_ordinals;
+            std::vector<uint64_t> tu_sequences;
+            for (size_t index = 0; index < kCohort; ++index) {
+                all_committed_exact = all_committed_exact &&
+                    outcomes[index].result.has_value() &&
+                    outcomes[index].exact;
+                all_before_original_deadlines = all_before_original_deadlines &&
+                    outcomes[index].finished <=
+                        rows[index].request.absolute_deadline
+                            .as_steady_time_point();
+                if (!outcomes[index].result)
+                    continue;
+                tu_sequences.push_back(outcomes[index].result->tu_seq);
+                size_t matches = 0;
+                std::lock_guard lock(wire_observation_mutex);
+                for (const R2TxCommit& receipt : wire_receipts) {
+                    if (receipt.inner.tu_seq.value ==
+                            outcomes[index].result->tu_seq &&
+                        receipt.inner.raw_digest ==
+                            outcomes[index].result->raw_digest &&
+                        receipt.relationship_ordinal != 0) {
+                        ++matches;
+                        accepted_ordinals.push_back(
+                            receipt.relationship_ordinal);
+                    }
+                }
+                if (matches != 1)
+                    all_committed_exact = false;
+            }
+            if (probe_result)
+                tu_sequences.push_back(probe_result->tu_seq);
+            std::sort(tu_sequences.begin(), tu_sequences.end());
+            const bool unique_tu_sequences = tu_sequences.size() ==
+                    kCohort + (probe_result ? 1u : 0u) &&
+                std::adjacent_find(tu_sequences.begin(),
+                                   tu_sequences.end()) ==
+                    tu_sequences.end();
+            if (probe_result) {
+                size_t probe_matches = 0;
+                std::lock_guard lock(wire_observation_mutex);
+                for (const R2TxCommit& receipt : wire_receipts) {
+                    if (receipt.inner.tu_seq.value == probe_result->tu_seq &&
+                        receipt.inner.raw_digest == probe_result->raw_digest &&
+                        receipt.relationship_ordinal ==
+                            probe_binding.relationship_ordinal &&
+                        receipt.binding_digest ==
+                            compute_r2_binding_digest(probe_binding) &&
+                        receipt.inner.transaction_digest ==
+                            probe_commit.transaction_digest) {
+                        ++probe_matches;
+                        accepted_ordinals.push_back(
+                            receipt.relationship_ordinal);
+                    }
+                }
+                if (probe_matches != 1)
+                    probe_exact = false;
+            }
+            std::sort(accepted_ordinals.begin(), accepted_ordinals.end());
+            bool contiguous_ordinals = accepted_ordinals.size() ==
+                    kCohort + (probe_result ? 1u : 0u);
+            for (size_t index = 1; index < accepted_ordinals.size(); ++index)
+                contiguous_ordinals = contiguous_ordinals &&
+                    accepted_ordinals[index] == accepted_ordinals[index - 1] + 1;
+            const bool all_operations_released = wait_for_source_operation_count(
+                c_runtime, 0, std::chrono::seconds(5));
+            const bool all_raw_credit_released = wait_for_source_raw_bytes(
+                c_runtime, 0, std::chrono::seconds(5));
+            size_t target_retirement_count = 0;
+            {
+                std::lock_guard lock(retired_mutex);
+                target_retirement_count = static_cast<size_t>(std::count_if(
+                    retired_rows.begin(), retired_rows.end(), [&](const auto& row) {
+                        return row.first == Id128{
+                            target.request.armed.reservation_id};
+                    }));
+            }
+            std::fprintf(stderr,
+                "P51_D07 committed-cancel profile=%u submitted=31 position=%zu "
+                "request=%llu ordinal=%llu exact-F-receipt=1 "
+                "C-validated-committed=%d cancel-after-commit-accepted=%d "
+                "target-preserved=%d survivors-exact=%d "
+                "post-cancel-probe=%d "
+                "contiguous-ordinals=%d unique-tu=%d "
+                "before-original-deadline=%d credits-released=%d/%d "
+                "target-retirements=%zu->%zu\n",
+                static_cast<unsigned>(profile), target_index,
+                static_cast<unsigned long long>(target.request_id),
+                static_cast<unsigned long long>(
+                    target_binding.relationship_ordinal),
+                target_committed_exact ? 1 : 0,
+                cancel_after_commit_accepted ? 1 : 0,
+                target_preserved_after_cancel ? 1 : 0,
+                all_committed_exact ? 1 : 0,
+                (probe_submitted && exact_f_probe && probe_bundle_sent &&
+                 probe_exact && probe_finished <= probe_deadline) ? 1 : 0,
+                contiguous_ordinals ? 1 : 0, unique_tu_sequences ? 1 : 0,
+                cancel_started_before_target_deadline &&
+                    all_before_original_deadlines ? 1 : 0,
+                all_operations_released ? 1 : 0,
+                all_raw_credit_released ? 1 : 0,
+                target_retirements_before_cancel,
+                target_retirement_count);
+            std::fflush(stderr);
+
+            CHECK(all_submitted);
+            CHECK(target_reached_f && exact_f_target);
+            CHECK(target_bundle_sent && target_f_receipt_observed);
+            CHECK(target_committed_exact && target_receipts_before_cancel == 1);
+            CHECK(target_deadline_live_before_cancel &&
+                  cancel_started_before_target_deadline);
+            CHECK(!cancel_after_commit_accepted);
+            CHECK(target_preserved_after_cancel);
+            CHECK(probe_submitted && exact_f_probe && probe_bundle_sent &&
+                  probe_exact && probe_finished <= probe_deadline);
+            CHECK(all_committed_exact);
+            CHECK(all_before_original_deadlines);
+            CHECK(contiguous_ordinals && unique_tu_sequences);
+            CHECK(all_operations_released && all_raw_credit_released);
+            CHECK(target_retirement_count ==
+                  target_retirements_before_cancel);
+            return;
+        }
         struct FullTargetReleaseGuard {
             std::mutex& mutex;
             std::condition_variable& changed;
@@ -5430,6 +5872,16 @@ void test_p51_d07_full_cancel_all_profiles() {
         for (const size_t index : {size_t{0}, size_t{15}, size_t{30}}) {
             test_p51_d07_active_cancel_recovery(
                 profile, D07Scenario::ActiveCancel, index);
+        }
+    }
+}
+
+void test_p51_d07_committed_full_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE}) {
+        for (const size_t index : {size_t{0}, size_t{15}, size_t{30}}) {
+            test_p51_d07_active_cancel_recovery(
+                profile, D07Scenario::ActiveCancel, std::nullopt, index);
         }
     }
 }
@@ -15757,6 +16209,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-committed-full") == 0) {
+            test_p51_d07_committed_full_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt-p29") == 0) {
             test_p51_d07_active_cancel_recovery(
                 ProfileId::P29V1, D07Scenario::InterruptedReplay);
@@ -15991,6 +16448,7 @@ int main(int argc, char** argv) {
         test_p51_d07_queued_cancel_first_middle_last();
         test_p51_d07_staged_cancel_all_profiles();
         test_p51_d07_full_cancel_all_profiles();
+        test_p51_d07_committed_full_all_profiles();
         test_p51_d07_active_cancel_all_profiles();
         test_p51_d07_active_cancel_replay_interrupt_all_profiles();
         test_p51_d07_positive_recovery_owner_all_profiles();
