@@ -12,6 +12,31 @@ retained artifact directories.
 
 ## Developer QA
 
+### Reply connection lifetime at settlement
+
+Candidate `b5578e77` integrates donor `5cc4e6c2`: P51 reply paths explicitly
+close their owned connection before releasing operation credit. Previously,
+cancelled asynchronous handlers could retain the reply pump and its connection
+after settlement. The test observes connection/readiness ownership while the
+pump remains alive; it does not depend on an integer descriptor remaining
+unused by other threads.
+
+The donor's nine D17 profile/cycle cells pass (`D17_EXIT=0`), checking held and
+quiescent F resource counters, exact retained-input counts/bytes, baseline
+descriptor count and closure before settlement. Removing only the explicit
+connection close fails the named ownership assertion (exit 1). This establishes
+the ordering regression, not the cause of the earlier intermittent descriptor
+count failure. The production service also builds without test hooks.
+
+Evidence directory: `/tanksmall/scratch/tmp/w30-d17-resource-20260926/`.
+`d17-qualified-normal.log` SHA256
+`dee78082ab29731c161ae4719b3d00dd8784f5798c60fe7bb631ef78ca8af3bb`;
+`d17-no-close-counterfactual.log` SHA256
+`fd24a6c1715b20b55157c21bbc1af0de75f5e909c392e06f3c7f5574042a890e`;
+`d17-macrooff-build.log` SHA256
+`04c5f50831108e2cad2476d6fabb191b8b8a870399b2dc20d8b9660cae4d03f0`.
+Sanitizer and merged full-suite qualification of this change remain pending.
+
 ### Staged cancellation with a failed predecessor
 
 Donor `c76cbeab` adds a P29V1/index-15 cell to the registered staged-cancellation
