@@ -42,4 +42,5 @@ EXTRA_DIST = \
 	p50-cache-advertisement.md \
 	p50-input-attachment.md \
 	p50-transfer-concurrency.md \
+	p50-transfer-window-firefox32-evidence.md \
 	p50-cache-diagnostics.md
