@@ -1137,9 +1137,27 @@ Integrated runner/wrapper SHA256 match tested source exactly:
 `8edb00f70b386c30fce28fad1742f8fd64f1127a9f99f3c063cecc53908ada96`,
 `56392e878869e1ba44aa325b059897be285bd7efc3a5b4a531efeccee01284e1`.
 The fixture requires an isolated root container, the positive-daemon test
-opt-in, and a separate wrapper UID. A registered bootstrap entry point is
-still being added. Earlier setup/assertion failures are retained and excluded;
-this pass does not close scheduler-to-F recovery or combined/external QA.
+opt-in, and a separate wrapper UID. `6140fe38` supplies those through
+`ICEFARM_TMPDIR=/existing/scratch make dev-gate GATE=p51-compiler-loss-w30`.
+The registered entry point passes a fresh Ubuntu 24.04 bootstrap on nas642
+with 2 CPUs/8 GiB: build 180.000s, gate 213.498s, all three profile markers
+exactly once. Its focused routing tests pass 16 cases. The first bootstrap
+exposed a missing check-only cache-service prerequisite; the gate now builds
+it in its owning directory before the unittests target. That failure is
+retained separately, not counted as a pass.
+
+Fresh bootstrap artifacts:
+`/tanksmall/scratch/tmp/p51-d09-public-gate-run2/icecream-qa-pg8oyl59`.
+Source snapshot SHA256:
+`8f3f972126ecd63d289decce589e8c625034f3d49d0c87e8d756a497c7c41d6c`.
+SDK image SHA256:
+`19ef868afec561456949471bd951f7d75aa689eb10af11579eba7f1a966dacb4`.
+`result.json` is PASS with all step exits zero; SHA256
+`aa9e33d735ed0ce3c1926182d4ba570a5bb502ffe5dacd0b369a7f7546d82f94`.
+`logs/03-gate-p51-compiler-loss-w30.log` SHA256:
+`6db9396579562f135c238ff0c7ef39a499c33e9b17d01ad004ebb92967a241a8`.
+Earlier setup/assertion failures are retained and excluded; this pass does
+not close scheduler-to-F recovery or combined/external QA.
 
 The opt-in local wrapper gate
 `ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1` passes for P29V1, ZSTD_TU and
