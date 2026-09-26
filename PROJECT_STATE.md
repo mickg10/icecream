@@ -211,6 +211,15 @@ expected counterexamples. Retained logs under the directory above:
 These results still do not establish fairness-based progress; that remains
 a separate model obligation.
 
+Distribution was checked with the existing generated SDK cache Makefile's
+`distdir-am` target, overriding source/VPATH to the frozen donor checkout:
+all 327 manifest entries plus the manifest itself were copied, zero missing.
+Artifact directory:
+`/tanksmall/scratch/tmp/w30-formal-reconcile-20260926/dist-files-check-r2/cache-dist`.
+The verification log `dist-verify.log` in its parent run directory has SHA256
+`d567fa9d26eaa7420c55ca648415873d05cf8fa395062ce8949a2885cd997a0d`.
+This verifies formal-file distribution, not a full release `distcheck`.
+
 Commit `983c64ab` implements typed CapacityBusy before source read/route work,
 with a response budget of at most 100 ms clipped to the original deadline.
 The compiler wrapper retries only completed, validated Busy responses using
