@@ -12,6 +12,31 @@ retained artifact directories.
 
 ## Developer QA
 
+### Bounded P29V1 transfer-window pilot
+
+[Machine-readable measurements](research/measurements/p50-window-pilot-corpus2-20260926.json)
+record 21 corrected-build runs on source `74ab9b11`: three repetitions of R1/W1
+and R2/W1,2,4,8,16,30, using 32 public RocksDB-derived inputs (171,488,309
+bytes), loopback transport and a two-CPU/8-GiB container. Every run verifies
+exact decoded bytes. Median two-pass transfer times in milliseconds:
+
+| Mode | R1/W1 | R2/W1 | R2/W2 | R2/W4 | R2/W8 | R2/W16 | R2/W30 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Median | 1415 | 1359 | 971 | 921 | 926 | 875 | 885 |
+
+R2/W30 uses one TCP connection versus R1's 64 across both passes. Its median
+fresh-route/retained-route times are 616/249 ms versus 911/492 ms for R1.
+These are identical-input codec-state passes, not OS-cache cold/hot or edited
+inputs. Requested W30 reaches only 9–13 outstanding transfers here; separate
+capacity gates establish full-window occupancy. W16/W30 timing differences
+are not evidence for choosing an optimal production window.
+
+This exploratory subset has unknown upstream revision/preprocessing command,
+and the host was not isolated from unrelated load. It is not full-build,
+cross-host, all-profile or complete section 9.4 qualification. The original
+21-run batch linked an older sender archive and is retained but excluded.
+The corrected artifact includes dependency/input/log hashes and timing scope.
+
 ### Reply connection lifetime at settlement
 
 Candidate `b5578e77` integrates donor `5cc4e6c2`: P51 reply paths explicitly
