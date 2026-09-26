@@ -220,6 +220,21 @@ The verification log `dist-verify.log` in its parent run directory has SHA256
 `d567fa9d26eaa7420c55ca648415873d05cf8fa395062ce8949a2885cd997a0d`.
 This verifies formal-file distribution, not a full release `distcheck`.
 
+### Scoped healthy-link progress
+
+Commit `b319522d` refines the existing transfer-concurrency model: healthy
+peer response availability is a separate event from local commit observation.
+The C1F2 temporal check passes under explicit weak fairness for the healthy
+peer and each continuously enabled local handoff, with a permanently silent
+other peer and fixed topology (no stop/restart/replacement). Its global-gate
+mutant violates `BlockedLinkDoesNotBlockHealthyProgress`, TLC exit 13.
+All 21 rows in the registered transfer-concurrency runner pass, including the
+existing safety, overlap and fault cases. Retained log:
+`/tanksmall/scratch/tmp/w30-formal-reconcile-20260926/transfer-progress-r2.log`,
+SHA256 `a79b8d8cdfa535a5307de5d33473123a10db76ee2d1fdb923096e7355254f96e`.
+This proves the stated finite shared-C independent-link property, not complete
+pipeline/network liveness, recovery under endless failures, or C++ refinement.
+
 Commit `983c64ab` implements typed CapacityBusy before source read/route work,
 with a response budget of at most 100 ms clipped to the original deadline.
 The compiler wrapper retries only completed, validated Busy responses using
