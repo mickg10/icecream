@@ -1,14 +1,14 @@
 # Paired transfer-window benchmark: Firefox32 sample
 
-This is a bounded local paired-workload measurement, not completion of the
+This is a bounded paired-workload measurement, not completion of the
 performance gate in `p50-transfer-concurrency.md` §9.4. It records a 32-TU
-slice of the preserved Firefox turn-A/turn-B corpus. No external farm, remote
-host, or network transport was involved.
+slice of the preserved Firefox turn-A/turn-B corpus using local loopback TCP;
+there was no cross-host run or external farm.
 
 ## Provenance and workload
 
-- Three profiles, three repetitions each, seven modes per profile: R1 and R2
-  windows 1, 2, 4, 8, 16, and 30; 63 cells total. Every cell runs A-fresh,
+- Three profiles, three repetitions each, seven modes per profile: R1/W1 and
+  R2 windows 1, 2, 4, 8, 16, and 30; 63 cells total. Every cell runs A-fresh,
   A-retained, and B-edited in the same order and verifies decoded raw bytes.
 - Input order and TU identifiers were matched by the paired manifest runner.
   Of the first 32 ordered entries, 31 raw digests changed and one was
@@ -21,6 +21,9 @@ host, or network transport was involved.
 - The per-input ordered identity/size/digest record is
   `firefox32-paired-inputs.tsv`, SHA-256
   `fd1fe4f75fbf063480c6d8e040816c646608436d76398a2aaa989027687a2296`.
+- Table profile labels are the emitted `ProfileId`: P1=P29V1, P2=ZSTD_TU,
+  P3=ZSTD_ROUTE. Runner CLI profile indexes are 0=ZSTD_TU, 1=P29V1,
+  2=ZSTD_ROUTE.
 - Production source closure is the current primary production closure at
   `0dc29331` (the intervening primary changes through `bb7dd504` only changed
   benchmark/test-state documentation and this benchmark TU). The benchmark
@@ -28,7 +31,8 @@ host, or network transport was involved.
   `364e1bf333f71d385747cb08f21efb4a904a99dc1a926018ba6a81928fa0c537`;
   binary SHA-256 is
   `fbf9c90ddf8a1dfc132b240802fbaaefb2c2b1bbb6d9c69b3b698e11688ee4ec`.
-- Runtime: SDK image `icecream-dev:current-da9f52155b23085c`, image ID
+- Container image used by the recorded invocation:
+  `icecream-dev:current-da9f52155b23085c`, image ID
   `sha256:f4620c324a32d6324ebc3958db7377fa6a3b2db8b52e46c63e49513414a5f7ab`,
   container limited to 2 CPUs and 8 GiB memory. Filesystem cache state was
   inherited and uncontrolled; this is not a cold-cache experiment. The
@@ -40,10 +44,23 @@ host, or network transport was involved.
   result/tmp mounts) is:
 
   ```sh
-  bash /tanksmall/scratch/tmp/p51-bench-paired-default/run_firefox32_paired_matrix.sh \
-    /tanksmall/scratch/tmp/p51-bench-paired-current-build/build/unittests/p50transferwindowbench \
-    /tanksmall/scratch/tmp/p51-bench-paired-current-build/results/firefox32-r1
+  outdir=$(mktemp -d /tanksmall/scratch/tmp/p51-firefox32-paired-rerun.XXXXXX)
+  docker run --rm --init --network none --cpus=2 --memory=8g --memory-swap=8g \
+    --user 4103:3513 --entrypoint /bin/bash \
+    -v "$outdir:$outdir" \
+    -v /tanksmall/scratch/tmp/p51-bench-paired-default:/tanksmall/scratch/tmp/p51-bench-paired-default:ro \
+    -v /tanksmall/scratch/tmp/p51-bench-paired-current-build:/tanksmall/scratch/tmp/p51-bench-paired-current-build:ro \
+    -v /tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-20260905T100313Z:/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-20260905T100313Z:ro \
+    -v /tanksmall/scratch/ictmp/corpus18/tanksmall/scratch/ictmp/src3:/tanksmall/scratch/ictmp/corpus18/tanksmall/scratch/ictmp/src3:ro \
+    -v /tanksmall/scratch/tmp/p51-bench-paired-current-build/tmp:/tmp \
+    -e TMPDIR=/tmp -e ICEFARM_TMPDIR=/tmp icecream-dev:current-da9f52155b23085c -lc \
+    'bash /tanksmall/scratch/tmp/p51-bench-paired-default/run_firefox32_paired_matrix.sh \
+      /tanksmall/scratch/tmp/p51-bench-paired-current-build/build/unittests/p50transferwindowbench \
+      "$1"' _ "$outdir"
   ```
+
+  This allocates a new output directory rather than overwriting the recorded
+  run. The command preserves the original corpus and runner mount paths.
 
 ## Results
 
