@@ -95,7 +95,10 @@ contract() {
     # opts in with a destination; the normal client path remains unchanged.
     require_text "$root/client/remote.cpp" 'ICECC_P50_PREPROCESSED_CAPTURE' || return 1
     require_text "$root/client/remote.cpp" 'retain_p50_preprocessed_capture' || return 1
-    require_text "$root/unittests/p50compilee2e-run.sh" 's7-$label-preprocessed.ii' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        "printf '%s/out/s7-%s-preprocessed.ii" || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        "printf '%s/s7-%s-preprocessed.ii" || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 's7-warm-c-action-trace.jsonl' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 's7-warm-f-action-trace.jsonl' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 'ICECC_P50_C_ACTION_TRACE=' || return 1
@@ -235,7 +238,8 @@ for pair in \
     "client/remote.cpp|std::chrono::seconds(120)" \
     "client/remote.cpp|ICECC_P50_PREPROCESSED_CAPTURE" \
     "client/remote.cpp|retain_p50_preprocessed_capture" \
-    "unittests/p50compilee2e-run.sh|s7-\$label-preprocessed.ii" \
+    "unittests/p50compilee2e-run.sh|printf '%s/out/s7-%s-preprocessed.ii" \
+    "unittests/p50compilee2e-run.sh|printf '%s/s7-%s-preprocessed.ii" \
     "unittests/p50compilee2e-run.sh|s7-warm-c-action-trace.jsonl" \
     "unittests/p50compilee2e-run.sh|s7-warm-f-action-trace.jsonl" \
     "unittests/p50compilee2e-run.sh|ICECC_P50_C_ACTION_TRACE=" \
