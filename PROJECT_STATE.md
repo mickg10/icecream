@@ -49,7 +49,7 @@ log/`.trs`. The original metrics failure is unexplained/non-reproduced because
 its runner deleted the underlying diagnostics; passing targeted reruns do not
 establish its cause or replace the final combined-candidate QA gate.
 
-### Daemon cancellation cleanup after source expiry
+### Isolated live harness qualification
 
 The remote-assignment harness now accepts
 `ICECC_P50_C1F1_WORKER_SCHEDULER_HOST` for F's scheduler connection, preserving
@@ -60,9 +60,22 @@ unchanged legacy default and strict non-loopback gates (actual exits 0).
 Evidence directory:
 `/tanksmall/scratch/tmp/p51-qa-293a/scratch/icecream-qa-kiyex8p9/current/artifacts/root-live-34f2/root-live-assignment/`.
 This is harness qualification on baseline `293a1367` binaries, not current
-combined-product qualification. The remaining completion-flow rerun is being
-updated to observe current session-quiescence state rather than the removed
-`cleared children` log message; its downstream retry assertions remain required.
+combined-product qualification.
+
+Candidate `84ba6f27` integrates completion-flow donor `3a58a0a6`: after the
+captured C-log offset, the gate requires scheduler EOF followed by SETTLED
+quiescence with zero children and no ownership/identity faults. This replaces
+the removed `cleared children` message, retaining downstream retry and exact
+object assertions. The full isolated completion-flow run exits 0 on baseline
+`293a1367` binaries, including the preclosed-proxy retry, replacement assignment
+and exact 1,358,496-byte object. Evidence:
+`current/artifacts/root-live-34f2/root-live-loss-preserve-r2/completionflow.log`
+under the QA directory above, SHA256
+`173e63403b9d2c3bcf97cec68e804793aa1ec8b65e42aacf6087a0a28052e8e9`.
+This repairs and qualifies the harness; final combined-candidate QA and mixed
+current/P43 image testing remain required.
+
+### Daemon cancellation cleanup after source expiry
 
 Candidate `3d37e024` integrates donors `0548b240` and `a0b65f20`.
 An exact cancellation exchange receives one fixed two-second local-control
