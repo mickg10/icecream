@@ -560,8 +560,13 @@ stop_interruption_wrapper() {
     kill -TERM "$wrapper_pid" 2>/dev/null || :
     wait "$wrapper_pid" 2>/dev/null || :
 }
+# Bash and some /bin/sh implementations copy the parent's EXIT trap into an
+# asynchronous command's child environment. Do not let that exact test child
+# run the wrapper cleanup before stop_interruption_wrapper reaps it.
+trap - EXIT HUP INT TERM
 sleep 60 &
 interruption_orphan_test_pid=$!
+trap cleanup EXIT HUP INT TERM
 stop_interruption_wrapper "$interruption_orphan_test_pid"
 if kill -0 "$interruption_orphan_test_pid" 2>/dev/null; then
     echo 'FAIL: parent wrapper cleanup left an orphan' >&2
@@ -570,6 +575,9 @@ fi
 echo 'ok - parent wrapper cleanup terminates and reaps the exact owner'
 
 (
+    # Bash may inherit the parent EXIT trap into this compound child. Its
+    # own signal cleanup below must own only this interruption runtime root.
+    trap - EXIT HUP INT TERM
     interruption_child_pid=
     stop_interruption_child() {
         if test -z "$interruption_child_pid"; then

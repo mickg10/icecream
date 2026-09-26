@@ -18,10 +18,27 @@ Generated `*.a` and `*.so` files are now ignored so QA's untracked-file
 snapshot cannot import stale build libraries through VPATH. The supervisor
 sanitizer script links `-lxxhash` rather than a Debian-specific absolute path.
 These two files match the corresponding changes in donor `43451abf`.
-Luna verified both ignore patterns and successful sanitizer compilation/linking.
-The subsequent supervisor runtime still fails its `gone` assertion in the
-isolated run; this is not a passing sanitizer gate. The proposed Bash trap
-fix is held separately pending the full interruption test.
+Luna verified both ignore patterns. The adapter source test also clears
+inherited cleanup traps around its background child launch and inside the
+compound interruption child; this prevents a Bash child from deleting the
+parent's runtime directory. The shell file matches donor `13fcef2b`, SHA256
+`8e8c1dd44007db6e0074aa9af0d095f3a33e05de1d94f5f91da884d10bccd1d8`.
+
+Both Bash and dash executions pass the complete adapter source/mutation gate
+(46.18s and 44.42s). The supervisor sanitizer script also passes (13.78s).
+Runs use `nobody`, a writable short `/tmp`, an init reaper, SYS_PTRACE, and the
+configured service, preload-helper and linker variables. Earlier runs without
+SYS_PTRACE failed process-identity observation and remain failed setup attempts.
+Logs under `/tanksmall/scratch/tmp/p51-candidate-portability-runtime-a027d14e/`:
+
+- `adapter-bash-ptrace.log`: `61ad660885d57099cdc77d91a82aefa5f60cf37e5a955d5e33fd86637b423ef0`
+- `adapter-dash-ptrace.log`: `71d02409607fcadb6e234af1d080e2d73fa95661b8ff8735465912be4dc56273`
+- `sanitize-ptrace.log`: `eec5eafaf4d458f6c5dbc70d40f2ec205ab6c2bfb62756d204b8bc589973c1be`
+
+The old/fixed Bash trap reproducer and fixed dash check are retained at
+`/tanksmall/scratch/tmp/p51-candidate-runtime-a027d14e/a027-trap-fixture.log`,
+SHA256 `66bfbe0d0dce7ce7480d355bdee2ccd56c8c85aee727c16c1e7df4ac659df65d`.
+These focused gates do not constitute a complete candidate QA run.
 
 ### Sender sanitizer lifetime correction and clean candidate build
 
