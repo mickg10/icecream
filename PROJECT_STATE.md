@@ -56,11 +56,13 @@ link and bounded shutdown. The full r6 gate passes all three profiles with
 observed 30+30+30 receipt windows and exact object checks. Product binaries
 were unchanged. The executed runner was based on `98fa7aa`; the integrated
 runner additionally preserves current compiler-loss cleanup and strengthens
-invalid deadline-input rejection. The combined `b270a223` S→F runner now
-also passes all three profiles against the same frozen product binaries;
-the independent compiler-loss rerun is still pending.
+invalid deadline-input rejection. The later S→F run also passes all three
+profiles against frozen product binaries, but its exact executed source
+mount/hash has not been independently recovered. Do not treat its reported
+`b270a223` identity as qualified combined-tree evidence. Fresh combined-source
+verification and the corrected compiler-loss rerun remain pending.
 
-Combined run `b5968616788f4e668025ec13fbfe84d3` retains its gate log under
+Run `b5968616788f4e668025ec13fbfe84d3` retains its gate log under
 `repair-gate-work/artifacts/opt-in-gates/` in the artifact root below, SHA256
 `9c2fc4ea4b3c14e6d5ff6ad8805449ba852ea114018e4c530344df11a9d8c66e`.
 Outer `repair-gate-logs/scheduler-f-gate-b270-r2.log` SHA256:
