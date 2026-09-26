@@ -105,6 +105,12 @@ public:
     [[nodiscard]] bool deadline_expired(std::chrono::steady_clock::time_point now) const noexcept {
         return status_ == DaemonControlStatus::InProgress && now >= deadline_;
     }
+    [[nodiscard]] std::chrono::steady_clock::time_point next_wakeup() const noexcept;
+    [[nodiscard]] bool timer_due(std::chrono::steady_clock::time_point now) const noexcept;
+    // Poll owners must omit native_handle() entirely when this is false (even
+    // POLLERR/POLLHUP can wake an unconnected socket). Wake at next_wakeup(),
+    // then call advance(now, 0) to perform a scheduled connect retry.
+    [[nodiscard]] bool wants_poll() const noexcept;
     [[nodiscard]] std::chrono::steady_clock::time_point deadline() const noexcept {
         return deadline_;
     }
@@ -123,7 +129,8 @@ private:
                                  CheckSourceReplyTrailing, WriteLifecycleGoodbye };
     void fail(DaemonControlStatus status) noexcept;
     void close_fd() noexcept;
-    void advance_phase(size_t& calls, size_t& budget) noexcept;
+    void advance_phase(std::chrono::steady_clock::time_point now, size_t& calls,
+                       size_t& budget) noexcept;
     bool query_peer() noexcept;
     bool write_bytes(size_t& offset, const std::vector<uint8_t>& bytes,
                      size_t& calls, size_t& budget) noexcept;
@@ -149,6 +156,8 @@ private:
     CredentialExpectation credentials_{};
     ControlOperation operation_{};
     std::string connect_path_;
+    std::chrono::steady_clock::time_point connect_retry_at_{};
+    bool connect_retry_waiting_ = false;
     std::vector<uint8_t> hello_;
     std::vector<uint8_t> control_;
     std::array<uint8_t, 40> handoff_{};

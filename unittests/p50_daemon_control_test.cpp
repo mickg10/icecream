@@ -4,6 +4,8 @@
 #include <chrono>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <exception>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdexcept>
@@ -170,7 +172,8 @@ void test_incremental_handoff_and_fairness() {
         CHECK(sender.last_advance_bytes() <= 7);
     }
     peer.join();
-    CHECK(sender.status() == DaemonControlStatus::Complete);
+    check(sender.status() == DaemonControlStatus::Complete,
+          daemon_control_status_name(sender.status()));
     CHECK(sender.rights_sent());
     ::close(pair[1]);
 }
@@ -265,7 +268,8 @@ void test_source_transfer_reply_and_tu0() {
         sender.advance(std::chrono::steady_clock::now(), pfd.revents);
     }
     peer.join();
-    CHECK(sender.status() == DaemonControlStatus::Complete);
+    check(sender.status() == DaemonControlStatus::Complete,
+          daemon_control_status_name(sender.status()));
     CHECK(sender.source_transfer_result().has_value());
     CHECK(sender.source_transfer_result()->tu_seq == 0);
     ::close(pair[1]);
@@ -707,6 +711,189 @@ void test_connect_pending_ignores_preconnect_hup() {
     (void)::unlink(path.c_str());
 }
 
+// Also run with the chained limits of the adapter's input lifecycle dialogue:
+// the EAGAIN retry must not chain while the phase stays ConnectPending.
+void test_connect_backlog_eagain_retries_after_timer_and_completes(
+    DaemonControlLimits limits) {
+    const std::string path =
+        "/tmp/p50-daemon-backlog-" + std::to_string(::getpid()) + ".sock";
+    (void)::unlink(path.c_str());
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    CHECK(path.size() < sizeof(address.sun_path));
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    CHECK(::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                 static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                        path.size() + 1)) == 0);
+    CHECK(::listen(listener, 0) == 0);
+
+    // Occupy the sole backlog slot without accepting it. On Linux, the next
+    // AF_UNIX connect returns EAGAIN while that queue is full.
+    const int blocker = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(blocker >= 0);
+    CHECK(::connect(blocker, reinterpret_cast<sockaddr*>(&address),
+                    static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                           path.size() + 1)) == 0);
+    const int client = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(client >= 0);
+    nonblock(client);
+    const int payload = ::open("/dev/null", O_RDONLY);
+    CHECK(payload >= 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    const ControlOperation expected = operation();
+    DaemonControlOperation sender;
+    CHECK(sender.begin_connecting(path, client, expected, payload, credentials(),
+                                  deadline, limits,
+                                  DaemonControlFdOwnership::Owned) ==
+          DaemonControlStatus::InProgress);
+
+    DaemonControlPollAdapter poll_adapter;
+    const auto registration = poll_adapter.add(sender);
+    const auto first_connect_time = std::chrono::steady_clock::now();
+    CHECK(poll_adapter.advance_ready(first_connect_time, {POLLOUT}) == 1);
+    CHECK(sender.status() == DaemonControlStatus::InProgress);
+    CHECK(sender.last_advance_syscalls() == 1);
+    CHECK(!sender.wants_poll());
+    CHECK(sender.next_wakeup() > first_connect_time);
+    CHECK(sender.next_wakeup() < deadline);
+    const auto calls_before_early_turn = sender.last_advance_syscalls();
+    CHECK(poll_adapter.advance_ready(first_connect_time, {POLLERR | POLLHUP}) == 0);
+    CHECK(sender.last_advance_syscalls() == calls_before_early_turn);
+    CHECK(!sender.wants_poll());
+
+    // Draining the queue does not itself wake an unconnected socket reliably;
+    // wait until the operation's timer, then let it retry the same pathname.
+    const int accepted_blocker = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted_blocker >= 0);
+    ::close(accepted_blocker);
+    ::close(blocker);
+
+    CHECK(poll_adapter.advance_ready(sender.next_wakeup(), {0}) == 1);
+    CHECK(sender.status() == DaemonControlStatus::InProgress);
+    CHECK(sender.wants_poll());
+
+    DaemonControlHandoffReceiver receiver;
+    std::exception_ptr peer_error;
+    std::jthread peer([&] {
+        int accepted = -1;
+        bool accepted_owned = false;
+        try {
+            pollfd listening{listener, POLLIN, 0};
+            CHECK(::poll(&listening, 1, 2500) == 1);
+            accepted = ::accept(listener, nullptr, nullptr);
+            CHECK(accepted >= 0);
+            timeval io_timeout{2, 0};
+            CHECK(::setsockopt(accepted, SOL_SOCKET, SO_RCVTIMEO,
+                               &io_timeout, sizeof(io_timeout)) == 0);
+            CHECK(::setsockopt(accepted, SOL_SOCKET, SO_SNDTIMEO,
+                               &io_timeout, sizeof(io_timeout)) == 0);
+            Frame hello;
+            CHECK(read_frame(accepted, hello) == Status::Ok);
+            CHECK(hello.type == MessageType::Hello && hello.identity == expected.identity);
+            write_frame(accepted, make_hello_ack(PeerRole::Sidecar, expected.identity));
+            Frame control;
+            CHECK(read_frame(accepted, control) == Status::Ok);
+            ControlOperation decoded;
+            CHECK(control.type == MessageType::Data && decode_control_operation(control.payload, decoded));
+            CHECK(decoded.kind == expected.kind && decoded.identity == expected.identity &&
+                  decoded.request_id == expected.request_id);
+            nonblock(accepted);
+            accepted_owned = true;
+            CHECK(receiver.begin_connected(accepted, expected,
+                                           std::chrono::steady_clock::now() + std::chrono::seconds(2),
+                                           DaemonControlLimits{2, 4096},
+                                           DaemonControlFdOwnership::Owned) ==
+                  DaemonControlStatus::InProgress);
+            const auto peer_deadline = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(2);
+            while (!receiver.done()) {
+                CHECK(std::chrono::steady_clock::now() < peer_deadline);
+                pollfd pfd{accepted, receiver.desired_events(), 0};
+                const int ready = ::poll(&pfd, 1, 100);
+                CHECK(ready >= 0);
+                receiver.advance(std::chrono::steady_clock::now(),
+                                 ready == 0 ? 0 : pfd.revents);
+            }
+            CHECK(receiver.status() == DaemonControlStatus::Complete);
+            const int adopted = receiver.take_fd();
+            CHECK(adopted >= 0);
+            ::close(adopted);
+        } catch (...) {
+            if (accepted >= 0 && !accepted_owned) ::close(accepted);
+            peer_error = std::current_exception();
+        }
+    });
+
+    while (!sender.done()) {
+        auto now = std::chrono::steady_clock::now();
+        if (!sender.wants_poll()) {
+            CHECK(sender.next_wakeup() <= deadline);
+            if (now < sender.next_wakeup())
+                std::this_thread::sleep_until(sender.next_wakeup());
+            now = std::chrono::steady_clock::now();
+            sender.advance(now, 0);
+        } else {
+            pollfd pfd{sender.native_handle(), sender.desired_events(), 0};
+            const int ready = ::poll(&pfd, 1, 1000);
+            CHECK(ready == 1);
+            sender.advance(std::chrono::steady_clock::now(), pfd.revents);
+        }
+    }
+    peer.join();
+    if (peer_error) std::rethrow_exception(peer_error);
+    CHECK(poll_adapter.remove(registration));
+    check(sender.status() == DaemonControlStatus::Complete,
+          daemon_control_status_name(sender.status()));
+    CHECK(sender.rights_sent());
+    CHECK(sender.deadline() == deadline);
+    ::close(listener);
+    (void)::unlink(path.c_str());
+}
+
+void test_connect_begin_eagain_keeps_original_deadline() {
+    const std::string path =
+        "/tmp/p50-daemon-backlog-timeout-" + std::to_string(::getpid()) + ".sock";
+    (void)::unlink(path.c_str());
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    CHECK(path.size() < sizeof(address.sun_path));
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    CHECK(::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                 static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                        path.size() + 1)) == 0);
+    CHECK(::listen(listener, 0) == 0);
+    const int blocker = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(blocker >= 0);
+    CHECK(::connect(blocker, reinterpret_cast<sockaddr*>(&address),
+                    static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                           path.size() + 1)) == 0);
+
+    const int payload = ::open("/dev/null", O_RDONLY);
+    CHECK(payload >= 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
+    DaemonControlOperation sender;
+    CHECK(sender.begin(path, operation(), payload, credentials(), deadline,
+                       DaemonControlLimits{1, 4096}) == DaemonControlStatus::InProgress);
+    CHECK(!sender.wants_poll());
+    CHECK(sender.deadline() == deadline);
+    while (!sender.done()) {
+        const auto wakeup = sender.next_wakeup();
+        CHECK(wakeup <= deadline);
+        std::this_thread::sleep_until(wakeup);
+        sender.advance(std::chrono::steady_clock::now(), POLLHUP);
+    }
+    CHECK(sender.status() == DaemonControlStatus::Timeout);
+    CHECK(sender.deadline() == deadline);
+    CHECK(sender.native_handle() == -1);
+    ::close(blocker);
+    ::close(listener);
+    (void)::unlink(path.c_str());
+}
+
 void test_authenticated_entry_consumes_transfer_on_every_return() {
     int invalid_pair[2] = {-1, -1};
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, invalid_pair) == 0);
@@ -900,6 +1087,10 @@ int main() {
     test_credentials_and_owned_fd_lifetime();
     test_poll_adapter_relevance_fairness_and_removal();
     test_connect_pending_ignores_preconnect_hup();
+    test_connect_backlog_eagain_retries_after_timer_and_completes(DaemonControlLimits{1, 4096});
+    test_connect_backlog_eagain_retries_after_timer_and_completes(
+        DaemonControlLimits{8, 4096, true});
+    test_connect_begin_eagain_keeps_original_deadline();
     test_authenticated_entry_consumes_transfer_on_every_return();
     test_lifecycle_chain_takes_one_advance_per_sidecar_reply();
     test_lifecycle_chain_honours_syscall_quota();
