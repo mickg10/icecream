@@ -68,8 +68,19 @@ instrumented. Preserved binary SHA256
 `4593b3a9ce379c9d89507d41b919c3386e22779f9779b6d29735643a176391b1`
 records `D17_ASAN_EXIT=0`, with no sanitizer diagnostics. Retained-input growth
 matches the deliberately preserved successful inputs; peak RSS is diagnostic,
-not an assertion of constant allocator residency. Merged full-suite
-qualification remains pending.
+not an assertion of constant allocator residency.
+
+The full registered cache-service suite passes on merged code `b5578e77`
+(test exit 0; test/global `.trs` PASS), including the failed-predecessor
+cancellation case and the new D17 resource assertions. Evidence under
+`/tanksmall/scratch/tmp/p51-b557-service/build/unittests/`:
+`p50cacheservice.log` SHA256
+`15b49927d1973df0f5446970f09d5e6d99b95d2e80dfb685a13fc465f9dace66`;
+binary SHA256
+`6122a1ec5fbf6683262c0b53b0474a244a011940e5f8d5ca2d677f79c386d48e`.
+Earlier runner setup failures are retained separately in the sibling `logs/`
+directory. This service-suite result does not qualify the whole native suite,
+mixed P43 farm, or the separately failing predecessor-source-deadline case.
 
 ### Staged cancellation with a failed predecessor
 
@@ -85,8 +96,12 @@ successful survivors.
 The focused `--d07-staged-cancel-predecessor-failure` run passed, exit 0.
 Log `/tanksmall/scratch/tmp/p51-d07-predecessor-failure-build/tmp/p51-d07-staged-predecessor-failure-r4.log`,
 SHA256 `8cd596aea18f7036354e296e36938a4f2bda3b50dfdf7b32740a857edc8424fe`.
-The predecessor-deadline variant and merged full-suite regression remain
-pending; this failure injection is not evidence for deadline expiry.
+The merged full-suite regression passes on `b5578e77` as recorded above.
+The predecessor-deadline variant remains open; this failure injection is not
+evidence for deadline expiry. The original-deadline diagnostic currently
+observes clean EOF for the expired predecessor, then a live successor timing
+out without a replacement link. Recovery's retained-job deadline handling is
+under investigation; do not classify this case as passing.
 
 ### P29 pre-FILL cancellation foundation
 
