@@ -51,6 +51,19 @@ establish its cause or replace the final combined-candidate QA gate.
 
 ### Daemon cancellation cleanup after source expiry
 
+The remote-assignment harness now accepts
+`ICECC_P50_C1F1_WORKER_SCHEDULER_HOST` for F's scheduler connection, preserving
+the loopback default for legacy tests. Strict required-remote mode needs an
+explicit non-loopback host; loopback previously made S advertise `localhost`,
+which the strict client correctly refused. Donor `e673eb79` passes both the
+unchanged legacy default and strict non-loopback gates (actual exits 0).
+Evidence directory:
+`/tanksmall/scratch/tmp/p51-qa-293a/scratch/icecream-qa-kiyex8p9/current/artifacts/root-live-34f2/root-live-assignment/`.
+This is harness qualification on baseline `293a1367` binaries, not current
+combined-product qualification. The remaining completion-flow rerun is being
+updated to observe current session-quiescence state rather than the removed
+`cleared children` log message; its downstream retry assertions remain required.
+
 Candidate `3d37e024` integrates donors `0548b240` and `a0b65f20`.
 An exact cancellation exchange receives one fixed two-second local-control
 budget, independent of its immutable original source deadline. It neither
