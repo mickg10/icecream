@@ -12,6 +12,21 @@ retained artifact directories.
 
 ## Developer QA
 
+### Third paired corpus: ClickHouse programs32
+
+The 63-cell ClickHouse paired transfer matrix passes with exact decoded
+outputs in every cell. P29V1 fresh/retained/edited median pass times are
+1452/1009/1111 ms for R1/W1, 1376/859/961 ms for R2/W1, and 961/490/490 ms
+for R2/W30. The same frozen benchmark binary was used for Firefox, RocksDB
+and ClickHouse; its exact source commit remains unverified, so this is
+exploratory performance evidence, not qualification of the current runtime.
+The configured W30 cap was not saturated by these workloads; OS cache state
+was uncontrolled and these are loopback transfers, not whole builds.
+See the [three-corpus comparison](research/reports/P50-PAIRED-CORPUS.md#three-corpus-p29v1-paired-window-comparison)
+and linked raw 63-cell measurement artifact for profiles, ranges, bytes and
+provenance. The full Chromium and cross-host performance requirements remain
+open; codebaseN under 150 seconds is not demonstrated.
+
 ### Current cleanup and collector qualification
 
 The C03 client-EOF fixture now requires exactly one cancellation queued and

@@ -127,3 +127,26 @@ does compare completion of the same ordered input workload. In R2, the
 maximum observed peak at configured W30 was 2/2/2 for ZSTD_TU, 10/14/15 for
 P29V1, and 1/1/1 for ZSTD_ROUTE. Thus the ROUTE workload did not approach W30;
 this matrix does not demonstrate saturation or a universal window speedup.
+
+## Three-corpus P29V1 paired window comparison
+
+The table compares the same frozen benchmark binary across the Firefox32,
+RocksDB32, and ClickHouse programs32 preprocessed-input matrices. Values are
+median pass wall time in milliseconds over three repetitions, each triplet
+fresh/retained/edited; bracketed values are observed min/max. For the complete
+ClickHouse raw 63-cell table and provenance, see
+[`p50-window-clickhouse-programs32-20260926.json`](../measurements/p50-window-clickhouse-programs32-20260926.json).
+
+| Corpus | R1/W1 fresh/retained/edited ms | R2/W1 fresh/retained/edited ms | R2/W30 fresh/retained/edited ms |
+|---|---|---|---|
+| Firefox32 | 1303[1236..1410] / 687[645..771] / 890[727..954] | 1276[1215..1361] / 655[625..667] / 634[620..741] | 791[783..934] / 374[324..457] / 350[332..430] |
+| RocksDB32 | 1076[956..1312] / 858[563..919] / 793[660..882] | 1154[1116..1212] / 810[729..819] / 779[702..816] | 709[706..809] / 409[398..469] / 418[392..447] |
+| ClickHouse programs32 | 1452[1323..1524] / 1009[965..1051] / 1111[988..1165] | 1376[1326..1413] / 859[845..917] / 961[874..988] | 961[940..983] / 490[490..524] / 490[428..542] |
+
+The P29V1 comparison uses emitted profile ID 1 (CLI profile index 1), not
+profile ID 2 (ZSTD_TU). These are descriptive paired measurements, not an
+isolated causal estimate: R1 and R2 have different submission behavior, OS
+cache state is inherited/uncontrolled, and W30 is a cap rather than guaranteed
+occupancy. In particular, observed P29V1 peaks at W30 were below 30 in all
+three corpora. Do not generalize to cross-host throughput or full project
+build performance.
