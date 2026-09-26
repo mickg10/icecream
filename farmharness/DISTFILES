@@ -156,6 +156,7 @@ farmharness/integration/tests/test_netem.py
 farmharness/integration/tests/test_node_netem_dependency.py
 farmharness/integration/tests/test_orchestration.py
 farmharness/integration/tests/test_performance.py
+farmharness/integration/tests/test_p50_preprocess_pairing.py
 farmharness/integration/tests/test_python_environment.py
 farmharness/integration/tests/test_r2_wire_trace.py
 farmharness/integration/tests/test_resolver_v2.py
@@ -269,3 +270,5 @@ research/farmharness/s8_retained_s7_package_test.py
 research/farmharness/s8_schema.py
 research/farmharness/s8_supervisor_image.py
 research/farmharness/s8_supervisor_image_test.py
+tools/__init__.py
+tools/p50_regenerate_paired_corpus.py

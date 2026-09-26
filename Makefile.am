@@ -21,6 +21,7 @@ EXTRA_DIST = README.md \
 	pytest.ini \
 	research/reports/BENCH \
 	research/reports/P50_RESULT_DISPOSITION_WIRE_AUDIT.md \
+	research/reports/P50-PAIRED-CORPUS.md \
 	GNUmakefile \
 	log_extractor \
 	package_builder \
