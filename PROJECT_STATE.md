@@ -76,8 +76,26 @@ results PASS). Log under
 has SHA256 `090e81322115b71fe09ce61338848fb92b24a9def3e4275164820e895f864be2`.
 The first normal build exposed an unguarded test-only callback access, fixed
 in `e0d1f0d9`; missing archive and offline Python runtime setup attempts are
-retained separately, not counted as product failures. Expanded sanitizer
-qualification and the later cancellation-plus-four-link snapshot remain pending.
+retained separately, not counted as product failures. The later
+cancellation-plus-four-link snapshot has separate qualification below.
+
+Expanded ASan/UBSan/LSan validation also passed: all nine staged cases and
+the three-profile active-cancellation probe, each exit 0 on the same binary.
+The instrumented sources include service, endpoint, slice0 codec state, route
+owner, sender and test code; remaining support archives and the external
+service executable are normal builds. This is not whole-process instrumentation
+of every dependency, nor a full sanitizer run of all tests. Script `0db6af85`
+adds direct endpoint/slice0 instrumentation and selector forwarding.
+Tested binary SHA256:
+`665a121ec99f8ad4ed63d2b4599165cae7d9af64563e2d542f95553ab7bb9e81`.
+Logs under `/tanksmall/scratch/tmp/p51-staged-cancel-asan-artifacts/`:
+`staged-cancel-asan-r4.log` SHA256
+`ecf66783e20bafa21567eb80a42cd665b5f9ef031edf06c214cf67d6bef2556f`;
+`active-cancel-asan.log` SHA256
+`dde960e9da9b187b8ade2ebb454ac5f023a4b1f4a4592659daf3daa0dac7ca35`.
+This run uses the cancellation checkpoint plus the endpoint const-reference
+fix `923924bb`, not the later four-link test hook. Prior compile/link setup
+failures are retained as `staged-cancel-asan.log`, `-r2.log` and `-r3.log`.
 
 ### Source admission pressure
 
