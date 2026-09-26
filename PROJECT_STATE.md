@@ -12,6 +12,21 @@ retained artifact directories.
 
 ## Developer QA
 
+### Persistent wrapper gate entry point
+
+`5f426c01` adds `ICEFARM_TMPDIR=/existing/scratch make dev-gate
+GATE=p51-wrapper-compile`. The bounded private-container gate requires all six
+profile/count cells (P29V1, ZSTD_TU, ZSTD_ROUTE; two and 100 sequential jobs),
+including exact markers rather than six arbitrary successes. The Make target
+also has a 1,800-second watchdog and explicitly selects all three profiles.
+
+The donor's pinned-UV bootstrap suite passes 51 tests, including executed
+positive, duplicate-cell and missing-cell marker checks. Retained log:
+`/tanksmall/scratch/tmp/p51-c01-selector-validation/pinned-uv-test-dev-bootstrap.log`,
+SHA256 `a14b585bae6cb851492930b5b60c8c1c6834f4cb651cdc7746c254710b9960e2`.
+The six-cell live invocation through this new entry point is **not yet
+qualified**; selector tests are not runtime persistence evidence.
+
 ### Fresh-bootstrap live-core qualification
 
 The private gate candidate `871cc921` passes a fresh source-snapshot bootstrap
