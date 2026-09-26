@@ -20,9 +20,14 @@ P29V1/ZSTD_TU/ZSTD_ROUTE, cancelling submission positions 0/14/29 from
 30 held jobs. Each cell observes 29 survivors and one fresh completion,
 zero transient raw bytes after cleanup, restored descriptor baseline, and
 retained input records/bytes matching the expected completed-input inventory.
-RSS is diagnostic, not a proof of an unbounded memory plateau. The current
-sanitizer rerun remains pending; its first invocation failed at link time
-because the configured libcap-ng link flag was omitted, before any test ran.
+RSS is diagnostic, not a proof of an unbounded memory plateau. The same nine
+cells also pass `p50cacheservice-sanitize.sh --d17-repeated-window-cancel`
+with ASan/UBSan/LSan (exit 0, no sanitizer diagnostics). The script instruments
+its selected test/service/route-owner/sender translation units; this is not
+a full-suite sanitizer run. Its first invocation failed at link time because
+the configured libcap-ng link flag was omitted, before any test ran.
+Sanitizer log: `current/tmp/d17-sanitizer-rerun.log`, SHA256
+`baa39c116108d20ecd842e4f47af548664a75e13a377f077491eb9e284886f41`.
 Native log: `current/tmp/d17-repeated-window-cancel.log` under the fresh
 bootstrap run below, SHA256
 `e9ece46770454621174300b68a582f5b00c2cbbe1f225bf1bbe90cf8814ed8eb`.
