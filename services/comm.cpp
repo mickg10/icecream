@@ -3822,6 +3822,7 @@ DiscoverSched::DiscoverSched(const std::string &_netname, int _timeout,
     , timeout(_timeout)
     , ask_fd(-1)
     , ask_second_fd(-1)
+    , connect_failed(false)
     , sport(port)
     , best_version(0)
     , best_start_time(0)
@@ -4111,6 +4112,15 @@ MsgChannel *DiscoverSched::try_get_scheduler()
             ask_fd = -1;
             return Service::createChannel(fd,
                                           (struct sockaddr *) &remote_addr, sizeof(remote_addr));
+        }
+        if (status < 0 && errno != EINPROGRESS && errno != EALREADY) {
+            const int connect_error = errno;
+            log_warning() << "scheduler connect attempt failed: "
+                          << strerror(connect_error) << endl;
+            if (-1 == close(ask_fd) && errno != EBADF)
+                log_perror("close failed");
+            ask_fd = -1;
+            connect_failed = true;
         }
     }
 

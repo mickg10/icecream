@@ -25,15 +25,38 @@ bounded retry attempt. This is W1 worker-loss cleanup, not transparent victim
 replay, W30 compiler occupancy, or an unaffected-sibling test. Ordinary
 scheduler-restart process-stability requirements remain unchanged.
 
-The stopped compiler consumes the queued input-lifecycle deadline during
-synchronous compiler cleanup; the observed F sidecar replacement is accepted
-only with that job-specific timeout and a distinct replacement READY identity.
-Avoiding this unnecessary replacement remains production work.
+Compiler cleanup now advances in the ordinary daemon loop instead of blocking
+input-lifecycle delivery. Exact process-group ownership and capacity accounting
+remain with the child registry; reconnect and new admission wait for settlement.
+Accounting/identity faults remain sticky; a cleanup timeout can recover only
+after exact settlement. Direct scheduler connection completion is now polled,
+with failed connects using the existing reconnect backoff.
+
+The stricter mode additionally sets `ICECC_P51_WRAPPER_EXPECT_STABLE_F=1`.
+All three profiles pass with Applied/AlreadyApplied CancelAttempt before group
+settlement, the original F sidecar PID/store GUID, one R2 adoption, zero R1
+readiness, and exact fresh-job output. Reviewed donor `5ce1bdef5c97de8269dc7eefd6f919605dca6768`;
+the seven imported source/test files match the recorded run's hashes.
+Final log `/tanksmall/scratch/tmp/p51-quiescence-runtime/w1-strict-stable-f-final2.log`,
+SHA256 `78ce5ff7f65877e943951a9309746b805945d242047595845ec025fe8d61c1db`;
+daemon SHA256 `85da3cf6261cf830852861181f8ecea582f2864df6c94a76d803c32238754069`.
+The production ownership-state transition helper also passes its regression.
+
+Separate checks passed refused-endpoint recovery (three-second test backoff)
+and empty orderly shutdown on the preceding binary, before the final ownership
+gate refactor. Logs under the same directory: `discovery-final-summary.log`
+SHA256 `c750b26f4be91eb29fedcf231e5c3cd636cd86a32dffd7887a6495476d782c15`,
+and `empty-shutdown-final-run2.log`
+SHA256 `e474d8855c9dbb1cebd33538886242b85833c72f4e6b64cb19842938dc4c9223`.
+These are not final-binary reruns or proof of production backoff timing.
+Two-group staggered cleanup, admission during grace, broader P43 recovery,
+and the complete W30 matrix remain unqualified. This is not a full-candidate
+regression pass; the reused build's complete source closure is not established.
 
 Run the existing `unittests/p51wrappercompile-run.sh` with its documented
 source/build, daemon-account and worker-address environment and explicit task
 scratch. The new mode generates only a heavy victim and a fresh probe.
-Reviewed donor: `c4a7cb12`. All-three log:
+Earlier replacement-mode donor: `c4a7cb12`. Its all-three log:
 `/tanksmall/scratch/tmp/p51-d07-compile.YLS0NG/tmp/p51-wloss-donor-cleanup-all3-run1.log`,
 SHA256 `497d4605f8de458a454ac20c1dbf716ab0fbb7d6a05927f46c495d0b674acaeb`.
 Qualified daemon binary SHA256:

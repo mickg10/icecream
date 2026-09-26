@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -42,6 +43,42 @@ struct SignalAuthority {
 
 struct SlotAccounting {
     bool active = true;
+};
+
+class ChildOwnershipGate {
+public:
+    void mark_sticky_failure() noexcept
+    {
+        blocked = true;
+        sticky_fault = true;
+    }
+
+    void mark_recoverable_block() noexcept
+    {
+        blocked = true;
+    }
+
+    void begin_barrier() noexcept
+    {
+        barrier_open = true;
+    }
+
+    void settle_exact(std::size_t current_kids) noexcept
+    {
+        if (!barrier_open)
+            return;
+        barrier_open = false;
+        if (!sticky_fault && current_kids == 0)
+            blocked = false;
+    }
+
+    bool admission_blocked() const noexcept { return blocked; }
+    bool sticky_failure() const noexcept { return sticky_fault; }
+
+private:
+    bool blocked = false;
+    bool sticky_fault = false;
+    bool barrier_open = false;
 };
 
 /* A compiler signal is retryable process loss only when it exactly matches a

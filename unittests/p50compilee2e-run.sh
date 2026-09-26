@@ -28,6 +28,7 @@ s2_process_loss=${ICECC_P50_S2_PROCESS_LOSS:-0}
 real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
 worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
+expect_stable_f=${ICECC_P50_C1F1_EXPECT_STABLE_F:-0}
 case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
@@ -59,6 +60,14 @@ case "$worker_session_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
 esac
+case "$expect_stable_f" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_EXPECT_STABLE_F must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$expect_stable_f" = 1 && test "$worker_session_loss" != 1; then
+    echo "FAIL: stable-F expectation requires the worker-session-loss scenario" >&2
+    exit 1
+fi
 if test "$worker_session_loss" = 1; then
     if test "$real_scheduler_restart_w30" = 1 || \
             test "$real_scheduler_f_restart_w30" = 1; then
@@ -2723,6 +2732,31 @@ EOF_VICTIM_STOPPED
         else
             echo "S8_REAL_WORKER_LOSS_F_SIDECAR_RETAINED pid=$old_f_service_pid"
         fi
+        if test "$expect_stable_f" = 1; then
+            if grep -F "P50 input settlement job $victim_job_id action 1 status timeout reason handle_end" \
+                    "$work/f.log" >/dev/null 2>&1; then
+                echo "FAIL: strict stable-F expectation observed handle_end input lifecycle timeout" >&2
+                return 1
+            fi
+            lifecycle_record=$(grep -F \
+                "P50 input settlement job $victim_job_id action 1 status " \
+                "$work/f.log" | head -n 1 || true)
+            case "$lifecycle_record" in
+                *" status applied reason handle_end"*|*" status already-applied reason handle_end"*) ;;
+                *) echo "FAIL: handle_end CancelAttempt did not return an exact successful lifecycle status" >&2; return 1 ;;
+            esac
+            lifecycle_line=$(grep -nF "$lifecycle_record" "$work/f.log" |
+                head -n 1 | cut -d: -f1)
+            test -n "$lifecycle_line" && test "$lifecycle_line" -lt "$settled_line" || {
+                echo "FAIL: handle_end lifecycle did not settle before compiler-group cleanup" >&2
+                return 1
+            }
+            kill -0 "$old_f_service_pid" 2>/dev/null || {
+                echo "FAIL: strict stable-F expectation lost the original sidecar process" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_F_LIFECYCLE_DELIVERED job=$victim_job_id before_group_settlement=1 timeout=0"
+        fi
         echo "S8_REAL_WORKER_LOSS_QUIESCED scope=global_scheduler_session job=$victim_job_id pid=$victim_pid pgid=$victim_pgid start_ticks=$victim_start_ticks old_epoch=$old_scheduler_epoch new_epoch=$new_scheduler_epoch F_daemon_pid=$old_worker_pid F_sidecar_pid_before=$old_f_service_pid exact_TERM=1 exact_KILL=1 exact_reaped=1"
 
         ready_snapshot "$work/ready-f.trace" || {
@@ -2730,6 +2764,14 @@ EOF_VICTIM_STOPPED
             return 1
         }
         recovery_f_guid=$ready_f_guid
+        if test "$expect_stable_f" = 1; then
+            test "$ready_pid" = "$old_f_service_pid" && \
+                    test "$recovery_f_guid" = "$old_f_store_guid" || {
+                echo "FAIL: strict stable-F expectation changed READY PID/store GUID" >&2
+                return 1
+            }
+            echo "S8_REAL_WORKER_LOSS_F_READY_STABLE pid=$ready_pid F_STORE_GUID=$recovery_f_guid"
+        fi
         if ! kill -0 "$old_f_service_pid" 2>/dev/null; then
             test "$ready_pid" != "$old_f_service_pid" && \
                     test "$recovery_f_guid" != "$old_f_store_guid" || {

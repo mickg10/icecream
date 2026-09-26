@@ -1657,6 +1657,11 @@ public:
         return schedname.empty() ? -1 : ask_fd;
     }
 
+    bool connection_failed() const
+    {
+        return connect_failed;
+    }
+
     // compat for icecream monitor
     int get_fd() const
     {
@@ -1700,6 +1705,7 @@ private:
     int timeout;
     int ask_fd;
     int ask_second_fd; // for debugging
+    bool connect_failed;
     time_t time0;
     unsigned int sport;
     int best_version;

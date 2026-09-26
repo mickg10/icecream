@@ -34,10 +34,19 @@ trap 'echo "P51 wrapper artifacts retained at $fixture"' EXIT
 chmod 0755 "$fixture"
 mkdir -p "$fixture/sources" "$fixture/predictive"
 worker_session_loss=${ICECC_P51_WRAPPER_WORKER_SESSION_LOSS:-0}
+expect_stable_f=${ICECC_P51_WRAPPER_EXPECT_STABLE_F:-0}
 case "$worker_session_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
 esac
+case "$expect_stable_f" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_EXPECT_STABLE_F must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$expect_stable_f" = 1 && test "$worker_session_loss" != 1; then
+    echo "FAIL: stable-F expectation requires ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1" >&2
+    exit 1
+fi
 if test "$worker_session_loss" = 1; then
     jobs=2
 else
@@ -143,6 +152,7 @@ for profile in $profiles; do
         ICECC_P50_C1F1_KEEP_WORK=1 \
         ICECC_P50_C1F1_TIMEOUT=300 \
         ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS="$worker_session_loss" \
+        ICECC_P50_C1F1_EXPECT_STABLE_F="$expect_stable_f" \
         "$src/unittests/p50compilee2e-run.sh" >"$log" 2>&1
     status=$?
     set -e
@@ -163,6 +173,18 @@ for profile in $profiles; do
             echo "FAIL: $profile committed victim/Error24 and fresh recovery outputs disagree with worker-loss scope" >&2
             exit 1
         }
+        if test "$expect_stable_f" = 1; then
+            grep -F "S8_REAL_WORKER_LOSS_F_LIFECYCLE_DELIVERED" "$log" >/dev/null || {
+                cat "$log"
+                echo "FAIL: $profile lifecycle was not delivered before compiler-group settlement" >&2
+                exit 1
+            }
+            grep -F "S8_REAL_WORKER_LOSS_F_READY_STABLE" "$log" >/dev/null || {
+                cat "$log"
+                echo "FAIL: $profile did not preserve the original F READY identity" >&2
+                exit 1
+            }
+        fi
     else
         grep -F "S8_BATCH_COMPLETE run=full-1 count=$jobs" "$log" >/dev/null || {
             echo "FAIL: $profile did not complete all $jobs compiler jobs" >&2
@@ -186,10 +208,18 @@ for profile in $profiles; do
     legacy_count=$(printf '%s\n' "$measured_f_log" | \
         grep -F -c 'P50_CACHE_SESSION_READY request=' || true)
     if test "$worker_session_loss" = 1; then
-        test "$ready_count" -eq 2 && test "$legacy_count" -eq 0 || {
+        expected_ready_count=2
+        if test "$expect_stable_f" = 1; then
+            # With the committed CancelAttempt delivered before compiler
+            # cleanup, the original F sidecar and its persistent P51 link
+            # survive; no replacement link should be counted.
+            expected_ready_count=1
+        fi
+        test "$ready_count" -eq "$expected_ready_count" && test "$legacy_count" -eq 0 || {
             cat "$log"
             cat "$work/f.log"
-            echo "FAIL: $profile did not use P51 links for active victim and fresh recovery " \
+            echo "FAIL: $profile used an unexpected number of P51 links for active victim and recovery " \
+                 "(expected=$expected_ready_count) " \
                  "(P51-ready=$ready_count R1-ready=$legacy_count)" >&2
             exit 1
         }

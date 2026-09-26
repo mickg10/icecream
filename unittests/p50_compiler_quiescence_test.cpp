@@ -175,6 +175,29 @@ void test_completed_and_active_slots_release_exactly_once()
             "completed A plus active B left incorrect capacity accounting");
 }
 
+void test_prior_accounting_failure_survives_empty_session_barrier()
+{
+    child::ChildOwnershipGate accounting_failure;
+    accounting_failure.mark_sticky_failure();
+    accounting_failure.begin_barrier();
+    accounting_failure.settle_exact(0);
+    require(accounting_failure.admission_blocked(),
+            "empty barrier cleared a prior sticky accounting failure");
+    require(accounting_failure.sticky_failure(),
+            "barrier reset erased the sticky accounting-failure identity");
+
+    child::ChildOwnershipGate timed_out_cleanup;
+    timed_out_cleanup.mark_recoverable_block();
+    timed_out_cleanup.begin_barrier();
+    timed_out_cleanup.settle_exact(1);
+    require(timed_out_cleanup.admission_blocked(),
+            "barrier reopened admission while a counted child remained");
+    timed_out_cleanup.begin_barrier();
+    timed_out_cleanup.settle_exact(0);
+    require(!timed_out_cleanup.admission_blocked(),
+            "later exact empty settlement did not clear a recoverable timeout");
+}
+
 void test_worker_process_loss_requires_both_shutdown_and_signal()
 {
     const auto wait_for_signal = [](int signal_number) {
@@ -516,6 +539,7 @@ int main()
         test_lost_anchor_never_authorizes_a_numeric_signal();
         test_malformed_group_identity_fails_before_syscalls();
         test_completed_and_active_slots_release_exactly_once();
+        test_prior_accounting_failure_survives_empty_session_barrier();
         test_worker_process_loss_requires_both_shutdown_and_signal();
         test_completed_cleanup_settles_on_a_later_event_loop_turn();
         test_group_disappearance_at_term_is_terminal();

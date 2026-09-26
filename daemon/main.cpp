@@ -1718,6 +1718,10 @@ struct Daemon {
     uint64_t next_p50_source_deadline_msec() const noexcept;
     int scheduler_get_internals() __attribute_warn_unused_result__;
     void clear_children();
+    void begin_session_quiescence();
+    void advance_session_quiescence();
+    uint64_t next_session_quiescence_wakeup_msec() const noexcept;
+    bool session_quiescence_pending() const noexcept;
     int scheduler_use_cs(UseCSMsg *msg) __attribute_warn_unused_result__;
     int scheduler_no_cs(NoCSMsg *msg) __attribute_warn_unused_result__;
     bool handle_get_cs(Client *client, Msg *msg) __attribute_warn_unused_result__;
@@ -1766,6 +1770,7 @@ struct Daemon {
     bool expire_scheduler_output();
     void record_waitforcs_latency(bool use_cs, uint64_t latency_msec);
     void close_scheduler(bool orderly_shutdown = false);
+    void schedule_scheduler_reconnect();
     bool finish_scheduler_loss_if_needed();
     bool reconnect();
     int working_loop();
@@ -5374,6 +5379,14 @@ static bool scheduler_owns_getcs_assignment(const Client *c)
         && c->getcs_generation == scheduler_session_generation;
 }
 
+void Daemon::schedule_scheduler_reconnect()
+{
+    next_scheduler_connect = time(nullptr) + 20 + (rand() & 31);
+    static bool fast_reconnect = getenv("ICECC_TESTS") != nullptr;
+    if (fast_reconnect)
+        next_scheduler_connect = time(nullptr) + 3;
+}
+
 void Daemon::close_scheduler(bool orderly_shutdown)
 {
     scheduler_cache_snapshot_valid = false;
@@ -5396,10 +5409,7 @@ void Daemon::close_scheduler(bool orderly_shutdown)
     reconcile_cache_route_state();
     delete discover;
     discover = nullptr;
-    next_scheduler_connect = time(nullptr) + 20 + (rand() & 31);
-    static bool fast_reconnect = getenv( "ICECC_TESTS" ) != nullptr;
-    if( fast_reconnect )
-        next_scheduler_connect = time(nullptr) + 3;
+    schedule_scheduler_reconnect();
 }
 
 bool Daemon::configure_cache_adapter() noexcept
@@ -5905,10 +5915,22 @@ struct ChildRecord {
     /* Logical capacity and OS cleanup are distinct.  Completion releases a
        slot once while the waitable leader can remain as signal authority. */
     icecc::daemon_child::SlotAccounting slot;
+    bool session_quiescence_target = false;
 };
 static std::map<pid_t, ChildRecord> child_registry;
 static icecc::daemon_child::PosixSignalOperations child_signal_operations;
-static bool child_ownership_failed = false;
+static icecc::daemon_child::ChildOwnershipGate child_ownership_gate;
+struct SessionQuiescenceTarget { pid_t pid; pid_t pgid; uint64_t generation; };
+struct SessionQuiescence {
+    enum Phase { IDLE, TERM_GRACE, REAP, SETTLED } phase = IDLE;
+    std::vector<SessionQuiescenceTarget> targets;
+    uint64_t term_deadline_msec = 0;
+    uint64_t reap_deadline_msec = 0;
+    uint64_t next_observation_msec = 0;
+    bool reap_deadline_reported = false;
+    bool identity_failed = false;
+};
+static SessionQuiescence session_quiescence;
 
 static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
                            unsigned int owning_client_id)
@@ -5949,46 +5971,112 @@ static bool complete_child_registration(pid_t pid)
     return icecc::daemon_child::release_slot_once(record->second.slot);
 }
 
-/* The exact quiescence barrier for one lost scheduler session:
-   1. retain each exact compiler leader waitable and signal its group TERM;
-   2. observe leaders with WNOWAIT under ONE whole-session grace deadline;
-   3. issue the final group KILL while the exact leader anchor is still owned,
-      then retire signal authority monotonically;
-   4. consume the exact leader status and poll group absence without signals;
-   5. lost authority means absence-only checks, never numeric best effort;
-   6. any residue fails CLOSED (child_ownership_failed blocks reconnect)
-      and the exact records stay exposed in dump_internals.  */
-static bool quiesce_session_compilers(uint64_t generation,
-                                      unsigned int *quiesced_out)
+/* Snapshot identities only: the canonical SignalAuthority and slot accounting
+   remain in child_registry. The ordinary child sweep skips marked records. */
+bool Daemon::session_quiescence_pending() const noexcept
 {
-    unsigned int quiesced_now = 0;
-    std::vector<pid_t> pending;
+    return session_quiescence.phase == SessionQuiescence::TERM_GRACE
+        || session_quiescence.phase == SessionQuiescence::REAP;
+}
+
+uint64_t Daemon::next_session_quiescence_wakeup_msec() const noexcept
+{
+    if (!session_quiescence_pending())
+        return 0;
+    uint64_t wakeup = session_quiescence.next_observation_msec;
+    // After an expired reap deadline, continue exact settlement observations
+    // at the bounded cadence instead of polling continuously at the old time.
+    if (session_quiescence.reap_deadline_reported)
+        return wakeup;
+    const uint64_t phase_deadline =
+        session_quiescence.phase == SessionQuiescence::TERM_GRACE
+            ? session_quiescence.term_deadline_msec
+            : session_quiescence.reap_deadline_msec;
+    return std::min(wakeup, phase_deadline);
+}
+
+void Daemon::begin_session_quiescence()
+{
+    if (session_quiescence_pending())
+        return;
+    session_quiescence = SessionQuiescence{};
+    session_quiescence.identity_failed = child_ownership_gate.sticky_failure();
+    child_ownership_gate.begin_barrier();
+    session_quiescence.phase = SessionQuiescence::TERM_GRACE;
+    const uint64_t now = monotonic_msec();
+    session_quiescence.term_deadline_msec = now + 5000;
+    session_quiescence.next_observation_msec = now + 50;
+
+    clear_pending_client_admissions();
+    while (!clients.empty()) {
+        Client *cl = clients.first();
+        handle_end(cl, 116);
+    }
+    close_assignment_transport_session();
+
     for (std::map<pid_t, ChildRecord>::iterator it = child_registry.begin();
             it != child_registry.end(); ++it) {
         ChildRecord &rec = it->second;
-        if (rec.kind == ChildRecord::COMPILER
-                && rec.session_generation <= generation) {
-            if (rec.signal.active && !rec.signal.term_sent
-                    && !rec.signal.final_sent) {
-                const icecc::daemon_child::SignalResult result =
-                    icecc::daemon_child::send_term_if_owned(
-                        rec.signal, rec.pid, rec.pgid,
-                        child_signal_operations);
-                if (result.invoked) {
-                    log_info() << "session quiescence TERM compiler pid="
-                               << rec.pid << " pgid=" << rec.pgid
-                               << " generation=" << rec.session_generation
-                               << " errno=" << result.error << endl;
-                    if (rec.signal.active)
-                        rec.state = ChildRecord::TERM_SENT;
-                }
+        if (rec.kind != ChildRecord::COMPILER
+                || rec.session_generation > scheduler_session_generation)
+            continue;
+        rec.session_quiescence_target = true;
+        session_quiescence.targets.push_back(
+            SessionQuiescenceTarget{rec.pid, rec.pgid,
+                                    rec.session_generation});
+        if (rec.signal.active && !rec.signal.term_sent
+                && !rec.signal.final_sent) {
+            const icecc::daemon_child::SignalResult result =
+                icecc::daemon_child::send_term_if_owned(
+                    rec.signal, rec.pid, rec.pgid, child_signal_operations);
+            if (result.invoked) {
+                rec.state = ChildRecord::TERM_SENT;
+                log_info() << "session quiescence TERM compiler pid="
+                           << rec.pid << " pgid=" << rec.pgid
+                           << " generation=" << rec.session_generation
+                           << " errno=" << result.error << endl;
             }
-            pending.push_back(rec.pid);
         }
     }
+    if (session_quiescence.targets.empty()) {
+        session_quiescence.phase = SessionQuiescence::REAP;
+        session_quiescence.reap_deadline_msec = now;
+    }
+}
 
-    auto erase_quiesced = [&](std::vector<pid_t>::iterator &pit) {
-        ChildRecord &rec = child_registry[*pit];
+void Daemon::advance_session_quiescence()
+{
+    if (!session_quiescence_pending())
+        return;
+    const uint64_t now = monotonic_msec();
+    bool any_running_anchor = false;
+    bool any_unsettled = false;
+    bool missing_identity = false;
+    size_t target_index = 0;
+    while (target_index < session_quiescence.targets.size()) {
+        const SessionQuiescenceTarget target =
+            session_quiescence.targets[target_index];
+        std::map<pid_t, ChildRecord>::iterator found =
+            child_registry.find(target.pid);
+        if (found == child_registry.end()) {
+            missing_identity = true;
+            ++target_index;
+            continue;
+        }
+        ChildRecord &rec = found->second;
+        if (!rec.session_quiescence_target || rec.pgid != target.pgid
+                || rec.session_generation != target.generation) {
+            missing_identity = true;
+            ++target_index;
+            continue;
+        }
+        if (rec.signal.active) {
+            const icecc::daemon_child::AnchorObservation observation =
+                icecc::daemon_child::observe_owned_anchor(
+                    rec.signal, rec.pid, child_signal_operations);
+            any_running_anchor |= observation
+                == icecc::daemon_child::AnchorObservation::Running;
+        }
         if (!rec.signal.active
                 && icecc::daemon_child::settle_retired(
                     rec.signal, rec.pid, rec.pgid,
@@ -5998,85 +6086,101 @@ static bool quiesce_session_compilers(uint64_t generation,
                        << rec.pid << " pgid=" << rec.pgid
                        << " generation=" << rec.session_generation << endl;
             ++fsession_compilers_quiesced;
-            if (icecc::daemon_child::release_slot_once(rec.slot))
-                ++quiesced_now;
-            child_registry.erase(*pit);
-            pit = pending.erase(pit);
-            return true;
+            const bool released =
+                icecc::daemon_child::release_slot_once(rec.slot);
+            if (released && current_kids > 0)
+                --current_kids;
+            else if (released) {
+                child_ownership_gate.mark_sticky_failure();
+                session_quiescence.identity_failed = true;
+                log_error() << "session quiescence slot accounting underflow"
+                            << endl;
+            }
+            child_registry.erase(found);
+            session_quiescence.targets.erase(
+                session_quiescence.targets.begin() + target_index);
+        } else {
+            any_unsettled = true;
+            ++target_index;
         }
-        return false;
-    };
+    }
 
-    /* TERM grace observes but never consumes an owned leader.  As soon as all
-       owned leaders are waitable, the final signal can be issued safely. */
-    const uint64_t grace_start = monotonic_msec();
-    bool grace_needed = true;
-    while (!pending.empty() && grace_needed
-            && monotonic_msec() - grace_start < 5000) {
-        grace_needed = false;
-        for (std::vector<pid_t>::iterator pit = pending.begin();
-                pit != pending.end();) {
-            ChildRecord &rec = child_registry[*pit];
-            if (erase_quiesced(pit))
+    if (missing_identity) {
+        const bool newly_failed = !session_quiescence.identity_failed;
+        child_ownership_gate.mark_sticky_failure();
+        session_quiescence.identity_failed = true;
+        if (newly_failed)
+            log_error() << "session quiescence snapshot identity missing or"
+                        << " changed; refusing reconnect" << endl;
+    }
+    if (session_quiescence.phase == SessionQuiescence::TERM_GRACE
+            && (!any_running_anchor || now >= session_quiescence.term_deadline_msec)) {
+        for (std::vector<SessionQuiescenceTarget>::const_iterator target =
+                 session_quiescence.targets.begin();
+             target != session_quiescence.targets.end(); ++target) {
+            std::map<pid_t, ChildRecord>::iterator found =
+                child_registry.find(target->pid);
+            if (found == child_registry.end())
                 continue;
-            if (rec.signal.active
-                    && icecc::daemon_child::observe_owned_anchor(
-                        rec.signal, rec.pid,
-                        child_signal_operations)
-                        == icecc::daemon_child::AnchorObservation::Running)
-                grace_needed = true;
-            ++pit;
+            ChildRecord &rec = found->second;
+            if (rec.session_quiescence_target && rec.signal.active
+                    && rec.pgid == target->pgid
+                    && rec.session_generation == target->generation) {
+                const icecc::daemon_child::SignalResult result =
+                    icecc::daemon_child::send_final_if_owned(
+                        rec.signal, rec.pid, rec.pgid,
+                        child_signal_operations);
+                if (result.invoked) {
+                    ++fsession_kill_escalations;
+                    rec.state = ChildRecord::KILL_SENT;
+                    log_info() << "session quiescence KILL compiler pid="
+                               << rec.pid << " pgid=" << rec.pgid
+                               << " generation=" << rec.session_generation
+                               << " errno=" << result.error << endl;
+                }
+            }
         }
-        if (grace_needed && !pending.empty())
-            usleep(50 * 1000);
+        session_quiescence.phase = SessionQuiescence::REAP;
+        session_quiescence.reap_deadline_msec = now + 5000;
     }
 
-    /* This is the last nonzero signal permitted for each record.  Validate the
-       exact waitable/running child immediately before addressing the group,
-       then retire authority regardless of signal delivery outcome. */
-    for (const pid_t pid : pending) {
-        ChildRecord &rec = child_registry[pid];
-        if (!rec.signal.active || rec.signal.final_sent)
-            continue;
-        const icecc::daemon_child::SignalResult result =
-            icecc::daemon_child::send_final_if_owned(
-                rec.signal, rec.pid, rec.pgid,
-                child_signal_operations);
-        if (result.invoked) {
-            ++fsession_kill_escalations;
-            rec.state = ChildRecord::KILL_SENT;
-            log_info() << "session quiescence KILL compiler pid="
-                       << rec.pid << " pgid=" << rec.pgid
-                       << " generation=" << rec.session_generation
-                       << " errno=" << result.error << endl;
+    if (session_quiescence.phase == SessionQuiescence::REAP
+            && now >= session_quiescence.reap_deadline_msec
+            && (any_unsettled || missing_identity)) {
+        if (!session_quiescence.reap_deadline_reported)
+            log_error() << "session quiescence reap deadline expired; retaining"
+                        << " ownership and blocking reconnect/capacity" << endl;
+        session_quiescence.reap_deadline_reported = true;
+        child_ownership_gate.mark_recoverable_block();
+    }
+    if (!any_unsettled && !missing_identity
+            && session_quiescence.phase == SessionQuiescence::REAP) {
+        session_quiescence.phase = SessionQuiescence::SETTLED;
+        if (current_kids != 0) {
+            log_error() << "clear_children: " << current_kids
+                        << " counted children had no owning compiler record;"
+                        << " failing closed" << endl;
+            fsession_unowned_residue += current_kids;
+            child_ownership_gate.mark_sticky_failure();
+            session_quiescence.identity_failed = true;
+        } else {
+            assert(fd2client.empty());
+            assert(pending_client_admissions.empty());
+            assert(connection_leases.size() == 0);
+            fd2client.clear();
+            new_client_id = 0;
         }
+        child_ownership_gate.settle_exact(current_kids);
+        log_info() << "session quiescence state phase=SETTLED targets="
+                   << session_quiescence.targets.size()
+                   << " current_kids=" << current_kids
+                   << " ownership_failed=" << child_ownership_gate.admission_blocked()
+                   << " ownership_faulted=" << child_ownership_gate.sticky_failure()
+                   << " identity_failed=" << (session_quiescence.identity_failed ? 1 : 0)
+                   << " scheduler_generation=" << scheduler_session_generation
+                   << endl;
     }
-
-    /* No path below this point is authorized to signal.  Repeated barriers see
-       the same retired state and can only consume/poll it. */
-    const uint64_t reap_start = monotonic_msec();
-    while (!pending.empty() && monotonic_msec() - reap_start < 5000) {
-        for (std::vector<pid_t>::iterator pit = pending.begin();
-                pit != pending.end();) {
-            if (erase_quiesced(pit))
-                continue;
-            ++pit;
-        }
-        if (!pending.empty())
-            usleep(50 * 1000);
-    }
-    if (quiesced_out) {
-        *quiesced_out = quiesced_now;
-    }
-    if (!pending.empty()) {
-        log_error() << "session quiescence FAILED: " << pending.size()
-                    << " compiler group(s) survive SIGKILL; failing closed"
-                    << " (no reconnect, no capacity)" << endl;
-        child_ownership_failed = true;
-        return false;
-    }
-    child_ownership_failed = false;
-    return true;
+    session_quiescence.next_observation_msec = now + 50;
 }
 
 string Daemon::dump_internals() const
@@ -6096,7 +6200,8 @@ string Daemon::dump_internals() const
         snprintf(handoff, sizeof(handoff),
                  "  Session quiescence: compilers_quiesced=%lu kill_escalations=%lu unowned_residue=%lu ownership_failed=%d gen=%llu\n",
                  fsession_compilers_quiesced, fsession_kill_escalations,
-                 fsession_unowned_residue, child_ownership_failed ? 1 : 0,
+                 fsession_unowned_residue,
+                 child_ownership_gate.admission_blocked() ? 1 : 0,
                  (unsigned long long)scheduler_session_generation);
         result += handoff;
         snprintf(handoff, sizeof(handoff),
@@ -7961,6 +8066,8 @@ P50CacheClientCapability Daemon::cache_capability_for_scheduler(
 
 void Daemon::handle_old_request()
 {
+    if (session_quiescence_pending() || child_ownership_gate.admission_blocked())
+        return;
     const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
     const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
@@ -8397,7 +8504,7 @@ bool Daemon::handle_compile_done(Client *client)
     if (!slot_released || current_kids == 0) {
         log_error() << "compiler completion has no exactly-once capacity slot for pid "
                     << client->child_pid << "; failing closed" << endl;
-        child_ownership_failed = true;
+        child_ownership_gate.mark_sticky_failure();
     } else {
         --current_kids;
     }
@@ -9339,60 +9446,7 @@ void Daemon::handle_end(Client *client, int exitcode)
 
 void Daemon::clear_children()
 {
-    // A channel still negotiating protocol has no Client/lease yet, but the
-    // predecessor would have dropped it before returning from its blocking
-    // accept factory. Preserve that teardown boundary across scheduler loss
-    // and orderly shutdown.
-    clear_pending_client_admissions();
-    /* EXACT session quiescence (issue #4 corrections P0-C + D).  The
-       registry snapshot happens BEFORE the Client objects vanish;
-       environment children are exact-handled by handle_end ->
-       finish_transfer_env.  */
-    while (!clients.empty()) {
-        Client *cl = clients.first();
-        handle_end(cl, 116);
-    }
-    close_assignment_transport_session();
-
-    unsigned int quiesced = 0;
-    const bool clean = quiesce_session_compilers(scheduler_session_generation,
-                                                 &quiesced);
-    const bool accounting_clean = quiesced <= current_kids;
-    if (accounting_clean) {
-        current_kids -= quiesced;
-    }
-
-    if (!clean || !accounting_clean) {
-        /* FAIL CLOSED: reconnect() refuses while child_ownership_failed
-           stands; the surviving records remain visible in
-           dump_internals.  Capacity is NOT re-advertised.  */
-        if (!accounting_clean)
-            log_error() << "clear_children: quiesced child count exceeds"
-                        << " current_kids; failing closed" << endl;
-        child_ownership_failed = true;
-        return;
-    }
-
-    if (current_kids != 0) {
-        /* Every counted child must have been owned by a Client; a nonzero
-           residue is an accounting defect.  Fail closed rather than
-           re-advertise capacity that unproven children may occupy.  */
-        log_error() << "clear_children: " << current_kids
-                    << " counted children had no owning record;"
-                    << " failing closed" << endl;
-        fsession_unowned_residue += current_kids;
-        child_ownership_failed = true;
-        return;
-    }
-
-    // they should be all in clients too
-    assert(fd2client.empty());
-    assert(pending_client_admissions.empty());
-    assert(connection_leases.size() == 0);
-
-    fd2client.clear();
-    new_client_id = 0;
-    trace() << "cleared children\n";
+    begin_session_quiescence();
 }
 
 bool Daemon::handle_get_cs(Client *client, Msg *msg)
@@ -11716,7 +11770,10 @@ void Daemon::answer_client_requests()
             const bool lifecycle_complete =
                 iterator->second.completion_observed;
             bool erased = false;
-            if (iterator->second.kind == ChildRecord::COMPILER) {
+            if (iterator->second.session_quiescence_target) {
+                // The persistent session barrier is the sole exact-reaper
+                // owner for this snapshot record.
+            } else if (iterator->second.kind == ChildRecord::COMPILER) {
                 ChildRecord &record = iterator->second;
                 if (!lifecycle_complete) {
                     /* Preserve the exact leader waitable.  Scheduler-loss
@@ -11742,7 +11799,7 @@ void Daemon::answer_client_requests()
                     log_error() << "completed compiler pid " << record.pid
                                 << " retains a capacity slot; failing closed"
                                 << endl;
-                    child_ownership_failed = true;
+                    child_ownership_gate.mark_sticky_failure();
                 } else {
                     const icecc::daemon_child::CleanupAdvance cleanup =
                         icecc::daemon_child::advance_exited_group_cleanup(
@@ -11827,7 +11884,10 @@ void Daemon::answer_client_requests()
         if (entry.second.listener_kind == ListenerKind::TcpRemote)
             ++pending_remote_count;
     }
-    const bool any_client_admission_capacity =
+    const bool admission_enabled =
+        !session_quiescence_pending() &&
+        !child_ownership_gate.admission_blocked();
+    const bool any_client_admission_capacity = admission_enabled &&
         pending_client_admissions.size() < pending_admission_limit;
     const bool remote_client_admission_capacity =
         any_client_admission_capacity &&
@@ -12013,6 +12073,14 @@ void Daemon::answer_client_requests()
         if (scheduler->has_pending_write())
             pfd.events |= POLLOUT;
         pollfds.push_back(pfd);
+    } else if (discover && discover->connect_fd() >= 0) {
+        // A direct -s scheduler endpoint uses a nonblocking TCP connect.  Its
+        // socket is writable when connect completion (success or failure) is
+        // ready; polling only listen_fd() skips this socket entirely and can
+        // strand scheduler rediscovery until its timeout.
+        pfd.fd = discover->connect_fd();
+        pfd.events = POLLOUT;
+        pollfds.push_back(pfd);
     } else if (discover && discover->listen_fd() >= 0) {
         /* We don't explicitely check for discover->get_fd() being in
         the selected set below.  If it's set, we simply will return
@@ -12038,6 +12106,16 @@ void Daemon::answer_client_requests()
         cache_adapter->outer_append_pollfds(pollfds);
 
     int poll_timeout_msec = max_scheduler_pong * 1000;
+    const uint64_t quiescence_wakeup =
+        next_session_quiescence_wakeup_msec();
+    if (quiescence_wakeup != 0) {
+        const uint64_t now = monotonic_msec();
+        const int timeout = quiescence_wakeup > now
+            ? static_cast<int>(std::min<uint64_t>(quiescence_wakeup - now,
+                  std::numeric_limits<int>::max())) : 0;
+        if (poll_timeout_msec < 0 || timeout < poll_timeout_msec)
+            poll_timeout_msec = timeout;
+    }
     if (scheduler && scheduler->deferred_output_armed()) {
         const uint64_t now = monotonic_msec();
         const uint64_t deadline = scheduler->deferred_output_deadline_msec();
@@ -12449,6 +12527,8 @@ void Daemon::answer_client_requests()
                     ++pending_remote_count;
             }
             const bool current_any_client_admission_capacity =
+                !session_quiescence_pending() &&
+                !child_ownership_gate.admission_blocked() &&
                 pending_client_admissions.size() < pending_admission_limit;
             const bool current_remote_client_admission_capacity =
                 current_any_client_admission_capacity &&
@@ -12695,6 +12775,10 @@ void Daemon::answer_client_requests()
 
 bool Daemon::reconnect()
 {
+    if (session_quiescence_pending() ||
+            child_ownership_gate.admission_blocked()) {
+        return false;
+    }
     if (scheduler_generation_exhausted) {
         /* G4 (17:20#3): the 64-bit session-generation space is exhausted.
            Refuse to (re)establish any session rather than reuse a generation;
@@ -12726,25 +12810,6 @@ bool Daemon::reconnect()
         return true;
     }
 
-    if (child_ownership_failed) {
-        /* The previous session's compilers are not provably quiescent:
-           retry the exact barrier and stay offline until it is clean.  */
-        unsigned int quiesced = 0;
-        const bool clean = quiesce_session_compilers(
-            scheduler_session_generation, &quiesced);
-        const bool accounting_clean = quiesced <= current_kids;
-        if (accounting_clean)
-            current_kids -= quiesced;
-        if (!clean || !accounting_clean || current_kids != 0
-                || child_ownership_failed) {
-            if (!accounting_clean || (clean && current_kids != 0))
-                child_ownership_failed = true;
-            log_warning() << "reconnect blocked: prior-session compilers"
-                          << " not quiescent" << endl;
-            return false;
-        }
-    }
-
     if (!discover && next_scheduler_connect > time(nullptr)) {
         trace() << "Delaying reconnect." << endl;
         return false;
@@ -12754,9 +12819,23 @@ bool Daemon::reconnect()
     trace() << "reconn " << dump_internals() << endl;
 #endif
 
-    if (!discover || (nullptr == (scheduler = discover->try_get_scheduler()) && discover->timed_out())) {
-        delete discover;
+    if (!discover) {
         discover = new DiscoverSched(netname, max_scheduler_pong, schedname, scheduler_port);
+    } else {
+        scheduler = discover->try_get_scheduler();
+        if (discover->connection_failed()) {
+            delete discover;
+            discover = nullptr;
+            schedule_scheduler_reconnect();
+            log_info() << "scheduler connect failed; retry scheduled in "
+                       << (next_scheduler_connect - time(nullptr))
+                       << " seconds" << endl;
+            return false;
+        }
+        if (scheduler == nullptr && discover->timed_out()) {
+            delete discover;
+            discover = new DiscoverSched(netname, max_scheduler_pong, schedname, scheduler_port);
+        }
     }
 
     if (!scheduler) {
@@ -12802,6 +12881,7 @@ bool Daemon::reconnect()
 int Daemon::working_loop()
 {
     bool cache_shutdown_started = false;
+    bool shutdown_children_started = false;
     for (;;) {
         // Shutdown remains in this same daemon outer loop.  Once requested,
         // stop reconnect/advertisement work but keep answer_client_requests()
@@ -12821,6 +12901,9 @@ int Daemon::working_loop()
                 std::chrono::steady_clock::now(), nullptr);
         }
         answer_client_requests();
+        // This remains in the ordinary loop even when answer_client_requests
+        // returns early after a lifecycle boundary.
+        advance_session_quiescence();
         maybe_dump_state();
 
         if (!cache_shutdown_started && exit_main_loop) {
@@ -12828,9 +12911,19 @@ int Daemon::working_loop()
             shutdown_cache_adapter();
         }
         if (cache_shutdown_started &&
+            !shutdown_children_started &&
             (cache_adapter == nullptr || cache_adapter->outer_shutdown_complete())) {
             close_scheduler(true);   /* orderly shutdown: no established-loss token */
             clear_children();
+            shutdown_children_started = true;
+        }
+        if (shutdown_children_started
+                && session_quiescence.phase == SessionQuiescence::SETTLED
+                && session_quiescence.targets.empty()
+                && current_kids == 0 &&
+                !child_ownership_gate.admission_blocked()) {
+            // Even if cleanup exceeded its reap deadline, orderly process exit
+            // waits for exact proof that every target group is settled.
             close_web();
             break;
         }
