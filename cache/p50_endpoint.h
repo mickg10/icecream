@@ -498,6 +498,10 @@ public:
                                        HistoryNonce history_nonce);
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
+    // Remove precisely one unadvanced tail preparation after the caller has
+    // established that no R2 JOB_BIND write began. P29 additionally requires
+    // the exact active pre-FILL TU; ordinary release() stays strict.
+    void cancel_unwritten_tail(PreparedTuHandle handle);
     void commit(PreparedTuHandle handle);
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;

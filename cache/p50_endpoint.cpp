@@ -2517,6 +2517,50 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     return 0;
 }
 
+void P50PreparationAuthority::cancel_unwritten_tail(
+    PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "unpublished cancellation handle belongs to another authority");
+    auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument(
+            "unpublished cancellation handle has been released");
+    Impl::Entry& entry = position->second;
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (entry.committed || entry.references != 1 ||
+        entry.speculative_advanced || route.speculative_entries.empty() ||
+        route.speculative_entries.back() != handle.entry_id_ ||
+        entry.shared->raw_bytes > route.speculative_raw_bytes)
+        throw std::logic_error(
+            "unpublished cancellation is not the exact unadvanced route tail");
+
+    if (entry.route.profile == ProfileId::P29V1) {
+        if (!route.p29_route || route.active_p29_entry != handle.entry_id_)
+            throw std::logic_error(
+                "unpublished P29 cancellation is not the active route tail");
+        route.p29_route->cancel_unadvanced_active_before_fill();
+        route.active_p29_entry.reset();
+    } else {
+        // Other profiles have no continuing NEED/FILL encoder state. Their
+        // existing strict tail release reconstructs ZSTD_ROUTE history.
+        (void)release(handle);
+        return;
+    }
+
+    route.speculative_raw_bytes -= entry.shared->raw_bytes;
+    route.speculative_entries.pop_back();
+    impl_->retained_bytes -= entry.retained_bytes;
+    const PreparationRouteKey route_key = entry.route;
+    const PrepareRequestKey request = entry.request;
+    const std::shared_ptr<Impl::Shared> shared = entry.shared;
+    impl_->entries.erase(position);
+    shared->entries.erase(route_key);
+    if (shared->entries.empty())
+        impl_->requests.erase(request);
+}
+
 void P50PreparationAuthority::accept_commit(PreparedTuHandle handle,
                                            const TxCommit& receipt) {
     impl_->owner.require();

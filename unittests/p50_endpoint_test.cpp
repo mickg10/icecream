@@ -4232,6 +4232,162 @@ void test_preparation_authority_window_refill_and_receipts() {
             "failed P29 cancellation dropped a retained route witness");
 }
 
+void test_cancel_unwritten_tail_authority_validation() {
+    PreparationAuthorityLimits limits;
+    limits.max_live_entries = 8;
+    limits.max_speculative_tus = 4;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    limits.max_retained_encoded_bytes = 1U << 20;
+    uint64_t identity = 0x43554e5749544500ULL;
+    uint64_t request = 1;
+
+    using AccountingSnapshot =
+        std::tuple<size_t, uint64_t, size_t, Digest128, size_t, uint64_t>;
+    const auto snapshot = [](const P50PreparationAuthority& authority,
+                             PreparationRouteKey route) {
+        return AccountingSnapshot{
+            authority.live_entry_count(),
+            authority.retained_encoded_bytes(),
+            authority.route_history_bytes(route),
+            authority.route_history_digest(route),
+            authority.route_history_entries(route),
+            authority.p29v1_route_state_bytes(route)};
+    };
+    const auto new_authority = [&](ProfileId profile) {
+        return std::make_shared<P50PreparationAuthority>(
+            Id128::from_u64(identity++), EndpointCaps{}.zstd, limits, 1,
+            profile);
+    };
+    const auto new_route = [&](ProfileId profile) {
+        return PreparationRouteKey{Id128::from_u64(identity++), 1, profile};
+    };
+    const auto prepare = [&](P50PreparationAuthority& authority,
+                             PreparationRouteKey route,
+                             std::string_view value) {
+        return authority.prepare_for_route(
+            route, PrepareRequestKey{96, request++}, bytes(value));
+    };
+
+    // A valid unadvanced tail can be canceled for each wire profile. The
+    // retained source/operation credits return exactly to baseline, committed
+    // route history is unchanged, and cancellation cannot be repeated.
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE}) {
+        auto authority = new_authority(profile);
+        const PreparationRouteKey route = new_route(profile);
+        const AccountingSnapshot baseline = snapshot(*authority, route);
+        const PreparedTuHandle handle =
+            prepare(*authority, route, "cancel valid route tail\n");
+        if (profile == ProfileId::P29V1)
+            (void)authority->predicted_p29v1_need(handle);
+        const AccountingSnapshot staged = snapshot(*authority, route);
+        require(std::get<0>(staged) == std::get<0>(baseline) + 1 &&
+                    std::get<1>(staged) > std::get<1>(baseline),
+                "unwritten tail did not acquire bounded preparation credits");
+        authority->cancel_unwritten_tail(handle);
+        const AccountingSnapshot canceled = snapshot(*authority, route);
+        require(std::get<0>(canceled) == std::get<0>(baseline) &&
+                    std::get<1>(canceled) == std::get<1>(baseline) &&
+                    std::get<2>(canceled) == std::get<2>(baseline) &&
+                    std::get<3>(canceled) == std::get<3>(baseline) &&
+                    std::get<4>(canceled) == std::get<4>(baseline),
+                "tail cancellation leaked entries, encoded bytes, or committed history");
+        require_throws<std::invalid_argument>(
+            [&] { authority->cancel_unwritten_tail(handle); },
+            "tail cancellation accepted the same handle twice");
+        require(snapshot(*authority, route) == canceled,
+                "rejected double cancellation changed authority accounting");
+    }
+
+    // A foreign authority cannot cancel this authority's handle, and failure
+    // leaves both owners' live/retained-credit snapshots unchanged.
+    {
+        auto owner = new_authority(ProfileId::ZSTD_ROUTE);
+        auto foreign = new_authority(ProfileId::ZSTD_ROUTE);
+        const PreparationRouteKey route = new_route(ProfileId::ZSTD_ROUTE);
+        const PreparationRouteKey foreign_route = new_route(ProfileId::ZSTD_ROUTE);
+        const PreparedTuHandle handle =
+            prepare(*owner, route, "foreign cancellation target\n");
+        const AccountingSnapshot owner_before = snapshot(*owner, route);
+        const AccountingSnapshot foreign_before = snapshot(*foreign, foreign_route);
+        require_throws<std::invalid_argument>(
+            [&] { foreign->cancel_unwritten_tail(handle); },
+            "foreign authority canceled another owner's preparation");
+        require(snapshot(*owner, route) == owner_before &&
+                    snapshot(*foreign, foreign_route) == foreign_before,
+                "foreign cancellation failure changed authority accounting");
+        owner->cancel_unwritten_tail(handle);
+    }
+
+    // A middle ZSTD_ROUTE entry is not a removable tail. After removing the
+    // actual tail, the former middle becomes the exact tail and can be safely
+    // canceled in reverse order without changing committed-history evidence.
+    {
+        auto authority = new_authority(ProfileId::ZSTD_ROUTE);
+        const PreparationRouteKey route = new_route(ProfileId::ZSTD_ROUTE);
+        const PreparedTuHandle first =
+            prepare(*authority, route, "middle guard first\n");
+        const PreparedTuHandle middle =
+            prepare(*authority, route, "middle guard middle\n");
+        const PreparedTuHandle tail =
+            prepare(*authority, route, "middle guard tail\n");
+        const AccountingSnapshot before_reject = snapshot(*authority, route);
+        require_throws<std::logic_error>(
+            [&] { authority->cancel_unwritten_tail(middle); },
+            "authority canceled a non-tail speculative preparation");
+        require(snapshot(*authority, route) == before_reject,
+                "rejected middle cancellation changed route/accounting state");
+        authority->cancel_unwritten_tail(tail);
+        authority->cancel_unwritten_tail(middle);
+        authority->cancel_unwritten_tail(first);
+        require(authority->live_entry_count() == 0 &&
+                    authority->retained_encoded_bytes() == 0 &&
+                    authority->route_history_bytes(route) == 0 &&
+                    authority->route_history_entries(route) == 0,
+                "reverse tail cancellation failed to restore exact baseline");
+    }
+
+    // Once advancement consumes speculative route history, cancellation is
+    // forbidden and must not erase the charged witness.
+    {
+        auto authority = new_authority(ProfileId::ZSTD_ROUTE);
+        const PreparationRouteKey route = new_route(ProfileId::ZSTD_ROUTE);
+        const PreparedTuHandle handle =
+            prepare(*authority, route, "already advanced route tail\n");
+        authority->advance_speculative(handle);
+        const AccountingSnapshot before_reject = snapshot(*authority, route);
+        require_throws<std::logic_error>(
+            [&] { authority->cancel_unwritten_tail(handle); },
+            "authority canceled a speculative entry after advancement");
+        require(snapshot(*authority, route) == before_reject &&
+                    authority->contains(handle),
+                "rejected advanced cancellation dropped the retained witness");
+    }
+
+    // Shared handles represent multiple owners. Tail cancellation remains
+    // forbidden until all but the caller's exact reference have been released.
+    {
+        auto authority = new_authority(ProfileId::ZSTD_ROUTE);
+        const PreparationRouteKey route = new_route(ProfileId::ZSTD_ROUTE);
+        const PreparedTuHandle handle =
+            prepare(*authority, route, "retained reference target\n");
+        require(authority->retain(handle) == 2,
+                "reference guard did not acquire the second owner");
+        const AccountingSnapshot before_reject = snapshot(*authority, route);
+        require_throws<std::logic_error>(
+            [&] { authority->cancel_unwritten_tail(handle); },
+            "authority canceled a preparation with retained references");
+        require(snapshot(*authority, route) == before_reject,
+                "rejected retained-reference cancellation changed credits");
+        require(authority->release(handle) == 1,
+                "reference guard did not release exactly one owner");
+        authority->cancel_unwritten_tail(handle);
+        require(authority->live_entry_count() == 0 &&
+                    authority->retained_encoded_bytes() == 0,
+                "released single-owner tail did not cancel cleanly");
+    }
+}
+
 void test_zstd_route_recovery_rebuild_cursor() {
     PreparationAuthorityLimits limits;
     limits.max_speculative_tus = 3;
@@ -10030,6 +10186,11 @@ int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
     if (argc > 2 || (argc == 2 && !performance_gate))
         fail("usage: p50endpoint [--performance]");
+    if (std::getenv("ICECC_P50_CANCEL_UNWRITTEN_TAIL_FOCUS") != nullptr) {
+        test_cancel_unwritten_tail_authority_validation();
+        std::cout << "p50_endpoint_test: focused preparation tail cancellation PASS\n";
+        return 0;
+    }
     if (std::getenv("ICECC_P50_ENDPOINT_CODEC_QUEUE_FOCUS") != nullptr) {
         test_p5co_codec_queue_is_bounded();
         std::cout << "p50_endpoint_test: focused codec queue PASS\n";
@@ -10148,6 +10309,7 @@ int main(int argc, char** argv) {
     test_lost_final_commit_identity_negative_matrix();
     test_idempotent_prepare_admission();
     test_preparation_authority_window_refill_and_receipts();
+    test_cancel_unwritten_tail_authority_validation();
     test_zstd_route_recovery_rebuild_cursor();
     test_r2_store_replaced_rejects_same_guid_old_generation();
     test_r2_definite_missing_reservation_is_typed_only_for_absence();
