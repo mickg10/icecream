@@ -365,6 +365,13 @@ struct EndpointIoControl {
     // Product callers leave it unset; it proves the owner timer cannot be
     // starved by a blocked codec worker.
     std::function<void()> before_materialize_on_worker;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Exact parsed-P51 target at the same worker boundary. The bundle has
+    // reached BODY closure, but no input publication or R2 receipt exists yet.
+    // Carries immutable identities only; never copies source payload bytes.
+    std::function<void(const JobBind&, const TxBegin&, const TxCommit&)>
+        before_materialize_identified_for_test;
+#endif
     // Simulator/test-only observation after one complete message has been
     // written successfully. It receives an immutable message copy and cannot
     // change product framing or endpoint state.

@@ -1069,6 +1069,11 @@ struct ServerMaterializationJob {
     TxCommit commit;
     std::shared_ptr<ProfileDialogue> dialogue;
     std::function<void()> before_materialize;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    std::optional<JobBind> p51_binding;
+    std::function<void(const JobBind&, const TxBegin&, const TxCommit&)>
+        before_materialize_identified_for_test;
+#endif
 };
 
 struct ServerMaterializationCompletion {
@@ -1249,6 +1254,13 @@ async_materialize(ServerMaterializationJob job,
                    try {
                        if (job.before_materialize)
                            job.before_materialize();
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                       if (job.before_materialize_identified_for_test &&
+                           job.p51_binding) {
+                           job.before_materialize_identified_for_test(
+                               *job.p51_binding, job.begin, job.commit);
+                       }
+#endif
                        const auto materialize_started =
                            std::chrono::steady_clock::now();
                        VerifiedMaterialization exact =
@@ -4309,7 +4321,12 @@ struct P50ServerEndpoint::Impl {
     }
 
     ServerMaterializationJob begin_materialization(
-        const Session& session, std::function<void()> before_materialize) {
+        const Session& session, std::function<void()> before_materialize
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        , std::function<void(const JobBind&, const TxBegin&, const TxCommit&)>
+              before_materialize_identified_for_test
+#endif
+        ) {
         Route& route = require_route(session);
         if (!route.pending)
             throw std::logic_error("F endpoint has no active transaction");
@@ -4363,7 +4380,13 @@ struct P50ServerEndpoint::Impl {
             .begin = begin,
             .commit = commit,
             .dialogue = std::move(pending.dialogue),
-            .before_materialize = std::move(before_materialize)};
+            .before_materialize = std::move(before_materialize),
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            .p51_binding = pending.p51_binding,
+            .before_materialize_identified_for_test =
+                std::move(before_materialize_identified_for_test),
+#endif
+        };
         if (!job.dialogue)
             throw std::logic_error(
                 "materialization dispatch lost its codec dialogue");
@@ -6562,7 +6585,12 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
 
         ServerMaterializationJob materialization =
             impl_->begin_materialization(
-                session, std::move(control.before_materialize_on_worker));
+                session, std::move(control.before_materialize_on_worker)
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                , std::move(
+                      control.before_materialize_identified_for_test)
+#endif
+                );
         ServerMaterializationCompletion materialization_completion =
             co_await async_materialize(std::move(materialization), io);
         // The codec worker owns no publication authority.  Revalidate the
@@ -7513,7 +7541,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
 
             ServerMaterializationJob materialization =
                 impl_->begin_materialization(
-                    session, control.before_materialize_on_worker);
+                    session, control.before_materialize_on_worker
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                    , control.before_materialize_identified_for_test
+#endif
+                    );
             ServerMaterializationCompletion materialization_completion =
                 co_await async_materialize(std::move(materialization), io);
             require_operation();
