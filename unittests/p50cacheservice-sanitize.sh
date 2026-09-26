@@ -18,10 +18,16 @@ libs=${ICECC_TEST_LIBS:-${LIBS:-}}
 boost_cppflags=${ICECC_TEST_BOOST_CPPFLAGS:-${BOOST_CPPFLAGS:-}}
 boost_ldflags=${ICECC_TEST_BOOST_LDFLAGS:-${BOOST_LDFLAGS:-}}
 boost_libs=${ICECC_TEST_BOOST_LIBS:-${BOOST_LIBS:-}}
-binary=$(mktemp "$build_dir/p50cacheservice-sanitize.XXXXXX")
-cleanup() {
-    rm -f -- "$binary"
-}
+if test -n "${ICECC_TEST_SANITIZER_BINARY:-}"; then
+    binary=$ICECC_TEST_SANITIZER_BINARY
+    test ! -e "$binary"
+    cleanup() { :; }
+else
+    binary=$(mktemp "$build_dir/p50cacheservice-sanitize.XXXXXX")
+    cleanup() {
+        rm -f -- "$binary"
+    }
+fi
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 dep_libdir=${ICECC_TEST_DEP_LIBDIR:-}
@@ -51,9 +57,10 @@ fi
     $ldflags $boost_ldflags \
     "$test_srcdir/p50cacheservice.cpp" \
     "$test_srcdir/../cache/p50_cache_service.cpp" \
+    "$test_srcdir/../cache/p50_endpoint.cpp" \
+    "$test_srcdir/../cache/p50_slice0.cpp" \
     "$test_srcdir/../client/p50_route_owner.cpp" \
     "$test_srcdir/../client/p50_zstd_sender.cpp" \
-    "$build_dir/../cache/libp50endpointtesthooks.a" \
     "$build_dir/../cache/libp50endpoint.a" \
     "$build_dir/../cache/libp50adoptedoutcomewriter.a" \
     "$build_dir/../cache/libp50input.a" \
@@ -69,4 +76,4 @@ ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1 \
     ICECC_TEST_CACHE_SERVICE=${ICECC_TEST_CACHE_SERVICE:-$top_build_dir/cache/icecc-cache-service} \
     ICECC_TEST_READY_CLOSE_SHIM=${ICECC_TEST_READY_CLOSE_SHIM:-$build_dir/readyclose_shim.so} \
-    "$binary"
+    "$binary" "$@"
