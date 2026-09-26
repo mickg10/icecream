@@ -12,6 +12,27 @@ retained artifact directories.
 
 ## Developer QA
 
+### Fresh integrated runtime: six core live gates pass
+
+Fresh public `make dev-gate GATE=p50-live-core` on `173dd1c4` passes all six
+required live tests: remote quick, assignment, completion flow, remote
+compilation, daemon-positive and source ARM. This source includes the stale
+ARM fix and exact receipt-marker assertion fix. Later endpoint-test/docs
+commits do not change this production closure. Build/install took 177.673s;
+the live gate took 416.383s on nas642, Ubuntu 24.04 SDK, 2 CPUs/8 GiB.
+These are QA durations, not codebaseN build timings.
+
+Run root:
+`/tanksmall/scratch/tmp/p51-c03-public-173dd1c4-scratch/icecream-qa-fik0arwo/`.
+Source snapshot SHA256:
+`102d6bd808719d8b5d61b191e37b91bb7b8e89dcbf6107a15418db0c2b4ca860`.
+`result.json` reports PASS and exit 0 for build/install and the live gate.
+Gate log `current/artifacts/opt-in-gates/24954373f9754237b118144d3583073e/p50-live-core.log`
+SHA256 `30edd3a7d2aeb07e65939c952f2c239eae8cdf427448886b72cdd685dbfd5b2d`.
+The registered C03 Make target, corrected W30 compiler-loss/restart gates,
+remaining interruption coverage and other open acceptance cells are not
+closed by this six-test pass.
+
 ### Partial HELLO and commit-reply interruption coverage
 
 The D03 endpoint tests now cover 555 incomplete HELLO prefixes across the
