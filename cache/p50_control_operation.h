@@ -150,6 +150,8 @@ struct P51SourceReservationResult {
 struct P51SourceReservationCancel {
     P51SourceArmFields arm{};
     P51SourceArmedFields armed{};
+    // Bounds only this exact authenticated cancellation exchange. It does not
+    // renew the original ARM/source deadline retained by F's reservation row.
     sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
     std::optional<bool> cancelled;
     auto operator<=>(const P51SourceReservationCancel&) const = default;

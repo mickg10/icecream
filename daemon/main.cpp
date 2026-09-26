@@ -138,6 +138,12 @@ static uint64_t monotonic_msec()
 // an absolute steady-clock deadline; ordinary traffic, replay, and a renewed
 // sidecar lease never extend it.
 static constexpr uint64_t kP50SourceArmBudgetMsec = 60000;
+// SourceReservationCancel is cleanup work, not another source attempt.  Give
+// the exact F-minted reservation revoke a small, independent I/O budget so a
+// source deadline crossing cannot suppress cleanup, while keeping each queued
+// cancel bounded and never refreshing its deadline in later poll turns.
+static constexpr auto kP51SourceCancelCleanupBudget =
+    std::chrono::seconds(2);
 
 /* The qualified topology supports four persistent relationships with up to
    thirty live jobs each. These pending poll records do not consume
@@ -172,6 +178,30 @@ static uint64_t p50_source_arm_budget_msec() noexcept
         }
     }
     return budget;
+}
+
+static std::optional<icecc::p50::sidecar::AbsoluteMonotonicDeadline>
+p51_source_cancel_cleanup_deadline(
+    const icecc::p50::sidecar::AbsoluteMonotonicDeadline& source_deadline,
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now()) noexcept
+{
+    using icecc::p50::sidecar::AbsoluteMonotonicDeadline;
+    using icecc::p50::sidecar::process_monotonic_clock_identity;
+    const auto clock = process_monotonic_clock_identity();
+    if (!source_deadline.valid() || !clock.valid() ||
+        !source_deadline.matches_clock(clock))
+        return std::nullopt;
+
+    // This is a distinct cleanup-control budget, not a replacement source
+    // deadline. Validate the original clock identity but never reinterpret or
+    // alter that source timestamp.
+    const auto result = AbsoluteMonotonicDeadline::from_steady_time_point(
+        now + kP51SourceCancelCleanupBudget,
+        clock.clock_domain_id, clock.time_namespace_id);
+    if (!result.valid() || !result.matches_clock(clock))
+        return std::nullopt;
+    return result;
 }
 
 static uint64_t next_daemon_generation()
@@ -620,6 +650,7 @@ public:
         icecc::p50::local::P51SourceReservationCancel request;
         icecc::p50::sidecar::ReadyLease ready_lease;
         std::chrono::steady_clock::time_point deadline{};
+        std::chrono::steady_clock::time_point source_deadline{};
         std::unique_ptr<icecc::p50::local::UnixConnectOperation> connect;
         std::unique_ptr<icecc::p50::local::Connection> control;
         std::unique_ptr<icecc::p50::local::FrameOperation> frame;
@@ -1746,7 +1777,7 @@ struct Daemon {
     void queue_p51_source_cancel(
         const P51SourceArmFields& arm,
         const P51SourceArmedFields& armed,
-        const icecc::p50::sidecar::AbsoluteMonotonicDeadline& deadline,
+        const icecc::p50::sidecar::AbsoluteMonotonicDeadline& source_deadline,
         const icecc::p50::sidecar::ReadyLease& ready_lease) noexcept;
     void withdraw_p51_source_incarnation(
         const icecc::p50::sidecar::ReadyLease& ready_lease,
@@ -10281,14 +10312,14 @@ void Daemon::withdraw_p51_source_incarnation(
 void Daemon::queue_p51_source_cancel(
     const P51SourceArmFields& arm,
     const P51SourceArmedFields& armed,
-    const icecc::p50::sidecar::AbsoluteMonotonicDeadline& absolute_deadline,
+    const icecc::p50::sidecar::AbsoluteMonotonicDeadline& source_deadline,
     const icecc::p50::sidecar::ReadyLease& ready_lease) noexcept
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
     if (!arm.valid() || !armed.valid() ||
         !armed.acknowledges(P51SourceArmMsg{arm}) ||
-        !absolute_deadline.valid() || !ready_lease.valid() ||
+        !source_deadline.valid() || !ready_lease.valid() ||
         !p51_source_operation_capacity_available(
             pending_p51_source_cancels.size())) {
         if (!p51_source_operation_capacity_available(
@@ -10298,12 +10329,23 @@ void Daemon::queue_p51_source_cancel(
         return;
     }
     try {
+        const auto cleanup_deadline =
+            p51_source_cancel_cleanup_deadline(source_deadline);
+        if (!cleanup_deadline.has_value()) {
+            log_warning() << "cannot queue P51 cancellation with invalid source clock identity"
+                          << endl;
+            return;
+        }
         auto pending = std::make_unique<Client::PendingP51SourceCancel>();
         pending->request.arm = arm;
         pending->request.armed = armed;
-        pending->request.absolute_deadline = absolute_deadline;
+        // In SourceReservationCancel this field bounds only the authenticated
+        // control exchange; the reservation's immutable source deadline stays
+        // with the original ARM/runtime row and is never renewed here.
+        pending->request.absolute_deadline = *cleanup_deadline;
         pending->ready_lease = ready_lease;
-        pending->deadline = absolute_deadline.as_steady_time_point();
+        pending->deadline = cleanup_deadline->as_steady_time_point();
+        pending->source_deadline = source_deadline.as_steady_time_point();
         if (pending->deadline <= std::chrono::steady_clock::now())
             return;
         pending->connect = std::make_unique<UnixConnectOperation>(
@@ -10327,7 +10369,7 @@ bool Daemon::advance_p51_source_cancels(const std::vector<pollfd> &pollfds)
          it != pending_p51_source_cancels.end();) {
         auto& pending = **it;
         if (std::chrono::steady_clock::now() >= pending.deadline) {
-            log_warning() << "P51 source-reservation cancellation expired"
+            log_warning() << "P51 source-reservation cancellation cleanup budget expired"
                           << endl;
             it = pending_p51_source_cancels.erase(it);
             progressed = true;
@@ -10344,7 +10386,7 @@ bool Daemon::advance_p51_source_cancels(const std::vector<pollfd> &pollfds)
         auto fail = [&](const char* reason) {
             log_warning() << "P51 source-reservation cancellation failed: "
                           << reason << endl;
-            if (std::chrono::steady_clock::now() < pending.deadline)
+            if (std::chrono::steady_clock::now() < pending.source_deadline)
                 withdraw_p51_source_incarnation(pending.ready_lease, reason);
             it = pending_p51_source_cancels.erase(it);
             progressed = true;

@@ -89,6 +89,14 @@ any other/ambiguous result is terminal. The refusal reply itself is bounded by
 the earlier of the request deadline and a short reply budget. These semantics
 do not change the ordinary protocol or the result record shape.
 
+The daemon's authenticated local `SourceReservationCancel` control exchange
+uses the exact original ARM and F-minted ARMED reservation ID. Its absolute
+deadline bounds only the cancellation exchange; it does not renew or replace
+the source/ARM deadline retained by F. A cancellation queued at or after source
+expiry receives one fixed, bounded local-control cleanup budget. Failure to
+complete that exact cleanup remains fail-closed and cannot authorize another
+source attempt or replay.
+
 The R2 auxiliary-link transition uses one protocol-51 ordinary connection per
 physical link. C sends empty P51_CACHE_LINK_SESSION and waits for the same
 empty message as READY. F first checks local sidecar availability and the
