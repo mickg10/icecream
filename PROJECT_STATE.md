@@ -116,7 +116,7 @@ Default local mixed-image testing now passes all five rows on rebuilt
 P43 worker and P43 client, with actual remote results. Summary:
 `/tanksmall/scratch/tmp/p51-current-0dc-qualified/mixed-default-r2/summary.json`,
 SHA256 `1065ecaa1e9c01d45731639ceff307980cae020025a6c63a6d58f7f9519abeeb`.
-This does not qualify the separate concurrent mixed-profile gates.
+Concurrent mixed-profile results are recorded separately below.
 The first launcher attempt lacked Docker and is retained as a setup failure.
 
 The explicit R2-only local image gate also passes all three profiles on the
@@ -127,8 +127,25 @@ the project's pinned UV environment, with `--jobs 2 --memory-gb 8 --p51-r2
 --only-p51-r2`. Summary:
 `/tanksmall/scratch/tmp/p51-current-0dc-qualified/mixed-r2-only/summary.json`,
 SHA256 `3e878160099d8f850bc2768718a74addb7ea20056d1355ea77ac377c22d24cfc`.
-This is three single-client profile cases, not concurrent P43/R1/R2 traffic
-or a thirty-outstanding-transfer witness. Those gates remain separate.
+This is three single-client profile cases, not a thirty-outstanding-transfer
+witness.
+
+Local concurrent P43/R1/R2 gates also pass for all three profiles on these
+same current/P43 images, using `--jobs 3 --memory-gb 8`. Each uses one shared
+scheduler and two workers (R1 and R2), proves stable overlapping compiler
+process identities for all three client roles, and verifies their exact remote
+outputs plus R2 source lease/link adoption. This is local Docker coexistence,
+not external-farm qualification or a W30 saturation measurement. Results under
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/tmp/`:
+
+| Summary path | SHA256 |
+|---|---|
+| `mixed-concurrent-P29V1/summary.json` | `b8e8f0f5972a31d50bd11c0237d4da2342e883780c99d3c97abf7252d0364da8` |
+| `mixed-concurrent-ZSTD_TU/summary.json` | `9b7e21e8179caafeba30830ba83374307364d77bcd313b9a21e321a3342b31e9` |
+| `mixed-concurrent-ZSTD_ROUTE/summary.json` | `6bc65ced85e44dc6cbd27fbad4856d37219e5ceb83ab206d86b6a60a5eb6a944` |
+
+An initial P29V1 launch failed before product activity because its output was
+outside `ICEFARM_TMPDIR`; its separate failed preflight summary is retained.
 
 Public QA on `1d87b3aa` later passes its two isolated-root service/sanitizer
 checks, then stops at Python with 1,597 PASS, 7 SKIP and one unsorted formal
