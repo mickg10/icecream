@@ -33,9 +33,26 @@ tested donor. Logs in `/tanksmall/scratch/tmp/p51-w30-capacity-runtime/`:
 - `merged-wrapper-capacity-identity-negative.log`: `e92bcd6f9dda1dd5d8a910ab5974d0884b36926c1b13b9985289e1e0410c4f63`
 - `merged-wrapper-capacity-nonbusy-negative.log`: `4718d13c388c4b11b887d78832cdfb87a04ca819e61167f9d53946e97c37e028`
 
+The cap-one service admission test now repeats the exact refused request 64
+times with fresh control pairs and CLOEXEC source duplicates. Every temporary
+attempt peaks at baseline + 3 descriptors and returns to baseline (17 in the
+recorded run), with one held operation, zero raw bytes and no source reads.
+After settlement and exact-request readmission, operation/raw credits are zero;
+the remaining 13 descriptors are an identity-matched subset of the original
+set. Snapshot enumeration errors fail the test. This is service-level coverage,
+not wrapper/daemon fresh-lease resource instrumentation or W30 occupancy.
+Donors `6cf2363b` and `a63902a7` passed the focused
+`p50cacheservice --p51-capacity-overflow` selector on the final source.
+Log: `/tanksmall/scratch/tmp/p51-capacity-plateau-build/runtime/p51-capacity-busy-plateau-strict-snapshot.log`,
+SHA256 `06ea43b036c5a85110223b11ba0b8e6eb7f23aba36b6627456323e841eb60cf7`.
+Source SHA256 `30337168820eaa429fa143355350b0725221f259a12dd066c921f21f69b70803`;
+binary SHA256 `97570d969ae033667f220a1a82aa9ee5efed38b77feda01998b980fc606dbb10`.
+An earlier fixed-count cleanup assertion failed because settlement closes
+fixture-owned descriptors; that failed diagnostic log remains retained.
+
 The registered service pass preceded the final default-off terminal-error
 hook; focused service and wrapper checks passed afterward. End-to-end
-retry expiry/no late publication, repeated-retry resource plateau, actual
+retry expiry/no late publication, wrapper-level retry resource plateau, actual
 four-link W30/reply-settlement overlap and latest-candidate full QA remain open.
 
 ### Lost RECOVER response retry
