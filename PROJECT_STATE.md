@@ -18,6 +18,10 @@ Donors `b39c771a` and `660d8752` add three D18 profile scenarios with P43,
 R1 and R2 clients, a shared start barrier, stable compiler-process overlap
 observations, exact remote-result checks and R2 sidecar-adoption evidence.
 The locked-UV focused spec/workload suite passes **215 tests**, exit 0.
+The same gate passes on merged tree `fad3181c` (215 tests, 8.47 seconds,
+exit 0). Retained log:
+`/tanksmall/scratch/tmp/d18-merged-qa-fad3181c/focused215.log`, SHA256
+`4574ef2f7030cfbcd4e2b358ed3223cd2910da2eba0f46caab2bd57f877aa45f`.
 Regression tests reject mismatched non-D18 driver/corpus pairs and ensure the
 Linux process observer does not count its own script as a compiler.
 
