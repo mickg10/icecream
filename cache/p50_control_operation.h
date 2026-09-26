@@ -74,6 +74,7 @@ enum class SourceTransferErrorCode : uint16_t {
     PermanentLocalProfileUnavailable = 0x5001,
     RouteReplacementRequired = 0x5002,
     SourceTooLarge = 0x5003,
+    CapacityBusy = 0x5004,
 };
 
 // The daemon asks the supervised sidecar to transfer one source using the

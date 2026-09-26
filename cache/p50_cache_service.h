@@ -46,6 +46,21 @@ namespace icecc::p50::service {
 struct PendingP51Transfer;
 struct PendingP51Admission;
 
+enum class P51SourceEnqueueResult : uint8_t {
+    Accepted,
+    CapacityBusy,
+    Rejected,
+};
+
+// A pre-admission source-transfer error is delivered synchronously under a
+// short bound on the authenticated control connection. It does not enter the
+// counted asynchronous reply pump; callers pass the original deadline.
+[[nodiscard]] bool send_p51_source_transfer_error_reply(
+    local::Connection& connection, local::Identity identity,
+    const local::ControlOperation& operation,
+    uint16_t error_code,
+    std::chrono::steady_clock::time_point original_deadline) noexcept;
+
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
 struct P51ReceiptLedgerSnapshot {
     uint64_t committed_prefix_k = 0;
@@ -227,10 +242,11 @@ public:
     // route work and the local reply/Goodbye exchange stay asynchronous on
     // the owner executor. The operation's original absolute deadline covers
     // queueing and every later phase.
-    [[nodiscard]] bool enqueue_p51_source_transfer(
+    [[nodiscard]] P51SourceEnqueueResult enqueue_p51_source_transfer(
         local::Connection&& connection, local::Identity identity,
-        local::ControlOperation operation,
-        local::HandoffFd source) noexcept;
+        const local::ControlOperation& operation,
+        local::HandoffFd&& source,
+        uint16_t* preflight_error = nullptr) noexcept;
 
     // Reserve one P51 source job on the endpoint owner before the daemon
     // publishes ARMED. The reservation is bounded and idempotent for the

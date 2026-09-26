@@ -69,6 +69,7 @@
 #include <memory>
 #include <optional>
 #include <exception>
+#include <thread>
 
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
@@ -563,6 +564,38 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
             diagnostic->error_code = 3;
         return p50_transfer_error(3);
     }
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    const bool capacity_trace =
+        ::getenv("ICECC_TEST_P51_CAPACITY_TRACE") != nullptr;
+    struct stat capacity_source_stat{};
+    const bool capacity_source_stat_valid = capacity_trace &&
+        ::fstat(source.get(), &capacity_source_stat) == 0;
+    const auto deadline_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()).count());
+    const auto trace_capacity_lease = [&](const P51CacheControlIdentity& value) {
+        if (!capacity_trace)
+            return;
+        char c_guid_hex[33]{};
+        for (size_t i = 0; i < value.c_store_guid.size(); ++i)
+            std::snprintf(c_guid_hex + i * 2, 3, "%02x",
+                          value.c_store_guid[i]);
+        std::fprintf(stderr,
+            "P51_CAPACITY_TRACE lease job=%u epoch=%llu nonce=%llu request=%llu c_control=%llu/%llu c_peer=%llu/%llu c_store_generation=%llu c_derivation=%u c_guid=%s deadline_ns=%llu\n",
+            assignment.job_id,
+            static_cast<unsigned long long>(assignment.assignmentEpoch()),
+            static_cast<unsigned long long>(assignment.assignmentNonce()),
+            static_cast<unsigned long long>(assignment.assignmentNonce()),
+            static_cast<unsigned long long>(value.control_generation),
+            static_cast<unsigned long long>(value.control_attempt),
+            static_cast<unsigned long long>(value.peer_uid),
+            static_cast<unsigned long long>(value.peer_gid),
+            static_cast<unsigned long long>(value.c_store_generation),
+            static_cast<unsigned>(value.derivation_version), c_guid_hex,
+            static_cast<unsigned long long>(deadline_ns));
+    };
+    trace_capacity_lease(control_identity);
+#endif
 
     P50SourceArmFields source_arm;
     source_arm.wire_job_id = assignment.job_id;
@@ -612,6 +645,23 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
         return p50_transfer_error(5);
     }
     arm_timer.finish();
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (capacity_trace) {
+        std::fprintf(stderr,
+            "P51_CAPACITY_TRACE arm_ack job=%u epoch=%llu nonce=%llu request=%llu deadline_ns=%llu source_dev=%llu source_ino=%llu source_bytes=%lld\n",
+            assignment.job_id,
+            static_cast<unsigned long long>(assignment.assignmentEpoch()),
+            static_cast<unsigned long long>(assignment.assignmentNonce()),
+            static_cast<unsigned long long>(assignment.assignmentNonce()),
+            static_cast<unsigned long long>(deadline_ns),
+            static_cast<unsigned long long>(capacity_source_stat_valid
+                ? capacity_source_stat.st_dev : 0),
+            static_cast<unsigned long long>(capacity_source_stat_valid
+                ? capacity_source_stat.st_ino : 0),
+            static_cast<long long>(capacity_source_stat_valid
+                ? capacity_source_stat.st_size : -1));
+    }
+#endif
     const auto armed_received_at = std::chrono::steady_clock::now();
     P50DiagnosticPhaseTimer control_begin_timer(
         diagnostic,
@@ -623,61 +673,203 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
         sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
             deadline, sidecar::process_monotonic_clock_identity().clock_domain_id,
             sidecar::process_monotonic_clock_identity().time_namespace_id);
+    const P51SourceArmedFields armed =
+        static_cast<const P51SourceArmedFields&>(*armed_message);
+    const P51SourceTransferRequest transfer_request{armed, absolute_deadline};
     const Identity identity{control_identity.control_generation,
-                             control_identity.control_attempt};
-    const P51SourceTransferRequest transfer_request{
-        static_cast<const P51SourceArmedFields&>(*armed_message),
-        absolute_deadline};
+                            control_identity.control_attempt};
     const ControlOperation operation = make_p51_source_transfer_operation(
         identity, transfer_request,
         transfer_request.armed.arm.source.source_request_id);
     CredentialExpectation credentials;
     credentials.uid = control_identity.peer_uid;
     credentials.gid = control_identity.peer_gid;
-    DaemonControlOperation control;
-    const int source_fd = source.release();
-    const DaemonControlStatus started = control.begin_authenticated(
-        control_fd, operation, source_fd, credentials, identity, deadline,
-        DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
-    control_begin_timer.finish();
-    if (started != DaemonControlStatus::InProgress) {
-        if (diagnostic != nullptr)
-            diagnostic->error_code = 6;
-        return p50_transfer_error(6);
-    }
+    auto send_retry_lease_until_deadline = [&]() {
+        if (!local_daemon.send_msg(
+                P51SourceLeaseRequestMsg(lease_request),
+                MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable))
+            return false;
+        while (local_daemon.has_pending_write()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                return false;
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - now);
+            const int timeout = static_cast<int>(std::max<int64_t>(
+                1, std::min<int64_t>(remaining.count(), INT_MAX)));
+            pollfd descriptor{local_daemon.fd, POLLOUT, 0};
+            const int ready = ::poll(&descriptor, 1, timeout);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready <= 0 ||
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+                !local_daemon.flush_pending())
+                return false;
+        }
+        return true;
+    };
     P50DiagnosticPhaseTimer control_wait_timer(
         diagnostic,
         diagnostic == nullptr ? nullptr : &diagnostic->control_wait_ms,
         icecc::p50::diagnostics::Stage::ControlWait);
-    while (!control.done()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            (void)control.advance(now, 0);
-            break;
+    int attempt_control_fd = control_fd;
+    P51CacheControlIdentity attempt_identity = control_identity;
+    std::chrono::milliseconds retry_delay{10};
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    size_t capacity_retry_count = 0;
+#endif
+    bool first_attempt = true;
+    for (;;) {
+        if (!first_attempt) {
+            // CapacityBusy proves the prior request was rejected before any
+            // source read or route dispatch. Obtain a fresh authenticated C
+            // lease, but do not ARM F again: the original ARM and assignment
+            // remain immutable across the retry.
+            if (std::chrono::steady_clock::now() >= deadline ||
+                !send_retry_lease_until_deadline()) {
+                if (diagnostic != nullptr)
+                    diagnostic->error_code = 8;
+                return p50_transfer_error(8);
+            }
+            attempt_control_fd = local_daemon.receive_p51_cache_fd_reply(
+                lease_request, attempt_identity, deadline);
+            if (attempt_control_fd < 0 || !attempt_identity.valid()) {
+                if (attempt_control_fd >= 0)
+                    ::close(attempt_control_fd);
+                if (diagnostic != nullptr)
+                    diagnostic->error_code = 8;
+                return p50_transfer_error(8);
+            }
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            if (capacity_retry_count == 1) {
+                const char* force_identity_change =
+                    ::getenv("ICECC_TEST_P51_CAPACITY_CHANGE_RETRY_IDENTITY");
+                if (force_identity_change != nullptr &&
+                    std::strcmp(force_identity_change, "1") == 0) {
+                    ++attempt_identity.control_generation;
+                    std::fprintf(stderr,
+                        "P51_CAPACITY_TRACE injected_retry_identity_change job=%u request=%llu\n",
+                        assignment.job_id,
+                        static_cast<unsigned long long>(assignment.assignmentNonce()));
+                }
+            }
+            trace_capacity_lease(attempt_identity);
+#endif
+            if (attempt_identity != control_identity) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                if (capacity_trace)
+                    std::fprintf(stderr,
+                        "P51_CAPACITY_TRACE identity_rejected job=%u epoch=%llu nonce=%llu request=%llu deadline_ns=%llu\n",
+                        assignment.job_id,
+                        static_cast<unsigned long long>(assignment.assignmentEpoch()),
+                        static_cast<unsigned long long>(assignment.assignmentNonce()),
+                        static_cast<unsigned long long>(assignment.assignmentNonce()),
+                        static_cast<unsigned long long>(deadline_ns));
+#endif
+                ::close(attempt_control_fd);
+                if (diagnostic != nullptr)
+                    diagnostic->error_code = 9;
+                return p50_transfer_error(9);
+            }
         }
-        const auto remaining = std::chrono::duration_cast<
-            std::chrono::milliseconds>(deadline - now);
-        const int timeout = static_cast<int>(std::max<int64_t>(
-            1, std::min<int64_t>(remaining.count(), INT_MAX)));
-        pollfd descriptor{control.native_handle(), control.desired_events(), 0};
-        const int ready = ::poll(&descriptor, 1, timeout);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready < 0) {
-            (void)control.advance(std::chrono::steady_clock::now(), POLLERR);
-            break;
+        first_attempt = false;
+        const int source_fd = ::fcntl(source.get(), F_DUPFD_CLOEXEC, 0);
+        if (source_fd < 0) {
+            ::close(attempt_control_fd);
+            if (diagnostic != nullptr)
+                diagnostic->error_code = 6;
+            return p50_transfer_error(6);
         }
-        (void)control.advance(std::chrono::steady_clock::now(),
-                              ready == 0 ? short{0} : descriptor.revents);
+        DaemonControlOperation control;
+        const DaemonControlStatus started = control.begin_authenticated(
+            attempt_control_fd, operation, source_fd, credentials, identity,
+            deadline, DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
+        control_begin_timer.finish();
+        if (started != DaemonControlStatus::InProgress) {
+            if (diagnostic != nullptr)
+                diagnostic->error_code = 6;
+            return p50_transfer_error(6);
+        }
+        while (!control.done()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                (void)control.advance(now, 0);
+                break;
+            }
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - now);
+            const int timeout = static_cast<int>(std::max<int64_t>(
+                1, std::min<int64_t>(remaining.count(), INT_MAX)));
+            pollfd descriptor{control.native_handle(),
+                              control.desired_events(), 0};
+            const int ready = ::poll(&descriptor, 1, timeout);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready < 0) {
+                (void)control.advance(std::chrono::steady_clock::now(), POLLERR);
+                break;
+            }
+            (void)control.advance(std::chrono::steady_clock::now(),
+                                  ready == 0 ? short{0} : descriptor.revents);
+        }
+        if (control.status() != DaemonControlStatus::Complete ||
+            !control.source_transfer_result().has_value()) {
+            control_wait_timer.finish();
+            if (diagnostic != nullptr)
+                diagnostic->error_code = 7;
+            return p50_transfer_error(7);
+        }
+        const P50SourceTransferResult result = *control.source_transfer_result();
+        const bool exact_capacity_busy =
+            result.code == SourceTransferResultCode::Error &&
+            result.error_code == static_cast<uint16_t>(
+                SourceTransferErrorCode::CapacityBusy) &&
+            result.attempts == 0 && result.tu_seq == 0 &&
+            result.raw_bytes == 0 && result.raw_digest == Digest128{} &&
+            result.c_store_guid == CStoreGuid{};
+        if (!exact_capacity_busy) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            if (capacity_trace) {
+                std::fprintf(stderr,
+                    "P51_CAPACITY_TRACE terminal job=%u epoch=%llu nonce=%llu request=%llu deadline_ns=%llu code=%u error=%u attempts=%u raw_bytes=%llu retries=%llu\n",
+                    assignment.job_id,
+                    static_cast<unsigned long long>(assignment.assignmentEpoch()),
+                    static_cast<unsigned long long>(assignment.assignmentNonce()),
+                    static_cast<unsigned long long>(assignment.assignmentNonce()),
+                    static_cast<unsigned long long>(deadline_ns),
+                    static_cast<unsigned>(result.code),
+                    static_cast<unsigned>(result.error_code),
+                    static_cast<unsigned>(result.attempts),
+                    static_cast<unsigned long long>(result.raw_bytes),
+                    static_cast<unsigned long long>(capacity_retry_count));
+            }
+#endif
+            control_wait_timer.finish();
+            return result;
+        }
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (capacity_trace) {
+            std::fprintf(stderr,
+                "P51_CAPACITY_TRACE busy job=%u epoch=%llu nonce=%llu request=%llu deadline_ns=%llu witness=none retry=%llu\n",
+                assignment.job_id,
+                static_cast<unsigned long long>(assignment.assignmentEpoch()),
+                static_cast<unsigned long long>(assignment.assignmentNonce()),
+                static_cast<unsigned long long>(assignment.assignmentNonce()),
+                static_cast<unsigned long long>(deadline_ns),
+                static_cast<unsigned long long>(++capacity_retry_count));
+        }
+#endif
+        if (std::chrono::steady_clock::now() >= deadline) {
+            control_wait_timer.finish();
+            if (diagnostic != nullptr)
+                diagnostic->error_code = 7;
+            return p50_transfer_error(7);
+        }
+        const auto retry_at = std::min(deadline,
+            std::chrono::steady_clock::now() + retry_delay);
+        std::this_thread::sleep_until(retry_at);
+        retry_delay = std::min(retry_delay * 2, std::chrono::milliseconds(200));
     }
-    control_wait_timer.finish();
-    if (control.status() != DaemonControlStatus::Complete ||
-        !control.source_transfer_result().has_value()) {
-        if (diagnostic != nullptr)
-            diagnostic->error_code = 7;
-        return p50_transfer_error(7);
-    }
-    return *control.source_transfer_result();
 }
 
 }

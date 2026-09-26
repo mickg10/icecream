@@ -139,6 +139,9 @@ worker_session_loss=${ICECC_P51_WRAPPER_WORKER_SESSION_LOSS:-0}
 expect_stable_f=${ICECC_P51_WRAPPER_EXPECT_STABLE_F:-0}
 staggered_quiescence=${ICECC_P51_WRAPPER_STAGGERED_QUIESCENCE:-0}
 c1f2_w30=${ICECC_P51_WRAPPER_C1F2_W30:-0}
+capacity_test=${ICECC_P51_WRAPPER_CAPACITY_TEST:-0}
+capacity_identity_negative=${ICECC_P51_WRAPPER_CAPACITY_IDENTITY_NEGATIVE:-0}
+capacity_nonbusy_negative=${ICECC_P51_WRAPPER_CAPACITY_NONBUSY_NEGATIVE:-0}
 case "$worker_session_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
@@ -169,6 +172,22 @@ if test "$staggered_quiescence" = 1 && \
     echo "FAIL: staggered quiescence requires worker-session-loss and strict stable-F mode" >&2
     exit 1
 fi
+case "$capacity_test" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_CAPACITY_TEST must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$capacity_identity_negative" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_CAPACITY_IDENTITY_NEGATIVE must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$capacity_nonbusy_negative" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_CAPACITY_NONBUSY_NEGATIVE must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$c1f2_w30" = 1 && { test "$capacity_test" = 1 || test "$capacity_identity_negative" = 1 || test "$capacity_nonbusy_negative" = 1; }; then
+    echo "FAIL: capacity tests cannot be combined with C1F2 W30 mode" >&2
+    exit 1
+fi
 if test "$worker_session_loss" = 1; then
     jobs=2
     test "$staggered_quiescence" = 0 || jobs=3
@@ -181,6 +200,25 @@ fi
 case "$jobs" in
     ''|*[!0-9]*|0) echo "FAIL: ICECC_P51_WRAPPER_JOBS must be a positive integer" >&2; exit 1 ;;
 esac
+if test "$capacity_identity_negative" = 1 && \
+        { test "$worker_session_loss" = 1 || test "$staggered_quiescence" = 1 || test "$jobs" -ne 2; }; then
+    echo "FAIL: identity-negative test requires exactly two ordinary concurrent jobs" >&2
+    exit 1
+fi
+if test "$capacity_nonbusy_negative" = 1 && \
+        { test "$worker_session_loss" = 1 || test "$staggered_quiescence" = 1 || test "$jobs" -ne 2; }; then
+    echo "FAIL: non-Busy negative test requires exactly two ordinary concurrent jobs" >&2
+    exit 1
+fi
+test "$((capacity_test + capacity_identity_negative + capacity_nonbusy_negative))" -le 1 || {
+    echo "FAIL: capacity test modes are mutually exclusive" >&2
+    exit 1
+}
+if test "$capacity_test" = 1 && \
+        { test "$worker_session_loss" = 1 || test "$staggered_quiescence" = 1 || test "$jobs" -lt 2; }; then
+    echo "FAIL: capacity retry test requires an ordinary batch with at least two jobs" >&2
+    exit 1
+fi
 
 sh "$src/dev/python.sh" --exec python - "$fixture" "$jobs" "$worker_session_loss" "$staggered_quiescence" <<'PY'
 import hashlib
@@ -281,6 +319,7 @@ for profile in $profiles; do
         ICECC_P50_C1F1_WORKDIR="$work" \
         ICECC_P50_C1F1_KEEP_WORK=1 \
         ICECC_P50_C1F1_TIMEOUT=300 \
+        ICECC_TEST_P51_CAPACITY_BUSY_AS_TERMINAL_ERROR="$capacity_nonbusy_negative" \
         ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS="$worker_session_loss" \
         ICECC_P50_C1F1_EXPECT_STABLE_F="$expect_stable_f" \
         ICECC_P50_C1F1_TEST_STAGGERED_QUIESCENCE="$staggered_quiescence" \
@@ -288,6 +327,120 @@ for profile in $profiles; do
         "$src/unittests/p50compilee2e-run.sh" >"$log" 2>&1
     status=$?
     set -e
+    if test "$capacity_identity_negative" = 1; then
+        test "$status" -ne 0 || {
+            cat "$log"
+            echo "FAIL: forced changed C identity unexpectedly allowed wrapper compile" >&2
+            exit 1
+        }
+        if awk '
+            /^P51_CAPACITY_TRACE / {
+                event = $2
+                delete fields
+                for (i = 3; i <= NF; ++i) {
+                    split($i, pair, "=")
+                    fields[pair[1]] = pair[2]
+                }
+                job = fields["job"]
+                if (job == "") next
+                if (event == "injected_retry_identity_change") {
+                    injected[job]++
+                    injected_request[job] = fields["request"]
+                    next
+                }
+                key = job "/" fields["epoch"] "/" fields["nonce"] "/" \
+                    fields["request"] "/" fields["deadline_ns"]
+                if (fields["epoch"] == "" || fields["nonce"] == "" ||
+                    fields["request"] == "" || fields["deadline_ns"] == "") bad[job] = 1
+                if (assignment[job] == "") assignment[job] = key
+                else if (assignment[job] != key) bad[job] = 1
+                if (assignment_request[job] == "")
+                    assignment_request[job] = fields["request"]
+                if (event == "arm_ack") arms[job]++
+                else if (event == "busy") busy[job]++
+                else if (event == "terminal") terminals[job]++
+                else if (event == "identity_rejected") rejected[job]++
+                else if (event == "lease") {
+                    if (fields["c_control"] == "" || fields["c_peer"] == "" ||
+                        fields["c_store_generation"] == "" ||
+                        fields["c_derivation"] == "" || fields["c_guid"] == "") bad[job] = 1
+                    identity = fields["c_control"] "/" fields["c_peer"] "/" \
+                        fields["c_store_generation"] "/" fields["c_derivation"] "/" fields["c_guid"]
+                    if (leases[job]++ == 0) original[job] = identity
+                    else if (identity != original[job]) changed[job] = 1
+                }
+            }
+            END {
+                for (job in injected) {
+                    if (injected[job] == 1 && injected_request[job] != "" &&
+                        injected_request[job] == assignment_request[job] &&
+                        rejected[job] == 1 && busy[job] == 1 &&
+                        arms[job] == 1 && terminals[job] == 0 &&
+                        leases[job] == 2 && changed[job] && !bad[job]) exit 0
+                }
+                exit 1
+            }
+        ' "$log"; then
+            printf 'P51_WRAPPER_CAPACITY_IDENTITY_REJECT_PASS profile=%s trace=%s retries_not_dispatched=1 one_arm=1 changed_C_identity=1\n' \
+                "$profile" "$log"
+        else
+            cat "$log"
+            echo "FAIL: no real Busy retry rejected a changed C identity" >&2
+            exit 1
+        fi
+        continue
+    fi
+    if test "$capacity_nonbusy_negative" = 1; then
+        test "$status" -ne 0 || {
+            cat "$log"
+            echo "FAIL: injected ordinary terminal error unexpectedly completed wrapper compile" >&2
+            exit 1
+        }
+        if awk '
+            /^P51_CAPACITY_TRACE / {
+                event = $2
+                delete fields
+                for (i = 3; i <= NF; ++i) {
+                    split($i, pair, "=")
+                    fields[pair[1]] = pair[2]
+                }
+                job = fields["job"]
+                if (job == "") next
+                key = job "/" fields["epoch"] "/" fields["nonce"] "/" \
+                    fields["request"] "/" fields["deadline_ns"]
+                if (fields["epoch"] == "" || fields["nonce"] == "" ||
+                    fields["request"] == "" || fields["deadline_ns"] == "") bad[job] = 1
+                if (assignment[job] == "") assignment[job] = key
+                else if (assignment[job] != key) bad[job] = 1
+                if (event == "arm_ack") arms[job]++
+                else if (event == "busy") busy[job]++
+                else if (event == "lease") {
+                    if (fields["c_control"] == "" || fields["c_peer"] == "" ||
+                        fields["c_store_generation"] == "" ||
+                        fields["c_derivation"] == "" || fields["c_guid"] == "") bad[job] = 1
+                    leases[job]++
+                } else if (event == "terminal" && fields["code"] == "2" &&
+                           fields["error"] == "20481" && fields["attempts"] == "0" &&
+                           fields["raw_bytes"] == "0" && fields["retries"] == "0")
+                    terminal[job]++
+            }
+            END {
+                for (job in terminal) {
+                    if (terminal[job] == 1 && arms[job] == 1 && busy[job] == 0 &&
+                        leases[job] == 1 && !bad[job]) exit 0
+                }
+                exit 1
+            }
+        ' "$log"; then
+            printf 'P51_WRAPPER_CAPACITY_NONBUSY_TERMINAL_PASS profile=%s trace=%s terminal_once=1 no_retry=1 one_arm=1\n' \
+                "$profile" "$log"
+        else
+            cat "$log"
+            echo "FAIL: ordinary typed terminal error was not delivered once without retry" >&2
+            exit 1
+        fi
+        continue
+    fi
     test "$status" -eq 0 || {
         cat "$log"
         echo "FAIL: actual P51 wrapper compile failed for $profile (status $status)" >&2
@@ -344,6 +497,84 @@ for profile in $profiles; do
         grep -F "PASS: all-P50 C1F1 $profile compile is remote and byte-identical" \
             "$log" >/dev/null || {
             echo "FAIL: $profile object-comparison gate did not pass" >&2
+            exit 1
+        }
+    fi
+    if test "$capacity_test" = 1; then
+        capacity_passed=0
+        for capacity_log in "$work"/job-full-1-*.log; do
+            test -f "$capacity_log" || continue
+            capacity_busy=$(grep -c '^P51_CAPACITY_TRACE busy ' "$capacity_log" || true)
+            test "$capacity_busy" -gt 0 || continue
+            capacity_ordinal=${capacity_log##*-}
+            capacity_ordinal=${capacity_ordinal%.log}
+            capacity_result="$work/result-full-1-$capacity_ordinal.tsv"
+            test -s "$capacity_result" || {
+                echo "FAIL: busy retry has no completed exact-output row ($capacity_ordinal)" >&2
+                exit 1
+            }
+            test "$(grep -c '^P51_CAPACITY_TRACE arm_ack ' "$capacity_log" || true)" -eq 1 || {
+                echo "FAIL: capacity retry repeated or omitted F ARM ($capacity_ordinal)" >&2
+                exit 1
+            }
+            test "$(grep -c '^P51_CAPACITY_TRACE terminal ' "$capacity_log" || true)" -eq 1 || {
+                echo "FAIL: capacity retry lacks one terminal outcome ($capacity_ordinal)" >&2
+                exit 1
+            }
+            test "$(grep -c '^P51_CAPACITY_TRACE lease ' "$capacity_log" || true)" -eq "$((capacity_busy + 1))" || {
+                echo "FAIL: lease retry count does not match exact Busy count ($capacity_ordinal)" >&2
+                exit 1
+            }
+            awk '
+                /^P51_CAPACITY_TRACE (lease|arm_ack|busy|terminal) / {
+                    event = $2
+                    delete fields
+                    for (i = 3; i <= NF; ++i) {
+                        split($i, pair, "=")
+                        fields[pair[1]] = pair[2]
+                    }
+                    current = fields["job"] "/" fields["epoch"] "/" fields["nonce"] "/" fields["request"] "/" fields["deadline_ns"]
+                    if (identity == "") identity = current
+                    if (current != identity) bad = 1
+                    if (event == "lease") {
+                        if (fields["c_control"] == "" || fields["c_peer"] == "" ||
+                            fields["c_store_generation"] == "" ||
+                            fields["c_derivation"] == "" || fields["c_guid"] == "") bad = 1
+                        c = fields["c_control"] "/" fields["c_peer"] "/" \
+                            fields["c_store_generation"] "/" fields["c_derivation"] "/" fields["c_guid"]
+                        if (c_identity == "") c_identity = c
+                        if (c != c_identity) bad = 1
+                    } else if (event == "arm_ack") {
+                        if (fields["source_dev"] == "" || fields["source_ino"] == "" ||
+                            fields["source_bytes"] == "" || fields["source_bytes"] <= 0) bad = 1
+                        source_bytes = fields["source_bytes"]
+                    } else if (event == "busy") {
+                        if (fields["witness"] != "none") bad = 1
+                        busy++
+                    } else if (event == "terminal") {
+                        if (fields["code"] != "1" || fields["error"] != "0" ||
+                            fields["attempts"] != "1" || fields["raw_bytes"] != source_bytes) bad = 1
+                        if (fields["retries"] != busy) bad = 1
+                        terminal++
+                    }
+                }
+                END { if (bad || busy < 1 || terminal != 1 || c_identity == "") exit 1 }
+            ' "$capacity_log" || {
+                echo "FAIL: retry changed assignment/C identity/deadline or terminal result ($capacity_ordinal)" >&2
+                exit 1
+            }
+            awk -F '\t' 'NF >= 11 && $7 == $10 && $8 == $11 && $8 > 0 { ok=1 } END { exit !ok }' \
+                "$capacity_result" || {
+                echo "FAIL: capacity-retried remote object differs from local exact output ($capacity_ordinal)" >&2
+                exit 1
+            }
+            capacity_passed=1
+            printf 'P51_WRAPPER_CAPACITY_RETRY_PASS profile=%s ordinal=%s busy=%s one_arm=1 stable_assignment=1 stable_C_identity=1 fixed_deadline=1 exact_output=1 trace=%s result=%s\n' \
+                "$profile" "$capacity_ordinal" "$capacity_busy" "$capacity_log" "$capacity_result"
+            break
+        done
+        test "$capacity_passed" -eq 1 || {
+            echo "FAIL: no real wrapper request observed typed CapacityBusy followed by successful exact-output retry" >&2
             exit 1
         }
     fi
@@ -432,6 +663,10 @@ done
 
 if test "$c1f2_w30" = 1; then
     echo "PASS: actual P51 C1F2 W30 F-specific loss, healthy-B isolation, cleanup, and fresh-A recovery passed per selected profile"
+elif test "$capacity_identity_negative" = 1; then
+    echo "PASS: changed C identity after exact Busy is terminal; no source operation was dispatched"
+elif test "$capacity_nonbusy_negative" = 1; then
+    echo "PASS: ordinary typed terminal error was not retried after capacity refusal"
 elif test "$worker_session_loss" = 1; then
     echo "PASS: P51 stopped-victim cleanup and fresh-job exact-object recovery passed per selected profile"
 else

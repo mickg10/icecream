@@ -1258,7 +1258,8 @@ void receive_p51_transfer_error(local::Connection& peer,
                                 bool acknowledge,
                                 uint16_t expected_error_code = 0) {
     local::Frame response;
-    CHECK(peer.receive_until(response, deadline) == local::Status::Ok);
+    const auto receive_status = peer.receive_until(response, deadline);
+    CHECK(receive_status == local::Status::Ok);
     CHECK(response.type == local::MessageType::Data);
     CHECK(local::validate_identity(response, identity) == local::Status::Ok);
     local::ControlOperation decoded;
@@ -1283,7 +1284,8 @@ local::P50SourceTransferResult receive_p51_transfer_result(
     local::Connection& peer, local::Identity identity, uint64_t request_id,
     std::chrono::steady_clock::time_point deadline, bool acknowledge) {
     local::Frame response;
-    CHECK(peer.receive_until(response, deadline) == local::Status::Ok);
+    const auto receive_status = peer.receive_until(response, deadline);
+    CHECK(receive_status == local::Status::Ok);
     CHECK(response.type == local::MessageType::Data);
     CHECK(local::validate_identity(response, identity) == local::Status::Ok);
     local::ControlOperation decoded;
@@ -1306,9 +1308,9 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x35;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
-    StoreIdentityRoot remote_root{};
-    remote_root.bytes[15] = 0x36;
-    const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = 0x36;
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
 
     service::RuntimeConfig config = test_runtime_config();
     config.c_store_guid = launch.c_store_guid;
@@ -1319,54 +1321,156 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
     config.max_pending_p51_source_reservations = 8;
     config.max_active_p51_source_transfers = 1;
     config.max_pending_p51_source_operations = 1;
+    std::atomic<size_t> source_read_chunks{0};
+    config.p51_source_read_chunk_for_test = [&] {
+        source_read_chunks.fetch_add(1, std::memory_order_relaxed);
+    };
     service::SidecarRuntime runtime(std::move(config));
+
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.c_store_guid = f_launch.c_store_guid;
+    f_config.f_store_guid = f_launch.f_store_guid;
+    f_config.f_store_generation = f_launch.store_generation;
+    f_config.sidecar_launch = f_launch;
+    service::SidecarRuntime f_runtime(std::move(f_config));
 
     auto make_request = [&](uint64_t request_id,
                             std::chrono::milliseconds lifetime) {
         auto reservation = test_p51_reservation_request(
-            remote_c, 31, launch.identity.generation, launch.identity.attempt,
+            launch.c_store_guid, launch.store_generation,
+            launch.identity.generation,
+            launch.identity.attempt,
             request_id, CACHE_PROFILE_ZSTD_TU, 30, lifetime);
         reservation.arm.source.selected_f_host = "127.0.0.1";
         reservation.arm.source.selected_f_cache_port = 1;
-        const auto armed = runtime.reserve_p51_source_on_owner(reservation);
+        const auto armed = f_runtime.reserve_p51_source_on_owner(reservation);
         CHECK(armed.error_code == 0 && armed.armed.has_value());
-        return local::P51SourceTransferRequest{
+        local::P51SourceTransferRequest transfer{
             *armed.armed, reservation.absolute_deadline};
+        CHECK(transfer.armed.valid());
+        return transfer;
     };
     auto enqueue = [&](RuntimeCase& pair,
-                       const local::P51SourceTransferRequest& request) {
+                       const local::P51SourceTransferRequest& request,
+                       size_t source_bytes = 1) {
         const auto operation = local::make_p51_source_transfer_operation(
             launch.identity, request,
             request.armed.arm.source.source_request_id);
         return runtime.enqueue_p51_source_transfer(
             std::move(pair.sender), launch.identity, operation,
-            oversized_test_source_fd());
+            sized_test_source_fd(source_bytes, 0x77)) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
 
+    // A missing Goodbye must independently release the operation credit at
+    // the original (short) source deadline.
+    RuntimeCase expires_without_goodbye = authenticated_runtime_pair();
+    const auto expiry_request = make_request(7100,
+                                             std::chrono::milliseconds(350));
+    CHECK(enqueue(expires_without_goodbye, expiry_request, 2));
+    receive_p51_transfer_error(
+        expires_without_goodbye.receiver, launch.identity, 7100,
+        expiry_request.absolute_deadline.as_steady_time_point(), false, 3);
+    CHECK(wait_for_source_operation_count(runtime, 1, std::chrono::seconds(1)));
+    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(2)));
+
     // A response stays admitted until Goodbye or the original source deadline;
-    // a cap+1 request is refused without consuming the queued socket/FD.
+    // a cap+1 request receives a typed, bounded refusal without consuming its
+    // source descriptor, incrementing admission, or starting source work.
     RuntimeCase stalled = authenticated_runtime_pair();
-    const auto short_request = make_request(7101, std::chrono::milliseconds(350));
-    CHECK(enqueue(stalled, short_request));
+    const auto short_request = make_request(7101, std::chrono::seconds(4));
+    // Deliberately oversize the admitted source. The normal asynchronous path
+    // emits its existing typed SourceRead error without touching the F route;
+    // keep that reply held at Goodbye to occupy the only operation slot.
+    CHECK(enqueue(stalled, short_request, 2));
     const auto short_deadline = short_request.absolute_deadline.as_steady_time_point();
     receive_p51_transfer_error(stalled.receiver, launch.identity, 7101,
-                               short_deadline, false);
+                               short_deadline, false, 3);
     CHECK(wait_for_source_operation_count(runtime, 1, std::chrono::seconds(1)));
+    CHECK(source_read_chunks.load(std::memory_order_relaxed) == 0);
 
     RuntimeCase refused = authenticated_runtime_pair();
     const auto refused_request = make_request(7102, std::chrono::seconds(2));
-    CHECK(!enqueue(refused, refused_request));
-    CHECK(refused.sender.valid()); // cap refusal leaves ownership with caller
-    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(2)));
+    const auto refused_operation = local::make_p51_source_transfer_operation(
+        launch.identity, refused_request,
+        refused_request.armed.arm.source.source_request_id);
+    auto refused_source = sized_test_source_fd(1, 0x88);
+    const int refused_source_fd = refused_source.get();
+    const size_t reads_before_refusal =
+        source_read_chunks.load(std::memory_order_relaxed);
+    uint16_t preflight_error = 0;
+    const auto refused_status = runtime.enqueue_p51_source_transfer(
+        std::move(refused.sender), launch.identity, refused_operation,
+        std::move(refused_source), &preflight_error);
+    CHECK(refused_status == service::P51SourceEnqueueResult::CapacityBusy);
+    CHECK(preflight_error == 0);
+    CHECK(refused.sender.valid() && refused_source.get() == refused_source_fd);
+    CHECK(runtime.pending_p51_source_operations_for_test() == 1);
+    CHECK(source_read_chunks.load(std::memory_order_relaxed) ==
+          reads_before_refusal);
 
-    // A later request reuses the released slot; successful local receipt and
-    // Goodbye are both required to retire the operation normally.
+    std::promise<local::P50SourceTransferResult> busy_result_promise;
+    auto busy_result_future = busy_result_promise.get_future();
+    std::exception_ptr busy_peer_exception;
+    std::jthread busy_peer([&] {
+        try {
+            busy_result_promise.set_value(receive_p51_transfer_result(
+                refused.receiver, launch.identity, 7102,
+                refused_request.absolute_deadline.as_steady_time_point(), true));
+        } catch (...) {
+            busy_peer_exception = std::current_exception();
+        }
+    });
+    const auto busy_reply_started = std::chrono::steady_clock::now();
+    CHECK(service::send_p51_source_transfer_error_reply(
+        refused.sender, launch.identity, refused_operation,
+        static_cast<uint16_t>(local::SourceTransferErrorCode::CapacityBusy),
+        refused_request.absolute_deadline.as_steady_time_point()));
+    const auto busy_reply_elapsed = std::chrono::steady_clock::now() -
+                                    busy_reply_started;
+    busy_peer.join();
+    if (busy_peer_exception)
+        std::rethrow_exception(busy_peer_exception);
+    const auto busy_result = busy_result_future.get();
+    CHECK(busy_result.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::CapacityBusy));
+    CHECK(busy_result.attempts == 0 && busy_result.c_store_guid == CStoreGuid{});
+    CHECK(busy_reply_elapsed < std::chrono::milliseconds(250));
+    CHECK(runtime.pending_p51_source_operations_for_test() == 1);
+
+    RuntimeCase silent = authenticated_runtime_pair();
+    const auto silent_operation = local::make_p51_source_transfer_operation(
+        launch.identity, refused_request,
+        refused_request.armed.arm.source.source_request_id);
+    const auto silent_started = std::chrono::steady_clock::now();
+    CHECK(!service::send_p51_source_transfer_error_reply(
+        silent.sender, launch.identity, silent_operation,
+        static_cast<uint16_t>(local::SourceTransferErrorCode::CapacityBusy),
+        refused_request.absolute_deadline.as_steady_time_point()));
+    const auto silent_elapsed = std::chrono::steady_clock::now() - silent_started;
+    CHECK(silent_elapsed < std::chrono::milliseconds(250));
+    silent.sender = local::Connection(-1);
+
+    // Release exactly the held reply; retry the identical F assignment/request
+    // on a fresh control connection, without reserving/re-arming a new source.
+    const local::Frame held_goodbye{local::kProtocolVersion,
+                                    local::MessageType::Goodbye,
+                                    launch.identity, {}};
+    CHECK(stalled.receiver.send_until(held_goodbye, short_deadline) ==
+          local::Status::Ok);
+    CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
+
+    // The exact refused source descriptor and unchanged request are admitted
+    // on a fresh control lease after capacity returns. Close the synthetic
+    // peer afterward to make this a slot-reuse test, not a route-success test.
     RuntimeCase normal = authenticated_runtime_pair();
-    const auto normal_request = make_request(7103, std::chrono::seconds(2));
-    CHECK(enqueue(normal, normal_request));
-    receive_p51_transfer_error(
-        normal.receiver, launch.identity, 7103,
-        normal_request.absolute_deadline.as_steady_time_point(), true);
+    CHECK(refused_source.get() == refused_source_fd);
+    CHECK(runtime.enqueue_p51_source_transfer(
+        std::move(normal.sender), launch.identity, refused_operation,
+        std::move(refused_source), &preflight_error) ==
+        service::P51SourceEnqueueResult::Accepted);
+    CHECK(preflight_error == 0);
+    normal.receiver = local::Connection(-1);
     CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
 
     // Peer EOF is also terminal for the local reply pump and releases its
@@ -1379,12 +1483,13 @@ void test_p51_async_transfer_reply_deadline_close_and_slot_reuse() {
 
     RuntimeCase stopped = authenticated_runtime_pair();
     const auto stopped_request = make_request(7105, std::chrono::seconds(2));
-    CHECK(enqueue(stopped, stopped_request));
+    CHECK(enqueue(stopped, stopped_request, 2));
     receive_p51_transfer_error(
         stopped.receiver, launch.identity, 7105,
-        stopped_request.absolute_deadline.as_steady_time_point(), false);
+        stopped_request.absolute_deadline.as_steady_time_point(), false, 3);
     CHECK(wait_for_source_operation_count(runtime, 1, std::chrono::seconds(1)));
     runtime.stop();
+    f_runtime.stop();
     CHECK(wait_for_source_operation_count(runtime, 0, std::chrono::seconds(1)));
     std::puts("P51_ASYNC_TRANSFER local-reply/deadline/peer-close/slot-reuse: ok");
 }
@@ -1475,7 +1580,7 @@ void test_p51_admitted_transfer_stop_releases_raw_credit() {
             launch.identity, request, request.armed.arm.source.source_request_id);
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        oversized_test_source_fd());
+        oversized_test_source_fd()) == service::P51SourceEnqueueResult::Accepted;
     const bool operation_seen = enqueued && wait_for_source_operation_count(
         runtime, 1, std::chrono::seconds(1));
     const bool accepted_ready = operation_seen &&
@@ -1596,7 +1701,7 @@ void test_p51_peer_close_during_active_read_cancels_before_route() {
     const int source_fd_number = source_fd.get();
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        std::move(source_fd));
+        std::move(source_fd)) == service::P51SourceEnqueueResult::Accepted;
     const bool read_entered = enqueued &&
         read_started.wait_for(std::chrono::seconds(3)) ==
             std::future_status::ready;
@@ -1738,7 +1843,8 @@ void test_p51_read_failure_releases_original_source_fd() {
     const auto operation = local::make_p51_source_transfer_operation(
         launch.identity, request, request.armed.arm.source.source_request_id);
     const bool enqueued = runtime.enqueue_p51_source_transfer(
-        std::move(pair.sender), launch.identity, operation, std::move(source));
+        std::move(pair.sender), launch.identity, operation, std::move(source)) ==
+        service::P51SourceEnqueueResult::Accepted;
     const bool completion_observed = enqueued &&
         source_read_complete.wait_for(std::chrono::seconds(3)) ==
             std::future_status::ready;
@@ -2009,7 +2115,8 @@ void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
             c_launch.identity, row.request, row.request_id);
         return c_runtime.enqueue_p51_source_transfer(
             std::move(row.pair.sender), c_launch.identity, operation,
-            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+            sized_test_source_fd(row.bytes.size(), row.bytes.front())) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
 
     const uint64_t base = 8200 + static_cast<uint64_t>(cancelled_index) * 100;
@@ -2510,7 +2617,8 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                 c_launch.identity, request.transfer, request.id);
             return c_runtime.enqueue_p51_source_transfer(
                 std::move(request.pair.sender), c_launch.identity, operation,
-                d14_exact_source_fd(request.bytes));
+                d14_exact_source_fd(request.bytes)) ==
+                service::P51SourceEnqueueResult::Accepted;
         };
         auto receive = [&](Request& request) {
             return receive_p51_transfer_result(
@@ -3463,7 +3571,8 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             c_launch.identity, row.request, row.request_id);
         return c_runtime.enqueue_p51_source_transfer(
             std::move(row.pair.sender), c_launch.identity, operation,
-            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+            sized_test_source_fd(row.bytes.size(), row.bytes.front())) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
     auto attach_exact = [&](RequestRow& row,
                             const local::P50SourceTransferResult& result,
@@ -4507,7 +4616,8 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
             c_launch.identity, row.request, row.request_id);
         return c_runtime.enqueue_p51_source_transfer(
             std::move(row.pair.sender), c_launch.identity, operation,
-            sized_test_source_fd(row.bytes.size(), row.bytes.front()));
+            sized_test_source_fd(row.bytes.size(), row.bytes.front())) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
     auto attach_exact = [&](RequestRow& row,
                             const local::P50SourceTransferResult& result) {
@@ -4904,7 +5014,7 @@ void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {
             request.armed.arm.source.source_request_id);
         return runtime.enqueue_p51_source_transfer(
             std::move(pair.sender), launch.identity, operation,
-            std::move(source));
+            std::move(source)) == service::P51SourceEnqueueResult::Accepted;
     };
 
     // An over-cap R2 source is rejected before F connection or aggregate
@@ -5306,7 +5416,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
         held_request.armed.arm.source.source_request_id);
     const bool held_enqueued = runtime.enqueue_p51_source_transfer(
         std::move(held.sender), launch.identity, held_operation,
-        sized_test_source_fd(14, 0xa1));
+        sized_test_source_fd(14, 0xa1)) == service::P51SourceEnqueueResult::Accepted;
     const bool held_read_observed = held_enqueued &&
         source_read_complete.wait_for(std::chrono::seconds(3)) ==
             std::future_status::ready;
@@ -5324,7 +5434,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
     const int waiting_source_fd_number = waiting_source_fd.get();
     const bool waiting_enqueued = runtime.enqueue_p51_source_transfer(
         std::move(waiting.sender), launch.identity, waiting_operation,
-        std::move(waiting_source_fd));
+        std::move(waiting_source_fd)) == service::P51SourceEnqueueResult::Accepted;
     const bool credit_wait_observed = waiting_enqueued &&
         source_credit_waiting.wait_for(std::chrono::seconds(2)) ==
             std::future_status::ready;
@@ -5343,7 +5453,7 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
         oversize_request.armed.arm.source.source_request_id);
     const bool oversize_enqueued = runtime.enqueue_p51_source_transfer(
         std::move(oversize.sender), launch.identity, oversize_operation,
-        sized_test_source_fd(17, 0xef));
+        sized_test_source_fd(17, 0xef)) == service::P51SourceEnqueueResult::Accepted;
     std::exception_ptr oversize_exception;
     std::chrono::steady_clock::time_point oversize_result_at{};
     try {
@@ -5375,7 +5485,8 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
         launch.identity, request, request.armed.arm.source.source_request_id);
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        sized_test_source_fd(expected_input.size(), 0xf1));
+        sized_test_source_fd(expected_input.size(), 0xf1)) ==
+        service::P51SourceEnqueueResult::Accepted;
     const bool fit_source_read_observed =
         fit_source_read_complete.wait_for(std::chrono::seconds(3)) ==
         std::future_status::ready;
@@ -5592,7 +5703,8 @@ void test_p51_credit_admission_bypasses_blocked_workers() {
             launch.identity, request, request_id);
         return runtime.enqueue_p51_source_transfer(
             std::move(pair.sender), launch.identity, operation,
-            sized_test_source_fd(bytes, fill));
+            sized_test_source_fd(bytes, fill)) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
 
     std::vector<RuntimeCase> pairs;
@@ -5786,7 +5898,8 @@ void test_p51_credit_admission_bypass_limit_serves_oldest() {
             launch.identity, request, request_id);
         return runtime.enqueue_p51_source_transfer(
             std::move(pair.sender), launch.identity, operation,
-            sized_test_source_fd(raw_bytes, 0x91));
+            sized_test_source_fd(raw_bytes, 0x91)) ==
+            service::P51SourceEnqueueResult::Accepted;
     };
     auto accept_one = [](int listener, int timeout_ms) {
         pollfd ready{listener, POLLIN, 0};
@@ -6113,7 +6226,7 @@ void test_p51_stop_while_waiting_for_link_session_echo() {
             launch.identity, request, request.armed.arm.source.source_request_id);
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        oversized_test_source_fd());
+        oversized_test_source_fd()) == service::P51SourceEnqueueResult::Accepted;
     const bool operation_seen = enqueued && wait_for_source_operation_count(
         runtime, 1, std::chrono::seconds(1));
     const bool got_p51_request = operation_seen &&
@@ -6313,7 +6426,7 @@ void test_p51_stop_while_waiting_for_link_state() {
             launch.identity, request, request.armed.arm.source.source_request_id);
     const bool enqueued = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        oversized_test_source_fd());
+        oversized_test_source_fd()) == service::P51SourceEnqueueResult::Accepted;
     const bool operation_seen = enqueued && wait_for_source_operation_count(
         runtime, 1, std::chrono::seconds(1));
     const bool got_hello = operation_seen &&
@@ -9696,7 +9809,8 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                 request.armed.arm.source.source_request_id);
             return client.enqueue_p51_source_transfer(
                 std::move(pair.sender), client_launch.identity, operation,
-                sized_test_source_fd(37, fill));
+                sized_test_source_fd(37, fill)) ==
+                service::P51SourceEnqueueResult::Accepted;
         };
         CHECK(enqueue(*first_client, first_launch, first_pair,
                       first_request.first, 0xb1));
@@ -14734,6 +14848,10 @@ int main(int argc, char** argv) {
         if (argc == 2 &&
             std::strcmp(argv[1], "--credit-admission-bypass-limit") == 0) {
             test_p51_credit_admission_bypass_limit_serves_oldest();
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--p51-capacity-overflow") == 0) {
+            test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
             return 0;
         }
         CHECK(argc == 1);

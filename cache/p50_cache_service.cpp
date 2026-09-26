@@ -1660,11 +1660,43 @@ bool handle_connection(local::Connection connection, const Options& options,
             if (handoff.status != local::FdHandoffStatus::Accepted)
                 return true;
             local::HandoffFd source = receiver.take_adopted_fd();
-            if (!runtime.enqueue_p51_source_transfer(
+            uint16_t preflight_error = 0;
+            const auto admission = runtime.enqueue_p51_source_transfer(
                     std::move(connection), options.identity,
-                    std::move(operation), std::move(source))) {
+                operation, std::move(source),
+                    &preflight_error);
+            if (admission == P51SourceEnqueueResult::CapacityBusy) {
+                uint16_t capacity_error = static_cast<uint16_t>(
+                    local::SourceTransferErrorCode::CapacityBusy);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                const char* capacity_busy_as_terminal_error =
+                    ::getenv("ICECC_TEST_P51_CAPACITY_BUSY_AS_TERMINAL_ERROR");
+                if (capacity_busy_as_terminal_error != nullptr &&
+                    std::strcmp(capacity_busy_as_terminal_error, "1") == 0)
+                    capacity_error = static_cast<uint16_t>(
+                        local::SourceTransferErrorCode::
+                            PermanentLocalProfileUnavailable);
+#endif
+                const bool replied = send_p51_source_transfer_error_reply(
+                    connection, options.identity, operation,
+                    capacity_error,
+                    operation.p51_source_transfer->absolute_deadline
+                        .as_steady_time_point());
                 std::fprintf(stderr,
-                             "P51_SOURCE_TRANSFER_REFUSED stage=queue-full\n");
+                             "P51_SOURCE_TRANSFER_REFUSED stage=capacity-busy typed_reply=%u\n",
+                             replied ? 1u : 0u);
+                std::fflush(stderr);
+            } else if (admission == P51SourceEnqueueResult::Rejected) {
+                if (preflight_error != 0 && operation.p51_source_transfer) {
+                    (void)send_p51_source_transfer_error_reply(
+                        connection, options.identity, operation,
+                        preflight_error,
+                        operation.p51_source_transfer->absolute_deadline
+                            .as_steady_time_point());
+                }
+                std::fprintf(stderr,
+                             "P51_SOURCE_TRANSFER_REFUSED stage=reject preflight_error=%u\n",
+                             static_cast<unsigned>(preflight_error));
                 std::fflush(stderr);
             }
             return true;
@@ -1919,6 +1951,57 @@ std::optional<uint64_t> source_fd_size(int fd, uint64_t limit) noexcept {
     return static_cast<uint64_t>(info.st_size);
 }
 
+uint16_t p51_source_preflight_error(
+    const local::P51SourceTransferRequest& request, int source_fd,
+    const RuntimeConfig& config, uint64_t* source_size = nullptr) noexcept {
+    constexpr uint16_t kInvalid = 1;
+    constexpr uint16_t kExpired = 7;
+    constexpr uint16_t kSourceRead = 3;
+    constexpr uint16_t kSourceTooLarge = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::SourceTooLarge);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto& armed = request.armed;
+    if (!armed.valid() || !request.absolute_deadline.valid() ||
+        !request.absolute_deadline.matches_clock(clock) || source_fd < 0 ||
+        !config.sidecar_launch || !config.sidecar_launch->valid() ||
+        armed.arm.source.c_store_guid != config.c_store_guid.bytes ||
+        armed.arm.source.c_store_generation !=
+            config.sidecar_launch->store_generation ||
+        armed.arm.source.c_control_generation !=
+            config.sidecar_launch->identity.generation ||
+        armed.arm.source.c_control_attempt !=
+            config.sidecar_launch->identity.attempt ||
+        armed.f_store_guid == config.f_store_guid.bytes ||
+        armed.f_store_guid == std::array<uint8_t, 16>{} ||
+        armed.f_store_generation == 0 ||
+        armed.selected_revision != CACHE_WIRE_REVISION_R2 ||
+        armed.selected_window == 0 || armed.selected_window > 30 ||
+        armed.arm.source.selected_f_cache_port == 0 ||
+        armed.arm.source.selected_f_cache_port > UINT16_MAX ||
+        armed.arm.source.selected_f_host.empty())
+        return kInvalid;
+    switch (armed.arm.source.cache_profile) {
+    case CACHE_PROFILE_P29V1:
+    case CACHE_PROFILE_ZSTD_TU:
+    case CACHE_PROFILE_ZSTD_ROUTE:
+        break;
+    default:
+        return kInvalid;
+    }
+    if (std::chrono::steady_clock::now() >=
+        request.absolute_deadline.as_steady_time_point())
+        return kExpired;
+    const auto size = source_fd_size(
+        source_fd, config.endpoint_caps.zstd.max_raw_bytes);
+    if (!size)
+        return kSourceRead;
+    if (*size > config.max_aggregate_source_raw_bytes)
+        return kSourceTooLarge;
+    if (source_size != nullptr)
+        *source_size = *size;
+    return 0;
+}
+
 bool source_control_peer_closed(int fd) noexcept {
     if (fd < 0)
         return true;
@@ -2015,6 +2098,49 @@ std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
 }
 
 } // namespace
+
+bool send_p51_source_transfer_error_reply(
+    local::Connection& connection, local::Identity identity,
+    const local::ControlOperation& operation,
+    uint16_t error_code,
+    std::chrono::steady_clock::time_point original_deadline) noexcept {
+    constexpr auto kReplyBudget = std::chrono::milliseconds(100);
+    if (!connection.valid() ||
+        operation.kind != local::ControlOperationKind::P51SourceTransfer ||
+        operation.identity != identity ||
+        !operation.p51_source_transfer.has_value() ||
+        !operation.p51_source_transfer->absolute_deadline.valid() ||
+        error_code == 0)
+        return false;
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = std::min(original_deadline, now + kReplyBudget);
+    if (deadline <= now)
+        return false;
+    local::P50SourceTransferResult result = source_transfer_error(
+        error_code);
+    std::vector<uint8_t> payload;
+    try {
+        payload = local::encode_control_operation(
+            local::make_p51_source_transfer_reply_operation(operation,
+                                                             result));
+    } catch (...) {
+        return false;
+    }
+    if (payload.empty())
+        return false;
+    const local::Frame response{local::kProtocolVersion,
+                                local::MessageType::Data, identity,
+                                std::move(payload)};
+    if (connection.send_until(response, deadline) != local::Status::Ok)
+        return false;
+    local::Frame acknowledgement;
+    return connection.receive_until(acknowledgement, deadline) ==
+               local::Status::Ok &&
+           acknowledgement.type == local::MessageType::Goodbye &&
+           acknowledgement.payload.empty() &&
+           local::validate_identity(acknowledgement, identity) ==
+               local::Status::Ok;
+}
 
 struct SidecarRuntime::P51RawCredit {
     P51RawCredit(SidecarRuntime* runtime, uint64_t reserved_bytes) noexcept
@@ -2868,19 +2994,47 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
 }
 
 
-bool SidecarRuntime::enqueue_p51_source_transfer(
+P51SourceEnqueueResult SidecarRuntime::enqueue_p51_source_transfer(
     local::Connection&& connection, local::Identity identity,
-    local::ControlOperation operation, local::HandoffFd source) noexcept {
+    const local::ControlOperation& operation, local::HandoffFd&& source,
+    uint16_t* preflight_error) noexcept {
+    if (preflight_error != nullptr)
+        *preflight_error = 0;
     const auto& configured = operation.p51_source_transfer;
     if (!connection.valid() || !source.valid() || !configured.has_value() ||
         operation.kind != local::ControlOperationKind::P51SourceTransfer ||
         operation.identity != identity || operation.request_id == 0 ||
-        stop_requested_.load(std::memory_order_acquire))
-        return false;
+        operation.request_id !=
+            configured->armed.arm.source.source_request_id ||
+        operation.absolute_deadline != configured->absolute_deadline ||
+        !config_.sidecar_launch || identity != config_.sidecar_launch->identity)
+        return P51SourceEnqueueResult::Rejected;
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        if (preflight_error != nullptr)
+            *preflight_error = 7;
+        return P51SourceEnqueueResult::Rejected;
+    }
     size_t pending = p51_source_operation_count_.load(std::memory_order_relaxed);
     for (;;) {
-        if (pending >= config_.max_pending_p51_source_operations)
-            return false;
+        if (pending >= config_.max_pending_p51_source_operations) {
+            // Revalidate the live state at the exact capacity decision. Never
+            // call an expired, malformed, stopping, or wrong-incarnation
+            // request a retryable Busy result.
+            const uint16_t invalid = p51_source_preflight_error(
+                *configured, source.get(), config_);
+            if (invalid != 0) {
+                if (preflight_error != nullptr)
+                    *preflight_error = invalid;
+                return P51SourceEnqueueResult::Rejected;
+            }
+            if (stop_requested_.load(std::memory_order_acquire) ||
+                route_replacement_required_.load(std::memory_order_acquire)) {
+                if (preflight_error != nullptr)
+                    *preflight_error = 7;
+                return P51SourceEnqueueResult::Rejected;
+            }
+            return P51SourceEnqueueResult::CapacityBusy;
+        }
         if (p51_source_operation_count_.compare_exchange_weak(
                 pending, pending + 1, std::memory_order_acq_rel,
                 std::memory_order_relaxed))
@@ -2891,48 +3045,31 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
     try {
         // configured aliases operation; copy before moving its containing object.
         const local::P51SourceTransferRequest request_copy = *configured;
+        local::ControlOperation pending_operation = operation;
         pending_transfer = std::make_shared<PendingP51Transfer>(
-            std::move(connection), identity, std::move(operation), request_copy,
+            std::move(connection), identity, std::move(pending_operation), request_copy,
             std::move(source), &p51_source_operation_count_,
             p51_metrics_enabled_);
         asio::post(p51_source_prepare_pool_, [this, pending_transfer] {
-            constexpr uint16_t kInvalid = 1;
             constexpr uint16_t kExpired = 7;
             constexpr uint16_t kSourceRead = 3;
-            constexpr uint16_t kSourceTooLarge = static_cast<uint16_t>(
-                local::SourceTransferErrorCode::SourceTooLarge);
             const auto& request = pending_transfer->request;
-            const auto deadline =
-                request.absolute_deadline.as_steady_time_point();
             auto fail = [this, pending_transfer](uint16_t code) {
                 post_p51_source_transfer_reply(
                     pending_transfer, source_transfer_error(code));
             };
             try {
-                const auto clock = sidecar::process_monotonic_clock_identity();
                 const auto& armed = request.armed;
-                if (!armed.valid() || !request.absolute_deadline.valid() ||
-                    !request.absolute_deadline.matches_clock(clock) ||
-                    !pending_transfer->source.valid() ||
-                    !config_.sidecar_launch ||
-                    !config_.sidecar_launch->valid() ||
-                    armed.arm.source.c_store_guid != config_.c_store_guid.bytes ||
-                    armed.arm.source.c_store_generation !=
-                        config_.sidecar_launch->store_generation ||
-                    armed.arm.source.c_control_generation !=
-                        config_.sidecar_launch->identity.generation ||
-                    armed.arm.source.c_control_attempt !=
-                        config_.sidecar_launch->identity.attempt ||
-                    armed.f_store_guid == config_.f_store_guid.bytes ||
-                    armed.f_store_guid == std::array<uint8_t, 16>{} ||
-                    armed.f_store_generation == 0 ||
-                    armed.selected_revision != CACHE_WIRE_REVISION_R2) {
-                    fail(kInvalid);
+                uint64_t checked_source_size = 0;
+                const uint16_t preflight_error = p51_source_preflight_error(
+                    request, pending_transfer->source.get(), config_,
+                    &checked_source_size);
+                if (preflight_error != 0) {
+                    fail(preflight_error);
                     return;
                 }
                 if (stop_requested_.load(std::memory_order_acquire) ||
-                    route_replacement_required_.load(std::memory_order_acquire) ||
-                    std::chrono::steady_clock::now() >= deadline) {
+                    route_replacement_required_.load(std::memory_order_acquire)) {
                     fail(kExpired);
                     return;
                 }
@@ -2949,32 +3086,12 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
                     profile = ProfileId::ZSTD_ROUTE;
                     break;
                 default:
-                    fail(kInvalid);
-                    return;
-                }
-                if (armed.selected_window == 0 ||
-                    armed.selected_window > 30 ||
-                    armed.arm.source.selected_f_cache_port == 0 ||
-                    armed.arm.source.selected_f_cache_port > UINT16_MAX ||
-                    armed.arm.source.selected_f_host.empty()) {
-                    fail(kInvalid);
-                    return;
-                }
-
-                const auto source_size = source_fd_size(
-                    pending_transfer->source.get(),
-                    config_.endpoint_caps.zstd.max_raw_bytes);
-                if (!source_size.has_value()) {
-                    fail(kSourceRead);
-                    return;
-                }
-                if (*source_size > config_.max_aggregate_source_raw_bytes) {
-                    fail(kSourceTooLarge);
+                    fail(1);
                     return;
                 }
                 asio::post(context_,
                     [this, pending_transfer, profile,
-                     raw_bytes = *source_size] {
+                     raw_bytes = checked_source_size] {
                         queue_p51_source_admission(
                             pending_transfer, profile, raw_bytes);
                     });
@@ -2982,13 +3099,13 @@ bool SidecarRuntime::enqueue_p51_source_transfer(
                 fail(kSourceRead);
             }
         });
-        return true;
+        return P51SourceEnqueueResult::Accepted;
     } catch (...) {
         if (pending_transfer)
             pending_transfer->release_slot();
         else
             p51_source_operation_count_.fetch_sub(1, std::memory_order_acq_rel);
-        return false;
+        return P51SourceEnqueueResult::Rejected;
     }
 }
 
@@ -6164,6 +6281,39 @@ void SidecarRuntime::advance_p51_transfer_reply(
         acknowledgement.payload.empty() &&
         local::validate_identity(acknowledgement, pump->identity) ==
             local::Status::Ok;
+    if (valid) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        // Deterministically hold one completed reply's capacity credit for
+        // the real-wrapper overload fixture. This is deliberately bounded,
+        // one-shot, and absent from production builds.
+        static std::atomic<bool> held_test_settlement{false};
+        const char* configured_delay =
+            ::getenv("ICECC_TEST_P51_HOLD_REPLY_SETTLEMENT_MS");
+        if (configured_delay != nullptr && !held_test_settlement.exchange(
+                true, std::memory_order_acq_rel)) {
+            char* end = nullptr;
+            errno = 0;
+            const long parsed = std::strtol(configured_delay, &end, 10);
+            if (errno == 0 && end != configured_delay && *end == '\0' &&
+                parsed > 0 && parsed <= 2000) {
+                const auto delay = std::chrono::milliseconds(parsed);
+                const auto now = std::chrono::steady_clock::now();
+                if (now < pump->deadline && now + delay < pump->deadline) {
+                    std::fprintf(stderr,
+                        "P51_CAPACITY_TEST_HOLD settlement_ms=%ld\n", parsed);
+                    std::fflush(stderr);
+                    pump->timer.expires_after(delay);
+                    pump->timer.async_wait(
+                        [this, pump](const boost::system::error_code& error) {
+                            if (!error)
+                                close_p51_transfer_reply(pump);
+                        });
+                    return;
+                }
+            }
+        }
+#endif
+    }
     (void)valid; // both success and a rejected ACK terminate this exact operation
     close_p51_transfer_reply(std::move(pump));
 }
@@ -6780,6 +6930,19 @@ int run(const Options& options) noexcept {
         return 2;
     }
     RuntimeConfig runtime_config;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Private end-to-end admission fixture only. Production builds do not
+    // compile this knob, so the shipping default remains the bounded 120.
+    if (const char* force_capacity =
+            ::getenv("ICECC_TEST_P51_FORCE_SOURCE_OP_CAP_ONE")) {
+        if (std::strcmp(force_capacity, "1") != 0) {
+            cleanup_listener(listener, effective_options.socket_path, identity,
+                             prebound);
+            return 2;
+        }
+        runtime_config.max_pending_p51_source_operations = 1;
+    }
+#endif
     const char* p29_fault = ::getenv("ICECC_P50_FAULT_INJECTION");
     if (!parse_p29_interner_fault_injection(
             p29_fault, runtime_config.p29_interner_fault_injection)) {

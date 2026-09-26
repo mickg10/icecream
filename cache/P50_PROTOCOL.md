@@ -78,6 +78,17 @@ not repeated in the raw descriptor reply. Ordinary traffic, changed request
 identity, malformed descriptor data or a non-clean boundary invalidates the
 exchange. End-to-end asynchronous daemon integration remains a separate gate.
 
+The existing local source-transfer result keeps its fixed wire layout. Error
+code `0x5004` (`CapacityBusy`) is a definite pre-admission refusal: the bounded
+source-operation limit, including reply settlement, is full; the request's
+source bytes have not been read or committed, and no route state is changed.
+The compiler wrapper may retry only this exact error with an empty commit witness,
+using the same F ARM/assignment and original absolute deadline. Each retry
+reacquires and validates the full C control/store identity; changed identity or
+any other/ambiguous result is terminal. The refusal reply itself is bounded by
+the earlier of the request deadline and a short reply budget. These semantics
+do not change the ordinary protocol or the result record shape.
+
 The R2 auxiliary-link transition uses one protocol-51 ordinary connection per
 physical link. C sends empty P51_CACHE_LINK_SESSION and waits for the same
 empty message as READY. F first checks local sidecar availability and the
