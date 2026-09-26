@@ -145,7 +145,7 @@ SHA256 `b51d497e5b65fc1fd4f1e2c4e0aac1685bc45be6e39c30cebeee3d41addfb26a`.
 The earlier `committed-full.runtime.log` is retained as a failed fixture
 attempt: it incorrectly tried to attach twice and expected a cancel-retirement
 after a rejected cancellation. Those expectations were corrected, not product
-cancellation semantics. Combined full-suite qualification remains pending.
+cancellation semantics. Combined full-suite qualification is recorded below.
 
 ### Cancellation after an observed partial frame
 
@@ -165,8 +165,17 @@ SHA256 `9d2c1a1b3cb8a2b79467c86fa1f902818e5b60c3d2c242eef74d157b243e6369`.
 Binary SHA256 before/after:
 `9d39cbc2dfc9915e630d250467ac46cdc7098e4e6f7f502d5fb6cf85232327f1`.
 The shared full-bundle path also gains the post-cancel probe. The combined
-partial/full/committed fixture required merge resolution; full registered
-qualification of that merged source is pending, not implied by donor passes.
+partial/full/committed fixture required merge resolution. A separate full
+registered run on exact merged snapshot `74ab9b11` passes (build exit 0,
+test-driver exit 0, `.trs` test/global PASS), including all nine cases for
+each partial/full/committed stage. Retained evidence directory:
+`/tanksmall/scratch/tmp/p51-d07-merged-74ab9b11-logs`;
+`p50cacheservice-registered-r2.log` SHA256
+`4659455488cc517a53972f821468babb95e3b10a47b5a49fb4df4505c1502034`.
+Binary SHA256:
+`98ca14ef3ef43cbc007d36da75e990ca55a4a1f3d3d4710b32d2675498b6c465`.
+This is the registered service suite, not latest whole-farm/P43 qualification
+or sanitizer coverage of these new cases.
 
 ### Source admission pressure
 
