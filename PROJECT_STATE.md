@@ -75,9 +75,26 @@ binary SHA256 `97570d969ae033667f220a1a82aa9ee5efed38b77feda01998b980fc606dbb10`
 An earlier fixed-count cleanup assertion failed because settlement closes
 fixture-owned descriptors; that failed diagnostic log remains retained.
 
+Commit `24ffd753` adds the real-wrapper capacity-expiry gate, passing separately
+for P29V1, ZSTD_TU and ZSTD_ROUTE. Hooks are compile-time test-only and armed
+after warmup. One exact assignment receives Busy, then waits for a deliberately
+withheld fresh control lease until its unchanged original deadline. It has
+one ARM, no terminal transfer result and no F input-attachment/compiler-start
+record through the post-release observation window. The ordinary wrapper may
+retry with a new assignment: the test verifies its distinct identity/deadline,
+one ARM and exact output, then a separate unrelated compile succeeds after
+capacity release. A failed assertion that required the whole invocation to
+fail was corrected; successful reassignment is not late success of the expired
+operation. Earlier failed setup/parser runs are not passing evidence.
+Logs in `/tanksmall/scratch/tmp/p51-capacity-deadline-build/`:
+
+- `expiry-p29-final2.log`: `421befa554a9daaf252c1354052bb3ba16cfd6b6fd88c99dad95cbd81375b57f`
+- `expiry-zstd_tu-final.log`: `9abe817e21abb6ac6a7a74bc2694b6b82674fb361855377876a983ee262b1953`
+- `expiry-zstd_route-final.log`: `2ef2a5e2d6a1ad569e6cd2bd4c3ef528ae60a524d65a4c26a78a4d4b0109a694`
+
 The registered service pass preceded the final default-off terminal-error
-hook; focused service and wrapper checks passed afterward. End-to-end
-retry expiry/no late publication, wrapper-level retry resource plateau, actual
+hook; focused service and wrapper checks passed afterward. Wrapper-level retry
+resource plateau, actual
 four-link W30/reply-settlement overlap and latest-candidate full QA remain open.
 
 ### Lost RECOVER response retry
