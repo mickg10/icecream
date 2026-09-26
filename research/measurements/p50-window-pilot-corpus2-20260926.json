@@ -1,0 +1,2178 @@
+{
+  "schema": "p50-transfer-window-pilot-v1",
+  "classification": "exploratory local loopback pilot; not a full §9.4 matrix or product acceptance",
+  "candidate_source": {
+    "commit": "74ab9b116f5242e0cd9938a5a9ebc1e8b8e51e42",
+    "working_tree_clean_at_build": true,
+    "benchmark_source_sha256": "b61c95f12bdedb441219d918a389df5d2692ddd165e428e8d27efeed90aed420"
+  },
+  "build": {
+    "sdk_image": "icecream-dev:sdk-ubuntu24.04-bad70dd1adb3",
+    "command": "make -C /work/build/client -j2 libp50zstdsender.a && make -C /work/build/cache -j2 libp50endpoint.a libp50adoptedoutcomewriter.a libprotocol50.a && make -C /work/build/services -j2 libicecc.la && make -C /work/build/unittests -j2 p50transferwindowbench",
+    "source_root": "/tanksmall/scratch/tmp/p51-d07-merged-74ab9b11",
+    "configured_build": "/tanksmall/scratch/tmp/p51-d07-full31-923924bb-build",
+    "dependency_closure_sha256": {
+      "client/libp50zstdsender.a": "4ce51d569767cdfb77855f5b18b3f866782e54203da5de51767604c0a9cfb83d",
+      "cache/libp50endpoint.a": "40d679b3697f43b550e17953edd3d93bf891e34d9357cb61f17bf7c36a447fb7",
+      "cache/libp50adoptedoutcomewriter.a": "3505fa840fc5a93a98072232cf4e180c3cf2110c9810a42d8ade1b4d4fe45933",
+      "cache/libprotocol50.a": "01ee23238955cad0f8983f3f448180cefa2595cabbe0f3258455454f6e904774",
+      "services/libicecc.la": "1ad2e4ae9e54903987bd90e225fecdff9b64479707a1e40fd55792fcaecdb555",
+      "services/.libs/libicecc.a": "190848c934bba60a12b39ca6191de1da1fdf1d055cd15e189171d5e6c09a265a"
+    },
+    "dynamic_link_dependencies_sha256": {
+      "/lib/x86_64-linux-gnu/liblzo2.so.2": "67a7624b45b4af0dd0d61122cfe16cf26353533a6b9d443179f6ec72093e0d48",
+      "/lib/x86_64-linux-gnu/libcap-ng.so.0": "25349c22956c7af94f46e728d7e4c1eba57d0e4a0517f72781fb495d541eeef3",
+      "/lib/x86_64-linux-gnu/libzstd.so.1": "0a2128bc10841fb29e76d08d945864dfb0b6a66da5df6df5d8299197439e54bb",
+      "/lib/x86_64-linux-gnu/libxxhash.so.0": "a43c43c2fbb643f42572577b6c2514905804f963d186d4d630e184c4015e68a7",
+      "/lib/x86_64-linux-gnu/libstdc++.so.6": "1fd75fe70354a416d75aef22bcae68c47bd25d20e2d0568c30b1a9838cf62f11",
+      "/lib/x86_64-linux-gnu/libgcc_s.so.1": "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb",
+      "/lib/x86_64-linux-gnu/libc.so.6": "3a15d66867d83762c7f2f1e37359cb8f6c5743edb369c65285cb0b1c4f7498bf",
+      "/lib/x86_64-linux-gnu/libm.so.6": "fce00b6f25f459cf4ae0b7fae4257909a1a8a86f9149e7c029a5d617baf1ccd0",
+      "/lib64/ld-linux-x86-64.so.2": "41daf7836f7fce21a40ca63a00c5caf21b05a35a76ccc075d86f1716212cdf01"
+    },
+    "compile_flags": {
+      "compiler": "g++",
+      "cppflags": "",
+      "cxxflags": "-g -Wall -Wextra -Wpointer-arith -Wcast-align -Wwrite-strings -Wundef -g -O2 -std=c++23 -DNDEBUG",
+      "target_cxxflags": "-pthread",
+      "boost_cppflags": "-DBOOST_ASIO_HAS_CO_AWAIT=1 -DBOOST_ASIO_HAS_STD_COROUTINE=1"
+    },
+    "binary_sha256": "0da57f88dc5406635518d3bd610224547404e624b299329bc009a7007e0acdba",
+    "limits": {
+      "cpu_quota": "200000 100000 (2 CPUs)",
+      "memory_bytes": 8589934592,
+      "memory_swap_bytes": 8589934592,
+      "uid_gid": "4103:3513"
+    }
+  },
+  "input": {
+    "project": "RocksDB-derived preprocessed C++ translation units",
+    "public_repository": "https://github.com/facebook/rocksdb",
+    "public_identity_verified": true,
+    "upstream_revision": null,
+    "build_command": null,
+    "provenance_note": "Quietbox2 corpus2 input-index paths identify CMakeFiles RocksDB test targets and .cc source paths; its README calls this first-50 RocksDB staging. Exact upstream source revision and preprocessing build command are not recorded; do not claim reproducible upstream version or representative project coverage.",
+    "source_stage": "quietbox2:/home/mickg10/farm-scratch/di-p29-amd-20260908-4Viyv9-TclcF5",
+    "full_source_manifest_sha256": "a39545c2b6814bc4c6aab3afde7d6ba8bfa3d4b8fb01fffba812f838a9b20823",
+    "source_index_sha256": "385c094045e8b266ab2a82c3391ddd94fa776d23667d64081b3071385f1801c4",
+    "study_readme_sha256": "a061bfbe29f23368965dd97865df942e3f8abeab2543d4b1ffde31e799ecc38d",
+    "subset_manifest_sha256": "41ba49e9ae7db047887abf9f9e0339da2d281eed778e119d63fe4d9f1fb51a68",
+    "entries": [
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/agg_merge_test.dir/utilities/agg_merge/agg_merge_test.cc.ii",
+        "bytes": 7069925,
+        "sha256": "445827e469f9dc8d44d41cae4906516a2e173a11e49e46e73d9b661194c57747"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/arena_test.dir/memory/arena_test.cc.ii",
+        "bytes": 4103275,
+        "sha256": "47576a7f4e6375aacfb12cccb8dc971744ac455ac6d6d738fc5add41f5abda5e"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/auto_roll_logger_test.dir/logging/auto_roll_logger_test.cc.ii",
+        "bytes": 7176133,
+        "sha256": "4d86842c788808ca2d1df8d60b710a4680d70267a2ec625eb24e7bdb575cfc66"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/autovector_test.dir/util/autovector_test.cc.ii",
+        "bytes": 6224340,
+        "sha256": "2e1436cd58b93b1c8402b1132a183d4f80af17b879b68bbc596d86051892dc5a"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/backup_engine_test.dir/utilities/backup/backup_engine_test.cc.ii",
+        "bytes": 8166516,
+        "sha256": "8255395cb6f9ffb33503dbfe4d62d471af1af4552bfc6ba21b97ad5bd8118af8"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_counting_iterator_test.dir/db/blob/blob_counting_iterator_test.cc.ii",
+        "bytes": 6348398,
+        "sha256": "e6f045f310e4172a406898a17006f43e95433134ea32ab965625ae9ce17908dc"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_db_test.dir/utilities/blob_db/blob_db_test.cc.ii",
+        "bytes": 7789896,
+        "sha256": "63da7c46c80328ae7cbedb1680af4629b52982cc1f097233bbea012be89b5665"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_file_addition_test.dir/db/blob/blob_file_addition_test.cc.ii",
+        "bytes": 3233616,
+        "sha256": "2a6776d2e71a3f0ed45bf269a418a92e8fd33ac3cc18b6b62ff3df4ce58908b7"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_file_builder_test.dir/db/blob/blob_file_builder_test.cc.ii",
+        "bytes": 5851842,
+        "sha256": "2bfe74abe5f42afe28be73ef3a1d3ca7a3efdbf092b67fc07d7c984ceb18847a"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_file_cache_test.dir/db/blob/blob_file_cache_test.cc.ii",
+        "bytes": 6238873,
+        "sha256": "2c0af537006f69694f9205516b36223dda93c3a80ecd655d8517aa25f2349207"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_file_garbage_test.dir/db/blob/blob_file_garbage_test.cc.ii",
+        "bytes": 3218884,
+        "sha256": "6aa01fee656426a6798305e83d590afe0f97e36c60f0c4cc37bc2a924e2eeb3b"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_file_reader_test.dir/db/blob/blob_file_reader_test.cc.ii",
+        "bytes": 6381050,
+        "sha256": "2ef6e13e2c8e5d6fbdb7beb876d8a05dea047a53978c16921427cfbb70390c24"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_garbage_meter_test.dir/db/blob/blob_garbage_meter_test.cc.ii",
+        "bytes": 5611209,
+        "sha256": "6a25294cf090474014fbfb200fbfe914de70714216bc69b097abbd526744438a"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/blob_source_test.dir/db/blob/blob_source_test.cc.ii",
+        "bytes": 7574081,
+        "sha256": "dded96a14a32ae2aedd97a44dcc68926f6056a5659b5ec74eb8331cd87d0bd65"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/block_based_table_reader_test.dir/table/block_based/block_based_table_reader_test.cc.ii",
+        "bytes": 7652092,
+        "sha256": "4d9fb52411a418a95dfa96ef1e5624f003ab813549264b59827c78abf030e37a"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/block_cache_trace_analyzer.dir/tools/block_cache_analyzer/block_cache_trace_analyzer_tool.cc.ii",
+        "bytes": 24011,
+        "sha256": "b10c5dbb206742b9118a3948f72faf1701d77fa09dd35bd904372f4f407f3688"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/block_cache_trace_analyzer_test.dir/tools/block_cache_analyzer/block_cache_trace_analyzer_test.cc.ii",
+        "bytes": 24039,
+        "sha256": "630d7a63a742fad4b233ac9a3378394e5c1d522c8c893011090db5b2f536260a"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/block_cache_tracer_test.dir/trace_replay/block_cache_tracer_test.cc.ii",
+        "bytes": 6349276,
+        "sha256": "32bd9c7f012e842fa2c28d0a3b5cfb287f7c689237f67dc24e4fd296fcf340d5"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/block_fetcher_test.dir/table/block_fetcher_test.cc.ii",
+        "bytes": 6803954,
+        "sha256": "ba1ef093bf27a6244cf3d1fc03182dfc32b5db7c980fb0e9341bfd79d6f45656"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/block_test.dir/table/block_based/block_test.cc.ii",
+        "bytes": 7471485,
+        "sha256": "1c5c3319afa0147d8c75bc4087a2116693d34066853f3b1b946248943d997884"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/bloom_test.dir/util/bloom_test.cc.ii",
+        "bytes": 23828,
+        "sha256": "26fe9a90ed1743f8015883fd412f8ade91c2c5dfc0bf77cf8685b2e86d9f875e"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cache_reservation_manager_test.dir/cache/cache_reservation_manager_test.cc.ii",
+        "bytes": 3789287,
+        "sha256": "a4ffbb10a2e97d679da269d96b20706d63ffe484c7e14b8e9dcbde3345c5d048"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cache_simulator_test.dir/utilities/simulator_cache/cache_simulator_test.cc.ii",
+        "bytes": 6342375,
+        "sha256": "0b60f8bbadc874d268f534d1cb620624db32fb4a6435e1190411016681179b53"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cache_test.dir/cache/cache_test.cc.ii",
+        "bytes": 6258057,
+        "sha256": "bf2a3d2ad19d1bbe1635b15ef54e03460ef16bdccc8df18979c67360d4bf4549"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cassandra_format_test.dir/utilities/cassandra/cassandra_format_test.cc.ii",
+        "bytes": 3474858,
+        "sha256": "f15683bff9e6bbc94adda8dc0e6445e46ac81c7a4832fe6af9fc9e50fca9af57"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cassandra_functional_test.dir/utilities/cassandra/cassandra_functional_test.cc.ii",
+        "bytes": 7039799,
+        "sha256": "de431929a087274af9afbc00ff1c9b660f641c79bdbb9380f83deb9a910993a4"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cassandra_row_merge_test.dir/utilities/cassandra/cassandra_row_merge_test.cc.ii",
+        "bytes": 3303754,
+        "sha256": "feeac74a653a4c615ed45efa27e7862d65339374d8d09e34cc07eecb33936ca9"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cassandra_serialize_test.dir/utilities/cassandra/cassandra_serialize_test.cc.ii",
+        "bytes": 3072809,
+        "sha256": "357c9a8e15dc2a1f82b2d1fc30e76f763d519803bc22c3bb500414d4ffc2527e"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/checkpoint_test.dir/utilities/checkpoint/checkpoint_test.cc.ii",
+        "bytes": 7792239,
+        "sha256": "0cfe0b7245b99d75c362addf5fef3d68e307a0a7263e193b5b88157d8d63b62a"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/cleanable_test.dir/table/cleanable_test.cc.ii",
+        "bytes": 6254866,
+        "sha256": "893be73902740d25071cb5a4070071f574682e664a6e8381b388349629ffdfc4"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/clipping_iterator_test.dir/db/compaction/clipping_iterator_test.cc.ii",
+        "bytes": 6287332,
+        "sha256": "351107d9a29f7c5cae559eff20f189d2be9ac8aac328b2229974340e31811669"
+      },
+      {
+        "original_path": "/tanksmall/scratch/ictmp/corpus2/CMakeFiles/coding_test.dir/util/coding_test.cc.ii",
+        "bytes": 4536210,
+        "sha256": "afa3fc1b586f9ae3310700a873f8826b1d142e0da0a6320f1f69d210bb82197b"
+      }
+    ],
+    "count": 32,
+    "raw_bytes": 171488309,
+    "raw_mib": 163.54,
+    "ordered_by": "first32 entries of corpus2.manifest"
+  },
+  "execution": {
+    "profile": "P29V1",
+    "profile_index": 1,
+    "repetitions": 3,
+    "protocols": [
+      "R1",
+      "R2"
+    ],
+    "matrix": [
+      {
+        "protocol": "R1",
+        "window": 1
+      },
+      {
+        "protocol": "R2",
+        "window": 1
+      },
+      {
+        "protocol": "R2",
+        "window": 2
+      },
+      {
+        "protocol": "R2",
+        "window": 4
+      },
+      {
+        "protocol": "R2",
+        "window": 8
+      },
+      {
+        "protocol": "R2",
+        "window": 16
+      },
+      {
+        "protocol": "R2",
+        "window": 30
+      }
+    ],
+    "order": "rep1 ascending cells; rep2 reverse cell order; rep3 ascending cells",
+    "run_start_utc": "2026-09-26T15:39:36Z",
+    "run_finish_utc": "2026-09-26T15:40:05Z",
+    "overall_exit": 0,
+    "cases": [
+      {
+        "run_id": "rep1-R1-w1",
+        "repetition": 1,
+        "protocol": "R1",
+        "requested_window": 1,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R1",
+          "window": 1,
+          "jobs_per_pass": 32,
+          "raw_bytes": 342976618,
+          "cachewire_bytes_measured": 1,
+          "cachewire_c_to_f_bytes": 1595058,
+          "cachewire_f_to_c_bytes": 112388,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_cachewire_c_to_f_bytes": 1587542,
+          "retained_pass_cachewire_c_to_f_bytes": 7516,
+          "fresh_pass_cachewire_f_to_c_bytes": 103812,
+          "retained_pass_cachewire_f_to_c_bytes": 8576,
+          "fresh_pass_ms": 890,
+          "retained_pass_ms": 352,
+          "fresh_latency_p50_us": 17846,
+          "fresh_latency_p95_us": 39366,
+          "fresh_latency_p99_us": 327552,
+          "retained_latency_p50_us": 11784,
+          "retained_latency_p95_us": 16643,
+          "retained_latency_p99_us": 17905,
+          "tcp_connections": 64,
+          "elapsed_ms": 1243,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.85,
+          "system_cpu_seconds": 0.73,
+          "cpu_percent": 98,
+          "wall_seconds": 1,
+          "max_rss_kib": 816280,
+          "major_page_faults": 594,
+          "minor_page_faults": 205079,
+          "voluntary_context_switches": 721,
+          "involuntary_context_switches": 255
+        },
+        "log_path": "logs/runs/rep1-R1-w1.log",
+        "time_path": "logs/runs/rep1-R1-w1.time"
+      },
+      {
+        "run_id": "rep1-R2-w1",
+        "repetition": 1,
+        "protocol": "R2",
+        "requested_window": 1,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 1,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 3001,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1605199,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1605199,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 1,
+          "fresh_peak_outstanding": 1,
+          "retained_peak_outstanding": 1,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 571267,
+          "fresh_latency_p95_us": 806108,
+          "fresh_latency_p99_us": 821675,
+          "retained_latency_p50_us": 250646,
+          "retained_latency_p95_us": 442926,
+          "retained_latency_p99_us": 453364,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 66,
+          "fresh_pass_ms": 822,
+          "retained_pass_ms": 453,
+          "elapsed_ms": 1275,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.96,
+          "system_cpu_seconds": 0.58,
+          "cpu_percent": 101,
+          "wall_seconds": 1,
+          "max_rss_kib": 810348,
+          "major_page_faults": 80,
+          "minor_page_faults": 201966,
+          "voluntary_context_switches": 374,
+          "involuntary_context_switches": 191
+        },
+        "log_path": "logs/runs/rep1-R2-w1.log",
+        "time_path": "logs/runs/rep1-R2-w1.time"
+      },
+      {
+        "run_id": "rep1-R2-w16",
+        "repetition": 1,
+        "protocol": "R2",
+        "requested_window": 16,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 16,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2385,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604583,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604583,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 6,
+          "fresh_peak_outstanding": 4,
+          "retained_peak_outstanding": 6,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 438949,
+          "fresh_latency_p95_us": 535911,
+          "fresh_latency_p99_us": 543836,
+          "retained_latency_p50_us": 130445,
+          "retained_latency_p95_us": 205186,
+          "retained_latency_p99_us": 210397,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 52,
+          "fresh_pass_ms": 544,
+          "retained_pass_ms": 210,
+          "elapsed_ms": 754,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.75,
+          "system_cpu_seconds": 0.66,
+          "cpu_percent": 140,
+          "wall_seconds": 1,
+          "max_rss_kib": 850340,
+          "major_page_faults": 0,
+          "minor_page_faults": 222594,
+          "voluntary_context_switches": 430,
+          "involuntary_context_switches": 330
+        },
+        "log_path": "logs/runs/rep1-R2-w16.log",
+        "time_path": "logs/runs/rep1-R2-w16.time"
+      },
+      {
+        "run_id": "rep1-R2-w2",
+        "repetition": 1,
+        "protocol": "R2",
+        "requested_window": 2,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 2,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1599132,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 3001,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1602133,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1602133,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 2,
+          "fresh_peak_outstanding": 2,
+          "retained_peak_outstanding": 2,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1588032,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 465310,
+          "fresh_latency_p95_us": 646157,
+          "fresh_latency_p99_us": 661376,
+          "retained_latency_p50_us": 161770,
+          "retained_latency_p95_us": 295722,
+          "retained_latency_p99_us": 312026,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 66,
+          "fresh_pass_ms": 661,
+          "retained_pass_ms": 312,
+          "elapsed_ms": 973,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.8,
+          "system_cpu_seconds": 0.72,
+          "cpu_percent": 122,
+          "wall_seconds": 1,
+          "max_rss_kib": 823772,
+          "major_page_faults": 0,
+          "minor_page_faults": 215642,
+          "voluntary_context_switches": 432,
+          "involuntary_context_switches": 311
+        },
+        "log_path": "logs/runs/rep1-R2-w2.log",
+        "time_path": "logs/runs/rep1-R2-w2.time"
+      },
+      {
+        "run_id": "rep1-R2-w30",
+        "repetition": 1,
+        "protocol": "R2",
+        "requested_window": 30,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 30,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2517,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604715,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604715,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 13,
+          "fresh_peak_outstanding": 5,
+          "retained_peak_outstanding": 13,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 458917,
+          "fresh_latency_p95_us": 580964,
+          "fresh_latency_p99_us": 587654,
+          "retained_latency_p50_us": 163052,
+          "retained_latency_p95_us": 298799,
+          "retained_latency_p99_us": 313311,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 55,
+          "fresh_pass_ms": 587,
+          "retained_pass_ms": 313,
+          "elapsed_ms": 901,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.86,
+          "system_cpu_seconds": 0.69,
+          "cpu_percent": 137,
+          "wall_seconds": 1,
+          "max_rss_kib": 873000,
+          "major_page_faults": 0,
+          "minor_page_faults": 229742,
+          "voluntary_context_switches": 461,
+          "involuntary_context_switches": 446
+        },
+        "log_path": "logs/runs/rep1-R2-w30.log",
+        "time_path": "logs/runs/rep1-R2-w30.time"
+      },
+      {
+        "run_id": "rep1-R2-w4",
+        "repetition": 1,
+        "protocol": "R2",
+        "requested_window": 4,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 4,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2737,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604935,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604935,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 4,
+          "fresh_peak_outstanding": 4,
+          "retained_peak_outstanding": 4,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 515233,
+          "fresh_latency_p95_us": 655731,
+          "fresh_latency_p99_us": 667867,
+          "retained_latency_p50_us": 205516,
+          "retained_latency_p95_us": 335990,
+          "retained_latency_p99_us": 348272,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 60,
+          "fresh_pass_ms": 668,
+          "retained_pass_ms": 348,
+          "elapsed_ms": 1016,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.94,
+          "system_cpu_seconds": 0.74,
+          "cpu_percent": 135,
+          "wall_seconds": 1,
+          "max_rss_kib": 834284,
+          "major_page_faults": 0,
+          "minor_page_faults": 216328,
+          "voluntary_context_switches": 461,
+          "involuntary_context_switches": 510
+        },
+        "log_path": "logs/runs/rep1-R2-w4.log",
+        "time_path": "logs/runs/rep1-R2-w4.time"
+      },
+      {
+        "run_id": "rep1-R2-w8",
+        "repetition": 1,
+        "protocol": "R2",
+        "requested_window": 8,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 8,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2825,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1605023,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1605023,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 8,
+          "fresh_peak_outstanding": 8,
+          "retained_peak_outstanding": 8,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 540805,
+          "fresh_latency_p95_us": 700228,
+          "fresh_latency_p99_us": 709649,
+          "retained_latency_p50_us": 197895,
+          "retained_latency_p95_us": 331487,
+          "retained_latency_p99_us": 342405,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 62,
+          "fresh_pass_ms": 710,
+          "retained_pass_ms": 342,
+          "elapsed_ms": 1052,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.91,
+          "system_cpu_seconds": 0.81,
+          "cpu_percent": 134,
+          "wall_seconds": 1,
+          "max_rss_kib": 838524,
+          "major_page_faults": 0,
+          "minor_page_faults": 224579,
+          "voluntary_context_switches": 527,
+          "involuntary_context_switches": 263
+        },
+        "log_path": "logs/runs/rep1-R2-w8.log",
+        "time_path": "logs/runs/rep1-R2-w8.time"
+      },
+      {
+        "run_id": "rep2-R1-w1",
+        "repetition": 2,
+        "protocol": "R1",
+        "requested_window": 1,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R1",
+          "window": 1,
+          "jobs_per_pass": 32,
+          "raw_bytes": 342976618,
+          "cachewire_bytes_measured": 1,
+          "cachewire_c_to_f_bytes": 1595058,
+          "cachewire_f_to_c_bytes": 112388,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_cachewire_c_to_f_bytes": 1587542,
+          "retained_pass_cachewire_c_to_f_bytes": 7516,
+          "fresh_pass_cachewire_f_to_c_bytes": 103812,
+          "retained_pass_cachewire_f_to_c_bytes": 8576,
+          "fresh_pass_ms": 911,
+          "retained_pass_ms": 503,
+          "fresh_latency_p50_us": 19479,
+          "fresh_latency_p95_us": 37236,
+          "fresh_latency_p99_us": 331741,
+          "retained_latency_p50_us": 17679,
+          "retained_latency_p95_us": 23875,
+          "retained_latency_p99_us": 26459,
+          "tcp_connections": 64,
+          "elapsed_ms": 1415,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 1.06,
+          "system_cpu_seconds": 0.59,
+          "cpu_percent": 98,
+          "wall_seconds": 1,
+          "max_rss_kib": 815532,
+          "major_page_faults": 0,
+          "minor_page_faults": 205190,
+          "voluntary_context_switches": 613,
+          "involuntary_context_switches": 639
+        },
+        "log_path": "logs/runs/rep2-R1-w1.log",
+        "time_path": "logs/runs/rep2-R1-w1.time"
+      },
+      {
+        "run_id": "rep2-R2-w1",
+        "repetition": 2,
+        "protocol": "R2",
+        "requested_window": 1,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 1,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 3001,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1605199,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1605199,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 1,
+          "fresh_peak_outstanding": 1,
+          "retained_peak_outstanding": 1,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 688741,
+          "fresh_latency_p95_us": 960540,
+          "fresh_latency_p99_us": 978040,
+          "retained_latency_p50_us": 273694,
+          "retained_latency_p95_us": 454423,
+          "retained_latency_p99_us": 471165,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 66,
+          "fresh_pass_ms": 978,
+          "retained_pass_ms": 471,
+          "elapsed_ms": 1449,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 1.02,
+          "system_cpu_seconds": 0.66,
+          "cpu_percent": 101,
+          "wall_seconds": 1,
+          "max_rss_kib": 810532,
+          "major_page_faults": 0,
+          "minor_page_faults": 201978,
+          "voluntary_context_switches": 381,
+          "involuntary_context_switches": 226
+        },
+        "log_path": "logs/runs/rep2-R2-w1.log",
+        "time_path": "logs/runs/rep2-R2-w1.time"
+      },
+      {
+        "run_id": "rep2-R2-w16",
+        "repetition": 2,
+        "protocol": "R2",
+        "requested_window": 16,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 16,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2737,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604935,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604935,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 15,
+          "fresh_peak_outstanding": 9,
+          "retained_peak_outstanding": 15,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 481179,
+          "fresh_latency_p95_us": 602826,
+          "fresh_latency_p99_us": 608711,
+          "retained_latency_p50_us": 153098,
+          "retained_latency_p95_us": 258487,
+          "retained_latency_p99_us": 266216,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 60,
+          "fresh_pass_ms": 609,
+          "retained_pass_ms": 266,
+          "elapsed_ms": 875,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.86,
+          "system_cpu_seconds": 0.66,
+          "cpu_percent": 133,
+          "wall_seconds": 1,
+          "max_rss_kib": 888264,
+          "major_page_faults": 0,
+          "minor_page_faults": 227770,
+          "voluntary_context_switches": 483,
+          "involuntary_context_switches": 195
+        },
+        "log_path": "logs/runs/rep2-R2-w16.log",
+        "time_path": "logs/runs/rep2-R2-w16.time"
+      },
+      {
+        "run_id": "rep2-R2-w2",
+        "repetition": 2,
+        "protocol": "R2",
+        "requested_window": 2,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 2,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 3001,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1605199,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1605199,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 2,
+          "fresh_peak_outstanding": 2,
+          "retained_peak_outstanding": 2,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 536503,
+          "fresh_latency_p95_us": 699291,
+          "fresh_latency_p99_us": 706321,
+          "retained_latency_p50_us": 154408,
+          "retained_latency_p95_us": 256825,
+          "retained_latency_p99_us": 264648,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 66,
+          "fresh_pass_ms": 706,
+          "retained_pass_ms": 264,
+          "elapsed_ms": 971,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.83,
+          "system_cpu_seconds": 0.69,
+          "cpu_percent": 126,
+          "wall_seconds": 1,
+          "max_rss_kib": 823128,
+          "major_page_faults": 0,
+          "minor_page_faults": 210764,
+          "voluntary_context_switches": 389,
+          "involuntary_context_switches": 271
+        },
+        "log_path": "logs/runs/rep2-R2-w2.log",
+        "time_path": "logs/runs/rep2-R2-w2.time"
+      },
+      {
+        "run_id": "rep2-R2-w30",
+        "repetition": 2,
+        "protocol": "R2",
+        "requested_window": 30,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 30,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2605,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604803,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604803,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 10,
+          "fresh_peak_outstanding": 9,
+          "retained_peak_outstanding": 10,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 522182,
+          "fresh_latency_p95_us": 636564,
+          "fresh_latency_p99_us": 642468,
+          "retained_latency_p50_us": 135456,
+          "retained_latency_p95_us": 226605,
+          "retained_latency_p99_us": 241891,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 57,
+          "fresh_pass_ms": 642,
+          "retained_pass_ms": 242,
+          "elapsed_ms": 885,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.86,
+          "system_cpu_seconds": 0.66,
+          "cpu_percent": 136,
+          "wall_seconds": 1,
+          "max_rss_kib": 865004,
+          "major_page_faults": 0,
+          "minor_page_faults": 221982,
+          "voluntary_context_switches": 445,
+          "involuntary_context_switches": 514
+        },
+        "log_path": "logs/runs/rep2-R2-w30.log",
+        "time_path": "logs/runs/rep2-R2-w30.time"
+      },
+      {
+        "run_id": "rep2-R2-w4",
+        "repetition": 2,
+        "protocol": "R2",
+        "requested_window": 4,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 4,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2737,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604935,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604935,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 4,
+          "fresh_peak_outstanding": 4,
+          "retained_peak_outstanding": 4,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 450615,
+          "fresh_latency_p95_us": 575883,
+          "fresh_latency_p99_us": 582616,
+          "retained_latency_p50_us": 185523,
+          "retained_latency_p95_us": 281353,
+          "retained_latency_p99_us": 286738,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 60,
+          "fresh_pass_ms": 582,
+          "retained_pass_ms": 286,
+          "elapsed_ms": 869,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.89,
+          "system_cpu_seconds": 0.64,
+          "cpu_percent": 135,
+          "wall_seconds": 1,
+          "max_rss_kib": 831828,
+          "major_page_faults": 0,
+          "minor_page_faults": 223791,
+          "voluntary_context_switches": 453,
+          "involuntary_context_switches": 244
+        },
+        "log_path": "logs/runs/rep2-R2-w4.log",
+        "time_path": "logs/runs/rep2-R2-w4.time"
+      },
+      {
+        "run_id": "rep2-R2-w8",
+        "repetition": 2,
+        "protocol": "R2",
+        "requested_window": 8,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 8,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2253,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604451,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604451,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 5,
+          "fresh_peak_outstanding": 5,
+          "retained_peak_outstanding": 5,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 423211,
+          "fresh_latency_p95_us": 521458,
+          "fresh_latency_p99_us": 526179,
+          "retained_latency_p50_us": 133957,
+          "retained_latency_p95_us": 203281,
+          "retained_latency_p99_us": 208495,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 49,
+          "fresh_pass_ms": 526,
+          "retained_pass_ms": 208,
+          "elapsed_ms": 735,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.77,
+          "system_cpu_seconds": 0.61,
+          "cpu_percent": 140,
+          "wall_seconds": 0,
+          "max_rss_kib": 825988,
+          "major_page_faults": 0,
+          "minor_page_faults": 232072,
+          "voluntary_context_switches": 460,
+          "involuntary_context_switches": 270
+        },
+        "log_path": "logs/runs/rep2-R2-w8.log",
+        "time_path": "logs/runs/rep2-R2-w8.time"
+      },
+      {
+        "run_id": "rep3-R1-w1",
+        "repetition": 3,
+        "protocol": "R1",
+        "requested_window": 1,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R1",
+          "window": 1,
+          "jobs_per_pass": 32,
+          "raw_bytes": 342976618,
+          "cachewire_bytes_measured": 1,
+          "cachewire_c_to_f_bytes": 1595058,
+          "cachewire_f_to_c_bytes": 112388,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_cachewire_c_to_f_bytes": 1587542,
+          "retained_pass_cachewire_c_to_f_bytes": 7516,
+          "fresh_pass_cachewire_f_to_c_bytes": 103812,
+          "retained_pass_cachewire_f_to_c_bytes": 8576,
+          "fresh_pass_ms": 923,
+          "retained_pass_ms": 492,
+          "fresh_latency_p50_us": 17281,
+          "fresh_latency_p95_us": 44127,
+          "fresh_latency_p99_us": 323971,
+          "retained_latency_p50_us": 16948,
+          "retained_latency_p95_us": 26917,
+          "retained_latency_p99_us": 28122,
+          "tcp_connections": 64,
+          "elapsed_ms": 1416,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.98,
+          "system_cpu_seconds": 0.68,
+          "cpu_percent": 99,
+          "wall_seconds": 1,
+          "max_rss_kib": 815532,
+          "major_page_faults": 0,
+          "minor_page_faults": 205190,
+          "voluntary_context_switches": 643,
+          "involuntary_context_switches": 150
+        },
+        "log_path": "logs/runs/rep3-R1-w1.log",
+        "time_path": "logs/runs/rep3-R1-w1.time"
+      },
+      {
+        "run_id": "rep3-R2-w1",
+        "repetition": 3,
+        "protocol": "R2",
+        "requested_window": 1,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 1,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 3001,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1605199,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1605199,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 1,
+          "fresh_peak_outstanding": 1,
+          "retained_peak_outstanding": 1,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 688570,
+          "fresh_latency_p95_us": 959950,
+          "fresh_latency_p99_us": 979628,
+          "retained_latency_p50_us": 232771,
+          "retained_latency_p95_us": 369790,
+          "retained_latency_p99_us": 379477,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 66,
+          "fresh_pass_ms": 979,
+          "retained_pass_ms": 379,
+          "elapsed_ms": 1359,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.97,
+          "system_cpu_seconds": 0.61,
+          "cpu_percent": 99,
+          "wall_seconds": 1,
+          "max_rss_kib": 810532,
+          "major_page_faults": 0,
+          "minor_page_faults": 201978,
+          "voluntary_context_switches": 406,
+          "involuntary_context_switches": 567
+        },
+        "log_path": "logs/runs/rep3-R2-w1.log",
+        "time_path": "logs/runs/rep3-R2-w1.time"
+      },
+      {
+        "run_id": "rep3-R2-w16",
+        "repetition": 3,
+        "protocol": "R2",
+        "requested_window": 16,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 16,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2605,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604803,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604803,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 13,
+          "fresh_peak_outstanding": 5,
+          "retained_peak_outstanding": 13,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 495903,
+          "fresh_latency_p95_us": 610603,
+          "fresh_latency_p99_us": 615532,
+          "retained_latency_p50_us": 173902,
+          "retained_latency_p95_us": 271699,
+          "retained_latency_p99_us": 278166,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 57,
+          "fresh_pass_ms": 615,
+          "retained_pass_ms": 278,
+          "elapsed_ms": 894,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.91,
+          "system_cpu_seconds": 0.78,
+          "cpu_percent": 134,
+          "wall_seconds": 1,
+          "max_rss_kib": 852996,
+          "major_page_faults": 0,
+          "minor_page_faults": 229502,
+          "voluntary_context_switches": 533,
+          "involuntary_context_switches": 859
+        },
+        "log_path": "logs/runs/rep3-R2-w16.log",
+        "time_path": "logs/runs/rep3-R2-w16.time"
+      },
+      {
+        "run_id": "rep3-R2-w2",
+        "repetition": 3,
+        "protocol": "R2",
+        "requested_window": 2,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 2,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 3001,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1605199,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1605199,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 2,
+          "fresh_peak_outstanding": 2,
+          "retained_peak_outstanding": 2,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 505093,
+          "fresh_latency_p95_us": 655739,
+          "fresh_latency_p99_us": 666652,
+          "retained_latency_p50_us": 160912,
+          "retained_latency_p95_us": 288600,
+          "retained_latency_p99_us": 294669,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 66,
+          "fresh_pass_ms": 666,
+          "retained_pass_ms": 294,
+          "elapsed_ms": 961,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.89,
+          "system_cpu_seconds": 0.7,
+          "cpu_percent": 123,
+          "wall_seconds": 1,
+          "max_rss_kib": 815512,
+          "major_page_faults": 0,
+          "minor_page_faults": 220326,
+          "voluntary_context_switches": 414,
+          "involuntary_context_switches": 325
+        },
+        "log_path": "logs/runs/rep3-R2-w2.log",
+        "time_path": "logs/runs/rep3-R2-w2.time"
+      },
+      {
+        "run_id": "rep3-R2-w30",
+        "repetition": 3,
+        "protocol": "R2",
+        "requested_window": 30,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 30,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2561,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604759,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604759,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 9,
+          "fresh_peak_outstanding": 9,
+          "retained_peak_outstanding": 8,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 488334,
+          "fresh_latency_p95_us": 605497,
+          "fresh_latency_p99_us": 616256,
+          "retained_latency_p50_us": 153722,
+          "retained_latency_p95_us": 239701,
+          "retained_latency_p99_us": 249528,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 56,
+          "fresh_pass_ms": 616,
+          "retained_pass_ms": 249,
+          "elapsed_ms": 866,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.83,
+          "system_cpu_seconds": 0.76,
+          "cpu_percent": 135,
+          "wall_seconds": 1,
+          "max_rss_kib": 862660,
+          "major_page_faults": 0,
+          "minor_page_faults": 225743,
+          "voluntary_context_switches": 507,
+          "involuntary_context_switches": 312
+        },
+        "log_path": "logs/runs/rep3-R2-w30.log",
+        "time_path": "logs/runs/rep3-R2-w30.time"
+      },
+      {
+        "run_id": "rep3-R2-w4",
+        "repetition": 3,
+        "protocol": "R2",
+        "requested_window": 4,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 4,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2605,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604803,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604803,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 4,
+          "fresh_peak_outstanding": 4,
+          "retained_peak_outstanding": 4,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 486059,
+          "fresh_latency_p95_us": 596034,
+          "fresh_latency_p99_us": 602070,
+          "retained_latency_p50_us": 185088,
+          "retained_latency_p95_us": 306032,
+          "retained_latency_p99_us": 318557,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 57,
+          "fresh_pass_ms": 602,
+          "retained_pass_ms": 318,
+          "elapsed_ms": 921,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.9,
+          "system_cpu_seconds": 0.76,
+          "cpu_percent": 132,
+          "wall_seconds": 1,
+          "max_rss_kib": 833680,
+          "major_page_faults": 0,
+          "minor_page_faults": 222263,
+          "voluntary_context_switches": 535,
+          "involuntary_context_switches": 519
+        },
+        "log_path": "logs/runs/rep3-R2-w4.log",
+        "time_path": "logs/runs/rep3-R2-w4.time"
+      },
+      {
+        "run_id": "rep3-R2-w8",
+        "repetition": 3,
+        "protocol": "R2",
+        "requested_window": 8,
+        "exit_code": 0,
+        "measurements": {
+          "profile": 1,
+          "protocol": "R2",
+          "window": 8,
+          "jobs_per_pass": 32,
+          "passes": 2,
+          "raw_bytes": 342976618,
+          "job_cachewire_c_to_f_bytes": 1602198,
+          "job_cachewire_f_to_c_bytes": 7424,
+          "shared_control_cachewire_c_to_f_bytes": 2649,
+          "shared_control_cachewire_f_to_c_bytes": 216,
+          "total_cachewire_c_to_f_bytes": 1604847,
+          "total_cachewire_f_to_c_bytes": 7640,
+          "F_socket_c_to_f_bytes": 1604847,
+          "F_socket_f_to_c_bytes": 7640,
+          "observed_peak_outstanding": 8,
+          "fresh_peak_outstanding": 8,
+          "retained_peak_outstanding": 8,
+          "fresh_pass_raw_bytes": 171488309,
+          "retained_pass_raw_bytes": 171488309,
+          "fresh_pass_job_cachewire_c_to_f_bytes": 1591098,
+          "retained_pass_job_cachewire_c_to_f_bytes": 11100,
+          "fresh_pass_job_cachewire_f_to_c_bytes": 3712,
+          "retained_pass_job_cachewire_f_to_c_bytes": 3712,
+          "fresh_latency_p50_us": 523569,
+          "fresh_latency_p95_us": 652795,
+          "fresh_latency_p99_us": 663826,
+          "retained_latency_p50_us": 153740,
+          "retained_latency_p95_us": 252475,
+          "retained_latency_p99_us": 261855,
+          "tcp_connections": 1,
+          "delayed_finalizer_batches": 0,
+          "control_intervals": 58,
+          "fresh_pass_ms": 664,
+          "retained_pass_ms": 262,
+          "elapsed_ms": 926,
+          "raw_decoded_bytes_verified": 342976618
+        },
+        "process": {
+          "user_cpu_seconds": 0.94,
+          "system_cpu_seconds": 0.79,
+          "cpu_percent": 133,
+          "wall_seconds": 1,
+          "max_rss_kib": 858640,
+          "major_page_faults": 0,
+          "minor_page_faults": 223371,
+          "voluntary_context_switches": 492,
+          "involuntary_context_switches": 121
+        },
+        "log_path": "logs/runs/rep3-R2-w8.log",
+        "time_path": "logs/runs/rep3-R2-w8.time"
+      }
+    ],
+    "cell_summary": [
+      {
+        "protocol": "R1",
+        "requested_window": 1,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 911,
+            "min": 890,
+            "max": 923
+          },
+          "retained_pass_ms": {
+            "median": 492,
+            "min": 352,
+            "max": 503
+          },
+          "elapsed_ms": {
+            "median": 1415,
+            "min": 1243,
+            "max": 1416
+          },
+          "fresh_latency_p50_us": {
+            "median": 17846,
+            "min": 17281,
+            "max": 19479
+          },
+          "fresh_latency_p95_us": {
+            "median": 39366,
+            "min": 37236,
+            "max": 44127
+          },
+          "fresh_latency_p99_us": {
+            "median": 327552,
+            "min": 323971,
+            "max": 331741
+          },
+          "retained_latency_p50_us": {
+            "median": 16948,
+            "min": 11784,
+            "max": 17679
+          },
+          "retained_latency_p95_us": {
+            "median": 23875,
+            "min": 16643,
+            "max": 26917
+          },
+          "retained_latency_p99_us": {
+            "median": 26459,
+            "min": 17905,
+            "max": 28122
+          },
+          "cachewire_c_to_f_bytes": {
+            "median": 1595058,
+            "min": 1595058,
+            "max": 1595058
+          },
+          "cachewire_f_to_c_bytes": {
+            "median": 112388,
+            "min": 112388,
+            "max": 112388
+          },
+          "tcp_connections": {
+            "median": 64,
+            "min": 64,
+            "max": 64
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 815532,
+            "min": 815532,
+            "max": 816280
+          }
+        }
+      },
+      {
+        "protocol": "R2",
+        "requested_window": 1,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 978,
+            "min": 822,
+            "max": 979
+          },
+          "retained_pass_ms": {
+            "median": 453,
+            "min": 379,
+            "max": 471
+          },
+          "elapsed_ms": {
+            "median": 1359,
+            "min": 1275,
+            "max": 1449
+          },
+          "fresh_latency_p50_us": {
+            "median": 688570,
+            "min": 571267,
+            "max": 688741
+          },
+          "fresh_latency_p95_us": {
+            "median": 959950,
+            "min": 806108,
+            "max": 960540
+          },
+          "fresh_latency_p99_us": {
+            "median": 978040,
+            "min": 821675,
+            "max": 979628
+          },
+          "retained_latency_p50_us": {
+            "median": 250646,
+            "min": 232771,
+            "max": 273694
+          },
+          "retained_latency_p95_us": {
+            "median": 442926,
+            "min": 369790,
+            "max": 454423
+          },
+          "retained_latency_p99_us": {
+            "median": 453364,
+            "min": 379477,
+            "max": 471165
+          },
+          "total_cachewire_c_to_f_bytes": {
+            "median": 1605199,
+            "min": 1605199,
+            "max": 1605199
+          },
+          "total_cachewire_f_to_c_bytes": {
+            "median": 7640,
+            "min": 7640,
+            "max": 7640
+          },
+          "observed_peak_outstanding": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "fresh_peak_outstanding": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "retained_peak_outstanding": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "tcp_connections": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 810532,
+            "min": 810348,
+            "max": 810532
+          }
+        }
+      },
+      {
+        "protocol": "R2",
+        "requested_window": 2,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 666,
+            "min": 661,
+            "max": 706
+          },
+          "retained_pass_ms": {
+            "median": 294,
+            "min": 264,
+            "max": 312
+          },
+          "elapsed_ms": {
+            "median": 971,
+            "min": 961,
+            "max": 973
+          },
+          "fresh_latency_p50_us": {
+            "median": 505093,
+            "min": 465310,
+            "max": 536503
+          },
+          "fresh_latency_p95_us": {
+            "median": 655739,
+            "min": 646157,
+            "max": 699291
+          },
+          "fresh_latency_p99_us": {
+            "median": 666652,
+            "min": 661376,
+            "max": 706321
+          },
+          "retained_latency_p50_us": {
+            "median": 160912,
+            "min": 154408,
+            "max": 161770
+          },
+          "retained_latency_p95_us": {
+            "median": 288600,
+            "min": 256825,
+            "max": 295722
+          },
+          "retained_latency_p99_us": {
+            "median": 294669,
+            "min": 264648,
+            "max": 312026
+          },
+          "total_cachewire_c_to_f_bytes": {
+            "median": 1605199,
+            "min": 1602133,
+            "max": 1605199
+          },
+          "total_cachewire_f_to_c_bytes": {
+            "median": 7640,
+            "min": 7640,
+            "max": 7640
+          },
+          "observed_peak_outstanding": {
+            "median": 2,
+            "min": 2,
+            "max": 2
+          },
+          "fresh_peak_outstanding": {
+            "median": 2,
+            "min": 2,
+            "max": 2
+          },
+          "retained_peak_outstanding": {
+            "median": 2,
+            "min": 2,
+            "max": 2
+          },
+          "tcp_connections": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 823128,
+            "min": 815512,
+            "max": 823772
+          }
+        }
+      },
+      {
+        "protocol": "R2",
+        "requested_window": 4,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 602,
+            "min": 582,
+            "max": 668
+          },
+          "retained_pass_ms": {
+            "median": 318,
+            "min": 286,
+            "max": 348
+          },
+          "elapsed_ms": {
+            "median": 921,
+            "min": 869,
+            "max": 1016
+          },
+          "fresh_latency_p50_us": {
+            "median": 486059,
+            "min": 450615,
+            "max": 515233
+          },
+          "fresh_latency_p95_us": {
+            "median": 596034,
+            "min": 575883,
+            "max": 655731
+          },
+          "fresh_latency_p99_us": {
+            "median": 602070,
+            "min": 582616,
+            "max": 667867
+          },
+          "retained_latency_p50_us": {
+            "median": 185523,
+            "min": 185088,
+            "max": 205516
+          },
+          "retained_latency_p95_us": {
+            "median": 306032,
+            "min": 281353,
+            "max": 335990
+          },
+          "retained_latency_p99_us": {
+            "median": 318557,
+            "min": 286738,
+            "max": 348272
+          },
+          "total_cachewire_c_to_f_bytes": {
+            "median": 1604935,
+            "min": 1604803,
+            "max": 1604935
+          },
+          "total_cachewire_f_to_c_bytes": {
+            "median": 7640,
+            "min": 7640,
+            "max": 7640
+          },
+          "observed_peak_outstanding": {
+            "median": 4,
+            "min": 4,
+            "max": 4
+          },
+          "fresh_peak_outstanding": {
+            "median": 4,
+            "min": 4,
+            "max": 4
+          },
+          "retained_peak_outstanding": {
+            "median": 4,
+            "min": 4,
+            "max": 4
+          },
+          "tcp_connections": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 833680,
+            "min": 831828,
+            "max": 834284
+          }
+        }
+      },
+      {
+        "protocol": "R2",
+        "requested_window": 8,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 664,
+            "min": 526,
+            "max": 710
+          },
+          "retained_pass_ms": {
+            "median": 262,
+            "min": 208,
+            "max": 342
+          },
+          "elapsed_ms": {
+            "median": 926,
+            "min": 735,
+            "max": 1052
+          },
+          "fresh_latency_p50_us": {
+            "median": 523569,
+            "min": 423211,
+            "max": 540805
+          },
+          "fresh_latency_p95_us": {
+            "median": 652795,
+            "min": 521458,
+            "max": 700228
+          },
+          "fresh_latency_p99_us": {
+            "median": 663826,
+            "min": 526179,
+            "max": 709649
+          },
+          "retained_latency_p50_us": {
+            "median": 153740,
+            "min": 133957,
+            "max": 197895
+          },
+          "retained_latency_p95_us": {
+            "median": 252475,
+            "min": 203281,
+            "max": 331487
+          },
+          "retained_latency_p99_us": {
+            "median": 261855,
+            "min": 208495,
+            "max": 342405
+          },
+          "total_cachewire_c_to_f_bytes": {
+            "median": 1604847,
+            "min": 1604451,
+            "max": 1605023
+          },
+          "total_cachewire_f_to_c_bytes": {
+            "median": 7640,
+            "min": 7640,
+            "max": 7640
+          },
+          "observed_peak_outstanding": {
+            "median": 8,
+            "min": 5,
+            "max": 8
+          },
+          "fresh_peak_outstanding": {
+            "median": 8,
+            "min": 5,
+            "max": 8
+          },
+          "retained_peak_outstanding": {
+            "median": 8,
+            "min": 5,
+            "max": 8
+          },
+          "tcp_connections": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 0,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 838524,
+            "min": 825988,
+            "max": 858640
+          }
+        }
+      },
+      {
+        "protocol": "R2",
+        "requested_window": 16,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 609,
+            "min": 544,
+            "max": 615
+          },
+          "retained_pass_ms": {
+            "median": 266,
+            "min": 210,
+            "max": 278
+          },
+          "elapsed_ms": {
+            "median": 875,
+            "min": 754,
+            "max": 894
+          },
+          "fresh_latency_p50_us": {
+            "median": 481179,
+            "min": 438949,
+            "max": 495903
+          },
+          "fresh_latency_p95_us": {
+            "median": 602826,
+            "min": 535911,
+            "max": 610603
+          },
+          "fresh_latency_p99_us": {
+            "median": 608711,
+            "min": 543836,
+            "max": 615532
+          },
+          "retained_latency_p50_us": {
+            "median": 153098,
+            "min": 130445,
+            "max": 173902
+          },
+          "retained_latency_p95_us": {
+            "median": 258487,
+            "min": 205186,
+            "max": 271699
+          },
+          "retained_latency_p99_us": {
+            "median": 266216,
+            "min": 210397,
+            "max": 278166
+          },
+          "total_cachewire_c_to_f_bytes": {
+            "median": 1604803,
+            "min": 1604583,
+            "max": 1604935
+          },
+          "total_cachewire_f_to_c_bytes": {
+            "median": 7640,
+            "min": 7640,
+            "max": 7640
+          },
+          "observed_peak_outstanding": {
+            "median": 13,
+            "min": 6,
+            "max": 15
+          },
+          "fresh_peak_outstanding": {
+            "median": 5,
+            "min": 4,
+            "max": 9
+          },
+          "retained_peak_outstanding": {
+            "median": 13,
+            "min": 6,
+            "max": 15
+          },
+          "tcp_connections": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 852996,
+            "min": 850340,
+            "max": 888264
+          }
+        }
+      },
+      {
+        "protocol": "R2",
+        "requested_window": 30,
+        "repetitions": 3,
+        "values": {
+          "fresh_pass_ms": {
+            "median": 616,
+            "min": 587,
+            "max": 642
+          },
+          "retained_pass_ms": {
+            "median": 249,
+            "min": 242,
+            "max": 313
+          },
+          "elapsed_ms": {
+            "median": 885,
+            "min": 866,
+            "max": 901
+          },
+          "fresh_latency_p50_us": {
+            "median": 488334,
+            "min": 458917,
+            "max": 522182
+          },
+          "fresh_latency_p95_us": {
+            "median": 605497,
+            "min": 580964,
+            "max": 636564
+          },
+          "fresh_latency_p99_us": {
+            "median": 616256,
+            "min": 587654,
+            "max": 642468
+          },
+          "retained_latency_p50_us": {
+            "median": 153722,
+            "min": 135456,
+            "max": 163052
+          },
+          "retained_latency_p95_us": {
+            "median": 239701,
+            "min": 226605,
+            "max": 298799
+          },
+          "retained_latency_p99_us": {
+            "median": 249528,
+            "min": 241891,
+            "max": 313311
+          },
+          "total_cachewire_c_to_f_bytes": {
+            "median": 1604759,
+            "min": 1604715,
+            "max": 1604803
+          },
+          "total_cachewire_f_to_c_bytes": {
+            "median": 7640,
+            "min": 7640,
+            "max": 7640
+          },
+          "observed_peak_outstanding": {
+            "median": 10,
+            "min": 9,
+            "max": 13
+          },
+          "fresh_peak_outstanding": {
+            "median": 9,
+            "min": 5,
+            "max": 9
+          },
+          "retained_peak_outstanding": {
+            "median": 10,
+            "min": 8,
+            "max": 13
+          },
+          "tcp_connections": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "process_wall_seconds": {
+            "median": 1,
+            "min": 1,
+            "max": 1
+          },
+          "max_rss_kib": {
+            "median": 865004,
+            "min": 862660,
+            "max": 873000
+          }
+        }
+      }
+    ],
+    "semantics": {
+      "fresh_retained": "Fresh = first measured pass on newly created sender/route state; retained = second pass reusing that route state and identical ordered inputs. These are not OS page-cache cold/hot states and are not an edited-pair comparison.",
+      "latency": "R1 latency is sequential per-transfer call time. R2 latency is concurrent submission-to-matching-receipt time. Do not compare their latency percentiles as equivalent quantities.",
+      "verification": "Each invocation required exact decoded input/output identity. raw_decoded_bytes_verified equals 342976618 (two passes of 171488309). R2 exact CacheWire counters are cross-checked against F socket byte totals.",
+      "occupancy": "Actual observed peak is recorded independently of requested window; W16 peaked 5–15 and W30 peaked 10–11, so these runs do not demonstrate full W16/W30 saturation."
+    },
+    "prior_unqualified_run": {
+      "status": "preserved but excluded",
+      "reason": "The first 21-run batch used an older client/libp50zstdsender.a; archive timestamp was older than source changes. It is retained only as build-closure diagnostic evidence.",
+      "binary_sha256": "c5c3968f72dca52db806c81a6b18af094b049799fd658224bf9c7289f286ffc7",
+      "artifacts_dir": "/tanksmall/scratch/tmp/p50-window-pilot-20260926/logs/initial-unqualified"
+    }
+  },
+  "host": {
+    "kernel": "Linux e45898edaf85 5.15.0-190-generic x86_64",
+    "container_cpu_set": "0-15",
+    "cpu_quota_cores": 2,
+    "memory_limit_bytes": 8589934592,
+    "load_average_before": [
+      1.21,
+      1.69,
+      2.17
+    ],
+    "load_average_after": [
+      1.29,
+      1.66,
+      2.15
+    ],
+    "competing_host_activity": "At start, unrelated python3 /repo/jobs/backup_coverage.py used ~33.6% CPU. No known competing timed benchmark overlapped; results are not isolated-host throughput claims."
+  },
+  "artifact_sha256": {
+    "logs/runs/rep1-R1-w1.log": "a458565eab04fb261ba6ecf1618f6066e90c238b838dd1c268f7aa6ada8014dc",
+    "logs/runs/rep1-R2-w1.log": "93c70c6cfc5fdbe9d8070a41fd7a4e83abc7a9ff16649235d8595161d248975e",
+    "logs/runs/rep1-R2-w16.log": "d87ba6299c83cda538c700cdadffb5b7de5a45b8f14a5c2f1165d6786bbbdb73",
+    "logs/runs/rep1-R2-w2.log": "298ed3c5ec47cbd5e0e96b01a362c53ecac3f2061f00c3d8d3a10205e4cb4983",
+    "logs/runs/rep1-R2-w30.log": "e38846023a728ce7c023ef3dc37336404697b06528e9ab88f11128bd978be36d",
+    "logs/runs/rep1-R2-w4.log": "753baf6d1e222be072706e53daa735e04e55485fc446aa42ceaf6a14fcef567d",
+    "logs/runs/rep1-R2-w8.log": "f5964a601b56be810ca14f9a6f4d5c0c78f2264f70f6a671e72a64ae45920bd5",
+    "logs/runs/rep2-R1-w1.log": "d01a9dc203f3a61d22542b8688a63d4705b03c5223ab87f17936a53309f3b932",
+    "logs/runs/rep2-R2-w1.log": "a4aec7e89da2c066c42b98d5c841adf4fb09e1fc2d610d94e51ae187a1c5324b",
+    "logs/runs/rep2-R2-w16.log": "87b06ce653cc9903e380a3b455105dbdb1cfaf66c230def6adebb3e8c00de408",
+    "logs/runs/rep2-R2-w2.log": "d3d9c9262ab13e7f8e6d38cb0fbfbf417f6ea0700e21d1a47c63381bf1fdde75",
+    "logs/runs/rep2-R2-w30.log": "4e6cc2d1b948240561fc6dd924d7176591f0d30aa704aa6fe08fac18334f8d96",
+    "logs/runs/rep2-R2-w4.log": "24917b0cafeb53b6f37e39a4944108681ba16b86fa47d66ac25aadebade386b4",
+    "logs/runs/rep2-R2-w8.log": "de7810872d355ff2948b1cebe08cb60e6c8adccc4b26ff2b2e52af74b82c8555",
+    "logs/runs/rep3-R1-w1.log": "5a043478b0c189256df1a40e37a525b12e05de210aa20e12ae382cdcf0a0cce0",
+    "logs/runs/rep3-R2-w1.log": "29f03fb91c9414d50212d175c4cb897d09692750d70838bab4d35530c98732ac",
+    "logs/runs/rep3-R2-w16.log": "d46bc079f5701c6eb81b95090e2e7d6c27aa0dedfa76b11d6ef42df794148722",
+    "logs/runs/rep3-R2-w2.log": "19a960296591903fe3ef4f33d250a04fdaf055c0a65f2e63bafd1e7997af506e",
+    "logs/runs/rep3-R2-w30.log": "6b03ab01cd4f0cb2c9892ce36e7c68b213e9baee43bc57caebc795d04da4f521",
+    "logs/runs/rep3-R2-w4.log": "74619846d52424acde857e56678d3d2475e3e6e08bdd895c0868c8fe0f3b9182",
+    "logs/runs/rep3-R2-w8.log": "0f0597be9e7180f244ab614000b4ad16f053a3f1dfb8796758bdd5b9acf42ff3",
+    "logs/runs/rep1-R1-w1.time": "500108a75d8744f6d5f35c0014170a2799a72193fce4429251a4d269224ba216",
+    "logs/runs/rep1-R2-w1.time": "9f8cd34209611d8310226e20d3ed6a51e46d42d900a48e0b7c7b97616cf11034",
+    "logs/runs/rep1-R2-w16.time": "46aacb53d2816dd5261e6f08ac5c7b1579c3880c8e8ae1cddf33a90d7f798265",
+    "logs/runs/rep1-R2-w2.time": "95af71d124eb7f0a606e17cbf2f944e75649aaad488d266e1a120e4341b9d9c5",
+    "logs/runs/rep1-R2-w30.time": "a3d779ed62ece64e4a9da2d250b67219b23c40194af243a7ee673d184342a6fb",
+    "logs/runs/rep1-R2-w4.time": "4ca28ede94136177b27c42ed515f8638144a65852e9b67ad3207d10e7f2fe1f0",
+    "logs/runs/rep1-R2-w8.time": "dba8887cc677be095f304e72be9334f7c74f8a99e9165485ea05c6c978fb8473",
+    "logs/runs/rep2-R1-w1.time": "5bccb1ce755fa29cef2357903dd4b7fa52904d4c811741105ea34a850ed017b5",
+    "logs/runs/rep2-R2-w1.time": "3ff19e7c787dc92e1ee6cc5b1e8dd239b2672a739ae4e192bf5c46ba38dd3dbe",
+    "logs/runs/rep2-R2-w16.time": "d3a48006a16903222b9f1bba35d4bd5d6a97ba3d198aea84263353a56a5942c6",
+    "logs/runs/rep2-R2-w2.time": "cb76470e7f35b1162dbde8be2daa3ba2eebb3de28f734fad2fd9569f3866563d",
+    "logs/runs/rep2-R2-w30.time": "41f9db0ccb7edd84c9977cb1e87d15f9e3314bd59747ad5bc2c477257af65bc1",
+    "logs/runs/rep2-R2-w4.time": "ac96221c79df1d4f3837d84b12fbb96ef8d5782550c60344826445563bef42be",
+    "logs/runs/rep2-R2-w8.time": "9c35bfb5de343c6c915a2e95e5a38ed75df0ef35ac2bac90f9aaa7b85dd1320d",
+    "logs/runs/rep3-R1-w1.time": "e6fc7913743dd01301cb7070894dffedf4c25bc44f5f2816e2da30824ebe8b20",
+    "logs/runs/rep3-R2-w1.time": "5c3de4cd4bc93ff6193b670ecbadf4920ad4ebd92ece9321b22383c4b3ac5048",
+    "logs/runs/rep3-R2-w16.time": "6f380982c1b263dd5c19190b0399c4768745f4e323fc3266514b8ec8aff27ee0",
+    "logs/runs/rep3-R2-w2.time": "acc177f4a090c2d078cda6b562ec35a4d9b9e8c6aac7bd899253524fa487a755",
+    "logs/runs/rep3-R2-w30.time": "4f8ac3d4e93236d6db21e808f8854a01c323de2893cc20350cc858d25c881342",
+    "logs/runs/rep3-R2-w4.time": "51132de7f6540b3b2d92d2e90344f563809cf69cf6965c498514f5b7f097defb",
+    "logs/runs/rep3-R2-w8.time": "a6130763ad7a41cb1353ac406cd24b4fd452b378a2839e692f70c89ecdc5a793",
+    "logs/run-status.csv": "e613c98d85e394b15ca519caa8a13757d395c9e7e770be7d945b3b4584a53d08",
+    "logs/container-metadata.txt": "e6a8b27cedb59a175a093ff3170ba2462ad14c5326c130670b770653106eea71",
+    "logs/host-session.log": "846276f186631eceee505198d377e9b93f0f00e977aaac128d4ed4f30412dcd5",
+    "logs/benchmark-closure-build.log": "26e7015d2487bfb0186c4a561ec4dafb3ec386f2a6759ffa00b069d220e7b4d9",
+    "/tanksmall/scratch/tmp/p51-d07-merged-74ab9b11-logs/cache-build-r2.log": "014bd09a48463868325da77caa2612179c175164550d29a211ad45d40d100a6a",
+    "/tanksmall/scratch/tmp/p51-d07-merged-74ab9b11-logs/services-build-r2.log": "76103123c014a8f070c4df0fb95c58e0b5515d22ae68b7a6263bcbef35be4913",
+    "/tanksmall/scratch/tmp/p51-d07-merged-74ab9b11-logs/test-build-r2.log": "6e6396e2eca91e5f96f74cea868bc4de5368cb14020c4749744878a86a978d3a",
+    "/tanksmall/scratch/tmp/p51-d07-merged-74ab9b11-logs/autogen-r2.log": "1224dab46ea2e1bef8cfe66fb465371d48c33a39830a7342d7c39ede9c26ecd1",
+    "run-pilot.sh": "b76b7a2e7a7ed9bb9e11758e999111967adc348e3c7eba3faaa5d45dfaa63f0a"
+  },
+  "artifact_paths": {
+    "evidence_dir": "/tanksmall/scratch/tmp/p50-window-pilot-20260926/logs",
+    "run_status": "logs/run-status.csv",
+    "container_metadata": "logs/container-metadata.txt",
+    "host_session": "logs/host-session.log",
+    "build_log": "logs/benchmark-closure-build.log",
+    "driver": "run-pilot.sh"
+  }
+}
