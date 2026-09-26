@@ -5,6 +5,14 @@ usage() {
     echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p50-live-core}" >&2
 }
 
+capture_gate_status() {
+    if "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+}
+
 if [[ $# -ne 1 ]]; then
     usage
     exit 2
@@ -293,15 +301,14 @@ elif [[ "$gate" == p51-scheduler-restart-w30 || "$gate" == p51-scheduler-f-resta
     else
         unset ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30
     fi
-    ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
+    capture_gate_status env ICECC_TEST_P51_PRIVATE_NETNS=1 ICECC_TEST_DAEMON_UID=icecc \
         ICECC_TEST_DAEMON_GID=icecc \
         timeout --signal=TERM --kill-after=20s "${timeout_s}s" \
             make -C /work/build/unittests "$target" >"$log" 2>&1
 else
-    timeout --signal=TERM --kill-after=15s "${timeout_s}s" \
+    capture_gate_status timeout --signal=TERM --kill-after=15s "${timeout_s}s" \
         make -C /work/build/unittests "$target" >"$log" 2>&1
 fi
-status=$?
 set -e
 printf '%s\n' "$status" >"$status_file"
 cat "$log"

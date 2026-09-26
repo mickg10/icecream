@@ -491,6 +491,14 @@ def test_capacity_gate_forwards_optional_profile_filter_and_defaults_in_containe
         filtered_argv[index + 1]
         for index, value in enumerate(filtered_argv[:-1]) if value == "--env"
     }
+    monkeypatch.setenv("ICECC_TEST_P51_CAPACITY_W30_PROFILE", "ZSTD_TU; bad")
+    rejected = GateCommandRun(tmp_path)
+    with pytest.raises(bootstrap.BootstrapError, match="must be P29V1"):
+        bootstrap.run_gate(
+            rejected, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+            "p51-capacity-w30",
+        )
+    assert rejected.commands == []
 
 
 def test_p50_live_core_routes_through_the_private_gate_lifecycle(
@@ -522,15 +530,6 @@ def test_p50_live_core_routes_through_the_private_gate_lifecycle(
     assert result["target"] == "six required root/live P50 gates"
     assert result["timeout_s"] == 1200
 
-    monkeypatch.setenv("ICECC_TEST_P51_CAPACITY_W30_PROFILE", "ZSTD_TU; bad")
-    rejected = GateCommandRun(tmp_path)
-    with pytest.raises(bootstrap.BootstrapError, match="must be P29V1"):
-        bootstrap.run_gate(
-            rejected, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
-            "p51-capacity-w30",
-        )
-    assert rejected.commands == []
-
 
 def test_p50_live_core_builds_check_only_completion_helper_before_tests() -> None:
     script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
@@ -544,7 +543,20 @@ def test_p50_live_core_builds_check_only_completion_helper_before_tests() -> Non
     assert live_gate.index(cache_build) < live_gate.index(daemon_build)
     assert live_gate.index(cache_build) < live_gate.index(helper_build)
     assert live_gate.index(helper_build) < live_gate.index(daemon_build)
-    assert live_gate.index(helper_build) < live_gate.index("live_tests=(")
+    assert live_gate.index(daemon_build) < live_gate.index("live_tests=(")
+
+
+def test_run_gate_captures_nonzero_status_without_overwriting_it() -> None:
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    start = script.index("capture_gate_status() {")
+    end = script.index("\n}", start) + 2
+    function = script[start:end]
+    result = subprocess.run(
+        ["bash", "-c", function + "\nstatus=0; capture_gate_status bash -c 'exit 23'; printf '%s\\n' \"$status\""],
+        check=True, capture_output=True, text=True,
+    )
+    assert result.stdout.strip() == "23"
+    assert "status=$?\nset -e" not in script
 
 
 @pytest.mark.parametrize("cleanup_failure", ["inspect-timeout", "remove-timeout"])

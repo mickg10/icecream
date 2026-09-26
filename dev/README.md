@@ -76,7 +76,7 @@ requires the explicit private-namespace opt-in shown above because its receipt
 helper installs a temporary namespace-local OUTPUT redirection rule.
 `dev-gate GATE=...` currently allowlists `p51-arm-expiry`, `p51-restart-w30`,
 `p51-scheduler-restart-w30`, `p51-scheduler-f-restart-w30` (active scheduler→F
-restart chain), `p51-restart-chain-w30` (active F→C restart chain), and
+restart chain), `p51-restart-chain-w30` (active F→C restart chain),
 `p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap), and
 `p50-live-core` (the two remote assignment gates, completion flow, compile
 end-to-end, daemon-positive, and live source-arm gates).
