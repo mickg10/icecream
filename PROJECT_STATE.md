@@ -147,6 +147,27 @@ attempt: it incorrectly tried to attach twice and expected a cancel-retirement
 after a rejected cancellation. Those expectations were corrected, not product
 cancellation semantics. Combined full-suite qualification remains pending.
 
+### Cancellation after an observed partial frame
+
+Commit `74ab9b11` integrates donor `a764f9c2`: all three profiles and indices
+0/15/30 in a 31-request cohort. C pauses after the four-byte R2_BODY header;
+F independently observes that header after the exact JOB_BIND/TU_BEGIN, with
+a positive payload length. The suffix stays withheld until cancellation;
+timeout release cannot qualify. Accepted cancellation leaves the target
+unpublished, all 30 survivors exact, receipts contiguous, original deadlines
+intact, credits drained and one target cancellation retirement. A subsequent
+transfer must attach exact bytes within its own deadline and drain credits.
+The test-only hooks are compiled out of production paths.
+
+The final focused nine-case run passed, exit 0. Log:
+`/tanksmall/scratch/tmp/p51-d07-partial-byte-cancel-build/tmp/p51-d07-partial-final-all9.log`,
+SHA256 `9d2c1a1b3cb8a2b79467c86fa1f902818e5b60c3d2c242eef74d157b243e6369`.
+Binary SHA256 before/after:
+`9d39cbc2dfc9915e630d250467ac46cdc7098e4e6f7f502d5fb6cf85232327f1`.
+The shared full-bundle path also gains the post-cancel probe. The combined
+partial/full/committed fixture required merge resolution; full registered
+qualification of that merged source is pending, not implied by donor passes.
+
 ### Source admission pressure
 
 The four-link overlap gate is integrated in `6d6276f6` from donor `321302e1`.
