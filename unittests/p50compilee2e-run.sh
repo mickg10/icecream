@@ -72,6 +72,11 @@ w30_typed_predecessor_terminal() {
         grep -Fq 'got exception Error 24 - local daemon did not settle P50 retry predecessor' "$client_log" && \
         grep -Fq 'remote-only policy refuses client-error fallback' "$client_log"
 }
+receipt_gate_has_single_link_state() {
+    receipt_state_log=$1
+    test "$(grep -Ec '^P51_RECEIPT_GATE_LINK_STATE_DECODED attempt=[0-9]+$' "$receipt_state_log")" -eq 1 && \
+        test "$(grep -Ec '^P51_RECEIPT_GATE_LINK_STATE port=[0-9]+$' "$receipt_state_log")" -eq 1
+}
 if test "${ICECC_P50_C1F2_W30_PARSER_SELFTEST:-0}" = 1; then
     fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50-w30-parser.XXXXXX")
     trap 'rm -rf "$fixture_dir"' EXIT HUP INT TERM
@@ -3967,7 +3972,7 @@ EOF_W30_CHILD
         victim_proxy_line="P51_RECEIPT_GATE_PASSTHROUGH port=$port_worker ordinal=1 tu_seq=$active_tu_seq"
         gate_victim_witness=0
         for _ in $(seq 1 200); do
-            if grep -Fq 'P51_RECEIPT_GATE_LINK_STATE' "$receipt_gate_log" && \
+            if receipt_gate_has_single_link_state "$receipt_gate_log" && \
                     grep -Fxq "$victim_proxy_line" "$receipt_gate_log"; then
                 gate_victim_witness=1
                 break
@@ -4962,8 +4967,7 @@ EOF_COMPILER_LOSS_HELD
             echo "FAIL: receipt gate held $active_window_wrappers/30 still-outstanding C1 wrappers" >&2
             return 1
         }
-        grep -F 'P51_RECEIPT_GATE_LINK_STATE' "$receipt_gate_log" >/dev/null && \
-                test "$(grep -F -c 'P51_RECEIPT_GATE_LINK_STATE' "$receipt_gate_log")" -eq 1 || {
+        receipt_gate_has_single_link_state "$receipt_gate_log" || {
             echo "FAIL: receipt proxy did not isolate exactly the newly opened C1-F link" >&2
             return 1
         }
