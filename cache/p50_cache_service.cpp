@@ -5003,6 +5003,20 @@ uint64_t SidecarRuntime::active_source_raw_bytes_for_test() noexcept {
     return active_source_raw_bytes_;
 }
 
+std::optional<P50ServerOwnerUsage>
+SidecarRuntime::endpoint_owner_usage_for_test() {
+    auto result = std::make_shared<std::optional<P50ServerOwnerUsage>>();
+    const bool completed = owner_round_trip(
+        [this, result] {
+            if (endpoint_)
+                *result = endpoint_->owner_usage();
+        },
+        std::chrono::steady_clock::now() + config_.cancellation_grace);
+    if (!completed)
+        return std::nullopt;
+    return *result;
+}
+
 std::optional<P51ReceiptLedgerSnapshot>
 SidecarRuntime::p51_receipt_ledger_for_test(const LinkHello& link) {
     auto result = std::make_shared<std::optional<P51ReceiptLedgerSnapshot>>();
@@ -6286,6 +6300,7 @@ void SidecarRuntime::start_p51_transfer_reply(
         return;
     }
     if (stop_requested_.load(std::memory_order_acquire)) {
+        close_p51_transfer_reply_connection_for_settlement(connection);
         if (settled) {
             try { settled(); } catch (...) {}
         }
@@ -6303,6 +6318,7 @@ void SidecarRuntime::start_p51_transfer_reply(
             local::encode_control_operation(
                 local::make_p51_source_transfer_reply_operation(operation, result));
         if (payload.empty() || std::chrono::steady_clock::now() >= deadline) {
+            close_p51_transfer_reply_connection_for_settlement(connection);
             settlement->run();
             return;
         }
@@ -6311,6 +6327,7 @@ void SidecarRuntime::start_p51_transfer_reply(
                                     identity, payload};
         readiness_fd = ::dup(connection.native_handle());
         if (readiness_fd < 0) {
+            close_p51_transfer_reply_connection_for_settlement(connection);
             settlement->run();
             return;
         }
@@ -6319,6 +6336,7 @@ void SidecarRuntime::start_p51_transfer_reply(
             ::fcntl(readiness_fd, F_SETFD, readiness_flags | FD_CLOEXEC) < 0) {
             (void)::close(readiness_fd);
             readiness_fd = -1;
+            close_p51_transfer_reply_connection_for_settlement(connection);
             settlement->run();
             return;
         }
@@ -6351,12 +6369,35 @@ void SidecarRuntime::start_p51_transfer_reply(
         else {
             if (readiness_fd >= 0)
                 (void)::close(readiness_fd);
+            close_p51_transfer_reply_connection_for_settlement(connection);
             if (settlement)
                 settlement->run();
             else if (settled)
                 settled();
         }
     }
+}
+
+void SidecarRuntime::close_p51_transfer_reply_connection_for_settlement(
+    local::Connection& connection, bool readiness_closed) noexcept {
+    const int descriptor = connection.native_handle();
+    connection = local::Connection(-1);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (descriptor >= 0 &&
+        config_.p51_reply_ownership_retired_before_settlement_for_test) {
+        // Inspect ownership state, not only the integer descriptor: another
+        // thread may reuse that number immediately after close().
+        const bool retired = !connection.valid() && readiness_closed;
+        try {
+            config_.p51_reply_ownership_retired_before_settlement_for_test(
+                descriptor, retired);
+        } catch (...) {
+        }
+    }
+#else
+    (void)descriptor;
+    (void)readiness_closed;
+#endif
 }
 
 void SidecarRuntime::advance_p51_transfer_reply(
@@ -6576,6 +6617,11 @@ void SidecarRuntime::close_p51_transfer_reply(
     pump->timer.cancel(ignored);
     pump->readiness.cancel(ignored);
     pump->readiness.close(ignored);
+    // The cancellation handlers below may retain `pump` after registry
+    // removal. Close its owned control connection before releasing source
+    // operation credit so that settlement also means its descriptor is gone.
+    close_p51_transfer_reply_connection_for_settlement(
+        pump->connection, !pump->readiness.is_open());
     for (auto it = p51_transfer_reply_pumps_.begin();
          it != p51_transfer_reply_pumps_.end(); ++it) {
         if (it->get() == pump.get()) {

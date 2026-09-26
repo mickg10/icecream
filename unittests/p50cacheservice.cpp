@@ -21,6 +21,7 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -78,6 +79,17 @@ size_t process_open_fd_count() {
     if (read_error != 0)
         throw std::runtime_error("cannot read /proc/self/fd");
     return count;
+}
+
+uint64_t process_peak_rss_bytes_for_diagnostics() {
+    rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_maxrss < 0)
+        throw std::runtime_error("cannot read process peak RSS");
+#if defined(__APPLE__)
+    return static_cast<uint64_t>(usage.ru_maxrss);
+#else
+    return static_cast<uint64_t>(usage.ru_maxrss) * 1024;
+#endif
 }
 
 std::map<int, std::string> process_open_fd_snapshot() {
@@ -6232,6 +6244,22 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
     f_config.endpoint_caps.profile = profile;
     f_config.endpoint_caps.supported_profiles = profile_bit(profile);
     f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+    // Keep the service's owner-side live and retained-input budgets explicit
+    // for this repeated-cycle resource check. History is allowed to grow, but
+    // is bounded independently from pending work and sampled below.
+    constexpr uint64_t kOwnerPendingByteCap = uint64_t{1} << 20;
+    constexpr size_t kOwnerRetainedRecordCap = 128;
+    constexpr uint64_t kOwnerRetainedByteCap = uint64_t{1} << 20;
+    f_config.endpoint_config.owner_limits.max_pending_encoded_bytes =
+        kOwnerPendingByteCap;
+    f_config.endpoint_config.owner_limits.max_pending_raw_bytes =
+        kOwnerPendingByteCap;
+    f_config.endpoint_config.owner_limits.max_decoder_window_bytes =
+        uint64_t{1} << 30;
+    f_config.endpoint_config.owner_limits.max_retained_input_records =
+        kOwnerRetainedRecordCap;
+    f_config.endpoint_config.owner_limits.max_retained_input_bytes =
+        kOwnerRetainedByteCap;
     f_config.max_pending_p51_source_reservations = 128;
     f_config.endpoint_config.input_job_state =
         [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
@@ -6266,6 +6294,16 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
     c_config.max_active_p51_source_transfers = 128;
     c_config.max_pending_p51_source_operations = 128;
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+    std::atomic<size_t> reply_fds_closed_before_settlement{0};
+    std::atomic<size_t> reply_fds_open_at_settlement{0};
+    c_config.p51_reply_ownership_retired_before_settlement_for_test =
+        [&](int, bool retired) {
+            if (!retired)
+                reply_fds_open_at_settlement.fetch_add(
+                    1, std::memory_order_relaxed);
+            reply_fds_closed_before_settlement.fetch_add(
+                1, std::memory_order_relaxed);
+        };
     c_config.after_r2_bundle_sent_for_test = [&](uint64_t ordinal) {
         {
             std::lock_guard lock(sent_mutex);
@@ -6497,13 +6535,31 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
     run_fresh(490001, 0x21);
     CHECK(wait_for_source_operation_count(c_runtime, 0, std::chrono::seconds(2)));
     CHECK(wait_for_source_raw_bytes(c_runtime, 0, std::chrono::seconds(2)));
+    const auto owner_usage_after_warm =
+        f_runtime.endpoint_owner_usage_for_test();
+    CHECK(owner_usage_after_warm.has_value());
+    if (owner_usage_after_warm) {
+        CHECK(owner_usage_after_warm->pending_encoded_bytes == 0);
+        CHECK(owner_usage_after_warm->pending_raw_bytes == 0);
+        CHECK(owner_usage_after_warm->decoder_window_bytes == 0);
+        CHECK(owner_usage_after_warm->retained_input_records <=
+              kOwnerRetainedRecordCap);
+        CHECK(owner_usage_after_warm->retained_input_bytes <=
+              kOwnerRetainedByteCap);
+    }
     {
         std::lock_guard lock(sent_mutex);
         sent_ordinals.clear();
     }
     const size_t warmed_fd_baseline = process_open_fd_count();
+    const auto warmed_fd_snapshot = process_open_fd_snapshot();
+    // process_open_fd_count includes its own transient DIR descriptor, which
+    // process_open_fd_snapshot intentionally excludes from the identity map.
+    CHECK(warmed_fd_snapshot.size() + 1 == warmed_fd_baseline);
     const std::array<size_t, 3> cancel_positions{0, 14, 29};
     uint64_t confirmed_prefix = 1;
+    size_t expected_retained_records = 1;
+    uint64_t expected_retained_bytes = 73;
 
     for (size_t cycle = 0; cycle < cycle_count; ++cycle) {
         const size_t cancel_index = cancel_positions[cycle];
@@ -6560,6 +6616,25 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
             c_runtime.pending_p51_source_operations_for_test();
         const uint64_t cut_raw_bytes =
             c_runtime.active_source_raw_bytes_for_test();
+        const auto owner_usage_at_cut =
+            f_runtime.endpoint_owner_usage_for_test();
+        CHECK(owner_usage_at_cut.has_value());
+        if (owner_usage_at_cut) {
+            CHECK(owner_usage_at_cut->pending_encoded_bytes <=
+                  kOwnerPendingByteCap);
+            CHECK(owner_usage_at_cut->pending_raw_bytes <=
+                  kOwnerPendingByteCap);
+            CHECK(owner_usage_at_cut->decoder_window_bytes <=
+                  (uint64_t{1} << 30));
+            CHECK(owner_usage_at_cut->retained_input_records <=
+                  kOwnerRetainedRecordCap);
+            CHECK(owner_usage_at_cut->retained_input_bytes <=
+                  kOwnerRetainedByteCap);
+            const uint64_t aggregate_owner_cap =
+                2 * kOwnerRetainedByteCap + 2 * kOwnerPendingByteCap;
+            CHECK(owner_usage_at_cut->global_detached_resident_bytes <=
+                  aggregate_owner_cap);
+        }
         size_t held_materializers_at_cut = 0;
         {
             std::lock_guard lock(materialize_mutex);
@@ -6712,6 +6787,8 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
         CHECK(one_unavailable_bit_in_range);
         CHECK(operations_zero);
         CHECK(raw_credit_zero);
+        CHECK(reply_fds_open_at_settlement.load(
+                  std::memory_order_acquire) == 0);
 
         {
             std::lock_guard lock(sent_mutex);
@@ -6728,6 +6805,12 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
             std::lock_guard lock(sent_mutex);
             sent_ordinals.clear();
         }
+        uint64_t committed_cycle_raw_bytes = 0;
+        for (size_t index = 0; index < kWindow; ++index) {
+            if (index != cancel_index)
+                committed_cycle_raw_bytes += 32 + (index % 7);
+        }
+        committed_cycle_raw_bytes += 73; // exact fresh transfer after recovery
         run_fresh(request_base + kWindow, static_cast<uint8_t>(0xe0 + cycle));
         {
             std::lock_guard lock(sent_mutex);
@@ -6741,15 +6824,75 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
         }
         CHECK(wait_for_source_operation_count(c_runtime, 0, std::chrono::seconds(2)));
         CHECK(wait_for_source_raw_bytes(c_runtime, 0, std::chrono::seconds(2)));
+        expected_retained_records += kWindow;
+        expected_retained_bytes += committed_cycle_raw_bytes;
+        const auto owner_usage = f_runtime.endpoint_owner_usage_for_test();
+        CHECK(owner_usage.has_value());
+        if (owner_usage) {
+            CHECK(owner_usage->pending_encoded_bytes == 0);
+            CHECK(owner_usage->pending_raw_bytes == 0);
+            CHECK(owner_usage->decoder_window_bytes == 0);
+            CHECK(owner_usage->retained_input_records <=
+                  kOwnerRetainedRecordCap);
+            CHECK(owner_usage->retained_input_bytes <=
+                  kOwnerRetainedByteCap);
+            CHECK(owner_usage->retained_input_records ==
+                  expected_retained_records);
+            CHECK(owner_usage->retained_input_bytes ==
+                  expected_retained_bytes);
+            // Detached history is valid persistent state, not a leak. It must
+            // stay inside the aggregate resource bound implied by the two
+            // explicit retained-input and pending-raw budgets.
+            const uint64_t aggregate_owner_cap =
+                2 * kOwnerRetainedByteCap + 2 * kOwnerPendingByteCap;
+            CHECK(owner_usage->global_detached_resident_bytes <=
+                  aggregate_owner_cap);
+            CHECK(owner_usage->detached_history_bytes <=
+                  aggregate_owner_cap);
+        }
         const size_t quiescent_fds = process_open_fd_count();
+        if (quiescent_fds != warmed_fd_baseline) {
+            const auto current_fd_snapshot = process_open_fd_snapshot();
+            std::fprintf(stderr,
+                         "P51_D17 fd-delta profile=%s cycle=%zu baseline=%zu "
+                         "current=%zu\n",
+                         profile_name, cycle, warmed_fd_baseline,
+                         quiescent_fds);
+            for (const auto& [descriptor, target] : warmed_fd_snapshot) {
+                const auto current = current_fd_snapshot.find(descriptor);
+                if (current == current_fd_snapshot.end())
+                    std::fprintf(stderr, "P51_D17 fd-closed fd=%d target=%s\n",
+                                 descriptor, target.c_str());
+                else if (current->second != target)
+                    std::fprintf(stderr,
+                                 "P51_D17 fd-replaced fd=%d before=%s after=%s\n",
+                                 descriptor, target.c_str(),
+                                 current->second.c_str());
+            }
+            for (const auto& [descriptor, target] : current_fd_snapshot) {
+                if (!warmed_fd_snapshot.contains(descriptor))
+                    std::fprintf(stderr, "P51_D17 fd-added fd=%d target=%s\n",
+                                 descriptor, target.c_str());
+            }
+            std::fflush(stderr);
+        }
         CHECK(quiescent_fds == warmed_fd_baseline);
+        const uint64_t peak_rss_bytes = process_peak_rss_bytes_for_diagnostics();
         std::printf("P51_D17 cycle profile=%s index=%zu jobs=30 "
                     "cancel-submission-index=%zu "
                     "survivors=29 fresh=1 accepted-links=%zu "
                     "active-held-at-cut=%zu materializers-held=%zu "
                     "raw-held-at-cut=%llu "
                     "raw-expected=%llu "
-                    "raw-bytes=0 fds=%zu baseline=%zu reset-K=%llu "
+                    "F-cut-encoded=%llu F-cut-raw=%llu "
+                    "F-cut-window=%llu F-cut-resident=%llu "
+                    "raw-bytes=0 fds=%zu baseline=%zu "
+                    "F-pending-encoded=%llu F-pending-raw=%llu "
+                    "F-decoder-window=%llu F-history=%llu "
+                    "F-global-resident=%llu F-input-records=%zu "
+                    "F-input-bytes=%llu F-retained-expected=%llu "
+                    "F-records-expected=%zu rss-peak-diagnostic=%llu "
+                    "reset-K=%llu "
                     "reset-P=%llu fresh-ordinal=%llu sent=30\n",
                     profile_name, cycle, cancel_index,
                     accepted_connections.load(std::memory_order_acquire),
@@ -6757,7 +6900,31 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                     held_materializers_at_cut,
                     static_cast<unsigned long long>(cut_raw_bytes),
                     static_cast<unsigned long long>(expected_active_raw_bytes),
+                    static_cast<unsigned long long>(owner_usage_at_cut
+                        ? owner_usage_at_cut->pending_encoded_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage_at_cut
+                        ? owner_usage_at_cut->pending_raw_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage_at_cut
+                        ? owner_usage_at_cut->decoder_window_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage_at_cut
+                        ? owner_usage_at_cut->global_detached_resident_bytes : 0),
                     quiescent_fds, warmed_fd_baseline,
+                    static_cast<unsigned long long>(owner_usage
+                        ? owner_usage->pending_encoded_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage
+                        ? owner_usage->pending_raw_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage
+                        ? owner_usage->decoder_window_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage
+                        ? owner_usage->detached_history_bytes : 0),
+                    static_cast<unsigned long long>(owner_usage
+                        ? owner_usage->global_detached_resident_bytes : 0),
+                    owner_usage ? owner_usage->retained_input_records : 0,
+                    static_cast<unsigned long long>(owner_usage
+                        ? owner_usage->retained_input_bytes : 0),
+                    static_cast<unsigned long long>(expected_retained_bytes),
+                    expected_retained_records,
+                    static_cast<unsigned long long>(peak_rss_bytes),
                     static_cast<unsigned long long>(observed_reset_k),
                     static_cast<unsigned long long>(observed_reset_p),
                     static_cast<unsigned long long>(confirmed_prefix));
@@ -6765,6 +6932,9 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
     }
     CHECK(accepted_connections.load(std::memory_order_acquire) ==
           cycle_count + 1);
+    CHECK(reply_fds_closed_before_settlement.load(
+              std::memory_order_acquire) == 1 + cycle_count * (kWindow + 1));
+    CHECK(reply_fds_open_at_settlement.load(std::memory_order_acquire) == 0);
 }
 
 void test_p51_aggregate_raw_budget_oversize_fit_and_stop_cleanup() {

@@ -147,6 +147,10 @@ struct RuntimeConfig {
     // Test-only observation of complete C-side bundle writes; distinct from
     // F-side materialization/receipt evidence.
     std::function<void(uint64_t)> after_r2_bundle_sent_for_test;
+    // Called synchronously before a P51 reply operation releases settlement
+    // credit, after both owned connection and readiness descriptors retire.
+    std::function<void(int, bool)>
+        p51_reply_ownership_retired_before_settlement_for_test;
     // Observes which assignment caller first enters shared R2 recovery.
     // Production builds expose no callback and this never changes outcomes.
     std::function<void(p50::PrepareRequestKey)> before_r2_recovery_for_test;
@@ -362,6 +366,8 @@ public:
         return p51_source_operation_count_.load(std::memory_order_acquire);
     }
     [[nodiscard]] uint64_t active_source_raw_bytes_for_test() noexcept;
+    [[nodiscard]] std::optional<P50ServerOwnerUsage>
+    endpoint_owner_usage_for_test();
     [[nodiscard]] std::optional<P51ReceiptLedgerSnapshot>
     p51_receipt_ledger_for_test(const LinkHello& link);
 #endif
@@ -625,6 +631,9 @@ private:
         std::shared_ptr<P51TransferReplyPump> pump) noexcept;
     void close_p51_transfer_reply(
         std::shared_ptr<P51TransferReplyPump> pump) noexcept;
+    void close_p51_transfer_reply_connection_for_settlement(
+        local::Connection& connection,
+        bool readiness_closed = true) noexcept;
     // Accessed only on the endpoint owner executor.
     fsession::FSessionServiceOwner fsession_owner_{4};
     std::vector<std::shared_ptr<FSessionPump>> fsession_pumps_;
