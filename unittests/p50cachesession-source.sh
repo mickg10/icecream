@@ -23,6 +23,8 @@ require_count 1 'CACHE_SESSION = 0x50f00000' services/comm.h \
     'collision-resistant Protocol-50 discriminator is present'
 require_count 1 'CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001)' services/comm.h \
     'fixed raw sidecar-ownership READY token is present'
+require_count 1 'CACHE_SESSION_BUSY_MAGIC = UINT32_C(0x50f00003)' services/comm.h \
+    'fixed raw sidecar-capacity BUSY token is present'
 require_count 1 'case Msg::CACHE_SESSION:' services/comm.cpp \
     'decoder has a dedicated CACHE_SESSION admission case'
 require_count 1 'CacheSessionMsg()' services/comm.h \
@@ -39,17 +41,23 @@ require_count 4 '    fd = -1;' services/comm.cpp \
     'destructor and all transfers clear descriptor ownership explicitly'
 require_count 4 'cache_session_release_armed = false;' services/comm.cpp \
     'construction, parser use, transfer, and outbound send clear the one-shot arm'
-require_count 1 'const uint32_t ready = htonl(CACHE_SESSION_READY_MAGIC);' services/comm.cpp \
-    'sidecar READY is encoded in exact network order'
+require_count 1 'const uint32_t word = htonl(magic);' services/comm.cpp \
+    'sidecar READY/BUSY is encoded in exact network order'
+require_count 1 'send_cache_session_word(fd, deadline, CACHE_SESSION_READY_MAGIC)' services/comm.cpp \
+    'sidecar READY sends the READY token'
 require_count 1 'ntohl(ready) != CACHE_SESSION_READY_MAGIC' services/comm.cpp \
     'client validates the exact READY fixture before release'
+require_count 1 'ntohl(ready) == CACHE_SESSION_BUSY_MAGIC' services/comm.cpp \
+    'client reports BUSY without releasing'
 require_count 1 'const bool armed = cache_session_send_release_armed;' services/comm.cpp \
     'client consumes the one-shot send arm on every READY attempt'
-require_count 1 'channel->release_fd_after_cache_session_ready(limit)' \
+require_count 1 'channel->release_fd_after_cache_session_ready(limit, &busy)' \
     cache/p50_cache_service.cpp \
     'production source transfer waits for sidecar ownership before CacheWire'
 require_count 2 'send_cache_session_ready(adopted.get(), deadline)' \
     cache/p50_cache_service.cpp 'production sidecar publishes READY on the adopted descriptor'
+require_count 1 'if (!runtime.try_reserve_session()) {' cache/p50_cache_service.cpp \
+    'production sidecar reserves a session before READY'
 
 create_until_slice=$(sed -n \
     '/^MsgChannel \*Service::createChannelUntil(/,/^MsgChannel \*Service::createChannelRetryUntil(/p' \

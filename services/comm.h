@@ -203,9 +203,10 @@ public:
         // Protocol 50.
         CACHE_SESSION = 0x50f00000,
 
-        // Protocol-50-only result disposition.  0x50f00001 is reserved by
-        // CACHE_SESSION_READY_MAGIC (a raw handoff witness, not a Msg), so
-        // this ordinary framed message deliberately uses the next value.
+        // Protocol-50-only result disposition.  0x50f00001 and 0x50f00003 are
+        // reserved by CACHE_SESSION_READY_MAGIC and CACHE_SESSION_BUSY_MAGIC
+        // (raw handoff witnesses, not Msgs), so this ordinary framed message
+        // deliberately uses the value between them.
         RESULT_DISPOSITION = 0x50f00002,
 
         // Protocol-50 source-arm phase.  These are ordinary framed messages;
@@ -574,6 +575,11 @@ inline constexpr uint32_t CACHE_WIRE_REVISION = 1;
    ordinary framed message and carries no CacheWire identity. */
 inline constexpr uint32_t CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001);
 
+/* Sent in READY's place when F's sidecar has no session capacity: F then
+   closes the socket having touched no CacheWire state, so C may use another
+   F.  Like READY it is raw, which is why no framed message uses the value. */
+inline constexpr uint32_t CACHE_SESSION_BUSY_MAGIC = UINT32_C(0x50f00003);
+
 /* Fixed raw reply value for the compiler/cache control descriptor.  The
    payload is: magic, version, wire job, assignment epoch, assignment nonce,
    selected profile, the already-authenticated sidecar generation/attempt,
@@ -583,9 +589,12 @@ inline constexpr uint32_t P50_CACHE_FD_LEASE_MAGIC = UINT32_C(0x5035464c);
 inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 3;
 inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 64;
 
-/* Send the exact network-order CACHE_SESSION_READY_MAGIC under one absolute
-   steady-clock deadline.  The caller retains descriptor ownership. */
+/* Send the exact network-order CACHE_SESSION_READY_MAGIC (or BUSY_MAGIC)
+   under one absolute steady-clock deadline.  The caller retains descriptor
+   ownership. */
 bool send_cache_session_ready(
+    int fd, std::chrono::steady_clock::time_point deadline) noexcept;
+bool send_cache_session_busy(
     int fd, std::chrono::steady_clock::time_point deadline) noexcept;
 
 /* Registry values are scoped to CACHE_WIRE_REVISION. */
@@ -1058,9 +1067,10 @@ public:
     /* After a successfully flushed Protocol-50 CACHE_SESSION, wait under the
        caller's unchanged absolute deadline for the exact raw sidecar READY
        witness.  Only then transfer the client descriptor.  Every call consumes
-       the one-shot send arm, including refusal and timeout paths. */
+       the one-shot send arm, including refusal and timeout paths.  A BUSY
+       witness returns -1 and sets *busy. */
     int release_fd_after_cache_session_ready(
-        std::chrono::steady_clock::time_point deadline);
+        std::chrono::steady_clock::time_point deadline, bool *busy = nullptr);
 
     /* Protocol-50 compiler/cache control seam.  The request must have been
        completely decoded on this channel and the reply is a one-shot raw

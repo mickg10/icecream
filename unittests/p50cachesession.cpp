@@ -300,10 +300,29 @@ static void test_ready_wire_and_failure_boundaries()
                    Bytes(reinterpret_cast<unsigned char *>(&wrong),
                          reinterpret_cast<unsigned char *>(&wrong) + sizeof(wrong)));
         const int owned = pair.left->fd;
+        bool busy = false;
         REQUIRE(pair.left->release_fd_after_cache_session_ready(
-                    std::chrono::steady_clock::now() + std::chrono::seconds(1)) == -1 &&
-                    pair.left->fd == owned,
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1), &busy) == -1 &&
+                    pair.left->fd == owned && !busy,
                 "wrong READY value fails closed and retains client ownership");
+        close(sidecar_fd);
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "BUSY row flushes CACHE_SESSION");
+        Msg *decoded = pair.right->get_msg(2, true);
+        delete decoded;
+        const int sidecar_fd = pair.right->release_fd_if_input_empty();
+        REQUIRE(send_cache_session_busy(
+                    sidecar_fd, std::chrono::steady_clock::now() + std::chrono::seconds(1)),
+                "a full sidecar sends BUSY in READY's place");
+        const int owned = pair.left->fd;
+        bool busy = false;
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1), &busy) == -1 &&
+                    pair.left->fd == owned && busy,
+                "BUSY fails the release, keeps ownership and is reported as BUSY");
         close(sidecar_fd);
     }
     {

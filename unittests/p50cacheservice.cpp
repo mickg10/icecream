@@ -2301,11 +2301,12 @@ bool eventually(Predicate predicate, std::chrono::milliseconds limit) {
 }
 
 // Stands in for F's iceccd and its sidecar control worker: acknowledges each
-// arm, answers CACHE_SESSION with READY and then hands the descriptor to the
-// F runtime, as the production control worker does.  Arms from the held C
-// store are parked instead and an idle loopback session is adopted in each
-// one's place, so F keeps one live session per parked arm, as it does for an
-// armed session waiting behind its C transfer gate.
+// arm, then answers CACHE_SESSION as the production control worker does:
+// reserve a session and send READY, then hand the descriptor to the F runtime,
+// or send BUSY when F has no session left.  Arms from the held C store are
+// parked instead and an idle loopback session is adopted in each one's place,
+// so F keeps one live session per parked arm, as it does for an armed session
+// waiting behind its C transfer gate.
 class CapacityFront {
 public:
     CapacityFront(service::SidecarRuntime& f_runtime, uint64_t f_store_generation)
@@ -2330,30 +2331,16 @@ public:
         return parked_.size();
     }
 
-    // Adopts one more idle session and reports whether F closed it at once.
+    // Reports whether F would answer one more session BUSY.
     [[nodiscard]] bool probe_refused() {
-        int peer = -1;
-        const int adopted = loopback_tcp_pair(peer);
-        if (adopted < 0)
-            return false;
-        f_runtime_.start_adopted_endpoint(adopted);
-        pollfd descriptor{peer, POLLIN, 0};
-        int ready = -1;
-        do {
-            ready = ::poll(&descriptor, 1, 2000);
-        } while (ready < 0 && errno == EINTR);
-        bool refused = false;
-        if (ready > 0) {
-            uint8_t byte = 0;
-            const ssize_t count = ::recv(peer, &byte, 1, MSG_DONTWAIT);
-            refused = count == 0 || (count < 0 && errno == ECONNRESET);
-        }
-        (void)::close(peer);
-        return refused;
+        if (!f_runtime_.try_reserve_session())
+            return true;
+        f_runtime_.release_session_reservation();
+        return false;
     }
 
-    // Ends every placeholder, waits until F holds no session, then hands F
-    // the parked CacheWire descriptors.
+    // Ends every placeholder, then hands F the parked CacheWire descriptors
+    // as their reservations come free.
     [[nodiscard]] bool release() {
         std::vector<std::pair<int, int>> parked;
         {
@@ -2363,11 +2350,16 @@ public:
         }
         for (const auto& entry : parked)
             (void)::close(entry.second);
-        const bool drained = eventually(
-            [this] { return f_runtime_.live_session_count() == 0; },
-            std::chrono::seconds(5));
-        for (const auto& entry : parked)
-            f_runtime_.start_adopted_endpoint(entry.first);
+        bool drained = true;
+        for (const auto& entry : parked) {
+            if (eventually([this] { return f_runtime_.try_reserve_session(); },
+                           std::chrono::seconds(5))) {
+                f_runtime_.start_adopted_endpoint(entry.first);
+            } else {
+                (void)::close(entry.first);
+                drained = false;
+            }
+        }
         return drained;
     }
 
@@ -2440,8 +2432,14 @@ private:
             const int raw_fd = channel->release_fd_if_input_empty();
             if (raw_fd < 0)
                 return;
-            if (!send_cache_session_ready(
-                    raw_fd, std::chrono::steady_clock::now() + std::chrono::seconds(2))) {
+            const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            if (!f_runtime_.try_reserve_session()) {
+                (void)send_cache_session_busy(raw_fd, ready_deadline);
+                (void)::close(raw_fd);
+                return;
+            }
+            if (!send_cache_session_ready(raw_fd, ready_deadline)) {
+                f_runtime_.release_session_reservation();
                 (void)::close(raw_fd);
                 return;
             }
@@ -2459,6 +2457,7 @@ private:
             int placeholder_peer = -1;
             const int placeholder = loopback_tcp_pair(placeholder_peer);
             if (placeholder < 0) {
+                f_runtime_.release_session_reservation();
                 (void)::close(raw_fd);
                 return;
             }
@@ -2483,9 +2482,9 @@ private:
 
 // Two C runtimes with distinct stores arm against one F whose live-session
 // bound is one armed window (RouteGate::kArmedSessions).  C1a's eight arms
-// stay live on F while parked, so every arm from C1b overflows it; F refuses
-// by closing the adopted socket after READY.  The overflow must end in a
-// typed transfer error without a hang and must leave neither C with a
+// stay live on F while parked, so every arm from C1b overflows it; F answers
+// BUSY instead of READY.  The overflow must end in the typed capacity error
+// with no attempt made, without a hang, and must leave neither C with a
 // replacement latch or a quarantined route: once F is idle again, C1b's next
 // transfer to the same F must commit.
 void test_f_live_session_overflow_from_two_c_runtimes() {
@@ -2563,6 +2562,8 @@ void test_f_live_session_overflow_from_two_c_runtimes() {
 
     const auto replacement = static_cast<uint16_t>(
         local::SourceTransferErrorCode::RouteReplacementRequired);
+    const auto capacity = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::FSessionCapacity);
     std::fprintf(stderr, "p50cacheservice: F overflow error/attempts");
     for (const auto& result : second_results)
         std::fprintf(stderr, " %u/%u", static_cast<unsigned>(result.error_code),
@@ -2576,7 +2577,7 @@ void test_f_live_session_overflow_from_two_c_runtimes() {
         CHECK(result.code == local::SourceTransferResultCode::Committed);
     for (const auto& result : second_results)
         CHECK(result.code == local::SourceTransferResultCode::Error &&
-              result.error_code != 0 && result.error_code != replacement);
+              result.error_code == capacity && result.attempts == 0);
     CHECK(overflow_elapsed < std::chrono::seconds(10));
     CHECK(released && first_drained);
     CHECK(first_later.code == local::SourceTransferResultCode::Committed);

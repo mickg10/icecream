@@ -64,6 +64,8 @@ enum class SourceTransferResultCode : uint16_t {
 enum class SourceTransferErrorCode : uint16_t {
     PermanentLocalProfileUnavailable = 0x5001,
     RouteReplacementRequired = 0x5002,
+    // F answered BUSY instead of READY: nothing was sent, try another F.
+    FSessionCapacity = 0x5003,
 };
 
 // The daemon asks the supervised sidecar to transfer one source using the

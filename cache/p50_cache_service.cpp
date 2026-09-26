@@ -1049,7 +1049,20 @@ bool handle_connection(local::Connection connection, const Options& options,
                 return true;
             }
             errno = 0;
+            if (!runtime.try_reserve_session()) {
+                // F is full: BUSY instead of READY, before any CacheWire byte, so C
+                // knows nothing was touched and uses another F.
+                const bool sent = send_cache_session_busy(adopted.get(), deadline);
+                std::fprintf(
+                    stderr,
+                    "P50_CACHE_SESSION_REFUSED stage=busy request=%llu sent=%u\n",
+                    static_cast<unsigned long long>(operation.request_id),
+                    sent ? 1u : 0u);
+                std::fflush(stderr);
+                return true;
+            }
             if (!send_cache_session_ready(adopted.get(), deadline)) {
+                runtime.release_session_reservation();
                 std::fprintf(
                     stderr,
                     "P50_CACHE_SESSION_REFUSED stage=ready request=%llu "
@@ -1593,6 +1606,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         int fd = -1;
         ~PendingFd() { if (fd >= 0) ::close(fd); }
     };
+    // open_armed's result when F answered BUSY instead of READY.
+    constexpr int kFSessionBusy = -2;
     auto open_armed = [arm, source_read_ns,
                        open_arm_timeout = config_.source_open_arm_timeout](
                           std::chrono::steady_clock::time_point outer_limit,
@@ -1667,7 +1682,12 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
                 return refused("f-cache-session-send");
             stage_start = std::chrono::steady_clock::now();
-            const int ready_fd = channel->release_fd_after_cache_session_ready(limit);
+            bool busy = false;
+            const int ready_fd = channel->release_fd_after_cache_session_ready(limit, &busy);
+            if (busy) {
+                refused("f-cache-session-busy");
+                return kFSessionBusy;
+            }
             return ready_fd >= 0 ? ready_fd : refused("f-cache-session-ready");
         } catch (...) {
             return refused("f-open-exception");
@@ -1698,6 +1718,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     uint64_t remote_f_generation = 0;
     const int first_fd = open_armed(transfer_deadline, remote_f_guid,
                                     remote_f_generation);
+    if (first_fd == kFSessionBusy)
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::FSessionCapacity));
     if (first_fd < 0)
         return source_transfer_error(4);
     auto first = std::make_shared<PendingFd>();
@@ -2520,10 +2543,27 @@ void SidecarRuntime::route_fsession_connection(int connection_fd) noexcept {
     }
 }
 
+bool SidecarRuntime::try_reserve_session() noexcept {
+    const size_t limit = config_.endpoint_config.owner_limits.max_live_sessions;
+    size_t current = session_reservations_.load(std::memory_order_relaxed);
+    do {
+        if (current >= limit)
+            return false;
+    } while (!session_reservations_.compare_exchange_weak(
+        current, current + 1, std::memory_order_acq_rel, std::memory_order_relaxed));
+    return true;
+}
+
+void SidecarRuntime::release_session_reservation() noexcept {
+    session_reservations_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
 void SidecarRuntime::start_adopted_endpoint(
     int adopted_fd, EndpointIoControl endpoint_control) noexcept {
-    if (adopted_fd < 0)
+    if (adopted_fd < 0) {
+        release_session_reservation();
         return;
+    }
     std::promise<EndpointOwnerResult> completion;
     try {
         // The coroutine is the sole owner of the adopted descriptor after
@@ -2533,9 +2573,10 @@ void SidecarRuntime::start_adopted_endpoint(
                        run_endpoint_on_owner(adopted_fd,
                                               std::move(endpoint_control),
                                               std::move(completion), -1),
-                       asio::detached);
+                       [this](std::exception_ptr) { release_session_reservation(); });
     } catch (...) {
         (void)::close(adopted_fd);
+        release_session_reservation();
     }
 }
 

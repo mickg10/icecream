@@ -3098,24 +3098,24 @@ int MsgChannel::release_fd_if_input_empty()
     return released_fd;
 }
 
-bool send_cache_session_ready(
-    int fd, std::chrono::steady_clock::time_point deadline) noexcept
+static bool send_cache_session_word(
+    int fd, std::chrono::steady_clock::time_point deadline, uint32_t magic) noexcept
 {
     if (fd < 0)
         return false;
 
-    const uint32_t ready = htonl(CACHE_SESSION_READY_MAGIC);
-    const auto *bytes = reinterpret_cast<const unsigned char *>(&ready);
+    const uint32_t word = htonl(magic);
+    const auto *bytes = reinterpret_cast<const unsigned char *>(&word);
     int send_flags = MSG_DONTWAIT;
 #ifdef MSG_NOSIGNAL
     send_flags |= MSG_NOSIGNAL;
 #endif
     size_t offset = 0;
-    while (offset != sizeof(ready)) {
+    while (offset != sizeof(word)) {
         if (std::chrono::steady_clock::now() >= deadline)
             return false;
         const ssize_t result =
-            send(fd, bytes + offset, sizeof(ready) - offset, send_flags);
+            send(fd, bytes + offset, sizeof(word) - offset, send_flags);
         if (result > 0) {
             offset += static_cast<size_t>(result);
             continue;
@@ -3142,8 +3142,20 @@ bool send_cache_session_ready(
     return std::chrono::steady_clock::now() <= deadline;
 }
 
-static bool receive_cache_session_ready(
+bool send_cache_session_ready(
     int fd, std::chrono::steady_clock::time_point deadline) noexcept
+{
+    return send_cache_session_word(fd, deadline, CACHE_SESSION_READY_MAGIC);
+}
+
+bool send_cache_session_busy(
+    int fd, std::chrono::steady_clock::time_point deadline) noexcept
+{
+    return send_cache_session_word(fd, deadline, CACHE_SESSION_BUSY_MAGIC);
+}
+
+static bool receive_cache_session_ready(
+    int fd, std::chrono::steady_clock::time_point deadline, bool *busy) noexcept
 {
     uint32_t ready = 0;
     auto *bytes = reinterpret_cast<unsigned char *>(&ready);
@@ -3175,8 +3187,14 @@ static bool receive_cache_session_ready(
             (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0)
             return false;
     }
-    if (std::chrono::steady_clock::now() > deadline ||
-        ntohl(ready) != CACHE_SESSION_READY_MAGIC)
+    if (std::chrono::steady_clock::now() > deadline)
+        return false;
+    if (ntohl(ready) == CACHE_SESSION_BUSY_MAGIC) {
+        if (busy != nullptr)
+            *busy = true;
+        return false;
+    }
+    if (ntohl(ready) != CACHE_SESSION_READY_MAGIC)
         return false;
 
     /* READY transfers ownership of the descriptor.  The F endpoint starts
@@ -3187,7 +3205,7 @@ static bool receive_cache_session_ready(
 }
 
 int MsgChannel::release_fd_after_cache_session_ready(
-    std::chrono::steady_clock::time_point deadline)
+    std::chrono::steady_clock::time_point deadline, bool *busy)
 {
     p50_note_channel_mutation();
     p50_clear_outbound_claim();
@@ -3199,7 +3217,7 @@ int MsgChannel::release_fd_after_cache_session_ready(
     if (!armed || fd < 0 || protocol != PROTOCOL_VERSION || eof ||
         instate == ERROR || instate != NEED_LEN || inofs != intogo ||
         msgtogo != 0 || !pending_frame_ends.empty() ||
-        !receive_cache_session_ready(fd, deadline))
+        !receive_cache_session_ready(fd, deadline, busy))
         return -1;
 
     const int released_fd = fd;

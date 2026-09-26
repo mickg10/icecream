@@ -168,7 +168,12 @@ public:
     // Start one already-authenticated public CacheWire socket on the endpoint
     // owner.  The control worker transfers ownership here after the
     // CacheSession handoff is ACKed; the historical run_one() worker remains
-    // out of the production path.
+    // out of the production path.  Each start consumes one session
+    // reservation, released when the endpoint's run ends: the control worker
+    // reserves before READY and answers BUSY when none is left, so F never
+    // refuses a session after READY.
+    [[nodiscard]] bool try_reserve_session() noexcept;
+    void release_session_reservation() noexcept;
     void start_adopted_endpoint(int adopted_fd,
                                 EndpointIoControl endpoint_control = {}) noexcept;
 
@@ -271,6 +276,9 @@ private:
     std::atomic_flag busy_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> stop_requested_{false};
     std::atomic<size_t> live_sessions_{0};
+    // Adopted endpoints started or about to be (READY sent); bounded by the
+    // endpoint's max_live_sessions.
+    std::atomic<size_t> session_reservations_{0};
     std::atomic<int> active_control_cancel_fd_{-1};
     mutable std::mutex endpoint_cancel_mutex_;
     std::optional<EndpointCancelPermit> endpoint_cancel_permit_;

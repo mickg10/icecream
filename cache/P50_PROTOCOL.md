@@ -104,6 +104,11 @@ Only then may C send CacheWire SESSION_HELLO. The marker carries no store,
 job or transaction identity; SESSION_HELLO provides the C-store identity.
 Both ordinary message encode and decode require exactly protocol 50.
 
+A sidecar that holds `max_live_sessions` sessions (counting those it has
+sent READY) writes `50 f0 00 03` (BUSY) instead and closes the socket. Nothing
+was touched, so C reports a capacity error without attempting the transfer
+and keeps its route to that F; the job retries on another F.
+
 F's `release_fd_if_input_empty()` detaches only after the exact message,
 with no buffered/read-ahead bytes, pending output, EOF or error and at the
 next ordinary length boundary. A non-consuming kernel peek also checks queued
