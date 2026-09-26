@@ -2,9 +2,11 @@
 
 #include "cache/p50_endpoint.h"
 
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -79,6 +81,17 @@ struct ZstdSourceTransferResult {
     bool route_local_failure = false;
 };
 
+// Where reopens run their blocking connect/arm/session round trip, off the
+// owner executor.  `outstanding` counts the reopens queued or running there,
+// across every sender that shares the executor; each keeps its count until
+// its blocking open returns, even after its caller has given up.  A reopen
+// that would exceed `limit` fails at once.
+struct ReopenExecutor {
+    boost::asio::any_io_executor executor;
+    std::shared_ptr<std::atomic<size_t>> outstanding;
+    size_t limit = 0;
+};
+
 struct ZstdSourceTransferConfig {
     EndpointCaps endpoint_caps{};
     PreparationAuthorityLimits authority_limits{};
@@ -92,6 +105,8 @@ struct ZstdSourceTransferConfig {
     std::chrono::steady_clock::duration maximum_duration =
         std::chrono::seconds(300);
     int compression_level = 1;
+    // Empty: a reopen runs inline.
+    std::optional<ReopenExecutor> reopen;
     // Deterministic unit-test seam for the typed route-poison boundary.
     // Product callers always leave this empty.
     std::function<void()> before_prepare_for_route_for_test;
@@ -100,9 +115,13 @@ struct ZstdSourceTransferConfig {
 // Called once per bounded attempt.  The callback returns ownership of one
 // already-connected TCP descriptor that has crossed the ordinary
 // CACHE_SESSION boundary, or -1 without leaking a descriptor.  It receives
-// the unchanged absolute sender deadline and must not extend it.
+// the unchanged absolute sender deadline and must not extend it.  It may
+// instead return kConnectedFdCapacityBusy: the same F store refused the
+// session for capacity before any CacheWire byte, so the attempt has not
+// started and the sender reopens later without consuming it.
 using ConnectedFdFactory =
     std::function<int(std::chrono::steady_clock::time_point deadline)>;
+inline constexpr int kConnectedFdCapacityBusy = -2;
 
 // C-side source transfer.  The historical class name is retained for source
 // compatibility; endpoint_caps.profile selects the exact P29V1, ZSTD_TU, or

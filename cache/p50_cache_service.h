@@ -34,6 +34,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/thread_pool.hpp>
 
 namespace icecc::p50::service {
 
@@ -292,6 +293,14 @@ private:
     fsession::FSessionServiceOwner fsession_owner_{4};
     std::vector<std::shared_ptr<FSessionPump>> fsession_pumps_;
     std::atomic<size_t> fsession_live_{0};
+    // Blocking reopens (a transfer's second open, and reopens after BUSY) run
+    // here, not on the owner: two at a time, with at most kReopenLimit queued
+    // or running; one more fails at once.  Declared last so it joins first on
+    // teardown.
+    static constexpr size_t kReopenLimit = 8;
+    std::shared_ptr<std::atomic<size_t>> reopen_outstanding_ =
+        std::make_shared<std::atomic<size_t>>(0);
+    boost::asio::thread_pool reopen_pool_{2};
 };
 
 struct Options {

@@ -1,14 +1,21 @@
 #include "p50_zstd_sender.h"
 
+#include <boost/asio/post.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -36,6 +43,90 @@ bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration
 
 bool route_history_profile(ProfileId profile) noexcept {
     return profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_ROUTE;
+}
+
+// Waits between reopens of an attempt that F refused for capacity.
+constexpr Clock::duration kCapacityWaitMin = std::chrono::milliseconds(10);
+constexpr Clock::duration kCapacityWaitMax = std::chrono::milliseconds(200);
+
+// One factory call.  A reopen may block for a whole connect/arm/session round
+// trip, so it runs on the reopen executor when one is configured.  The caller
+// resumes by the deadline even if that open has not returned; the open keeps
+// its thread and its credit until it does and closes a descriptor nobody is
+// waiting for.
+boost::asio::awaitable<int> open_connection(
+    const ConnectedFdFactory& factory, Clock::time_point deadline,
+    const std::optional<ReopenExecutor>& reopen) {
+    if (!reopen)
+        co_return factory(deadline);
+    // Released when the posted open is destroyed: after it ran, or unrun.
+    struct Credit {
+        std::shared_ptr<std::atomic<size_t>> outstanding;
+        ~Credit() {
+            if (outstanding)
+                outstanding->fetch_sub(1);
+        }
+    };
+    auto credit = std::make_shared<Credit>();
+    for (size_t held = reopen->outstanding->load();;) {
+        if (held >= reopen->limit)
+            co_return -1;
+        if (reopen->outstanding->compare_exchange_weak(held, held + 1))
+            break;
+    }
+    credit->outstanding = reopen->outstanding;
+    struct Open {
+        explicit Open(const boost::asio::any_io_executor& executor) : wake(executor) {}
+        ~Open() {
+            if (fd >= 0)
+                (void)::close(fd);
+        }
+        std::mutex mutex;
+        bool abandoned = false;
+        int fd = -1;
+        std::exception_ptr error;
+        boost::asio::steady_timer wake;
+    };
+    const auto executor = co_await boost::asio::this_coro::executor;
+    auto open = std::make_shared<Open>(executor);
+    open->wake.expires_at(deadline);
+    boost::asio::post(reopen->executor, [open, executor, factory, deadline,
+                                         credit = std::move(credit)] {
+        int fd = -1;
+        std::exception_ptr error;
+        try {
+            if (Clock::now() < deadline)
+                fd = factory(deadline);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        std::lock_guard lock(open->mutex);
+        if (open->abandoned) {
+            if (fd >= 0)
+                (void)::close(fd);
+            return;
+        }
+        open->fd = fd;
+        open->error = error;
+        try {
+            boost::asio::post(executor, [open] { open->wake.cancel(); });
+        } catch (...) {
+            // The deadline still wakes the caller.
+        }
+    });
+    boost::system::error_code ignored;
+    co_await open->wake.async_wait(
+        boost::asio::redirect_error(boost::asio::use_awaitable, ignored));
+    std::lock_guard lock(open->mutex);
+    open->abandoned = true;
+    if (open->error)
+        std::rethrow_exception(open->error);
+    int fd = std::exchange(open->fd, -1);
+    if (fd >= 0 && Clock::now() >= deadline) {
+        (void)::close(fd);
+        fd = -1;
+    }
+    co_return fd;
 }
 
 std::optional<std::vector<uint8_t>> read_complete_fd(int fd, uint64_t limit) {
@@ -502,15 +593,34 @@ P50ZstdSourceSender::transfer_bytes(
                     deadline);
             } else {
                 int connected_fd = -1;
-                try {
-                    connected_fd = std::get<ConnectedFdFactory>(target)(
-                        deadline);
-                } catch (...) {
-                    ZstdSourceTransferResult result =
-                        impl_->invalid(ZstdSourceTransferStatus::TerminalError);
-                    result.attempts = attempt;
-                    impl_->require_replacement(result, explicit_route);
-                    co_return result;
+                // BUSY is capacity only: this attempt has not started and no
+                // route or commit state changed.  Wait (bounded, under the
+                // original deadline) and reopen the same attempt.
+                auto capacity_wait = kCapacityWaitMin;
+                for (bool reopen = attempt > 1;; reopen = true) {
+                    try {
+                        connected_fd = co_await open_connection(
+                            std::get<ConnectedFdFactory>(target), deadline,
+                            reopen ? impl_->config.reopen : std::nullopt);
+                    } catch (...) {
+                        ZstdSourceTransferResult result =
+                            impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+                        result.attempts = attempt;
+                        impl_->require_replacement(result, explicit_route);
+                        co_return result;
+                    }
+                    const auto now = Clock::now();
+                    if (connected_fd != kConnectedFdCapacityBusy || now >= deadline)
+                        break;
+                    boost::asio::steady_timer timer(
+                        co_await boost::asio::this_coro::executor,
+                        std::min(capacity_wait, deadline - now));
+                    boost::system::error_code wait_error;
+                    co_await timer.async_wait(
+                        boost::asio::redirect_error(boost::asio::use_awaitable, wait_error));
+                    if (wait_error)
+                        break;
+                    capacity_wait = std::min(2 * capacity_wait, kCapacityWaitMax);
                 }
                 if (connected_fd < 0) {
                     run.status = Clock::now() >= deadline

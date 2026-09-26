@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <grp.h>
 #include <poll.h>
 #include <stdexcept>
@@ -2586,6 +2587,287 @@ void test_f_live_session_overflow_from_two_c_runtimes() {
     CHECK(second_later.code == local::SourceTransferResultCode::Committed);
 }
 
+// Sockets only: a runtime creates its reactor descriptors lazily.
+size_t open_socket_count() {
+    size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+        std::error_code error;
+        const auto target = std::filesystem::read_symlink(entry.path(), error);
+        if (!error && target.native().starts_with("socket:"))
+            ++count;
+    }
+    return count;
+}
+
+// Stands in for F's iceccd and control worker, answering each arm with the
+// next step of a script (the last step repeats).  Sessions it admits run on
+// the real F runtime.
+class ScriptedFront {
+public:
+    enum class Step {
+        Ready,
+        ReadyLoseFinal,  // F commits the input but never writes TX_COMMIT
+        Busy,
+        BusyReplaced,  // BUSY from F's next store generation
+        Stall,  // never answers the arm; C's open waits out its arm timeout
+    };
+
+    ScriptedFront(service::SidecarRuntime& f_runtime, uint64_t f_store_generation,
+                  std::vector<Step> steps, std::function<void()> before_refusal = {})
+        : f_runtime_(f_runtime), f_store_generation_(f_store_generation),
+          steps_(std::move(steps)), before_refusal_(std::move(before_refusal)),
+          listener_(loopback_listener(port_)) {
+        CHECK(::listen(listener_, 64) == 0);
+        acceptor_ = std::thread([this] { accept_loop(); });
+    }
+    ~ScriptedFront() { stop(); }
+    ScriptedFront(const ScriptedFront&) = delete;
+    ScriptedFront& operator=(const ScriptedFront&) = delete;
+
+    [[nodiscard]] uint16_t port() const noexcept { return port_; }
+    [[nodiscard]] size_t arms() const noexcept { return arms_.load(); }
+
+    void stop() noexcept {
+        stopping_.store(true, std::memory_order_release);
+        if (acceptor_.joinable())
+            acceptor_.join();
+        for (std::thread& worker : workers_)
+            if (worker.joinable())
+                worker.join();
+        workers_.clear();
+        if (listener_ >= 0)
+            (void)::close(listener_);
+        listener_ = -1;
+    }
+
+private:
+    void accept_loop() noexcept {
+        while (!stopping_.load(std::memory_order_acquire)) {
+            pollfd descriptor{listener_, POLLIN, 0};
+            if (::poll(&descriptor, 1, 20) <= 0)
+                continue;
+            sockaddr_in peer{};
+            socklen_t peer_size = sizeof(peer);
+            const int accepted = ::accept(
+                listener_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            if (accepted < 0)
+                continue;
+            try {
+                workers_.emplace_back([this, accepted, peer, peer_size] {
+                    serve(accepted, peer, peer_size);
+                });
+            } catch (...) {
+                (void)::close(accepted);
+            }
+        }
+    }
+
+    void serve(int accepted, sockaddr_in peer, socklen_t peer_size) noexcept {
+        try {
+            std::unique_ptr<MsgChannel> channel(Service::createChannel(
+                accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+            if (!channel)
+                return;
+            std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+            const auto* arm = arm_message != nullptr
+                                  ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                                  : nullptr;
+            if (arm == nullptr || !arm->valid_payload())
+                return;
+            const Step step = steps_[std::min(arms_.fetch_add(1), steps_.size() - 1)];
+            const bool busy = step == Step::Busy || step == Step::BusyReplaced;
+            if (step == Step::Stall) {
+                if (before_refusal_)
+                    before_refusal_();
+                // Returns at C's close, or after ten seconds.
+                (void)std::unique_ptr<Msg>(channel->get_msg(10, true));
+                return;
+            }
+            ClaimAttemptCapability128 capability_1;
+            ClaimAttemptCapability128 capability_2;
+            capability_1.bytes.fill(0xe1);
+            capability_2.bytes.fill(0xe2);
+            const P50SourceArmedMsg acknowledgement(
+                arm->arm, 111, 112,
+                f_store_generation_ + (step == Step::BusyReplaced ? 1 : 0),
+                f_runtime_.f_store_guid().bytes, kStoreIdentityDerivationVersion,
+                113, 2500, capability_1, capability_2);
+            if (!channel->send_msg(acknowledgement))
+                return;
+            std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+            if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+                return;
+            const int raw_fd = channel->release_fd_if_input_empty();
+            if (raw_fd < 0)
+                return;
+            const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            if (busy) {
+                if (before_refusal_)
+                    before_refusal_();
+                (void)send_cache_session_busy(raw_fd, ready_deadline);
+                (void)::close(raw_fd);
+                return;
+            }
+            if (!f_runtime_.try_reserve_session()) {
+                (void)::close(raw_fd);
+                return;
+            }
+            if (!send_cache_session_ready(raw_fd, ready_deadline)) {
+                f_runtime_.release_session_reservation();
+                (void)::close(raw_fd);
+                return;
+            }
+            EndpointIoControl control;
+            if (step == Step::ReadyLoseFinal)
+                control.close_before_write = MessageType::TX_COMMIT;
+            f_runtime_.start_adopted_endpoint(raw_fd, control);
+        } catch (...) {
+        }
+    }
+
+    service::SidecarRuntime& f_runtime_;
+    const uint64_t f_store_generation_;
+    const std::vector<Step> steps_;
+    const std::function<void()> before_refusal_;
+    uint16_t port_ = 0;
+    int listener_ = -1;
+    std::atomic<bool> stopping_{false};
+    std::atomic<size_t> arms_{0};
+    std::vector<std::thread> workers_;
+    std::thread acceptor_;
+};
+
+// C's first attempt commits on F but loses TX_COMMIT, so C reopens F for the
+// same operation.  BUSY from the same F store is capacity only: C waits and
+// reopens until F takes the session, then recovers the exact receipt without
+// a second publication.  BUSY from a replaced F store is a failed open, and a
+// stop is honoured between waits; neither opens F again.  A stop while a
+// reopen is already blocked is bounded by the open's arm timeout, not the
+// backoff step.
+void test_reopen_busy_waits_only_for_the_same_f_store() {
+    using Step = ScriptedFront::Step;
+    constexpr uint64_t kFStoreGeneration = 31;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x93;
+    std::atomic<size_t> publications{0};
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    f_config.endpoint_config.input_job_state =
+        [&publications](CStoreGuid, const TxBegin&, const TxCommit&,
+                        std::span<const uint8_t>) {
+            ++publications;
+            return InputJobState::Open;
+        };
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    const auto c_config = [](uint8_t root_byte) {
+        StoreIdentityRoot root{};
+        root.bytes[15] = root_byte;
+        const SidecarLaunchIdentity launch = test_sidecar_launch(root);
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        return config;
+    };
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](service::SidecarRuntime& runtime, uint16_t port,
+                              uint64_t identity) {
+        const std::string text = "reopen-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            clock.clock_domain_id, clock.time_namespace_id);
+        return runtime.transfer_source_on_owner(
+            source_transfer_request(port, identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-busy-reopen", source)));
+    };
+    const auto settled = [&](size_t sockets) {
+        return eventually(
+            [&] {
+                return f_runtime.live_session_count() == 0 &&
+                       open_socket_count() == sockets;
+            },
+            std::chrono::seconds(5));
+    };
+    const auto retry_exhausted = static_cast<uint16_t>(
+        static_cast<uint16_t>(ZstdSourceTransferStatus::RetryExhausted) + 1);
+
+    {
+        service::SidecarRuntime c_runtime(c_config(0xc1));
+        ScriptedFront front(f_runtime, kFStoreGeneration,
+                            {Step::ReadyLoseFinal, Step::Busy, Step::Busy, Step::Ready});
+        const size_t sockets = open_socket_count();
+        const local::P50SourceTransferResult recovered = transfer(c_runtime, front.port(), 1000);
+        CHECK(recovered.code == local::SourceTransferResultCode::Committed);
+        CHECK(recovered.attempts == 2);
+        CHECK(front.arms() == 4);
+        CHECK(publications.load() == 1);
+        const local::P50SourceTransferResult successor = transfer(c_runtime, front.port(), 1100);
+        CHECK(successor.code == local::SourceTransferResultCode::Committed);
+        CHECK(successor.tu_seq == recovered.tu_seq + 1);
+        CHECK(front.arms() == 5);
+        CHECK(publications.load() == 2);
+        CHECK(settled(sockets));
+    }
+    {
+        service::SidecarRuntime c_runtime(c_config(0xc2));
+        ScriptedFront front(f_runtime, kFStoreGeneration,
+                            {Step::ReadyLoseFinal, Step::BusyReplaced});
+        const size_t sockets = open_socket_count();
+        const local::P50SourceTransferResult replaced = transfer(c_runtime, front.port(), 2000);
+        CHECK(replaced.code == local::SourceTransferResultCode::Error);
+        CHECK(replaced.error_code == retry_exhausted);
+        CHECK(replaced.attempts == 2);
+        CHECK(front.arms() == 2);
+        CHECK(settled(sockets));
+    }
+    {
+        service::SidecarRuntime c_runtime(c_config(0xc3));
+        ScriptedFront front(f_runtime, kFStoreGeneration, {Step::ReadyLoseFinal, Step::Busy},
+                            [&c_runtime] { c_runtime.stop(); });
+        const size_t sockets = open_socket_count();
+        const auto started = std::chrono::steady_clock::now();
+        const local::P50SourceTransferResult stopped = transfer(c_runtime, front.port(), 3000);
+        CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+        CHECK(stopped.code == local::SourceTransferResultCode::Error);
+        CHECK(stopped.error_code == retry_exhausted);
+        CHECK(stopped.attempts == 2);
+        CHECK(front.arms() == 2);
+        CHECK(settled(sockets));
+    }
+    {
+        service::RuntimeConfig config = c_config(0xc4);
+        config.source_open_arm_timeout = std::chrono::milliseconds(1000);
+        service::SidecarRuntime c_runtime(std::move(config));
+        std::atomic<std::chrono::steady_clock::rep> stop_at{0};
+        ScriptedFront front(f_runtime, kFStoreGeneration, {Step::ReadyLoseFinal, Step::Stall},
+                            [&] {
+                                stop_at = std::chrono::steady_clock::now().time_since_epoch().count();
+                                c_runtime.stop();
+                            });
+        const size_t sockets = open_socket_count();
+        const local::P50SourceTransferResult stalled = transfer(c_runtime, front.port(), 4000);
+        const auto after_stop = std::chrono::steady_clock::now() -
+            std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(stop_at.load()));
+        std::fprintf(stderr,
+                     "p50cacheservice: stop during a blocked reopen: result %lld ms later "
+                     "(arm timeout 1000 ms, deadline 20 s)\n",
+                     static_cast<long long>(
+                         std::chrono::duration_cast<std::chrono::milliseconds>(after_stop).count()));
+        CHECK(stalled.code == local::SourceTransferResultCode::Error);
+        CHECK(stalled.error_code == retry_exhausted);
+        CHECK(stalled.attempts == 2);
+        CHECK(stop_at.load() != 0);
+        CHECK(after_stop >= std::chrono::milliseconds(900) &&
+              after_stop < std::chrono::milliseconds(2000));
+        CHECK(front.arms() == 2);
+        CHECK(settled(sockets));
+    }
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -3089,6 +3371,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::strcmp(argv[1], "--f-live-capacity") == 0) {
             test_f_live_session_overflow_from_two_c_runtimes();
+            test_reopen_busy_waits_only_for_the_same_f_store();
             return 0;
         }
         CHECK(argc == 1);

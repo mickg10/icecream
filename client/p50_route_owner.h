@@ -40,6 +40,8 @@ struct P50RouteOwnerConfig {
     std::chrono::steady_clock::duration maximum_duration =
         std::chrono::seconds(300);
     int compression_level = 3;
+    // Forwarded to every sender: where reopens run their blocking round trip.
+    std::optional<ReopenExecutor> reopen;
     P29InternerFaultInjection p29_interner_fault_injection =
         P29InternerFaultInjection::Disabled;
     // Forwarded only to the sender's deterministic route-poison unit seam.

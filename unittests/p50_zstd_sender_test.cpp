@@ -3,15 +3,24 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_future.hpp>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
 #include <future>
+#include <mutex>
 #include <netinet/in.h>
+#include <optional>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -730,6 +739,498 @@ void test_factory_cannot_extend_absolute_deadline() {
     CHECK(transfer.attempts == 1);
 }
 
+EndpointCaps route_caps() {
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_ROUTE;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    return caps;
+}
+
+size_t open_fd_count() {
+    size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+        (void)entry;
+        ++count;
+    }
+    return count;
+}
+
+// F-side evidence: each publication of a committed input and its bytes.
+struct Publications {
+    size_t count = 0;
+    std::vector<uint8_t> last;
+};
+
+P50ServerEndpointConfig publishing_config(Publications& publications) {
+    P50ServerEndpointConfig result;
+    result.input_job_state = [&publications](CStoreGuid, const TxBegin&, const TxCommit&,
+                                             std::span<const uint8_t> exact) {
+        ++publications.count;
+        publications.last.assign(exact.begin(), exact.end());
+        return InputJobState::Open;
+    };
+    return result;
+}
+
+asio::awaitable<ServerRunStatus> serve_twice(P50ServerEndpoint& server,
+                                             tcp::acceptor& acceptor,
+                                             EndpointIoControl first) {
+    (void)co_await server.accept_one(acceptor, std::move(first));
+    co_return (co_await server.accept_one(acceptor)).status;
+}
+
+bool send_all(int fd, const uint8_t* data, size_t size) {
+    while (size != 0) {
+        const ssize_t count = ::send(fd, data, size, MSG_NOSIGNAL);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return false;
+        data += count;
+        size -= static_cast<size_t>(count);
+    }
+    return true;
+}
+
+// Forwards one connection to `server` until the client has sent `cut` bytes,
+// then closes both sides, so F sees a CacheWire stream cut mid-BODY.
+class CutRelay {
+public:
+    CutRelay(tcp::endpoint server, size_t cut) : server_(server), cut_(cut) {
+        listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t size = sizeof(address);
+        CHECK(listener_ >= 0 &&
+              ::bind(listener_, reinterpret_cast<const sockaddr*>(&address), size) == 0 &&
+              ::listen(listener_, 1) == 0 &&
+              ::getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+        endpoint_ = {asio::ip::address_v4::loopback(), ntohs(address.sin_port)};
+        thread_ = std::thread([this] { run(); });
+    }
+    ~CutRelay() {
+        thread_.join();
+        (void)::close(listener_);
+    }
+    CutRelay(const CutRelay&) = delete;
+    CutRelay& operator=(const CutRelay&) = delete;
+
+    [[nodiscard]] tcp::endpoint endpoint() const { return endpoint_; }
+    [[nodiscard]] size_t forwarded() const { return forwarded_.load(); }
+
+private:
+    void run() {
+        pollfd waiting{listener_, POLLIN, 0};
+        if (::poll(&waiting, 1, 10000) != 1)
+            return;
+        const int client = ::accept4(listener_, nullptr, nullptr, SOCK_CLOEXEC);
+        const int upstream = client < 0 ? -1 : connect_fd(server_);
+        std::array<uint8_t, 4096> buffer{};
+        pollfd sides[2] = {{client, POLLIN, 0}, {upstream, POLLIN, 0}};
+        while (client >= 0 && upstream >= 0 && forwarded_.load() < cut_ &&
+               ::poll(sides, 2, 10000) > 0) {
+            if (sides[0].revents != 0) {
+                const ssize_t count = ::read(
+                    client, buffer.data(), std::min(buffer.size(), cut_ - forwarded_.load()));
+                if (count <= 0 || !send_all(upstream, buffer.data(), static_cast<size_t>(count)))
+                    break;
+                forwarded_ += static_cast<size_t>(count);
+            }
+            if (sides[1].revents != 0) {
+                const ssize_t count = ::read(upstream, buffer.data(), buffer.size());
+                if (count <= 0 || !send_all(client, buffer.data(), static_cast<size_t>(count)))
+                    break;
+            }
+        }
+        if (client >= 0)
+            (void)::close(client);
+        if (upstream >= 0)
+            (void)::close(upstream);
+    }
+
+    tcp::endpoint server_;
+    size_t cut_;
+    int listener_ = -1;
+    tcp::endpoint endpoint_;
+    std::atomic<size_t> forwarded_{0};
+    std::thread thread_;
+};
+
+// Connection factory whose calls follow a script; calls past its end repeat
+// the last step.  Records the thread each call ran on.
+class ScriptedConnections {
+public:
+    enum class Step { Server, Relay, Busy, LateServer };
+
+    ScriptedConnections(std::vector<Step> steps, tcp::endpoint server,
+                        tcp::endpoint relay = {})
+        : steps_(std::move(steps)), server_(server), relay_(relay) {}
+
+    ConnectedFdFactory factory() {
+        return [this](auto) {
+            Step step;
+            {
+                std::lock_guard lock(mutex_);
+                step = steps_[std::min(threads_.size(), steps_.size() - 1)];
+                threads_.push_back(std::this_thread::get_id());
+            }
+            switch (step) {
+            case Step::Server:
+                return connect_fd(server_);
+            case Step::Relay:
+                return connect_fd(relay_);
+            case Step::Busy:
+                return kConnectedFdCapacityBusy;
+            case Step::LateServer:
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                return connect_fd(server_);
+            }
+            return -1;
+        };
+    }
+
+    std::vector<std::thread::id> calls() {
+        std::lock_guard lock(mutex_);
+        return threads_;
+    }
+
+private:
+    const std::vector<Step> steps_;
+    const tcp::endpoint server_;
+    const tcp::endpoint relay_;
+    std::mutex mutex_;
+    std::vector<std::thread::id> threads_;
+};
+
+using Step = ScriptedConnections::Step;
+
+ReopenExecutor reopen_on(asio::thread_pool& pool, size_t limit = 8) {
+    return {pool.get_executor(), std::make_shared<std::atomic<size_t>>(0), limit};
+}
+
+bool reopens_left_owner(const std::vector<std::thread::id>& calls) {
+    if (calls.empty() || calls.front() != std::this_thread::get_id())
+        return false;
+    return std::none_of(calls.begin() + 1, calls.end(), [](std::thread::id id) {
+        return id == std::this_thread::get_id();
+    });
+}
+
+// F commits the first attempt but its TX_COMMIT is lost, and the reopen meets
+// BUSY twice.  C recovers the exact receipt: no second publication, no extra
+// attempt or open, and the successor follows at the next TU.
+void test_busy_reopen_recovers_lost_final_commit() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    Publications publications;
+    P50ServerEndpoint server(Id128::from_u64(7082), route_caps(), nullptr, nullptr,
+                             publishing_config(publications));
+    ScriptedConnections connections({Step::Server, Step::Busy, Step::Busy, Step::Server},
+                                    acceptor.local_endpoint());
+    asio::thread_pool reopen_pool(1);
+    ZstdSourceTransferConfig sender_config = route_config();
+    sender_config.reopen = reopen_on(reopen_pool);
+    P50ZstdSourceSender sender(Id128::from_u64(7081), PrepareRequestKey{109, 1},
+                               sender_config);
+    const size_t descriptors = open_fd_count();
+    EndpointIoControl lose_final;
+    lose_final.close_before_write = MessageType::TX_COMMIT;
+    const std::vector<uint8_t> source{'l', 'o', 's', 't', '-', 'f', 'i', 'n', 'a', 'l'};
+    auto server_run = asio::co_spawn(context, serve_twice(server, acceptor, lose_final),
+                                     asio::use_future);
+    auto transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(connections.factory(), PrepareRequestKey{9201, 1},
+                              std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                              source),
+        asio::use_future);
+    context.run();
+    const auto result = transfer.get();
+    CHECK(result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(result.attempts == 2);
+    CHECK(result.committed_input.has_value());
+    CHECK(result.committed_input->tu_seq.value == 0);
+    CHECK(result.committed_input == server.last_committed_input(Id128::from_u64(7081)));
+    // C accepts F's retained commit from SESSION_STATE and closes, so F's
+    // reconciling session ends at that EOF rather than completing a dialogue.
+    CHECK(server_run.get() != ServerRunStatus::TerminalError);
+    CHECK(publications.count == 1 && publications.last == source);
+    CHECK(connections.calls().size() == 4);
+    CHECK(reopens_left_owner(connections.calls()));
+
+    const std::vector<uint8_t> successor{'n', 'e', 'x', 't'};
+    context.restart();
+    auto successor_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                           asio::use_future);
+    auto successor_transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(acceptor.local_endpoint(), PrepareRequestKey{9201, 2},
+                              std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                              successor),
+        asio::use_future);
+    context.run();
+    CHECK(successor_server.get().status == ServerRunStatus::Completed);
+    const auto successor_result = successor_transfer.get();
+    CHECK(successor_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(successor_result.committed_input->tu_seq.value == 1);
+    CHECK(publications.count == 2 && publications.last == successor);
+    reopen_pool.join();
+    CHECK(open_fd_count() == descriptors);
+}
+
+// The first attempt is cut mid-BODY and its reopen meets BUSY twice.  C
+// completes the same operation with its retained body: one publication of the
+// exact bytes at the same TU.
+void test_busy_reopen_completes_cut_body() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    Publications publications;
+    P50ServerEndpoint server(Id128::from_u64(7092), route_caps(), nullptr, nullptr,
+                             publishing_config(publications));
+    asio::thread_pool reopen_pool(1);
+    ZstdSourceTransferConfig sender_config = route_config();
+    sender_config.reopen = reopen_on(reopen_pool);
+    P50ZstdSourceSender sender(Id128::from_u64(7091), PrepareRequestKey{110, 1},
+                               sender_config);
+    // Incompressible, so the encoded BODY is far longer than the cut.
+    std::vector<uint8_t> source(256 * 1024);
+    uint32_t state = 0x9e3779b9;
+    for (uint8_t& byte : source) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<uint8_t>(state);
+    }
+    const size_t descriptors = open_fd_count();
+    std::optional<CutRelay> relay;
+    relay.emplace(acceptor.local_endpoint(), 64 * 1024);
+    ScriptedConnections connections({Step::Relay, Step::Busy, Step::Busy, Step::Server},
+                                    acceptor.local_endpoint(), relay->endpoint());
+    auto server_run = asio::co_spawn(context, serve_twice(server, acceptor, {}),
+                                     asio::use_future);
+    auto transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(connections.factory(), PrepareRequestKey{9301, 1},
+                              std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                              source),
+        asio::use_future);
+    context.run();
+    const auto result = transfer.get();
+    CHECK(result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(server_run.get() == ServerRunStatus::Completed);
+    CHECK(relay->forwarded() == 64 * 1024);
+    CHECK(result.attempts == 2);
+    CHECK(result.committed_input->tu_seq.value == 0);
+    CHECK(result.raw_digest == icecc::digest128(source));
+    CHECK(publications.count == 1 && publications.last == source);
+    CHECK(connections.calls().size() == 4);
+    CHECK(reopens_left_owner(connections.calls()));
+    relay.reset();
+    reopen_pool.join();
+    CHECK(open_fd_count() == descriptors);
+}
+
+// A reopen that meets BUSY until the original deadline ends there, neither
+// early nor late, with bounded opens; the route and its unresolved commit are
+// then quarantined as for any deadline.
+void test_perpetual_busy_ends_at_original_deadline() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    Publications publications;
+    P50ServerEndpoint server(Id128::from_u64(7102), route_caps(), nullptr, nullptr,
+                             publishing_config(publications));
+    ScriptedConnections connections({Step::Server, Step::Busy}, acceptor.local_endpoint());
+    asio::thread_pool reopen_pool(1);
+    ZstdSourceTransferConfig sender_config = route_config();
+    sender_config.reopen = reopen_on(reopen_pool);
+    P50ZstdSourceSender sender(Id128::from_u64(7101), PrepareRequestKey{111, 1},
+                               sender_config);
+    const size_t descriptors = open_fd_count();
+    EndpointIoControl lose_final;
+    lose_final.close_before_write = MessageType::TX_COMMIT;
+    const std::vector<uint8_t> source{'b', 'u', 's', 'y'};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+    auto server_run = asio::co_spawn(context, server.accept_one(acceptor, lose_final),
+                                     asio::use_future);
+    auto transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(connections.factory(), PrepareRequestKey{9401, 1},
+                              deadline, source),
+        asio::use_future);
+    context.run();
+    const auto ended = std::chrono::steady_clock::now();
+    (void)server_run.get();
+    const auto result = transfer.get();
+    CHECK(result.status == ZstdSourceTransferStatus::DeadlineExceeded);
+    CHECK(result.attempts == 2);
+    CHECK(result.replacement_required && result.route_local_failure);
+    CHECK(ended >= deadline && ended - deadline < std::chrono::milliseconds(150));
+    const size_t calls = connections.calls().size();
+    CHECK(calls >= 5 && calls <= 12);
+    CHECK(publications.count == 1);
+
+    unsigned later_connections = 0;
+    context.restart();
+    auto later = asio::co_spawn(
+        context,
+        sender.transfer_route(
+            ConnectedFdFactory{[&later_connections](auto) {
+                ++later_connections;
+                return -1;
+            }},
+            PrepareRequestKey{9401, 2},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    CHECK(later.get().status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(later_connections == 0);
+    reopen_pool.join();
+    CHECK(open_fd_count() == descriptors);
+}
+
+// A reopen still blocked in its open at the deadline: the sender resumes at
+// the deadline, and the descriptor that open returns later is closed.
+void test_late_reopen_is_abandoned_at_deadline() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                       std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    P50ServerEndpoint server(Id128::from_u64(7112), route_caps(), nullptr, nullptr,
+                             server_config);
+    ScriptedConnections connections({Step::Server, Step::LateServer},
+                                    acceptor.local_endpoint());
+    asio::thread_pool reopen_pool(1);
+    ZstdSourceTransferConfig sender_config = route_config();
+    sender_config.reopen = reopen_on(reopen_pool);
+    P50ZstdSourceSender sender(Id128::from_u64(7111), PrepareRequestKey{112, 1},
+                               sender_config);
+    const size_t descriptors = open_fd_count();
+    EndpointIoControl lose_final;
+    lose_final.close_before_write = MessageType::TX_COMMIT;
+    const std::vector<uint8_t> source{'l', 'a', 't', 'e'};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    auto server_run = asio::co_spawn(context, server.accept_one(acceptor, lose_final),
+                                     asio::use_future);
+    auto transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(connections.factory(), PrepareRequestKey{9501, 1},
+                              deadline, source),
+        asio::use_future);
+    context.run();
+    const auto ended = std::chrono::steady_clock::now();
+    (void)server_run.get();
+    const auto result = transfer.get();
+    CHECK(result.status == ZstdSourceTransferStatus::DeadlineExceeded);
+    CHECK(ended - deadline < std::chrono::milliseconds(150));
+    reopen_pool.join();
+    CHECK(connections.calls().size() == 2);
+    CHECK(open_fd_count() == descriptors);
+}
+
+// Two callers' reopens block, one running and one queued, until both callers
+// give up at their deadlines; both keep their credits meanwhile.  A third
+// caller is refused at once, without an open.  When the blocked open returns,
+// its late descriptor is closed and the queued open runs past its deadline
+// without opening, freeing both credits for the next caller.
+void test_reopen_credits_bound_blocked_and_queued_opens() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool gate_open = false;
+    std::atomic<unsigned> blocked_opens{0};
+    std::atomic<unsigned> first_calls{0};
+    std::atomic<unsigned> second_calls{0};
+    std::atomic<unsigned> third_calls{0};
+    std::atomic<unsigned> fourth_calls{0};
+    asio::thread_pool reopen_pool(1);
+    const ReopenExecutor reopen = reopen_on(reopen_pool, 2);
+    // The first call fails, losing the attempt; a reopen waits for the gate.
+    const auto gated = [&](std::atomic<unsigned>& calls) {
+        return ConnectedFdFactory{[&, counter = &calls, remote = acceptor.local_endpoint()](auto) {
+            if ((*counter)++ == 0)
+                return -1;
+            ++blocked_opens;
+            std::unique_lock lock(gate_mutex);
+            gate_changed.wait(lock, [&] { return gate_open; });
+            return connect_fd(remote);
+        }};
+    };
+    const auto sender = [&](uint64_t id) {
+        ZstdSourceTransferConfig sender_config = route_config();
+        sender_config.reopen = reopen;
+        return std::make_unique<P50ZstdSourceSender>(Id128::from_u64(id),
+                                                     PrepareRequestKey{id, 1}, sender_config);
+    };
+    const std::vector<uint8_t> source{'q', 'u', 'e', 'u', 'e'};
+    const size_t descriptors = open_fd_count();
+
+    auto first = sender(7121);
+    auto second = sender(7122);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto first_transfer = asio::co_spawn(
+        context,
+        first->transfer_route(gated(first_calls), PrepareRequestKey{9601, 1}, deadline, source),
+        asio::use_future);
+    auto second_transfer = asio::co_spawn(
+        context,
+        second->transfer_route(gated(second_calls), PrepareRequestKey{9602, 1}, deadline, source),
+        asio::use_future);
+    context.run();
+    CHECK(first_transfer.get().status == ZstdSourceTransferStatus::DeadlineExceeded);
+    CHECK(second_transfer.get().status == ZstdSourceTransferStatus::DeadlineExceeded);
+    CHECK(blocked_opens.load() == 1);
+    CHECK(reopen.outstanding->load() == 2);
+
+    auto third = sender(7123);
+    context.restart();
+    const auto third_started = std::chrono::steady_clock::now();
+    auto third_transfer = asio::co_spawn(
+        context,
+        third->transfer_route(gated(third_calls), PrepareRequestKey{9603, 1},
+                              std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                              source),
+        asio::use_future);
+    context.run();
+    CHECK(third_transfer.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(std::chrono::steady_clock::now() - third_started < std::chrono::milliseconds(100));
+    CHECK(third_calls.load() == 1);
+
+    {
+        std::lock_guard lock(gate_mutex);
+        gate_open = true;
+    }
+    gate_changed.notify_all();
+    const auto drained = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (reopen.outstanding->load() != 0 && std::chrono::steady_clock::now() < drained)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(reopen.outstanding->load() == 0);
+    CHECK(blocked_opens.load() == 1);
+
+    auto fourth = sender(7124);
+    context.restart();
+    auto fourth_transfer = asio::co_spawn(
+        context,
+        fourth->transfer_route(
+            ConnectedFdFactory{[&fourth_calls](auto) {
+                ++fourth_calls;
+                return -1;
+            }},
+            PrepareRequestKey{9604, 1},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    CHECK(fourth_transfer.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(fourth_calls.load() == 2);
+    reopen_pool.join();
+    CHECK(open_fd_count() == descriptors);
+}
+
 }  // namespace
 
 int main() {
@@ -745,4 +1246,9 @@ int main() {
     test_absolute_deadline_is_required();
     test_disconnected_retry_is_bounded_and_exactly_once();
     test_factory_cannot_extend_absolute_deadline();
+    test_busy_reopen_recovers_lost_final_commit();
+    test_busy_reopen_completes_cut_body();
+    test_perpetual_busy_ends_at_original_deadline();
+    test_late_reopen_is_abandoned_at_deadline();
+    test_reopen_credits_bound_blocked_and_queued_opens();
 }

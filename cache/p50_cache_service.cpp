@@ -1461,6 +1461,8 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.max_completed_requests = config_.max_route_completed_requests;
     route_config.max_relationships = config_.max_route_relationships;
     route_config.compression_level = 3;
+    route_config.reopen = ReopenExecutor{reopen_pool_.get_executor(), reopen_outstanding_,
+                                         kReopenLimit};
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -1789,7 +1791,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     const P50RouteRelationship relationship{
         config_.c_store_guid, remote_f_guid, remote_f_generation, profile};
     const ConnectedFdFactory connection =
-        [first, open_armed, expected_guid = remote_f_guid,
+        [this, first, open_armed, expected_guid = remote_f_guid,
          expected_generation = remote_f_generation](
             std::chrono::steady_clock::time_point limit) mutable {
             if (first->fd >= 0) {
@@ -1797,11 +1799,18 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 first->fd = -1;
                 return fd;
             }
+            if (stop_requested_.load(std::memory_order_acquire))
+                return -1;
             FStoreGuid observed_guid;
             uint64_t observed_generation = 0;
             const int fd = open_armed(limit, observed_guid, observed_generation);
-            if (fd < 0 || observed_guid != expected_guid ||
-                observed_generation != expected_generation) {
+            const bool same_store = observed_guid == expected_guid &&
+                                    observed_generation == expected_generation;
+            // BUSY from the same F store is capacity only; any other store
+            // takes the ordinary failed-open path.
+            if (fd == kFSessionBusy && same_store)
+                return kConnectedFdCapacityBusy;
+            if (fd < 0 || !same_store) {
                 if (fd >= 0)
                     ::close(fd);
                 return -1;
