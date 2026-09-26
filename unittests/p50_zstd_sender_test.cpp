@@ -918,7 +918,8 @@ void test_p51_completed_ledger_reserves_live_capacity() {
     std::cerr << "P51_COMPLETED_LEDGER_CAP_SELECTOR PASS\n";
 }
 
-void test_p51_expired_retained_witness_retires_capacity_waiters() {
+void test_p51_expired_retained_witness_has_bounded_cleanup(
+    bool prompt_connector_failure) {
     constexpr uint32_t kWindow = 2;
     constexpr uint64_t kPhysicalGeneration = 27;
     const ProfileId profile = ProfileId::ZSTD_TU;
@@ -940,8 +941,8 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
     const std::vector<uint8_t> waiting_input(waiting_text.begin(), waiting_text.end());
     const std::vector<uint8_t> after_input(after_text.begin(), after_text.end());
     const auto old_deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(2);
-    const auto waiter_deadline = old_deadline + std::chrono::seconds(8);
+                              std::chrono::seconds(1);
+    const auto waiter_deadline = old_deadline + std::chrono::seconds(2);
 
     std::mutex progress_mutex;
     std::condition_variable progress_cv;
@@ -1064,6 +1065,7 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
     auto authority = std::make_shared<P50PreparationAuthority>(
         c_guid, caps.zstd, limits, 1, profile);
     ZstdSourceTransferConfig sender_config = config();
+    sender_config.maximum_duration = std::chrono::seconds(4);
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
     sender_config.max_completed_requests = 1;
@@ -1096,10 +1098,15 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
                                                     std::memory_order_relaxed);
         if (call == 1) {
             completion(connect_fd(remote));
+        } else if (prompt_connector_failure) {
+            // F is unavailable throughout this bounded cleanup episode.
+            // Recovery may be attempted, but must not replay the expired row
+            // or let fresh callers restart the cleanup budget indefinitely.
+            (void)deadline;
+            completion(-1);
         } else {
-            // Keep the recovery connector pending until the retained witness's
-            // original deadline. Immediate refusal would only prove a
-            // transient route-local error, not expiry settlement.
+            // Preserve the case where recovery setup withholds its completion
+            // until this caller's own absolute deadline.
             auto timer = std::make_shared<asio::steady_timer>(c_context);
             timer->expires_at(deadline);
             timer->async_wait(
@@ -1172,7 +1179,7 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
     CHECK(first.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
     const auto expired = first.get();
     CHECK(expired.status == ZstdSourceTransferStatus::DeadlineExceeded);
-    CHECK(waiting.wait_for(std::chrono::seconds(3)) ==
+    CHECK(waiting.wait_for(std::chrono::seconds(4)) ==
           std::future_status::ready);
     const auto replacement = waiting.get();
     std::cerr << "P51_COMPLETED_LEDGER_EXPIRED_WITNESS wait_status="
@@ -1186,24 +1193,36 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
               << connector_calls_after_expiry.load() << "\n";
     CHECK(waiting_finished_after_old_deadline.load(
         std::memory_order_acquire));
-    CHECK(replacement.status == ZstdSourceTransferStatus::Unavailable);
-    CHECK(replacement.replacement_required);
-    CHECK(replacement.replacement_trigger ==
-          ReplacementTrigger::ExpiredUnresolvedWitness);
+    CHECK(replacement.status == ZstdSourceTransferStatus::Unavailable ||
+          replacement.status == ZstdSourceTransferStatus::DeadlineExceeded);
+    CHECK(!replacement.replacement_required);
     CHECK(replacement.attempts == 0);
+    CHECK(std::chrono::steady_clock::now() <=
+          waiter_deadline + std::chrono::seconds(1));
     CHECK(std::chrono::steady_clock::now() - old_deadline <
-          std::chrono::seconds(3));
+          std::chrono::seconds(4));
     CHECK(bundles_sent.load(std::memory_order_acquire) == 1);
     CHECK(binds.load(std::memory_order_acquire) == 1);
     CHECK(committed.load(std::memory_order_acquire) == 1);
     CHECK(acknowledged.load(std::memory_order_acquire) == 0);
-    CHECK(connector_calls_after_expiry.load(std::memory_order_acquire) == 0);
+    CHECK(connector_calls_after_expiry.load(std::memory_order_acquire) > 0);
+    CHECK(connector_calls_after_expiry.load(std::memory_order_acquire) <= 20);
     CHECK(input_mismatches.load(std::memory_order_relaxed) == 0);
+
+    const auto cleanup_deadline = old_deadline + sender_config.maximum_duration;
+    std::this_thread::sleep_until(cleanup_deadline +
+                                  std::chrono::milliseconds(50));
+    const unsigned connectors_before_terminal =
+        connector_calls.load(std::memory_order_acquire);
+    const unsigned post_expiry_before_terminal =
+        connector_calls_after_expiry.load(std::memory_order_acquire);
+    const auto after_deadline = std::chrono::steady_clock::now() +
+                                sender_config.maximum_duration;
 
     auto after = asio::co_spawn(
         c_context,
         sender->transfer_p51_route(after_armed, kPhysicalGeneration,
-            connector, PrepareRequestKey{3, 18203}, waiter_deadline,
+            connector, PrepareRequestKey{3, 18203}, after_deadline,
             after_input),
         asio::use_future);
     CHECK(after.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
@@ -1213,12 +1232,31 @@ void test_p51_expired_retained_witness_retires_capacity_waiters() {
     CHECK(after_result.replacement_trigger ==
           ReplacementTrigger::ExpiredUnresolvedWitness);
     CHECK(after_result.attempts == 0);
+    CHECK(connector_calls.load(std::memory_order_acquire) ==
+          connectors_before_terminal);
+    auto terminal_again = asio::co_spawn(
+        c_context,
+        sender->transfer_p51_route(after_armed, kPhysicalGeneration,
+            connector, PrepareRequestKey{3, 18203}, after_deadline,
+            after_input),
+        asio::use_future);
+    CHECK(terminal_again.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    const auto terminal_again_result = terminal_again.get();
+    CHECK(terminal_again_result.replacement_required);
+    CHECK(terminal_again_result.replacement_trigger ==
+          ReplacementTrigger::ExpiredUnresolvedWitness);
+    CHECK(connector_calls.load(std::memory_order_acquire) ==
+          connectors_before_terminal);
     CHECK(bundles_sent.load(std::memory_order_acquire) == 1);
-    CHECK(connector_calls_after_expiry.load(std::memory_order_acquire) == 0);
+    CHECK(connector_calls_after_expiry.load(std::memory_order_acquire) ==
+          post_expiry_before_terminal);
     CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
           std::future_status::ready);
     CHECK(server_future.get().status == ServerRunStatus::Disconnected);
-    std::cerr << "P51_COMPLETED_LEDGER_EXPIRED_WITNESS before+after waiter cold-replacement: ok\n";
+    std::cerr << "P51_COMPLETED_LEDGER_EXPIRED_WITNESS bounded-cleanup="
+              << (prompt_connector_failure ? "prompt-failure" : "withheld")
+              << " terminal-replacement=1 no-expired-replay=1\n";
 }
 
 asio::awaitable<ServerRunResult> sender_r2_accept(
@@ -5838,7 +5876,8 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 &&
         std::string_view(argv[1]) == "--completed-ledger-expired-witness") {
-        test_p51_expired_retained_witness_retires_capacity_waiters();
+        test_p51_expired_retained_witness_has_bounded_cleanup(false);
+        test_p51_expired_retained_witness_has_bounded_cleanup(true);
         return 0;
     }
     if (argc == 2 &&
@@ -5956,7 +5995,10 @@ int main(int argc, char** argv) {
     run("completed_ledger_cap_w2",
         test_p51_completed_ledger_reserves_live_capacity);
     run("completed_ledger_expired_witness",
-        test_p51_expired_retained_witness_retires_capacity_waiters);
+        [] {
+            test_p51_expired_retained_witness_has_bounded_cleanup(false);
+            test_p51_expired_retained_witness_has_bounded_cleanup(true);
+        });
     run("window_matrix_and_serial_control",
         test_p51_sender_window_matrix_and_serial_control);
     run("connector_first_failure_w30", [] {

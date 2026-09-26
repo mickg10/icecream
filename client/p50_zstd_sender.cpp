@@ -675,6 +675,10 @@ struct P50ZstdSourceSender::Impl {
     // same deadline so a W30 suffix cannot multiply immediate reconnects.
     std::vector<std::shared_ptr<boost::asio::steady_timer>> r2_recovery_waiters;
     Clock::time_point r2_recovery_retry_not_before{};
+    // A first expired unresolved witness starts one non-refreshing cleanup
+    // episode. Live callers may drive exact RESET reconciliation within this
+    // window; once it expires, fresh callers cannot restart it indefinitely.
+    Clock::time_point r2_expired_witness_cleanup_deadline{};
     unsigned r2_recovery_failures = 0;
     std::deque<std::shared_ptr<PendingReceipt>> r2_receipt_queue;
     // Retain every fully transmitted but not locally verified bundle across a
@@ -754,40 +758,61 @@ struct P50ZstdSourceSender::Impl {
         try_finalize_r2_physical_retirement();
     }
 
-    bool retire_expired_r2_witnesses() noexcept {
+    bool quarantine_expired_r2_witnesses() {
         bool expired = false;
+        bool newly_quarantined = false;
+        bool cleanup_expired = false;
         {
             std::lock_guard lock(r2_transfer_mutex);
             const auto now = Clock::now();
-            expired = std::any_of(
-                r2_retained_jobs.begin(), r2_retained_jobs.end(),
-                [now](const auto& entry) {
-                    const auto& pending = entry.second;
-                    if (!pending || pending->deadline > now)
-                        return false;
-                    return !(pending->done && !pending->failure &&
-                             pending->client_result.status ==
-                                 ClientRunStatus::Committed &&
-                             pending->client_result.committed_commit.has_value());
-                });
+            Clock::time_point first_expired_deadline{};
+            for (const auto& [ordinal, pending] : r2_retained_jobs) {
+                (void)ordinal;
+                if (!pending || pending->deadline > now ||
+                    (pending->done && !pending->failure &&
+                     pending->client_result.status ==
+                         ClientRunStatus::Committed &&
+                     pending->client_result.committed_commit.has_value()))
+                    continue;
+                if (first_expired_deadline == Clock::time_point{} ||
+                    pending->deadline < first_expired_deadline)
+                    first_expired_deadline = pending->deadline;
+            }
+            expired = first_expired_deadline != Clock::time_point{};
             if (expired && !route_replacement_required) {
-                // An unresolved exact witness cannot be replayed once its
-                // original ARM deadline has elapsed. Cold-retire this sender
-                // instead of allowing repeated fresh callers to spin through
-                // failed recovery attempts or extending that deadline.
-                route_replacement_required = true;
-                route_replacement_trigger =
-                    ReplacementTrigger::ExpiredUnresolvedWitness;
+                // Keep the exact expired witness in the bounded recovery
+                // interval so F can classify it during RESET. Its caller
+                // deadline still forbids replay, but must not prevent a live
+                // sibling from driving recovery and settling the suffix.
+                if (r2_expired_witness_cleanup_deadline == Clock::time_point{})
+                    r2_expired_witness_cleanup_deadline =
+                        first_expired_deadline + config.maximum_duration;
+                if (!r2_recovery_required) {
+                    r2_recovery_required = true;
+                    r2_failed_physical_generation =
+                        r2_physical_link_generation;
+                    r2_recovery_floor = endpoint->r2_confirmed_prefix();
+                    newly_quarantined = true;
+                }
+                if (now >= r2_expired_witness_cleanup_deadline) {
+                    if (!route_replacement_required)
+                        route_replacement_trigger =
+                            ReplacementTrigger::ExpiredUnresolvedWitness;
+                    route_replacement_required = true;
+                    cleanup_expired = true;
+                }
                 route_transport_quarantined = true;
             } else {
                 expired = false;
             }
         }
-        if (expired) {
+        if (newly_quarantined || cleanup_expired) {
             if (r2_socket) {
                 boost::system::error_code ignored;
                 r2_socket->close(ignored);
             }
+        }
+        if (expired) {
             wake_r2_recovery_waiters();
             wake_r2_completed_capacity_waiters();
         }
@@ -808,8 +833,10 @@ struct P50ZstdSourceSender::Impl {
         for (;;) {
             if (Clock::now() >= deadline)
                 co_return false;
-            if (retire_expired_r2_witnesses())
+            if (quarantine_expired_r2_witnesses()) {
+                recovery_required = true;
                 co_return false;
+            }
             std::shared_ptr<boost::asio::steady_timer> waiter;
             Clock::time_point wait_deadline = deadline;
             {
@@ -1059,6 +1086,12 @@ boost::asio::awaitable<bool> P50ZstdSourceSender::wait_for_r2_retry_not_before(
         Clock::duration retry_delay{};
         {
             std::lock_guard lock(impl_->r2_transfer_mutex);
+            if (impl_->r2_expired_witness_cleanup_deadline !=
+                Clock::time_point{})
+                deadline = std::min(
+                    deadline, impl_->r2_expired_witness_cleanup_deadline);
+            if (Clock::now() >= deadline)
+                co_return false;
             if (impl_->route_replacement_required)
                 co_return false;
             if ((require_recovery && !impl_->r2_recovery_required) ||
@@ -1122,6 +1155,26 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
         }
     } retirement_finalize{impl_.get(),
                           impl_->r2_background_task_started(true)};
+    struct ReaderRunningFinalize {
+        Impl* owner;
+        uint64_t generation;
+        ~ReaderRunningFinalize() noexcept {
+            bool stopped = false;
+            {
+                std::lock_guard lock(owner->r2_transfer_mutex);
+                if (owner->r2_reader_generation == generation &&
+                    owner->r2_physical_link_generation == generation &&
+                    owner->r2_reader_running) {
+                    owner->r2_reader_running = false;
+                    stopped = true;
+                }
+            }
+            if (stopped) {
+                owner->wake_r2_recovery_waiters();
+                owner->wake_r2_completed_capacity_waiters();
+            }
+        }
+    } reader_running_finalize{impl_.get(), physical_link_generation};
     if (impl_->config.hold_r2_receipt_reader_for_test) {
         boost::asio::steady_timer test_gate(executor);
         while (impl_->config.hold_r2_receipt_reader_for_test()) {
@@ -1140,7 +1193,6 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                 impl_->r2_reader_generation != physical_link_generation)
                 co_return;
             if (impl_->r2_receipt_queue.empty()) {
-                impl_->r2_reader_running = false;
                 co_return;
             }
             pending = impl_->r2_receipt_queue.front();
@@ -1282,7 +1334,6 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
                 failed_rows.assign(impl_->r2_receipt_queue.begin(),
                                    impl_->r2_receipt_queue.end());
                 impl_->r2_receipt_queue.clear();
-                impl_->r2_reader_running = false;
                 for (const auto& row : failed_rows) {
                     row->failure = pending->failure;
                     row->failure_physical_link_generation =
@@ -1348,6 +1399,26 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
         }
     } retirement_finalize{impl_.get(),
                           impl_->r2_background_task_started(false)};
+    struct AckPumpRunningFinalize {
+        Impl* owner;
+        uint64_t generation;
+        ~AckPumpRunningFinalize() noexcept {
+            bool stopped = false;
+            {
+                std::lock_guard lock(owner->r2_transfer_mutex);
+                if (owner->r2_ack_pump_generation == generation &&
+                    owner->r2_physical_link_generation == generation &&
+                    owner->r2_ack_pump_running) {
+                    owner->r2_ack_pump_running = false;
+                    stopped = true;
+                }
+            }
+            if (stopped) {
+                owner->wake_r2_recovery_waiters();
+                owner->wake_r2_completed_capacity_waiters();
+            }
+        }
+    } ack_pump_running_finalize{impl_.get(), physical_link_generation};
     const auto executor = co_await boost::asio::this_coro::executor;
     for (;;) {
         uint64_t target = 0;
@@ -1355,16 +1426,11 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
             std::lock_guard lock(impl_->r2_transfer_mutex);
             target = impl_->r2_pending_ack_ordinal;
         if (target == 0) {
-                if (impl_->r2_ack_pump_generation == physical_link_generation)
-                    impl_->r2_ack_pump_running = false;
                 co_return;
             }
         }
         if (impl_->r2_physical_link_generation != physical_link_generation ||
             impl_->r2_ack_pump_generation != physical_link_generation) {
-            std::lock_guard lock(impl_->r2_transfer_mutex);
-            if (impl_->r2_ack_pump_generation == physical_link_generation)
-                impl_->r2_ack_pump_running = false;
             co_return;
         }
         while (impl_->config.hold_r2_ack_pump_for_test &&
@@ -1378,9 +1444,6 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
         }
         if (impl_->route_replacement_required ||
             impl_->r2_physical_link_generation != physical_link_generation) {
-            std::lock_guard lock(impl_->r2_transfer_mutex);
-            if (impl_->r2_ack_pump_generation == physical_link_generation)
-                impl_->r2_ack_pump_running = false;
             co_return;
         }
         const auto deadline = Clock::now() + impl_->config.maximum_duration;
@@ -1423,8 +1486,6 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
                         impl_->r2_socket->close(ignored);
                     }
                 }
-                if (impl_->r2_ack_pump_generation == physical_link_generation)
-                    impl_->r2_ack_pump_running = false;
             }
             impl_->wake_r2_completed_capacity_waiters();
             co_return;
@@ -1457,21 +1518,30 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_ack_pump(
 boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
     AsyncConnectedFdFactory connection, uint64_t requested_generation,
     Clock::time_point deadline) {
+    {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        if (impl_->r2_expired_witness_cleanup_deadline != Clock::time_point{})
+            deadline = std::min(deadline,
+                                impl_->r2_expired_witness_cleanup_deadline);
+    }
     if (impl_->route_replacement_required ||
         !impl_->r2_recovery_required || !impl_->r2_hello || !connection ||
         deadline <= Clock::now())
         throw std::logic_error("R2 recovery has no retained link context");
-    if (impl_->r2_reader_running || impl_->r2_ack_pump_running)
+    if (impl_->r2_reader_running || impl_->r2_ack_pump_running) {
         throw std::logic_error("R2 recovery raced a live reader or ACK pump");
+    }
 
     const uint64_t verified_floor_a = impl_->r2_recovery_floor;
     std::vector<R2SentBundle> witnesses =
         impl_->endpoint->r2_pending_witnesses(verified_floor_a);
     if (witnesses.size() > impl_->r2_hello->window)
         throw std::length_error("retained R2 recovery suffix exceeds link window");
+    const auto recovery_started = Clock::now();
     for (const auto& [ordinal, pending] : impl_->r2_retained_jobs) {
         (void)ordinal;
-        deadline = std::min(deadline, pending->deadline);
+        if (pending && pending->deadline > recovery_started)
+            deadline = std::min(deadline, pending->deadline);
     }
     if (deadline <= Clock::now())
         throw boost::system::system_error(boost::asio::error::timed_out);
@@ -1725,6 +1795,22 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
       impl_->r2_retained_jobs.swap(reindexed_jobs);
       {
         std::lock_guard lock(impl_->r2_transfer_mutex);
+        const auto now = Clock::now();
+        const bool expired_witness_remains = std::any_of(
+            impl_->r2_retained_jobs.begin(), impl_->r2_retained_jobs.end(),
+            [now](const auto& entry) {
+              const auto& pending = entry.second;
+              return pending && pending->deadline <= now &&
+                     !(pending->done && !pending->failure &&
+                       pending->client_result.status ==
+                           ClientRunStatus::Committed &&
+                       pending->client_result.committed_commit.has_value());
+            });
+        if (!expired_witness_remains)
+          impl_->r2_expired_witness_cleanup_deadline = Clock::time_point{};
+      }
+      {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
         impl_->r2_receipt_queue.clear();
       }
       impl_->r2_pending_ack_ordinal = 0;
@@ -1772,7 +1858,6 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
       impl_->r2_recovery_required = false;
       impl_->route_transport_quarantined = false;
       impl_->r2_failed_physical_generation = 0;
-      impl_->reset_r2_recovery_backoff();
 
       bool reader_started = false;
       for (const auto &pending : replay_rows) {
@@ -1848,6 +1933,17 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
         throw std::runtime_error(
             "R2 replay reader failed on the newly recovered physical link");
       }
+      // RESET alone does not settle an expired row if F did not report its
+      // exact reservation unavailable. Keep the recovery backoff until every
+      // surviving row is safely replayed and all expired witnesses are gone.
+      bool expired_witnesses_settled = false;
+      {
+        std::lock_guard lock(impl_->r2_transfer_mutex);
+        expired_witnesses_settled =
+            impl_->r2_expired_witness_cleanup_deadline == Clock::time_point{};
+      }
+      if (expired_witnesses_settled)
+        impl_->reset_r2_recovery_backoff();
     } catch (...) {
       // RESET may already have settled positive receipts and moved the
       // endpoint to a new epoch before replaying the retained suffix. Any
@@ -2051,7 +2147,7 @@ P50ZstdSourceSender::transfer_p51_route(
         if (!co_await acquire_r2_writer(deadline))
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
         writer_guard = std::make_unique<Impl::R2TransferGuard>(impl_.get());
-        (void)impl_->retire_expired_r2_witnesses();
+        (void)impl_->quarantine_expired_r2_witnesses();
         if (impl_->route_replacement_required)
             co_return impl_->r2_route_replacement_result(
                 ZstdSourceTransferStatus::Unavailable);
@@ -2135,8 +2231,8 @@ P50ZstdSourceSender::transfer_p51_route(
                     failed.r2_link_rejection = std::move(route_rejection);
                     co_return failed;
                 }
-                if (impl_->retire_expired_r2_witnesses() ||
-                    impl_->route_replacement_required)
+                (void)impl_->quarantine_expired_r2_witnesses();
+                if (impl_->route_replacement_required)
                     co_return impl_->r2_route_replacement_result(
                         ZstdSourceTransferStatus::Unavailable);
                 impl_->note_r2_recovery_failure();
@@ -2145,8 +2241,8 @@ P50ZstdSourceSender::transfer_p51_route(
                 failed.route_local_failure = true;
                 co_return failed;
             } catch (...) {
-                if (impl_->retire_expired_r2_witnesses() ||
-                    impl_->route_replacement_required)
+                (void)impl_->quarantine_expired_r2_witnesses();
+                if (impl_->route_replacement_required)
                     co_return impl_->r2_route_replacement_result(
                         ZstdSourceTransferStatus::Unavailable);
                 impl_->note_r2_recovery_failure();

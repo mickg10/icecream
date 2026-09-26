@@ -1324,6 +1324,11 @@ void receive_p51_transfer_error(local::Connection& peer,
                                 uint16_t expected_error_code = 0) {
     local::Frame response;
     const auto receive_status = peer.receive_until(response, deadline);
+    if (receive_status != local::Status::Ok)
+        std::fprintf(stderr,
+            "P51_TEST_RESULT_RECEIVE_FAILED request=%llu status=%s\n",
+            static_cast<unsigned long long>(request_id),
+            local::status_name(receive_status));
     CHECK(receive_status == local::Status::Ok);
     CHECK(response.type == local::MessageType::Data);
     CHECK(local::validate_identity(response, identity) == local::Status::Ok);
@@ -1350,6 +1355,11 @@ local::P50SourceTransferResult receive_p51_transfer_result(
     std::chrono::steady_clock::time_point deadline, bool acknowledge) {
     local::Frame response;
     const auto receive_status = peer.receive_until(response, deadline);
+    if (receive_status != local::Status::Ok)
+        std::fprintf(stderr,
+            "P51_TEST_RESULT_RECEIVE_FAILED request=%llu status=%s\n",
+            static_cast<unsigned long long>(request_id),
+            local::status_name(receive_status));
     CHECK(receive_status == local::Status::Ok);
     CHECK(response.type == local::MessageType::Data);
     CHECK(local::validate_identity(response, identity) == local::Status::Ok);
@@ -2435,7 +2445,8 @@ void test_p51_d07_queued_cancel_first_middle_last() {
 
 void test_p51_d07_staged_cancel_case(ProfileId profile,
                                     size_t cancelled_index,
-                                    bool fail_predecessor = false) {
+                                    bool fail_predecessor = false,
+                                    bool expire_predecessor = false) {
     constexpr size_t kCohort = 31;
     constexpr size_t kSurvivors = 30;
     CHECK(cancelled_index < kCohort);
@@ -2472,16 +2483,24 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::atomic<bool> cancelled_hook_exact{false};
     const bool hold_predecessor_receipt =
         profile == ProfileId::P29V1 && cancelled_index == 15;
-    CHECK(!fail_predecessor || hold_predecessor_receipt);
+    CHECK(!(fail_predecessor && expire_predecessor));
+    CHECK(!(fail_predecessor || expire_predecessor) ||
+          hold_predecessor_receipt);
     bool predecessor_worker_entered = false;
     bool release_predecessor_worker = !hold_predecessor_receipt;
     std::atomic<bool> fail_predecessor_worker{false};
     std::atomic<bool> predecessor_failure_injected{false};
     std::atomic<uint64_t> failed_predecessor_request{0};
     std::atomic<uint64_t> failed_predecessor_ordinal{0};
+    bool predecessor_deadline_settled = false;
     std::vector<uint64_t> f_commit_ordinals;
+    std::vector<ResetAck> f_reset_acks;
     std::atomic<bool> stop_accepting{false};
     std::atomic<size_t> accepted_connections{0};
+    std::atomic<size_t> recovery_waits{0};
+    std::atomic<size_t> recovery_attempts{0};
+    std::atomic<uint64_t> recovery_wait_request{0};
+    std::atomic<uint64_t> recovery_attempt_request{0};
 
     service::RuntimeConfig f_config = test_runtime_config();
     f_config.c_store_guid = f_launch.c_store_guid;
@@ -2492,6 +2511,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     f_config.endpoint_caps.supported_profiles = profile_bit(profile);
     f_config.endpoint_caps.zstd.max_raw_bytes = 8192;
     f_config.max_pending_p51_source_reservations = 48;
+    if (expire_predecessor) {
+    }
     f_config.endpoint_config.input_job_state =
         [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
             std::span<const uint8_t> bytes) {
@@ -2524,6 +2545,23 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     c_config.max_active_p51_source_transfers = 40;
     c_config.max_pending_p51_source_operations = 40;
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (expire_predecessor) {
+        c_config.before_r2_recovery_for_test = [&](PrepareRequestKey key) {
+            recovery_wait_request.store(key.request_token,
+                                        std::memory_order_release);
+            recovery_waits.fetch_add(1, std::memory_order_acq_rel);
+        };
+        c_config.before_r2_recovery_attempt_for_test =
+            [&](PrepareRequestKey key) {
+                recovery_attempt_request.store(key.request_token,
+                                               std::memory_order_release);
+                recovery_attempts.fetch_add(1, std::memory_order_acq_rel);
+            };
+    }
+#endif
+    if (expire_predecessor) {
+    }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     const uint64_t target_request_id = 120000 +
         static_cast<uint64_t>(profile) * 100 + cancelled_index;
@@ -2583,7 +2621,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::thread acceptor([&] {
         const auto end = std::chrono::steady_clock::now() +
                          std::chrono::seconds(40);
-        const size_t max_connections = fail_predecessor ? 2 : 1;
+        const size_t max_connections =
+            (fail_predecessor || expire_predecessor) ? 2 : 1;
         while (!stop_accepting.load(std::memory_order_acquire) &&
                accepted_connections.load(std::memory_order_acquire) <
                    max_connections &&
@@ -2688,6 +2727,12 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 [&](ActorSide actor, const Message& message) {
                     if (actor != ActorSide::F)
                         return;
+                    if (const auto* reset = std::get_if<ResetAck>(&message)) {
+                        std::lock_guard lock(event_mutex);
+                        f_reset_acks.push_back(*reset);
+                        event_changed.notify_all();
+                        return;
+                    }
                     const auto* commit = std::get_if<R2TxCommit>(&message);
                     if (!commit)
                         return;
@@ -2724,13 +2769,18 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     };
     std::vector<RequestRow> rows;
     rows.reserve(kCohort);
+    sidecar::AbsoluteMonotonicDeadline predecessor_arm_deadline{};
     const uint64_t first_id = 120000 + static_cast<uint64_t>(profile) * 100;
     for (size_t index = 0; index < kCohort; ++index) {
         const uint64_t id = first_id + index;
         auto reservation = test_p51_reservation_request(
             c_launch.c_store_guid, c_launch.store_generation,
             c_launch.identity.generation, c_launch.identity.attempt,
-            id, cache_profile, 30, std::chrono::seconds(30));
+            id, cache_profile, 30,
+            expire_predecessor && index == 0 ? std::chrono::seconds(8)
+                                             : std::chrono::seconds(30));
+        if (index == 0)
+            predecessor_arm_deadline = reservation.absolute_deadline;
         reservation.arm.source.assignment_nonce = id;
         reservation.arm.source.logical_job = 160000 + id;
         reservation.arm.source.compiler_attempt = 1;
@@ -2870,6 +2920,34 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 release_target = true;
             }
             CHECK(failed_while_target_gated);
+        } else if (expire_predecessor) {
+            const auto predecessor_deadline =
+                predecessor_arm_deadline.as_steady_time_point();
+            {
+                std::unique_lock lock(event_mutex);
+                if (std::chrono::steady_clock::now() < predecessor_deadline)
+                    (void)event_changed.wait_until(lock, predecessor_deadline);
+                CHECK(std::chrono::steady_clock::now() >=
+                      predecessor_deadline);
+                release_predecessor_worker = true;
+            }
+            event_changed.notify_all();
+            const Id128 predecessor_reservation{
+                rows[0].transfer.armed.reservation_id};
+            {
+                std::unique_lock lock(event_mutex);
+                predecessor_deadline_settled = event_changed.wait_for(
+                    lock, std::chrono::seconds(5), [&] {
+                        return std::any_of(retired.begin(), retired.end(),
+                            [&](const auto& item) {
+                                return item.first == predecessor_reservation;
+                            });
+                    });
+                CHECK(!release_target);
+                release_target = true;
+            }
+            CHECK(predecessor_deadline_settled);
+            event_changed.notify_all();
         } else {
             {
                 std::lock_guard lock(event_mutex);
@@ -2889,9 +2967,56 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         if (index == cancelled_index)
             continue;
         auto& row = rows[index];
-        const auto result = receive_p51_transfer_result(
-            row.pair.receiver, c_launch.identity, row.id,
-            row.transfer.absolute_deadline.as_steady_time_point(), true);
+        local::P50SourceTransferResult result;
+        if (expire_predecessor && index == 0) {
+            CHECK(std::chrono::steady_clock::now() >=
+                  row.transfer.absolute_deadline.as_steady_time_point());
+            local::Frame late_response;
+            const auto eof_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(3);
+            const auto status = row.pair.receiver.receive_until(
+                late_response, eof_deadline);
+            CHECK(status == local::Status::CleanEof);
+            CHECK(row.pair.receiver.valid());
+            std::fprintf(stderr,
+                "P51_D07 predecessor-source-deadline request=%llu "
+                "status=%s no-late-frame=1 arm-expired=1 source-expired=1\n",
+                static_cast<unsigned long long>(row.id),
+                local::status_name(status));
+            ++typed_replacement_outcomes;
+            continue;
+        }
+        try {
+            result = receive_p51_transfer_result(
+                row.pair.receiver, c_launch.identity, row.id,
+                row.transfer.absolute_deadline.as_steady_time_point(), true);
+        } catch (...) {
+            if (expire_predecessor) {
+                const auto now = std::chrono::steady_clock::now();
+                std::fprintf(stderr,
+                    "P51_D07 expiry-survivor-response-failed index=%zu "
+                    "request=%llu ops=%zu raw=%llu accepted=%zu "
+                    "deadline_remaining_ms=%lld recovery_waits=%zu "
+                    "wait_token=%llu recovery_attempts=%zu "
+                    "attempt_token=%llu\n", index,
+                    static_cast<unsigned long long>(row.id),
+                    c_runtime.pending_p51_source_operations_for_test(),
+                    static_cast<unsigned long long>(
+                        c_runtime.active_source_raw_bytes_for_test()),
+                    accepted_connections.load(std::memory_order_acquire),
+                    static_cast<long long>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            row.transfer.absolute_deadline.as_steady_time_point() -
+                            now).count()),
+                    recovery_waits.load(std::memory_order_acquire),
+                    static_cast<unsigned long long>(
+                        recovery_wait_request.load(std::memory_order_acquire)),
+                    recovery_attempts.load(std::memory_order_acquire),
+                    static_cast<unsigned long long>(
+                        recovery_attempt_request.load(std::memory_order_acquire)));
+            }
+            throw;
+        }
         if (fail_predecessor &&
             result.code == local::SourceTransferResultCode::Error) {
             CHECK(result.error_code == static_cast<uint16_t>(
@@ -2992,12 +3117,16 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         f_runtime.finish_input_attachment_on_owner(attach, probe_exact, deadline);
     }
     std::sort(survivor_tu_seqs.begin(), survivor_tu_seqs.end());
-    bool unique_tu_seqs = survivor_tu_seqs.size() == kSurvivors;
+    const size_t expected_survivor_sequences =
+        kSurvivors - (expire_predecessor ? 1 : 0);
+    bool unique_tu_seqs =
+        survivor_tu_seqs.size() == expected_survivor_sequences;
     for (size_t i = 1; i < survivor_tu_seqs.size(); ++i)
         unique_tu_seqs = unique_tu_seqs &&
                          survivor_tu_seqs[i] != survivor_tu_seqs[i - 1];
 
     bool target_retired_once = false;
+    bool predecessor_retired_once = false;
     {
         std::lock_guard lock(event_mutex);
         const Id128 target_id{rows[cancelled_index].transfer.armed.reservation_id};
@@ -3007,18 +3136,65 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             std::count_if(retired.begin(), retired.end(), [&](const auto& item) {
                 return item.first == target_id;
             }) == 1;
+        if (expire_predecessor) {
+            const Id128 predecessor_id{
+                rows[0].transfer.armed.reservation_id};
+            const auto predecessor = std::find_if(
+                retired.begin(), retired.end(), [&](const auto& item) {
+                    return item.first == predecessor_id;
+                });
+            predecessor_retired_once = predecessor != retired.end() &&
+                !predecessor->second &&
+                std::count_if(retired.begin(), retired.end(),
+                    [&](const auto& item) {
+                        return item.first == predecessor_id;
+                    }) == 1;
+        }
     }
     std::vector<uint64_t> expected_ordinals(kSurvivors + 1);
     for (size_t i = 0; i < kSurvivors + 1; ++i)
         expected_ordinals[i] = i + 1;
+    if (expire_predecessor) {
+        expected_ordinals.clear();
+        const uint64_t target_ordinal =
+            target_binding.relationship_ordinal;
+        CHECK(target_ordinal > 1 && target_ordinal <= 30);
+        for (uint64_t ordinal = 1; ordinal < target_ordinal; ++ordinal)
+            expected_ordinals.push_back(ordinal);
+        for (uint64_t ordinal = target_ordinal - 1; ordinal <= 30; ++ordinal)
+            expected_ordinals.push_back(ordinal);
+    }
     std::sort(expected_ordinals.begin(), expected_ordinals.end());
     std::vector<uint64_t> sent_ordinals_snapshot;
+    std::vector<uint64_t> f_commit_ordinals_snapshot;
+    std::vector<ResetAck> f_reset_acks_snapshot;
     {
         std::lock_guard lock(event_mutex);
         sent_ordinals_snapshot = sent_ordinals;
+        f_commit_ordinals_snapshot = f_commit_ordinals;
+        f_reset_acks_snapshot = f_reset_acks;
     }
     std::sort(sent_ordinals_snapshot.begin(), sent_ordinals_snapshot.end());
     bool exact_ordinals = sent_ordinals_snapshot == expected_ordinals;
+    std::sort(f_commit_ordinals_snapshot.begin(),
+              f_commit_ordinals_snapshot.end());
+    std::vector<uint64_t> expected_f_commit_ordinals;
+    const uint64_t expected_f_commit_count =
+        expire_predecessor ? kSurvivors : kSurvivors + 1;
+    for (uint64_t ordinal = 1; ordinal <= expected_f_commit_count; ++ordinal)
+        expected_f_commit_ordinals.push_back(ordinal);
+    const bool exact_f_commit_ordinals =
+        f_commit_ordinals_snapshot == expected_f_commit_ordinals;
+    const uint64_t expired_request_preparations = static_cast<uint64_t>(
+        std::count_if(prepared_ordinals.begin(), prepared_ordinals.end(),
+            [&](const auto& row) { return row.first == rows[0].id; }));
+    const bool exact_expired_reset = !expire_predecessor ||
+        (f_reset_acks_snapshot.size() == 1 &&
+         f_reset_acks_snapshot[0].recovery_verified_floor_a == 0 &&
+         f_reset_acks_snapshot[0].recovery_prepared_prefix_p ==
+             target_binding.relationship_ordinal - 1 &&
+         f_reset_acks_snapshot[0].unavailable_suffix_mask == 1 &&
+         expired_request_preparations == 1);
     bool candidate_reused = false;
     {
         std::lock_guard lock(event_mutex);
@@ -3054,7 +3230,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         c_runtime, 0, std::chrono::seconds(4));
     const size_t connection_count =
         accepted_connections.load(std::memory_order_acquire);
-    const bool one_link = connection_count == (fail_predecessor ? 2 : 1);
+    const bool one_link = connection_count ==
+        ((fail_predecessor || expire_predecessor) ? 2 : 1);
 
     CHECK(all_submitted);
     CHECK(staged);
@@ -3062,37 +3239,58 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     CHECK(cancelled_hook_exact.load(std::memory_order_acquire));
     CHECK(exact_f_cancelled);
     CHECK(!duplicate_f_cancelled);
-    if (!fail_predecessor)
+    if (!fail_predecessor && !expire_predecessor)
         CHECK(exact_survivors == kSurvivors);
-    else
+    else if (fail_predecessor)
         CHECK(exact_survivors == kSurvivors &&
               typed_replacement_outcomes == 0 &&
               predecessor_failure_injected.load(std::memory_order_acquire) &&
               failed_predecessor_request.load(std::memory_order_acquire) ==
                   rows[0].id &&
-              failed_predecessor_ordinal.load(std::memory_order_acquire) == 1);
+                  failed_predecessor_ordinal.load(std::memory_order_acquire) == 1);
+    else
+        CHECK(exact_survivors == kSurvivors - 1 &&
+              typed_replacement_outcomes == 1 &&
+              predecessor_deadline_settled && predecessor_retired_once &&
+              !survivor_attached[0] && exact_expired_reset);
     CHECK(probe_exact);
     CHECK(unique_tu_seqs);
     CHECK(exact_ordinals);
-    CHECK(candidate_reused);
+    CHECK(exact_f_commit_ordinals);
+    if (!expire_predecessor)
+        CHECK(candidate_reused);
     CHECK(target_retired_once);
     CHECK(operations_released);
     CHECK(raw_credit_released);
     CHECK(one_link);
-    std::printf("P51_D07 staged-cancel profile=%u position=%zu submitted=31 "
-                "survivors=30 probe=1 exact-ordinals=1..31 "
-                "target-no-bind=1 same-ordinal-reused=1 "
-                "predecessor-failure=%u failure-request=%llu "
-                "failure-ordinal=%llu predecessor-attempts=%u "
-                "replacement-outcomes=%zu\n",
-                static_cast<unsigned>(profile), cancelled_index,
-                fail_predecessor,
-                static_cast<unsigned long long>(
-                    failed_predecessor_request.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(
-                    failed_predecessor_ordinal.load(std::memory_order_acquire)),
-                static_cast<unsigned>(predecessor_transfer_attempts),
-                typed_replacement_outcomes);
+    if (expire_predecessor) {
+        std::printf("P51_D07 staged-cancel-deadline profile=%u position=%zu "
+                    "submitted=31 survivors=29 probe=1 "
+                    "wire-ordinals=dynamic-from-reset-target "
+                    "F-commit-prefix=1..30 target-no-bind=1 "
+                    "expired-predecessor-no-publication=1 "
+                    "reset-disposition=exact-unavailable "
+                    "replacement-outcomes=%zu\n",
+                    static_cast<unsigned>(profile), cancelled_index,
+                    typed_replacement_outcomes);
+    } else {
+        std::printf("P51_D07 staged-cancel profile=%u position=%zu "
+                    "submitted=31 survivors=30 probe=1 "
+                    "exact-ordinals=1..31 target-no-bind=1 "
+                    "same-ordinal-reused=1 predecessor-failure=%u "
+                    "failure-request=%llu failure-ordinal=%llu "
+                    "predecessor-attempts=%u replacement-outcomes=%zu\n",
+                    static_cast<unsigned>(profile), cancelled_index,
+                    fail_predecessor,
+                    static_cast<unsigned long long>(
+                        failed_predecessor_request.load(
+                            std::memory_order_acquire)),
+                    static_cast<unsigned long long>(
+                        failed_predecessor_ordinal.load(
+                            std::memory_order_acquire)),
+                    static_cast<unsigned>(predecessor_transfer_attempts),
+                    typed_replacement_outcomes);
+    }
 }
 
 void test_p51_d07_staged_cancel_all_profiles() {
@@ -3102,6 +3300,7 @@ void test_p51_d07_staged_cancel_all_profiles() {
             test_p51_d07_staged_cancel_case(profile, index);
     }
     test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, true);
+    test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true);
 }
 
 // Active-cancel recovery regression: a complete bundle is paused on F's
@@ -16760,6 +16959,12 @@ int main(int argc, char** argv) {
             std::strcmp(argv[1],
                         "--d07-staged-cancel-predecessor-failure") == 0) {
             test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, true);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--d07-staged-cancel-predecessor-deadline") == 0) {
+            test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true);
             return 0;
         }
         if (argc == 2 &&
