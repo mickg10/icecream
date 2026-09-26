@@ -57,6 +57,7 @@
 #include "input_pump.h"
 #include "p50_compile_binding.h"
 #include "p50_remote_diagnostics.h"
+#include "p50_preprocessed_capture.h"
 #include "cache/p50_control_operation.h"
 #include "cache/p50_daemon_control.h"
 #include "cache/p50_sidecar_identity.h"
@@ -306,57 +307,7 @@ private:
 static bool retain_p50_preprocessed_capture(const char *source) noexcept
 {
     const char *capture = ::getenv("ICECC_P50_PREPROCESSED_CAPTURE");
-    if (capture == nullptr)
-        return true;
-    if (*capture == '\0' || *capture != '/')
-        return false;
-
-    const int input = ::open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (input < 0)
-        return false;
-    const int output = ::open(capture, O_WRONLY | O_CREAT | O_EXCL |
-                              O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (output < 0) {
-        (void)::close(input);
-        return false;
-    }
-    bool success = true;
-    char buffer[64 * 1024];
-    for (;;) {
-        const ssize_t read_bytes = ::read(input, buffer, sizeof(buffer));
-        if (read_bytes == 0)
-            break;
-        if (read_bytes < 0) {
-            if (errno == EINTR)
-                continue;
-            success = false;
-            break;
-        }
-        ssize_t written_total = 0;
-        while (written_total < read_bytes) {
-            const ssize_t written = ::write(output, buffer + written_total,
-                                            static_cast<size_t>(read_bytes - written_total));
-            if (written > 0) {
-                written_total += written;
-                continue;
-            }
-            if (written < 0 && errno == EINTR)
-                continue;
-            success = false;
-            break;
-        }
-        if (!success)
-            break;
-    }
-    if (success && ::fsync(output) != 0)
-        success = false;
-    if (::close(input) != 0)
-        success = false;
-    if (::close(output) != 0)
-        success = false;
-    if (!success)
-        (void)::unlink(capture);
-    return success;
+    return icecc::client::detail::retain_preprocessed_capture(source, capture);
 }
 
 icecc::p50::OwnedSourceFd prepare_complete_p50_source(

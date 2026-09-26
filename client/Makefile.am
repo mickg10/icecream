@@ -56,6 +56,7 @@ noinst_HEADERS = \
 	input_pump.h \
 	md5.h \
 	p50_remote_diagnostics.h \
+	p50_preprocessed_capture.h \
 	util.h
 AM_CPPFLAGS = \
 	-DPLIBDIR=\"$(pkglibexecdir)\" \

@@ -225,11 +225,14 @@ check_PROGRAMS += p50sidecarlifecycle
 check_PROGRAMS += p50daemoncontrol
 check_PROGRAMS += p50cachefdseam
 check_PROGRAMS += assignment_identity_test
+check_PROGRAMS += p50_preprocessed_capture
+TESTS += p50_preprocessed_capture
 check_PROGRAMS += codec_parity codec_provider codec_intern codec_wire
 check_PROGRAMS += daemonqueue
 daemonqueue_SOURCES = daemonqueue.cpp
 assignment_identity_test_SOURCES = assignment_identity_test.cpp
 assignment_identity_test_LDADD = ../services/libicecc.la
+p50_preprocessed_capture_SOURCES = p50_preprocessed_capture_test.cpp
 codec_parity_SOURCES = codec_parity_test.cpp
 codec_parity_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS)

@@ -12,6 +12,20 @@ retained artifact directories.
 
 ## Developer QA
 
+### Retry-safe preprocessed capture
+
+The opt-in `ICECC_P50_PREPROCESSED_CAPTURE` observer now accepts an existing
+regular capture only when its bytes exactly match the retry source. It never
+overwrites prior evidence. Bounded comparisons cover short reads and large or
+empty inputs; normal behavior with the variable absent is unchanged.
+The registered `p50_preprocessed_capture` test passes standalone with strict
+compiler warnings, including different-content/length and nonregular-file
+rejection. Reviewed donor `13390d08`; source hashes match the tested donor.
+Retained log `/tanksmall/scratch/tmp/p51-capture-observer-tests/test.log`, SHA256
+`b553f8d5fc26035bd1025f6c28bf502550ca9828b968bbe161f9a4b642d02939`.
+This corrects an observer failure that masked retries in the private C1F2
+W30 gate; it does not itself qualify that recovery scenario or full QA.
+
 ### Active compiler loss and fresh-job recovery
 
 The opt-in local wrapper gate
