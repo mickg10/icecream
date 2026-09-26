@@ -46,7 +46,7 @@ Remaining D03 work includes LINK_STATE, COMMIT_ACK, recovery/reset record
 interruptions and deterministic short-write/EAGAIN coverage. Bytewise
 successful writes are not evidence of those missing interruption cases.
 
-### Scheduler-to-F recovery and open ARM invalidation defect
+### Scheduler-to-F recovery and ARM invalidation fix
 
 `b270a223` integrates the repaired S→F receipt interceptor: install before F
 replacement, forward a valid initial LINK_REJECT, permit bounded pre-arm
@@ -91,16 +91,42 @@ Deadline parser checks include historical failed wrappers and negative inputs;
 truncated r6 first-attempt logs are derived parser fixtures, not complete
 one-attempt wrapper outcomes.
 
-**Open runtime defect (C03):** controlled post-Goodbye tests on unchanged
+**Runtime defect fixed, combined qualification pending (C03):** controlled post-Goodbye tests on unchanged
 production code reproduce stale P51_SOURCE_ARMED after either client
 half-close or exact F-sidecar death. Responses arrived 5/10 ms after ARM send,
 inside the unchanged 2,000 ms test budget. This establishes stale cached-owner
-publication, not a same-poll ordering proof. Client-half-close permits a later
-healthy ARM; the sidecar-death recovery check is also not yet green. Fix and
-regression qualification remain pending. Red logs:
+publication, not a same-poll ordering proof. `173dd1c4` now checks buffered
+client input (including a parsed header awaiting payload), non-consuming
+socket EOF and the exact READY child's pidfd immediately before publication.
+It does not consume child status or reorder the daemon event loop. Red logs:
 `/tanksmall/scratch/tmp/p51-c03-discriminator-run/tmp/c03-client-eof-r2.log`
-and `c03-sidecar-death-r2.log`. Do not interpret the restart-gate pass as
-closing this independent invalidation race or the overall W30 gate matrix.
+and `c03-sidecar-death-r2.log`.
+
+The donor's opt-in shell runner passes client-half-close, exact sidecar death
+and expired ARM across all three profiles, plus healthy P29V1: ten cases.
+Invalidated attempts return END plus EOF before their unchanged 2,000ms
+deadline; separate fresh ARMs succeed, including after sidecar replacement.
+The replacement fixture preserves the scheduler epoch: changing it without
+a new scheduler session had caused an earlier fixture-only failure.
+Run `make -C unittests p50daemonpositive-p51-c03-check` in a configured,
+isolated root container with the `icecc` account, private scratch-backed
+`/tmp` and writable `ICEFARM_TMPDIR`. Qualification executed the identical
+shell runner directly; the new Make target and combined tree await a fresh
+build. Donor daemon SHA256:
+`196a377a03406252c449916c0e684ce1108a5be3f719f9603307a6dcc61f7c25`;
+test binary SHA256:
+`466cfba1a6b56fca596582a6d7b074676610addb64cd0abdd3b013cfd2626b0a`.
+Aggregate `/tanksmall/scratch/tmp/p51-c03-discriminator-build/tmp/c03-optin-gate.log`
+SHA256 `dbeff6353a28dd6beaeb47b6a80591b8c645d3fb5b4c5de1da2038a12fd4b4bc`.
+Exact once-only reservation cancellation/reclamation remains unverified;
+fresh ARM success alone does not establish that accounting invariant.
+
+The combined compiler-loss rerun `49f6b14686c646839de05ecde767525d`
+failed a harness assertion: a substring count included both LINK_STATE and
+LINK_STATE_DECODED markers for one connection. `e8ebf4e5` fixes exact event
+counting and adds generated-log regressions (18 focused Python tests pass
+including deadline tests). This failed rerun is not a product failure or a
+qualified combined compiler-loss result; the corrected live rerun is pending.
 
 ### Idle reconnect and batch verdict propagation
 
@@ -135,7 +161,7 @@ through pinned `dev/python.sh`; retained log:
 An earlier offline environment-setup attempt failed on an uncached wheel;
 that retained failure is not counted as a test pass.
 Neither this harness fix nor the focused idle test establishes full combined
-candidate qualification; the independent ARM invalidation defect remains open.
+candidate qualification; combined validation of the ARM fix remains open.
 
 ### Persistent wrapper gate entry point
 
