@@ -366,10 +366,22 @@ std::vector<std::string> read_and_validate_pair(const std::string& a_manifest,
     auto b = read_manifest(b_manifest, count);
     require(!a_root.empty() && !b_root.empty(), "paired path roots must be explicit");
     auto relative_id = [](const std::string& path, const std::string& root) {
+        auto has_dot_component = [](const std::filesystem::path& value) {
+            for (const auto& component : value)
+                if (component == "." || component == "..") return true;
+            return false;
+        };
+        const std::filesystem::path root_path(root);
+        require(root_path.is_absolute() && !has_dot_component(root_path),
+                "paired path root must be absolute and contain no dot components");
         const std::string prefix = root.back() == '/' ? root : root + '/';
         require(path.starts_with(prefix), "paired path is outside its declared root");
         const std::string id = path.substr(prefix.size());
         require(!id.empty(), "paired path has an empty relative identity");
+        const std::filesystem::path id_path(id);
+        require(!id_path.is_absolute() && !has_dot_component(id_path) &&
+                    id_path.lexically_normal().generic_string() == id,
+                "paired translation-unit identity is not a canonical relative path");
         return id;
     };
     std::set<std::string> unique_ids;
@@ -837,6 +849,10 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
               << " retained_peak_outstanding=" << peak_outstanding[1]
               << " fresh_pass_raw_bytes=" << pass_raw[0]
               << " retained_pass_raw_bytes=" << pass_raw[1]
+              << (active_passes == 3 ? " edited_pass_raw_bytes=" : "")
+              << (active_passes == 3 ? std::to_string(pass_raw[2]) : "")
+              << (active_passes == 3 ? " edited_peak_outstanding=" : "")
+              << (active_passes == 3 ? std::to_string(peak_outstanding[2]) : "")
               << " fresh_pass_job_cachewire_c_to_f_bytes=" << pass_job_sent[0]
               << " retained_pass_job_cachewire_c_to_f_bytes=" << pass_job_sent[1]
               << (active_passes == 3 ? " edited_pass_job_cachewire_c_to_f_bytes=" : "")
@@ -1146,7 +1162,7 @@ int main(int argc, char** argv) {
         }
         if (argc != 6) {
             std::cerr << "usage: p50-transfer-window-bench MANIFEST PROTOCOL JOBS PROFILE_INDEX WINDOW\n"
-                         "   or: p50-transfer-window-bench --paired A_MANIFEST B_MANIFEST A_ROOT B_ROOT R2 JOBS PROFILE_INDEX WINDOW\n";
+                         "   or: p50-transfer-window-bench --paired A_MANIFEST B_MANIFEST A_ROOT B_ROOT PROTOCOL JOBS PROFILE_INDEX WINDOW\n";
             return 2;
         }
         const std::string protocol = argv[2];
