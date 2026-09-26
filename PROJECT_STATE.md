@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### Independent caller/reservation expiry recovery
+
+Candidate `928d9955` integrates runtime donor `d39e227a`. A failed receipt
+read now wakes the remaining same-generation callers even when its timed-out
+front row was already dequeued. After confirmed RESET and exact positive-receipt
+reconciliation, locally expired uncommitted rows are retired separately from
+F's unavailable mask; healthy retained rows can replay without renewing deadlines.
+
+The donor's registered sender and service suites pass (actual exits 0).
+Default service coverage includes all three profiles with C expired/F live,
+disconnect before first replay and mid-suffix, and the earlier expiry/failure
+cases. Exact outputs and no replay of RESET-settled prefixes remain asserted.
+All six changed files match the integrated source byte-for-byte; this is source
+identity plus donor binary qualification, not a new merged-image result.
+Under `/tanksmall/scratch/tmp/p51-d07-c-expired-f-live-build/build/unittests/`:
+
+- `p50cacheservice.log`: SHA256 `4eb5b64df8f1de7664d41bf0399d52ebee7a97b61ee17d350ca085cbc6f66eeb`.
+- `p50zstdsender.log`: SHA256 `53f9696f9b556be702412376b42e63f14eb7549fe08ce76c4f672e60124ec8d6`.
+
+The positive-receipt path has no suspension between endpoint acceptance and
+sender queue reconciliation on the required single-owner thread; no artificial
+interleaving was added. Final counterfactual controls, current mixed images and
+daemon end-to-end C-expired/F-live qualification remain pending.
+
 ### External mixed-client harness (live run pending)
 
 Donors `b39c771a` and `660d8752` add three D18 profile scenarios with P43,
@@ -42,6 +66,18 @@ assumption is not a real-time recovery guarantee or C++ refinement proof.
 Runtime replay-loss regression qualification remains required.
 
 ### Current broad candidate qualification
+
+Public QA on `1d87b3aa` later passes its two isolated-root service/sanitizer
+checks, then stops at Python with 1,597 PASS, 7 SKIP and one unsorted formal
+distribution-manifest failure. It does not reach image construction or default
+mixed-image testing. Donor `0b016802`, integrated as `0dc29331`, sorts the formal
+manifest and includes five omitted harness files. Its full locked-Python rerun
+passes 1,613 tests with one skip in 228.17 seconds, actual exit 0. Log:
+`/tanksmall/scratch/tmp/d18-distfiles-evidence-3d5f2b60/full-python-r2.log`, SHA256
+`03e5353468d33fd97d021730e53bc9a6df11df9c677f25bbe1bed017b3f0de41`.
+An earlier private rerun incorrectly put temporary fixtures under its checkout;
+its three path-dependent failures are retained separately and were resolved by
+moving scratch outside the checkout, without weakening tests.
 
 The newer public `make qa` run on `1d87b3aa` completes its native stage with
 **178 tests: 172 PASS, 6 SKIP, 0 FAIL, 0 ERROR**, actual native-check exit 0.
