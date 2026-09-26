@@ -194,8 +194,22 @@ named invariant and an actual full-window trace. Retained log:
 `ac03dd3148420fdc72dbd810fc12f6cf81c21ad10fff80ba9fb4ff752814b6a1`.
 These are finite safety/reachability checks. The accounting projection does
 not model codec or worker behavior; neither lane proves fairness-based
-liveness or C++ refinement. The reset-before-worker-fence negative control
-remains separate work.
+liveness or C++ refinement.
+
+Commit `8b309521` adds the reset-before-worker-fence negative control and
+registers the new window files in the formal distribution manifest. The mutant
+bypasses the actual `RequestReset` worker guard; its trace enters
+`ResetRequested` with an old-generation worker still owning a job and violates
+`ResetRequiresPendingWorkerFence` (TLC exit 12). Normal configurations keep the
+guard and check that invariant. The updated 44-row recovery runner and 20-row
+window sweep both passed, using exact exit 12 plus the named invariant for
+expected counterexamples. Retained logs under the directory above:
+`recovery-mutant-run.log`, SHA256
+`b0241d23520831004445b34eb957ce2e215d7788b124f01873d15836cfebd737`;
+`post-mutant-window.log`, SHA256
+`6da6abf3cfed462f770840e8646fa905152ba2b357a15cab72f89effada82187`.
+These results still do not establish fairness-based progress; that remains
+a separate model obligation.
 
 Commit `983c64ab` implements typed CapacityBusy before source read/route work,
 with a response budget of at most 100 ms clipped to the original deadline.
