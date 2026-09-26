@@ -133,7 +133,12 @@ Merged logs in the same directory:
 | ZSTD_ROUTE | `merged-final-ZSTD_ROUTE.log` | `1110426fb41d37e7417395c2836e6c62c3b029903e389547cb8bba9d6115ee31` |
 
 An earlier merged P29 run overlapped a link step and is excluded from this
-qualification. Supported dev-gate routing remains pending.
+qualification. Commit `8f9f2d01` adds
+`ICEFARM_TMPDIR=/prepared/scratch make dev-gate GATE=p51-capacity-w30`.
+The container gate entrypoint passed its default three-profile run and a
+single ZSTD_TU run; invalid profiles fail before test start. Bootstrap unit
+tests passed 44/44. These routing checks reused a qualified configured build;
+a fresh full public-command bootstrap is still pending.
 The distributed runner is `unittests/p51capacity-w30-run.sh`;
 it requires an isolated root container with NET_ADMIN, not an ordinary local
 `make check` environment.
