@@ -38,11 +38,15 @@ farmharness/integration/mutants/scheduler-tail-armed.patch
 farmharness/integration/mutants/scheduler-tail.patch
 farmharness/integration/netem.py
 farmharness/integration/performance.py
+farmharness/integration/r2_wire_trace.py
 farmharness/integration/remote.py
 farmharness/integration/report.py
 farmharness/integration/retry_decision.py
 farmharness/integration/s50_fairness.py
 farmharness/integration/scenario_spec.py
+farmharness/integration/scenarios/D18-P29V1.json
+farmharness/integration/scenarios/D18-ZSTD_ROUTE.json
+farmharness/integration/scenarios/D18-ZSTD_TU.json
 farmharness/integration/scenarios/H1-role-hash-refusal.json
 farmharness/integration/scenarios/H2-client-kill-switch.json
 farmharness/integration/scenarios/H3-mutant-scheduler.json
@@ -153,6 +157,7 @@ farmharness/integration/tests/test_node_netem_dependency.py
 farmharness/integration/tests/test_orchestration.py
 farmharness/integration/tests/test_performance.py
 farmharness/integration/tests/test_python_environment.py
+farmharness/integration/tests/test_r2_wire_trace.py
 farmharness/integration/tests/test_resolver_v2.py
 farmharness/integration/tests/test_resource_retry.py
 farmharness/integration/tests/test_s30_mutant_catalog.py
