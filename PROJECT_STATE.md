@@ -12,6 +12,40 @@ retained artifact directories.
 
 ## Developer QA
 
+### Partial HELLO and commit-reply interruption coverage
+
+The D03 endpoint tests now cover 555 incomplete HELLO prefixes across the
+three profiles (zero through 184 bytes of each 185-byte frame), followed by
+one exact successful input, with no reservation lookup or publication from
+partial frames. They also cover every positive partial offset of a 116-byte
+F→C commit reply: 345 new cases plus the existing 25 C→F interruption cases.
+Commit-reply loss recovers the exact retained receipt without replay or
+duplicate materialization; final committed/acknowledged prefixes are 1/1.
+
+Run from a configured build's `unittests/` directory:
+
+```sh
+ICECC_P50_R2_D03_HELLO_CUTS_FOCUS=1 ./p50endpoint
+ICECC_P50_R2_D03_COMMIT_CUTS_FOCUS=1 ./p50endpoint
+```
+
+The exhaustive additions are opt-in: HELLO takes 0.22s and the commit selector
+about 53s; the existing default 25 interruption cases remain unchanged in
+scope (6.87s focused). This qualifies the freshly compiled test translation
+unit against the frozen configured endpoint libraries, not a full fresh build.
+Donor `c26e9276`; test source SHA256
+`f916967d25e1cf56c4fdbaf152edf660f28394ce90bba6c068611fd1151803d1`;
+binary SHA256
+`0250d69c344ad32a1e0d6ff28bd6f8349b73f8b7fd7727addb5461729792c5c0`.
+Logs under `/tanksmall/scratch/tmp/p51-d03-hello-ack-cuts-runtime/tmp/`:
+`hello-qualified-final.log` SHA256
+`81492d99925452796302c477f90b14f6c11d0192dfb03d06ec335cac07784d7b`;
+`commit-qualified-final.log` SHA256
+`1f0065da05f5cb8e51867e7acc97a8fc5338d5998f38e7bd9fa04f67067421c9`.
+Remaining D03 work includes LINK_STATE, COMMIT_ACK, recovery/reset record
+interruptions and deterministic short-write/EAGAIN coverage. Bytewise
+successful writes are not evidence of those missing interruption cases.
+
 ### Scheduler-to-F recovery and open ARM invalidation defect
 
 `b270a223` integrates the repaired S→F receipt interceptor: install before F
