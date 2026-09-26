@@ -2099,7 +2099,7 @@ void P50PreparationAuthority::reset_r2_route_for_recovery(
         throw std::logic_error("R2 recovery route profile changed");
     std::vector<uint64_t> remove_ids;
     remove_ids.reserve(unavailable_suffix.size());
-    for (const PreparedTuHandle handle : unavailable_suffix) {
+    for (const PreparedTuHandle& handle : unavailable_suffix) {
         if (handle.authority_.lock() != impl_->identity ||
             handle.entry_id_ == 0 ||
             std::find(remove_ids.begin(), remove_ids.end(), handle.entry_id_) !=
