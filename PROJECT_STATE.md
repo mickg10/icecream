@@ -158,11 +158,36 @@ qualification. Commit `8f9f2d01` adds
 `ICEFARM_TMPDIR=/prepared/scratch make dev-gate GATE=p51-capacity-w30`.
 The container gate entrypoint passed its default three-profile run and a
 single ZSTD_TU run; invalid profiles fail before test start. Bootstrap unit
-tests passed 44/44. These routing checks reused a qualified configured build;
-a fresh full public-command bootstrap is still pending.
+tests passed 44/44. These routing checks reused a qualified configured build.
+The full public command subsequently passed from a fresh bootstrap with donor
+`ea961932` (integrated as `b9eb1efc`). It explicitly builds the check-only
+daemon helper and a separate, non-installed hook-enabled service; the installed
+production service remains hook-free. All three profiles passed. Retained run:
+`/tanksmall/scratch/tmp/p51-capacity-public-gate-run/icecream-qa-k7q_e5nz`.
+Its `result.json` records bootstrap exit 0 (175.285 seconds) and gate exit 0
+(131.920 seconds), source snapshot SHA256
+`06f7166792979844ecd18da94059f5ea46afb098f0c8cb87465b140bf339ce81`.
+The gate log SHA256 is
+`8fe3a60a137e87ee9e8c6b892eaaaad8fc1a3b332eb6f1f815b6fe2516742b00`.
+This snapshot predates the new full-bundle cancellation tests; it is not a
+fresh-bootstrap qualification of every later candidate change.
 The distributed runner is `unittests/p51capacity-w30-run.sh`;
 it requires an isolated root container with NET_ADMIN, not an ordinary local
 `make check` environment.
+
+### Bounded formal window sweep
+
+Donor `f5c6201f` (integrated as `573a7349`) adds W3 safety and full-window
+reachability checks in both C2/3/4F1 and C1F2/3/4 directions, and W4/8/16/30
+accounting-model checks with full-window witnesses. All 20 rows passed the
+pinned TLC runner; expected witness counterexamples required exit 12, the
+named invariant and an actual full-window trace. Retained log:
+`/tanksmall/scratch/tmp/w30-formal-reconcile-20260926/final-runner.log`, SHA256
+`ac03dd3148420fdc72dbd810fc12f6cf81c21ad10fff80ba9fb4ff752814b6a1`.
+These are finite safety/reachability checks. The accounting projection does
+not model codec or worker behavior; neither lane proves fairness-based
+liveness or C++ refinement. The reset-before-worker-fence negative control
+remains separate work.
 
 Commit `983c64ab` implements typed CapacityBusy before source read/route work,
 with a response budget of at most 100 ms clipped to the original deadline.
