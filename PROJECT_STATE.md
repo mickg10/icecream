@@ -60,7 +60,16 @@ Evidence directory: `/tanksmall/scratch/tmp/w30-d17-resource-20260926/`.
 `fd24a6c1715b20b55157c21bbc1af0de75f5e909c392e06f3c7f5574042a890e`;
 `d17-macrooff-build.log` SHA256
 `04c5f50831108e2cad2476d6fabb191b8b8a870399b2dc20d8b9660cae4d03f0`.
-Sanitizer and merged full-suite qualification of this change remain pending.
+The same frozen donor also passes all nine cells under ASan/UBSan/LSan;
+the test, service, endpoint, slice0, route-owner and sender sources are directly
+instrumented. Preserved binary SHA256
+`a6a05dbaeb1d29eb010467cde3154cbd8c54332d3922c18b12083798b5fe2928`;
+`d17-final-asan-repeat.log` SHA256
+`4593b3a9ce379c9d89507d41b919c3386e22779f9779b6d29735643a176391b1`
+records `D17_ASAN_EXIT=0`, with no sanitizer diagnostics. Retained-input growth
+matches the deliberately preserved successful inputs; peak RSS is diagnostic,
+not an assertion of constant allocator residency. Merged full-suite
+qualification remains pending.
 
 ### Staged cancellation with a failed predecessor
 
