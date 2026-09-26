@@ -12,6 +12,23 @@ retained artifact directories.
 
 ## Developer QA
 
+### Staged cancellation with a failed predecessor
+
+Donor `c76cbeab` adds a P29V1/index-15 cell to the registered staged-cancellation
+matrix. The target stays at its prewrite gate while an exact predecessor
+(request 120100, logical ordinal 1) is selected for injected materialization
+failure. Cancellation has already been observed. Recovery uses a second
+connection; all 30 surviving inputs attach byte-exactly, the cancelled target
+is absent, a fresh probe succeeds, accepted ordinals remain contiguous and
+operation/raw credits drain. Terminal replacement errors do not count as
+successful survivors.
+
+The focused `--d07-staged-cancel-predecessor-failure` run passed, exit 0.
+Log `/tanksmall/scratch/tmp/p51-d07-predecessor-failure-build/tmp/p51-d07-staged-predecessor-failure-r4.log`,
+SHA256 `8cd596aea18f7036354e296e36938a4f2bda3b50dfdf7b32740a857edc8424fe`.
+The predecessor-deadline variant and merged full-suite regression remain
+pending; this failure injection is not evidence for deadline expiry.
+
 ### P29 pre-FILL cancellation foundation
 
 Commit `491fb851` adds explicit serializer/route cancellation before FILL
