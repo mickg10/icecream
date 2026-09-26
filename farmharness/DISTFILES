@@ -140,6 +140,7 @@ farmharness/integration/tests/test_disk_fill_cleanup.py
 farmharness/integration/tests/test_distribution_manifest.py
 farmharness/integration/tests/test_events.py
 farmharness/integration/tests/test_farmtest_live_lock.py
+farmharness/integration/tests/test_finish_batch_status.py
 farmharness/integration/tests/test_firefox_corpus_authority.py
 farmharness/integration/tests/test_firefox_corpus_promotion.py
 farmharness/integration/tests/test_firefox_root_header_authority.py

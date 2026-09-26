@@ -2423,7 +2423,7 @@ PY
                 rm -f "$reference"
             done
         fi
-batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
+if ! batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
                 "$batch_end_ns" "$relationship_count" "$slots_per_f" \
                 "$real_scheduler_restart_w30" "$w30_f_loss" "$work/scheduler.log" <<'PY'
 import pathlib, re, sys
@@ -2558,7 +2558,10 @@ print(" ".join((
     f"max_concurrent_active_per_relationship={max(per_relationship)}",
 )))
 PY
-)
+); then
+            echo "FAIL: batch metrics validation failed ($run_label)" >&2
+            return 1
+        fi
         if test "$emit_rows" = 1; then
             printf 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s\n' \
                 "$run_label" "$batch_start_ns" "$batch_end_ns"
