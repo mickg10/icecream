@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -40,6 +41,10 @@ using tcp = asio::ip::tcp;
 namespace {
 
 void require(bool ok, const char* what) {
+    if (!ok) throw std::runtime_error(what);
+}
+
+void require(bool ok, const std::string& what) {
     if (!ok) throw std::runtime_error(what);
 }
 
@@ -295,23 +300,39 @@ asio::awaitable<ZstdSourceTransferResult> transfer_p51_route_owned(
 struct R1BatchMeasurements {
     std::vector<ZstdSourceTransferResult> results;
     std::vector<uint64_t> latency_us;
-    std::array<int64_t, 2> pass_elapsed_ms{};
+    std::array<int64_t, 3> pass_elapsed_ms{};
+    std::array<int64_t, 3> pass_process_cpu_ms{};
+};
+
+struct R1CommitMetrics {
+    std::mutex mutex;
+    std::array<std::chrono::steady_clock::time_point, 3> pass_started_at{};
+    std::array<uint64_t, 3> first_commit_us{};
 };
 
 asio::awaitable<R1BatchMeasurements> transfer_r1_serial_batch(
     std::shared_ptr<P50ZstdSourceSender> sender, AsyncConnectedFdFactory connector,
     const std::vector<std::vector<uint8_t>>& input,
+    const std::vector<std::vector<uint8_t>>* edited_input,
+    R1CommitMetrics* commit_metrics,
     std::chrono::steady_clock::time_point deadline) {
+    const size_t passes = edited_input ? 3 : 2;
     R1BatchMeasurements measurements;
-    measurements.results.reserve(input.size() * 2);
-    measurements.latency_us.reserve(input.size() * 2);
-    for (size_t pass = 0; pass != 2; ++pass) {
+    measurements.results.reserve(input.size() * passes);
+    measurements.latency_us.reserve(input.size() * passes);
+    for (size_t pass = 0; pass != passes; ++pass) {
         const auto started = std::chrono::steady_clock::now();
+        const std::clock_t cpu_started = std::clock();
+        {
+            std::lock_guard lock(commit_metrics->mutex);
+            commit_metrics->pass_started_at[pass] = started;
+        }
         for (size_t i = 0; i < input.size(); ++i) {
             const size_t job = pass * input.size() + i;
+            const auto& bytes = pass == 2 ? (*edited_input)[i] : input[i];
             const auto transfer_started = std::chrono::steady_clock::now();
             auto result = co_await sender->transfer_route(
-                connector, PrepareRequestKey{3, 20000 + job}, deadline, input[i]);
+                connector, PrepareRequestKey{3, 20000 + job}, deadline, bytes);
             measurements.latency_us.push_back(static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - transfer_started).count()));
@@ -320,6 +341,8 @@ asio::awaitable<R1BatchMeasurements> transfer_r1_serial_batch(
         measurements.pass_elapsed_ms[pass] =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started).count();
+        measurements.pass_process_cpu_ms[pass] = static_cast<int64_t>(
+            (std::clock() - cpu_started) * 1000.0 / CLOCKS_PER_SEC);
     }
     co_return measurements;
 }
@@ -332,6 +355,33 @@ std::vector<std::string> read_manifest(const std::string& path, size_t count) {
         if (!line.empty() && line.front() != '#') paths.push_back(line);
     require(paths.size() == count, "manifest has fewer entries than requested");
     return paths;
+}
+
+std::vector<std::string> read_and_validate_pair(const std::string& a_manifest,
+                                                const std::string& b_manifest,
+                                                const std::string& a_root,
+                                                const std::string& b_root,
+                                                size_t count) {
+    auto a = read_manifest(a_manifest, count);
+    auto b = read_manifest(b_manifest, count);
+    require(!a_root.empty() && !b_root.empty(), "paired path roots must be explicit");
+    auto relative_id = [](const std::string& path, const std::string& root) {
+        const std::string prefix = root.back() == '/' ? root : root + '/';
+        require(path.starts_with(prefix), "paired path is outside its declared root");
+        const std::string id = path.substr(prefix.size());
+        require(!id.empty(), "paired path has an empty relative identity");
+        return id;
+    };
+    std::set<std::string> unique_ids;
+    for (size_t i = 0; i < count; ++i) {
+        const std::string a_id = relative_id(a[i], a_root);
+        const std::string b_id = relative_id(b[i], b_root);
+        require(unique_ids.insert(a_id).second, "paired manifest repeats a TU identity");
+        require(a_id == b_id,
+                "paired manifests have different translation-unit identity/order at index " +
+                    std::to_string(i));
+    }
+    return b;
 }
 
 std::vector<std::vector<uint8_t>> load_inputs(const std::vector<std::string>& paths) {
@@ -380,17 +430,28 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
               ProfileId profile, uint32_t window,
               std::chrono::steady_clock::duration maximum_duration =
                   std::chrono::minutes(4),
-              bool delay_finalizers_for_regression = false) {
+              bool delay_finalizers_for_regression = false,
+              const std::vector<std::vector<uint8_t>>* edited_input = nullptr) {
     require(!input.empty() && input.size() > window, "smoke needs jobs > window");
+    require(!edited_input || edited_input->size() == input.size(),
+            "edited pass must have the same number of TUs");
+    const size_t active_passes = edited_input ? 3 : 2;
+    const auto bytes_for_job = [&](size_t job) -> const std::vector<uint8_t>& {
+        const size_t pass = job / input.size();
+        const size_t item = job % input.size();
+        return pass == 2 ? (*edited_input)[item] : input[item];
+    };
     const auto [c_guid, f_guid] = store_guids();
     std::vector<Digest128> input_digests;
-    input_digests.reserve(input.size());
-    for (const auto& bytes : input) input_digests.push_back(icecc::digest128(bytes));
+    input_digests.reserve(input.size() * active_passes);
+    for (size_t pass = 0; pass < active_passes; ++pass)
+        for (size_t i = 0; i < input.size(); ++i)
+            input_digests.push_back(icecc::digest128(bytes_for_job(pass * input.size() + i)));
     const Id128 relationship{Id128::from_u64(0x5102)};
     const uint64_t physical_generation = 1;
     std::vector<P51SourceArmedFields> armed;
-    constexpr size_t kPasses = 2;
-    for (size_t i = 0; i < input.size() * kPasses; ++i)
+    constexpr size_t kPasses = 3;
+    for (size_t i = 0; i < input.size() * active_passes; ++i)
         armed.push_back(make_armed(c_guid, f_guid, i, window, profile));
 
     asio::io_context f_context;
@@ -399,15 +460,17 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
     std::thread f_thread;
     auto acceptor = std::make_shared<tcp::acceptor>(
         f_context, tcp::endpoint{asio::ip::address_v4::loopback(), 0});
-    std::vector<size_t> index_by_tu(input.size() * kPasses,
-                                    input.size() * kPasses);
-    std::vector<bool> consumed(input.size() * kPasses, false);
+    std::vector<size_t> index_by_tu(input.size() * active_passes,
+                                    input.size() * active_passes);
+    std::vector<bool> consumed(input.size() * active_passes, false);
     std::mutex map_mutex;
     size_t commits = 0;
+    std::array<std::chrono::steady_clock::time_point, kPasses> pass_started_at{};
+    std::array<uint64_t, kPasses> first_commit_us{};
     std::mutex metric_mutex;
     std::vector<R2WireControlSnapshot> intervals;
-    std::vector<size_t> job_by_ordinal(input.size() * kPasses + 1,
-                                       input.size() * kPasses);
+    std::vector<size_t> job_by_ordinal(input.size() * active_passes + 1,
+                                       input.size() * active_passes);
     struct OrdinalEvent {
         uint64_t ordinal = 0;
         bool sent = false;
@@ -416,8 +479,8 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
     std::vector<OrdinalEvent> ordinal_events;
     std::array<size_t, kPasses> peak_outstanding{};
     std::vector<std::chrono::steady_clock::time_point> request_started(
-        input.size() * kPasses);
-    std::vector<uint64_t> receipt_latency_us(input.size() * kPasses, 0);
+        input.size() * active_passes);
+    std::vector<uint64_t> receipt_latency_us(input.size() * active_passes, 0);
     EndpointCaps f_caps;
     f_caps.profile = profile;
     f_caps.supported_profiles = profile_bit(profile);
@@ -431,10 +494,10 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
                     tu < index_by_tu.size(),
                 "server received unknown input identity");
         const size_t i = index_by_tu[tu];
-        const auto& expected = input[i % input.size()];
+        const auto& expected = bytes_for_job(i);
         require(i < index_by_tu.size() && bytes.size() == expected.size() &&
                 std::equal(bytes.begin(), bytes.end(), expected.begin()) &&
-                commit.raw_digest == input_digests[i % input.size()],
+                commit.raw_digest == input_digests[i],
                 "decoded input differs from corpus bytes");
         return InputJobState::Open;
     };
@@ -472,8 +535,8 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
                 bind.physical_link_generation != physical_generation ||
                 bind.profile != profile || i == armed.size() ||
                 bind.tu_seq.value >= index_by_tu.size() ||
-                bind.raw_bytes != input[i % input.size()].size() ||
-                bind.raw_digest != input_digests[i % input.size()] ||
+                bind.raw_bytes != bytes_for_job(i).size() ||
+                bind.raw_digest != input_digests[i] ||
                 bind.wire_job_id != armed[i].arm.source.wire_job_id ||
                 bind.assignment_nonce != armed[i].arm.source.assignment_nonce ||
                 bind.source_request_id != armed[i].arm.source.source_request_id)
@@ -497,9 +560,15 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
             lease.input_key = InputRecordKey{c_guid, bind.tu_seq};
             return lease;
         };
-    f_config.record_p51_job_commit = [&](const LinkHello&, const JobBind&, const R2TxCommit&) {
+    f_config.record_p51_job_commit = [&](const LinkHello&, const JobBind& bind, const R2TxCommit&) {
         std::lock_guard lock(map_mutex);
         ++commits;
+        const size_t pass = static_cast<size_t>(bind.tu_seq.value) / input.size();
+        if (pass < active_passes && first_commit_us[pass] == 0 &&
+            pass_started_at[pass] != std::chrono::steady_clock::time_point{})
+            first_commit_us[pass] = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - pass_started_at[pass]).count());
         return true;
     };
     f_config.acknowledge_p51_receipt = [](const LinkHello&, const CommitAck&) { return true; };
@@ -572,11 +641,17 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
     std::array<uint64_t, kPasses> pass_raw{}, pass_job_sent{}, pass_job_receipt{};
     std::vector<size_t> result_job_by_tu(armed.size(), armed.size());
     std::array<int64_t, kPasses> pass_elapsed_ms{};
+    std::array<int64_t, kPasses> pass_process_cpu_ms{};
     f_thread = std::thread([&] { f_context.run(); });
     IoThreadGuard thread_guard{c_context, f_context, c_thread, f_thread};
     c_thread = std::thread([&] { c_context.run(); });
-    for (size_t pass = 0; pass < kPasses; ++pass) {
+    for (size_t pass = 0; pass < active_passes; ++pass) {
         const auto pass_start = std::chrono::steady_clock::now();
+        const std::clock_t cpu_start = std::clock();
+        {
+            std::lock_guard lock(map_mutex);
+            pass_started_at[pass] = pass_start;
+        }
         std::vector<std::future<ZstdSourceTransferResult>> futures;
         futures.reserve(input.size());
         for (size_t i = 0; i < input.size(); ++i) {
@@ -588,7 +663,7 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
             futures.push_back(co_spawn_future(c_context,
                 transfer_p51_route_owned(sender, armed[job], physical_generation,
                     connector, PrepareRequestKey{3, 10000 + job}, deadline,
-                    input[i])));
+                    bytes_for_job(job))));
         }
         for (size_t i = 0; i < futures.size(); ++i) {
             require(futures[i].wait_until(deadline) == std::future_status::ready,
@@ -604,11 +679,11 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
             }
             require(result.status == ZstdSourceTransferStatus::Committed,
                     "sender failed to commit corpus input");
-            require(result.committed_input.has_value() &&
-                        result.raw_bytes == input[i].size() &&
-                        result.raw_digest == input_digests[i],
-                    "sender result identity mismatch");
             const size_t job = pass * input.size() + i;
+            require(result.committed_input.has_value() &&
+                        result.raw_bytes == bytes_for_job(job).size() &&
+                        result.raw_digest == input_digests[job],
+                    "sender result identity mismatch");
             const size_t result_tu =
                 static_cast<size_t>(result.committed_input->tu_seq.value);
             require(result_tu < result_job_by_tu.size() &&
@@ -651,6 +726,8 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
         }
         pass_elapsed_ms[pass] = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - pass_start).count();
+        pass_process_cpu_ms[pass] = static_cast<int64_t>(
+            (std::clock() - cpu_start) * 1000.0 / CLOCKS_PER_SEC);
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
     auto retired = std::make_shared<std::promise<void>>();
@@ -693,6 +770,8 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
     require(std::all_of(receipt_latency_us.begin(), receipt_latency_us.end(),
                         [](uint64_t value) { return value != 0; }),
             "missing per-request receipt latency witness");
+    for (size_t pass = 0; pass < active_passes; ++pass)
+        require(first_commit_us[pass] != 0, "missing first-commit latency witness");
     std::array<std::vector<uint64_t>, kPasses> pass_latency_us;
     for (size_t job = 0; job < receipt_latency_us.size(); ++job)
         pass_latency_us[job / input.size()].push_back(receipt_latency_us[job]);
@@ -740,10 +819,10 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
             "F async-socket byte totals disagree with R2 interval totals");
     if (delayed_finalizer_gate)
         require(delayed_finalizer_gate->released_batches.load(
-                    std::memory_order_relaxed) == kPasses,
+                    std::memory_order_relaxed) == active_passes,
                 "delayed finalizer did not release one full caller batch per pass");
     std::cout << "profile=" << static_cast<unsigned>(profile) << " protocol=R2 window="
-              << window << " jobs_per_pass=" << input.size() << " passes=2 raw_bytes=" << raw
+              << window << " jobs_per_pass=" << input.size() << " passes=" << active_passes << " raw_bytes=" << raw
               << " job_cachewire_c_to_f_bytes=" << interval_job_c_to_f
               << " job_cachewire_f_to_c_bytes=" << interval_job_f_to_c
               << " shared_control_cachewire_c_to_f_bytes=" << interval_shared_c_to_f
@@ -760,14 +839,24 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
               << " retained_pass_raw_bytes=" << pass_raw[1]
               << " fresh_pass_job_cachewire_c_to_f_bytes=" << pass_job_sent[0]
               << " retained_pass_job_cachewire_c_to_f_bytes=" << pass_job_sent[1]
+              << (active_passes == 3 ? " edited_pass_job_cachewire_c_to_f_bytes=" : "")
+              << (active_passes == 3 ? std::to_string(pass_job_sent[2]) : "")
               << " fresh_pass_job_cachewire_f_to_c_bytes=" << pass_job_receipt[0]
               << " retained_pass_job_cachewire_f_to_c_bytes=" << pass_job_receipt[1]
+              << (active_passes == 3 ? " edited_pass_job_cachewire_f_to_c_bytes=" : "")
+              << (active_passes == 3 ? std::to_string(pass_job_receipt[2]) : "")
               << " fresh_latency_p50_us=" << percentile_us(pass_latency_us[0], 50)
               << " fresh_latency_p95_us=" << percentile_us(pass_latency_us[0], 95)
               << " fresh_latency_p99_us=" << percentile_us(pass_latency_us[0], 99)
               << " retained_latency_p50_us=" << percentile_us(pass_latency_us[1], 50)
               << " retained_latency_p95_us=" << percentile_us(pass_latency_us[1], 95)
               << " retained_latency_p99_us=" << percentile_us(pass_latency_us[1], 99)
+              << (active_passes == 3 ? " edited_latency_p50_us=" : "")
+              << (active_passes == 3 ? std::to_string(percentile_us(pass_latency_us[2], 50)) : "")
+              << (active_passes == 3 ? " edited_latency_p95_us=" : "")
+              << (active_passes == 3 ? std::to_string(percentile_us(pass_latency_us[2], 95)) : "")
+              << (active_passes == 3 ? " edited_latency_p99_us=" : "")
+              << (active_passes == 3 ? std::to_string(percentile_us(pass_latency_us[2], 99)) : "")
               << " tcp_connections=" << connection_count.load(std::memory_order_relaxed)
               << " delayed_finalizer_batches="
               << (delayed_finalizer_gate
@@ -776,17 +865,38 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
               << " control_intervals=" << intervals.size()
               << " fresh_pass_ms=" << pass_elapsed_ms[0]
               << " retained_pass_ms=" << pass_elapsed_ms[1]
+              << " fresh_process_cpu_ms=" << pass_process_cpu_ms[0]
+              << " retained_process_cpu_ms=" << pass_process_cpu_ms[1]
+              << " fresh_first_commit_us=" << first_commit_us[0]
+              << " retained_first_commit_us=" << first_commit_us[1]
+              << (active_passes == 3 ? " edited_first_commit_us=" : "")
+              << (active_passes == 3 ? std::to_string(first_commit_us[2]) : "")
+              << " cpu_scope=process_all_threads_no_cycles"
+              << (active_passes == 3 ? " edited_pass_ms=" : "")
+              << (active_passes == 3 ? std::to_string(pass_elapsed_ms[2]) : "")
+              << (active_passes == 3 ? " edited_process_cpu_ms=" : "")
+              << (active_passes == 3 ? std::to_string(pass_process_cpu_ms[2]) : "")
               << " elapsed_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
               << " raw_decoded_bytes_verified=" << raw << '\n';
 }
 
-void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile) {
+void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile,
+              const std::vector<std::vector<uint8_t>>* edited_input = nullptr) {
     require(!input.empty(), "R1 smoke needs at least one input");
+    require(!edited_input || edited_input->size() == input.size(),
+            "edited pass must have the same number of TUs");
+    const size_t active_passes = edited_input ? 3 : 2;
+    const auto bytes_for_job = [&](size_t job) -> const std::vector<uint8_t>& {
+        const size_t pass = job / input.size();
+        const size_t item = job % input.size();
+        return pass == 2 ? (*edited_input)[item] : input[item];
+    };
     const auto [c_guid, f_guid] = store_guids();
     std::vector<Digest128> input_digests;
-    input_digests.reserve(input.size());
-    for (const auto& bytes : input) input_digests.push_back(icecc::digest128(bytes));
+    input_digests.reserve(input.size() * active_passes);
+    for (size_t job = 0; job < input.size() * active_passes; ++job)
+        input_digests.push_back(icecc::digest128(bytes_for_job(job)));
     std::mutex observation_mutex;
     size_t exact_receipts = 0;
     size_t exact_commits = 0;
@@ -799,24 +909,34 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
                                   const TxCommit& commit,
                                   std::span<const uint8_t> bytes) {
         const size_t tu = static_cast<size_t>(begin.tu_seq.value);
-        require(observed == c_guid && tu < input.size() * 2,
+        require(observed == c_guid && tu < input.size() * active_passes,
                 "R1 decoded input identity out of range");
-        const size_t input_index = tu % input.size();
-        const auto& expected = input[input_index];
+        const auto& expected = bytes_for_job(tu);
         require(bytes.size() == expected.size() &&
                     std::equal(bytes.begin(), bytes.end(), expected.begin()) &&
-                    commit.raw_digest == input_digests[input_index],
+                    commit.raw_digest == input_digests[tu],
                 "R1 decoded input differs from the exact TU witness");
         std::lock_guard lock(observation_mutex);
         ++exact_receipts;
         return InputJobState::Open;
     };
+    R1CommitMetrics commit_metrics;
     bool bad_commit_callback = false;
     f_config.on_input_committed = [&](InputRecordKey key, bool committed) {
         std::lock_guard lock(observation_mutex);
-        if (key.c_store_guid != c_guid || key.tu_seq.value >= input.size() * 2 ||
+        if (key.c_store_guid != c_guid || key.tu_seq.value >= input.size() * active_passes ||
             !committed)
             bad_commit_callback = true;
+        const size_t pass = static_cast<size_t>(key.tu_seq.value) / input.size();
+        {
+            std::lock_guard metrics_lock(commit_metrics.mutex);
+            if (pass < active_passes && commit_metrics.first_commit_us[pass] == 0 &&
+                commit_metrics.pass_started_at[pass] != std::chrono::steady_clock::time_point{})
+                commit_metrics.first_commit_us[pass] = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() -
+                        commit_metrics.pass_started_at[pass]).count());
+        }
         ++exact_commits;
     };
     auto server = std::make_shared<P50ServerEndpoint>(
@@ -828,9 +948,9 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
     auto acceptor = std::make_shared<tcp::acceptor>(
         f_context, tcp::endpoint{asio::ip::address_v4::loopback(), 0});
     auto server_future = co_spawn_future(f_context,
-        accept_r1_batch_owned(acceptor, server, input.size() * 2));
+        accept_r1_batch_owned(acceptor, server, input.size() * active_passes));
     PreparationAuthorityLimits limits;
-    limits.max_live_entries = input.size() * 2 + 4;
+    limits.max_live_entries = input.size() * active_passes + 4;
     limits.max_speculative_tus = 1;
     limits.max_speculative_raw_bytes = 512ULL << 20;
     auto authority = std::make_shared<P50PreparationAuthority>(
@@ -855,25 +975,26 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
     f_thread = std::thread([&] { f_context.run(); });
     IoThreadGuard thread_guard{c_context, f_context, c_thread, f_thread};
     auto results_future = co_spawn_future(c_context,
-        transfer_r1_serial_batch(sender, connector, input, deadline));
+        transfer_r1_serial_batch(sender, connector, input, edited_input,
+                                 &commit_metrics, deadline));
     c_thread = std::thread([&] { c_context.run(); });
     const auto measurements = results_future.get();
     const auto& results = measurements.results;
-    std::array<uint64_t, 2> raw_by_pass{}, c_to_f_by_pass{}, f_to_c_by_pass{};
-    std::array<std::vector<uint64_t>, 2> pass_latency_us;
+    std::array<uint64_t, 3> raw_by_pass{}, c_to_f_by_pass{}, f_to_c_by_pass{};
+    std::array<std::vector<uint64_t>, 3> pass_latency_us;
     for (size_t i = 0; i < results.size(); ++i) {
         const auto& result = results[i];
         const size_t pass = i / input.size();
         pass_latency_us[pass].push_back(measurements.latency_us[i]);
-        const auto& expected = input[i % input.size()];
+        const auto& expected = bytes_for_job(i);
         if (result.status != ZstdSourceTransferStatus::Committed ||
             !result.committed_input || result.raw_bytes != expected.size() ||
-            result.raw_digest != input_digests[i % input.size()])
+            result.raw_digest != input_digests[i])
             std::cerr << "R1 result mismatch index=" << i
                       << " status=" << static_cast<unsigned>(result.status)
                       << " raw=" << result.raw_bytes << " expected=" << expected.size()
                       << " digest_match="
-                      << (result.raw_digest == input_digests[i % input.size()])
+                      << (result.raw_digest == input_digests[i])
                       << " committed=" << result.committed_input.has_value()
                       << " terminal="
                       << (result.terminal_error ? result.terminal_error->detail : "none")
@@ -881,7 +1002,7 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
         require(result.status == ZstdSourceTransferStatus::Committed &&
                     result.committed_input.has_value() &&
                     result.raw_bytes == expected.size() &&
-                    result.raw_digest == input_digests[i % input.size()],
+                    result.raw_digest == input_digests[i],
                 "R1 sender result does not match its exact corpus input");
         add_bytes(raw_by_pass[pass], result.raw_bytes);
         if (result.wire_bytes_measured) {
@@ -900,15 +1021,19 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
     if (f_thread.joinable()) f_thread.join();
     drain_ready(c_context);
     drain_ready(f_context);
-    require(exact_receipts == input.size() * 2 && exact_commits == input.size() * 2,
+    require(exact_receipts == input.size() * active_passes &&
+                exact_commits == input.size() * active_passes,
             "R1 server receipt/commit count mismatch");
     require(!bad_commit_callback, "R1 endpoint published an invalid commit callback");
     uint64_t raw_total = 0, cachewire_c_to_f = 0, cachewire_f_to_c = 0;
-    for (size_t pass = 0; pass < raw_by_pass.size(); ++pass) {
+    for (size_t pass = 0; pass < active_passes; ++pass) {
         add_bytes(raw_total, raw_by_pass[pass]);
         add_bytes(cachewire_c_to_f, c_to_f_by_pass[pass]);
         add_bytes(cachewire_f_to_c, f_to_c_by_pass[pass]);
     }
+    for (size_t pass = 0; pass < active_passes; ++pass)
+        require(commit_metrics.first_commit_us[pass] != 0,
+                "missing R1 first-commit latency witness");
     std::cout << "profile=" << static_cast<unsigned>(profile) << " protocol=R1 window=1 jobs_per_pass="
               << input.size() << " raw_bytes=" << raw_total << " cachewire_bytes_measured="
               << all_wire_measured << " cachewire_c_to_f_bytes="
@@ -917,6 +1042,8 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
               << (all_wire_measured ? std::to_string(cachewire_f_to_c) : "unmeasured")
               << " fresh_pass_raw_bytes=" << raw_by_pass[0]
               << " retained_pass_raw_bytes=" << raw_by_pass[1]
+              << (active_passes == 3 ? " edited_pass_raw_bytes=" : "")
+              << (active_passes == 3 ? std::to_string(raw_by_pass[2]) : "")
               << " fresh_pass_cachewire_c_to_f_bytes="
               << (all_wire_measured ? std::to_string(c_to_f_by_pass[0]) : "unmeasured")
               << " retained_pass_cachewire_c_to_f_bytes="
@@ -925,14 +1052,39 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile)
               << (all_wire_measured ? std::to_string(f_to_c_by_pass[0]) : "unmeasured")
               << " retained_pass_cachewire_f_to_c_bytes="
               << (all_wire_measured ? std::to_string(f_to_c_by_pass[1]) : "unmeasured")
+              << (active_passes == 3 ? " edited_pass_cachewire_c_to_f_bytes=" : "")
+              << (active_passes == 3
+                      ? (all_wire_measured ? std::to_string(c_to_f_by_pass[2]) : "unmeasured")
+                      : "")
+              << (active_passes == 3 ? " edited_pass_cachewire_f_to_c_bytes=" : "")
+              << (active_passes == 3
+                      ? (all_wire_measured ? std::to_string(f_to_c_by_pass[2]) : "unmeasured")
+                      : "")
               << " fresh_pass_ms=" << measurements.pass_elapsed_ms[0]
               << " retained_pass_ms=" << measurements.pass_elapsed_ms[1]
+              << " fresh_process_cpu_ms=" << measurements.pass_process_cpu_ms[0]
+              << " retained_process_cpu_ms=" << measurements.pass_process_cpu_ms[1]
+              << " fresh_first_commit_us=" << commit_metrics.first_commit_us[0]
+              << " retained_first_commit_us=" << commit_metrics.first_commit_us[1]
+              << " cpu_scope=process_all_threads_no_cycles"
+              << (active_passes == 3 ? " edited_pass_ms=" : "")
+              << (active_passes == 3 ? std::to_string(measurements.pass_elapsed_ms[2]) : "")
+              << (active_passes == 3 ? " edited_process_cpu_ms=" : "")
+              << (active_passes == 3 ? std::to_string(measurements.pass_process_cpu_ms[2]) : "")
+              << (active_passes == 3 ? " edited_first_commit_us=" : "")
+              << (active_passes == 3 ? std::to_string(commit_metrics.first_commit_us[2]) : "")
               << " fresh_latency_p50_us=" << percentile_us(pass_latency_us[0], 50)
               << " fresh_latency_p95_us=" << percentile_us(pass_latency_us[0], 95)
               << " fresh_latency_p99_us=" << percentile_us(pass_latency_us[0], 99)
               << " retained_latency_p50_us=" << percentile_us(pass_latency_us[1], 50)
               << " retained_latency_p95_us=" << percentile_us(pass_latency_us[1], 95)
               << " retained_latency_p99_us=" << percentile_us(pass_latency_us[1], 99)
+              << (active_passes == 3 ? " edited_latency_p50_us=" : "")
+              << (active_passes == 3 ? std::to_string(percentile_us(pass_latency_us[2], 50)) : "")
+              << (active_passes == 3 ? " edited_latency_p95_us=" : "")
+              << (active_passes == 3 ? std::to_string(percentile_us(pass_latency_us[2], 95)) : "")
+              << (active_passes == 3 ? " edited_latency_p99_us=" : "")
+              << (active_passes == 3 ? std::to_string(percentile_us(pass_latency_us[2], 99)) : "")
               << " tcp_connections=" << connection_count.load(std::memory_order_relaxed)
               << " elapsed_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
@@ -959,8 +1111,42 @@ int main(int argc, char** argv) {
                          "passes=2 window=4\n";
             return 0;
         }
+        if (argc == 10 && std::string_view(argv[1]) == "--paired") {
+            const std::string protocol = argv[6];
+            const size_t jobs = std::stoul(argv[7]);
+            const unsigned profile = static_cast<unsigned>(std::stoul(argv[8]));
+            const uint32_t window = static_cast<uint32_t>(std::stoul(argv[9]));
+            require(protocol == "R1" || protocol == "R2",
+                    "paired protocol must be R1 or R2");
+            require(profile < 3, "profile index must be 0,1,2");
+            require(jobs > 1 &&
+                        (protocol == "R1" ? window == 1
+                                           : (window > 0 && window <= 30 && window < jobs)),
+                    "invalid paired window/job count");
+            const ProfileId profiles[] = {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                          ProfileId::ZSTD_ROUTE};
+            const auto b_paths = read_and_validate_pair(argv[2], argv[3], argv[4], argv[5], jobs);
+            const auto a_paths = read_manifest(argv[2], jobs);
+            const auto a = load_inputs(a_paths);
+            const auto b = load_inputs(b_paths);
+            size_t changed = 0;
+            for (size_t i = 0; i < jobs; ++i)
+                changed += icecc::digest128(a[i]) != icecc::digest128(b[i]);
+            require(changed != 0, "paired edited pass contains no changed TU bytes");
+            if (protocol == "R1") smoke_r1(a, profiles[profile], &b);
+            else smoke_r2(a, profiles[profile], window, std::chrono::minutes(4), false, &b);
+            std::cout << "paired_inputs=PASS jobs=" << jobs
+                      << " changed_raw_digests=" << changed
+                      << " unchanged_raw_digests=" << jobs - changed
+                      << " ordered_tu_ids=verified os_cache_state=inherited_uncontrolled"
+                      << " pass_semantics=A_fresh,A_retained,B_edited"
+                      << " profile=" << profile << " window="
+                      << (protocol == "R1" ? 1 : window) << '\n';
+            return 0;
+        }
         if (argc != 6) {
-            std::cerr << "usage: p50-transfer-window-bench MANIFEST PROTOCOL JOBS PROFILE_INDEX WINDOW\n";
+            std::cerr << "usage: p50-transfer-window-bench MANIFEST PROTOCOL JOBS PROFILE_INDEX WINDOW\n"
+                         "   or: p50-transfer-window-bench --paired A_MANIFEST B_MANIFEST A_ROOT B_ROOT R2 JOBS PROFILE_INDEX WINDOW\n";
             return 2;
         }
         const std::string protocol = argv[2];
