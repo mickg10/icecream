@@ -43,10 +43,18 @@ W4). Logs under `/tanksmall/scratch/tmp/p51-candidate-runtime-a027d14e/`:
 - `a027-source-preflight.log`: `fee2d042dc88fc89c9138612382ee23c8b1900ecefbc2eacd385fd9f4e92aa0f`
 - `a027-bench-direct.log`: `856f00b7e40c6044a2349ebc07ec555c83cea66c2d5bffffc400f29077a16cfd`
 
-The subdirectory-only Automake invocation failed on an unbuilt test-only
-cache archive. The root recursive check is still running. This build predates
-the fixture correction above and does not qualify private capacity changes
-or constitute full candidate QA.
+The root recursive `make check TESTS=p50transferwindowbench` also passes with
+`ICEFARM_TMPDIR=/tmp UV_CACHE_DIR=/tmp/uv-cache`, taking 395.83 seconds to
+build all test-program prerequisites and execute the one selected test.
+`a027-root-check-retry.log` in the same log directory has SHA256
+`7c5987706e74596f4173a38d438d6ea691c6f7b0fb96300be5ada21e7fb9b526`.
+The registered `.trs` receipt under
+`/tanksmall/scratch/tmp/p51-candidate-build-a027d14e/unittests/`
+is PASS, SHA256 `7f175f2f5d04511903d382671ba96ca623e127f57730d53966587cf2c2689229`.
+The earlier subdirectory-only invocation failed because it did not build
+the cache test archive; the first root invocation lacked the required scratch
+variable. Neither is a passing run. This build predates the fixture correction
+above and does not qualify private capacity changes or full candidate QA.
 
 ### Retry-safe preprocessed capture
 
