@@ -34,8 +34,19 @@ Final codec test source SHA256:
 `bb01e00543e74301c76e3afec6e4bd89179fe6c476f75138c19a8ee438af6647`;
 binary SHA256:
 `b439fc3b1f7e17565ed552366fcffe8b584d663e57d07e72f6a7d98e9d7f38fc`.
-Authority validation, request-specific monitoring and the 31-request service
-cancellation cases remain separate qualification work.
+The authority layer now exposes explicit `cancel_unwritten_tail`, with a
+caller obligation that no write has started. It validates ownership, sole
+reference, unadvanced state and exact tail identity before changing accounting.
+The focused default-registered endpoint test passes with
+`ICECC_P50_CANCEL_UNWRITTEN_TAIL_FOCUS=1`: valid cancellation for all profiles,
+plus wrong-owner, middle-entry, advanced-entry, retained-reference and repeated
+cancellation rejection. Failed calls preserve accounting/history snapshots;
+successful calls return preparation entries/encoded bytes to baseline.
+Donor `a294e811`; log `cancel-unwritten-tail-focus.log` in the directory above,
+SHA256 `97135898f3b03ca686b5045acac99e7a681ad07e3958bf3982bd623bf301ed58`.
+Test source SHA256 `26665da40cad0b4ab23eb128327944bedda303863176820a69aadd99ff25095a`.
+Request-specific monitoring and the 31-request service cancellation cases
+remain separate qualification work; this API test does not prove their wiring.
 
 ### Source admission pressure
 
