@@ -18,7 +18,7 @@ Commit `491fb851` adds explicit serializer/route cancellation before FILL
 starts, preserving continuing entropy state and earlier speculative witnesses.
 The existing broad abandon/release behavior is unchanged. A fill-started flag
 rejects this narrow operation even when FILL throws before becoming ready.
-This is the codec foundation, not yet the integrated source-request cancel path.
+The integrated source-request path has separate qualification below.
 
 Luna ran `p50slice0` and `codec_wire` in the SDK; both exited 0. The route
 test retains an unacknowledged predecessor, cancels the next BODY preparation,
@@ -45,8 +45,31 @@ successful calls return preparation entries/encoded bytes to baseline.
 Donor `a294e811`; log `cancel-unwritten-tail-focus.log` in the directory above,
 SHA256 `97135898f3b03ca686b5045acac99e7a681ad07e3958bf3982bd623bf301ed58`.
 Test source SHA256 `26665da40cad0b4ab23eb128327944bedda303863176820a69aadd99ff25095a`.
-Request-specific monitoring and the 31-request service cancellation cases
-remain separate qualification work; this API test does not prove their wiring.
+This API test alone does not prove request-specific monitoring or service wiring.
+
+### Request cancellation before first write
+
+Candidate `5fbde51e` integrates request-scoped control-peer monitoring and
+prewrite cancellation (`6f17e170`), adapted to the typed admission result.
+The cancellation/write-ownership decision is atomic. An unwritten cancellation
+discards only the exact preparation tail; it preserves earlier unresolved
+transfers and does not roll back globally unique TU_SEQ allocation.
+
+Luna built donor `aad8f43f` and ran `p50cacheservice --d07-staged-cancel`:
+exit 0, all nine profile/submission-position cases passed (three profiles,
+positions 0/15/30 in a 31-request cohort). A separate post-cohort request
+checks continued progress and ordinal reuse. The P29 middle case holds an
+earlier transfer unacknowledged during cancellation. The existing active-cancel
+selector also passed all three profiles. These are not the remaining D07
+partial-write/full-write/committed position matrix.
+
+Donor runtime log `staged-cancel-r5.log` under
+`/tanksmall/scratch/tmp/p51-d07-staged-cancel-build-r1/` has SHA256
+`7661da584879e00ee96e55a963389c5ba6e5e97f0f3b99b581de6ba7564c636c`.
+The exact committed-source rerun produced the same log hash; its binary SHA256
+is `b86b0d951a76fcf70e88a03087d070adc6f52727275f96536a2e74637eccb8d6`.
+Merged-candidate registered-suite and sanitizer qualification are pending;
+donor success must not be presented as their result.
 
 ### Source admission pressure
 
