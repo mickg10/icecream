@@ -68,8 +68,16 @@ Donor runtime log `staged-cancel-r5.log` under
 `7661da584879e00ee96e55a963389c5ba6e5e97f0f3b99b581de6ba7564c636c`.
 The exact committed-source rerun produced the same log hash; its binary SHA256
 is `b86b0d951a76fcf70e88a03087d070adc6f52727275f96536a2e74637eccb8d6`.
-Merged-candidate registered-suite and sanitizer qualification are pending;
-donor success must not be presented as their result.
+The merged cancellation checkpoint `e0d1f0d9` is pushed. Its equivalent isolated
+code snapshot `188bc50e` built the production service and passed the full
+registered `p50cacheservice.log` target (test exit 0; both test/global `.trs`
+results PASS). Log under
+`/tanksmall/scratch/tmp/p51-merged-5fbde51e.WHnBjQ/build-oot/unittests/`
+has SHA256 `090e81322115b71fe09ce61338848fb92b24a9def3e4275164820e895f864be2`.
+The first normal build exposed an unguarded test-only callback access, fixed
+in `e0d1f0d9`; missing archive and offline Python runtime setup attempts are
+retained separately, not counted as product failures. Expanded sanitizer
+qualification and the later cancellation-plus-four-link snapshot remain pending.
 
 ### Source admission pressure
 
