@@ -1107,6 +1107,34 @@ client `c50e5d67c267ecff4e1e057939913a95e92760c0724ebbb2cfa1e84aa1ce646c`.
 
 ### Active compiler loss and fresh-job recovery
 
+`78faa78c` adds independent compiler-owner loss with an observed W30 source
+window. The local mode `ICECC_P51_WRAPPER_COMPILER_LOSS_W30=1` passes all three
+profiles on the unchanged qualified runtime, using two C daemons and one F.
+It kills only the exact committed victim compiler group (PID/PGID/start ticks),
+while 30 distinct C1 source receipts are held. An already-admitted C2 job
+produces its exact reference object before release; the helper is still live,
+without a failure marker, and none of those 30 C1 jobs has attached early.
+After release, all 30 original assignments compile exactly once with exact
+objects, followed by 30 fresh outputs. The original victim has a failed END;
+a distinct fresh-assignment retry may succeed. S/C/F identities remain stable
+and measured traffic uses exactly two persistent links, excluding warmup.
+This is W30 source concurrency, not 30 simultaneously executing compilers.
+
+Final run12 exits zero. Profile logs under
+`/tanksmall/scratch/tmp/p51-d09-compiler-loss-runtime/tmp/p51-wrapper-fixture.sPPWzJ/`:
+
+- `P29V1.log`: SHA256 `47da33ad5cd5c3cf77baebe4a76b9d30ec54ee7c9180f0e1128cd4057612f06d`.
+- `ZSTD_TU.log`: SHA256 `049a2d0edaa7696f4e4443e939b069074f83aaa1a9287a99b5f4410bf144c9f6`.
+- `ZSTD_ROUTE.log`: SHA256 `64583d86f7adec9636da501e7cce2417f4bf6f0e620ce43f4cee2db0f1d6459b`.
+
+Integrated runner/wrapper SHA256 match tested source exactly:
+`8edb00f70b386c30fce28fad1742f8fd64f1127a9f99f3c063cecc53908ada96`,
+`56392e878869e1ba44aa325b059897be285bd7efc3a5b4a531efeccee01284e1`.
+The fixture requires an isolated root container, the positive-daemon test
+opt-in, and a separate wrapper UID. A registered bootstrap entry point is
+still being added. Earlier setup/assertion failures are retained and excluded;
+this pass does not close scheduler-to-F recovery or combined/external QA.
+
 The opt-in local wrapper gate
 `ICECC_P51_WRAPPER_WORKER_SESSION_LOSS=1` passes for P29V1, ZSTD_TU and
 ZSTD_ROUTE. It stops one exact compiler child, identified by job/epoch/nonce,
