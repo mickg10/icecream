@@ -84,13 +84,23 @@ std::map<int, std::string> process_open_fd_snapshot() {
     DIR* directory = ::opendir("/proc/self/fd");
     if (directory == nullptr)
         throw std::runtime_error("cannot enumerate /proc/self/fd");
+    struct DirectoryGuard {
+        DIR* value;
+        ~DirectoryGuard() {
+            if (value != nullptr)
+                (void)::closedir(value);
+        }
+    } guard{directory};
     const int directory_fd = ::dirfd(directory);
     std::map<int, std::string> snapshot;
+    int snapshot_error = 0;
     for (;;) {
         errno = 0;
         dirent* entry = ::readdir(directory);
-        if (entry == nullptr)
+        if (entry == nullptr) {
+            snapshot_error = errno;
             break;
+        }
         if (entry->d_name[0] == '.')
             continue;
         char* end = nullptr;
@@ -102,12 +112,23 @@ std::map<int, std::string> process_open_fd_snapshot() {
         std::snprintf(path, sizeof(path), "/proc/self/fd/%ld", descriptor);
         char target[512];
         const ssize_t target_size = ::readlink(path, target, sizeof(target) - 1);
-        if (target_size < 0)
-            continue;
+        if (target_size < 0) {
+            snapshot_error = errno == 0 ? EIO : errno;
+            break;
+        }
+        if (target_size == static_cast<ssize_t>(sizeof(target) - 1)) {
+            snapshot_error = EOVERFLOW;
+            break;
+        }
         target[target_size] = '\0';
         snapshot.emplace(static_cast<int>(descriptor), target);
     }
-    (void)::closedir(directory);
+    if (::closedir(directory) != 0 && snapshot_error == 0)
+        snapshot_error = errno == 0 ? EIO : errno;
+    guard.value = nullptr;
+    if (snapshot_error != 0)
+        throw std::runtime_error(std::string("cannot complete /proc/self/fd snapshot: ") +
+                                 std::strerror(snapshot_error));
     return snapshot;
 }
 
