@@ -28,6 +28,11 @@ s2_process_loss=${ICECC_P50_S2_PROCESS_LOSS:-0}
 real_scheduler_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_RESTART_W30:-0}
 real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
 worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
+capacity_expiry=${ICECC_P50_C1F1_TEST_CAPACITY_EXPIRY:-0}
+case "$capacity_expiry" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C1F1_TEST_CAPACITY_EXPIRY must be 0 or 1" >&2; exit 1 ;;
+esac
 expect_stable_f=${ICECC_P50_C1F1_EXPECT_STABLE_F:-0}
 w30_f_loss=${ICECC_P50_C1F2_F_LOSS_W30:-0}
 c1f2_baseline=${ICECC_P50_C1F2_BASELINE:-0}
@@ -268,12 +273,23 @@ if test "$worker_session_loss" = 1; then
     # not the separate pending-window W30 scheduler-replacement scenario.
     export ICECC_TESTS=1
 fi
+if test "$capacity_expiry" = 1; then
+    if test "$external_mode" != 0 || test "$suite" != C1F1/100000 || \
+            test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1; then
+        echo "FAIL: capacity expiry requires local cache-enabled P51 C1F1, WARM=0, PASSES=1" >&2
+        exit 1
+    fi
+    # One spare dispatch credit lets both real wrapper assignments overlap;
+    # one operation occupies the cap while the other exercises Busy retry.
+    export ICECC_TESTS=1
+fi
 worker_maxjobs=$slots_per_f
 if test "$staggered_quiescence" = 1; then
     # The focused barrier probe needs two simultaneous real compiler groups.
     # The scheduler reserves one dispatch credit, so expose one spare slot.
     worker_maxjobs=3
 fi
+if test "$capacity_expiry" = 1; then worker_maxjobs=3; fi
 if test "$real_scheduler_restart_w30" = 1; then
     # The scheduler reserves one dispatch-credit slot: when the worker's
     # advertised farm capacity is N, effective_dispatch_credit() admits at
@@ -4289,7 +4305,145 @@ EOF_W30_ACTIVE_NEW
         fi
         echo "S7_WARM_PREWARM_COMPLETE"
     fi
-    if test "$w30_f_loss" = 1; then
+    if test "$capacity_expiry" = 1; then
+        test "$batch_expected_count" -eq 2 || {
+            echo "FAIL: capacity-expiry fixture requires exactly two jobs" >&2
+            exit 1
+        }
+        expiry_start_ns=$(date +%s%N)
+        expiry_marker=${ICECC_TEST_P51_CAPACITY_EXPIRY_MARKER:-$work/capacity-expiry-arm}
+        printf '%s\n' "$expiry_start_ns" >"$expiry_marker"
+        run_batch capacity-expiry 1 "$work/batch.tsv" 2 1
+        expired_ordinal=
+        for expiry_ordinal in 0 1; do
+            expiry_log="$work/job-capacity-expiry-$expiry_ordinal.log"
+            if grep -F 'P51_CAPACITY_TRACE retry_lease_receive_failed ' \
+                    "$expiry_log" | grep -F 'expired=1' >/dev/null; then
+                test -z "$expired_ordinal" || {
+                    echo "FAIL: more than one wrapper reached the withheld retry-lease expiry" >&2
+                    exit 1
+                }
+                expired_ordinal=$expiry_ordinal
+            fi
+        done
+        test -n "$expired_ordinal" || {
+            echo "FAIL: no measured wrapper crossed Busy into the bounded retry-lease receive deadline" >&2
+            exit 1
+        }
+        expiry_client_log="$work/job-capacity-expiry-$expired_ordinal.log"
+        awk '
+            /^P51_CAPACITY_TRACE (lease|arm_ack|busy|retry_lease_receive_failed|terminal) / {
+                event = $2
+                delete fields
+                for (i = 3; i <= NF; ++i) {
+                    split($i, pair, "=")
+                    fields[pair[1]] = pair[2]
+                }
+                key = fields["job"] "/" fields["epoch"] "/" fields["nonce"] "/" \
+                    fields["request"] "/" fields["deadline_ns"]
+                job = fields["job"]
+                if (job == "" || fields["epoch"] == "" ||
+                    fields["nonce"] == "" || fields["request"] == "" ||
+                    fields["deadline_ns"] == "") bad[job] = 1
+                if (identity[job] == "") identity[job] = key
+                if (identity[job] != key) bad[job] = 1
+                deadline[job] = fields["deadline_ns"]
+                if (event == "lease") {
+                    leases[job]++
+                    c_identity = fields["c_control"] "/" fields["c_peer"] "/" \
+                        fields["c_store_generation"] "/" fields["c_derivation"] "/" fields["c_guid"]
+                    if (fields["c_control"] == "" || fields["c_peer"] == "" ||
+                        fields["c_store_generation"] == "" || fields["c_derivation"] == "" ||
+                        fields["c_guid"] == "") bad[job] = 1
+                    if (c_identity_for_job[job] == "") c_identity_for_job[job] = c_identity
+                    else if (c_identity_for_job[job] != c_identity) bad[job] = 1
+                }
+                else if (event == "arm_ack") {
+                    arms[job]++
+                    if (fields["source_dev"] == "" || fields["source_ino"] == "" ||
+                        fields["source_bytes"] == "" || fields["source_bytes"] <= 0) bad[job] = 1
+                } else if (event == "busy") {
+                    busy[job]++
+                    if (fields["witness"] != "none") bad[job] = 1
+                } else if (event == "retry_lease_receive_failed") {
+                    failed[job]++
+                    if (fields["expired"] != "1") bad[job] = 1
+                } else if (event == "terminal") {
+                    terminal[job]++
+                    if (fields["code"] == "1" && fields["error"] == "0" &&
+                        fields["attempts"] == "1" && fields["raw_bytes"] > 0)
+                        succeeded[job]++
+                }
+            }
+            END {
+                for (job in failed) {
+                    if (failed[job] == 1 && leases[job] == 1 &&
+                        arms[job] == 1 && busy[job] >= 1 &&
+                        terminal[job] == 0 && !bad[job]) {
+                        for (fresh in succeeded) {
+                            if (fresh != job && succeeded[fresh] == 1 &&
+                                arms[fresh] == 1 && leases[fresh] >= 1 &&
+                                deadline[fresh] != deadline[job] &&
+                                identity[fresh] != identity[job] && !bad[fresh]) {
+                                print job, fresh
+                                exit 0
+                            }
+                        }
+                    }
+                }
+                exit 1
+            }
+        ' "$expiry_client_log" >"$work/capacity-expiry-job-id" || {
+            cat "$expiry_client_log" >&2
+            echo "FAIL: no exact expired assignment plus distinct fresh successful assignment was observed" >&2
+            exit 1
+        }
+        read -r expiry_job_id fresh_retry_job_id <"$work/capacity-expiry-job-id"
+        grep -F 'P51_CAPACITY_TEST_WITHHELD_RETRY_LEASE' \
+            "$work/c-daemon-startup.stderr" | \
+            grep -F "job=$expiry_job_id " >/dev/null || {
+                cat "$work/c-daemon-startup.stderr" >&2
+                echo "FAIL: daemon did not observe and withhold the retry lease request" >&2
+                exit 1
+            }
+        grep -F 'P51_CAPACITY_TEST_HOLD settlement_ms=1800 past_deadline=1' \
+            "$work/c-daemon-startup.stderr" >/dev/null || {
+            cat "$work/c-daemon-startup.stderr" >&2
+            echo "FAIL: service did not hold the completed settlement past the caller deadline" >&2
+            exit 1
+        }
+        # The bounded service settlement hold outlives the original assignment
+        # deadline. The wrapper's distinct retry succeeds only after credit is
+        # released; then an unrelated compile proves the same service remains
+        # healthy after the expired assignment was retired.
+        sleep 2
+        sed -n '1p' "$work/batch.tsv" >"$work/batch-capacity-expiry-fresh.tsv"
+        run_batch capacity-expiry-fresh 1 \
+            "$work/batch-capacity-expiry-fresh.tsv" 1
+        expiry_elapsed_ms=$((( $(date +%s%N) - expiry_start_ns ) / 1000000))
+        awk -F '\t' 'NF >= 11 && $7 == $10 && $8 == $11 && $8 > 0 { ok=1 } END { exit !ok }' \
+            "$work/result-capacity-expiry-fresh-0.tsv" || {
+            echo "FAIL: post-expiry unrelated job did not produce the exact expected object" >&2
+            exit 1
+        }
+        awk -F '\t' -v expected="$fresh_retry_job_id" \
+            'NF >= 19 && $19 == expected && $7 == $10 && $8 == $11 && $8 > 0 { ok=1 } END { exit !ok }' \
+            "$work/result-capacity-expiry-$expired_ordinal.tsv" || {
+            echo "FAIL: wrapper result was not produced by the distinct fresh assignment after expiry" >&2
+            exit 1
+        }
+        if grep -F "P51_CAPACITY_TRACE terminal job=$expiry_job_id " \
+                "$expiry_client_log" >/dev/null; then
+            echo "FAIL: expired exact assignment acquired a late terminal result" >&2
+            exit 1
+        fi
+        if grep -F "P50_INPUT_ATTACH_BEGIN job=$expiry_job_id " "$work/f.log" >/dev/null || \
+                grep -F "P50_TEST_COMPILER_CHILD job=$expiry_job_id " "$work/f.log" >/dev/null; then
+            echo "FAIL: expired exact assignment reached F input publication/compiler start" >&2
+            exit 1
+        fi
+        echo "P51_WRAPPER_CAPACITY_EXPIRY_PASS profile=$profile_marker expired_ordinal=$expired_ordinal expired_job=$expiry_job_id fresh_retry_job=$fresh_retry_job_id exact_deadline=1 expired_job_unpublished=1 distinct_deadline_and_ARM=1 fresh_after_release=1 unrelated_after_release=1 elapsed_ms=$expiry_elapsed_ms client_trace=$expiry_client_log daemon_log=$work/c-daemon-startup.stderr fresh_result=$work/result-capacity-expiry-fresh-0.tsv"
+    elif test "$w30_f_loss" = 1; then
         run_real_c1f2_w30_worker_loss
         exit 0
     elif test "$worker_session_loss" = 1; then

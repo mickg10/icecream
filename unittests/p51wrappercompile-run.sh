@@ -142,6 +142,7 @@ c1f2_w30=${ICECC_P51_WRAPPER_C1F2_W30:-0}
 capacity_test=${ICECC_P51_WRAPPER_CAPACITY_TEST:-0}
 capacity_identity_negative=${ICECC_P51_WRAPPER_CAPACITY_IDENTITY_NEGATIVE:-0}
 capacity_nonbusy_negative=${ICECC_P51_WRAPPER_CAPACITY_NONBUSY_NEGATIVE:-0}
+capacity_expiry=${ICECC_P51_WRAPPER_CAPACITY_EXPIRY:-0}
 case "$worker_session_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_WORKER_SESSION_LOSS must be 0 or 1" >&2; exit 1 ;;
@@ -184,7 +185,11 @@ case "$capacity_nonbusy_negative" in
     0|1) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_CAPACITY_NONBUSY_NEGATIVE must be 0 or 1" >&2; exit 1 ;;
 esac
-if test "$c1f2_w30" = 1 && { test "$capacity_test" = 1 || test "$capacity_identity_negative" = 1 || test "$capacity_nonbusy_negative" = 1; }; then
+case "$capacity_expiry" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P51_WRAPPER_CAPACITY_EXPIRY must be 0 or 1" >&2; exit 1 ;;
+esac
+if test "$c1f2_w30" = 1 && { test "$capacity_test" = 1 || test "$capacity_identity_negative" = 1 || test "$capacity_nonbusy_negative" = 1 || test "$capacity_expiry" = 1; }; then
     echo "FAIL: capacity tests cannot be combined with C1F2 W30 mode" >&2
     exit 1
 fi
@@ -196,6 +201,9 @@ else
 fi
 if test "$c1f2_w30" = 1; then
     jobs=31
+fi
+if test "$capacity_expiry" = 1; then
+    jobs=2
 fi
 case "$jobs" in
     ''|*[!0-9]*|0) echo "FAIL: ICECC_P51_WRAPPER_JOBS must be a positive integer" >&2; exit 1 ;;
@@ -210,13 +218,18 @@ if test "$capacity_nonbusy_negative" = 1 && \
     echo "FAIL: non-Busy negative test requires exactly two ordinary concurrent jobs" >&2
     exit 1
 fi
-test "$((capacity_test + capacity_identity_negative + capacity_nonbusy_negative))" -le 1 || {
+test "$((capacity_test + capacity_identity_negative + capacity_nonbusy_negative + capacity_expiry))" -le 1 || {
     echo "FAIL: capacity test modes are mutually exclusive" >&2
     exit 1
 }
 if test "$capacity_test" = 1 && \
         { test "$worker_session_loss" = 1 || test "$staggered_quiescence" = 1 || test "$jobs" -lt 2; }; then
     echo "FAIL: capacity retry test requires an ordinary batch with at least two jobs" >&2
+    exit 1
+fi
+if test "$capacity_expiry" = 1 && \
+        { test "$worker_session_loss" = 1 || test "$staggered_quiescence" = 1 || test "$jobs" -ne 2; }; then
+    echo "FAIL: capacity expiry requires exactly two ordinary concurrent jobs" >&2
     exit 1
 fi
 
@@ -276,6 +289,12 @@ with (root / "batch.jsonl").open("w", encoding="utf-8") as stream:
 PY
 
 profiles=${ICECC_P51_WRAPPER_PROFILES:-"P29V1 ZSTD_TU ZSTD_ROUTE"}
+capacity_expiry_deadline=0
+capacity_expiry_hold_ms=0
+if test "$capacity_expiry" = 1; then
+    capacity_expiry_deadline=1500
+    capacity_expiry_hold_ms=1800
+fi
 case "$profiles" in
     "P29V1 ZSTD_TU ZSTD_ROUTE"|"P29V1 ZSTD_TU"|P29V1|ZSTD_TU|ZSTD_ROUTE) ;;
     *) echo "FAIL: ICECC_P51_WRAPPER_PROFILES must select one supported profile or the default set" >&2; exit 1 ;;
@@ -320,6 +339,14 @@ for profile in $profiles; do
         ICECC_P50_C1F1_KEEP_WORK=1 \
         ICECC_P50_C1F1_TIMEOUT=300 \
         ICECC_TEST_P51_CAPACITY_BUSY_AS_TERMINAL_ERROR="$capacity_nonbusy_negative" \
+        ICECC_P50_C1F1_TEST_CAPACITY_EXPIRY="$capacity_expiry" \
+        ICECC_TEST_P51_CAPACITY_DEADLINE_MS="$capacity_expiry_deadline" \
+        ICECC_TEST_P51_CAPACITY_EXPIRY_MARKER="$work/capacity-expiry-arm" \
+        ICECC_TEST_P51_WITHHOLD_RETRY_LEASE="$capacity_expiry" \
+        ICECC_TEST_P51_HOLD_REPLY_SETTLEMENT_MS="$capacity_expiry_hold_ms" \
+        ICECC_TEST_P51_HOLD_SETTLEMENT_PAST_DEADLINE="$capacity_expiry" \
+        ICECC_TEST_P51_FORCE_SOURCE_OP_CAP_ONE="$capacity_expiry" \
+        ICECC_TEST_P51_CAPACITY_TRACE="$capacity_expiry" \
         ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS="$worker_session_loss" \
         ICECC_P50_C1F1_EXPECT_STABLE_F="$expect_stable_f" \
         ICECC_P50_C1F1_TEST_STAGGERED_QUIESCENCE="$staggered_quiescence" \
@@ -327,6 +354,28 @@ for profile in $profiles; do
         "$src/unittests/p50compilee2e-run.sh" >"$log" 2>&1
     status=$?
     set -e
+    if test "$capacity_expiry" = 1; then
+        test "$status" -eq 0 || {
+            cat "$log"
+            echo "FAIL: bounded capacity expiry gate failed for $profile (status $status)" >&2
+            exit 1
+        }
+        grep -F "P51_WRAPPER_CAPACITY_EXPIRY_PASS profile=$profile" "$log" >/dev/null || {
+            cat "$log"
+            echo "FAIL: $profile did not prove expired retry and post-release progress" >&2
+            exit 1
+        }
+        grep -F 'P51_CAPACITY_TEST_WITHHELD_RETRY_LEASE' \
+            "$work/c-daemon-startup.stderr" >/dev/null || {
+            echo "FAIL: $profile daemon did not observe the test retry lease" >&2
+            exit 1
+        }
+        test -s "$work/result-capacity-expiry-fresh-0.tsv" || {
+            echo "FAIL: capacity expiry did not leave the fresh exact output" >&2
+            exit 1
+        }
+        continue
+    fi
     if test "$capacity_identity_negative" = 1; then
         test "$status" -ne 0 || {
             cat "$log"

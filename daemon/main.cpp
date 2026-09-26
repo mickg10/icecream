@@ -806,6 +806,9 @@ public:
     std::optional<DeferredP50CacheFdRequest>
         deferred_p50_cache_fd_request;
     std::unique_ptr<PendingP51SourceLease> pending_p51_source_lease;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    uint32_t test_p51_source_lease_requests = 0;
+#endif
     std::unique_ptr<PendingP51SourceArm> pending_p51_source_arm;
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
@@ -10096,6 +10099,34 @@ bool Daemon::handle_p51_source_lease_request(
     const auto ready_lease = cache_adapter->outer_current_ready_lease();
     if (!ready_lease.has_value() || !ready_lease->valid())
         return refuse("supervised cache service has no current READY lease");
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // The expiry regression withholds exactly one repeated lease reply while
+    // leaving the daemon event loop live.  The wrapper must time out under its
+    // original deadline; unrelated clients and the retained assignment remain
+    // serviceable.  This is private-fixture-only and defaults off.
+    ++client->test_p51_source_lease_requests;
+    static bool test_withheld_retry_lease = false;
+    const char *withhold_retry =
+        ::getenv("ICECC_TEST_P51_WITHHOLD_RETRY_LEASE");
+    const char *expiry_marker =
+        ::getenv("ICECC_TEST_P51_CAPACITY_EXPIRY_MARKER");
+    const bool expiry_gate_armed = expiry_marker == nullptr ||
+        ::access(expiry_marker, F_OK) == 0;
+    if (!test_withheld_retry_lease && withhold_retry != nullptr &&
+        std::strcmp(withhold_retry, "1") == 0 &&
+        expiry_gate_armed &&
+        client->test_p51_source_lease_requests == 2) {
+        test_withheld_retry_lease = true;
+        std::fprintf(stderr,
+            "P51_CAPACITY_TEST_WITHHELD_RETRY_LEASE job=%u epoch=%llu nonce=%llu profile=%u window=%u\n",
+            request.wire_job_id,
+            static_cast<unsigned long long>(request.assignment_epoch),
+            static_cast<unsigned long long>(request.assignment_nonce),
+            request.profile, request.requested_window);
+        std::fflush(stderr);
+        return true;
+    }
+#endif
     if (client->pending_p51_source_lease)
         return refuse("a source lease is already pending on this wrapper");
     size_t pending_count = 0;

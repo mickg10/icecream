@@ -6289,8 +6289,12 @@ void SidecarRuntime::advance_p51_transfer_reply(
         static std::atomic<bool> held_test_settlement{false};
         const char* configured_delay =
             ::getenv("ICECC_TEST_P51_HOLD_REPLY_SETTLEMENT_MS");
-        if (configured_delay != nullptr && !held_test_settlement.exchange(
-                true, std::memory_order_acq_rel)) {
+        const char *expiry_marker =
+            ::getenv("ICECC_TEST_P51_CAPACITY_EXPIRY_MARKER");
+        const bool expiry_gate_armed = expiry_marker == nullptr ||
+            ::access(expiry_marker, F_OK) == 0;
+        if (configured_delay != nullptr && expiry_gate_armed &&
+            !held_test_settlement.exchange(true, std::memory_order_acq_rel)) {
             char* end = nullptr;
             errno = 0;
             const long parsed = std::strtol(configured_delay, &end, 10);
@@ -6298,9 +6302,17 @@ void SidecarRuntime::advance_p51_transfer_reply(
                 parsed > 0 && parsed <= 2000) {
                 const auto delay = std::chrono::milliseconds(parsed);
                 const auto now = std::chrono::steady_clock::now();
-                if (now < pump->deadline && now + delay < pump->deadline) {
+                const char *hold_past_deadline =
+                    ::getenv("ICECC_TEST_P51_HOLD_SETTLEMENT_PAST_DEADLINE");
+                const bool test_hold_past_deadline =
+                    hold_past_deadline != nullptr &&
+                    std::strcmp(hold_past_deadline, "1") == 0;
+                if (now < pump->deadline &&
+                    (now + delay < pump->deadline ||
+                     test_hold_past_deadline)) {
                     std::fprintf(stderr,
-                        "P51_CAPACITY_TEST_HOLD settlement_ms=%ld\n", parsed);
+                        "P51_CAPACITY_TEST_HOLD settlement_ms=%ld past_deadline=%u\n",
+                        parsed, test_hold_past_deadline ? 1u : 0u);
                     std::fflush(stderr);
                     pump->timer.expires_after(delay);
                     pump->timer.async_wait(

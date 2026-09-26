@@ -522,8 +522,26 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(120);
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(120);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Private wrapper-fixture control for the bounded retry-expiry gate.
+    // Product builds retain the fixed protocol deadline above.
+    if (const char *configured =
+            ::getenv("ICECC_TEST_P51_CAPACITY_DEADLINE_MS")) {
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(configured, &end, 10);
+        const char *armed_marker =
+            ::getenv("ICECC_TEST_P51_CAPACITY_EXPIRY_MARKER");
+        const bool expiry_gate_armed = armed_marker == nullptr ||
+            ::access(armed_marker, F_OK) == 0;
+        if (errno == 0 && end != configured && *end == '\0' &&
+            parsed >= 100 && parsed <= 10000 && expiry_gate_armed)
+            deadline = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(parsed);
+    }
+#endif
     const std::optional<uint32_t> profile_wire = p50_profile_wire(profile);
     const std::optional<uint32_t> source_mode = p50_source_mode_wire(profile);
     if (!profile_wire || !source_mode || !source ||
@@ -734,6 +752,17 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
             attempt_control_fd = local_daemon.receive_p51_cache_fd_reply(
                 lease_request, attempt_identity, deadline);
             if (attempt_control_fd < 0 || !attempt_identity.valid()) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                if (capacity_trace)
+                    std::fprintf(stderr,
+                        "P51_CAPACITY_TRACE retry_lease_receive_failed job=%u epoch=%llu nonce=%llu request=%llu deadline_ns=%llu expired=%u\n",
+                        assignment.job_id,
+                        static_cast<unsigned long long>(assignment.assignmentEpoch()),
+                        static_cast<unsigned long long>(assignment.assignmentNonce()),
+                        static_cast<unsigned long long>(assignment.assignmentNonce()),
+                        static_cast<unsigned long long>(deadline_ns),
+                        std::chrono::steady_clock::now() >= deadline ? 1u : 0u);
+#endif
                 if (attempt_control_fd >= 0)
                     ::close(attempt_control_fd);
                 if (diagnostic != nullptr)
