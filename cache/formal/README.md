@@ -321,6 +321,55 @@ This is one protocol design, not competing architectures. The split keeps the al
 
 The older experimental model under `formal/protocol50/` on the capability branch is withdrawn. It contained the separate `ComputeNeed`/`PinClosure` race and did not implement the callback/restart semantics its review claimed.
 
+## Independent-deadline recovery overlay
+
+`Protocol50DeadlineRecovery.tla` is a focused abstraction for independent C
+caller and F reservation deadlines across six labels: C1F2/3/4 and C2/3/4F1,
+with caller-expiry-first and F-expiry-first rows. These are not six complete
+topology models: each configuration has one target C-F relationship and one
+abstract independent sibling. It does not claim link-count resource accounting
+or full concurrent-pipeline coverage.
+
+The model keeps F's RESET unavailable-mask disposition separate from C's
+caller deadline. A mask bit of zero is represented as an available witnessed F
+reservation whether or not the worker had consumed it. Caller expiry blocks a
+new replay independently. An old admitted worker may still publish after C
+expiry while F's reservation remains live, but activation fences it before
+snapshot; confirmation preserves the exact committed prefix. The model
+separates RESET construction, client observation, and confirmation, permits a
+lost witness, and allows exact F cancellation to be accepted or rejected.
+
+`RetireExpiredFenced` is a candidate local C-row retirement guarded by exact
+reset confirmation, no old worker, no committed prefix, and no new-epoch bind
+or write. It does not cancel or mutate F's reservation. A same-link successor
+admission is gated on that retirement. The transition is an architectural
+hypothesis to test against runtime evidence, not a statement that every current
+runtime path implements it. The separate sibling token only checks the
+abstract availability of unrelated progress.
+
+The twelve non-urgent configurations explore safety, cleanup-budget
+immutability, and sibling-progress enablement under arbitrary interleavings.
+The bounded caller-expiry row is deliberately stronger: `UrgentExpiryRecovery`
+freezes the model clock at first expiry, disallows old-worker start and reset
+retry/lost-witness churn, and assumes fair recovery/retirement/admission steps.
+It demonstrates a reachable recovery-and-admission path under that urgent
+abstraction; it is not an elapsed-time or real-time response guarantee. Its
+matched mutants drop the expiry notification or disable retirement. Additional
+mutants exercise cleanup-budget renewal, replay after expiry, a replay bound
+before expiry but written after expiry, and sibling gating. Run the pinned,
+bounded row set with:
+
+```sh
+TLA2TOOLS_JAR=/path/to/pinned/tla2tools.jar \
+TLC_STATE_ROOT=/absolute/path/to/new-empty-directory \
+sh cache/formal/run_deadline_recovery_tlc.sh
+```
+
+The runner checks exact TLC exit codes and named counterexample diagnostics.
+No successful commit-through-expiry or arbitrary-topology liveness claim is
+made by this overlay. `Protocol50DeadlineRecoveryEvidence.md` records the
+exact retained logs, row/config hashes, state counts, and pinned jar identity.
+
 ## Cache-model rules
 
 The cache model includes:
