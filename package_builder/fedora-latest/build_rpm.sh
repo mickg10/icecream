@@ -105,7 +105,9 @@ dnf_cmd -y install \
     patch \
     diffutils \
     findutils \
-    which
+    which \
+    libasan \
+    libubsan
 
 # Version metadata comes from the COMMITTED revision -- a local
 # configure.ac edit must not relabel committed source.
@@ -150,6 +152,10 @@ sed -i -E \
     "$SPEC_PATH"
 
 sed -i -E "s@^Source0:.*@Source0: %{name}-%{version}.tar.xz@" "$SPEC_PATH"
+# Keep static libraries so unittests can link libicecc.a
+sed -i "s/--disable-static //" "$SPEC_PATH"
+# Disable Fedora hardening so test programs link as they do on Ubuntu (no -pie/-fPIE from redhat-hardened-ld/cc1)
+sed -i "s/^%global _hardened_build 1/%undefine _hardened_build/" "$SPEC_PATH"
 
 # Fedora packaging for RC snapshots may use a different topdir (e.g. appending
 # "rc1") in %prep via %autosetup/%setup -n. We generate Source0 with the
