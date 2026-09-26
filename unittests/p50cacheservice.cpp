@@ -2213,6 +2213,729 @@ enum class D07Scenario : uint8_t {
     CommittedAttemptReplacement,
 };
 
+std::vector<uint8_t> d14_input(size_t index) {
+    static constexpr std::array<std::string_view, 4> history = {
+        "", "alpha\nbeta\n", "alpha\nbeta\n", "alpha\ngamma\n"};
+    if (index < history.size()) {
+        const auto value = history[index];
+        return std::vector<uint8_t>(value.begin(), value.end());
+    }
+    std::string value = "header\n";
+    value += (index % 5 == 0) ? "repeat\n" : "line-";
+    if (index % 5 != 0)
+        value += std::to_string(index) + "\n";
+    value += "tail-" + std::to_string(index % 3) + "\n";
+    return std::vector<uint8_t>(value.begin(), value.end());
+}
+
+local::HandoffFd d14_exact_source_fd(std::span<const uint8_t> bytes) {
+    const char* temporary_directory = std::getenv("TMPDIR");
+    if (temporary_directory == nullptr || temporary_directory[0] == '\0')
+        temporary_directory = "/tmp";
+    std::string path = std::string(temporary_directory) +
+                       "/icecc-p51-d14-source-XXXXXX";
+    std::vector<char> mutable_path(path.begin(), path.end());
+    mutable_path.push_back('\0');
+    const int fd = ::mkstemp(mutable_path.data());
+    CHECK(fd >= 0);
+    CHECK(::unlink(mutable_path.data()) == 0);
+    CHECK(write_all(fd, bytes));
+    CHECK(::lseek(fd, 0, SEEK_SET) == 0);
+    return local::HandoffFd(fd);
+}
+
+void test_p51_d14_reset_boundary_smoke(ProfileId profile,
+                                       size_t job_count = 3,
+                                       size_t cut_boundary = 1,
+                                       bool w30 = false) {
+    CHECK(job_count >= 3);
+    CHECK(cut_boundary < job_count);
+    struct RunResult {
+        std::vector<local::P50SourceTransferResult> results;
+        std::vector<std::vector<uint8_t>> inputs;
+        std::vector<R2TxCommit> commits;
+        std::vector<ResetAck> reset_acks;
+        std::vector<uint64_t> sent_ordinals;
+        std::vector<std::pair<CStoreGuid, TuSeq>> materialized_identity;
+        std::vector<std::vector<uint8_t>> materialized_bytes;
+        Id128 relationship_id{};
+        bool held_suffix_worker = false;
+        bool suffix_bundles_sent = false;
+        bool reset_before_release = false;
+        bool exact_attachments = false;
+        size_t final_source_operations = 0;
+        uint64_t final_source_raw_bytes = 0;
+    };
+    const auto profile_bits = profile_bit(profile);
+    uint32_t cache_profile = 0;
+    switch (profile) {
+    case ProfileId::P29V1: cache_profile = CACHE_PROFILE_P29V1; break;
+    case ProfileId::ZSTD_TU: cache_profile = CACHE_PROFILE_ZSTD_TU; break;
+    case ProfileId::ZSTD_ROUTE: cache_profile = CACHE_PROFILE_ZSTD_ROUTE; break;
+    }
+    auto run_episode = [&](bool force_reset) {
+        StoreIdentityRoot c_root{};
+        c_root.bytes[15] = force_reset ? 0x6c : 0x6b;
+        const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+        StoreIdentityRoot f_root{};
+        f_root.bytes[15] = force_reset ? 0x7c : 0x7b;
+        const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+        uint16_t f_port = 0;
+        const int listener = loopback_listener(f_port);
+        CHECK(listener >= 0 && f_port != 0);
+
+        RunResult output;
+        std::mutex gate_mutex;
+        std::condition_variable gate_changed;
+        bool gate_armed = false;
+        bool release_gate = true;
+        bool suffix_worker_entered = false;
+        size_t materialize_calls = 0;
+        size_t hold_from_call = 2;
+        std::mutex event_mutex;
+        std::condition_variable event_changed;
+        std::vector<R2TxCommit> commits;
+        std::vector<ResetAck> reset_acks;
+        std::vector<uint64_t> sent_ordinals;
+        std::vector<std::pair<CStoreGuid, TuSeq>> materialized_identity;
+        std::vector<std::vector<uint8_t>> materialized_bytes;
+
+        service::RuntimeConfig f_config = test_runtime_config();
+        f_config.c_store_guid = f_launch.c_store_guid;
+        f_config.f_store_guid = f_launch.f_store_guid;
+        f_config.f_store_generation = f_launch.store_generation;
+        f_config.sidecar_launch = f_launch;
+        f_config.endpoint_caps.profile = profile;
+        f_config.endpoint_caps.supported_profiles = profile_bits;
+        f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+        f_config.max_pending_p51_source_reservations = job_count + 8;
+        f_config.endpoint_config.input_job_state =
+            [&](CStoreGuid c_guid, const TxBegin& begin, const TxCommit&,
+                std::span<const uint8_t> bytes) {
+                std::lock_guard lock(event_mutex);
+                materialized_identity.emplace_back(c_guid, begin.tu_seq);
+                materialized_bytes.emplace_back(bytes.begin(), bytes.end());
+                event_changed.notify_all();
+                return InputJobState::Open;
+            };
+        service::SidecarRuntime f_runtime(std::move(f_config));
+
+        service::RuntimeConfig c_config = test_runtime_config();
+        c_config.c_store_guid = c_launch.c_store_guid;
+        c_config.f_store_guid = c_launch.f_store_guid;
+        c_config.f_store_generation = c_launch.store_generation;
+        c_config.sidecar_launch = c_launch;
+        c_config.endpoint_caps.profile = profile;
+        c_config.endpoint_caps.supported_profiles = profile_bits;
+        c_config.endpoint_caps.zstd.max_raw_bytes = 65536;
+        c_config.max_active_source_transfers = w30 ? 32 : 4;
+        // The P51 source admission cap is deliberately above 30 here. The
+        // protocol's negotiated W30 is the wire-level bound; request 31 must
+        // be accepted into the client queue without becoming wire ordinal 31.
+        c_config.max_active_p51_source_transfers = w30 ? 32 : 8;
+        c_config.max_pending_p51_source_operations = job_count + 8;
+        c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+        c_config.after_r2_bundle_sent_for_test = [&](uint64_t ordinal) {
+            std::lock_guard lock(event_mutex);
+            sent_ordinals.push_back(ordinal);
+            event_changed.notify_all();
+        };
+        service::SidecarRuntime c_runtime(std::move(c_config));
+
+        std::atomic<bool> stop_accepting{false};
+        std::atomic<size_t> accepted_connections{0};
+        std::atomic<int> probe_fd{-1};
+        std::thread acceptor([&] {
+            const auto end = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(45);
+            while (!stop_accepting.load(std::memory_order_acquire) &&
+                   accepted_connections.load(std::memory_order_acquire) < 8 &&
+                   std::chrono::steady_clock::now() < end) {
+                pollfd ready{listener, POLLIN, 0};
+                int polled;
+                do { polled = ::poll(&ready, 1, 100); }
+                while (polled < 0 && errno == EINTR);
+                if (polled <= 0 || (ready.revents & POLLIN) == 0)
+                    continue;
+                sockaddr_storage peer{};
+                socklen_t peer_size = sizeof(peer);
+                int fd;
+                do {
+                    fd = ::accept(listener,
+                        reinterpret_cast<sockaddr*>(&peer), &peer_size);
+                } while (fd < 0 && errno == EINTR);
+                if (fd < 0)
+                    continue;
+                std::unique_ptr<MsgChannel> channel(
+                    Service::createChannelAccepted(
+                        fd, reinterpret_cast<sockaddr*>(&peer), peer_size));
+                if (!channel)
+                    continue;
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(4);
+                bool ready_protocol = true;
+                while (channel->protocol_admission_state() ==
+                           MsgChannel::ProtocolAdmissionState::Pending &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    short events = POLLIN;
+                    if (channel->has_pending_write())
+                        events = static_cast<short>(events | POLLOUT);
+                    pollfd socket{channel->fd, events, 0};
+                    int result;
+                    do { result = ::poll(&socket, 1, 50); }
+                    while (result < 0 && errno == EINTR);
+                    if (result < 0 ||
+                        (socket.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                        ready_protocol = false;
+                        break;
+                    }
+                    if ((socket.revents & POLLOUT) &&
+                        !channel->flush_pending()) {
+                        ready_protocol = false;
+                        break;
+                    }
+                    if ((socket.revents & POLLIN) && !channel->read_a_bit()) {
+                        ready_protocol = false;
+                        break;
+                    }
+                }
+                if (!ready_protocol ||
+                    channel->protocol_admission_state() !=
+                        MsgChannel::ProtocolAdmissionState::Ready ||
+                    !channel->finish_protocol_admission())
+                    continue;
+                std::unique_ptr<Msg> request(channel->get_msg_until(deadline));
+                if (!dynamic_cast<P51CacheLinkSessionMsg*>(request.get()))
+                    continue;
+                const int adopted =
+                    channel->send_p51_cache_link_session_ready_and_release(
+                        deadline);
+                if (adopted < 0)
+                    continue;
+                const int duplicate = ::dup(adopted);
+                if (duplicate >= 0) {
+                    const int previous = probe_fd.exchange(
+                        duplicate, std::memory_order_acq_rel);
+                    if (previous >= 0)
+                        (void)::close(previous);
+                }
+                EndpointIoControl control;
+                control.before_materialize_on_worker = [&] {
+                    std::unique_lock lock(gate_mutex);
+                    ++materialize_calls;
+                    if (!gate_armed || materialize_calls < hold_from_call)
+                        return;
+                    suffix_worker_entered = true;
+                    gate_changed.notify_all();
+                    gate_changed.wait(lock, [&] { return release_gate; });
+                };
+                control.outbound_message_observer =
+                    [&](ActorSide actor, const Message& message) {
+                        if (actor != ActorSide::F)
+                            return;
+                        std::lock_guard lock(event_mutex);
+                        if (const auto* commit = std::get_if<R2TxCommit>(&message))
+                            commits.push_back(*commit);
+                        else if (const auto* ack = std::get_if<ResetAck>(&message))
+                            reset_acks.push_back(*ack);
+                        event_changed.notify_all();
+                    };
+                accepted_connections.fetch_add(1, std::memory_order_acq_rel);
+                f_runtime.start_adopted_r2_endpoint(adopted,
+                                                     std::move(control));
+            }
+        });
+        auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+            reinterpret_cast<int*>(1), [&](int*) {
+                {
+                    std::lock_guard lock(gate_mutex);
+                    release_gate = true;
+                }
+                gate_changed.notify_all();
+                stop_accepting.store(true, std::memory_order_release);
+                (void)::shutdown(listener, SHUT_RDWR);
+                if (acceptor.joinable())
+                    acceptor.join();
+                (void)::close(listener);
+                const int duplicate = probe_fd.exchange(
+                    -1, std::memory_order_acq_rel);
+                if (duplicate >= 0)
+                    (void)::close(duplicate);
+                c_runtime.stop();
+                f_runtime.stop();
+            });
+
+        struct Request {
+            local::P51SourceTransferRequest transfer;
+            RuntimeCase pair{local::Connection(-1), local::Connection(-1)};
+            uint64_t id = 0;
+            std::vector<uint8_t> bytes;
+        };
+        auto make_request = [&](uint64_t id, std::vector<uint8_t> bytes) {
+            auto reservation = test_p51_reservation_request(
+                c_launch.c_store_guid, c_launch.store_generation,
+                c_launch.identity.generation, c_launch.identity.attempt,
+                id, cache_profile, 30, std::chrono::seconds(30));
+            reservation.arm.source.assignment_nonce = id;
+            reservation.arm.source.logical_job = 140000 + id;
+            reservation.arm.source.compiler_attempt = 1;
+            reservation.arm.source.selected_f_host = "127.0.0.1";
+            reservation.arm.source.selected_f_cache_port = f_port;
+            const auto armed = f_runtime.reserve_p51_source_on_owner(reservation);
+            CHECK(armed.error_code == 0 && armed.armed.has_value());
+            return Request{
+                local::P51SourceTransferRequest{
+                    *armed.armed, reservation.absolute_deadline},
+                authenticated_runtime_pair(), id, std::move(bytes)};
+        };
+        auto enqueue = [&](Request& request) {
+            const auto operation = local::make_p51_source_transfer_operation(
+                c_launch.identity, request.transfer, request.id);
+            return c_runtime.enqueue_p51_source_transfer(
+                std::move(request.pair.sender), c_launch.identity, operation,
+                d14_exact_source_fd(request.bytes));
+        };
+        auto receive = [&](Request& request) {
+            return receive_p51_transfer_result(
+                request.pair.receiver, c_launch.identity, request.id,
+                request.transfer.absolute_deadline.as_steady_time_point(), true);
+        };
+        auto attach_exact = [&](Request& request,
+                                const local::P50SourceTransferResult& result) {
+            if (result.code != local::SourceTransferResultCode::Committed ||
+                !result.valid() || result.raw_bytes != request.bytes.size() ||
+                result.raw_digest != icecc::digest128(request.bytes))
+                return false;
+            const InputLeaseOwner owner{
+                request.transfer.armed.arm.source.logical_job,
+                request.transfer.armed.arm.source.assignment_epoch,
+                request.transfer.armed.arm.source.assignment_nonce};
+            const InputFdRequest attach{
+                f_launch.identity,
+                InputRecordKey{result.c_store_guid, TuSeq{result.tu_seq}},
+                owner, request.id + 900000};
+            const auto deadline =
+                request.transfer.absolute_deadline.as_steady_time_point();
+            auto cursor = f_runtime.attach_input_on_owner(attach, deadline);
+            bool exact = cursor && cursor->remaining() == request.bytes.size() &&
+                         cursor->raw_digest() == result.raw_digest;
+            if (exact) {
+                std::vector<uint8_t> actual(request.bytes.size());
+                exact = cursor->read(actual) == actual.size() &&
+                        actual == request.bytes;
+            }
+            f_runtime.finish_input_attachment_on_owner(attach, exact, deadline);
+            return exact;
+        };
+
+        std::vector<Request> requests;
+        requests.reserve(job_count);
+        for (size_t index = 0; index < job_count; ++index)
+            requests.push_back(make_request(
+                9201 + index, d14_input(index == 0 ? 1 : index + 1)));
+        output.relationship_id.bytes =
+            requests[0].transfer.armed.logical_relationship_id;
+        output.inputs.reserve(requests.size());
+        for (const auto& request : requests)
+            output.inputs.push_back(request.bytes);
+        if (!force_reset) {
+            bool all_exact_attachments = true;
+            for (auto& request : requests) {
+                CHECK(enqueue(request));
+                auto result = receive(request);
+                if (result.code != local::SourceTransferResultCode::Committed) {
+                    std::fprintf(stderr,
+                        "P51_D14 transfer-failed profile=%u episode=baseline "
+                        "index=%zu code=%u error=%u attempts=%u raw=%zu\n",
+                        static_cast<unsigned>(profile), output.results.size(),
+                        static_cast<unsigned>(result.code), result.error_code,
+                        static_cast<unsigned>(result.attempts),
+                        request.bytes.size());
+                    std::fflush(stderr);
+                }
+                CHECK(result.code == local::SourceTransferResultCode::Committed);
+                all_exact_attachments = attach_exact(request, result) &&
+                                        all_exact_attachments;
+                output.results.push_back(result);
+            }
+            output.exact_attachments = all_exact_attachments;
+        } else if (w30) {
+            {
+                std::lock_guard lock(gate_mutex);
+                gate_armed = true;
+                release_gate = false;
+                hold_from_call = 1;
+            }
+            bool all_enqueued = true;
+            uint64_t expected_raw_bytes = 0;
+            for (auto& request : requests) {
+                expected_raw_bytes += request.bytes.size();
+                all_enqueued = enqueue(request) && all_enqueued;
+            }
+            bool worker_held = false;
+            {
+                std::unique_lock lock(gate_mutex);
+                worker_held = gate_changed.wait_for(
+                    lock, std::chrono::seconds(8), [&] {
+                        return suffix_worker_entered;
+                    });
+            }
+            const bool operations_full = all_enqueued &&
+                wait_for_source_operation_count(
+                    c_runtime, job_count, std::chrono::seconds(8));
+            const bool raw_credits_full = wait_for_source_raw_bytes(
+                c_runtime, expected_raw_bytes, std::chrono::seconds(8));
+            bool initial_window_full = false;
+            {
+                std::unique_lock lock(event_mutex);
+                initial_window_full = event_changed.wait_for(
+                    lock, std::chrono::seconds(8), [&] {
+                        return sent_ordinals.size() >= 30;
+                    });
+                CHECK(sent_ordinals.size() == 30);
+                for (uint64_t ordinal = 1; ordinal <= 30; ++ordinal)
+                    CHECK(std::count(sent_ordinals.begin(),
+                                     sent_ordinals.end(), ordinal) == 1);
+                CHECK(std::find(sent_ordinals.begin(), sent_ordinals.end(),
+                                31) == sent_ordinals.end());
+            }
+            if (!(worker_held && operations_full && raw_credits_full &&
+                  initial_window_full)) {
+                std::lock_guard lock(event_mutex);
+                std::fprintf(stderr,
+                    "P51_D14 w30-precut profile=%u held=%u operations=%u "
+                    "raw=%u window=%u op-count=%zu expected-ops=%zu "
+                    "raw-now=%llu raw-expected=%llu sent-count=%zu\n",
+                    static_cast<unsigned>(profile), worker_held,
+                    operations_full, raw_credits_full, initial_window_full,
+                    c_runtime.pending_p51_source_operations_for_test(),
+                    job_count,
+                    static_cast<unsigned long long>(
+                        c_runtime.active_source_raw_bytes_for_test()),
+                    static_cast<unsigned long long>(expected_raw_bytes),
+                    sent_ordinals.size());
+                std::fflush(stderr);
+            }
+            CHECK(worker_held && operations_full && raw_credits_full &&
+                  initial_window_full);
+            CHECK(c_runtime.pending_p51_source_operations_for_test() == 31);
+            CHECK(c_runtime.active_source_raw_bytes_for_test() ==
+                  expected_raw_bytes);
+            output.held_suffix_worker = worker_held;
+            output.suffix_bundles_sent = initial_window_full;
+
+            const int descriptor = probe_fd.load(std::memory_order_acquire);
+            CHECK(descriptor >= 0);
+            CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
+            std::vector<std::optional<local::P50SourceTransferResult>> results(
+                job_count);
+            std::vector<std::exception_ptr> waiter_errors(job_count);
+            std::vector<bool> attachments(job_count, false);
+            std::vector<std::thread> waiters;
+            waiters.reserve(job_count);
+            for (size_t index = 0; index < job_count; ++index) {
+                waiters.emplace_back([&, index] {
+                    try {
+                        results[index] = receive(requests[index]);
+                    } catch (...) {
+                        waiter_errors[index] = std::current_exception();
+                    }
+                });
+            }
+            const uint64_t expected_p = 30;
+            bool reset_seen = false;
+            {
+                std::unique_lock lock(event_mutex);
+                reset_seen = event_changed.wait_for(
+                    lock, std::chrono::seconds(10), [&] {
+                        return std::any_of(reset_acks.begin(), reset_acks.end(),
+                            [&](const ResetAck& ack) {
+                                return ack.request.settled_prefix_k == 0 &&
+                                    ack.recovery_prepared_prefix_p == expected_p;
+                            });
+                    });
+                if (reset_seen) {
+                    const auto ack = std::find_if(
+                        reset_acks.begin(), reset_acks.end(),
+                        [&](const ResetAck& item) {
+                            return item.request.settled_prefix_k == 0 &&
+                                item.recovery_prepared_prefix_p == expected_p;
+                        });
+                    output.reset_acks.push_back(*ack);
+                }
+            }
+            {
+                std::lock_guard lock(gate_mutex);
+                gate_armed = false;
+                release_gate = true;
+            }
+            gate_changed.notify_all();
+            for (auto& waiter : waiters)
+                waiter.join();
+            output.reset_before_release = reset_seen;
+            CHECK(reset_seen);
+            for (size_t index = 0; index < waiter_errors.size(); ++index) {
+                if (waiter_errors[index]) {
+                    std::fprintf(stderr,
+                        "P51_D14 waiter-exception profile=%u index=%zu\n",
+                        static_cast<unsigned>(profile), index);
+                    std::rethrow_exception(waiter_errors[index]);
+                }
+            }
+            bool exact_attachments = true;
+            for (size_t index = 0; index < job_count; ++index) {
+                CHECK(results[index].has_value());
+                if (results[index]->code !=
+                    local::SourceTransferResultCode::Committed) {
+                    std::fprintf(stderr,
+                        "P51_D14 transfer-failed profile=%u episode=W30-k0 "
+                        "index=%zu code=%u error=%u attempts=%u raw=%zu\n",
+                        static_cast<unsigned>(profile), index,
+                        static_cast<unsigned>(results[index]->code),
+                        results[index]->error_code,
+                        static_cast<unsigned>(results[index]->attempts),
+                        requests[index].bytes.size());
+                    std::fflush(stderr);
+                }
+                CHECK(results[index]->code ==
+                      local::SourceTransferResultCode::Committed);
+                attachments[index] = attach_exact(requests[index],
+                                                   *results[index]);
+                exact_attachments = attachments[index] && exact_attachments;
+                output.results.push_back(*results[index]);
+            }
+            output.exact_attachments = exact_attachments;
+        } else {
+            // First TU is a settled positive prefix. Hold worker #2 while the
+            // writer sends the complete suffix; an external duplicate-F-socket
+            // shutdown then forces RESET with K=1 and P=3.
+            CHECK(enqueue(requests[0]));
+            auto first = receive(requests[0]);
+            CHECK(first.code == local::SourceTransferResultCode::Committed);
+            CHECK(attach_exact(requests[0], first));
+            output.results.push_back(first);
+            {
+                std::lock_guard lock(gate_mutex);
+                gate_armed = true;
+                release_gate = false;
+            }
+            CHECK(enqueue(requests[1]));
+            bool entered = false;
+            {
+                std::unique_lock lock(gate_mutex);
+                entered = gate_changed.wait_for(lock, std::chrono::seconds(8), [&] {
+                    return suffix_worker_entered;
+                });
+            }
+            CHECK(entered);
+            CHECK(enqueue(requests[2]));
+            bool all_sent = false;
+            {
+                std::unique_lock lock(event_mutex);
+                all_sent = event_changed.wait_for(lock, std::chrono::seconds(8), [&] {
+                    return std::count(sent_ordinals.begin(), sent_ordinals.end(), 2) >= 1 &&
+                           std::count(sent_ordinals.begin(), sent_ordinals.end(), 3) >= 1;
+                });
+            }
+            CHECK(all_sent);
+            output.held_suffix_worker = entered;
+            output.suffix_bundles_sent = all_sent;
+            const int descriptor = probe_fd.load(std::memory_order_acquire);
+            CHECK(descriptor >= 0);
+            CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
+            std::vector<std::optional<local::P50SourceTransferResult>> suffix_results(2);
+            std::vector<bool> attached(2, false);
+            std::array<std::thread, 2> waiters{
+                std::thread([&] {
+                    try { suffix_results[0] = receive(requests[1]); } catch (...) {}
+                }),
+                std::thread([&] {
+                    try { suffix_results[1] = receive(requests[2]); } catch (...) {}
+                })};
+            bool reset_seen = false;
+            {
+                std::unique_lock lock(event_mutex);
+                reset_seen = event_changed.wait_for(lock, std::chrono::seconds(10), [&] {
+                    return std::any_of(reset_acks.begin(), reset_acks.end(),
+                        [](const ResetAck& ack) {
+                            return ack.request.settled_prefix_k == 1 &&
+                                   ack.recovery_prepared_prefix_p == 3;
+                        });
+                });
+                if (reset_seen) {
+                    const auto ack = std::find_if(reset_acks.begin(), reset_acks.end(),
+                        [](const ResetAck& item) {
+                            return item.request.settled_prefix_k == 1 &&
+                                   item.recovery_prepared_prefix_p == 3;
+                        });
+                    output.reset_acks.push_back(*ack);
+                }
+            }
+            output.reset_before_release = reset_seen;
+            {
+                std::lock_guard lock(gate_mutex);
+                release_gate = true;
+                gate_armed = false;
+            }
+            gate_changed.notify_all();
+            for (auto& waiter : waiters)
+                waiter.join();
+            CHECK(reset_seen);
+            CHECK(suffix_results[0].has_value() && suffix_results[1].has_value());
+            for (size_t i = 0; i < 2; ++i) {
+                if (suffix_results[i]->code !=
+                        local::SourceTransferResultCode::Committed) {
+                    std::fprintf(stderr,
+                        "P51_D14 transfer-failed profile=%u episode=recovered "
+                        "index=%zu code=%u error=%u attempts=%u raw=%zu\n",
+                        static_cast<unsigned>(profile), i + 1,
+                        static_cast<unsigned>(suffix_results[i]->code),
+                        suffix_results[i]->error_code,
+                        static_cast<unsigned>(suffix_results[i]->attempts),
+                        requests[i + 1].bytes.size());
+                    std::fflush(stderr);
+                }
+            }
+            CHECK(suffix_results[0]->code == local::SourceTransferResultCode::Committed);
+            CHECK(suffix_results[1]->code == local::SourceTransferResultCode::Committed);
+            for (size_t i = 0; i < 2; ++i) {
+                attached[i] = attach_exact(requests[i + 1], *suffix_results[i]);
+                output.results.push_back(*suffix_results[i]);
+            }
+            output.exact_attachments = attached[0] && attached[1];
+        }
+        // Explicitly stop and join before returning evidence; no callback may
+        // mutate output vectors after their snapshots are copied.
+        cleanup.reset();
+        output.final_source_operations =
+            c_runtime.pending_p51_source_operations_for_test();
+        output.final_source_raw_bytes =
+            c_runtime.active_source_raw_bytes_for_test();
+        {
+            std::lock_guard lock(event_mutex);
+            output.commits = commits;
+            output.sent_ordinals = sent_ordinals;
+            output.reset_acks = reset_acks;
+            output.materialized_identity = materialized_identity;
+            output.materialized_bytes = materialized_bytes;
+        }
+        return output;
+    };
+
+    const RunResult baseline = run_episode(false);
+    const RunResult recovered = run_episode(true);
+    CHECK(baseline.results.size() == job_count);
+    CHECK(recovered.results.size() == job_count);
+    CHECK(baseline.exact_attachments);
+    CHECK(baseline.final_source_operations == 0);
+    CHECK(baseline.final_source_raw_bytes == 0);
+    CHECK(recovered.held_suffix_worker);
+    CHECK(recovered.suffix_bundles_sent);
+    CHECK(recovered.reset_before_release);
+    CHECK(recovered.exact_attachments);
+    CHECK(recovered.final_source_operations == 0);
+    CHECK(recovered.final_source_raw_bytes == 0);
+    CHECK(recovered.reset_acks.size() == 1);
+    const ResetAck& ack = recovered.reset_acks.front();
+    const uint64_t expected_k = w30 ? 0 : cut_boundary;
+    CHECK(ack.request.settled_prefix_k == expected_k);
+    const uint64_t expected_p =
+        w30 && expected_k == 0 ? 30 : job_count;
+    CHECK(ack.recovery_prepared_prefix_p == expected_p);
+    CHECK(ack.request.relationship_id == recovered.relationship_id);
+    CHECK(ack.request.new_relationship_epoch >
+          ack.request.old_relationship_epoch);
+    auto committed_records = [](const RunResult& run) {
+        std::vector<R2TxCommit> unique;
+        for (const auto& commit : run.commits) {
+            const auto prior = std::find_if(unique.begin(), unique.end(),
+                [&](const R2TxCommit& candidate) {
+                    return candidate.relationship_ordinal ==
+                           commit.relationship_ordinal;
+                });
+            if (prior == unique.end())
+                unique.push_back(commit);
+            else {
+                CHECK(prior->relationship_ordinal ==
+                      commit.relationship_ordinal);
+                CHECK(prior->inner == commit.inner);
+                CHECK(prior->transaction_digest == commit.transaction_digest);
+            }
+        }
+        std::sort(unique.begin(), unique.end(),
+            [](const R2TxCommit& left, const R2TxCommit& right) {
+                return left.relationship_ordinal < right.relationship_ordinal;
+            });
+        return unique;
+    };
+    const auto baseline_commits = committed_records(baseline);
+    const auto recovered_commits = committed_records(recovered);
+    CHECK(baseline_commits.size() == job_count);
+    CHECK(recovered_commits.size() == job_count);
+    auto materialization_matches = [](const RunResult& run, size_t index) {
+        const auto& result = run.results[index];
+        for (size_t i = 0; i < run.materialized_identity.size(); ++i) {
+            if (run.materialized_identity[i].first == result.c_store_guid &&
+                run.materialized_identity[i].second.value == result.tu_seq &&
+                run.materialized_bytes[i] == run.inputs[index])
+                return true;
+        }
+        return false;
+    };
+    for (size_t i = 0; i < job_count; ++i) {
+        CHECK(baseline.results[i].code == local::SourceTransferResultCode::Committed);
+        CHECK(recovered.results[i].code == local::SourceTransferResultCode::Committed);
+        CHECK(baseline.results[i].raw_bytes == recovered.results[i].raw_bytes);
+        CHECK(baseline.results[i].raw_digest == recovered.results[i].raw_digest);
+        CHECK(baseline.inputs[i] == recovered.inputs[i]);
+        CHECK(baseline.results[i].raw_bytes == baseline.inputs[i].size());
+        CHECK(baseline.results[i].raw_digest ==
+              icecc::digest128(baseline.inputs[i]));
+        CHECK(recovered.results[i].raw_bytes == recovered.inputs[i].size());
+        CHECK(recovered.results[i].raw_digest ==
+              icecc::digest128(recovered.inputs[i]));
+        CHECK(materialization_matches(baseline, i));
+        CHECK(materialization_matches(recovered, i));
+        const auto has_receipt = [&](const std::vector<R2TxCommit>& records,
+                                     const local::P50SourceTransferResult& result) {
+            return std::any_of(records.begin(), records.end(),
+                [&](const R2TxCommit& record) {
+                    return record.inner.tu_seq.value == result.tu_seq &&
+                           record.inner.raw_digest == result.raw_digest;
+                });
+        };
+        CHECK(has_receipt(baseline_commits, baseline.results[i]));
+        CHECK(has_receipt(recovered_commits, recovered.results[i]));
+    }
+    std::printf("P51_D14 reset-boundary-smoke profile=%u jobs=%zu requested-K=%zu "
+                "observed-K=%llu P=%llu old-epoch=%llu new-epoch=%llu "
+                "held-worker=%u suffix-sent=%u reset-before-release=%u "
+                "exact-results=%zu exact-attachments=1 final-ops=%zu "
+                "final-raw=%llu scope=%s\n",
+                static_cast<unsigned>(profile), job_count, cut_boundary,
+                static_cast<unsigned long long>(ack.request.settled_prefix_k),
+                static_cast<unsigned long long>(ack.recovery_prepared_prefix_p),
+                static_cast<unsigned long long>(ack.request.old_relationship_epoch),
+                static_cast<unsigned long long>(ack.request.new_relationship_epoch),
+                recovered.held_suffix_worker, recovered.suffix_bundles_sent,
+                recovered.reset_before_release, job_count,
+                recovered.final_source_operations,
+                static_cast<unsigned long long>(recovered.final_source_raw_bytes),
+                w30 ? "w30-k0" : "smoke");
+}
+
+void test_p51_d14_reset_boundary_smoke_all_profiles() {
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE})
+        test_p51_d14_reset_boundary_smoke(profile);
+}
+
+void test_p51_d14_w30_k0_all_profiles() {
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE})
+        test_p51_d14_reset_boundary_smoke(profile, 31, 0, true);
+}
+
 void test_p51_d07_active_cancel_recovery(ProfileId profile,
                                          D07Scenario scenario =
                                              D07Scenario::ActiveCancel) {
@@ -13618,6 +14341,31 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-reset-boundary-smoke-zstd-tu") == 0) {
+            test_p51_d14_reset_boundary_smoke(ProfileId::ZSTD_TU);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-reset-boundary-smoke-zstd-route") == 0) {
+            test_p51_d14_reset_boundary_smoke(ProfileId::ZSTD_ROUTE);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-w30-k0-zstd-tu") == 0) {
+            test_p51_d14_reset_boundary_smoke(ProfileId::ZSTD_TU, 31, 0, true);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-w30-k0-all-profiles") == 0) {
+            test_p51_d14_w30_k0_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-reset-boundary-smoke") == 0) {
+            test_p51_d14_reset_boundary_smoke_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt") == 0) {
             test_p51_d07_active_cancel_replay_interrupt_all_profiles();
             return 0;
@@ -13776,6 +14524,7 @@ int main(int argc, char** argv) {
         test_p51_d07_active_cancel_replay_interrupt_all_profiles();
         test_p51_d07_positive_recovery_owner_all_profiles();
         test_p51_d07_committed_attempt_replacement_all_profiles();
+        test_p51_d14_w30_k0_all_profiles();
         for (const ProfileId profile : {
                  ProfileId::P29V1, ProfileId::ZSTD_TU,
                  ProfileId::ZSTD_ROUTE})

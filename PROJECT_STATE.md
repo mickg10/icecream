@@ -12,6 +12,37 @@ retained artifact directories.
 
 ## Developer QA
 
+### Full-window reset with a pending 31st input
+
+The default service suite now includes an all-profile K=0/P=30 recovery
+case. Thirty distinct bundles are observed sent while F's first materializer
+is held; a 31st admitted source has no wire ordinal yet. Disconnecting the
+owned F socket must produce the exact RESET_ACK before worker release.
+All 31 requests then return exact results and attached input bytes, with
+consistent receipts and zero source-operation/raw credits after shutdown.
+An uninterrupted baseline supplies per-request byte/digest parity; asynchronous
+TU assignment order and history-dependent transaction digests are not assumed
+equal across episodes. The C admission cap is 32, independently of wire W30.
+
+P29V1, ZSTD_TU and ZSTD_ROUTE pass this case and the three-input K=1/P=3
+smoke. This qualifies K=0 with a full window, not the remaining boundaries,
+arbitrary restart combinations or real compiler-process cleanup.
+Named selectors: `--d14-w30-k0-all-profiles` and
+`--d14-reset-boundary-smoke`. No production code changed.
+
+Qualification is base `e2d99b5d` plus this test-only integration; imported
+TU SHA256 `262fecd3081850559f7aaf7150dc817fca901b834df070fe3fbfffc0829499ab`.
+Binary SHA256 `5f6381e5382f2c57df4c5c2c161e9ca17fb3c1718223c5392f1b6baf969bd979`.
+Both focused selectors and the full ordinary service suite exit zero;
+the generated `.trs` reports PASS. Evidence under
+`/tanksmall/scratch/tmp/p51-d11-metadata-expiry-c6fce0e7/work/artifacts/`:
+
+| Log | SHA256 |
+|---|---|
+| `d14-d14-w30-k0-all-profiles-r1.log` | `fc28dfe2bc4f5f26f94609efa6a86d0d4bd0e2a6fed200f3099752d61a9137d8` |
+| `d14-d14-reset-boundary-smoke-r1.log` | `30164e4716302c80720cf8fb8ef68732e1bd65b3a85809c4a675b897daa08a3e` |
+| `d14-default-r1.log` | `86a48521327ad01c69b8845d31104f2cc2ac08f9ec3e7e0c7aaa30c1e851e459` |
+
 ### Concurrent source-credit admission
 
 The enhanced default service fixture passes for P29V1, ZSTD_TU and
