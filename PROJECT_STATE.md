@@ -177,6 +177,17 @@ Observed outstanding peaks reach at most 16, not 30; this workload is not the
 separate W30 saturation witness. Larger/multiple-corpus and cross-host
 performance qualification remains pending; no whole-build result is implied.
 
+The same frozen binary also passes the 63-cell RocksDB32 paired matrix:
+32 regenerated baseline TUs, 279,514,742 bytes per baseline pass, one controlled
+edited TU. All cells verify 838,544,291 decoded bytes across their three passes.
+P29V1 R2/W1 fresh/retained/edited median wall times are 1154/810/779 ms versus
+709/409/418 ms at W30. W30 peak outstanding maxima are 10/14/15, not 30;
+ZSTD_ROUTE remains at 1/1/1 on this sample. See the full per-mode ranges,
+wire/CPU measurements and provenance in the
+[paired-corpus report](research/reports/P50-PAIRED-CORPUS.md).
+This adds a second bounded loopback corpus, not the required distinct larger
+corpus, cross-host measurements or a codebaseN whole-build speedup.
+
 ### External mixed-client harness (live run pending)
 
 Donors `b39c771a` and `660d8752` add three D18 profile scenarios with P43,

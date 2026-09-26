@@ -121,8 +121,9 @@ profile IDs differ and are the names in the first column.
 | ZSTD_ROUTE R2/W16 | 9522[9034,9849]/10249[9758,10364]/9865[9684,10644] | 11075[10513,11276]/11577[11299,12109]/11151[11097,12469] | 142114[129090,145786]/329604[322753,404900]/346341[336520,506520] | 1/2/2 | 79874618[79874530,79874618]/11352[11352,11352] |
 | ZSTD_ROUTE R2/W30 | 9690[9519,10087]/10229[10109,10440]/10460[10069,11030] | 11272[10959,11762]/11798[11732,12077]/12127[11659,12804] | 137969[121812,143746]/416853[330201,423629]/505627[456596,547111] | 1/1/1 | 79874618[79874618,79874618]/11352[11352,11352] |
 
-R1 is serial sender latency, whereas R2 represents concurrent submission and
-queueing; their pass latencies are not the same offered load. In R2, the
+R1 submits serially, whereas R2 submits concurrently. Per-job latency includes
+different queueing and is not a like-for-like comparison; whole-pass wall time
+does compare completion of the same ordered input workload. In R2, the
 maximum observed peak at configured W30 was 2/2/2 for ZSTD_TU, 10/14/15 for
 P29V1, and 1/1/1 for ZSTD_ROUTE. Thus the ROUTE workload did not approach W30;
 this matrix does not demonstrate saturation or a universal window speedup.
