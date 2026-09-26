@@ -15,6 +15,7 @@ CONSTANTS CStores, FStores, Profiles,
           MaxCCount, MaxCBytes, MaxFCount, MaxFBytes,
           ByteHeavyEnabled, HeavyF, OldProfile,
           BlockedC, BlockedF, ProgressC, ProgressF,
+          ProgressMode,
           EnableFaultScenario, MutantProfileKey, MutantGlobalGate,
           MutantStaleCallback, MutantWrongCreditRelease,
           MutantDuplicateRelease, MutantEarlyLostAckRelease
@@ -33,6 +34,7 @@ ASSUME /\ CStores # {}
        /\ BlockedF \in FStores
        /\ ProgressC \in CStores
        /\ ProgressF \in FStores
+       /\ ProgressMode \in BOOLEAN
        /\ EnableFaultScenario \in BOOLEAN
        /\ MutantProfileKey \in BOOLEAN
        /\ MutantGlobalGate \in BOOLEAN
@@ -51,7 +53,7 @@ BlockedLink == <<BlockedC, BlockedF>>
 NewProfile == CHOOSE p \in Profiles : p # OldProfile
 
 IdleStates == {"Queued", "Committed", "Cancelled", "TimedOut", "Stopped"}
-OwnedStates == {"Reserved", "Published", "Running", "CommittedUnacked"}
+OwnedStates == {"Reserved", "Published", "Running", "ResponseReady", "CommittedUnacked"}
 TerminalStates == {"Committed", "Cancelled", "TimedOut", "Stopped"}
 TokenDomain == (0..2) \X (0..2) \X (0..2)
 NoToken == <<2, 2, 2>>
@@ -174,6 +176,23 @@ BeginTransfer(o) ==
                     lateCallback, staleMutation, stopping,
                     compilerRestarted, committedAtRestart>>
 
+(***************************************************************************
+PeerRespond is the environment response event. In the healthy-progress
+scenario the designated blocked link may remain silent forever; every other
+continuously running request has a response under weak fairness. A received
+response is separate from the local commit observation/scheduler hand-off.
+***************************************************************************)
+PeerRespond(o) ==
+    /\ ProgressMode
+    /\ state[o] = "Running"
+    /\ LinkOf(o) # BlockedLink
+    /\ state' = [state EXCEPT ![o] = "ResponseReady"]
+    /\ UNCHANGED <<cGeneration, fGeneration, linkGeneration,
+                    owner, sequence, nextSequence, committedInput,
+                    cCount, cBytes, fCount, fBytes, releaseCount,
+                    lateCallback, staleMutation, stopping,
+                    compilerRestarted, committedAtRestart>>
+
 ReleaseReservation(o) ==
     /\ cCount[o.c] > 0
     /\ cBytes[o.c] >= RawUnit(o)
@@ -186,7 +205,7 @@ ReleaseReservation(o) ==
     /\ releaseCount' = [releaseCount EXCEPT ![o] = @ + 1]
 
 CommitObserved(o) ==
-    /\ state[o] = "Running"
+    /\ state[o] = IF ProgressMode THEN "ResponseReady" ELSE "Running"
     /\ IF EnableFaultScenario
           THEN cGeneration[o.c] = 1 \/ fGeneration[o.f] = 1
           ELSE TRUE
@@ -202,6 +221,7 @@ CommitObserved(o) ==
                     compilerRestarted, committedAtRestart>>
 
 CommitLostAck(o) ==
+    /\ ~ProgressMode
     /\ state[o] = "Running"
     /\ IF EnableFaultScenario
           THEN cGeneration[o.c] = 1 \/ fGeneration[o.f] = 1
@@ -221,6 +241,7 @@ CommitLostAck(o) ==
                     compilerRestarted, committedAtRestart>>
 
 ReconcileLostAck(o) ==
+    /\ ~ProgressMode
     /\ state[o] = "CommittedUnacked"
     /\ owner[o] = CurrentToken(o)
     /\ state' = [state EXCEPT ![o] = "Committed"]
@@ -275,6 +296,7 @@ DeliverLateCallback(l) ==
 
 RestartCompiler(c) ==
     /\ c \in CStores
+    /\ ~ProgressMode
     /\ ~compilerRestarted[c]
     /\ compilerRestarted' = [compilerRestarted EXCEPT ![c] = TRUE]
     /\ committedAtRestart' = [committedAtRestart EXCEPT ![c] =
@@ -290,7 +312,7 @@ ReplaceFIncarnation(f, o) ==
     /\ o \in Ops
     /\ o.f = f
     /\ fGeneration[f] = 0
-    /\ state[o] \in {"Reserved", "Published", "Running"}
+    /\ state[o] \in {"Reserved", "Published", "Running", "ResponseReady"}
     /\ \A x \in Ops : x.f = f /\ state[x] \in OwnedStates => x = o
     /\ state' = [state EXCEPT ![o] = "TimedOut"]
     /\ owner' = [owner EXCEPT ![o] = NoToken]
@@ -307,7 +329,7 @@ ReplaceCNamespace(c, o) ==
     /\ o \in Ops
     /\ o.c = c
     /\ cGeneration[c] = 0
-    /\ state[o] \in {"Reserved", "Published", "Running"}
+    /\ state[o] \in {"Reserved", "Published", "Running", "ResponseReady"}
     /\ \A x \in Ops : x.c = c /\ state[x] \in OwnedStates => x = o
     /\ state' = [state EXCEPT ![o] = "TimedOut"]
     /\ owner' = [owner EXCEPT ![o] = NoToken]
@@ -359,6 +381,7 @@ Next ==
     \/ \E o \in Ops : Admit(o)
     \/ \E o \in Ops : Publish(o)
     \/ \E o \in Ops : BeginTransfer(o)
+    \/ \E o \in Ops : PeerRespond(o)
     \/ \E o \in Ops : CommitObserved(o)
     \/ \E o \in Ops : CommitLostAck(o)
     \/ \E o \in Ops : ReconcileLostAck(o)
@@ -372,9 +395,14 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
         /\ \A admitOp \in Ops : WF_vars(Admit(admitOp))
-        /\ \A advanceOp \in Ops : WF_vars(Publish(advanceOp) \/ BeginTransfer(advanceOp) \/
-                                             CommitObserved(advanceOp) \/ CommitLostAck(advanceOp) \/
-                                             ReconcileLostAck(advanceOp))
+        /\ \A publishOp \in Ops : WF_vars(Publish(publishOp))
+        /\ \A transferOp \in Ops : WF_vars(BeginTransfer(transferOp))
+        /\ \A observedOp \in Ops : WF_vars(CommitObserved(observedOp))
+        /\ \A lostAckOp \in Ops : WF_vars(CommitLostAck(lostAckOp))
+        /\ \A reconcileOp \in Ops : WF_vars(ReconcileLostAck(reconcileOp))
+        /\ IF ProgressMode
+              THEN \A responseOp \in Ops : WF_vars(PeerRespond(responseOp))
+              ELSE TRUE
         /\ \A restartedC \in CStores : WF_vars(RestartCompiler(restartedC))
         /\ \A callbackLink \in Links : WF_vars(DeliverLateCallback(callbackLink))
         /\ \A replacedF \in FStores : WF_vars(\E fOp \in Ops : ReplaceFIncarnation(replacedF, fOp))

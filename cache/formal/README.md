@@ -75,6 +75,21 @@ independent-link and stale-identity failure modes. Expected negative outcomes
 are accepted only when the runner sees their exact invariant/temporal
 diagnostic; parse failures, timeouts, and generic nonzero exits are failures.
 
+The C1F2 progress row is a scoped temporal claim, not a peer/network guarantee:
+`ProgressMode` models a separate peer-response event and a later local commit
+observation. Under `Spec`, each continuously enabled local publish/transfer/
+commit hand-off is weakly fair, and each continuously outstanding request to
+the designated healthy peer receives a response (`WF(PeerRespond)`). The
+designated blocked peer has no response action and may remain silent forever.
+The row fixes the topology and disables stop, compiler restart, and F-store
+replacement; it proves only that the shared-C/local scheduler does not let a
+permanently blocked F0 prevent an F1 operation from reaching local commit.
+The global-gate mutant violates this temporal property. The fault-enabled
+recovery/replacement behavior is checked in separate finite safety/witness
+models; this row makes no liveness claim under recurring failures, arbitrary
+peer delay, network partitions, or unbounded starvation outside the stated
+weak-fair scheduler assumption.
+
 The model treats profile as a route selector, not as part of the relationship
 identity. It represents admission credits as count and abstract raw-byte
 units, with both C-owned and F-owned limits; it does not model codec internals.
