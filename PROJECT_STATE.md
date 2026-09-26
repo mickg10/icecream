@@ -33,9 +33,9 @@ reruns are pending. This failed native stage does not qualify the later Python
 or mixed-image QA stages.
 Evidence is retained under
 `/tanksmall/scratch/tmp/p51-qa-293a/scratch/icecream-qa-kiyex8p9/current/`.
-The source-expiry recovery fix is integrated locally at `22b06a59`, awaiting
-merged service-suite qualification before publication. Independent daemon
-cancellation cleanup remains in its private donor worktree.
+The source-expiry recovery fix is integrated at `22b06a59` and passes its
+merged service-suite gate, as recorded below. Independent daemon cancellation
+cleanup remains in its private donor worktree.
 
 Local candidate `34f2e409` integrates QA donor `bb7d3615`: the completion
 source gate now uses function boundaries, retaining its behavioral assertions,
@@ -73,9 +73,16 @@ input publication, and exact F unavailable disposition. Evidence under
 `d475dc5c5e117b6b5584a6a71b6e727c3f6e0c33aa51f250db73b981ab1d8613`;
 `p51-d07-full-service-canonical-r2.log` SHA256
 `94b4a01c3cdeb4b735c87edfa4508d108484fc0f94142c01fbfd697e4d9a2888`.
-These donor results do not yet qualify the merge with the later reply-lifetime
-fix. C-expired/F-still-live RESET followed by delayed exact cancellation and
-healthy-suffix progress remains a separate runtime/formal follow-up.
+The merged full registered service suite on exact `22b06a59`, including the
+reply-lifetime fix and D17 tests, also passes (actual test exit 0; test/global
+`.trs` PASS). Evidence:
+`/tanksmall/scratch/tmp/p51-d07-merged-22b-build/build/unittests/p50cacheservice.log`
+SHA256 `24d660b60c45fb0feab1ce45643b685e6460938bcf709bd9486915a4a62ebc45`;
+binary SHA256
+`02896c655a770558d737d1b5ad9d88d72adcbde24fa4df29dbc40d718d00061b`.
+Initial bootstrap/UV setup failures are retained separately; they ran no service
+assertions. C-expired/F-still-live RESET followed by delayed exact cancellation
+and healthy-suffix progress remains a separate runtime/formal follow-up.
 
 ### Bounded P29V1 transfer-window pilot
 
@@ -165,8 +172,8 @@ The merged full-suite regression passes on `b5578e77` as recorded above.
 This failure injection is not evidence for deadline expiry. The earlier
 deadline diagnostic observed clean EOF for the expired predecessor, then a
 live successor timing out without a replacement link. The bounded-recovery
-donor described above now passes that expiry regression; merged qualification
-and the independent C-expired/F-live case remain outstanding.
+donor and merged candidate described above now pass that expiry regression;
+the independent C-expired/F-live case remains outstanding.
 
 ### P29 pre-FILL cancellation foundation
 
