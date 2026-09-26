@@ -2263,7 +2263,17 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     };
     config_.endpoint_config.settle_p51_interrupted_job = [this](
         const LinkHello& link) {
-        return settle_p51_interrupted_job_on_owner(link);
+        const bool settled = settle_p51_interrupted_job_on_owner(link);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (settled && config_.p51_interrupted_job_settled_for_test) {
+            try {
+                config_.p51_interrupted_job_settled_for_test(link);
+            } catch (...) {
+                // Test observation cannot alter owner-affine settlement.
+            }
+        }
+#endif
+        return settled;
     };
     config_.endpoint_config.p51_source_reservation_terminal = [this](
         const JobBind& binding) {
@@ -5979,6 +5989,15 @@ bool SidecarRuntime::confirm_p51_reset_on_owner(
             relationship.last_reset_ack->request.settled_prefix_k)
         return false;
     relationship.last_reset_confirmed = true;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (config_.p51_reset_confirmed_for_test) {
+        try {
+            config_.p51_reset_confirmed_for_test(link, confirm);
+        } catch (...) {
+            // A test observation must never change a confirmed RESET.
+        }
+    }
+#endif
     return true;
 }
 

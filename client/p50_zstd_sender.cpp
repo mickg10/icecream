@@ -1300,10 +1300,13 @@ boost::asio::awaitable<void> P50ZstdSourceSender::run_r2_receipt_reader(
             std::lock_guard lock(impl_->r2_transfer_mutex);
             if (!is_current_generation ||
                 impl_->r2_physical_link_generation != physical_link_generation ||
-                impl_->r2_reader_generation != physical_link_generation ||
-                impl_->r2_receipt_queue.empty() ||
-                impl_->r2_receipt_queue.front() != pending)
+                impl_->r2_reader_generation != physical_link_generation)
                 co_return;
+            // A caller whose absolute deadline elapsed may have removed this
+            // failed front row while the independent reader was still in its
+            // socket read. The physical-generation fence is authoritative:
+            // broadcast this transport failure to the remaining exact rows
+            // even when the timed-out row is no longer queue.front().
             pending->failure = std::move(read_failure);
             pending->failure_physical_link_generation = physical_link_generation;
             if (impl_->r2_physical_link_generation == physical_link_generation) {
@@ -1741,6 +1744,32 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
         unavailable_handles.push_back(position->second->sent.prepared);
         unavailable_pending.push_back(position->second);
       }
+      // A confirmed RESET is an old-generation fence. Exact commit receipts
+      // above settle positives; rows still uncommitted whose own caller
+      // deadlines elapsed must not be emitted into the new epoch. Retire
+      // those exact handles locally, distinct from F's unavailable mask.
+      std::vector<PreparedTuHandle> locally_expired_handles;
+      std::vector<std::shared_ptr<Impl::PendingReceipt>> locally_expired_pending;
+      const auto reset_confirmed_at = Clock::now();
+      for (const auto &[ordinal, pending] : impl_->r2_retained_jobs) {
+        if (!pending || pending->deadline > reset_confirmed_at ||
+            std::find(unavailable_pending.begin(), unavailable_pending.end(),
+                      pending) != unavailable_pending.end())
+          continue;
+        if (ordinal <= settled_prefix_k ||
+            ordinal - verified_floor_a == 0 ||
+            ordinal - verified_floor_a > witnesses.size())
+          throw std::logic_error(
+              "locally expired recovery row has no exact reset witness");
+        const size_t witness_index = static_cast<size_t>(
+            ordinal - verified_floor_a - 1);
+        if (witnesses[witness_index].binding != pending->sent.binding ||
+            witnesses[witness_index].prepared != pending->sent.prepared)
+          throw std::logic_error(
+              "locally expired recovery row differs from reset witness");
+        locally_expired_handles.push_back(pending->sent.prepared);
+        locally_expired_pending.push_back(pending);
+      }
       std::vector<std::shared_ptr<Impl::PendingReceipt>> replay_rows;
       replay_rows.reserve(impl_->r2_retained_jobs.size());
       for (const auto &[ordinal, pending] : impl_->r2_retained_jobs) {
@@ -1750,8 +1779,21 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
         if (std::find(unavailable_pending.begin(), unavailable_pending.end(),
                       pending) != unavailable_pending.end())
           continue;
+        if (std::find(locally_expired_pending.begin(),
+                      locally_expired_pending.end(), pending) !=
+            locally_expired_pending.end())
+          continue;
         replay_rows.push_back(pending);
       }
+      std::vector<PreparedTuHandle> retired_handles = unavailable_handles;
+      retired_handles.reserve(unavailable_handles.size() +
+                              locally_expired_handles.size());
+      retired_handles.insert(retired_handles.end(),
+          locally_expired_handles.begin(), locally_expired_handles.end());
+      const std::exception_ptr locally_expired_failure =
+          locally_expired_pending.empty() ? std::exception_ptr{} :
+          std::make_exception_ptr(boost::system::system_error(
+              boost::asio::error::timed_out));
       std::map<uint64_t, std::shared_ptr<Impl::PendingReceipt>> reindexed_jobs;
       uint64_t replay_ordinal = settled_prefix_k;
       for (const auto &pending : replay_rows) {
@@ -1767,13 +1809,16 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
       // All allocating sender-side reconstruction work is complete before the
       // authority changes its retained route ledger.
       // F's exact RESET disposition has retired these unavailable rows from
-      // the relationship. Retire their per-job accounting before the sender
-      // drops their retained-window reservations and wakes successors.
+      // the relationship. Locally expired rows are separately retired only
+      // after exact old-link fencing and commit-receipt reconciliation. Retire
+      // their per-job accounting before dropping retained-window reservations.
       for (const auto &pending : unavailable_pending)
+        impl_->finish_pending_wire_accounting(*pending);
+      for (const auto &pending : locally_expired_pending)
         impl_->finish_pending_wire_accounting(*pending);
       impl_->authority->reset_r2_route_for_recovery(
           impl_->route, recovered.link_state.f_store_guid,
-          recovered.link_state.history_nonce, unavailable_handles);
+          recovered.link_state.history_nonce, retired_handles);
       for (const auto &pending : unavailable_pending) {
         {
           std::lock_guard lock(impl_->r2_transfer_mutex);
@@ -1783,6 +1828,15 @@ boost::asio::awaitable<void> P50ZstdSourceSender::recover_r2_link(
           pending->client_result.status = ClientRunStatus::TerminalError;
           pending->client_result.terminal_error = ErrorMessage{
               0, "F reset reports this exact R2 reservation unavailable"};
+        }
+        pending->notification.expires_at(Clock::now());
+      }
+      for (const auto &pending : locally_expired_pending) {
+        {
+          std::lock_guard lock(impl_->r2_transfer_mutex);
+          pending->failure = locally_expired_failure;
+          pending->failure_physical_link_generation = physical_generation;
+          pending->done = true;
         }
         pending->notification.expires_at(Clock::now());
       }

@@ -159,6 +159,14 @@ struct RuntimeConfig {
         before_r2_recovery_attempt_for_test;
     std::function<void(p50::PrepareRequestKey, uint64_t)>
         after_r2_recovery_receipt_settled_for_test;
+    // Exact F-side synchronization point after RESET_CONFIRM has committed
+    // the new relationship epoch; production builds expose no callback.
+    std::function<void(const LinkHello&, const ResetConfirm&)>
+        p51_reset_confirmed_for_test;
+    // Fires after a new physical generation has owner-affinely settled the
+    // old staged job; it is an exact publication fence, not socket accept.
+    std::function<void(const LinkHello&)>
+        p51_interrupted_job_settled_for_test;
     std::function<bool(uint64_t, size_t, bool, bool)>
         disconnect_r2_before_replay_bundle_for_test;
     std::function<boost::asio::awaitable<void>(p50::PrepareRequestKey,

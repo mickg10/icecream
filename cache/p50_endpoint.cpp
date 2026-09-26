@@ -2113,7 +2113,7 @@ void P50PreparationAuthority::advance_speculative(PreparedTuHandle handle) {
 void P50PreparationAuthority::reset_r2_route_for_recovery(
     PreparationRouteKey route_key, FStoreGuid f_store_guid,
     HistoryNonce history_nonce,
-    std::span<const PreparedTuHandle> unavailable_suffix) {
+    std::span<const PreparedTuHandle> retired_suffix) {
     impl_->owner.require();
     if (f_store_guid == FStoreGuid{} || history_nonce.value == 0)
         throw std::invalid_argument("R2 recovery reset identity is invalid");
@@ -2129,14 +2129,14 @@ void P50PreparationAuthority::reset_r2_route_for_recovery(
     if (route.profile != route_key.profile)
         throw std::logic_error("R2 recovery route profile changed");
     std::vector<uint64_t> remove_ids;
-    remove_ids.reserve(unavailable_suffix.size());
-    for (const PreparedTuHandle& handle : unavailable_suffix) {
+    remove_ids.reserve(retired_suffix.size());
+    for (const PreparedTuHandle& handle : retired_suffix) {
         if (handle.authority_.lock() != impl_->identity ||
             handle.entry_id_ == 0 ||
             std::find(remove_ids.begin(), remove_ids.end(), handle.entry_id_) !=
                 remove_ids.end())
             throw std::invalid_argument(
-                "unavailable recovery suffix contains a foreign or duplicate handle");
+                "retired recovery suffix contains a foreign or duplicate handle");
         const auto entry = impl_->entries.find(handle.entry_id_);
         if (entry == impl_->entries.end() || entry->second.committed ||
             entry->second.route != route_key || entry->second.references != 1 ||
@@ -2144,7 +2144,7 @@ void P50PreparationAuthority::reset_r2_route_for_recovery(
                       route.speculative_entries.end(), handle.entry_id_) ==
                 route.speculative_entries.end())
             throw std::logic_error(
-                "unavailable recovery handle is not one exact retained suffix entry");
+                "retired recovery handle is not one exact retained suffix entry");
         remove_ids.push_back(handle.entry_id_);
     }
 
@@ -2167,13 +2167,14 @@ void P50PreparationAuthority::reset_r2_route_for_recovery(
         route.p29_route->reset_v1_route(f_store_guid, history_nonce);
     }
 
-    // Filter only the explicit F-unavailable rows after validating the entire
-    // retained suffix. Generic release() deliberately remains strict for
-    // unconfirmed staged entries and cannot safely remove a middle route TU.
+    // Filter only exact rows already retired by the caller after validating
+    // the entire retained suffix. Generic release() deliberately remains
+    // strict for unconfirmed staged entries and cannot safely remove a middle
+    // route TU.
     for (const uint64_t id : remove_ids) {
         auto position = impl_->entries.find(id);
         if (position == impl_->entries.end())
-            throw std::logic_error("validated unavailable recovery entry disappeared");
+            throw std::logic_error("validated retired recovery entry disappeared");
         Impl::Entry& entry = position->second;
         impl_->retained_bytes -= entry.retained_bytes;
         const PreparationRouteKey entry_route = entry.route;

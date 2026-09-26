@@ -485,11 +485,14 @@ public:
     void advance_speculative(PreparedTuHandle handle);
     // Coordinated R2 transport recovery resets only relationship codec
     // history. C-wide TU/job identity and immutable source records survive.
+    // retired_suffix contains exact handles proved not replayable after the
+    // confirmed reset (F-unavailable or locally expired after the old-link
+    // fence); the caller retains those distinct terminal dispositions.
     void reset_r2_route_for_recovery(PreparationRouteKey route,
                                      FStoreGuid f_store_guid,
                                      HistoryNonce history_nonce,
                                      std::span<const PreparedTuHandle>
-                                         unavailable_suffix = {});
+                                         retired_suffix = {});
     void rebuild_r2_entry_for_recovery(PreparedTuHandle handle,
                                        Digest128 f_system_source_fingerprint);
     [[nodiscard]] TxBegin r2_staged_begin(

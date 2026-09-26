@@ -2446,7 +2446,10 @@ void test_p51_d07_queued_cancel_first_middle_last() {
 void test_p51_d07_staged_cancel_case(ProfileId profile,
                                     size_t cancelled_index,
                                     bool fail_predecessor = false,
-                                    bool expire_predecessor = false) {
+                                    bool expire_predecessor = false,
+                                    bool keep_f_live_after_expiry = false,
+                                    bool disconnect_before_first_replay = false,
+                                    bool disconnect_mid_suffix = false) {
     constexpr size_t kCohort = 31;
     constexpr size_t kSurvivors = 30;
     CHECK(cancelled_index < kCohort);
@@ -2482,8 +2485,12 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     bool cancellation_observed = false;
     std::atomic<bool> cancelled_hook_exact{false};
     const bool hold_predecessor_receipt =
-        profile == ProfileId::P29V1 && cancelled_index == 15;
+        cancelled_index == 15 && (fail_predecessor || expire_predecessor);
     CHECK(!(fail_predecessor && expire_predecessor));
+    CHECK(!keep_f_live_after_expiry || expire_predecessor);
+    CHECK(!disconnect_before_first_replay || keep_f_live_after_expiry);
+    CHECK(!(disconnect_before_first_replay && disconnect_mid_suffix));
+    CHECK(!disconnect_mid_suffix || keep_f_live_after_expiry);
     CHECK(!(fail_predecessor || expire_predecessor) ||
           hold_predecessor_receipt);
     bool predecessor_worker_entered = false;
@@ -2493,7 +2500,15 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::atomic<uint64_t> failed_predecessor_request{0};
     std::atomic<uint64_t> failed_predecessor_ordinal{0};
     bool predecessor_deadline_settled = false;
+    std::atomic<bool> predecessor_reset_confirmed{false};
+    std::atomic<bool> predecessor_released_after_generation_fence{false};
+    bool predecessor_delayed_cancelled = false;
+    bool predecessor_unpublished_at_fence = false;
+    std::atomic<bool> pre_first_replay_disconnect_requested{false};
+    std::atomic<uint64_t> forced_replay_disconnect_ordinal{0};
     std::vector<uint64_t> f_commit_ordinals;
+    std::vector<std::pair<size_t, uint64_t>> f_commit_connection_ordinals;
+    std::vector<size_t> f_reset_connection_ids;
     std::vector<ResetAck> f_reset_acks;
     std::atomic<bool> stop_accepting{false};
     std::atomic<size_t> accepted_connections{0};
@@ -2511,8 +2526,6 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     f_config.endpoint_caps.supported_profiles = profile_bit(profile);
     f_config.endpoint_caps.zstd.max_raw_bytes = 8192;
     f_config.max_pending_p51_source_reservations = 48;
-    if (expire_predecessor) {
-    }
     f_config.endpoint_config.input_job_state =
         [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
             std::span<const uint8_t> bytes) {
@@ -2530,6 +2543,23 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             retired.emplace_back(id, marker_retired);
             event_changed.notify_all();
         };
+    f_config.p51_reset_confirmed_for_test =
+        [&](const LinkHello&, const ResetConfirm&) {
+            predecessor_reset_confirmed.store(true, std::memory_order_release);
+            event_changed.notify_all();
+        };
+    f_config.p51_interrupted_job_settled_for_test =
+        [&](const LinkHello&) {
+            if (!keep_f_live_after_expiry)
+                return;
+            {
+                std::lock_guard lock(event_mutex);
+                release_predecessor_worker = true;
+                predecessor_released_after_generation_fence.store(
+                    true, std::memory_order_release);
+            }
+            event_changed.notify_all();
+        };
 #endif
     service::SidecarRuntime f_runtime(std::move(f_config));
 
@@ -2545,6 +2575,23 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     c_config.max_active_p51_source_transfers = 40;
     c_config.max_pending_p51_source_operations = 40;
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
+    if (disconnect_before_first_replay || disconnect_mid_suffix) {
+        c_config.disconnect_r2_before_replay_bundle_for_test =
+            [&](uint64_t ordinal, size_t retained_rows, bool reader_running,
+                bool ack_pump_running) {
+                (void)reader_running;
+                (void)ack_pump_running;
+                const uint64_t requested_ordinal =
+                    disconnect_before_first_replay ? 1 : 15;
+                if (ordinal != requested_ordinal || retained_rows != 29 ||
+                    pre_first_replay_disconnect_requested.exchange(
+                        true, std::memory_order_acq_rel))
+                    return false;
+                forced_replay_disconnect_ordinal.store(
+                    ordinal, std::memory_order_release);
+                return true;
+            };
+    }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     if (expire_predecessor) {
         c_config.before_r2_recovery_for_test = [&](PrepareRequestKey key) {
@@ -2560,8 +2607,6 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             };
     }
 #endif
-    if (expire_predecessor) {
-    }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     const uint64_t target_request_id = 120000 +
         static_cast<uint64_t>(profile) * 100 + cancelled_index;
@@ -2621,7 +2666,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::thread acceptor([&] {
         const auto end = std::chrono::steady_clock::now() +
                          std::chrono::seconds(40);
-        const size_t max_connections =
+        const size_t max_connections = keep_f_live_after_expiry ? 3 :
             (fail_predecessor || expire_predecessor) ? 2 : 1;
         while (!stop_accepting.load(std::memory_order_acquire) &&
                accepted_connections.load(std::memory_order_acquire) <
@@ -2686,7 +2731,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                     deadline);
             if (adopted < 0)
                 continue;
-            accepted_connections.fetch_add(1, std::memory_order_acq_rel);
+            const size_t connection_id = accepted_connections.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
             EndpointIoControl control;
             control.before_materialize_on_worker = [&] {
                 if (!hold_predecessor_receipt)
@@ -2724,12 +2770,13 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 };
 #endif
             control.outbound_message_observer =
-                [&](ActorSide actor, const Message& message) {
+                [&, connection_id](ActorSide actor, const Message& message) {
                     if (actor != ActorSide::F)
                         return;
                     if (const auto* reset = std::get_if<ResetAck>(&message)) {
                         std::lock_guard lock(event_mutex);
                         f_reset_acks.push_back(*reset);
+                        f_reset_connection_ids.push_back(connection_id);
                         event_changed.notify_all();
                         return;
                     }
@@ -2739,6 +2786,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                     std::lock_guard lock(event_mutex);
                     f_commit_ordinals.push_back(
                         commit->relationship_ordinal);
+                    f_commit_connection_ordinals.emplace_back(
+                        connection_id, commit->relationship_ordinal);
                     event_changed.notify_all();
                 };
             f_runtime.start_adopted_r2_endpoint(adopted, std::move(control));
@@ -2763,13 +2812,14 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
 
     struct RequestRow {
         local::P51SourceTransferRequest transfer;
+        sidecar::AbsoluteMonotonicDeadline f_reservation_deadline{};
         RuntimeCase pair{local::Connection(-1), local::Connection(-1)};
         uint64_t id = 0;
         std::vector<uint8_t> bytes;
     };
     std::vector<RequestRow> rows;
     rows.reserve(kCohort);
-    sidecar::AbsoluteMonotonicDeadline predecessor_arm_deadline{};
+    sidecar::AbsoluteMonotonicDeadline predecessor_caller_deadline{};
     const uint64_t first_id = 120000 + static_cast<uint64_t>(profile) * 100;
     for (size_t index = 0; index < kCohort; ++index) {
         const uint64_t id = first_id + index;
@@ -2777,10 +2827,19 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             c_launch.c_store_guid, c_launch.store_generation,
             c_launch.identity.generation, c_launch.identity.attempt,
             id, cache_profile, 30,
-            expire_predecessor && index == 0 ? std::chrono::seconds(8)
-                                             : std::chrono::seconds(30));
-        if (index == 0)
-            predecessor_arm_deadline = reservation.absolute_deadline;
+            expire_predecessor && index == 0 &&
+                    !keep_f_live_after_expiry
+                ? std::chrono::seconds(8)
+                : std::chrono::seconds(30));
+        auto caller_deadline = reservation.absolute_deadline;
+        if (expire_predecessor && index == 0) {
+            const auto clock = sidecar::process_monotonic_clock_identity();
+            caller_deadline =
+                sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                    std::chrono::steady_clock::now() + std::chrono::seconds(8),
+                    clock.clock_domain_id, clock.time_namespace_id);
+            predecessor_caller_deadline = caller_deadline;
+        }
         reservation.arm.source.assignment_nonce = id;
         reservation.arm.source.logical_job = 160000 + id;
         reservation.arm.source.compiler_attempt = 1;
@@ -2792,8 +2851,9 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                                    static_cast<uint8_t>(index + 1));
         rows.push_back(RequestRow{
             local::P51SourceTransferRequest{
-                *armed.armed, reservation.absolute_deadline},
-            authenticated_runtime_pair(), id, std::move(bytes)});
+                *armed.armed, caller_deadline},
+            reservation.absolute_deadline, authenticated_runtime_pair(), id,
+            std::move(bytes)});
     }
 
     bool all_submitted = true;
@@ -2900,6 +2960,17 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 rows[cancelled_index].transfer.absolute_deadline
                     .as_steady_time_point());
         }
+        if (keep_f_live_after_expiry && exact_cancel_seen) {
+            // The exact F-side cancellation is now known. Release the
+            // canceled middle writer so the expired predecessor can become
+            // the recovery coordinator; keep the old F materializer held
+            // until owner-affine generation settlement proves its fence.
+            {
+                std::lock_guard lock(event_mutex);
+                release_target = true;
+            }
+            event_changed.notify_all();
+        }
         if (fail_predecessor) {
             {
                 std::lock_guard lock(event_mutex);
@@ -2922,18 +2993,58 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             CHECK(failed_while_target_gated);
         } else if (expire_predecessor) {
             const auto predecessor_deadline =
-                predecessor_arm_deadline.as_steady_time_point();
+                predecessor_caller_deadline.as_steady_time_point();
             {
                 std::unique_lock lock(event_mutex);
-                if (std::chrono::steady_clock::now() < predecessor_deadline)
+                while (std::chrono::steady_clock::now() < predecessor_deadline)
                     (void)event_changed.wait_until(lock, predecessor_deadline);
                 CHECK(std::chrono::steady_clock::now() >=
                       predecessor_deadline);
-                release_predecessor_worker = true;
+                if (!keep_f_live_after_expiry)
+                    release_predecessor_worker = true;
             }
             event_changed.notify_all();
             const Id128 predecessor_reservation{
                 rows[0].transfer.armed.reservation_id};
+            if (keep_f_live_after_expiry) {
+                bool reset_mask_zero = false;
+                {
+                    std::unique_lock lock(event_mutex);
+                    reset_mask_zero = event_changed.wait_for(
+                        lock, std::chrono::seconds(8), [&] {
+                            return std::any_of(f_reset_acks.begin(),
+                                f_reset_acks.end(), [](const ResetAck& ack) {
+                                    return ack.unavailable_suffix_mask == 0;
+                                }) && predecessor_reset_confirmed.load(
+                                    std::memory_order_acquire);
+                        });
+                }
+                if (reset_mask_zero) {
+                    predecessor_delayed_cancelled =
+                        f_runtime.cancel_p51_source_on_owner(
+                            rows[0].transfer.armed.arm,
+                            rows[0].transfer.armed.reservation_id,
+                            rows[0].f_reservation_deadline
+                                .as_steady_time_point());
+                }
+                CHECK(reset_mask_zero);
+                CHECK(predecessor_reset_confirmed.load(
+                    std::memory_order_acquire));
+                CHECK(predecessor_delayed_cancelled);
+                {
+                    std::lock_guard lock(event_mutex);
+                    const std::vector<uint8_t> expired_bytes(
+                        128, static_cast<uint8_t>(1));
+                    predecessor_unpublished_at_fence =
+                        std::none_of(materialized.begin(), materialized.end(),
+                            [&](const auto& row) {
+                                return row.second == expired_bytes;
+                            });
+                    release_predecessor_worker = true;
+                }
+                CHECK(predecessor_unpublished_at_fence);
+                event_changed.notify_all();
+                }
             {
                 std::unique_lock lock(event_mutex);
                 predecessor_deadline_settled = event_changed.wait_for(
@@ -2943,7 +3054,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                                 return item.first == predecessor_reservation;
                             });
                     });
-                CHECK(!release_target);
+                CHECK(keep_f_live_after_expiry || !release_target);
                 release_target = true;
             }
             CHECK(predecessor_deadline_settled);
@@ -2978,11 +3089,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 late_response, eof_deadline);
             CHECK(status == local::Status::CleanEof);
             CHECK(row.pair.receiver.valid());
-            std::fprintf(stderr,
-                "P51_D07 predecessor-source-deadline request=%llu "
-                "status=%s no-late-frame=1 arm-expired=1 source-expired=1\n",
-                static_cast<unsigned long long>(row.id),
-                local::status_name(status));
+            (void)status;
             ++typed_replacement_outcomes;
             continue;
         }
@@ -2991,30 +3098,6 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 row.pair.receiver, c_launch.identity, row.id,
                 row.transfer.absolute_deadline.as_steady_time_point(), true);
         } catch (...) {
-            if (expire_predecessor) {
-                const auto now = std::chrono::steady_clock::now();
-                std::fprintf(stderr,
-                    "P51_D07 expiry-survivor-response-failed index=%zu "
-                    "request=%llu ops=%zu raw=%llu accepted=%zu "
-                    "deadline_remaining_ms=%lld recovery_waits=%zu "
-                    "wait_token=%llu recovery_attempts=%zu "
-                    "attempt_token=%llu\n", index,
-                    static_cast<unsigned long long>(row.id),
-                    c_runtime.pending_p51_source_operations_for_test(),
-                    static_cast<unsigned long long>(
-                        c_runtime.active_source_raw_bytes_for_test()),
-                    accepted_connections.load(std::memory_order_acquire),
-                    static_cast<long long>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            row.transfer.absolute_deadline.as_steady_time_point() -
-                            now).count()),
-                    recovery_waits.load(std::memory_order_acquire),
-                    static_cast<unsigned long long>(
-                        recovery_wait_request.load(std::memory_order_acquire)),
-                    recovery_attempts.load(std::memory_order_acquire),
-                    static_cast<unsigned long long>(
-                        recovery_attempt_request.load(std::memory_order_acquire)));
-            }
             throw;
         }
         if (fail_predecessor &&
@@ -3078,6 +3161,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     RequestRow probe{
         local::P51SourceTransferRequest{
             *probe_armed.armed, probe_reservation.absolute_deadline},
+        probe_reservation.absolute_deadline,
         authenticated_runtime_pair(), probe_id,
         std::vector<uint8_t>(512, 0xf0)};
     const auto probe_operation = local::make_p51_source_transfer_operation(
@@ -3143,8 +3227,9 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                 retired.begin(), retired.end(), [&](const auto& item) {
                     return item.first == predecessor_id;
                 });
-            predecessor_retired_once = predecessor != retired.end() &&
-                !predecessor->second &&
+        predecessor_retired_once = predecessor != retired.end() &&
+            (keep_f_live_after_expiry ? predecessor->second
+                                      : !predecessor->second) &&
                 std::count_if(retired.begin(), retired.end(),
                     [&](const auto& item) {
                         return item.first == predecessor_id;
@@ -3156,22 +3241,35 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         expected_ordinals[i] = i + 1;
     if (expire_predecessor) {
         expected_ordinals.clear();
-        const uint64_t target_ordinal =
-            target_binding.relationship_ordinal;
-        CHECK(target_ordinal > 1 && target_ordinal <= 30);
-        for (uint64_t ordinal = 1; ordinal < target_ordinal; ++ordinal)
-            expected_ordinals.push_back(ordinal);
-        for (uint64_t ordinal = target_ordinal - 1; ordinal <= 30; ++ordinal)
-            expected_ordinals.push_back(ordinal);
+        if (keep_f_live_after_expiry) {
+            for (uint64_t ordinal = 1; ordinal <= 30; ++ordinal)
+                expected_ordinals.push_back(ordinal);
+            // After the confirmed RESET, 29 suffix replays occupy ordinals
+            // 1..29 and the independent progress probe uses ordinal 30.
+            expected_ordinals.push_back(30);
+        } else {
+            const uint64_t target_ordinal =
+                target_binding.relationship_ordinal;
+            CHECK(target_ordinal > 1 && target_ordinal <= 30);
+            for (uint64_t ordinal = 1; ordinal < target_ordinal; ++ordinal)
+                expected_ordinals.push_back(ordinal);
+            for (uint64_t ordinal = target_ordinal - 1; ordinal <= 30;
+                 ++ordinal)
+                expected_ordinals.push_back(ordinal);
+        }
     }
     std::sort(expected_ordinals.begin(), expected_ordinals.end());
     std::vector<uint64_t> sent_ordinals_snapshot;
     std::vector<uint64_t> f_commit_ordinals_snapshot;
+    std::vector<std::pair<size_t, uint64_t>> f_commit_events_snapshot;
+    std::vector<size_t> f_reset_connection_ids_snapshot;
     std::vector<ResetAck> f_reset_acks_snapshot;
     {
         std::lock_guard lock(event_mutex);
         sent_ordinals_snapshot = sent_ordinals;
         f_commit_ordinals_snapshot = f_commit_ordinals;
+        f_commit_events_snapshot = f_commit_connection_ordinals;
+        f_reset_connection_ids_snapshot = f_reset_connection_ids;
         f_reset_acks_snapshot = f_reset_acks;
     }
     std::sort(sent_ordinals_snapshot.begin(), sent_ordinals_snapshot.end());
@@ -3183,18 +3281,90 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         expire_predecessor ? kSurvivors : kSurvivors + 1;
     for (uint64_t ordinal = 1; ordinal <= expected_f_commit_count; ++ordinal)
         expected_f_commit_ordinals.push_back(ordinal);
-    const bool exact_f_commit_ordinals =
+    bool exact_f_commit_ordinals =
         f_commit_ordinals_snapshot == expected_f_commit_ordinals;
+    if (disconnect_before_first_replay || disconnect_mid_suffix) {
+        auto events = f_commit_events_snapshot;
+        std::sort(events.begin(), events.end());
+        const bool unique_connection_receipts =
+            std::adjacent_find(events.begin(), events.end()) == events.end();
+        bool exact_reconciled_prefix = unique_connection_receipts &&
+            f_reset_connection_ids_snapshot.size() ==
+                f_reset_acks_snapshot.size();
+        if (exact_reconciled_prefix && f_reset_acks_snapshot.size() >= 2) {
+            for (size_t index = 1; index < f_reset_acks_snapshot.size(); ++index) {
+                const auto& prior = f_reset_acks_snapshot[index - 1];
+                const auto& current = f_reset_acks_snapshot[index];
+                exact_reconciled_prefix = exact_reconciled_prefix &&
+                    current.request.relationship_id ==
+                        prior.request.relationship_id &&
+                    current.request.new_relationship_epoch >
+                        prior.request.new_relationship_epoch;
+                const size_t current_connection =
+                    f_reset_connection_ids_snapshot[index];
+                for (const auto& event : events) {
+                    if (event.first == current_connection &&
+                        event.second <= current.request.settled_prefix_k)
+                        exact_reconciled_prefix = false;
+                }
+            }
+        }
+        for (const auto& event : events)
+            exact_reconciled_prefix = exact_reconciled_prefix &&
+                event.first > 0 && event.first <= 3 && event.second > 0 &&
+                event.second <= expected_f_commit_count;
+        for (uint64_t ordinal = 1; ordinal <= expected_f_commit_count;
+             ++ordinal) {
+            bool directly_observed = std::any_of(
+                events.begin(), events.end(), [&](const auto& event) {
+                    return event.second == ordinal;
+                });
+            const bool reset_confirmed = std::any_of(
+                f_reset_acks_snapshot.begin(), f_reset_acks_snapshot.end(),
+                [&](const ResetAck& ack) {
+                    return ack.request.settled_prefix_k >= ordinal;
+                });
+            exact_reconciled_prefix = exact_reconciled_prefix &&
+                (directly_observed || reset_confirmed);
+        }
+        for (size_t index = 1; index < f_reset_acks_snapshot.size(); ++index)
+            exact_reconciled_prefix = exact_reconciled_prefix &&
+                f_reset_connection_ids_snapshot[index] >
+                    f_reset_connection_ids_snapshot[index - 1] &&
+                f_reset_acks_snapshot[index].request.new_relationship_epoch >
+                    f_reset_acks_snapshot[index - 1]
+                        .request.new_relationship_epoch;
+        exact_f_commit_ordinals = exact_reconciled_prefix;
+    }
     const uint64_t expired_request_preparations = static_cast<uint64_t>(
         std::count_if(prepared_ordinals.begin(), prepared_ordinals.end(),
             [&](const auto& row) { return row.first == rows[0].id; }));
+    const uint64_t expected_expired_reset_prepared =
+        keep_f_live_after_expiry ? kSurvivors
+                                 : target_binding.relationship_ordinal - 1;
     const bool exact_expired_reset = !expire_predecessor ||
-        (f_reset_acks_snapshot.size() == 1 &&
+        ((keep_f_live_after_expiry
+              ? !f_reset_acks_snapshot.empty() &&
+                    f_reset_acks_snapshot.front().unavailable_suffix_mask == 0
+              : f_reset_acks_snapshot.size() == 1 &&
+                    f_reset_acks_snapshot[0].unavailable_suffix_mask == 1) &&
          f_reset_acks_snapshot[0].recovery_verified_floor_a == 0 &&
          f_reset_acks_snapshot[0].recovery_prepared_prefix_p ==
-             target_binding.relationship_ordinal - 1 &&
-         f_reset_acks_snapshot[0].unavailable_suffix_mask == 1 &&
+             expected_expired_reset_prepared &&
          expired_request_preparations == 1);
+    const bool exact_pre_replay_disconnect =
+        !(disconnect_before_first_replay || disconnect_mid_suffix) ||
+        (pre_first_replay_disconnect_requested.load(
+             std::memory_order_acquire) &&
+         forced_replay_disconnect_ordinal.load(
+             std::memory_order_acquire) ==
+             (disconnect_before_first_replay ? 1u : 15u) &&
+         f_reset_acks_snapshot.size() >= 2 &&
+         f_reset_acks_snapshot[0].unavailable_suffix_mask == 0 &&
+         f_reset_acks_snapshot[0].recovery_prepared_prefix_p == kSurvivors &&
+         f_reset_acks_snapshot[1].request.new_relationship_epoch >
+             f_reset_acks_snapshot[0].request.new_relationship_epoch &&
+         recovery_attempts.load(std::memory_order_acquire) >= 2);
     bool candidate_reused = false;
     {
         std::lock_guard lock(event_mutex);
@@ -3231,7 +3401,12 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     const size_t connection_count =
         accepted_connections.load(std::memory_order_acquire);
     const bool one_link = connection_count ==
-        ((fail_predecessor || expire_predecessor) ? 2 : 1);
+        (disconnect_before_first_replay || disconnect_mid_suffix ? 3 :
+         keep_f_live_after_expiry ? 2 :
+         (fail_predecessor || expire_predecessor) ? 2 : 1);
+    if (disconnect_before_first_replay || disconnect_mid_suffix)
+        CHECK(pre_first_replay_disconnect_requested.load(
+            std::memory_order_acquire));
 
     CHECK(all_submitted);
     CHECK(staged);
@@ -3253,6 +3428,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
               typed_replacement_outcomes == 1 &&
               predecessor_deadline_settled && predecessor_retired_once &&
               !survivor_attached[0] && exact_expired_reset);
+    CHECK(exact_pre_replay_disconnect);
     CHECK(probe_exact);
     CHECK(unique_tu_seqs);
     CHECK(exact_ordinals);
@@ -3269,9 +3445,12 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                     "wire-ordinals=dynamic-from-reset-target "
                     "F-commit-prefix=1..30 target-no-bind=1 "
                     "expired-predecessor-no-publication=1 "
-                    "reset-disposition=exact-unavailable "
+                    "reset-disposition=%s delayed-exact-cancel=%u "
                     "replacement-outcomes=%zu\n",
                     static_cast<unsigned>(profile), cancelled_index,
+                    keep_f_live_after_expiry ? "mask-zero-then-cancel"
+                                             : "exact-unavailable",
+                    predecessor_delayed_cancelled ? 1u : 0u,
                     typed_replacement_outcomes);
     } else {
         std::printf("P51_D07 staged-cancel profile=%u position=%zu "
@@ -3301,6 +3480,22 @@ void test_p51_d07_staged_cancel_all_profiles() {
     }
     test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, true);
     test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true);
+}
+
+void test_p51_d07_staged_cancel_c_expired_f_live_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+        test_p51_d07_staged_cancel_case(profile, 15, false, true, true);
+}
+
+void test_p51_d07_staged_cancel_expiry_recovery() {
+    test_p51_d07_staged_cancel_c_expired_f_live_all_profiles();
+    test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true,
+                                    true, true);
+    test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true,
+                                    true, false, true);
+    test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true);
+    test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, true);
 }
 
 // Active-cancel recovery regression: a complete bundle is paused on F's
@@ -16968,6 +17163,26 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--d07-staged-cancel-c-expired-f-live") == 0) {
+            test_p51_d07_staged_cancel_c_expired_f_live_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--d07-staged-cancel-c-expired-f-live-disconnect") == 0) {
+            test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true,
+                                            true, true);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1],
+                        "--d07-staged-cancel-c-expired-f-live-mid-disconnect") == 0) {
+            test_p51_d07_staged_cancel_case(ProfileId::P29V1, 15, false, true,
+                                            true, false, true);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d17-window-cancel-zstd-tu") == 0) {
             test_p51_d17_repeated_window_cancel(ProfileId::ZSTD_TU, 1);
             return 0;
@@ -17097,6 +17312,7 @@ int main(int argc, char** argv) {
         test_p51_read_failure_releases_original_source_fd();
         test_p51_d07_queued_cancel_first_middle_last();
         test_p51_d07_staged_cancel_all_profiles();
+        test_p51_d07_staged_cancel_expiry_recovery();
         test_p51_d07_full_cancel_all_profiles();
         test_p51_d07_committed_full_all_profiles();
         test_p51_d07_partial_body_cancel_all_profiles();
