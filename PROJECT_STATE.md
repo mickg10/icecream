@@ -67,11 +67,17 @@ suite, including its freshly linked service lifecycle baseline and executable
 mutants. Adapter source-suite log SHA256:
 `13ba9fbbb01a131f0f9973db27cbea63c64c476ebe798ea6696711067629e2ca`,
 retained as `p50daemonsidecaradapter-source.log` in the donor directory below.
-The separate direct adapter binary run against the prebuilt service exits 30:
-absent cancellation returns Applied rather than UnknownRecord. A stale service
-is suspected, not established; a matched rebuilt-service rerun is pending.
-That direct adapter run is not counted as a pass. The combined service run
-below now passes after its fixture ordering correction.
+The direct adapter runtime also passes after relinking its generated test
+executable. The earlier exit 30 was an artifact mismatch: the service trace
+correctly reported UnknownRecord, but the test executable predated the rebuilt
+adapter archive and reported Applied. Rebuilding that target, without source
+changes, produces UnknownRecord and exit zero. The failed run remains retained;
+source hashes alone did not establish executable freshness.
+Fresh adapter-test SHA256:
+`293dda5d0ae5390299fd2631706ef10d4c7a7a2965ef315b174bba4ed0f3cfe1`;
+service SHA256:
+`67acb6a1676167da90827e857afdea05912b5b0ec9c2e9c01cb93b0cfc280fff`.
+The combined service run below also passes after its fixture ordering correction.
 
 Qualified donor: `536dc696`. Test binary SHA256:
 `8ddc058a9675cdeaf0312740efd841cb174ad8246176bec2c56396ab822047d5`.
