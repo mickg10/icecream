@@ -173,6 +173,35 @@ adapter archive and reported Applied. Rebuilding that target, without source
 changes, produces UnknownRecord and exit zero. The failed run remains retained;
 source hashes alone did not establish executable freshness.
 Fresh adapter-test SHA256:
+
+### W30 sender accounting lifetime
+
+Per-job R2 wire accounting now retires at exact validated receipt time, before
+the sender returns that receipt's window slot to another caller. The retained
+snapshot travels with its pending receipt to the result/replay path, and
+accounting-registration failure marks the evidence unavailable rather than
+silently treating it as valid. The old caller-finalization timing allowed
+more than 30 completed-but-not-finalized rows while the protocol window was
+already accepting more work.
+
+Donor `edcf2c4d`; imported candidate commit `e98a8ba3`. The registered
+`p50transferwindowbench` Automake test exercises all three profiles with 32
+deterministic inputs, two passes, W4, exact receipt and socket-byte
+reconciliation, and a bounded missing-participant check. It passed on the
+canonical configured SDK build. A matched negative control with only
+receipt-time retirement disabled fails because a successful result lacks
+valid per-job wire accounting. The 20-repeat corpus-shaped gated run is a
+regression stress test, not a speed benchmark; the ordinary CLI benchmark no
+longer enables that gate. Focused recovery selectors also pass on the tested
+sender binary. The clean current patch still needs ASAN and full candidate
+build-closure qualification.
+
+Positive 20-repeat log:
+`/tanksmall/scratch/tmp/w30-adapter-runtime-user/windowbench-fixed-r2-32-p0-w4-finalizer-repeat20.log`,
+SHA256 `88de71cf8904ea3bb9f87ff6a8f43c28aba479b401a5968de1ddc9574d93fc23`.
+Matched negative log:
+`/tanksmall/scratch/tmp/w30-adapter-runtime-user/windowbench-finalizer-negative-r2-32-p0-w4.log`,
+SHA256 `7ee729dad791d37e74b43f8b1522e4d484dcc79f03fbb25244307a143c054be8`.
 `293dda5d0ae5390299fd2631706ef10d4c7a7a2965ef315b174bba4ed0f3cfe1`;
 service SHA256:
 `67acb6a1676167da90827e857afdea05912b5b0ec9c2e9c01cb93b0cfc280fff`.
