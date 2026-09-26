@@ -24,8 +24,24 @@ The donor's pinned-UV bootstrap suite passes 51 tests, including executed
 positive, duplicate-cell and missing-cell marker checks. Retained log:
 `/tanksmall/scratch/tmp/p51-c01-selector-validation/pinned-uv-test-dev-bootstrap.log`,
 SHA256 `a14b585bae6cb851492930b5b60c8c1c6834f4cb651cdc7746c254710b9960e2`.
-The six-cell live invocation through this new entry point is **not yet
-qualified**; selector tests are not runtime persistence evidence.
+The six-cell live invocation now **passes** from clean integrated source
+`1c0473c894f71d65cb43447603d7bf3651e46587` on nas642, Ubuntu 24.04 SDK,
+2 CPUs/8 GiB. Fresh autogen/configure/build/install succeed; build takes
+177.506 seconds and the gate 127.529 seconds. All six profile/count cells
+report one persistent link with real remote compilation and output checks.
+This closes C01's sequential reuse gate, not W30 concurrency, idle reconnect,
+failure recovery, external-farm qualification or whole-build performance.
+
+Artifacts:
+`/tanksmall/scratch/tmp/p51-c01-wrapper-selector-gate/icecream-qa-zw5ifxb2`.
+Source snapshot SHA256:
+`aeb2c63cb04d4401a980e171f0fb652a980124dd19470aaeaf1fb373b783ba2a`.
+`result.json` is PASS with all step exits zero; SHA256
+`45dd32d5809f0d1d664e5459d2bee024c177e6d97cc03171a813ccc30749968a`.
+`logs/03-gate-p51-wrapper-compile.log` SHA256:
+`b11bd6ac1bba12fa8d9f705b26ce8490055d787762f8538fae7115fa2a43d217`.
+Inner gate log under `current/artifacts/opt-in-gates/725f2771c14f436e845a471c56b18842/`
+has SHA256 `0f395ff3fa43b029def082d40752272d28110060e574bb9d5cdc6d67912945b7`.
 
 ### Fresh-bootstrap live-core qualification
 
