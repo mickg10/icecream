@@ -26,6 +26,13 @@ disconnect before first replay and mid-suffix, and the earlier expiry/failure
 cases. Exact outputs and no replay of RESET-settled prefixes remain asserted.
 All six changed files match the integrated source byte-for-byte; this is source
 identity plus donor binary qualification, not a new merged-image result.
+The later dependency-refreshed build/install of `0dc29331` also passes the full
+registered service suite (actual test exit 0, `.trs` PASS). Merged log:
+`/tanksmall/scratch/tmp/p51-current-0dc-qualified/build/unittests/p50cacheservice.log`,
+SHA256 `33460446af1953c2073e3f31e9f9c58432a1fcf8296498b83c0f2d0df030d5d4`.
+An initial launcher attempt failed before product testing because its scratch
+`/tmp` mount was mode 0755; the retained successful run uses mode 1777 for the
+test's reduced-privilege child. Mixed-image qualification remains separate.
 Under `/tanksmall/scratch/tmp/p51-d07-c-expired-f-live-build/build/unittests/`:
 
 - `p50cacheservice.log`: SHA256 `4eb5b64df8f1de7664d41bf0399d52ebee7a97b61ee17d350ca085cbc6f66eeb`.
