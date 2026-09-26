@@ -176,8 +176,13 @@ PY
         export ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc
         build_status=0
         timeout --signal=TERM --kill-after=15s 300s \
-            make -C /work/build/unittests p50daemonpositive p50sourcearm-live \
+            make -C /work/build/cache icecc-cache-service-test \
             >>"$log" 2>&1 || build_status=$?
+        if [[ $build_status -eq 0 ]]; then
+            timeout --signal=TERM --kill-after=15s 300s \
+                make -C /work/build/unittests p50daemonpositive p50sourcearm-live \
+                >>"$log" 2>&1 || build_status=$?
+        fi
         if [[ $build_status -eq 0 ]]; then
             completion_build_status=0
             timeout --signal=TERM --kill-after=15s 180s \
