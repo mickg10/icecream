@@ -1,6 +1,6 @@
 # Sorbet 1.5.0: validation and remaining work
 
-Updated 2026-09-25. Package version is **1.5.0**; the release branch is
+Updated 2026-09-26. Package version is **1.5.0**; the release branch is
 `sorbet_v1.5`. The repository is public. The Docker bootstrap implementation
 was published as `de027cefc31d79d062c3158400951916a9aa5d63`.
 A pushed branch is not a published release tag or a newly qualified farm image.
@@ -12,36 +12,51 @@ retained artifact directories.
 
 ## Developer QA
 
-### Full-window reset with a pending 31st input
+### Reset boundaries and terminal reconnect
 
-The default service suite now includes an all-profile K=0/P=30 recovery
-case. Thirty distinct bundles are observed sent while F's first materializer
-is held; a 31st admitted source has no wire ordinal yet. Disconnecting the
-owned F socket must produce the exact RESET_ACK before worker release.
-All 31 requests then return exact results and attached input bytes, with
-consistent receipts and zero source-operation/raw credits after shutdown.
-An uninterrupted baseline supplies per-request byte/digest parity; asynchronous
-TU assignment order and history-dependent transaction digests are not assumed
-equal across episodes. The C admission cap is 32, independently of wire W30.
+The default service suite now includes all 93 profile × K=0..30 boundary
+cases and three K=31 terminal reconnect cases. At K=0, thirty distinct bundles
+are observed sent while F's first materializer is held; the 31st admitted
+source has no wire ordinal yet. For K=1..30, an exactly completed prefix
+precedes the held suffix. The owned F socket is cut and the exact RESET_ACK
+must arrive before worker release. All 31 requests return exact results and
+attached input bytes. Only K=0 asserts a full 30-item outstanding window;
+the other cases exercise the remaining suffix after the stated prefix.
 
-P29V1, ZSTD_TU and ZSTD_ROUTE pass this case and the three-input K=1/P=3
-smoke. This qualifies K=0 with a full window, not the remaining boundaries,
-arbitrary restart combinations or real compiler-process cleanup.
-Named selectors: `--d14-w30-k0-all-profiles` and
-`--d14-reset-boundary-smoke`. No production code changed.
+At K=31, the test completes 31 inputs, cuts the settled link and submits a
+32nd exact probe. F's outbound LinkState proves a new physical generation;
+all 32 results/attachments and unique receipts are checked. If reset occurs,
+its K=31/P=32 acknowledgement is checked. No held worker is fabricated for
+this terminal boundary. An uninterrupted baseline supplies per-request
+byte/digest parity without assuming asynchronous TU order or identical
+history-dependent transaction digests across episodes.
 
-Qualification is base `e2d99b5d` plus this test-only integration; imported
-TU SHA256 `262fecd3081850559f7aaf7150dc817fca901b834df070fe3fbfffc0829499ab`.
-Binary SHA256 `5f6381e5382f2c57df4c5c2c161e9ca17fb3c1718223c5392f1b6baf969bd979`.
-Both focused selectors and the full ordinary service suite exit zero;
-the generated `.trs` reports PASS. Evidence under
-`/tanksmall/scratch/tmp/p51-d11-metadata-expiry-c6fce0e7/work/artifacts/`:
+The fixture waits at most five seconds for zero operation/raw credits after
+requesting asynchronous stop; stop itself is not a runtime join. A prior
+immediate snapshot raced that cleanup. No production code changed.
+Selectors: `--d14-w30-boundary-matrix`, `--d14-w30-terminal-all-profiles`,
+`--d14-w30-boundary PROFILE K`, plus the existing K0 and smoke selectors.
+
+Focused matrix (93/93) and terminal (3/3) selectors exit zero on base
+`0bc9df39` plus this patch. TU SHA256:
+`bcf1272c755f007b23aa10e2a8989bf3b73054ba9a19ce41e63166325dfb46e6`;
+binary SHA256:
+`503ff3976e857426fa8de2e08a653a4cb539176ddb13e6203f2f10a2a34d2453`.
+Evidence under
+`/tanksmall/scratch/tmp/p51-d14-f004-scratch.yDlJDu/icecream-qa-h514rgg9/current/artifacts/`:
 
 | Log | SHA256 |
 |---|---|
-| `d14-d14-w30-k0-all-profiles-r1.log` | `fc28dfe2bc4f5f26f94609efa6a86d0d4bd0e2a6fed200f3099752d61a9137d8` |
-| `d14-d14-reset-boundary-smoke-r1.log` | `30164e4716302c80720cf8fb8ef68732e1bd65b3a85809c4a675b897daa08a3e` |
-| `d14-default-r1.log` | `86a48521327ad01c69b8845d31104f2cc2ac08f9ec3e7e0c7aaa30c1e851e459` |
+| `d14-matrix-drain-r1.log` | `8ddc27a69766cd4f8868b6cf62d2dc32bca5a862491dc9f17666693042408452` |
+| `d14-terminal-drain-r1.log` | `c772a8cdfde60b0bc5c1d96a7a5f6f555c95402b5172720dc42b9ad6db725006` |
+
+The combined generated service-test target is **not passing**: it aborts
+with exit 134 in D07 cancellation/recovery, before reaching this matrix.
+Its `.trs` reports FAIL even though the make invocation returns zero.
+The focused D07 positive-owner selector passes on the same binary; the
+combined abort still needs diagnosis. Earlier manual full runs also failed
+on missing harness environment and are not counted as passes. These results
+do not qualify arbitrary restart combinations or real compiler cleanup.
 
 ### Concurrent source-credit admission
 

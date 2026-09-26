@@ -2249,7 +2249,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                                        size_t cut_boundary = 1,
                                        bool w30 = false) {
     CHECK(job_count >= 3);
-    CHECK(cut_boundary < job_count);
+    CHECK(cut_boundary <= job_count);
     struct RunResult {
         std::vector<local::P50SourceTransferResult> results;
         std::vector<std::vector<uint8_t>> inputs;
@@ -2258,6 +2258,10 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         std::vector<uint64_t> sent_ordinals;
         std::vector<std::pair<CStoreGuid, TuSeq>> materialized_identity;
         std::vector<std::vector<uint8_t>> materialized_bytes;
+        std::vector<LinkHello> quiesced_links;
+        std::vector<LinkState> observed_link_states;
+        size_t accepted_links = 0;
+        bool owned_duplicate_shutdown = false;
         Id128 relationship_id{};
         bool held_suffix_worker = false;
         bool suffix_bundles_sent = false;
@@ -2299,12 +2303,16 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         std::vector<uint64_t> sent_ordinals;
         std::vector<std::pair<CStoreGuid, TuSeq>> materialized_identity;
         std::vector<std::vector<uint8_t>> materialized_bytes;
+        std::vector<LinkHello> quiesced_links;
+        std::vector<LinkState> observed_link_states;
 
         service::RuntimeConfig f_config = test_runtime_config();
         f_config.c_store_guid = f_launch.c_store_guid;
         f_config.f_store_guid = f_launch.f_store_guid;
         f_config.f_store_generation = f_launch.store_generation;
         f_config.sidecar_launch = f_launch;
+        if (w30)
+            f_config.max_active_source_transfers = 1;
         f_config.endpoint_caps.profile = profile;
         f_config.endpoint_caps.supported_profiles = profile_bits;
         f_config.endpoint_caps.zstd.max_raw_bytes = 65536;
@@ -2438,6 +2446,15 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                             commits.push_back(*commit);
                         else if (const auto* ack = std::get_if<ResetAck>(&message))
                             reset_acks.push_back(*ack);
+                        else if (const auto* link_state =
+                                     std::get_if<LinkState>(&message))
+                            observed_link_states.push_back(*link_state);
+                        event_changed.notify_all();
+                    };
+                control.r2_link_io_quiesced_observer =
+                    [&](const LinkHello& hello, uint64_t, uint64_t) {
+                        std::lock_guard lock(event_mutex);
+                        quiesced_links.push_back(hello);
                         event_changed.notify_all();
                     };
                 accepted_connections.fetch_add(1, std::memory_order_acq_rel);
@@ -2560,151 +2577,196 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
             }
             output.exact_attachments = all_exact_attachments;
         } else if (w30) {
-            {
-                std::lock_guard lock(gate_mutex);
-                gate_armed = true;
-                release_gate = false;
-                hold_from_call = 1;
-            }
-            bool all_enqueued = true;
-            uint64_t expected_raw_bytes = 0;
-            for (auto& request : requests) {
-                expected_raw_bytes += request.bytes.size();
-                all_enqueued = enqueue(request) && all_enqueued;
-            }
-            bool worker_held = false;
-            {
-                std::unique_lock lock(gate_mutex);
-                worker_held = gate_changed.wait_for(
-                    lock, std::chrono::seconds(8), [&] {
-                        return suffix_worker_entered;
-                    });
-            }
-            const bool operations_full = all_enqueued &&
-                wait_for_source_operation_count(
-                    c_runtime, job_count, std::chrono::seconds(8));
-            const bool raw_credits_full = wait_for_source_raw_bytes(
-                c_runtime, expected_raw_bytes, std::chrono::seconds(8));
-            bool initial_window_full = false;
-            {
-                std::unique_lock lock(event_mutex);
-                initial_window_full = event_changed.wait_for(
-                    lock, std::chrono::seconds(8), [&] {
-                        return sent_ordinals.size() >= 30;
-                    });
-                CHECK(sent_ordinals.size() == 30);
-                for (uint64_t ordinal = 1; ordinal <= 30; ++ordinal)
-                    CHECK(std::count(sent_ordinals.begin(),
-                                     sent_ordinals.end(), ordinal) == 1);
-                CHECK(std::find(sent_ordinals.begin(), sent_ordinals.end(),
-                                31) == sent_ordinals.end());
-            }
-            if (!(worker_held && operations_full && raw_credits_full &&
-                  initial_window_full)) {
-                std::lock_guard lock(event_mutex);
-                std::fprintf(stderr,
-                    "P51_D14 w30-precut profile=%u held=%u operations=%u "
-                    "raw=%u window=%u op-count=%zu expected-ops=%zu "
-                    "raw-now=%llu raw-expected=%llu sent-count=%zu\n",
-                    static_cast<unsigned>(profile), worker_held,
-                    operations_full, raw_credits_full, initial_window_full,
-                    c_runtime.pending_p51_source_operations_for_test(),
-                    job_count,
-                    static_cast<unsigned long long>(
-                        c_runtime.active_source_raw_bytes_for_test()),
-                    static_cast<unsigned long long>(expected_raw_bytes),
-                    sent_ordinals.size());
-                std::fflush(stderr);
-            }
-            CHECK(worker_held && operations_full && raw_credits_full &&
-                  initial_window_full);
-            CHECK(c_runtime.pending_p51_source_operations_for_test() == 31);
-            CHECK(c_runtime.active_source_raw_bytes_for_test() ==
-                  expected_raw_bytes);
-            output.held_suffix_worker = worker_held;
-            output.suffix_bundles_sent = initial_window_full;
-
-            const int descriptor = probe_fd.load(std::memory_order_acquire);
-            CHECK(descriptor >= 0);
-            CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
-            std::vector<std::optional<local::P50SourceTransferResult>> results(
-                job_count);
-            std::vector<std::exception_ptr> waiter_errors(job_count);
-            std::vector<bool> attachments(job_count, false);
-            std::vector<std::thread> waiters;
-            waiters.reserve(job_count);
-            for (size_t index = 0; index < job_count; ++index) {
-                waiters.emplace_back([&, index] {
-                    try {
-                        results[index] = receive(requests[index]);
-                    } catch (...) {
-                        waiter_errors[index] = std::current_exception();
-                    }
-                });
-            }
-            const uint64_t expected_p = 30;
-            bool reset_seen = false;
-            {
-                std::unique_lock lock(event_mutex);
-                reset_seen = event_changed.wait_for(
-                    lock, std::chrono::seconds(10), [&] {
-                        return std::any_of(reset_acks.begin(), reset_acks.end(),
-                            [&](const ResetAck& ack) {
-                                return ack.request.settled_prefix_k == 0 &&
-                                    ack.recovery_prepared_prefix_p == expected_p;
-                            });
-                    });
-                if (reset_seen) {
-                    const auto ack = std::find_if(
-                        reset_acks.begin(), reset_acks.end(),
-                        [&](const ResetAck& item) {
-                            return item.request.settled_prefix_k == 0 &&
-                                item.recovery_prepared_prefix_p == expected_p;
-                        });
-                    output.reset_acks.push_back(*ack);
-                }
-            }
-            {
-                std::lock_guard lock(gate_mutex);
-                gate_armed = false;
-                release_gate = true;
-            }
-            gate_changed.notify_all();
-            for (auto& waiter : waiters)
-                waiter.join();
-            output.reset_before_release = reset_seen;
-            CHECK(reset_seen);
-            for (size_t index = 0; index < waiter_errors.size(); ++index) {
-                if (waiter_errors[index]) {
-                    std::fprintf(stderr,
-                        "P51_D14 waiter-exception profile=%u index=%zu\n",
-                        static_cast<unsigned>(profile), index);
-                    std::rethrow_exception(waiter_errors[index]);
-                }
-            }
             bool exact_attachments = true;
-            for (size_t index = 0; index < job_count; ++index) {
-                CHECK(results[index].has_value());
-                if (results[index]->code !=
-                    local::SourceTransferResultCode::Committed) {
-                    std::fprintf(stderr,
-                        "P51_D14 transfer-failed profile=%u episode=W30-k0 "
-                        "index=%zu code=%u error=%u attempts=%u raw=%zu\n",
-                        static_cast<unsigned>(profile), index,
-                        static_cast<unsigned>(results[index]->code),
-                        results[index]->error_code,
-                        static_cast<unsigned>(results[index]->attempts),
-                        requests[index].bytes.size());
+            for (size_t index = 0; index < cut_boundary; ++index) {
+                CHECK(enqueue(requests[index]));
+                auto result = receive(requests[index]);
+                CHECK(result.code ==
+                      local::SourceTransferResultCode::Committed);
+                exact_attachments =
+                    attach_exact(requests[index], result) && exact_attachments;
+                output.results.push_back(std::move(result));
+            }
+            if (cut_boundary == 31 && job_count == 32) {
+                const int descriptor = probe_fd.load(std::memory_order_acquire);
+                CHECK(descriptor >= 0);
+                CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
+                output.owned_duplicate_shutdown = true;
+                CHECK(!suffix_worker_entered);
+                CHECK(enqueue(requests[31]));
+                auto probe = receive(requests[31]);
+                CHECK(probe.code == local::SourceTransferResultCode::Committed);
+                exact_attachments =
+                    attach_exact(requests[31], probe) && exact_attachments;
+                output.results.push_back(std::move(probe));
+                output.exact_attachments = exact_attachments;
+            } else {
+                CHECK(cut_boundary < job_count);
+                const size_t suffix_count = job_count - cut_boundary;
+                const size_t expected_suffix_sent =
+                    std::min<size_t>(suffix_count, 30);
+                const uint64_t expected_p = cut_boundary + expected_suffix_sent;
+                {
+                    std::lock_guard lock(gate_mutex);
+                    gate_armed = true;
+                    release_gate = false;
+                    hold_from_call = materialize_calls + 1;
+                }
+                bool all_enqueued = true;
+                uint64_t expected_raw_bytes = 0;
+                for (size_t index = cut_boundary; index < job_count; ++index) {
+                    auto &request = requests[index];
+                    expected_raw_bytes += request.bytes.size();
+                    all_enqueued = enqueue(request) && all_enqueued;
+                }
+                bool worker_held = false;
+                {
+                    std::unique_lock lock(gate_mutex);
+                    worker_held = gate_changed.wait_for(
+                        lock, std::chrono::seconds(8),
+                        [&] { return suffix_worker_entered; });
+                }
+                const bool operations_full =
+                    all_enqueued &&
+                    wait_for_source_operation_count(c_runtime, suffix_count,
+                                                    std::chrono::seconds(8));
+                const bool raw_credits_full = wait_for_source_raw_bytes(
+                    c_runtime, expected_raw_bytes, std::chrono::seconds(8));
+                bool initial_window_full = false;
+                {
+                    std::unique_lock lock(event_mutex);
+                    initial_window_full = event_changed.wait_for(
+                        lock, std::chrono::seconds(8),
+                        [&] { return sent_ordinals.size() >= expected_p; });
+                    CHECK(sent_ordinals.size() == expected_p);
+                    for (uint64_t ordinal = 1; ordinal <= expected_p; ++ordinal)
+                        CHECK(std::count(sent_ordinals.begin(),
+                                         sent_ordinals.end(), ordinal) == 1);
+                    CHECK(std::find(sent_ordinals.begin(), sent_ordinals.end(),
+                                    expected_p + 1) == sent_ordinals.end());
+                }
+                if (!(worker_held && operations_full && raw_credits_full &&
+                      initial_window_full)) {
+                    std::lock_guard lock(event_mutex);
+                    std::fprintf(
+                        stderr,
+                        "P51_D14 w30-precut profile=%u held=%u operations=%u "
+                        "raw=%u window=%u op-count=%zu expected-ops=%zu "
+                        "raw-now=%llu raw-expected=%llu sent-count=%zu\n",
+                        static_cast<unsigned>(profile), worker_held,
+                        operations_full, raw_credits_full, initial_window_full,
+                        c_runtime.pending_p51_source_operations_for_test(),
+                        suffix_count,
+                        static_cast<unsigned long long>(
+                            c_runtime.active_source_raw_bytes_for_test()),
+                        static_cast<unsigned long long>(expected_raw_bytes),
+                        sent_ordinals.size());
                     std::fflush(stderr);
                 }
-                CHECK(results[index]->code ==
-                      local::SourceTransferResultCode::Committed);
-                attachments[index] = attach_exact(requests[index],
-                                                   *results[index]);
-                exact_attachments = attachments[index] && exact_attachments;
-                output.results.push_back(*results[index]);
+                CHECK(worker_held && operations_full && raw_credits_full &&
+                      initial_window_full);
+                CHECK(c_runtime.pending_p51_source_operations_for_test() ==
+                      suffix_count);
+                CHECK(c_runtime.active_source_raw_bytes_for_test() ==
+                      expected_raw_bytes);
+                output.held_suffix_worker = worker_held;
+                output.suffix_bundles_sent = initial_window_full;
+
+                const int descriptor = probe_fd.load(std::memory_order_acquire);
+                CHECK(descriptor >= 0);
+                CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
+                output.owned_duplicate_shutdown = true;
+                std::vector<std::optional<local::P50SourceTransferResult>>
+                    results(suffix_count);
+                std::vector<std::exception_ptr> waiter_errors(suffix_count);
+                std::vector<std::thread> waiters;
+                waiters.reserve(suffix_count);
+                for (size_t suffix_index = 0; suffix_index < suffix_count;
+                     ++suffix_index) {
+                    waiters.emplace_back([&, suffix_index] {
+                        try {
+                            results[suffix_index] =
+                                receive(requests[cut_boundary + suffix_index]);
+                        } catch (...) {
+                            waiter_errors[suffix_index] =
+                                std::current_exception();
+                        }
+                    });
+                }
+                const uint64_t expected_k = cut_boundary;
+                bool reset_seen = false;
+                {
+                    std::unique_lock lock(event_mutex);
+                    reset_seen = event_changed.wait_for(
+                        lock, std::chrono::seconds(10), [&] {
+                            return std::any_of(
+                                reset_acks.begin(), reset_acks.end(),
+                                [&](const ResetAck &ack) {
+                                    return ack.request.settled_prefix_k ==
+                                               expected_k &&
+                                           ack.recovery_prepared_prefix_p ==
+                                               expected_p;
+                                });
+                        });
+                    if (reset_seen) {
+                        const auto ack = std::find_if(
+                            reset_acks.begin(), reset_acks.end(),
+                            [&](const ResetAck &item) {
+                                return item.request.settled_prefix_k ==
+                                           expected_k &&
+                                       item.recovery_prepared_prefix_p ==
+                                           expected_p;
+                            });
+                        output.reset_acks.push_back(*ack);
+                    }
+                }
+                {
+                    std::lock_guard lock(gate_mutex);
+                    gate_armed = false;
+                    release_gate = true;
+                }
+                gate_changed.notify_all();
+                for (auto &waiter : waiters)
+                    waiter.join();
+                output.reset_before_release = reset_seen;
+                CHECK(reset_seen);
+                for (size_t index = 0; index < waiter_errors.size(); ++index) {
+                    if (waiter_errors[index]) {
+                        std::fprintf(
+                            stderr,
+                            "P51_D14 waiter-exception profile=%u index=%zu\n",
+                            static_cast<unsigned>(profile), index);
+                        std::rethrow_exception(waiter_errors[index]);
+                    }
+                }
+                for (size_t suffix_index = 0; suffix_index < suffix_count;
+                     ++suffix_index) {
+                    CHECK(results[suffix_index].has_value());
+                    if (results[suffix_index]->code !=
+                        local::SourceTransferResultCode::Committed) {
+                        std::fprintf(
+                            stderr,
+                            "P51_D14 transfer-failed profile=%u episode=W30 "
+                            "index=%zu code=%u error=%u attempts=%u raw=%zu\n",
+                            static_cast<unsigned>(profile),
+                            cut_boundary + suffix_index,
+                            static_cast<unsigned>(results[suffix_index]->code),
+                            results[suffix_index]->error_code,
+                            static_cast<unsigned>(
+                                results[suffix_index]->attempts),
+                            requests[cut_boundary + suffix_index].bytes.size());
+                        std::fflush(stderr);
+                    }
+                    CHECK(results[suffix_index]->code ==
+                          local::SourceTransferResultCode::Committed);
+                    const size_t index = cut_boundary + suffix_index;
+                    exact_attachments =
+                        attach_exact(requests[index], *results[suffix_index]) &&
+                        exact_attachments;
+                    output.results.push_back(*results[suffix_index]);
+                }
+                output.exact_attachments = exact_attachments;
             }
-            output.exact_attachments = exact_attachments;
         } else {
             // First TU is a settled positive prefix. Hold worker #2 while the
             // writer sends the complete suffix; an external duplicate-F-socket
@@ -2743,6 +2805,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
             const int descriptor = probe_fd.load(std::memory_order_acquire);
             CHECK(descriptor >= 0);
             CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
+            output.owned_duplicate_shutdown = true;
             std::vector<std::optional<local::P50SourceTransferResult>> suffix_results(2);
             std::vector<bool> attached(2, false);
             std::array<std::thread, 2> waiters{
@@ -2804,13 +2867,36 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
             }
             output.exact_attachments = attached[0] && attached[1];
         }
-        // Explicitly stop and join before returning evidence; no callback may
-        // mutate output vectors after their snapshots are copied.
+        // Stop requests asynchronous owner cleanup; it does not join the
+        // endpoint work. Wait for accounting to drain before taking the final
+        // credit snapshot rather than racing that cleanup.
         cleanup.reset();
-        output.final_source_operations =
+        const auto drain_deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(5);
+        size_t pending_operations =
             c_runtime.pending_p51_source_operations_for_test();
-        output.final_source_raw_bytes =
+        uint64_t pending_raw_bytes =
             c_runtime.active_source_raw_bytes_for_test();
+        while ((pending_operations != 0 || pending_raw_bytes != 0) &&
+               std::chrono::steady_clock::now() < drain_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            pending_operations =
+                c_runtime.pending_p51_source_operations_for_test();
+            pending_raw_bytes = c_runtime.active_source_raw_bytes_for_test();
+        }
+        if (pending_operations != 0 || pending_raw_bytes != 0) {
+            std::fprintf(stderr,
+                         "P51_D14 cleanup-credit-timeout operations=%zu raw=%llu\n",
+                         pending_operations,
+                         static_cast<unsigned long long>(pending_raw_bytes));
+            std::fflush(stderr);
+        }
+        output.final_source_operations =
+            pending_operations;
+        output.final_source_raw_bytes =
+            pending_raw_bytes;
+        output.accepted_links = accepted_connections.load(
+            std::memory_order_acquire);
         {
             std::lock_guard lock(event_mutex);
             output.commits = commits;
@@ -2818,6 +2904,8 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
             output.reset_acks = reset_acks;
             output.materialized_identity = materialized_identity;
             output.materialized_bytes = materialized_bytes;
+            output.quiesced_links = quiesced_links;
+            output.observed_link_states = observed_link_states;
         }
         return output;
     };
@@ -2829,22 +2917,9 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
     CHECK(baseline.exact_attachments);
     CHECK(baseline.final_source_operations == 0);
     CHECK(baseline.final_source_raw_bytes == 0);
-    CHECK(recovered.held_suffix_worker);
-    CHECK(recovered.suffix_bundles_sent);
-    CHECK(recovered.reset_before_release);
     CHECK(recovered.exact_attachments);
     CHECK(recovered.final_source_operations == 0);
     CHECK(recovered.final_source_raw_bytes == 0);
-    CHECK(recovered.reset_acks.size() == 1);
-    const ResetAck& ack = recovered.reset_acks.front();
-    const uint64_t expected_k = w30 ? 0 : cut_boundary;
-    CHECK(ack.request.settled_prefix_k == expected_k);
-    const uint64_t expected_p =
-        w30 && expected_k == 0 ? 30 : job_count;
-    CHECK(ack.recovery_prepared_prefix_p == expected_p);
-    CHECK(ack.request.relationship_id == recovered.relationship_id);
-    CHECK(ack.request.new_relationship_epoch >
-          ack.request.old_relationship_epoch);
     auto committed_records = [](const RunResult& run) {
         std::vector<R2TxCommit> unique;
         for (const auto& commit : run.commits) {
@@ -2907,11 +2982,95 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         CHECK(has_receipt(baseline_commits, baseline.results[i]));
         CHECK(has_receipt(recovered_commits, recovered.results[i]));
     }
+    if (w30 && cut_boundary == 31 && job_count == 32) {
+        CHECK(recovered.owned_duplicate_shutdown);
+        CHECK(!recovered.held_suffix_worker);
+        CHECK(!recovered.suffix_bundles_sent);
+        CHECK(!recovered.reset_before_release);
+        CHECK(recovered.accepted_links >= 2);
+        CHECK(!recovered.quiesced_links.empty());
+        CHECK(recovered.observed_link_states.size() >= 2);
+        CHECK(recovered.commits.size() == job_count);
+        for (uint64_t ordinal = 1; ordinal <= job_count; ++ordinal)
+            CHECK(std::count_if(recovered.commits.begin(),
+                                recovered.commits.end(),
+                [&](const R2TxCommit& receipt) {
+                    return receipt.relationship_ordinal == ordinal;
+                }) == 1);
+        CHECK(std::all_of(recovered.quiesced_links.begin(),
+                          recovered.quiesced_links.end(),
+            [&](const LinkHello& hello) {
+                return hello.relationship_id == recovered.relationship_id;
+            }));
+        const auto first_link = std::min_element(
+            recovered.quiesced_links.begin(), recovered.quiesced_links.end(),
+            [](const LinkHello& left, const LinkHello& right) {
+                return left.physical_link_generation <
+                       right.physical_link_generation;
+            });
+        CHECK(first_link->relationship_id == recovered.relationship_id);
+        const auto reconnect = std::find_if(
+            recovered.observed_link_states.begin(),
+            recovered.observed_link_states.end(),
+            [&](const LinkState& state) {
+                return state.relationship_id == recovered.relationship_id &&
+                       state.physical_link_generation >
+                           first_link->physical_link_generation;
+            });
+        CHECK(reconnect != recovered.observed_link_states.end());
+        CHECK(reconnect->relationship_epoch == first_link->relationship_epoch);
+        uint64_t terminal_reset_k = 0;
+        uint64_t terminal_reset_p = 0;
+        if (!recovered.reset_acks.empty()) {
+            CHECK(recovered.reset_acks.size() == 1);
+            const ResetAck& terminal_ack = recovered.reset_acks.front();
+            CHECK(terminal_ack.request.relationship_id ==
+                  recovered.relationship_id);
+            CHECK(terminal_ack.request.settled_prefix_k == 31);
+            CHECK(terminal_ack.recovery_prepared_prefix_p == 32);
+            terminal_reset_k = terminal_ack.request.settled_prefix_k;
+            terminal_reset_p = terminal_ack.recovery_prepared_prefix_p;
+        }
+        for (size_t index = 0; index < 31; ++index)
+            CHECK(recovered.results[index].code ==
+                      local::SourceTransferResultCode::Committed &&
+                  recovered.results[index].tu_seq == index);
+        CHECK(recovered.results[31].tu_seq == 31);
+        std::printf("P51_D14 w30-terminal-reconnect profile=%u settled-K=31 "
+                    "probe=32 owned-cut=1 adopted-links=%zu old-generation=%llu "
+                    "new-generation=%llu held-worker=0 exact-results=32 "
+                    "exact-attachments=1 commits=32 reset-acks=%zu "
+                    "reset-K=%llu reset-P=%llu "
+                    "final-ops=0 final-raw=0\n",
+                    static_cast<unsigned>(profile), recovered.accepted_links,
+                    static_cast<unsigned long long>(
+                        first_link->physical_link_generation),
+                    static_cast<unsigned long long>(
+                        reconnect->physical_link_generation),
+                    recovered.reset_acks.size(),
+                    static_cast<unsigned long long>(terminal_reset_k),
+                    static_cast<unsigned long long>(terminal_reset_p));
+        return;
+    }
+    CHECK(recovered.held_suffix_worker);
+    CHECK(recovered.suffix_bundles_sent);
+    CHECK(recovered.reset_before_release);
+    CHECK(recovered.owned_duplicate_shutdown);
+    CHECK(recovered.reset_acks.size() == 1);
+    const ResetAck& ack = recovered.reset_acks.front();
+    const uint64_t expected_k = cut_boundary;
+    CHECK(ack.request.settled_prefix_k == expected_k);
+    const uint64_t expected_p =
+        w30 && expected_k == 0 ? 30 : job_count;
+    CHECK(ack.recovery_prepared_prefix_p == expected_p);
+    CHECK(ack.request.relationship_id == recovered.relationship_id);
+    CHECK(ack.request.new_relationship_epoch >
+          ack.request.old_relationship_epoch);
     std::printf("P51_D14 reset-boundary-smoke profile=%u jobs=%zu requested-K=%zu "
                 "observed-K=%llu P=%llu old-epoch=%llu new-epoch=%llu "
                 "held-worker=%u suffix-sent=%u reset-before-release=%u "
                 "exact-results=%zu exact-attachments=1 final-ops=%zu "
-                "final-raw=%llu scope=%s\n",
+                "final-raw=%llu scope=%s boundary=%zu\n",
                 static_cast<unsigned>(profile), job_count, cut_boundary,
                 static_cast<unsigned long long>(ack.request.settled_prefix_k),
                 static_cast<unsigned long long>(ack.recovery_prepared_prefix_p),
@@ -2921,7 +3080,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                 recovered.reset_before_release, job_count,
                 recovered.final_source_operations,
                 static_cast<unsigned long long>(recovered.final_source_raw_bytes),
-                w30 ? "w30-k0" : "smoke");
+                w30 ? "w30" : "smoke", cut_boundary);
 }
 
 void test_p51_d14_reset_boundary_smoke_all_profiles() {
@@ -2934,6 +3093,20 @@ void test_p51_d14_w30_k0_all_profiles() {
     for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
                                     ProfileId::ZSTD_ROUTE})
         test_p51_d14_reset_boundary_smoke(profile, 31, 0, true);
+}
+
+void test_p51_d14_w30_terminal_all_profiles() {
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE})
+        test_p51_d14_reset_boundary_smoke(profile, 32, 31, true);
+}
+
+void test_p51_d14_w30_reset_boundary_matrix() {
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE}) {
+        for (size_t boundary = 0; boundary <= 30; ++boundary)
+            test_p51_d14_reset_boundary_smoke(profile, 31, boundary, true);
+    }
 }
 
 void test_p51_d07_active_cancel_recovery(ProfileId profile,
@@ -14361,6 +14534,33 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-w30-boundary-matrix") == 0) {
+            test_p51_d14_w30_reset_boundary_matrix();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d14-w30-terminal-all-profiles") == 0) {
+            test_p51_d14_w30_terminal_all_profiles();
+            return 0;
+        }
+        if (argc == 4 &&
+            std::strcmp(argv[1], "--d14-w30-boundary") == 0) {
+            char* profile_end = nullptr;
+            char* boundary_end = nullptr;
+            const unsigned long profile_value =
+                std::strtoul(argv[2], &profile_end, 10);
+            const unsigned long boundary_value =
+                std::strtoul(argv[3], &boundary_end, 10);
+            CHECK(profile_end != argv[2] && *profile_end == '\0');
+            CHECK(boundary_end != argv[3] && *boundary_end == '\0');
+            CHECK(profile_value >= 1 && profile_value <= 3);
+            CHECK(boundary_value <= 30);
+            test_p51_d14_reset_boundary_smoke(
+                static_cast<ProfileId>(profile_value), 31,
+                static_cast<size_t>(boundary_value), true);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d14-reset-boundary-smoke") == 0) {
             test_p51_d14_reset_boundary_smoke_all_profiles();
             return 0;
@@ -14525,6 +14725,8 @@ int main(int argc, char** argv) {
         test_p51_d07_positive_recovery_owner_all_profiles();
         test_p51_d07_committed_attempt_replacement_all_profiles();
         test_p51_d14_w30_k0_all_profiles();
+        test_p51_d14_w30_reset_boundary_matrix();
+        test_p51_d14_w30_terminal_all_profiles();
         for (const ProfileId profile : {
                  ProfileId::P29V1, ProfileId::ZSTD_TU,
                  ProfileId::ZSTD_ROUTE})
