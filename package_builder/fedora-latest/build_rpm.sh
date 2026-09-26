@@ -225,6 +225,8 @@ fi
 
 dnf_cmd -y builddep "$SPEC_PATH"
 
+# root-mode %check drops to an unprivileged uid that must reach the build tree
+chmod o+x "$HOME"
 rpmbuild -ba "$SPEC_PATH"
 
 # Empty per-run output directory + manifest (PKG-2): repeated runs used to
