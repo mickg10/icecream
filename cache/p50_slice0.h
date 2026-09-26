@@ -386,6 +386,7 @@ public:
     void accept_commit(const TxCommit& committed,
                        ActionType action = ActionType::COMMIT_ACCEPTED);
     void abandon_active();
+    void cancel_unadvanced_active_before_fill();
     void configure_speculative_window(uint32_t max_tus,
                                       uint64_t max_raw_bytes);
     [[nodiscard]] std::vector<uint8_t> predicted_need_v1();

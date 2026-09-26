@@ -627,6 +627,126 @@ void test_speculative_window_holds_exact_ordered_commit_witnesses() {
         "C accepted a duplicate receipt after the speculative ledger drained");
 }
 
+void test_cancel_unadvanced_p29_preserves_warm_history() {
+    const CStoreGuid c_guid = CStoreGuid::from_u64(79);
+    const FStoreGuid f_guid = FStoreGuid::from_u64(80);
+    const HistoryNonce nonce{81};
+    CAuthority authority(c_guid);
+    CRoute route(authority, f_guid, nonce);
+    route.configure_speculative_window(4, 4096);
+    FStore store(f_guid, 1, nullptr, UINT64_C(1) << 20, false);
+    const SessionHandle session = store.connect(c_guid, ProfileId::P29V1);
+    store.start_route(session, nonce, initial_route_digest(c_guid, nonce));
+
+    const auto prepare_text = [&](std::string_view text) {
+        return P50Slice0TestAccess::prepare(
+            authority, std::span<const uint8_t>(
+                           reinterpret_cast<const uint8_t*>(text.data()),
+                           text.size()));
+    };
+    const std::string predecessor =
+        "namespace warm_history {\nint shared_symbol = 41;\n}\n";
+    const std::string cancelled =
+        "namespace warm_history {\nint shared_symbol = 41;\nint discarded = 9;\n}\n";
+    const std::string successor =
+        "namespace warm_history {\nint shared_symbol = 41;\nint kept = 10;\n}\n";
+    const PreparedTUPtr predecessor_tu = prepare_text(predecessor);
+    const PreparedTUPtr cancelled_tu = prepare_text(cancelled);
+    const PreparedTUPtr successor_tu = prepare_text(successor);
+
+    const auto send_and_commit_f = [&](const CActiveTx& active,
+                                       std::string_view expected) {
+        const std::vector<uint8_t> predicted = route.predicted_need_v1();
+        store.begin(session, active.begin);
+        store.append_body(session, active.body);
+        const std::vector<uint8_t> need = store.p29v1_need_frames(session);
+        require(predicted == need,
+                "P29 cancellation regression predicted the wrong real NEED");
+        const std::span<const uint8_t> fill_span = route.build_fill_v1(need);
+        const std::vector<uint8_t> fill(fill_span.begin(), fill_span.end());
+        store.append_fill_v1(session, fill);
+        const std::vector<uint8_t> materialized =
+            store.materialize_and_verify(session);
+        require(materialized.size() == expected.size() &&
+                    std::equal(materialized.begin(), materialized.end(),
+                               reinterpret_cast<const uint8_t*>(expected.data())),
+                "P29 warm-history route decoded bytes differ from exact input");
+        TxCommit commit = store.commit_input(session);
+        route.advance_speculative_v1();
+        return commit;
+    };
+
+    const CActiveTx& first =
+        route.begin_v1(predecessor_tu, UINT64_C(1) << 20);
+    route.pin_v1_system_source_reuse(false);
+    const TxCommit predecessor_commit = send_and_commit_f(first, predecessor);
+    require(route.next_rel_seq() == RelSeq{0} &&
+                route.speculative_next_rel_seq() == RelSeq{1} &&
+                route.speculative_tu_count() == 1 &&
+                store.resume(session).next_rel_seq == RelSeq{1},
+            "warm predecessor did not remain as one exact speculative witness");
+
+    const CActiveTx& abandoned =
+        route.begin_v1(cancelled_tu, UINT64_C(1) << 20);
+    const TxBegin abandoned_begin = abandoned.begin;
+    (void)route.predicted_need_v1();
+    route.cancel_unadvanced_active_before_fill();
+    require(!route.active() && route.next_rel_seq() == RelSeq{0} &&
+                route.speculative_next_rel_seq() == RelSeq{1} &&
+                route.speculative_tu_count() == 1 &&
+                route.speculative_raw_bytes() == predecessor.size(),
+            "pre-FILL cancellation changed the retained predecessor witness");
+
+    const CActiveTx& next =
+        route.begin_v1(successor_tu, UINT64_C(1) << 20);
+    require(next.begin.rel_seq == abandoned_begin.rel_seq &&
+                next.begin.history_nonce == abandoned_begin.history_nonce,
+            "pre-FILL cancellation did not reuse the unadvanced identity");
+    const TxCommit successor_commit = send_and_commit_f(next, successor);
+    require(route.speculative_next_rel_seq() == RelSeq{2} &&
+                route.speculative_tu_count() == 2 &&
+                store.resume(session).next_rel_seq == RelSeq{2},
+            "warm successor did not extend the exact predecessor prefix");
+    route.accept_commit(predecessor_commit);
+    route.accept_commit(successor_commit);
+    require(route.next_rel_seq() == RelSeq{2} &&
+                route.state_digest() == successor_commit.post_state_digest &&
+                route.speculative_tu_count() == 0 &&
+                route.speculative_raw_bytes() == 0,
+            "warm-history cancellation receipts did not drain in order");
+
+    // A valid NEED followed by build_fill_v1() enters answer_need()'s FILL
+    // encoder. That boundary is deliberately irreversible even if the FILL
+    // bytes have not yet been sent to F.
+    const std::string after_fill = "int after_fill = 11;\n";
+    const CActiveTx& filling = route.begin_v1(
+        prepare_text(after_fill), UINT64_C(1) << 20);
+    const std::vector<uint8_t> predicted = route.predicted_need_v1();
+    store.begin(session, filling.begin);
+    store.append_body(session, filling.body);
+    const std::vector<uint8_t> need = store.p29v1_need_frames(session);
+    require(predicted == need,
+            "post-FILL rejection test did not use a valid real NEED");
+    const std::span<const uint8_t> final_fill_span = route.build_fill_v1(need);
+    const std::vector<uint8_t> final_fill(final_fill_span.begin(),
+                                          final_fill_span.end());
+    require_throws<std::logic_error>(
+        [&] { route.cancel_unadvanced_active_before_fill(); },
+        "pre-FILL cancellation accepted a serializer after FILL encoding");
+    store.append_fill_v1(session, final_fill);
+    const auto final_materialized = store.materialize_and_verify(session);
+    require(final_materialized.size() == after_fill.size() &&
+                std::equal(final_materialized.begin(), final_materialized.end(),
+                           reinterpret_cast<const uint8_t*>(after_fill.data())),
+            "post-FILL rejection corrupted the valid transaction");
+    const TxCommit final_commit = store.commit_input(session);
+    route.advance_speculative_v1();
+    route.accept_commit(final_commit);
+    require(route.next_rel_seq() == RelSeq{3} &&
+                route.speculative_tu_count() == 0,
+            "post-FILL rejection did not permit ordinary transaction completion");
+}
+
 void test_reset_rebuilds_only_unsent_speculative_suffix() {
     const CStoreGuid c_guid = CStoreGuid::from_u64(74);
     const FStoreGuid f_guid = FStoreGuid::from_u64(75);
@@ -791,6 +911,7 @@ int main() {
     test_f_store_routes_are_isolated_by_profile();
     test_authority_and_route_fail_closed_before_enablement();
     test_speculative_window_holds_exact_ordered_commit_witnesses();
+    test_cancel_unadvanced_p29_preserves_warm_history();
     test_reset_rebuilds_only_unsent_speculative_suffix();
     test_terminal_session_serial();
     return 0;

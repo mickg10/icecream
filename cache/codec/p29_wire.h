@@ -899,6 +899,19 @@ public:
     clear_pending();
   }
 
+  // Abort only the preparation phase before the first continuing-entropy
+  // encoder call. Unlike abandon(), this preserves the route's committed and
+  // speculative entropy state; it is safe for a staged R2 request that has
+  // not emitted JOB_BIND/FILL.
+  void abandon_before_fill() {
+    require_pending();
+    if (pending_.fill_started)
+      fail("P29 serializer cannot abandon after FILL encoding started");
+    if (matcher_.has_pending())
+      matcher_.abort();
+    clear_pending();
+  }
+
   [[nodiscard]] const p29::BlockCatalogue &catalogue() const {
     return matcher_.catalogue();
   }
@@ -959,6 +972,7 @@ private:
 
   struct Pending {
     bool active = false;
+    bool fill_started = false;
     bool fill_ready = false;
     bool close_entropy = false;
     std::uint64_t base_revision = 0;
@@ -1007,6 +1021,7 @@ private:
     return;
 #endif
     pending_.active = false;
+    pending_.fill_started = false;
     pending_.fill_ready = false;
     pending_.close_entropy = false;
     pending_.base_revision = 0;
@@ -1393,6 +1408,9 @@ private:
 
   void build_fill(bool close_entropy) {
     using namespace p29_wire_detail;
+    // Set before any mutation: an exception partway through encode() is not
+    // an invitation to reuse the continuing entropy stream.
+    pending_.fill_started = true;
     encode_missing_regions();
     for (const std::string &path : pending_.new_paths) {
       put_varint(pending_.path_raw, path.size());

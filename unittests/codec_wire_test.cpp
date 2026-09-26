@@ -367,6 +367,30 @@ static_assert(icecc::codec::P29ReceiverProvider<ResearchProvider>);
 static_assert(icecc::codec::P29SenderProvider<ProductProvider>);
 static_assert(icecc::codec::P29ReceiverProvider<ProductProvider>);
 
+class ThrowingFillDictionary {
+public:
+  explicit ThrowingFillDictionary(
+      const P29Interner<MmapInternProvider> &interner)
+      : interner_(interner) {}
+
+  std::span<const std::uint8_t> line(std::uint32_t id) const {
+    return interner_.line(id);
+  }
+  std::span<const std::uint32_t> region_lines(std::uint32_t id) const {
+    return interner_.region_lines(id);
+  }
+  std::span<const std::uint8_t> region_bytes(std::uint32_t id) const {
+    if (throw_region_bytes_)
+      throw std::runtime_error("injected FILL dictionary failure");
+    return interner_.region_bytes(id);
+  }
+  void throw_on_region_bytes(bool enabled) { throw_region_bytes_ = enabled; }
+
+private:
+  const P29Interner<MmapInternProvider> &interner_;
+  bool throw_region_bytes_ = false;
+};
+
 struct LogicalTu {
   fs::path path;
   std::uint64_t raw_size = 0;
@@ -766,6 +790,43 @@ void run_wire_controls(const Corpus &corpus,
   require(!corpus.tus.empty() && !corpus.tus.front().regions->empty(),
           "wire controls need one Region");
   const auto no_setup = [](ResearchProvider &) {};
+
+  // Force dictionary access to throw from encode_missing_regions(), after
+  // answer_need() has marked FILL encoding started but before fill_ready can
+  // become true. The receiver constructs the valid NEED from the exact BODY.
+  ResearchProvider sender_provider;
+  ResearchProvider receiver_provider;
+  ThrowingFillDictionary fault_dictionary(interner);
+  P29Serializer<ResearchProvider, ThrowingFillDictionary> serializer(
+      sender_provider, fault_dictionary);
+  P29Deserializer<ResearchProvider> deserializer(receiver_provider);
+  const std::vector<std::uint8_t> fault_body =
+      serializer.begin_tu(*corpus.tus.front().regions);
+  const std::vector<std::uint8_t> fault_need =
+      deserializer.receive_body(fault_body);
+  require(!fault_need.empty() &&
+              serializer.predicted_need_frames() == fault_need,
+          "partial-FILL guard test did not produce a real NEED");
+  fault_dictionary.throw_on_region_bytes(true);
+  bool fill_failed = false;
+  try {
+    (void)serializer.answer_need(fault_need, false);
+  } catch (const std::runtime_error &) {
+    fill_failed = true;
+  }
+  require(fill_failed && serializer.has_pending(),
+          "injected FILL failure did not leave a pending serializer");
+  bool partial_fill_rejected = false;
+  try {
+    serializer.abandon_before_fill();
+  } catch (const std::exception &) {
+    partial_fill_rejected = true;
+  }
+  require(partial_fill_rejected,
+          "serializer allowed pre-FILL abandon after partial FILL encoding");
+  serializer.abandon();
+  deserializer.abandon();
+
   const std::vector<std::uint8_t> body = single_region_body();
   const std::vector<std::uint8_t> control = literal_control(1, 3, 3);
   const std::array<std::uint8_t, 3> abc{'a', 'b', 'c'};

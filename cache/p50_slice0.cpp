@@ -2322,6 +2322,20 @@ void CRoute::abandon_active() {
     }
 }
 
+void CRoute::cancel_unadvanced_active_before_fill() {
+    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal || !p29v1_->serializer.has_pending() ||
+        p29v1_->fill_answered)
+        throw std::logic_error(
+            "P29 cancellation does not identify an active pre-FILL TU");
+    // The serializer method rejects a NEED whose FILL encoder was entered,
+    // including a throwing/partially-mutating encoder call.
+    p29v1_->serializer.abandon_before_fill();
+    record(ActionType::TX_ABORTED, *active_);
+    active_.reset();
+    p29v1_->answered_need.clear();
+}
+
 void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) {
     if (history_nonce == history_nonce_)
         throw std::invalid_argument("history reset requires a fresh HISTORY_NONCE");
