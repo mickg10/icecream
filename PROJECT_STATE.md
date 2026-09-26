@@ -12,6 +12,35 @@ retained artifact directories.
 
 ## Developer QA
 
+### Idle reconnect and batch verdict propagation
+
+`cdb13e0e` adds the opt-in `make -C unittests p50zstdsender-idle-check`
+to a configured build. All three profiles pass against the real sender and
+server endpoint: first request commits and is acknowledged, the link closes
+after its actual 60-second idle interval with K=Q=1, and a later request
+reconnects once and commits exact input without changing its absolute
+deadline. This is endpoint/sender coverage, not a full daemon restart test.
+The long check is excluded from the default fast suite; product code is
+unchanged. The final binary also passes the default sender suite.
+
+Artifacts: `/tanksmall/scratch/tmp/p51-c06-idle-reconnect-build/`.
+Final binary SHA256:
+`7633154a896a02767f2a97e0fe54a348346cc7df401fd3461c5acf22c071f1d3`.
+`c06-idle-run-r4.log` SHA256:
+`207c646cd806f9f06da8a3594540f585f319358197a619aaab4f155a46916b90`.
+`c06-default-sender-r2.log` SHA256:
+`6b0d04f514f36e47ba9bdf1323ecff721289c9fc07a18d1a2d02a1d3a8d3866b`.
+
+`44a04fc2` fixes a test-harness false-success path: a failed Python batch
+validator now explicitly fails `finish_batch`, including when its caller
+uses a shell OR-list (where implicit `set -e` is ineffective). Regression
+tests execute the extracted real shell function with success/failure stubs.
+The donor's focused tests plus distribution checks pass 14 tests; log:
+`/tanksmall/scratch/tmp/p51-finish-batch-status-guard/pytest-verify.log`,
+SHA256 `f622c9f0e936ba275637fd440925c6075acef59a55b19ddcdf44dda5c5826f1a`.
+Neither this harness fix nor the focused idle test establishes full combined
+candidate qualification; scheduler-to-F recovery remains open.
+
 ### Persistent wrapper gate entry point
 
 `5f426c01` adds `ICEFARM_TMPDIR=/existing/scratch make dev-gate
