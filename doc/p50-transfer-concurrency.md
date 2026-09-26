@@ -967,6 +967,40 @@ with measured per-link occupancy. Do not infer end-to-end 4xW30 occupancy
 from isolated cache-link tests or raise production dispatch bounds without
 measuring their effects on queued work and recovery.
 
+#### Pending implementation: source-operation capacity response
+
+The current C-side operation cap is 120 and includes reply/Goodbye settlement,
+not just pending wire receipts. Four W30 links can therefore overlap with
+settling operations and reach this cap. A cap refusal currently closes the
+local control connection after source-FD handoff. Increasing the cap alone
+does not resolve this outcome. The required change is:
+
+- Distinguish accepted, capacity-full, and other rejected enqueue outcomes.
+  Validate the request, clock/deadline and C incarnation before reporting
+  capacity. The capacity branch must precede source read/allocation, route
+  binding, ordinal allocation and any transfer to F; retain caller ownership
+  of the control connection, operation and source descriptor on that branch.
+- Return a typed capacity result in the existing result field, with zero
+  attempts and no commit witness. Its response/Goodbye exchange has an
+  explicit short budget clipped to the original deadline. Use the existing
+  bounded control worker; do not create an unbounded rejection-reply queue
+  or release an accepted operation's credit before its reply settles.
+- The wrapper retains its immutable source and uses one owned CLOEXEC
+  duplicate per control attempt. Retry only a fully validated, completed
+  capacity response, with 10 ms exponential backoff capped at 200 ms and the
+  same absolute deadline. Do not repeat F ARM or replace the F reservation.
+  A fresh C control lease must match the entire original C identity,
+  including generation, attempt, peer IDs and store identity. A changed
+  identity, ambiguous control failure or any other error is not capacity.
+- Verify cap-one with withheld Goodbye, bounded capacity response, release
+  and same-assignment success; expiry without late publication; malformed
+  and changed-identity rejection; a nonreading rejection peer; repeated
+  retries without descriptor/credit growth; and unrelated-link progress.
+  Real four-link W30 plus reply-settlement overlap remains a separate gate.
+  Assert exactly one F ARM and unchanged operation/deadline across retries.
+
+This subsection specifies work in progress, not a qualified capacity fix.
+
 Initial rollout keeps R2 opt-in and W1. For R2 tests expose validated window,
 raw-byte, encoded-byte, F-output-byte and metadata-count settings through one
 configuration path; reject zero/overflow/inconsistent budgets at startup.
