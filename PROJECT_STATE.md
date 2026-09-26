@@ -233,6 +233,18 @@ SHA256 `88de71cf8904ea3bb9f87ff6a8f43c28aba479b401a5968de1ddc9574d93fc23`.
 Matched negative log:
 `/tanksmall/scratch/tmp/w30-adapter-runtime-user/windowbench-finalizer-negative-r2-32-p0-w4.log`,
 SHA256 `7ee729dad791d37e74b43f8b1522e4d484dcc79f03fbb25244307a143c054be8`.
+Registered Automake result: `.trs`
+`/tanksmall/scratch/tmp/p51-transfer-window-config-20260926/work/build/unittests/p50transferwindowbench.trs`,
+SHA256 `7f175f2f5d04511903d382671ba96ca623e127f57730d53966587cf2c2689229`;
+log
+`/tanksmall/scratch/tmp/p51-transfer-window-config-20260926/work/build/unittests/p50transferwindowbench.log`,
+SHA256 `fad9b89182b80563e854a62f79e315d6299de27ab802af6a30088dd9f29d0e2f`.
+Normal ungated 32-input CLI smoke log
+`/tanksmall/scratch/tmp/w30-adapter-runtime-user/windowbench-cli-ungated-r2-32-p0-w4.log`,
+SHA256 `9ac3d9e974cdb34c76e62ba65aa0db3f35453177a394a1164a1dc15fa277d840`;
+focused recovery suite log
+`/tanksmall/scratch/tmp/w30-adapter-runtime-user/windowbench-recovery-focused-r1.log`,
+SHA256 `f6133521fdf5207a97679e001fbc17c0fff9567fe3fbbd41a4ca21837eece7d2`.
 `293dda5d0ae5390299fd2631706ef10d4c7a7a2965ef315b174bba4ed0f3cfe1`;
 service SHA256:
 `67acb6a1676167da90827e857afdea05912b5b0ec9c2e9c01cb93b0cfc280fff`.
