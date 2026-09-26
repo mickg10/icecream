@@ -60,6 +60,17 @@ for each selector. Logs under
 These qualify the existing C/F replacement matrix and ARM-expiry assertions,
 not all compiler-loss, chained restart or external-farm cases.
 
+The same frozen build passes `p51-scheduler-restart-w30` for all three profiles;
+log `05-gate-p51-scheduler-restart-w30.log` in that directory has SHA256
+`8d1874fdfbadbb7f76c0267248ca4501d05a6d78ddb656f7067f89bd8326a4cf`.
+The following scheduler-to-F chain **fails** its final receipt-window witness:
+the new-connection-only interceptor sees zero commits while post-F clients
+complete over the existing connection. This is evidence of a fixture limitation,
+not a passed chained-restart gate or a demonstrated product failure. Retained
+log `07-gate-p51-scheduler-f-restart-w30.log` has SHA256
+`437896d49f10bc6610a7192f87cf46ab316e8e24bb472c32e040c0570da84d58`.
+The persistent-connection observation must be corrected and the gate rerun.
+
 Candidate `f15b1561` also integrates the GCC 11 build workaround, donor
 `c3da4617`: only the production/test cache-service targets demote
 `-Wmismatched-new-delete`; other warnings remain errors and frame recycling
