@@ -73,6 +73,30 @@ donor success must not be presented as their result.
 
 ### Source admission pressure
 
+The four-link overlap gate is integrated in `6d6276f6` from donor `321302e1`.
+On donor binaries, P29V1, ZSTD_TU and ZSTD_ROUTE each passed: all four links
+held 30 wire receipts simultaneously; releasing one link's receipts left
+90 wire-pending operations plus 30 local reply settlements. At that point
+request 121 received CapacityBusy with zero attempts, no witness and unchanged
+source offset. Explicitly releasing one settlement allowed the same assignment,
+ARM, source and deadline to complete; all 120 original operations settled.
+Release acknowledgments are published after credit release, and timeout release
+does not qualify as an explicit release. This exercises real sidecars and
+daemon control, not a full compiler-wrapper workload.
+
+Logs under `/tanksmall/scratch/tmp/p51-w30-capacity-overlap-build/tmp/`:
+
+| Profile | Log | SHA256 |
+| --- | --- | --- |
+| P29V1 | `c1f4-p29v1.log` | `f5a34283a574bdb45b55ebf56656472b3e8885772bf8974668855767dd1789b9` |
+| ZSTD_TU | `c1f4-zstd-tu.log` | `c00fd437d700a2c6149eefa2dabac59c3c270ffe8f38460bcd9a9e6a1bd618f7` |
+| ZSTD_ROUTE | `c1f4-zstd-route.log` | `078314af6d5ccb337a488a1600275fde74304317efc1f8e5044476352882b9b1` |
+
+Merged cancellation-plus-overlap qualification and supported dev-gate routing
+are pending. The distributed runner is `unittests/p51capacity-w30-run.sh`;
+it requires an isolated root container with NET_ADMIN, not an ordinary local
+`make check` environment.
+
 Commit `983c64ab` implements typed CapacityBusy before source read/route work,
 with a response budget of at most 100 ms clipped to the original deadline.
 The compiler wrapper retries only completed, validated Busy responses using
