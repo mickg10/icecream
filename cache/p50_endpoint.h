@@ -371,6 +371,14 @@ struct EndpointIoControl {
     // Carries immutable identities only; never copies source payload bytes.
     std::function<void(const JobBind&, const TxBegin&, const TxCommit&)>
         before_materialize_identified_for_test;
+    // Inbound strict-prefix witness for a parsed P51 job. Called after the
+    // complete frame header is read and before its payload read begins.
+    std::function<void(const JobBind&, const TxBegin&, MessageType, size_t)>
+        after_r2_component_header_for_test;
+    // Outbound fragmentation seam. The callback runs after each successful
+    // fragment and may asynchronously gate the sender in deterministic tests.
+    std::function<boost::asio::awaitable<void>(const Message&, size_t, size_t)>
+        after_write_fragment_for_test;
 #endif
     // Simulator/test-only observation after one complete message has been
     // written successfully. It receives an immutable message copy and cannot

@@ -2486,6 +2486,21 @@ P50ZstdSourceSender::transfer_p51_route(
         // the first JOB_BIND byte is made visible on the stream.
         EndpointIoControl bundle_control = std::exchange(
             impl_->config.r2_bundle_io_control_for_test, EndpointIoControl{});
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (impl_->config.after_r2_write_fragment_for_test) {
+            auto observer = impl_->config.after_r2_write_fragment_for_test;
+            const PrepareRequestKey fragment_key = request;
+            const JobBind fragment_binding = binding;
+            bundle_control.after_write_fragment_for_test =
+                [observer = std::move(observer), fragment_key,
+                 fragment_binding](const Message& message, size_t offset,
+                                   size_t total)
+                    -> boost::asio::awaitable<void> {
+                    co_await observer(fragment_key, fragment_binding, message,
+                                      offset, total);
+                };
+        }
+#endif
         endpoint_bundle_call_started = true;
         pending->sent = co_await impl_->endpoint->write_r2_bundle(
             *impl_->r2_socket, binding, prepared, deadline,

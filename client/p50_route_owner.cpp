@@ -60,6 +60,8 @@ ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     result.before_r2_first_bundle_write_for_test =
         owner_config.before_r2_first_bundle_write_for_test;
+    result.after_r2_write_fragment_for_test =
+        owner_config.after_r2_write_fragment_for_test;
     result.r2_prewrite_cancelled_for_test =
         owner_config.r2_prewrite_cancelled_for_test;
 #endif

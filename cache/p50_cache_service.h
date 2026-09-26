@@ -160,6 +160,10 @@ struct RuntimeConfig {
     std::function<boost::asio::awaitable<void>(p50::PrepareRequestKey,
                                                const JobBind&)>
         before_r2_first_bundle_write_for_test;
+    std::function<boost::asio::awaitable<void>(p50::PrepareRequestKey,
+                                               const JobBind&, const Message&,
+                                               size_t, size_t)>
+        after_r2_write_fragment_for_test;
     std::function<void(p50::PrepareRequestKey, const JobBind&)>
         r2_prewrite_cancelled_for_test;
 #endif

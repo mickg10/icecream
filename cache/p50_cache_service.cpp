@@ -2320,6 +2320,8 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
         config_.disconnect_r2_before_replay_bundle_for_test;
     route_config.before_r2_first_bundle_write_for_test =
         config_.before_r2_first_bundle_write_for_test;
+    route_config.after_r2_write_fragment_for_test =
+        config_.after_r2_write_fragment_for_test;
     route_config.r2_prewrite_cancelled_for_test =
         config_.r2_prewrite_cancelled_for_test;
 #endif

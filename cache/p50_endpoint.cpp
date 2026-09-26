@@ -1427,7 +1427,12 @@ asio::awaitable<void> async_write_message(tcp::socket& socket, Message message,
         log->begin_r2_bundle_attempt(stamp);
     size_t offset = 0;
     while (offset != frame.size()) {
-        const size_t count = std::min(control.max_write_fragment, frame.size() - offset);
+        size_t count = std::min(control.max_write_fragment,
+                                frame.size() - offset);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (control.after_write_fragment_for_test && offset == 0)
+            count = std::min<size_t>(4, count);
+#endif
         const CompletionStamp expected =
             with_operation(stamp, AsyncOperationKind::WriteFragment);
         boost::system::error_code error;
@@ -1439,6 +1444,11 @@ asio::awaitable<void> async_write_message(tcp::socket& socket, Message message,
         if (error)
             throw boost::system::system_error(error);
         offset += written;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (control.after_write_fragment_for_test)
+            co_await control.after_write_fragment_for_test(message, offset,
+                                                             frame.size());
+#endif
     }
     if (control.outbound_message_observer)
         control.outbound_message_observer(stamp.actor, message);
@@ -1475,7 +1485,12 @@ asio::awaitable<void> async_report_client_terminal(
 template <class Verify>
 asio::awaitable<Frame> async_read_frame(tcp::socket& socket, uint32_t max_payload,
                                         CompletionStamp stamp, CompletionLog* log,
-                                        Verify verify) {
+                                        Verify verify
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                                        , std::function<void(const FrameHeader&)>
+                                              after_header = {}
+#endif
+                                        ) {
     std::array<uint8_t, 4> raw_header{};
     const CompletionStamp expected_header =
         with_operation(stamp, AsyncOperationKind::ReadHeader);
@@ -1487,6 +1502,10 @@ asio::awaitable<Frame> async_read_frame(tcp::socket& socket, uint32_t max_payloa
     if (error)
         throw boost::system::system_error(error);
     const FrameHeader header = decode_frame_header(raw_header, max_payload);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (after_header)
+        after_header(header);
+#endif
     Frame frame{header.type, std::vector<uint8_t>(header.payload_bytes)};
     if (!frame.payload.empty()) {
         const CompletionStamp expected_payload =
@@ -7480,9 +7499,23 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
             Digest128 outer_transaction_digest{};
 
             for (;;) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                auto header_observer = [&](const FrameHeader& header) {
+                    if (header.type == MessageType::R2_BODY &&
+                        header.payload_bytes != 0 &&
+                        control.after_r2_component_header_for_test)
+                        control.after_r2_component_header_for_test(
+                            binding, tu_begin.inner, header.type,
+                            header.payload_bytes);
+                };
+#endif
                 Frame component = co_await async_read_frame(
                     socket, frame_cap, stamp(AsyncOperationKind::ReadHeader),
-                    impl_->completions, verify);
+                    impl_->completions, verify
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+                    , header_observer
+#endif
+                    );
                 if (component.type == MessageType::TU_END) {
                     const TuEnd end = decode_as<TuEnd>(component);
                     outer_transaction_digest = outer_digest.finish();

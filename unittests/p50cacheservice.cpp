@@ -3016,6 +3016,7 @@ enum class D07Scenario : uint8_t {
     InterruptedReplay,
     PositiveRecoveryOwner,
     CommittedAttemptReplacement,
+    PartialBodyPrefix,
 };
 
 std::vector<uint8_t> d14_input(size_t index) {
@@ -3924,15 +3925,18 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                                          std::optional<size_t>
                                              committed_cohort_target_index =
                                                  std::nullopt) {
+    const bool partial_body_prefix =
+        scenario == D07Scenario::PartialBodyPrefix;
     CHECK(!(full_cohort_target_index.has_value() &&
             committed_cohort_target_index.has_value()));
     const bool full_committed_cohort =
         committed_cohort_target_index.has_value();
     const bool full_cohort = full_cohort_target_index.has_value() ||
-                             full_committed_cohort;
+                             full_committed_cohort || partial_body_prefix;
+    CHECK(!(full_committed_cohort && partial_body_prefix));
     const size_t full_target_index = full_committed_cohort
         ? *committed_cohort_target_index
-        : full_cohort_target_index.value_or(0);
+        : full_cohort_target_index.value_or(partial_body_prefix ? 15 : 0);
     if (full_cohort)
         CHECK(full_target_index < 31);
     const bool interrupt_replay =
@@ -4009,6 +4013,14 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
     std::optional<JobBind> full_followup_binding;
     std::optional<TxBegin> full_followup_begin;
     std::optional<TxCommit> full_followup_commit;
+    std::mutex partial_prefix_mutex;
+    std::condition_variable partial_prefix_changed;
+    std::atomic<bool> partial_sender_prefix_reached{false};
+    std::atomic<bool> partial_sender_waiting{false};
+    std::atomic<bool> release_partial_sender{false};
+    std::atomic<bool> partial_sender_gate_timed_out{false};
+    std::atomic<size_t> partial_body_payload_bytes{0};
+    std::atomic<size_t> partial_f_header_payload_bytes{0};
 
     service::RuntimeConfig f_config = test_runtime_config();
     f_config.c_store_guid = f_launch.c_store_guid;
@@ -4070,6 +4082,45 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         }
         first_bundle_changed.notify_all();
     };
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (partial_body_prefix) {
+        c_config.after_r2_write_fragment_for_test =
+            [&](PrepareRequestKey request, const JobBind& binding,
+                const Message& message, size_t written, size_t total)
+                -> boost::asio::awaitable<void> {
+                if (request.request_token != full_cohort_target_id ||
+                    binding.source_request_id != full_cohort_target_id ||
+                    !std::holds_alternative<R2BodyMessage>(message) ||
+                    written != 4 || total <= written)
+                    co_return;
+                partial_body_payload_bytes.store(total - 4,
+                                                 std::memory_order_release);
+                partial_sender_prefix_reached.store(true,
+                                                    std::memory_order_release);
+                partial_prefix_changed.notify_all();
+                const auto executor = co_await
+                    boost::asio::this_coro::executor;
+                boost::asio::steady_timer timer(executor);
+                const auto limit = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(10);
+                while (!release_partial_sender.load(std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < limit) {
+                    partial_sender_waiting.store(true,
+                                                 std::memory_order_release);
+                    partial_prefix_changed.notify_all();
+                    timer.expires_after(std::chrono::milliseconds(1));
+                    co_await timer.async_wait(boost::asio::use_awaitable);
+                }
+                if (!release_partial_sender.load(std::memory_order_acquire)) {
+                    partial_sender_gate_timed_out.store(
+                        true, std::memory_order_release);
+                    throw std::runtime_error(
+                        "D07 partial-body sender gate exceeded bound");
+                }
+                co_return;
+            };
+    }
+#endif
     auto replay_bundle_calls = std::make_shared<std::atomic<size_t>>(0);
     auto interrupted_ordinal = std::make_shared<std::atomic<uint64_t>>(0);
     std::atomic<bool> first_recovered_positive{false};
@@ -4210,7 +4261,8 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             control.before_materialize_on_worker = before_materialize;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
             if (full_cohort) {
-                control.before_materialize_identified_for_test =
+                if (!partial_body_prefix)
+                    control.before_materialize_identified_for_test =
                     [&](const JobBind& binding, const TxBegin& begin,
                         const TxCommit& commit) {
                         if (binding.source_request_id ==
@@ -4240,6 +4292,25 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                             full_bundle_changed.notify_all();
                         }
                     };
+                if (partial_body_prefix)
+                    control.after_r2_component_header_for_test =
+                        [&](const JobBind& binding, const TxBegin& begin,
+                            MessageType type, size_t payload_bytes) {
+                            if (binding.source_request_id !=
+                                    full_cohort_target_id ||
+                                type != MessageType::R2_BODY ||
+                                payload_bytes == 0)
+                                return;
+                            std::lock_guard lock(full_bundle_mutex);
+                            if (full_target_bundle_reached)
+                                return;
+                            full_target_binding = binding;
+                            full_target_begin = begin;
+                            partial_f_header_payload_bytes.store(
+                                payload_bytes, std::memory_order_release);
+                            full_target_bundle_reached = true;
+                            full_bundle_changed.notify_all();
+                        };
             }
 #endif
             control.outbound_message_observer =
@@ -4412,6 +4483,15 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 static_cast<uint8_t>(0x20 + index)));
         }
         RequestRow& target = rows[target_index];
+        struct PartialWriterReleaseGuard {
+            std::atomic<bool>& released;
+            std::condition_variable& changed;
+            ~PartialWriterReleaseGuard() {
+                released.store(true, std::memory_order_release);
+                changed.notify_all();
+            }
+        } partial_writer_release_guard{
+            release_partial_sender, partial_prefix_changed};
         const auto target_deadline =
             target.request.absolute_deadline.as_steady_time_point();
         if (full_committed_cohort) {
@@ -4842,7 +4922,8 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         const Digest128 target_digest = icecc::digest128(target.bytes);
         bool all_submitted = true;
         std::fprintf(stderr,
-            "P51_D07 full-cancel-stage begin-submit profile=%u target=%zu\n",
+            "P51_D07 %s-cancel-stage begin-submit profile=%u target=%zu\n",
+            partial_body_prefix ? "partial-body" : "full",
             static_cast<unsigned>(profile), target_index);
         std::fflush(stderr);
         size_t submitted_count = 0;
@@ -4859,7 +4940,8 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             }
         }
         std::fprintf(stderr,
-            "P51_D07 full-cancel-stage submitted=%d target-index=%zu\n",
+            "P51_D07 %s-cancel-stage submitted=%d target-index=%zu\n",
+            partial_body_prefix ? "partial-body" : "full",
             all_submitted ? 1 : 0, target_index);
         std::fflush(stderr);
         CHECK(all_submitted);
@@ -4873,21 +4955,24 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 });
         }
         std::fprintf(stderr,
-            "P51_D07 full-cancel-stage target-at-F=%d target-index=%zu\n",
+            "P51_D07 %s-cancel-stage target-at-F=%d target-index=%zu\n",
+            partial_body_prefix ? "partial-body" : "full",
             target_reached_f ? 1 : 0, target_index);
         std::fflush(stderr);
         CHECK(target_reached_f);
         JobBind observed_binding{};
         TxBegin observed_begin{};
-        TxCommit observed_commit{};
+        std::optional<TxCommit> observed_commit;
         {
             std::lock_guard lock(full_bundle_mutex);
             CHECK(full_target_binding.has_value());
             CHECK(full_target_begin.has_value());
-            CHECK(full_target_commit.has_value());
             observed_binding = *full_target_binding;
             observed_begin = *full_target_begin;
-            observed_commit = *full_target_commit;
+            if (full_target_commit)
+                observed_commit = *full_target_commit;
+            CHECK(partial_body_prefix ? !observed_commit.has_value()
+                                      : observed_commit.has_value());
         }
         const bool exact_f_target_identity =
             observed_binding.source_request_id == target.request_id &&
@@ -4901,9 +4986,10 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             observed_begin.profile == profile &&
             observed_begin.raw_bytes == target.bytes.size() &&
             observed_begin.raw_digest == target_digest &&
-            observed_commit.tu_seq == observed_begin.tu_seq &&
-            observed_commit.rel_seq == observed_begin.rel_seq &&
-            observed_commit.raw_digest == target_digest;
+            (partial_body_prefix ||
+             (observed_commit->tu_seq == observed_begin.tu_seq &&
+              observed_commit->rel_seq == observed_begin.rel_seq &&
+              observed_commit->raw_digest == target_digest));
         std::fprintf(stderr,
             "P51_D07 full-cancel-identity profile=%u target-index=%zu "
             "req=%llu binding={request:%d,reservation:%d,tu:%d,"
@@ -4925,17 +5011,30 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             observed_begin.profile == profile,
             observed_begin.raw_bytes == target.bytes.size(),
             observed_begin.raw_digest == target_digest,
-            observed_commit.tu_seq == observed_begin.tu_seq,
-            observed_commit.rel_seq == observed_begin.rel_seq,
-            observed_commit.raw_digest == target_digest);
+            !partial_body_prefix &&
+                observed_commit->tu_seq == observed_begin.tu_seq,
+            !partial_body_prefix &&
+                observed_commit->rel_seq == observed_begin.rel_seq,
+            !partial_body_prefix &&
+                observed_commit->raw_digest == target_digest);
         std::fflush(stderr);
         CHECK(exact_f_target_identity);
 
-        // The F parser has closed this exact bundle and dispatched its
-        // identity-bearing materializer, which is held before publication.
-        // Therefore there cannot yet be a positive target receipt at C.
+        // Full mode holds materialization after bundle closure. Partial mode
+        // holds C after the BODY frame header and proves F parsed that header.
+        // In either case there cannot yet be a positive target receipt.
         bool c_completed_target_bundle = false;
-        {
+        bool sender_prefix_held = false;
+        if (partial_body_prefix) {
+            std::unique_lock lock(partial_prefix_mutex);
+            sender_prefix_held = partial_prefix_changed.wait_for(
+                lock, std::chrono::seconds(5), [&] {
+                    return partial_sender_prefix_reached.load(
+                               std::memory_order_acquire) &&
+                           partial_sender_waiting.load(
+                               std::memory_order_acquire);
+                });
+        } else {
             std::unique_lock lock(first_bundle_mutex);
             c_completed_target_bundle = first_bundle_changed.wait_for(
                 lock, std::chrono::seconds(3), [&] {
@@ -4957,19 +5056,30 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                            receipt.inner.raw_digest == target_digest;
                 });
         }
-        CHECK(c_completed_target_bundle);
+        CHECK(partial_body_prefix
+                  ? (sender_prefix_held &&
+                     partial_body_payload_bytes.load(
+                         std::memory_order_acquire) > 0)
+                  : c_completed_target_bundle);
         CHECK(target_receipt_absent_at_cut);
         std::fprintf(stderr,
-            "P51_D07 full-cancel-stage ready-to-cancel index=%zu ordinal=%llu\n",
+            "P51_D07 %s-cancel-stage ready-to-cancel index=%zu ordinal=%llu "
+            "F-header=%d payload-bytes=%zu sender-prefix-held=%d\n",
+            partial_body_prefix ? "partial-body" : "full",
             target_index,
             static_cast<unsigned long long>(
-                observed_binding.relationship_ordinal));
+                observed_binding.relationship_ordinal),
+            partial_body_prefix ? 1 : 0,
+            partial_body_payload_bytes.load(std::memory_order_acquire),
+            sender_prefix_held ? 1 : 0);
         std::fflush(stderr);
 
         const auto cancellation_time = std::chrono::steady_clock::now();
         const bool f_cancelled = f_runtime.cancel_p51_source_on_owner(
             target.request.armed.arm,
             target.request.armed.reservation_id, target_deadline);
+        release_partial_sender.store(true, std::memory_order_release);
+        partial_prefix_changed.notify_all();
         {
             std::lock_guard lock(full_bundle_mutex);
             release_full_target_worker = true;
@@ -5111,6 +5221,38 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             c_runtime, 0, std::chrono::seconds(5));
         const bool raw_credit_released = wait_for_source_raw_bytes(
             c_runtime, 0, std::chrono::seconds(5));
+        bool followup_after_cancel = false;
+        bool followup_enqueued = false;
+        bool followup_before_deadline = false;
+        if (operations_released && raw_credit_released) {
+            RequestRow followup = make_request(
+                full_cohort_base + 900, 256, 0x7e);
+            const auto followup_deadline =
+                followup.request.absolute_deadline.as_steady_time_point();
+            followup_enqueued = enqueue(followup);
+            if (followup_enqueued) {
+                try {
+                    const auto followup_result = receive_p51_transfer_result(
+                        followup.pair.receiver, c_launch.identity,
+                        followup.request_id, followup_deadline, true);
+                    followup_before_deadline =
+                        std::chrono::steady_clock::now() <= followup_deadline;
+                    followup_after_cancel =
+                        followup_result.code ==
+                            local::SourceTransferResultCode::Committed &&
+                        attach_exact(followup, followup_result,
+                                     owner_for(followup), true);
+                } catch (...) {
+                    followup_after_cancel = false;
+                }
+            }
+        }
+        const bool post_followup_credits_released =
+            followup_after_cancel &&
+            wait_for_source_operation_count(c_runtime, 0,
+                                            std::chrono::seconds(5)) &&
+            wait_for_source_raw_bytes(c_runtime, 0,
+                                      std::chrono::seconds(5));
         size_t target_retirement_count = 0;
         {
             std::lock_guard lock(retired_mutex);
@@ -5121,15 +5263,23 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
                 }));
         }
         std::fprintf(stderr,
-            "P51_D07 full-cancel profile=%u submitted=31 position=%zu "
-            "request=%llu F-full-bundle=1 ordinal=%llu "
+            "P51_D07 %s-cancel profile=%u submitted=31 position=%zu "
+            "request=%llu F-full-bundle=%d partial-body-prefix=%d "
+            "F-payload-bytes=%zu sender-payload-bytes=%zu sender-suffix-held=%d "
+            "ordinal=%llu "
             "receipt-unresolved-at-cut=%d accepted-cancel=%d "
             "target-error=%d target-unpublished=%d survivors-exact=%d "
             "survivor-receipts=%d contiguous-ordinals=%d unique-tu=%d "
             "before-original-deadline=%d target-absence-probed-live=%d "
-            "credits-released=%d/%d retired=%zu\n",
+            "credits-released=%d/%d retired=%zu followup=%d/%d/%d\n",
+            partial_body_prefix ? "partial-body" : "full",
             static_cast<unsigned>(profile), target_index,
             static_cast<unsigned long long>(target.request_id),
+            partial_body_prefix ? 0 : 1,
+            partial_body_prefix ? 1 : 0,
+            partial_f_header_payload_bytes.load(std::memory_order_acquire),
+            partial_body_payload_bytes.load(std::memory_order_acquire),
+            partial_body_prefix && sender_prefix_held ? 1 : 0,
             static_cast<unsigned long long>(
                 observed_binding.relationship_ordinal),
             target_receipt_absent_at_cut ? 1 : 0, f_cancelled ? 1 : 0,
@@ -5142,12 +5292,26 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
             original_deadline_live && all_survivors_before_deadline ? 1 : 0,
             target_deadline_live_for_absence ? 1 : 0,
             operations_released ? 1 : 0, raw_credit_released ? 1 : 0,
-            target_retirement_count);
+            target_retirement_count, followup_after_cancel ? 1 : 0,
+            followup_before_deadline ? 1 : 0,
+            post_followup_credits_released ? 1 : 0);
         std::fflush(stderr);
         CHECK(all_submitted);
         CHECK(target_reached_f);
         CHECK(exact_f_target_identity);
-        CHECK(c_completed_target_bundle);
+        CHECK(partial_body_prefix ? sender_prefix_held
+                                  : c_completed_target_bundle);
+        if (partial_body_prefix) {
+            CHECK(!partial_sender_gate_timed_out.load(
+                std::memory_order_acquire));
+            CHECK(release_partial_sender.load(std::memory_order_acquire));
+            CHECK(partial_f_header_payload_bytes.load(
+                      std::memory_order_acquire) > 0);
+            CHECK(partial_body_payload_bytes.load(
+                      std::memory_order_acquire) ==
+                  partial_f_header_payload_bytes.load(
+                      std::memory_order_acquire));
+        }
         CHECK(target_receipt_absent_at_cut);
         CHECK(f_cancelled);
         CHECK(target_terminal_error);
@@ -5162,6 +5326,10 @@ void test_p51_d07_active_cancel_recovery(ProfileId profile,
         CHECK(target_deadline_live_for_absence);
         CHECK(operations_released);
         CHECK(raw_credit_released);
+        CHECK(followup_enqueued);
+        CHECK(followup_after_cancel);
+        CHECK(followup_before_deadline);
+        CHECK(post_followup_credits_released);
         CHECK(target_retirement_count == 1);
         return;
     }
@@ -5883,6 +6051,15 @@ void test_p51_d07_committed_full_all_profiles() {
             test_p51_d07_active_cancel_recovery(
                 profile, D07Scenario::ActiveCancel, std::nullopt, index);
         }
+    }
+}
+
+void test_p51_d07_partial_body_cancel_all_profiles() {
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE}) {
+        for (const size_t index : {size_t{0}, size_t{15}, size_t{30}})
+            test_p51_d07_active_cancel_recovery(
+                profile, D07Scenario::PartialBodyPrefix, index);
     }
 }
 
@@ -16214,6 +16391,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d07-partial-body-cancel") == 0) {
+            test_p51_d07_partial_body_cancel_all_profiles();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d07-active-cancel-replay-interrupt-p29") == 0) {
             test_p51_d07_active_cancel_recovery(
                 ProfileId::P29V1, D07Scenario::InterruptedReplay);
@@ -16449,6 +16631,7 @@ int main(int argc, char** argv) {
         test_p51_d07_staged_cancel_all_profiles();
         test_p51_d07_full_cancel_all_profiles();
         test_p51_d07_committed_full_all_profiles();
+        test_p51_d07_partial_body_cancel_all_profiles();
         test_p51_d07_active_cancel_all_profiles();
         test_p51_d07_active_cancel_replay_interrupt_all_profiles();
         test_p51_d07_positive_recovery_owner_all_profiles();
