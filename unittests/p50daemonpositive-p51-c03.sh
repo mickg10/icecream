@@ -47,6 +47,9 @@ run_case() {
             [ "$mode" = client ] && scenario=client_eof
             grep -q "C03_OBSERVATION scenario=$scenario" "$log"
             grep -q "C03_FRESH scenario=$scenario .*success=1" "$log"
+            if [ "$mode" = client ]; then
+                grep -q '^C03_CANCEL_ONCE scenario=client_eof job=2054227713 ' "$log"
+            fi
             ;;
         expiry)
             grep -q "expired exact R2 reservation produced End then EOF" "$log"

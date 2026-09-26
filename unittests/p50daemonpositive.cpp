@@ -6721,6 +6721,12 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_C03_SIDECAR_DEATH") != nullptr;
     const bool p51_c03_invalidation =
         p51_c03_client_eof || p51_c03_sidecar_death;
+    if (p51_c03_client_eof &&
+        ::setenv("ICECC_P50_DEBUG_ATTACH", "1", 1) != 0) {
+        std::fprintf(stderr,
+            "FAIL: cannot enable exact source-cancellation trace for C03\n");
+        return 2;
+    }
     const bool p51_cancel_before_start =
         ::getenv("ICECC_TEST_P51_CANCEL_BEFORE_START") != nullptr;
     const bool p51_cancel_after_deadline =
@@ -7360,6 +7366,68 @@ int main(int argc, char **argv)
             }
             REQUIRE(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
                     "C03 invalidation fixture daemon exits cleanly under bounded cleanup");
+            if (p51_c03_client_eof) {
+                const std::string daemon_log = read_file_suffix(log, 0);
+                const std::string identity =
+                    "job=" + std::to_string(kExpiredArmWireJob) +
+                    " epoch=" + std::to_string(arm_epoch) +
+                    " nonce=" + std::to_string(kExpiredArmWireNonce) +
+                    " request=" + std::to_string(kExpiredArmWireNonce) +
+                    " reservation=";
+                const std::string queued_prefix =
+                    "P51_SOURCE_CANCEL_QUEUED " + identity;
+                const std::string result_prefix =
+                    "P51_SOURCE_CANCEL_RESULT " + identity;
+                const size_t queued_at = daemon_log.find(queued_prefix);
+                const size_t result_at = daemon_log.find(result_prefix);
+                auto line_at = [&](size_t position) {
+                    if (position == std::string::npos) return std::string{};
+                    const size_t end = daemon_log.find('\n', position);
+                    return daemon_log.substr(position,
+                        end == std::string::npos ? std::string::npos
+                                                : end - position);
+                };
+                const std::string queued_line = line_at(queued_at);
+                const std::string result_line = line_at(result_at);
+                auto reservation_from = [](const std::string& line) {
+                    const std::string key = " reservation=";
+                    const size_t begin = line.find(key);
+                    if (begin == std::string::npos) return std::string{};
+                    const size_t value = begin + key.size();
+                    const size_t end = line.find(' ', value);
+                    return line.substr(value,
+                        end == std::string::npos ? std::string::npos
+                                                : end - value);
+                };
+                const std::string queued_reservation =
+                    reservation_from(queued_line);
+                const bool exact_cancel_once =
+                    count_text(daemon_log, queued_prefix) == 1 &&
+                    count_text(daemon_log, result_prefix) == 1 &&
+                    queued_at < result_at &&
+                    queued_line.find(" source_expired=0 ") != std::string::npos &&
+                    result_line.ends_with(" cancelled=1") &&
+                    !queued_reservation.empty() &&
+                    reservation_from(result_line) == queued_reservation;
+                REQUIRE(exact_cancel_once,
+                        "client EOF settles exactly one cancellation for the original ARM and reservation");
+                if (exact_cancel_once) {
+                    std::fprintf(stderr,
+                        "C03_CANCEL_ONCE scenario=client_eof job=%u epoch=%llu nonce=%llu request=%llu reservation=%s cancelled=1\n",
+                        kExpiredArmWireJob,
+                        static_cast<unsigned long long>(arm_epoch),
+                        static_cast<unsigned long long>(kExpiredArmWireNonce),
+                        static_cast<unsigned long long>(kExpiredArmWireNonce),
+                        queued_reservation.c_str());
+                } else {
+                    std::fprintf(stderr,
+                        "C03_CANCEL_TRACE target_job=%u epoch=%llu nonce=%llu queued=%s result=%s\n",
+                        kExpiredArmWireJob,
+                        static_cast<unsigned long long>(arm_epoch),
+                        static_cast<unsigned long long>(kExpiredArmWireNonce),
+                        queued_line.c_str(), result_line.c_str());
+                }
+            }
             delete scheduler;
             ::close(scheduler_listener);
             if (failures == 0) std::filesystem::remove_all(work);
