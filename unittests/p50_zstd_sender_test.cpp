@@ -3263,10 +3263,11 @@ void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
         CHECK(seen);
         return true;
     };
+    asio::io_context c_context;
+    // PendingReceipt owns Asio timers bound to c_context, so destroy sender
+    // before c_context tears down its timer service.
     auto sender = std::make_shared<P50ZstdSourceSender>(
         authority, route, PrepareRequestKey{3, 901}, sender_config);
-
-    asio::io_context c_context;
     auto c_work = asio::make_work_guard(c_context);
     const tcp::endpoint remote = acceptor.local_endpoint();
     std::atomic<unsigned> connector_calls{0};
@@ -4318,12 +4319,14 @@ void run_p51_sender_shared_failure_case(size_t kJobs, ProfileId profile,
 
     P50ServerEndpoint server(f_guid, server_caps, nullptr, nullptr,
                              std::move(server_config));
-    std::shared_ptr<P50ZstdSourceSender> sender;
     AsyncConnectedFdFactory connector;
     std::future<ZstdSourceTransferResult> future_offer_result;
     asio::io_context f_context;
     tcp::acceptor acceptor(f_context, {asio::ip::address_v4::loopback(), 0});
     asio::io_context c_context;
+    // PendingReceipt timers use c_context's executor; sender must destruct
+    // before the context destroys that executor's timer service.
+    std::shared_ptr<P50ZstdSourceSender> sender;
     std::thread c_thread;
     std::thread f_thread;
     struct ThreadCleanup {
