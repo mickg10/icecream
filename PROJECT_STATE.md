@@ -64,8 +64,39 @@ ZSTD_ROUTE executed the imported `567a68d0…` runner with the same client and
 daemon binaries and exited 0. Its log records all 30 held callers completing,
 an exact fresh-assignment object for the active victim, and exact fresh A
 recovery after the old group is gone. Root independently checked the retained
-log and its hash. A generated-input wrapper entry is still being qualified.
+log and its hash. A generated-input wrapper entry now passes ZSTD_ROUTE.
 This evidence does not establish a complete current-candidate build closure.
+
+### Generated-input wrapper entry for scoped W30 recovery
+
+The opt-in `ICECC_P51_WRAPPER_C1F2_W30=1` path in
+`unittests/p51wrappercompile-run.sh` generates 31 small manifest inputs and
+invokes the existing C1F2/31 gate. It checks all 30 held callers, B progress,
+cleanup before fresh A recovery, exact A/B link counts by phase, and exact
+fresh recovery output. The source-contract preflight also follows the capture
+path's `printf` construction and retains deletion-sensitive assertions.
+
+The generated-input wrapper passed ZSTD_ROUTE on the frozen cleanup daemon,
+capture-safe client and positive helper, in the isolated 2-CPU/8-GiB SDK
+container. It observed 30 held A commits, exact B progress, old A group gone
+before re-login, a fresh exact A object, and one B adoption. A had three
+measured adoptions: initial, after cleanup/reconnect, and before the fresh
+probe following 137 seconds without a compiler-input attach. The last is
+consistent with the endpoint's 60-second idle deadline; absence of compiler
+input attach does not prove there were no control frames. This qualifies the
+wrapper entry and that scoped profile run, not all-profile wrapper execution
+or the full current-candidate build closure.
+
+Donor `39c9e211`; imported commit `09d93aa8`. Outer log:
+`/tanksmall/scratch/tmp/p51-d07-compile.YLS0NG/tmp/p51-wrapper-c1f2-route-20260926-r4.log`,
+SHA256 `dd363652b9d6e86c21cab2c8dfd66f459a615de82cfc89870eedf5022628f72e`.
+Executed wrapper SHA256
+`7b647270483214117c84b42b0152736645920dd38f7d9ab6b349e98e65ed1d04`;
+source-preflight SHA256
+`c9fe2263537f7777b2190a7a664ff8deec3e0eaca14a74e32929413176b6932d`;
+runner `567a68d02a8d808de52d6180fdd88f11802c251e5b1ab0b54712ab7524bb655b`,
+daemon `85da3cf6261cf830852861181f8ecea582f2864df6c94a76d803c32238754069`,
+client `c50e5d67c267ecff4e1e057939913a95e92760c0724ebbb2cfa1e84aa1ce646c`.
 
 ### Active compiler loss and fresh-job recovery
 
