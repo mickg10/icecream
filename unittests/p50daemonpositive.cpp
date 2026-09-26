@@ -1845,13 +1845,17 @@ static icecc::p50::local::P50SourceTransferResult retry_p51_kind8_same_arm(
     MsgChannel& local, uint32_t wire_id, uint64_t epoch, uint64_t nonce,
     const P51SourceArmedFields& armed, int source_fd, uint32_t profile_mask,
     Clock::time_point deadline,
-    const P51CacheControlIdentity& expected_control_identity)
+    const P51CacheControlIdentity& expected_control_identity,
+    icecc::p50::local::DaemonControlStatus *final_status_out = nullptr)
 {
     using namespace icecc::p50;
     using namespace icecc::p50::local;
     P50SourceTransferResult failed{};
     bool source_owned_here = true;
+    DaemonControlStatus observed_status = DaemonControlStatus::Idle;
     const auto fail_at = [&](const char *stage) {
+        if (final_status_out != nullptr)
+            *final_status_out = observed_status;
         std::fprintf(stderr,
             "P51_CAPACITY_OVERLAP_RETRY_FAIL job=%u stage=%s\n", wire_id, stage);
         if (source_owned_here && source_fd >= 0) ::close(source_fd);
@@ -1897,6 +1901,8 @@ static icecc::p50::local::P50SourceTransferResult retry_p51_kind8_same_arm(
     const DaemonControlStatus started = control.begin_authenticated(
         control_fd, operation, source_fd, credentials, identity, deadline,
         DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
+    observed_status = control.status();
+    if (final_status_out != nullptr) *final_status_out = observed_status;
     if (started != DaemonControlStatus::InProgress)
         return fail_at("kind8-begin");
 
@@ -1904,6 +1910,7 @@ static icecc::p50::local::P50SourceTransferResult retry_p51_kind8_same_arm(
         const auto now = Clock::now();
         if (now >= deadline) {
             (void)control.advance(now, 0);
+            observed_status = control.status();
             break;
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1914,10 +1921,13 @@ static icecc::p50::local::P50SourceTransferResult retry_p51_kind8_same_arm(
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) {
             (void)control.advance(Clock::now(), POLLERR);
+            observed_status = control.status();
             break;
         }
         (void)control.advance(Clock::now(),
                               ready == 0 ? short{0} : descriptor.revents);
+        observed_status = control.status();
+        if (final_status_out != nullptr) *final_status_out = observed_status;
     }
     if (control.status() != DaemonControlStatus::Complete ||
         !control.source_transfer_result().has_value())
@@ -1995,6 +2005,7 @@ enum class P51CancelScenario : uint8_t {
     None = 0,
     BeforePublication,
     AfterSourceDeadline,
+    CExpiredWhileFLive,
     RetainedCommitted,
 };
 
@@ -2009,6 +2020,8 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         std::optional<std::string> capture_stderr;
         std::optional<std::string> debug_attach;
         std::optional<std::string> source_budget;
+        std::optional<std::string> source_result_trace;
+        std::optional<std::string> source_admission_trace;
         bool active = false;
         ~EnvironmentRestore()
         {
@@ -2021,6 +2034,8 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             restore("ICECC_TEST_CAPTURE_DAEMON_STDERR", capture_stderr);
             restore("ICECC_P50_DEBUG_ATTACH", debug_attach);
             restore("ICECC_TEST_P50_SOURCE_BUDGET_MSEC", source_budget);
+            restore("ICECC_P50_SOURCE_RESULT_TRACE", source_result_trace);
+            restore("ICECC_P50_SOURCE_ADMISSION_TRACE", source_admission_trace);
         }
     } environment_restore;
     if (drop_lost_receipts ||
@@ -2032,12 +2047,21 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         if (const char *previous =
                 ::getenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC"))
             environment_restore.source_budget = previous;
+        if (const char *previous =
+                ::getenv("ICECC_P50_SOURCE_RESULT_TRACE"))
+            environment_restore.source_result_trace = previous;
+        if (const char *previous =
+                ::getenv("ICECC_P50_SOURCE_ADMISSION_TRACE"))
+            environment_restore.source_admission_trace = previous;
         environment_restore.active = true;
         if (::setenv("ICECC_TEST_CAPTURE_DAEMON_STDERR", "1", 1) != 0 ||
             ::setenv("ICECC_P50_DEBUG_ATTACH", "1", 1) != 0)
             return 2;
         if (cancel_scenario == P51CancelScenario::AfterSourceDeadline &&
             ::setenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC", "5000", 1) != 0)
+            return 2;
+        if (cancel_scenario == P51CancelScenario::CExpiredWhileFLive &&
+            ::setenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC", "30000", 1) != 0)
             return 2;
     }
     ::signal(SIGPIPE, SIG_IGN);
@@ -2053,6 +2077,18 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
     const std::string work(created);
     const std::string cdir = work + "/c";
     const std::string fdir = work + "/f";
+    const std::string source_result_trace_path =
+        work + "/p51-source-result.jsonl";
+    const std::string source_admission_trace_path =
+        cdir + "/p51-source-admitted.log";
+    if (cancel_scenario == P51CancelScenario::CExpiredWhileFLive &&
+        ::setenv("ICECC_P50_SOURCE_RESULT_TRACE",
+                 source_result_trace_path.c_str(), 1) != 0)
+        return 2;
+    if (cancel_scenario == P51CancelScenario::CExpiredWhileFLive &&
+        ::setenv("ICECC_P50_SOURCE_ADMISSION_TRACE",
+                 source_admission_trace_path.c_str(), 1) != 0)
+        return 2;
     const auto prepare_role = [&](const std::string& directory) {
         const bool made = ::mkdir(directory.c_str(), 0700) == 0;
         const bool owned = made && ::chown(directory.c_str(), icecc->pw_uid,
@@ -2068,7 +2104,19 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
                 ::chmod(work.c_str(), 0700) == 0 && prepare_role(cdir) && prepare_role(fdir),
             "distinct C and F daemons have exact private runtime ownership");
     if (failures) return 2;
-    if (drop_lost_receipts) {
+    if (cancel_scenario == P51CancelScenario::CExpiredWhileFLive) {
+        const int admission_fd = ::open(source_admission_trace_path.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        const bool admission_ready = admission_fd >= 0 &&
+            ::fchown(admission_fd, icecc->pw_uid, icecc->pw_gid) == 0 &&
+            ::fchmod(admission_fd, 0600) == 0;
+        if (admission_fd >= 0) ::close(admission_fd);
+        REQUIRE(admission_ready,
+                "C successful-admission trace is a private daemon-owned file");
+        if (!admission_ready) return 2;
+    }
+    if (drop_lost_receipts ||
+        cancel_scenario == P51CancelScenario::CExpiredWhileFLive) {
         bool captured_logs_ready = true;
         for (const std::string& directory : {cdir, fdir}) {
             const std::string path = directory + "/iceccd.log";
@@ -2217,6 +2265,9 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             source_use->cache_protocol == CACHE_WIRE_REVISION_R2 &&
             source_use->cache_profile_mask == profile_mask;
         job.bytes = "vertical P51 source bytes job=" + std::to_string(index) + "\\n";
+        if (cancel_scenario == P51CancelScenario::CExpiredWhileFLive &&
+            index == 1)
+            job.bytes = "int main(void) { return 0; }\n";
         job.source_fd = job.compiler
             ? make_vertical_source_fd(work, job.bytes) : -1;
         all_assignments_ready &= job.assigned && job.compiler != nullptr &&
@@ -2225,6 +2276,527 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
     REQUIRE(all_assignments_ready,
             "all C and F assignments retain distinct authenticated wrapper channels");
     if (!all_assignments_ready) return 1;
+
+    if (cancel_scenario == P51CancelScenario::CExpiredWhileFLive) {
+        REQUIRE(job_count == 2,
+                "C-expired/F-live regression owns a victim and an admitted successor");
+        if (job_count != 2) return 2;
+        const bool test_service_selected =
+            std::strstr(cache_service, "icecc-cache-service-test") != nullptr;
+        REQUIRE(test_service_selected,
+                "C admission witness uses only the noninstalled hook-enabled service binary");
+        if (!test_service_selected) return 2;
+
+        std::array<P50SourceArmFields, 2> arms{};
+        std::array<P51CacheControlIdentity, 2> control_identities{};
+        std::array<Clock::time_point, 2> f_deadline_lower_bounds{};
+        bool both_armed = true;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            auto& job = jobs[i];
+            const auto arm_observed_at = Clock::now();
+            const auto arm_result = execute_p51_kind8(
+                *job.wrapper, *job.compiler, job.wire_id, epoch, job.nonce,
+                static_cast<uint32_t>(f_port), job.source_fd, profile_mask,
+                &job.armed, nullptr, nullptr, true, &arms[i],
+                &control_identities[i]);
+            job.source_fd = -1;
+            // The local timestamp precedes ARM delivery, so this is a
+            // conservative lower bound on F's independently-clocked expiry.
+            f_deadline_lower_bounds[i] = arm_observed_at +
+                std::chrono::milliseconds(job.armed.source_budget_msec);
+            const bool exact_arm = arm_result.code ==
+                    icecc::p50::local::SourceTransferResultCode::None &&
+                arms[i].valid_for_cache_revision(CACHE_WIRE_REVISION_R2) &&
+                job.armed.valid() &&
+                job.armed.acknowledges(P51SourceArmMsg{
+                    P51SourceArmFields{arms[i], 30}}) &&
+                control_identities[i].valid() &&
+                job.armed.source_budget_msec >= 25000;
+            REQUIRE(exact_arm,
+                    "one exact long-lived F ARM is retained for each assignment");
+            both_armed &= exact_arm;
+        }
+        if (!both_armed) return 1;
+        auto& victim = jobs[0];
+        auto& successor = jobs[1];
+        const bool same_relationship =
+            victim.armed.logical_relationship_id ==
+                successor.armed.logical_relationship_id &&
+            victim.armed.relationship_epoch ==
+                successor.armed.relationship_epoch &&
+            victim.armed.f_store_guid == successor.armed.f_store_guid &&
+            victim.armed.f_store_generation ==
+                successor.armed.f_store_generation &&
+            victim.armed.selected_revision ==
+                successor.armed.selected_revision &&
+            victim.armed.selected_window == successor.armed.selected_window &&
+            arms[0].c_store_guid == arms[1].c_store_guid &&
+            control_identities[0].c_store_guid ==
+                control_identities[1].c_store_guid &&
+            control_identities[0].c_store_generation ==
+                control_identities[1].c_store_generation &&
+            control_identities[0].derivation_version ==
+                control_identities[1].derivation_version &&
+            control_identities[0].control_generation ==
+                control_identities[1].control_generation &&
+            control_identities[0].peer_uid == control_identities[1].peer_uid &&
+            control_identities[0].peer_gid == control_identities[1].peer_gid;
+        REQUIRE(same_relationship,
+                "distinct victim/successor ARMs belong to the same exact C-F relationship and C store incarnation");
+        if (!same_relationship) return 1;
+
+        const auto profile = profile_mask == CACHE_PROFILE_P29V1
+            ? CompileInputIdentity::P29V1Profile
+            : profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+                ? CompileInputIdentity::ZstdRouteProfile
+                : CompileInputIdentity::ZstdTuProfile;
+        // Keep both original ordinary assignment channels open, but do not
+        // send CompileFile before the source exists: F rejects that ordering
+        // with UnknownRecord rather than retaining a WAITP50INPUT waiter.
+        const uintmax_t f_log_offset = std::filesystem::file_size(
+            fdir + "/iceccd.log");
+        REQUIRE(victim.compiler != nullptr && victim.wrapper != nullptr,
+                "victim retains its original ordinary assigned compiler channel");
+        REQUIRE(successor.compiler != nullptr && successor.wrapper != nullptr,
+                "successor retains its distinct ordinary assigned compiler channel");
+
+        const pid_t f_sidecar = find_attachment_sidecar(f_pid, cache_service);
+        const pid_t c_sidecar = find_attachment_sidecar(c_pid, cache_service);
+        const uint64_t f_sidecar_start = process_start_time_ticks(f_sidecar);
+        const uint64_t c_sidecar_start = process_start_time_ticks(c_sidecar);
+        const bool sidecar_stop_sent = f_sidecar > 1 &&
+            ::kill(f_sidecar, SIGSTOP) == 0;
+        bool sidecar_stopped = false;
+        const auto stop_deadline = Clock::now() + std::chrono::seconds(2);
+        while (sidecar_stop_sent && Clock::now() < stop_deadline) {
+            std::ifstream status(std::string("/proc/") +
+                                 std::to_string(f_sidecar) + "/status");
+            std::string line;
+            while (std::getline(status, line))
+                if (line.rfind("State:", 0) == 0 &&
+                    line.find('T') != std::string::npos)
+                    sidecar_stopped = true;
+            if (sidecar_stopped) break;
+            ::usleep(10000);
+        }
+        REQUIRE(sidecar_stopped,
+                "only the exact F sidecar is paused after both ARMs and before source transfer");
+        if (!sidecar_stopped) {
+            if (sidecar_stop_sent) (void)::kill(f_sidecar, SIGCONT);
+            return 2;
+        }
+        struct ResumeFLiveSidecar {
+            pid_t pid;
+            bool needed = true;
+            ~ResumeFLiveSidecar() {
+                if (needed && pid > 1) (void)::kill(pid, SIGCONT);
+            }
+        } resume_sidecar{f_sidecar};
+
+        const Clock::time_point victim_deadline =
+            Clock::now() + std::chrono::seconds(8);
+        const Clock::time_point successor_deadline =
+            Clock::now() + std::chrono::seconds(24);
+        const auto steady_ns = [](Clock::time_point time) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                time.time_since_epoch()).count();
+        };
+        std::mutex result_mutex;
+        std::condition_variable result_changed;
+        icecc::p50::local::P50SourceTransferResult victim_result{};
+        icecc::p50::local::P50SourceTransferResult successor_result{};
+        icecc::p50::local::DaemonControlStatus victim_control_status =
+            icecc::p50::local::DaemonControlStatus::Idle;
+        icecc::p50::local::DaemonControlStatus successor_control_status =
+            icecc::p50::local::DaemonControlStatus::Idle;
+        Clock::time_point victim_finished_at{};
+        Clock::time_point successor_finished_at{};
+        bool victim_finished = false;
+        bool successor_finished = false;
+        Clock::time_point victim_transfer_started_at{};
+        Clock::time_point successor_transfer_started_at{};
+        bool victim_transfer_started = false;
+        bool successor_transfer_started = false;
+        int victim_fd = make_vertical_source_fd(work, victim.bytes);
+        int successor_fd = make_vertical_source_fd(work, successor.bytes);
+        REQUIRE(victim_fd >= 0 && successor_fd >= 0,
+                "both immutable source descriptors are available before transfer");
+        if (victim_fd < 0 || successor_fd < 0) {
+            if (victim_fd >= 0) ::close(victim_fd);
+            if (successor_fd >= 0) ::close(successor_fd);
+            return 2;
+        }
+        const uintmax_t c_admission_offset = std::filesystem::file_size(
+            source_admission_trace_path);
+        std::thread victim_transfer([&] {
+            {
+                std::lock_guard lock(result_mutex);
+                victim_transfer_started_at = Clock::now();
+                victim_transfer_started = true;
+            }
+            result_changed.notify_all();
+            victim_result = retry_p51_kind8_same_arm(
+                *victim.wrapper, victim.wire_id, epoch, victim.nonce,
+                victim.armed, victim_fd, profile_mask, victim_deadline,
+                control_identities[0], &victim_control_status);
+            {
+                std::lock_guard lock(result_mutex);
+                victim_finished_at = Clock::now();
+                victim_finished = true;
+            }
+            result_changed.notify_all();
+        });
+        std::thread successor_transfer([&] {
+            {
+                std::lock_guard lock(result_mutex);
+                successor_transfer_started_at = Clock::now();
+                successor_transfer_started = true;
+            }
+            result_changed.notify_all();
+            successor_result = retry_p51_kind8_same_arm(
+                *successor.wrapper, successor.wire_id, epoch, successor.nonce,
+                successor.armed, successor_fd, profile_mask,
+                successor_deadline, control_identities[1],
+                &successor_control_status);
+            {
+                std::lock_guard lock(result_mutex);
+                successor_finished_at = Clock::now();
+                successor_finished = true;
+            }
+            result_changed.notify_all();
+        });
+
+        bool both_transfers_started = false;
+        {
+            std::unique_lock lock(result_mutex);
+            both_transfers_started = result_changed.wait_until(
+                lock, Clock::now() + std::chrono::seconds(2),
+                [&] { return victim_transfer_started &&
+                             successor_transfer_started; });
+        }
+        REQUIRE(both_transfers_started &&
+                    successor_transfer_started_at < victim_deadline,
+                "both exact same-ARM transfers start before the victim deadline");
+
+        const auto admission_marker = [](const VerticalJob& job,
+                                         const P50SourceArmFields& arm) {
+            return "P51_SOURCE_TRANSFER_ADMITTED job=" +
+                std::to_string(job.wire_id) + " epoch=" +
+                std::to_string(arm.assignment_epoch) + " nonce=" +
+                std::to_string(arm.assignment_nonce) + " request=" +
+                std::to_string(arm.source_request_id) + " admitted_steady_ns=";
+        };
+        const std::string victim_admission = admission_marker(victim, arms[0]);
+        const std::string successor_admission =
+            admission_marker(successor, arms[1]);
+        bool victim_admitted = false;
+        bool successor_admitted = false;
+        while (Clock::now() < victim_deadline &&
+               !(victim_admitted && successor_admitted)) {
+            const std::string suffix = read_file_suffix(
+                source_admission_trace_path, c_admission_offset);
+            victim_admitted = suffix.find(victim_admission) !=
+                std::string::npos;
+            successor_admitted = suffix.find(successor_admission) !=
+                std::string::npos;
+            if (!(victim_admitted && successor_admitted)) ::usleep(10000);
+        }
+        REQUIRE(victim_admitted && successor_admitted,
+                "both exact source operations reach C's successful admission branch before expiry");
+        const std::string c_admission_suffix = read_file_suffix(
+            source_admission_trace_path, c_admission_offset);
+        const auto admitted_before_deadline = [&](const std::string& marker,
+                                                  Clock::time_point deadline) {
+            const size_t at = c_admission_suffix.find(marker);
+            const size_t end = at == std::string::npos
+                ? std::string::npos : c_admission_suffix.find('\n', at);
+            if (end == std::string::npos) return false;
+            const std::string line = c_admission_suffix.substr(at, end - at);
+            const std::string expected_deadline = "deadline_steady_ns=" +
+                std::to_string(steady_ns(deadline));
+            const size_t admitted_at = line.find("admitted_steady_ns=");
+            if (line.find(expected_deadline) == std::string::npos ||
+                admitted_at == std::string::npos ||
+                count_text(c_admission_suffix, marker) != 1)
+                return false;
+            const size_t value_start = admitted_at +
+                std::string("admitted_steady_ns=").size();
+            const size_t value_end = line.find(' ', value_start);
+            if (value_end == std::string::npos) return false;
+            try {
+                const auto admitted_ns = std::stoll(
+                    line.substr(value_start, value_end - value_start));
+                return admitted_ns < steady_ns(deadline);
+            } catch (...) {
+                return false;
+            }
+        };
+        REQUIRE(admitted_before_deadline(victim_admission, victim_deadline) &&
+                    admitted_before_deadline(successor_admission,
+                                             successor_deadline),
+                "both exact C admissions precede their immutable absolute deadlines");
+
+        bool victim_done_on_deadline = false;
+        {
+            std::unique_lock lock(result_mutex);
+            victim_done_on_deadline = result_changed.wait_until(
+                lock, victim_deadline + std::chrono::seconds(3),
+                [&] { return victim_finished; });
+        }
+        REQUIRE(victim_done_on_deadline,
+                "C-side victim operation settles by its unchanged eight-second deadline");
+        bool victim_failed_at_deadline = false;
+        if (victim_done_on_deadline) {
+            victim_failed_at_deadline =
+                victim_control_status ==
+                    icecc::p50::local::DaemonControlStatus::Timeout &&
+                victim_result.code ==
+                    icecc::p50::local::SourceTransferResultCode::None &&
+                victim_finished_at >= victim_deadline -
+                    std::chrono::milliseconds(500) &&
+                victim_finished_at < victim_deadline +
+                    std::chrono::seconds(3);
+        }
+        REQUIRE(victim_failed_at_deadline,
+                "victim C transfer expires at its own deadline, not an early link error");
+        REQUIRE(victim_done_on_deadline &&
+                    victim_finished_at < f_deadline_lower_bounds[0] -
+                    std::chrono::seconds(10),
+                "the exact F victim reservation is still live when the C deadline expires");
+
+        // Closing the original F compiler assignment requests exact cleanup;
+        // the successor transfer is already live and is not restarted below.
+        delete victim.compiler;
+        victim.compiler = nullptr;
+        if (!victim_done_on_deadline && victim.wrapper != nullptr &&
+            victim.wrapper->fd >= 0)
+            (void)::shutdown(victim.wrapper->fd, SHUT_RDWR);
+        if (victim_transfer.joinable()) victim_transfer.join();
+        delete victim.wrapper;
+        victim.wrapper = nullptr;
+        const auto hex_id = [](const std::array<uint8_t, 16>& bytes) {
+            static constexpr char digits[] = "0123456789abcdef";
+            std::string value;
+            value.reserve(bytes.size() * 2);
+            for (const uint8_t byte : bytes) {
+                value.push_back(digits[byte >> 4]);
+                value.push_back(digits[byte & 0x0f]);
+            }
+            return value;
+        };
+        const uintmax_t cancel_log_offset = f_log_offset;
+        const std::string cancel_queue = "P51_SOURCE_CANCEL_QUEUED job=" +
+            std::to_string(victim.wire_id) + " epoch=" +
+            std::to_string(epoch) + " nonce=" +
+            std::to_string(victim.nonce) + " request=" +
+            std::to_string(arms[0].source_request_id) + " reservation=" +
+            hex_id(victim.armed.reservation_id) + " source_expired=0";
+        const bool exact_cancel_queued = wait_attachment_log(
+            fdir + "/iceccd.log", cancel_log_offset, cancel_queue, 5000);
+        REQUIRE(exact_cancel_queued,
+                "F queues one exact reservation cancel while the immutable F deadline is live");
+        (void)::kill(f_sidecar, SIGCONT);
+        resume_sidecar.needed = false;
+        const std::string cancel_result = "P51_SOURCE_CANCEL_RESULT job=" +
+            std::to_string(victim.wire_id) + " epoch=" +
+            std::to_string(epoch) + " nonce=" +
+            std::to_string(victim.nonce) + " request=" +
+            std::to_string(arms[0].source_request_id) + " reservation=" +
+            hex_id(victim.armed.reservation_id) + " cancelled=1";
+        const bool exact_cancelled = wait_attachment_log(
+            fdir + "/iceccd.log", cancel_log_offset, cancel_result, 5000);
+        REQUIRE(exact_cancelled,
+                "F confirms exact cancellation without expiring/replacing the sidecar");
+        const std::string cancel_suffix = read_file_suffix(
+            fdir + "/iceccd.log", cancel_log_offset);
+        REQUIRE(count_text(cancel_suffix, cancel_queue) == 1 &&
+                    count_text(cancel_suffix, cancel_result) == 1,
+                "the exact victim reservation is queued and released exactly once");
+
+        bool successor_done_before_deadline = false;
+        {
+            std::unique_lock lock(result_mutex);
+            successor_done_before_deadline = result_changed.wait_until(
+                lock, successor_deadline + std::chrono::seconds(1),
+                [&] { return successor_finished; });
+        }
+        if (victim_transfer.joinable()) victim_transfer.join();
+        if (successor_transfer.joinable()) successor_transfer.join();
+        REQUIRE(successor_done_before_deadline &&
+                    successor_result.code ==
+                        icecc::p50::local::SourceTransferResultCode::Committed &&
+                    successor_transfer_started_at < victim_finished_at &&
+                    successor_finished_at < successor_deadline,
+                "already-admitted healthy successor commits without a new invocation or deadline reset");
+        const std::string victim_trace_marker =
+            "\"wire_job_id\":" + std::to_string(victim.wire_id) + ",";
+        const std::string successor_trace_marker =
+            "\"wire_job_id\":" + std::to_string(successor.wire_id) + ",";
+        const bool victim_trace_ready = wait_attachment_log(
+            source_result_trace_path, 0, victim_trace_marker, 5000);
+        const bool successor_trace_ready = wait_attachment_log(
+            source_result_trace_path, 0, successor_trace_marker, 5000);
+        REQUIRE(victim_trace_ready && successor_trace_ready,
+                "C sidecar records post-read dispatch for both exact source operations");
+        const std::string source_trace = read_file_tail(
+            source_result_trace_path, 1u << 20);
+        const auto has_exact_dispatch = [&](const VerticalJob& job,
+                                            const P50SourceArmFields& arm,
+                                            bool committed) {
+            const std::string wire = "\"wire_job_id\":" +
+                std::to_string(job.wire_id) + ",";
+            const size_t at = source_trace.find(wire);
+            const size_t end = at == std::string::npos
+                ? std::string::npos : source_trace.find('\n', at);
+            if (end == std::string::npos) return false;
+            const std::string expected_guid =
+                "\"c_store_guid\":\"" + hex_id(arm.c_store_guid) + "\"";
+            const std::string expected_digest = "\"raw_digest\":\"" +
+                icecc::digest128_hex(icecc::digest128(job.bytes)) + "\"";
+            const size_t previous_newline = at == 0 ? std::string::npos :
+                source_trace.rfind('\n', at - 1);
+            const size_t line_start = previous_newline == std::string::npos
+                ? 0 : previous_newline + 1;
+            const std::string line = source_trace.substr(
+                line_start, end - line_start);
+            return count_text(source_trace, wire) == 1 &&
+                line.find("\"stage\":\"post_read_dispatch_completion\"") !=
+                    std::string::npos &&
+                line.find("\"assignment_epoch\":" +
+                    std::to_string(epoch) + ",") != std::string::npos &&
+                line.find("\"assignment_nonce\":" +
+                    std::to_string(job.nonce) + ",") != std::string::npos &&
+                line.find(expected_guid) != std::string::npos &&
+                line.find("\"raw_bytes\":" +
+                    std::to_string(job.bytes.size()) + ",") !=
+                    std::string::npos &&
+                line.find(expected_digest) != std::string::npos &&
+                (line.find("\"status\":0,") != std::string::npos) ==
+                    committed;
+        };
+        REQUIRE(has_exact_dispatch(victim, arms[0], false) &&
+                    has_exact_dispatch(successor, arms[1], true),
+                "both exact source FDs were read once; only the healthy successor committed");
+        const auto successor_digest = icecc::digest128(successor.bytes);
+        REQUIRE(successor_result.c_store_guid.bytes ==
+                    arms[1].c_store_guid &&
+                    successor_result.raw_bytes == successor.bytes.size() &&
+                    successor_result.raw_digest.bytes == successor_digest.bytes,
+                "successor result retains its exact original source identity and bytes");
+        REQUIRE(Clock::now() < f_deadline_lower_bounds[1] -
+                    std::chrono::seconds(5),
+                "successor remains inside its original F ARM deadline");
+
+        CompileJob successor_compile = attachment_compile_job(
+            successor.wire_id, epoch, successor.nonce, arms[1],
+            &successor_result);
+        CompileInputIdentity committed_input;
+        committed_input.profile = profile;
+        committed_input.c_store_guid = successor_result.c_store_guid.bytes;
+        committed_input.tu_seq = successor_result.tu_seq;
+        committed_input.raw_bytes = successor_result.raw_bytes;
+        committed_input.raw_digest = successor_result.raw_digest.bytes;
+        committed_input.attempt_id = arms[1].compiler_attempt;
+        committed_input.request_id = arms[1].source_request_id;
+        successor_compile.setCompileInputIdentity(committed_input);
+        successor.attach_log_offset = std::filesystem::file_size(
+            fdir + "/iceccd.log");
+        successor.compile_sent = successor.compiler &&
+            successor.compiler->send_msg(CompileFileMsg(&successor_compile));
+        REQUIRE(successor.compile_sent,
+                "successor submits its exact CompileFile only after source commit");
+
+        const std::string successor_attach_marker =
+            "P50_INPUT_ATTACH_END job=" + std::to_string(successor.wire_id) +
+            " epoch=" + std::to_string(epoch) + " nonce=" +
+            std::to_string(successor.nonce) + " request=" +
+            std::to_string(arms[1].source_request_id) + " elapsed_ms=";
+        bool successor_attached = successor.compile_sent && wait_attachment_log(
+            fdir + "/iceccd.log", successor.attach_log_offset,
+            successor_attach_marker, 15000);
+        if (successor_attached) {
+            const std::string suffix = read_file_suffix(
+                fdir + "/iceccd.log", successor.attach_log_offset);
+            const size_t at = suffix.find(successor_attach_marker);
+            const size_t line_end = at == std::string::npos
+                ? std::string::npos : suffix.find('\n', at);
+            successor_attached = line_end != std::string::npos &&
+                suffix.substr(at, line_end - at).find(" status=0") !=
+                    std::string::npos;
+        }
+        REQUIRE(successor_attached,
+                "exact successor source is attached to the waiting remote compile");
+        successor.compile_bounded = wait_eof(successor.compiler, 15000);
+        REQUIRE(successor.compile_bounded,
+                "healthy successor ordinary compiler channel settles within its existing bound (not an object-output assertion)");
+
+        const std::string f_suffix = read_file_suffix(
+            fdir + "/iceccd.log", f_log_offset);
+        const std::string victim_attach_end =
+            "P50_INPUT_ATTACH_END job=" + std::to_string(victim.wire_id) +
+            " epoch=" + std::to_string(epoch) + " nonce=" +
+            std::to_string(victim.nonce) + " request=" +
+            std::to_string(arms[0].source_request_id);
+        const std::string successor_commit =
+            "P50 sidecar lifecycle commit tu=" +
+            std::to_string(successor_result.tu_seq) +
+            " retained=1 observed=1";
+        REQUIRE(f_suffix.find(victim_attach_end + " elapsed_ms=") ==
+                    std::string::npos,
+                "expired C request publishes no victim input to F");
+        REQUIRE(f_suffix.find(successor_commit) != std::string::npos,
+                "healthy successor has exactly the expected F lifecycle commit witness");
+        REQUIRE(count_text(f_suffix, successor_attach_marker) == 1 &&
+                    count_text(f_suffix, successor_commit) == 1,
+                "the exact successor input attachment and lifecycle commit occur once");
+        REQUIRE(count_text(f_suffix, cancel_queue) == 1 &&
+                    count_text(f_suffix, cancel_result) == 1,
+                "final F lifecycle contains exactly one completed victim cancellation");
+        REQUIRE(find_attachment_sidecar(f_pid, cache_service) == f_sidecar &&
+                    process_start_time_ticks(f_sidecar) == f_sidecar_start &&
+                    find_attachment_sidecar(c_pid, cache_service) == c_sidecar &&
+                    process_start_time_ticks(c_sidecar) == c_sidecar_start,
+                "both original sidecar incarnations survive C expiry and exact F cleanup");
+
+        delete successor.compiler;
+        successor.compiler = nullptr;
+        delete successor.wrapper;
+        successor.wrapper = nullptr;
+        for (pid_t pid : {c_pid, f_pid}) (void)::kill(pid, SIGTERM);
+        int c_status = 0, f_status = 0;
+        const bool c_reaped = wait_child(c_pid, 10000, &c_status);
+        const bool f_reaped = wait_child(f_pid, 10000, &f_status);
+        if (c_reaped) daemon_cleanup.c_pid = -1;
+        if (f_reaped) daemon_cleanup.f_pid = -1;
+        REQUIRE(c_reaped && WIFEXITED(c_status) && WEXITSTATUS(c_status) == 0 &&
+                    f_reaped && WIFEXITED(f_status) && WEXITSTATUS(f_status) == 0,
+                "both daemons exit cleanly after independent-deadline recovery");
+        delete c_scheduler;
+        delete f_scheduler;
+        ::close(c_scheduler_listener);
+        ::close(f_scheduler_listener);
+        if (failures == 0) {
+            std::fprintf(stderr,
+            "P51_D07_C_EXPIRED_F_LIVE_PASS profile=%u service=test-hooks victim=%u/%llu/%llu successor=%u/%llu/%llu victim_c_deadline_ns=%lld successor_c_deadline_ns=%lld victim_f_deadline_lower_bound_ns=%lld successor_f_deadline_lower_bound_ns=%lld victim_f_budget_ms=%u successor_f_budget_ms=%u exact_cancel=1 source_expired_at_cancel=0 successor_started_before_cancel=1 successor_commit=1 successor_attach=1 c_f_sidecars_preserved=1 source_arm_count=2\n",
+                profile_mask, victim.wire_id,
+                static_cast<unsigned long long>(epoch),
+                static_cast<unsigned long long>(victim.nonce),
+                successor.wire_id,
+                static_cast<unsigned long long>(epoch),
+                static_cast<unsigned long long>(successor.nonce),
+                static_cast<long long>(steady_ns(victim_deadline)),
+                static_cast<long long>(steady_ns(successor_deadline)),
+                static_cast<long long>(steady_ns(f_deadline_lower_bounds[0])),
+                static_cast<long long>(steady_ns(f_deadline_lower_bounds[1])),
+                victim.armed.source_budget_msec,
+                successor.armed.source_budget_msec);
+            std::filesystem::remove_all(work);
+            return 0;
+        }
+        std::fprintf(stderr,
+            "retained C-expired/F-live work directory: %s\n", work.c_str());
+        return 1;
+    }
 
     if (cancel_scenario != P51CancelScenario::None) {
         const bool after_source_deadline =
@@ -2570,7 +3142,8 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
         if (log_error) return 2;
     }
     std::unique_ptr<P51CommitReceiptGate> receipt_gate;
-    if (job_count > 1 || drop_lost_receipts) {
+    if ((job_count > 1 && cancel_scenario == P51CancelScenario::None) ||
+        drop_lost_receipts) {
         receipt_gate = std::make_unique<P51CommitReceiptGate>(
             f_port, icecc->pw_uid, job_count);
         REQUIRE(receipt_gate->ready(),
@@ -5531,15 +6104,19 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_CANCEL_BEFORE_START") != nullptr;
     const bool p51_cancel_after_deadline =
         ::getenv("ICECC_TEST_P51_CANCEL_AFTER_DEADLINE") != nullptr;
+    const bool p51_cancel_c_expired_f_live =
+        ::getenv("ICECC_TEST_P51_CANCEL_C_EXPIRED_F_LIVE") != nullptr;
     const bool p51_cancel_retained_committed =
         ::getenv("ICECC_TEST_P51_CANCEL_RETAINED_COMMITTED") != nullptr;
     const unsigned p51_cancel_scenarios =
         static_cast<unsigned>(p51_cancel_before_start) +
         static_cast<unsigned>(p51_cancel_after_deadline) +
+        static_cast<unsigned>(p51_cancel_c_expired_f_live) +
         static_cast<unsigned>(p51_cancel_retained_committed);
     const P51CancelScenario p51_cancel_scenario = p51_cancel_before_start
         ? P51CancelScenario::BeforePublication
         : p51_cancel_after_deadline ? P51CancelScenario::AfterSourceDeadline
+        : p51_cancel_c_expired_f_live ? P51CancelScenario::CExpiredWhileFLive
         : p51_cancel_retained_committed ? P51CancelScenario::RetainedCommitted
                                         : P51CancelScenario::None;
     const char *other_p51_modes[] = {
@@ -5635,7 +6212,11 @@ int main(int argc, char **argv)
                 "FAIL: ICECC_TEST_P51_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE\n");
             return 2;
         }
-        return run_p51_vertical(argv[1], argv[2], icecc, 1, profile_mask,
+        return run_p51_vertical(argv[1], argv[2], icecc,
+                                p51_cancel_scenario ==
+                                        P51CancelScenario::CExpiredWhileFLive
+                                    ? 2u : 1u,
+                                profile_mask,
                                 false, p51_cancel_scenario);
     }
 

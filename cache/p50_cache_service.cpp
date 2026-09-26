@@ -1667,6 +1667,53 @@ bool handle_connection(local::Connection connection, const Options& options,
                     std::move(connection), options.identity,
                 operation, std::move(source),
                     &preflight_error);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            if (admission == P51SourceEnqueueResult::Accepted &&
+                operation.p51_source_transfer &&
+                ::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr) {
+                const auto& request = *operation.p51_source_transfer;
+                const auto& identity = request.armed.arm.source;
+                const auto admitted_ns = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                const auto deadline_ns = std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        request.absolute_deadline.as_steady_time_point()
+                            .time_since_epoch()).count();
+                char line[256];
+                const int length = std::snprintf(
+                    line, sizeof(line),
+                    "P51_SOURCE_TRANSFER_ADMITTED job=%llu epoch=%llu nonce=%llu request=%llu admitted_steady_ns=%lld deadline_steady_ns=%lld\n",
+                    static_cast<unsigned long long>(identity.wire_job_id),
+                    static_cast<unsigned long long>(identity.assignment_epoch),
+                    static_cast<unsigned long long>(identity.assignment_nonce),
+                    static_cast<unsigned long long>(identity.source_request_id),
+                    static_cast<long long>(admitted_ns),
+                    static_cast<long long>(deadline_ns));
+                if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
+                    const char* trace_path = ::getenv(
+                        "ICECC_P50_SOURCE_ADMISSION_TRACE");
+                    if (trace_path != nullptr && *trace_path != '\0') {
+                        const int trace_fd = ::open(
+                            trace_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                            0600);
+                        if (trace_fd >= 0) {
+                            size_t written = 0;
+                            while (written < static_cast<size_t>(length)) {
+                                const ssize_t count = ::write(
+                                    trace_fd, line + written,
+                                    static_cast<size_t>(length) - written);
+                                if (count > 0) written +=
+                                    static_cast<size_t>(count);
+                                else if (count < 0 && errno == EINTR) continue;
+                                else break;
+                            }
+                            (void)::close(trace_fd);
+                        }
+                    }
+                }
+            }
+#endif
             if (admission == P51SourceEnqueueResult::CapacityBusy) {
                 uint16_t capacity_error = static_cast<uint16_t>(
                     local::SourceTransferErrorCode::CapacityBusy);

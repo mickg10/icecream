@@ -367,7 +367,8 @@ p50daemonpositive_LDADD = ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
-p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service
+p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service \
+	../cache/icecc-cache-service-test
 .PHONY: p50daemonpositive-p51-w30-check
 p50daemonpositive-p51-w30-check: p50daemonpositive
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
