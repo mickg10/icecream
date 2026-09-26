@@ -1373,6 +1373,14 @@ public:
         return eof || instate == HAS_MSG;
     }
 
+    // Non-consuming event-loop probe: true if a complete message, EOF, or
+    // any partial/complete bytes are already buffered for the peer. This is
+    // intentionally separate from get_msg(), which transfers frame ownership.
+    bool has_buffered_input(void) const noexcept
+    {
+        return has_msg() || inofs > intogo || instate != NEED_LEN;
+    }
+
     // Returns ture if there were no errors filling inbuf.
     bool read_a_bit(void);
 

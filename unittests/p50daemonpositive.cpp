@@ -6628,6 +6628,73 @@ static uint32_t source_mode_for_profile(uint32_t profile_mask)
         : P50_SOURCE_MODE_ZSTD_TU;
 }
 
+static void test_msgchannel_buffered_input_probe()
+{
+    for (const size_t prefix_size : {size_t{1}, size_t{2}, size_t{3},
+                                     size_t{4}, size_t{5}, size_t{7},
+                                     size_t{8}}) {
+        int fds[2] = {-1, -1};
+        const bool pair_created =
+            ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0;
+        REQUIRE(pair_created,
+                "input-probe socketpair created for every frame-prefix boundary");
+        if (!pair_created) return;
+        sockaddr_in peer{};
+        peer.sin_family = AF_INET;
+        MsgChannel *receiver = nullptr;
+        MsgChannel *sender = nullptr;
+        std::thread sender_setup([&] {
+            sender = Service::createChannel(
+                fds[1], reinterpret_cast<sockaddr *>(&peer), sizeof(peer));
+        });
+        receiver = Service::createChannel(
+            fds[0], reinterpret_cast<sockaddr *>(&peer), sizeof(peer));
+        sender_setup.join();
+        REQUIRE(receiver != nullptr && sender != nullptr,
+                "input-probe channels complete ordinary protocol negotiation");
+        if (receiver == nullptr || sender == nullptr) {
+            delete receiver;
+            delete sender;
+            continue;
+        }
+        REQUIRE(!receiver->has_buffered_input(),
+                "empty negotiated MsgChannel has no buffered input");
+
+        uint32_t frame[2] = {
+            htonl(sizeof(uint32_t)),
+            htonl(static_cast<uint32_t>(Msg::END))};
+        const auto *bytes = reinterpret_cast<const unsigned char *>(frame);
+        const bool prefix_sent = write_all(sender->fd, bytes, prefix_size);
+        const bool prefix_read = prefix_sent && receiver->read_a_bit();
+        REQUIRE(prefix_read && receiver->has_buffered_input(),
+                "input probe detects a buffered 1..8 byte ordinary-frame prefix");
+        if (prefix_read && prefix_size < sizeof(frame)) {
+            unsigned char peek = 0;
+            errno = 0;
+            const ssize_t kernel_bytes = ::recv(
+                receiver->fd, &peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT);
+            REQUIRE(kernel_bytes < 0 &&
+                        (errno == EAGAIN || errno == EWOULDBLOCK),
+                    "partial-frame probe leaves received bytes owned by MsgChannel");
+            const size_t remaining = sizeof(frame) - prefix_size;
+            REQUIRE(write_all(sender->fd, bytes + prefix_size, remaining),
+                    "remaining ordinary frame bytes are sent after the prefix probe");
+            REQUIRE(receiver->read_a_bit(),
+                    "MsgChannel reads the remainder after non-consuming probe");
+        }
+        std::unique_ptr<Msg> complete(receiver->get_msg(0, true));
+        REQUIRE(complete && *complete == Msg::END,
+                "original buffered frame remains decodable exactly once");
+        REQUIRE(!receiver->has_buffered_input(),
+                "fully consumed ordinary frame leaves no buffered input");
+        delete sender;
+        sender = nullptr;
+        REQUIRE(receiver->read_a_bit() && receiver->has_buffered_input(),
+                "peer EOF is visible as buffered terminal state to the probe");
+        delete receiver;
+    }
+}
+
 static constexpr uint32_t kExpiredArmWireJob = 0x7a710701;
 static constexpr uint64_t kExpiredArmWireNonce = UINT64_C(0x7a71070100000001);
 static constexpr uint32_t kFreshArmWireJob = 0x7a710702;
@@ -6648,6 +6715,12 @@ int main(int argc, char **argv)
         std::strcmp(argv[1], "--p51-commit-receipt-gate-delayed") == 0;
     const bool p51_expired_arm_wire_case =
         ::getenv("ICECC_TEST_P51_EXPIRED_ARM_WIRE") != nullptr;
+    const bool p51_c03_client_eof =
+        ::getenv("ICECC_TEST_P51_C03_CLIENT_EOF") != nullptr;
+    const bool p51_c03_sidecar_death =
+        ::getenv("ICECC_TEST_P51_C03_SIDECAR_DEATH") != nullptr;
+    const bool p51_c03_invalidation =
+        p51_c03_client_eof || p51_c03_sidecar_death;
     const bool p51_cancel_before_start =
         ::getenv("ICECC_TEST_P51_CANCEL_BEFORE_START") != nullptr;
     const bool p51_cancel_after_deadline =
@@ -6656,6 +6729,12 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_CANCEL_C_EXPIRED_F_LIVE") != nullptr;
     const bool p51_cancel_retained_committed =
         ::getenv("ICECC_TEST_P51_CANCEL_RETAINED_COMMITTED") != nullptr;
+    if ((p51_c03_client_eof && p51_c03_sidecar_death) ||
+        (p51_expired_arm_wire_case && p51_c03_invalidation)) {
+        std::fprintf(stderr,
+            "FAIL: select exactly one P51 wire invalidation scenario\n");
+        return 2;
+    }
     const unsigned p51_cancel_scenarios =
         static_cast<unsigned>(p51_cancel_before_start) +
         static_cast<unsigned>(p51_cancel_after_deadline) +
@@ -6695,11 +6774,11 @@ int main(int argc, char **argv)
             "FAIL: receipt gate cannot be combined with a P51 cancellation scenario\n");
         return 2;
     }
-    if (p51_expired_arm_wire_case &&
+    if ((p51_expired_arm_wire_case || p51_c03_invalidation) &&
         (receipt_gate_mode || conflicting_p51_mode ||
          p51_cancel_scenario != P51CancelScenario::None)) {
         std::fprintf(stderr,
-            "FAIL: P51 expired-ARM wire gate cannot be combined with another mode\n");
+            "FAIL: P51 wire invalidation gate cannot be combined with another mode\n");
         return 2;
     }
     if (!receipt_gate_mode && !receipt_prearm_selftest && argc != 3) {
@@ -6731,6 +6810,8 @@ int main(int argc, char **argv)
             passed ? "PASS" : "FAIL");
         return passed ? 0 : 1;
     }
+    if (p51_c03_invalidation)
+        test_msgchannel_buffered_input_probe();
     if (receipt_gate_mode) {
         char *end = nullptr;
         errno = 0;
@@ -6929,7 +7010,7 @@ int main(int argc, char **argv)
     int scheduler_port = 0;
     const int scheduler_listener = listen_ephemeral(&scheduler_port);
     const int daemon_port = reserve_port();
-    if (p51_expired_arm_wire_case) {
+    if (p51_expired_arm_wire_case || p51_c03_invalidation) {
         const uint32_t profile = selected_vertical_profile();
         if (profile == 0) {
             std::fprintf(stderr,
@@ -6988,7 +7069,7 @@ int main(int argc, char **argv)
             "LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive");
     delete premature;
 
-    const uint64_t epoch = UINT64_C(0x5000000000000001);
+    uint64_t epoch = UINT64_C(0x5000000000000001);
     const ConfCSMsg activate(epoch, ConfCSMsg::StrictNonce);
     REQUIRE(scheduler && scheduler->send_msg(activate),
             "first ConfCS activates the scheduler session");
@@ -6997,7 +7078,8 @@ int main(int argc, char **argv)
     const bool p51_cancel_case =
         std::getenv("ICECC_TEST_P51_CANCEL_REPLACEMENT") != nullptr;
     const bool p51_r2_positive_case =
-        p51_cancel_case || p51_expired_arm_wire_case;
+        p51_cancel_case || p51_expired_arm_wire_case ||
+        p51_c03_invalidation;
     REQUIRE(present_revision(
                 positive, static_cast<uint32_t>(daemon_port),
                 p51_r2_positive_case ? CACHE_WIRE_REVISION_R2
@@ -7005,22 +7087,23 @@ int main(int argc, char **argv)
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
 
-    if (p51_expired_arm_wire_case) {
+    if (p51_expired_arm_wire_case || p51_c03_invalidation) {
         const uint32_t profile = selected_vertical_profile();
+        uint64_t arm_epoch = epoch;
         auto prepare = [&](uint32_t wire_id, uint64_t nonce) {
             const bool sent = scheduler && scheduler->send_msg(
-                AssignPrepareMsg(epoch, wire_id, nonce, 1));
+                AssignPrepareMsg(arm_epoch, wire_id, nonce, 1));
             Msg *reply = sent
                 ? wait_for_type(scheduler, Msg::ASSIGN_READY, 5000) : nullptr;
             const auto *ready = dynamic_cast<const AssignReadyMsg *>(reply);
             const bool exact = ready && ready->wire_id == wire_id &&
-                ready->epoch() == epoch && ready->nonce() == nonce;
+                ready->epoch() == arm_epoch && ready->nonce() == nonce;
             delete reply;
             return exact;
         };
         auto make_arm = [&](uint32_t wire_id, uint64_t nonce) {
             P50SourceArmFields source = source_arm(
-                wire_id, epoch, nonce, static_cast<uint32_t>(daemon_port),
+                wire_id, arm_epoch, nonce, static_cast<uint32_t>(daemon_port),
                 static_cast<uint32_t>(daemon_port));
             source.cache_protocol = CACHE_WIRE_REVISION_R2;
             source.cache_profile = profile;
@@ -7058,6 +7141,232 @@ int main(int argc, char **argv)
         REQUIRE(first_ready && first_sent && daemon_stopped &&
                     stopped_before_deadline,
                 "daemon reached post-Goodbye pause for the exact successful reservation before its deadline");
+
+        if (p51_c03_invalidation) {
+            const auto original_deadline = arm_sent_at +
+                std::chrono::milliseconds(kExpiredArmWireBudgetMsec);
+            pid_t f_sidecar = -1;
+            uint64_t f_sidecar_start = 0;
+            bool invalidation_sent = false;
+            bool invalidation_before_deadline = false;
+            bool exact_sidecar_zombie = false;
+            Clock::time_point invalidation_at{};
+            if (p51_c03_client_eof) {
+                invalidation_at = Clock::now();
+                invalidation_before_deadline = invalidation_at < original_deadline;
+                invalidation_sent = first_wrapper != nullptr &&
+                    ::shutdown(first_wrapper->fd, SHUT_WR) == 0;
+            } else {
+                f_sidecar = find_attachment_sidecar(daemon_pid, argv[2]);
+                f_sidecar_start = process_start_time_ticks(f_sidecar);
+                invalidation_at = Clock::now();
+                invalidation_before_deadline = invalidation_at < original_deadline;
+                invalidation_sent = f_sidecar > 1 && f_sidecar_start != 0 &&
+                    ::kill(f_sidecar, SIGKILL) == 0;
+                const auto child_deadline = Clock::now() +
+                    std::chrono::seconds(2);
+                while (invalidation_sent && Clock::now() < child_deadline) {
+                    std::ifstream stat("/proc/" + std::to_string(f_sidecar) +
+                                       "/stat");
+                    std::string line;
+                    if (std::getline(stat, line)) {
+                        const size_t comm_end = line.rfind(')');
+                        if (comm_end != std::string::npos &&
+                            comm_end + 2 < line.size() &&
+                            line[comm_end + 2] == 'Z') {
+                            exact_sidecar_zombie =
+                                process_start_time_ticks(f_sidecar) ==
+                                f_sidecar_start;
+                            break;
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            REQUIRE(invalidation_sent && invalidation_before_deadline &&
+                        (p51_c03_client_eof || exact_sidecar_zombie),
+                    "isolated client EOF or exact READY sidecar death occurs while the original ARM deadline is live");
+            const bool resumed = daemon_stopped &&
+                ::kill(daemon_pid, SIGCONT) == 0;
+            daemon_stopped = !resumed;
+            const auto resumed_at = Clock::now();
+            const auto result_deadline = Clock::now() +
+                std::chrono::milliseconds(1200);
+            Msg *invalidated_response = resumed && first_wrapper
+                ? wait_for_any_type(first_wrapper, 1200) : nullptr;
+            const auto response_observed_at = Clock::now();
+            const bool got_armed = invalidated_response &&
+                *invalidated_response == Msg::P51_SOURCE_ARMED;
+            const bool got_end = invalidated_response &&
+                *invalidated_response == Msg::END;
+            const int first_response_type = invalidated_response
+                ? static_cast<int>(*invalidated_response) : -1;
+            const bool had_response = invalidated_response != nullptr;
+            delete invalidated_response;
+            bool invalidated_eof = first_wrapper != nullptr &&
+                first_wrapper->at_eof();
+            bool unexpected_trailing_message = false;
+            if (got_end && !invalidated_eof) {
+                while (Clock::now() < result_deadline) {
+                    Msg *trailing = first_wrapper->get_msg(1, true);
+                    if (trailing != nullptr) {
+                        unexpected_trailing_message = true;
+                        delete trailing;
+                        break;
+                    }
+                    if (first_wrapper->at_eof()) {
+                        invalidated_eof = true;
+                        break;
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                "C03_OBSERVATION scenario=%s arm_request=%llu original_budget_ms=%llu invalidation_elapsed_ms=%lld resume_elapsed_ms=%lld response_elapsed_ms=%lld invalidation_before_deadline=%d resume_before_deadline=%d response_before_deadline=%d response_type=%d eof=%d unexpected_trailing=%d old_f_pid=%d old_f_start=%llu\n",
+                p51_c03_client_eof ? "client_eof" : "sidecar_death",
+                static_cast<unsigned long long>(kExpiredArmWireNonce),
+                static_cast<unsigned long long>(kExpiredArmWireBudgetMsec),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    invalidation_at - arm_sent_at).count()),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    resumed_at - arm_sent_at).count()),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    response_observed_at - arm_sent_at).count()),
+                int(invalidation_before_deadline),
+                int(resumed_at < original_deadline),
+                int(response_observed_at < original_deadline),
+                first_response_type, int(invalidated_eof),
+                int(unexpected_trailing_message), f_sidecar,
+                static_cast<unsigned long long>(f_sidecar_start));
+            const bool terminal_only =
+                (got_end && invalidated_eof && !unexpected_trailing_message) ||
+                (!had_response && invalidated_eof);
+            REQUIRE(resumed && resumed_at < original_deadline &&
+                        !got_armed && terminal_only &&
+                        response_observed_at < original_deadline,
+                    "known client EOF or killed READY incarnation rejects the pending ARM before its unchanged deadline");
+            delete first_wrapper;
+            first_wrapper = nullptr;
+
+            bool replacement_ready = p51_c03_client_eof;
+            pid_t replacement_sidecar = -1;
+            uint64_t replacement_start = 0;
+            if (p51_c03_sidecar_death) {
+                const auto replacement_deadline = Clock::now() +
+                    std::chrono::seconds(8);
+                while (Clock::now() < replacement_deadline) {
+                    replacement_sidecar =
+                        find_attachment_sidecar(daemon_pid, argv[2]);
+                    replacement_start =
+                        process_start_time_ticks(replacement_sidecar);
+                    if (replacement_sidecar > 1 && replacement_start != 0 &&
+                        (replacement_sidecar != f_sidecar ||
+                         replacement_start != f_sidecar_start))
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                std::unique_ptr<Msg> replacement_login(
+                    wait_for_type(scheduler, Msg::LOGIN, 5000));
+                const auto *replacement_ready_msg =
+                    dynamic_cast<const LoginMsg *>(replacement_login.get());
+                if (absent(replacement_ready_msg)) {
+                    // Sidecar replacement does not create a scheduler
+                    // session.  Wait for the new positive advertisement in
+                    // the already-active epoch; unsolicited ConfCS is ignored
+                    // by the daemon and must not advance this fixture's ARM.
+                    replacement_ready = true;
+                    const auto ready_deadline = Clock::now() +
+                        std::chrono::seconds(8);
+                    while (replacement_ready &&
+                           Clock::now() < ready_deadline) {
+                        std::unique_ptr<Msg> candidate(
+                            wait_for_type(scheduler, Msg::LOGIN, 500));
+                        const auto *candidate_login =
+                            dynamic_cast<const LoginMsg *>(candidate.get());
+                        if (present_revision(candidate_login,
+                                static_cast<uint32_t>(daemon_port),
+                                CACHE_WIRE_REVISION_R2)) {
+                            replacement_ready = true;
+                            break;
+                        }
+                    }
+                    if (Clock::now() >= ready_deadline)
+                        replacement_ready = false;
+                } else {
+                    replacement_ready = present_revision(
+                        replacement_ready_msg,
+                        static_cast<uint32_t>(daemon_port),
+                        CACHE_WIRE_REVISION_R2);
+                }
+                replacement_ready = replacement_ready &&
+                    replacement_sidecar > 1 && replacement_start != 0 &&
+                    (replacement_sidecar != f_sidecar ||
+                     replacement_start != f_sidecar_start);
+            }
+            REQUIRE(replacement_ready,
+                    "healthy daemon reannounces only after the exact dead sidecar incarnation is replaced");
+            if (p51_c03_sidecar_death && !replacement_ready) {
+                const std::string daemon_tail = read_file_tail(log, 24000);
+                std::fprintf(stderr,
+                    "C03_SIDECAR_RECOVERY_DIAGNOSTIC old_pid=%d old_start=%llu replacement_pid=%d replacement_start=%llu daemon_log_tail_begin\n%s\nC03_SIDECAR_RECOVERY_DIAGNOSTIC_END\n",
+                    f_sidecar, static_cast<unsigned long long>(f_sidecar_start),
+                    replacement_sidecar,
+                    static_cast<unsigned long long>(replacement_start),
+                    daemon_tail.c_str());
+            }
+            const bool fresh_ready = prepare(kFreshArmWireJob,
+                                             kFreshArmWireNonce);
+            MsgChannel *fresh_wrapper = fresh_ready
+                ? connect_tcp_bounded(daemon_port, 5000) : nullptr;
+            const P51SourceArmMsg fresh_request{
+                make_arm(kFreshArmWireJob, kFreshArmWireNonce)};
+            const bool fresh_sent = fresh_wrapper &&
+                fresh_wrapper->send_msg(fresh_request);
+            Msg *fresh_message = fresh_sent
+                ? wait_for_type(fresh_wrapper, Msg::P51_SOURCE_ARMED, 5000)
+                : nullptr;
+            const auto *fresh_armed =
+                dynamic_cast<const P51SourceArmedMsg *>(fresh_message);
+            const bool fresh_success = fresh_armed &&
+                fresh_armed->acknowledges(fresh_request) &&
+                fresh_armed->selected_window == 30 &&
+                fresh_armed->f_store_generation != 0;
+            const int fresh_response_type = fresh_message
+                ? static_cast<int>(*fresh_message) : -1;
+            delete fresh_message;
+            std::fprintf(stderr,
+                "C03_FRESH scenario=%s arm_epoch=%llu prepared=%d connected=%d sent=%d success=%d response_type=%d replacement_pid=%d replacement_start=%llu\n",
+                p51_c03_client_eof ? "client_eof" : "sidecar_death",
+                static_cast<unsigned long long>(arm_epoch), int(fresh_ready),
+                int(fresh_wrapper != nullptr), int(fresh_sent),
+                int(fresh_success), fresh_response_type,
+                replacement_sidecar,
+                static_cast<unsigned long long>(replacement_start));
+            if (!fresh_success) {
+                const std::string daemon_tail = read_file_tail(log, 24000);
+                std::fprintf(stderr,
+                    "C03_FRESH_DAEMON_LOG_BEGIN\n%s\nC03_FRESH_DAEMON_LOG_END\n",
+                    daemon_tail.c_str());
+            }
+            REQUIRE(fresh_ready && fresh_sent && fresh_success,
+                    "a separate fresh ARM succeeds without extending the invalidated request deadline");
+            delete fresh_wrapper;
+            if (daemon_stopped) (void)::kill(daemon_pid, SIGCONT);
+            (void)::kill(daemon_pid, SIGTERM);
+            int status = 0;
+            bool reaped = wait_child(daemon_pid, 10000, &status);
+            if (!reaped) {
+                (void)::kill(daemon_pid, SIGKILL);
+                (void)::waitpid(daemon_pid, &status, 0);
+            }
+            REQUIRE(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                    "C03 invalidation fixture daemon exits cleanly under bounded cleanup");
+            delete scheduler;
+            ::close(scheduler_listener);
+            if (failures == 0) std::filesystem::remove_all(work);
+            else std::fprintf(stderr,
+                "retained failing C03 work directory: %s\n", work.c_str());
+            return failures ? 1 : 0;
+        }
 
         if (daemon_stopped) {
             std::this_thread::sleep_until(

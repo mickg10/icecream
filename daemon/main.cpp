@@ -11062,6 +11062,45 @@ bool Daemon::advance_p51_source_arms(const std::vector<pollfd> &pollfds)
                     fail("source deadline expired before ARMED");
                     return true;
                 }
+                // Final ARM publication must not trust only cached READY and
+                // connection leases: the peer or exact sidecar process may
+                // already be observably gone while their poll events await
+                // the next ordinary event-loop dispatch. These probes do not
+                // consume input or child status; MsgChannel and the central
+                // child reaper remain their sole owners.
+                bool client_peer_live = client->channel != nullptr &&
+                    client->channel->fd >= 0 &&
+                    !client->channel->has_buffered_input();
+                if (client_peer_live) {
+                    char peek = 0;
+                    const ssize_t peeked = ::recv(
+                        client->channel->fd, &peek, sizeof(peek),
+                        MSG_PEEK | MSG_DONTWAIT);
+                    if (peeked > 0 || peeked == 0 ||
+                        (peeked < 0 && errno != EAGAIN &&
+                         errno != EWOULDBLOCK))
+                        client_peer_live = false;
+                }
+                if (!client_peer_live) {
+                    fail("client EOF, buffered input, or socket failure before ARMED");
+                    return true;
+                }
+                const pid_t ready_child = cache_adapter != nullptr
+                    ? cache_adapter->outer_child_pid() : -1;
+                const int ready_pidfd = cache_adapter != nullptr
+                    ? cache_adapter->outer_pidfd() : -1;
+                if (ready_pidfd < 0 || ready_child <= 1 ||
+                    current_lease->pid != ready_child) {
+                    fail("READY child lacks the exact registered pidfd");
+                    return true;
+                }
+                pollfd ready_child_observation{
+                    ready_pidfd, POLLIN | POLLERR | POLLHUP, 0};
+                const int child_poll = ::poll(&ready_child_observation, 1, 0);
+                if (child_poll != 0 || ready_child_observation.revents != 0) {
+                    fail("READY child exited before ARMED publication");
+                    return true;
+                }
                 client->p50_source_arm_fields = pending->arm.source;
                 client->p51_source_arm_fields = pending->arm;
                 client->p51_source_armed_fields = *pending->armed;
