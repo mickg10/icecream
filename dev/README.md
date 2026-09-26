@@ -19,6 +19,9 @@ For a supported opt-in process gate, run (for example)
 `ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p51-arm-expiry`; the command
 builds this checkout in a unique scratch run and invokes the bounded gate in a
 separate disposable root container.
+To rerun the six root/live P50 checks intentionally skipped by an
+unprivileged `make qa`, use
+`ICEFARM_TMPDIR=/data/icecream make dev-gate GATE=p50-live-core`.
 On normal exit, build output ownership returns to the invoking host user.
 The container's `/tmp` also maps into the selected run directory, covering
 older tests that ignore `TMPDIR`.
@@ -74,7 +77,9 @@ helper installs a temporary namespace-local OUTPUT redirection rule.
 `dev-gate GATE=...` currently allowlists `p51-arm-expiry`, `p51-restart-w30`,
 `p51-scheduler-restart-w30`, `p51-scheduler-f-restart-w30` (active scheduler→F
 restart chain), `p51-restart-chain-w30` (active F→C restart chain), and
-`p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap).
+`p51-capacity-w30` (bounded four-link capacity/reply-settlement overlap), and
+`p50-live-core` (the two remote assignment gates, completion flow, compile
+end-to-end, daemon-positive, and live source-arm gates).
 It creates a private internal bridge, grants
 only `NET_ADMIN`, and retains uniquely named logs under the run's
 `/work/artifacts`. A missing prerequisite or skip result is a failure, not a
@@ -97,6 +102,13 @@ does not change the service's production capacity. Its runner uses the
 non-installed hook-enabled `cache/icecc-cache-service-test`; set
 `ICECC_TEST_P51_CAPACITY_SERVICE` only to override that binary with another
 dedicated test service. The installed `icecc-cache-service` stays hook-free.
+The `p50-live-core` gate force-runs the six existing Automake script targets
+and requires a freshly produced `.trs` reporting `PASS` for each. It uses the
+disposable container's non-loopback bridge address for worker registration,
+requires remote execution for both assignment tests, and uses the test-only
+`icecc` account for daemon lifecycle checks. A missing account, skipped test,
+stale result, or failed gate is fatal; detailed logs and retained scratch-backed
+work directories stay under the gate artifact run.
 The restart gate currently covers ZSTD_TU C1F2/F-cache and C2F1/C-cache
 replacement, one affected transfer plus a healthy sibling. The separate
 `restart-w30` gate covers both replacements for all three profiles: 30 held

@@ -346,6 +346,7 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
     ("p51-scheduler-f-restart-w30", "p51schedulerrestart-w30-check", 1800),
     ("p51-restart-chain-w30", "p50daemonpositive-p51-restart-chain-w30-check", 1200),
     ("p51-capacity-w30", "p51capacity-w30-run.sh", 600),
+    ("p50-live-core", "six required root/live P50 gates", 1200),
 ])
 def test_opt_in_gate_names_are_fixed_and_bounded(
     gate: str, target: str, timeout_s: int,
@@ -491,6 +492,36 @@ def test_capacity_gate_forwards_optional_profile_filter_and_defaults_in_containe
         for index, value in enumerate(filtered_argv[:-1]) if value == "--env"
     }
 
+
+def test_p50_live_core_routes_through_the_private_gate_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    run = GateCommandRun(tmp_path)
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    work = tmp_path / "current"
+    (work / "tmp").mkdir(parents=True)
+
+    def fake_subprocess_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        labels = {"icecream.dev.gate.id": run.gate_id}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(labels))
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_subprocess_run)
+    result = bootstrap.run_gate(
+        run, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+        "p50-live-core",
+    )
+    network_name, network_argv = run.commands[0]
+    gate_name, gate_argv = run.commands[1]
+    assert network_name == "gate-network-create"
+    assert "--internal" in network_argv
+    assert gate_name == "gate-p50-live-core"
+    assert gate_argv[-2:] == ["/source/dev/run-gate.sh", "p50-live-core"]
+    assert gate_argv[gate_argv.index("--cpus") + 1] == "2"
+    assert gate_argv[gate_argv.index("--memory") + 1] == "8g"
+    assert result["target"] == "six required root/live P50 gates"
+    assert result["timeout_s"] == 1200
+
     monkeypatch.setenv("ICECC_TEST_P51_CAPACITY_W30_PROFILE", "ZSTD_TU; bad")
     rejected = GateCommandRun(tmp_path)
     with pytest.raises(bootstrap.BootstrapError, match="must be P29V1"):
@@ -499,6 +530,14 @@ def test_capacity_gate_forwards_optional_profile_filter_and_defaults_in_containe
             "p51-capacity-w30",
         )
     assert rejected.commands == []
+
+
+def test_p50_live_core_builds_check_only_completion_helper_before_tests() -> None:
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    live_gate = script.split('if [[ "$gate" == p50-live-core ]]; then', 1)[1]
+    helper_build = "make -C /work/build/client icecc-p50-completion-test"
+    assert helper_build in live_gate
+    assert live_gate.index(helper_build) < live_gate.index("live_tests=(")
 
 
 @pytest.mark.parametrize("cleanup_failure", ["inspect-timeout", "remove-timeout"])

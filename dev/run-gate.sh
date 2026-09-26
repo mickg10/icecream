@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30}" >&2
+    echo "usage: run-gate.sh {p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p50-live-core}" >&2
 }
 
 if [[ $# -ne 1 ]]; then
@@ -58,6 +58,13 @@ case "$1" in
             P29V1|ZSTD_TU|ZSTD_ROUTE) expected_markers=1 ;;
             *) echo "FAIL: unsupported capacity W30 profile filter: $capacity_profile" >&2; exit 2 ;;
         esac
+        ;;
+    p50-live-core)
+        gate=$1
+        target="six required root/live P50 gates"
+        timeout_s=1200
+        marker=P50_LIVE_CORE_PASS=
+        expected_markers=1
         ;;
     *)
         echo "FAIL: unsupported opt-in gate: $1" >&2
@@ -145,7 +152,106 @@ log="$run_dir/$gate.log"
 status_file="$run_dir/$gate.exit"
 echo "GATE_START name=$gate target=$target timeout_s=$timeout_s run_id=$ICECREAM_GATE_RUN_ID"
 set +e
-if [[ "$gate" == p51-capacity-w30 ]]; then
+status=0
+if [[ "$gate" == p50-live-core ]]; then
+    worker_scheduler_host=$(hostname -I | awk '{print $1}')
+    if ! python3 - "$worker_scheduler_host" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit(1)
+if (address.is_loopback or address.is_unspecified or address.is_multicast or
+        address.is_reserved or address.is_link_local):
+    raise SystemExit(1)
+PY
+    then
+        echo "FAIL: could not derive an ordinary bridge IPv4 for the live P50 worker scheduler: $worker_scheduler_host" >>"$log"
+        status=2
+    else
+        export ICECC_P50_C1F1_WORKER_SCHEDULER_HOST="$worker_scheduler_host"
+        export ICECC_P50_C1F1_KEEP_WORK=1
+        export ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc
+        build_status=0
+        timeout --signal=TERM --kill-after=15s 300s \
+            make -C /work/build/unittests p50daemonpositive p50sourcearm-live \
+            >>"$log" 2>&1 || build_status=$?
+        if [[ $build_status -eq 0 ]]; then
+            completion_build_status=0
+            timeout --signal=TERM --kill-after=15s 180s \
+                make -C /work/build/client icecc-p50-completion-test \
+                >>"$log" 2>&1 || completion_build_status=$?
+            if [[ $completion_build_status -ne 0 ]]; then
+                echo "FAIL: could not build required completion-flow client helper (exit=$completion_build_status)" >>"$log"
+                build_status=$completion_build_status
+            fi
+        fi
+        live_tests=(
+            remoteice-quick
+            p50assignment-remote
+            p50completionflow-run
+            p50compilee2e-run
+            p50daemonpositive-run
+            p50sourcearm-live-run
+        )
+        if [[ $build_status -ne 0 ]]; then
+            status=$build_status
+        fi
+        for test_name in "${live_tests[@]}"; do
+            [[ $status -eq 0 ]] || break
+            script="/work/source/unittests/$test_name.sh"
+            base=${test_name%.sh}
+            test_log="/work/build/unittests/$base.log"
+            test_trs="/work/build/unittests/$base.trs"
+            if [[ -e "$test_log" || -e "$test_trs" ]]; then
+                echo "FAIL: refusing stale live-test result for $test_name" >>"$log"
+                status=1
+                break
+            fi
+            echo "LIVE_TEST_START name=$test_name script=$script" >>"$log"
+            test_status=0
+            case "$test_name" in
+                remoteice-quick|p50assignment-remote)
+                    ICECC_TEST_REQUIRE_REMOTE=1 \
+                        timeout --signal=TERM --kill-after=15s 240s \
+                        make -C /work/build/unittests -W "$script" "$base.log" \
+                        >>"$log" 2>&1 || test_status=$?
+                    ;;
+                p50completionflow-run|p50compilee2e-run)
+                    timeout --signal=TERM --kill-after=15s 600s \
+                        make -C /work/build/unittests -W "$script" "$base.log" \
+                        >>"$log" 2>&1 || test_status=$?
+                    ;;
+                p50daemonpositive-run)
+                    timeout --signal=TERM --kill-after=15s 600s \
+                        env ICECC_TEST_POSITIVE_DAEMON=1 \
+                        make -C /work/build/unittests -W "$script" "$base.log" \
+                        >>"$log" 2>&1 || test_status=$?
+                    ;;
+                p50sourcearm-live-run)
+                    timeout --signal=TERM --kill-after=15s 600s \
+                        env ICECC_TEST_SOURCE_ARM_LIVE=1 \
+                        make -C /work/build/unittests -W "$script" "$base.log" \
+                        >>"$log" 2>&1 || test_status=$?
+                    ;;
+            esac
+            if [[ $test_status -ne 0 ]] ||
+               [[ ! -f "$test_trs" ]] ||
+               ! grep -Fxq ':test-result: PASS' "$test_trs"; then
+                echo "FAIL: $test_name did not produce a fresh PASS .trs (exit=$test_status)" >>"$log"
+                status=${test_status:-1}
+                [[ $status -eq 0 ]] && status=1
+                break
+            fi
+            echo "LIVE_TEST_PASS name=$test_name trs=$test_trs" >>"$log"
+        done
+        if [[ $status -eq 0 ]]; then
+            echo "P50_LIVE_CORE_PASS=1 worker_scheduler_host=$worker_scheduler_host tests=${#live_tests[@]}" >>"$log"
+        fi
+    fi
+elif [[ "$gate" == p51-capacity-w30 ]]; then
     profiles=(P29V1 ZSTD_TU ZSTD_ROUTE)
     if [[ -n "$capacity_profile" ]]; then
         profiles=("$capacity_profile")
