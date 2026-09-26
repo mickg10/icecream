@@ -12,6 +12,20 @@ retained artifact directories.
 
 ## Developer QA
 
+### External mixed-client harness (live run pending)
+
+Donors `b39c771a` and `660d8752` add three D18 profile scenarios with P43,
+R1 and R2 clients, a shared start barrier, stable compiler-process overlap
+observations, exact remote-result checks and R2 sidecar-adoption evidence.
+The locked-UV focused spec/workload suite passes **215 tests**, exit 0.
+Regression tests reject mismatched non-D18 driver/corpus pairs and ensure the
+Linux process observer does not count its own script as a compiler.
+
+This is harness qualification only: no external farm deployment or live D18
+pass is claimed. Example scenarios still reference historical images; running
+them requires a confirmed operator farm configuration and current pinned image
+references. Default example hosts are not authorization to deploy to them.
+
 ### Bounded deadline/recovery formal checks
 
 Integrated formal donor `21e0cc2d` passes its pinned 19-row TLC gate: twelve
