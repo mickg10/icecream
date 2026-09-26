@@ -118,8 +118,23 @@ Logs under `/tanksmall/scratch/tmp/p51-w30-capacity-overlap-build/tmp/`:
 | ZSTD_TU | `c1f4-zstd-tu.log` | `c00fd437d700a2c6149eefa2dabac59c3c270ffe8f38460bcd9a9e6a1bd618f7` |
 | ZSTD_ROUTE | `c1f4-zstd-route.log` | `078314af6d5ccb337a488a1600275fde74304317efc1f8e5044476352882b9b1` |
 
-Merged cancellation-plus-overlap qualification and supported dev-gate routing
-are pending. The distributed runner is `unittests/p51capacity-w30-run.sh`;
+Merged cancellation-plus-overlap snapshot `923924bb` also passed all three
+profiles with actual exit 0 in a frozen sequential batch. Every tracked source
+path matched the committed snapshot. Service/test binary hashes were unchanged
+before and after the batch:
+`2cc0ca17df13085a48e44885a46f4d55fa3ac1a71361d3cc87153c5774245783` /
+`c9cf6f74f6cc3bcec5f8a57a25b303f85c369829a6a4e0a5a2b2c0de6941e595`.
+Merged logs in the same directory:
+
+| Profile | Log | SHA256 |
+| --- | --- | --- |
+| P29V1 | `merged-final-P29V1.log` | `31a2aafcc5d4ba90ced4c676c68d14cccbc1024b5c34c1372cecd7589f022080` |
+| ZSTD_TU | `merged-final-ZSTD_TU.log` | `10b8933e90c3c53c3852bd628d6f9f289d5cb9c7d64ce765e6d3b42ef833bc2c` |
+| ZSTD_ROUTE | `merged-final-ZSTD_ROUTE.log` | `1110426fb41d37e7417395c2836e6c62c3b029903e389547cb8bba9d6115ee31` |
+
+An earlier merged P29 run overlapped a link step and is excluded from this
+qualification. Supported dev-gate routing remains pending.
+The distributed runner is `unittests/p51capacity-w30-run.sh`;
 it requires an isolated root container with NET_ADMIN, not an ordinary local
 `make check` environment.
 
