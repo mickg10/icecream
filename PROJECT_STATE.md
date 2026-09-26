@@ -12,6 +12,42 @@ retained artifact directories.
 
 ## Developer QA
 
+### Sender sanitizer lifetime correction and clean candidate build
+
+The R2 recovery and shared-failure test fixtures now declare their sender
+after its Asio context, so retained receipt timers are destroyed before the
+context's timer service. The original sanitizer runs failed during teardown
+even where the logical checks printed PASS; those runs remain failed.
+Donor `6b538e2a`, imported as `55635641`, changes only these two fixtures.
+The service's context already outlives its route owner by member declaration
+order; this fix does not change product source.
+
+The corrected ASAN/UBSAN binary passes nine focused selectors: W30 accounting,
+lost-COMMIT recovery, changed RESET_ACK replay, lost RESET_CONFIRM,
+positive-after-rejection, retirement during recovery, deadline recovery ACK,
+completion-log accounting, and observer-failure recovery. Every selector
+exits 0. Product objects were rebuilt with instrumentation from `e98a8ba3`;
+the imported test source matches the tested source byte-for-byte.
+Log `/tanksmall/scratch/tmp/p51-r2-accounting-asan-e98/asan-focused-fixed-lifetime.log`,
+SHA256 `cb2df548eec25b490785d13088b998268b55d6cb083321f05b23e9f8d3ffaf04`.
+Binary SHA256 `4fddf93667ac03d67c22007d61cf0ce92ae32c6c5fa278e8694c301dadf24c95`;
+test source SHA256 `66a202f79a89845ca6ab0c4f4bb25c72d79ed1be713bdbaf0524704b7f325976`.
+These focused passes do not close the complete D17 lifecycle matrix.
+
+Separately, an isolated checkout of `a027d14e` completes an out-of-tree
+`make -j2`, the source-contract preflight, and direct execution of the
+registered accounting regression (three profiles, 32 inputs, two passes,
+W4). Logs under `/tanksmall/scratch/tmp/p51-candidate-runtime-a027d14e/`:
+
+- `a027-out-build.log`: `d1d33ebc9ddbb092d6ef914210361c0c77883e149b0d5870a7ed1ac64c4abd25`
+- `a027-source-preflight.log`: `fee2d042dc88fc89c9138612382ee23c8b1900ecefbc2eacd385fd9f4e92aa0f`
+- `a027-bench-direct.log`: `856f00b7e40c6044a2349ebc07ec555c83cea66c2d5bffffc400f29077a16cfd`
+
+The subdirectory-only Automake invocation failed on an unbuilt test-only
+cache archive. The root recursive check is still running. This build predates
+the fixture correction above and does not qualify private capacity changes
+or constitute full candidate QA.
+
 ### Retry-safe preprocessed capture
 
 The opt-in `ICECC_P50_PREPROCESSED_CAPTURE` observer now accepts an existing
