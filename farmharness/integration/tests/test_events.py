@@ -3487,8 +3487,8 @@ def test_receipt_gate_event_restart_receipt_is_accepted_by_collector(
     gate = {
         "negotiated_window": 30,
         "links": [
-            {"client": "C1", "worker": "F2", "first_job": 1, "last_job": 31},
-            {"client": "C1", "worker": "F1", "first_job": 32, "last_job": 62},
+            {"client": "C1", "worker": "F2", "first_job": 1, "last_job": 30},
+            {"client": "C1", "worker": "F1", "first_job": 31, "last_job": 60},
         ],
         "restart_extension": {
             "kind": "held-f-restart-v1",
@@ -3507,9 +3507,9 @@ def test_receipt_gate_event_restart_receipt_is_accepted_by_collector(
             "f_store_guid": guid, "f_store_generation": generation,
             "stopped_by_restart": stopped, "after_restart": after,
         }
-    affected_old = evidence("C1", "F1", 32, 62, "e" * 32, 1, stopped=True)
-    healthy = evidence("C1", "F2", 1, 31, "f" * 32, 1)
-    phase2 = evidence("C1", "F1", 63, 93, "b" * 32, 2, after=True)
+    affected_old = evidence("C1", "F1", 31, 60, "e" * 32, 1, stopped=True)
+    healthy = evidence("C1", "F2", 1, 30, "f" * 32, 1)
+    phase2 = evidence("C1", "F1", 61, 91, "b" * 32, 2, after=True)
     restart.update({
         "schema": "icefarm-p51-held-f-restart-v1",
         "stopped_interval_ms": 100,
@@ -3519,11 +3519,16 @@ def test_receipt_gate_event_restart_receipt_is_accepted_by_collector(
             "discarded_marker": "explicit abort discarded held COMMIT interval",
         },
         "healthy_progress": {
-            "client": "C1", "worker": "F2", "first_job": 1, "last_job": 31,
+            "client": "C1", "worker": "F2", "first_job": 1, "last_job": 30,
             "verified_while_stopped": True,
         },
+        "old_cohort_drain": {
+            "client": "C1", "first_job": 31, "last_job": 60,
+            "retry_worker": "F2", "verified_while_stopped": True,
+        },
+        "phase2_gate_ready_while_stopped": True,
         "phase2": {
-            "worker": "F1", "first_job": 63, "last_job": 93,
+            "worker": "F1", "first_job": 61, "last_job": 91,
             "held": {"count": 30, "profile": "ZSTD_TU", "negotiated_window": 30},
             "identity": {
                 "f_store_guid": "b" * 32, "f_store_generation": 2,
@@ -3538,10 +3543,13 @@ def test_receipt_gate_event_restart_receipt_is_accepted_by_collector(
             "links": [healthy, affected_old, phase2], "restart_extension": restart,
         }}]},
         ScenarioSpec(path=Path("scenario.json"), data=scenario.data),
-        {"successful_strict_p50_retry_bindings": [{
-            "first_worker": "F1", "final_worker": "F2",
-            "failure_reason": "source-transfer-loss", "job_id": "C1:A:1:33",
-        }]},
+        {"successful_strict_p50_retry_bindings": [
+            {
+                "first_worker": "F1", "final_worker": "F2",
+                "failure_reason": "source-transfer-loss", "job_id": f"C1:A:1:{ordinal}",
+            }
+            for ordinal in range(31, 61)
+        ]},
     )
 
 
