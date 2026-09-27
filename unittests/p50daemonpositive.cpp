@@ -1201,6 +1201,9 @@ private:
                 if (within_count && within_time) {
                     failed_.store(false, std::memory_order_release);
                     stop_.store(false, std::memory_order_release);
+                    terminal_kind_.store(TerminalKind::Other,
+                                         std::memory_order_release);
+                    terminal_recorded_.store(false, std::memory_order_release);
                     retry_prearm = true;
                 } else {
                     std::fprintf(stderr,
@@ -1470,7 +1473,8 @@ static bool p51_receipt_gate_prearm_retry_selftest(uid_t sidecar_uid,
                 while (gate.prearm_disconnects() == 0 && Clock::now() < deadline)
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 ::close(client);
-                return gate.prearm_disconnects() == 1;
+                return gate.prearm_disconnects() == 1 &&
+                    !gate.terminal_observed();
             }
             std::array<unsigned char, 4> max_version{};
             std::array<unsigned char, 4> selected_version{};
@@ -1534,7 +1538,8 @@ static bool p51_receipt_gate_prearm_retry_selftest(uid_t sidecar_uid,
                 while (gate.prearm_disconnects() < 2 && Clock::now() < deadline)
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 ::close(client);
-                return gate.prearm_disconnects() == 2;
+                return gate.prearm_disconnects() == 2 &&
+                    !gate.terminal_observed();
             }
             const bool decoded_by_gate = gate.link_state_seen();
             const bool rearmed = decoded_by_gate && gate.rearm(30, 1);
@@ -1549,7 +1554,8 @@ static bool p51_receipt_gate_prearm_retry_selftest(uid_t sidecar_uid,
         while (!gate.finished() && Clock::now() < finish_deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         valid_path = valid_link && gate.finished() && gate.connection_attempts() == 3 &&
-            gate.prearm_disconnects() == 2 && gate.link_state_seen();
+            gate.prearm_disconnects() == 2 && gate.link_state_seen() &&
+            gate.terminal_observed() && gate.clean_idle_link_eof();
     }
     ::close(upstream_listener);
     if (upstream.joinable()) upstream.join();
