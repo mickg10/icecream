@@ -41,8 +41,14 @@ Commit `be66761c` separates D18 local expected-output preparation from its
 measured start. It checks run/client/turn-bound preparation results before
 allowing measured drivers, retaining the 60-second barrier and overlap
 limits; 259 focused harness tests pass. The first external attempt timed out
-before measured traffic and remains a setup failure. Fresh external runs
-must establish the mixed-role result; unit tests do not establish it.
+before measured traffic and remains a setup failure. Retry
+`d18-p29-prep-20260927-2` reached measured work (100 jobs per client), but failed
+the required-worker/exact-remote row check. It is a measured failure. The
+verifier omitted the offending row and failure-path cleanup removed the
+uncollected result files, so surviving endpoint errors do not establish its
+cause. Row-specific diagnostics and preservation before cleanup are being
+fixed before rerunning. Exact old-run containers are absent on q2/q3/q5.
+External mixed qualification remains open; unit tests do not establish it.
 
 ### Sidecar recovery budget
 
