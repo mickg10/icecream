@@ -120,6 +120,15 @@ Log `/tanksmall/scratch/tmp/p51-multilink-e2deb-focused.log`, SHA256
 `454b7efc285ad753167c19f2a11efb340bca28e4917de67c106bf410fd5c9cdb`.
 A live isolated multi-link run remains required.
 
+`402d11fc` removes an incorrect multi-link exception to strict P50 policy.
+`ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
+does not require a single client/worker topology. All-new receipt-link runs
+now keep the existing bounded strict-P50 retry instead of requesting legacy
+on retry; mixed-version/profile-off/control cases retain their prior policy.
+Donor `3b4bfc3f` passed all 110 workload-module tests, including both topology
+directions and actual driver arguments. This enables a truthful automatic
+P50 restart test; it does not itself prove restart recovery or fresh W30.
+
 The complete supported Python QA directory (`farmharness/integration/tests`)
 also passed on merged `e2deb92b`: 1,758 passed, one skipped, 233.53 seconds.
 Retained log `/tanksmall/scratch/tmp/p51-multilink-e2deb-integration-python.log`.
