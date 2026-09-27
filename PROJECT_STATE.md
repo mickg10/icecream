@@ -44,13 +44,21 @@ SHA256 `9c62cf8ac7f5a68f4a3bd25be6f4d3efd42e87e5521bd70f3b80582e0660eb60`.
 It records the completed container (exit 0), exact source/image/binary/trace
 identities and resource limits. This is not a complete D03 or whole-QA pass.
 
-The corrected `6cffafa0` farm image has also built successfully, locally only:
+The corrected `6cffafa0` farm image has also built successfully:
 `tt-quietbox3:5000/icefarm/icecream:p50s4-6cffafa0-c06`, image ID
 `sha256:6dced048e1cac905480466c51514c98209f03d2d84bc028cccd2bfe24ae7ea47`.
 Source archive, closure and role-binary pins are machine-generated in
 `/tanksmall/scratch/tmp/icefarm-role-c06-6cff/role-image-authority.json`.
-Distribution and fresh D18 qualification remain pending; the earlier runtime's
-retry-only D18 failure is unchanged.
+Save/load distribution to q2/q3/q5 completed with identical runtime closure
+`83fae0ebaf5c8d3ad38f109c0a20227b22db77f50de6201c2f6796948605decc`.
+The 114,868,777-byte archive has SHA256
+`122f9cfa7d79f9f319832732b1805504b1be1cb62a673099003f535d9a11ab27`;
+receipt `d18/image-distribution.json` under the image evidence directory records
+all host image identities (which differ from the hub identity) and 28 successful
+commands. Fresh P29 mixed-version run `d18-c06-p29-20260927-1` is underway on
+C=q5, F=q2, S=q3, with the original zero-retry requirement. This is not a pass;
+the earlier runtime's retry-only D18 failure is unchanged. TU/ROUTE runs remain
+pending.
 
 ### Multi-link receipt-window harness
 
