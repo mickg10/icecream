@@ -14,6 +14,15 @@ retained artifact directories.
 
 ### Frozen QA and legacy build boundary
 
+Fresh public `make qa` on `be66761c` has completed native checks: 178 total,
+172 PASS, 6 SKIP, zero failures/errors. The six skips have the same capability,
+live-test-switch and non-loopback-host requirements described below. Root,
+Python, legacy and mixed stages are not yet a completed overall result.
+This run includes the READY restart-budget and legacy bootstrap corrections,
+but not the later diagnostic-retention or private multi-link harness changes.
+Evidence directory:
+`/tanksmall/scratch/tmp/p51-final-qa-be667-scratch/icecream-qa-v24we0rw`.
+
 Frozen source `ca40e89f` completed native QA (172 PASS, 6 SKIP), isolated-root
 service QA (2 PASS), and Python QA (1659 PASS, 7 SKIP). Overall `make qa`
 failed before mixed-image tests: the pinned P43 source has no Python project
