@@ -12,6 +12,23 @@ retained artifact directories.
 
 ## Developer QA
 
+### Sidecar status diagnostics
+
+Donor `4790aaa3` adds a read-only `Cache sidecar supervisor` row to the
+existing GetInternalStatus response: adapter/lifecycle states, authenticated
+bit, attempt, child PID, last error and cumulative post-READY exits, or an
+explicit absent row. It uses existing in-memory getters; no extra waitpid,
+filesystem lookup or supervision behavior change is introduced.
+The existing live `cachehandoffdaemon` fixture passes with assertions on the
+READY row. The private daemon/test rebuild reused unchanged production inputs
+whose hashes matched the frozen `ca40e89f` QA closure; its active sanitizer
+temporary output was not a linked dependency. Log:
+`/tanksmall/scratch/tmp/p51-cache-sidecar-status-run/status-test.log`, SHA256
+`f79e9c7a494c7192761d4c4794c3cf94dce8bf020ab3ccfae15777749c92aa8f`.
+Daemon SHA256 `d90b0b7547338abe990ca4582b22d1d195bf2cc88416a2dbf259d6804b8806e5`.
+This diagnostic is newer than both the external farm image and frozen full
+QA; it does not establish the cause or fix of Implementer's s39 service loss.
+
 ### Independent pending-input caps across profiles
 
 Donor `ff922f7a` expands the existing real-service pending-budget fixture to
