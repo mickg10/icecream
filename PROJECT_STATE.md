@@ -31,8 +31,27 @@ with 18 PASS markers and `D11_PENDING_MATRIX_EXIT=0`. Binary SHA256:
 `ff8423fdb30d8afdb493290b5355ecf8a100ce09f9a399c2d82cf82969d61044`.
 This is four independent C links with charged decoder-window accounting,
 not 30 simultaneous decoder contexts or a measured process-memory bound.
-Independent retained-input-record-count saturation/refill and final merged
-QA remain open; existing byte-cap and receipt-ledger tests are unchanged.
+Final merged QA remains open; existing receipt-ledger tests are unchanged.
+
+Donor `75aaec5b` adds service retained-record-count admission at W1/W30 for
+all three profiles. A count limit of two refuses a third input while retained
+payload is only 192 bytes against a 1 MiB byte cap. Prior inputs remain exact;
+closing a retained lease releases capacity and a fitting successor commits
+and reads back exactly. InputLifecycleRegistry and InputRecordStore share
+this configured count limit: the lifecycle table refuses before record-store
+publication. This is not an isolated test of the later record-store guard.
+Six final-source count cells and the six existing byte-cap cells pass.
+Logs under `/tanksmall/scratch/tmp/p51-d11-record-cap-profiles-build/logs/`:
+`record-cap-final.log` SHA256
+`e539cc55341f49407da616378e27989630e91e8497f087979f7f4d1244e2f25c`;
+`byte-cap-final.log` SHA256
+`5969c80e5aefa54ecda0e06387bf069de4de4af1e8acabc1201b44db7f666152`.
+Binary SHA256 `49c9b6264b4e82cca250ac1bf8952ca2709634898f6dd5379f627ad3410f3365`.
+An earlier default service run passed, but final-source `service-default-r3.log`
+failed the existing D07 `one_link` assertion after a live-interrupted-reservation
+refusal. This remains under investigation; focused cap passes do not turn
+that full-suite failure into a pass. Metadata and measured memory bounds
+remain separate open coverage.
 
 ### Delayed old-generation connector completion
 
