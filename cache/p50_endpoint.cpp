@@ -7541,7 +7541,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
             for (;;) {
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
                 auto header_observer = [&](const FrameHeader& header) {
-                    if (header.type == MessageType::R2_BODY &&
+                    if ((header.type == MessageType::R2_BODY ||
+                         header.type == MessageType::R2_FILL) &&
                         header.payload_bytes != 0 &&
                         control.after_r2_component_header_for_test)
                         control.after_r2_component_header_for_test(

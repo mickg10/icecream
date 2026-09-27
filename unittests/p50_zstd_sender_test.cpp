@@ -3674,7 +3674,8 @@ asio::awaitable<ServerRunResult> sender_r2_accept_with_first_commit_gate(
     std::atomic<int>& observed_peer_fd, std::atomic<bool>& gate_entered,
     std::atomic<bool>& gate_returned,
     std::mutex& gate_mutex, std::condition_variable& gate_cv,
-    bool& release_gate) {
+    bool& release_gate,
+    bool gate_second_body_header = false) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await acceptor.async_accept(socket, asio::use_awaitable);
     socket.set_option(tcp::socket::receive_buffer_size(4096));
@@ -3684,8 +3685,42 @@ asio::awaitable<ServerRunResult> sender_r2_accept_with_first_commit_gate(
         throw std::runtime_error("D16 could not duplicate the accepted peer socket");
 
     EndpointIoControl control;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (gate_second_body_header) {
+        bool body_gate_fired = false;
+        control.after_r2_component_header_for_test =
+            [&, body_gate_fired](const JobBind& binding, const TxBegin&,
+                                 MessageType type, size_t payload_bytes) mutable {
+                const MessageType gated_component =
+                    binding.profile == ProfileId::P29V1
+                        ? MessageType::R2_FILL : MessageType::R2_BODY;
+                if (type != gated_component || payload_bytes == 0 ||
+                    binding.tu_seq.value != 1 || body_gate_fired)
+                    return;
+                body_gate_fired = true;
+                std::fprintf(stderr,
+                             "P51_D03_PAYLOAD_GATE profile=%s component=%s tu_seq=%llu bytes=%zu offset=0\n",
+                             binding.profile == ProfileId::P29V1 ? "P29V1"
+                                 : binding.profile == ProfileId::ZSTD_ROUTE
+                                     ? "ZSTD_ROUTE" : "ZSTD_TU",
+                             gated_component == MessageType::R2_FILL
+                                 ? "R2_FILL" : "R2_BODY",
+                             static_cast<unsigned long long>(binding.tu_seq.value),
+                             payload_bytes);
+                gate_entered.store(true, std::memory_order_release);
+                gate_cv.notify_all();
+                std::unique_lock lock(gate_mutex);
+                if (!gate_cv.wait_for(lock, std::chrono::seconds(10),
+                                      [&] { return release_gate; }))
+                    throw std::runtime_error("D03 BODY-payload gate expired");
+                gate_returned.store(true, std::memory_order_release);
+            };
+    }
+#endif
     control.outbound_message_observer =
         [&](ActorSide actor, const Message& message) {
+            if (gate_second_body_header)
+                return;
             if (actor != ActorSide::F ||
                 !std::holds_alternative<R2TxCommit>(message) ||
                 std::get<R2TxCommit>(message).inner.tu_seq.value != 0)
@@ -3745,7 +3780,8 @@ std::string sender_test_tcp_tuple(int fd) {
 void run_p51_sender_writer_backpressure_case(
     ProfileId profile, bool retire_while_reader_and_writer_held = false,
     bool resume_after_backpressure = false,
-    bool shrink_send_buffer_before_body = false) {
+    bool shrink_send_buffer_before_body = false,
+    bool payload_shortwrite_candidate = false) {
     CHECK(!(retire_while_reader_and_writer_held && resume_after_backpressure));
     ScopedP50Diagnostics diagnostics;
     constexpr size_t kLargeRawBytes = 512U << 10;
@@ -3890,7 +3926,8 @@ void run_p51_sender_writer_backpressure_case(
     auto server_future = asio::co_spawn(
         f_context, sender_r2_accept_with_first_commit_gate(
             acceptor, server, observed_f_fd, f_gate_entered,
-            f_gate_returned, f_gate_mutex, f_gate_cv, release_f_gate),
+            f_gate_returned, f_gate_mutex, f_gate_cv, release_f_gate,
+            payload_shortwrite_candidate),
         asio::use_future);
 
     PreparationAuthorityLimits limits;
@@ -3965,7 +4002,9 @@ void run_p51_sender_writer_backpressure_case(
                                                    std::memory_order_release);
                 const std::string tuple = sender_test_tcp_tuple(fd);
                 std::fprintf(stderr,
-                             "P51_D03_EAGAIN_ARM profile=%s tuple=%s sndbuf=%d\n",
+                             payload_shortwrite_candidate
+                                 ? "P51_D03_PAYLOAD_ARM profile=%s tuple=%s sndbuf=%d\n"
+                                 : "P51_D03_EAGAIN_ARM profile=%s tuple=%s sndbuf=%d\n",
                              profile_name, tuple.c_str(), effective);
             }
             co_return;
@@ -4068,11 +4107,17 @@ void run_p51_sender_writer_backpressure_case(
     CHECK(wait_for_progress([&] {
         return complete_bundles.load(std::memory_order_acquire) == 1;
     }, std::chrono::seconds(5)));
-    {
+    if (!payload_shortwrite_candidate) {
         std::unique_lock lock(f_gate_mutex);
         CHECK(f_gate_cv.wait_for(lock, std::chrono::seconds(2), [&] {
             return f_gate_entered.load(std::memory_order_acquire);
         }));
+    } else {
+        // This mode gates the second job's BODY, so first let the ordinary
+        // first-job COMMIT be observed before submitting that second job.
+        CHECK(wait_for_progress([&] {
+            return commit_count.load(std::memory_order_acquire) == 1;
+        }, std::chrono::seconds(5)));
     }
     CHECK(!first_receipt_validated.load(std::memory_order_acquire));
     CHECK(first.wait_for(std::chrono::milliseconds(0)) ==
@@ -4084,6 +4129,12 @@ void run_p51_sender_writer_backpressure_case(
             armed[1], kPhysicalGeneration, connector,
             PrepareRequestKey{3, 31002}, deadline.as_steady_time_point(), input[1]),
         asio::use_future);
+    if (payload_shortwrite_candidate) {
+        std::unique_lock lock(f_gate_mutex);
+        CHECK(f_gate_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return f_gate_entered.load(std::memory_order_acquire);
+        }));
+    }
     const uint64_t heartbeat_before = heartbeat_ticks.load(std::memory_order_acquire);
     const auto blocked_deadline = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(5);
@@ -4151,6 +4202,24 @@ void run_p51_sender_writer_backpressure_case(
         const int peer_receive_fd =
             observed_f_fd.load(std::memory_order_acquire);
         CHECK(peer_receive_fd >= 0);
+        int f_inq_at_release = -1;
+        int c_outq_at_release = -1;
+        (void)::ioctl(peer_receive_fd, SIOCINQ, &f_inq_at_release);
+        const int c_fd_at_release =
+            observed_c_fd.load(std::memory_order_acquire);
+        if (c_fd_at_release >= 0)
+            (void)::ioctl(c_fd_at_release, SIOCOUTQ, &c_outq_at_release);
+        {
+            std::lock_guard lock(f_gate_mutex);
+            if (payload_shortwrite_candidate)
+                std::fprintf(stderr,
+                             "P51_D03_PAYLOAD_GATE_RELEASE profile=%s\n",
+                             profile_name);
+            release_f_gate = true;
+        }
+        f_gate_cv.notify_all();
+        hold_receipt_reader.store(false, std::memory_order_release);
+        progress_cv.notify_all();
         const int requested_resumed_receive_buffer = 1U << 20;
         CHECK(::setsockopt(peer_receive_fd, SOL_SOCKET, SO_RCVBUF,
                            &requested_resumed_receive_buffer,
@@ -4165,20 +4234,6 @@ void run_p51_sender_writer_backpressure_case(
         std::cerr << "P51_D03_BACKPRESSURE_RESUME_BUFFER profile="
                   << profile_name << " initial_rcvbuf=4096 effective_after="
                   << effective_resumed_receive_buffer << '\n';
-        int f_inq_at_release = -1;
-        int c_outq_at_release = -1;
-        (void)::ioctl(peer_receive_fd, SIOCINQ, &f_inq_at_release);
-        const int c_fd_at_release =
-            observed_c_fd.load(std::memory_order_acquire);
-        if (c_fd_at_release >= 0)
-            (void)::ioctl(c_fd_at_release, SIOCOUTQ, &c_outq_at_release);
-        {
-            std::lock_guard lock(f_gate_mutex);
-            release_f_gate = true;
-        }
-        f_gate_cv.notify_all();
-        hold_receipt_reader.store(false, std::memory_order_release);
-        progress_cv.notify_all();
 
         std::array<int, 4> f_inq_samples{};
         std::array<int, 4> c_outq_samples{};
@@ -4373,9 +4428,14 @@ void run_p51_sender_writer_backpressure_case(
         if (shrink_send_buffer_before_body) {
             CHECK(send_buffer_shrunk.load(std::memory_order_acquire));
             CHECK(effective_shrunk_send_buffer.load(std::memory_order_acquire) > 0);
-            std::fprintf(stderr,
-                         "P51_D03_EAGAIN_CASE profile=%s exact=1 receipts=2 commits=2 credits=1 PASS\n",
-                         profile_name);
+            if (payload_shortwrite_candidate)
+                std::fprintf(stderr,
+                             "P51_D03_PAYLOAD_CASE profile=%s exact=1 receipts=2 commits=2 credits=1 PASS\n",
+                             profile_name);
+            else
+                std::fprintf(stderr,
+                             "P51_D03_EAGAIN_CASE profile=%s exact=1 receipts=2 commits=2 credits=1 PASS\n",
+                             profile_name);
         }
 #endif
     }
@@ -4423,6 +4483,12 @@ void test_p51_sender_writer_backpressure_eagain_candidate() {
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE})
         run_p51_sender_writer_backpressure_case(profile, false, true, true);
+}
+
+void test_p51_sender_writer_payload_shortwrite_candidate() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        run_p51_sender_writer_backpressure_case(profile, false, true, true, true);
 }
 #endif
 #endif
@@ -7272,6 +7338,17 @@ int main(int argc, char** argv) {
         return 0;
 #else
         std::cerr << "UNSUPPORTED: D03 kernel EAGAIN witness requires Linux\n";
+        return 77;
+#endif
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--d03-kernel-payload-shortwrite") {
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS) && defined(__linux__)
+        test_p51_sender_writer_payload_shortwrite_candidate();
+        std::cerr << "P51_D03_KERNEL_PAYLOAD_SHORTWRITE_SELECTOR PASS\n";
+        return 0;
+#else
+        std::cerr << "UNSUPPORTED: D03 payload short-write witness requires Linux test hooks\n";
         return 77;
 #endif
     }
