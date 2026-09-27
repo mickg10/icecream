@@ -21,8 +21,8 @@ remote defaults remain unchanged. Local role containers require CPU/memory
 caps, checked against declared host capacity. The transport candidate passed
 1718 Python tests with one skip before the endpoint correction; post-correction
 focused tests passed 336, plus two image-transport checks. Actual same-host
-receipt execution is prepared with the corrected runtime diagnostic selection
-and queued behind the external run's shared farm lock.
+receipt execution is prepared with the corrected runtime diagnostic selection;
+the external run has now released the shared farm lock.
 See the operator example in `farmharness/integration/tests/README.md`.
 
 The candidate now materializes 36 receipt-window scenarios: C1F2/3/4 and
@@ -59,7 +59,7 @@ unchanged limits. Log
 Its final C4F1/ZSTD_ROUTE cell established four links after six attempts;
 no first-failure marker occurred. This does not explain or erase the earlier
 12-attempt failure. New local Docker receipt execution is prepared using
-the tiny31 corpus and labelled 9e product image, but is queued behind the
+the tiny31 corpus and labelled 9e product image. It was queued behind the
 intentional host-global farm lock held by D18. The first invocation used the
 workload-only command without an UP receipt; the corrected one-shot invocation
 was refused by that lock. Neither launched a local workload. This remains
@@ -82,6 +82,12 @@ Build log `/tanksmall/scratch/tmp/icefarm-role-be667.URglLL/build.log`, SHA256
 `1e6a641198d13aa88ed1c93f398d975ccc4cd7d41b0472da6e72b421543de636`,
 records a successful build. Distribution and current-image farm qualification
 are not yet complete; older 9e farm results do not qualify this image.
+Machine-generated source/image/role pins are retained in `role-image-authority.json`
+under the same directory, SHA256
+`b3d50e1e3aa3301972aaf604e6e161be3eac22231ee23b6f0489e7114d541411`.
+The existing receipt helper loads in this image: it requires at most GLIBC
+2.34 and GLIBCXX 3.4.29, within the image's libraries. Its usage-only probe
+returned the expected exit 2, not a successful full helper test.
 
 Fresh public `make qa` on `be66761c` completed native checks: 178 total,
 172 PASS, 6 SKIP, zero failures/errors; root checks passed 2/2. Python then
@@ -174,12 +180,22 @@ revision 2 instead of the C/F runtime R2 settings. The selector now requires
 a positive cache relationship, a P50-or-newer C, and runtime R2 on both C/F.
 485 focused plan/collection/catalog tests pass with one skip, including actual
 D18 and receipt-window plans with diagnostics enabled despite base revision 1.
-Collector validity requirements are unchanged. Fresh measured execution is
-still required; existing unmeasured records cannot become numeric evidence.
-Run `d18-p29-diagnostics-20260927-5` is active. Its first successful R2 source
-result reports valid wire accounting and external link intervals, with 35,776
-C-to-F bundle bytes, 116 F-to-C receipt bytes and drained ACK prefix 1.
-This verifies early measurement availability, not the final scenario verdict.
+Collector validity requirements are unchanged; existing unmeasured records
+cannot become numeric evidence. Run `d18-p29-diagnostics-20260927-5` is now
+terminal **FAIL**: all 300 jobs compiled remotely with exact outputs, zero
+local fallbacks, valid accounting, and 15 matching oracle samples. Its only
+failed clause is `retries.bounded`: six R2 jobs recorded retries against the
+configured maximum of zero. Their cause is under offline investigation;
+the retry limit has not been relaxed. Cell wall was 1,283,935 ms. The runtime
+remains the older 9e image, not the newly built be667 image.
+Evidence under
+`/tanksmall/scratch/ictmp/experiments/icecream/integration/results/d18-p29-diagnostics-20260927-5/`:
+`EVIDENCE.md` SHA256
+`1760c6a6f1f8c34177863c58b37596a13f421dff01a8e4000d68d6b986ce681f`;
+`verdict.json` SHA256
+`a4ff095190c4e466660e4963680575263b64cd7a15368a2f93c90417d6e76ab5`.
+Teardown reports DOWN with no problems or diagnostic errors; its shared
+farm lock has been released for the queued local multi-link run.
 The multi-link driver now likewise separates preferred worker names from
 verified address:port endpoints. Its correction passes 301 focused harness
 tests, including same-host/wrong-port rejection; this is not a farm pass.
