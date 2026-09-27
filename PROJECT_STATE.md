@@ -65,6 +65,17 @@ TU/ROUTE runs remain pending.
 
 ### Multi-link receipt-window harness
 
+Receipt-window clients now automatically use one private Docker bridge each;
+S/F endpoints remain unchanged. UP verifies exact network IDs and exclusive
+C attachment, and the workload repeats those live checks before receipt-gate
+execution. Creation intent and returned IDs are saved before further side
+effects; teardown removes only recorded, verified IDs and reports unresolved
+leftovers instead of guessing. Repeated teardown is harmless. This addresses
+the shared host-network UID interception gap found in the failed local runs.
+Donor `8768a201` passed 366 focused tests covering planning, lifecycle, workload,
+partial creation, crash-leftover reporting and stale network state. Integrated
+as `e2deb92b`; a live isolated multi-link run remains required.
+
 Same-host farm execution is now explicit (`hosts[].execution="local"` with
 Docker context `default`), without requiring local SSH. The runner verifies
 a Unix-socket Docker endpoint before authority, preflight and image writes;
