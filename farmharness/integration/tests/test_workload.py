@@ -54,7 +54,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "b71eb105db36845ec726b1df80ec5d5ad7015b46ac94f8a454efdaae64a1c137"
+        "9e4b81da1c08e2b2fdf2627a7eca152fad1898a6e0d41611e5df73e7cb314d29"
     )
 
 
@@ -93,7 +93,55 @@ def test_p51_shell_route_mapping_is_exact_in_child_bash() -> None:
             text=True, capture_output=True, check=False,
         )
         assert overlap_or_hole.returncode != 0
-    assert "export -f read_boundary_release p51_expected_worker compile_one" in MANIFEST_DRIVER
+    assert "export -f read_boundary_release p51_expected_worker p51_expected_endpoint compile_one" in MANIFEST_DRIVER
+
+
+def test_p51_shell_endpoint_mapping_is_exact_in_child_bash() -> None:
+    match = re.search(
+        r"(?ms)^p51_expected_endpoint\(\) \{.*?^\}", MANIFEST_DRIVER
+    )
+    assert match is not None
+    prefix = match.group(0)
+    good = subprocess.run(
+        [
+            "/bin/bash", "-c",
+            prefix + '\np51_link_endpoint_map="1-2=10.0.0.2:23005,3-5=10.0.0.3:23006"; p51_expected_endpoint 4',
+        ], text=True, capture_output=True, check=False,
+    )
+    assert good.returncode == 0
+    assert good.stdout == "10.0.0.3:23006"
+    exported_child = subprocess.run(
+        [
+            "/bin/bash", "-c",
+            prefix + '\np51_link_endpoint_map="1-2=10.0.0.2:23005,3-5=10.0.0.3:23006"; '
+            'export p51_link_endpoint_map; export -f p51_expected_endpoint; '
+            '/bin/bash -c "p51_expected_endpoint 1"',
+        ], text=True, capture_output=True, check=False,
+    )
+    assert exported_child.returncode == 0
+    assert exported_child.stdout == "10.0.0.2:23005"
+
+    validator = re.search(
+        r"(?ms)^p51_validate_link_endpoint_map\(\) \{.*?^\}", MANIFEST_DRIVER
+    )
+    assert validator is not None
+    validation_script = prefix + "\n" + validator.group(0)
+    for endpoint_map, should_fail in (
+        ("1-2=10.0.0.2:23005,3-5=10.0.0.3:23006", False),
+        ("1-3=10.0.0.2:23005,3-5=10.0.0.3:23006", True),
+        ("1-2=10.0.0.2:23005,4-5=10.0.0.3:23006", True),
+        ("1-5=10.0.0.2:65536", True),
+        ("1-5=not-an-endpoint", True),
+    ):
+        checked = subprocess.run(
+            [
+                "/bin/bash", "-c",
+                validation_script
+                + f'\np51_link_endpoint_map="{endpoint_map}"; expected_jobs=5; '
+                + "p51_validate_link_endpoint_map",
+            ], text=True, capture_output=True, check=False,
+        )
+        assert (checked.returncode != 0) is should_fail
 
 
 @pytest.mark.parametrize(
@@ -251,24 +299,41 @@ def test_multilink_output_checker_rejects_an_actual_wrong_worker_row(tmp_path: P
     result = tmp_path / "jobs" / "000001" / "result.tsv"
     result.parent.mkdir(parents=True)
     fields = ["field"] * 13
-    fields[5] = "F_WRONG"
+    fields[5] = "10.0.0.99:23005"
     fields[8] = "0"
     fields[11] = "1"
     fields[12] = "1"
     result.write_text("\t".join(fields) + "\n", encoding="utf-8")
     argv = _p51_link_output_check_argv(
-        "C1", 1, 1, "F_R1", "A"
+        "C1", 1, 1, "F_R1", "10.0.0.2:23005", "A"
     )
     command = list(argv)
     command[4] = str(tmp_path)
     rejected = subprocess.run(command, text=True, capture_output=True, check=False)
     assert rejected.returncode != 0
 
-    fields[5] = "F_R1"
+    fields[5] = "10.0.0.2:23005"
     result.write_text("\t".join(fields) + "\n", encoding="utf-8")
     accepted = subprocess.run(command, text=True, capture_output=True, check=False)
     assert accepted.returncode == 0
-    assert "P51_LINK_OUTPUTS_OK client=C1 worker=F_R1 first=1 last=1" in accepted.stdout
+    assert "P51_LINK_OUTPUTS_OK client=C1 worker=F_R1 endpoint=10.0.0.2:23005 first=1 last=1" in accepted.stdout
+
+    for wrong_endpoint in ("10.0.0.2:23006", "10.0.0.3:23005"):
+        fields[5] = wrong_endpoint
+        result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+        wrong = subprocess.run(command, text=True, capture_output=True, check=False)
+        assert wrong.returncode != 0
+
+
+def test_driver_keeps_worker_alias_preference_and_passes_endpoint_map() -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
+    command = _driver_command(
+        farm, scenario, plan, clients[0], "A", CommandFactory()
+    )
+    assert "ICEFARM_P51_LINK_MAP=1-2=F1,3-4=F2" in command.argv
+    assert "ICEFARM_P51_LINK_ENDPOINT_MAP=1-2=10.0.0.2:23003,3-4=10.0.0.3:23004" in command.argv
+    assert 'preferred=(ICECC_PREFERRED_HOST="$mapped_worker" ICECC_REMOTE_REQUIRED=1)' in MANIFEST_DRIVER
+    assert '"$worker" != "$mapped_endpoint"' in MANIFEST_DRIVER
 
 
 def _multilink_orchestrator_fixture(topology: str):
@@ -314,6 +379,14 @@ def _multilink_orchestrator_fixture(topology: str):
         "timeouts": {"turn_s": 1},
     })
     clients = [{"role": "C", "name": name, "host": "host"} for name in names_c]
+    for client in clients:
+        client.update({
+            "container_image": "sha256:" + "a" * 64,
+            "compiler_recipe": {
+                "executable": "/usr/bin/c++", "binary_sha256": "b" * 64,
+                "arguments": ["-O2"],
+            },
+        })
     plan = {
         "topology": {"instances": instances},
         "ports": {"instances": {name: 23003 + i for i, name in enumerate(names_f)}},
@@ -323,6 +396,7 @@ def _multilink_orchestrator_fixture(topology: str):
         "run_id": "multilink-test",
     }
     farm = SimpleNamespace(
+        hosts={"host": {"docker_context": "test-context"}},
         data={"corpora": {"tiny": {"tus": tus, "repeat": 1}}},
     )
     return farm, scenario, plan, clients

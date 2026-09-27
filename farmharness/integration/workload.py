@@ -309,11 +309,22 @@ def _driver_command(
     receipt_gate = workload.get("receipt_gate", {})
     receipt_links = receipt_gate.get("links", [])
     link_map = ""
+    link_endpoint_map = ""
     link_window = ""
     if receipt_links:
         client_links = [link for link in receipt_links if link["client"] == client["name"]]
+        workers_by_name = {
+            item["name"]: item
+            for item in plan["topology"]["instances"]
+            if item["role"] == "F"
+        }
         link_map = ",".join(
             f"{link['first_job']}-{link['last_job']}={link['worker']}"
+            for link in client_links
+        )
+        link_endpoint_map = ",".join(
+            f"{link['first_job']}-{link['last_job']}="
+            f"{workers_by_name[link['worker']]['address']}:{plan['ports']['instances'][link['worker']]}"
             for link in client_links
         )
         if not link_map:
@@ -368,6 +379,7 @@ def _driver_command(
             ),
             *d18_environment,
             *(("--env", f"ICEFARM_P51_LINK_MAP={link_map}") if link_map else ()),
+            *(("--env", f"ICEFARM_P51_LINK_ENDPOINT_MAP={link_endpoint_map}") if link_endpoint_map else ()),
             *(("--env", f"ICEFARM_P51_LINK_WINDOW={link_window}") if link_window else ()),
             *(
                 (
@@ -586,7 +598,8 @@ def _p51_check_scoped_identity_marker(
 
 
 def _p51_link_output_check_argv(
-    client: str, first_job: int, last_job: int, expected_worker: str, turn: str,
+    client: str, first_job: int, last_job: int, expected_worker: str,
+    expected_endpoint: str, turn: str,
 ) -> tuple[str, ...]:
     # Check one bounded contiguous range using the manifest driver's stable
     # result.tsv columns.  This observes exact local-SHA outputs and the
@@ -597,23 +610,24 @@ root=$1
 first=$2
 last=$3
 worker=$4
+endpoint=$5
 index=$first
 while test "$index" -le "$last"
 do
     file=$(printf '%s/jobs/%06d/result.tsv' "$root" "$index")
     test -f "$file" -a ! -L "$file"
-    test "$(cut -f6 "$file")" = "$worker"
+    test "$(cut -f6 "$file")" = "$endpoint"
     test "$(cut -f9 "$file")" = 0
     test "$(cut -f12 "$file")" = 1
     test "$(cut -f13 "$file")" = 1
     index=$((index + 1))
 done
-printf 'P51_LINK_OUTPUTS_OK client=%s worker=%s first=%s last=%s\n' "$5" "$worker" "$first" "$last"
+printf 'P51_LINK_OUTPUTS_OK client=%s worker=%s endpoint=%s first=%s last=%s\n' "$6" "$worker" "$endpoint" "$first" "$last"
 '''
     return (
         "/bin/sh", "-c", script, "check-link-outputs",
         f"/results/workload/{turn}", str(first_job), str(last_job),
-        expected_worker, client,
+        expected_worker, expected_endpoint, client,
     )
 
 
@@ -866,7 +880,8 @@ def _run_p51_receipt_window_multilink(
                         raise WorkloadError(f"receipt gate release was not acknowledged for {key}")
                     first, last = row["spec"]["first_job"], row["spec"]["last_job"]
                     output_argv = _p51_link_output_check_argv(
-                        key[0], first, last, key[1], turn
+                        key[0], first, last, key[1],
+                        f"{row['worker']['address']}:{row['port']}", turn,
                     )
                     output_deadline = time.monotonic() + deadline_s
                     while time.monotonic() < output_deadline:
@@ -925,6 +940,7 @@ def _run_p51_receipt_window_multilink(
                             sibling["spec"]["first_job"],
                             sibling["spec"]["last_job"],
                             sibling_key[1],
+                            f"{sibling['worker']['address']}:{sibling['port']}",
                             turn,
                         )
                         sibling_output_command = factory.make(

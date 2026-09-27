@@ -116,6 +116,7 @@ s60_admit_through=${ICEFARM_S60_ADMIT_THROUGH:-0}
 disk_fill_worker=${ICEFARM_DISK_FILL_WORKER:-}
 disk_fill_trigger=${ICEFARM_DISK_FILL_TRIGGER:-0}
 p51_link_map=${ICEFARM_P51_LINK_MAP:-}
+p51_link_endpoint_map=${ICEFARM_P51_LINK_ENDPOINT_MAP:-}
 p51_link_window=${ICEFARM_P51_LINK_WINDOW:-}
 case "$s60_admit_through" in
     ''|*[!0-9]*) echo "invalid S60 admission boundary" >&2; exit 65 ;;
@@ -276,6 +277,34 @@ p51_expected_worker() {
     test -n "$match" || return 1
     printf '%s' "$match"
 }
+p51_expected_endpoint() {
+    local target=$1 entry endpoint first last
+    local match=""
+    local -a entries=()
+    IFS=',' read -r -a entries <<<"$p51_link_endpoint_map"
+    for entry in "${entries[@]}"
+    do
+        if [[ "$entry" =~ ^([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9.-]+):([1-9][0-9]{0,4})$ ]]
+        then
+            first=${BASH_REMATCH[1]}
+            last=${BASH_REMATCH[2]}
+            endpoint=${BASH_REMATCH[3]}:${BASH_REMATCH[4]}
+            if test "${BASH_REMATCH[4]}" -gt 65535
+            then
+                return 1
+            fi
+            if test "$target" -ge "$first" -a "$target" -le "$last"
+            then
+                test -z "$match" || return 1
+                match=$endpoint
+            fi
+        else
+            return 1
+        fi
+    done
+    test -n "$match" || return 1
+    printf '%s' "$match"
+}
 p51_validate_link_map() {
     local entry first last mapped_index
     local -a entries=()
@@ -300,9 +329,34 @@ p51_validate_link_map() {
         p51_expected_worker "$mapped_index" >/dev/null || return 1
     done
 }
+p51_validate_link_endpoint_map() {
+    local entry first last mapped_index
+    local -a entries=()
+    IFS=',' read -r -a entries <<<"$p51_link_endpoint_map"
+    test "${#entries[@]}" -gt 0 || return 1
+    for entry in "${entries[@]}"
+    do
+        if [[ "$entry" =~ ^([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9.-]+):([1-9][0-9]{0,4})$ ]]
+        then
+            first=${BASH_REMATCH[1]}
+            last=${BASH_REMATCH[2]}
+            if test "$first" -gt "$last" -o "$last" -gt "$expected_jobs" \
+                -o "${BASH_REMATCH[4]}" -gt 65535
+            then
+                return 1
+            fi
+        else
+            return 1
+        fi
+    done
+    for ((mapped_index=1; mapped_index<=expected_jobs; mapped_index++))
+    do
+        p51_expected_endpoint "$mapped_index" >/dev/null || return 1
+    done
+}
 if test -n "$p51_link_map"
 then
-    p51_validate_link_map || {
+    p51_validate_link_map && p51_validate_link_endpoint_map || {
         echo "P51 receipt route map is malformed, overlapping, or incomplete" >&2
         exit 65
     }
@@ -851,9 +905,11 @@ compile_one() {
     done
     test "$strict_p50" -eq 0 || strict=(ICECC_P50_C1F1_REQUIRED=1)
     mapped_worker=""
+    mapped_endpoint=""
     if test -n "$p51_link_map"
     then
         mapped_worker=$(p51_expected_worker "$index")
+        mapped_endpoint=$(p51_expected_endpoint "$index")
         preferred=(ICECC_PREFERRED_HOST="$mapped_worker" ICECC_REMOTE_REQUIRED=1)
     fi
     if test "$disk_fill_trigger" -gt 0 -a "$index" -eq "$disk_fill_trigger"
@@ -916,9 +972,9 @@ compile_one() {
     then
         remote=0
     fi
-    if test -n "$mapped_worker" -a "$worker" != "$mapped_worker"
+    if test -n "$mapped_endpoint" -a "$worker" != "$mapped_endpoint"
     then
-        echo "P51 receipt route mismatch job=$index expected=$mapped_worker actual=$worker" >&2
+        echo "P51 receipt route mismatch job=$index preferred=$mapped_worker expected_endpoint=$mapped_endpoint actual=$worker" >&2
         remote=0
     fi
     retries=$((assignment_count > 0 ? assignment_count - 1 : 0))
@@ -1014,12 +1070,13 @@ compile_one() {
     trap - EXIT
     return 0
 }
-export -f read_boundary_release p51_expected_worker compile_one
+export -f read_boundary_release p51_expected_worker p51_expected_endpoint compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
 export gate_root gate_state gate_lock gate_active event_serial_through s60_admit_through
 export disk_fill_worker disk_fill_trigger
 export p51_link_map
+export p51_link_endpoint_map
 export p51_link_window
 export resume_mode resume_indices
 
