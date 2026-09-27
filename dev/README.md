@@ -195,6 +195,18 @@ actual `DeadlineExceeded` close, then checks one physical reconnect and exact
 second-job identity/deadline/result. It is not part of the fast default sender
 suite and does not shorten the production timeout.
 
+The opt-in service pressure regression uses the same configured SDK build:
+
+```sh
+ICEFARM_TMPDIR="$SCRATCH" make -C "$BUILD/unittests" p50service-stop-pressure-check
+```
+
+It runs service shutdown with 30 held requests for all three profiles, then
+nine cancellation/reconnect cases, checking session and credit cleanup.
+The target rebuilds its native dependencies and checks every profile marker.
+It is separate from default QA and sanitizer runs. Failed runs retain their
+logs and print the artifact directory; use an existing writable scratch path.
+
 ### Repository and offline inputs
 
 Set `image_repository` to a prepared SDK repository, or override it with

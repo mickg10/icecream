@@ -48,9 +48,21 @@ Logs under `/tanksmall/scratch/tmp/p51-d16-stop-pressure/runtime/`:
 `d17-native-final-r1.log` SHA256
 `ad7a4db2a1415f0dd008ecd1a44a0057789cf7d94053985e805c10973249f166`.
 An earlier run used a stale endpoint archive and is not qualification.
-The focused D16 sanitizer run is pending; this evidence is not a fresh full
-suite qualification. The older D17 runs below did not assert the live-session
+The focused D16 run also passes ASan/UBSan/LSan (exit 0, all three profiles,
+no sanitizer diagnostics). Its log `d16-sanitize-r1.log` has the same SHA256
+as the native D16 log because the emitted test output is identical; the
+instrumented executable has distinct SHA256
+`43e2cfa95d932c07a12ec4b134f4ce05ec1223c0f4911c83811ff5c7b5ed639c`.
+This is not a fresh full-suite qualification. The older D17 runs below did not assert the live-session
 bound and therefore did not detect this defect.
+
+The opt-in `make -C "$BUILD/unittests" p50service-stop-pressure-check`
+target rebuilds dependencies and runs both selectors. Its runner passes with
+all 12 expected cells; a controlled failure propagates exit 17 and retains
+the failure logs. The runner was exercised against the frozen binaries above;
+this is not a new public-bootstrap run. Registration execution log
+`registration-final-r1.log` SHA256:
+`4e50c4ba8267a1c5b0c175fbba19bcda424d1ae081ae2e620aa4bcb33d5b6890`.
 
 The C03 client-EOF fixture now requires exactly one cancellation queued and
 one successful result for the original job/epoch/nonce/request, with the
