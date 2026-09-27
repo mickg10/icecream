@@ -75,6 +75,35 @@ SHA256 `e2115d236a2156938121e74bd087d350cb2a2d2a32e469635a65aeb0c2c62da7`.
 Fresh run `d18-c06-p29-20260927-3` uses the revalidated private authority;
 its final verdict and teardown remain pending.
 
+### Current-source transfer measurements
+
+The `6cffafa0` production closure completed the Firefox **32-TU sample**:
+63/63 cells passed (three repetitions, three profiles, R1/W1 and R2 windows
+1/2/4/8/16/30). Each cell verifies 729,029,554 raw bytes across fresh,
+retained and edited passes. These are local transfer timings under a two-CPU,
+8-GiB container cap, with uncontrolled inherited OS cache and other host load;
+they are not whole-build or external-network measurements.
+
+| Profile | R1/W1 median total ms | R2/W1 | R2/W30 | R2/W30 per-pass peak range |
+| --- | ---: | ---: | ---: | ---: |
+| ZSTD_TU | 5,021 | 4,844 | 2,755 | 3–4 |
+| P29V1 | 3,144 | 2,646 | 1,718 | 5–16 |
+| ZSTD_ROUTE | 36,886 | 36,752 | 30,327 | 1–2 |
+
+Configured W30 is not evidence of 30 naturally outstanding transfers. Peak
+ranges use all individual pass fields: the current executable's aggregate
+peak field omits the edited pass; a reporting correction is being tested
+separately without changing the running benchmark. Full Firefox matrix wall
+time was 14:16.37, maximum RSS 1,845,748 KiB. RocksDB/ClickHouse remain pending.
+Evidence directory `/tanksmall/scratch/tmp/p51-bench-6cff-current/firefox/`:
+`firefox32-paired-matrix.log` SHA256
+`83afeeb39392efadfd6711cab578cc69ce8356dfbf728a5dd83811eb81466d8e`;
+`firefox32-paired-inputs.tsv` SHA256
+`fd1fe4f75fbf063480c6d8e040816c646608436d76398a2aaa989027687a2296`.
+Exact source, production archive and executable identities are in the parent
+directory's `run-manifest.txt` (executable SHA256
+`1dac4d96afdca494e401669fa491cd42ec26b2a30706c7f2cd7fc9aab4c82c68`).
+
 ### Multi-link receipt-window harness
 
 Receipt-window clients now automatically use one private Docker bridge each;
