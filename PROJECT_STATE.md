@@ -134,9 +134,15 @@ This is actual external q5 C / q3 S / q2 F single-link occupancy, not merely
 a configured window. Result:
 `/tanksmall/scratch/tmp/luna-w30-current-build/w30-a-run.json`, SHA256
 `dc2415312928a1207978e893ea8ab0f306946a7dd59c5cb05d89ca4cf2178cba`.
-The W1-underfill negative control, other-profile external cells, required
-topology/restart/mixed cases and full qualification remain open. Neither
-positive gate is a whole-build speed measurement.
+Fresh control `w1-luna-w1-p29-20260927-p` also passes: negotiated P29V1/W1
+produces exactly one held receipt at ordinal 1 (`commits=1 peak=1`), then the
+helper fails its expected-thirty-receipt assertion with the typed bounded
+underfill marker. The harness requires this failure, not a generic timeout
+or setup error; all 31 jobs subsequently complete with zero failures and
+exact outputs. Result:
+`/tanksmall/scratch/tmp/luna-w30-current-build/w1-p-run.json` (`COMPLETE`).
+Other-profile external cells, required topology/restart/mixed cases and full
+qualification remain open. These gates are not whole-build speed measurements.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
