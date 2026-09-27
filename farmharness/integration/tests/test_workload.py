@@ -4,6 +4,7 @@ import hashlib
 import base64
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -40,7 +41,6 @@ from farmharness.integration.workload import (
     _p51_check_scoped_identity_marker,
     _p51_link_output_check_argv,
     _p51_require_sibling_held,
-    _run_d18_preparation,
     _strict_p50_required,
     run_workload,
 )
@@ -54,7 +54,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "9e4b81da1c08e2b2fdf2627a7eca152fad1898a6e0d41611e5df73e7cb314d29"
+        "629f7f67709c6495fc651830619254ea1104bf66361c012d3b9931704341b079"
     )
 
 
@@ -344,7 +344,15 @@ def _multilink_orchestrator_fixture(topology: str):
         {"role": "S", "name": "S", "env": {"ICECC_P50_PROFILE": "P29V1"}}
     ]
     instances += [
-        {"role": "C", "name": name, "host": "host"} for name in names_c
+        {
+            "role": "C", "name": name, "host": "host",
+            "container_image": "sha256:" + "a" * 64,
+            "compiler_recipe": {
+                "executable": "/usr/bin/c++", "binary_sha256": "b" * 64,
+                "arguments": ["-O2"],
+            },
+        }
+        for name in names_c
     ]
     instances += [
         {"role": "F", "name": name, "address": f"10.0.0.{i + 2}", "slots": 1}
@@ -371,6 +379,7 @@ def _multilink_orchestrator_fixture(topology: str):
         "controls": [],
         "timeline": [],
         "workload": {
+            "driver": "p51-receipt-window",
             "corpus": "tiny", "repeat": 1, "jobs": jobs, "clients": names_c,
             "turns": ["A"],
             "receipt_gate": {
@@ -404,6 +413,225 @@ def _multilink_orchestrator_fixture(topology: str):
         data={"corpora": {"tiny": {"tus": tus, "repeat": 1}}},
     )
     return farm, scenario, plan, clients
+
+
+@pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
+def test_receipt_window_prepares_oracle_before_starting_gate_timer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, topology: str,
+) -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture(topology)
+    farm.digest = "farm-digest"
+    farm.data["hub"] = {"results_root": str(tmp_path)}
+    scenario.digest = "scenario-digest"
+    plan["topology_digest"] = "topology-digest"
+    order: list[str] = []
+
+    class Events:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            order.append("events-start")
+
+        def raise_if_failed(self):
+            pass
+
+        def signal_turn_start(self, _turn):
+            order.append("turn-start")
+
+        def signal_turn_complete(self, _turn):
+            order.append("turn-complete")
+
+        def wait(self):
+            order.append("events-wait")
+
+        def stop(self):
+            order.append("events-stop")
+
+    prepared_clients: set[str] = set()
+
+    class PreparationRecorder:
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            assert command.phase == "run.oracle-prepare"
+            assert "ICEFARM_D18_PHASE=prepare" in command.argv
+            assert "ICEFARM_D18_BARRIER=1" not in command.argv
+            assert command.argv[command.argv.index("--user") + 1] == "1:1"
+            prepared_clients.add(command.instance)
+            return CommandResult(0, "", "")
+
+    run_oracle_preparation = workload_module._run_oracle_preparation
+
+    def observe_preparation(commands, transport, timeout):
+        run_oracle_preparation(commands, transport, timeout)
+        order.append("oracle-prepared")
+
+    def run_gate(*_args, **_kwargs):
+        assert order.index("oracle-prepared") < order.index("turn-start")
+        assert prepared_clients == {client["name"] for client in clients}
+        assert "receipt-gate-start" not in order
+        order.append("receipt-gate-start")
+        return (
+            [
+                {
+                    "client": client["name"],
+                    "jobs": scenario.data["workload"]["jobs"],
+                    "failures": 0,
+                    "samples": 1,
+                }
+                for client in clients
+            ],
+            {"links": []},
+        )
+
+    monkeypatch.setattr(workload_module, "EventProducer", Events)
+    monkeypatch.setattr(workload_module, "_run_oracle_preparation", observe_preparation)
+    monkeypatch.setattr(
+        workload_module, "_run_p51_receipt_window_multilink", run_gate
+    )
+    monkeypatch.setattr(workload_module, "_atomic_json", lambda *_args, **_kwargs: None)
+
+    receipt = run_workload(
+        farm, scenario, plan,
+        recorder=RecordingTransport(PreparationRecorder()), require_up=False
+    )
+
+    assert receipt["status"] == "COMPLETE"
+    assert order == [
+        "events-start", "oracle-prepared", "turn-start", "receipt-gate-start",
+        "turn-complete", "events-wait", "events-stop",
+    ]
+    for client in clients:
+        prepared = _driver_command(
+            farm, scenario, plan, client, "A", CommandFactory(),
+            exec_uid="1:1", prepared_oracle=True,
+        )
+        assert "ICEFARM_ORACLE_PREPARED=1" in prepared.argv
+        assert "ICEFARM_D18_BARRIER=1" not in prepared.argv
+        assert f"ICEFARM_D18_RUN_ID={plan['run_id']}" in prepared.argv
+
+
+def test_receipt_prepared_driver_validates_certificate_before_remote_dispatch() -> None:
+    # The existing D18 certificate carries exact run/client/turn and oracle
+    # identity (manifest, compiler digest/configuration, sample hashes). The
+    # receipt driver reuses that barrier, whose shell validator runs before
+    # compile_one can dispatch any remote job.
+    marker_validation = MANIFEST_DRIVER.index(
+        "d18_prepared_sample_total=$(d18_validate_preparation"
+    )
+    compile_dispatch = MANIFEST_DRIVER.index("compile_one() {")
+    prepare_exit = MANIFEST_DRIVER.index('if test "$d18_phase" = prepare\nthen')
+    assert marker_validation < compile_dispatch
+    assert prepare_exit < compile_dispatch
+    assert 'echo "D18 measured phase has an incomplete preparation marker"' in MANIFEST_DRIVER
+
+
+@pytest.mark.parametrize("marker_state", ["valid", "missing", "stale"])
+def test_receipt_prepared_shell_path_validates_then_dispatches_without_d18_go(
+    tmp_path: Path, marker_state: str,
+) -> None:
+    function = re.search(
+        r"(?ms)^d18_validate_preparation\(\) \{\n.*?^\}", MANIFEST_DRIVER
+    )
+    validation = re.search(
+        r'(?ms)^if test "\$d18_barrier" = 1 -o "\$oracle_prepared" = 1\n'
+        r"then\n.*?^fi\n",
+        MANIFEST_DRIVER,
+    )
+    go_wait = re.search(
+        r'(?ms)^if test "\$\{ICEFARM_D18_BARRIER:-0\}" = 1\n'
+        r"then\n.*?^fi\n",
+        MANIFEST_DRIVER,
+    )
+    assert function is not None and validation is not None and go_wait is not None
+
+    prep = tmp_path / marker_state
+    prep.mkdir()
+    samples = prep / "oracle-samples.tsv"
+    summary = prep / "oracle-summary.tsv"
+    samples.write_text("tiny.cc\t" + "a" * 64 + "\t" + "a" * 64 + "\t1\n")
+    summary.write_text("sample_total\t1\nsample_mismatches\t0\n")
+    identity = "b" * 64
+    if marker_state != "missing":
+        marker_identity = "c" * 64 if marker_state == "stale" else identity
+        (prep / "PREPARED.tsv").write_text(
+            "\t".join((
+                "D18_PREPARED_V1", marker_identity, "1",
+                hashlib.sha256(samples.read_bytes()).hexdigest(),
+                hashlib.sha256(summary.read_bytes()).hexdigest(),
+            )) + "\n",
+            encoding="ascii",
+        )
+
+    script = "\n".join((
+        "set -euo pipefail",
+        "d18_phase=run",
+        "d18_barrier=0",
+        "oracle_prepared=1",
+        "d18_prep_root=$1",
+        "d18_prep_identity=$2",
+        "cache_ready=1",
+        function.group(0),
+        validation.group(0),
+        go_wait.group(0),
+        "printf 'RECEIPT_DISPATCH_REACHED\\n'",
+    ))
+    result = subprocess.run(
+        ["/bin/bash", "-c", script, "prepared-receipt-test", str(prep), identity],
+        env={**os.environ, "ICEFARM_D18_BARRIER": "0", "ICEFARM_ORACLE_PREPARED": "1"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if marker_state == "valid":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.endswith("RECEIPT_DISPATCH_REACHED\n")
+    else:
+        assert result.returncode != 0
+        assert "RECEIPT_DISPATCH_REACHED" not in result.stdout
+
+
+def test_receipt_oracle_preparation_failure_never_starts_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan, _clients = _multilink_orchestrator_fixture("C1F2")
+    farm.digest = "farm-digest"
+    farm.data["hub"] = {"results_root": str(tmp_path)}
+    scenario.digest = "scenario-digest"
+    plan["topology_digest"] = "topology-digest"
+    events_stopped: list[bool] = []
+
+    class Events:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            pass
+
+        def stop(self):
+            events_stopped.append(True)
+
+    def failed_preparation(*_args, **_kwargs):
+        raise WorkloadError("local-oracle preparation failed for C1: sample mismatch")
+
+    def unexpected_gate(*_args, **_kwargs):
+        raise AssertionError("receipt gate started despite preparation failure")
+
+    monkeypatch.setattr(workload_module, "EventProducer", Events)
+    monkeypatch.setattr(workload_module, "_run_oracle_preparation", failed_preparation)
+    monkeypatch.setattr(
+        workload_module, "_run_p51_receipt_window_multilink", unexpected_gate
+    )
+    monkeypatch.setattr(workload_module, "_atomic_json", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(WorkloadError, match="local-oracle preparation failed"):
+        run_workload(
+            farm, scenario, plan, recorder=RecordingTransport(), require_up=False
+        )
+    assert events_stopped == [True]
 
 
 @pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
@@ -1862,6 +2090,8 @@ def test_manifest_driver_relaunch_replaces_oracle_samples_atomically(
     (oracle_root / f"{key}.sha256").write_text(observed + "\n", encoding="ascii")
     prefix = f"""
 set -eu
+oracle_prepared=0
+d18_barrier=0
 client_name=C1
 manifest_digest={'b' * 64}
 result_root={result_root}

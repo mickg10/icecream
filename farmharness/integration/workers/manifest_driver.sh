@@ -36,6 +36,7 @@ d18_phase=${ICEFARM_D18_PHASE:-run}
 d18_barrier=${ICEFARM_D18_BARRIER:-0}
 d18_run_id=${ICEFARM_D18_RUN_ID:-}
 d18_prep_root=${ICEFARM_D18_PREP_ROOT:-}
+oracle_prepared=${ICEFARM_ORACLE_PREPARED:-0}
 
 read_boundary_release() {
     python3 -c '
@@ -95,7 +96,9 @@ case "$d18_phase" in
     run|prepare) ;;
     *) echo "invalid D18 phase" >&2; exit 65 ;;
 esac
-if test "$d18_phase" = prepare || test "$d18_barrier" = 1
+test "$oracle_prepared" = 0 -o "$oracle_prepared" = 1
+if test "$d18_phase" = prepare || test "$d18_barrier" = 1 \
+    || test "$oracle_prepared" = 1
 then
     printf '%s' "$d18_run_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
     test "$d18_prep_root" = "/results/d18-prep/$d18_run_id/$turn/$client_name"
@@ -103,6 +106,7 @@ fi
 if test "$d18_phase" = prepare
 then
     test "$d18_barrier" = 0
+    test "$oracle_prepared" = 0
     result_root=$d18_prep_root
 else
     test "$d18_barrier" = 0 -o "$d18_barrier" = 1
@@ -110,6 +114,11 @@ fi
 if test "${d18_barrier:-0}" = 1
 then
     test "$d18_phase" = run
+fi
+if test "$oracle_prepared" = 1
+then
+    test "$d18_phase" = run
+    test "$d18_barrier" = 0
 fi
 event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}
 s60_admit_through=${ICEFARM_S60_ADMIT_THROUGH:-0}
@@ -494,7 +503,7 @@ d18_validate_preparation() {
 }
 
 d18_prepared_sample_total=0
-if test "$d18_barrier" = 1
+if test "$d18_barrier" = 1 -o "$oracle_prepared" = 1
 then
     # Validate before any possible oracle/sample compile fallback.
     d18_prepared_sample_total=$(d18_validate_preparation \
@@ -586,7 +595,7 @@ fi
 
 sample_bucket=$((16#$(printf '%s' "$client_name:$manifest_digest" | sha256sum | cut -c1-7) % 20))
 sample_file="$result_root/oracle-samples.tsv"
-if test "${d18_barrier:-0}" = 1
+if test "${d18_barrier:-0}" = 1 -o "$oracle_prepared" = 1
 then
     cp -- "$d18_prep_root/oracle-samples.tsv" "$sample_file"
     cp -- "$d18_prep_root/oracle-summary.tsv" "$result_root/oracle-summary.tsv"

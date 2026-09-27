@@ -325,6 +325,7 @@ def _driver_command(
     checkpoint_sha256: str | None = None,
     exec_uid: str = "65534:65534",
     d18_phase: str | None = None,
+    prepared_oracle: bool = False,
 ) -> PlannedCommand:
     workload = scenario.data["workload"]
     corpus = farm.data["corpora"][workload["corpus"]]
@@ -387,16 +388,17 @@ def _driver_command(
     if d18_phase not in (None, "prepare"):
         raise WorkloadError("unsupported D18 driver phase")
     d18_environment: tuple[str, ...] = ()
-    if d18_role is not None:
+    if d18_role is not None or d18_phase == "prepare" or prepared_oracle:
         d18_identity = (
             "--env", f"ICEFARM_D18_RUN_ID={plan['run_id']}",
             "--env", f"ICEFARM_D18_PREP_ROOT=/results/d18-prep/{plan['run_id']}/{turn}/{client['name']}",
         )
-        d18_environment = (
-            d18_identity + ("--env", "ICEFARM_D18_PHASE=prepare")
-            if d18_phase == "prepare"
-            else d18_identity + ("--env", "ICEFARM_D18_BARRIER=1")
-        )
+        if d18_phase == "prepare":
+            d18_environment = d18_identity + ("--env", "ICEFARM_D18_PHASE=prepare")
+        elif d18_role is not None:
+            d18_environment = d18_identity + ("--env", "ICEFARM_D18_BARRIER=1")
+        else:
+            d18_environment = d18_identity + ("--env", "ICEFARM_ORACLE_PREPARED=1")
     compiler_args = list(client["compiler_recipe"]["arguments"])
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300
@@ -469,7 +471,9 @@ def _driver_command(
         ),
     )
     return factory.make(
-        phase="run.d18-prepare" if d18_phase == "prepare" else "run.workload",
+        phase=(
+            "run.d18-prepare" if d18_role is not None else "run.oracle-prepare"
+        ) if d18_phase == "prepare" else "run.workload",
         host=client["host"],
         instance=client["name"],
         transport=_docker_transport(farm, client["host"]),
@@ -478,27 +482,27 @@ def _driver_command(
     )
 
 
-def _run_d18_preparation(
+def _run_oracle_preparation(
     commands: list[PlannedCommand], transport: RecordingTransport, timeout_s: int
 ) -> None:
-    """Finish every D18 local-oracle preparation before measured drivers start."""
+    """Finish every local-oracle preparation before measured drivers start."""
     if not commands:
-        raise WorkloadError("D18 preparation has no client commands")
+        raise WorkloadError("oracle preparation has no client commands")
     deadline = time.monotonic() + timeout_s
     with ThreadPoolExecutor(max_workers=len(commands)) as executor:
         futures = [executor.submit(transport.invoke, command) for command in commands]
         for command, future in zip(commands, futures, strict=True):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise WorkloadError("D18 local-oracle preparation timed out")
+                raise WorkloadError("local-oracle preparation timed out")
             try:
                 result = future.result(timeout=remaining)
             except TimeoutError as exc:
-                raise WorkloadError("D18 local-oracle preparation timed out") from exc
+                raise WorkloadError("local-oracle preparation timed out") from exc
             if result.returncode != 0:
                 detail = result.stderr.strip() or "no stderr"
                 raise WorkloadError(
-                    f"D18 local-oracle preparation failed for {command.instance}: {detail}"
+                    f"local-oracle preparation failed for {command.instance}: {detail}"
                 )
 
 
@@ -811,7 +815,8 @@ def _run_p51_receipt_window_multilink(
         # manifest, with each ordinal pinned to exactly one declared F.
         driver_commands = {
             client["name"]: _driver_command(
-                farm, scenario, plan, client, turn, factory, exec_uid="1:1"
+                farm, scenario, plan, client, turn, factory, exec_uid="1:1",
+                prepared_oracle=True,
             )
             for client in clients
         }
@@ -1293,7 +1298,8 @@ def _run_p51_receipt_window(
     # distinct existing account with access to the run-private writable
     # /results mount.
     command = _driver_command(
-        farm, scenario, plan, client, turn, factory, exec_uid="1:1"
+        farm, scenario, plan, client, turn, factory, exec_uid="1:1",
+        prepared_oracle=True,
     )
     _p51_gate_call(
         farm, plan, client, factory, transport, "prepare-control-dir",
@@ -1934,7 +1940,10 @@ def run_workload(
                     factory,
                     timeout_s=scenario.data["timeouts"]["turn_s"],
                 )
-            if isinstance(d18_roles, dict):
+            receipt_window = (
+                scenario.data["workload"].get("driver") == "p51-receipt-window"
+            )
+            if isinstance(d18_roles, dict) or receipt_window:
                 preparation_commands = [
                     _driver_command(
                         farm,
@@ -1944,10 +1953,11 @@ def run_workload(
                         turn,
                         factory,
                         d18_phase="prepare",
+                        exec_uid="1:1" if receipt_window else "65534:65534",
                     )
                     for client in clients
                 ]
-                _run_d18_preparation(
+                _run_oracle_preparation(
                     preparation_commands,
                     transport,
                     max(1, scenario.data["timeouts"]["turn_s"]),
