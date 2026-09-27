@@ -64,10 +64,19 @@ bound and therefore did not detect this defect.
 The opt-in `make -C "$BUILD/unittests" p50service-stop-pressure-check`
 target rebuilds dependencies and runs both selectors. Its runner passes with
 all 12 expected cells; a controlled failure propagates exit 17 and retains
-the failure logs. The runner was exercised against the frozen binaries above;
-this is not a new public-bootstrap run. Registration execution log
+the failure logs. Registration execution log
 `registration-final-r1.log` SHA256:
 `4e50c4ba8267a1c5b0c175fbba19bcda424d1ae081ae2e620aa4bcb33d5b6890`.
+The regenerated Make target also passes all 12 cells after correcting an
+early test snapshot: worker-held budget references can outlive session/gate
+cleanup, so D16 now waits for owner credits within the same eight-second
+deadline. Observed drainage was 2–4 ms. The original target failure remains
+in `make-target-final-r1.log`; passing `make-target-final-r2.log` SHA256:
+`9bfeb726e53b2d9cc97291cdc9e6bcde386cff35795133321f2b35edbcd17ae5`.
+Test binary SHA256:
+`635f3176bfce3a7b41652e335613c508a6e41a618ce7b1baec4241d884ab6ea1`.
+This used a configured SDK build with the polling test change, not a new
+full public-bootstrap qualification. Production behavior was unchanged.
 
 The C03 client-EOF fixture now requires exactly one cancellation queued and
 one successful result for the original job/epoch/nonce/request, with the
