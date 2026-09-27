@@ -10937,7 +10937,7 @@ std::vector<uint8_t> d11_encoded_cap_input(size_t size) {
 }
 
 boost::asio::awaitable<void> d11_pending_budget_client(
-    uint16_t f_port, uint32_t window,
+    uint16_t f_port, ProfileId profile, uint32_t window,
     const SidecarLaunchIdentity& c_launch,
     const SidecarLaunchIdentity& f_launch,
     const P51SourceArmedFields& armed,
@@ -10945,7 +10945,6 @@ boost::asio::awaitable<void> d11_pending_budget_client(
     D11PendingBudgetClientState& state) {
     namespace asio = boost::asio;
     using tcp = asio::ip::tcp;
-    constexpr ProfileId profile = ProfileId::ZSTD_TU;
     const PreparationRouteKey route{
         FStoreGuid{f_launch.f_store_guid.bytes}, f_launch.store_generation,
         profile};
@@ -10979,8 +10978,9 @@ boost::asio::awaitable<void> d11_pending_budget_client(
         link.max_raw_bytes = 1U << 20;
         link.max_encoded_bytes = 1U << 20;
         link.max_output_bytes = 1U << 20;
-        link.system_source_fingerprint =
-            icecc::digest128("D11 aggregate encoded budget");
+        link.system_source_fingerprint = profile == ProfileId::P29V1
+            ? authority->p29v1_system_source_fingerprint(prepared)
+            : icecc::digest128("D11 aggregate encoded budget");
         const LinkState opened = co_await client.open_r2_link(
             socket, link, deadline);
         CHECK(opened.window == window && opened.profile == profile);
@@ -11058,12 +11058,15 @@ boost::asio::awaitable<void> d11_pending_budget_client(
 }
 
 void test_p51_d11_real_r2_pending_budget(
-    D11PendingBudgetKind budget_kind, uint32_t window) {
-    constexpr ProfileId profile = ProfileId::ZSTD_TU;
+    ProfileId profile, D11PendingBudgetKind budget_kind, uint32_t window) {
+    const char* profile_name = profile == ProfileId::P29V1 ? "P29V1" :
+        profile == ProfileId::ZSTD_TU ? "ZSTD_TU" : "ZSTD_ROUTE";
     constexpr size_t kRawBytes = 1024;
     constexpr uint64_t kEncodedCap = 1536;
     constexpr uint64_t kRawCap = 1536;
     CHECK(window == 1 || window == 30);
+    const uint64_t encoded_cap = profile == ProfileId::P29V1
+        ? 20 : kEncodedCap;
 
     StoreIdentityRoot f_root{};
     f_root.bytes[15] = 0xe1;
@@ -11092,7 +11095,7 @@ void test_p51_d11_real_r2_pending_budget(
         uint64_t{1} << config.endpoint_caps.zstd.max_window_log;
     const uint64_t budget_cap = [&] {
         switch (budget_kind) {
-        case D11PendingBudgetKind::Encoded: return kEncodedCap;
+        case D11PendingBudgetKind::Encoded: return encoded_cap;
         case D11PendingBudgetKind::Raw: return kRawCap;
         case D11PendingBudgetKind::DecoderWindow: return one_decoder_window;
         }
@@ -11100,7 +11103,7 @@ void test_p51_d11_real_r2_pending_budget(
     }();
     CHECK(budget_cap != 0);
     const uint64_t encoded_limit =
-        budget_kind == D11PendingBudgetKind::Encoded ? kEncodedCap
+        budget_kind == D11PendingBudgetKind::Encoded ? encoded_cap
                                                     : 4 * kRawBytes;
     const uint64_t raw_limit =
         budget_kind == D11PendingBudgetKind::Raw ? kRawCap : 4 * kRawBytes;
@@ -11138,7 +11141,11 @@ void test_p51_d11_real_r2_pending_budget(
             c_launches[index].store_generation,
             c_launches[index].identity.generation,
             c_launches[index].identity.attempt,
-            0xd110 + index, CACHE_PROFILE_ZSTD_TU, window,
+            0xd110 + index,
+            profile == ProfileId::P29V1 ? CACHE_PROFILE_P29V1 :
+                profile == ProfileId::ZSTD_TU ? CACHE_PROFILE_ZSTD_TU
+                                               : CACHE_PROFILE_ZSTD_ROUTE,
+            window,
             std::chrono::seconds(120));
         requests[index].arm.source.selected_f_host = "127.0.0.1";
         requests[index].arm.source.selected_f_cache_port = f_port;
@@ -11216,7 +11223,7 @@ void test_p51_d11_real_r2_pending_budget(
                 auto future = asio::co_spawn(
                     context,
                     d11_pending_budget_client(
-                        f_port, window, c_launches[index], f_launch,
+                        f_port, profile, window, c_launches[index], f_launch,
                         armed[index], raw, states[index]),
                     asio::use_future);
                 context.run();
@@ -11565,7 +11572,8 @@ void test_p51_d11_real_r2_pending_budget(
     }
     CHECK(accepted_connections.load(std::memory_order_acquire) == 4);
     std::printf(
-        "P51_D11_REAL_R2_PENDING_BUDGET profile=ZSTD_TU kind=%s window=%u encoded=%llu raw=%llu decoder-window=%llu cap=%llu: PASS\n",
+        "P51_D11_REAL_PENDING_BUDGET profile=%s kind=%s window=%u encoded=%llu raw=%llu decoder-window=%llu cap=%llu: PASS\n",
+        profile_name,
         d11_pending_budget_name(budget_kind), window,
         static_cast<unsigned long long>(encoded_charge),
         static_cast<unsigned long long>(raw_charge),
@@ -18205,37 +18213,42 @@ int main(int argc, char** argv) {
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-encoded-cap-zstd-tu-w1") == 0) {
             test_p51_d11_real_r2_pending_budget(
-                D11PendingBudgetKind::Encoded, 1);
+                ProfileId::ZSTD_TU, D11PendingBudgetKind::Encoded, 1);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-encoded-cap") == 0) {
-            for (const uint32_t window : {1U, 30U}) {
-                test_p51_d11_real_r2_pending_budget(
-                    D11PendingBudgetKind::Encoded, window);
-            }
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE})
+                for (const uint32_t window : {1U, 30U})
+                    test_p51_d11_real_r2_pending_budget(
+                        profile, D11PendingBudgetKind::Encoded, window);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-raw-cap-zstd-tu-w1") == 0) {
             test_p51_d11_real_r2_pending_budget(
-                D11PendingBudgetKind::Raw, 1);
+                ProfileId::ZSTD_TU, D11PendingBudgetKind::Raw, 1);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-window-cap-zstd-tu-w1") == 0) {
             test_p51_d11_real_r2_pending_budget(
-                D11PendingBudgetKind::DecoderWindow, 1);
+                ProfileId::ZSTD_TU, D11PendingBudgetKind::DecoderWindow, 1);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-r2-pending-raw-window-cap") == 0) {
-            for (const uint32_t window : {1U, 30U}) {
-                test_p51_d11_real_r2_pending_budget(
-                    D11PendingBudgetKind::Raw, window);
-                test_p51_d11_real_r2_pending_budget(
-                    D11PendingBudgetKind::DecoderWindow, window);
-            }
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE})
+                for (const uint32_t window : {1U, 30U}) {
+                    test_p51_d11_real_r2_pending_budget(
+                        profile, D11PendingBudgetKind::Raw, window);
+                    test_p51_d11_real_r2_pending_budget(
+                        profile, D11PendingBudgetKind::DecoderWindow, window);
+                }
             return 0;
         }
         if (argc == 2 &&
@@ -18316,14 +18329,17 @@ int main(int argc, char** argv) {
             test_p51_d11_real_f_output_byte_cap(profile, 30);
         }
         test_p51_d11_real_f_output_byte_cap(ProfileId::P29V1, 1, true);
-        for (const uint32_t window : {1U, 30U}) {
-            test_p51_d11_real_r2_pending_budget(
-                D11PendingBudgetKind::Encoded, window);
-            test_p51_d11_real_r2_pending_budget(
-                D11PendingBudgetKind::Raw, window);
-            test_p51_d11_real_r2_pending_budget(
-                D11PendingBudgetKind::DecoderWindow, window);
-        }
+        for (const ProfileId profile : {
+                 ProfileId::P29V1, ProfileId::ZSTD_TU,
+                 ProfileId::ZSTD_ROUTE})
+            for (const uint32_t window : {1U, 30U}) {
+                test_p51_d11_real_r2_pending_budget(
+                    profile, D11PendingBudgetKind::Encoded, window);
+                test_p51_d11_real_r2_pending_budget(
+                    profile, D11PendingBudgetKind::Raw, window);
+                test_p51_d11_real_r2_pending_budget(
+                    profile, D11PendingBudgetKind::DecoderWindow, window);
+            }
         test_p51_cancel_publication_and_reset_lifecycle();
         test_p51_interrupted_reservation_relationship_isolation();
         test_p51_interrupted_reservation_relationship_isolation(true);
