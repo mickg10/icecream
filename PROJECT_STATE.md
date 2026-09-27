@@ -51,8 +51,8 @@ are retained as setup mistakes, not product failures or P29 passes.
 ### Initial handshake recovery and invalid-message checks
 
 Candidate commits `6d9d8a1c` and `dbb010ba` integrate two separately tested
-changes; qualification of their combined source with the cleanup fix is
-in progress. Neither is evidence of a new whole-build performance result.
+changes. Their combined runtime with the cleanup fix now passes the focused
+regressions below; this is not a new whole-build performance result.
 
 Initial response loss now retries the exact empty relationship under the
 original deadline. Terminal cancellation/expiry quarantines only that route;
@@ -78,6 +78,24 @@ or absence. Private donor: `0336df1fde2a4e2249095acae85f49f62082ae0c`;
 retained log:
 `/tanksmall/scratch/tmp/p51-d15-endpoint-wire-build/d15-r2-wire-run-r2.log`.
 This is not the entire D15 record-validation matrix.
+
+The combined `dbb010ba` runtime was explicitly rebuilt through its services,
+cache and client archive dependencies before linking the three test binaries.
+The source also carried an opt-in Make-target/docs patch, not additional
+runtime changes. All following runs exited 0; logs are retained in
+`/tanksmall/scratch/tmp/p51-dbb010ba-qualified/logs/`:
+
+| Log | Scope | SHA256 |
+| --- | --- | --- |
+| `d15-make-target.log` | Nine actual-wire cases | `8c046a9d99da39ea8c6380154b690da8673ef68d51deba848690d88e5a4c3315` |
+| `initial-link-make-target.log` | Lost Initial, terminal cases, typed rejection | `18800cbea172c66bed758d75627df18b6e70f0b505420e58409158c180b24202` |
+| `initial-endpoint-service-selectors.log` | All-profile LINK_STATE cuts; TU service rearm and empty-route allocator | `ec29238ba9c069c46806098264e6a6f54f51a24c6276912f23590e1bcecebe61` |
+| `service-stop-pressure.log` | D16 three profiles and D17 nine reconnect/cancel cases | `8f038c470db9f728723fbb91fd5084f5cec2fa6b346793148b6c750f121be4ee` |
+
+An initial rebuild failed because the fresh worktree lacked generated
+Autotools helpers; its log is retained. Running `autogen.sh` and rebuilding
+the actual dependencies corrected setup. These native focused runs are not
+a new sanitizer pass, full QA, or full formal qualification.
 
 The user-confirmed cross-machine farm is q2/q3/q5, with research6 available
 to launch C. Readiness checks are in progress; this is not a farm-test pass.
