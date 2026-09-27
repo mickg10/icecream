@@ -33,7 +33,18 @@ and `client-compile-env-ready.log`):
 
 These retained-build runs used explicit source/gate overlays and separate
 scratch mounts. They are not a fresh checkout/bootstrap pass of the combined
-candidate. That public-command qualification is being run separately.
+candidate. A subsequent fresh public-command run now passes for ZSTD_ROUTE
+on runtime source `520f63e6` (snapshot also included a docs-only state update).
+Artifact root: `/tanksmall/scratch/tmp/icecream-qa-677o_zte`;
+`result.json` records PASS, build/install 176.241 seconds and gate 141.210
+seconds, on the 2 CPU/8 GiB Ubuntu 24.04 SDK. Source snapshot SHA256:
+`a95d375a9c644b8c6b0e3bb701b8459e531b372f52ba18e1e83914f3a64c84d5`.
+Gate log SHA256:
+`833e1dfeeb66c0b327096bdd0562a334372e14c3f89bad10330ef7c71efa0c86`.
+Raw cold/warm traces are retained under `current/tmp/p5e.3ScRNb` in that
+artifact root. The owned gate container was removed after completion.
+This is one fresh C02 profile gate, not the full W30 suite or a performance
+benchmark; the earlier all-profile focused runs remain separate evidence.
 An earlier reused-temp permission failure and incorrectly selected profile
 are retained as setup mistakes, not product failures or P29 passes.
 
