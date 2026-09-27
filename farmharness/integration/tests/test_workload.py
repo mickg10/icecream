@@ -598,7 +598,7 @@ def test_d18_remote_row_failure_reports_exact_worker_and_result_fields(
     job = jobs / "000007"
     job.mkdir(parents=True)
     (job / "result.tsv").write_text(
-        "7\tA\t0\tfiles/example.cc.ii\tjob-007\tF_R1\t10\t11\t0\t"
+        "7\tA\t0\tfiles/example.cc.ii\tjob-007\t10.0.27.212:23005\t10\t11\t0\t"
         "remote-sha\tlocal-sha\t1\t1\t2\n",
         encoding="ascii",
     )
@@ -606,7 +606,7 @@ def test_d18_remote_row_failure_reports_exact_worker_and_result_fields(
     result = subprocess.run(
         [
             "/bin/bash", "-c", workload_module._D18_VERIFY_REMOTE_ROWS_SCRIPT,
-            "d18-verify", str(jobs), "F_R2", "1",
+            "d18-verify", str(jobs), "F_R2", "10.0.27.212:23006", "1",
         ],
         check=False,
         capture_output=True,
@@ -615,8 +615,69 @@ def test_d18_remote_row_failure_reports_exact_worker_and_result_fields(
 
     assert result.returncode != 0
     assert "index=7 job_id=job-007" in result.stderr
-    assert "expected_worker='F_R2' actual_worker='F_R1'" in result.stderr
+    assert "expected_worker='F_R2' expected_endpoint='10.0.27.212:23006' actual_worker='10.0.27.212:23005'" in result.stderr
     assert "rc=0 remote_sha=remote-sha local_sha=local-sha exact=1 remote=1 retries=2" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("expected_endpoint", "error_fragment"),
+    [
+        ("10.0.27.212:23006", "expected_endpoint='10.0.27.212:23006'"),
+        ("10.0.27.213:23005", "expected_endpoint='10.0.27.213:23005'"),
+        ("worker-one", "malformed expected worker endpoint"),
+    ],
+)
+def test_d18_remote_row_verifier_rejects_wrong_or_malformed_worker_endpoint(
+    tmp_path: Path, expected_endpoint: str, error_fragment: str,
+) -> None:
+    jobs = tmp_path / "jobs"
+    job = jobs / "000001"
+    job.mkdir(parents=True)
+    (job / "result.tsv").write_text(
+        "1\tA\t0\tfiles/example.cc.ii\tjob-001\t10.0.27.212:23005\t10\t11\t0\t"
+        "remote-sha\tlocal-sha\t1\t1\t0\n",
+        encoding="ascii",
+    )
+
+    result = subprocess.run(
+        [
+            "/bin/bash", "-c", workload_module._D18_VERIFY_REMOTE_ROWS_SCRIPT,
+            "d18-verify", str(jobs), "F_R1", expected_endpoint, "1",
+        ],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode != 0
+    assert error_fragment in result.stderr
+
+
+def test_d18_remote_row_verifier_accepts_the_exact_planned_worker_endpoint(
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "jobs"
+    job = jobs / "000001"
+    job.mkdir(parents=True)
+    (job / "result.tsv").write_text(
+        "1\tA\t0\tfiles/example.cc.ii\tjob-001\t10.0.27.212:23005\t10\t11\t0\t"
+        "remote-sha\tremote-sha\t1\t1\t0\n",
+        encoding="ascii",
+    )
+
+    result = subprocess.run(
+        [
+            "/bin/bash", "-c", workload_module._D18_VERIFY_REMOTE_ROWS_SCRIPT,
+            "d18-verify", str(jobs), "F_R1", "10.0.27.212:23005", "1",
+        ],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"count": 1' in result.stdout
+    assert '"worker": "10.0.27.212:23005"' in result.stdout
 
 
 def test_d18_driver_uses_shared_barrier_without_changing_compiler_identity(

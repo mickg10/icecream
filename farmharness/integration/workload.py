@@ -1577,19 +1577,29 @@ def _d18_barrier_and_observe(
         time.sleep(0.05)
 
 
-_D18_VERIFY_REMOTE_ROWS_SCRIPT = r'''python3 - "$1" "$2" "$3" <<'PY'
-import json, pathlib, sys
-root, worker, expected = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+_D18_VERIFY_REMOTE_ROWS_SCRIPT = r'''python3 - "$1" "$2" "$3" "$4" <<'PY'
+import ipaddress, json, pathlib, sys
+root, worker_name, worker_endpoint, expected = (
+    pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+)
+try:
+    endpoint_address, endpoint_port = worker_endpoint.rsplit(":", 1)
+    ipaddress.ip_address(endpoint_address)
+    if not endpoint_port.isdecimal() or not 1 <= int(endpoint_port) <= 65535:
+        raise ValueError("invalid port")
+except ValueError as exc:
+    raise SystemExit(f"malformed expected worker endpoint: {worker_endpoint!r}") from exc
 rows = []
 for path in sorted(root.glob("*/result.tsv")):
     values = path.read_text(encoding="ascii").splitlines()
     if len(values) != 1 or len(values[0].split("\t")) != 14:
         raise SystemExit("malformed measured result row")
     row = values[0].split("\t")
-    if row[5] != worker or row[8] != "0" or row[11] != "1" or row[12] != "1":
+    if row[5] != worker_endpoint or row[8] != "0" or row[11] != "1" or row[12] != "1":
         raise SystemExit(
             "role job was not exact remote work on its required F: "
-            f"index={row[0]} job_id={row[4]} expected_worker={worker!r} "
+            f"index={row[0]} job_id={row[4]} expected_worker={worker_name!r} "
+            f"expected_endpoint={worker_endpoint!r} "
             f"actual_worker={row[5]!r} rc={row[8]} remote_sha={row[9]} "
             f"local_sha={row[10]} exact={row[11]} remote={row[12]} retries={row[13]}"
         )
@@ -1613,10 +1623,14 @@ def _d18_verify_remote_rows(
     expected = farm.data["corpora"][scenario.data["workload"]["corpus"]]["tus"]
     expected *= farm.data["corpora"][scenario.data["workload"]["corpus"]].get("repeat", 1)
     expected *= scenario.data["workload"]["repeat"]
+    worker = next(
+        item for item in plan["topology"]["instances"] if item["name"] == worker_name
+    )
+    worker_endpoint = f"{worker['address']}:{plan['ports']['instances'][worker_name]}"
     result = _d18_docker_call(
         farm, plan, client, factory, transport, f"verify-remote-{role}",
         ("/bin/bash", "-c", _D18_VERIFY_REMOTE_ROWS_SCRIPT, "d18-verify",
-         "/results/workload/A/jobs", worker_name, str(expected)),
+         "/results/workload/A/jobs", worker_name, worker_endpoint, str(expected)),
     )
     try:
         receipt = json.loads(result.stdout)
