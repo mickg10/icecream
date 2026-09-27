@@ -126,6 +126,7 @@ def test_default_uv_storage_is_under_scratch_not_checkout(tmp_path: Path) -> Non
     log = (tmp_path / "uv.log").read_text(encoding="utf-8")
     project = _project_path_from_log(log)
     assert project.is_relative_to(scratch.resolve())
+    assert project.parent.name.startswith("icecream-uv-")
     assert not _path_is_within(project, ROOT)
 
 
