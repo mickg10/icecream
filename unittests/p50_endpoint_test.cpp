@@ -4706,6 +4706,9 @@ enum class R2EndpointWireFault : uint8_t {
 
 enum class D15MalformedTarget : uint8_t {
     None,
+    LinkHello,
+    LinkState,
+    LinkReject,
     JobBind,
     TuBegin,
     Body,
@@ -4757,6 +4760,70 @@ asio::awaitable<void> raw_write_malformed_frame(
     co_await raw_write_bytes(socket, frame);
 }
 
+asio::awaitable<void> d15_malformed_handshake_peer(
+    tcp::acceptor& acceptor, ProfileId profile, D15MalformedTarget target,
+    D15MalformedShape shape) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    const Frame offered_frame = co_await raw_read(socket, kInitialMaxFramePayload);
+    require(offered_frame.type == MessageType::LINK_HELLO,
+            "D15 fake F peer did not receive LINK_HELLO");
+    const LinkHello hello = std::get<LinkHello>(decode_payload(
+        offered_frame.type, offered_frame.payload));
+    Message response;
+    if (target == D15MalformedTarget::LinkState) {
+        LinkState state;
+        state.profile = profile;
+        state.window = hello.window;
+        state.reservation_id = hello.reservation_id;
+        state.relationship_id = hello.relationship_id;
+        state.relationship_epoch = hello.relationship_epoch;
+        state.physical_link_generation = hello.physical_link_generation;
+        state.c_store_guid = hello.c_store_guid;
+        state.c_store_generation = hello.c_store_generation;
+        state.f_store_guid = hello.f_store_guid;
+        state.f_store_generation = hello.f_store_generation;
+        state.c_control_generation = hello.c_control_generation;
+        state.c_control_attempt = hello.c_control_attempt;
+        state.selected_max_frame_payload = hello.max_frame_payload;
+        state.selected_max_raw_bytes = hello.max_raw_bytes;
+        state.selected_max_encoded_bytes = hello.max_encoded_bytes;
+        state.selected_max_output_bytes = hello.max_output_bytes;
+        state.f_system_source_fingerprint =
+            icecc::digest128("D15 malformed LINK_STATE peer");
+        state.history_nonce = HistoryNonce{0xd15001};
+        state.state_digest = initial_route_digest(
+            CStoreGuid{hello.c_store_guid}, state.history_nonce);
+        response = Message{state};
+    } else {
+        LinkRejectMessage rejection;
+        rejection.reason = LinkRejectReason::StoreReplaced;
+        rejection.offered_hello_digest = compute_r2_link_offer_digest(hello);
+        response = Message{rejection};
+    }
+    co_await raw_write_malformed_frame(socket, std::move(response), shape,
+                                        hello.max_frame_payload);
+    co_await raw_wait_for_close(socket);
+}
+
+asio::awaitable<std::string> d15_malformed_handshake_client(
+    tcp::endpoint endpoint, P50ClientEndpoint& client, LinkHello hello) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await socket.async_connect(endpoint, asio::use_awaitable);
+    std::string error_text;
+    try {
+        (void)co_await client.open_r2_link(
+            socket, hello, std::chrono::steady_clock::now() +
+                               std::chrono::seconds(5));
+        error_text = "unexpectedly accepted malformed handshake reply";
+    } catch (const std::exception& error) {
+        error_text = error.what();
+    }
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return error_text;
+}
+
 asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
     tcp::endpoint endpoint, LinkHello hello,
     std::vector<R2EndpointTestJob> jobs,
@@ -4765,6 +4832,15 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
     std::optional<D15MalformedFrame> malformed = std::nullopt) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await socket.async_connect(endpoint, asio::use_awaitable);
+    if (malformed && malformed->target == D15MalformedTarget::LinkHello) {
+        co_await raw_write_malformed_frame(socket, Message{hello},
+                                            malformed->shape,
+                                            hello.max_frame_payload);
+        co_await raw_wait_for_close(socket);
+        if (observed_terminal_close != nullptr)
+            *observed_terminal_close = true;
+        co_return std::vector<R2TxCommit>{};
+    }
     co_await raw_write(socket, Message{hello});
     const Frame state_frame = co_await raw_read(socket, hello.max_frame_payload);
     require(state_frame.type == MessageType::LINK_STATE,
@@ -7161,6 +7237,8 @@ void test_r2_endpoint_rejects_wire_fault(
         malformed->shape != D15MalformedShape::Truncated &&
         result.status == ServerRunStatus::TerminalError &&
         result.terminal_error.has_value();
+    const bool malformed_hello = malformed &&
+        malformed->target == D15MalformedTarget::LinkHello;
     if (malformed && malformed->shape == D15MalformedShape::Oversized)
         require(result.terminal_error &&
                     result.terminal_error->detail ==
@@ -7190,12 +7268,17 @@ void test_r2_endpoint_rejects_wire_fault(
     require((malformed ? malformed_eof || malformed_protocol_error
                        : result.status == ServerRunStatus::TerminalError &&
                              result.terminal_error.has_value()) &&
-                peer_observed_close && link_lookups == 1 &&
-                terminal_calls == 1 &&
-                (malformed && malformed->target == D15MalformedTarget::JobBind
+                peer_observed_close && link_lookups == (malformed_hello ? 0 : 1) &&
+                terminal_calls == (malformed_hello ? 0 : 1) &&
+                (malformed && (malformed_hello ||
+                               malformed->target == D15MalformedTarget::JobBind)
                      ? consumes == 0
                      : consumes == 1),
             "D15 malformed wire sequence was not terminal at the exact admitted link");
+    if (malformed_hello)
+        require(link_lookups == 0 && consumes == 0 && terminal_calls == 0 &&
+                    peer_commits.empty() && materializations == 0 && commits == 0,
+                "malformed LINK_HELLO reached reservation admission or job publication");
     if (malformed && malformed->target != D15MalformedTarget::CommitAck) {
         bool no_input_record = false;
         try {
@@ -7281,6 +7364,10 @@ void test_r2_endpoint_rejects_wire_fault(
               << "\n";
 }
 
+void test_r2_d15_malformed_client_handshake(ProfileId profile,
+                                            D15MalformedTarget target,
+                                            D15MalformedShape shape);
+
 void test_r2_d15_malformed_frame_matrix() {
     const std::array<ProfileId, 3> profiles{
         ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
@@ -7292,6 +7379,14 @@ void test_r2_d15_malformed_frame_matrix() {
         D15MalformedTarget::TuEnd, D15MalformedTarget::CommitAck,
         D15MalformedTarget::Body};
     for (const ProfileId profile : profiles) {
+        for (const D15MalformedShape shape : shapes)
+            test_r2_endpoint_rejects_wire_fault(
+                profile, R2EndpointWireFault::None,
+                D15MalformedFrame{D15MalformedTarget::LinkHello, shape, 0});
+        for (const D15MalformedTarget target :
+             {D15MalformedTarget::LinkState, D15MalformedTarget::LinkReject})
+            for (const D15MalformedShape shape : shapes)
+                test_r2_d15_malformed_client_handshake(profile, target, shape);
         for (const D15MalformedTarget target : fixed_targets) {
             // BODY is length-delimited opaque bytes: appended bytes reach the
             // transaction-identity check rather than being a decoder error.
@@ -7315,6 +7410,73 @@ void test_r2_d15_malformed_frame_matrix() {
         }
     }
     std::puts("P51_D15_R2_WIRE malformed outer frames all-applicable-profiles: PASS");
+}
+
+void test_r2_d15_malformed_client_handshake(ProfileId profile,
+                                            D15MalformedTarget target,
+                                            D15MalformedShape shape) {
+    require(target == D15MalformedTarget::LinkState ||
+                target == D15MalformedTarget::LinkReject,
+            "D15 client handshake fixture received a non-handshake target");
+    const P5coStoreGuids stores = p5co_store_guids(
+        0xd15c + static_cast<uint64_t>(profile) * 16 +
+        static_cast<uint64_t>(target) * 4 + static_cast<uint64_t>(shape));
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    TestClient client(stores.c, caps);
+    LinkHello hello;
+    hello.profile = profile;
+    hello.window = 1;
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128::from_u64(0xd15c01);
+    hello.relationship_id = Id128::from_u64(0xd15c02);
+    hello.relationship_epoch = 7;
+    hello.physical_link_generation = 8;
+    hello.c_store_guid = stores.c;
+    hello.c_store_generation = 9;
+    hello.f_store_guid = stores.f;
+    hello.f_store_generation = 10;
+    hello.c_control_generation = 11;
+    hello.c_control_attempt = 12;
+    hello.system_source_fingerprint =
+        icecc::digest128("D15 malformed client handshake");
+    hello.history_nonce = HistoryNonce{13};
+    hello.start_mode = LinkStartMode::Initial;
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           {asio::ip::address_v4::loopback(), 0});
+    std::string client_error;
+    auto client_future = asio::co_spawn(
+        context,
+        d15_malformed_handshake_client(acceptor.local_endpoint(), client.endpoint,
+                                       hello),
+        asio::use_future);
+    auto peer_future = asio::co_spawn(
+        context,
+        d15_malformed_handshake_peer(acceptor, profile, target, shape),
+        asio::use_future);
+    context.run();
+    client_error = client_future.get();
+    peer_future.get();
+    if (shape == D15MalformedShape::Truncated)
+        require(client_error.find("End of file") != std::string::npos,
+                "truncated handshake reply did not report exact peer EOF");
+    else if (shape == D15MalformedShape::Oversized)
+        require(client_error == "frame payload exceeds configured cap",
+                "oversized handshake reply did not report configured frame cap");
+    else
+        require(client_error == "wire payload has trailing bytes",
+                "handshake reply trailing byte escaped exact decoder boundary");
+    std::cout << "P51_D15_R2_WIRE client profile="
+              << static_cast<unsigned>(profile) << " target="
+              << static_cast<unsigned>(target) << " shape="
+              << static_cast<unsigned>(shape) << " error=" << client_error
+              << "\n";
 }
 
 void test_r2_d15_wire_faults_all_profiles() {
