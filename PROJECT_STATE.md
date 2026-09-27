@@ -81,7 +81,7 @@ The registered run was explicitly forced after a UV setup failure and a
 Make no-op; neither earlier attempt counts as a pass. This is not a fresh
 full candidate QA or sanitizer qualification of the added fixture.
 
-### External receipt-window harness: P29 W1 passed, W30 pending
+### External receipt-window harness: P29 W1 and W30 passed
 
 `f60381ab` makes the R2 client's requested window selectable through
 `ICECC_P50_PIPELINE_WINDOW` (default 30). `162f744e` through `b740c5b6`
@@ -118,14 +118,26 @@ epoch 1 and physical link generation 1 are recorded in
 Its first invocation stopped before the workload on a checksum-output
 format mismatch; that failure is retained separately as
 `w1-o-run-stagefail.stderr`. The corrected invocation reused the still-clean
-UP farm. This is a real cross-host W1 result, not W30 occupancy, other-profile
-qualification, or a whole-build speed measurement.
+UP farm. Its result SHA256 is
+`84e04eeb1f54912d965eda7ecbff5901562bf6a82c8fdf100512379cc6adaead`.
+
+Fresh attempt `w30-luna-w30-p29-20260927-a` also passes: negotiated P29V1/W30,
+30 held COMMITs at ordinals 1 through 30 before release, epoch 1 and physical
+link generation 1, followed by all 31 exact-output jobs with zero failures.
+This is actual external q5 C / q3 S / q2 F single-link occupancy, not merely
+a configured window. Result:
+`/tanksmall/scratch/tmp/luna-w30-current-build/w30-a-run.json`, SHA256
+`dc2415312928a1207978e893ea8ab0f306946a7dd59c5cb05d89ca4cf2178cba`.
+The W1-underfill negative control, other-profile external cells, required
+topology/restart/mixed cases and full qualification remain open. Neither
+positive gate is a whole-build speed measurement.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
 `/tanksmall/scratch/ictmp/experiments/icecream/integration/results/w30-luna-w1-p29-20260926-j/`.
 The earlier q5 storage refusal was followed by a bounded 313 MB/s recheck;
-the 200 MB/s threshold was not changed. External W30 remains unqualified.
+the 200 MB/s threshold was not changed. These positive P29 cells do not
+qualify the full external matrix.
 
 ### Malformed R2 records preserve committed inputs
 
