@@ -598,7 +598,7 @@ def test_plan_commands_are_argv_only_and_label_scoped() -> None:
     assert all("icefarm.run=argv-check" in item["argv"] for item in starts)
 
 
-def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() -> None:
+def test_r2_diagnostics_follow_positive_runtime_p51_relationship_not_base_revision() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     legacy = load_scenario_spec(
         INTEGRATION / "scenarios" / "S00-smoke.json", farm
@@ -612,10 +612,12 @@ def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() ->
 
     topology = {
         "instances": [
-            {"name": "C2", "role": "C", "version": 50,
-             "cache_wire_revision": 2},
-            {"name": "F2", "role": "F", "cache_wire_revision": 2},
-            {"name": "F1", "role": "F", "cache_wire_revision": 1},
+            {"name": "C2", "role": "C", "version": 50, "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "on"}},
+            {"name": "F2", "role": "F", "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "on"}},
+            {"name": "F1", "role": "F", "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "off"}},
         ],
         "relationships": [
             {"c": "C2", "f": "F2", "cache_expected": True},
@@ -624,6 +626,20 @@ def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() ->
     }
     assert farmtest._r2_diagnostics_requested(topology, "C2", 50)
     assert not farmtest._r2_diagnostics_requested(topology, "C2", 43)
+    topology["instances"][1]["env"]["ICECC_P51_MODE"] = "off"
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+    topology["instances"][1]["env"]["ICECC_P51_MODE"] = "on"
+    topology["instances"][0]["env"].pop("ICECC_P51_MODE")
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "on"
+    topology["instances"][1]["cache_wire_revision"] = 2
+    topology["instances"][0]["cache_wire_revision"] = 2
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "off"
+    topology["instances"][1]["env"]["ICECC_P51_MODE"] = "off"
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "on"
+    topology["instances"][1]["env"]["ICECC_P51_MODE"] = "on"
+    assert farmtest._r2_diagnostics_requested(topology, "C2", 50)
     topology["relationships"] = [
         {"c": "C2", "f": "F1", "cache_expected": True}
     ]
@@ -632,17 +648,23 @@ def test_r2_diagnostics_are_opted_in_only_for_positive_revision_two_clients() ->
         {"c": "C2", "f": "F2", "cache_expected": False}
     ]
     assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
+    topology["relationships"] = [
+        {"c": "C2", "f": "F1", "cache_expected": True}
+    ]
+    assert not farmtest._r2_diagnostics_requested(topology, "C2", 50)
 
 
-def test_r2_f_worker_trace_is_opted_in_only_for_positive_r2_peer() -> None:
+def test_r2_f_worker_trace_requires_runtime_p51_on_both_link_peers() -> None:
     topology = {
         "instances": [
-            {"name": "C2", "role": "C", "version": 50,
-             "cache_wire_revision": 2},
-            {"name": "C43", "role": "C", "version": 43,
-             "cache_wire_revision": 1},
-            {"name": "F2", "role": "F", "cache_wire_revision": 2},
-            {"name": "F1", "role": "F", "cache_wire_revision": 1},
+            {"name": "C2", "role": "C", "version": 50, "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "on"}},
+            {"name": "C43", "role": "C", "version": 43, "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "on"}},
+            {"name": "F2", "role": "F", "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "on"}},
+            {"name": "F1", "role": "F", "cache_wire_revision": 1,
+             "env": {"ICECC_P51_MODE": "off"}},
         ],
         "relationships": [
             {"c": "C2", "f": "F2", "cache_expected": True},
@@ -653,10 +675,50 @@ def test_r2_f_worker_trace_is_opted_in_only_for_positive_r2_peer() -> None:
     }
     assert farmtest._r2_worker_diagnostics_requested(topology, "F2")
     assert not farmtest._r2_worker_diagnostics_requested(topology, "F1")
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "off"
+    assert not farmtest._r2_worker_diagnostics_requested(topology, "F2")
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "on"
+    topology["instances"][2]["env"].pop("ICECC_P51_MODE")
+    assert not farmtest._r2_worker_diagnostics_requested(topology, "F2")
+    topology["instances"][2]["env"]["ICECC_P51_MODE"] = "on"
+    topology["instances"][0]["cache_wire_revision"] = 2
+    topology["instances"][2]["cache_wire_revision"] = 2
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "off"
+    topology["instances"][2]["env"]["ICECC_P51_MODE"] = "off"
+    assert not farmtest._r2_worker_diagnostics_requested(topology, "F2")
+    topology["instances"][0]["env"]["ICECC_P51_MODE"] = "on"
+    topology["instances"][2]["env"]["ICECC_P51_MODE"] = "on"
+    assert farmtest._r2_worker_diagnostics_requested(topology, "F2")
     topology["relationships"] = [
         {"c": "C43", "f": "F2", "cache_expected": True}
     ]
     assert not farmtest._r2_worker_diagnostics_requested(topology, "F2")
+    topology["relationships"] = [
+        {"c": "C2", "f": "F2", "cache_expected": False}
+    ]
+    assert not farmtest._r2_worker_diagnostics_requested(topology, "F2")
+
+
+def test_d18_plan_enables_numeric_r2_diagnostics_for_its_r2_link_only() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "D18-P29V1.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="d18-r2-diagnostics-plan")
+    starts = {
+        command["instance"]: command["argv"]
+        for command in plan["commands"]
+        if command["phase"].startswith("up.start-")
+    }
+    for instance in ("C_R2", "F_R2"):
+        assert "ICECC_P50_DIAGNOSTICS=1" in starts[instance]
+    for instance in ("C_R1", "F_R1", "C_P43"):
+        assert "ICECC_P50_DIAGNOSTICS=1" not in starts[instance]
+    assert all(
+        item.get("cache_wire_revision") == 1
+        for item in plan["topology"]["instances"]
+        if item["role"] in {"C", "F"} and item["version"] == 50
+    )
 
 
 def test_only_f_starts_have_the_fixed_nofile_contract() -> None:

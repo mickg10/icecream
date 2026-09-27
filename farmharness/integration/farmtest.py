@@ -465,18 +465,26 @@ def _env_args(environment: dict[str, str]) -> list[str]:
 def _r2_diagnostics_requested(
     topology: dict[str, Any], client_name: str, client_version: int
 ) -> bool:
-    """Opt in to expensive wire attribution only for accepted CacheWire-R2."""
+    """Opt in only when this client has a positive runtime P51 relationship."""
 
     if client_version < 50:
         return False
-    revision_by_name = {
-        item["name"]: item.get("cache_wire_revision")
-        for item in topology.get("instances", [])
+    instances_by_name = {
+        item["name"]: item for item in topology.get("instances", [])
     }
+    client = instances_by_name.get(client_name)
+    if (
+        not isinstance(client, dict)
+        or client.get("env", {}).get("ICECC_P51_MODE") != "on"
+    ):
+        return False
     return any(
         relationship["c"] == client_name
         and relationship["cache_expected"]
-        and revision_by_name.get(relationship["f"]) == 2
+        and isinstance(instances_by_name.get(relationship["f"]), dict)
+        and instances_by_name[relationship["f"]].get("env", {}).get(
+            "ICECC_P51_MODE"
+        ) == "on"
         for relationship in topology.get("relationships", [])
     )
 
@@ -484,22 +492,26 @@ def _r2_diagnostics_requested(
 def _r2_worker_diagnostics_requested(
     topology: dict[str, Any], worker_name: str
 ) -> bool:
-    """Opt in to F-side link events only for a declared positive R2 peer."""
+    """Opt in to F-side link events only for a positive runtime P51 peer."""
 
-    revision_by_name = {
-        item["name"]: item.get("cache_wire_revision")
-        for item in topology.get("instances", [])
+    instances_by_name = {
+        item["name"]: item for item in topology.get("instances", [])
     }
-    version_by_name = {
-        item["name"]: item.get("version")
-        for item in topology.get("instances", [])
-    }
+    worker = instances_by_name.get(worker_name)
+    if (
+        not isinstance(worker, dict)
+        or worker.get("env", {}).get("ICECC_P51_MODE") != "on"
+    ):
+        return False
     return any(
         relationship["f"] == worker_name
         and relationship["cache_expected"]
-        and revision_by_name.get(worker_name) == 2
-        and type(version_by_name.get(relationship["c"])) is int
-        and version_by_name[relationship["c"]] >= 50
+        and isinstance(instances_by_name.get(relationship["c"]), dict)
+        and type(instances_by_name[relationship["c"]].get("version")) is int
+        and instances_by_name[relationship["c"]]["version"] >= 50
+        and instances_by_name[relationship["c"]].get("env", {}).get(
+            "ICECC_P51_MODE"
+        ) == "on"
         for relationship in topology.get("relationships", [])
     )
 
@@ -837,9 +849,9 @@ def _planned_commands(
                 )
             # R2 wire attribution is opt-in because it adds per-fragment
             # accounting. Enable the existing diagnostics switch only for a
-            # P50 client with a declared positive CacheWire revision-2
-            # relationship; R1, legacy, and negative-control farms keep the
-            # production hot path off.
+            # P50 client with a declared positive runtime P51 relationship;
+            # base cache_wire_revision remains envelope metadata, while R1,
+            # legacy, and negative-control farms keep this path disabled.
             if _r2_diagnostics_requested(
                 topology, instance["name"], instance["version"]
             ):

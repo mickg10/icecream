@@ -86,9 +86,14 @@ def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_p
     start_client = next(
         command for command in plan["commands"] if command["phase"] == "up.start-c"
     )
+    start_worker = next(
+        command for command in plan["commands"] if command["phase"] == "up.start-f"
+    )
     assert helper_command["transport"] == "rsync-ssh"
     assert helper_command["argv"][-1].endswith("/output/p50daemonpositive")
     assert "NET_ADMIN" in start_client["argv"]
+    assert "ICECC_P50_DIAGNOSTICS=1" in start_client["argv"]
+    assert "ICECC_P50_DIAGNOSTICS=1" in start_worker["argv"]
     assert plan["p51_receipt_gate"]["binary_sha256"] == hashlib.sha256(
         helper.read_bytes()
     ).hexdigest()
