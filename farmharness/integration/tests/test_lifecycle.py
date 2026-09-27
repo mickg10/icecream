@@ -330,6 +330,50 @@ def test_successful_up_executes_exact_planned_starts_and_proves_canary(
     assert "readiness canary compiled locally" in CANARY_SCRIPT
 
 
+def test_p51_receipt_helper_is_staged_between_prepare_and_client_start(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, _ = _farm_scenario_plan(tmp_path)
+    farm.data["authority"]["topologies"]["C1F1"]["slots_per_f"] = 31
+    scenario.data["id"] = "P51-receipt-stage-test"
+    scenario.data["instances"][1]["slots"] = 31
+    scenario.data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    scenario.data["instances"][2]["env"].update(
+        {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on"}
+    )
+    helper = Path("/bin/true")
+    scenario.data["workload"].update(
+        {
+            "driver": "p51-receipt-window",
+            "jobs": 1,
+            "receipt_gate": {
+                "binary": str(helper),
+                "binary_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+                "expected_commits": 1,
+                "negotiated_window": 1,
+                "expect_observed": True,
+            },
+        }
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="p51-receipt-stage")
+    transport = RecordingTransport(ScriptedLifecycle(farm))
+
+    receipt = bring_up(
+        farm,
+        scenario,
+        plan,
+        recorder=transport,
+        probe_bytes=0,
+        sync_corpora=False,
+    )
+
+    assert receipt["status"] == "UP"
+    phases = [command.phase for command in transport.commands]
+    assert phases.count("up.stage-p51-receipt-gate") == 1
+    assert phases.index("up.prepare") < phases.index("up.stage-p51-receipt-gate")
+    assert phases.index("up.stage-p51-receipt-gate") < phases.index("up.start-c")
+
+
 def test_readiness_canaries_cover_every_workload_client_worker_pair(
     tmp_path: Path,
 ) -> None:
@@ -363,6 +407,48 @@ def test_readiness_canaries_cover_every_workload_client_worker_pair(
         for command in commands
     }
     assert containers == {"icefarm-unit-run-C1", "icefarm-unit-run-C2"}
+
+
+def test_p51_receipt_window_canary_does_not_preopen_the_r2_link(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _farm_scenario_plan(tmp_path)
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    transport = RecordingTransport(ScriptedLifecycle(farm))
+
+    _run_canaries(
+        farm,
+        scenario,
+        plan,
+        transport,
+        CommandFactory(),
+        deadline=10,
+        monotonic=Clock(),
+    )
+
+    command = next(
+        item for item in transport.commands if item.phase == "readiness.canary"
+    )
+    assert "--env" in command.argv
+    assert "ICECC_P50_MODE=off" in command.argv
+    assert "ICECC_P51_MODE=off" in command.argv
+
+    ordinary_farm, ordinary_scenario, ordinary_plan = _farm_scenario_plan(tmp_path)
+    ordinary_transport = RecordingTransport(ScriptedLifecycle(ordinary_farm))
+    _run_canaries(
+        ordinary_farm,
+        ordinary_scenario,
+        ordinary_plan,
+        ordinary_transport,
+        CommandFactory(),
+        deadline=10,
+        monotonic=Clock(),
+    )
+    ordinary_command = next(
+        item for item in ordinary_transport.commands if item.phase == "readiness.canary"
+    )
+    assert "ICECC_P50_MODE=off" not in ordinary_command.argv
+    assert "ICECC_P51_MODE=off" not in ordinary_command.argv
 
 
 def test_s30_mutant_rotates_readiness_trace_before_workload(tmp_path: Path) -> None:

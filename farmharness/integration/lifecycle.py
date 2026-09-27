@@ -3033,6 +3033,9 @@ def _run_canaries(
         key=lambda item: item["name"],
     )
     results: dict[str, dict[str, str]] = {}
+    receipt_window_canary = (
+        scenario.data.get("workload", {}).get("driver") == "p51-receipt-window"
+    )
     for client in clients:
         client_name = client["name"]
         container = f"icefarm-{plan['run_id']}-{client_name}"
@@ -3046,6 +3049,10 @@ def _run_canaries(
         )
         client_results: dict[str, str] = {}
         for worker in workers:
+            canary_mode_env = (
+                ("--env", "ICECC_P50_MODE=off", "--env", "ICECC_P51_MODE=off")
+                if receipt_window_canary else ()
+            )
             result = recorder.invoke(
                 _command(
                     factory,
@@ -3060,6 +3067,7 @@ def _run_canaries(
                             "exec",
                             "--user",
                             "65534:65534",
+                            *canary_mode_env,
                             container,
                             "/bin/bash",
                             "-c",
@@ -3754,6 +3762,7 @@ def bring_up(
             phase: [command for command in planned if command.phase == phase]
             for phase in (
                 "up.prepare",
+                "up.stage-p51-receipt-gate",
                 "up.prepare-persistent",
                 "up.network-create",
                 "up.start-s",
@@ -3764,6 +3773,7 @@ def bring_up(
             )
         }
         execute(phases["up.prepare"], transport)
+        execute(phases["up.stage-p51-receipt-gate"], transport)
         execute(phases["up.prepare-persistent"], transport)
         create_results = execute(phases["up.network-create"], transport)
         network_receipt = _netem_created_receipt(
@@ -3887,6 +3897,7 @@ def bring_up(
         observed_commands = getattr(transport, "commands", [])
         prepared_or_started = any(
             command.phase.startswith("up.prepare")
+            or command.phase == "up.stage-p51-receipt-gate"
             or command.phase.startswith("up.start-")
             or command.phase.startswith("up.network-")
             or command.phase.startswith("up.netem-")

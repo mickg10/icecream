@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -267,6 +268,107 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
         (tmp_path / "results" / "workload-unit" / "workload.json").read_text()
     )
     assert persisted == receipt
+
+
+def _receipt_gate_stub_inputs():
+    farm = SimpleNamespace(hosts={"C-host": {"docker_context": "q5"}})
+    scenario = SimpleNamespace(
+        data={
+            "workload": {
+                "receipt_gate": {
+                    "expected_commits": 1,
+                    "negotiated_window": 1,
+                    "expect_observed": True,
+                    "command_timeout_s": 30,
+                },
+                "corpus": "tiny",
+                "repeat": 1,
+            },
+            "instances": [
+                {"role": "S", "env": {"ICECC_P50_PROFILE": "P29V1"}}
+            ],
+        }
+    )
+    plan = {
+        "topology": {
+            "instances": [
+                {"role": "F", "name": "F1", "address": "10.0.0.2"}
+            ]
+        },
+        "ports": {"instances": {"F1": 23003}},
+        "p51_receipt_gate": {
+            "container_path": "/results/p50daemonpositive",
+            "binary_sha256": "a" * 64,
+        },
+        "run_id": "receipt-gate-unit",
+    }
+    client = {"name": "C1", "host": "C-host"}
+    return farm, scenario, plan, client
+
+
+def test_p51_receipt_window_refuses_unverified_staged_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan, client = _receipt_gate_stub_inputs()
+    phases: list[str] = []
+
+    def gate_call(_farm, _plan, _client, _factory, _transport, phase, _argv):
+        phases.append(phase)
+        return CommandResult(0, "b" * 64 + "\n", "")
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    with pytest.raises(WorkloadError, match="staged P51 receipt-gate helper hash"):
+        workload_module._run_p51_receipt_window(
+            farm, scenario, plan, client, CommandFactory(), RecordingTransport(WorkloadRecorder()), "A"
+        )
+
+    # Hash verification is the first remote action; a bad or missing staged
+    # helper must fail before starting either the helper or manifest driver.
+    assert phases == ["verify-staged-helper"]
+
+
+def test_p51_receipt_window_separates_driver_and_sidecar_uids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan, client = _receipt_gate_stub_inputs()
+    phases: list[str] = []
+    gate_commands: list[dict[str, object]] = []
+    driver_uids: list[str] = []
+
+    def gate_call(_farm, _plan, _client, _factory, _transport, phase, argv):
+        phases.append(phase)
+        if phase == "verify-staged-helper":
+            return CommandResult(0, "a" * 64 + "\n", "")
+        if phase == "sidecar-uid":
+            assert argv == ("/usr/bin/id", "-u", "nobody")
+            return CommandResult(0, "65534\n", "")
+        raise AssertionError(f"unexpected gate call before driver launch: {phase}")
+
+    class CapturingFactory:
+        def make(self, **kwargs):
+            gate_commands.append(kwargs)
+            return object()
+
+    class DriverReached(Exception):
+        pass
+
+    def driver_command(*_args, **kwargs):
+        driver_uids.append(kwargs["exec_uid"])
+        raise DriverReached
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    monkeypatch.setattr(workload_module, "_driver_command", driver_command)
+    with pytest.raises(DriverReached):
+        workload_module._run_p51_receipt_window(
+            farm, scenario, plan, client, CapturingFactory(), RecordingTransport(WorkloadRecorder()), "A"
+        )
+
+    assert phases == ["verify-staged-helper", "sidecar-uid"]
+    assert driver_uids == ["1:1"]
+    argv = gate_commands[0]["argv"]
+    assert isinstance(argv, tuple)
+    assert argv[argv.index("--user") + 1] == "0"
+    assert argv[argv.index("--p51-commit-receipt-gate-remote") + 3] == "65534"
 
 
 def test_manifest_driver_exports_boundary_dependencies_to_compiler_children(

@@ -6893,7 +6893,12 @@ int main(int argc, char **argv)
         return 77;
     }
     passwd *icecc = ::getpwnam("icecc");
-    if (icecc == nullptr || icecc->pw_uid == 0 || icecc->pw_gid == 0) {
+    /* The remote receipt gate uses the caller-supplied UID of the C
+       sidecar.  Some client-only images run that sidecar as nobody and do
+       not define an icecc account; keep the named-account requirement for
+       the daemon scenarios that actually launch iceccd under icecc. */
+    if (!remote_receipt_gate_mode &&
+        (icecc == nullptr || icecc->pw_uid == 0 || icecc->pw_gid == 0)) {
         std::fprintf(stderr, "SKIP: isolated image has no unprivileged icecc identity\n");
         return 77;
     }
@@ -6924,7 +6929,7 @@ int main(int argc, char **argv)
         end = nullptr;
         const unsigned long sidecar_uid = std::strtoul(argv[4], &end, 10);
         if (errno != 0 || end == argv[4] || *end != '\0' || sidecar_uid == 0 ||
-            sidecar_uid != static_cast<unsigned long>(icecc->pw_uid) ||
+            sidecar_uid > static_cast<unsigned long>(std::numeric_limits<uid_t>::max()) ||
             sidecar_uid == static_cast<unsigned long>(::geteuid())) {
             std::fprintf(stderr,
                 "FAIL: remote receipt gate requires root helper and distinct unprivileged sidecar UID\n");

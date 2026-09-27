@@ -248,6 +248,7 @@ def _driver_command(
     *,
     resume: bool = False,
     checkpoint_sha256: str | None = None,
+    exec_uid: str = "65534:65534",
 ) -> PlannedCommand:
     workload = scenario.data["workload"]
     corpus = farm.data["corpora"][workload["corpus"]]
@@ -292,7 +293,7 @@ def _driver_command(
         (
             "exec",
             "--user",
-            "65534:65534",
+            exec_uid,
             *(
                 (
                     "--env", f"ICEFARM_DISK_FILL_WORKER={preferred_worker}",
@@ -473,10 +474,23 @@ def _run_p51_receipt_window(
     )
     gate_dir = "/results/p51-receipt-gate"
     gate_binary = plan["p51_receipt_gate"]["container_path"]
+    expected_gate_sha = plan["p51_receipt_gate"]["binary_sha256"]
     container = f"icefarm-{plan['run_id']}-{client['name']}"
+    helper_probe = _p51_gate_call(
+        farm, plan, client, factory, transport, "verify-staged-helper",
+        (
+            "/bin/sh", "-c",
+            'set -eu; path=$1; expected=$2; test -x "$path"; '
+            'actual=$(sha256sum "$path"); set -- $actual; '
+            'test "$1" = "$expected"; printf "%s\\n" "$1"',
+            "verify-helper", gate_binary, expected_gate_sha,
+        ),
+    )
+    if helper_probe.stdout != expected_gate_sha + "\n":
+        raise WorkloadError("staged P51 receipt-gate helper hash differs from the pinned binary")
     uid_result = _p51_gate_call(
         farm, plan, client, factory, transport, "sidecar-uid",
-        ("/usr/bin/id", "-u", "icecc"),
+        ("/usr/bin/id", "-u", "nobody"),
     )
     try:
         sidecar_uid = int(uid_result.stdout.strip())
@@ -503,7 +517,13 @@ def _run_p51_receipt_window(
         timeout_s=workload["receipt_gate"].get("command_timeout_s", 260),
         argv=docker_argv(farm, client["host"], gate_argv),
     )
-    command = _driver_command(farm, scenario, plan, client, turn, factory)
+    # Keep normal compile-channel connections outside the UID-scoped receipt
+    # redirect.  The C sidecar remains nobody (65534); daemon (UID 1) is a
+    # distinct existing account with access to the run-private writable
+    # /results mount.
+    command = _driver_command(
+        farm, scenario, plan, client, turn, factory, exec_uid="1:1"
+    )
     _p51_gate_call(
         farm, plan, client, factory, transport, "prepare-control-dir",
         ("/bin/mkdir", "-p", gate_dir),
@@ -517,7 +537,20 @@ def _run_p51_receipt_window(
                 farm, plan, client, factory, transport, f"{gate_dir}/ready", timeout_s=20
             )
             if ready is None:
-                raise WorkloadError("remote P51 receipt gate did not become ready")
+                exit_probe = _p51_gate_call(
+                    farm, plan, client, factory, transport, "probe-gate-exit",
+                    ("/bin/sh", "-c", P51_GATE_READ_MARKER,
+                     "read-marker", f"{gate_dir}/exit"),
+                )
+                detail = "helper did not publish ready or exit"
+                if exit_probe.stdout != "__WAIT__\n":
+                    detail = f"helper exit={exit_probe.stdout.strip()}"
+                    if gate_future.done():
+                        gate_result = gate_future.result()
+                        output = (gate_result.stderr or gate_result.stdout).strip()
+                        if output:
+                            detail += f": {output[-1200:]}"
+                raise WorkloadError(f"remote P51 receipt gate did not become ready ({detail})")
             workload_future = executor.submit(transport.invoke, command)
             if gate_spec["expect_observed"]:
                 held = _p51_wait_marker(
