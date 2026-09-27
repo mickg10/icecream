@@ -3497,6 +3497,7 @@ void test_p51_sender_serial_control_only() {
 asio::awaitable<ServerRunResult> sender_r2_accept_with_first_commit_gate(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
     std::atomic<int>& observed_peer_fd, std::atomic<bool>& gate_entered,
+    std::atomic<bool>& gate_returned,
     std::mutex& gate_mutex, std::condition_variable& gate_cv,
     bool& release_gate) {
     tcp::socket socket(co_await asio::this_coro::executor);
@@ -3517,9 +3518,10 @@ asio::awaitable<ServerRunResult> sender_r2_accept_with_first_commit_gate(
             gate_entered.store(true, std::memory_order_release);
             gate_cv.notify_all();
             std::unique_lock lock(gate_mutex);
-            if (!gate_cv.wait_for(lock, std::chrono::seconds(10), [&] {
-                    return release_gate;
-                }))
+            const bool released = gate_cv.wait_for(
+                lock, std::chrono::seconds(10), [&] { return release_gate; });
+            gate_returned.store(released, std::memory_order_release);
+            if (!released)
                 throw std::runtime_error("D16 first-COMMIT gate expired");
         };
     co_return co_await endpoint.run_adopted_r2(std::move(socket),
@@ -3540,7 +3542,9 @@ asio::awaitable<void> sender_test_heartbeat(
 }
 
 void run_p51_sender_writer_backpressure_case(
-    ProfileId profile, bool retire_while_reader_and_writer_held = false) {
+    ProfileId profile, bool retire_while_reader_and_writer_held = false,
+    bool resume_after_backpressure = false) {
+    CHECK(!(retire_while_reader_and_writer_held && resume_after_backpressure));
     ScopedP50Diagnostics diagnostics;
     constexpr size_t kLargeRawBytes = 512U << 10;
     constexpr uint64_t kPhysicalGeneration = 27;
@@ -3582,8 +3586,12 @@ void run_p51_sender_writer_backpressure_case(
     std::condition_variable f_gate_cv;
     bool release_f_gate = false;
     std::atomic<bool> f_gate_entered{false};
+    std::atomic<bool> f_gate_returned{false};
+    std::atomic<unsigned> jobs_consumed{0};
     std::atomic<int> observed_f_fd{-1};
     std::atomic<unsigned> commit_count{0};
+    std::array<std::atomic<unsigned>, 2> commits_by_tu{};
+    std::atomic<unsigned> ack_count{0};
     std::atomic<unsigned> input_mismatches{0};
     CompletionLog f_socket_observations;
     std::mutex interval_mutex;
@@ -3634,6 +3642,7 @@ void run_p51_sender_writer_backpressure_case(
             binding.raw_bytes != input[index].size() ||
             binding.raw_digest != icecc::digest128(input[index]))
             return std::nullopt;
+        jobs_consumed.fetch_add(1, std::memory_order_release);
         P51SourceJobLease lease;
         lease.armed = armed[index];
         lease.absolute_deadline = deadline;
@@ -3649,13 +3658,20 @@ void run_p51_sender_writer_backpressure_case(
             binding.tu_seq.value >= input.size())
             return false;
         commit_count.fetch_add(1, std::memory_order_release);
+        commits_by_tu[binding.tu_seq.value].fetch_add(
+            1, std::memory_order_release);
         return true;
     };
     server_config.acknowledge_p51_receipt =
         [&](const LinkHello& hello, const CommitAck& ack) {
-        return hello.relationship_id == relationship_id &&
+        const bool valid = hello.relationship_id == relationship_id &&
             ack.relationship_id == relationship_id &&
             ack.physical_link_generation == kPhysicalGeneration;
+        if (valid)
+            ack_count.store(static_cast<unsigned>(ack.contiguous_verified_ordinal),
+                            std::memory_order_release);
+        interval_cv.notify_all();
+        return valid;
     };
     EndpointCaps server_caps;
     server_caps.profile = profile;
@@ -3667,7 +3683,8 @@ void run_p51_sender_writer_backpressure_case(
     auto server_future = asio::co_spawn(
         f_context, sender_r2_accept_with_first_commit_gate(
             acceptor, server, observed_f_fd, f_gate_entered,
-            f_gate_mutex, f_gate_cv, release_f_gate), asio::use_future);
+            f_gate_returned, f_gate_mutex, f_gate_cv, release_f_gate),
+        asio::use_future);
 
     PreparationAuthorityLimits limits;
     limits.max_speculative_tus = kWindow;
@@ -3701,6 +3718,7 @@ void run_p51_sender_writer_backpressure_case(
         sender_config.compression_level = 3;
     std::atomic<unsigned> complete_bundles{0};
     std::atomic<bool> first_receipt_validated{false};
+    std::atomic<unsigned> receipts_validated{0};
     std::atomic<bool> hold_receipt_reader{true};
     std::mutex progress_mutex;
     std::condition_variable progress_cv;
@@ -3709,6 +3727,7 @@ void run_p51_sender_writer_backpressure_case(
         progress_cv.notify_all();
     };
     sender_config.after_r2_receipt_validated_for_test = [&](uint64_t ordinal) {
+        receipts_validated.fetch_add(1, std::memory_order_release);
         if (ordinal == 1)
             first_receipt_validated.store(true, std::memory_order_release);
         progress_cv.notify_all();
@@ -3890,6 +3909,122 @@ void run_p51_sender_writer_backpressure_case(
         CHECK(terminal_count_during_retire.load(std::memory_order_acquire) == 0);
         hold_receipt_reader.store(false, std::memory_order_release);
         progress_cv.notify_all();
+    } else if (resume_after_backpressure) {
+        const int peer_receive_fd =
+            observed_f_fd.load(std::memory_order_acquire);
+        CHECK(peer_receive_fd >= 0);
+        const int requested_resumed_receive_buffer = 1U << 20;
+        CHECK(::setsockopt(peer_receive_fd, SOL_SOCKET, SO_RCVBUF,
+                           &requested_resumed_receive_buffer,
+                           sizeof(requested_resumed_receive_buffer)) == 0);
+        int effective_resumed_receive_buffer = 0;
+        socklen_t resumed_buffer_size =
+            sizeof(effective_resumed_receive_buffer);
+        CHECK(::getsockopt(peer_receive_fd, SOL_SOCKET, SO_RCVBUF,
+                           &effective_resumed_receive_buffer,
+                           &resumed_buffer_size) == 0);
+        CHECK(effective_resumed_receive_buffer > 8192);
+        std::cerr << "P51_D03_BACKPRESSURE_RESUME_BUFFER profile="
+                  << profile_name << " initial_rcvbuf=4096 effective_after="
+                  << effective_resumed_receive_buffer << '\n';
+        int f_inq_at_release = -1;
+        int c_outq_at_release = -1;
+        (void)::ioctl(peer_receive_fd, SIOCINQ, &f_inq_at_release);
+        const int c_fd_at_release =
+            observed_c_fd.load(std::memory_order_acquire);
+        if (c_fd_at_release >= 0)
+            (void)::ioctl(c_fd_at_release, SIOCOUTQ, &c_outq_at_release);
+        {
+            std::lock_guard lock(f_gate_mutex);
+            release_f_gate = true;
+        }
+        f_gate_cv.notify_all();
+        hold_receipt_reader.store(false, std::memory_order_release);
+        progress_cv.notify_all();
+
+        std::array<int, 4> f_inq_samples{};
+        std::array<int, 4> c_outq_samples{};
+        f_inq_samples.fill(-1);
+        c_outq_samples.fill(-1);
+        bool receipts_resumed = false;
+        for (size_t sample = 0; sample < f_inq_samples.size(); ++sample) {
+            receipts_resumed = wait_for_progress([&] {
+                return receipts_validated.load(std::memory_order_acquire) == 2;
+            }, std::chrono::seconds(2));
+            const int current_f_fd =
+                observed_f_fd.load(std::memory_order_acquire);
+            if (current_f_fd >= 0)
+                (void)::ioctl(current_f_fd, SIOCINQ, &f_inq_samples[sample]);
+            const int current_c_fd =
+                observed_c_fd.load(std::memory_order_acquire);
+            if (current_c_fd >= 0)
+                (void)::ioctl(current_c_fd, SIOCOUTQ,
+                              &c_outq_samples[sample]);
+            if (receipts_resumed)
+                break;
+        }
+        if (!receipts_resumed) {
+            int c_outq = -1;
+            const int current_c_fd =
+                observed_c_fd.load(std::memory_order_acquire);
+            if (current_c_fd >= 0)
+                (void)::ioctl(current_c_fd, SIOCOUTQ, &c_outq);
+            std::cerr << "P51_D03_KERNEL_BACKPRESSURE_DIAG profile="
+                      << profile_name << " receipts="
+                      << receipts_validated.load() << " bundles="
+                      << complete_bundles.load() << " jobs_consumed="
+                      << jobs_consumed.load() << " commits="
+                      << commit_count.load() << " gate_returned="
+                      << f_gate_returned.load() << " f_inq_release="
+                      << f_inq_at_release << " f_inq_samples="
+                      << f_inq_samples[0] << ',' << f_inq_samples[1] << ','
+                      << f_inq_samples[2] << ',' << f_inq_samples[3]
+                      << " c_outq_release=" << c_outq_at_release
+                      << " c_outq_samples=" << c_outq_samples[0] << ','
+                      << c_outq_samples[1] << ',' << c_outq_samples[2] << ','
+                      << c_outq_samples[3]
+                      << " c_outq=" << c_outq << " mismatches="
+                      << input_mismatches.load() << " first_ready="
+                      << (first.wait_for(std::chrono::seconds(0)) ==
+                          std::future_status::ready) << " second_ready="
+                      << (second.wait_for(std::chrono::seconds(0)) ==
+                          std::future_status::ready) << " server_ready="
+                      << (server_future.wait_for(std::chrono::seconds(0)) ==
+                          std::future_status::ready) << '\n';
+        }
+        CHECK(receipts_resumed);
+        CHECK(first.wait_for(std::chrono::seconds(2)) ==
+              std::future_status::ready);
+        CHECK(second.wait_for(std::chrono::seconds(2)) ==
+              std::future_status::ready);
+        CHECK(complete_bundles.load(std::memory_order_acquire) == 2);
+        CHECK(commit_count.load(std::memory_order_acquire) == 2);
+        CHECK(commits_by_tu[0].load(std::memory_order_acquire) == 1);
+        CHECK(commits_by_tu[1].load(std::memory_order_acquire) == 1);
+        CHECK(input_mismatches.load(std::memory_order_acquire) == 0);
+        {
+            std::unique_lock lock(interval_mutex);
+            CHECK(interval_cv.wait_for(lock, std::chrono::seconds(3), [&] {
+                return ack_count.load(std::memory_order_acquire) == 2;
+            }));
+        }
+        const auto drain_deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(3);
+        size_t live_entries = std::numeric_limits<size_t>::max();
+        while (std::chrono::steady_clock::now() < drain_deadline) {
+            auto usage_promise = std::make_shared<std::promise<size_t>>();
+            auto usage = usage_promise->get_future();
+            asio::post(c_context, [authority, usage_promise] {
+                usage_promise->set_value(authority->live_entry_count());
+            });
+            CHECK(usage.wait_for(std::chrono::seconds(1)) ==
+                  std::future_status::ready);
+            live_entries = usage.get();
+            if (live_entries == 0)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(live_entries == 0);
     } else {
         hold_receipt_reader.store(false, std::memory_order_release);
         progress_cv.notify_all();
@@ -3941,10 +4076,21 @@ void run_p51_sender_writer_backpressure_case(
               std::future_status::ready);
     }
     CHECK(second.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
-    CHECK(second.get().status != ZstdSourceTransferStatus::Committed);
+    const ZstdSourceTransferResult second_result = second.get();
+    if (resume_after_backpressure) {
+        CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
+        CHECK(second_result.committed_input.has_value());
+    } else {
+        CHECK(second_result.status != ZstdSourceTransferStatus::Committed);
+    }
     CHECK(first.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
     const ZstdSourceTransferResult first_result = first.get();
-    if (retire_while_reader_and_writer_held)
+    if (resume_after_backpressure)
+    {
+        CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
+        CHECK(first_result.committed_input.has_value());
+    }
+    else if (retire_while_reader_and_writer_held)
         CHECK(first_result.status != ZstdSourceTransferStatus::Committed);
     else
         CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
@@ -3977,7 +4123,15 @@ void run_p51_sender_writer_backpressure_case(
             prior_sequence = interval.interval_sequence;
         }
     }
-    CHECK(commit_count.load(std::memory_order_acquire) == 1);
+    CHECK(commit_count.load(std::memory_order_acquire) ==
+          (resume_after_backpressure ? 2 : 1));
+    if (resume_after_backpressure) {
+        CHECK(commits_by_tu[0].load(std::memory_order_acquire) == 1);
+        CHECK(commits_by_tu[1].load(std::memory_order_acquire) == 1);
+        CHECK(receipts_validated.load(std::memory_order_acquire) == 2);
+        CHECK(ack_count.load(std::memory_order_acquire) == 2);
+        CHECK(connector_calls.load(std::memory_order_acquire) == 1);
+    }
     CHECK(input_mismatches.load(std::memory_order_relaxed) == 0);
     CHECK(connector_calls.load(std::memory_order_acquire) <= 2);
     stop_heartbeat.store(true, std::memory_order_release);
@@ -3987,13 +4141,21 @@ void run_p51_sender_writer_backpressure_case(
     if (c_thread.joinable()) c_thread.join();
     f_context.stop();
     if (f_thread.joinable()) f_thread.join();
-    std::cerr << "P51_D16_BACKPRESSURE_ACK_SHUTDOWN profile=" << profile_name
-              << " first_committed="
-              << (!retire_while_reader_and_writer_held)
-              << " blocked_write=1 receipt_reader_progress="
-              << (!retire_while_reader_and_writer_held)
-              << " held_io_retirement=" << retire_while_reader_and_writer_held
-              << " bounded=1 PASS\n";
+    if (resume_after_backpressure) {
+        std::cerr << "P51_D03_KERNEL_BACKPRESSURE_RESUMED profile="
+                  << profile_name << " outq=" << queued_bytes
+                  << " sndbuf=" << effective_send_buffer
+                  << " not_writable=1 receipts=2 commits=2 exact_bytes=1 "
+                     "credits_drained=1 PASS\n";
+    } else {
+        std::cerr << "P51_D16_BACKPRESSURE_ACK_SHUTDOWN profile=" << profile_name
+                  << " first_committed="
+                  << (!retire_while_reader_and_writer_held)
+                  << " blocked_write=1 receipt_reader_progress="
+                  << (!retire_while_reader_and_writer_held)
+                  << " held_io_retirement=" << retire_while_reader_and_writer_held
+                  << " bounded=1 PASS\n";
+    }
 }
 
 void test_p51_sender_writer_backpressure_ack_and_shutdown() {
@@ -4001,6 +4163,12 @@ void test_p51_sender_writer_backpressure_ack_and_shutdown() {
                                     ProfileId::ZSTD_ROUTE})
         run_p51_sender_writer_backpressure_case(profile);
     run_p51_sender_writer_backpressure_case(ProfileId::ZSTD_TU, true);
+}
+
+void test_p51_sender_writer_backpressure_resumes() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        run_p51_sender_writer_backpressure_case(profile, false, true);
 }
 #endif
 
@@ -6826,6 +6994,17 @@ int main(int argc, char** argv) {
         return 0;
 #else
         std::cerr << "SKIP: D16 SIOCOUTQ backpressure witness is Linux-only\n";
+        return 77;
+#endif
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--d03-kernel-backpressure-resume") {
+#if defined(__linux__)
+        test_p51_sender_writer_backpressure_resumes();
+        std::cerr << "P51_D03_KERNEL_BACKPRESSURE_RESUME_SELECTOR PASS\n";
+        return 0;
+#else
+        std::cerr << "UNSUPPORTED: D03 kernel backpressure witness requires Linux SIOCOUTQ\n";
         return 77;
 #endif
     }

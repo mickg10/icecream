@@ -189,6 +189,25 @@ component-level kernel-backpressure check, not a full service-process shutdown
 or an observed `send()` EAGAIN trace. Non-Linux focused runs exit 77 because
 the queue witness requires Linux `SIOCOUTQ`; Linux failures are not skips.
 
+The D03 successful-resumption variant is opt-in:
+
+```sh
+make -C "$BUILD/unittests" p50zstdsender-d03-kernel-backpressure-check
+```
+
+It uses the same bounded 512-KiB incompressible second TU, tiny socket buffers,
+and held F reader. Once the client socket is observably non-writable with
+queued bytes and the second sender future is still pending, it releases both
+gates and requires two exact committed inputs, two receipts, and drained
+authority entries for each profile. This proves real loopback kernel
+backpressure and successful stream resumption. A separate bounded `strace`
+run on the same successful binary observed positive short `sendto` returns on
+the C-to-F TCP data socket (65,536-byte requests returned 32,741 bytes three
+times and 32,768 bytes 42 times). The trace observed receiver-side
+`recvfrom` EAGAIN, but no sender-side EAGAIN; the runtime target does not
+require `strace`. The separate D16 shutdown/retirement checks remain
+unchanged.
+
 The real R2 idle-expiry/reconnect check is an opt-in native target because it
 waits for the endpoint's production 60-second idle deadline. Run it from an
 existing configured build:

@@ -652,6 +652,15 @@ p50zstdsender-initial-link-check:
 	timeout 120s ./p50zstdsender --initial-handshake-terminal
 	timeout 120s ./p50zstdsender --typed-link-rejection
 
+# Linux-only real-socket backpressure followed by successful stream resumption.
+.PHONY: p50zstdsender-d03-kernel-backpressure-check
+p50zstdsender-d03-kernel-backpressure-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpoint.a libp50adoptedoutcomewriter.a libprotocol50.a
+	$(MAKE) -C $(top_builddir)/client libp50zstdsender.a
+	$(MAKE) p50zstdsender
+	timeout 120s ./p50zstdsender --d03-kernel-backpressure-resume
+
 # Opt-in end-to-end Initial cut/rearm on one F service for every profile.
 .PHONY: p50cacheservice-initial-cut-rearm-check
 p50cacheservice-initial-cut-rearm-check:
