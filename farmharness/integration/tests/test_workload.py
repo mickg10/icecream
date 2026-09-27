@@ -2237,8 +2237,9 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
 @pytest.mark.parametrize(
     ("configured", "expected", "valid"),
     [(None, "1", True), ("1", "1", True), ("4", "4", True),
+     ("000000001", "1", True),
      ("0", "", False), ("-1", "", False), ("1x", "", False),
-     ("61", "", False)],
+     ("61", "", False), ("999999999999", "", False)],
 )
 def test_oracle_prepare_fanout_is_separate_from_measured_jobs(
     configured: str | None, expected: str, valid: bool,
