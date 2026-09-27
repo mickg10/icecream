@@ -26,8 +26,23 @@ Commit `e7f54519` adds an explicit native-only `legacy-bootstrap` mode used
 by the pinned P43 build. It rejects Python metadata in that mode and retains
 the exact SDK metadata check for current sources. Its Python-sync result is
 explicitly skipped, not a fabricated pass. The focused runner/bootstrap suite
-passes 62 tests. Actual P43 build and mixed-image continuation are pending;
-the original QA remains failed and does not qualify the later lifecycle fix.
+passes 62 tests. A separately labelled continuation built and installed exact
+P43 `cd74801e` successfully, then passed eight local mixed-image rows: R1
+P29V1/ZSTD_TU/ZSTD_ROUTE, P43 worker/client, and R2 for all three profiles.
+R2 rows require selected mode, source lease and adopted link evidence.
+Continuation summary:
+`/tanksmall/scratch/tmp/p51-legacy-bootstrap-continuation/mixed-default-r2/summary.json`,
+SHA256 `552b437c44e1129917fb5d7082066e2d8281dde5154021e11e115484084d695b`.
+The current product image was frozen ca40, not the lifecycle-fix candidate;
+the original full QA remains failed. This continuation used a patched runner
+overlay and is not fresh public bootstrap reproduction.
+
+Commit `be66761c` separates D18 local expected-output preparation from its
+measured start. It checks run/client/turn-bound preparation results before
+allowing measured drivers, retaining the 60-second barrier and overlap
+limits; 259 focused harness tests pass. The first external attempt timed out
+before measured traffic and remains a setup failure. Fresh external runs
+must establish the mixed-role result; unit tests do not establish it.
 
 ### Sidecar recovery budget
 
