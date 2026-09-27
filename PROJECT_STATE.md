@@ -118,6 +118,15 @@ the correction, including wrong-host/wrong-port/malformed endpoint rejection.
 Rows remain under that run's `diagnostics/tt-quietbox5/C_*.output/` directory.
 Teardown records DOWN with no cleanup or diagnostic errors. A fresh complete
 scenario verdict remains required.
+Fresh retry `d18-p29-endpoint-20260927-4` passed the corrected worker check but
+failed collection: source-result v5 R2 measurements were unavailable or
+invalid for numeric accounting on assignment
+`(6, 5313725957874579522, 11485645625671867361)`. Its evidence is retained and
+teardown records DOWN without problems. The reporting/collector cause is
+under investigation; measurement checks have not been bypassed.
+The multi-link driver now likewise separates preferred worker names from
+verified address:port endpoints. Its correction passes 301 focused harness
+tests, including same-host/wrong-port rejection; this is not a farm pass.
 External mixed qualification remains open; unit tests do not establish it.
 
 ### Sidecar recovery budget
