@@ -12,6 +12,27 @@ retained artifact directories.
 
 ## Developer QA
 
+### Real sender EAGAIN witness
+
+The opt-in target `p50zstdsender-d03-kernel-eagain-check` now observes a real
+kernel `EAGAIN` on a C-to-F R2_BODY header, then the identical send succeeding,
+for P29V1, ZSTD_TU and ZSTD_ROUTE. Each case also checks exact output, receipts,
+commits and released capacity. Its trace checker binds the observation to the
+profile's actual socket tuple and has 11 passing fixture tests. Separate
+test-hook executable/archives leave production and default sender target
+definitions unchanged. The required trace/test/exit artifacts are retained
+under `ICEFARM_TMPDIR`; Python uses the shared UV environment.
+
+The public target passed against the be667 product source with this test
+increment. Log
+`/tanksmall/scratch/tmp/p50-eagain-optin-evidence/optin-build-run-r3.log`, SHA256
+`24fb8b566d72a1962da6fbc39600ac2e6ea77899cb9f84083d50b83c46e182a3`;
+trace bundle `p50-eagain.zT33xd` under that directory, trace SHA256
+`35cd41b64c88226ac6d67a3aa6fb2c0a587e5df7ee38ec5106750860cb78415c`.
+Earlier compile/parser failures remain separate. This closes the missing
+real-syscall backpressure witness for those cases, not the whole D03
+fragmentation/reconnect matrix or qualification of later product changes.
+
 ### Multi-link receipt-window harness
 
 Same-host farm execution is now explicit (`hosts[].execution="local"` with
