@@ -55,15 +55,27 @@ def compiler_identity_digest(instance: dict[str, Any]) -> str:
 
 
 def oracle_root(
-    farm: FarmSpec, instance: dict[str, Any], corpus_name: str
+    farm: FarmSpec,
+    instance: dict[str, Any],
+    corpus_name: str,
+    *,
+    writer_uid: int | None = None,
 ) -> PurePosixPath:
-    return (
+    if writer_uid is not None and (
+        isinstance(writer_uid, bool) or not isinstance(writer_uid, int) or writer_uid < 0
+    ):
+        raise ValueError("oracle writer UID must be a nonnegative integer")
+    root = (
         PurePosixPath(farm.hosts[instance["host"]]["scratch_root"])
         / "icefarm"
         / "oracle"
         / corpus_name
         / compiler_identity_digest(instance)
     )
+    # Writable oracle locks and result objects belong to the identity that
+    # runs the manifest driver. Keep the legacy path unchanged for existing
+    # workloads, while avoiding cross-UID reuse of an unwritable cache.
+    return root if writer_uid is None else root / f"uid-{writer_uid}"
 
 
 def toolchain_root(farm: FarmSpec, instance: dict[str, Any]) -> PurePosixPath | None:

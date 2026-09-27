@@ -673,6 +673,11 @@ def _planned_commands(
     receipt_network_by_instance = {
         binding.instance: binding for binding in receipt_networks
     }
+    oracle_writer_uid = (
+        1
+        if scenario.data["workload"]["driver"] == "p51-receipt-window"
+        else None
+    )
 
     scheduler = next(item for item in topology["instances"] if item["role"] == "S")
     receipt_dispatch_credit = _receipt_dispatch_credit(scenario)
@@ -716,7 +721,12 @@ def _planned_commands(
         directories = []
         if instance["role"] == "C":
             directories.append(
-                str(oracle_root(farm, instance, scenario.data["workload"]["corpus"]))
+                str(oracle_root(
+                    farm,
+                    instance,
+                    scenario.data["workload"]["corpus"],
+                    writer_uid=oracle_writer_uid,
+                ))
             )
         prepare_argv = ssh_argv(
             farm,
@@ -1024,7 +1034,10 @@ def _planned_commands(
         if instance["role"] == "C":
             corpus_root = root / "input"
             client_oracle_root = oracle_root(
-                farm, instance, scenario.data["workload"]["corpus"]
+                farm,
+                instance,
+                scenario.data["workload"]["corpus"],
+                writer_uid=oracle_writer_uid,
             )
             args.extend(
                 (

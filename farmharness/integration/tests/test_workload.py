@@ -7,11 +7,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import textwrap
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +23,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration import farmtest, workload as workload_module
 from farmharness.integration import scenario_spec as scenario_spec_module
 from farmharness.integration.farm_spec import load_farm_spec
+from farmharness.integration.layout import oracle_root
 from farmharness.integration.images import CommandFactory, RecordingTransport
 from farmharness.integration.events import EventProducer
 from farmharness.integration.remote import (
@@ -1239,6 +1242,130 @@ def test_d18_driver_uses_shared_barrier_without_changing_compiler_identity(
         for argument in preparation.argv
         if argument.startswith("ICEFARM_D18_PREP_ROOT=")
     )
+
+
+def test_receipt_oracle_plan_uses_uid_scoped_root_for_prepare_and_mount(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "D18-P29V1.json", farm
+    )
+    base_plan = farmtest.build_plan(farm, scenario, run_id="receipt-oracle-uid-plan")
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    scenario.data["workload"]["receipt_gate"] = {
+        "binary": "/bin/true",
+        "binary_sha256": hashlib.sha256(Path("/bin/true").read_bytes()).hexdigest(),
+        "expect_observed": True,
+        "expected_commits": 1,
+        "negotiated_window": 1,
+        "command_timeout_s": 30,
+    }
+    scenario.data["workload"].pop("d18_roles", None)
+    commands = farmtest._planned_commands(
+        farm,
+        scenario,
+        base_plan["topology"],
+        base_plan["ports"],
+        "receipt-oracle-uid-plan",
+    )
+    client = next(
+        item for item in base_plan["topology"]["instances"] if item["role"] == "C"
+    )
+    legacy = oracle_root(farm, client, scenario.data["workload"]["corpus"])
+    receipt = oracle_root(
+        farm, client, scenario.data["workload"]["corpus"], writer_uid=1
+    )
+
+    assert receipt == legacy / "uid-1"
+    for invalid_uid in (True, -1, "1"):
+        with pytest.raises(ValueError, match="writer UID"):
+            oracle_root(
+                farm, client, scenario.data["workload"]["corpus"],
+                writer_uid=invalid_uid,
+            )
+    prepare = next(
+        command.as_dict() for command in commands
+        if command.phase == "up.prepare-persistent"
+        and command.instance == client["name"]
+    )
+    start = next(
+        command.as_dict() for command in commands
+        if command.phase == "up.start-c" and command.instance == client["name"]
+    )
+    prepare_argv = json.dumps(decode_ssh_payload(prepare["argv"]))
+    start_argv = json.dumps(start["argv"])
+    assert str(receipt) in prepare_argv
+    assert "0777" in prepare_argv
+    assert f"src={receipt},dst=/oracle" in start_argv
+    assert f"src={legacy},dst=/oracle" not in start_argv
+
+
+def test_receipt_uid_oracle_can_be_created_and_reused_without_mutating_legacy(
+) -> None:
+    if os.geteuid() != 0 or shutil.which("setpriv") is None:
+        pytest.skip("requires root, setpriv, and the existing daemon UID 1")
+    with tempfile.TemporaryDirectory(
+        prefix="p51-oracle-uid1-", dir=tempfile.gettempdir()
+    ) as root:
+        scratch = Path(root)
+        scratch.chmod(0o755)
+        farm = SimpleNamespace(hosts={"host": {"scratch_root": str(scratch)}})
+        client = {
+            "host": "host",
+            "container_image": "sha256:" + "a" * 64,
+            "compiler_recipe": {"executable": "/usr/bin/g++", "arguments": ["-O2"]},
+        }
+        legacy_root = Path(str(oracle_root(farm, client, "tiny")))
+        legacy = legacy_root / "A"
+        receipt = Path(str(oracle_root(farm, client, "tiny", writer_uid=1)))
+        legacy.mkdir(parents=True)
+        old_lock = legacy / ".lock"
+        old_lock.touch()
+        old_lock.chmod(0o644)
+        os.chown(legacy, 65534, 65534)
+        os.chown(old_lock, 65534, 65534)
+        old_lock_stat = old_lock.stat()
+        legacy_stat = legacy.stat()
+
+        # This is the same parent preparation mode emitted by up.prepare-persistent.
+        subprocess.run(
+            ["install", "-d", "-m", "0777", "--", str(receipt)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        smoke = (
+            'set -eu; root=$1; mkdir -p "$root/A"; exec 9>"$root/A/.lock"; '
+            'flock -x 9; printf "reuse\\n" >> "$root/A/probe"'
+        )
+        command = [
+            shutil.which("setpriv"), "--reuid=1", "--regid=1", "--clear-groups",
+            "/bin/bash", "-c", smoke, "uid-one-oracle", str(receipt),
+        ]
+        for _ in range(2):
+            subprocess.run(command, check=True, capture_output=True, text=True)
+
+        assert (receipt / "A" / "probe").read_text(encoding="ascii") == "reuse\nreuse\n"
+        assert (receipt / "A" / ".lock").stat().st_uid == 1
+        legacy_attempt = subprocess.run(
+            [
+                shutil.which("setpriv"), "--reuid=1", "--regid=1", "--clear-groups",
+                "/bin/bash", "-c", 'exec 9>"$1/.lock"', "legacy-oracle", str(legacy),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert legacy_attempt.returncode != 0
+        assert old_lock.read_bytes() == b""
+        assert (old_lock.stat().st_uid, old_lock.stat().st_gid, old_lock.stat().st_mode) == (
+            old_lock_stat.st_uid, old_lock_stat.st_gid, old_lock_stat.st_mode
+        )
+        assert (legacy.stat().st_uid, legacy.stat().st_gid, legacy.stat().st_mode) == (
+            legacy_stat.st_uid, legacy_stat.st_gid, legacy_stat.st_mode
+        )
 
 
 def _d18_fixture_plan(tmp_path: Path):
