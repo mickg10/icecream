@@ -90,6 +90,12 @@ format, execute helper staging, and separate compiler/helper/sidecar UIDs.
 The touched lifecycle, workload and ladder-catalog Python modules pass all
 104 tests on donor `de78212c`. This checks harness behavior, not successful
 end-to-end negotiation of W1/W30 or selector error handling in a real client.
+Follow-up `be337e86` publishes the fixes used by the successful external runs:
+explicit R2 scheduler validation, checksum-pinned offline Debian tool staging,
+retained helper stderr and exact profile/window checks for the W1 negative
+control. All 243 tests in workload, lifecycle and specs-and-plan modules pass
+on donor `09b0c5d7`. The bundle acquisition instructions are still pending;
+these changes are newer than the separately running frozen `ca40e89f` QA.
 
 External attempt `w30-luna-w1-p29-20260926-j` passed preflight and startup,
 then failed because its helper required GLIBC_2.38 and GLIBCXX_3.4.31/32,
