@@ -66,13 +66,24 @@ Logs under `/tanksmall/scratch/tmp/p51-d11-record-cap-profiles-build/logs/`:
 Binary SHA256 `49c9b6264b4e82cca250ac1bf8952ca2709634898f6dd5379f627ad3410f3365`.
 An earlier default service run passed, but final-source `service-default-r3.log`
 failed the existing D07 `one_link` assertion after a live-interrupted-reservation
-refusal. This remains under investigation; focused cap passes do not turn
-that full-suite failure into a pass. A diagnostic combined-D07 run and full
-service rerun (`service-default-d07-trace-r1.log`) subsequently pass with
-expected connection counts and no live-reservation rejection. They do not
-explain the earlier failure, whose exact count/subcase was not logged;
-bounded repetition and causal-order analysis continue. Metadata and measured
-memory bounds remain separate open coverage.
+refusal. That failed result is retained; its exact count/subcase was not logged.
+Causal-order review found a fixture race: main-thread cancellation after reset
+confirmation could lose to the first replay bind while F still retained the
+predecessor. Donor `7fa6573a` orders the exact cancellation in the existing
+C-side pre-replay callback, after confirmed reset and before replay. It does
+not change production behavior or relax connection-count assertions.
+
+The affected focused selector passes all three profiles in three runs; the
+corrected full default service run also passes. In the same log directory,
+`service-default-d07-ordered-r3.log` ends `p50cacheservice: ok` and
+`CONTAINER_RUN_EXIT=0`, SHA256
+`4d6466929abf62c83953613f27df34478cdd323c8430e729fd46a102d68a0692`.
+Binary SHA256 is
+`a0629a6619e95df546d828b22f584a140da8afa3a2d322c1a3b1bd247779ae4b`.
+The committed source adds only an explanatory comment after this build.
+Two prior invocations omitted required fixture environment variables and
+are setup failures, not passing runs. Metadata and measured memory bounds,
+and final merged-source QA, remain open.
 
 ### Delayed old-generation connector completion
 
