@@ -50,9 +50,16 @@ An instrumented matched-Debian C4F1/ZSTD_ROUTE run passed 120 jobs with four
 established links, using 11 attempts (seven ended before LINK_STATE).
 Log `/tanksmall/scratch/tmp/p51-c4f1-firstfail/logs/c4f1-route-debian-matched.log`,
 SHA256 `5c44583867be47f4e53152b65e75725d43df4cfcb9f3839861c9b206f4e034f7`.
-An Ubuntu diagnostic pass is separate substrate evidence. Neither isolated
-pass explains the original 12-attempt failure; a single instrumented full
-18-cell replay in the original order is pending.
+An Ubuntu diagnostic pass is separate substrate evidence. The single
+instrumented full 18-cell replay in original order passed on Debian with
+unchanged limits. Log
+`/tanksmall/scratch/tmp/p51-c4f1-firstfail/logs/full18-replay.log`, SHA256
+`3c9a931f8791ad828624c7dd03ecbedcf6cc661b4232a1c32974e73bbeb3bb1b`.
+Its final C4F1/ZSTD_ROUTE cell established four links after six attempts;
+no first-failure marker occurred. This does not explain or erase the earlier
+12-attempt failure. New local Docker receipt execution is separately running
+on the tiny31 corpus and labelled 9e product image; it is not a current-source
+farm or performance result.
 
 ### Frozen QA and legacy build boundary
 
