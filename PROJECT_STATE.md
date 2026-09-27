@@ -43,8 +43,15 @@ failed one fixture (1683 passed, 7 skipped): the receipt-window test omitted
 the scheduler's R2 setting. Overall QA is FAIL; image/legacy/mixed stages did
 not run. The current branch already supplies the missing fixture setting.
 The six native skips have the same capability, live-test-switch and
-non-loopback-host requirements described below. A current Python run and
-separately labelled continuation are pending; no native/root rerun is implied.
+non-loopback-host requirements described below. A separate current Python run
+passes 1713 tests with one skip after moving the non-scenario matrix template
+out of the scenario catalog. Its full log is
+`/tanksmall/scratch/tmp/e7e7-python-validation/full.log`, SHA256
+`4e539aa1f83da503c85db14534c3da16b3b2d29e8343e40f5b4be022b8c59ab6`.
+An additional focused UV test correction uses resolved path containment,
+not a string prefix that falsely rejects similarly named sibling directories.
+Earlier Python failures remain preserved. Separately labelled image/mixed
+continuation is pending; no native/root rerun or full-QA PASS is implied.
 This run includes the READY restart-budget and legacy bootstrap corrections,
 but not the later diagnostic-retention or private multi-link harness changes.
 Evidence directory:
