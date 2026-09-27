@@ -199,7 +199,12 @@ SHA256 `58f1bc9a3bc818bd13833b45aef180c34d79a4811ceabc3abaa19156aafa910a`.
 ZSTD_ROUTE/W1 passes on fresh `w1-luna-w1-route-20260927-a`: negotiated
 profile 3/window 1, one held ordinal 1, epoch/generation 1 and 31 exact-output
 jobs with zero failures. Result `route-w1-run.json` in the same directory.
-ZSTD_ROUTE W30/negative, required topology/restart/mixed cases and full
+ZSTD_ROUTE/W30 passes on fresh `w30-luna-w30-route-20260927-a`: negotiated
+profile 3/window 30, exactly thirty held COMMITs at ordinals 1–30 on epoch/
+generation 1, helper exit zero, then 31 exact-output jobs with zero failures.
+Result `route-w30-run.json` in the same artifact directory.
+Thus all three profiles have actual external W1 and W30 positive witnesses.
+ZSTD_ROUTE negative, required topology/restart/mixed cases and full
 qualification remain open. These gates are not whole-build speed measurements.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
