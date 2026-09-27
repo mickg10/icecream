@@ -91,6 +91,13 @@ Log `/tanksmall/scratch/tmp/p51-multilink-e2deb-focused.log`, SHA256
 `454b7efc285ad753167c19f2a11efb340bca28e4917de67c106bf410fd5c9cdb`.
 A live isolated multi-link run remains required.
 
+The complete supported Python QA directory (`farmharness/integration/tests`)
+also passed on merged `e2deb92b`: 1,758 passed, one skipped, 233.53 seconds.
+Retained log `/tanksmall/scratch/tmp/p51-multilink-e2deb-integration-python.log`.
+This is the Python stage, not a fresh complete native/image/mixed QA pass.
+An earlier unrestricted repository-wide pytest invocation collected historical
+research modules and failed collection; that invocation is not the QA entrypoint.
+
 Same-host farm execution is now explicit (`hosts[].execution="local"` with
 Docker context `default`), without requiring local SSH. The runner verifies
 a Unix-socket Docker endpoint before authority, preflight and image writes;
