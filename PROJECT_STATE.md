@@ -46,8 +46,15 @@ before measured traffic and remains a setup failure. Retry
 the required-worker/exact-remote row check. It is a measured failure. The
 verifier omitted the offending row and failure-path cleanup removed the
 uncollected result files, so surviving endpoint errors do not establish its
-cause. Row-specific diagnostics and preservation before cleanup are being
-fixed before rerunning. Exact old-run containers are absent on q2/q3/q5.
+cause. Commit `f6b0dcf5` adds row-specific diagnostics and allowlisted client
+result/log/receipt capture before cleanup. If capture fails, teardown retains
+the affected output directory and records its exact path and errors in
+`down.json`, while removing the run's other resources. The four focused
+harness modules pass 279 tests, including actual rsync filtering of identity
+marker files and copy-failure preservation. This is harness evidence, not a
+product pass. P29-only retry `d18-p29-diag-20260927-3` uses the same labelled
+product images; its result is pending. Exact previous-run containers are
+absent on q2/q3/q5.
 External mixed qualification remains open; unit tests do not establish it.
 
 ### Sidecar recovery budget
