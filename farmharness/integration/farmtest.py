@@ -75,7 +75,11 @@ try:
         PlannedCommand,
         RemoteError,
         docker_argv,
+        docker_transport,
         execute,
+        host_transport,
+        rsync_remote_argv,
+        rsync_transport,
         ssh_argv,
     )
     from .scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
@@ -156,7 +160,11 @@ except ImportError:  # Executed as ./farmtest.py.
         PlannedCommand,
         RemoteError,
         docker_argv,
+        docker_transport,
         execute,
+        host_transport,
+        rsync_remote_argv,
+        rsync_transport,
         ssh_argv,
     )
     from scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
@@ -651,7 +659,7 @@ def _planned_commands(
                 phase="up.prepare",
                 host=instance["host"],
                 instance=instance["name"],
-                transport="ssh",
+                transport=host_transport(farm, instance["host"]),
                 timeout_s=timeout,
                 argv=prepare_argv,
             )
@@ -671,14 +679,14 @@ def _planned_commands(
                     phase="up.stage-p51-receipt-gate",
                     host=instance["host"],
                     instance=instance["name"],
-                    transport="rsync-ssh",
+                    transport=rsync_transport(farm, instance["host"]),
                     timeout_s=timeout,
-                    argv=(
+                    argv=rsync_remote_argv(farm, instance["host"], (
                         "rsync", "--archive", "--checksum", "--protect-args",
                         "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10 -o Compression=no",
                         str(helper),
                         f"{farm.hosts[instance['host']]['ssh']}:{root / 'output' / 'p50daemonpositive'}",
-                    ),
+                    )),
                 )
             )
             sequence += 1
@@ -689,7 +697,7 @@ def _planned_commands(
                     phase="up.prepare-persistent",
                     host=instance["host"],
                     instance=instance["name"],
-                    transport="ssh",
+                    transport=host_transport(farm, instance["host"]),
                     timeout_s=timeout,
                     argv=ssh_argv(
                         farm,
@@ -710,11 +718,7 @@ def _planned_commands(
                 phase="up.network-create",
                 host=binding.host,
                 instance=binding.instance,
-                transport=(
-                    "docker-context"
-                    if farm.hosts[binding.host].get("docker_context")
-                    else "ssh-docker"
-                ),
+                transport=docker_transport(farm, binding.host),
                 timeout_s=timeout,
                 argv=docker_argv(
                     farm,
@@ -731,6 +735,9 @@ def _planned_commands(
         sequence += 1
 
     role_order = {"S": 0, "F": 1, "C": 2}
+    requested_instances = {
+        item["name"]: item for item in scenario.data["instances"]
+    }
     for instance in sorted(
         topology["instances"], key=lambda item: (role_order[item["role"]], item["name"])
     ):
@@ -749,6 +756,11 @@ def _planned_commands(
             "--network",
             "host",
         ]
+        requested = requested_instances[instance["name"]]
+        if "cpus" in requested:
+            args.extend(("--cpus", str(requested["cpus"])))
+        if "memory_mb" in requested:
+            args.extend(("--memory", f"{requested['memory_mb']}m"))
         if instance["role"] == "F":
             args.append("--init")
         binding = netem_by_instance.get(instance["name"])
@@ -1003,7 +1015,7 @@ def _planned_commands(
                     "--idle",
                 )
             )
-        transport = "docker-context" if host.get("docker_context") else "ssh-docker"
+        transport = docker_transport(farm, instance["host"])
         commands.append(
             PlannedCommand(
                 sequence=sequence,
@@ -1031,11 +1043,7 @@ def _planned_commands(
                     phase=phase,
                     host=binding.host,
                     instance=binding.instance,
-                    transport=(
-                        "docker-context"
-                        if farm.hosts[binding.host].get("docker_context")
-                        else "ssh-docker"
-                    ),
+                    transport=docker_transport(farm, binding.host),
                     timeout_s=timeout,
                     argv=docker_argv(farm, binding.host, argv),
                 )

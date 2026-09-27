@@ -20,8 +20,13 @@ from farmharness.integration.remote import (
     PlannedCommand,
     RemoteError,
     SubprocessTransport,
+    docker_argv,
     decode_ssh_payload,
     execute,
+    host_transport,
+    rsync_remote_argv,
+    rsync_transport,
+    ssh_argv,
 )
 from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
 from farmharness.integration.schema_validation import ValidationError, validate
@@ -50,6 +55,74 @@ def _load(tmp_path: Path, farm: dict[str, object], scenario: dict[str, object]):
     farm_path, scenario_path = _write(tmp_path, farm, scenario)
     loaded_farm = load_farm_spec(farm_path)
     return loaded_farm, load_scenario_spec(scenario_path, loaded_farm)
+
+
+def test_explicit_local_transport_is_native_and_rsync_uses_local_paths(tmp_path: Path) -> None:
+    farm_data, _scenario_data = _documents()
+    local_host = next(host for host in farm_data["hosts"] if host["name"] == "tt-quietbox3")
+    local_host["execution"] = "local"
+    local_host["docker_context"] = "default"
+    farm_path = tmp_path / "local-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    farm = load_farm_spec(farm_path)
+
+    assert host_transport(farm, "tt-quietbox3") == "local"
+    assert ssh_argv(farm, "tt-quietbox3", ("install", "-d", "/tmp/x")) == (
+        "install", "-d", "/tmp/x"
+    )
+    assert docker_argv(farm, "tt-quietbox3", ("info",)) == (
+        "docker", "--context", "default", "info"
+    )
+    assert rsync_transport(farm, "tt-quietbox3") == "rsync-local"
+    assert rsync_remote_argv(
+        farm,
+        "tt-quietbox3",
+        ("rsync", "--archive", "-e", "ssh -o BatchMode=yes", "/tmp/a", "mickg10@10.0.27.101:/tmp/b"),
+    ) == ("rsync", "--archive", "/tmp/a", "/tmp/b")
+
+
+def test_local_execution_rejects_remote_docker_context(tmp_path: Path) -> None:
+    farm_data, _scenario_data = _documents()
+    host = next(host for host in farm_data["hosts"] if host["name"] == "tt-quietbox3")
+    host["execution"] = "local"
+    host["docker_context"] = "q3"
+    farm_path = tmp_path / "local-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    with pytest.raises(FarmSpecError, match="docker_context='default'"):
+        load_farm_spec(farm_path)
+
+
+def test_local_instances_require_explicit_bounded_docker_resources(tmp_path: Path) -> None:
+    farm_data, scenario_data = _documents()
+    local_name = "tt-quietbox3"
+    host = next(host for host in farm_data["hosts"] if host["name"] == local_name)
+    host["execution"] = "local"
+    host["docker_context"] = "default"
+    for instance in scenario_data["instances"]:
+        instance["host"] = local_name
+        instance["cpus"], instance["memory_mb"] = {
+            "S": (0.25, 512), "F": (0.75, 1536), "C": (1.0, 2048)
+        }[instance["role"]]
+    farm, scenario = _load(tmp_path, farm_data, scenario_data)
+    plan = farmtest.build_plan(farm, scenario, run_id="local-resources")
+    starts = [command for command in plan["commands"] if command["phase"].startswith("up.start-")]
+    assert len(starts) == 3
+    total_cpus = 0.0
+    total_memory = 0
+    for command in starts:
+        argv = command["argv"]
+        image_index = argv.index("--entrypoint") + 2
+        assert "--cpus" in argv[:image_index]
+        assert "--memory" in argv[:image_index]
+        total_cpus += float(argv[argv.index("--cpus") + 1])
+        total_memory += int(argv[argv.index("--memory") + 1][:-1])
+        assert command["transport"] == "local-docker"
+    assert total_cpus == 2.0
+    assert total_memory == 4096
+
+    scenario_data["instances"][0].pop("cpus")
+    with pytest.raises(ScenarioSpecError, match="local execution requires explicit cpus"):
+        _load(tmp_path, farm_data, scenario_data)
 
 
 def test_committed_examples_validate_and_plan_is_stable() -> None:

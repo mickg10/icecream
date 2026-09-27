@@ -25,6 +25,13 @@ try:
         PlannedCommand,
         RemoteError,
         SubprocessTransport,
+        docker_argv,
+        host_transport,
+        is_local_host,
+        local_docker_endpoint_argv,
+        require_local_docker_endpoint,
+        rsync_remote_argv,
+        rsync_transport,
         ssh_argv,
     )
     from .schema_validation import canonical_bytes
@@ -36,6 +43,13 @@ except ImportError:  # Direct execution from this directory.
         PlannedCommand,
         RemoteError,
         SubprocessTransport,
+        docker_argv,
+        host_transport,
+        is_local_host,
+        local_docker_endpoint_argv,
+        require_local_docker_endpoint,
+        rsync_remote_argv,
+        rsync_transport,
         ssh_argv,
     )
     from schema_validation import canonical_bytes
@@ -341,6 +355,34 @@ class CommandFactory:
         )
         self.sequence += 1
         return command
+
+
+def _verify_local_docker_endpoints(
+    farm: FarmSpec,
+    recorder: Recorder,
+    commands: CommandFactory,
+    *,
+    timeout_s: int,
+) -> None:
+    """Fail before image writes if a declared local host uses remote Docker."""
+    for host_name in sorted(farm.hosts):
+        if not is_local_host(farm, host_name):
+            continue
+        result = recorder.invoke(
+            commands.make(
+                phase="images.verify-local-docker-endpoint",
+                host=host_name,
+                transport="local-docker",
+                timeout_s=timeout_s,
+                argv=local_docker_endpoint_argv(farm, host_name),
+            )
+        )
+        try:
+            require_local_docker_endpoint(result.stdout)
+        except ValueError as exc:
+            raise ImageError(
+                f"local Docker endpoint verification failed on {host_name}: {exc}"
+            ) from exc
 
 
 def _sha256(path: Path) -> str:
@@ -825,10 +867,22 @@ def _host_docker_argv(
     farm: FarmSpec, host_name: str, args: Iterable[str]
 ) -> tuple[str, ...]:
     host = farm.hosts[host_name]
+    resolved = tuple(args)
+    if is_local_host(farm, host_name):
+        return docker_argv(farm, host_name, resolved)
     context = host.get("docker_context")
     if context:
-        return ("docker", "--context", context, *tuple(args))
-    return ("docker", "--host", f"ssh://{host['ssh']}", *tuple(args))
+        return ("docker", "--context", context, *resolved)
+    # Preserve the established image transport: the local Docker CLI talks
+    # to the remote daemon over its SSH Docker endpoint.  The generic
+    # lifecycle transport intentionally uses its separate remote-exec path.
+    return ("docker", "--host", f"ssh://{host['ssh']}", *resolved)
+
+
+def _image_docker_transport(farm: FarmSpec, host_name: str) -> str:
+    if is_local_host(farm, host_name):
+        return "local-docker"
+    return "docker-context" if farm.hosts[host_name].get("docker_context") else "docker-ssh"
 
 
 def build_image(
@@ -982,9 +1036,7 @@ def _inspect_host(
             commands.make(
                 phase=phase,
                 host=host_name,
-                transport="docker-context"
-                if farm.hosts[host_name].get("docker_context")
-                else "docker-ssh",
+                transport=_image_docker_transport(farm, host_name),
                 timeout_s=timeout_s,
                 argv=_host_docker_argv(
                     farm,
@@ -1199,7 +1251,7 @@ def _sync_transport_archive(
         commands.make(
             phase="images.transport-mkdir",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1212,9 +1264,9 @@ def _sync_transport_archive(
         commands.make(
             phase="images.sync-compressed",
             host=host_name,
-            transport="rsync-ssh",
+            transport=rsync_transport(farm, host_name),
             timeout_s=timeout_s,
-            argv=(
+            argv=rsync_remote_argv(farm, host_name, (
                 "rsync",
                 "--archive",
                 "--checksum",
@@ -1224,14 +1276,14 @@ def _sync_transport_archive(
                 "ssh -o BatchMode=yes -o ConnectTimeout=10 -o Compression=no",
                 str(image_archive),
                 f"{farm.hosts[host_name]['ssh']}:{remote_archive}",
-            ),
+            )),
         )
     )
     verified = recorder.invoke(
         commands.make(
             phase="images.verify-compressed",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1313,7 +1365,7 @@ def _save_load_host(
         commands.make(
             phase="images.load-compressed",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1350,9 +1402,7 @@ def _save_load_host(
             phase="images.tag-verified",
             host=host_name,
             transport=(
-                "docker-context"
-                if farm.hosts[host_name].get("docker_context")
-                else "docker-ssh"
+                _image_docker_transport(farm, host_name)
             ),
             timeout_s=timeout_s,
             argv=_host_docker_argv(
@@ -1426,11 +1476,7 @@ def _registry_host(
     commands: CommandFactory,
     timeout_s: int,
 ) -> ImageIdentity:
-    transport = (
-        "docker-context"
-        if farm.hosts[host_name].get("docker_context")
-        else "docker-ssh"
-    )
+    transport = _image_docker_transport(farm, host_name)
     recorder.invoke(
         commands.make(
             phase="images.pull",
@@ -1771,6 +1817,9 @@ def build_and_distribute_foundations(
     transport = recorder or RecordingTransport()
     commands = CommandFactory()
     timeout_s = 7200
+    _verify_local_docker_endpoints(
+        farm, transport, commands, timeout_s=timeout_s
+    )
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {}
@@ -1877,6 +1926,9 @@ def build_and_distribute(
     transport = recorder or RecordingTransport()
     commands = CommandFactory()
     timeout_s = 1800
+    _verify_local_docker_endpoints(
+        farm, transport, commands, timeout_s=timeout_s
+    )
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {}

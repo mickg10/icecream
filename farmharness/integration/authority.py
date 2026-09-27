@@ -15,11 +15,19 @@ from typing import Any, Protocol
 
 try:
     from .farm_spec import FarmSpec
-    from .remote import CommandResult, PlannedCommand, SubprocessTransport, docker_argv, ssh_argv
+    from .remote import (
+        CommandResult, PlannedCommand, SubprocessTransport, docker_argv,
+        host_transport, is_local_host, local_docker_endpoint_argv,
+        require_local_docker_endpoint, ssh_argv,
+    )
     from .schema_validation import canonical_bytes
 except ImportError:  # Direct execution from this directory.
     from farm_spec import FarmSpec
-    from remote import CommandResult, PlannedCommand, SubprocessTransport, docker_argv, ssh_argv
+    from remote import (
+        CommandResult, PlannedCommand, SubprocessTransport, docker_argv,
+        host_transport, is_local_host, local_docker_endpoint_argv,
+        require_local_docker_endpoint, ssh_argv,
+    )
     from schema_validation import canonical_bytes
 
 
@@ -116,6 +124,23 @@ def _capture_steps(farm: FarmSpec, timeout_s: int) -> tuple[_CaptureStep, ...]:
     # authority bootstrap cycle.  Capture only physical-host and Docker-daemon
     # identity, with no container or image mutation.
     for host_name, host in sorted(farm.hosts.items()):
+        if is_local_host(farm, host_name):
+            steps.append(
+                _CaptureStep(
+                    PlannedCommand(
+                        sequence,
+                        "authority.verify-local-docker-endpoint",
+                        host_name,
+                        None,
+                        "local-docker",
+                        timeout_s,
+                        local_docker_endpoint_argv(farm, host_name),
+                    ),
+                    "endpoint",
+                    host_name,
+                )
+            )
+            sequence += 1
         probe_argv = (
             "env",
             f"ICEFARM_EXPECTED_ADDRESS={host['lan_ip']}",
@@ -130,7 +155,7 @@ def _capture_steps(farm: FarmSpec, timeout_s: int) -> tuple[_CaptureStep, ...]:
                     "authority.probe-host",
                     host_name,
                     None,
-                    "ssh",
+                    host_transport(farm, host_name),
                     timeout_s,
                     ssh_argv(farm, host_name, probe_argv),
                 ),
@@ -147,7 +172,7 @@ def _capture_steps(farm: FarmSpec, timeout_s: int) -> tuple[_CaptureStep, ...]:
                     "authority.probe-docker",
                     host_name,
                     None,
-                    "docker-context" if context else "ssh-docker",
+                    "local-docker" if is_local_host(farm, host_name) else ("docker-context" if context else "ssh-docker"),
                     timeout_s,
                     docker_argv(
                         farm,
@@ -338,6 +363,12 @@ def capture_authority(
     hosts: dict[str, dict[str, Any]] = {}
     for step in steps:
         result = transport.invoke(step.command)
+        if step.kind == "endpoint":
+            try:
+                require_local_docker_endpoint(result.stdout)
+            except ValueError as exc:
+                raise AuthorityCaptureError(str(exc)) from exc
+            continue
         if step.kind == "host":
             hosts[step.host] = _parse_host_capture(
                 result.stdout, farm, step.host, now=observed_at

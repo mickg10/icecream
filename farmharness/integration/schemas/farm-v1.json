@@ -128,6 +128,7 @@
           "maxLength": 80,
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
         },
+        "execution": {"enum": ["ssh", "local"]},
         "lan_ip": {"type": "string", "minLength": 3, "maxLength": 64},
         "arch": {"type": "string", "minLength": 1, "maxLength": 32},
         "cores": {"type": "integer", "minimum": 1},

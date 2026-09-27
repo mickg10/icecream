@@ -127,6 +127,11 @@ def load_farm_spec(path: str | Path) -> FarmSpec:
             if context in contexts:
                 raise FarmSpecError(f"$.hosts[{index}].docker_context: duplicate {context!r}")
             contexts.add(context)
+        execution = host.get("execution", "ssh")
+        if execution == "local" and context != "default":
+            raise FarmSpecError(
+                f"$.hosts[{index}]: local execution requires docker_context='default'"
+            )
         _absolute_safe_path(host["scratch_root"], f"$.hosts[{index}].scratch_root")
         try:
             ipaddress.ip_address(host["lan_ip"])

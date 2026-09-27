@@ -20,6 +20,7 @@ from farmharness.integration.images import (
     ImageError,
     RecordingTransport,
     _image_identity,
+    _host_docker_argv,
     build_and_distribute,
     build_and_distribute_foundations,
     build_image,
@@ -645,6 +646,21 @@ def test_unknown_or_duplicate_labels_are_refused() -> None:
         image_bindings(farm, ["p43-1.4.0", "p43-1.4.0"])
 
 
+def test_image_docker_transport_preserves_remote_ssh_and_local_context_modes() -> None:
+    farm = _farm()
+    host = next(item for item in farm.data["hosts"] if item["name"] == "tt-quietbox3")
+    host.pop("docker_context")
+    assert _host_docker_argv(farm, "tt-quietbox3", ("info",)) == (
+        "docker", "--host", "ssh://mickg10@10.0.27.101", "info"
+    )
+
+    host["execution"] = "local"
+    host["docker_context"] = "default"
+    assert _host_docker_argv(farm, "tt-quietbox3", ("info",)) == (
+        "docker", "--context", "default", "info"
+    )
+
+
 def test_build_uses_commit_not_display_label_and_binds_runtime_closure(
     tmp_path: Path,
 ) -> None:
@@ -704,6 +720,40 @@ def test_receipt_binds_saved_transport_archive(tmp_path: Path) -> None:
     }
     assert transport["path"].endswith(".docker.tar.zst")
     assert json.loads(output.read_text()) == receipt
+
+
+def test_local_docker_endpoint_is_rejected_before_image_output_or_build(
+    tmp_path: Path,
+) -> None:
+    farm = _farm()
+    local = next(
+        host for host in farm.data["hosts"] if host["name"] == "tt-quietbox3"
+    )
+    local["execution"] = "local"
+    local["docker_context"] = "default"
+
+    class RemoteEndpointRecorder:
+        def __init__(self) -> None:
+            self.commands: list[PlannedCommand] = []
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            return CommandResult(0, json.dumps("tcp://docker.example:2376") + "\n", "")
+
+    recorder = RemoteEndpointRecorder()
+    output = tmp_path / "not-created" / "images.json"
+    with pytest.raises(ImageError, match="Unix-socket Docker context"):
+        build_and_distribute(
+            farm,
+            ["p50s2-624702e9"],
+            repo=REPO,
+            output=output,
+            recorder=recorder,
+        )
+    assert [command.phase for command in recorder.commands] == [
+        "images.verify-local-docker-endpoint"
+    ]
+    assert not output.parent.exists()
 
 
 def test_preexisting_expected_hub_id_mismatch_is_refused(tmp_path: Path) -> None:

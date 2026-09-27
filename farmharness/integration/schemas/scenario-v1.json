@@ -125,7 +125,9 @@
         "client_environment": {"$ref": "#/$defs/name"},
         "system_source_snapshot": {"$ref": "#/$defs/name"},
         "env": {"$ref": "#/$defs/environment"},
-        "slots": {"type": "integer", "minimum": 1}
+        "slots": {"type": "integer", "minimum": 1},
+        "cpus": {"type": "number", "exclusiveMinimum": 0, "maximum": 256},
+        "memory_mb": {"type": "integer", "minimum": 64}
       },
       "allOf": [
         {

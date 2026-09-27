@@ -38,6 +38,13 @@ try:
         PlannedCommand,
         RemoteError,
         docker_argv,
+        docker_transport,
+        host_transport,
+        is_local_host,
+        local_docker_endpoint_argv,
+        require_local_docker_endpoint,
+        rsync_remote_argv,
+        rsync_transport,
         execute,
         ssh_argv,
     )
@@ -74,6 +81,13 @@ except ImportError:  # Direct execution from this directory.
         PlannedCommand,
         RemoteError,
         docker_argv,
+        docker_transport,
+        host_transport,
+        is_local_host,
+        local_docker_endpoint_argv,
+        require_local_docker_endpoint,
+        rsync_remote_argv,
+        rsync_transport,
         execute,
         ssh_argv,
     )
@@ -817,7 +831,7 @@ def _verify_remote_corpus_archive(
             factory,
             phase="preflight.corpus-archive-verify",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -852,7 +866,7 @@ def _sync_corpus_archives(
             factory,
             phase="preflight.corpus-archive-mkdir",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -903,9 +917,9 @@ def _sync_corpus_archives(
                     factory,
                     phase="preflight.corpus-archive-sync",
                     host=host_name,
-                    transport="rsync-ssh",
+                    transport=rsync_transport(farm, host_name),
                     timeout_s=timeout_s,
-                    argv=(
+                    argv=rsync_remote_argv(farm, host_name, (
                         "rsync",
                         "--archive",
                         "--checksum",
@@ -914,7 +928,7 @@ def _sync_corpus_archives(
                         "--partial-dir=.rsync-partial",
                         str(source),
                         f"{farm.hosts[host_name]['ssh']}:{remote}",
-                    ),
+                    )),
                 )
             )
             first = _verify_remote_corpus_archive(
@@ -958,7 +972,7 @@ def _clear_corpus_input(
             factory,
             phase="run.corpus-input-mkdir",
             host=instance["host"],
-            transport="ssh",
+            transport=host_transport(farm, instance["host"]),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1213,7 +1227,7 @@ def _host_facts(
             factory,
             phase="preflight.host",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1267,11 +1281,7 @@ def _host_facts(
 
 
 def _docker_transport(farm: FarmSpec, host_name: str) -> str:
-    return (
-        "docker-context"
-        if farm.hosts[host_name].get("docker_context")
-        else "ssh-docker"
-    )
+    return docker_transport(farm, host_name)
 
 
 def _labelled_containers(
@@ -1550,7 +1560,7 @@ def _materialize_runtime(
             factory,
             phase="preflight.runtime-mkdir",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1777,8 +1787,8 @@ def _materialize_system_source_snapshot(
     if private:
         materialized_parent = private_root(farm.hosts[host_name]["scratch_root"], key, run_id, instance["name"]).parent
     remote_archive = archive_parent / f"{archive_key}.tar.zst"
-    recorder.invoke(_command(factory, phase="preflight.system-source-mkdir", host=host_name, transport="ssh", timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("install", "-d", "-m", "0755", "--", str(archive_parent), str(materialized_parent)))))
-    first = recorder.invoke(_command(factory, phase="preflight.system-source-verify", host=host_name, transport="ssh", timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("python3", "-c", SYSTEM_SOURCE_VERIFY_SCRIPT, str(remote_archive), str(snapshot["archive"]["archive_bytes"]), archive_key))))
+    recorder.invoke(_command(factory, phase="preflight.system-source-mkdir", host=host_name, transport=host_transport(farm, host_name), timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("install", "-d", "-m", "0755", "--", str(archive_parent), str(materialized_parent)))))
+    first = recorder.invoke(_command(factory, phase="preflight.system-source-verify", host=host_name, transport=host_transport(farm, host_name), timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("python3", "-c", SYSTEM_SOURCE_VERIFY_SCRIPT, str(remote_archive), str(snapshot["archive"]["archive_bytes"]), archive_key))))
     def parse_archive_status(result: CommandResult) -> dict[str, Any]:
         if result.returncode != 0:
             raise PreflightRefusal("remote system-source verifier failed", reason_code="system-source-archive")
@@ -1810,8 +1820,8 @@ def _materialize_system_source_snapshot(
     elif first_status["status"] != "absent":
         raise PreflightRefusal("remote system-source archive is unsafe or mismatched", reason_code="system-source-archive")
     if first_status["status"] == "absent":
-        recorder.invoke(_command(factory, phase="preflight.system-source-sync", host=host_name, transport="rsync-ssh", timeout_s=timeout_s, argv=("rsync", "--archive", "--checksum", "--protect-args", str(local["path"]), f"{farm.hosts[host_name]['ssh']}:{remote_archive}")))
-        verified = recorder.invoke(_command(factory, phase="preflight.system-source-verify", host=host_name, transport="ssh", timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("python3", "-c", SYSTEM_SOURCE_VERIFY_SCRIPT, str(remote_archive), str(snapshot["archive"]["archive_bytes"]), archive_key))))
+        recorder.invoke(_command(factory, phase="preflight.system-source-sync", host=host_name, transport=rsync_transport(farm, host_name), timeout_s=timeout_s, argv=rsync_remote_argv(farm, host_name, ("rsync", "--archive", "--checksum", "--protect-args", str(local["path"]), f"{farm.hosts[host_name]['ssh']}:{remote_archive}"))))
+        verified = recorder.invoke(_command(factory, phase="preflight.system-source-verify", host=host_name, transport=host_transport(farm, host_name), timeout_s=timeout_s, argv=ssh_argv(farm, host_name, ("python3", "-c", SYSTEM_SOURCE_VERIFY_SCRIPT, str(remote_archive), str(snapshot["archive"]["archive_bytes"]), archive_key))))
         verified_status = parse_archive_status(verified)
         if verified_status["status"] != "ready" or verified_status["bytes"] != snapshot["archive"]["archive_bytes"] or verified_status["sha256"] != archive_key:
             raise PreflightRefusal("remote system-source archive did not verify after sync", reason_code="system-source-archive")
@@ -1907,7 +1917,7 @@ def _materialize_toolchain(
             factory,
             phase="preflight.toolchain-mkdir",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(
                 farm,
@@ -1929,16 +1939,16 @@ def _materialize_toolchain(
             factory,
             phase="preflight.toolchain-sync",
             host=host_name,
-            transport="rsync-ssh",
+            transport=rsync_transport(farm, host_name),
             timeout_s=timeout_s,
-            argv=(
+            argv=rsync_remote_argv(farm, host_name, (
                 "rsync",
                 "--archive",
                 "--checksum",
                 "--protect-args",
                 str(archive),
                 f"{farm.hosts[host_name]['ssh']}:{remote_archive}",
-            ),
+            )),
         )
     )
     remote_digest = recorder.invoke(
@@ -1946,7 +1956,7 @@ def _materialize_toolchain(
             factory,
             phase="preflight.toolchain-verify",
             host=host_name,
-            transport="ssh",
+            transport=host_transport(farm, host_name),
             timeout_s=timeout_s,
             argv=ssh_argv(farm, host_name, ("sha256sum", "--", str(remote_archive))),
         )
@@ -2270,6 +2280,26 @@ def preflight(
     topology = plan["topology"]
     hosts = _used_hosts(farm, topology)
     timeout_s = scenario.data["timeouts"]["up_s"]
+    for host_name in hosts:
+        if not is_local_host(farm, host_name):
+            continue
+        endpoint = recorder.invoke(
+            _command(
+                factory,
+                phase="preflight.local-docker-endpoint",
+                host=host_name,
+                transport="local-docker",
+                timeout_s=timeout_s,
+                argv=local_docker_endpoint_argv(farm, host_name),
+            )
+        )
+        try:
+            require_local_docker_endpoint(endpoint.stdout)
+        except ValueError as exc:
+            raise PreflightRefusal(
+                f"local Docker endpoint verification failed on {host_name}: {exc}",
+                reason_code="docker-endpoint-mismatch",
+            ) from exc
     netem_targets = {binding.instance for binding in _netem_bindings(plan)}
     for instance in topology["instances"]:
         authority = farm.data["authority"]["images"][instance["image"]["label"]]
@@ -2990,7 +3020,7 @@ def _wait_clients(
                     factory,
                     phase="readiness.client-cache",
                     host=client["host"],
-                    transport="ssh",
+                    transport=host_transport(farm, client["host"]),
                     timeout_s=min(_timeout_left(deadline, monotonic), 5),
                     argv=ssh_argv(
                         farm,
@@ -3227,7 +3257,7 @@ def _wait_environments(
                 factory,
                 phase="readiness.environments",
                 host=scheduler["host"],
-                transport="ssh",
+                transport=host_transport(farm, scheduler["host"]),
                 timeout_s=min(_timeout_left(deadline, monotonic), 5),
                 argv=ssh_argv(
                     farm,
@@ -3367,15 +3397,15 @@ def collect_diagnostics(
                     factory,
                     phase="diagnostics.sync-log",
                     host=host_name,
-                    transport="rsync-ssh",
+                    transport=rsync_transport(farm, host_name),
                     timeout_s=60,
-                    argv=(
+                    argv=rsync_remote_argv(farm, host_name, (
                         "rsync",
                         "--archive",
                         "--protect-args",
                         f"{farm.hosts[host_name]['ssh']}:{remote_log}/",
                         str(local_log) + "/",
-                    ),
+                    )),
                 )
             )
         except RemoteError as exc:
@@ -3403,9 +3433,9 @@ def collect_diagnostics(
                         factory,
                         phase="diagnostics.sync-output",
                         host=host_name,
-                        transport="rsync-ssh",
+                        transport=rsync_transport(farm, host_name),
                         timeout_s=60,
-                        argv=(
+                        argv=rsync_remote_argv(farm, host_name, (
                             "rsync",
                             "--archive",
                             "--no-owner",
@@ -3421,7 +3451,7 @@ def collect_diagnostics(
                             "*",
                             f"{farm.hosts[host_name]['ssh']}:{remote_output}/",
                             str(local_output) + "/",
-                        ),
+                        )),
                     )
                 )
             except RemoteError as exc:

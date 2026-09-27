@@ -130,6 +130,8 @@ def ssh_argv(farm: FarmSpec, host_name: str, remote_argv: Iterable[str]) -> tupl
     resolved = tuple(remote_argv)
     if not resolved or any(not isinstance(item, str) or "\0" in item for item in resolved):
         raise ValueError("remote argv must contain non-NUL strings")
+    if host.get("execution", "ssh") == "local":
+        return resolved
     # OpenSSH concatenates its command operands for a remote login shell.  No
     # spec value is placed in that shell text: the sole dynamic operand is a
     # URL-safe base64 JSON payload decoded by this fixed, quoted Python shim.
@@ -148,6 +150,69 @@ def ssh_argv(farm: FarmSpec, host_name: str, remote_argv: Iterable[str]) -> tupl
         shlex.quote(REMOTE_ARGV_EXEC),
         payload,
     )
+
+
+def is_local_host(farm: FarmSpec, host_name: str) -> bool:
+    return farm.hosts[host_name].get("execution", "ssh") == "local"
+
+
+def host_transport(farm: FarmSpec, host_name: str) -> str:
+    return "local" if is_local_host(farm, host_name) else "ssh"
+
+
+def rsync_transport(farm: FarmSpec, host_name: str) -> str:
+    return "rsync-local" if host_transport(farm, host_name) == "local" else "rsync-ssh"
+
+
+def docker_transport(farm: FarmSpec, host_name: str) -> str:
+    if is_local_host(farm, host_name):
+        return "local-docker"
+    return "docker-context" if farm.hosts[host_name].get("docker_context") else "ssh-docker"
+
+
+def local_docker_endpoint_argv(farm: FarmSpec, host_name: str) -> tuple[str, ...]:
+    if not is_local_host(farm, host_name):
+        raise ValueError("local Docker endpoint requested for a nonlocal host")
+    return (
+        "docker", "--context", "default", "context", "inspect", "default",
+        "--format", "{{json .Endpoints.docker.Host}}",
+    )
+
+
+def require_local_docker_endpoint(raw: str) -> str:
+    """Return the local Unix socket endpoint; reject SSH/TCP/npipe endpoints."""
+    try:
+        endpoint = json.loads(raw.strip())
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("default Docker context returned an invalid endpoint") from exc
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint.startswith("unix:///")
+        or "\x00" in endpoint
+    ):
+        raise ValueError("local execution requires a Unix-socket Docker context")
+    return endpoint
+
+
+def rsync_remote_argv(
+    farm: FarmSpec, host_name: str, argv: Iterable[str]
+) -> tuple[str, ...]:
+    """Resolve an existing rsync-to-host argv for local or SSH execution."""
+    values = tuple(argv)
+    if host_transport(farm, host_name) != "local":
+        return values
+    host = farm.hosts[host_name]
+    rewritten: list[str] = []
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value == "-e" and index + 1 < len(values):
+            index += 2
+            continue
+        prefix = host["ssh"] + ":"
+        rewritten.append(value[len(prefix):] if value.startswith(prefix) else value)
+        index += 1
+    return tuple(rewritten)
 
 
 def decode_ssh_payload(argv: Iterable[str]) -> tuple[str, ...]:

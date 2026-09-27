@@ -19,7 +19,7 @@ try:
     from .images import CommandFactory, RecordingTransport
     from .layout import compiler_identity_digest
     from .lifecycle import LifecycleError, activate_corpus_turn, bundle_root
-    from .remote import CommandResult, PlannedCommand, RemoteError, docker_argv
+    from .remote import CommandResult, PlannedCommand, RemoteError, docker_argv, docker_transport
     from .scenario_spec import PROFILES, ScenarioSpec
     from .schema_validation import canonical_bytes
 except ImportError:  # Direct execution from this directory.
@@ -28,7 +28,7 @@ except ImportError:  # Direct execution from this directory.
     from images import CommandFactory, RecordingTransport
     from layout import compiler_identity_digest
     from lifecycle import LifecycleError, activate_corpus_turn, bundle_root
-    from remote import CommandResult, PlannedCommand, RemoteError, docker_argv
+    from remote import CommandResult, PlannedCommand, RemoteError, docker_argv, docker_transport
     from scenario_spec import PROFILES, ScenarioSpec
     from schema_validation import canonical_bytes
 
@@ -116,11 +116,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _docker_transport(farm: FarmSpec, host_name: str) -> str:
-    return (
-        "docker-context"
-        if farm.hosts[host_name].get("docker_context")
-        else "ssh-docker"
-    )
+    return docker_transport(farm, host_name)
 
 
 def _assert_up(farm: FarmSpec, scenario: ScenarioSpec, plan: dict[str, Any]) -> None:

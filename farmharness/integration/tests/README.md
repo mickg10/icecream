@@ -40,6 +40,24 @@ The historical H3 patch-application probe also skips in gitless source
 snapshots when its exact base commit is absent; in a full Git checkout it
 continues to verify that the patch applies to the unchanged historical files.
 
+## Explicit same-host Docker execution
+
+Farm specs keep SSH as the default. A disposable same-host scenario may opt in
+per host with `"execution": "local"` and `"docker_context": "default"`; the
+runner verifies that this context resolves to a Unix socket before authority
+capture, lifecycle preflight, or image-distribution writes. It rejects TCP and
+SSH Docker endpoints. The legacy `ssh` field remains the host's address
+identity (and source for existing rsync destination paths), but no SSH command
+is run for that host. Remote hosts retain their existing SSH and Docker
+transport behavior.
+
+Every instance placed on a local-execution host must declare Docker resource
+caps, for example `"cpus": 0.75` and `"memory_mb": 1536`. The scenario loader
+checks the summed local-instance limits against the host's declared CPU and
+memory capacity, and the start plan passes those values as Docker `--cpus` and
+`--memory` limits. This is a per-container cap, not an additional host-wide
+reservation.
+
 For individual tests use `sh dev/python.sh -m pytest
 farmharness/integration/tests/PATH.py`. Use `make python-sync` for setup alone.
 Both Make test targets avoid pytest's cache and Python bytecode writes.

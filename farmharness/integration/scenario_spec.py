@@ -445,6 +445,11 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
             raise ScenarioSpecError(
                 f"$.instances[{index}].host: undeclared host {instance['host']!r}"
             )
+        if farm_hosts[instance["host"]].get("execution", "ssh") == "local":
+            if "cpus" not in instance or "memory_mb" not in instance:
+                raise ScenarioSpecError(
+                    f"$.instances[{index}]: local execution requires explicit cpus and memory_mb limits"
+                )
         if instance["image"] not in value["images"]:
             raise ScenarioSpecError(
                 f"$.instances[{index}].image: undeclared alias {instance['image']!r}"
@@ -522,6 +527,22 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
                 f"$.instances[{index}].env.{P29_FAULT_ENV}: must be {P29_FAULT_VALUE!r}"
             )
         _validate_environment(environment, f"$.instances[{index}].env")
+
+    local_usage: dict[str, tuple[float, int]] = {}
+    for instance in value["instances"]:
+        host_name = instance["host"]
+        if farm_hosts[host_name].get("execution", "ssh") != "local":
+            continue
+        cpus, memory_mb = local_usage.get(host_name, (0.0, 0))
+        local_usage[host_name] = (
+            cpus + float(instance["cpus"]), memory_mb + int(instance["memory_mb"])
+        )
+    for host_name, (cpus, memory_mb) in local_usage.items():
+        host = farm_hosts[host_name]
+        if cpus > host["cores"] or memory_mb > host["mem_gb"] * 1024:
+            raise ScenarioSpecError(
+                f"local instance limits exceed host {host_name!r} capacity"
+            )
 
     if len(role_instances["S"]) != 1:
         raise ScenarioSpecError(

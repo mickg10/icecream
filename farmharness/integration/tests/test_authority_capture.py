@@ -11,7 +11,11 @@ from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import authority, farmtest
 from farmharness.integration.farm_spec import FarmSpecError, load_farm_spec
-from farmharness.integration.remote import CommandResult, decode_ssh_payload
+from farmharness.integration.remote import (
+    CommandResult,
+    decode_ssh_payload,
+    require_local_docker_endpoint,
+)
 from farmharness.integration.schema_validation import canonical_bytes
 
 
@@ -62,6 +66,8 @@ class _Recorder:
 
     def invoke(self, command):
         self.commands.append(command)
+        if command.phase == "authority.verify-local-docker-endpoint":
+            return CommandResult(0, '"unix:///var/run/docker.sock"\n', "")
         if command.phase == "authority.probe-host":
             identity_host = sorted(self.farm.hosts)[0] if self.duplicate_host else command.host
             return CommandResult(
@@ -74,6 +80,41 @@ class _Recorder:
         if self.bad_arch:
             docker_info["Architecture"] = "arm64"
         return CommandResult(0, json.dumps(docker_info), "")
+
+
+def test_explicit_local_authority_captures_only_unix_docker_endpoint(tmp_path: Path) -> None:
+    document = json.loads((farm_fixture.example_farm_path()).read_text(encoding="utf-8"))
+    local_host = next(host for host in document["hosts"] if host["name"] == "tt-quietbox3")
+    local_host["execution"] = "local"
+    local_host["docker_context"] = "default"
+    path = tmp_path / "farm-local-template.json"
+    path.write_bytes(canonical_bytes(document))
+    farm = load_farm_spec(path)
+    plan = json.loads(authority.render_capture_plan(farm))
+    endpoint = next(
+        item for item in plan["commands"]
+        if item["phase"] == "authority.verify-local-docker-endpoint"
+    )
+    assert endpoint["transport"] == "local-docker"
+    assert endpoint["argv"][:4] == ["docker", "--context", "default", "context"]
+
+    recorder = _Recorder(farm)
+    output = tmp_path / "captured.json"
+    descriptors = tmp_path / "descriptors"
+    authority.capture_authority(
+        farm, output=output, descriptor_dir=descriptors, recorder=recorder, now=NOW
+    )
+    assert sum(c.phase == "authority.verify-local-docker-endpoint" for c in recorder.commands) == 1
+    captured = load_farm_spec(output)
+    assert captured.hosts["tt-quietbox3"]["execution"] == "local"
+
+
+@pytest.mark.parametrize(
+    "raw", ['"tcp://127.0.0.1:2375"', '"ssh://remote-docker"', '"npipe:////./pipe/docker_engine"']
+)
+def test_local_docker_endpoint_refuses_non_unix_sockets(raw: str) -> None:
+    with pytest.raises(ValueError, match="Unix-socket"):
+        require_local_docker_endpoint(raw)
 
 
 def test_authority_dry_run_is_pure_stable_and_argv_only(tmp_path: Path) -> None:
