@@ -102,6 +102,14 @@ COMMIT; client wrappers closed their local control channels. Earlier F
 admission timers preceded the workload and are not an established cause.
 A later attempt failed test-tool package provisioning before the workload;
 an offline pinned Debian package bundle is being used for the next attempt.
+Attempt `w30-luna-w1-p29-20260927-n` successfully installed that bundle and
+started the helper, but again saw zero COMMITs. Retained compiler diagnostics
+identify Error 105: the strict all-P50 assignment lacked a cache handoff.
+The scenario enabled R2 on C/F but omitted `ICECC_P51_MODE=on` on S.
+Inspection of the immutable `9e5692e4` scheduler confirms that it withholds
+R2 handoffs when this setting is absent. Corrected configuration and a
+scenario-validation regression are required before rerunning; no external
+window pass or product-code fix is claimed from this diagnosis.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
