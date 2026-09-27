@@ -113,7 +113,15 @@ the exact run containers are absent on q2/q3/q5. Evidence directory:
 Verdict SHA256 `3a75af6c821942e07f5982d0d286ce7250a1555433d6461ebd3403452669be46`;
 DOWN SHA256 `757ec2347bf3055bfd1211919f8d2f31860e0e904fc916e09f61d15942a31e71`.
 Like P29 D18, this is serial work within each client, not a held-W30 test.
-External ZSTD_ROUTE remains outstanding.
+External **ZSTD_ROUTE** also passes run `d18-c06-zstd-route-20260927-1`:
+300 exact remote jobs, zero retries, 15 matching oracle samples, 29/29 clauses
+and clean DOWN; no exact run containers remain on q2/q3/q5. Its result directory
+is alongside the TU result above. Verdict SHA256
+`3a75af6c821942e07f5982d0d286ce7250a1555433d6461ebd3403452669be46`;
+DOWN SHA256 `46b75b68b0421fe574ad97bc6927c50a6ce2e495060538bbb1c434c386dbf905`;
+bundle SHA256 `e981fac412be9144e17f828a5d8b9f070550b12eb99c2c6b5e5084ca9281ffc4`.
+All three external mixed profiles therefore pass on the corrected product;
+this still does not establish simultaneous multi-link W30 or restart coverage.
 
 The `6cffafa0` production closure completed the Firefox **32-TU sample**:
 63/63 cells passed (three repetitions, three profiles, R1/W1 and R2 windows
@@ -227,10 +235,22 @@ These focused checks do not establish an end-to-end held-W30 pass. Fresh local
 run `p51-local-c1f2-p29-w30-20260927b` still fails: preparation completes before
 gate startup and both links negotiate W30, but only 14/18 commits are held,
 respectively. Relay durations are 22.2/22.6 seconds. The exact total of 32 and
-a pause in new source-control leases suggest an admission bottleneck; the
-cause is not yet established. No deadlines were increased. Evidence is under
+a pause in new source-control leases were traced to the scheduler's default
+32 unconfirmed dispatch credits per submitter, as recorded in its startup
+log and assignment sequence. No deadlines were increased. Evidence is under
 the same local results root, with run suffix `b`; DOWN is clean, SHA256
 `850a64577b6b56ecb75b9bfeed0104b1d2ceca802fb127acc0fa79fabc47dd61`.
+
+`1e329834` derives the required per-C credit for positive receipt tests and
+uses the pinned scheduler's existing option when that requirement exceeds 32.
+It retains user/logging/fence settings and leaves ordinary/legacy launch paths
+unchanged. Validation and matrix generation account for each F's held windows
+and the scheduler's aggregate-farm-slot clamp. A C1F2/W30 run needs credit 60
+and at least 61 total F slots, not just a larger credit flag. All 302 tests in
+the three affected modules pass; retained log
+`/tanksmall/scratch/tmp/p51-dispatch-credit-evidence/pytest-302.log`, SHA256
+`17e3bfe3203c60704245bbbdaabd1f1c56e9a1e09bfe159d0f83fd55df487d8d`.
+The live credit-corrected run remains required; these are planning/test results.
 
 `402d11fc` removes an incorrect multi-link exception to strict P50 policy.
 `ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
