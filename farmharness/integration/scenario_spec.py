@@ -294,6 +294,16 @@ def _validate_p51_receipt_window(
             "$.instances: receipt-window requires selected-profile R2 scheduler and P50/R2 C+F"
         )
     gate = workload["receipt_gate"]
+    if "command_timeout_s" in gate:
+        command_timeout_s = gate["command_timeout_s"]
+        if command_timeout_s <= 30:
+            raise ScenarioSpecError(
+                "$.workload.receipt_gate.command_timeout_s: must leave a 30s cleanup margin"
+            )
+        if command_timeout_s > value["timeouts"]["turn_s"]:
+            raise ScenarioSpecError(
+                "$.workload.receipt_gate.command_timeout_s: may not exceed the turn budget"
+            )
     binary = Path(gate["binary"])
     if not binary.is_absolute() or ".." in binary.parts:
         raise ScenarioSpecError("$.workload.receipt_gate.binary: must be an absolute safe path")

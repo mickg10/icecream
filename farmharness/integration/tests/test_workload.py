@@ -506,11 +506,11 @@ def _multilink_orchestrator_fixture(topology: str):
             "receipt_gate": {
                 "links": links, "expected_commits": 1,
                 "negotiated_window": 1, "expect_observed": True,
-                "command_timeout_s": 1,
+                "command_timeout_s": 1800,
             },
         },
         "instances": instances,
-        "timeouts": {"turn_s": 1},
+        "timeouts": {"turn_s": 1800},
     })
     clients = [{"role": "C", "name": name, "host": "host"} for name in names_c]
     for client in clients:
@@ -1260,7 +1260,7 @@ def test_receipt_oracle_plan_uses_uid_scoped_root_for_prepare_and_mount(
         "expect_observed": True,
         "expected_commits": 1,
         "negotiated_window": 1,
-        "command_timeout_s": 30,
+        "command_timeout_s": 1800,
     }
     scenario.data["workload"].pop("d18_roles", None)
     commands = farmtest._planned_commands(
@@ -1787,7 +1787,7 @@ def _receipt_gate_stub_inputs():
                     "expected_commits": 1,
                     "negotiated_window": 1,
                     "expect_observed": True,
-                    "command_timeout_s": 30,
+                    "command_timeout_s": 1800,
                 },
                 "corpus": "tiny",
                 "repeat": 1,
@@ -1908,6 +1908,28 @@ def test_p51_receipt_window_separates_driver_and_sidecar_uids(
     assert isinstance(argv, tuple)
     assert argv[argv.index("--user") + 1] == "0"
     assert argv[argv.index("--p51-commit-receipt-gate-remote") + 3] == "65534"
+    remote_gate_index = argv.index("--p51-commit-receipt-gate-remote")
+    assert argv[remote_gate_index + 7] == "1770"
+    assert gate_commands[0]["timeout_s"] == 1800
+
+
+@pytest.mark.parametrize(
+    ("gate_spec", "expected"),
+    [
+        ({}, (260, None)),
+        ({"command_timeout_s": 1800}, (1800, 1770)),
+    ],
+)
+def test_p51_receipt_gate_budget_preserves_legacy_and_reserves_cleanup(
+    gate_spec, expected
+) -> None:
+    assert workload_module._p51_gate_budget(gate_spec) == expected
+
+
+@pytest.mark.parametrize("value", [True, 30, 86401, "1800", 0])
+def test_p51_receipt_gate_budget_rejects_invalid_explicit_limits(value) -> None:
+    with pytest.raises(WorkloadError, match="command_timeout_s"):
+        workload_module._p51_gate_budget({"command_timeout_s": value})
 
 
 def test_p51_iptables_bundle_is_hash_checked_and_staged_in_bounded_chunks(

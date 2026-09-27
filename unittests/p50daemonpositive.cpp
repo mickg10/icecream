@@ -256,12 +256,14 @@ public:
                          std::string abort_path = {},
                          bool insert_rule_first = false,
                          std::string upstream_ipv4 = "127.0.0.1",
-                         std::string match_ipv4 = {})
+                         std::string match_ipv4 = {},
+                         Clock::time_point helper_deadline = Clock::time_point::max())
         : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected),
           first_ordinal_(first_ordinal), abort_path_(std::move(abort_path)),
           delayed_arm_mode_(insert_rule_first),
           upstream_ipv4_(std::move(upstream_ipv4)),
-          match_ipv4_(std::move(match_ipv4))
+          match_ipv4_(std::move(match_ipv4)),
+          helper_deadline_(helper_deadline)
     {
         in_addr parsed_address{};
         if (::inet_pton(AF_INET, upstream_ipv4_.c_str(), &parsed_address) != 1 ||
@@ -864,9 +866,18 @@ private:
                         peak_commits_ = std::max(peak_commits_, commits_.size());
                         changed_.notify_all();
                         if (commits_.size() == expected_) {
-                        if (!changed_.wait_for(lock, std::chrono::seconds(30),
-                                               [&] { return release_ || failed_; }) ||
-                                failed_ || discard_) break;
+                            const bool released = helper_deadline_ == Clock::time_point::max()
+                                ? changed_.wait_for(lock, std::chrono::seconds(30),
+                                                    [&] { return release_ || failed_; })
+                                : changed_.wait_until(lock, helper_deadline_,
+                                                      [&] { return release_ || failed_; });
+                            if (!released) {
+                                if (helper_deadline_ != Clock::time_point::max() &&
+                                    Clock::now() >= helper_deadline_)
+                                    terminal_reason = "receipt-helper-hold-timeout";
+                                break;
+                            }
+                            if (failed_ || discard_) break;
                             for (const auto& held : commits_) {
                                 if (!write_relay_bytes(
                                         client_fd_, held.data(), held.size(),
@@ -983,6 +994,7 @@ private:
     bool delayed_arm_mode_ = false;
     std::string upstream_ipv4_ = "127.0.0.1";
     std::string match_ipv4_;
+    Clock::time_point helper_deadline_ = Clock::time_point::max();
     std::atomic<unsigned> connection_attempts_{0};
     unsigned prearm_disconnects_ = 0;
     Clock::time_point prearm_retry_started_{};
@@ -1348,6 +1360,20 @@ static bool p51_gate_wait_for_path(const std::string& path,
     return false;
 }
 
+static bool p51_gate_wait_for_path_until(
+    const std::string& path, Clock::time_point deadline)
+{
+    while (Clock::now() < deadline) {
+        std::error_code error;
+        const auto abort_path = std::filesystem::path(path).parent_path() / "abort";
+        if (std::filesystem::exists(abort_path, error) && !error) return false;
+        error.clear();
+        if (std::filesystem::exists(path, error) && !error) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
 static bool p51_gate_write_marker(const std::string& path,
                                   const std::string& contents = "ok\n")
 {
@@ -1396,9 +1422,11 @@ static bool p51_wait_settlement_ack(const std::string& path,
 
 static bool p51_gate_wait_rearm(P51CommitReceiptGate& gate, size_t expected,
                                 uint64_t first_ordinal,
-                                const std::string& abort_path)
+                                const std::string& abort_path,
+                                std::chrono::milliseconds timeout =
+                                    std::chrono::seconds(10))
 {
-    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    const auto deadline = Clock::now() + timeout;
     while (Clock::now() < deadline) {
         std::error_code error;
         if (std::filesystem::exists(abort_path, error) && !error) return false;
@@ -1414,7 +1442,8 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
                                        bool one_shot = false,
                                        bool delayed_arm = false,
                                        std::string upstream_ipv4 = "127.0.0.1",
-                                       std::string match_ipv4 = {})
+                                       std::string match_ipv4 = {},
+                                       unsigned helper_budget_s = 0)
 {
     if (endpoint_port <= 0 || sidecar_uid == 0 || expected == 0 ||
         expected > 30 || control_dir.empty())
@@ -1422,10 +1451,14 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
     std::error_code error;
     if (!std::filesystem::create_directories(control_dir, error) && error)
         return 2;
+    const auto helper_deadline = helper_budget_s == 0
+        ? Clock::time_point::max()
+        : Clock::now() + std::chrono::seconds(helper_budget_s);
     P51CommitReceiptGate gate(endpoint_port, sidecar_uid,
                               delayed_arm ? 0 : expected, first_ordinal,
                               control_dir + "/abort", delayed_arm,
-                              std::move(upstream_ipv4), std::move(match_ipv4));
+                              std::move(upstream_ipv4), std::move(match_ipv4),
+                              helper_deadline);
     if (!gate.ready() || !p51_gate_write_marker(control_dir + "/ready")) {
         (void)p51_gate_write_marker(control_dir + "/failed", "gate setup failed\n");
         return 1;
@@ -1449,9 +1482,24 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
             return 1;
         }
     }
+    std::string timeout_phase;
     const auto wait_stage = [&](unsigned stage) {
-        if (!gate.wait_for_commits(std::chrono::seconds(30)))
+        std::chrono::milliseconds commit_wait = std::chrono::seconds(30);
+        if (helper_budget_s != 0) {
+            const auto remaining = helper_deadline - Clock::now();
+            if (remaining <= Clock::duration::zero()) {
+                timeout_phase = "commit-formation";
+                return false;
+            }
+            commit_wait = std::chrono::ceil<std::chrono::milliseconds>(remaining);
+            if (commit_wait > std::chrono::seconds(30))
+                commit_wait = std::chrono::seconds(30);
+        }
+        if (!gate.wait_for_commits(commit_wait)) {
+            if (helper_budget_s != 0 && Clock::now() >= helper_deadline)
+                timeout_phase = "commit-formation";
             return false;
+        }
         const auto witnesses = gate.commit_witnesses();
         if (witnesses.size() != expected) return false;
         uint64_t first = UINT64_MAX;
@@ -1507,10 +1555,16 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         if (last - first + 1 != expected || !p51_gate_write_marker(
                 control_dir + "/held-" + std::to_string(stage), summary))
             return false;
-        const bool released = p51_gate_wait_for_path(
-            control_dir + "/release-" + std::to_string(stage),
-            std::chrono::seconds(30));
+        const bool released = helper_budget_s == 0
+            ? p51_gate_wait_for_path(
+                control_dir + "/release-" + std::to_string(stage),
+                std::chrono::seconds(30))
+            : p51_gate_wait_for_path_until(
+                control_dir + "/release-" + std::to_string(stage),
+                helper_deadline);
         if (!released) {
+            if (helper_budget_s != 0 && Clock::now() >= helper_deadline)
+                timeout_phase = "control-release";
             std::error_code error;
             if (std::filesystem::exists(control_dir + "/abort", error) && !error) {
                 gate.discard_held_commits();
@@ -1522,17 +1576,52 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         return released;
     };
     if (!wait_stage(1)) {
+        if (!timeout_phase.empty()) {
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_TIMEOUT phase=%s budget_s=%u\n",
+                timeout_phase.c_str(), helper_budget_s);
+            (void)p51_gate_write_marker(control_dir + "/failed",
+                "receipt helper timeout phase=" + timeout_phase + "\n");
+            return 1;
+        }
         (void)p51_gate_write_marker(control_dir + "/failed", "first receipt window failed\n");
         return 1;
     }
     gate.release_commits();
-    if (!p51_gate_wait_rearm(gate, 0, 0, control_dir + "/abort") ||
+    std::chrono::milliseconds rearm_wait = std::chrono::seconds(10);
+    if (helper_budget_s != 0) {
+        const auto remaining = helper_deadline - Clock::now();
+        if (remaining <= Clock::duration::zero())
+            rearm_wait = std::chrono::milliseconds::zero();
+        else if (remaining < rearm_wait)
+            rearm_wait = std::chrono::ceil<std::chrono::milliseconds>(remaining);
+    }
+    if (!p51_gate_wait_rearm(gate, 0, 0, control_dir + "/abort", rearm_wait) ||
         !p51_gate_write_marker(control_dir + "/released-1")) {
+        if (helper_budget_s != 0 && Clock::now() >= helper_deadline) {
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_TIMEOUT phase=release-settle budget_s=%u\n",
+                helper_budget_s);
+            (void)p51_gate_write_marker(control_dir + "/failed",
+                "receipt helper timeout phase=release-settle\n");
+            return 1;
+        }
         (void)p51_gate_write_marker(control_dir + "/failed", "first release did not settle\n");
         return 1;
     }
     if (one_shot) {
-        if (!p51_gate_wait_for_path(control_dir + "/finish", std::chrono::seconds(180))) {
+        const bool finished = helper_budget_s == 0
+            ? p51_gate_wait_for_path(control_dir + "/finish", std::chrono::seconds(180))
+            : p51_gate_wait_for_path_until(control_dir + "/finish", helper_deadline);
+        if (!finished) {
+            if (helper_budget_s != 0 && Clock::now() >= helper_deadline) {
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_TIMEOUT phase=finish budget_s=%u\n",
+                    helper_budget_s);
+                (void)p51_gate_write_marker(control_dir + "/failed",
+                    "receipt helper timeout phase=finish\n");
+                return 1;
+            }
             (void)p51_gate_write_marker(control_dir + "/failed", "one-shot batch did not finish before gate shutdown\n");
             return 1;
         }
@@ -6994,7 +7083,7 @@ static constexpr uint64_t kExpiredArmWireBudgetMsec = 2000;
 
 int main(int argc, char **argv)
 {
-    const bool remote_receipt_gate_mode = argc == 8 &&
+    const bool remote_receipt_gate_mode = (argc == 8 || argc == 9) &&
         std::strcmp(argv[1], "--p51-commit-receipt-gate-remote") == 0;
     const bool receipt_prearm_selftest = argc == 3 &&
         std::strcmp(argv[1], "--p51-receipt-prearm-retry-selftest") == 0;
@@ -7169,13 +7258,24 @@ int main(int argc, char **argv)
         if (!parse_positive_u64(argv[6], &first) ||
             first > std::numeric_limits<uint64_t>::max() - (expected - 1))
             return 2;
+        unsigned helper_budget_s = 0;
+        if (argc == 9) {
+            uint64_t parsed_budget = 0;
+            if (!parse_positive_u64(argv[8], &parsed_budget) || parsed_budget > 86400) {
+                std::fprintf(stderr,
+                    "FAIL: remote receipt gate helper budget must be decimal seconds in [1,86400]\n");
+                return 2;
+            }
+            helper_budget_s = static_cast<unsigned>(parsed_budget);
+        }
         std::fprintf(stderr,
-            "P51_RECEIPT_GATE_REMOTE_CONFIG address=%s port=%ld sidecar_uid=%lu helper_uid=%lu expected=%lu\n",
+            "P51_RECEIPT_GATE_REMOTE_CONFIG address=%s port=%ld sidecar_uid=%lu helper_uid=%lu expected=%lu helper_budget_s=%u\n",
             argv[2], endpoint_port, sidecar_uid,
-            static_cast<unsigned long>(::geteuid()), expected);
+            static_cast<unsigned long>(::geteuid()), expected, helper_budget_s);
         return run_p51_commit_receipt_gate(
             static_cast<int>(endpoint_port), static_cast<uid_t>(sidecar_uid),
-            static_cast<size_t>(expected), first, argv[7], true, false, argv[2], argv[2]);
+            static_cast<size_t>(expected), first, argv[7], true, false,
+            argv[2], argv[2], helper_budget_s);
     }
     if (p51_c03_invalidation)
         test_msgchannel_buffered_input_probe();

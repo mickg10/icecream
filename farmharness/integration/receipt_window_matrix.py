@@ -207,6 +207,9 @@ def generate_matrix(
                         "expected_commits": window,
                         "negotiated_window": window,
                         "expect_observed": True,
+                        # The remote helper gets the declared turn budget less
+                        # the runner's 30s shutdown/collection margin.
+                        "command_timeout_s": int(scenario["timeouts"]["turn_s"]),
                         "links": links,
                     },
                 })

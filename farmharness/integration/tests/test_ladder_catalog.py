@@ -15,7 +15,7 @@ from farmharness.integration.events import EventProducer
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.farm_spec import FarmSpec
 from farmharness.integration.images import RecordingTransport
-from farmharness.integration.scenario_spec import load_scenario_spec
+from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
 from farmharness.integration.suite_spec import (
     CONTROL_SCENARIO_IDS,
     S70_SCENARIO_IDS,
@@ -141,11 +141,19 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
         for window in (1, 30)
     }
 
+    over_budget = json.loads(generated[0].read_text())
+    over_budget["workload"]["receipt_gate"]["command_timeout_s"] += 1
+    over_budget_path = tmp_path / "over-budget.json"
+    over_budget_path.write_text(json.dumps(over_budget), encoding="utf-8")
+    with pytest.raises(ScenarioSpecError, match="may not exceed the turn budget"):
+        load_scenario_spec(over_budget_path, load_farm_spec(farm_path))
+
     max_plan = None
     for path in generated:
         scenario = load_scenario_spec(path, load_farm_spec(farm_path))
         gate = scenario.data["workload"]["receipt_gate"]
         window = gate["negotiated_window"]
+        assert gate["command_timeout_s"] == scenario.data["timeouts"]["turn_s"]
         clients = [item for item in scenario.data["instances"] if item["role"] == "C"]
         assert all(item["image"] == "new" for item in clients)
         assert all(item["env"]["ICECC_P50_MODE"] == "on" for item in clients)

@@ -171,6 +171,7 @@
             "expected_commits": {"type": "integer", "minimum": 1, "maximum": 30},
             "negotiated_window": {"type": "integer", "minimum": 1, "maximum": 30},
             "expect_observed": {"type": "boolean"},
+            "command_timeout_s": {"type": "integer", "minimum": 31, "maximum": 86400},
             "links": {
               "type": "array",
               "minItems": 2,

@@ -78,6 +78,22 @@ P51_GATE_READ_MARKER = (
 P51_IPTABLES_BUNDLE_MANIFEST_SHA256 = (
     "d1d7980ebc0b342caea791cc4fc86be4a6dcfc44f89e6884f2e4fbc69fd5568a"
 )
+P51_GATE_CLEANUP_MARGIN_S = 30
+
+
+def _p51_gate_budget(gate_spec: dict[str, Any]) -> tuple[int, int | None]:
+    """Return command timeout and optional shared helper lifetime budget."""
+    configured = gate_spec.get("command_timeout_s")
+    if configured is None:
+        return 260, None  # Preserve legacy focused-gate behavior.
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        raise WorkloadError("P51 receipt gate command_timeout_s must be an integer")
+    helper_budget = configured - P51_GATE_CLEANUP_MARGIN_S
+    if configured > 86400 or helper_budget <= 0:
+        raise WorkloadError(
+            "P51 receipt gate command_timeout_s must leave a positive 30s cleanup margin"
+        )
+    return configured, helper_budget
 P51_IPTABLES_BUNDLE_FILES = (
     "iptables_1.8.9-2_amd64.deb",
     "libip6tc2_1.8.9-2_amd64.deb",
@@ -743,7 +759,7 @@ def _run_p51_receipt_window_multilink(
     )
     gate_binary = plan["p51_receipt_gate"]["container_path"]
     expected_gate_sha = plan["p51_receipt_gate"]["binary_sha256"]
-    timeout_s = int(gate_spec.get("command_timeout_s", 260))
+    timeout_s, helper_budget_s = _p51_gate_budget(gate_spec)
     gate_rows: list[dict[str, Any]] = []
     for link_index, spec in enumerate(links):
         client = clients_by_name[spec["client"]]
@@ -834,7 +850,7 @@ def _run_p51_receipt_window_multilink(
                 "receipt-gate", gate_dir, gate_binary, "--p51-commit-receipt-gate-remote",
                 worker["address"], str(row["port"]), str(sidecar_uid),
                 str(gate_spec["expected_commits"]), "1", gate_dir,
-            )
+            ) + (() if helper_budget_s is None else (str(helper_budget_s),))
             command = factory.make(
                 phase=f"run.p51-receipt-window.start-gate.{client_name}.{worker_name}",
                 host=client["host"], instance=client_name,
@@ -1280,6 +1296,7 @@ def _run_p51_receipt_window(
     gate_dir = "/results/p51-receipt-gate"
     gate_binary = plan["p51_receipt_gate"]["container_path"]
     expected_gate_sha = plan["p51_receipt_gate"]["binary_sha256"]
+    command_timeout_s, helper_budget_s = _p51_gate_budget(gate_spec)
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     helper_probe = _p51_gate_call(
         farm, plan, client, factory, transport, "verify-staged-helper",
@@ -1334,12 +1351,12 @@ def _run_p51_receipt_window(
         container, "/bin/sh", "-c", gate_shell, "receipt-gate",
         gate_binary, "--p51-commit-receipt-gate-remote", worker_addr,
         str(endpoint_port), str(sidecar_uid), str(expected), "1", gate_dir,
-    )
+    ) + (() if helper_budget_s is None else (str(helper_budget_s),))
     gate_command = factory.make(
         phase="run.p51-receipt-window.start-gate",
         host=client["host"], instance=client["name"],
         transport=_docker_transport(farm, client["host"]),
-        timeout_s=workload["receipt_gate"].get("command_timeout_s", 260),
+        timeout_s=command_timeout_s,
         argv=docker_argv(farm, client["host"], gate_argv),
     )
     # Keep normal compile-channel connections outside the UID-scoped receipt
