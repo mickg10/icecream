@@ -355,11 +355,11 @@ DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
         lifecycle_config.ready_timeout = config_.readiness_timeout;
         lifecycle_config.grace_timeout = config_.shutdown_timeout;
         lifecycle_config.kill_timeout = config_.shutdown_timeout;
-        // The outer reducer spends one allocator attempt per RetryEligible
-        // turn.  max_attempts_per_recovery bounds the legacy synchronous API;
-        // the live path must still have enough total identity slots to honor
-        // the rolling restart budget and mint a fresh B after each exact A
-        // retirement.  Keep the sum bounded before narrowing to uint32_t.
+        // The lifecycle limit bounds consecutive launch attempts before a
+        // valid READY. It resets at READY; the allocator's identity counters
+        // do not. Repeated successful-incarnation exits are bounded by the
+        // separate rolling restart window below, not a lifetime attempt cap.
+        // Keep this per-recovery limit bounded before narrowing to uint32_t.
         const uint64_t outer_attempt_budget =
             std::min<uint64_t>(100000,
                                static_cast<uint64_t>(config_.max_restarts) +

@@ -709,6 +709,9 @@ struct SidecarLifecycleConfig {
     std::chrono::milliseconds ready_timeout{1000};
     std::chrono::milliseconds grace_timeout{1000};
     std::chrono::milliseconds kill_timeout{1000};
+    // Bounds consecutive launch/recovery attempts since the most recent
+    // accepted READY. It is not a lifetime identity limit: the allocator's
+    // control attempt/store generation remain monotonic across READY cycles.
     uint32_t max_attempts = 3;
     // This allocator is the sole mint for the complete launch incarnation:
     // control attempt, F-store generation, StoreIdentity root, and role GUIDs.
@@ -835,6 +838,8 @@ private:
     std::optional<ReadyLease> current_ready_lease_;
     pid_t child_pid_ = -1;
     pid_t process_group_ = -1;
+    // Consecutive attempts since the last accepted READY, not total minted
+    // identities. Successful service incarnations reset this streak only.
     uint32_t attempts_ = 0;
     bool leader_reaped_ = false;
     bool leader_waitable_ = false;

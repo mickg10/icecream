@@ -561,7 +561,8 @@ void test_lifecycle() {
     CHECK(ambiguous_group.advance(t0 + std::chrono::milliseconds(20), numeric_gone).action ==
               LifecycleAction::FailedClosed &&
               ambiguous_group.state() == LifecycleState::FailedClosed &&
-              !ambiguous_group.current_ready_lease().has_value(),
+              !ambiguous_group.current_ready_lease().has_value() &&
+              ambiguous_group.next_deadline() == Clock::time_point{},
           "zombie/reused PGID ambiguity fails closed with capacity withheld");
 
     SidecarLifecycle reused_group(rejecting_config);
@@ -794,10 +795,171 @@ void test_lifecycle() {
     remove_socket_node(replacement.identity);
 }
 
+bool repeatedly_ready_sidecar_can_restart() {
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::time_point{};
+    SidecarLifecycleConfig config;
+    config.control_generation = 0x5a;
+    config.private_root = "/tmp/icecc-p50-restart-streak";
+    config.launch_timeout = std::chrono::milliseconds(10);
+    config.exec_timeout = std::chrono::milliseconds(10);
+    config.ready_timeout = std::chrono::milliseconds(10);
+    config.grace_timeout = std::chrono::milliseconds(10);
+    config.kill_timeout = std::chrono::milliseconds(10);
+    config.max_attempts = 4;
+    config.identities = allocator(config.control_generation);
+    auto verifier = std::make_shared<TestKillDomainVerifier>();
+    config.kill_domain_verifier = verifier;
+
+    SidecarLifecycle lifecycle(config);
+    ReapEvent previous_reap;
+    LifecycleIdentity previous_identity;
+    std::vector<std::string> incarnation_directories;
+    constexpr uint64_t kSuccessfulIncarnations = 7;
+    auto cleanup = [&] {
+        std::error_code error;
+        for (const std::string& path : incarnation_directories)
+            std::filesystem::remove_all(path, error);
+    };
+    auto fail = [&](const char* message, uint64_t index) {
+        std::fprintf(stderr, "READY_RESTART_STREAK_FAIL index=%llu %s\n",
+                     static_cast<unsigned long long>(index), message);
+        cleanup();
+        return false;
+    };
+    for (uint64_t index = 0; index != kSuccessfulIncarnations; ++index) {
+        auto launch = lifecycle.begin(t0 + std::chrono::milliseconds(index * 10));
+        if (launch.action != LifecycleAction::LaunchPrepared ||
+            !launch.identity.valid()) {
+            std::fprintf(stderr,
+                         "READY_RESTART_REFUSED incarnation=%llu prior_ready=%llu state=%s\n",
+                         static_cast<unsigned long long>(index + 1),
+                         static_cast<unsigned long long>(index),
+                         lifecycle_state_name(lifecycle.state()));
+            cleanup();
+            return false;
+        }
+        const LifecycleIdentity identity = launch.identity;
+        incarnation_directories.push_back(identity.private_directory);
+        if (index != 0) {
+            if (identity.control.attempt != previous_identity.control.attempt + 1 ||
+                identity.store_generation != previous_identity.store_generation + 1 ||
+                identity.store_root == previous_identity.store_root)
+                return fail("replacement identity is not monotonic/distinct", index + 1);
+            const auto mailbox = lifecycle.reap_mailbox().lock();
+            if (!mailbox || !mailbox->enqueue(previous_reap))
+                return fail("could not queue previous exact reap", index + 1);
+        }
+
+        const pid_t pid = static_cast<pid_t>(1200 + index);
+        move_to_forked(lifecycle, pid, t0 + std::chrono::milliseconds(index * 10),
+                       verifier);
+        if (lifecycle.state() != LifecycleState::ForkedAwaitExecAndReady)
+            return fail("stale prior-incarnation reap poisoned current launch", index + 1);
+        LifecycleObservation ready;
+        ready.ready = ReadyObservation::Complete;
+        ready.store_generation = identity.store_generation;
+        ready.ready_lease = ready_for(identity, pid);
+        ready.observed_device = ready.ready_lease->listener_device;
+        ready.observed_inode = ready.ready_lease->listener_inode;
+        if (lifecycle.advance(t0 + std::chrono::milliseconds(index * 10), ready).action !=
+                LifecycleAction::PublishReady ||
+            lifecycle.state() != LifecycleState::Ready)
+            return fail("valid READY was not accepted", index + 1);
+        constexpr int kPidfdBase = 4000;
+        const int pidfd = kPidfdBase + static_cast<int>(index);
+        const uint64_t registry_generation = 5000 + index;
+        lifecycle.bind_reaper_identity(pidfd, registry_generation);
+        previous_reap = exact_reap_for(lifecycle, pid, pidfd,
+                                       registry_generation);
+        previous_identity = identity;
+        const auto lease = *lifecycle.current_ready_lease();
+        const auto mailbox = lifecycle.reap_mailbox().lock();
+        if (!mailbox || !mailbox->enqueue(previous_reap))
+            return fail("could not queue exact current reap", index + 1);
+        if (lifecycle.advance(t0 + std::chrono::milliseconds(index * 10)).action !=
+            LifecycleAction::Withdraw)
+            return fail("exact current exit did not withdraw", index + 1);
+        if (lifecycle.advance(t0 + std::chrono::milliseconds(index * 10)).action !=
+            LifecycleAction::SendTerm)
+            return fail("replacement teardown omitted TERM phase", index + 1);
+
+        LifecycleObservation gone;
+        gone.group = GroupObservation::Gone;
+        gone.observed_pgid = pid;
+        gone.group_domain = *verifier->lease_for(pid);
+        gone.path_absent = true;
+        gone.observed_path = identity.private_directory;
+        gone.observed_device = lease.listener_device;
+        gone.observed_inode = lease.listener_inode;
+        remove_socket_node(identity);
+        if (lifecycle.advance(t0 + std::chrono::milliseconds(index * 10 + 1), gone).action !=
+                LifecycleAction::None ||
+            lifecycle.state() != LifecycleState::ReapAndGroupCheck)
+            return fail("successor bypassed exact group-absence proof", index + 1);
+        if (lifecycle.advance(t0 + std::chrono::milliseconds(index * 10 + 2), gone).action !=
+                LifecycleAction::RetryEligible ||
+            lifecycle.state() != LifecycleState::RetryEligible ||
+            lifecycle.next_deadline() != Clock::time_point{})
+            return fail("successor bypassed exact path-absence proof", index + 1);
+    }
+
+    cleanup();
+    std::puts("READY_RESTART_STREAK_PASS incarnations=7");
+    return true;
+}
+
+void test_unready_recovery_streak_exhausts() {
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::time_point{};
+    SidecarLifecycleConfig config;
+    config.control_generation = 0x5b;
+    config.private_root = "/tmp/icecc-p50-unready-streak";
+    config.launch_timeout = std::chrono::milliseconds(10);
+    config.exec_timeout = std::chrono::milliseconds(10);
+    config.ready_timeout = std::chrono::milliseconds(10);
+    config.grace_timeout = std::chrono::milliseconds(10);
+    config.kill_timeout = std::chrono::milliseconds(10);
+    config.max_attempts = 2;
+    config.identities = allocator(config.control_generation);
+    // A valid READY resets the consecutive start-failure allowance, but a
+    // streak of failed pre-READY launches still exhausts it.
+    SidecarLifecycle failing(config);
+    for (uint64_t attempt = 1; attempt <= 2; ++attempt) {
+        const auto launch = failing.begin(t0 + std::chrono::milliseconds(attempt * 10));
+        CHECK(launch.action == LifecycleAction::LaunchPrepared &&
+                  launch.identity.control.attempt == attempt,
+              "pre-READY retry preserves monotonic identity numbering");
+        LifecycleObservation failed_exec;
+        failed_exec.exec = ExecObservation::Failed;
+        failed_exec.path_absent = true;
+        failed_exec.observed_path = launch.identity.private_directory;
+        const auto result = failing.advance(
+            t0 + std::chrono::milliseconds(attempt * 10), failed_exec);
+        if (attempt == 1) {
+            CHECK(result.action == LifecycleAction::RetryEligible &&
+                      failing.state() == LifecycleState::RetryEligible &&
+                      failing.attempts() == 1,
+                  "one failed pre-READY attempt permits bounded retry");
+        } else {
+            CHECK(result.action == LifecycleAction::EnterDegradedLegacy &&
+                      failing.state() == LifecycleState::DegradedLegacy &&
+                      failing.attempts() == 2 &&
+                      failing.next_deadline() == Clock::time_point{},
+                  "repeated pre-READY failures exhaust the streak bound");
+        }
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--ready-restart-streak-only")
+        return repeatedly_ready_sidecar_can_restart() ? EXIT_SUCCESS : EXIT_FAILURE;
     test_lifecycle();
+    CHECK(repeatedly_ready_sidecar_can_restart(),
+          "successful READY cycles outlive the per-recovery attempt cap");
+    test_unready_recovery_streak_exhausts();
     if (failures != 0) return EXIT_FAILURE;
     std::cout << "p50 sidecar lifecycle tests passed\n";
     return EXIT_SUCCESS;

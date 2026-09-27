@@ -472,6 +472,143 @@ int main()
     if (!drive_shutdown(other_lifecycle_adapter, reaper, other_update))
         return 40;
 
+    // Successful READY incarnations do not consume a lifetime identity
+    // allowance. Here the rolling window is deliberately shorter than the
+    // spacing between replacements; monotonic identities plus exact cleanup
+    // must permit more than the historical initial+3 lifetime attempts.
+    auto spaced_config = config;
+    spaced_config.restart_window = std::chrono::milliseconds(5);
+    spaced_config.max_restarts = 3;
+    spaced_config.max_attempts_per_recovery = 1;
+    DaemonSidecarAdapter spaced_adapter(spaced_config);
+    spaced_adapter.observe_public_listener(true, spaced_config.public_listener_port);
+    spaced_adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update spaced_update;
+    if (!drive_until(spaced_adapter, reaper, spaced_update,
+                     std::chrono::seconds(5), [&] {
+                         return spaced_adapter.authenticated() &&
+                                spaced_adapter.advertisement_snapshot().present();
+                     }))
+    {
+        std::fprintf(stderr, "restart-budget spaced initial READY timeout\n");
+        return 41;
+    }
+    constexpr unsigned kSpacedIncarnations = 6;
+    for (unsigned index = 1; index != kSpacedIncarnations; ++index) {
+        const auto previous = spaced_adapter.outer_current_ready_lease();
+        if (!previous || !previous->valid())
+        {
+            std::fprintf(stderr, "restart-budget missing prior READY index=%u\n", index);
+            return 42;
+        }
+        const auto previous_identity = previous->identity;
+        const std::string previous_directory = previous->private_directory;
+        const uint64_t previous_attempt = spaced_adapter.attempt();
+        spaced_adapter.outer_request_replacement();
+        if (!drive_until(spaced_adapter, reaper, spaced_update,
+                         std::chrono::seconds(5), [&] {
+                             return spaced_adapter.attempt() > previous_attempt &&
+                                    spaced_adapter.authenticated() &&
+                                    spaced_adapter.advertisement_snapshot().present();
+                         }))
+        {
+            std::fprintf(stderr,
+                         "restart-budget spaced replacement timeout index=%u attempt=%llu\n",
+                         index, static_cast<unsigned long long>(previous_attempt));
+            return 43;
+        }
+        const auto current = spaced_adapter.outer_current_ready_lease();
+        struct stat retired_directory{};
+        if (!current || !current->valid() ||
+            current->identity.generation != previous_identity.generation ||
+            current->identity.attempt <= previous_identity.attempt ||
+            current->store_generation <= previous->store_generation ||
+            current->store_root == previous->store_root ||
+            ::lstat(previous_directory.c_str(), &retired_directory) == 0 ||
+            errno != ENOENT) {
+            std::fprintf(stderr,
+                         "restart-budget stale incarnation/path index=%u current=%llu old=%llu errno=%d\n",
+                         index,
+                         current ? static_cast<unsigned long long>(current->identity.attempt) : 0,
+                         static_cast<unsigned long long>(previous_identity.attempt), errno);
+            return 44;
+        }
+        // Ensure each successful replacement is outside the tiny rolling
+        // window, so this test specifically distinguishes rolling admission
+        // from a lifetime max-attempt cap.
+        ::usleep(20000);
+    }
+    if (!drive_shutdown(spaced_adapter, reaper, spaced_update))
+    {
+        std::fprintf(stderr, "restart-budget spaced adapter shutdown failed\n");
+        return 45;
+    }
+
+    // The rolling limiter still rejects a rapid fourth restart within the
+    // production 3-per-10-second window after three successful replacements.
+    auto rapid_config = config;
+    rapid_config.restart_window = std::chrono::seconds(10);
+    rapid_config.max_restarts = 3;
+    rapid_config.max_attempts_per_recovery = 1;
+    DaemonSidecarAdapter rapid_adapter(rapid_config);
+    rapid_adapter.observe_public_listener(true, rapid_config.public_listener_port);
+    rapid_adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update rapid_update;
+    if (!drive_until(rapid_adapter, reaper, rapid_update,
+                     std::chrono::seconds(5), [&] {
+                         return rapid_adapter.authenticated() &&
+                                rapid_adapter.advertisement_snapshot().present();
+                     }))
+    {
+        std::fprintf(stderr, "restart-budget rapid initial READY timeout\n");
+        return 46;
+    }
+    const auto rapid_started = std::chrono::steady_clock::now();
+    for (unsigned restart = 0; restart != 3; ++restart) {
+        const uint64_t previous_attempt = rapid_adapter.attempt();
+        rapid_adapter.outer_request_replacement();
+        if (!drive_until(rapid_adapter, reaper, rapid_update,
+                         std::chrono::seconds(5), [&] {
+                             return rapid_adapter.attempt() > previous_attempt &&
+                                    rapid_adapter.authenticated() &&
+                                    rapid_adapter.advertisement_snapshot().present();
+                         }))
+        {
+            std::fprintf(stderr,
+                         "restart-budget rapid replacement timeout index=%u attempt=%llu\n",
+                         restart, static_cast<unsigned long long>(previous_attempt));
+            return 47;
+        }
+    }
+    const auto rapid_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - rapid_started);
+    if (rapid_elapsed >= std::chrono::seconds(10)) {
+        std::fprintf(stderr,
+                     "restart-budget rapid witness exceeded 10s: elapsed_ms=%lld\n",
+                     static_cast<long long>(rapid_elapsed.count()));
+        return 48;
+    }
+    const uint64_t last_rapid_attempt = rapid_adapter.attempt();
+    rapid_adapter.outer_request_replacement();
+    if (!drive_until(rapid_adapter, reaper, rapid_update,
+                     std::chrono::seconds(2), [&] {
+                         return rapid_adapter.last_error() ==
+                                icecc::p50::daemon::AdapterError::AttemptExhausted;
+                     }) || rapid_adapter.attempt() != last_rapid_attempt)
+    {
+        std::fprintf(stderr,
+                     "restart-budget expected fourth rapid restart refusal: error=%u old_attempt=%llu current_attempt=%llu\n",
+                     static_cast<unsigned>(rapid_adapter.last_error()),
+                     static_cast<unsigned long long>(last_rapid_attempt),
+                     static_cast<unsigned long long>(rapid_adapter.attempt()));
+        return 49;
+    }
+    if (!drive_shutdown(rapid_adapter, reaper, rapid_update))
+    {
+        std::fprintf(stderr, "restart-budget rapid adapter shutdown failed\n");
+        return 50;
+    }
+
     if (!remove_p29_fingerprint_cache(root) || ::rmdir(directory) != 0)
         return 25;
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
