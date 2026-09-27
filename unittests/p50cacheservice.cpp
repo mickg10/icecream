@@ -3616,10 +3616,17 @@ local::HandoffFd d14_exact_source_fd(std::span<const uint8_t> bytes) {
 void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                                        size_t job_count = 3,
                                        size_t cut_boundary = 1,
-                                       bool w30 = false) {
+                                       bool w30 = false,
+                                       bool idle_terminal = false) {
     CHECK(job_count >= 3);
     CHECK(cut_boundary <= job_count);
+    CHECK(!idle_terminal || (w30 && job_count == 32 && cut_boundary == 31));
     struct RunResult {
+        enum class EventKind { LinkState, ResetAck, BundleSent };
+        struct OrderedEvent {
+            EventKind kind;
+            uint64_t value;
+        };
         std::vector<local::P50SourceTransferResult> results;
         std::vector<std::vector<uint8_t>> inputs;
         std::vector<R2TxCommit> commits;
@@ -3629,6 +3636,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         std::vector<std::vector<uint8_t>> materialized_bytes;
         std::vector<LinkHello> quiesced_links;
         std::vector<LinkState> observed_link_states;
+        std::vector<OrderedEvent> wire_events;
         size_t accepted_links = 0;
         bool owned_duplicate_shutdown = false;
         Id128 relationship_id{};
@@ -3674,6 +3682,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         std::vector<std::vector<uint8_t>> materialized_bytes;
         std::vector<LinkHello> quiesced_links;
         std::vector<LinkState> observed_link_states;
+        std::vector<RunResult::OrderedEvent> wire_events;
 
         service::RuntimeConfig f_config = test_runtime_config();
         f_config.c_store_guid = f_launch.c_store_guid;
@@ -3715,6 +3724,8 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         c_config.after_r2_bundle_sent_for_test = [&](uint64_t ordinal) {
             std::lock_guard lock(event_mutex);
             sent_ordinals.push_back(ordinal);
+            wire_events.push_back(
+                {RunResult::EventKind::BundleSent, ordinal});
             event_changed.notify_all();
         };
         service::SidecarRuntime c_runtime(std::move(c_config));
@@ -3813,11 +3824,19 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                         std::lock_guard lock(event_mutex);
                         if (const auto* commit = std::get_if<R2TxCommit>(&message))
                             commits.push_back(*commit);
-                        else if (const auto* ack = std::get_if<ResetAck>(&message))
+                        else if (const auto* ack = std::get_if<ResetAck>(&message)) {
                             reset_acks.push_back(*ack);
+                            wire_events.push_back({
+                                RunResult::EventKind::ResetAck,
+                                ack->recovery_prepared_prefix_p});
+                        }
                         else if (const auto* link_state =
-                                     std::get_if<LinkState>(&message))
+                                     std::get_if<LinkState>(&message)) {
                             observed_link_states.push_back(*link_state);
+                            wire_events.push_back({
+                                RunResult::EventKind::LinkState,
+                                link_state->physical_link_generation});
+                        }
                         event_changed.notify_all();
                     };
                 control.r2_link_io_quiesced_observer =
@@ -3957,7 +3976,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
                     attach_exact(requests[index], result) && exact_attachments;
                 output.results.push_back(std::move(result));
             }
-            if (cut_boundary == 31 && job_count == 32) {
+            if (cut_boundary == 31 && job_count == 32 && idle_terminal) {
                 const int descriptor = probe_fd.load(std::memory_order_acquire);
                 CHECK(descriptor >= 0);
                 CHECK(::shutdown(descriptor, SHUT_RDWR) == 0);
@@ -4240,20 +4259,76 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
         // Stop requests asynchronous owner cleanup; it does not join the
         // endpoint work. Wait for accounting to drain before taking the final
         // credit snapshot rather than racing that cleanup.
+        uint64_t retired_link_generation = 0;
+        const bool require_retired_link_quiescence =
+            force_reset && w30 && cut_boundary == 31 && job_count == 32;
+        if (require_retired_link_quiescence) {
+            std::lock_guard lock(event_mutex);
+            for (const LinkState& state : observed_link_states) {
+                if (state.relationship_id == output.relationship_id &&
+                    state.physical_link_generation != 0 &&
+                    (retired_link_generation == 0 ||
+                     state.physical_link_generation < retired_link_generation))
+                    retired_link_generation =
+                        state.physical_link_generation;
+            }
+            CHECK(retired_link_generation != 0);
+        }
         cleanup.reset();
         const auto drain_deadline = std::chrono::steady_clock::now() +
                                     std::chrono::seconds(5);
+        bool retired_link_quiesced = !require_retired_link_quiescence;
         size_t pending_operations =
             c_runtime.pending_p51_source_operations_for_test();
         uint64_t pending_raw_bytes =
             c_runtime.active_source_raw_bytes_for_test();
-        while ((pending_operations != 0 || pending_raw_bytes != 0) &&
+        while ((!retired_link_quiesced || pending_operations != 0 ||
+                pending_raw_bytes != 0) &&
                std::chrono::steady_clock::now() < drain_deadline) {
+            if (!retired_link_quiesced) {
+                std::unique_lock lock(event_mutex);
+                retired_link_quiesced = event_changed.wait_until(
+                    lock,
+                    std::min(drain_deadline,
+                             std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(2)),
+                    [&] {
+                        return std::any_of(
+                            quiesced_links.begin(), quiesced_links.end(),
+                            [&](const LinkHello& hello) {
+                                return hello.relationship_id ==
+                                           output.relationship_id &&
+                                       hello.physical_link_generation ==
+                                           retired_link_generation;
+                            });
+                    });
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             pending_operations =
                 c_runtime.pending_p51_source_operations_for_test();
             pending_raw_bytes = c_runtime.active_source_raw_bytes_for_test();
         }
+        if (!retired_link_quiesced) {
+            size_t state_count = 0;
+            size_t quiesced_count = 0;
+            {
+                std::lock_guard lock(event_mutex);
+                state_count = observed_link_states.size();
+                quiesced_count = quiesced_links.size();
+            }
+            std::fprintf(stderr,
+                         "P51_D14 retired-link-quiescence-timeout profile=%u "
+                         "case=%s generation=%llu accepted=%zu states=%zu "
+                         "quiesced=%zu\n",
+                         static_cast<unsigned>(profile),
+                         idle_terminal ? "idle-prestage" : "staged32",
+                         static_cast<unsigned long long>(
+                             retired_link_generation),
+                         accepted_connections.load(std::memory_order_acquire),
+                         state_count, quiesced_count);
+            std::fflush(stderr);
+        }
+        CHECK(retired_link_quiesced);
         if (pending_operations != 0 || pending_raw_bytes != 0) {
             std::fprintf(stderr,
                          "P51_D14 cleanup-credit-timeout operations=%zu raw=%llu\n",
@@ -4276,6 +4351,7 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
             output.materialized_bytes = materialized_bytes;
             output.quiesced_links = quiesced_links;
             output.observed_link_states = observed_link_states;
+            output.wire_events = wire_events;
         }
         return output;
     };
@@ -4354,10 +4430,32 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
     }
     if (w30 && cut_boundary == 31 && job_count == 32) {
         CHECK(recovered.owned_duplicate_shutdown);
-        CHECK(!recovered.held_suffix_worker);
-        CHECK(!recovered.suffix_bundles_sent);
-        CHECK(!recovered.reset_before_release);
+        if (idle_terminal) {
+            CHECK(!recovered.held_suffix_worker);
+            CHECK(!recovered.suffix_bundles_sent);
+            CHECK(!recovered.reset_before_release);
+        } else {
+            CHECK(recovered.held_suffix_worker);
+            CHECK(recovered.suffix_bundles_sent);
+            CHECK(recovered.reset_before_release);
+        }
         CHECK(recovered.accepted_links >= 2);
+        if (recovered.quiesced_links.empty()) {
+            std::fprintf(stderr,
+                         "P51_D14 missing-quiesced-link profile=%u case=%s "
+                         "accepted=%zu states=%zu commits=%zu reset-acks=%zu "
+                         "results=%zu final-ops=%zu final-raw=%llu\n",
+                         static_cast<unsigned>(profile),
+                         idle_terminal ? "idle-prestage" : "staged32",
+                         recovered.accepted_links,
+                         recovered.observed_link_states.size(),
+                         recovered.commits.size(), recovered.reset_acks.size(),
+                         recovered.results.size(),
+                         recovered.final_source_operations,
+                         static_cast<unsigned long long>(
+                             recovered.final_source_raw_bytes));
+            std::fflush(stderr);
+        }
         CHECK(!recovered.quiesced_links.empty());
         CHECK(recovered.observed_link_states.size() >= 2);
         CHECK(recovered.commits.size() == job_count);
@@ -4389,37 +4487,77 @@ void test_p51_d14_reset_boundary_smoke(ProfileId profile,
             });
         CHECK(reconnect != recovered.observed_link_states.end());
         CHECK(reconnect->relationship_epoch == first_link->relationship_epoch);
+        const auto recovery_link_event = std::find_if(
+            recovered.wire_events.begin(), recovered.wire_events.end(),
+            [&](const RunResult::OrderedEvent& event) {
+                return event.kind == RunResult::EventKind::LinkState &&
+                       event.value == reconnect->physical_link_generation;
+            });
+        const auto terminal_ack_event = std::find_if(
+            recovered.wire_events.begin(), recovered.wire_events.end(),
+            [](const RunResult::OrderedEvent& event) {
+                return event.kind == RunResult::EventKind::ResetAck;
+            });
+        const auto bundle32_event = std::find_if(
+            recovered.wire_events.begin(), recovered.wire_events.end(),
+            [](const RunResult::OrderedEvent& event) {
+                return event.kind == RunResult::EventKind::BundleSent &&
+                       event.value == 32;
+            });
+        CHECK(recovery_link_event != recovered.wire_events.end());
+        CHECK(terminal_ack_event != recovered.wire_events.end());
+        CHECK(bundle32_event != recovered.wire_events.end());
+        CHECK(recovered.reset_acks.size() == 1);
         uint64_t terminal_reset_k = 0;
         uint64_t terminal_reset_p = 0;
-        if (!recovered.reset_acks.empty()) {
-            CHECK(recovered.reset_acks.size() == 1);
-            const ResetAck& terminal_ack = recovered.reset_acks.front();
-            CHECK(terminal_ack.request.relationship_id ==
-                  recovered.relationship_id);
-            CHECK(terminal_ack.request.settled_prefix_k == 31);
-            CHECK(terminal_ack.recovery_prepared_prefix_p == 32);
-            terminal_reset_k = terminal_ack.request.settled_prefix_k;
-            terminal_reset_p = terminal_ack.recovery_prepared_prefix_p;
+        const ResetAck& terminal_ack = recovered.reset_acks.front();
+        CHECK(terminal_ack.request.relationship_id ==
+              recovered.relationship_id);
+        CHECK(terminal_ack.request.settled_prefix_k == 31);
+        const uint64_t expected_terminal_p = idle_terminal ? 31 : 32;
+        CHECK(terminal_ack.recovery_prepared_prefix_p == expected_terminal_p);
+        CHECK(terminal_ack_event->value == expected_terminal_p);
+        if (idle_terminal) {
+            CHECK(recovery_link_event < terminal_ack_event);
+            CHECK(terminal_ack_event < bundle32_event);
+        } else {
+            CHECK(bundle32_event < terminal_ack_event);
         }
+        terminal_reset_k = terminal_ack.request.settled_prefix_k;
+        terminal_reset_p = terminal_ack.recovery_prepared_prefix_p;
         for (size_t index = 0; index < 31; ++index)
             CHECK(recovered.results[index].code ==
                       local::SourceTransferResultCode::Committed &&
                   recovered.results[index].tu_seq == index);
         CHECK(recovered.results[31].tu_seq == 31);
-        std::printf("P51_D14 w30-terminal-reconnect profile=%u settled-K=31 "
+        const auto event_index = [&](
+            const auto& event) -> size_t {
+                return static_cast<size_t>(event - recovered.wire_events.begin());
+            };
+        std::printf("P51_D14 w30-terminal-reconnect profile=%u case=%s settled-K=31 "
                     "probe=32 owned-cut=1 adopted-links=%zu old-generation=%llu "
-                    "new-generation=%llu held-worker=0 exact-results=32 "
+                    "new-generation=%llu held-worker=%u suffix-sent=%u "
+                    "reset-before-release=%u exact-results=32 "
                     "exact-attachments=1 commits=32 reset-acks=%zu "
-                    "reset-K=%llu reset-P=%llu "
+                    "reset-K=%llu reset-P=%llu order-link=%zu order-ack=%zu "
+                    "order-bundle32=%zu "
                     "final-ops=0 final-raw=0\n",
-                    static_cast<unsigned>(profile), recovered.accepted_links,
+                    static_cast<unsigned>(profile),
+                    idle_terminal ? "idle-prestage" : "staged32",
+                    recovered.accepted_links,
                     static_cast<unsigned long long>(
                         first_link->physical_link_generation),
                     static_cast<unsigned long long>(
                         reconnect->physical_link_generation),
+                    recovered.held_suffix_worker ? 1u : 0u,
+                    recovered.suffix_bundles_sent ? 1u : 0u,
+                    recovered.reset_before_release ? 1u : 0u,
                     recovered.reset_acks.size(),
                     static_cast<unsigned long long>(terminal_reset_k),
-                    static_cast<unsigned long long>(terminal_reset_p));
+                    static_cast<unsigned long long>(terminal_reset_p),
+                    event_index(recovery_link_event),
+                    event_index(terminal_ack_event),
+                    event_index(bundle32_event));
         return;
     }
     CHECK(recovered.held_suffix_worker);
@@ -4467,8 +4605,10 @@ void test_p51_d14_w30_k0_all_profiles() {
 
 void test_p51_d14_w30_terminal_all_profiles() {
     for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
-                                    ProfileId::ZSTD_ROUTE})
-        test_p51_d14_reset_boundary_smoke(profile, 32, 31, true);
+                                    ProfileId::ZSTD_ROUTE}) {
+        test_p51_d14_reset_boundary_smoke(profile, 32, 31, true, true);
+        test_p51_d14_reset_boundary_smoke(profile, 32, 31, true, false);
+    }
 }
 
 void test_p51_d14_w30_reset_boundary_matrix() {
