@@ -12,6 +12,29 @@ retained artifact directories.
 
 ## Developer QA
 
+### Multi-link receipt-window harness
+
+The candidate now materializes 36 receipt-window scenarios: C1F2/3/4 and
+C2/3/4F1, W1/W30, and P29V1/ZSTD_TU/ZSTD_ROUTE. It checks exact per-link
+worker assignments, fills each link's initial window before dispatching suffix
+jobs, and verifies output progress while other links remain held. Invalid
+worklist generation stops before compiler dispatch, including when an old
+destination file exists. The combined harness suite passes 307 tests after
+integration with diagnostic retention. These are unit/driver checks, not
+36 completed Docker or external-farm cells. Restart-under-load remains separate.
+
+The compatible helper was freshly built from the be667 product closure plus
+the identity-marker test change. Its native 18-cell multi-link wrapper passed
+17 cells then failed C4F1/ZSTD_ROUTE; a separate targeted retry passed four
+links and 120 jobs. The original suite remains failed, and startup variability
+does not yet establish the cause. Logs under
+`/tanksmall/scratch/tmp/p51-multilink-helper-build/logs-r1/`:
+`local-multilink-wrapper-r2.log` SHA256
+`61532b7d6fcf28ff27afeb29614b227217071aa61bd0f3ca2b11ee4787e876d0`;
+`local-c4f1-route-diagnostic-r1.log` SHA256
+`c7980674a1e040e6d5bdf156ecd13458fb8ebb833ef18ce2d0b6fa7ab6e3fb16`.
+The new Docker receipt-driver matrix has not yet been executed.
+
 ### Frozen QA and legacy build boundary
 
 Fresh public `make qa` on `be66761c` has completed native checks: 178 total,
