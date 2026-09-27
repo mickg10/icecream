@@ -7194,18 +7194,38 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                 materialize_calls.load(std::memory_order_acquire) >= 2;
             const auto settle_deadline = stop_started +
                                          std::chrono::seconds(8);
+            std::optional<P50ServerOwnerUsage> owner_after_stop =
+                f_runtime.endpoint_owner_usage_for_test(true);
+            const auto has_pressure = [](const P50ServerOwnerUsage& usage) {
+                return usage.pending_encoded_bytes != 0 ||
+                       usage.pending_raw_bytes != 0 ||
+                       usage.decoder_window_bytes != 0;
+            };
+            bool owner_pressure_drained_after_release = false;
+            auto owner_drained_at = stop_started;
             for (;;) {
                 size_t current_gate_waiters = 0;
                 {
                     std::lock_guard lock(materialize_mutex);
                     current_gate_waiters = gate_waiters;
                 }
+                const auto owner_sample =
+                    f_runtime.endpoint_owner_usage_for_test(true);
+                if (owner_sample)
+                    owner_after_stop = owner_sample;
+                const bool owner_drained = owner_sample &&
+                    !has_pressure(*owner_sample) &&
+                    owner_sample->retained_input_records == 1 &&
+                    owner_sample->retained_input_bytes == 73;
                 if (current_gate_waiters == 0 &&
-                    f_runtime.live_session_count() == 0)
+                    f_runtime.live_session_count() == 0 && owner_drained) {
+                    owner_pressure_drained_after_release = true;
+                    owner_drained_at = std::chrono::steady_clock::now();
                     break;
+                }
                 if (std::chrono::steady_clock::now() >= settle_deadline)
                     break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             const bool f_session_drained =
                 f_runtime.live_session_count() == 0;
@@ -7218,8 +7238,6 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                 remaining_gate_waiters = gate_waiters;
             }
             const bool f_gate_workers_drained = remaining_gate_waiters == 0;
-            const auto owner_after_stop =
-                f_runtime.endpoint_owner_usage_for_test(true);
             bool warm_witness_preserved = false;
             size_t materialized_after_release = 0;
             {
@@ -7259,7 +7277,8 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                     "Fhandoff=%zu gate=%zu owner=%u enc=%llu raw=%llu "
                     "window=%llu records=%llu bytes=%llu Cops=%zu Craw=%llu "
                     "terminal=%zu eof=%zu invalid=%zu commits=%zu "
-                    "materialized=%zu warm=%zu\n",
+                    "materialized=%zu warm=%zu pressure-drained=%u "
+                    "drain-ms=%lld\n",
                     profile_name,
                     accepted_connections.load(std::memory_order_acquire),
                     f_runtime.live_session_count(),
@@ -7280,7 +7299,11 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                         c_runtime.active_source_raw_bytes_for_test()),
                     stop_terminal_errors, stop_clean_eof,
                     stop_invalid_observations, unexpected_commits,
-                    materialized_after_release, warm_witness_count);
+                    materialized_after_release, warm_witness_count,
+                    owner_pressure_drained_after_release ? 1u : 0u,
+                    static_cast<long long>(std::chrono::duration_cast<
+                        std::chrono::milliseconds>(owner_drained_at -
+                                                   stop_started).count()));
                 std::fflush(stderr);
             }
 
@@ -7290,6 +7313,7 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
             CHECK(f_session_drained);
             CHECK(c_session_drained);
             CHECK(f_gate_workers_drained);
+            CHECK(owner_pressure_drained_after_release);
             CHECK(warm_witness_preserved);
             CHECK(materialized_after_release == warm_witness_count);
             CHECK(owner_credits_drained);
@@ -7304,7 +7328,8 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                         "f-pending-raw=%llu f-window=%llu "
                         "c-errors=%zu c-clean-eof=%zu warm-commit=1 late-publications=0 "
                         "c-ops=0 c-raw=0 f-pending=0 sessions=0 fds-no-growth=1 "
-                        "stop-terminal-before-release=1 bounded=1 PASS\n",
+                        "stop-terminal-before-release=1 owner-drain-ms=%lld "
+                        "bounded=1 PASS\n",
                         profile_name,
                         static_cast<unsigned long long>(cut_raw_bytes),
                         static_cast<unsigned long long>(owner_usage_at_cut
@@ -7313,7 +7338,10 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
                             ? owner_usage_at_cut->pending_raw_bytes : 0),
                         static_cast<unsigned long long>(owner_usage_at_cut
                             ? owner_usage_at_cut->decoder_window_bytes : 0),
-                        stop_terminal_errors, stop_clean_eof);
+                        stop_terminal_errors, stop_clean_eof,
+                        static_cast<long long>(std::chrono::duration_cast<
+                            std::chrono::milliseconds>(owner_drained_at -
+                                                       stop_started).count()));
             std::fflush(stdout);
             return;
         }
