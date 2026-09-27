@@ -2522,7 +2522,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     bool predecessor_deadline_settled = false;
     std::atomic<bool> predecessor_reset_confirmed{false};
     std::atomic<bool> predecessor_released_after_generation_fence{false};
-    bool predecessor_delayed_cancelled = false;
+    std::atomic<bool> predecessor_delayed_cancelled{false};
+    std::atomic<bool> predecessor_delayed_cancel_attempted{false};
     bool predecessor_unpublished_at_fence = false;
     std::atomic<bool> pre_first_replay_disconnect_requested{false};
     std::atomic<uint64_t> forced_replay_disconnect_ordinal{0};
@@ -2536,6 +2537,7 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     std::atomic<size_t> recovery_attempts{0};
     std::atomic<uint64_t> recovery_wait_request{0};
     std::atomic<uint64_t> recovery_attempt_request{0};
+    std::function<bool()> cancel_expired_predecessor;
 
     service::RuntimeConfig f_config = test_runtime_config();
     f_config.c_store_guid = f_launch.c_store_guid;
@@ -2595,21 +2597,39 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
     c_config.max_active_p51_source_transfers = 40;
     c_config.max_pending_p51_source_operations = 40;
     c_config.max_aggregate_source_raw_bytes = 1024 * 1024;
-    if (disconnect_before_first_replay || disconnect_mid_suffix) {
+    // Cancel after the confirmed reset but before the first replay bind. The
+    // reset-confirm observer runs on F's owner and only signals the test; the
+    // C-side pre-replay hook can safely perform the bounded F-owner roundtrip
+    // before the sender advances, avoiding a race with install_begin().
+    if (keep_f_live_after_expiry || disconnect_before_first_replay ||
+        disconnect_mid_suffix) {
         c_config.disconnect_r2_before_replay_bundle_for_test =
             [&](uint64_t ordinal, size_t retained_rows, bool reader_running,
                 bool ack_pump_running) {
                 (void)reader_running;
                 (void)ack_pump_running;
-                const uint64_t requested_ordinal =
-                    disconnect_before_first_replay ? 1 : 15;
-                if (ordinal != requested_ordinal || retained_rows != 29 ||
-                    pre_first_replay_disconnect_requested.exchange(
-                        true, std::memory_order_acq_rel))
-                    return false;
-                forced_replay_disconnect_ordinal.store(
-                    ordinal, std::memory_order_release);
-                return true;
+                if (keep_f_live_after_expiry && ordinal == 1 &&
+                    retained_rows == 29 &&
+                    !predecessor_delayed_cancel_attempted.exchange(
+                        true, std::memory_order_acq_rel)) {
+                    const bool cancelled = cancel_expired_predecessor &&
+                                           cancel_expired_predecessor();
+                    predecessor_delayed_cancelled.store(
+                        cancelled, std::memory_order_release);
+                    event_changed.notify_all();
+                }
+                if (disconnect_before_first_replay || disconnect_mid_suffix) {
+                    const uint64_t requested_ordinal =
+                        disconnect_before_first_replay ? 1 : 15;
+                    if (ordinal != requested_ordinal || retained_rows != 29 ||
+                        pre_first_replay_disconnect_requested.exchange(
+                            true, std::memory_order_acq_rel))
+                        return false;
+                    forced_replay_disconnect_ordinal.store(
+                        ordinal, std::memory_order_release);
+                    return true;
+                }
+                return false;
             };
     }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -2875,6 +2895,33 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
             reservation.absolute_deadline, authenticated_runtime_pair(), id,
             std::move(bytes)});
     }
+    if (keep_f_live_after_expiry) {
+        const P51SourceArmFields predecessor_arm =
+            rows[0].transfer.armed.arm;
+        const auto predecessor_reservation =
+            rows[0].transfer.armed.reservation_id;
+        const auto predecessor_f_deadline =
+            rows[0].f_reservation_deadline.as_steady_time_point();
+        cancel_expired_predecessor = [&, predecessor_arm,
+                                      predecessor_reservation,
+                                      predecessor_f_deadline] {
+            bool reset_confirmed_with_mask_zero = false;
+            {
+                std::lock_guard lock(event_mutex);
+                reset_confirmed_with_mask_zero =
+                    predecessor_reset_confirmed.load(
+                        std::memory_order_acquire) &&
+                    std::any_of(f_reset_acks.begin(), f_reset_acks.end(),
+                        [](const ResetAck& ack) {
+                            return ack.unavailable_suffix_mask == 0;
+                        });
+            }
+            return reset_confirmed_with_mask_zero &&
+                f_runtime.cancel_p51_source_on_owner(
+                    predecessor_arm, predecessor_reservation,
+                    predecessor_f_deadline);
+        };
+    }
 
     bool all_submitted = true;
     auto enqueue_row = [&](RequestRow& row) {
@@ -3039,18 +3086,19 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                                     std::memory_order_acquire);
                         });
                 }
-                if (reset_mask_zero) {
-                    predecessor_delayed_cancelled =
-                        f_runtime.cancel_p51_source_on_owner(
-                            rows[0].transfer.armed.arm,
-                            rows[0].transfer.armed.reservation_id,
-                            rows[0].f_reservation_deadline
-                                .as_steady_time_point());
-                }
                 CHECK(reset_mask_zero);
                 CHECK(predecessor_reset_confirmed.load(
                     std::memory_order_acquire));
-                CHECK(predecessor_delayed_cancelled);
+                bool exact_cancel_completed_before_replay = false;
+                {
+                    std::unique_lock lock(event_mutex);
+                    exact_cancel_completed_before_replay =
+                        event_changed.wait_for(lock, std::chrono::seconds(8), [&] {
+                            return predecessor_delayed_cancelled.load(
+                                std::memory_order_acquire);
+                        });
+                }
+                CHECK(exact_cancel_completed_before_replay);
                 {
                     std::lock_guard lock(event_mutex);
                     const std::vector<uint8_t> expired_bytes(
@@ -3420,10 +3468,11 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
         c_runtime, 0, std::chrono::seconds(4));
     const size_t connection_count =
         accepted_connections.load(std::memory_order_acquire);
-    const bool one_link = connection_count ==
-        (disconnect_before_first_replay || disconnect_mid_suffix ? 3 :
-         keep_f_live_after_expiry ? 2 :
-         (fail_predecessor || expire_predecessor) ? 2 : 1);
+    const size_t expected_connection_count =
+        disconnect_before_first_replay || disconnect_mid_suffix ? 3 :
+        keep_f_live_after_expiry ? 2 :
+        (fail_predecessor || expire_predecessor) ? 2 : 1;
+    const bool one_link = connection_count == expected_connection_count;
     if (disconnect_before_first_replay || disconnect_mid_suffix)
         CHECK(pre_first_replay_disconnect_requested.load(
             std::memory_order_acquire));
@@ -3470,7 +3519,8 @@ void test_p51_d07_staged_cancel_case(ProfileId profile,
                     static_cast<unsigned>(profile), cancelled_index,
                     keep_f_live_after_expiry ? "mask-zero-then-cancel"
                                              : "exact-unavailable",
-                    predecessor_delayed_cancelled ? 1u : 0u,
+                    predecessor_delayed_cancelled.load(
+                        std::memory_order_acquire) ? 1u : 0u,
                     typed_replacement_outcomes);
     } else {
         std::printf("P51_D07 staged-cancel profile=%u position=%zu "
