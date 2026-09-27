@@ -95,6 +95,22 @@ Patched sender binary SHA256:
 Full sender log under the scratch parent above:
 `fullsender-output/p50zstdsender-full.log`, SHA256
 `9f2edbf6060dde50d39f8885adbaa61e84962a21bcfa9c29a76d6939fc773863`.
+
+The separate corrected-source root stage now passes both selected tests:
+`make -C /work/build/unittests -j2 check
+TESTS='p50cacheservice p50cacheservice-sanitize.sh'` (two passes, no skips).
+It uses a private copy of the frozen closure with all five tracked changes
+from `182a3da3` to `ea496ad7` overlaid; those five files compare byte-for-byte
+with `ea496ad7`. The sanitizer binary was rebuilt in the capped SDK and its
+ASan/UBSan/LSan run passed. This is a stage continuation, not a clean full-QA
+rerun or mixed-version result. Earlier source-mount/scratch/Python setup
+failures are retained separately. The successful stage reused the original
+Python environment/cache mounts; it did not reuse the original result paths.
+Under the scratch parent above, log
+`root-stage-copy/results/native-root-check-r4.log` SHA256 is
+`4e8e95d9e2dad17ff46f24c63943dcd5d7afbb8eda97dac21759f8cf3ee4625f`;
+`root-stage-copy/build/unittests/p50cacheservice-sanitize.log` SHA256 is
+`40c96ea1750e5fce894b540027580b448676821c2870f51246c023c1a872722f`.
 The separate native-environment verification
 skipped because sudo requested a password; the full legacy suite was not run.
 This is correctness evidence, not a measured whole-build speedup.
