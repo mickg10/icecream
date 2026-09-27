@@ -160,9 +160,24 @@ test source SHA256 `59e4fa9ff1188ec4d252add501a0f44d32c7dd4688c617a6a17ca134ab94
 Earlier failed fixture runs remain retained. The duplicate-binding fixture
 now selects/materializes the committed input and verifies it once, rather
 than trying to attach it again after terminal cleanup.
-This is not full D15 qualification: R2_TX_COMMIT semantic identity/digest
-corruption still needs coverage; R1 negative matrices do not prove it.
-It is not a fresh full-suite run of the merged tip.
+Donor `8aa2246d` closes the R2_TX_COMMIT semantic identity/digest gap with
+nine independently changed fields across all three profiles: relationship
+ordinal, binding digest, envelope transaction digest, history nonce, REL_SEQ,
+TU_SEQ, inner transaction digest, raw digest and post-state digest. The proxy
+forwards a complete validly encoded changed record. The real client must
+reject it with the exact witness-mismatch error, retain its pending witness,
+leave ACK/confirmed prefixes and codec state unchanged, then recover the
+server's original committed receipt without replay. All 27 cases and the
+earlier malformed/recovery matrix pass the `--d15-r2-wire` selector.
+Log `/tanksmall/scratch/tmp/p51-d15-matrix-ea65/runtime-tmp/d15-semantic-r23.log`,
+SHA256 `cb623d8d68c2acb10c6affa4cfbd9cfe1ef38135e27b0f3d571f0d40f69451cd`,
+ends `SELECTOR_EXIT=0`. Binary SHA256:
+`0e54dff52945b2480b9e80a773744b66398a1f345aef7d0d3f7e22673dc81555`;
+test source SHA256:
+`813fc52f1f33a13d7e2984d2f662881e6ebfea73ea9e1eb38f13bac286b9afdd`.
+The verified unchanged production closure was reused. This is opt-in selector
+coverage, not a fresh full-suite run of the merged tip or every D15 mutation
+across every topology. Public bootstrap gate registration remains pending.
 
 ### Queued cancellation across profiles
 
