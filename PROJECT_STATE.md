@@ -12,6 +12,26 @@ retained artifact directories.
 
 ## Developer QA
 
+### Queued cancellation across profiles
+
+`7f8a8d6b` and `e19dde44` extend the existing queued-cancellation fixture to
+P29V1, ZSTD_TU and ZSTD_ROUTE, each at submission positions 0, 15 and 30.
+`p50cacheservice --d07-queued-cancel` exits zero with nine complete markers.
+All cases retain the raw-credit queue witness, once-only target retirement,
+thirty exact surviving inputs/attachments with contiguous TU sequences, and
+zero remaining C operation/raw credits. This fixture has no compiler process;
+it does not by itself prove a cancelled compiler never ran.
+
+Evidence log:
+`/tanksmall/scratch/tmp/p51-d07-queued-profiles-run/logs/queued-profile9-frozen.log`,
+SHA256 `fae60ad4c2fd8ea681432803207d4e7c8a89b99050becb6ade4b1899178cd504`.
+The adjacent `.exit` receipt records `SELECTOR_EXIT=0` and `MARKER_COUNT=9`.
+Test binary SHA256:
+`6534c107164f41ef1167f5880d11ea33c1f430a6907c7ffe20e4e1f5862482af`.
+The capped SDK run rebuilt current production archives before the test-only
+changes. Earlier passing runs with interleaved summary lines are retained;
+the final markers are emitted after fixture shutdown and explicitly flushed.
+
 ### P29 speculative history parity
 
 `ac6ff93a` integrates donor `5fb34d67`: the existing `codec_wire` control now
