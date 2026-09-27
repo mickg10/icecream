@@ -12,6 +12,28 @@ retained artifact directories.
 
 ## Developer QA
 
+### Malformed R2 records preserve committed inputs
+
+`05a5f0b7` integrates donor `19fc6cce`: 48 record/shape/profile combinations
+run both before any committed job and after a valid committed/ACKed first
+job (96 executions), plus nine existing wire cases. The real F endpoint
+receives malformed JOB_BIND, TU_BEGIN, BODY, TU_END and COMMIT_ACK for all
+three profiles, and FILL for P29V1. Truncation requires Disconnected; oversize
+and trailing cases require terminal errors, with exact error details checked
+in the first-job controls. BODY/FILL are opaque payloads: appended bytes are
+rejected by their declared length/identity constraints, not a fictitious
+outer-record trailing-byte rule. A malformed ACK retains its already
+committed input but does not advance the acknowledged prefix.
+
+Focused SDK run (2 CPU, 8 GiB) on donor base `ea65d6eb` records `D15_EXIT=0`:
+`/tanksmall/scratch/tmp/p51-d15-matrix-ea65/build/d15-r9-confirm.log`, SHA256
+`a586364dce8914e3fafb8e077a67841c626f016f4bd8ccee0623236106861108`.
+Binary SHA256 `3868b3db110dadf9b532a1ba8c6190837a1d4d4055e6f58ff7ae1ff60418a4ab`;
+test source SHA256 `aea01ed8ede3e23ad90d21f02f4ea03606e5f089531a385e00d7fc41b6751076`.
+Earlier fixture failures remain in adjacent logs. This is not full D15
+qualification: handshake/recovery records and the opposite receive direction
+still require coverage. It is not a fresh full-suite run of the merged tip.
+
 ### Queued cancellation across profiles
 
 `7f8a8d6b` and `e19dde44` extend the existing queued-cancellation fixture to
