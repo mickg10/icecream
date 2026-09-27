@@ -564,22 +564,80 @@ run_dialogue(const Corpus &corpus,
 void run_speculative_advancement_control(
     const Corpus &corpus, const P29Interner<MmapInternProvider> &interner) {
   require(!corpus.tus.empty(), "speculative advancement control needs a TU");
-  const LogicalTu &tu = corpus.tus.front();
-  const std::vector<std::uint8_t> expected = read_file(tu.path);
+  constexpr std::size_t long_stream_jobs = 96;
   ResearchProvider sender_provider;
   ResearchProvider receiver_provider;
   P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>> serializer(
       sender_provider, interner);
   P29Deserializer<ResearchProvider> deserializer(receiver_provider);
+  // Independent ordinary committed pair: this is the canonical one-at-a-time
+  // R1 progression against which speculative NEED and state are compared.
+  ResearchProvider committed_sender_provider;
+  ResearchProvider committed_receiver_provider;
+  P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>>
+      committed_serializer(committed_sender_provider, interner);
+  P29Deserializer<ResearchProvider> committed_deserializer(
+      committed_receiver_provider);
+  // A third isolated sender is used only to prove that the real serializer
+  // rejects a well-framed NEED naming the wrong Region.
+  ResearchProvider mutation_sender_provider;
+  P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>>
+      mutation_serializer(mutation_sender_provider, interner);
   wire::MessageCodec messages;
   bool saw_empty_need = false;
   bool saw_zero_missing_need = false;
+  bool saw_nonzero_missing_need = false;
   bool saw_block_reuse = false;
+  bool saw_repeated_input = false;
+  bool saw_reused_input_need = false;
+  bool did_need_mutation_control = false;
+  std::vector<const LogicalTu *> selected_inputs;
+  std::vector<std::string> selected_paths;
+
+  struct NeedSummary {
+    bool present = false;
+    std::size_t missing_regions = 0;
+  };
+  const auto summarize_need = [&](std::span<const std::uint8_t> frames) {
+    NeedSummary result;
+    for (const wire::FrameView &frame : wire::parse_frames(frames)) {
+      if (frame.kind != P29WireKind::Need)
+        continue;
+      require(!result.present, "speculative NEED has duplicate frames");
+      const std::vector<std::uint8_t> decoded = messages.decode(frame.payload);
+      wire::Cursor cursor(decoded);
+      result.present = true;
+      result.missing_regions = cursor.varint();
+    }
+    return result;
+  };
 
   // F commits every decoded successor, while C advances only the sender's
   // speculative codec history. Its protocol commit witness is owned by CRoute
-  // and deliberately is not represented by P29Serializer::commit().
-  for (std::size_t ordinal = 0; ordinal != 30; ++ordinal) {
+  // and deliberately is not represented by P29Serializer::commit(). Select
+  // at most sixteen unique paths and cycle them long enough to exercise both
+  // first-use transfer and reuse without making large custom manifests
+  // vacuously fail the repeated-input witness.
+  for (const LogicalTu &tu : corpus.tus) {
+    const std::string path = tu.path.string();
+    if (std::find(selected_paths.begin(), selected_paths.end(), path) !=
+        selected_paths.end())
+      continue;
+    selected_paths.push_back(path);
+    selected_inputs.push_back(&tu);
+    if (selected_inputs.size() == 16)
+      break;
+  }
+  const std::size_t job_count = selected_inputs.size() > 1
+                                    ? long_stream_jobs
+                                    : std::size_t{30};
+
+  for (std::size_t ordinal = 0; ordinal != job_count; ++ordinal) {
+    const LogicalTu &tu = *selected_inputs[ordinal % selected_inputs.size()];
+    const std::vector<std::uint8_t> expected = read_file(tu.path);
+    const bool repeated_input = ordinal >= selected_inputs.size();
+    saw_repeated_input = saw_repeated_input || repeated_input;
+
     const std::vector<std::uint8_t> body = serializer.begin_tu(*tu.regions);
     const std::vector<wire::FrameView> body_frames = wire::parse_frames(body);
     const bool has_block_definition = std::any_of(
@@ -591,36 +649,149 @@ void run_speculative_advancement_control(
     const std::vector<std::uint8_t> predicted =
         serializer.predicted_need_frames();
     saw_empty_need = saw_empty_need || predicted.empty();
-    for (const wire::FrameView& frame : wire::parse_frames(predicted)) {
-      if (frame.kind != P29WireKind::Need)
-        continue;
-      const std::vector<std::uint8_t> decoded = messages.decode(frame.payload);
-      wire::Cursor cursor(decoded);
-      saw_zero_missing_need = saw_zero_missing_need || cursor.varint() == 0;
-    }
     const std::vector<std::uint8_t> need = deserializer.receive_body(body);
     require(predicted == need,
             "speculative sender's predicted NEED differs from F decoder");
+    const NeedSummary need_summary = summarize_need(predicted);
+    saw_zero_missing_need = saw_zero_missing_need ||
+                            (need_summary.present &&
+                             need_summary.missing_regions == 0);
+    saw_nonzero_missing_need =
+        saw_nonzero_missing_need ||
+        (need_summary.present && need_summary.missing_regions != 0);
+    saw_reused_input_need =
+        saw_reused_input_need ||
+        (repeated_input &&
+         (!need_summary.present || need_summary.missing_regions == 0));
+
+    const std::vector<std::uint8_t> committed_body =
+        committed_serializer.begin_tu(*tu.regions);
+    const std::vector<std::uint8_t> committed_need =
+        committed_deserializer.receive_body(committed_body);
+    require(body == committed_body && predicted == committed_need,
+            "speculative BODY/NEED differs from canonical committed R1");
+
+    const std::vector<std::uint8_t> mutation_body =
+        mutation_serializer.begin_tu(*tu.regions);
+    require(body == mutation_body,
+            "isolated NEED mutation control has different BODY state");
+    if (!did_need_mutation_control && need_summary.present &&
+        need_summary.missing_regions != 0) {
+      const std::vector<wire::FrameView> need_frames =
+          wire::parse_frames(predicted, 1);
+      require(need_frames.size() == 1 &&
+                  need_frames.front().kind == P29WireKind::Need,
+              "nonempty NEED mutation control lacks one NEED frame");
+      const std::vector<std::uint8_t> need_raw =
+          messages.decode(need_frames.front().payload);
+      wire::Cursor need_cursor(need_raw);
+      const std::uint64_t missing_count = need_cursor.varint();
+      require(missing_count != 0,
+              "NEED mutation control lacks a missing Region");
+      std::vector<std::uint8_t> wrong_need_raw;
+      wire::put_varint(wrong_need_raw, missing_count);
+      for (std::uint64_t index = 0; index < missing_count; ++index) {
+        const std::uint64_t region = need_cursor.varint();
+        wire::put_varint(wrong_need_raw,
+                         index == 0 ? (region == 0 ? 1 : 0) : region);
+      }
+      require(need_cursor.varint() == 0 && need_cursor.empty(),
+              "NEED mutation control found malformed canonical payload");
+      wire::put_varint(wrong_need_raw, 0);
+      std::vector<std::uint8_t> wrong_need;
+      const std::vector<std::uint8_t> wrong_payload =
+          messages.encode(wrong_need_raw);
+      wire::append_frame(wrong_need, P29WireKind::Need, wrong_payload);
+
+      const P29SenderRouteState state_before =
+          mutation_sender_provider.sender_route();
+      bool rejected_wrong_region = false;
+      try {
+        (void)mutation_serializer.answer_need(wrong_need, false);
+      } catch (const std::invalid_argument &error) {
+        rejected_wrong_region =
+            std::string_view(error.what()) == "P29 NEED Region identity differs";
+      }
+      require(rejected_wrong_region,
+              "serializer accepted a validly framed wrong-Region NEED");
+      require(mutation_sender_provider.sender_route() == state_before,
+              "rejected NEED mutation changed sender route state");
+      mutation_serializer.abandon_before_fill();
+      require(mutation_sender_provider.sender_route() == state_before,
+              "pre-FILL abandon after rejected NEED changed sender state");
+      const std::vector<std::uint8_t> retry_body =
+          mutation_serializer.begin_tu(*tu.regions);
+      require(retry_body == body,
+              "mutation-control retry changed the prepared BODY");
+      did_need_mutation_control = true;
+    }
+
     const std::vector<std::uint8_t> fill = serializer.answer_need(need, false);
     const std::span<const std::uint8_t> materialized =
         deserializer.receive_fill(fill, false);
+    const std::vector<std::uint8_t> committed_fill =
+        committed_serializer.answer_need(committed_need, false);
+    const std::vector<std::uint8_t> mutation_fill =
+        mutation_serializer.answer_need(predicted, false);
+    const std::span<const std::uint8_t> committed_materialized =
+        committed_deserializer.receive_fill(committed_fill, false);
+    require(fill == committed_fill,
+            "speculative FILL differs from canonical committed R1");
+    require(mutation_fill == committed_fill,
+            "NEED mutation-control retry differs from canonical R1 FILL");
     require(materialized.size() == expected.size() &&
                 std::equal(materialized.begin(), materialized.end(),
                            expected.begin()),
             "speculative F decoder materialized different raw bytes");
+    require(committed_materialized.size() == expected.size() &&
+                std::equal(committed_materialized.begin(),
+                           committed_materialized.end(), expected.begin()) &&
+                icecc::digest128(materialized) ==
+                    icecc::digest128(committed_materialized) &&
+                icecc::digest128(materialized) == icecc::digest128(expected),
+            "speculative/canonical raw bytes or digest differ");
+
     deserializer.commit();
+    committed_deserializer.commit();
     serializer.advance_speculative();
+    committed_serializer.commit();
+    mutation_serializer.commit();
+    require(sender_provider.sender_route() ==
+                committed_sender_provider.sender_route() &&
+                mutation_sender_provider.sender_route() ==
+                    committed_sender_provider.sender_route() &&
+                receiver_provider.receiver_route() ==
+                    committed_receiver_provider.receiver_route(),
+            "speculative route state differs from canonical committed R1");
   }
 
   const P29SenderRouteState &sender = sender_provider.sender_route();
   const P29ReceiverRouteState &receiver = receiver_provider.receiver_route();
+  require(sender == committed_sender_provider.sender_route() &&
+              receiver == committed_receiver_provider.receiver_route(),
+          "long speculative stream diverged from canonical committed R1");
   require(sender.paths == receiver.paths &&
               sender.revision == receiver.revision &&
               sender.known_region_count == receiver.known_region_count &&
               sender.known_block_count == receiver.known_block_count,
-          "30-step speculative codec advancement diverged from F route state");
-  require(saw_empty_need && saw_zero_missing_need && saw_block_reuse,
-          "speculative NEED parity missed empty, zero-missing, or block-reuse cases");
+          "long speculative codec stream diverged from F route state");
+  require(selected_inputs.size() == selected_paths.size(),
+          "speculative control selected duplicate input paths");
+  require(saw_empty_need && saw_zero_missing_need &&
+              saw_nonzero_missing_need && saw_block_reuse &&
+              did_need_mutation_control && saw_reused_input_need &&
+              (corpus.tus.size() == 1 || saw_repeated_input),
+          "speculative NEED parity missed empty/nonzero/zero/reuse/long-stream coverage");
+  std::cout << "P29_SPECULATIVE_ADVANCEMENT_PASS jobs=" << job_count
+            << " unique_inputs=" << selected_inputs.size()
+            << " repeated_input=" << saw_repeated_input
+            << " empty_need=" << saw_empty_need
+            << " zero_missing=" << saw_zero_missing_need
+            << " nonzero_missing=" << saw_nonzero_missing_need
+            << " reused_input_zero_missing=" << saw_reused_input_need
+            << " block_reuse=" << saw_block_reuse
+            << " canonical_r1_state_parity=1 mutation_rejected="
+            << did_need_mutation_control << '\n';
 }
 
 [[nodiscard]] std::vector<std::uint8_t>
