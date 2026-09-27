@@ -67,8 +67,12 @@ Binary SHA256 `49c9b6264b4e82cca250ac1bf8952ca2709634898f6dd5379f627ad3410f3365`
 An earlier default service run passed, but final-source `service-default-r3.log`
 failed the existing D07 `one_link` assertion after a live-interrupted-reservation
 refusal. This remains under investigation; focused cap passes do not turn
-that full-suite failure into a pass. Metadata and measured memory bounds
-remain separate open coverage.
+that full-suite failure into a pass. A diagnostic combined-D07 run and full
+service rerun (`service-default-d07-trace-r1.log`) subsequently pass with
+expected connection counts and no live-reservation rejection. They do not
+explain the earlier failure, whose exact count/subcase was not logged;
+bounded repetition and causal-order analysis continue. Metadata and measured
+memory bounds remain separate open coverage.
 
 ### Delayed old-generation connector completion
 
