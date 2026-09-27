@@ -81,7 +81,7 @@ The registered run was explicitly forced after a UV setup failure and a
 Make no-op; neither earlier attempt counts as a pass. This is not a fresh
 full candidate QA or sanitizer qualification of the added fixture.
 
-### External receipt-window harness: implemented, workload not qualified
+### External receipt-window harness: P29 W1 passed, W30 pending
 
 `f60381ab` makes the R2 client's requested window selectable through
 `ICECC_P50_PIPELINE_WINDOW` (default 30). `162f744e` through `b740c5b6`
@@ -110,12 +110,22 @@ Inspection of the immutable `9e5692e4` scheduler confirms that it withholds
 R2 handoffs when this setting is absent. Corrected configuration and a
 scenario-validation regression are required before rerunning; no external
 window pass or product-code fix is claimed from this diagnosis.
+Corrected attempt `w30-luna-w1-p29-20260927-o` now passes P29V1/W1:
+31 jobs, zero failures, exact local-SHA outputs, and one held receipt at
+ordinal 1 under negotiated window 1. Relationship/reservation identities,
+epoch 1 and physical link generation 1 are recorded in
+`/tanksmall/scratch/tmp/luna-w30-current-build/w1-o-run.json` (`COMPLETE`).
+Its first invocation stopped before the workload on a checksum-output
+format mismatch; that failure is retained separately as
+`w1-o-run-stagefail.stderr`. The corrected invocation reused the still-clean
+UP farm. This is a real cross-host W1 result, not W30 occupancy, other-profile
+qualification, or a whole-build speed measurement.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
 `/tanksmall/scratch/ictmp/experiments/icecream/integration/results/w30-luna-w1-p29-20260926-j/`.
 The earlier q5 storage refusal was followed by a bounded 313 MB/s recheck;
-the 200 MB/s threshold was not changed. No external W1/W30 pass is claimed.
+the 200 MB/s threshold was not changed. External W30 remains unqualified.
 
 ### Malformed R2 records preserve committed inputs
 
