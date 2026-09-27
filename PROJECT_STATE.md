@@ -25,6 +25,18 @@ receipt execution is prepared with the corrected runtime diagnostic selection;
 the external run has now released the shared farm lock.
 See the operator example in `farmharness/integration/tests/README.md`.
 
+Local preflight now recognizes simple ZFS pools with direct block-device
+leaves, rather than requiring the mount source itself to begin with `/dev/`.
+It verifies the exact dataset/mount relationship, pool health and every
+leaf's rotation status; unsupported layouts are rejected. Free-space and
+write-probe requirements remain unchanged. The focused lifecycle/transport/
+planning suite passed 374 tests; log
+`/tanksmall/scratch/tmp/p51-local-multilink-run1/zfs-focused-r3.log`, SHA256
+`0473c7a209ad2bcc4a930dca5566d7f791b2e89d0ee6b39f91a7c0658566f36b`.
+A real read-only probe verified the designated ZFS scratch dataset and its
+two nonrotational leaves. This does not yet prove a complete local farm run;
+no root-filesystem storage workaround was used.
+
 The candidate now materializes 36 receipt-window scenarios: C1F2/3/4 and
 C2/3/4F1, W1/W30, and P29V1/ZSTD_TU/ZSTD_ROUTE. It checks exact per-link
 worker assignments, fills each link's initial window before dispatching suffix
@@ -185,8 +197,14 @@ cannot become numeric evidence. Run `d18-p29-diagnostics-20260927-5` is now
 terminal **FAIL**: all 300 jobs compiled remotely with exact outputs, zero
 local fallbacks, valid accounting, and 15 matching oracle samples. Its only
 failed clause is `retries.bounded`: six R2 jobs recorded retries against the
-configured maximum of zero. Their cause is under offline investigation;
-the retry limit has not been relaxed. Cell wall was 1,283,935 ms. The runtime
+configured maximum of zero. The six cases follow the endpoint's 60-second
+idle timeout: one after the canary/preparation gap, five after the five long
+preceding compilations. The receipt reader exits on an empty queue, leaving
+idle EOF undetected until the next bundle starts. Each case has one compiler
+assignment and one F commit, but two source-bundle attempts. A pre-bundle
+idle-closure check is being implemented separately; it is not yet qualified.
+The retry limit and idle timeout have not been relaxed. Cell wall was
+1,283,935 ms. The runtime
 remains the older 9e image, not the newly built be667 image.
 Evidence under
 `/tanksmall/scratch/ictmp/experiments/icecream/integration/results/d18-p29-diagnostics-20260927-5/`:
