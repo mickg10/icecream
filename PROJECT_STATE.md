@@ -113,6 +113,21 @@ to launch C. Read-only SSH/Docker readiness checks succeeded and the
 Implementer confirmed their benchmark farm is separate. Cross-host W30
 occupancy testing remains in development; this is not a farm-test pass.
 
+### Focused formal requalification
+
+The focused pipeline runner passed on the combined source: recovery 44 rows;
+replacement six safety, six witness, two reset-confirmation witness and four
+expected-counterexample rows; final `PIPELINE-FORMAL-TLC PASS lanes=2`.
+TLC 1.7.4 used two workers, a 2 GiB heap and 120-second per-row limits.
+The 62 row logs and states are retained beneath
+`/tanksmall/scratch/tmp/p51-dbb010ba-qualified/tlc-state/`.
+The sibling `logs/pipeline-formal-receipt.md` records the invocation, tool,
+module and runtime-source hashes; `logs/formal-row-log-sha256.txt` indexes
+every row log and has SHA256
+`4d941071ea9aafc567e85b42cb9829c761f7319d41b049aa5a9e3114b877a034`.
+These bounded models start after Initial establishment. This is not a formal
+proof of the new Initial behavior, arbitrary W30 interleavings, or C++ safety.
+
 ### Third paired corpus: ClickHouse programs32
 
 The 63-cell ClickHouse paired transfer matrix passes with exact decoded
