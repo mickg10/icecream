@@ -372,6 +372,9 @@ def _driver_command(
     link_map = ""
     link_endpoint_map = ""
     link_window = ""
+    retry_endpoint_map = ""
+    phase2_first = 0
+    phase2_release = ""
     if receipt_links:
         client_links = [link for link in receipt_links if link["client"] == client["name"]]
         workers_by_name = {
@@ -379,15 +382,42 @@ def _driver_command(
             for item in plan["topology"]["instances"]
             if item["role"] == "F"
         }
-        link_map = ",".join(
+        link_map_parts = [
             f"{link['first_job']}-{link['last_job']}={link['worker']}"
             for link in client_links
-        )
-        link_endpoint_map = ",".join(
+        ]
+        endpoint_parts = [
             f"{link['first_job']}-{link['last_job']}="
             f"{workers_by_name[link['worker']]['address']}:{plan['ports']['instances'][link['worker']]}"
             for link in client_links
-        )
+        ]
+        restart = receipt_gate.get("restart_extension")
+        if restart is not None:
+            affected = restart["affected_link"]
+            if affected["client"] == client["name"]:
+                phase2_first = max(link["last_job"] for link in client_links) + 1
+                phase2_last = phase2_first + int(receipt_gate["negotiated_window"])
+                link_map_parts.append(
+                    f"{phase2_first}-{phase2_last}={affected['worker']}"
+                )
+                endpoint_parts.append(
+                    f"{phase2_first}-{phase2_last}="
+                    f"{workers_by_name[affected['worker']]['address']}:{plan['ports']['instances'][affected['worker']]}"
+                )
+                phase2_release = f"/results/workload/{turn}/d09-phase2-release"
+                healthy = restart["healthy_link"]
+                healthy_worker = workers_by_name[healthy["worker"]]
+                affected_spec = next(
+                    link for link in client_links
+                    if (link["client"], link["worker"])
+                    == (affected["client"], affected["worker"])
+                )
+                retry_endpoint_map = (
+                    f"{affected_spec['first_job']}-{affected_spec['last_job']}="
+                    f"{healthy_worker['address']}:{plan['ports']['instances'][healthy['worker']]}"
+                )
+        link_map = ",".join(link_map_parts)
+        link_endpoint_map = ",".join(endpoint_parts)
         if not link_map:
             raise WorkloadError(f"no receipt-window route map for client {client['name']}")
         link_window = str(receipt_gate["negotiated_window"])
@@ -443,6 +473,11 @@ def _driver_command(
             *(("--env", f"ICEFARM_P51_LINK_MAP={link_map}") if link_map else ()),
             *(("--env", f"ICEFARM_P51_LINK_ENDPOINT_MAP={link_endpoint_map}") if link_endpoint_map else ()),
             *(("--env", f"ICEFARM_P51_LINK_WINDOW={link_window}") if link_window else ()),
+            *(("--env", f"ICEFARM_P51_PHASE2_FIRST={phase2_first}",
+               "--env", f"ICEFARM_P51_PHASE2_RELEASE={phase2_release}")
+              if phase2_first and phase2_release else ()),
+            *(("--env", f"ICEFARM_P51_RETRY_ENDPOINT_MAP={retry_endpoint_map}")
+              if retry_endpoint_map else ()),
             *(
                 (
                     "--env",
@@ -745,6 +780,7 @@ def _run_p51_receipt_window_multilink(
     factory: CommandFactory,
     transport: RecordingTransport,
     turn: str,
+    event_controller: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the existing receipt gate once per explicit C→F relationship."""
     workload = scenario.data["workload"]
@@ -776,8 +812,12 @@ def _run_p51_receipt_window_multilink(
     # dispatches every link's first negotiated window before any suffix, then
     # naturally reaches suffix ranges in ordinal order.
     gate_rows.sort(key=lambda row: (row["client"]["name"], row["spec"]["first_job"]))
+    restart_spec = gate_spec.get("restart_extension")
+    restart_receipt: dict[str, Any] | None = None
+    phase2_row: dict[str, Any] | None = None
 
     gate_futures: dict[tuple[str, str], Any] = {}
+    sidecar_uids: dict[str, int] = {}
     completed = False
     deadline_s = max(timeout_s, int(scenario.data["timeouts"]["turn_s"]))
     try:
@@ -805,6 +845,7 @@ def _run_p51_receipt_window_multilink(
                 raise WorkloadError("receipt gate could not identify the C sidecar UID") from exc
             if sidecar_uid <= 0:
                 raise WorkloadError("receipt gate requires a distinct non-root C sidecar UID")
+            sidecar_uids[client["name"]] = sidecar_uid
             _stage_p51_iptables_bundle(farm, plan, client, factory, transport)
             _p51_gate_call(
                 farm, plan, client, factory, transport, "install-test-iptables",
@@ -874,7 +915,7 @@ def _run_p51_receipt_window_multilink(
             farm, plan, clients[0], factory, transport, "prepare-root-control-dir",
             ("/bin/mkdir", "-p", "/results/p51-receipt-gate"),
         )
-        with ThreadPoolExecutor(max_workers=len(gate_rows) + len(clients)) as executor:
+        with ThreadPoolExecutor(max_workers=len(gate_rows) + len(clients) + 1) as executor:
             running_gates = {
                 key: executor.submit(transport.invoke, command)
                 for key, command in gate_futures.items()
@@ -962,7 +1003,260 @@ def _run_p51_receipt_window_multilink(
 
                 summaries: list[dict[str, Any]] = []
                 output_progress: list[dict[str, Any]] = []
-                for row_index, row in enumerate(gate_rows):
+                if restart_spec is not None:
+                    if event_controller is None:
+                        raise WorkloadError("D09 restart requires the authenticated event controller")
+                    affected = restart_spec["affected_link"]
+                    healthy = restart_spec["healthy_link"]
+                    affected_key = (affected["client"], affected["worker"])
+                    healthy_key = (healthy["client"], healthy["worker"])
+                    affected_row = next(
+                        row for row in gate_rows
+                        if (row["spec"]["client"], row["spec"]["worker"]) == affected_key
+                    )
+                    healthy_row = next(
+                        row for row in gate_rows
+                        if (row["spec"]["client"], row["spec"]["worker"]) == healthy_key
+                    )
+                    restart_receipt = event_controller.stop_worker_for_receipt_gate(
+                        affected["worker"], turn
+                    )
+                    stop_observed_ms = int(time.time_ns() // 1_000_000)
+                    affected_client = affected_row["client"]
+                    affected_gate_dir = affected_row["gate_dir"]
+                    # The helper is blocked while holding the complete COMMIT
+                    # window, so it cannot observe F's EOF until its explicit
+                    # abort path releases that wait. Retire only this gate after
+                    # the exact F stop; the discarded marker records that the
+                    # old window was not mistaken for a successful completion.
+                    _p51_gate_call(
+                        farm, plan, affected_client, factory, transport,
+                        f"d09-abort-stopped-{affected['worker']}",
+                        ("/usr/bin/touch", f"{affected_gate_dir}/abort"),
+                    )
+                    discarded_marker = _p51_wait_marker(
+                        farm, plan, affected_client, factory, transport,
+                        f"{affected_gate_dir}/discarded-1", timeout_s=5,
+                    )
+                    if discarded_marker != "explicit abort discarded held COMMIT interval\n":
+                        raise WorkloadError(
+                            "D09 stopped F gate lacks its explicit held-window retirement witness"
+                        )
+                    old_gate_result = running_gates[affected_key].result(timeout=timeout_s + 5)
+                    if old_gate_result.returncode != 0:
+                        raise WorkloadError(
+                            "D09 stopped F helper command failed: "
+                            f"{old_gate_result.stderr.strip()}"
+                        )
+                    old_gate_exit = _p51_wait_marker(
+                        farm, plan, affected_client, factory, transport,
+                        f"{affected_gate_dir}/exit", timeout_s=5,
+                    )
+                    try:
+                        old_gate_status = int((old_gate_exit or "").strip())
+                    except ValueError as exc:
+                        raise WorkloadError("D09 stopped F gate did not publish an exit status") from exc
+                    if old_gate_status == 0:
+                        raise WorkloadError("D09 F stop did not terminate the old receipt helper")
+                    old_gate_loss = {
+                        "helper_exit_status": old_gate_status,
+                        "retirement": "explicit-abort-after-f-stop",
+                        "discarded_marker": discarded_marker.rstrip("\n"),
+                    }
+                    healthy_client = healthy_row["client"]
+                    healthy_gate_dir = healthy_row["gate_dir"]
+                    _p51_gate_call(
+                        farm, plan, healthy_client, factory, transport,
+                        f"d09-release-healthy-{healthy['worker']}",
+                        ("/usr/bin/touch", f"{healthy_gate_dir}/release-1"),
+                    )
+                    healthy_released = _p51_wait_marker(
+                        farm, plan, healthy_client, factory, transport,
+                        f"{healthy_gate_dir}/released-1", timeout_s=35,
+                    )
+                    if healthy_released is None:
+                        raise WorkloadError("D09 healthy F gate did not acknowledge release while affected F was stopped")
+                    healthy_first = healthy_row["spec"]["first_job"]
+                    healthy_last = healthy_row["spec"]["last_job"]
+                    healthy_endpoint = f"{healthy_row['worker']['address']}:{healthy_row['port']}"
+                    healthy_check = _p51_link_output_check_argv(
+                        healthy["client"], healthy_first, healthy_last,
+                        healthy["worker"], healthy_endpoint, turn,
+                    )
+                    healthy_deadline = time.monotonic() + deadline_s
+                    while time.monotonic() < healthy_deadline:
+                        probe = factory.make(
+                            phase="run.p51-receipt-window.d09-healthy-output-while-stopped",
+                            host=healthy_client["host"], instance=healthy["client"],
+                            transport=_docker_transport(farm, healthy_client["host"]),
+                            timeout_s=20,
+                            argv=docker_argv(farm, healthy_client["host"], (
+                                "exec", "--user", "0",
+                                f"icefarm-{plan['run_id']}-{healthy['client']}",
+                                *healthy_check,
+                            )),
+                        )
+                        result = transport.invoke(probe)
+                        if _p51_link_outputs_complete(
+                            result.stdout, client=healthy["client"],
+                            first_job=healthy_first, last_job=healthy_last,
+                            expected_worker=healthy["worker"], expected_endpoint=healthy_endpoint,
+                        ):
+                            break
+                        time.sleep(0.2)
+                    else:
+                        raise WorkloadError("D09 healthy link did not complete exact output while affected F was stopped")
+                    output_progress.append({
+                        "client": healthy["client"], "worker": healthy["worker"],
+                        "first_job": healthy_first, "last_job": healthy_last,
+                        "while_worker_stopped": affected["worker"], "verified": True,
+                    })
+                    stopped_interval_ms = int(time.time_ns() // 1_000_000) - stop_observed_ms
+                    restart_receipt = event_controller.start_worker_for_receipt_gate(restart_receipt)
+                    restart_receipt["old_gate_loss"] = old_gate_loss
+                    restart_receipt["healthy_progress"] = {
+                        "client": healthy["client"], "worker": healthy["worker"],
+                        "first_job": healthy_first, "last_job": healthy_last,
+                        "verified_while_stopped": True,
+                    }
+                    restart_receipt["stopped_interval_ms"] = stopped_interval_ms
+
+                    phase2_first = max(row["spec"]["last_job"] for row in gate_rows) + 1
+                    phase2_last = phase2_first + int(gate_spec["negotiated_window"])
+                    client = affected_row["client"]
+                    worker = affected_row["worker"]
+                    phase2_row = {
+                        "client": client, "worker": worker,
+                        "port": affected_row["port"],
+                        "spec": {**affected_row["spec"], "first_job": phase2_first, "last_job": phase2_last},
+                        "gate_dir": f"/results/p51-receipt-gate/links/{affected['client']}-{affected['worker']}-phase2",
+                    }
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport, "d09-prepare-phase2-dir",
+                        ("/bin/mkdir", "-p", phase2_row["gate_dir"]),
+                    )
+                    uid = sidecar_uids[client["name"]]
+                    phase2_dir = phase2_row["gate_dir"]
+                    gate_shell = (
+                        'gate_dir=$1; shift; set +e; "$@" 2> "$gate_dir/helper.stderr"; rc=$?; '
+                        'cat "$gate_dir/helper.stderr" >&2; printf "%s\\n" "$rc" > "$gate_dir/exit"; exit 0'
+                    )
+                    phase2_argv = docker_argv(
+                        farm, client["host"], (
+                            "exec", "--user", "0", "--env", "ICECC_TEST_POSITIVE_DAEMON=1",
+                            f"icefarm-{plan['run_id']}-{client['name']}", "/bin/sh", "-c", gate_shell,
+                            "receipt-gate", phase2_dir, gate_binary, "--p51-commit-receipt-gate-remote",
+                            worker["address"], str(phase2_row["port"]), str(uid),
+                            str(gate_spec["expected_commits"]), "1", phase2_dir,
+                        ),
+                    )
+                    phase2_command = factory.make(
+                        phase="run.p51-receipt-window.d09-phase2-gate",
+                        host=client["host"], instance=client["name"],
+                        transport=_docker_transport(farm, client["host"]), timeout_s=timeout_s,
+                        argv=phase2_argv,
+                    )
+                    phase2_future = executor.submit(transport.invoke, phase2_command)
+                    phase2_ready = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{phase2_dir}/ready", timeout_s=20,
+                    )
+                    if phase2_ready is None:
+                        raise WorkloadError("D09 replacement F receipt gate did not become ready")
+                    release_path = f"/results/workload/{turn}/d09-phase2-release"
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport, "d09-release-phase2-worklist",
+                        ("/usr/bin/touch", release_path),
+                    )
+                    phase2_held_text = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{phase2_dir}/held-1", timeout_s=40,
+                    )
+                    if phase2_held_text is None:
+                        raise WorkloadError("D09 replacement F did not hold a fresh W30 cohort")
+                    phase2_held = _p51_check_held_marker(
+                        phase2_held_text, expected=int(gate_spec["expected_commits"]),
+                        profile=expected_profile, negotiated_window=int(gate_spec["negotiated_window"]),
+                    )
+                    phase2_identity_text = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{phase2_dir}/identity-1", timeout_s=5,
+                    )
+                    if phase2_identity_text is None:
+                        raise WorkloadError("D09 replacement F lacks a scoped fresh identity")
+                    phase2_identity = _p51_check_scoped_identity_marker(phase2_identity_text, phase2_held)
+                    if (
+                        phase2_identity["f_store_guid"] == affected_row["identity"]["f_store_guid"]
+                        and phase2_identity["f_store_generation"] == affected_row["identity"]["f_store_generation"]
+                    ):
+                        raise WorkloadError("D09 F restart reused the old F store identity")
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport, "d09-release-phase2-window",
+                        ("/usr/bin/touch", f"{phase2_dir}/release-1"),
+                    )
+                    if _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{phase2_dir}/released-1", timeout_s=35,
+                    ) is None:
+                        raise WorkloadError("D09 replacement F gate release was not acknowledged")
+                    phase2_endpoint = f"{worker['address']}:{phase2_row['port']}"
+                    phase2_check = _p51_link_output_check_argv(
+                        affected["client"], phase2_first, phase2_last,
+                        affected["worker"], phase2_endpoint, turn,
+                    )
+                    phase2_deadline = time.monotonic() + deadline_s
+                    while time.monotonic() < phase2_deadline:
+                        probe = factory.make(
+                            phase="run.p51-receipt-window.d09-phase2-output",
+                            host=client["host"], instance=client["name"],
+                            transport=_docker_transport(farm, client["host"]), timeout_s=20,
+                            argv=docker_argv(farm, client["host"], (
+                                "exec", "--user", "0", f"icefarm-{plan['run_id']}-{client['name']}",
+                                *phase2_check,
+                            )),
+                        )
+                        output = transport.invoke(probe)
+                        if _p51_link_outputs_complete(
+                            output.stdout, client=affected["client"], first_job=phase2_first,
+                            last_job=phase2_last, expected_worker=affected["worker"],
+                            expected_endpoint=phase2_endpoint,
+                        ):
+                            break
+                        time.sleep(0.2)
+                    else:
+                        raise WorkloadError("D09 second F cohort did not complete exact output")
+                    output_progress.append({
+                        "client": affected["client"], "worker": affected["worker"],
+                        "first_job": phase2_first, "last_job": phase2_last,
+                        "store_restarted": True, "verified": True,
+                    })
+                    phase2_row["held"] = phase2_held
+                    phase2_row["identity"] = phase2_identity
+                    restart_receipt["phase2"] = {
+                        "first_job": phase2_first, "last_job": phase2_last,
+                        "held": phase2_held, "identity": phase2_identity,
+                        "worker": affected["worker"], "verified": True,
+                        "old_gate_exit_status": old_gate_status,
+                    }
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport, "d09-finish-phase2-gate",
+                        ("/usr/bin/touch", f"{phase2_dir}/finish"),
+                    )
+                    phase2_result = phase2_future.result()
+                    phase2_exit = _p51_wait_marker(
+                        farm, plan, client, factory, transport, f"{phase2_dir}/exit", timeout_s=5,
+                    )
+                    if (
+                        phase2_exit != "0\n"
+                        or P51_NEGOTIATED_RE.search(phase2_result.stderr) is None
+                        or not _p51_negotiation_matches(
+                            P51_NEGOTIATED_RE.search(phase2_result.stderr),
+                            profile=expected_profile, window=int(gate_spec["negotiated_window"]),
+                        )
+                    ):
+                        raise WorkloadError("D09 replacement F gate did not exit cleanly")
+                    restart_receipt["phase2"]["gate_completed"] = True
+                for row_index, row in enumerate([] if restart_spec is not None else gate_rows):
                     client = row["client"]
                     gate_dir = row["gate_dir"]
                     key = (client["name"], row["worker"]["name"])
@@ -1110,6 +1404,31 @@ def _run_p51_receipt_window_multilink(
                         farm, plan, client, factory, transport,
                         f"{row['gate_dir']}/exit", timeout_s=5,
                     )
+                    is_stopped_affected = (
+                        restart_spec is not None
+                        and key == (
+                            restart_spec["affected_link"]["client"],
+                            restart_spec["affected_link"]["worker"],
+                        )
+                    )
+                    if is_stopped_affected:
+                        try:
+                            failed_status = int((exit_text or "").strip())
+                        except ValueError as exc:
+                            raise WorkloadError("D09 stopped F gate lacks an exit status") from exc
+                        if failed_status == 0 or restart_receipt is None:
+                            raise WorkloadError("D09 stopped F gate did not report its connection loss")
+                        gate_evidence.append({
+                            **row["held"], **row["identity"],
+                            "client": key[0], "worker": key[1],
+                            "worker_address": row["worker"]["address"],
+                            "worker_port": row["port"],
+                            "first_job": row["spec"]["first_job"],
+                            "last_job": row["spec"]["last_job"],
+                            "stopped_by_restart": True,
+                            "helper_exit_status": failed_status,
+                        })
+                        continue
                     if (
                         exit_text != "0\n"
                         or P51_NEGOTIATED_RE.search(gate_result.stderr) is None
@@ -1129,6 +1448,19 @@ def _run_p51_receipt_window_multilink(
                         "first_job": row["spec"]["first_job"],
                         "last_job": row["spec"]["last_job"],
                     })
+                if restart_spec is not None and phase2_row is not None:
+                    gate_evidence.append({
+                        **phase2_row["held"], **phase2_row["identity"],
+                        "client": phase2_row["client"]["name"],
+                        "worker": phase2_row["worker"]["name"],
+                        "worker_address": phase2_row["worker"]["address"],
+                        "worker_port": phase2_row["port"],
+                        "first_job": phase2_row["spec"]["first_job"],
+                        "last_job": phase2_row["spec"]["last_job"],
+                        "after_restart": True,
+                    })
+                if restart_spec is not None and restart_receipt is not None:
+                    restart_receipt["schema"] = "icefarm-p51-held-f-restart-v1"
                 completed = True
             finally:
                 for row in gate_rows:
@@ -1156,13 +1488,39 @@ def _run_p51_receipt_window_multilink(
                             ))
                         except BaseException:
                             pass
+                if phase2_row is not None:
+                    for marker in ("abort", "release-1", "release-phase2", "finish"):
+                        try:
+                            _p51_gate_call(
+                                farm, plan, phase2_row["client"], factory, transport,
+                                f"cleanup-d09-phase2-{marker}",
+                                ("/usr/bin/touch", f"{phase2_row['gate_dir']}/{marker}"),
+                            )
+                        except BaseException:
+                            pass
+                # A failure between stopping and authenticated restart must not
+                # strand the selected worker.  The start operation accepts the
+                # exact stop receipt and is idempotent if start succeeded but
+                # a later readiness check raised.
+                if (
+                    restart_spec is not None
+                    and restart_receipt is not None
+                    and "after" not in restart_receipt
+                    and event_controller is not None
+                ):
+                    try:
+                        event_controller.start_worker_for_receipt_gate(restart_receipt)
+                    except BaseException as exc:
+                        raise WorkloadError(
+                            "D09 cleanup could not restore the stopped F worker"
+                        ) from exc
 
         evidence = {
             "profile": expected_profile,
             "negotiated_window": int(gate_spec["negotiated_window"]),
             "links": gate_evidence,
             "release_order_output_progress": output_progress,
-            "restart_extension": "pending-not-run",
+            "restart_extension": restart_receipt if restart_spec is not None else "pending-not-run",
         }
         return summaries, evidence
     except BaseException:
@@ -2033,7 +2391,8 @@ def run_workload(
                 receipt_gate = scenario.data["workload"]["receipt_gate"]
                 if receipt_gate.get("links"):
                     summaries, window_evidence = _run_p51_receipt_window_multilink(
-                        farm, scenario, plan, clients, factory, transport, turn
+                        farm, scenario, plan, clients, factory, transport, turn,
+                        event_controller=events,
                     )
                     for summary in summaries:
                         total = totals[summary["client"]]

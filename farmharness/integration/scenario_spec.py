@@ -262,6 +262,15 @@ def _validate_p51_receipt_window(
 ) -> None:
     links = workload["receipt_gate"].get("links")
     multilink = links is not None
+    restart_extension = workload["receipt_gate"].get("restart_extension")
+    if restart_extension is not None and not multilink:
+        raise ScenarioSpecError(
+            "$.workload.receipt_gate.restart_extension: requires multi-link receipt mode"
+        )
+    if restart_extension is not None and workload["receipt_gate"].get("negotiated_window") != 30:
+        raise ScenarioSpecError(
+            "$.workload.receipt_gate.restart_extension: held worker restart requires W30"
+        )
     selected_clients = {item["name"] for item in role_instances["C"]}
     selected_workers = {item["name"] for item in role_instances["F"]}
     if (
@@ -337,13 +346,16 @@ def _validate_p51_receipt_window(
         )
 
     if multilink:
+        restart = gate.get("restart_extension")
         if not gate["expect_observed"]:
             raise ScenarioSpecError("$.workload.receipt_gate.links: multi-link gates are positive only")
-        if len(selected_clients) != 1 and len(selected_workers) != 1:
+        if (len(selected_clients) != 1 and len(selected_workers) != 1) or (
+            restart is not None and (len(selected_clients) != 1 or len(selected_workers) != 2)
+        ):
             raise ScenarioSpecError(
                 "$.workload.receipt_gate.links: only one-to-many or many-to-one topologies are supported"
             )
-        if len(links) < 2:
+        if len(links) < 2 or (restart is not None and len(links) != 2):
             raise ScenarioSpecError("$.workload.receipt_gate.links: requires multiple links")
         by_name = {item["name"]: item for item in role_instances["C"] + role_instances["F"]}
         seen_pairs: set[tuple[str, str]] = set()
@@ -382,6 +394,7 @@ def _validate_p51_receipt_window(
                 "$.workload.receipt_gate.links: must cover every selected C/F relationship exactly once"
             )
 
+        initial_end_by_client: dict[str, int] = {}
         for client_name, ranges in ranges_by_client.items():
             ordered = sorted(ranges)
             cursor = 1
@@ -392,10 +405,32 @@ def _validate_p51_receipt_window(
                         "contiguous, disjoint, and cover the full manifest"
                     )
                 cursor = last + 1
-            if cursor - 1 != manifest_jobs:
+            initial_end_by_client[client_name] = cursor - 1
+            if restart is None and cursor - 1 != manifest_jobs:
                 raise ScenarioSpecError(
                     f"$.workload.receipt_gate.links: {client_name} ranges do not cover "
                     "the full manifest"
+                )
+        if restart is not None:
+            client_name = next(iter(selected_clients))
+            initial_end = initial_end_by_client[client_name]
+            affected = restart["affected_link"]
+            healthy = restart["healthy_link"]
+            affected_pair = (affected["client"], affected["worker"])
+            healthy_pair = (healthy["client"], healthy["worker"])
+            if (
+                restart.get("kind") != "held-f-restart-v1"
+                or affected_pair not in seen_pairs
+                or healthy_pair not in seen_pairs
+                or affected_pair == healthy_pair
+                or affected["client"] != client_name
+                or healthy["client"] != client_name
+                or selected_workers != {affected["worker"], healthy["worker"]}
+                or manifest_jobs != initial_end + negotiated + 1
+            ):
+                raise ScenarioSpecError(
+                    "$.workload.receipt_gate.restart_extension: requires C1F2, two initial links, "
+                    "and one post-restart window plus trailing transfer"
                 )
         for client_name, total in windows_by_client.items():
             if workload["jobs"] < total:

@@ -883,7 +883,8 @@ path = pathlib.Path(sys.argv[1])
 offset = int(sys.argv[2])
 target = sys.argv[3]
 profile = sys.argv[4].lower()
-include_loss = len(sys.argv) == 6 and sys.argv[5] == "include-loss"
+role_protocol, cache_wire, cache_protocol = (int(value) for value in sys.argv[5:8])
+include_loss = len(sys.argv) == 9 and sys.argv[8] == "include-loss"
 try:
     payload = path.read_bytes()[offset:]
 except FileNotFoundError:
@@ -891,12 +892,13 @@ except FileNotFoundError:
 lines = payload.decode("utf-8", "replace").splitlines()
 role_pattern = re.compile(
     r"\blogin\s+" + re.escape(target)
-    + r"\s+protocol\s+version:\s*50\b"
+    + r"\s+protocol\s+version:\s*" + str(role_protocol) + r"\b"
 )
 cache_pattern = re.compile(
     r"\bRELOGIN " + re.escape(target)
-    + r"\([^)]*\):.*\bcache=([^ ]+) cache_wire=v1 "
-      r"cache_protocol=1 cache_profiles=([a-z0-9_ ]+)\s*$"
+    + r"\([^)]*\):.*\bcache=([^ ]+) cache_wire=v" + str(cache_wire)
+      + r" cache_protocol=" + str(cache_protocol)
+      + r" cache_profiles=([a-z0-9_ ]+)\s*$"
 )
 role_lines = [line for line in lines if role_pattern.search(line)]
 cache_matches = []
@@ -918,11 +920,12 @@ loss_job_ids = sorted({
 document = {
     "bytes": len(payload),
     "cache_line": cache_line,
-    "cache_protocol": 1 if cache_line is not None else None,
+    "cache_protocol": cache_protocol if cache_line is not None else None,
+    "cache_wire": cache_wire if cache_line is not None else None,
     "login_line": role_line,
     "profile": profile,
     "ready": role_line is not None and cache_line is not None,
-    "role_protocol": 50 if role_line is not None else None,
+    "role_protocol": role_protocol if role_line is not None else None,
     "sha256": hashlib.sha256(payload).hexdigest(),
     "target": target,
 }
@@ -2474,6 +2477,8 @@ class EventProducer:
         profile = scheduler.get("env", {}).get("ICECC_P50_PROFILE")
         if profile not in {"P29V1", "ZSTD_TU", "ZSTD_ROUTE"}:
             raise EventError("header_edit requires a selected P50 scheduler profile")
+        p51 = target.get("env", {}).get("ICECC_P51_MODE") == "on"
+        role_protocol, cache_wire, cache_protocol = (51, 1, 2) if p51 else (50, 1, 1)
         deadline = min(
             self._start + self.deadline_s,
             self.monotonic() + float(self.scenario.data["timeouts"]["up_s"]),
@@ -2497,6 +2502,7 @@ class EventProducer:
                             str(baseline["offset"]),
                             target["name"],
                             profile,
+                            str(role_protocol), str(cache_wire), str(cache_protocol),
                             *(("include-loss",) if include_loss else ()),
                         ),
                     ),
@@ -2513,6 +2519,7 @@ class EventProducer:
                     "bytes",
                     "cache_line",
                     "cache_protocol",
+                    "cache_wire",
                     "login_line",
                     "profile",
                     "ready",
@@ -2526,19 +2533,20 @@ class EventProducer:
                 and witness["bytes"] > 0
                 and witness.get("target") == target["name"]
                 and witness.get("profile") == profile.lower()
-                and witness.get("role_protocol") == 50
+                and witness.get("role_protocol") == role_protocol
                 and isinstance(witness.get("sha256"), str)
                 and re.fullmatch(r"[0-9a-f]{64}", witness["sha256"]) is not None
-                and witness.get("cache_protocol") == 1
+                and witness.get("cache_protocol") == cache_protocol
+                and witness.get("cache_wire") == cache_wire
                 and isinstance(witness.get("login_line"), str)
                 and re.search(
-                    rf"\blogin\s+{re.escape(target['name'])}\s+protocol\s+version:\s*50\b",
+                    rf"\blogin\s+{re.escape(target['name'])}\s+protocol\s+version:\s*{role_protocol}\b",
                     witness["login_line"],
                 )
                 and isinstance(witness.get("cache_line"), str)
                 and f"RELOGIN {target['name']}" in witness["cache_line"]
-                and "cache_wire=v1" in witness["cache_line"]
-                and "cache_protocol=1" in witness["cache_line"]
+                and f"cache_wire=v{cache_wire}" in witness["cache_line"]
+                and f"cache_protocol={cache_protocol}" in witness["cache_line"]
                 and f"{profile.lower()}" in witness["cache_line"]
                 and (
                     not include_loss
@@ -2555,13 +2563,13 @@ class EventProducer:
             ):
                 result = {
                     "cache_line": witness["cache_line"],
-                    "cache_protocol": 1,
+                    "cache_protocol": cache_protocol,
                     "host": baseline["host"],
                     "login_line": witness["login_line"],
                     "log_path": baseline["path"],
                     "offset": baseline["offset"],
                     "profile": profile,
-                    "role_protocol": 50,
+                    "role_protocol": role_protocol,
                     "scheduler": scheduler["name"],
                     "target": target["name"],
                 }
@@ -5298,6 +5306,158 @@ class EventProducer:
             "instance": event.instance,
             "schema": WORKER_RESTART_SCHEMA,
             "turn": turn,
+        }
+
+    def stop_worker_for_receipt_gate(self, name: str, turn: str) -> dict[str, Any]:
+        """Stop one authenticated F while a receipt-gate caller proves a sibling."""
+        with self._lock:
+            if self._active_turn != turn:
+                raise EventError("receipt-gate worker stop is outside its active turn")
+        container, instance = self._container(name)
+        if instance.get("role") != "F":
+            raise EventError("receipt-gate restart target is not an F instance")
+        state = self._state[name]
+        expected_runtime = str(runtime_root(self.farm, instance | {"image": state["image"]}))
+        before = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if before.get("running") is not True:
+            raise EventError("receipt-gate restart target was not running before stop")
+        readiness_baseline = self._readiness_baseline(instance)
+        scheduler = next(
+            item for item in self.plan["topology"]["instances"] if item["role"] == "S"
+        )
+        scheduler_baseline = self._readiness_baseline(scheduler)
+        self._invoke(self.factory.make(
+            phase="event.receipt-gate-stop",
+            host=instance["host"], instance=name,
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(
+                self.farm, instance["host"],
+                ("container", "stop", "--time", "10", before["id"]),
+            ),
+        ))
+        stopped = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if (
+            stopped.get("id") != before["id"]
+            or stopped.get("running") is not False
+            or stopped.get("started_at") != before.get("started_at")
+        ):
+            raise EventError("receipt-gate stop lacks an authenticated stopped state")
+        return {
+            "instance": name,
+            "turn": turn,
+            "before": {"container_id": before["id"], "started_at": before["started_at"]},
+            "stopped": {
+                "container_id": stopped["id"], "started_at": stopped["started_at"],
+                "running": False,
+            },
+            "readiness_baseline": readiness_baseline,
+            "scheduler_baseline": scheduler_baseline,
+        }
+
+    def start_worker_for_receipt_gate(self, stopped_receipt: Mapping[str, Any]) -> dict[str, Any]:
+        """Restart the exact stopped F and authenticate fresh readiness/rejoin."""
+        name = stopped_receipt.get("instance")
+        turn = stopped_receipt.get("turn")
+        with self._lock:
+            if not isinstance(name, str) or self._active_turn != turn:
+                raise EventError("receipt-gate worker start is not bound to its active turn")
+        if set(stopped_receipt) != {
+            "instance", "turn", "before", "stopped", "readiness_baseline", "scheduler_baseline"
+        }:
+            raise EventError("receipt-gate stopped receipt has an invalid shape")
+        container, instance = self._container(name)
+        if instance.get("role") != "F":
+            raise EventError("receipt-gate restart target is not an F instance")
+        state = self._state[name]
+        expected_runtime = str(runtime_root(self.farm, instance | {"image": state["image"]}))
+        before = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        before_receipt = stopped_receipt.get("before")
+        stop = stopped_receipt.get("stopped")
+        if not isinstance(before_receipt, Mapping) or not isinstance(stop, Mapping):
+            raise EventError("receipt-gate stop receipt has invalid identity fields")
+        still_stopped = (
+            before.get("id") == stop.get("container_id")
+            and before.get("id") == before_receipt.get("container_id")
+            and before.get("running") is False
+            and before.get("started_at") == stop.get("started_at")
+        )
+        if not still_stopped:
+            raise EventError("receipt-gate F changed while its stop interval was active")
+        self._invoke(self.factory.make(
+            phase="event.receipt-gate-start",
+            host=instance["host"], instance=name,
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, instance["host"], ("container", "start", before["id"])),
+        ))
+        after = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if (
+            after.get("id") != before.get("id")
+            or after.get("running") is not True
+            or not isinstance(after.get("started_at"), str)
+            or after.get("started_at") == stop.get("started_at")
+        ):
+            raise EventError("receipt-gate start lacks an authenticated fresh F state")
+        scheduler = next(
+            item for item in self.plan["topology"]["instances"] if item["role"] == "S"
+        )
+        readiness = self._header_readiness_witness(
+            instance, stopped_receipt["readiness_baseline"]
+        )
+        scheduler_rejoin = self._header_scheduler_rejoin_witness(
+            scheduler, instance, stopped_receipt["scheduler_baseline"], include_loss=True
+        )
+        p51 = instance.get("env", {}).get("ICECC_P51_MODE") == "on"
+        expected_role_protocol, expected_cache_wire, expected_cache_protocol = (
+            (51, 1, 2) if p51 else (50, 1, 1)
+        )
+        if (
+            not isinstance(readiness, Mapping)
+            or readiness.get("role") != "F"
+            or not isinstance(readiness.get("line"), str)
+            or not isinstance(readiness.get("cache_line"), str)
+            or not isinstance(scheduler_rejoin, Mapping)
+            or scheduler_rejoin.get("target") != name
+            or scheduler_rejoin.get("role_protocol") != expected_role_protocol
+            or scheduler_rejoin.get("cache_protocol") != expected_cache_protocol
+            or (f"cache_wire=v{expected_cache_wire}" not in scheduler_rejoin.get("cache_line", ""))
+            or not isinstance(scheduler_rejoin.get("loss_job_ids"), list)
+            or not isinstance(scheduler_rejoin.get("sha256"), str)
+        ):
+            raise EventError("receipt-gate F restart lacks readiness or scheduler rejoin evidence")
+        deadline = min(
+            self._start + self.deadline_s,
+            self.monotonic() + float(self.scenario.data["timeouts"]["up_s"]),
+        )
+        worker_snapshot = _wait_workers(
+            self.farm, self.plan, self.recorder, self.factory,
+            deadline=deadline, monotonic=self.monotonic, sleeper=time.sleep,
+        )
+        return {
+            "schema": "icefarm-receipt-worker-restart-v1",
+            "instance": name,
+            "turn": turn,
+            "before": dict(stopped_receipt["before"]),
+            "stopped": dict(stopped_receipt["stopped"]),
+            "after": {
+                "container_id": after["id"], "started_at": after["started_at"],
+                "running": True,
+            },
+            "coordination": {
+                "readiness": readiness,
+                "scheduler_rejoin": scheduler_rejoin,
+                "worker_snapshot": worker_snapshot,
+                "workers": sorted(item["name"] for item in self.plan["topology"]["instances"] if item["role"] == "F"),
+            },
         }
 
     def _coordinated_header_edit(

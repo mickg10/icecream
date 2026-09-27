@@ -13,6 +13,7 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest, report
+from farmharness.integration import collect
 from farmharness.integration.r2_wire_trace import (
     R2_LINK_EVENT_SCHEMA,
     validate_r2_wire_trace,
@@ -59,6 +60,7 @@ from farmharness.integration.collect import (
     _unassigned_p50_failure_observation,
     _validate_preexposure_redispatches,
     _validate_orphan_recovery_markers,
+    _validate_p51_held_f_restart_receipt,
     _warm_hint_overrides,
     collect_bundle,
     load_verified_bundle,
@@ -72,7 +74,7 @@ from farmharness.integration.remote import (
     decode_ssh_payload,
 )
 from farmharness.integration.report import ReportError, report_bundle, verify_bundle
-from farmharness.integration.scenario_spec import load_scenario_spec
+from farmharness.integration.scenario_spec import ScenarioSpec, load_scenario_spec
 from farmharness.integration.schema_validation import canonical_bytes
 from farmharness.integration.verdict import (
     _assignment_preference_errors,
@@ -3292,10 +3294,13 @@ def test_worker_restart_loss_is_the_only_restart_identity_exception() -> None:
     assert _missing_compile_result_identity_reason(**kwargs) is None
 
 
-def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
+def _make_fresh_p50_retry_fixture(
+    plan: dict[str, object], root: Path, *, profile: str = "P29V1"
+) -> None:
     scheduler = next(
         item for item in plan["topology"]["instances"] if item["role"] == "S"
     )
+    scheduler.setdefault("env", {})["ICECC_P50_PROFILE"] = profile
     scheduler_log = (
         root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
     )
@@ -3324,14 +3329,14 @@ def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
         "c_guid 1 tu_seq 1\n"
         f"ICECC[2] 2026-09-05 01:00:04: Have to use host {endpoint} "
         "- Job ID: 2 - env: x86_64\n"
-        "P29V1 source committed for P50 CompileFile: 100 exact bytes, "
+        f"{profile} source committed for P50 CompileFile: 100 exact bytes, "
         "TU sequence 1\n"
         "normalizing P50 client error 14 to Error 106 for a fresh assignment\n"
         "P50 assignment identity bound for job 3 epoch 1 nonce 2 "
         "c_guid 1 tu_seq 2\n"
         f"ICECC[3] 2026-09-05 01:00:06: Have to use host {endpoint} "
         "- Job ID: 3 - env: x86_64\n"
-        "P29V1 source committed for P50 CompileFile: 100 exact bytes, "
+        f"{profile} source committed for P50 CompileFile: 100 exact bytes, "
         "TU sequence 2\n",
         encoding="utf-8",
     )
@@ -3342,6 +3347,9 @@ def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
     result_path.write_text("\t".join(fields) + "\n", encoding="utf-8")
 
     sources = [json.loads((results / "source-result.jsonl").read_text())]
+    sources[0]["profile"] = profile
+    if profile != "P29V1":
+        sources[0]["system_source_reuse"] = None
     sources.append(
         {
             **sources[0],
@@ -3390,8 +3398,8 @@ def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
     (
         root / "diagnostics" / worker["host"] / "F1.log" / "iceccd.log"
     ).write_text(
-        "P50 CompileFile attached exact P29V1 input for job 2\n"
-        "P50 CompileFile attached exact P29V1 input for job 3\n",
+        f"P50 CompileFile attached exact {profile} input for job 2\n"
+        f"P50 CompileFile attached exact {profile} input for job 3\n",
         encoding="utf-8",
     )
 
@@ -4196,6 +4204,48 @@ def test_fresh_p50_retry_binds_only_the_final_result_identity(
         }
     ]
     assert bundle["observations"]["compile_failure_job_ids"] == []
+
+
+def test_d09_observations_bind_retry_using_configured_non_p29_profile(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_fresh_p50_retry_fixture(plan, root, profile="ZSTD_TU")
+    scenario.data["workload"]["receipt_gate"] = {
+        "restart_extension": {"kind": "held-f-restart-v1"},
+    }
+    for item in plan["topology"]["instances"]:
+        name = item["name"]
+        instance_root = root / "instances" / name / "results"
+        instance_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(root / f"{name}.results", instance_root)
+    receipts = root / "receipts"
+    receipts.mkdir()
+    shutil.copy(root / "preflight.json", receipts / "preflight.json")
+
+    rows, row_facts = collect._parse_rows(scenario, plan, root, [])
+    observations = collect._observations(
+        farm, scenario, plan, root, rows, row_facts, []
+    )
+
+    assert rows[0]["tail_profile"] == "ZSTD_TU"
+    assert observations["successful_strict_p50_retry_bindings"] == [
+        {
+            "failure_reason": "result-stream-loss",
+            "final_dispatch_ms": 1_788_570_006_000,
+            "final_generation": 1,
+            "final_scheduler_job": 3,
+            "final_terminal_ms": 1_788_570_007_000,
+            "final_worker": "F1",
+            "first_dispatch_ms": 1_788_570_004_000,
+            "first_generation": 1,
+            "first_scheduler_job": 2,
+            "first_terminal": "completion",
+            "first_terminal_ms": 1_788_570_005_000,
+            "first_worker": "F1",
+            "job_id": "C1:A:1:3",
+        }
+    ]
 
 
 def test_retry_loss_witness_must_be_in_the_same_attempt_window(
@@ -5444,3 +5494,111 @@ def test_authenticated_rejoin_line_rejects_invalid_boundary(fault):
         receipt["offset"] = True
     with pytest.raises(CollectError):
         _authenticated_rejoin_line(prefix + window, receipt)
+
+
+def _d09_collector_fixture(*, affected_second: bool = True):
+    affected = {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 62}
+    healthy = {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31}
+    links = [healthy, affected] if affected_second else [affected, healthy]
+    gate = {
+        "negotiated_window": 30, "expected_commits": 30, "expect_observed": True,
+        "profile": "zstd_tu", "links": [dict(item) for item in links],
+        "restart_extension": {
+            "kind": "held-f-restart-v1",
+            "affected_link": {key: affected[key] for key in ("client", "worker")},
+            "healthy_link": {key: healthy[key] for key in ("client", "worker")},
+        },
+    }
+    scenario = ScenarioSpec(path=Path("scenario.json"), data={
+        "instances": [{"role": "S", "env": {"ICECC_P50_PROFILE": "ZSTD_TU"}}],
+        "workload": {"receipt_gate": gate},
+    })
+
+    def link_evidence(item, *, stopped=False, after=False, fstore="b" * 32, fgen=3):
+        return {
+            "client": item["client"], "worker": item["worker"],
+            "first_job": item["first_job"], "last_job": item["last_job"],
+        "count": 30, "profile": "ZSTD_TU", "negotiated_window": 30,
+            "relationship_id": "c" * 32, "reservation_id": "d" * 32,
+            "epoch": 4, "physical_link_generation": 1,
+            "c_store_guid": "a" * 32, "c_store_generation": 1,
+            "f_store_guid": fstore, "f_store_generation": fgen,
+            "stopped_by_restart": stopped, "after_restart": after,
+        }
+
+    old_f2 = link_evidence(affected, stopped=True, fstore="e" * 32, fgen=1)
+    old_f1 = link_evidence(healthy, fstore="f" * 32, fgen=2)
+    new_f2 = link_evidence({"client": "C1", "worker": "F2", "first_job": 63, "last_job": 93}, after=True)
+    restart = {
+        "schema": "icefarm-p51-held-f-restart-v1", "turn": "A", "instance": "F2",
+        "stopped_interval_ms": 100,
+        "before": {"container_id": "sha256:old", "started_at": "old"},
+        "stopped": {"container_id": "sha256:old", "started_at": "old", "running": False},
+        "after": {"container_id": "sha256:old", "started_at": "new", "running": True},
+        "old_gate_loss": {
+            "helper_exit_status": 1,
+            "retirement": "explicit-abort-after-f-stop",
+            "discarded_marker": "explicit abort discarded held COMMIT interval",
+        },
+        "healthy_progress": {
+            "client": "C1", "worker": "F1", "first_job": 1, "last_job": 31,
+            "verified_while_stopped": True,
+        },
+        "phase2": {
+            "worker": "F2", "first_job": 63, "last_job": 93,
+            "held": {"count": 30, "profile": "ZSTD_TU", "negotiated_window": 30},
+            "identity": {
+                "f_store_guid": "b" * 32, "f_store_generation": 3,
+                "relationship_id": "c" * 32, "reservation_id": "d" * 32,
+            },
+            "verified": True, "gate_completed": True, "old_gate_exit_status": 1,
+        },
+    }
+    receipt = {"turns": [{"turn": "A", "p51_receipt_window": {
+        "profile": "ZSTD_TU", "negotiated_window": 30,
+        "links": [old_f1, old_f2, new_f2], "restart_extension": restart,
+    }}]}
+    observations = {"successful_strict_p50_retry_bindings": [{
+        "first_worker": "F2", "final_worker": "F1", "failure_reason": "source-transfer-loss",
+        "job_id": "C1:A:1:33",
+    }]}
+    return receipt, scenario, observations
+
+
+@pytest.mark.parametrize("affected_second", [False, True])
+def test_d09_collector_binds_exact_affected_link_in_either_order(affected_second: bool) -> None:
+    receipt, scenario, observations = _d09_collector_fixture(affected_second=affected_second)
+    _validate_p51_held_f_restart_receipt(receipt, scenario, observations)
+
+
+@pytest.mark.parametrize(
+    "mutation", [
+        "wrong-client", "wrong-retry-worker", "malformed-progress", "unfinished-phase2",
+        "missing-abort-witness", "stale-after", "stale-f-store", "malformed-identity",
+    ]
+)
+def test_d09_collector_rejects_unbound_restart_evidence(mutation: str) -> None:
+    receipt, scenario, observations = _d09_collector_fixture()
+    restart = receipt["turns"][0]["p51_receipt_window"]["restart_extension"]
+    if mutation == "wrong-client":
+        observations["successful_strict_p50_retry_bindings"][0]["job_id"] = "C2:A:1:33"
+    elif mutation == "wrong-retry-worker":
+        observations["successful_strict_p50_retry_bindings"][0]["final_worker"] = "F3"
+    elif mutation == "malformed-progress":
+        restart["healthy_progress"] = [True]
+    elif mutation == "unfinished-phase2":
+        restart["phase2"]["gate_completed"] = False
+    elif mutation == "stale-after":
+        restart["after"]["started_at"] = "old"
+    elif mutation == "stale-f-store":
+        restart["phase2"]["identity"]["f_store_guid"] = "e" * 32
+        for link in receipt["turns"][0]["p51_receipt_window"]["links"]:
+            if link.get("after_restart"):
+                link["f_store_guid"] = "e" * 32
+                link["f_store_generation"] = 1
+    elif mutation == "missing-abort-witness":
+        restart["old_gate_loss"]["discarded_marker"] = ""
+    else:
+        restart["phase2"]["identity"] = ["not", "a", "mapping"]
+    with pytest.raises(CollectError):
+        _validate_p51_held_f_restart_receipt(receipt, scenario, observations)

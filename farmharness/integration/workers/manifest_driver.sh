@@ -149,6 +149,9 @@ disk_fill_trigger=${ICEFARM_DISK_FILL_TRIGGER:-0}
 p51_link_map=${ICEFARM_P51_LINK_MAP:-}
 p51_link_endpoint_map=${ICEFARM_P51_LINK_ENDPOINT_MAP:-}
 p51_link_window=${ICEFARM_P51_LINK_WINDOW:-}
+p51_retry_endpoint_map=${ICEFARM_P51_RETRY_ENDPOINT_MAP:-}
+p51_phase2_first=${ICEFARM_P51_PHASE2_FIRST:-0}
+p51_phase2_release=${ICEFARM_P51_PHASE2_RELEASE:-}
 case "$s60_admit_through" in
     ''|*[!0-9]*) echo "invalid S60 admission boundary" >&2; exit 65 ;;
 esac
@@ -158,6 +161,19 @@ esac
 case "$disk_fill_trigger" in
     ''|*[!0-9]*) echo "invalid disk-fill trigger" >&2; exit 65 ;;
 esac
+case "$p51_phase2_first" in
+    ''|*[!0-9]*) echo "invalid P51 phase-2 boundary" >&2; exit 65 ;;
+esac
+if test "$p51_phase2_first" -gt 0
+then
+    test -n "$p51_link_map" -a -n "$p51_phase2_release"
+    case "$p51_phase2_release" in
+        "$result_root"/*) ;;
+        *) echo "P51 phase-2 release marker is outside result root" >&2; exit 65 ;;
+    esac
+else
+    test -z "$p51_phase2_release"
+fi
 if test "$disk_fill_trigger" -gt 0
 then
     printf '%s' "$disk_fill_worker" | grep -Eq '^F[1-9][0-9]*$'
@@ -334,6 +350,28 @@ p51_expected_endpoint() {
         fi
     done
     test -n "$match" || return 1
+    printf '%s' "$match"
+}
+p51_retry_endpoint() {
+    local target=$1 entry endpoint first last match=""
+    local -a entries=()
+    IFS=',' read -r -a entries <<<"$p51_retry_endpoint_map"
+    for entry in "${entries[@]}"
+    do
+        if [[ "$entry" =~ ^([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9.-]+):([1-9][0-9]{0,4})$ ]] \
+            && test "${BASH_REMATCH[4]}" -le 65535
+        then
+            first=${BASH_REMATCH[1]}; last=${BASH_REMATCH[2]}
+            endpoint=${BASH_REMATCH[3]}:${BASH_REMATCH[4]}
+            if test "$target" -ge "$first" -a "$target" -le "$last"
+            then
+                test -z "$match" || return 1
+                match=$endpoint
+            fi
+        else
+            return 1
+        fi
+    done
     printf '%s' "$match"
 }
 p51_validate_link_map() {
@@ -760,6 +798,19 @@ compile_one() {
     occurrence=$3
     relative=$4
     digest=$5
+    if test "$p51_phase2_first" -gt 0 -a "$index" -ge "$p51_phase2_first"
+    then
+        phase2_deadline=$((SECONDS + per_job_timeout))
+        while test ! -f "$p51_phase2_release" -o -L "$p51_phase2_release"
+        do
+            if test "$SECONDS" -ge "$phase2_deadline"
+            then
+                echo "P51 phase-2 release deadline expired for job $index" >&2
+                return 75
+            fi
+            sleep 0.05
+        done
+    fi
     if test "$resume_mode" -eq 1 && grep -Fqx "$index" "$resume_indices"
     then
         return 0
@@ -1003,12 +1054,18 @@ compile_one() {
     then
         remote=0
     fi
+    retries=$((assignment_count > 0 ? assignment_count - 1 : 0))
     if test -n "$mapped_endpoint" -a "$worker" != "$mapped_endpoint"
     then
-        echo "P51 receipt route mismatch job=$index preferred=$mapped_worker expected_endpoint=$mapped_endpoint actual=$worker" >&2
-        remote=0
+        retry_endpoint=$(p51_retry_endpoint "$index")
+        if test -z "$retry_endpoint" -o "$worker" != "$retry_endpoint" -o "$retries" -lt 1
+        then
+            echo "P51 receipt route mismatch job=$index preferred=$mapped_worker expected_endpoint=$mapped_endpoint actual=$worker" >&2
+            remote=0
+        else
+            echo "P51 strict retry endpoint candidate job=$index preferred=$mapped_worker initial_endpoint=$mapped_endpoint final_endpoint=$worker retries=$retries" >&2
+        fi
     fi
-    retries=$((assignment_count > 0 ? assignment_count - 1 : 0))
     if test "$event_serial_through" -gt 0 \
         -a "$index" -eq "$event_serial_through"
     then
@@ -1104,7 +1161,7 @@ compile_one() {
     trap - EXIT
     return 0
 }
-export -f read_boundary_release p51_expected_worker p51_expected_endpoint compile_one
+export -f read_boundary_release p51_expected_worker p51_expected_endpoint p51_retry_endpoint compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
 export gate_root gate_state gate_lock gate_active event_serial_through s60_admit_through
@@ -1136,16 +1193,17 @@ if test -n "$p51_link_map"
 then
     dispatch_worklist="$result_root/.p51-dispatch-worklist"
     python3 - "$worklist" "$dispatch_worklist" "$expected_jobs" "$jobs" \
-        "$p51_link_window" "$p51_link_map" <<'PY'
+        "$p51_link_window" "$p51_link_map" "$p51_phase2_first" <<'PY'
 import os
 import pathlib
 import re
 import sys
 
-source, destination, expected_text, concurrency_text, window_text, route_text = sys.argv[1:]
+source, destination, expected_text, concurrency_text, window_text, route_text, phase2_text = sys.argv[1:]
 expected = int(expected_text)
 concurrency = int(concurrency_text)
 window = int(window_text)
+phase2_first = int(phase2_text)
 routes = []
 for entry in route_text.split(","):
     match = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9._-]+)", entry)
@@ -1161,9 +1219,19 @@ for first, last, _worker in ordered_routes:
     if first != cursor:
         raise SystemExit("P51 routes do not partition the manifest")
     cursor = last + 1
-if cursor != expected + 1 or len({worker for _first, _last, worker in routes}) != len(routes):
-    raise SystemExit("P51 routes are incomplete or repeat a worker")
-if concurrency < len(routes) * window or any(last - first + 1 < window for first, last, _worker in routes):
+if cursor != expected + 1:
+    raise SystemExit("P51 routes are incomplete or unexpectedly repeat a worker")
+initial_routes = [route for route in routes if not phase2_first or route[0] < phase2_first]
+phase2_routes = [route for route in routes if phase2_first and route[0] >= phase2_first]
+if len({worker for _first, _last, worker in initial_routes}) != len(initial_routes):
+    raise SystemExit("P51 initial routes unexpectedly repeat a worker")
+if phase2_first and (
+    phase2_first < 2 or len(phase2_routes) != 1
+    or phase2_routes[0][0] != phase2_first
+    or any(last >= phase2_first for _first, last, _worker in initial_routes)
+):
+    raise SystemExit("P51 phase-2 route is not a distinct final cohort")
+if concurrency < len(initial_routes) * window or any(last - first + 1 < window for first, last, _worker in routes):
     raise SystemExit("P51 dispatch cannot admit every link's initial window")
 
 raw = pathlib.Path(source).read_bytes()
@@ -1188,7 +1256,7 @@ if set(by_ordinal) != set(range(1, expected + 1)):
 # gates in range order lets that link finish before later held ranges launch.
 first_wave = []
 for offset in range(window):
-    for first, last, _worker in routes:
+    for first, last, _worker in initial_routes:
         ordinal = first + offset
         if ordinal <= last:
             first_wave.append(ordinal)

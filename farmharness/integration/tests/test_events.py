@@ -27,6 +27,7 @@ from farmharness.integration.collect import (
     _event_log,
     _stage_evidence,
     _validate_scheduler_active_loss_receipt,
+    _validate_p51_held_f_restart_receipt,
 )
 from farmharness.integration.events import (
     ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
@@ -67,7 +68,7 @@ from farmharness.integration.remote import (
     PlannedCommand,
     decode_ssh_payload,
 )
-from farmharness.integration.scenario_spec import load_scenario_spec
+from farmharness.integration.scenario_spec import ScenarioSpec, load_scenario_spec
 from farmharness.integration.verdict import BUNDLE_SCHEMA, ROW_SCHEMA, evaluate_bundle
 from farmharness.integration.workload import run_workload
 
@@ -2219,6 +2220,7 @@ class HeaderEditRecorder(EventRecorder):
                             "cache_protocol=1 cache_profiles=p29v1 zstd_tu zstd_route"
                         ),
                         "cache_protocol": 1,
+                        "cache_wire": 1,
                         "login_line": (
                             "[1] 2026-09-05 01:02:00: login F2 protocol version: 50"
                         ),
@@ -3297,6 +3299,7 @@ def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
                                 "zstd_route"
                             ),
                             "cache_protocol": 1,
+                            "cache_wire": 1,
                             "login_line": "login F1 protocol version: 50",
                             "loss_job_ids": [],
                             "profile": "p29v1",
@@ -3363,6 +3366,183 @@ def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
     (tmp_path / "events" / "events.json").write_text(json.dumps(document))
     with pytest.raises(CollectError, match="in-place fresh restart"):
         _event_log(tmp_path, scenario, farm=farm, plan=plan)
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong-container", "unexpected-running", "stale-start", "missing-rejoin"]
+)
+def test_receipt_gate_worker_restart_rejects_stale_identity_or_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    producer._start = time.monotonic() - 0.01
+    target = next(item for item in plan["topology"]["instances"] if item["role"] == "F")
+    name = target["name"]
+    producer._readiness_baseline = lambda _instance: {
+        "host": target["host"], "path": "/tmp/log", "offset": 1,
+    }
+    inspect_states = [
+        {"id": "sha256:old", "running": False, "started_at": "old"},
+        {"id": "sha256:old", "running": True,
+         "started_at": "old" if failure == "stale-start" else "new"},
+    ]
+    if failure == "wrong-container":
+        inspect_states[0] = {"id": "sha256:other", "running": False, "started_at": "old"}
+    elif failure == "unexpected-running":
+        inspect_states[0] = {"id": "sha256:old", "running": True, "started_at": "new"}
+    producer._inspect = lambda *_a, **_k: inspect_states.pop(0)
+    producer._invoke = lambda _command: CommandResult(0, "", "")
+    producer._header_readiness_witness = lambda *_a: {
+        "role": "F", "line": "ICECREAM daemon F1 starting up",
+        "cache_line": "cache sidecar adapter state=2 lifecycle=3",
+    }
+    producer._header_scheduler_rejoin_witness = lambda *_a, **_k: (
+        None if failure == "missing-rejoin" else {
+            "target": name, "role_protocol": 50, "cache_wire": 1, "cache_protocol": 1,
+            "loss_job_ids": [], "sha256": "a" * 64,
+        }
+    )
+    monkeypatch.setattr(events_module, "_wait_workers", lambda *_a, **_k: {"workers": [name]})
+    stopped = {
+        "instance": name, "turn": "A",
+        "before": {"container_id": "sha256:old", "started_at": "old"},
+        "stopped": {"container_id": "sha256:old", "started_at": "old", "running": False},
+        "readiness_baseline": {"host": target["host"], "path": "/tmp/log", "offset": 1},
+        "scheduler_baseline": {"host": target["host"], "path": "/tmp/scheduler", "offset": 1},
+    }
+    with pytest.raises(EventError):
+        producer.start_worker_for_receipt_gate(stopped)
+
+
+def test_scheduler_rejoin_probe_accepts_exact_p51_revision_and_rejects_mismatch(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "scheduler.log"
+    log.write_text(
+        "login F1 protocol version: 51\n"
+        "RELOGIN F1(x86_64): [] cache=10.0.27.212:23003 cache_wire=v1 cache_protocol=2 "
+        "cache_profiles=zstd_tu\n"
+    )
+    def probe(role: int, wire: int, cache: int):
+        completed = subprocess.run(
+            [
+                sys.executable, "-c", events_module.SCHEDULER_HEADER_RELOGIN_SCRIPT,
+                str(log), "0", "F1", "ZSTD_TU", str(role), str(wire), str(cache),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return json.loads(completed.stdout)
+
+    exact = probe(51, 1, 2)
+    assert exact["ready"] is True
+    assert exact["role_protocol"] == 51
+    assert exact["cache_wire"] == 1 and exact["cache_protocol"] == 2
+    wrong_revision = probe(50, 1, 1)
+    assert wrong_revision["ready"] is False
+
+
+def test_receipt_gate_event_restart_receipt_is_accepted_by_collector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    scheduler = next(item for item in scenario.data["instances"] if item["role"] == "S")
+    scheduler.setdefault("env", {})["ICECC_P50_PROFILE"] = "ZSTD_TU"
+    target_scenario = next(item for item in scenario.data["instances"] if item["role"] == "F")
+    target_scenario.setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    target = next(item for item in plan["topology"]["instances"] if item["role"] == "F")
+    target.setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    producer._start = time.monotonic() - 0.01
+    producer._readiness_baseline = lambda _instance: {
+        "host": target["host"], "path": "/tmp/f.log", "offset": 0,
+    }
+    inspect_states = [
+        {"id": "sha256:f1", "running": False, "started_at": "old"},
+        {"id": "sha256:f1", "running": True, "started_at": "new"},
+    ]
+    producer._inspect = lambda *_a, **_k: inspect_states.pop(0)
+    producer._invoke = lambda _command: CommandResult(0, "", "")
+    producer._header_readiness_witness = lambda *_a: {
+        "role": "F", "line": "ICECREAM daemon F1 starting up",
+        "cache_line": "cache sidecar adapter state=2 lifecycle=3",
+    }
+    producer._header_scheduler_rejoin_witness = lambda *_a, **_k: {
+        "target": target["name"], "role_protocol": 51,
+        "cache_wire": 1, "cache_protocol": 2,
+        "loss_job_ids": [], "sha256": "a" * 64,
+        "cache_line": "RELOGIN F1(x86_64): [] cache_wire=v1 cache_protocol=2",
+    }
+    monkeypatch.setattr(events_module, "_wait_workers", lambda *_a, **_k: {"workers": ["F1"]})
+    stopped = {
+        "instance": "F1", "turn": "A",
+        "before": {"container_id": "sha256:f1", "started_at": "old"},
+        "stopped": {"container_id": "sha256:f1", "started_at": "old", "running": False},
+        "readiness_baseline": {"host": target["host"], "path": "/tmp/f.log", "offset": 0},
+        "scheduler_baseline": {"host": scheduler["host"], "path": "/tmp/s.log", "offset": 0},
+    }
+    restart = producer.start_worker_for_receipt_gate(stopped)
+    gate = {
+        "negotiated_window": 30,
+        "links": [
+            {"client": "C1", "worker": "F2", "first_job": 1, "last_job": 31},
+            {"client": "C1", "worker": "F1", "first_job": 32, "last_job": 62},
+        ],
+        "restart_extension": {
+            "kind": "held-f-restart-v1",
+            "affected_link": {"client": "C1", "worker": "F1"},
+            "healthy_link": {"client": "C1", "worker": "F2"},
+        },
+    }
+    scenario.data["workload"]["receipt_gate"] = gate
+    def evidence(client, worker, first, last, guid, generation, *, stopped=False, after=False):
+        return {
+            "client": client, "worker": worker, "first_job": first, "last_job": last,
+            "count": 30, "profile": "ZSTD_TU", "negotiated_window": 30,
+            "relationship_id": "c" * 32, "reservation_id": "d" * 32,
+            "epoch": 1, "physical_link_generation": 1,
+            "c_store_guid": "a" * 32, "c_store_generation": 1,
+            "f_store_guid": guid, "f_store_generation": generation,
+            "stopped_by_restart": stopped, "after_restart": after,
+        }
+    affected_old = evidence("C1", "F1", 32, 62, "e" * 32, 1, stopped=True)
+    healthy = evidence("C1", "F2", 1, 31, "f" * 32, 1)
+    phase2 = evidence("C1", "F1", 63, 93, "b" * 32, 2, after=True)
+    restart.update({
+        "schema": "icefarm-p51-held-f-restart-v1",
+        "stopped_interval_ms": 100,
+        "old_gate_loss": {
+            "helper_exit_status": 1,
+            "retirement": "explicit-abort-after-f-stop",
+            "discarded_marker": "explicit abort discarded held COMMIT interval",
+        },
+        "healthy_progress": {
+            "client": "C1", "worker": "F2", "first_job": 1, "last_job": 31,
+            "verified_while_stopped": True,
+        },
+        "phase2": {
+            "worker": "F1", "first_job": 63, "last_job": 93,
+            "held": {"count": 30, "profile": "ZSTD_TU", "negotiated_window": 30},
+            "identity": {
+                "f_store_guid": "b" * 32, "f_store_generation": 2,
+                "relationship_id": "c" * 32, "reservation_id": "d" * 32,
+            },
+            "verified": True, "gate_completed": True, "old_gate_exit_status": 1,
+        },
+    })
+    _validate_p51_held_f_restart_receipt(
+        {"turns": [{"turn": "A", "p51_receipt_window": {
+            "profile": "ZSTD_TU", "negotiated_window": 30,
+            "links": [healthy, affected_old, phase2], "restart_extension": restart,
+        }}]},
+        ScenarioSpec(path=Path("scenario.json"), data=scenario.data),
+        {"successful_strict_p50_retry_bindings": [{
+            "first_worker": "F1", "final_worker": "F2",
+            "failure_reason": "source-transfer-loss", "job_id": "C1:A:1:33",
+        }]},
+    )
 
 
 def test_upgrade_and_downgrade_direction_is_fail_closed(tmp_path: Path) -> None:

@@ -61,7 +61,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "729b90901e55bd5d794e4e3985454d54bf7c4e37e027cbed38e1c55643c7ca01"
+        "e11f4a17f2cb8b50df870c87cbbb954c5e65ee6f198660d16b8877a11db50499"
     )
 
 
@@ -100,7 +100,7 @@ def test_p51_shell_route_mapping_is_exact_in_child_bash() -> None:
             text=True, capture_output=True, check=False,
         )
         assert overlap_or_hole.returncode != 0
-    assert "export -f read_boundary_release p51_expected_worker p51_expected_endpoint compile_one" in MANIFEST_DRIVER
+    assert "export -f read_boundary_release p51_expected_worker p51_expected_endpoint p51_retry_endpoint compile_one" in MANIFEST_DRIVER
 
 
 def test_p51_shell_endpoint_mapping_is_exact_in_child_bash() -> None:
@@ -164,7 +164,7 @@ def test_multilink_dispatch_prefills_each_gate_before_suffix_jobs(
     match = re.search(
         r"(?ms)^    python3 - \"\$worklist\" \"\$dispatch_worklist\" "
         r"\"\$expected_jobs\" \"\$jobs\" \\\n        \"\$p51_link_window\" "
-        r"\"\$p51_link_map\" <<'PY'\n(.*?)\nPY$",
+        r"\"\$p51_link_map\" \"\$p51_phase2_first\" <<'PY'\n(.*?)\nPY$",
         MANIFEST_DRIVER,
     )
     assert match is not None
@@ -178,7 +178,7 @@ def test_multilink_dispatch_prefills_each_gate_before_suffix_jobs(
     completed = subprocess.run(
         [
             sys.executable, "-c", match.group(1), str(source), str(destination),
-            str(jobs), str(concurrency), str(window), routes,
+            str(jobs), str(concurrency), str(window), routes, "0",
         ],
         text=True, capture_output=True, check=False,
     )
@@ -204,7 +204,7 @@ def test_multilink_dispatch_prefills_each_gate_before_suffix_jobs(
         undersized = subprocess.run(
             [
                 sys.executable, "-c", match.group(1), str(source), str(destination),
-                str(jobs), str(concurrency - 1), str(window), routes,
+                str(jobs), str(concurrency - 1), str(window), routes, "0",
             ],
             text=True, capture_output=True, check=False,
         )
@@ -621,6 +621,35 @@ def test_receipt_window_requires_worker_capacity_beyond_credit_clamp(
     )
 
 
+@pytest.mark.parametrize("invalid", ["single-link", "w1"])
+def test_d09_restart_extension_fails_closed_outside_multilink_w30(invalid: str) -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
+    gate = scenario.data["workload"]["receipt_gate"]
+    gate["restart_extension"] = {
+        "kind": "held-f-restart-v1",
+        "affected_link": {"client": "C1", "worker": "F2"},
+        "healthy_link": {"client": "C1", "worker": "F1"},
+    }
+    role_instances = {
+        role: [dict(item) for item in plan["topology"]["instances"] if item["role"] == role]
+        for role in ("S", "C", "F")
+    }
+    workload = scenario.data["workload"]
+    workload.update({"clients": ["C1"], "turns": ["A"], "repeat": 1})
+    value = {"timeline": [], "controls": []}
+    if invalid == "single-link":
+        gate.pop("links")
+        with pytest.raises(ScenarioSpecError, match="requires multi-link receipt mode"):
+            scenario_spec_module._validate_p51_receipt_window(
+                value, workload, role_instances, manifest_jobs=4,
+            )
+    else:
+        with pytest.raises(ScenarioSpecError, match="requires W30"):
+            scenario_spec_module._validate_p51_receipt_window(
+                value, workload, role_instances, manifest_jobs=4,
+            )
+
+
 @pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
 def test_receipt_window_prepares_oracle_before_starting_gate_timer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, topology: str,
@@ -998,6 +1027,151 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
     assert all(done for _, _, done in output_checks if done)
     assert any(not done for _, _, done in output_checks)
     assert evidence["restart_extension"] == "pending-not-run"
+
+
+def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
+    gate = scenario.data["workload"]["receipt_gate"]
+    gate.update({"expected_commits": 30, "negotiated_window": 30})
+    gate["links"] = [
+        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
+        {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 62},
+    ]
+    gate["restart_extension"] = {
+        "kind": "held-f-restart-v1",
+        "affected_link": {"client": "C1", "worker": "F2"},
+        "healthy_link": {"client": "C1", "worker": "F1"},
+    }
+    scenario.data["workload"].update({"jobs": 93})
+    farm.data["corpora"]["tiny"].update({"tus": 31, "repeat": 3})
+    for worker in (item for item in plan["topology"]["instances"] if item["role"] == "F"):
+        worker["slots"] = 31
+    release_f1 = threading.Event()
+    stop_f2 = threading.Event()
+    finish_f2_phase2 = threading.Event()
+    ready = {"F1": threading.Event(), "F2": threading.Event(), "phase2": threading.Event()}
+    events: list[str] = []
+
+    class Factory:
+        def make(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+    class Transport:
+        def invoke(self, command):
+            phase = command.phase
+            if ".start-gate.C1.F1" in phase:
+                ready["F1"].set()
+                assert release_f1.wait(2)
+                return CommandResult(0, "", "P51_RECEIPT_GATE_NEGOTIATED profile=1 window=30 epoch=1 generation=1\n")
+            if ".start-gate.C1.F2" in phase:
+                ready["F2"].set()
+                assert stop_f2.wait(2)
+                return CommandResult(0, "", "P51_RECEIPT_GATE_TERMINAL attempt=1 link_state=1 protocol_error=0 reason=disconnect-after-link-state\n")
+            if phase.endswith("d09-phase2-gate"):
+                ready["phase2"].set()
+                assert finish_f2_phase2.wait(2)
+                return CommandResult(0, "", "P51_RECEIPT_GATE_NEGOTIATED profile=1 window=30 epoch=2 generation=1\n")
+            if phase.startswith("run.p51-receipt-window.d09-healthy-output-while-stopped"):
+                assert stop_f2.is_set() and not any(x == "start-F2" for x in events)
+                events.append("healthy-output-while-F2-stopped")
+                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F1 endpoint=10.0.0.2:23003 first=1 last=31\n", "")
+            if phase.startswith("run.p51-receipt-window.d09-phase2-output"):
+                assert "start-F2" in events
+                events.append("phase2-output")
+                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F2 endpoint=10.0.0.3:23004 first=63 last=93\n", "")
+            if phase.startswith("driver-"):
+                return CommandResult(0, "summary", "")
+            raise AssertionError(f"unexpected D09 command {phase}")
+
+    class EventController:
+        def stop_worker_for_receipt_gate(self, name, turn):
+            assert name == "F2" and turn == "A"
+            events.append("stop-F2")
+            stop_f2.set()
+            return {
+                "instance": name, "turn": turn,
+                "before": {"container_id": "sha256:f2", "started_at": "old"},
+                "stopped": {"container_id": "sha256:f2", "started_at": "old", "running": False},
+                "readiness_baseline": {}, "scheduler_baseline": {},
+            }
+
+        def start_worker_for_receipt_gate(self, receipt):
+            assert stop_f2.is_set() and any("healthy-output" in x for x in events)
+            events.append("start-F2")
+            return {
+                **receipt,
+                "schema": "icefarm-receipt-worker-restart-v1",
+                "after": {"container_id": "sha256:f2", "started_at": "new", "running": True},
+                "coordination": {},
+            }
+
+    def gate_call(_farm, _plan, client, _factory, _transport, phase, _argv, **_kw):
+        if phase == "verify-staged-helper":
+            return CommandResult(0, "a" * 64 + "\n", "")
+        if phase == "sidecar-uid":
+            return CommandResult(0, "65534\n", "")
+        if phase.startswith("d09-release-healthy"):
+            release_f1.set()
+        if phase.startswith("d09-abort-stopped"):
+            events.append("abort-stopped-F2-gate")
+        if phase == "d09-finish-phase2-gate":
+            finish_f2_phase2.set()
+        return CommandResult(0, "", "")
+
+    def wait_marker(_farm, _plan, _client, _factory, _transport, marker, **_kwargs):
+        if marker.endswith("/ready"):
+            key = "phase2" if "-phase2/" in marker else "F1" if "C1-F1/" in marker else "F2"
+            return "ready\n" if ready[key].wait(1) else None
+        if marker.endswith("/held-1"):
+            key = "phase2" if "-phase2/" in marker else "F1" if "C1-F1/" in marker else "F2"
+            if not ready[key].is_set():
+                return None
+            if key == "phase2":
+                events.append("phase2-held")
+                rel, res, epoch, gen = """%032x""" % 901, """%032x""" % 902, 2, 1
+            elif key == "F1":
+                rel, res, epoch, gen = f"{201:032x}", f"{301:032x}", 1, 1
+            else:
+                rel, res, epoch, gen = f"{202:032x}", f"{302:032x}", 1, 1
+            return f"count=30 first_ordinal=1 last_ordinal=30 profile=1 window=30 relationship={rel} reservation={res} epoch={epoch} generation={gen}\n"
+        if marker.endswith("/identity-1"):
+            key = "phase2" if "-phase2/" in marker else "F1" if "C1-F1/" in marker else "F2"
+            f_guid = {"F1": 101, "F2": 102, "phase2": 901}[key]
+            rel, res = (901, 902) if key == "phase2" else ((201, 301) if key == "F1" else (202, 302))
+            f_generation = 2 if key == "phase2" else 1
+            return f"c_store={1:032x} c_store_generation=1 f_store={f_guid:032x} f_store_generation={f_generation} relationship={rel:032x} reservation={res:032x} epoch={2 if key == 'phase2' else 1} generation=1 profile=1 window=30\n"
+        if marker.endswith("/released-1"):
+            return "released\n"
+        if marker.endswith("/discarded-1"):
+            return "explicit abort discarded held COMMIT interval\n"
+        if marker.endswith("/exit"):
+            return "1\n" if "C1-F2/" in marker else "0\n"
+        return None
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
+    monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", lambda *_a, **_k: None)
+    monkeypatch.setattr(workload_module, "_driver_command", lambda *_a, **_k: SimpleNamespace(phase="driver-C1"))
+    monkeypatch.setattr(workload_module, "_parse_summary", lambda *_a: {"client": "C1", "jobs": 93, "failures": 0})
+    monkeypatch.setattr(workload_module, "_docker_transport", lambda *_a, **_k: "docker")
+    monkeypatch.setattr(workload_module, "docker_argv", lambda _f, _h, argv: tuple(argv))
+
+    monkeypatch.setattr(workload_module, "_p51_link_outputs_complete", lambda output, **_kwargs: "P51_LINK_OUTPUTS_OK" in output)
+    summaries, evidence = workload_module._run_p51_receipt_window_multilink(
+        farm, scenario, plan, clients, Factory(), Transport(), "A",
+        event_controller=EventController(),
+    )
+    assert summaries[0]["failures"] == 0
+    assert [item for item in events if item in {
+        "stop-F2", "abort-stopped-F2-gate", "healthy-output-while-F2-stopped",
+        "start-F2", "phase2-held", "phase2-output"
+    }] == [
+        "stop-F2", "abort-stopped-F2-gate", "healthy-output-while-F2-stopped",
+        "start-F2", "phase2-held", "phase2-output"
+    ]
+    assert evidence["restart_extension"]["phase2"]["gate_completed"] is True
 
 
 @pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
@@ -2254,6 +2428,104 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
         check=True,
         capture_output=True,
     )
+
+
+def test_manifest_driver_d09_dispatch_barrier_and_retry_endpoint_shell_paths(
+    tmp_path: Path,
+) -> None:
+    header = 'python3 - "$worklist" "$dispatch_worklist" "$expected_jobs" "$jobs"'
+    header_end = MANIFEST_DRIVER.index("<<'PY'\n", MANIFEST_DRIVER.index(header))
+    start = header_end + len("<<'PY'\n")
+    end = MANIFEST_DRIVER.index("\nPY\n", start)
+    order_program = MANIFEST_DRIVER[start:end]
+    source = tmp_path / "worklist.bin"
+    destination = tmp_path / "dispatch.bin"
+    records = [
+        field
+        for ordinal in range(1, 7)
+        for field in (str(ordinal), "A", "0", f"files/{ordinal}.ii", "a" * 64)
+    ]
+    source.write_bytes(b"\0".join(item.encode() for item in records) + b"\0")
+    generated = subprocess.run(
+        [
+            sys.executable, "-c", order_program, str(source), str(destination),
+            "6", "4", "2", "1-2=F1,3-4=F2,5-6=F2", "5",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    fields = destination.read_bytes().split(b"\0")
+    order = [int(fields[index]) for index in range(0, len(fields) - 1, 5)]
+    assert order == [1, 3, 2, 4, 5, 6]
+    assert "initial=4 jobs=6" in generated.stdout
+
+    wait_start = MANIFEST_DRIVER.index(
+        '    if test "$p51_phase2_first" -gt 0 -a "$index" -ge "$p51_phase2_first"'
+    )
+    wait_end = MANIFEST_DRIVER.index('    if test "$resume_mode" -eq 1', wait_start)
+    wait_block = MANIFEST_DRIVER[wait_start:wait_end]
+    release = tmp_path / "phase2.release"
+    output = tmp_path / "fake-compiler-ran"
+    fake_compiler = tmp_path / "fake-compiler.sh"
+    fake_compiler.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$1" >"$FAKE_COMPILER_OUTPUT"\n',
+        encoding="utf-8",
+    )
+    fake_compiler.chmod(0o755)
+    environment = {
+        **os.environ,
+        "p51_phase2_first": "5",
+        "index": "5",
+        "p51_phase2_release": str(release),
+        "per_job_timeout": "4",
+        "FAKE_COMPILER_OUTPUT": str(output),
+        "FAKE_COMPILER": str(fake_compiler),
+    }
+    waiting = subprocess.Popen(
+        ["/bin/bash", "-c", wait_block + '\n"$FAKE_COMPILER" "$index"'],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.15)
+    assert waiting.poll() is None
+    assert not output.exists()
+    release.touch()
+    stdout, stderr = waiting.communicate(timeout=3)
+    assert waiting.returncode == 0, stderr
+    assert stdout == ""
+    assert output.read_text(encoding="utf-8") == "5\n"
+
+    functions_start = MANIFEST_DRIVER.index("p51_expected_worker() {")
+    functions_end = MANIFEST_DRIVER.index("p51_validate_link_map() {", functions_start)
+    functions = MANIFEST_DRIVER[functions_start:functions_end]
+    exported = subprocess.run(
+        [
+            "/bin/bash", "-c",
+            functions
+            + "export -f p51_expected_worker p51_expected_endpoint p51_retry_endpoint; "
+            + "export p51_link_map p51_link_endpoint_map p51_retry_endpoint_map; "
+            + "bash -c 'printf \"%s|%s|%s\\n\" "
+            + "\"$(p51_expected_worker 1)\" "
+            + "\"$(p51_expected_endpoint 1)\" "
+            + "\"$(p51_retry_endpoint 1)\"'",
+            "driver-route-child",
+        ],
+        env={
+            **os.environ,
+            "p51_link_map": "1-31=F_R1,32-62=F_R2",
+            "p51_link_endpoint_map": "1-31=10.0.0.1:23003,32-62=10.0.0.2:23004",
+            "p51_retry_endpoint_map": "1-31=10.0.0.2:23004",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert exported.stdout == "F_R1|10.0.0.1:23003|10.0.0.2:23004\n"
 
 
 @pytest.mark.parametrize(

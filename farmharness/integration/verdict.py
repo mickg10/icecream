@@ -1609,6 +1609,39 @@ def _authenticated_strict_p50_retry_ids(
             and isinstance(source_transfer, Mapping)
             and source_transfer.get("error") == P29_PERMANENT_PROFILE_UNAVAILABLE
         )
+        gate = None
+        workload = scenario.get("workload") if isinstance(scenario, Mapping) else None
+        if isinstance(workload, Mapping):
+            gate = workload.get("receipt_gate")
+        restart_retry_profile = None
+        if isinstance(gate, Mapping) and isinstance(
+            gate.get("restart_extension"), Mapping
+        ):
+            plan = bundle.get("plan")
+            topology = plan.get("topology") if isinstance(plan, Mapping) else None
+            instances = topology.get("instances") if isinstance(topology, Mapping) else None
+            schedulers = [
+                item
+                for item in instances or []
+                if isinstance(item, Mapping) and item.get("role") == "S"
+            ]
+            if len(schedulers) == 1:
+                environment = schedulers[0].get("env", {})
+                restart_retry_profile = (
+                    environment.get("ICECC_P50_PROFILE") or "P29V1"
+                    if isinstance(environment, Mapping)
+                    else None
+                )
+            if restart_retry_profile not in {"P29V1", "ZSTD_TU", "ZSTD_ROUTE"}:
+                restart_retry_profile = None
+        expected_retry_profile = (
+            "ZSTD_TU"
+            if b5_zstd_tu_retry
+            else restart_retry_profile
+            if isinstance(gate, Mapping)
+            and isinstance(gate.get("restart_extension"), Mapping)
+            else "P29V1"
+        )
         valid = (
             job_id not in authenticated
             and isinstance(row, Mapping)
@@ -1634,7 +1667,7 @@ def _authenticated_strict_p50_retry_ids(
             and row.get("retries") == 1
             and row.get("exact") is True
             and row.get("tail_present") is True
-            and row.get("tail_profile") == ("ZSTD_TU" if b5_zstd_tu_retry else "P29V1")
+            and row.get("tail_profile") == expected_retry_profile
             and row.get("session_outcome") == "committed"
             and row.get("cs") == binding.get("final_worker")
             and first

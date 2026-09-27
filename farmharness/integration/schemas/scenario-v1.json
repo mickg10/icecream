@@ -108,6 +108,15 @@
       "maxLength": 100,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     },
+    "receiptLinkIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client", "worker"],
+      "properties": {
+        "client": {"$ref": "#/$defs/name"},
+        "worker": {"$ref": "#/$defs/name"}
+      }
+    },
     "environment": {
       "type": "object",
       "propertyNames": {"pattern": "^[A-Z_][A-Z0-9_]*$"},
@@ -185,6 +194,16 @@
                   "first_job": {"type": "integer", "minimum": 1},
                   "last_job": {"type": "integer", "minimum": 1}
                 }
+              }
+            },
+            "restart_extension": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "affected_link", "healthy_link"],
+              "properties": {
+                "kind": {"const": "held-f-restart-v1"},
+                "affected_link": {"$ref": "#/$defs/receiptLinkIdentity"},
+                "healthy_link": {"$ref": "#/$defs/receiptLinkIdentity"}
               }
             }
           }
