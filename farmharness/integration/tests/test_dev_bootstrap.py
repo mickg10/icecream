@@ -278,7 +278,7 @@ def test_scratch_is_required_absolute_existing_and_writable(
         bootstrap.scratch_root()
 
 
-@pytest.mark.parametrize("mode", ["qa", "bootstrap"])
+@pytest.mark.parametrize("mode", ["qa", "bootstrap", "legacy-bootstrap"])
 def test_build_source_mounts_read_only_snapshot_and_cleans_its_container(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:

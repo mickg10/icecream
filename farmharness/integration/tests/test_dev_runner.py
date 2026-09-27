@@ -17,6 +17,103 @@ def _executable(path: Path, contents: str) -> None:
     path.chmod(0o755)
 
 
+def _run_bootstrap_fixture(tmp_path: Path, mode: str,
+                           source_metadata: bool) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
+    source_mount = tmp_path / "snapshot"
+    work_root = tmp_path / "scratch"
+    fake_bin = tmp_path / "fake-bin"
+    sdk_metadata = tmp_path / "sdk-metadata"
+    for path in (source_mount, work_root, fake_bin, sdk_metadata):
+        path.mkdir(parents=True)
+    metadata = ("pyproject.toml", "uv.lock", ".python-version")
+    if source_metadata:
+        for name in metadata:
+            (source_mount / name).write_text("source metadata\n", encoding="utf-8")
+    for name in metadata:
+        (sdk_metadata / name).write_text("sdk metadata\n", encoding="utf-8")
+
+    runner_text = RUNNER.read_text(encoding="utf-8")
+    runner_text = runner_text.replace("SOURCE_MOUNT=/source", f"SOURCE_MOUNT={source_mount}")
+    runner_text = runner_text.replace("WORK_ROOT=/work", f"WORK_ROOT={work_root}")
+    runner_text = runner_text.replace("SDK_METADATA_ROOT=/opt/icecream-python-src",
+                                      f"SDK_METADATA_ROOT={sdk_metadata}")
+    runner = tmp_path / "run-qa.sh"
+    _executable(runner, runner_text)
+    _executable(fake_bin / "findmnt", "#!/bin/sh\nprintf 'ro,relatime\\n'\n")
+    _executable(fake_bin / "stat", "#!/bin/sh\necho 12:34\n")
+    _executable(fake_bin / "id",
+                "#!/bin/sh\ncase \"$*\" in '-u') echo 0 ;; '-u nobody'|'-g nobody') echo 65534 ;; *) exit 2 ;; esac\n")
+    _executable(fake_bin / "runuser",
+                "#!/bin/sh\n[ \"$1\" = -u ] && [ \"$2\" = nobody ] && [ \"$3\" = -- ] || exit 2\nshift 3\nexec \"$@\"\n")
+    _executable(fake_bin / "chown", "#!/bin/sh\nexit 0\n")
+    _executable(source_mount / "autogen.sh", "#!/bin/sh\nexit 0\n")
+    _executable(source_mount / "configure", "#!/bin/sh\nexit 0\n")
+    make_log = tmp_path / "make.log"
+    _executable(fake_bin / "make",
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$MAKE_LOG"\n'
+                "exit 0\n")
+    uv_log = tmp_path / "uv.log"
+    _executable(fake_bin / "uv",
+                "#!/bin/sh\nprintf 'unexpected uv invocation\\n' >> \"$UV_LOG\"\nexit 99\n")
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "WORK_ROOT": str(work_root),
+        "ICEFARM_TMPDIR": str(work_root / "tmp"),
+        "MAKE_LOG": str(make_log),
+        "UV_LOG": str(uv_log),
+    }
+    result = subprocess.run(("bash", str(runner), mode, "2"), env=env,
+                            capture_output=True, text=True, check=False)
+    return result, work_root, make_log, uv_log
+
+
+def test_legacy_native_bootstrap_skips_python_and_rejects_current_source(
+    tmp_path: Path,
+) -> None:
+    result, work_root, make_log, uv_log = _run_bootstrap_fixture(
+        tmp_path / "legacy", "legacy-bootstrap", source_metadata=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "python-sync skipped: legacy-native bootstrap has no Python project" in result.stdout
+    assert not uv_log.exists()
+    make_calls = make_log.read_text(encoding="utf-8").splitlines()
+    assert len(make_calls) == 2
+    assert make_calls[0].endswith("/scratch/build -j2 all")
+    assert make_calls[1].endswith("/scratch/build install")
+    summary = json.loads((work_root / "artifacts" / "summary.json").read_text())
+    assert summary["mode"] == "legacy-bootstrap"
+    assert summary["python_sync_exit"] is None
+    assert summary["python_sync_status"] == "skipped-legacy-native"
+    assert summary["overall_exit"] == 0
+
+    rejected, rejected_work, rejected_make, rejected_uv = _run_bootstrap_fixture(
+        tmp_path / "current", "legacy-bootstrap", source_metadata=True
+    )
+    assert rejected.returncode == 2
+    assert "legacy-bootstrap accepts only native source without Python metadata" in rejected.stderr
+    assert not rejected_make.exists()
+    assert not rejected_uv.exists()
+    assert not (rejected_work / "artifacts" / "summary.json").exists()
+
+    invalid_mode, _invalid_work, invalid_make, invalid_uv = _run_bootstrap_fixture(
+        tmp_path / "invalid", "legacy-qa", source_metadata=False
+    )
+    assert invalid_mode.returncode == 2
+    assert "usage: run-qa.sh bootstrap|legacy-bootstrap|qa" in invalid_mode.stderr
+    assert not invalid_make.exists()
+    assert not invalid_uv.exists()
+
+    current_mismatch, _mismatch_work, mismatch_make, mismatch_uv = _run_bootstrap_fixture(
+        tmp_path / "mismatch", "bootstrap", source_metadata=True
+    )
+    assert current_mismatch.returncode == 2
+    assert "SDK Python metadata mismatch for pyproject.toml" in current_mismatch.stderr
+    assert not mismatch_make.exists()
+    assert not mismatch_uv.exists()
+
+
 @pytest.mark.parametrize("native_status", [9, 0])
 def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     tmp_path: Path, native_status: int
@@ -192,6 +289,7 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "build_exit": 0,
         "install_exit": 0,
         "python_sync_exit": 0,
+        "python_sync_status": "run",
         "native_check_exit": native_status,
         "native_root_check_exit": None if native_status else 0,
         "pytest_exit": 0,

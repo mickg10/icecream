@@ -2,12 +2,12 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-qa.sh bootstrap|qa [jobs (default: 2)]" >&2
+    echo "usage: run-qa.sh bootstrap|legacy-bootstrap|qa [jobs (default: 2)]" >&2
 }
 
 MODE=${1:-}
 JOBS=${2:-${JOBS:-2}}
-if [[ $# -gt 2 || ( "$MODE" != bootstrap && "$MODE" != qa ) ]]; then
+if [[ $# -gt 2 || ( "$MODE" != bootstrap && "$MODE" != legacy-bootstrap && "$MODE" != qa ) ]]; then
     usage
     exit 2
 fi
@@ -102,16 +102,26 @@ else
 fi
 
 # The managed Python environment was resolved from this exact metadata during
-# SDK image construction. Refuse to run a source snapshot with a different
-# lockfile or interpreter pin; rebuilding the SDK is required instead.
+# SDK image construction. Current-source bootstrap/QA must match it exactly.
+# The explicitly selected legacy-native mode is only for the pinned P43 tree,
+# which predates this repository's Python tooling and has no Python metadata.
 SDK_METADATA_ROOT=/opt/icecream-python-src
-for metadata in pyproject.toml uv.lock .python-version; do
-    if [[ ! -f "$SRC/$metadata" || ! -f "$SDK_METADATA_ROOT/$metadata" ]] ||
-       ! cmp -s "$SRC/$metadata" "$SDK_METADATA_ROOT/$metadata"; then
-        echo "SDK Python metadata mismatch for $metadata; rebuild the SDK from this source snapshot" >&2
-        exit 2
-    fi
-done
+if [[ "$MODE" == legacy-bootstrap ]]; then
+    for metadata in pyproject.toml uv.lock .python-version; do
+        if [[ -e "$SRC/$metadata" || -L "$SRC/$metadata" ]]; then
+            echo "legacy-bootstrap accepts only native source without Python metadata ($metadata present)" >&2
+            exit 2
+        fi
+    done
+else
+    for metadata in pyproject.toml uv.lock .python-version; do
+        if [[ ! -f "$SRC/$metadata" || ! -f "$SDK_METADATA_ROOT/$metadata" ]] ||
+           ! cmp -s "$SRC/$metadata" "$SDK_METADATA_ROOT/$metadata"; then
+            echo "SDK Python metadata mismatch for $metadata; rebuild the SDK from this source snapshot" >&2
+            exit 2
+        fi
+    done
+fi
 mkdir -p "$BUILD" "$INSTALL" || exit 2
 mkdir -p "$WORK_ROOT/uv-cache" "$WORK_ROOT/python-env" || exit 2
 if [[ -d /opt/uv-cache ]]; then
@@ -167,9 +177,13 @@ run_stage() {
 }
 
 # Resolve the locked Python environment as the same unprivileged identity used
-# for source and native QA. This is required in both bootstrap and QA modes;
-# no prebuilt root-owned environment is used as a fallback.
-run_stage python-sync bash -c 'cd "$1" && uv sync --locked --offline --managed-python --python "$(cat .python-version)"' _ "$SRC"
+# for source and native QA. This is required for current-source bootstrap and
+# QA; no prebuilt root-owned environment is used as a fallback.
+if [[ "$MODE" != legacy-bootstrap ]]; then
+    run_stage python-sync bash -c 'cd "$1" && uv sync --locked --offline --managed-python --python "$(cat .python-version)"' _ "$SRC"
+else
+    echo "python-sync skipped: legacy-native bootstrap has no Python project"
+fi
 
 prepare_build() {
     run_stage autogen bash -c 'cd "$1" && ./autogen.sh' _ "$SRC"
@@ -186,7 +200,7 @@ if prepare_build; then
     build_ok=1
 fi
 
-if [[ "$MODE" == bootstrap ]]; then
+if [[ "$MODE" == bootstrap || "$MODE" == legacy-bootstrap ]]; then
     if (( build_ok )); then
         run_stage install make -C "$BUILD" install
     fi
@@ -226,6 +240,8 @@ done
 if [[ "$MODE" == bootstrap ]]; then
     [[ "$install_status" == 0 ]] || overall=1
     [[ "$python_sync_status" == 0 ]] || overall=1
+elif [[ "$MODE" == legacy-bootstrap ]]; then
+    [[ "$install_status" == 0 ]] || overall=1
 else
     [[ "$install_status" == 0 ]] || overall=1
     [[ "$native_check_status" == 0 && "$build_ok" == 1 ]] || overall=1
@@ -234,9 +250,13 @@ else
 fi
 
 summary_tmp="$ARTIFACTS/summary.json.tmp"
-printf '{"mode":"%s","jobs":%s,"autogen_exit":%s,"configure_exit":%s,"build_exit":%s,"install_exit":%s,"python_sync_exit":%s,"native_check_exit":%s,"native_root_check_exit":%s,"pytest_exit":%s,"overall_exit":%s}\n' \
+python_sync_label=run
+if [[ "$MODE" == legacy-bootstrap ]]; then
+    python_sync_label=skipped-legacy-native
+fi
+printf '{"mode":"%s","jobs":%s,"autogen_exit":%s,"configure_exit":%s,"build_exit":%s,"install_exit":%s,"python_sync_exit":%s,"python_sync_status":"%s","native_check_exit":%s,"native_root_check_exit":%s,"pytest_exit":%s,"overall_exit":%s}\n' \
     "$MODE" "$JOBS" "$autogen_status" "$configure_status" "$build_status" \
-    "$install_status" "$python_sync_status" "$native_check_status" "$native_root_check_status" "$pytest_status" "$overall" > "$summary_tmp"
+    "$install_status" "$python_sync_status" "$python_sync_label" "$native_check_status" "$native_root_check_status" "$pytest_status" "$overall" > "$summary_tmp"
 mv -f "$summary_tmp" "$ARTIFACTS/summary.json"
 printf '\nSummary: %s/summary.json\nArtifacts: %s\n' "$ARTIFACTS" "$ARTIFACTS"
 exit "$overall"

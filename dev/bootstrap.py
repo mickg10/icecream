@@ -461,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
             current_image = product_image(run, sdk, current, "current", identity)
             report["current_image"] = current_image
             old_source = legacy_source(run)
-            old = build_source(run, sdk, old_source, spec, "legacy", "bootstrap")
+            old = build_source(run, sdk, old_source, spec, "legacy", "legacy-bootstrap")
             old_image = product_image(run, sdk, old, "p43", LEGACY_COMMIT)
             report.update(legacy_image=old_image, legacy_source_commit=LEGACY_COMMIT)
             run.command("mixed", [sys.executable, str(ROOT / "dev/mixed.py"),
