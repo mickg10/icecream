@@ -111,6 +111,19 @@ Under the scratch parent above, log
 `4e8e95d9e2dad17ff46f24c63943dcd5d7afbb8eda97dac21759f8cf3ee4625f`;
 `root-stage-copy/build/unittests/p50cacheservice-sanitize.log` SHA256 is
 `40c96ea1750e5fce894b540027580b448676821c2870f51246c023c1a872722f`.
+
+The existing default `dev/mixed.py` gate also passes all five rows on that
+corrected closure: current/current P29V1, ZSTD_TU and ZSTD_ROUTE, plus P43
+worker and P43 client. Each row observes real remote execution and checks
+the resulting program. This default run has `p51_r2_requested=false` and
+`concurrent_mixed_requested=false`; it is not W30 occupancy or concurrent
+P43/R1/R2 qualification. Summary under the scratch parent above:
+`mixed-ea496-default/summary.json`, SHA256
+`f30c5dcf74999bcc53d82066663b09685eda25179681295d960fadf5baddd579`.
+Current image `icecream-dev:current-corrected-ea496ad770495018` ID:
+`sha256:1e5927c3e6bc89a01e436029b64636ca37dc3ab5880971aa472da382baa3fb89`;
+pinned P43 image `icecream-dev:p43-cd74801e0fa4e83e` ID:
+`sha256:9140ad2c1a1afb2086bdfcc483d0b0d5d98bf1954168e0889d2e3ee05bc45050`.
 The separate native-environment verification
 skipped because sudo requested a password; the full legacy suite was not run.
 This is correctness evidence, not a measured whole-build speedup.
