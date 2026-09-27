@@ -3439,6 +3439,10 @@ def _run_canaries(
         )
         client_results: dict[str, str] = {}
         for worker in workers:
+            # The receipt workload's later client appends compile-identity
+            # records to this mode-0600 file, so its readiness canary must
+            # create the file under the same UID.
+            canary_uid = "1:1" if receipt_window_canary else "65534:65534"
             canary_mode_env = (
                 ("--env", "ICECC_P50_MODE=off", "--env", "ICECC_P51_MODE=off")
                 if receipt_window_canary else ()
@@ -3456,7 +3460,7 @@ def _run_canaries(
                         (
                             "exec",
                             "--user",
-                            "65534:65534",
+                            canary_uid,
                             *canary_mode_env,
                             container,
                             "/bin/bash",

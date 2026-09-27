@@ -895,6 +895,7 @@ def test_p51_receipt_window_canary_does_not_preopen_the_r2_link(
     assert "--env" in command.argv
     assert "ICECC_P50_MODE=off" in command.argv
     assert "ICECC_P51_MODE=off" in command.argv
+    assert command.argv[command.argv.index("--user") + 1] == "1:1"
 
     ordinary_farm, ordinary_scenario, ordinary_plan = _farm_scenario_plan(tmp_path)
     ordinary_transport = RecordingTransport(ScriptedLifecycle(ordinary_farm))
@@ -912,6 +913,7 @@ def test_p51_receipt_window_canary_does_not_preopen_the_r2_link(
     )
     assert "ICECC_P50_MODE=off" not in ordinary_command.argv
     assert "ICECC_P51_MODE=off" not in ordinary_command.argv
+    assert ordinary_command.argv[ordinary_command.argv.index("--user") + 1] == "65534:65534"
 
 
 def test_s30_mutant_rotates_readiness_trace_before_workload(tmp_path: Path) -> None:
