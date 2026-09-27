@@ -2039,7 +2039,8 @@ void test_p51_read_failure_releases_original_source_fd() {
     std::puts("P51_ASYNC_TRANSFER read failure releases original source fd: ok");
 }
 
-void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
+void test_p51_d07_queued_cancel_position(ProfileId profile,
+                                        size_t cancelled_index) {
     constexpr size_t kSurvivors = 30;
     constexpr size_t kCohort = kSurvivors + 1;
     constexpr uint64_t kHeldRawBytes = 4096;
@@ -2072,8 +2073,8 @@ void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
     f_config.f_store_guid = f_launch.f_store_guid;
     f_config.f_store_generation = f_launch.store_generation;
     f_config.sidecar_launch = f_launch;
-    f_config.endpoint_caps.profile = ProfileId::ZSTD_TU;
-    f_config.endpoint_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    f_config.endpoint_caps.profile = profile;
+    f_config.endpoint_caps.supported_profiles = profile_bit(profile);
     f_config.endpoint_caps.zstd.max_raw_bytes = 8192;
     f_config.max_pending_p51_source_reservations = 64;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -2090,8 +2091,8 @@ void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
     c_config.f_store_guid = c_launch.f_store_guid;
     c_config.f_store_generation = c_launch.store_generation;
     c_config.sidecar_launch = c_launch;
-    c_config.endpoint_caps.profile = ProfileId::ZSTD_TU;
-    c_config.endpoint_caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    c_config.endpoint_caps.profile = profile;
+    c_config.endpoint_caps.supported_profiles = profile_bit(profile);
     c_config.endpoint_caps.zstd.max_raw_bytes = 8192;
     c_config.max_active_source_transfers = 4;
     c_config.max_active_p51_source_transfers = kCohort + 1;
@@ -2225,10 +2226,15 @@ void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
     };
     auto reserve_request = [&](uint64_t request_id, size_t raw_bytes,
                                uint8_t fill) {
+        const uint32_t cache_profile = profile == ProfileId::P29V1
+            ? CACHE_PROFILE_P29V1
+            : profile == ProfileId::ZSTD_ROUTE
+                ? CACHE_PROFILE_ZSTD_ROUTE
+                : CACHE_PROFILE_ZSTD_TU;
         auto reservation = test_p51_reservation_request(
             c_launch.c_store_guid, c_launch.store_generation,
             c_launch.identity.generation, c_launch.identity.attempt,
-            request_id, CACHE_PROFILE_ZSTD_TU, 30,
+            request_id, cache_profile, 30,
             std::chrono::seconds(30));
         reservation.arm.source.assignment_nonce = request_id;
         reservation.arm.source.logical_job = 100000 + request_id;
@@ -2432,15 +2438,28 @@ void test_p51_d07_queued_cancel_position(size_t cancelled_index) {
     CHECK(all_operations_released);
     CHECK(all_raw_credits_released);
     CHECK(exact_target_retired_once);
-    std::printf("P51_D07 queued cancel submission=%zu survivors=30 exact-inputs=30 "
-                "fresh-tu-seq=0..29 C-raw-credit=0 scope=no-compiler\n",
-                cancelled_index);
+}
+
+void test_p51_d07_queued_cancel_position_with_marker(ProfileId profile,
+                                                    size_t cancelled_index) {
+    test_p51_d07_queued_cancel_position(profile, cancelled_index);
+    // The fixture's runtime destructors join endpoint-owner threads. Emit its
+    // summary afterward so those asynchronous endpoint diagnostics cannot
+    // interleave with or corrupt the per-cell marker.
+    std::printf("P51_D07 queued cancel profile=%u submission=%zu survivors=30 "
+                "exact-inputs=30 fresh-tu-seq=0..29 C-raw-credit=0 "
+                "scope=no-compiler\n",
+                static_cast<unsigned>(profile), cancelled_index);
+    std::fflush(stdout);
 }
 
 void test_p51_d07_queued_cancel_first_middle_last() {
-    test_p51_d07_queued_cancel_position(0);
-    test_p51_d07_queued_cancel_position(15);
-    test_p51_d07_queued_cancel_position(30);
+    for (const ProfileId profile : {
+             ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE}) {
+        test_p51_d07_queued_cancel_position_with_marker(profile, 0);
+        test_p51_d07_queued_cancel_position_with_marker(profile, 15);
+        test_p51_d07_queued_cancel_position_with_marker(profile, 30);
+    }
 }
 
 void test_p51_d07_staged_cancel_case(ProfileId profile,
@@ -17700,17 +17719,20 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d07-queued-cancel-first") == 0) {
-            test_p51_d07_queued_cancel_position(0);
+            test_p51_d07_queued_cancel_position_with_marker(
+                ProfileId::ZSTD_TU, 0);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d07-queued-cancel-middle") == 0) {
-            test_p51_d07_queued_cancel_position(15);
+            test_p51_d07_queued_cancel_position_with_marker(
+                ProfileId::ZSTD_TU, 15);
             return 0;
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--d07-queued-cancel-last") == 0) {
-            test_p51_d07_queued_cancel_position(30);
+            test_p51_d07_queued_cancel_position_with_marker(
+                ProfileId::ZSTD_TU, 30);
             return 0;
         }
         if (argc == 2 &&
