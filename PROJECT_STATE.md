@@ -63,6 +63,18 @@ requirement. Neither this setup failure nor successful image distribution is
 a product pass; the earlier runtime's retry-only D18 failure is unchanged.
 TU/ROUTE runs remain pending.
 
+The next one-shot attempt stopped in preflight: its copied foundation pin
+predated `f242cdf2`, which added iproute2 to the runtime image. Reconciliation
+verified the intended current closure `1433755c7d56cc76ff647bcc76ff6e981388f0664b7d5a7aad78e4929a85b67e`,
+GCC/G++ 11.4.0 and Boost 1.74. The fresh system-source snapshot has 16,820
+files: all 16,819 old files are byte-identical; only
+`/usr/include/iproute2/bpf_elf.h` was added. The new snapshot is separately
+pinned, not represented as identical to the old snapshot. Evidence:
+`d18/foundation-reconciliation.json` under the image evidence directory,
+SHA256 `e2115d236a2156938121e74bd087d350cb2a2d2a32e469635a65aeb0c2c62da7`.
+Fresh run `d18-c06-p29-20260927-3` uses the revalidated private authority;
+its final verdict and teardown remain pending.
+
 ### Multi-link receipt-window harness
 
 Receipt-window clients now automatically use one private Docker bridge each;
