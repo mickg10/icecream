@@ -101,8 +101,13 @@ they are not whole-build or external-network measurements.
 
 Configured W30 is not evidence of 30 naturally outstanding transfers. Peak
 ranges use all individual pass fields: the current executable's aggregate
-peak field omits the edited pass; a reporting correction is being tested
-separately without changing the running benchmark. Full Firefox matrix wall
+peak field omits the edited pass. The reporting correction is now integrated
+as `45d995d6`, separately from the unchanged measured executable. Its focused
+compiled smoke passes all three profiles and checks both three-active-pass
+aggregation and exclusion of an inactive third pass. Log
+`/tanksmall/scratch/tmp/p51-bench-6cff-current/metricfix/focused-smoke.log`,
+SHA256 `858af5804798b9497d56ab7f09c1acefc2870a420ffcce97b8573b7c2c75ccf1`.
+This is not a fresh whole-QA pass. Full Firefox matrix wall
 time was 14:16.37, maximum RSS 1,845,748 KiB. All three corpora are now complete.
 Evidence directory `/tanksmall/scratch/tmp/p51-bench-6cff-current/firefox/`:
 `firefox32-paired-matrix.log` SHA256
