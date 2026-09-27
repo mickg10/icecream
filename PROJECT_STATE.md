@@ -44,6 +44,15 @@ does not yet establish the cause. Logs under
 `local-c4f1-route-diagnostic-r1.log` SHA256
 `c7980674a1e040e6d5bdf156ecd13458fb8ebb833ef18ce2d0b6fa7ab6e3fb16`.
 The new Docker receipt-driver matrix has not yet been executed.
+The native helper now logs the first failure reason/attempt and bounded
+per-connection read-end diagnostics without changing limits or acceptance.
+An instrumented matched-Debian C4F1/ZSTD_ROUTE run passed 120 jobs with four
+established links, using 11 attempts (seven ended before LINK_STATE).
+Log `/tanksmall/scratch/tmp/p51-c4f1-firstfail/logs/c4f1-route-debian-matched.log`,
+SHA256 `5c44583867be47f4e53152b65e75725d43df4cfcb9f3839861c9b206f4e034f7`.
+An Ubuntu diagnostic pass is separate substrate evidence. Neither isolated
+pass explains the original 12-attempt failure; a single instrumented full
+18-cell replay in the original order is pending.
 
 ### Frozen QA and legacy build boundary
 
@@ -140,6 +149,10 @@ a positive cache relationship, a P50-or-newer C, and runtime R2 on both C/F.
 D18 and receipt-window plans with diagnostics enabled despite base revision 1.
 Collector validity requirements are unchanged. Fresh measured execution is
 still required; existing unmeasured records cannot become numeric evidence.
+Run `d18-p29-diagnostics-20260927-5` is active. Its first successful R2 source
+result reports valid wire accounting and external link intervals, with 35,776
+C-to-F bundle bytes, 116 F-to-C receipt bytes and drained ACK prefix 1.
+This verifies early measurement availability, not the final scenario verdict.
 The multi-link driver now likewise separates preferred worker names from
 verified address:port endpoints. Its correction passes 301 focused harness
 tests, including same-host/wrong-port rejection; this is not a farm pass.
