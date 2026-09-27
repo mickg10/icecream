@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import os
 import re
 import threading
@@ -59,10 +61,35 @@ done'''
 P51_GATE_READ_MARKER = (
     'if test -f "$1"; then cat "$1"; else printf "__WAIT__\\n"; fi'
 )
+P51_IPTABLES_BUNDLE_MANIFEST_SHA256 = (
+    "d1d7980ebc0b342caea791cc4fc86be4a6dcfc44f89e6884f2e4fbc69fd5568a"
+)
+P51_IPTABLES_BUNDLE_FILES = (
+    "iptables_1.8.9-2_amd64.deb",
+    "libip6tc2_1.8.9-2_amd64.deb",
+    "libmnl0_1.0.4-3_amd64.deb",
+    "libnetfilter-conntrack3_1.0.9-3_amd64.deb",
+    "libnfnetlink0_1.0.2-2_amd64.deb",
+    "libnftnl11_1.2.4-2_amd64.deb",
+    "libxtables12_1.8.9-2_amd64.deb",
+    "netbase_6.4_all.deb",
+)
 P51_NEGOTIATED_RE = re.compile(
     r"P51_RECEIPT_GATE_NEGOTIATED profile=([1-3]) window=([1-9][0-9]*) "
     r"epoch=([1-9][0-9]*) generation=([1-9][0-9]*)"
 )
+P51_PROFILE_IDS = {"P29V1": 1, "ZSTD_TU": 2, "ZSTD_ROUTE": 3}
+
+
+def _p51_negotiation_matches(
+    match: re.Match[str] | None, *, profile: str, window: int
+) -> bool:
+    return (
+        match is not None
+        and profile in P51_PROFILE_IDS
+        and int(match.group(1)) == P51_PROFILE_IDS[profile]
+        and int(match.group(2)) == window
+    )
 
 
 # Values from farm/scenario documents are passed as argv after this fixed
@@ -431,6 +458,79 @@ def _p51_gate_call(
     return result
 
 
+def _stage_p51_iptables_bundle(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    client: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+) -> None:
+    bundle_dir = os.environ.get("ICEFARM_P51_IPTABLES_BUNDLE")
+    if not bundle_dir:
+        raise WorkloadError(
+            "P51 receipt gate requires ICEFARM_P51_IPTABLES_BUNDLE with the "
+            "pinned Debian bookworm iptables package closure"
+        )
+    root = Path(bundle_dir)
+    manifest = (root / "SHA256SUMS").read_bytes()
+    if hashlib.sha256(manifest).hexdigest() != P51_IPTABLES_BUNDLE_MANIFEST_SHA256:
+        raise WorkloadError("P51 iptables package bundle manifest hash differs from pin")
+    expected: dict[str, str] = {}
+    for line in manifest.decode("ascii").splitlines():
+        digest, name = line.split(maxsplit=1)
+        expected[name.strip().lstrip("* ")] = digest
+    if set(expected) != set(P51_IPTABLES_BUNDLE_FILES):
+        raise WorkloadError("P51 iptables package bundle has an unexpected file set")
+
+    remote_dir = "/results/p51-receipt-gate/debs"
+    _p51_gate_call(
+        farm, plan, client, factory, transport, "stage-iptables-bundle-dir",
+        ("/bin/sh", "-c", 'set -eu; mkdir -p "$1"', "stage-debs", remote_dir),
+    )
+    manifest_payload = base64.b64encode(manifest).decode("ascii")
+    stage_items = [("SHA256SUMS", manifest_payload)]
+    for name in P51_IPTABLES_BUNDLE_FILES:
+        payload = (root / name).read_bytes()
+        if hashlib.sha256(payload).hexdigest() != expected[name]:
+            raise WorkloadError(f"P51 iptables package hash differs from pin: {name}")
+        stage_items.append((name, base64.b64encode(payload).decode("ascii")))
+
+    # Keep each argv payload below Linux's per-argument limit after the
+    # transport's JSON/base64 wrapping; package bytes remain on the run-private
+    # C output mount and never enter the immutable product image.
+    chunk_size = 42000
+    for name, encoded in stage_items:
+        remote_path = f"{remote_dir}/{name}"
+        _p51_gate_call(
+            farm, plan, client, factory, transport, "stage-iptables-bundle-file",
+            ("/bin/sh", "-c", ': > "$1"', "stage-deb", remote_path),
+        )
+        for offset in range(0, len(encoded), chunk_size):
+            chunk = encoded[offset : offset + chunk_size]
+            _p51_gate_call(
+                farm, plan, client, factory, transport, "stage-iptables-bundle-chunk",
+                (
+                    "/bin/sh", "-c",
+                    'printf %s "$1" | base64 -d >> "$2"',
+                    "stage-deb-chunk", chunk, remote_path,
+                ),
+            )
+        remote_hash = _p51_gate_call(
+            farm, plan, client, factory, transport, "verify-iptables-bundle-file",
+            (
+                "/bin/sh", "-c", 'sha256sum "$1" | awk \'{print $1}\'',
+                "verify-deb", remote_path,
+            ),
+        )
+        expected_digest = (
+            P51_IPTABLES_BUNDLE_MANIFEST_SHA256
+            if name == "SHA256SUMS"
+            else expected[name]
+        )
+        if remote_hash.stdout != f"{expected_digest}\n":
+            raise WorkloadError(f"staged P51 iptables package hash mismatch: {name}")
+
+
 def _p51_wait_marker(
     farm: FarmSpec,
     plan: dict[str, Any],
@@ -499,9 +599,29 @@ def _run_p51_receipt_window(
     if sidecar_uid <= 0:
         raise WorkloadError("receipt gate requires a distinct non-root C sidecar UID")
 
+    # Keep the redirect tool test-only and run-private: the immutable client
+    # image intentionally does not ship iptables. Stage a checksum-pinned
+    # Debian bookworm package closure from the host so the farm workload does
+    # not depend on outbound package-mirror access.
+    _stage_p51_iptables_bundle(farm, plan, client, factory, transport)
+    _p51_gate_call(
+        farm, plan, client, factory, transport, "install-test-iptables",
+        (
+            "/bin/sh", "-c",
+            "set -eu; cd /results/p51-receipt-gate/debs; "
+            "echo d1d7980ebc0b342caea791cc4fc86be4a6dcfc44f89e6884f2e4fbc69fd5568a  SHA256SUMS | sha256sum -c -; "
+            "sha256sum -c SHA256SUMS; dpkg -i ./*.deb; "
+            "test \"$(dpkg-query -W -f='${Version}' iptables)\" = 1.8.9-2; "
+            "iptables --version",
+            "install-test-iptables",
+        ),
+        timeout_s=180,
+    )
+
     worker_addr = worker["address"]
     gate_shell = (
-        'set +e; "$@"; rc=$?; '
+        'set +e; "$@" 2> /results/p51-receipt-gate/helper.stderr; rc=$?; '
+        'cat /results/p51-receipt-gate/helper.stderr >&2; '
         'printf "%s\\n" "$rc" > /results/p51-receipt-gate/exit; exit 0'
     )
     gate_argv = (
@@ -558,7 +678,13 @@ def _run_p51_receipt_window(
                     f"{gate_dir}/held-1", timeout_s=40,
                 )
                 if held is None:
-                    raise WorkloadError("remote gate did not observe the expected COMMIT window")
+                    detail = "remote gate did not observe the expected COMMIT window"
+                    if gate_future.done():
+                        gate_result = gate_future.result()
+                        output = (gate_result.stderr or gate_result.stdout).strip()
+                        if output:
+                            detail += f": {output[-1600:]}"
+                    raise WorkloadError(detail)
                 match = re.fullmatch(
                     r"count=([0-9]+) first_ordinal=([0-9]+) last_ordinal=([0-9]+) "
                     r"profile=([1-3]) window=([1-9][0-9]*) "
@@ -570,7 +696,7 @@ def _run_p51_receipt_window(
                     raise WorkloadError("remote gate held marker has invalid exact-window evidence")
                 count, first, last = (int(match.group(i)) for i in (1, 2, 3))
                 profile_id, selected_window = int(match.group(4)), int(match.group(5))
-                profile_id_expected = {"P29V1": 1, "ZSTD_TU": 2, "ZSTD_ROUTE": 3}[expected_profile]
+                profile_id_expected = P51_PROFILE_IDS[expected_profile]
                 if (
                     count != expected or last - first + 1 != expected or first != 1
                     or selected_window != gate_spec["negotiated_window"]
@@ -658,7 +784,9 @@ def _run_p51_receipt_window(
                 )
                 if (
                     exit_text != "1\n" or negotiated is None or failure is None
-                    or int(negotiated.group(2)) != 1
+                    or not _p51_negotiation_matches(
+                        negotiated, profile=expected_profile, window=1
+                    )
                     or tuple(int(failure.group(i)) for i in (1, 2, 3, 4, 5)) != (1, 1, 1, 1, 1)
                     or _p51_wait_marker(
                         farm, plan, client, factory, transport,

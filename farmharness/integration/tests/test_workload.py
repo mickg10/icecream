@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 from pathlib import Path
 import subprocess
@@ -306,6 +307,25 @@ def _receipt_gate_stub_inputs():
     return farm, scenario, plan, client
 
 
+@pytest.mark.parametrize(
+    ("line", "profile", "window", "expected"),
+    [
+        ("P51_RECEIPT_GATE_NEGOTIATED profile=1 window=1 epoch=1 generation=1", "P29V1", 1, True),
+        ("P51_RECEIPT_GATE_NEGOTIATED profile=2 window=1 epoch=1 generation=1", "P29V1", 1, False),
+        ("P51_RECEIPT_GATE_NEGOTIATED profile=1 window=30 epoch=1 generation=1", "P29V1", 1, False),
+        ("P51_RECEIPT_GATE_NEGOTIATED profile=3 window=1 epoch=1 generation=1", "ZSTD_ROUTE", 1, True),
+        ("not a negotiation record", "P29V1", 1, False),
+    ],
+)
+def test_p51_negotiation_matches_expected_profile_and_window(
+    line: str, profile: str, window: int, expected: bool
+) -> None:
+    match = workload_module.P51_NEGOTIATED_RE.search(line)
+    assert workload_module._p51_negotiation_matches(
+        match, profile=profile, window=window
+    ) is expected
+
+
 def test_p51_receipt_window_refuses_unverified_staged_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -334,14 +354,21 @@ def test_p51_receipt_window_separates_driver_and_sidecar_uids(
     phases: list[str] = []
     gate_commands: list[dict[str, object]] = []
     driver_uids: list[str] = []
+    staged_bundles: list[tuple[dict[str, object], dict[str, object]]] = []
 
-    def gate_call(_farm, _plan, _client, _factory, _transport, phase, argv):
+    def gate_call(_farm, _plan, _client, _factory, _transport, phase, argv, **_kwargs):
         phases.append(phase)
         if phase == "verify-staged-helper":
             return CommandResult(0, "a" * 64 + "\n", "")
         if phase == "sidecar-uid":
             assert argv == ("/usr/bin/id", "-u", "nobody")
             return CommandResult(0, "65534\n", "")
+        if phase == "install-test-iptables":
+            assert argv[:2] == ("/bin/sh", "-c")
+            assert len(argv) == 4 and argv[3] == "install-test-iptables"
+            assert "dpkg -i ./*.deb" in argv[2]
+            assert "dpkg-query" in argv[2]
+            return CommandResult(0, "iptables v1.8.9 (nf_tables)\n", "")
         raise AssertionError(f"unexpected gate call before driver launch: {phase}")
 
     class CapturingFactory:
@@ -356,19 +383,90 @@ def test_p51_receipt_window_separates_driver_and_sidecar_uids(
         driver_uids.append(kwargs["exec_uid"])
         raise DriverReached
 
+    def stage_bundle(_farm, _plan, _client, _factory, _transport):
+        staged_bundles.append((_plan, _client))
+
     monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", stage_bundle)
     monkeypatch.setattr(workload_module, "_driver_command", driver_command)
     with pytest.raises(DriverReached):
         workload_module._run_p51_receipt_window(
             farm, scenario, plan, client, CapturingFactory(), RecordingTransport(WorkloadRecorder()), "A"
         )
 
-    assert phases == ["verify-staged-helper", "sidecar-uid"]
+    assert phases == ["verify-staged-helper", "sidecar-uid", "install-test-iptables"]
+    assert staged_bundles == [(plan, client)]
     assert driver_uids == ["1:1"]
     argv = gate_commands[0]["argv"]
     assert isinstance(argv, tuple)
     assert argv[argv.index("--user") + 1] == "0"
     assert argv[argv.index("--p51-commit-receipt-gate-remote") + 3] == "65534"
+
+
+def test_p51_iptables_bundle_is_hash_checked_and_staged_in_bounded_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "debs"
+    bundle.mkdir()
+    payloads = {
+        name: (f"fixture:{name}:".encode() + b"x" * 100_000)
+        for name in workload_module.P51_IPTABLES_BUNDLE_FILES
+    }
+    rows = []
+    for name, payload in payloads.items():
+        (bundle / name).write_bytes(payload)
+        rows.append(f"{hashlib.sha256(payload).hexdigest()}  {name}")
+    manifest = ("\n".join(rows) + "\n").encode()
+    (bundle / "SHA256SUMS").write_bytes(manifest)
+    monkeypatch.setenv("ICEFARM_P51_IPTABLES_BUNDLE", str(bundle))
+    monkeypatch.setattr(
+        workload_module,
+        "P51_IPTABLES_BUNDLE_MANIFEST_SHA256",
+        hashlib.sha256(manifest).hexdigest(),
+    )
+
+    farm, _scenario, plan, client = _receipt_gate_stub_inputs()
+    reconstructed: dict[str, bytearray] = {}
+    current_path = ""
+    wrong_remote_hash = False
+
+    def gate_call(_farm, _plan, _client, _factory, _transport, phase, argv, **_kwargs):
+        nonlocal current_path
+        if phase == "stage-iptables-bundle-file":
+            current_path = argv[-1].rsplit("/", 1)[-1]
+            reconstructed[current_path] = bytearray()
+            return CommandResult(0, "", "")
+        if phase == "stage-iptables-bundle-chunk":
+            chunk, remote_path = argv[-2:]
+            current_path = remote_path.rsplit("/", 1)[-1]
+            reconstructed[current_path].extend(base64.b64decode(chunk))
+            assert len(chunk) <= 42_000
+            return CommandResult(0, "", "")
+        if phase == "verify-iptables-bundle-file":
+            name = argv[-1].rsplit("/", 1)[-1]
+            if wrong_remote_hash:
+                return CommandResult(0, f"{'0' * 64}\n", "")
+            return CommandResult(
+                0,
+                f"{hashlib.sha256(reconstructed[name]).hexdigest()}\n",
+                "",
+            )
+        assert phase == "stage-iptables-bundle-dir"
+        return CommandResult(0, "", "")
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    workload_module._stage_p51_iptables_bundle(
+        farm, plan, client, CommandFactory(), RecordingTransport(WorkloadRecorder())
+    )
+    for name, payload in payloads.items():
+        assert bytes(reconstructed[name]) == payload
+    assert bytes(reconstructed["SHA256SUMS"]) == manifest
+
+    wrong_remote_hash = True
+    with pytest.raises(WorkloadError, match="staged P51 iptables package hash mismatch"):
+        workload_module._stage_p51_iptables_bundle(
+            farm, plan, client, CommandFactory(), RecordingTransport(WorkloadRecorder())
+        )
 
 
 def test_manifest_driver_exports_boundary_dependencies_to_compiler_children(

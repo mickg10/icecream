@@ -34,7 +34,7 @@ from farmharness.integration.remote import (
     RemoteError,
     decode_ssh_payload,
 )
-from farmharness.integration.scenario_spec import load_scenario_spec
+from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
@@ -336,6 +336,7 @@ def test_p51_receipt_helper_is_staged_between_prepare_and_client_start(
     farm, scenario, _ = _farm_scenario_plan(tmp_path)
     farm.data["authority"]["topologies"]["C1F1"]["slots_per_f"] = 31
     scenario.data["id"] = "P51-receipt-stage-test"
+    scenario.data["instances"][0].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario.data["instances"][1]["slots"] = 31
     scenario.data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario.data["instances"][2]["env"].update(
@@ -372,6 +373,41 @@ def test_p51_receipt_helper_is_staged_between_prepare_and_client_start(
     assert phases.count("up.stage-p51-receipt-gate") == 1
     assert phases.index("up.prepare") < phases.index("up.stage-p51-receipt-gate")
     assert phases.index("up.stage-p51-receipt-gate") < phases.index("up.start-c")
+
+
+def test_p51_receipt_window_requires_r2_scheduler_mode(tmp_path: Path) -> None:
+    farm, scenario, _plan = _farm_scenario_plan(tmp_path)
+    scenario.data["id"] = "P51-receipt-r2-scheduler-validation"
+    scenario.data["instances"][0]["env"]["ICECC_P50_PROFILE"] = "P29V1"
+    scenario.data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    scenario.data["instances"][1]["slots"] = 31
+    scenario.data["instances"][2]["env"].update(
+        {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on"}
+    )
+    helper = Path("/bin/true")
+    scenario.data["workload"].update(
+        {
+            "driver": "p51-receipt-window",
+            "jobs": 1,
+            "receipt_gate": {
+                "binary": str(helper),
+                "binary_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+                "expected_commits": 1,
+                "negotiated_window": 1,
+                "expect_observed": True,
+            },
+        }
+    )
+    path = tmp_path / "receipt-scenario.json"
+    path.write_text(json.dumps(scenario.data), encoding="utf-8")
+
+    with pytest.raises(ScenarioSpecError, match="selected-profile R2 scheduler"):
+        load_scenario_spec(path, farm)
+
+    scenario.data["instances"][0]["env"]["ICECC_P51_MODE"] = "on"
+    path.write_text(json.dumps(scenario.data), encoding="utf-8")
+    loaded = load_scenario_spec(path, farm)
+    assert loaded.data["instances"][0]["env"]["ICECC_P51_MODE"] == "on"
 
 
 def test_readiness_canaries_cover_every_workload_client_worker_pair(

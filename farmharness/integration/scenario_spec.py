@@ -270,15 +270,19 @@ def _validate_p51_receipt_window(
         raise ScenarioSpecError(
             "$.workload: p51-receipt-window requires one C/F/S, one A turn, and no controls"
         )
+    scheduler = role_instances["S"][0]
     client, worker = role_instances["C"][0], role_instances["F"][0]
     if (
-        client.get("env", {}).get("ICECC_P50_MODE") != "on"
+        scheduler.get("env", {}).get("ICECC_P51_MODE") != "on"
+        or scheduler.get("env", {}).get("ICECC_P50_PROFILE") not in PROFILES
+        or client.get("env", {}).get("ICECC_P50_MODE") != "on"
         or client.get("env", {}).get("ICECC_P51_MODE") != "on"
         or worker.get("env", {}).get("ICECC_P51_MODE") != "on"
         or int(worker.get("slots", 0)) < 31
     ):
         raise ScenarioSpecError(
-            "$.instances: receipt-window requires P50/R2 C+F and at least 31 F slots"
+            "$.instances: receipt-window requires selected-profile R2 scheduler, "
+            "P50/R2 C+F, and at least 31 F slots"
         )
     gate = workload["receipt_gate"]
     binary = Path(gate["binary"])
