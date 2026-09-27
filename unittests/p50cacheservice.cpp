@@ -8381,15 +8381,28 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
         oversize_ready = ::poll(&no_oversize_connect, 1, 0);
     } while (oversize_ready < 0 && errno == EINTR);
 
+    // Receiving the pre-admission oversize error may precede release of its
+    // asynchronous operation slot. Wait for that exact slot to retire before
+    // submitting the fitting transfer; keep the held transfer and oldest
+    // waiter live so this still proves fitting work can bypass the waiter.
+    const bool oversize_retired_before_fit = wait_for_source_operation_count(
+        runtime, 2, std::chrono::seconds(1));
+    const size_t pending_after_oversize_retirement =
+        runtime.pending_p51_source_operations_for_test();
+    const bool held_credit_still_exact_before_fit =
+        runtime.active_source_raw_bytes_for_test() == 14;
+
     // The 2-byte fit is submitted after the cap refusal, while the observed
     // 3-byte waiter remains queued. It may bypass that waiter only because it
-    // fits the remaining credit; prove exact F commit and result before cancel.
+    // fits the remaining credit; first let the completed over-cap reply leave
+    // the bounded operation slots, then prove exact F commit before cancel.
     RuntimeCase pair = authenticated_runtime_pair();
     const auto operation = local::make_p51_source_transfer_operation(
         launch.identity, request, request.armed.arm.source.source_request_id);
-    const bool enqueued = runtime.enqueue_p51_source_transfer(
+    const auto fit_enqueue_result = runtime.enqueue_p51_source_transfer(
         std::move(pair.sender), launch.identity, operation,
-        sized_test_source_fd(expected_input.size(), 0xf1)) ==
+        sized_test_source_fd(expected_input.size(), 0xf1));
+    const bool enqueued = fit_enqueue_result ==
         service::P51SourceEnqueueResult::Accepted;
     const bool fit_source_read_observed =
         fit_source_read_complete.wait_for(std::chrono::seconds(3)) ==
@@ -8503,6 +8516,9 @@ void test_p51_aggregate_raw_budget_fitting_commit_is_exact(
               oversize_request.absolute_deadline.as_steady_time_point());
     CHECK(oversize_no_read_or_credit);
     CHECK(oversize_ready == 0);
+    CHECK(oversize_retired_before_fit);
+    CHECK(pending_after_oversize_retirement == 2);
+    CHECK(held_credit_still_exact_before_fit);
     CHECK(fit_source_read_observed);
     CHECK(fit_credit_uses_remaining_bytes);
     CHECK(fit_credit_released_to_holder);
