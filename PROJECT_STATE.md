@@ -21,7 +21,8 @@ remote defaults remain unchanged. Local role containers require CPU/memory
 caps, checked against declared host capacity. The transport candidate passed
 1718 Python tests with one skip before the endpoint correction; post-correction
 focused tests passed 336, plus two image-transport checks. Actual same-host
-receipt execution remains pending the runtime diagnostic-selection correction.
+receipt execution is prepared with the corrected runtime diagnostic selection
+and queued behind the external run's shared farm lock.
 See the operator example in `farmharness/integration/tests/README.md`.
 
 The candidate now materializes 36 receipt-window scenarios: C1F2/3/4 and
@@ -65,6 +66,22 @@ was refused by that lock. Neither launched a local workload. This remains
 runner qualification, not a current-source farm or performance result.
 
 ### Frozen QA and legacy build boundary
+
+A current-production farm role image has also been built locally from exact
+source `be66761c1b14846db10c236180d274c293577eb7`; the production directories
+remain unchanged through `b9da3553`. This uses the existing Ubuntu 22.04 farm
+Dockerfile, not the generic developer runtime image below. BuildKit was capped
+at two CPUs and 8 GiB, with `BUILD_JOBS=2`. Local image
+`icecream-farm:p50s4-be66761c` has native ID
+`sha256:47a7ebf183415bf298ecaf113c64e6970c3a15fabdfe4e9a710ebb856e9dcada`
+and image-identity closure SHA256
+`7eb5915a696509b9732d6049edb8579d8ac7742a348e6afe1188473a512db102`.
+Its source archive SHA256 is
+`a070cc7a004e3076be14fca16928a2049836495a5890f8da9d45e0671059a641`.
+Build log `/tanksmall/scratch/tmp/icefarm-role-be667.URglLL/build.log`, SHA256
+`1e6a641198d13aa88ed1c93f398d975ccc4cd7d41b0472da6e72b421543de636`,
+records a successful build. Distribution and current-image farm qualification
+are not yet complete; older 9e farm results do not qualify this image.
 
 Fresh public `make qa` on `be66761c` completed native checks: 178 total,
 172 PASS, 6 SKIP, zero failures/errors; root checks passed 2/2. Python then
