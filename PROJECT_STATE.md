@@ -108,8 +108,24 @@ binary SHA256 `600d9227aa0819d6f9aa229ad540d86c2dbd713eafca5be3d9245ebc4d7aebac`
 test source SHA256 `445e9354cf995d989f594c5dfe0ee9d68cd0602ffebb2e6ea49aa0293549ea3c`.
 The earlier handshake fixture crash was corrected by preserving coroutine
 argument lifetimes and having the fake F accept the client connection.
-This is not full D15 qualification: malformed recovery/control-message
-directions remain open. It is not a fresh full-suite run of the merged tip.
+Donor `b6d0a76d` adds 81 malformed recovery/control cases: RECOVER begin,
+witness and end; RECEIPTS row and end; RESET; RESET_ACK; and RESET_CONFIRM
+in both directions, each across three shapes and profiles. Nine malformed
+R2_TX_COMMIT frame cases and three post-commit duplicate JOB_BIND cases also
+pass. Recovery cases retain exact committed-prefix checks and parser errors;
+duplicate JOB_BIND is rejected at K=1/Q=1 without a second publication.
+The focused target is `make -C "$BUILD/unittests" p50endpoint-d15-wire-check`.
+Its retained log is
+`/tanksmall/scratch/tmp/p51-d15-matrix-ea65/build/d15-r21.log`, SHA256
+`5cc9ed4321fcf0b63f39e6cd92c511bd1c89f2f1a3e650f9e8b163017ca4f9d4`;
+binary SHA256 `90dbd2fc369b80f236aefb6e8f17c09cf62e8af7760157370205b6d9a30038d4`;
+test source SHA256 `59e4fa9ff1188ec4d252add501a0f44d32c7dd4688c617a6a17ca134ab94c7b1`.
+Earlier failed fixture runs remain retained. The duplicate-binding fixture
+now selects/materializes the committed input and verifies it once, rather
+than trying to attach it again after terminal cleanup.
+This is not full D15 qualification: R2_TX_COMMIT semantic identity/digest
+corruption still needs coverage; R1 negative matrices do not prove it.
+It is not a fresh full-suite run of the merged tip.
 
 ### Queued cancellation across profiles
 
