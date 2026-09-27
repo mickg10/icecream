@@ -6,6 +6,7 @@ import copy
 import hashlib
 import ipaddress
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -41,6 +42,7 @@ RUNNER_ENV = frozenset(
         "ICECC_P50_SOURCE_RESULT_TRACE",
         "ICECC_P50_TEST_LIFECYCLE_TRACE",
         "ICECC_P50_TEST_READY_TRACE",
+        "ICECC_P50_PIPELINE_WINDOW",
         "ICECC_SCHEDULER",
         "ICECC_TEST_SOCKET",
         "ICECC_VERSION",
@@ -250,6 +252,68 @@ def _validate_d18_role_mix(
         raise ScenarioSpecError("$.workload.d18_roles.workers: worker protocol modes do not match R1/R2")
 
 
+def _validate_p51_receipt_window(
+    value: dict[str, Any], workload: dict[str, Any],
+    role_instances: dict[str, list[dict[str, Any]]],
+) -> None:
+    if (
+        len(role_instances["S"]) != 1
+        or len(role_instances["C"]) != 1
+        or len(role_instances["F"]) != 1
+        or workload["clients"] != [role_instances["C"][0]["name"]]
+        or workload["turns"] != ["A"]
+        or workload["repeat"] != 1
+        or value["timeline"]
+        or value["controls"]
+        or "fault" in value
+    ):
+        raise ScenarioSpecError(
+            "$.workload: p51-receipt-window requires one C/F/S, one A turn, and no controls"
+        )
+    client, worker = role_instances["C"][0], role_instances["F"][0]
+    if (
+        client.get("env", {}).get("ICECC_P50_MODE") != "on"
+        or client.get("env", {}).get("ICECC_P51_MODE") != "on"
+        or worker.get("env", {}).get("ICECC_P51_MODE") != "on"
+        or int(worker.get("slots", 0)) < 31
+    ):
+        raise ScenarioSpecError(
+            "$.instances: receipt-window requires P50/R2 C+F and at least 31 F slots"
+        )
+    gate = workload["receipt_gate"]
+    binary = Path(gate["binary"])
+    if not binary.is_absolute() or ".." in binary.parts:
+        raise ScenarioSpecError("$.workload.receipt_gate.binary: must be an absolute safe path")
+    try:
+        metadata = binary.lstat()
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ScenarioSpecError(f"$.workload.receipt_gate.binary: unavailable: {exc}") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not metadata.st_mode & 0o111
+        or digest != gate["binary_sha256"]
+    ):
+        raise ScenarioSpecError(
+            "$.workload.receipt_gate: helper must be an executable regular file matching binary_sha256"
+        )
+    expected = gate["expected_commits"]
+    negotiated = gate["negotiated_window"]
+    if workload["jobs"] < expected:
+        raise ScenarioSpecError(
+            "$.workload.jobs: must offer enough jobs to test the configured receipt window"
+        )
+    if gate["expect_observed"]:
+        if expected != negotiated:
+            raise ScenarioSpecError(
+                "$.workload.receipt_gate: positive gate count must equal negotiated window"
+            )
+    elif expected != 30 or negotiated != 1:
+        raise ScenarioSpecError(
+            "$.workload.receipt_gate: W1 negative control must offer and assert 30"
+        )
+
+
 def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
     resolved = Path(path).resolve()
     try:
@@ -416,11 +480,14 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
         )
     d18_roles = workload.get("d18_roles")
     is_d18 = workload["driver"] == "d18-role-mix"
+    is_receipt_window = workload["driver"] == "p51-receipt-window"
     if is_d18 != (d18_roles is not None):
         raise ScenarioSpecError(
             "$.workload.d18_roles: required only for d18-role-mix workloads"
         )
-    expected_driver_corpus = "tu-manifest" if is_d18 else workload["driver"]
+    expected_driver_corpus = (
+        "tu-manifest" if is_d18 or is_receipt_window else workload["driver"]
+    )
     if expected_driver_corpus != corpus["kind"]:
         raise ScenarioSpecError(
             "$.workload.driver: does not match the declared corpus kind"
@@ -429,6 +496,12 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
         _validate_d18_role_mix(
             value, workload, role_instances, generations, wire_revisions
         )
+    if is_receipt_window:
+        if "receipt_gate" not in workload:
+            raise ScenarioSpecError("$.workload.receipt_gate: required for receipt-window driver")
+        _validate_p51_receipt_window(value, workload, role_instances)
+    elif "receipt_gate" in workload:
+        raise ScenarioSpecError("$.workload.receipt_gate: valid only for receipt-window driver")
     allowed_turns = {"A"} if "manifest" in corpus else {"A", "B"}
     unknown_turns = sorted(set(workload["turns"]) - allowed_turns)
     if unknown_turns:

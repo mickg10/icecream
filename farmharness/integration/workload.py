@@ -56,6 +56,14 @@ do
     printf '%s %s\n' "$pid" "${20}"
 done'''
 
+P51_GATE_READ_MARKER = (
+    'if test -f "$1"; then cat "$1"; else printf "__WAIT__\\n"; fi'
+)
+P51_NEGOTIATED_RE = re.compile(
+    r"P51_RECEIPT_GATE_NEGOTIATED profile=([1-3]) window=([1-9][0-9]*) "
+    r"epoch=([1-9][0-9]*) generation=([1-9][0-9]*)"
+)
+
 
 # Values from farm/scenario documents are passed as argv after this fixed
 # program.  They are never interpolated into shell source.
@@ -384,6 +392,299 @@ def _d18_docker_call(
             f"{result.stderr.strip() or result.stdout.strip() or result.returncode}"
         )
     return result
+
+
+def _p51_gate_call(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    client: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    suffix: str,
+    argv: tuple[str, ...],
+    *,
+    user: str = "0",
+    timeout_s: int = 20,
+) -> CommandResult:
+    command = factory.make(
+        phase=f"run.p51-receipt-window.{suffix}",
+        host=client["host"],
+        instance=client["name"],
+        transport=_docker_transport(farm, client["host"]),
+        timeout_s=timeout_s,
+        argv=docker_argv(
+            farm,
+            client["host"],
+            (
+                "exec", "--user", user,
+                f"icefarm-{plan['run_id']}-{client['name']}", *argv,
+            ),
+        ),
+    )
+    result = transport.invoke(command)
+    if result.returncode != 0:
+        raise WorkloadError(
+            f"P51 receipt gate {suffix} failed for {client['name']}: "
+            f"{result.stderr.strip() or result.stdout.strip() or result.returncode}"
+        )
+    return result
+
+
+def _p51_wait_marker(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    client: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    marker: str,
+    *,
+    timeout_s: int,
+) -> str | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = _p51_gate_call(
+            farm, plan, client, factory, transport, f"poll-{Path(marker).name}",
+            ("/bin/sh", "-c", P51_GATE_READ_MARKER, "read-marker", marker),
+        )
+        if result.stdout != "__WAIT__\n":
+            return result.stdout
+        time.sleep(0.2)
+    return None
+
+
+def _run_p51_receipt_window(
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    client: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    turn: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run a real manifest batch through the C-side remote receipt gate."""
+    workload = scenario.data["workload"]
+    gate_spec = workload["receipt_gate"]
+    worker = next(item for item in plan["topology"]["instances"] if item["role"] == "F")
+    endpoint_port = plan["ports"]["instances"][worker["name"]]
+    expected = int(gate_spec["expected_commits"])
+    expected_profile = next(
+        item.get("env", {}).get("ICECC_P50_PROFILE")
+        for item in scenario.data["instances"] if item["role"] == "S"
+    )
+    gate_dir = "/results/p51-receipt-gate"
+    gate_binary = plan["p51_receipt_gate"]["container_path"]
+    container = f"icefarm-{plan['run_id']}-{client['name']}"
+    uid_result = _p51_gate_call(
+        farm, plan, client, factory, transport, "sidecar-uid",
+        ("/usr/bin/id", "-u", "icecc"),
+    )
+    try:
+        sidecar_uid = int(uid_result.stdout.strip())
+    except ValueError as exc:
+        raise WorkloadError("receipt gate could not identify the C sidecar UID") from exc
+    if sidecar_uid <= 0:
+        raise WorkloadError("receipt gate requires a distinct non-root C sidecar UID")
+
+    worker_addr = worker["address"]
+    gate_shell = (
+        'set +e; "$@"; rc=$?; '
+        'printf "%s\\n" "$rc" > /results/p51-receipt-gate/exit; exit 0'
+    )
+    gate_argv = (
+        "exec", "--user", "0", "--env", "ICECC_TEST_POSITIVE_DAEMON=1",
+        container, "/bin/sh", "-c", gate_shell, "receipt-gate",
+        gate_binary, "--p51-commit-receipt-gate-remote", worker_addr,
+        str(endpoint_port), str(sidecar_uid), str(expected), "1", gate_dir,
+    )
+    gate_command = factory.make(
+        phase="run.p51-receipt-window.start-gate",
+        host=client["host"], instance=client["name"],
+        transport=_docker_transport(farm, client["host"]),
+        timeout_s=workload["receipt_gate"].get("command_timeout_s", 260),
+        argv=docker_argv(farm, client["host"], gate_argv),
+    )
+    command = _driver_command(farm, scenario, plan, client, turn, factory)
+    _p51_gate_call(
+        farm, plan, client, factory, transport, "prepare-control-dir",
+        ("/bin/mkdir", "-p", gate_dir),
+    )
+    workload_future = None
+    completed = False
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gate_future = executor.submit(transport.invoke, gate_command)
+        try:
+            ready = _p51_wait_marker(
+                farm, plan, client, factory, transport, f"{gate_dir}/ready", timeout_s=20
+            )
+            if ready is None:
+                raise WorkloadError("remote P51 receipt gate did not become ready")
+            workload_future = executor.submit(transport.invoke, command)
+            if gate_spec["expect_observed"]:
+                held = _p51_wait_marker(
+                    farm, plan, client, factory, transport,
+                    f"{gate_dir}/held-1", timeout_s=40,
+                )
+                if held is None:
+                    raise WorkloadError("remote gate did not observe the expected COMMIT window")
+                match = re.fullmatch(
+                    r"count=([0-9]+) first_ordinal=([0-9]+) last_ordinal=([0-9]+) "
+                    r"profile=([1-3]) window=([1-9][0-9]*) "
+                    r"relationship=([0-9a-f]{32}) reservation=([0-9a-f]{32}) "
+                    r"epoch=([1-9][0-9]*) generation=([1-9][0-9]*)\n",
+                    held,
+                )
+                if match is None:
+                    raise WorkloadError("remote gate held marker has invalid exact-window evidence")
+                count, first, last = (int(match.group(i)) for i in (1, 2, 3))
+                profile_id, selected_window = int(match.group(4)), int(match.group(5))
+                profile_id_expected = {"P29V1": 1, "ZSTD_TU": 2, "ZSTD_ROUTE": 3}[expected_profile]
+                if (
+                    count != expected or last - first + 1 != expected or first != 1
+                    or selected_window != gate_spec["negotiated_window"]
+                    or profile_id != profile_id_expected
+                ):
+                    raise WorkloadError(
+                        f"remote gate observed unexpected negotiated window: {held.strip()}"
+                    )
+                if match.group(6) == "0" * 32 or match.group(7) == "0" * 32:
+                    raise WorkloadError("remote gate negotiated zero relationship/reservation identity")
+                _p51_gate_call(
+                    farm, plan, client, factory, transport, "release-window",
+                    ("/usr/bin/touch", f"{gate_dir}/release-1"),
+                )
+                released = _p51_wait_marker(
+                    farm, plan, client, factory, transport,
+                    f"{gate_dir}/released-1", timeout_s=35,
+                )
+                if released is None:
+                    raise WorkloadError("remote gate did not acknowledge release of the held window")
+                workload_result = workload_future.result()
+                summary = _parse_summary(workload_result, client["name"])
+                expected_jobs = (
+                    farm.data["corpora"][workload["corpus"]]["tus"]
+                    * farm.data["corpora"][workload["corpus"]].get("repeat", 1)
+                    * workload["repeat"]
+                )
+                if summary["jobs"] != expected_jobs or summary["failures"] != 0:
+                    raise WorkloadError("receipt-window manifest did not produce all exact local-SHA outputs")
+                _p51_gate_call(
+                    farm, plan, client, factory, transport, "finish-gate",
+                    ("/usr/bin/touch", f"{gate_dir}/finish"),
+                )
+                gate_result = gate_future.result()
+                exit_text = _p51_wait_marker(
+                    farm, plan, client, factory, transport, f"{gate_dir}/exit", timeout_s=5
+                )
+                if exit_text != "0\n" or P51_NEGOTIATED_RE.search(gate_result.stderr) is None:
+                    raise WorkloadError("remote gate did not exit cleanly after one exact R2 window")
+                evidence = {
+                    "count": count,
+                    "first_ordinal": first,
+                    "last_ordinal": last,
+                    "profile": expected_profile,
+                    "negotiated_window": selected_window,
+                    "relationship_id": match.group(6),
+                    "reservation_id": match.group(7),
+                    "epoch": int(match.group(8)),
+                    "physical_link_generation": int(match.group(9)),
+                    "worker": worker["name"],
+                    "worker_address": worker_addr,
+                    "worker_port": endpoint_port,
+                }
+            else:
+                # Under negotiated W1, the first exact receipt may be held but
+                # the 30-receipt assertion must time out without a W30 marker.
+                fail_summary = None
+                deadline = time.monotonic() + 35
+                while time.monotonic() < deadline:
+                    polled = _p51_gate_call(
+                        farm, plan, client, factory, transport, "poll-short-window",
+                        ("/bin/sh", "-c", P51_GATE_READ_MARKER,
+                         "read-marker", f"{gate_dir}/failed"),
+                    )
+                    if polled.stdout != "__WAIT__\n":
+                        fail_summary = polled.stdout
+                        break
+                    if workload_future.done():
+                        # The job may complete locally, but only the explicit
+                        # gate failure record is accepted as this control.
+                        workload_future.result()
+                    time.sleep(0.2)
+                if fail_summary is None or "first receipt window failed" not in fail_summary:
+                    raise WorkloadError("W1 negative control did not reach the expected bounded gate timeout")
+                gate_result = gate_future.result()
+                exit_text = _p51_wait_marker(
+                    farm, plan, client, factory, transport, f"{gate_dir}/exit", timeout_s=5
+                )
+                negotiated = P51_NEGOTIATED_RE.search(gate_result.stderr)
+                failure = re.search(
+                    r"P51_RECEIPT_GATE_FAIL port=[0-9]+ expected=30 first=1 "
+                    r"woke=0 failed=0 commits=([0-9]+) peak=([0-9]+) "
+                    r"ordinal_count=([0-9]+) ordinal_min=([0-9]+) ordinal_max=([0-9]+)",
+                    gate_result.stderr,
+                )
+                if (
+                    exit_text != "1\n" or negotiated is None or failure is None
+                    or int(negotiated.group(2)) != 1
+                    or tuple(int(failure.group(i)) for i in (1, 2, 3, 4, 5)) != (1, 1, 1, 1, 1)
+                    or _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{gate_dir}/held-1", timeout_s=1,
+                    ) is not None
+                ):
+                    raise WorkloadError("W1 negative control did not prove one held receipt and no W30 window")
+                if workload_future is None:
+                    raise WorkloadError("W1 negative control did not launch the manifest driver")
+                workload_result = workload_future.result()
+                summary = _parse_summary(workload_result, client["name"])
+                evidence = {
+                    "count": 1,
+                    "expected_commits": expected,
+                    "profile": expected_profile,
+                    "negotiated_window": 1,
+                    "single_held_ordinal": int(failure.group(4)),
+                    "negative_control": "W1-no-W30-window",
+                    "worker": worker["name"],
+                    "worker_address": worker_addr,
+                    "worker_port": endpoint_port,
+                }
+            completed = True
+        finally:
+            # Unblock helper waits and preserve a bounded owned process tree on
+            # every failure path; these are run-private /results markers.
+            for marker in ("abort", "release-1", "finish"):
+                try:
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport,
+                        f"cleanup-{marker}", ("/usr/bin/touch", f"{gate_dir}/{marker}"),
+                    )
+                except BaseException:
+                    pass
+            if not completed:
+                try:
+                    transport.invoke(factory.make(
+                        phase="run.p51-receipt-window.abort-client-container",
+                        host=client["host"], instance=client["name"],
+                        transport=_docker_transport(farm, client["host"]),
+                        timeout_s=10,
+                        argv=docker_argv(
+                            farm, client["host"],
+                            ("kill", f"icefarm-{plan['run_id']}-{client['name']}"),
+                        ),
+                    ))
+                except BaseException:
+                    pass
+            if gate_future.done():
+                try:
+                    gate_future.result()
+                except BaseException:
+                    pass
+            if workload_future is not None and workload_future.done():
+                try:
+                    workload_future.result()
+                except BaseException:
+                    pass
+    return summary, evidence
 
 
 def _d18_processes(
@@ -796,6 +1097,21 @@ def run_workload(
                     timeout_s=scenario.data["timeouts"]["turn_s"],
                 )
             events.signal_turn_start(turn)
+            if scenario.data["workload"]["driver"] == "p51-receipt-window":
+                summary, window_evidence = _run_p51_receipt_window(
+                    farm, scenario, plan, clients[0], factory, transport, turn
+                )
+                total = totals[clients[0]["name"]]
+                for field in ("failures", "jobs", "samples"):
+                    total[field] += int(summary[field])
+                turn_receipts.append({
+                    "clients": [summary],
+                    "p51_receipt_window": window_evidence,
+                    "turn": turn,
+                })
+                events.signal_turn_complete(turn)
+                events.raise_if_failed()
+                continue
             commands = [
                 _driver_command(farm, scenario, plan, client, turn, factory)
                 for client in clients

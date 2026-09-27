@@ -143,7 +143,7 @@
       "additionalProperties": false,
       "required": ["driver", "corpus", "turns", "jobs", "clients", "repeat", "oracle"],
       "properties": {
-        "driver": {"enum": ["cmake-project", "ii-manifest", "tu-manifest", "d18-role-mix"]},
+        "driver": {"enum": ["cmake-project", "ii-manifest", "tu-manifest", "d18-role-mix", "p51-receipt-window"]},
         "corpus": {"$ref": "#/$defs/name"},
         "turns": {
           "type": "array",
@@ -159,6 +159,18 @@
           "items": {"$ref": "#/$defs/name"}
         },
         "repeat": {"type": "integer", "minimum": 1},
+        "receipt_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["binary", "binary_sha256", "expected_commits", "negotiated_window", "expect_observed"],
+          "properties": {
+            "binary": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "expected_commits": {"type": "integer", "minimum": 1, "maximum": 30},
+            "negotiated_window": {"type": "integer", "minimum": 1, "maximum": 30},
+            "expect_observed": {"type": "boolean"}
+          }
+        },
         "oracle": {"const": "local-sha"},
         "d18_roles": {
           "type": "object",

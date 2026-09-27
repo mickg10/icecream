@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import copy
+import hashlib
+import json
 
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
 from farmharness.integration.events import EventProducer
 from farmharness.integration.farm_spec import load_farm_spec
+from farmharness.integration.farm_spec import FarmSpec
 from farmharness.integration.images import RecordingTransport
 from farmharness.integration.scenario_spec import load_scenario_spec
 from farmharness.integration.suite_spec import (
@@ -32,6 +36,64 @@ def test_s95_plan_preserves_client_canary_output_for_failure_diagnostics() -> No
     smoke = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     smoke_plan = farmtest.build_plan(farm, smoke, run_id="s00-no-diagnostic-capture")
     assert "diagnostic_capture_client_output" not in smoke_plan
+
+
+def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_path: Path) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm_data = copy.deepcopy(farm.data)
+    farm_data["authority"]["topologies"]["C1F1"]["slots_per_f"] = 31
+    farm = FarmSpec(farm.path, farm_data)
+    helper = Path("/bin/true")
+    scenario_data = json.loads(
+        (INTEGRATION / "scenarios" / "S00-smoke.json").read_text(encoding="utf-8")
+    )
+    scenario_data["id"] = "P51-receipt-window-test"
+    scenario_data["instances"][1]["slots"] = 31
+    scenario_data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    scenario_data["instances"][2]["env"]["ICECC_P51_MODE"] = "on"
+    scenario_data["workload"].update(
+        {
+            "driver": "p51-receipt-window",
+            "jobs": 30,
+            "receipt_gate": {
+                "binary": str(helper),
+                "binary_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+                "expected_commits": 30,
+                "negotiated_window": 30,
+                "expect_observed": True,
+            },
+        }
+    )
+    scenario_path = tmp_path / "p51-receipt-window.json"
+    scenario_path.write_text(json.dumps(scenario_data), encoding="utf-8")
+    scenario = load_scenario_spec(scenario_path, farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="p51-receipt-window-plan")
+
+    helper_command = next(
+        command for command in plan["commands"]
+        if command["phase"] == "up.stage-p51-receipt-gate"
+    )
+    start_client = next(
+        command for command in plan["commands"] if command["phase"] == "up.start-c"
+    )
+    assert helper_command["transport"] == "rsync-ssh"
+    assert helper_command["argv"][-1].endswith("/output/p50daemonpositive")
+    assert "NET_ADMIN" in start_client["argv"]
+    assert plan["p51_receipt_gate"]["binary_sha256"] == hashlib.sha256(
+        helper.read_bytes()
+    ).hexdigest()
+    assert plan["topology"]["relationships"][0]["cache_expected"] is True
+
+    scenario_data["workload"]["receipt_gate"].update(
+        {"expected_commits": 30, "negotiated_window": 1, "expect_observed": False}
+    )
+    scenario_path.write_text(json.dumps(scenario_data), encoding="utf-8")
+    negative = load_scenario_spec(scenario_path, farm)
+    negative_plan = farmtest.build_plan(farm, negative, run_id="p51-window1-negative")
+    client = next(
+        item for item in negative_plan["commands"] if item["phase"] == "up.start-c"
+    )
+    assert "ICECC_P50_PIPELINE_WINDOW=1" in client["argv"]
 
 
 def test_checked_in_harness_gate_suites_are_exact_and_complete() -> None:

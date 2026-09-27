@@ -657,6 +657,31 @@ def _planned_commands(
             )
         )
         sequence += 1
+        if (
+            instance["role"] == "C"
+            and scenario.data["workload"]["driver"] == "p51-receipt-window"
+        ):
+            gate = scenario.data["workload"]["receipt_gate"]
+            helper = Path(gate["binary"]).resolve(strict=True)
+            if hashlib.sha256(helper.read_bytes()).hexdigest() != gate["binary_sha256"]:
+                raise PlanError("P51 receipt-gate helper changed after scenario validation")
+            commands.append(
+                PlannedCommand(
+                    sequence=sequence,
+                    phase="up.stage-p51-receipt-gate",
+                    host=instance["host"],
+                    instance=instance["name"],
+                    transport="rsync-ssh",
+                    timeout_s=timeout,
+                    argv=(
+                        "rsync", "--archive", "--checksum", "--protect-args",
+                        "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10 -o Compression=no",
+                        str(helper),
+                        f"{farm.hosts[instance['host']]['ssh']}:{root / 'output' / 'p50daemonpositive'}",
+                    ),
+                )
+            )
+            sequence += 1
         if directories:
             commands.append(
                 PlannedCommand(
@@ -794,6 +819,10 @@ def _planned_commands(
                     "ICECC_SCHEDULER": scheduler_addr,
                 }
             )
+            if scenario.data["workload"]["driver"] == "p51-receipt-window":
+                environment["ICECC_P50_PIPELINE_WINDOW"] = str(
+                    scenario.data["workload"]["receipt_gate"]["negotiated_window"]
+                )
             # R2 wire attribution is opt-in because it adds per-fragment
             # accounting. Enable the existing diagnostics switch only for a
             # P50 client with a declared positive CacheWire revision-2
@@ -848,6 +877,8 @@ def _planned_commands(
                 )
         elif instance["role"] == "C":
             args.extend(("--user", "0"))
+            if scenario.data["workload"]["driver"] == "p51-receipt-window":
+                args.extend(("--cap-add", "NET_ADMIN"))
         for source, target in (
             (root / "cache", "/var/cache/icecream"),
             (root / "tmp", CONTAINER_TEMP_ROOT),
@@ -1063,6 +1094,16 @@ def build_plan(
         **({"worker_endpoint_contract": "icefarm-live-bridge-endpoint-v1"}
            if netem_bindings else {}),
         "ports": ports,
+        **({
+            "p51_receipt_gate": {
+                "binary": str(Path(scenario.data["workload"]["receipt_gate"]["binary"]).resolve()),
+                "binary_sha256": scenario.data["workload"]["receipt_gate"]["binary_sha256"],
+                "container_path": "/results/p50daemonpositive",
+                "expected_commits": scenario.data["workload"]["receipt_gate"]["expected_commits"],
+                "negotiated_window": scenario.data["workload"]["receipt_gate"]["negotiated_window"],
+                "expect_observed": scenario.data["workload"]["receipt_gate"]["expect_observed"],
+            }
+        } if scenario.data["workload"]["driver"] == "p51-receipt-window" else {}),
         "network_shaping": {
             "bindings": [binding.as_dict() for binding in netem_bindings],
             "schema": NETEM_PLAN_SCHEMA,

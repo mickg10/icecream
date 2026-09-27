@@ -158,7 +158,14 @@ static MsgChannel *connect_tcp_bounded(int port, int timeout_msec)
     return nullptr;
 }
 
+static int connect_raw_tcp(const std::string& ipv4_address, int port);
+
 static int connect_raw_tcp(int port)
+{
+    return connect_raw_tcp("127.0.0.1", port);
+}
+
+static int connect_raw_tcp(const std::string& ipv4_address, int port)
 {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -169,8 +176,11 @@ static int connect_raw_tcp(int port)
     }
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(static_cast<uint16_t>(port));
+    if (::inet_pton(AF_INET, ipv4_address.c_str(), &address.sin_addr) != 1) {
+        ::close(fd);
+        return -1;
+    }
     const int connected = ::connect(
         fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
     if (connected < 0 && errno != EINPROGRESS) {
@@ -179,11 +189,11 @@ static int connect_raw_tcp(int port)
     }
     if (connected < 0) {
         pollfd waiter{fd, POLLOUT, 0};
-        const auto connect_deadline = Clock::now() + std::chrono::milliseconds(250);
+        const auto deadline = Clock::now() + std::chrono::milliseconds(250);
         int ready = -1;
         while (true) {
             const auto remaining = std::chrono::duration_cast<
-                std::chrono::milliseconds>(connect_deadline - Clock::now()).count();
+                std::chrono::milliseconds>(deadline - Clock::now()).count();
             if (remaining <= 0) break;
             ready = ::poll(&waiter, 1, static_cast<int>(remaining));
             if (ready >= 0 || errno != EINTR) break;
@@ -243,25 +253,26 @@ public:
     P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected,
                          uint64_t first_ordinal = 1,
                          std::string abort_path = {},
-                         bool insert_rule_first = false)
+                         bool insert_rule_first = false,
+                         std::string upstream_ipv4 = "127.0.0.1",
+                         std::string match_ipv4 = {})
         : endpoint_port_(endpoint_port), sidecar_uid_(sidecar_uid), expected_(expected),
           first_ordinal_(first_ordinal), abort_path_(std::move(abort_path)),
-          delayed_arm_mode_(insert_rule_first)
+          delayed_arm_mode_(insert_rule_first),
+          upstream_ipv4_(std::move(upstream_ipv4)),
+          match_ipv4_(std::move(match_ipv4))
     {
+        in_addr parsed_address{};
+        if (::inet_pton(AF_INET, upstream_ipv4_.c_str(), &parsed_address) != 1 ||
+            (!match_ipv4_.empty() &&
+             ::inet_pton(AF_INET, match_ipv4_.c_str(), &parsed_address) != 1) ||
+            (!match_ipv4_.empty() && ::geteuid() == sidecar_uid_))
+            return;
         listener_fd_ = listen_ephemeral(&proxy_port_);
         if (listener_fd_ < 0 || proxy_port_ <= 0) return;
-        const auto rule = [&](const char *action) {
-            return run_iptables_rule({"-t", "nat", action, "OUTPUT", "-p", "tcp",
-                "--dport", std::to_string(endpoint_port_),
-                "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
-                "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
-        };
         rule_installed_ = insert_rule_first
-            ? run_iptables_rule({"-t", "nat", "-I", "OUTPUT", "1", "-p", "tcp",
-                "--dport", std::to_string(endpoint_port_),
-                "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
-                "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)})
-            : rule("-A");
+            ? run_iptables_rule(redirect_rule("-I", true))
+            : run_iptables_rule(redirect_rule("-A", false));
         if (rule_installed_) thread_ = std::thread([this] {
             try { run(); }
             catch (...) { fail(); }
@@ -286,10 +297,7 @@ public:
         if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
         if (listener_fd_ >= 0) { ::close(listener_fd_); listener_fd_ = -1; }
         if (rule_installed_)
-            (void)run_iptables_rule({"-t", "nat", "-D", "OUTPUT", "-p", "tcp",
-                "--dport", std::to_string(endpoint_port_),
-                "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
-                "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
+            (void)run_iptables_rule(redirect_rule("-D", false));
     }
 
     bool ready() const noexcept { return listener_fd_ >= 0 && rule_installed_; }
@@ -404,6 +412,18 @@ public:
         return true;
     }
 
+    std::optional<icecc::p50::LinkState> link_state() const
+    {
+        std::lock_guard lock(mutex_);
+        return link_state_;
+    }
+
+    size_t link_state_observations() const
+    {
+        std::lock_guard lock(mutex_);
+        return link_state_observations_;
+    }
+
     void release_commits()
     {
         {
@@ -424,6 +444,21 @@ public:
     }
 
 private:
+    std::vector<std::string> redirect_rule(const char *action,
+                                           bool insert_first = false) const
+    {
+        std::vector<std::string> arguments{"-t", "nat", action, "OUTPUT"};
+        if (insert_first) arguments.emplace_back("1");
+        arguments.insert(arguments.end(), {"-p", "tcp"});
+        if (!match_ipv4_.empty())
+            arguments.insert(arguments.end(), {"-d", match_ipv4_});
+        arguments.insert(arguments.end(), {
+            "--dport", std::to_string(endpoint_port_),
+            "-m", "owner", "--uid-owner", std::to_string(sidecar_uid_),
+            "-j", "REDIRECT", "--to-ports", std::to_string(proxy_port_)});
+        return arguments;
+    }
+
     bool abort_requested() const
     {
         if (abort_path_.empty()) return false;
@@ -518,7 +553,9 @@ private:
         std::fprintf(stderr,
             "P51_RECEIPT_GATE_CONNECTION attempt=%u peer=%s:%u\n",
             attempt, peer_address, static_cast<unsigned>(peer_port));
-        server_fd_ = connect_raw_tcp(endpoint_port_);
+        server_fd_ = match_ipv4_.empty()
+            ? connect_raw_tcp(endpoint_port_)
+            : connect_raw_tcp(upstream_ipv4_, endpoint_port_);
         if (server_fd_ < 0) {
             std::fprintf(stderr,
                 "P51_RECEIPT_GATE_TERMINAL attempt=%u stage=upstream-connect errno=%d\n",
@@ -643,7 +680,17 @@ private:
                             icecc::p50::MessageType::LINK_STATE,
                             std::span<const uint8_t>(frame.data() + payload_offset,
                                                      payload_bytes));
-                        (void)std::get<icecc::p50::LinkState>(decoded);
+                        const auto& state = std::get<icecc::p50::LinkState>(decoded);
+                        {
+                            std::lock_guard lock(mutex_);
+                            link_state_ = state;
+                            ++link_state_observations_;
+                        }
+                        std::fprintf(stderr,
+                            "P51_RECEIPT_GATE_NEGOTIATED profile=%u window=%u epoch=%llu generation=%llu\n",
+                            static_cast<unsigned>(state.profile), state.window,
+                            static_cast<unsigned long long>(state.relationship_epoch),
+                            static_cast<unsigned long long>(state.physical_link_generation));
                     } catch (...) {
                         protocol_error = true;
                         terminal_reason = "invalid-link-state-payload";
@@ -806,6 +853,8 @@ private:
     uint64_t first_ordinal_ = 1;
     std::string abort_path_;
     bool delayed_arm_mode_ = false;
+    std::string upstream_ipv4_ = "127.0.0.1";
+    std::string match_ipv4_;
     std::atomic<unsigned> connection_attempts_{0};
     unsigned prearm_disconnects_ = 0;
     Clock::time_point prearm_retry_started_{};
@@ -819,6 +868,8 @@ private:
     std::condition_variable changed_;
     std::vector<std::vector<uint8_t>> commits_;
     std::set<uint64_t> ordinals_;
+    std::optional<icecc::p50::LinkState> link_state_;
+    size_t link_state_observations_ = 0;
     size_t peak_commits_ = 0;
     bool release_ = false;
     bool discard_ = false;
@@ -1233,7 +1284,9 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
                                        size_t expected, uint64_t first_ordinal,
                                        const std::string& control_dir,
                                        bool one_shot = false,
-                                       bool delayed_arm = false)
+                                       bool delayed_arm = false,
+                                       std::string upstream_ipv4 = "127.0.0.1",
+                                       std::string match_ipv4 = {})
 {
     if (endpoint_port <= 0 || sidecar_uid == 0 || expected == 0 ||
         expected > 30 || control_dir.empty())
@@ -1243,7 +1296,8 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         return 2;
     P51CommitReceiptGate gate(endpoint_port, sidecar_uid,
                               delayed_arm ? 0 : expected, first_ordinal,
-                              control_dir + "/abort", delayed_arm);
+                              control_dir + "/abort", delayed_arm,
+                              std::move(upstream_ipv4), std::move(match_ipv4));
     if (!gate.ready() || !p51_gate_write_marker(control_dir + "/ready")) {
         (void)p51_gate_write_marker(control_dir + "/failed", "gate setup failed\n");
         return 1;
@@ -1278,9 +1332,27 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
             first = std::min(first, witness.relationship_ordinal);
             last = std::max(last, witness.relationship_ordinal);
         }
+        const auto link_state = gate.link_state();
+        if (!link_state || gate.link_state_observations() != 1) return false;
+        static constexpr char hex[] = "0123456789abcdef";
+        const auto id_hex = [&](const auto& id) {
+            std::string result;
+            result.reserve(id.bytes.size() * 2);
+            for (const uint8_t byte : id.bytes) {
+                result.push_back(hex[byte >> 4]);
+                result.push_back(hex[byte & 0x0f]);
+            }
+            return result;
+        };
         const std::string summary = "count=" + std::to_string(witnesses.size()) +
             " first_ordinal=" + std::to_string(first) +
-            " last_ordinal=" + std::to_string(last) + "\n";
+            " last_ordinal=" + std::to_string(last) +
+            " profile=" + std::to_string(static_cast<unsigned>(link_state->profile)) +
+            " window=" + std::to_string(link_state->window) +
+            " relationship=" + id_hex(link_state->relationship_id) +
+            " reservation=" + id_hex(link_state->reservation_id) +
+            " epoch=" + std::to_string(link_state->relationship_epoch) +
+            " generation=" + std::to_string(link_state->physical_link_generation) + "\n";
         if (last - first + 1 != expected || !p51_gate_write_marker(
                 control_dir + "/held-" + std::to_string(stage), summary))
             return false;
@@ -6703,6 +6775,8 @@ static constexpr uint64_t kExpiredArmWireBudgetMsec = 2000;
 
 int main(int argc, char **argv)
 {
+    const bool remote_receipt_gate_mode = argc == 8 &&
+        std::strcmp(argv[1], "--p51-commit-receipt-gate-remote") == 0;
     const bool receipt_prearm_selftest = argc == 3 &&
         std::strcmp(argv[1], "--p51-receipt-prearm-retry-selftest") == 0;
     const bool receipt_gate_mode = argc == 7 &&
@@ -6775,19 +6849,21 @@ int main(int argc, char **argv)
             "FAIL: select one P51 exact-cancellation scenario\n");
         return 2;
     }
-    if (receipt_gate_mode && p51_cancel_scenario != P51CancelScenario::None) {
+    if ((receipt_gate_mode || remote_receipt_gate_mode) &&
+        p51_cancel_scenario != P51CancelScenario::None) {
         std::fprintf(stderr,
             "FAIL: receipt gate cannot be combined with a P51 cancellation scenario\n");
         return 2;
     }
     if ((p51_expired_arm_wire_case || p51_c03_invalidation) &&
-        (receipt_gate_mode || conflicting_p51_mode ||
+        (receipt_gate_mode || remote_receipt_gate_mode || conflicting_p51_mode ||
          p51_cancel_scenario != P51CancelScenario::None)) {
         std::fprintf(stderr,
             "FAIL: P51 wire invalidation gate cannot be combined with another mode\n");
         return 2;
     }
-    if (!receipt_gate_mode && !receipt_prearm_selftest && argc != 3) {
+    if (!receipt_gate_mode && !remote_receipt_gate_mode &&
+        !receipt_prearm_selftest && argc != 3) {
         std::fprintf(stderr, "usage: %s <iceccd> <icecc-cache-service>\n", argv[0]);
         return 2;
     }
@@ -6815,6 +6891,67 @@ int main(int argc, char **argv)
             "%s: P51 receipt prearm stale-candidate retry and shutdown\n",
             passed ? "PASS" : "FAIL");
         return passed ? 0 : 1;
+    }
+    if (remote_receipt_gate_mode) {
+        const auto parse_ipv4 = [](const char *text) {
+            in_addr address{};
+            return text != nullptr && ::inet_pton(AF_INET, text, &address) == 1;
+        };
+        char *end = nullptr;
+        errno = 0;
+        const long endpoint_port = std::strtol(argv[3], &end, 10);
+        if (!parse_ipv4(argv[2]) || errno != 0 ||
+            end == argv[3] || *end != '\0' || endpoint_port <= 0 ||
+            endpoint_port > 65535) {
+            std::fprintf(stderr,
+                "FAIL: remote receipt gate requires literal IPv4 addresses and a valid port\n");
+            return 2;
+        }
+        errno = 0;
+        end = nullptr;
+        const unsigned long sidecar_uid = std::strtoul(argv[4], &end, 10);
+        if (errno != 0 || end == argv[4] || *end != '\0' || sidecar_uid == 0 ||
+            sidecar_uid != static_cast<unsigned long>(icecc->pw_uid) ||
+            sidecar_uid == static_cast<unsigned long>(::geteuid())) {
+            std::fprintf(stderr,
+                "FAIL: remote receipt gate requires root helper and distinct unprivileged sidecar UID\n");
+            return 2;
+        }
+        errno = 0;
+        end = nullptr;
+        const unsigned long expected = std::strtoul(argv[5], &end, 10);
+        if (errno != 0 || end == argv[5] || *end != '\0' || expected == 0 ||
+            expected > 30) {
+            std::fprintf(stderr,
+                "FAIL: remote receipt gate expected count must be in [1,30]\n");
+            return 2;
+        }
+        errno = 0;
+        end = nullptr;
+        const auto parse_positive_u64 = [](const char *text, uint64_t *value) {
+            if (text == nullptr || *text == '\0') return false;
+            for (const unsigned char *p =
+                     reinterpret_cast<const unsigned char *>(text); *p != '\0'; ++p)
+                if (*p < '0' || *p > '9') return false;
+            errno = 0;
+            char *number_end = nullptr;
+            const unsigned long long parsed = std::strtoull(text, &number_end, 10);
+            if (errno != 0 || number_end == text || *number_end != '\0' || parsed == 0)
+                return false;
+            *value = static_cast<uint64_t>(parsed);
+            return static_cast<unsigned long long>(*value) == parsed;
+        };
+        uint64_t first = 0;
+        if (!parse_positive_u64(argv[6], &first) ||
+            first > std::numeric_limits<uint64_t>::max() - (expected - 1))
+            return 2;
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_REMOTE_CONFIG address=%s port=%ld sidecar_uid=%lu helper_uid=%lu expected=%lu\n",
+            argv[2], endpoint_port, sidecar_uid,
+            static_cast<unsigned long>(::geteuid()), expected);
+        return run_p51_commit_receipt_gate(
+            static_cast<int>(endpoint_port), static_cast<uid_t>(sidecar_uid),
+            static_cast<size_t>(expected), first, argv[7], true, false, argv[2], argv[2]);
     }
     if (p51_c03_invalidation)
         test_msgchannel_buffered_input_probe();
