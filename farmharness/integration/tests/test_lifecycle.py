@@ -29,10 +29,12 @@ from farmharness.integration.lifecycle import (
     bundle_root,
     corpus_layout,
     down_from_state,
+    collect_diagnostics,
     _run_canaries,
     _rotate_s30_canary_traces,
     _expected_image_labels,
     _diagnostic_client_output_patterns,
+    _diagnostic_p51_trace_patterns,
     _host_facts,
 )
 from farmharness.integration.remote import (
@@ -423,6 +425,7 @@ class ScriptedLifecycle:
         bad_role_hash: bool = False,
         client_cache_timeout: bool = False,
         fail_output_capture: bool = False,
+        fail_p51_trace_capture: bool = False,
     ) -> None:
         self.farm = farm
         self.scheduler_interrupt = scheduler_interrupt
@@ -431,6 +434,7 @@ class ScriptedLifecycle:
         self.bad_role_hash = bad_role_hash
         self.client_cache_timeout = client_cache_timeout
         self.fail_output_capture = fail_output_capture
+        self.fail_p51_trace_capture = fail_p51_trace_capture
         runtime_closure = farm.data["runtime_image"]["closure_sha256"]
         matching_labels = [
             label
@@ -457,6 +461,11 @@ class ScriptedLifecycle:
     def invoke(self, command: PlannedCommand) -> CommandResult:
         if command.phase == "diagnostics.sync-output" and self.fail_output_capture:
             raise RemoteError("injected output capture failure")
+        if (
+            command.phase == "diagnostics.sync-p51-traces"
+            and self.fail_p51_trace_capture
+        ):
+            raise RemoteError("injected P51 trace capture failure")
         if command.phase == "preflight.stale-list":
             return CommandResult(
                 0, "\n".join(self._containers_on(command.host)) + "\n", ""
@@ -1302,6 +1311,11 @@ def test_failed_client_output_capture_is_bounded_and_retained_before_cleanup(
 
     phases = [command.phase for command in teardown.commands]
     assert phases.index("diagnostics.sync-output") < phases.index("down.remove-scratch")
+    d18_output = next(
+        command for command in teardown.commands
+        if command.phase == "diagnostics.sync-output"
+    )
+    assert "--rsync-path=sudo -n rsync" not in d18_output.argv
     output_problem = next(
         error for error in receipt["diagnostic_errors"]
         if error.endswith(":sync-output:injected output capture failure")
@@ -1347,6 +1361,32 @@ def test_failed_client_output_capture_is_bounded_and_retained_before_cleanup(
     )
 
 
+def test_failed_p51_trace_capture_is_reported_before_scratch_cleanup(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _farm_scenario_plan(tmp_path)
+    plan["diagnostic_capture_client_output"] = True
+    plan["diagnostic_capture_client_output_kind"] = "p51-receipt-window"
+    scripted = ScriptedLifecycle(farm, fail_p51_trace_capture=True)
+    bring_up(farm, scenario, plan, recorder=RecordingTransport(scripted), probe_bytes=0)
+
+    teardown = RecordingTransport(scripted)
+    receipt = down_from_state(farm, plan, recorder=teardown)
+
+    phases = [command.phase for command in teardown.commands]
+    assert phases.count("diagnostics.sync-p51-traces") == 2
+    assert max(
+        index for index, phase in enumerate(phases)
+        if phase == "diagnostics.sync-p51-traces"
+    ) < phases.index("down.remove-scratch")
+    errors = [
+        error for error in receipt["diagnostic_errors"]
+        if ":sync-p51-traces:" in error
+    ]
+    assert len(errors) == 2
+    assert all(error.endswith(":injected P51 trace capture failure") for error in errors)
+
+
 def test_diagnostic_output_filter_keeps_receipts_not_compiled_payloads(
     tmp_path: Path,
 ) -> None:
@@ -1361,6 +1401,7 @@ def test_diagnostic_output_filter_keeps_receipts_not_compiled_payloads(
         "workload/A/jobs/000001/client-debug.log": "debug\n",
         "workload/A/jobs/000001/client-output.log": "output\n",
         "workload/A/jobs/000001/remote.o": "compiled-object-must-not-copy\n",
+        "source-result.jsonl": '{"schema":"icecream-p50-source-result-v5"}\n',
         "p51-receipt-gate/helper.stderr": "gate diagnostic\n",
         "p51-receipt-gate/exit": "0\n",
         "p51-receipt-gate/links/C1-F1/helper.stderr": "link diagnostic\n",
@@ -1409,6 +1450,105 @@ def test_diagnostic_output_filter_keeps_receipts_not_compiled_payloads(
     assert not (destination / "p51-receipt-gate/debs/iptables.deb").exists()
     assert not (destination / "p51-receipt-gate/links/C1-F1/debs/iptables.deb").exists()
     assert not (destination / "p50daemonpositive").exists()
+    assert not (destination / "source-result.jsonl").exists()
+
+    # Root-owned protocol traces use separate exact-file allowlists.
+    c_trace_source = tmp_path / "remote-c-traces"
+    c_trace_destination = tmp_path / "captured-c-traces"
+    c_trace_source.mkdir()
+    c_trace_destination.mkdir()
+    (c_trace_source / "source-result.jsonl").write_text(
+        '{"schema":"icecream-p50-source-result-v5"}\n', encoding="ascii"
+    )
+    (c_trace_source / "f-action.jsonl").write_text(
+        '{"action":"must-not-copy-from-C"}\n', encoding="ascii"
+    )
+    c_patterns = _diagnostic_p51_trace_patterns("C")
+    c_result = subprocess.run(
+        [
+            "rsync", "--archive", "--no-owner", "--no-group",
+            *(argument for pattern in c_patterns for argument in ("--include", pattern)),
+            "--exclude", "*", str(c_trace_source) + "/", str(c_trace_destination) + "/",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert c_result.returncode == 0, c_result.stderr
+    assert (c_trace_destination / "source-result.jsonl").is_file()
+    assert not (c_trace_destination / "f-action.jsonl").exists()
+
+    # F-side traces copy only bounded action/source-result JSONL files.
+    f_source = tmp_path / "remote-f-output"
+    f_destination = tmp_path / "captured-f-output"
+    for relative, content in {
+        "f-action.jsonl": '{"action":"INPUT_COMMITTED"}\n',
+        "source-result.jsonl": '{"schema":"icecream-p50-source-result-v5"}\n',
+        "cache/raw-bundle.bin": "must-not-copy\n",
+    }.items():
+        path = f_source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="ascii")
+    f_destination.mkdir()
+    f_patterns = _diagnostic_p51_trace_patterns("F")
+    f_result = subprocess.run(
+        [
+            "rsync", "--archive", "--no-owner", "--no-group",
+            *(argument for pattern in f_patterns for argument in ("--include", pattern)),
+            "--exclude", "*", str(f_source) + "/", str(f_destination) + "/",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert f_result.returncode == 0, f_result.stderr
+    assert (f_destination / "f-action.jsonl").is_file()
+    assert (f_destination / "source-result.jsonl").is_file()
+    assert not (f_destination / "cache/raw-bundle.bin").exists()
+    with pytest.raises(LifecycleError, match="C or F role"):
+        _diagnostic_p51_trace_patterns("S")
+
+
+def test_p51_trace_diagnostics_use_bounded_privileged_remote_rsync(
+    tmp_path: Path,
+) -> None:
+    farm, _scenario, plan = _farm_scenario_plan(tmp_path)
+    plan["diagnostic_capture_client_output"] = True
+    plan["diagnostic_capture_client_output_kind"] = "p51-receipt-window"
+    transport = RecordingTransport(ScriptedLifecycle(farm))
+
+    collect_diagnostics(
+        farm,
+        plan,
+        transport,
+        CommandFactory(),
+        tmp_path / "diagnostics",
+    )
+
+    output_commands = [
+        command for command in transport.commands
+        if command.phase == "diagnostics.sync-output"
+    ]
+    assert len(output_commands) == 1
+    assert any("/C1/output/" in command.argv[-2] for command in output_commands)
+    assert all("--rsync-path=sudo -n rsync" not in command.argv for command in output_commands)
+    assert all("--exclude" in command.argv for command in output_commands)
+    trace_commands = [
+        command for command in transport.commands
+        if command.phase == "diagnostics.sync-p51-traces"
+    ]
+    assert len(trace_commands) == 2
+    assert any("/C1/output/" in command.argv[-2] for command in trace_commands)
+    assert any("/F1/output/" in command.argv[-2] for command in trace_commands)
+    assert all("--rsync-path=sudo -n rsync" in command.argv for command in trace_commands)
+    for command in trace_commands:
+        if "/C1/output/" in command.argv[-2]:
+            assert command.argv.count("--include") == 1
+            assert "/source-result.jsonl" in command.argv
+        else:
+            assert command.argv.count("--include") == 2
+            assert "/f-action.jsonl" in command.argv
+            assert "/source-result.jsonl" in command.argv
 
 
 def test_ports_are_unique_and_every_daemon_gets_an_explicit_port(

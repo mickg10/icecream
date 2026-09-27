@@ -3775,8 +3775,8 @@ def collect_diagnostics(
         except RemoteError as exc:
             problems.append(f"{host_name}:{instance['name']}:sync-log:{exc}")
         if (
-            instance.get("role") == "C"
-            and plan.get("diagnostic_capture_client_output") is True
+            plan.get("diagnostic_capture_client_output") is True
+            and instance.get("role") == "C"
         ):
             remote_output = (
                 PurePosixPath(farm.hosts[host_name]["scratch_root"])
@@ -3821,6 +3821,54 @@ def collect_diagnostics(
             except RemoteError as exc:
                 problems.append(
                     f"{host_name}:{instance['name']}:sync-output:{exc}"
+                )
+        if (
+            plan.get("diagnostic_capture_client_output") is True
+            and plan.get("diagnostic_capture_client_output_kind")
+            == "p51-receipt-window"
+            and instance.get("role") in ("C", "F")
+        ):
+            remote_output = (
+                PurePosixPath(farm.hosts[host_name]["scratch_root"])
+                / "icefarm"
+                / plan["run_id"]
+                / instance["name"]
+                / "output"
+            )
+            local_output = host_dir / f"{instance['name']}.output"
+            local_output.mkdir(parents=True, exist_ok=True)
+            trace_patterns = _diagnostic_p51_trace_patterns(instance["role"])
+            try:
+                recorder.invoke(
+                    _command(
+                        factory,
+                        phase="diagnostics.sync-p51-traces",
+                        host=host_name,
+                        transport=rsync_transport(farm, host_name),
+                        timeout_s=60,
+                        argv=rsync_remote_argv(farm, host_name, (
+                            "rsync",
+                            "--archive",
+                            "--no-owner",
+                            "--no-group",
+                            "--omit-dir-times",
+                            "--protect-args",
+                            "--rsync-path=sudo -n rsync",
+                            *(
+                                argument
+                                for pattern in trace_patterns
+                                for argument in ("--include", pattern)
+                            ),
+                            "--exclude",
+                            "*",
+                            f"{farm.hosts[host_name]['ssh']}:{remote_output}/",
+                            str(local_output) + "/",
+                        )),
+                    )
+                )
+            except RemoteError as exc:
+                problems.append(
+                    f"{host_name}:{instance['name']}:sync-p51-traces:{exc}"
                 )
     return problems
 
@@ -3878,6 +3926,16 @@ def _diagnostic_client_output_patterns(kind: Any) -> tuple[str, ...]:
             "/p51-receipt-gate/links/*/identity-*",
         )
     raise LifecycleError("client output diagnostic capture has an unknown allowlist")
+
+
+def _diagnostic_p51_trace_patterns(role: Any) -> tuple[str, ...]:
+    """Exact root-owned P51 JSONL traces; never broaden to a role output tree."""
+
+    if role == "C":
+        return ("/source-result.jsonl",)
+    if role == "F":
+        return ("/f-action.jsonl", "/source-result.jsonl")
+    raise LifecycleError("P51 trace diagnostics require a C or F role")
 
 
 def _remove_netem_bridges(
