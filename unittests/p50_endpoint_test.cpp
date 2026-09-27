@@ -4697,9 +4697,18 @@ asio::awaitable<void> r2_client_write_window_before_receipts(
     socket.close(ignored);
 }
 
+enum class R2EndpointWireFault : uint8_t {
+    None,
+    WrongTuEndDigest,
+    DuplicateTuEnd,
+    AckBeyondCommittedPrefix,
+};
+
 asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
     tcp::endpoint endpoint, LinkHello hello,
-    std::vector<R2EndpointTestJob> jobs) {
+    std::vector<R2EndpointTestJob> jobs,
+    R2EndpointWireFault fault = R2EndpointWireFault::None,
+    bool* observed_terminal_close = nullptr) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await socket.async_connect(endpoint, asio::use_awaitable);
     co_await raw_write(socket, Message{hello});
@@ -4732,15 +4741,23 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
             compute_r2_binding_digest(job.binding);
         const Digest128 transaction_digest = compute_r2_transaction_digest(
             job.binding, begin, bodies, job.fills);
-        const TuEnd end{job.binding.relationship_ordinal, binding_digest,
-                        transaction_digest};
+        TuEnd end{job.binding.relationship_ordinal, binding_digest,
+                  transaction_digest};
 
         co_await raw_write(socket, Message{job.binding});
         co_await raw_write(socket, Message{begin});
         co_await raw_write(socket, Message{bodies.front()});
         for (const R2FillMessage& fill : job.fills)
             co_await raw_write(socket, Message{fill});
+        if (fault == R2EndpointWireFault::WrongTuEndDigest && commits.empty())
+            end.transaction_digest.bytes[0] ^= 0x80;
         co_await raw_write(socket, Message{end});
+        if (fault == R2EndpointWireFault::WrongTuEndDigest && commits.empty()) {
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
         const Frame commit_frame =
             co_await raw_read(socket, hello.max_frame_payload);
         require(commit_frame.type == MessageType::R2_TX_COMMIT,
@@ -4758,12 +4775,31 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
         state.next_rel_seq = RelSeq{commit.inner.rel_seq.value + 1};
         state.state_digest = commit.inner.post_state_digest;
 
+        if (fault == R2EndpointWireFault::DuplicateTuEnd && commits.size() == 1) {
+            co_await raw_write(socket, Message{end});
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
+        const uint64_t ack_ordinal =
+            fault == R2EndpointWireFault::AckBeyondCommittedPrefix &&
+                    commits.size() == 1
+                ? job.binding.relationship_ordinal + 1
+                : job.binding.relationship_ordinal;
         co_await raw_write(
             socket,
             Message{CommitAck{hello.relationship_id,
                               hello.relationship_epoch,
                               hello.physical_link_generation,
-                              job.binding.relationship_ordinal}});
+                              ack_ordinal}});
+        if (fault == R2EndpointWireFault::AckBeyondCommittedPrefix &&
+            commits.size() == 1) {
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
     }
     co_await raw_write(socket, Message{CloseMessage{}});
     boost::system::error_code ignored;
@@ -6734,6 +6770,238 @@ asio::awaitable<ClientRunResult> r2_fragmented_single_job_client(
     socket.shutdown(tcp::socket::shutdown_both, ignored);
     socket.close(ignored);
     co_return receipt;
+}
+
+void test_r2_endpoint_rejects_wire_fault(ProfileId profile,
+                                         R2EndpointWireFault fault) {
+    const uint64_t fault_id = static_cast<uint64_t>(fault);
+    const P5coStoreGuids stores = p5co_store_guids(
+        0xd150 + static_cast<uint64_t>(profile) * 8 + fault_id);
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_speculative_tus = 1;
+    authority_limits.max_speculative_raw_bytes = 1U << 20;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        stores.c, caps.zstd, authority_limits, 1, profile);
+    const PreparationRouteKey route{stores.f, 23, profile};
+    const std::vector<uint8_t> input{
+        'D','1','5',' ','e','x','a','c','t',' ','w','i','r','e','\n'};
+    const uint64_t request_id = 61500 + static_cast<uint64_t>(profile) * 8 + fault_id;
+    const P51SourceArmFields arm{
+        r2_test_arm(stores.c, request_id,
+                    71500 + static_cast<uint32_t>(profile) * 8 +
+                        static_cast<uint32_t>(fault_id), profile),
+        1};
+    const P51SourceArmedFields armed = r2_test_armed(
+        arm, stores.f, 0xd151 + static_cast<uint64_t>(profile) * 8 + fault_id);
+    const PreparedTuHandle prepared_handle = authority->prepare_for_route(
+        route, PrepareRequestKey{request_id, arm.source.logical_job}, input);
+    std::vector<R2FillMessage> fills;
+    if (profile == ProfileId::P29V1) {
+        authority->pin_p29v1_system_source_reuse(prepared_handle, Digest128{});
+        const std::vector<uint8_t> need =
+            authority->predicted_p29v1_need(prepared_handle);
+        const std::span<const uint8_t> fill =
+            authority->answer_p29v1_need(prepared_handle, need);
+        icecc::codec::P29WireLimits wire_limits;
+        wire_limits.max_tu_bytes = static_cast<size_t>(caps.zstd.max_raw_bytes);
+        wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+        const std::vector<FillMessage> encoded = encode_p29v1_fill_messages(
+            fill, kInitialMaxFramePayload,
+            icecc::codec::p29v1_fill_inner_bound(wire_limits));
+        fills.reserve(encoded.size());
+        for (const FillMessage& message : encoded)
+            fills.push_back(R2FillMessage{message.bytes});
+        authority->advance_p29v1_speculative(prepared_handle);
+    } else {
+        authority->advance_speculative(prepared_handle);
+    }
+    const PreparedInputPtr prepared =
+        P50PreparationAuthorityTestAccess::resolve(*authority, prepared_handle);
+    const sidecar::AbsoluteMonotonicDeadline deadline =
+        r2_test_deadline(std::chrono::seconds(20));
+
+    LinkHello hello;
+    hello.profile = profile;
+    hello.window = 1;
+    hello.max_frame_payload = kInitialMaxFramePayload;
+    hello.max_raw_bytes = 1U << 20;
+    hello.max_encoded_bytes = 1U << 20;
+    hello.max_output_bytes = 1U << 20;
+    hello.reservation_id = Id128{armed.reservation_id};
+    hello.relationship_id = Id128{armed.logical_relationship_id};
+    hello.relationship_epoch = armed.relationship_epoch;
+    hello.physical_link_generation = 0xd153;
+    hello.c_store_guid = stores.c;
+    hello.c_store_generation = arm.source.c_store_generation;
+    hello.f_store_guid = stores.f;
+    hello.f_store_generation = armed.f_store_generation;
+    hello.c_control_generation = arm.source.c_control_generation;
+    hello.c_control_attempt = arm.source.c_control_attempt;
+    hello.system_source_fingerprint = profile == ProfileId::P29V1
+        ? authority->p29v1_system_source_fingerprint(prepared_handle)
+        : icecc::digest128("D15 actual-wire fault fixture");
+    hello.history_nonce = prepared->begin.history_nonce;
+    hello.start_mode = LinkStartMode::Initial;
+
+    JobBind binding;
+    binding.reservation_id = Id128{armed.reservation_id};
+    binding.physical_link_generation = hello.physical_link_generation;
+    binding.relationship_ordinal = 1;
+    binding.wire_job_id = arm.source.wire_job_id;
+    binding.assignment_epoch = arm.source.assignment_epoch;
+    binding.assignment_nonce = arm.source.assignment_nonce;
+    binding.logical_job = arm.source.logical_job;
+    binding.compiler_attempt = arm.source.compiler_attempt;
+    binding.source_request_id = arm.source.source_request_id;
+    binding.tu_seq = prepared->begin.tu_seq;
+    binding.profile = profile;
+    binding.raw_bytes = prepared->begin.raw_bytes;
+    binding.raw_digest = prepared->begin.raw_digest;
+
+    P51SourceJobLease lease;
+    lease.armed = armed;
+    lease.absolute_deadline = deadline;
+    lease.binding = binding;
+    lease.binding_digest = compute_r2_binding_digest(binding);
+    lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
+    R2EndpointTestJob job{binding, lease, prepared, std::move(fills)};
+    std::atomic<unsigned> link_lookups{0};
+    std::atomic<unsigned> consumes{0};
+    std::atomic<unsigned> materializations{0};
+    std::atomic<unsigned> commits{0};
+    std::atomic<unsigned> ack_callback_calls{0};
+    std::atomic<unsigned> acknowledgements{0};
+    std::atomic<unsigned> terminal_calls{0};
+    std::optional<R2TxCommit> exact_commit;
+    P50ServerEndpointConfig config;
+    config.lookup_p51_link_reservation =
+        [&](const LinkHello& observed) -> std::optional<P51SourceLinkLease> {
+            ++link_lookups;
+            if (observed != hello)
+                return std::nullopt;
+            P51SourceLinkLease link{armed, deadline};
+            link.relationship_epoch = hello.relationship_epoch;
+            link.history_nonce = hello.history_nonce;
+            return link;
+        };
+    config.consume_p51_job_reservation =
+        [&](const LinkHello& observed, const JobBind& offered)
+            -> std::optional<P51SourceJobLease> {
+            if (observed != hello || offered != binding || consumes++ != 0)
+                return std::nullopt;
+            return lease;
+        };
+    config.input_job_state =
+        [&](CStoreGuid observed_c, const TxBegin&, const TxCommit& commit,
+            std::span<const uint8_t> exact) {
+            require(observed_c == stores.c && commit.tu_seq == binding.tu_seq &&
+                        commit.raw_digest == binding.raw_digest &&
+                        std::ranges::equal(exact, input),
+                    "D15 materializer observed a different source witness");
+            ++materializations;
+            return InputJobState::Open;
+        };
+    config.record_p51_job_commit =
+        [&](const LinkHello& observed, const JobBind& committed_binding,
+            const R2TxCommit& commit) {
+            if (observed != hello || committed_binding != binding ||
+                commit.relationship_ordinal != 1 ||
+                commit.binding_digest != lease.binding_digest ||
+                commit.inner.tu_seq != binding.tu_seq ||
+                commit.inner.raw_digest != binding.raw_digest)
+                return false;
+            exact_commit = commit;
+            ++commits;
+            return true;
+        };
+    config.acknowledge_p51_receipt =
+        [&](const LinkHello& observed, const CommitAck& ack) {
+            ++ack_callback_calls;
+            if (observed != hello || ack.relationship_id != hello.relationship_id ||
+                ack.relationship_epoch != hello.relationship_epoch ||
+                ack.physical_link_generation != hello.physical_link_generation ||
+                ack.contiguous_verified_ordinal != 1)
+                return false;
+            ++acknowledgements;
+            return true;
+        };
+    config.on_p51_link_terminal = [&](
+        const LinkHello&, const std::optional<JobBind>&) { ++terminal_calls; };
+
+    P50ServerEndpoint server(stores.f, caps, nullptr, nullptr, std::move(config));
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    bool peer_observed_close = false;
+    auto server_future = asio::co_spawn(
+        context, r2_accept_one(acceptor, server), asio::use_future);
+    auto peer_future = asio::co_spawn(
+        context,
+        r2_two_job_peer(acceptor.local_endpoint(), hello, {job}, fault,
+                        &peer_observed_close),
+        asio::use_future);
+    context.run();
+    const ServerRunResult result = server_future.get();
+    const std::vector<R2TxCommit> peer_commits = peer_future.get();
+
+    require(result.status == ServerRunStatus::TerminalError &&
+                result.terminal_error.has_value() && peer_observed_close &&
+                link_lookups == 1 && consumes == 1 && terminal_calls == 1,
+            "D15 malformed wire sequence was not terminal at the exact admitted link");
+    if (fault == R2EndpointWireFault::WrongTuEndDigest) {
+        bool no_input_record = false;
+        try {
+            (void)server.attach_input(lease.input_key);
+        } catch (const std::out_of_range&) {
+            no_input_record = true;
+        }
+        require(result.terminal_error->detail.find("TU_END") != std::string::npos &&
+                    peer_commits.empty() && materializations == 0 && commits == 0 &&
+                    ack_callback_calls == 0 && acknowledgements == 0 &&
+                    !exact_commit.has_value() && no_input_record,
+                "wrong TU_END digest published/materialized or committed input");
+    } else {
+        require(peer_commits.size() == 1 && peer_commits.front().relationship_ordinal == 1 &&
+                    peer_commits.front().binding_digest == lease.binding_digest &&
+                    peer_commits.front().inner.tu_seq == binding.tu_seq &&
+                    peer_commits.front().inner.raw_digest == binding.raw_digest &&
+                    exact_commit.has_value() && *exact_commit == peer_commits.front() &&
+                    materializations == 1 && commits == 1 &&
+                    ack_callback_calls == 0 && acknowledgements == 0,
+                "duplicate TU_END or ACK>K changed the one-commit K/Q witness");
+        InputCursor cursor = server.attach_input(lease.input_key);
+        std::vector<uint8_t> recovered(input.size());
+        require(cursor && cursor.read(recovered) == recovered.size() &&
+                    recovered == input,
+                "D15 terminal post-commit sequence changed exact committed input");
+        if (fault == R2EndpointWireFault::AckBeyondCommittedPrefix)
+            require(result.terminal_error->detail.find("COMMIT_ACK") !=
+                        std::string::npos,
+                    "ACK>K did not terminate with a COMMIT_ACK error");
+        if (fault == R2EndpointWireFault::DuplicateTuEnd)
+            require(result.terminal_error->detail.find("expected JOB_BIND") !=
+                        std::string::npos,
+                    "duplicate TU_END did not terminate as an unexpected wire record");
+    }
+    std::cout << "P51_D15_R2_WIRE profile=" << static_cast<unsigned>(profile)
+              << " fault=" << static_cast<unsigned>(fault)
+              << " status=TerminalError K=" << commits.load()
+              << " Q=" << acknowledgements.load()
+              << " materialized=" << materializations.load() << "\n";
+}
+
+void test_r2_d15_wire_faults_all_profiles() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        for (const R2EndpointWireFault fault : {
+                 R2EndpointWireFault::WrongTuEndDigest,
+                 R2EndpointWireFault::DuplicateTuEnd,
+                 R2EndpointWireFault::AckBeyondCommittedPrefix})
+            test_r2_endpoint_rejects_wire_fault(profile, fault);
+    }
+    std::puts("P51_D15_R2_WIRE all-profiles: PASS");
 }
 
 void test_r2_fragmented_one_job_each_profile() {
@@ -11318,8 +11586,14 @@ void test_lost_final_commit_identity_negative_matrix() {
 
 int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
-    if (argc > 2 || (argc == 2 && !performance_gate))
-        fail("usage: p50endpoint [--performance]");
+    const bool d15_wire_gate = argc == 2 &&
+        std::string_view(argv[1]) == "--d15-r2-wire";
+    if (argc > 2 || (argc == 2 && !performance_gate && !d15_wire_gate))
+        fail("usage: p50endpoint [--performance|--d15-r2-wire]");
+    if (d15_wire_gate) {
+        test_r2_d15_wire_faults_all_profiles();
+        return 0;
+    }
     if (std::getenv("ICECC_P50_CANCEL_UNWRITTEN_TAIL_FOCUS") != nullptr) {
         test_cancel_unwritten_tail_authority_validation();
         std::cout << "p50_endpoint_test: focused preparation tail cancellation PASS\n";

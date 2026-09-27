@@ -624,6 +624,11 @@ p50service-stop-pressure-check:
 	$(MAKE) p50cacheservice readyclose_shim.so
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' ICECC_TEST_P50CACHESERVICE_BIN='$(abs_builddir)/p50cacheservice' ICECC_TEST_CACHE_SERVICE='$(abs_top_builddir)/cache/icecc-cache-service' ICECC_TEST_READY_CLOSE_SHIM='$(abs_builddir)/readyclose_shim.so' sh '$(srcdir)/p50service-stop-pressure-run.sh'
 
+# Opt-in D15 actual-wire malformed TU_END / cumulative ACK conformance cases.
+.PHONY: p50endpoint-d15-wire-check
+p50endpoint-d15-wire-check: p50endpoint
+	timeout 120s ./p50endpoint --d15-r2-wire
+
 connectivity_DEPENDENCIES = conn_shim.so
 
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log
