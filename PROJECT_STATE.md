@@ -33,6 +33,25 @@ Earlier compile/parser failures remain separate. This closes the missing
 real-syscall backpressure witness for those cases, not the whole D03
 fragmentation/reconnect matrix or qualification of later product changes.
 
+The same public target also passed on clean combined candidate `6cffafa0`
+(including the idle-link correction), after explicit dependency regeneration
+and rebuilding the separate test-hook archives. All three profiles show a
+real BODY-header EAGAIN followed by the identical successful retry; all 11
+checker fixtures pass. Default sender target flags remain macro-free.
+Machine receipt:
+`/tanksmall/scratch/tmp/p50-eagain-6cff-evidence/qualification-6cffafa0.json`,
+SHA256 `9c62cf8ac7f5a68f4a3bd25be6f4d3efd42e87e5521bd70f3b80582e0660eb60`.
+It records the completed container (exit 0), exact source/image/binary/trace
+identities and resource limits. This is not a complete D03 or whole-QA pass.
+
+The corrected `6cffafa0` farm image has also built successfully, locally only:
+`tt-quietbox3:5000/icefarm/icecream:p50s4-6cffafa0-c06`, image ID
+`sha256:6dced048e1cac905480466c51514c98209f03d2d84bc028cccd2bfe24ae7ea47`.
+Source archive, closure and role-binary pins are machine-generated in
+`/tanksmall/scratch/tmp/icefarm-role-c06-6cff/role-image-authority.json`.
+Distribution and fresh D18 qualification remain pending; the earlier runtime's
+retry-only D18 failure is unchanged.
+
 ### Multi-link receipt-window harness
 
 Same-host farm execution is now explicit (`hosts[].execution="local"` with
