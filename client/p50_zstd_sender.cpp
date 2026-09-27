@@ -3235,7 +3235,8 @@ P50ZstdSourceSender::transfer_p51_route(
         rejected.r2_link_rejection = std::move(terminal_rejection);
         co_return finish_wire_accounting(std::move(rejected), pending);
     }
-    if (impl_->route_replacement_required)
+    if (impl_->route_replacement_required &&
+        impl_->r2_initial_handshake_failed)
         co_return finish_wire_accounting(
             impl_->r2_route_replacement_result(
                 Clock::now() >= deadline
