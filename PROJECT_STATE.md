@@ -143,7 +143,18 @@ partial creation, crash-leftover reporting and stale network state. Integrated
 as `e2deb92b`; its merged-source rerun also passed all 366 tests (18.84 s).
 Log `/tanksmall/scratch/tmp/p51-multilink-e2deb-focused.log`, SHA256
 `454b7efc285ad753167c19f2a11efb340bca28e4917de67c106bf410fd5c9cdb`.
-A live isolated multi-link run remains required.
+A successful live isolated multi-link run remains required. First run
+`p51-local-c1f2-p29-w30-20260927a` (harness `402d11fc`, product `6cffafa0`)
+verified private C attachment, passed readiness and negotiated P29/W30 on both
+links, but failed the held-window requirement at 11 and 10 commits. Helper
+diagnostics show `woke=0`, not a protocol failure, and cleanup was already
+active when EOF was recorded. The 30-second helper timer starts before local
+oracle preparation; observed connections lasted only about seven seconds.
+Preparation is being separated from the measured gate interval without
+increasing its deadline. Successful final objects do not qualify this run.
+Teardown is clean, including removal of the exact created bridge. Evidence:
+`/tanksmall/scratch/tmp/p51-local-receipt-current-plan/results/results/p51-local-c1f2-p29-w30-20260927a/`;
+`down.json` SHA256 `fcc8b658a50094b2747239f5b28d8fbf6394431b324b0fb951f038bc079cb644`.
 
 `402d11fc` removes an incorrect multi-link exception to strict P50 policy.
 `ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
