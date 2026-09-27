@@ -30,9 +30,18 @@ Focused SDK run (2 CPU, 8 GiB) on donor base `ea65d6eb` records `D15_EXIT=0`:
 `a586364dce8914e3fafb8e077a67841c626f016f4bd8ccee0623236106861108`.
 Binary SHA256 `3868b3db110dadf9b532a1ba8c6190837a1d4d4055e6f58ff7ae1ff60418a4ab`;
 test source SHA256 `aea01ed8ede3e23ad90d21f02f4ea03606e5f089531a385e00d7fc41b6751076`.
-Earlier fixture failures remain in adjacent logs. This is not full D15
-qualification: handshake/recovery records and the opposite receive direction
-still require coverage. It is not a fresh full-suite run of the merged tip.
+Earlier fixture failures remain in adjacent logs. Follow-up donor `b2052dd1`
+adds nine malformed LINK_HELLO cases and eighteen malformed LINK_STATE /
+R2_LINK_REJECT replies (three shapes and three profiles). The focused run
+retains all earlier transaction/prefix cases and exits zero. Its log is
+`/tanksmall/scratch/tmp/p51-d15-matrix-ea65/build/d15-r12.log`, SHA256
+`815635790890dd6f6c20296ed5a32afda6f30c4c60bdccf9ce470c5e4d41f4c4`;
+binary SHA256 `600d9227aa0819d6f9aa229ad540d86c2dbd713eafca5be3d9245ebc4d7aebac`;
+test source SHA256 `445e9354cf995d989f594c5dfe0ee9d68cd0602ffebb2e6ea49aa0293549ea3c`.
+The earlier handshake fixture crash was corrected by preserving coroutine
+argument lifetimes and having the fake F accept the client connection.
+This is not full D15 qualification: malformed recovery/control-message
+directions remain open. It is not a fresh full-suite run of the merged tip.
 
 ### Queued cancellation across profiles
 
