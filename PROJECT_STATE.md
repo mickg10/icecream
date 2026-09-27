@@ -12,7 +12,25 @@ retained artifact directories.
 
 ## Developer QA
 
-Latest fresh public QA on clean `0693ea6e`, with the rebuilt SDK including
+Latest fresh public QA on frozen `80c0bc24` is terminal **FAIL**. Build/install
+passed; native tests finished 171 PASS / 6 SKIP / 1 FAIL. The sole failure is
+`p50cacheservice-sanitize`'s aggregate-fit listener assertion. Python passed
+1,818 tests with nine skips in 203.29 seconds. The current stage took
+3,078.746 seconds; subsequent root/image/mixed stages were not reached.
+The six native skips require explicit capabilities or integration opt-ins
+and are not passes. Later commits are not covered by this frozen run.
+Evidence root `/tanksmall/scratch/tmp/p51-c06-qa-80c0-run/icecream-qa-5iathr_0`;
+`result.json` SHA256
+`eb76d5237828d54102ef8ddb6c9fb91c287711b56fe43ac2cfdda4f170d18898`.
+
+Focused diagnostics found that the preceding over-limit response can arrive
+before its pending-operation slot retires. Immediate fit admission then
+returns capacity-busy; the listener timeout is a consequence, not slow setup.
+A bounded slot-retirement synchronization fixes the diagnostic reproduction
+without changing product deadlines. Final-source registered sanitizer
+qualification is pending; this is not a whole-QA pass.
+
+Earlier fresh public QA on clean `0693ea6e`, with the rebuilt SDK including
 `rsync`, is terminal **FAIL**. Build/install passed; native tests finished
 170 PASS / 6 SKIP / 2 FAIL. Both failures are the terminal-reconnect
 `recovery_prepared_prefix_p == 32` assertion in normal and sanitized
