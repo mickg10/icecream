@@ -103,7 +103,7 @@ Configured W30 is not evidence of 30 naturally outstanding transfers. Peak
 ranges use all individual pass fields: the current executable's aggregate
 peak field omits the edited pass; a reporting correction is being tested
 separately without changing the running benchmark. Full Firefox matrix wall
-time was 14:16.37, maximum RSS 1,845,748 KiB. RocksDB/ClickHouse remain pending.
+time was 14:16.37, maximum RSS 1,845,748 KiB. All three corpora are now complete.
 Evidence directory `/tanksmall/scratch/tmp/p51-bench-6cff-current/firefox/`:
 `firefox32-paired-matrix.log` SHA256
 `83afeeb39392efadfd6711cab578cc69ce8356dfbf728a5dd83811eb81466d8e`;
@@ -124,10 +124,33 @@ Its median total ms are:
 | ZSTD_ROUTE | 36,404 | 36,395 | 30,495 | 1–2 |
 
 Matrix wall 14:11.75, maximum RSS 1,985,356 KiB; the same loopback, quota and
-cache caveats apply. ClickHouse remains pending. Under the same evidence root,
+cache caveats apply. Under the same evidence root,
 `rocksdb/rocksdb32-paired-matrix.log` SHA256
 `ee385599701aa50c71e6a4a52bff54b9938ee8d1b1e53114c562383e845bd8d0`;
 input ledger SHA256 `49274d63bcce5da30308b9c9d1ec4162f4d8678b1c2f12e1dcca1b09e42d0f5f`.
+
+**ClickHouse programs32 edited** completes the same 63/63 cells, with
+927,433,485 raw bytes checked per three-pass run (one edited TU, 31 unchanged).
+
+| Profile | R1/W1 | R2/W1 | R2/W30 | R2/W30 per-pass peak range |
+| --- | ---: | ---: | ---: | ---: |
+| ZSTD_TU | 6,195 | 5,644 | 3,152 | 1–2 |
+| P29V1 | 3,361 | 2,719 | 1,635 | 4–18 |
+| ZSTD_ROUTE | 38,855 | 38,483 | 31,704 | 1 |
+
+Matrix wall 15:18.55, maximum RSS 2,141,400 KiB. Same measurement limitations
+apply. Under the evidence root, `clickhouse/clickhouse32-paired-matrix.log`
+has SHA256 `58f4592310780bd2435e780141c1c335e138d33bb6094d74d4fa411f17a0e760`;
+input ledger SHA256 `c21ca596876a09179d736160a3b0cf0025a14f37b5bba75fd24737270ecec061`.
+The completed `paired-matrix-summary.json`, covering all 189 successful cells,
+has SHA256 `50358c29c2fa82ce984c09f13b5b75a9abc621943111cf79471c039bfb46b005`.
+Each corpus runner returned zero and wrote its success marker. The outer
+wrapper subsequently exited **1** while writing its final receipt because
+`log` was unset (`/runner/run.sh:60`); `launcher.log` preserves that failure.
+This is successful corpus execution, not a successful outer-wrapper run.
+No rerun or changed executable was used to erase the bookkeeping failure.
+P29V1 R2/W30 reduces median transfer elapsed time by about 35–42% versus
+R2/W1 across these samples; whole-build speedup remains unmeasured.
 
 ### Multi-link receipt-window harness
 
