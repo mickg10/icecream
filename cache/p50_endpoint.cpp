@@ -3376,10 +3376,13 @@ struct P50ServerEndpoint::Impl {
 
     void release_session(const Session& session) {
         const auto position = live_sessions.find(session.serial);
+        // Session::deadline is a mutable completion budget: R2 updates the
+        // live session deadline for each job, while SessionRegistration keeps
+        // the original link-scoped snapshot.  Release ownership by immutable
+        // session identity only; completion validation still checks deadline.
         if (position != live_sessions.end() &&
             position->second.f_guid == session.f_guid &&
-            position->second.operation == session.operation &&
-            position->second.deadline == session.deadline)
+            position->second.operation == session.operation)
             live_sessions.erase(position);
     }
 

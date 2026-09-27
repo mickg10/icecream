@@ -5061,14 +5061,15 @@ uint64_t SidecarRuntime::active_source_raw_bytes_for_test() noexcept {
 }
 
 std::optional<P50ServerOwnerUsage>
-SidecarRuntime::endpoint_owner_usage_for_test() {
+SidecarRuntime::endpoint_owner_usage_for_test(bool allow_during_stop) {
     auto result = std::make_shared<std::optional<P50ServerOwnerUsage>>();
     const bool completed = owner_round_trip(
         [this, result] {
             if (endpoint_)
                 *result = endpoint_->owner_usage();
         },
-        std::chrono::steady_clock::now() + config_.cancellation_grace);
+        std::chrono::steady_clock::now() + config_.cancellation_grace,
+        allow_during_stop);
     if (!completed)
         return std::nullopt;
     return *result;

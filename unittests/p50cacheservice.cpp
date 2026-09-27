@@ -6578,7 +6578,8 @@ void test_p51_d07_committed_attempt_replacement_all_profiles() {
 }
 
 void test_p51_d17_repeated_window_cancel(ProfileId profile,
-                                         size_t cycle_count) {
+                                         size_t cycle_count,
+                                         bool stop_under_pressure = false) {
     constexpr size_t kWindow = 30;
     CHECK(cycle_count > 0 && cycle_count <= 3);
     uint32_t cache_profile = 0;
@@ -7039,6 +7040,284 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
             cut_raw_bytes == expected_active_raw_bytes &&
             held_materializers_at_cut > 0;
         const Id128 cancelled_id{cohort[cancel_index].request.armed.reservation_id};
+
+        if (stop_under_pressure) {
+            const bool owner_pressure_at_cut = owner_usage_at_cut.has_value() &&
+                (owner_usage_at_cut->pending_encoded_bytes != 0 ||
+                 owner_usage_at_cut->pending_raw_bytes != 0 ||
+                 owner_usage_at_cut->decoder_window_bytes != 0);
+            size_t warm_witness_count = 0;
+            {
+                std::lock_guard lock(materialized_mutex);
+                warm_witness_count = materialized_inputs.size();
+                if (warm_witness_count == 1)
+                    CHECK(materialized_inputs.front().bytes_match_digest);
+            }
+            CHECK(cycle_count == 1);
+            CHECK(occupancy_at_cut);
+            CHECK(owner_pressure_at_cut);
+            CHECK(held_materializers_at_cut > 0);
+            CHECK(f_runtime.live_session_count() == 1);
+            CHECK(c_runtime.pending_p51_source_operations_for_test() == kWindow);
+            CHECK(c_runtime.active_source_raw_bytes_for_test() ==
+                  expected_active_raw_bytes);
+
+            // Stop the F owner while the accepted 30-job input window is
+            // still held in its materializer. Drop the test-owned duplicate
+            // first: it shares the accepted socket endpoint and would keep
+            // the peer alive, so it cannot serve as a close witness.
+            const auto stop_started = std::chrono::steady_clock::now();
+            const int stop_probe = probe_fd.exchange(
+                -1, std::memory_order_acq_rel);
+            if (stop_probe >= 0)
+                (void)::close(stop_probe);
+            f_runtime.stop();
+            c_runtime.stop();
+
+            struct StopObservation {
+                std::optional<local::P50SourceTransferResult> result;
+                local::Status status = local::Status::Ok;
+                std::string error;
+            };
+            std::vector<StopObservation> stop_observations(kWindow);
+            std::vector<std::thread> stop_waiters;
+            stop_waiters.reserve(kWindow);
+            std::atomic<size_t> stop_waiters_done{0};
+            const auto stop_reply_deadline = stop_started +
+                                             std::chrono::seconds(7);
+            for (size_t index = 0; index < kWindow; ++index) {
+                stop_waiters.emplace_back([&, index] {
+                    try {
+                        RequestRow& row = cohort[index];
+                        local::Frame response;
+                        auto& observation = stop_observations[index];
+                        observation.status = row.pair.receiver.receive_until(
+                            response,
+                            std::min(row.request.absolute_deadline
+                                         .as_steady_time_point(),
+                                     stop_reply_deadline));
+                        if (observation.status == local::Status::Ok) {
+                            if (response.type != local::MessageType::Data ||
+                                local::validate_identity(
+                                    response, c_launch.identity) !=
+                                    local::Status::Ok) {
+                                observation.error = "invalid stop response frame";
+                            } else {
+                                local::ControlOperation decoded;
+                                if (!local::decode_control_operation(
+                                        response.payload, decoded) ||
+                                    decoded.kind !=
+                                        local::ControlOperationKind::P51SourceTransfer ||
+                                    decoded.request_id != row.request_id ||
+                                    !decoded.p51_source_transfer_result ||
+                                    !decoded.p51_source_transfer_result->valid()) {
+                                    observation.error =
+                                        "invalid stop transfer result";
+                                } else {
+                                    observation.result =
+                                        *decoded.p51_source_transfer_result;
+                                    const local::Frame goodbye{
+                                        local::kProtocolVersion,
+                                        local::MessageType::Goodbye,
+                                        c_launch.identity, {}};
+                                    if (row.pair.receiver.send_until(
+                                            goodbye, stop_reply_deadline) !=
+                                        local::Status::Ok)
+                                        observation.error =
+                                            "stop result Goodbye failed";
+                                }
+                            }
+                        }
+                    } catch (const std::exception& error) {
+                        stop_observations[index].error = error.what();
+                    } catch (...) {
+                        stop_observations[index].error = "unknown exception";
+                    }
+                    stop_waiters_done.fetch_add(1, std::memory_order_release);
+                });
+            }
+            const auto cancel_observation_deadline = stop_started +
+                                                     std::chrono::seconds(2);
+            while (stop_waiters_done.load(std::memory_order_acquire) == 0 &&
+                   std::chrono::steady_clock::now() <
+                       cancel_observation_deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            const bool stop_cancellation_observed_before_release =
+                stop_waiters_done.load(std::memory_order_acquire) != 0;
+            size_t materialized_before_release = 0;
+            {
+                std::lock_guard lock(materialized_mutex);
+                materialized_before_release = materialized_inputs.size();
+            }
+            const bool no_late_publication_before_release =
+                materialized_before_release == warm_witness_count;
+            // A held materializer may legitimately delay complete source
+            // settlement. Once stop has produced a terminal control result,
+            // release that cooperative worker and require all remaining
+            // owned work to drain within the same absolute watchdog.
+            {
+                std::lock_guard lock(materialize_mutex);
+                gate_armed = false;
+                release_gate = true;
+            }
+            materialize_changed.notify_all();
+            for (auto& waiter : stop_waiters)
+                waiter.join();
+            for (RequestRow& row : cohort)
+                row.pair.receiver = local::Connection(-1);
+            size_t stop_terminal_errors = 0;
+            size_t stop_clean_eof = 0;
+            size_t stop_invalid_observations = 0;
+            size_t unexpected_commits = 0;
+            for (const StopObservation& observation : stop_observations) {
+                if (observation.result &&
+                    observation.result->code ==
+                        local::SourceTransferResultCode::Error &&
+                    observation.result->error_code != 0)
+                    ++stop_terminal_errors;
+                if (observation.status == local::Status::CleanEof)
+                    ++stop_clean_eof;
+                else if (observation.status != local::Status::Ok ||
+                         !observation.error.empty())
+                    ++stop_invalid_observations;
+                if (observation.result &&
+                    observation.result->code ==
+                        local::SourceTransferResultCode::Committed)
+                    ++unexpected_commits;
+            }
+            const bool c_drained_after_release =
+                stop_terminal_errors + stop_clean_eof == kWindow &&
+                stop_invalid_observations == 0 && unexpected_commits == 0 &&
+                c_runtime.pending_p51_source_operations_for_test() == 0 &&
+                c_runtime.active_source_raw_bytes_for_test() == 0 &&
+                held_materializers_at_cut > 0 &&
+                materialize_calls.load(std::memory_order_acquire) >= 2;
+            const auto settle_deadline = stop_started +
+                                         std::chrono::seconds(8);
+            for (;;) {
+                size_t current_gate_waiters = 0;
+                {
+                    std::lock_guard lock(materialize_mutex);
+                    current_gate_waiters = gate_waiters;
+                }
+                if (current_gate_waiters == 0 &&
+                    f_runtime.live_session_count() == 0)
+                    break;
+                if (std::chrono::steady_clock::now() >= settle_deadline)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const bool f_session_drained =
+                f_runtime.live_session_count() == 0;
+            const bool c_session_drained =
+                c_runtime.live_session_count() == 0 &&
+                c_runtime.live_handoff_count() == 0;
+            size_t remaining_gate_waiters = 0;
+            {
+                std::lock_guard lock(materialize_mutex);
+                remaining_gate_waiters = gate_waiters;
+            }
+            const bool f_gate_workers_drained = remaining_gate_waiters == 0;
+            const auto owner_after_stop =
+                f_runtime.endpoint_owner_usage_for_test(true);
+            bool warm_witness_preserved = false;
+            size_t materialized_after_release = 0;
+            {
+                std::lock_guard lock(materialized_mutex);
+                materialized_after_release = materialized_inputs.size();
+                warm_witness_preserved = materialized_inputs.size() == 1 &&
+                    materialized_inputs.front().raw_bytes == 73 &&
+                    materialized_inputs.front().bytes_match_digest;
+            }
+            const bool owner_credits_drained = owner_after_stop.has_value() &&
+                owner_after_stop->pending_encoded_bytes == 0 &&
+                owner_after_stop->pending_raw_bytes == 0 &&
+                owner_after_stop->decoder_window_bytes == 0 &&
+                owner_after_stop->retained_input_records == 1 &&
+                owner_after_stop->retained_input_bytes == 73;
+            const bool reply_ownership_drained =
+                reply_fds_closed_before_settlement.load(
+                    std::memory_order_acquire) == 1 + kWindow &&
+                reply_fds_open_at_settlement.load(
+                    std::memory_order_acquire) == 0;
+            const auto final_fd_snapshot = process_open_fd_snapshot();
+            bool no_new_fds = true;
+            for (const auto& [descriptor, target] : final_fd_snapshot) {
+                const auto prior = warmed_fd_snapshot.find(descriptor);
+                if (prior == warmed_fd_snapshot.end() || prior->second != target)
+                    no_new_fds = false;
+            }
+            const bool stop_bounded = std::chrono::steady_clock::now() <
+                                          settle_deadline &&
+                                      f_session_drained && c_session_drained &&
+                                      f_gate_workers_drained;
+
+            if (!f_session_drained || !f_gate_workers_drained ||
+                !owner_credits_drained || !c_drained_after_release) {
+                std::fprintf(stderr,
+                    "P51_D16 stop-state profile=%s accepted=%zu Fsession=%zu "
+                    "Fhandoff=%zu gate=%zu owner=%u enc=%llu raw=%llu "
+                    "window=%llu records=%llu bytes=%llu Cops=%zu Craw=%llu "
+                    "terminal=%zu eof=%zu invalid=%zu commits=%zu "
+                    "materialized=%zu warm=%zu\n",
+                    profile_name,
+                    accepted_connections.load(std::memory_order_acquire),
+                    f_runtime.live_session_count(),
+                    f_runtime.live_handoff_count(), remaining_gate_waiters,
+                    owner_after_stop.has_value() ? 1u : 0u,
+                    static_cast<unsigned long long>(owner_after_stop
+                        ? owner_after_stop->pending_encoded_bytes : 0),
+                    static_cast<unsigned long long>(owner_after_stop
+                        ? owner_after_stop->pending_raw_bytes : 0),
+                    static_cast<unsigned long long>(owner_after_stop
+                        ? owner_after_stop->decoder_window_bytes : 0),
+                    static_cast<unsigned long long>(owner_after_stop
+                        ? owner_after_stop->retained_input_records : 0),
+                    static_cast<unsigned long long>(owner_after_stop
+                        ? owner_after_stop->retained_input_bytes : 0),
+                    c_runtime.pending_p51_source_operations_for_test(),
+                    static_cast<unsigned long long>(
+                        c_runtime.active_source_raw_bytes_for_test()),
+                    stop_terminal_errors, stop_clean_eof,
+                    stop_invalid_observations, unexpected_commits,
+                    materialized_after_release, warm_witness_count);
+                std::fflush(stderr);
+            }
+
+            CHECK(stop_cancellation_observed_before_release);
+            CHECK(c_drained_after_release);
+            CHECK(no_late_publication_before_release);
+            CHECK(f_session_drained);
+            CHECK(c_session_drained);
+            CHECK(f_gate_workers_drained);
+            CHECK(warm_witness_preserved);
+            CHECK(materialized_after_release == warm_witness_count);
+            CHECK(owner_credits_drained);
+            CHECK(reply_ownership_drained);
+            CHECK(no_new_fds);
+            CHECK(stop_bounded);
+            CHECK(accepted_connections.load(std::memory_order_acquire) == 1);
+            CHECK(reply_fds_closed_before_settlement.load(
+                      std::memory_order_acquire) == 1 + kWindow);
+            std::printf("P51_D16_SERVICE_STOP_PRESSURE profile=%s "
+                        "active=30 raw-held=%llu f-pending-encoded=%llu "
+                        "f-pending-raw=%llu f-window=%llu "
+                        "c-errors=%zu c-clean-eof=%zu warm-commit=1 late-publications=0 "
+                        "c-ops=0 c-raw=0 f-pending=0 sessions=0 fds-no-growth=1 "
+                        "stop-terminal-before-release=1 bounded=1 PASS\n",
+                        profile_name,
+                        static_cast<unsigned long long>(cut_raw_bytes),
+                        static_cast<unsigned long long>(owner_usage_at_cut
+                            ? owner_usage_at_cut->pending_encoded_bytes : 0),
+                        static_cast<unsigned long long>(owner_usage_at_cut
+                            ? owner_usage_at_cut->pending_raw_bytes : 0),
+                        static_cast<unsigned long long>(owner_usage_at_cut
+                            ? owner_usage_at_cut->decoder_window_bytes : 0),
+                        stop_terminal_errors, stop_clean_eof);
+            std::fflush(stdout);
+            return;
+        }
+
         const bool cancelled = occupancy_at_cut &&
             f_runtime.cancel_p51_source_on_owner(
                 cohort[cancel_index].request.armed.arm,
@@ -7206,6 +7485,9 @@ void test_p51_d17_repeated_window_cancel(ProfileId profile,
         }
         committed_cycle_raw_bytes += 73; // exact fresh transfer after recovery
         run_fresh(request_base + kWindow, static_cast<uint8_t>(0xe0 + cycle));
+        // The forced transport reset/reconnect above must retire the old
+        // active-job session registration before the replacement stays live.
+        CHECK(f_runtime.live_session_count() == 1);
         {
             std::lock_guard lock(sent_mutex);
             CHECK(sent_ordinals.size() == 1);
@@ -17193,6 +17475,14 @@ int main(int argc, char** argv) {
                      ProfileId::P29V1, ProfileId::ZSTD_TU,
                      ProfileId::ZSTD_ROUTE})
                 test_p51_d17_repeated_window_cancel(profile, 3);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--d16-service-stop-pressure") == 0) {
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE})
+                test_p51_d17_repeated_window_cancel(profile, 1, true);
             return 0;
         }
         if (argc == 2 &&

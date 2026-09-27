@@ -375,7 +375,7 @@ public:
     }
     [[nodiscard]] uint64_t active_source_raw_bytes_for_test() noexcept;
     [[nodiscard]] std::optional<P50ServerOwnerUsage>
-    endpoint_owner_usage_for_test();
+    endpoint_owner_usage_for_test(bool allow_during_stop = false);
     [[nodiscard]] std::optional<P51ReceiptLedgerSnapshot>
     p51_receipt_ledger_for_test(const LinkHello& link);
 #endif
