@@ -61,7 +61,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "e11f4a17f2cb8b50df870c87cbbb954c5e65ee6f198660d16b8877a11db50499"
+        "c7340d2eb066ffe29f951cb63c1d1e61594724808352f8d48a3daf67932d12a0"
     )
 
 
@@ -2502,30 +2502,48 @@ def test_manifest_driver_d09_dispatch_barrier_and_retry_endpoint_shell_paths(
     functions_start = MANIFEST_DRIVER.index("p51_expected_worker() {")
     functions_end = MANIFEST_DRIVER.index("p51_validate_link_map() {", functions_start)
     functions = MANIFEST_DRIVER[functions_start:functions_end]
+    assignments_start = MANIFEST_DRIVER.index("p51_link_map=${ICEFARM_P51_LINK_MAP:-}")
+    assignments_end = MANIFEST_DRIVER.index('case "$s60_admit_through"', assignments_start)
+    assignments = MANIFEST_DRIVER[assignments_start:assignments_end]
+    function_exports = next(
+        line for line in MANIFEST_DRIVER.splitlines()
+        if line.startswith("export -f ") and "p51_retry_endpoint" in line
+    )
+    variable_exports_start = MANIFEST_DRIVER.index("export p51_link_map\n")
+    variable_exports_end = MANIFEST_DRIVER.index("export resume_mode", variable_exports_start)
+    variable_exports = MANIFEST_DRIVER[variable_exports_start:variable_exports_end]
     exported = subprocess.run(
         [
             "/bin/bash", "-c",
-            functions
-            + "export -f p51_expected_worker p51_expected_endpoint p51_retry_endpoint; "
-            + "export p51_link_map p51_link_endpoint_map p51_retry_endpoint_map; "
-            + "bash -c 'printf \"%s|%s|%s\\n\" "
+            assignments
+            + functions
+            + "read_boundary_release() { :; }; compile_one() { :; };\n"
+            + function_exports + "\n" + variable_exports
+            + "\n"
+            + "bash -c 'printf \"%s|%s|%s|%s|%s\\n\" "
             + "\"$(p51_expected_worker 1)\" "
             + "\"$(p51_expected_endpoint 1)\" "
-            + "\"$(p51_retry_endpoint 1)\"'",
+            + "\"$(p51_retry_endpoint 1)\" "
+            + "\"$p51_phase2_first\" \"$p51_phase2_release\"'",
             "driver-route-child",
         ],
         env={
             **os.environ,
-            "p51_link_map": "1-31=F_R1,32-62=F_R2",
-            "p51_link_endpoint_map": "1-31=10.0.0.1:23003,32-62=10.0.0.2:23004",
-            "p51_retry_endpoint_map": "1-31=10.0.0.2:23004",
+            "ICEFARM_P51_LINK_MAP": "1-31=F_R1,32-62=F_R2",
+            "ICEFARM_P51_LINK_ENDPOINT_MAP": "1-31=10.0.0.1:23003,32-62=10.0.0.2:23004",
+            "ICEFARM_P51_RETRY_ENDPOINT_MAP": "1-31=10.0.0.2:23004",
+            "ICEFARM_P51_PHASE2_FIRST": "63",
+            "ICEFARM_P51_PHASE2_RELEASE": "/results/workload/A/d09-phase2-release",
         },
         check=True,
         capture_output=True,
         text=True,
         timeout=5,
     )
-    assert exported.stdout == "F_R1|10.0.0.1:23003|10.0.0.2:23004\n"
+    assert exported.stdout == (
+        "F_R1|10.0.0.1:23003|10.0.0.2:23004|63|"
+        "/results/workload/A/d09-phase2-release\n"
+    )
 
 
 @pytest.mark.parametrize(

@@ -4248,6 +4248,38 @@ def test_d09_observations_bind_retry_using_configured_non_p29_profile(
     ]
 
 
+@pytest.mark.parametrize("bad_profile", [None, "NOT_A_PROFILE"])
+def test_d09_collection_rejects_missing_or_invalid_scheduler_profile(
+    tmp_path: Path, bad_profile: str | None,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_fresh_p50_retry_fixture(plan, root, profile="ZSTD_TU")
+    scenario.data["workload"]["receipt_gate"] = {
+        "restart_extension": {"kind": "held-f-restart-v1"},
+    }
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    if bad_profile is None:
+        scheduler["env"].pop("ICECC_P50_PROFILE")
+    else:
+        scheduler["env"]["ICECC_P50_PROFILE"] = bad_profile
+    for item in plan["topology"]["instances"]:
+        name = item["name"]
+        instance_root = root / "instances" / name / "results"
+        instance_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(root / f"{name}.results", instance_root)
+    receipts = root / "receipts"
+    receipts.mkdir()
+    shutil.copy(root / "preflight.json", receipts / "preflight.json")
+
+    rows, row_facts = collect._parse_rows(scenario, plan, root, [])
+    with pytest.raises(CollectError, match="configured scheduler profile"):
+        collect._observations(
+            farm, scenario, plan, root, rows, row_facts, []
+        )
+
+
 def test_retry_loss_witness_must_be_in_the_same_attempt_window(
     tmp_path: Path,
 ) -> None:

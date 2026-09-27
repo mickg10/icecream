@@ -1628,7 +1628,7 @@ def _authenticated_strict_p50_retry_ids(
             if len(schedulers) == 1:
                 environment = schedulers[0].get("env", {})
                 restart_retry_profile = (
-                    environment.get("ICECC_P50_PROFILE") or "P29V1"
+                    environment.get("ICECC_P50_PROFILE")
                     if isinstance(environment, Mapping)
                     else None
                 )
@@ -1667,6 +1667,7 @@ def _authenticated_strict_p50_retry_ids(
             and row.get("retries") == 1
             and row.get("exact") is True
             and row.get("tail_present") is True
+            and expected_retry_profile in {"P29V1", "ZSTD_TU", "ZSTD_ROUTE"}
             and row.get("tail_profile") == expected_retry_profile
             and row.get("session_outcome") == "committed"
             and row.get("cs") == binding.get("final_worker")

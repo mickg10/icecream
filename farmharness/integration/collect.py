@@ -8954,7 +8954,7 @@ def _observations(
                 raise CollectError(
                     "held-F restart retry requires exactly one configured scheduler profile"
                 )
-            configured_profile = restart_scheduler_profiles[0] or "P29V1"
+            configured_profile = restart_scheduler_profiles[0]
             if configured_profile not in {"P29V1", "ZSTD_TU", "ZSTD_ROUTE"}:
                 raise CollectError(
                     "held-F restart retry has an unsupported configured scheduler profile"

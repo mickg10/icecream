@@ -1169,6 +1169,7 @@ export disk_fill_worker disk_fill_trigger
 export p51_link_map
 export p51_link_endpoint_map
 export p51_link_window
+export p51_retry_endpoint_map p51_phase2_first p51_phase2_release
 export resume_mode resume_indices
 
 set +e

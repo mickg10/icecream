@@ -3302,6 +3302,39 @@ def test_s70_b4_source_transfer_loss_is_recovered_by_exact_strict_retry() -> Non
     assert verdict["status"] == "PASS", verdict
 
 
+def test_d09_strict_retry_uses_configured_non_p29_profile_and_fails_closed() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    scenario = fixture["scenario"]
+    scenario.setdefault("workload", {})["receipt_gate"] = {
+        "restart_extension": {"kind": "held-f-restart-v1"}
+    }
+    fixture["plan"]["topology"]["instances"].append(
+        {"name": "S1", "role": "S", "env": {"ICECC_P50_PROFILE": "ZSTD_TU"}}
+    )
+    row = next(
+        item for item in fixture["rows"]
+        if item["job_id"]
+        == fixture["observations"]["successful_strict_p50_retry_bindings"][0]["job_id"]
+    )
+    row["tail_profile"] = "ZSTD_TU"
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture, fixture["observations"], fixture["rows"]
+    )
+    assert authenticated == {row["job_id"]}
+    assert not bad
+
+    for bad_profile in (None, "NOT_A_PROFILE"):
+        fixture["plan"]["topology"]["instances"][-1]["env"][
+            "ICECC_P50_PROFILE"
+        ] = bad_profile
+        row["tail_profile"] = None
+        authenticated, bad = _authenticated_strict_p50_retry_ids(
+            fixture, fixture["observations"], fixture["rows"]
+        )
+        assert not authenticated
+        assert bad
+
+
 @pytest.mark.parametrize("mutation", [
     None, "received", "line", "bool-line", "attempts", "bool-attempts",
     "missing-status", "committed", "error", "client-attempts", "missing-field",
