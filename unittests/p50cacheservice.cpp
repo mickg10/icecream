@@ -2446,6 +2446,7 @@ void test_p51_d07_queued_cancel_position_with_marker(ProfileId profile,
     // The fixture's runtime destructors join endpoint-owner threads. Emit its
     // summary afterward so those asynchronous endpoint diagnostics cannot
     // interleave with or corrupt the per-cell marker.
+    std::fflush(stdout);
     std::printf("P51_D07 queued cancel profile=%u submission=%zu survivors=30 "
                 "exact-inputs=30 fresh-tu-seq=0..29 C-raw-credit=0 "
                 "scope=no-compiler\n",
