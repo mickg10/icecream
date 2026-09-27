@@ -29,6 +29,29 @@ open; codebaseN under 150 seconds is not demonstrated.
 
 ### Current cleanup and collector qualification
 
+The interrupted-job session retirement regression is reproduced and fixed:
+R2 changes the live session's completion deadline, while the registration
+retains its original link deadline. Release now matches immutable session
+serial/F identity/operation, rather than the mutable deadline. Completion
+validation still checks deadlines, and session serials are never reused.
+
+The focused `p50cacheservice --d16-service-stop-pressure` run passes all
+three profiles with 30 held requests: clean terminal outcomes, zero pending
+credits and live sessions, no late publication, retained warm input, and no
+descriptor growth. The strengthened `--d17-repeated-window-cancel` run passes
+nine cases and checks exactly one live session after each reconnect.
+Native helper SHA256:
+`c6215e53732db7c7a4ee3662b17b81f2171554ec0a8c1a78c0fcb12a9b20ea10`.
+Logs under `/tanksmall/scratch/tmp/p51-d16-stop-pressure/runtime/`:
+`d16-native-final-r1.log` SHA256
+`b5b61aef45990a83db04640b9d257fe6e3a64d6ef93826e512d7c157f64977dc`;
+`d17-native-final-r1.log` SHA256
+`ad7a4db2a1415f0dd008ecd1a44a0057789cf7d94053985e805c10973249f166`.
+An earlier run used a stale endpoint archive and is not qualification.
+The focused D16 sanitizer run is pending; this evidence is not a fresh full
+suite qualification. The older D17 runs below did not assert the live-session
+bound and therefore did not detect this defect.
+
 The C03 client-EOF fixture now requires exactly one cancellation queued and
 one successful result for the original job/epoch/nonce/request, with the
 same nonempty reservation ID and queue-before-result ordering. All three
