@@ -48,6 +48,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <vector>
+#include <cstdlib>
 
 #include <comm.h>
 #include "client.h"
@@ -435,6 +436,26 @@ icecc::p50::local::P50SourceTransferResult p50_transfer_error(
     return result;
 }
 
+bool p51_requested_window(uint32_t& result)
+{
+    const char *configured = ::getenv("ICECC_P50_PIPELINE_WINDOW");
+    if (configured == nullptr) {
+        result = 30;
+        return true;
+    }
+    if (*configured == '\0') return false;
+    for (const unsigned char *p =
+             reinterpret_cast<const unsigned char *>(configured); *p != '\0'; ++p)
+        if (*p < '0' || *p > '9') return false;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(configured, &end, 10);
+    if (errno != 0 || end == configured || *end != '\0' || parsed < 1 || parsed > 30)
+        return false;
+    result = static_cast<uint32_t>(parsed);
+    return true;
+}
+
 icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     CompileJob &job, const UseCSMsg &assignment, MsgChannel &local_daemon,
     icecc::p50::OwnedSourceFd source, icecc::p50::ProfileId profile)
@@ -569,6 +590,14 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
 #endif
     const std::optional<uint32_t> profile_wire = p50_profile_wire(profile);
     const std::optional<uint32_t> source_mode = p50_source_mode_wire(profile);
+    uint32_t requested_window = 0;
+    if (!p51_requested_window(requested_window)) {
+        log_error() << "ICECC_P50_PIPELINE_WINDOW must be a decimal integer in [1,30]"
+                    << std::endl;
+        if (diagnostic != nullptr)
+            diagnostic->error_code = 1;
+        return p50_transfer_error(1);
+    }
     if (!profile_wire || !source_mode || !source ||
         !protocol_supports_cache_r2(cserver.protocol) ||
         assignment.cache_protocol != CACHE_WIRE_REVISION_R2) {
@@ -583,7 +612,7 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
     lease_request.assignment_nonce = assignment.assignmentNonce();
     lease_request.profile = *profile_wire;
     lease_request.requested_cache_revision = CACHE_WIRE_REVISION_R2;
-    lease_request.requested_window = 30;
+    lease_request.requested_window = requested_window;
     const auto lease_start = std::chrono::steady_clock::now();
     P50DiagnosticPhaseTimer lease_timer(
         diagnostic, diagnostic == nullptr ? nullptr : &diagnostic->lease_send_to_fd_ms,
