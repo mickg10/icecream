@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ from farmharness.integration.images import (
 )
 from farmharness.integration.lifecycle import (
     CANARY_SCRIPT,
+    HOST_PREFLIGHT_SCRIPT,
     LifecycleError,
     MIN_FREE_BYTES,
     PreflightRefusal,
@@ -29,6 +32,7 @@ from farmharness.integration.lifecycle import (
     _rotate_s30_canary_traces,
     _expected_image_labels,
     _diagnostic_client_output_patterns,
+    _host_facts,
 )
 from farmharness.integration.remote import (
     CommandResult,
@@ -98,6 +102,314 @@ def _farm_scenario_plan(tmp_path: Path, *, up_s: int = 5):
     return farm, scenario, plan
 
 
+def _run_host_preflight_script(
+    tmp_path: Path,
+    *,
+    mount: dict[str, str],
+    mount_document: object | None = None,
+    findmnt_output: str | None = None,
+    zfs_listing: str = "",
+    zpool_status: str = "",
+    rotations: dict[str, list[str]] | None = None,
+):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    config_path = tmp_path / "commands.json"
+    config_path.write_text(
+        json.dumps({
+            "mount": mount,
+            "mount_document": mount_document,
+            "findmnt_output": findmnt_output,
+            "zfs_listing": zfs_listing,
+            "zpool_status": zpool_status,
+            "rotations": rotations or {},
+        }),
+        encoding="utf-8",
+    )
+    command = fake_bin / "probe-command"
+    command.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "cfg = json.load(open(os.environ['ICEFARM_PREFLIGHT_FIXTURE']))\n"
+        "name = pathlib.Path(sys.argv[0]).name\n"
+        "if name == 'findmnt':\n"
+        " if cfg['findmnt_output'] is not None:\n"
+        "  sys.stdout.write(cfg['findmnt_output'])\n"
+        " else:\n"
+        "  document = cfg['mount_document']\n"
+        "  if document is None: document = {'filesystems': [cfg['mount']]}\n"
+        "  print(json.dumps(document))\n"
+        "elif name == 'zfs':\n"
+        " print(cfg['zfs_listing'], end='')\n"
+        "elif name == 'zpool':\n"
+        " print(cfg['zpool_status'], end='')\n"
+        "elif name == 'lsblk':\n"
+        " print('\\n'.join(cfg['rotations'].get(sys.argv[-1], [])))\n"
+        "else:\n"
+        " raise SystemExit(64)\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    for name in ("findmnt", "zfs", "zpool", "lsblk"):
+        (fake_bin / name).symlink_to(command)
+    scratch = tmp_path / "mounted" / "scratch"
+    scratch.mkdir(parents=True)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ICEFARM_PREFLIGHT_FIXTURE": str(config_path),
+            "PATH": str(fake_bin) + os.pathsep + environment.get("PATH", "/usr/bin:/bin"),
+        }
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            HOST_PREFLIGHT_SCRIPT,
+            str(scratch),
+            "unit-run",
+            "[]",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+
+def _zpool_status(rows: str, *, state: str = "ONLINE") -> str:
+    return (
+        "  pool: tank\n"
+        f" state: {state}\n"
+        "config:\n\n"
+        "        NAME        STATE     READ WRITE CKSUM\n"
+        f"        tank        {state}       0     0     0\n"
+        f"{rows}"
+        "\nerrors: No known data errors\n"
+    )
+
+
+def test_host_preflight_preserves_direct_block_device_path(tmp_path: Path) -> None:
+    result = _run_host_preflight_script(
+        tmp_path,
+        mount={
+            "source": "/dev/nvme0n1p2",
+            "fstype": "ext4",
+            "target": str(tmp_path / "mounted"),
+        },
+        rotations={"/dev/nvme0n1p2": ["0"]},
+    )
+
+    assert result.returncode == 0, result.stderr
+    facts = json.loads(result.stdout)
+    assert facts["device"] == "/dev/nvme0n1p2"
+    assert facts["filesystem"] == "ext4"
+    assert facts["backing_devices"] == ["/dev/nvme0n1p2"]
+    assert facts["rotational"] is False
+
+
+@pytest.mark.parametrize(
+    ("mount_document", "findmnt_output", "message"),
+    [
+        ({}, None, "ambiguous"),
+        ({"filesystems": []}, None, "ambiguous"),
+        ({"filesystems": [{"source": "tank/scratch"}]}, None, "incomplete"),
+        (None, "not-json\n", "malformed"),
+    ],
+)
+def test_host_preflight_refuses_malformed_or_missing_mount_identity(
+    tmp_path: Path,
+    mount_document: object | None,
+    findmnt_output: str | None,
+    message: str,
+) -> None:
+    result = _run_host_preflight_script(
+        tmp_path,
+        mount={},
+        mount_document=mount_document,
+        findmnt_output=findmnt_output,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_host_preflight_accepts_only_fully_verified_nonrotational_zfs_pool(
+    tmp_path: Path,
+) -> None:
+    mount_target = str(tmp_path / "mounted")
+    result = _run_host_preflight_script(
+        tmp_path,
+        mount={"source": "tank/scratch", "fstype": "zfs", "target": mount_target},
+        zfs_listing=f"tank/scratch\t{mount_target}\n",
+        zpool_status=_zpool_status(
+            "          /dev/sdb1  ONLINE       0     0     0\n"
+            "          /dev/sdd1  ONLINE       0     0     0\n"
+        ),
+        rotations={"/dev/sdb1": ["0"], "/dev/sdd1": ["0"]},
+    )
+
+    assert result.returncode == 0, result.stderr
+    facts = json.loads(result.stdout)
+    assert facts["device"] == "tank/scratch"
+    assert facts["filesystem"] == "zfs"
+    assert facts["mount_target"] == mount_target
+    assert facts["backing_devices"] == ["/dev/sdb1", "/dev/sdd1"]
+    assert facts["rotational"] is False
+
+
+@pytest.mark.parametrize(
+    ("mount", "zfs_listing", "zpool_status", "rotations", "message"),
+    [
+        (
+            {"source": "tank/scratch", "fstype": "zfs", "target": "/wrong"},
+            "tank/scratch\t/wrong\n",
+            _zpool_status("          /dev/sdb1 ONLINE 0 0 0\n"),
+            {"/dev/sdb1": ["0"]},
+            "not contained",
+        ),
+        (
+            {"source": "tank/scratch", "fstype": "zfs", "target": "MOUNT"},
+            "tank/scratch\tDIFFERENT\n",
+            _zpool_status("          /dev/sdb1 ONLINE 0 0 0\n"),
+            {"/dev/sdb1": ["0"]},
+            "does not own",
+        ),
+        (
+            {"source": "tank/scratch", "fstype": "zfs", "target": "MOUNT"},
+            "tank/scratch\tMOUNT\n",
+            _zpool_status("          /dev/sdb1 ONLINE 0 0 0\n", state="DEGRADED"),
+            {"/dev/sdb1": ["0"]},
+            "not ONLINE",
+        ),
+        (
+            {"source": "tank/scratch", "fstype": "zfs", "target": "MOUNT"},
+            "tank/scratch\tMOUNT\n",
+            _zpool_status(
+                "          mirror-0 ONLINE 0 0 0\n"
+                "            /dev/sdb1 ONLINE 0 0 0\n"
+                "            /dev/sdd1 ONLINE 0 0 0\n"
+            ),
+            {"/dev/sdb1": ["0"], "/dev/sdd1": ["0"]},
+            "unsupported",
+        ),
+        (
+            {"source": "tank/scratch", "fstype": "zfs", "target": "MOUNT"},
+            "tank/scratch\tMOUNT\n",
+            _zpool_status(
+                "          /dev/sdb1 ONLINE 0 0 0\n\n"
+                "        special\n"
+                "          /dev/sdd1 ONLINE 0 0 0\n"
+            ),
+            {"/dev/sdb1": ["0"], "/dev/sdd1": ["0"]},
+            "unsupported vdev layout",
+        ),
+        (
+            {"source": "tank/scratch", "fstype": "zfs", "target": "MOUNT"},
+            "tank/scratch\tMOUNT\n",
+            _zpool_status(
+                "          /dev/sdb1 ONLINE 0 0 0\n\n"
+                "          /dev/sdd1 ONLINE 0 0 0\n"
+            ),
+            {"/dev/sdb1": ["0"], "/dev/sdd1": ["1"]},
+            "rotation",
+        ),
+    ],
+)
+def test_host_preflight_refuses_ambiguous_or_unsafe_zfs_layouts(
+    tmp_path: Path,
+    mount: dict[str, str],
+    zfs_listing: str,
+    zpool_status: str,
+    rotations: dict[str, list[str]],
+    message: str,
+) -> None:
+    if mount["target"] == "MOUNT":
+        mount = {**mount, "target": str(tmp_path / "mounted")}
+        zfs_listing = zfs_listing.replace("\tMOUNT\n", f"\t{mount['target']}\n")
+    result = _run_host_preflight_script(
+        tmp_path,
+        mount=mount,
+        zfs_listing=zfs_listing,
+        zpool_status=zpool_status,
+        rotations=rotations,
+    )
+
+    if message == "rotation":
+        assert result.returncode == 0, result.stderr
+        facts = json.loads(result.stdout)
+        assert facts["backing_devices"] == ["/dev/sdb1", "/dev/sdd1"]
+        assert facts["rotational"] is True
+    else:
+        assert result.returncode != 0
+        assert message in result.stderr
+
+
+def test_host_facts_refuses_rotational_zfs_leaf(tmp_path: Path) -> None:
+    farm, _scenario, _plan = _farm_scenario_plan(tmp_path)
+    document = {
+        "backing_devices": ["/dev/sdb1", "/dev/sdd1"],
+        "device": "tank/scratch",
+        "filesystem": "zfs",
+        "free_bytes": 100_000_000_000,
+        "mount_target": "/tanksmall/scratch",
+        "protected": {"bigfarm": 0},
+        "rotational": True,
+        "scratch_root": farm.hosts["tt-quietbox3"]["scratch_root"],
+        "write_bps": None,
+    }
+
+    class FactsRecorder:
+        def invoke(self, command):
+            assert command.phase == "preflight.host"
+            return CommandResult(0, json.dumps(document), "")
+
+    with pytest.raises(PreflightRefusal, match="scratch backing device is rotational"):
+        _host_facts(
+            farm,
+            "tt-quietbox3",
+            "unit-run",
+            FactsRecorder(),
+            CommandFactory(),
+            timeout_s=1,
+            probe_bytes=0,
+        )
+
+
+def test_host_facts_accepts_verified_zfs_identity(tmp_path: Path) -> None:
+    farm, _scenario, _plan = _farm_scenario_plan(tmp_path)
+    document = {
+        "backing_devices": ["/dev/sdb1", "/dev/sdd1"],
+        "device": "tank/scratch",
+        "filesystem": "zfs",
+        "free_bytes": 100_000_000_000,
+        "mount_target": "/tanksmall/scratch",
+        "protected": {"bigfarm": 0},
+        "rotational": False,
+        "scratch_root": farm.hosts["tt-quietbox3"]["scratch_root"],
+        "write_bps": 900_000_000,
+    }
+
+    class FactsRecorder:
+        def invoke(self, command):
+            assert command.phase == "preflight.host"
+            return CommandResult(0, json.dumps(document), "")
+
+    facts = _host_facts(
+        farm,
+        "tt-quietbox3",
+        "unit-run",
+        FactsRecorder(),
+        CommandFactory(),
+        timeout_s=1,
+        probe_bytes=1,
+    )
+    assert facts["filesystem"] == "zfs"
+    assert facts["device"] == "tank/scratch"
+    assert facts["backing_devices"] == ["/dev/sdb1", "/dev/sdd1"]
+
+
 class ScriptedLifecycle:
     def __init__(
         self,
@@ -165,8 +477,11 @@ class ScriptedLifecycle:
                 0,
                 json.dumps(
                     {
+                        "backing_devices": ["/dev/nvme0n1p2"],
                         "device": "/dev/nvme0n1p2",
+                        "filesystem": "ext4",
                         "free_bytes": self.free_bytes,
+                        "mount_target": "/scratch",
                         "protected": {"bigfarm": self.protected_count},
                         "rotational": False,
                         "scratch_root": self.farm.hosts[command.host]["scratch_root"],

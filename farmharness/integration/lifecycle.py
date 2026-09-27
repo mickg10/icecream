@@ -147,18 +147,121 @@ if not root.is_dir() or root.is_symlink():
     raise SystemExit("scratch root is absent, not a directory, or a symlink")
 usage = os.statvfs(root)
 free_bytes = usage.f_bavail * usage.f_frsize
-source = subprocess.run(
-    ["findmnt", "-T", str(root), "-no", "SOURCE"],
+mount_result = subprocess.run(
+    ["findmnt", "--json", "--target", str(root), "--output", "SOURCE,FSTYPE,TARGET"],
     check=True, capture_output=True, text=True,
-).stdout.strip()
-if not source.startswith("/dev/"):
-    raise SystemExit("scratch root has no named block device")
-rotations = subprocess.run(
-    ["lsblk", "-srndo", "ROTA", source],
-    check=True, capture_output=True, text=True,
-).stdout.split()
-if not rotations or any(item not in ("0", "1") for item in rotations):
-    raise SystemExit("scratch device rotation state is unavailable")
+)
+try:
+    mount_document = json.loads(mount_result.stdout)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("scratch mount identity is malformed") from exc
+if not isinstance(mount_document, dict):
+    raise SystemExit("scratch mount identity is malformed")
+filesystems = mount_document.get("filesystems")
+if not isinstance(filesystems, list) or len(filesystems) != 1:
+    raise SystemExit("scratch mount identity is ambiguous")
+mount = filesystems[0]
+if not isinstance(mount, dict) or any(
+    not isinstance(mount.get(field), str) or not mount[field]
+    for field in ("source", "fstype", "target")
+):
+    raise SystemExit("scratch mount identity is incomplete")
+source, filesystem, mount_target = (
+    mount["source"], mount["fstype"], mount["target"]
+)
+
+def block_rotations(devices):
+    values = []
+    for device in devices:
+        if not isinstance(device, str) or not device.startswith("/dev/"):
+            raise SystemExit("scratch backing device is not a named block device")
+        result = subprocess.run(
+            ["lsblk", "-srndo", "ROTA", device],
+            check=True, capture_output=True, text=True,
+        )
+        rotations = result.stdout.split()
+        if not rotations or any(item not in ("0", "1") for item in rotations):
+            raise SystemExit("scratch device rotation state is unavailable")
+        values.extend(rotations)
+    if not values:
+        raise SystemExit("scratch backing-device set is empty")
+    return values
+
+if source.startswith("/dev/"):
+    backing_devices = [source]
+    rotations = block_rotations(backing_devices)
+elif filesystem == "zfs":
+    # ZFS mount SOURCE is a dataset, not a block path.  Authenticate the
+    # exact dataset/mount relationship, then accept only a simple pool made
+    # of directly named block leaves.  More complex vdev layouts fail closed
+    # rather than silently omitting logs/special/cache/spare devices.
+    dataset = source
+    pool, separator, suffix = dataset.partition("/")
+    if not pool or (separator and not suffix):
+        raise SystemExit("ZFS scratch source is not a pool or dataset name")
+    try:
+        root_real = root.resolve(strict=True)
+        target_real = pathlib.Path(mount_target).resolve(strict=True)
+        root_real.relative_to(target_real)
+    except (OSError, ValueError) as exc:
+        raise SystemExit("scratch root is not contained by the reported ZFS mount") from exc
+    listed = subprocess.run(
+        ["zfs", "list", "-H", "-o", "name,mountpoint", dataset],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    if len(listed) != 1 or listed[0].split("\t") != [dataset, mount_target]:
+        raise SystemExit("ZFS dataset does not own the exact reported mountpoint")
+    status = subprocess.run(
+        ["zpool", "status", "-P", pool],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    pool_lines = [line.strip() for line in status if line.strip().startswith("pool:")]
+    state_lines = [line.strip() for line in status if line.strip().startswith("state:")]
+    if pool_lines != ["pool: " + pool] or state_lines != ["state: ONLINE"]:
+        raise SystemExit("ZFS scratch pool identity or health is not ONLINE")
+    try:
+        config_index = next(i for i, line in enumerate(status) if line.strip() == "config:")
+    except StopIteration as exc:
+        raise SystemExit("ZFS pool status has no config section") from exc
+    config_rows = []
+    config_started = False
+    config_ended = False
+    for line in status[config_index + 1:]:
+        if line.strip().startswith("errors:"):
+            config_ended = True
+            break
+        if not line.strip():
+            continue
+        fields = line.split()
+        if fields[:2] == ["NAME", "STATE"]:
+            config_started = True
+            continue
+        if not config_started:
+            raise SystemExit("ZFS pool config header is malformed")
+        config_rows.append((len(line) - len(line.lstrip()), fields))
+    if not config_ended or len(config_rows) < 2:
+        raise SystemExit("ZFS pool config has no backing leaves")
+    root_indent, root_fields = config_rows[0]
+    if (
+        root_indent <= 0
+        or len(root_fields) < 5
+        or root_fields[0] != pool
+        or root_fields[1] != "ONLINE"
+    ):
+        raise SystemExit("ZFS pool config root is unknown or unhealthy")
+    backing_devices = []
+    for indent, fields in config_rows[1:]:
+        if indent <= root_indent or len(fields) < 5:
+            raise SystemExit("ZFS pool config contains an unsupported vdev layout")
+        device, state = fields[0], fields[1]
+        if not device.startswith("/dev/") or state != "ONLINE":
+            raise SystemExit("ZFS pool contains an unsupported or unhealthy vdev")
+        backing_devices.append(device)
+    if len(set(backing_devices)) != len(backing_devices):
+        raise SystemExit("ZFS pool repeats a backing device")
+    rotations = block_rotations(backing_devices)
+else:
+    raise SystemExit("scratch root has no supported block-backed filesystem")
 
 protected = {pattern: 0 for pattern in patterns}
 skip = {os.getpid(), os.getppid()}
@@ -198,8 +301,11 @@ if probe_bytes:
     write_bps = probe_bytes / elapsed
 
 print(json.dumps({
+    "backing_devices": backing_devices,
     "device": source,
+    "filesystem": filesystem,
     "free_bytes": free_bytes,
+    "mount_target": mount_target,
     "protected": protected,
     "rotational": any(item == "1" for item in rotations),
     "scratch_root": str(root),
@@ -1246,8 +1352,11 @@ def _host_facts(
     )
     value = _json_result(result, f"host preflight on {host_name}")
     required = {
+        "backing_devices": list,
         "device": str,
+        "filesystem": str,
         "free_bytes": int,
+        "mount_target": str,
         "protected": dict,
         "rotational": bool,
         "scratch_root": str,
@@ -1259,9 +1368,22 @@ def _host_facts(
             )
     if value["scratch_root"] != farm.hosts[host_name]["scratch_root"]:
         raise PreflightRefusal(f"host {host_name} reported a different scratch root")
+    if not value["device"] or not value["filesystem"] or not value["mount_target"].startswith("/"):
+        raise PreflightRefusal(f"host {host_name} reported incomplete scratch storage identity")
+    if not value["backing_devices"] or any(
+        not isinstance(device, str) or not device.startswith("/dev/")
+        for device in value["backing_devices"]
+    ):
+        raise PreflightRefusal(f"host {host_name} reported invalid scratch backing devices")
+    if value["filesystem"] == "zfs":
+        if value["device"].startswith("/dev/"):
+            raise PreflightRefusal(f"host {host_name} reported inconsistent ZFS source identity")
+    elif not value["device"].startswith("/dev/") or value["backing_devices"] != [value["device"]]:
+        raise PreflightRefusal(f"host {host_name} reported inconsistent block-device identity")
     if value["rotational"]:
         raise PreflightRefusal(
-            f"host {host_name} scratch device {value['device']} is rotational"
+            f"host {host_name} scratch backing device is rotational: "
+            f"{value['backing_devices']}"
         )
     if probe_bytes:
         speed = value.get("write_bps")
