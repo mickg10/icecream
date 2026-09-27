@@ -73,6 +73,21 @@ def _run(tmp_path: Path, *args: str, env: dict[str, str] | None = None) -> subpr
     )
 
 
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _project_path_from_log(log: str) -> Path:
+    values = [line.removeprefix("project=") for line in log.splitlines()
+              if line.startswith("project=")]
+    assert len(values) == 1
+    return Path(values[0]).resolve()
+
+
 def test_missing_scratch_fails_before_uv(tmp_path: Path) -> None:
     env, scratch = _env(tmp_path)
     scratch.rmdir()
@@ -109,8 +124,16 @@ def test_default_uv_storage_is_under_scratch_not_checkout(tmp_path: Path) -> Non
     result = _run(tmp_path, "--sync", env=env)
     assert result.returncode == 0, result.stderr
     log = (tmp_path / "uv.log").read_text(encoding="utf-8")
-    assert f"project={scratch}/icecream-uv-" in log
-    assert f"project={ROOT}" not in log
+    project = _project_path_from_log(log)
+    assert project.is_relative_to(scratch.resolve())
+    assert not _path_is_within(project, ROOT)
+
+
+def test_checkout_prefix_sibling_is_not_inside_checkout(tmp_path: Path) -> None:
+    checkout = tmp_path / "repository"
+    sibling = tmp_path / "repository-sibling" / "uv-env"
+    assert str(checkout) in str(sibling)
+    assert not _path_is_within(sibling, checkout)
 
 
 def test_child_uses_managed_python_and_wrapper_path(tmp_path: Path) -> None:
