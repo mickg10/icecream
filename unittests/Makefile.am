@@ -439,6 +439,10 @@ p50daemonpositive-p51-c03-check: p50daemonpositive ../daemon/iceccd ../cache/ice
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
 	$(SHELL) '$(srcdir)/p50daemonpositive-p51-c03.sh'
+.PHONY: p50daemonpositive-p51-terminal-retirement-check
+p50daemonpositive-p51-terminal-retirement-check: p50daemonpositive
+	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
+	$(SHELL) '$(srcdir)/p50daemonpositive-p51-terminal-retirement.sh'
 .PHONY: p51schedulerrestart-w30-check
 p51schedulerrestart-w30-check: p50daemonpositive ../daemon/iceccd ../cache/icecc-cache-service
 	ICECC_TEST_TOP_SRCDIR='$(abs_top_srcdir)' \
@@ -761,7 +765,7 @@ EXTRA_DIST += p51wrappercompile-run.sh
 EXTRA_DIST += p51capacity-w30-run.sh
 EXTRA_DIST += p50service-stop-pressure-run.sh
 
-EXTRA_DIST += p50service-metrics-run.sh p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50daemonpositive-p51-w30.sh p50daemonpositive-p51-multilink.sh p50daemonpositive-p51-restart.sh p50daemonpositive-p51-restart-w30.sh p50daemonpositive-p51-synthetic-scheduler-w30.sh p50daemonpositive-p51-arm-expiry.sh p50daemonpositive-p51-c03.sh p50zstdsender-source.sh p50_eagain_trace_check.py p50_payload_shortwrite_trace_check.py
+EXTRA_DIST += p50service-metrics-run.sh p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50daemonpositive-p51-w30.sh p50daemonpositive-p51-multilink.sh p50daemonpositive-p51-restart.sh p50daemonpositive-p51-restart-w30.sh p50daemonpositive-p51-synthetic-scheduler-w30.sh p50daemonpositive-p51-arm-expiry.sh p50daemonpositive-p51-c03.sh p50daemonpositive-p51-terminal-retirement.sh p50zstdsender-source.sh p50_eagain_trace_check.py p50_payload_shortwrite_trace_check.py
 EXTRA_DIST += releaseidentity-source.sh
 EXTRA_DIST += releaseidentity-artifact.sh
 EXTRA_DIST += p50sourcearm-source.sh p50sourcearm-wait-mutants.sh p50phaseopen-source.sh

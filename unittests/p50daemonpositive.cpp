@@ -249,8 +249,122 @@ static bool run_iptables_rule(const std::vector<std::string>& arguments)
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+static bool p51_is_clean_idle_terminal(bool link_state_seen, bool protocol_error,
+                                       bool failed_before_cleanup,
+                                       bool stop_before_cleanup,
+                                       const std::string& terminal_reason,
+                                       bool frame_boundary_eof)
+{
+    return link_state_seen && !protocol_error && !failed_before_cleanup &&
+        !stop_before_cleanup && frame_boundary_eof &&
+        terminal_reason == "disconnect-after-link-state";
+}
+
+static bool p51_read_exact_relay_bytes(int fd, void *buffer, size_t size,
+                                       const std::atomic<bool>& stop,
+                                       std::string *failure = nullptr,
+                                       const char *stage = "relay-read",
+                                       size_t *received_out = nullptr)
+{
+    auto *position = static_cast<unsigned char *>(buffer);
+    const size_t requested = size;
+    while (size != 0 && !stop.load(std::memory_order_acquire)) {
+        pollfd descriptor{fd, POLLIN, 0};
+        const int ready = ::poll(&descriptor, 1, 100);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            if (failure) *failure = std::string(stage) + ":poll-errno=" +
+                std::to_string(errno);
+            return false;
+        }
+        if (ready > 0 && (descriptor.revents & (POLLERR | POLLNVAL))) {
+            if (failure) *failure = std::string(stage) + ":poll-revents=" +
+                std::to_string(descriptor.revents);
+            return false;
+        }
+        if (ready == 0) continue;
+        const ssize_t count = ::recv(fd, position, size, 0);
+        if (count > 0) {
+            position += count;
+            size -= static_cast<size_t>(count);
+            if (received_out) *received_out = requested - size;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (received_out) *received_out = requested - size;
+        if (failure) *failure = count == 0
+            ? std::string(stage) + ":eof"
+            : std::string(stage) + ":recv-errno=" + std::to_string(errno);
+        return false;
+    }
+    if (received_out) *received_out = requested - size;
+    if (size != 0 && failure) *failure = std::string(stage) + ":stopped";
+    return size == 0;
+}
+
+static bool p51_exact_read_framing_eof_selftest()
+{
+    std::atomic<bool> stop{false};
+    int clean_pair[2]{};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, clean_pair) != 0) return false;
+    ::close(clean_pair[1]);
+    std::array<unsigned char, 4> word{};
+    size_t received = 99;
+    std::string failure;
+    const bool clean_eof = !p51_read_exact_relay_bytes(
+        clean_pair[0], word.data(), word.size(), stop, &failure, "test-header",
+        &received) && received == 0 && failure == "test-header:eof" &&
+        p51_is_clean_idle_terminal(true, false, false, false,
+            "disconnect-after-link-state", true);
+    ::close(clean_pair[0]);
+
+    int short_header_pair[2]{};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, short_header_pair) != 0) return false;
+    const unsigned char short_header[2]{0x80, 0x00};
+    const bool sent_header = ::send(short_header_pair[0], short_header,
+                                    sizeof(short_header), MSG_NOSIGNAL) == 2;
+    (void)::shutdown(short_header_pair[0], SHUT_WR);
+    received = 99;
+    failure.clear();
+    const bool short_header_seen = sent_header && !p51_read_exact_relay_bytes(
+        short_header_pair[1], word.data(), word.size(), stop, &failure,
+        "test-header", &received) && received == 2 && failure == "test-header:eof" &&
+        !p51_is_clean_idle_terminal(true, false, false, false,
+            "truncated-frame-header", false);
+    ::close(short_header_pair[0]);
+    ::close(short_header_pair[1]);
+
+    int short_payload_pair[2]{};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, short_payload_pair) != 0) return false;
+    const unsigned char frame[4]{0x80, 0x00, 0x00, 0x06};
+    const bool sent_frame = ::send(short_payload_pair[0], frame, sizeof(frame),
+                                   MSG_NOSIGNAL) == 4;
+    received = 0;
+    failure.clear();
+    const bool full_header = sent_frame && p51_read_exact_relay_bytes(
+        short_payload_pair[1], word.data(), word.size(), stop, &failure,
+        "test-header", &received) && received == 4;
+    const unsigned char partial_payload[2]{0xaa, 0xbb};
+    const bool sent_payload = ::send(short_payload_pair[0], partial_payload,
+        sizeof(partial_payload), MSG_NOSIGNAL) == 2;
+    (void)::shutdown(short_payload_pair[0], SHUT_WR);
+    std::array<unsigned char, 6> payload{};
+    received = 99;
+    failure.clear();
+    const bool short_payload_seen = full_header && sent_payload &&
+        !p51_read_exact_relay_bytes(short_payload_pair[1], payload.data(),
+            payload.size(), stop, &failure, "test-payload", &received) &&
+        received == 2 && failure == "test-payload:eof" &&
+        !p51_is_clean_idle_terminal(true, true, false, false,
+            "truncated-frame-payload", false);
+    ::close(short_payload_pair[0]);
+    ::close(short_payload_pair[1]);
+    return clean_eof && short_header_seen && short_payload_seen;
+}
+
 class P51CommitReceiptGate {
 public:
+    enum class TerminalKind : uint8_t { Other, CleanIdleLinkEof };
     P51CommitReceiptGate(int endpoint_port, uid_t sidecar_uid, size_t expected,
                          uint64_t first_ordinal = 1,
                          std::string abort_path = {},
@@ -321,6 +435,142 @@ public:
     bool finished() const noexcept
     {
         return finished_.load(std::memory_order_acquire);
+    }
+    bool clean_idle_link_eof() const noexcept
+    {
+        return terminal_kind_.load(std::memory_order_acquire) ==
+            TerminalKind::CleanIdleLinkEof;
+    }
+    bool terminal_observed() const noexcept
+    {
+        return terminal_recorded_.load(std::memory_order_acquire);
+    }
+    void acknowledge_released_window() noexcept
+    {
+        released_window_acknowledged_.store(true, std::memory_order_release);
+    }
+
+    // Once the released receipt window has drained, a clean idle EOF means
+    // this relay will not accept another connection. Remove its exact redirect
+    // and close the listener so queued redirected peers terminate promptly.
+    bool retire_redirect_after_clean_idle_eof()
+    {
+        if (!finished() || !clean_idle_link_eof() ||
+            !released_window_acknowledged_.load(std::memory_order_acquire))
+            return false;
+        size_t queued_peers_closed = 0;
+        bool drain_ok = true;
+        if (listener_fd_ >= 0) {
+            // Drain while the exact redirect rule is still installed:
+            // abortive closes must receive reverse NAT translation. Closing
+            // a listening fd alone does not reliably terminate completed
+            // connections already in its accept queue.
+            const int listener_flags = ::fcntl(listener_fd_, F_GETFL, 0);
+            if (listener_flags < 0 ||
+                ::fcntl(listener_fd_, F_SETFL, listener_flags | O_NONBLOCK) < 0) {
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=nonblocking errno=%d\n",
+                    endpoint_port_, errno);
+                drain_ok = false;
+            } else {
+                // A connect that selected the redirect just before rule
+                // deletion can finish its handshake slightly later. Require
+                // a bounded quiet interval after draining, with a hard cap,
+                // before closing the listener.
+                const auto drain_deadline = Clock::now() +
+                    std::chrono::seconds(1);
+                auto quiet_since = Clock::now();
+                unsigned interrupted = 0;
+                while (Clock::now() < drain_deadline) {
+                    pollfd listener{listener_fd_, POLLIN, 0};
+                    const int ready = ::poll(&listener, 1, 25);
+                    if (ready < 0 && errno == EINTR && interrupted++ < 8)
+                        continue;
+                    if (ready < 0 || (ready > 0 &&
+                        (listener.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
+                        std::fprintf(stderr,
+                            "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=poll errno=%d revents=%d\n",
+                            endpoint_port_, errno, listener.revents);
+                        drain_ok = false;
+                        break;
+                    }
+                    if (ready == 0) {
+                        if (Clock::now() - quiet_since >=
+                            std::chrono::milliseconds(100))
+                            break;
+                        continue;
+                    }
+                    for (;;) {
+                        const int peer = ::accept4(listener_fd_, nullptr, nullptr,
+                            SOCK_NONBLOCK | SOCK_CLOEXEC);
+                        if (peer >= 0) {
+                            const linger reset_peer{1, 0};
+                            if (::setsockopt(peer, SOL_SOCKET, SO_LINGER,
+                                    &reset_peer, sizeof(reset_peer)) != 0) {
+                                std::fprintf(stderr,
+                                    "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=linger errno=%d\n",
+                                    endpoint_port_, errno);
+                                drain_ok = false;
+                            }
+                            if (::shutdown(peer, SHUT_RDWR) != 0 &&
+                                errno != ENOTCONN) {
+                                std::fprintf(stderr,
+                                    "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=shutdown errno=%d\n",
+                                    endpoint_port_, errno);
+                                drain_ok = false;
+                            }
+                            if (::close(peer) != 0) {
+                                std::fprintf(stderr,
+                                    "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=close errno=%d\n",
+                                    endpoint_port_, errno);
+                                drain_ok = false;
+                            }
+                            ++queued_peers_closed;
+                            if (!drain_ok) break;
+                            continue;
+                        }
+                        if (errno == EINTR && interrupted++ < 8) continue;
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            std::fprintf(stderr,
+                                "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=accept errno=%d\n",
+                                endpoint_port_, errno);
+                            drain_ok = false;
+                        }
+                        break;
+                    }
+                    quiet_since = Clock::now();
+                    if (!drain_ok) break;
+                }
+                if (drain_ok && Clock::now() >= drain_deadline) {
+                    std::fprintf(stderr,
+                        "P51_RECEIPT_GATE_REDIRECT_QUEUE_DRAIN_FAILED port=%d stage=quiescence-timeout\n",
+                        endpoint_port_);
+                    drain_ok = false;
+                }
+            }
+        }
+        // Keep the redirect active only through the bounded queue-drain
+        // quiescence interval. Once no stale connection is arriving, remove
+        // the exact rule before closing the listener, so new connects bypass
+        // this one-shot relay.
+        if (rule_installed_) {
+            if (!run_iptables_rule(redirect_rule("-D", false))) {
+                std::fprintf(stderr,
+                    "P51_RECEIPT_GATE_REDIRECT_RETIRE_FAILED port=%d proxy_port=%d\n",
+                    endpoint_port_, proxy_port_);
+                drain_ok = false;
+            } else {
+                rule_installed_ = false;
+            }
+        }
+        if (listener_fd_ >= 0) {
+            ::close(listener_fd_);
+            listener_fd_ = -1;
+        }
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_REDIRECT_RETIRED port=%d proxy_port=%d queued_peers_closed=%zu reason=clean-idle-link-eof\n",
+            endpoint_port_, proxy_port_, queued_peers_closed);
+        return drain_ok;
     }
     size_t observed_commits() const
     {
@@ -517,39 +767,11 @@ private:
 
     bool read_relay_bytes(int fd, void *buffer, size_t size,
                           std::string *failure = nullptr,
-                          const char *stage = "relay-read")
+                          const char *stage = "relay-read",
+                          size_t *received_out = nullptr)
     {
-        auto *position = static_cast<unsigned char *>(buffer);
-        while (size != 0 && !stop_.load(std::memory_order_acquire)) {
-            pollfd descriptor{fd, POLLIN, 0};
-            const int ready = ::poll(&descriptor, 1, 100);
-            if (ready < 0 && errno == EINTR) continue;
-            if (ready < 0) {
-                if (failure) *failure = std::string(stage) + ":poll-errno=" +
-                    std::to_string(errno);
-                return false;
-            }
-            if (ready > 0 &&
-                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-                if (failure) *failure = std::string(stage) + ":poll-revents=" +
-                    std::to_string(descriptor.revents);
-                return false;
-            }
-            if (ready == 0) continue;
-            const ssize_t count = ::recv(fd, position, size, 0);
-            if (count > 0) {
-                position += count;
-                size -= static_cast<size_t>(count);
-                continue;
-            }
-            if (count < 0 && errno == EINTR) continue;
-            if (failure) *failure = count == 0
-                ? std::string(stage) + ":eof"
-                : std::string(stage) + ":recv-errno=" + std::to_string(errno);
-            return false;
-        }
-        if (size != 0 && failure) *failure = std::string(stage) + ":stopped";
-        return size == 0;
+        return p51_read_exact_relay_bytes(fd, buffer, size, stop_, failure,
+                                          stage, received_out);
     }
 
     static long long elapsed_ms(Clock::time_point started)
@@ -729,11 +951,24 @@ private:
             bool link_state_reported = false;
             bool link_reject_reported = false;
             while (!stop_.load(std::memory_order_acquire) && !failed_) {
-                if (!read_relay_bytes(server_fd_, header, sizeof(header))) {
-                    terminal_reason = link_state_seen
-                        ? "disconnect-after-link-state"
-                        : (link_reject_seen ? "disconnect-after-link-reject"
-                                            : "disconnect-before-link-state");
+                std::string header_failure;
+                size_t header_bytes = 0;
+                if (!read_relay_bytes(server_fd_, header, sizeof(header),
+                                      &header_failure, "server-r2-frame-header",
+                                      &header_bytes)) {
+                    const bool boundary_eof = header_bytes == 0 &&
+                        header_failure == "server-r2-frame-header:eof";
+                    if (boundary_eof) {
+                        terminal_reason = link_state_seen
+                            ? "disconnect-after-link-state"
+                            : (link_reject_seen ? "disconnect-after-link-reject"
+                                                : "disconnect-before-link-state");
+                    } else {
+                        protocol_error = true;
+                        terminal_reason = header_bytes != 0
+                            ? "truncated-frame-header" : "server-frame-header-read-error";
+                        terminal_io_result = header_failure;
+                    }
                     break;
                 }
                 const uint32_t word = (uint32_t(header[0]) << 24) |
@@ -938,6 +1173,14 @@ private:
             "P51_RECEIPT_GATE_TERMINAL attempt=%u link_state=%u protocol_error=%u reason=%s\n",
             attempt, link_state_seen ? 1u : 0u, protocol_error ? 1u : 0u,
             terminal_reason.c_str());
+        const bool clean_idle_link_eof = p51_is_clean_idle_terminal(
+            link_state_seen, protocol_error, failed_before_cleanup,
+            stop_before_cleanup, terminal_reason,
+            terminal_reason == "disconnect-after-link-state");
+        terminal_kind_.store(clean_idle_link_eof
+            ? TerminalKind::CleanIdleLinkEof : TerminalKind::Other,
+            std::memory_order_release);
+        terminal_recorded_.store(true, std::memory_order_release);
         const auto now = Clock::now();
         if (client_fd_ >= 0) { ::close(client_fd_); client_fd_ = -1; }
         if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
@@ -1018,6 +1261,9 @@ private:
     std::atomic<bool> terminal_stop_{false};
     std::atomic<bool> link_state_seen_{false};
     std::atomic<bool> finished_{false};
+    std::atomic<TerminalKind> terminal_kind_{TerminalKind::Other};
+    std::atomic<bool> terminal_recorded_{false};
+    std::atomic<bool> released_window_acknowledged_{false};
 };
 
 static bool p51_read_all_for_gate_test(int fd, void *buffer, size_t size)
@@ -1394,6 +1640,69 @@ static bool p51_gate_write_marker(const std::string& path,
     return false;
 }
 
+static bool p51_gate_wait_one_shot_finish(P51CommitReceiptGate& gate,
+                                          const std::string& control_dir,
+                                          Clock::time_point finish_deadline,
+                                          unsigned helper_budget_s)
+{
+    bool redirect_retired = false;
+    while (Clock::now() < finish_deadline) {
+        std::error_code abort_error;
+        if (std::filesystem::exists(control_dir + "/abort", abort_error) &&
+            !abort_error) {
+            (void)p51_gate_write_marker(control_dir + "/failed",
+                "one-shot batch aborted before finish\n");
+            return false;
+        }
+        // A previously observed terminal takes precedence over /finish. Only
+        // the exact clean, frame-boundary idle EOF after the released window
+        // permits retirement; protocol/I/O/abort terminals stay failures.
+        if (gate.terminal_observed() && !gate.clean_idle_link_eof()) {
+            (void)p51_gate_write_marker(control_dir + "/failed",
+                "receipt relay reached a non-clean terminal before finish\n");
+            return false;
+        }
+        if (gate.finished()) {
+            if (!gate.clean_idle_link_eof()) {
+                (void)p51_gate_write_marker(control_dir + "/failed",
+                    "receipt relay ended before finish without clean idle EOF\n");
+                return false;
+            }
+            if (!redirect_retired) {
+                if (!gate.retire_redirect_after_clean_idle_eof() ||
+                    !p51_gate_write_marker(control_dir + "/redirect-retired",
+                        "reason=clean-idle-link-eof after released-1\n")) {
+                    (void)p51_gate_write_marker(control_dir + "/failed",
+                        "clean idle EOF redirect retirement failed\n");
+                    return false;
+                }
+                redirect_retired = true;
+            }
+        }
+        std::error_code finish_error;
+        if (std::filesystem::exists(control_dir + "/finish", finish_error) &&
+            !finish_error) {
+            if (gate.terminal_observed() && !gate.clean_idle_link_eof()) {
+                (void)p51_gate_write_marker(control_dir + "/failed",
+                    "receipt relay ended with a non-clean terminal before finish\n");
+                return false;
+            }
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (helper_budget_s != 0 && Clock::now() >= finish_deadline) {
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_TIMEOUT phase=finish budget_s=%u\n", helper_budget_s);
+        (void)p51_gate_write_marker(control_dir + "/failed",
+            "receipt helper timeout phase=finish\n");
+    } else {
+        (void)p51_gate_write_marker(control_dir + "/failed",
+            "one-shot batch did not finish before gate shutdown\n");
+    }
+    return false;
+}
+
 static bool p51_read_settlement_ack(const std::string& path,
                                     uint64_t expected_request)
 {
@@ -1418,6 +1727,315 @@ static bool p51_wait_settlement_ack(const std::string& path,
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     } while (Clock::now() < deadline);
     return false;
+}
+
+static bool p51_receipt_gate_terminal_retirement_selftest(uid_t sidecar_uid,
+                                                           const std::string& work)
+{
+    std::error_code fs_error;
+    std::filesystem::create_directories(work, fs_error);
+    if (fs_error) return false;
+    const std::string rule_log = work + "/iptables.log";
+    const std::string fake_bin = work + "/bin";
+    std::filesystem::create_directories(fake_bin, fs_error);
+    if (fs_error) return false;
+    const std::string fake_iptables = fake_bin + "/iptables";
+    {
+        std::ofstream script(fake_iptables);
+        script << "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" << rule_log << "'\n";
+        if (!script.good()) return false;
+    }
+    if (::chmod(fake_iptables.c_str(), 0755) != 0) return false;
+    const char *old_path_value = ::getenv("PATH");
+    const std::string old_path = old_path_value ? old_path_value : "/usr/bin:/bin";
+    if (::setenv("PATH", (fake_bin + ":" + old_path).c_str(), 1) != 0)
+        return false;
+
+    const std::array<unsigned char, 4> version{51, 0, 0, 0};
+    int upstream_port = 0;
+    const int upstream_listener = listen_ephemeral(&upstream_port);
+    if (upstream_listener < 0) {
+        (void)::setenv("PATH", old_path.c_str(), 1);
+        return false;
+    }
+    std::atomic<bool> server_ok{true};
+    std::atomic<bool> permit_idle_close{false};
+    std::thread upstream([&] {
+        pollfd incoming{upstream_listener, POLLIN, 0};
+        if (::poll(&incoming, 1, 5000) <= 0) {
+            server_ok.store(false, std::memory_order_release);
+            return;
+        }
+        const int connection = ::accept(upstream_listener, nullptr, nullptr);
+        if (connection < 0) {
+            server_ok.store(false, std::memory_order_release);
+            return;
+        }
+        std::array<unsigned char, 4> wire{};
+        const bool got_client_max = p51_read_all_for_gate_test(
+            connection, wire.data(), wire.size()) && wire == version;
+        const bool sent_server_max = got_client_max &&
+            write_all(connection, version.data(), version.size());
+        const bool got_client_selected = sent_server_max &&
+            p51_read_all_for_gate_test(connection, wire.data(), wire.size()) &&
+            wire == version;
+        const bool sent_server_selected = got_client_selected &&
+            write_all(connection, version.data(), version.size());
+        bool ok = sent_server_selected;
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_RETIREMENT_SELFTEST_SERVER_HANDSHAKE max=%u/%u selected=%u/%u\n",
+            got_client_max ? 1u : 0u, sent_server_max ? 1u : 0u,
+            got_client_selected ? 1u : 0u, sent_server_selected ? 1u : 0u);
+        icecc::p50::StoreIdentityRoot c_root{};
+        icecc::p50::StoreIdentityRoot f_root{};
+        if (!icecc::p50::fresh_store_identity_root(c_root) ||
+            !icecc::p50::fresh_store_identity_root(f_root) || c_root == f_root)
+            ok = false;
+        icecc::p50::LinkState state{};
+        state.profile = icecc::p50::ProfileId::P29V1;
+        state.window = 1;
+        state.reservation_id.bytes.fill(0x11);
+        state.relationship_id.bytes.fill(0x22);
+        state.relationship_epoch = 1;
+        state.physical_link_generation = 1;
+        state.c_store_guid = icecc::p50::c_store_guid_for_root(c_root);
+        state.c_store_generation = 1;
+        state.f_store_guid = icecc::p50::f_store_guid_for_root(f_root);
+        state.f_store_generation = 1;
+        state.c_control_generation = 1;
+        state.c_control_attempt = 1;
+        state.selected_max_frame_payload =
+            icecc::p50::kR2MandatoryControlFramePayload;
+        state.selected_max_raw_bytes = 4096;
+        state.selected_max_encoded_bytes = 4096;
+        state.selected_max_output_bytes = 4096;
+        state.history_nonce.value = 1;
+        const auto state_frame = icecc::p50::encode_frame(
+            icecc::p50::Message{state});
+        icecc::p50::R2TxCommit receipt{};
+        receipt.relationship_ordinal = 1;
+        receipt.binding_digest.bytes.fill(0x51);
+        receipt.transaction_digest.bytes.fill(0x61);
+        receipt.inner.history_nonce.value = 1;
+        const auto receipt_frame = icecc::p50::encode_frame(
+            icecc::p50::Message{receipt});
+        ok = ok && write_all(connection, state_frame.data(), state_frame.size()) &&
+            write_all(connection, receipt_frame.data(), receipt_frame.size());
+        if (!ok) server_ok.store(false, std::memory_order_release);
+        const auto idle_deadline = Clock::now() + std::chrono::seconds(3);
+        while (!permit_idle_close.load(std::memory_order_acquire) &&
+               Clock::now() < idle_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!permit_idle_close.load(std::memory_order_acquire))
+            server_ok.store(false, std::memory_order_release);
+        ::close(connection);
+        // Accept a fresh direct connection after the helper retired its
+        // redirect and closed its no-longer-serviced listener.
+        pollfd second{upstream_listener, POLLIN, 0};
+        if (ok && permit_idle_close.load(std::memory_order_acquire) &&
+            ::poll(&second, 1, 5000) > 0) {
+            const int reconnect = ::accept(upstream_listener, nullptr, nullptr);
+            if (reconnect >= 0) {
+                static constexpr char marker[] = "direct-reconnect\n";
+                if (!write_all(reconnect, marker, sizeof(marker) - 1))
+                    server_ok.store(false, std::memory_order_release);
+                ::close(reconnect);
+            } else {
+                server_ok.store(false, std::memory_order_release);
+            }
+        } else {
+            server_ok.store(false, std::memory_order_release);
+        }
+    });
+
+    bool passed = false;
+    {
+        P51CommitReceiptGate gate(upstream_port, sidecar_uid, 1, 1,
+                                  work + "/abort-retirement");
+        const bool pre_release_rejected =
+            !gate.retire_redirect_after_clean_idle_eof();
+        int client = gate.ready() ? connect_raw_tcp(gate.proxy_port()) : -1;
+        if (client >= 0) {
+            const int client_flags = ::fcntl(client, F_GETFL, 0);
+            if (client_flags < 0 ||
+                ::fcntl(client, F_SETFL, client_flags & ~O_NONBLOCK) < 0) {
+                ::close(client);
+                client = -1;
+            }
+        }
+        if (client >= 0) {
+            std::array<unsigned char, 4> wire{};
+            const bool sent_client_max = write_all(client, version.data(), version.size());
+            const bool got_server_max = sent_client_max &&
+                p51_read_all_for_gate_test(client, wire.data(), wire.size()) &&
+                wire == version;
+            const bool sent_client_selected = got_server_max &&
+                write_all(client, version.data(), version.size());
+            const bool got_server_selected = sent_client_selected &&
+                p51_read_all_for_gate_test(client, wire.data(), wire.size()) &&
+                wire == version;
+            bool protocol_ok = got_server_selected;
+            std::fprintf(stderr,
+                "P51_RECEIPT_GATE_RETIREMENT_SELFTEST_CLIENT_HANDSHAKE max=%u selected=%u/%u selected_reply=%u\n",
+                sent_client_max ? 1u : 0u, got_server_max ? 1u : 0u,
+                sent_client_selected ? 1u : 0u, got_server_selected ? 1u : 0u);
+            std::array<unsigned char, 4> frame_header{};
+            if (protocol_ok)
+                protocol_ok = p51_read_all_for_gate_test(client, frame_header.data(), 4);
+            icecc::p50::FrameHeader decoded{};
+            if (protocol_ok) {
+                try {
+                    decoded = icecc::p50::decode_frame_header(
+                        std::span<const uint8_t>(frame_header.data(), 4));
+                } catch (...) { protocol_ok = false; }
+            }
+            std::vector<unsigned char> payload;
+            if (protocol_ok) {
+                payload.resize(decoded.payload_bytes);
+                protocol_ok = decoded.type == icecc::p50::MessageType::LINK_STATE &&
+                    p51_read_all_for_gate_test(client, payload.data(), payload.size());
+            }
+            if (protocol_ok) {
+                try {
+                    (void)icecc::p50::decode_payload(
+                        icecc::p50::MessageType::LINK_STATE, payload);
+                } catch (...) { protocol_ok = false; }
+            }
+            const bool held = protocol_ok && gate.wait_for_commits(
+                std::chrono::seconds(2));
+            if (held) gate.release_commits();
+            const bool commit_drained = held && p51_read_all_for_gate_test(
+                client, frame_header.data(), 4);
+            if (commit_drained) {
+                try {
+                    decoded = icecc::p50::decode_frame_header(
+                        std::span<const uint8_t>(frame_header.data(), 4));
+                    payload.resize(decoded.payload_bytes);
+                    protocol_ok = decoded.type == icecc::p50::MessageType::R2_TX_COMMIT &&
+                        p51_read_all_for_gate_test(client, payload.data(), payload.size());
+                    if (protocol_ok)
+                        (void)icecc::p50::decode_payload(
+                            icecc::p50::MessageType::R2_TX_COMMIT, payload);
+                } catch (...) { protocol_ok = false; }
+            }
+            const bool rearmed = protocol_ok && commit_drained && gate.rearm(0, 0);
+            if (rearmed) {
+                gate.acknowledge_released_window();
+                permit_idle_close.store(true, std::memory_order_release);
+            }
+            if (rearmed) {
+                const auto deadline = Clock::now() + std::chrono::seconds(2);
+                while (!gate.finished() && Clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            const bool clean_terminal = rearmed && gate.finished() &&
+                gate.clean_idle_link_eof();
+            std::vector<int> queued_peers;
+            if (clean_terminal) {
+                for (unsigned i = 0; i < 2; ++i) {
+                    const int peer = connect_raw_tcp(gate.proxy_port());
+                    if (peer >= 0) queued_peers.push_back(peer);
+                }
+            }
+            std::thread finish_publisher;
+            if (queued_peers.size() == 2) {
+                finish_publisher = std::thread([&] {
+                    const auto deadline = Clock::now() + std::chrono::seconds(2);
+                    const auto retired_marker = work + "/redirect-retired";
+                    while (Clock::now() < deadline) {
+                        std::error_code marker_error;
+                        if (std::filesystem::exists(retired_marker, marker_error) &&
+                            !marker_error) {
+                            (void)p51_gate_write_marker(work + "/finish", "ok\n");
+                            return;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                });
+            }
+            const bool retired = queued_peers.size() == 2 &&
+                p51_gate_wait_one_shot_finish(
+                    gate, work, Clock::now() + std::chrono::seconds(2), 2);
+            if (finish_publisher.joinable()) finish_publisher.join();
+            unsigned queued_terminated = 0;
+            for (const int peer : queued_peers) {
+                pollfd stale{peer, POLLIN | POLLHUP | POLLERR, 0};
+                if (::poll(&stale, 1, 1000) > 0) {
+                    char byte = 0;
+                    const ssize_t got = ::recv(peer, &byte, 1, 0);
+                    if (got <= 0) ++queued_terminated;
+                }
+                ::close(peer);
+            }
+            const bool all_queued_terminated = retired &&
+                queued_peers.size() == 2 && queued_terminated == 2;
+            int direct = retired ? connect_raw_tcp(upstream_port) : -1;
+            bool direct_reconnected = false;
+            if (direct >= 0) {
+                const int direct_flags = ::fcntl(direct, F_GETFL, 0);
+                if (direct_flags >= 0)
+                    (void)::fcntl(direct, F_SETFL, direct_flags & ~O_NONBLOCK);
+                pollfd readable{direct, POLLIN, 0};
+                char response[32]{};
+                if (::poll(&readable, 1, 1000) > 0) {
+                    const ssize_t got = ::recv(direct, response, sizeof(response), 0);
+                    direct_reconnected = got == 17 &&
+                        std::string(response, static_cast<size_t>(got)) ==
+                            "direct-reconnect\n";
+                }
+                ::close(direct);
+            }
+            std::ifstream rules(rule_log);
+            std::vector<std::string> rule_commands;
+            std::string rule_line;
+            while (std::getline(rules, rule_line)) rule_commands.push_back(rule_line);
+            const std::string rule_tail = " OUTPUT -p tcp --dport " +
+                std::to_string(upstream_port) + " -m owner --uid-owner " +
+                std::to_string(sidecar_uid) + " -j REDIRECT --to-ports " +
+                std::to_string(gate.proxy_port());
+            const bool exact_rule_removed =
+                std::find(rule_commands.begin(), rule_commands.end(),
+                    "-t nat -A" + rule_tail) != rule_commands.end() &&
+                std::find(rule_commands.begin(), rule_commands.end(),
+                    "-t nat -D" + rule_tail) != rule_commands.end();
+            const std::string abort_case = work + "/abort-priority";
+            std::filesystem::create_directories(abort_case, fs_error);
+            const bool abort_markers = !fs_error &&
+                p51_gate_write_marker(abort_case + "/finish", "ok\n") &&
+                p51_gate_write_marker(abort_case + "/abort", "ok\n");
+            const bool abort_wins = abort_markers &&
+                !p51_gate_wait_one_shot_finish(
+                    gate, abort_case, Clock::now() + std::chrono::milliseconds(100), 1) &&
+                std::filesystem::exists(abort_case + "/failed");
+            const bool terminal_negatives =
+                !p51_is_clean_idle_terminal(true, false, false, false,
+                    "truncated-frame-header", false) &&
+                !p51_is_clean_idle_terminal(true, true, false, false,
+                    "truncated-frame-payload", false) &&
+                !p51_is_clean_idle_terminal(true, false, true, false,
+                    "disconnect-after-link-state", true) &&
+                !p51_is_clean_idle_terminal(false, false, false, false,
+                    "disconnect-after-link-state", true);
+            passed = p51_exact_read_framing_eof_selftest() &&
+                pre_release_rejected && protocol_ok && held && commit_drained &&
+                clean_terminal && retired && terminal_negatives && abort_wins &&
+                all_queued_terminated && direct_reconnected && exact_rule_removed &&
+                std::filesystem::exists(work + "/redirect-retired") &&
+                std::filesystem::exists(work + "/finish");
+            ::close(client);
+        }
+    }
+    ::close(upstream_listener);
+    if (upstream.joinable()) upstream.join();
+    (void)::setenv("PATH", old_path.c_str(), 1);
+    if (passed) {
+        std::filesystem::remove_all(work, fs_error);
+    } else {
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_TERMINAL_RETIREMENT_EVIDENCE path=%s\n",
+            work.c_str());
+    }
+    return passed && !fs_error && server_ok.load(std::memory_order_acquire);
 }
 
 static bool p51_gate_wait_rearm(P51CommitReceiptGate& gate, size_t expected,
@@ -1596,8 +2214,7 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         else if (remaining < rearm_wait)
             rearm_wait = std::chrono::ceil<std::chrono::milliseconds>(remaining);
     }
-    if (!p51_gate_wait_rearm(gate, 0, 0, control_dir + "/abort", rearm_wait) ||
-        !p51_gate_write_marker(control_dir + "/released-1")) {
+    if (!p51_gate_wait_rearm(gate, 0, 0, control_dir + "/abort", rearm_wait)) {
         if (helper_budget_s != 0 && Clock::now() >= helper_deadline) {
             std::fprintf(stderr,
                 "P51_RECEIPT_GATE_TIMEOUT phase=release-settle budget_s=%u\n",
@@ -1609,23 +2226,16 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         (void)p51_gate_write_marker(control_dir + "/failed", "first release did not settle\n");
         return 1;
     }
+    if (!p51_gate_write_marker(control_dir + "/released-1")) {
+        (void)p51_gate_write_marker(control_dir + "/failed", "first release marker failed\n");
+        return 1;
+    }
+    gate.acknowledge_released_window();
     if (one_shot) {
-        const bool finished = helper_budget_s == 0
-            ? p51_gate_wait_for_path(control_dir + "/finish", std::chrono::seconds(180))
-            : p51_gate_wait_for_path_until(control_dir + "/finish", helper_deadline);
-        if (!finished) {
-            if (helper_budget_s != 0 && Clock::now() >= helper_deadline) {
-                std::fprintf(stderr,
-                    "P51_RECEIPT_GATE_TIMEOUT phase=finish budget_s=%u\n",
-                    helper_budget_s);
-                (void)p51_gate_write_marker(control_dir + "/failed",
-                    "receipt helper timeout phase=finish\n");
-                return 1;
-            }
-            (void)p51_gate_write_marker(control_dir + "/failed", "one-shot batch did not finish before gate shutdown\n");
-            return 1;
-        }
-        return 0;
+        const auto finish_deadline = helper_budget_s == 0
+            ? Clock::now() + std::chrono::seconds(180) : helper_deadline;
+        return p51_gate_wait_one_shot_finish(
+            gate, control_dir, finish_deadline, helper_budget_s) ? 0 : 1;
     }
     if (!p51_gate_wait_for_path(control_dir + "/arm-2", std::chrono::seconds(30)) ||
         !p51_gate_wait_rearm(gate, expected, 0, control_dir + "/abort") ||
@@ -7200,6 +7810,8 @@ int main(int argc, char **argv)
         std::strcmp(argv[1], "--p51-commit-receipt-gate-remote") == 0;
     const bool receipt_prearm_selftest = argc == 3 &&
         std::strcmp(argv[1], "--p51-receipt-prearm-retry-selftest") == 0;
+    const bool receipt_terminal_retirement_selftest = argc == 3 &&
+        std::strcmp(argv[1], "--p51-receipt-terminal-retirement-selftest") == 0;
     const bool receipt_gate_mode = argc == 7 &&
         (std::strcmp(argv[1], "--p51-commit-receipt-gate") == 0 ||
          std::strcmp(argv[1], "--p51-commit-receipt-gate-once") == 0 ||
@@ -7294,7 +7906,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (!receipt_gate_mode && !remote_receipt_gate_mode &&
-        !receipt_prearm_selftest && argc != 3) {
+        !receipt_prearm_selftest && !receipt_terminal_retirement_selftest && argc != 3) {
         std::fprintf(stderr, "usage: %s <iceccd> <icecc-cache-service>\n", argv[0]);
         return 2;
     }
@@ -7315,7 +7927,7 @@ int main(int argc, char **argv)
        sidecar.  Some client-only images run that sidecar as nobody and do
        not define an icecc account; keep the named-account requirement for
        the daemon scenarios that actually launch iceccd under icecc. */
-    if (!remote_receipt_gate_mode &&
+    if (!remote_receipt_gate_mode && !receipt_terminal_retirement_selftest &&
         (icecc == nullptr || icecc->pw_uid == 0 || icecc->pw_gid == 0)) {
         std::fprintf(stderr, "SKIP: isolated image has no unprivileged icecc identity\n");
         return 77;
@@ -7326,6 +7938,21 @@ int main(int argc, char **argv)
         std::fprintf(stderr,
             "%s: P51 receipt prearm stale-candidate retry and shutdown\n",
             passed ? "PASS" : "FAIL");
+        return passed ? 0 : 1;
+    }
+    if (receipt_terminal_retirement_selftest) {
+        passwd *sidecar = ::getpwnam("nobody");
+        if (sidecar == nullptr || sidecar->pw_uid == 0) {
+            std::fprintf(stderr,
+                "FAIL: terminal-retirement selftest requires a distinct unprivileged identity\n");
+            return 2;
+        }
+        const bool passed = p51_receipt_gate_terminal_retirement_selftest(
+            sidecar->pw_uid, argv[2]);
+        std::fprintf(stderr,
+            "%s: P51 one-shot clean idle EOF retires redirect, closes queued peers, and permits direct reconnect%s%s\n",
+            passed ? "PASS" : "FAIL",
+            passed ? "" : "; retained fixture evidence: ", passed ? "" : argv[2]);
         return passed ? 0 : 1;
     }
     if (remote_receipt_gate_mode) {
