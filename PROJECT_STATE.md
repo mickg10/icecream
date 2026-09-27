@@ -177,7 +177,11 @@ test source SHA256:
 `813fc52f1f33a13d7e2984d2f662881e6ebfea73ea9e1eb38f13bac286b9afdd`.
 The verified unchanged production closure was reused. This is opt-in selector
 coverage, not a fresh full-suite run of the merged tip or every D15 mutation
-across every topology. Public bootstrap gate registration remains pending.
+across every topology. `1f0de87e` registers the public opt-in command
+`make dev-gate GATE=p50-d15-r2-wire`; its marker validator requires both
+malformed-matrix summaries and all 27 semantic cells exactly once. Syntax,
+gate lookup and positive/missing/duplicate marker checks pass. A fresh public
+bootstrap execution remains pending; registration is not that qualification.
 
 ### Queued cancellation across profiles
 
