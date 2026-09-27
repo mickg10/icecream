@@ -18,11 +18,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <semaphore>
 #include <string>
 #include <thread>
 
 #include "p50_endpoint.h"
+#include "p50_armed_admission.h"
 #include "p50_control_operation.h"
 #include "p50_fsession_service_owner.h"
 #include "p50_fd_handoff.h"
@@ -258,10 +258,12 @@ private:
     // Uploads to different F overlap on the owner executor.  Buffered source
     // memory is at most kArmedSessions TUs per F endpoint.  Arming costs four
     // round trips before the gate, so a far F (~18 ms) needs a window of about
-    // eight to keep its gate busy; three capped it near 18 inputs/s.
+    // eight to keep its gate busy; three capped it near 18 inputs/s.  The
+    // window is taken in ArmedAdmission's order, largest sources first within
+    // a bounded head start.
     struct RouteGate {
         static constexpr std::ptrdiff_t kArmedSessions = 8;
-        std::counting_semaphore<kArmedSessions> armed{kArmedSessions};
+        ArmedAdmission armed{kArmedSessions};
         std::timed_mutex transfer;
     };
     std::mutex source_route_mutex_;

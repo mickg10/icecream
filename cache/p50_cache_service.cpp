@@ -1709,12 +1709,17 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         }
     };
     const auto source_mutex_wait_start = std::chrono::steady_clock::now();
-    if (!wait_for([&](auto limit) { return route_gate->armed.try_acquire_until(limit); }))
+    // The source is a regular file (read_source_fd accepts nothing else); its
+    // size orders the armed window.
+    struct stat source_stat {};
+    const uint64_t source_size_hint =
+        ::fstat(source.get(), &source_stat) == 0 && source_stat.st_size > 0
+            ? static_cast<uint64_t>(source_stat.st_size)
+            : 0;
+    ArmedAdmission::Wait armed_slot{route_gate->armed, source_size_hint,
+                                    source_mutex_wait_start};
+    if (!wait_for([&](auto limit) { return armed_slot.acquire_until(limit); }))
         return source_transfer_error(7);
-    struct ArmedSlot {
-        RouteGate& gate;
-        ~ArmedSlot() { gate.armed.release(); }
-    } armed_slot{*route_gate};
 
     FStoreGuid remote_f_guid;
     uint64_t remote_f_generation = 0;

@@ -6,6 +6,7 @@ check_LIBRARIES = libp50endpointtesthooks.a
 sbin_PROGRAMS = icecc-cache-service
 
 icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h \
+	p50_armed_admission.h \
 	../client/p50_route_owner.cpp ../client/p50_route_owner.h \
 	../client/p50_zstd_sender.cpp ../client/p50_zstd_sender.h
 icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
