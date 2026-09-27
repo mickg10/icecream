@@ -52,6 +52,13 @@ try:
         observe_args,
         resolve_bindings,
     )
+    from .receipt_network import (
+        RECEIPT_NETWORK_SCHEMA,
+        ReceiptClientNetwork,
+        ReceiptNetworkError,
+        create_args as receipt_network_create_args,
+        resolve_client_networks,
+    )
     from .lifecycle import (
         F_NOFILE_HARD,
         F_NOFILE_SOFT,
@@ -136,6 +143,13 @@ except ImportError:  # Executed as ./farmtest.py.
         create_args,
         observe_args,
         resolve_bindings,
+    )
+    from receipt_network import (
+        RECEIPT_NETWORK_SCHEMA,
+        ReceiptClientNetwork,
+        ReceiptNetworkError,
+        create_args as receipt_network_create_args,
+        resolve_client_networks,
     )
     from lifecycle import (
         F_NOFILE_HARD,
@@ -605,11 +619,15 @@ def _planned_commands(
     run_id: str,
     netem_bindings: tuple[NetemBinding, ...] = (),
     assignment_fence_mode: str | None = None,
+    receipt_networks: tuple[ReceiptClientNetwork, ...] = (),
 ) -> list[PlannedCommand]:
     commands: list[PlannedCommand] = []
     timeout = scenario.data["timeouts"]["up_s"]
     sequence = 0
     netem_by_instance = {binding.instance: binding for binding in netem_bindings}
+    receipt_network_by_instance = {
+        binding.instance: binding for binding in receipt_networks
+    }
 
     scheduler = next(item for item in topology["instances"] if item["role"] == "S")
     scheduler_port = ports["scheduler"]
@@ -618,6 +636,10 @@ def _planned_commands(
     client_entry = (Path(__file__).parent / "docker" / "entry-client.sh").read_bytes()
     client_entry_payload = base64.urlsafe_b64encode(client_entry).decode("ascii")
     client_entry_sha256 = hashlib.sha256(client_entry).hexdigest()
+    if receipt_networks and client_entry.count(b"--no-remote") != 1:
+        raise PlanError(
+            "P51 isolated receipt clients require the fixed no-remote entrypoint"
+        )
     disk_fill_targets = {
         event["instance"]
         for event in scenario.data.get("timeline", [])
@@ -746,6 +768,32 @@ def _planned_commands(
         )
         sequence += 1
 
+    # Receipt-window OUTPUT rules are UID-scoped.  Give every selected C its
+    # own network namespace before starting any role container; S and F keep
+    # their existing host/LAN endpoints.
+    for binding in receipt_networks:
+        commands.append(
+            PlannedCommand(
+                sequence=sequence,
+                phase="up.receipt-network-create",
+                host=binding.host,
+                instance=binding.instance,
+                transport=docker_transport(farm, binding.host),
+                timeout_s=timeout,
+                argv=docker_argv(
+                    farm,
+                    binding.host,
+                    receipt_network_create_args(
+                        binding,
+                        run_id,
+                        scenario.digest,
+                        topology["topology_digest"],
+                    ),
+                ),
+            )
+        )
+        sequence += 1
+
     role_order = {"S": 0, "F": 1, "C": 2}
     requested_instances = {
         item["name"]: item for item in scenario.data["instances"]
@@ -766,7 +814,9 @@ def _planned_commands(
             "--label",
             f"icefarm.instance={instance['name']}",
             "--network",
-            "host",
+            receipt_network_by_instance[instance["name"]].bridge
+            if instance["name"] in receipt_network_by_instance
+            else "host",
         ]
         requested = requested_instances[instance["name"]]
         if "cpus" in requested:
@@ -1079,10 +1129,16 @@ def build_plan(
         )
     except NetemPlanError as exc:
         raise PlanError(str(exc)) from exc
+    try:
+        receipt_networks = resolve_client_networks(
+            scenario.data, topology, selected_run_id
+        )
+    except ReceiptNetworkError as exc:
+        raise PlanError(str(exc)) from exc
     assignment_fence_mode = _assignment_fence_mode(topology, scenario, farm)
     commands = _planned_commands(
         farm, scenario, topology, ports, selected_run_id, netem_bindings,
-        assignment_fence_mode,
+        assignment_fence_mode, receipt_networks,
     )
     return {
         "assignment_fence_mode": assignment_fence_mode,
@@ -1122,6 +1178,7 @@ def build_plan(
                 "expected_commits": scenario.data["workload"]["receipt_gate"]["expected_commits"],
                 "negotiated_window": scenario.data["workload"]["receipt_gate"]["negotiated_window"],
                 "expect_observed": scenario.data["workload"]["receipt_gate"]["expect_observed"],
+                "clients": sorted(scenario.data["workload"].get("clients", [])),
                 **({"links": scenario.data["workload"]["receipt_gate"]["links"]}
                    if "links" in scenario.data["workload"]["receipt_gate"] else {}),
             }
@@ -1130,6 +1187,17 @@ def build_plan(
             "bindings": [binding.as_dict() for binding in netem_bindings],
             "schema": NETEM_PLAN_SCHEMA,
         },
+        **({"receipt_client_networks": {
+            "bindings": [binding.as_dict() for binding in receipt_networks],
+            "clients": sorted({binding.instance for binding in receipt_networks}),
+            "client_mode": "no-remote",
+            "entrypoint_sha256": hashlib.sha256(
+                (Path(__file__).parent / "docker" / "entry-client.sh").read_bytes()
+            ).hexdigest(),
+            "schema": RECEIPT_NETWORK_SCHEMA,
+            "scenario_digest": scenario.digest,
+            "topology_digest": topology["topology_digest"],
+        }} if scenario.data["workload"]["driver"] == "p51-receipt-window" else {}),
         "run_id": selected_run_id,
         # Preserve narrowly selected client output during teardown. These
         # files are diagnostic evidence, never inputs to a verdict.

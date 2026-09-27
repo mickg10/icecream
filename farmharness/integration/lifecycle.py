@@ -33,6 +33,17 @@ try:
         network_remove_args,
         validate_network_inspect,
     )
+    from .receipt_network import (
+        RECEIPT_NETWORK_SCHEMA,
+        ReceiptClientNetwork,
+        ReceiptNetworkError,
+        inspect_args as receipt_network_inspect_args,
+        list_args as receipt_network_list_args,
+        remove_args as receipt_network_remove_args,
+        resolve_client_networks,
+        validate_client_inspect,
+        validate_network_inspect as validate_receipt_network_inspect,
+    )
     from .remote import (
         CommandResult,
         PlannedCommand,
@@ -75,6 +86,17 @@ except ImportError:  # Direct execution from this directory.
         network_inspect_args,
         network_remove_args,
         validate_network_inspect,
+    )
+    from receipt_network import (
+        RECEIPT_NETWORK_SCHEMA,
+        ReceiptClientNetwork,
+        ReceiptNetworkError,
+        inspect_args as receipt_network_inspect_args,
+        list_args as receipt_network_list_args,
+        remove_args as receipt_network_remove_args,
+        resolve_client_networks,
+        validate_client_inspect,
+        validate_network_inspect as validate_receipt_network_inspect,
     )
     from remote import (
         CommandResult,
@@ -2794,6 +2816,222 @@ def _netem_bindings(plan: Mapping[str, Any]) -> tuple[NetemBinding, ...]:
     return tuple(result)
 
 
+def _receipt_client_networks(
+    plan: Mapping[str, Any],
+) -> tuple[ReceiptClientNetwork, ...]:
+    document = plan.get("receipt_client_networks")
+    if not plan.get("p51_receipt_gate"):
+        if document is not None:
+            raise LifecycleError("non-receipt run unexpectedly has client network isolation")
+        return ()
+    if not isinstance(document, Mapping):
+        raise LifecycleError("receipt client network plan is absent")
+    if (
+        document.get("schema") != RECEIPT_NETWORK_SCHEMA
+        or document.get("client_mode") != "no-remote"
+        or not isinstance(document.get("entrypoint_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", document["entrypoint_sha256"]) is None
+        or document.get("scenario_digest") != plan.get("scenario_digest")
+        or document.get("topology_digest") != plan.get("topology_digest")
+    ):
+        raise LifecycleError("receipt client network plan is not digest-bound")
+    entrypoint = Path(__file__).parent / "docker" / "entry-client.sh"
+    try:
+        entrypoint_bytes = entrypoint.read_bytes()
+    except OSError as exc:
+        raise LifecycleError("receipt client entrypoint cannot be verified") from exc
+    if (
+        hashlib.sha256(entrypoint_bytes).hexdigest() != document["entrypoint_sha256"]
+        or entrypoint_bytes.count(b"--no-remote") != 1
+    ):
+        raise LifecycleError("receipt client entrypoint differs from no-remote plan")
+    values = document.get("bindings")
+    if not isinstance(values, list):
+        raise LifecycleError("receipt client network bindings are absent")
+    clients = document.get("clients")
+    if not isinstance(clients, list) or any(not isinstance(name, str) for name in clients):
+        raise LifecycleError("receipt client network client list is malformed")
+    gate = plan.get("p51_receipt_gate")
+    if isinstance(gate, Mapping):
+        if clients != gate.get("clients"):
+            raise LifecycleError("receipt client networks do not cover exact gate clients")
+        if isinstance(gate.get("links"), list):
+            linked = sorted({
+                link.get("client") for link in gate["links"] if isinstance(link, Mapping)
+            })
+            if linked != clients:
+                raise LifecycleError("receipt links do not cover all isolated gate clients")
+    expected = resolve_client_networks(
+        {"workload": {"driver": "p51-receipt-window", "clients": clients}},
+        plan["topology"],
+        plan["run_id"],
+    ) if plan.get("p51_receipt_gate") else ()
+    if [binding.as_dict() for binding in expected] != values:
+        raise LifecycleError("receipt client network bindings differ from the selected clients")
+    if len({binding.bridge for binding in expected}) != len(expected):
+        raise LifecycleError("receipt client networks are not distinct")
+    commands = plan.get("commands")
+    if not isinstance(commands, list):
+        raise LifecycleError("receipt plan commands are absent")
+    for binding in expected:
+        starts = [
+            command for command in commands
+            if isinstance(command, Mapping)
+            and command.get("phase") == "up.start-c"
+            and command.get("instance") == binding.instance
+        ]
+        if len(starts) != 1:
+            raise LifecycleError(f"receipt client {binding.instance} has no unique start command")
+        argv = starts[0].get("argv")
+        if not isinstance(argv, list) or not any(
+            argv[index:index + 2] == ["--network", binding.bridge]
+            for index in range(max(0, len(argv) - 1))
+        ):
+            raise LifecycleError(f"receipt client {binding.instance} is not planned on its private bridge")
+    return expected
+
+
+def _receipt_network_created_receipt(
+    plan: Mapping[str, Any],
+    bindings: tuple[ReceiptClientNetwork, ...],
+    results: list[CommandResult],
+    commands: list[PlannedCommand],
+) -> dict[str, Any]:
+    errors = []
+    if not (len(bindings) == len(results) == len(commands)):
+        errors.append("create command/result cardinality differs")
+    records = []
+    for binding, result, command in zip(bindings, results, commands):
+        if result.returncode != 0:
+            errors.append(f"{binding.instance}:create rc={result.returncode}")
+            continue
+        network_id = result.stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+            errors.append(f"{binding.instance}:create returned no exact network id")
+            continue
+        records.append({
+            "bridge": {"argv": list(command.argv), "network_id": network_id,
+                       "returncode": result.returncode},
+            "container": binding.container,
+            "instance": binding.instance,
+            "request": binding.as_dict(),
+        })
+    return {
+        "bindings": records,
+        "complete": len(records) == len(bindings) and not errors,
+        "creation_errors": errors,
+        "scenario_digest": plan["scenario_digest"],
+        "schema": RECEIPT_NETWORK_SCHEMA,
+        "status": "CREATED" if records else "NOT_APPLIED",
+        "topology_digest": plan["topology_digest"],
+    }
+
+
+def _receipt_network_intent_receipt(
+    plan: Mapping[str, Any],
+    bindings: tuple[ReceiptClientNetwork, ...],
+    commands: list[PlannedCommand],
+) -> dict[str, Any]:
+    """Durable write-ahead identity for networks before Docker side effects."""
+    rows = []
+    for binding, command in zip(bindings, commands):
+        rows.append({
+            "bridge": {"argv": list(command.argv), "network_id": None, "returncode": None},
+            "container": binding.container,
+            "instance": binding.instance,
+            "request": binding.as_dict(),
+        })
+    return {
+        "bindings": rows,
+        "complete": False,
+        "creation_errors": [],
+        "scenario_digest": plan["scenario_digest"],
+        "schema": RECEIPT_NETWORK_SCHEMA,
+        "status": "CREATING",
+        "topology_digest": plan["topology_digest"],
+    }
+
+
+def _verify_receipt_client_networks(
+    farm: FarmSpec,
+    plan: Mapping[str, Any],
+    bindings: tuple[ReceiptClientNetwork, ...],
+    creation_receipt: Mapping[str, Any],
+    recorder: Recorder,
+    factory: CommandFactory,
+    timeout_s: int,
+) -> dict[str, dict[str, str]]:
+    if not bindings:
+        return {}
+    if (
+        creation_receipt.get("schema") != RECEIPT_NETWORK_SCHEMA
+        or creation_receipt.get("status") not in {"CREATED", "VERIFIED"}
+        or creation_receipt.get("complete") is not True
+        or creation_receipt.get("scenario_digest") != plan["scenario_digest"]
+        or creation_receipt.get("topology_digest") != plan["topology_digest"]
+    ):
+        raise LifecycleError("receipt client network creation receipt is incomplete")
+    created = {
+        item.get("instance"): item.get("bridge", {}).get("network_id")
+        for item in creation_receipt.get("bindings", [])
+        if isinstance(item, Mapping)
+    }
+    if len(created) != len(bindings) or len(set(created.values())) != len(bindings):
+        raise LifecycleError("receipt client bridges lack distinct created network IDs")
+    observed: dict[str, dict[str, str]] = {}
+    for binding in bindings:
+        network_id = created.get(binding.instance)
+        if not isinstance(network_id, str):
+            raise LifecycleError(f"receipt network for {binding.instance} was not created")
+        network_command = _command(
+            factory,
+            phase="readiness.receipt-network-inspect",
+            host=binding.host,
+            instance=binding.instance,
+            transport=_docker_transport(farm, binding.host),
+            timeout_s=min(timeout_s, 5),
+            argv=docker_argv(
+                farm, binding.host, receipt_network_inspect_args(network_id)
+            ),
+        )
+        network_result = recorder.invoke(network_command)
+        try:
+            validate_receipt_network_inspect(
+                binding,
+                plan["run_id"],
+                plan["scenario_digest"],
+                plan["topology_digest"],
+                network_id,
+                _json_result(network_result, f"receipt network {binding.instance}"),
+            )
+        except ReceiptNetworkError as exc:
+            raise LifecycleError(str(exc)) from exc
+        container_command = _command(
+            factory,
+            phase="readiness.receipt-client-network",
+            host=binding.host,
+            instance=binding.instance,
+            transport=_docker_transport(farm, binding.host),
+            timeout_s=min(timeout_s, 5),
+            argv=docker_argv(
+                farm,
+                binding.host,
+                ("container", "inspect", "--format", "{{json .}}", binding.container),
+            ),
+        )
+        container_result = recorder.invoke(container_command)
+        try:
+            observed[binding.instance] = validate_client_inspect(
+                binding,
+                plan["run_id"],
+                network_id,
+                _json_result(container_result, f"receipt client {binding.instance}"),
+            )
+        except ReceiptNetworkError as exc:
+            raise LifecycleError(str(exc)) from exc
+    return observed
+
+
 def _netem_up_receipt(
     run_id: str,
     bindings: tuple[NetemBinding, ...],
@@ -3791,6 +4029,130 @@ def _remove_netem_bridges(
     return receipts, problems
 
 
+def _remove_receipt_client_bridges(
+    farm: FarmSpec,
+    plan: Mapping[str, Any],
+    bindings: tuple[ReceiptClientNetwork, ...],
+    recorder: Recorder,
+    factory: CommandFactory,
+    timeout_s: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Remove only receipt bridges whose create IDs were retained in lifecycle state."""
+    receipts: list[dict[str, Any]] = []
+    problems: list[str] = []
+    if not bindings:
+        return receipts, problems
+    expected: dict[str, str] = {}
+    lifecycle_path = bundle_root(farm, plan["run_id"]) / "lifecycle.json"
+    attempted = any(
+        getattr(command, "phase", None) == "up.receipt-network-create"
+        for command in getattr(recorder, "commands", [])
+    )
+    if not lifecycle_path.is_file() and not attempted:
+        return receipts, problems
+    receipt_error: str | None = None
+    try:
+        document = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        created = document.get("receipt_client_networks")
+        if (
+            not isinstance(created, Mapping)
+            or created.get("schema") != RECEIPT_NETWORK_SCHEMA
+            or created.get("status") not in {"CREATING", "CREATED", "VERIFIED", "NOT_APPLIED"}
+            or created.get("scenario_digest") != plan["scenario_digest"]
+            or created.get("topology_digest") != plan["topology_digest"]
+        ):
+            raise LifecycleError("receipt bridge creation record is not verified")
+        for item in created.get("bindings", []):
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("instance")
+            bridge = item.get("bridge")
+            network_id = bridge.get("network_id") if isinstance(bridge, Mapping) else None
+            if isinstance(name, str) and isinstance(network_id, str) and re.fullmatch(
+                r"[0-9a-f]{64}", network_id
+            ):
+                expected[name] = network_id
+    except (OSError, json.JSONDecodeError, AttributeError, LifecycleError) as exc:
+        receipt_error = str(exc) or type(exc).__name__
+
+    for binding in bindings:
+        try:
+            listed_command = _command(
+                factory,
+                phase="down.receipt-network-list",
+                host=binding.host,
+                instance=binding.instance,
+                transport=_docker_transport(farm, binding.host),
+                timeout_s=timeout_s,
+                argv=docker_argv(
+                    farm, binding.host, receipt_network_list_args(binding, plan["run_id"])
+                ),
+            )
+            listed = recorder.invoke(listed_command)
+            if listed.returncode != 0:
+                problems.append(f"{binding.instance}:network-list:rc={listed.returncode}")
+                continue
+            candidates = listed.stdout.split()
+            expected_id = expected.get(binding.instance)
+            if not candidates:
+                receipts.append({
+                    "instance": binding.instance,
+                    "status": "ALREADY_REMOVED" if expected_id else "NO_NETWORK_CREATED",
+                })
+                continue
+            if receipt_error is not None:
+                problems.append(
+                    f"{binding.instance}:network-list:unverified-create-record:{receipt_error}"
+                )
+                continue
+            if expected_id is None:
+                problems.append(
+                    f"{binding.instance}:network-list:unreceipted-network-present"
+                )
+                continue
+            if candidates != [expected_id]:
+                problems.append(f"{binding.instance}:network-list:created-id-mismatch")
+                continue
+            inspect_command = _command(
+                factory,
+                phase="down.receipt-network-inspect",
+                host=binding.host,
+                instance=binding.instance,
+                transport=_docker_transport(farm, binding.host),
+                timeout_s=timeout_s,
+                argv=docker_argv(farm, binding.host, receipt_network_inspect_args(expected_id)),
+            )
+            inspected = recorder.invoke(inspect_command)
+            validate_receipt_network_inspect(
+                binding,
+                plan["run_id"],
+                plan["scenario_digest"],
+                plan["topology_digest"],
+                expected_id,
+                _json_result(inspected, f"receipt network {binding.instance} inspect"),
+            )
+            remove_command = _command(
+                factory,
+                phase="down.receipt-network-remove",
+                host=binding.host,
+                instance=binding.instance,
+                transport=_docker_transport(farm, binding.host),
+                timeout_s=timeout_s,
+                argv=docker_argv(farm, binding.host, receipt_network_remove_args(expected_id)),
+            )
+            removed = recorder.invoke(remove_command)
+            receipts.append({
+                "instance": binding.instance,
+                "network_id": expected_id,
+                "status": "REMOVED" if removed.returncode == 0 else "REMOVE_FAILED",
+            })
+            if removed.returncode != 0:
+                problems.append(f"{binding.instance}:network-remove:rc={removed.returncode}")
+        except (RemoteError, LifecycleError, ReceiptNetworkError) as exc:
+            problems.append(f"{binding.instance}:network-cleanup:{exc}")
+    return receipts, problems
+
+
 def _remove_run_containers(
     farm: FarmSpec,
     plan: dict[str, Any],
@@ -3851,11 +4213,15 @@ def tear_down(
 ) -> dict[str, Any]:
     timeout_s = plan.get("timeouts", {}).get("down_s", 300)
     bindings = _netem_bindings(plan)
+    receipt_networks = _receipt_client_networks(plan)
     problems = _remove_run_containers(farm, plan, recorder, factory, timeout_s)
     network_receipts, network_problems = _remove_netem_bridges(
         farm, plan, bindings, recorder, factory, timeout_s
     )
-    problems = [*problems, *network_problems]
+    receipt_network_receipts, receipt_network_problems = _remove_receipt_client_bridges(
+        farm, plan, receipt_networks, recorder, factory, timeout_s
+    )
+    problems = [*problems, *network_problems, *receipt_network_problems]
     for instance in plan["topology"]["instances"]:
         root = instance_root(farm, instance["host"], plan["run_id"], instance["name"])
         reference = instance["container_image"]["reference"]
@@ -3930,6 +4296,11 @@ def tear_down(
             "schema": NETEM_RECEIPT_SCHEMA,
             "status": "REMOVED" if not network_problems else "REMOVE_FAILED",
         },
+        **({"receipt_client_networks": {
+            "bindings": receipt_network_receipts,
+            "schema": RECEIPT_NETWORK_SCHEMA,
+            "status": "REMOVED" if not receipt_network_problems else "REMOVE_FAILED",
+        }} if receipt_networks else {}),
         "problems": problems,
         "protected_after": protected_after,
         "run_id": plan["run_id"],
@@ -3966,7 +4337,16 @@ def bring_up(
         "schema": NETEM_RECEIPT_SCHEMA,
         "status": "NOT_APPLIED",
     }
+    receipt_network_receipt: dict[str, Any] = {
+        "bindings": [],
+        "schema": RECEIPT_NETWORK_SCHEMA,
+        "status": "NOT_APPLIED",
+    }
+    receipt_network_bindings: tuple[ReceiptClientNetwork, ...] = ()
     try:
+        # Reject a legacy/host-network P51 plan before preflight or any
+        # persistent preparation can run.
+        receipt_network_bindings = _receipt_client_networks(plan)
         preflight_receipt = preflight(
             farm,
             scenario,
@@ -3988,6 +4368,7 @@ def bring_up(
                 "up.stage-p51-receipt-gate",
                 "up.prepare-persistent",
                 "up.network-create",
+                "up.receipt-network-create",
                 "up.start-s",
                 "up.start-f",
                 "up.start-c",
@@ -4007,13 +4388,21 @@ def bring_up(
             create_results,
             phases["up.network-create"],
         )
-        if network_receipt["status"] == "CREATED":
+        receipt_create_commands = phases["up.receipt-network-create"]
+        if receipt_network_bindings:
+            receipt_network_receipt = _receipt_network_intent_receipt(
+                plan, receipt_network_bindings, receipt_create_commands
+            )
+
+        def persist_starting_receipt() -> None:
             _atomic_json(
                 bundle / "lifecycle.json",
                 {
                     "farm": str(farm.path),
                     "farm_digest": farm.digest,
                     "network_shaping": network_receipt,
+                    **({"receipt_client_networks": receipt_network_receipt}
+                       if receipt_network_bindings else {}),
                     "plan": plan,
                     "run_id": plan["run_id"],
                     "scenario": str(scenario.path),
@@ -4022,6 +4411,61 @@ def bring_up(
                     "status": "STARTING",
                     "topology_digest": plan["topology_digest"],
                 },
+            )
+
+        if receipt_network_bindings:
+            # Write intent before the first bridge side effect. A crash after
+            # Docker creates a network but before its ID is recorded will
+            # leave an explicit unresolved identity for safe cleanup.
+            persist_starting_receipt()
+        elif network_receipt["status"] == "CREATED":
+            # Preserve the pre-existing netem bridge receipt behavior for
+            # non-P51 runs, whose bridge also needs durable cleanup identity.
+            persist_starting_receipt()
+        for index, command in enumerate(receipt_create_commands):
+            try:
+                result = transport.invoke(command)
+            except Exception as exc:
+                result = CommandResult(255, "", str(exc))
+            binding = receipt_network_bindings[index]
+            row = receipt_network_receipt["bindings"][index]
+            network_id = result.stdout.strip()
+            row["bridge"]["returncode"] = result.returncode
+            if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}", network_id):
+                row["bridge"]["network_id"] = network_id
+            else:
+                detail = (
+                    f"{binding.instance}:create rc={result.returncode}"
+                    if result.returncode != 0
+                    else f"{binding.instance}:create returned no exact network id"
+                )
+                receipt_network_receipt["creation_errors"].append(detail)
+            # Each returned identity is durable before the next create starts.
+            persist_starting_receipt()
+        if receipt_network_bindings:
+            receipt_network_receipt["complete"] = (
+                len(receipt_network_receipt["bindings"]) == len(receipt_network_bindings)
+                and all(
+                    isinstance(row.get("bridge", {}).get("network_id"), str)
+                    for row in receipt_network_receipt["bindings"]
+                )
+                and not receipt_network_receipt["creation_errors"]
+            )
+            receipt_network_receipt["status"] = (
+                "CREATED"
+                if any(row.get("bridge", {}).get("network_id") for row in receipt_network_receipt["bindings"])
+                else "NOT_APPLIED"
+            )
+        if (
+            network_receipt["status"] == "CREATED"
+            or receipt_network_receipt["status"] == "CREATED"
+            or receipt_network_bindings
+        ):
+            persist_starting_receipt()
+        if receipt_network_bindings and not receipt_network_receipt.get("complete"):
+            raise LifecycleError(
+                "receipt client network creation incomplete: "
+                + "; ".join(receipt_network_receipt.get("creation_errors", []))
             )
         execute(phases["up.start-s"], transport)
         scheduler = _wait_scheduler(
@@ -4065,6 +4509,15 @@ def bring_up(
             monotonic=monotonic,
             sleeper=sleeper,
         )
+        receipt_client_network_readiness = _verify_receipt_client_networks(
+            farm,
+            plan,
+            receipt_network_bindings,
+            receipt_network_receipt,
+            transport,
+            factory,
+            timeout_s=_timeout_left(deadline, monotonic),
+        )
         canaries = _run_canaries(
             farm,
             scenario,
@@ -4103,6 +4556,11 @@ def bring_up(
             "farm": str(farm.path),
             "farm_digest": farm.digest,
             "network_shaping": network_receipt,
+            **({"receipt_client_networks": {
+                **receipt_network_receipt,
+                "client_readiness": receipt_client_network_readiness,
+                "status": "VERIFIED" if receipt_client_network_readiness else receipt_network_receipt["status"],
+            }} if receipt_network_bindings else {}),
             "plan": plan,
             "run_id": plan["run_id"],
             "scenario": str(scenario.path),
@@ -4123,6 +4581,7 @@ def bring_up(
             or command.phase == "up.stage-p51-receipt-gate"
             or command.phase.startswith("up.start-")
             or command.phase.startswith("up.network-")
+            or command.phase.startswith("up.receipt-network-")
             or command.phase.startswith("up.netem-")
             for command in observed_commands
         )
@@ -4179,6 +4638,8 @@ def bring_up(
             "error": str(exc) or type(exc).__name__,
             "farm_digest": farm.digest,
             "network_shaping": network_receipt,
+            **({"receipt_client_networks": receipt_network_receipt}
+               if receipt_network_bindings else {}),
             "plan": plan,
             "run_id": plan["run_id"],
             "scenario_digest": scenario.digest,

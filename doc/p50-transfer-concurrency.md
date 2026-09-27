@@ -1306,6 +1306,15 @@ restart-under-load remains explicitly pending and requires its own measured
 phase. The existing singleton W1 negative control is not changed by this
 matrix.
 
+For these receipt-window scenarios, the harness automatically creates one
+private Docker bridge per selected C container and starts that C with the
+pinned no-remote entrypoint. S and F retain their planned host networking and
+addresses; receipt-gate rules run inside the isolated C network namespace.
+Teardown removes only bridges whose exact IDs were durably recorded. If a
+bridge exists but its create ID was not recorded (for example, after an
+interrupted launch), cleanup reports the leftover for operator inspection and
+does not guess which network to remove.
+
 ## 10. Full Chromium corpus without unbounded resource use
 
 ### 10.1 Define and pin the deliverable

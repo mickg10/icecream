@@ -26,6 +26,7 @@ from farmharness.integration.lifecycle import (
     PreflightRefusal,
     ROLE_BINARY_PATHS,
     bring_up,
+    bundle_root,
     corpus_layout,
     down_from_state,
     _run_canaries,
@@ -441,6 +442,7 @@ class ScriptedLifecycle:
         self.protected_count = 1
         self.remote_archives: set[str] = set()
         self.containers: dict[str, dict[str, str]] = {}
+        self.receipt_networks: dict[str, dict[str, object]] = {}
         if stale:
             self.containers["aaaaaaaaaaaa"] = {
                 "created": "2026-09-01T00:00:00Z",
@@ -554,7 +556,48 @@ class ScriptedLifecycle:
         if command.phase == "preflight.stale-reap":
             self.containers.pop(command.argv[-1])
             return CommandResult(0, "", "")
+        if command.phase == "up.receipt-network-create":
+            labels = {}
+            for index, argument in enumerate(command.argv[:-1]):
+                if argument == "--label":
+                    key, value = command.argv[index + 1].split("=", 1)
+                    labels[key] = value
+            name = command.argv[-1]
+            run_id = labels["icefarm.run"]
+            intent = json.loads(
+                (bundle_root(self.farm, run_id) / "lifecycle.json").read_text(
+                    encoding="utf-8"
+                )
+            )["receipt_client_networks"]
+            assert intent["status"] == "CREATING"
+            assert intent["bindings"][0]["bridge"]["network_id"] is None
+            identifier = hashlib.sha256(name.encode()).hexdigest()
+            self.receipt_networks[identifier] = {
+                "name": name,
+                "labels": labels,
+                "instance": command.instance,
+            }
+            return CommandResult(0, identifier + "\n", "")
         if command.phase.startswith("up.start-"):
+            if command.phase == "up.start-s" and self.receipt_networks:
+                run_id = next(
+                    command.argv[index + 1].split("=", 1)[1]
+                    for index, argument in enumerate(command.argv[:-1])
+                    if argument == "--label"
+                    and command.argv[index + 1].startswith("icefarm.run=")
+                )
+                starting = json.loads(
+                    (bundle_root(self.farm, run_id) / "lifecycle.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                receipt_networks = starting.get("receipt_client_networks")
+                if receipt_networks is not None:
+                    assert receipt_networks["status"] == "CREATED"
+                    assert all(
+                        row["bridge"]["network_id"] in self.receipt_networks
+                        for row in receipt_networks["bindings"]
+                    )
             name = command.argv[command.argv.index("--name") + 1]
             run_label = command.argv[command.argv.index("--label") + 1].split("=", 1)[1]
             identifier = f"{len(self.containers) + 1:012x}"
@@ -563,8 +606,51 @@ class ScriptedLifecycle:
                 "host": command.host,
                 "name": name,
                 "run_id": run_label,
+                "network": command.argv[command.argv.index("--network") + 1],
             }
             return CommandResult(0, identifier + "\n", "")
+        if command.phase == "readiness.receipt-network-inspect":
+            network_id = command.argv[-1]
+            value = self.receipt_networks[network_id]
+            return CommandResult(
+                0,
+                json.dumps({
+                    "Id": network_id,
+                    "Name": value["name"],
+                    "Driver": "bridge",
+                    "Labels": value["labels"],
+                }),
+                "",
+            )
+        if command.phase == "readiness.receipt-client-network":
+            container = next(
+                value for value in self.containers.values()
+                if value["name"] == command.argv[-1]
+            )
+            network_id = next(
+                key for key, value in self.receipt_networks.items()
+                if value["name"] == container["network"]
+            )
+            network = self.receipt_networks[network_id]
+            return CommandResult(
+                0,
+                json.dumps({
+                    "Name": "/" + str(container["name"]),
+                    "Config": {"Labels": {
+                        "icefarm.run": container["run_id"],
+                        "icefarm.instance": command.instance,
+                    }},
+                    "State": {"Running": True},
+                    "HostConfig": {"NetworkMode": container["network"]},
+                    "NetworkSettings": {"Networks": {
+                        container["network"]: {
+                            "NetworkID": network_id,
+                            "IPAddress": "172.28.0.2",
+                        }
+                    }},
+                }),
+                "",
+            )
         if command.phase == "readiness.listcs":
             if self.scheduler_interrupt:
                 raise KeyboardInterrupt
@@ -611,6 +697,26 @@ class ScriptedLifecycle:
             )
         if command.phase == "down.remove-container":
             self.containers.pop(command.argv[-1])
+            return CommandResult(0, "", "")
+        if command.phase == "down.receipt-network-list":
+            binding_name = command.instance
+            return CommandResult(
+                0,
+                "\n".join(
+                    identifier for identifier, value in self.receipt_networks.items()
+                    if value["instance"] == binding_name
+                ),
+                "",
+            )
+        if command.phase == "down.receipt-network-inspect":
+            network_id = command.argv[-1]
+            value = self.receipt_networks[network_id]
+            return CommandResult(0, json.dumps({
+                "Id": network_id, "Name": value["name"], "Driver": "bridge",
+                "Labels": value["labels"],
+            }), "")
+        if command.phase == "down.receipt-network-remove":
+            self.receipt_networks.pop(command.argv[-1], None)
             return CommandResult(0, "", "")
         return CommandResult(0, "", "")
 

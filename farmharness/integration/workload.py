@@ -18,8 +18,15 @@ try:
     from .farm_spec import FarmSpec
     from .images import CommandFactory, RecordingTransport
     from .layout import compiler_identity_digest
-    from .lifecycle import LifecycleError, activate_corpus_turn, bundle_root
+    from .lifecycle import (
+        LifecycleError,
+        _receipt_client_networks,
+        _verify_receipt_client_networks,
+        activate_corpus_turn,
+        bundle_root,
+    )
     from .remote import CommandResult, PlannedCommand, RemoteError, docker_argv, docker_transport
+    from .receipt_network import RECEIPT_NETWORK_SCHEMA
     from .scenario_spec import PROFILES, ScenarioSpec
     from .schema_validation import canonical_bytes
 except ImportError:  # Direct execution from this directory.
@@ -27,8 +34,15 @@ except ImportError:  # Direct execution from this directory.
     from farm_spec import FarmSpec
     from images import CommandFactory, RecordingTransport
     from layout import compiler_identity_digest
-    from lifecycle import LifecycleError, activate_corpus_turn, bundle_root
+    from lifecycle import (
+        LifecycleError,
+        _receipt_client_networks,
+        _verify_receipt_client_networks,
+        activate_corpus_turn,
+        bundle_root,
+    )
     from remote import CommandResult, PlannedCommand, RemoteError, docker_argv, docker_transport
+    from receipt_network import RECEIPT_NETWORK_SCHEMA
     from scenario_spec import PROFILES, ScenarioSpec
     from schema_validation import canonical_bytes
 
@@ -133,6 +147,44 @@ def _assert_up(farm: FarmSpec, scenario: ScenarioSpec, plan: dict[str, Any]) -> 
         or value.get("topology_digest") != plan["topology_digest"]
     ):
         raise WorkloadError("lifecycle receipt does not authenticate this UP run")
+
+
+def _revalidate_p51_client_networks(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    transport: RecordingTransport,
+    factory: CommandFactory,
+) -> None:
+    """Recheck P51 bridge identity and C attachment immediately before gates."""
+    bindings = _receipt_client_networks(plan)
+    if not bindings:
+        return
+    path = bundle_root(farm, plan["run_id"]) / "lifecycle.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkloadError(f"cannot reload P51 bridge receipt: {exc}") from exc
+    receipt = value.get("receipt_client_networks") if isinstance(value, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("status") != "VERIFIED"
+        or receipt.get("schema") != RECEIPT_NETWORK_SCHEMA
+        or receipt.get("scenario_digest") != plan["scenario_digest"]
+        or receipt.get("topology_digest") != plan["topology_digest"]
+    ):
+        raise WorkloadError("UP lifecycle receipt lacks verified P51 client networks")
+    try:
+        _verify_receipt_client_networks(
+            farm,
+            plan,
+            bindings,
+            receipt,
+            transport,
+            factory,
+            timeout_s=10,
+        )
+    except LifecycleError as exc:
+        raise WorkloadError(f"P51 client network changed since UP: {exc}") from exc
 
 
 def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
@@ -1711,6 +1763,11 @@ def run_workload(
         _assert_up(farm, scenario, plan)
     transport = recorder or RecordingTransport()
     factory = CommandFactory()
+    if (
+        require_up
+        and scenario.data["workload"].get("driver") == "p51-receipt-window"
+    ):
+        _revalidate_p51_client_networks(farm, plan, transport, factory)
     client_names = set(scenario.data["workload"]["clients"])
     clients = sorted(
         (

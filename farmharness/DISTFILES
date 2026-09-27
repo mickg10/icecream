@@ -40,6 +40,7 @@ farmharness/integration/netem.py
 farmharness/integration/p51-receipt-window-matrix.template.json
 farmharness/integration/performance.py
 farmharness/integration/r2_wire_trace.py
+farmharness/integration/receipt_network.py
 farmharness/integration/receipt_window_matrix.py
 farmharness/integration/remote.py
 farmharness/integration/report.py
@@ -164,6 +165,7 @@ farmharness/integration/tests/test_p51_scheduler_f_restart_deadlines.py
 farmharness/integration/tests/test_performance.py
 farmharness/integration/tests/test_python_environment.py
 farmharness/integration/tests/test_r2_wire_trace.py
+farmharness/integration/tests/test_receipt_network.py
 farmharness/integration/tests/test_resolver_v2.py
 farmharness/integration/tests/test_resource_retry.py
 farmharness/integration/tests/test_s30_mutant_catalog.py
