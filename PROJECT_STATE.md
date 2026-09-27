@@ -14,6 +14,16 @@ retained artifact directories.
 
 ### Multi-link receipt-window harness
 
+Same-host farm execution is now explicit (`hosts[].execution="local"` with
+Docker context `default`), without requiring local SSH. The runner verifies
+a Unix-socket Docker endpoint before authority, preflight and image writes;
+remote defaults remain unchanged. Local role containers require CPU/memory
+caps, checked against declared host capacity. The transport candidate passed
+1718 Python tests with one skip before the endpoint correction; post-correction
+focused tests passed 336, plus two image-transport checks. Actual same-host
+receipt execution remains pending the runtime diagnostic-selection correction.
+See the operator example in `farmharness/integration/tests/README.md`.
+
 The candidate now materializes 36 receipt-window scenarios: C1F2/3/4 and
 C2/3/4F1, W1/W30, and P29V1/ZSTD_TU/ZSTD_ROUTE. It checks exact per-link
 worker assignments, fills each link's initial window before dispatching suffix
