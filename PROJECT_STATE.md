@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### Explicit local-job limit for matched benchmarks
+
+`2570a086` adds `iceccd --max-local-jobs N`. Defaults remain unchanged:
+`max(1, max_kids)`. The option changes local-job admission and its matching
+full-job accounting, not the scheduler's advertised remote slots. Existing
+remote children still count toward the shared admission predicate. Positive
+values are bounded to half the unsigned counter range to prevent full-job
+reservation overflow. No container CPU auto-detection is implied.
+
+The focused `ICECC_TEST_ONLY=zero_local_jobs make -C "$BUILD/tests" test-run`
+passes on private donor `bca795a7`: `-m 0 --max-local-jobs 2`, four submitted
+local jobs with a two-held barrier, completion/reaping, actual remote object
+compilation, and full-job counters returning to zero in a later state row.
+Artifacts: `/tanksmall/scratch/tmp/p51-local-jobs-zero-cap-run/`;
+`tmp/focused-test.log` SHA256
+`acc0cc3226b21e0da004a7008e9d34b5961e00fe6425d7a0c40c4a6251dcebc9`;
+installed daemon SHA256
+`46bc2b1218cac4cd3e370c13e7a3e85640a293aa19ce4081d89103391c00681c`.
+The disposable test container added `expect` and `libcap2-bin`; the developer
+SDK now declares those dependencies. A clean build of that new SDK and full
+candidate QA remain pending. The separate native-environment verification
+skipped because sudo requested a password; the full legacy suite was not run.
+This is correctness evidence, not a measured whole-build speedup.
+
 ### Ordinary compiler-channel witness
 
 `520f63e6` integrates the opt-in C02 gate and dormant client trace hook.
