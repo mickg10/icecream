@@ -32,6 +32,10 @@ fault_job=$4
 checkpoint_path=${5:-"$result_root/checkpoint.json"}
 resume_mode=${6:-0}
 expected_checkpoint_sha=${7:-}
+d18_phase=${ICEFARM_D18_PHASE:-run}
+d18_barrier=${ICEFARM_D18_BARRIER:-0}
+d18_run_id=${ICEFARM_D18_RUN_ID:-}
+d18_prep_root=${ICEFARM_D18_PREP_ROOT:-}
 
 read_boundary_release() {
     python3 -c '
@@ -87,6 +91,26 @@ test "$jobs" -ge 1
 test "$per_job_timeout" -ge 1
 test "$layout" = single -o "$layout" = paired
 test "$strict_p50" = 0 -o "$strict_p50" = 1
+case "$d18_phase" in
+    run|prepare) ;;
+    *) echo "invalid D18 phase" >&2; exit 65 ;;
+esac
+if test "$d18_phase" = prepare || test "$d18_barrier" = 1
+then
+    printf '%s' "$d18_run_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+    test "$d18_prep_root" = "/results/d18-prep/$d18_run_id/$turn/$client_name"
+fi
+if test "$d18_phase" = prepare
+then
+    test "$d18_barrier" = 0
+    result_root=$d18_prep_root
+else
+    test "$d18_barrier" = 0 -o "$d18_barrier" = 1
+fi
+if test "${d18_barrier:-0}" = 1
+then
+    test "$d18_phase" = run
+fi
 event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}
 s60_admit_through=${ICEFARM_S60_ADMIT_THROUGH:-0}
 disk_fill_worker=${ICEFARM_DISK_FILL_WORKER:-}
@@ -159,6 +183,9 @@ esac
 oracle_identity=$(printf '%s\n%s\n%s\n%s\n%s\n' \
     "$manifest_digest" "$compiler_digest" "$recipe_identity" \
     "$oracle_recipe" "$compiler_target" | sha256sum | awk '{print $1}')
+d18_prep_identity=$(printf '%s\n%s\n%s\n%s\n' \
+    "$d18_run_id" "$client_name" "$turn" "$oracle_identity" \
+    | sha256sum | awk '{print $1}')
 worklist="$result_root/worklist.bin"
 unique="$result_root/unique.tsv"
 ordinal=0
@@ -312,6 +339,46 @@ then
     cache_ready=1
 fi
 
+d18_validate_preparation() {
+    local root=$1 identity=$2 cache_is_ready=$3
+    local marker samples summary version observed_identity sample_total sample_sha summary_sha extra
+    test "$cache_is_ready" -eq 1 || {
+        echo "D18 measured phase has no complete local-oracle cache" >&2
+        return 65
+    }
+    marker="$root/PREPARED.tsv"
+    samples="$root/oracle-samples.tsv"
+    summary="$root/oracle-summary.tsv"
+    test -f "$marker" -a ! -L "$marker" \
+        -a -f "$samples" -a ! -L "$samples" \
+        -a -f "$summary" -a ! -L "$summary" || {
+        echo "D18 measured phase has an incomplete preparation marker" >&2
+        return 65
+    }
+    IFS=$'\t' read -r version observed_identity sample_total sample_sha summary_sha extra <"$marker"
+    printf '%s' "$sample_total" | grep -Eq '^[1-9][0-9]*$' || return 65
+    printf '%s' "$sample_sha" | grep -Eq '^[0-9a-f]{64}$' || return 65
+    printf '%s' "$summary_sha" | grep -Eq '^[0-9a-f]{64}$' || return 65
+    test "$version" = D18_PREPARED_V1 \
+        -a "$observed_identity" = "$identity" \
+        -a -z "$extra" \
+        -a "$(sha256sum "$samples" | awk '{print $1}')" = "$sample_sha" \
+        -a "$(sha256sum "$summary" | awk '{print $1}')" = "$summary_sha" \
+        -a "$(cat "$summary")" = "$(printf 'sample_total\t%s\nsample_mismatches\t0' "$sample_total")" || {
+        echo "D18 measured phase preparation marker does not match this run" >&2
+        return 65
+    }
+    printf '%s\n' "$sample_total"
+}
+
+d18_prepared_sample_total=0
+if test "$d18_barrier" = 1
+then
+    # Validate before any possible oracle/sample compile fallback.
+    d18_prepared_sample_total=$(d18_validate_preparation \
+        "$d18_prep_root" "$d18_prep_identity" "$cache_ready")
+fi
+
 compiler_arg_index=0
 while test "$compiler_arg_index" -lt "$compiler_arg_count"
 do
@@ -396,39 +463,61 @@ then
 fi
 
 sample_bucket=$((16#$(printf '%s' "$client_name:$manifest_digest" | sha256sum | cut -c1-7) % 20))
-sample_total=0
-sample_mismatches=0
-unique_index=0
 sample_file="$result_root/oracle-samples.tsv"
-sample_temporary="$sample_file.tmp-$BASHPID"
-rm -f -- "$sample_temporary"
-: >"$sample_temporary"
-while IFS=$'\t' read -r digest relative source
-do
-    unique_index=$((unique_index + 1))
-    key=$(printf '%s\n%s\n' "$digest" "$relative" | sha256sum | awk '{print $1}')
-    bucket=$((16#${key:0:7} % 20))
-    if test "$bucket" -ne "$sample_bucket" -a "$unique_index" -ne 1
-    then
-        continue
-    fi
-    sample_total=$((sample_total + 1))
-    object="$result_root/oracle-samples/$unique_index.o"
-    oracle_compile "$source" "$object"
-    observed=$(sha256sum "$object" | awk '{print $1}')
-    expected=$(cat "$oracle_root/$key.sha256")
-    exact=0
-    test "$observed" = "$expected" && exact=1 || sample_mismatches=$((sample_mismatches + 1))
-    printf '%s\t%s\t%s\t%s\n' "$relative" "$observed" "$expected" "$exact" \
-        >>"$sample_temporary"
-    rm -f -- "$object"
-done <"$unique"
-test "$sample_total" -ge 1
-mv -f -- "$sample_temporary" "$sample_file"
-printf 'sample_total\t%s\nsample_mismatches\t%s\n' "$sample_total" "$sample_mismatches" \
-    >"$result_root/oracle-summary.tsv"
+if test "${d18_barrier:-0}" = 1
+then
+    cp -- "$d18_prep_root/oracle-samples.tsv" "$sample_file"
+    cp -- "$d18_prep_root/oracle-summary.tsv" "$result_root/oracle-summary.tsv"
+    sample_total=$d18_prepared_sample_total
+    sample_mismatches=0
+else
+    sample_total=0
+    sample_mismatches=0
+    unique_index=0
+    sample_temporary="$sample_file.tmp-$BASHPID"
+    rm -f -- "$sample_temporary"
+    : >"$sample_temporary"
+    while IFS=$'\t' read -r digest relative source
+    do
+        unique_index=$((unique_index + 1))
+        key=$(printf '%s\n%s\n' "$digest" "$relative" | sha256sum | awk '{print $1}')
+        bucket=$((16#${key:0:7} % 20))
+        if test "$bucket" -ne "$sample_bucket" -a "$unique_index" -ne 1
+        then
+            continue
+        fi
+        sample_total=$((sample_total + 1))
+        object="$result_root/oracle-samples/$unique_index.o"
+        oracle_compile "$source" "$object"
+        observed=$(sha256sum "$object" | awk '{print $1}')
+        expected=$(cat "$oracle_root/$key.sha256")
+        exact=0
+        test "$observed" = "$expected" && exact=1 || sample_mismatches=$((sample_mismatches + 1))
+        printf '%s\t%s\t%s\t%s\n' "$relative" "$observed" "$expected" "$exact" \
+            >>"$sample_temporary"
+        rm -f -- "$object"
+    done <"$unique"
+    test "$sample_total" -ge 1
+    mv -f -- "$sample_temporary" "$sample_file"
+    printf 'sample_total\t%s\nsample_mismatches\t%s\n' "$sample_total" "$sample_mismatches" \
+        >"$result_root/oracle-summary.tsv"
+fi
 flock -u 9
 test "$sample_mismatches" -eq 0
+
+if test "$d18_phase" = prepare
+then
+    marker_tmp="$d18_prep_root/.PREPARED.tsv.$BASHPID"
+    printf 'D18_PREPARED_V1\t%s\t%s\t%s\t%s\n' \
+        "$d18_prep_identity" "$sample_total" \
+        "$(sha256sum "$sample_file" | awk '{print $1}')" \
+        "$(sha256sum "$result_root/oracle-summary.tsv" | awk '{print $1}')" \
+        >"$marker_tmp"
+    mv -f -- "$marker_tmp" "$d18_prep_root/PREPARED.tsv"
+    printf 'ICEFARM_D18_PREPARED client=%s turn=%s identity=%s samples=%s\n' \
+        "$client_name" "$turn" "$d18_prep_identity" "$sample_total"
+    exit 0
+fi
 
 write_checkpoint() {
     checkpoint_tmp="$checkpoint_path.tmp-$BASHPID"

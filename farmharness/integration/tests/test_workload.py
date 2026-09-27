@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import concurrent.futures
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -17,6 +19,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration import farmtest, workload as workload_module
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import CommandFactory, RecordingTransport
+from farmharness.integration.events import EventProducer
 from farmharness.integration.remote import (
     CommandResult,
     PlannedCommand,
@@ -28,10 +31,12 @@ from farmharness.integration.workload import (
     D18_PROCESS_OBSERVER,
     WORKLOAD_SCHEMA,
     WorkloadError,
+    _d18_barrier_and_observe,
     _active_loss_serial_through,
     _d18_concurrent_witness,
     _driver_command,
     _parse_summary,
+    _run_d18_preparation,
     _strict_p50_required,
     run_workload,
 )
@@ -45,7 +50,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "9c2ec61c288c718d726af9e7e560f96bc8f2fc2cfe4244647e95bc6936a40980"
+        "24712cbf0acce5ac976acbfad357a4b79ad32446ee6f8bd169f9ea2cb5e5b1da"
     )
 
 
@@ -89,6 +94,245 @@ def test_d18_driver_uses_shared_barrier_without_changing_compiler_identity(
     assert "ICEFARM_D18_BARRIER=1" in command.argv
     assert not any("ICEFARM_D18_ROLE_" in argument for argument in command.argv)
     assert "-O2" in command.argv
+
+    preparation = _driver_command(
+        farm, scenario, plan, client, "A", CommandFactory(), d18_phase="prepare"
+    )
+    assert preparation.phase == "run.d18-prepare"
+    assert "ICEFARM_D18_PHASE=prepare" in preparation.argv
+    assert "ICEFARM_D18_BARRIER=1" not in preparation.argv
+    assert f"ICEFARM_D18_RUN_ID={plan['run_id']}" in preparation.argv
+    assert any(
+        argument.endswith(f"/A/{client['name']}")
+        for argument in preparation.argv
+        if argument.startswith("ICEFARM_D18_PREP_ROOT=")
+    )
+
+
+def _d18_fixture_plan(tmp_path: Path):
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "D18-P29V1.json", farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="d18-phase-unit")
+    return farm, scenario, plan
+
+
+class _IdleEvents:
+    def start(self) -> None:
+        pass
+
+    def raise_if_failed(self) -> None:
+        pass
+
+    def signal_turn_start(self, _turn: str) -> None:
+        pass
+
+    def signal_turn_complete(self, _turn: str) -> None:
+        pass
+
+    def wait(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+def test_d18_delayed_preparation_finishes_before_measured_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, plan = _d18_fixture_plan(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class DelayedRecorder:
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            calls.append(command.phase)
+            if command.phase == "run.d18-prepare" and command.instance == "C_R1":
+                started.set()
+                if not release.wait(timeout=3):
+                    return CommandResult(124, "", "preparation test timed out")
+            if command.phase == "run.d18-prepare":
+                return CommandResult(0, "ICEFARM_D18_PREPARED\n", "")
+            return CommandResult(0, "ICEFARM_WORKLOAD jobs=1 failures=0 samples=1\n", "")
+
+    recorder = RecordingTransport(DelayedRecorder())
+    monkeypatch.setattr(workload_module, "EventProducer", lambda *a, **kw: _IdleEvents())
+    monkeypatch.setattr(
+        workload_module,
+        "_d18_barrier_and_observe",
+        lambda *a, **kw: {"workers": {"F_R1": [], "F_R2": []}},
+    )
+    monkeypatch.setattr(workload_module, "_d18_verify_remote_rows", lambda *a, **kw: {})
+    monkeypatch.setattr(workload_module, "_d18_verify_r2_link_adoption", lambda *a, **kw: {})
+
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            run_workload(farm, scenario, plan, recorder=recorder, require_up=False)
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        assert started.wait(timeout=2)
+        time.sleep(0.05)
+        assert "run.workload" not in calls
+    finally:
+        release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert failures == []
+    assert calls.count("run.d18-prepare") == 3
+    assert calls.count("run.workload") == 3
+
+
+def test_d18_preparation_failure_prevents_measured_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, plan = _d18_fixture_plan(tmp_path)
+    calls: list[str] = []
+
+    class FailingPreparation:
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            calls.append(command.phase)
+            if command.phase == "run.d18-prepare" and command.instance == "C_R1":
+                return CommandResult(1, "", "oracle sample mismatch")
+            return CommandResult(0, "ICEFARM_D18_PREPARED\n", "")
+
+    monkeypatch.setattr(workload_module, "EventProducer", lambda *a, **kw: _IdleEvents())
+    with pytest.raises(WorkloadError, match="local-oracle preparation failed"):
+        run_workload(
+            farm,
+            scenario,
+            plan,
+            recorder=RecordingTransport(FailingPreparation()),
+            require_up=False,
+        )
+    assert calls
+    assert all(phase == "run.d18-prepare" for phase in calls)
+
+
+def test_d18_missing_ready_fails_without_releasing_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, plan = _d18_fixture_plan(tmp_path)
+    clients = [
+        item for item in plan["topology"]["instances"] if item["role"] == "C"
+    ]
+    release_calls: list[str] = []
+
+    def docker_call(_farm, _plan, instance, _factory, _transport, phase, _argv):
+        if phase.startswith("barrier-release-"):
+            release_calls.append(instance["name"])
+        return CommandResult(0, "", "")
+
+    monkeypatch.setattr(workload_module, "_d18_docker_call", docker_call)
+    pending = [concurrent.futures.Future()]
+    with pytest.raises(WorkloadError, match="did not all reach"):
+        _d18_barrier_and_observe(
+            farm,
+            scenario,
+            plan,
+            clients,
+            pending,
+            CommandFactory(),
+            RecordingTransport(),
+            deadline_s=0,
+        )
+    assert release_calls == []
+
+
+@pytest.mark.parametrize(
+    ("case", "valid"),
+    [
+        ("valid", True),
+        ("missing-marker", False),
+        ("cache-not-ready", False),
+        ("sample-changed", False),
+        ("wrong-identity", False),
+    ],
+)
+def test_d18_preparation_marker_validation(
+    tmp_path: Path, case: str, valid: bool
+) -> None:
+    match = re.search(
+        r"(?ms)^d18_validate_preparation\(\) \{\n.*?^\}", MANIFEST_DRIVER
+    )
+    assert match is not None
+    root = tmp_path / "prep"
+    root.mkdir()
+    samples = root / "oracle-samples.tsv"
+    summary = root / "oracle-summary.tsv"
+    samples.write_text("tiny.cc\t" + "a" * 64 + "\t" + "a" * 64 + "\t1\n")
+    summary.write_text("sample_total\t1\nsample_mismatches\t0\n")
+    identity = "b" * 64
+    if case != "missing-marker":
+        marker_identity = "c" * 64 if case == "wrong-identity" else identity
+        (root / "PREPARED.tsv").write_text(
+            "\t".join(
+                (
+                    "D18_PREPARED_V1",
+                    marker_identity,
+                    "1",
+                    hashlib.sha256(samples.read_bytes()).hexdigest(),
+                    hashlib.sha256(summary.read_bytes()).hexdigest(),
+                )
+            )
+            + "\n"
+        )
+    if case == "sample-changed":
+        samples.write_text("corrupted after the preparation certificate\n")
+    cache_is_ready = "0" if case == "cache-not-ready" else "1"
+    script = (
+        match.group(0)
+        + "\nd18_validate_preparation \"$1\" \"$2\" \"$3\"\n"
+    )
+    result = subprocess.run(
+        [
+            "/bin/bash", "-c", script, "d18-marker-test", str(root), identity,
+            cache_is_ready,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if valid:
+        assert result.returncode == 0
+        assert result.stdout == "1\n"
+    else:
+        assert result.returncode != 0
+        assert result.stdout == ""
+
+
+def test_d18_preparation_certificate_follows_zero_mismatch_check() -> None:
+    zero_mismatch_check = MANIFEST_DRIVER.index('test "$sample_mismatches" -eq 0')
+    certificate_write = MANIFEST_DRIVER.index('marker_tmp="$d18_prep_root/.PREPARED.tsv.')
+    certificate_publish = MANIFEST_DRIVER.index(
+        'mv -f -- "$marker_tmp" "$d18_prep_root/PREPARED.tsv"'
+    )
+    assert zero_mismatch_check < certificate_write < certificate_publish
+
+
+def test_d18_no_timeline_event_producer_has_no_deadline_thread(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _d18_fixture_plan(tmp_path)
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(),
+        factory=CommandFactory(),
+        deadline_s=0.01,
+    )
+    producer.start()
+    time.sleep(0.02)
+    producer.raise_if_failed()
+    producer.stop()
+    assert producer._thread is None
 
 
 def test_d18_r2_adoption_evidence_requires_sidecar_handoff() -> None:

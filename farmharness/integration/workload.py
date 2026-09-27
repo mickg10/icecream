@@ -276,6 +276,7 @@ def _driver_command(
     resume: bool = False,
     checkpoint_sha256: str | None = None,
     exec_uid: str = "65534:65534",
+    d18_phase: str | None = None,
 ) -> PlannedCommand:
     workload = scenario.data["workload"]
     corpus = farm.data["corpora"][workload["corpus"]]
@@ -311,9 +312,24 @@ def _driver_command(
         if isinstance(d18_roles, dict)
         else None
     )
+    if d18_phase not in (None, "prepare"):
+        raise WorkloadError("unsupported D18 driver phase")
+    d18_environment: tuple[str, ...] = ()
+    if d18_role is not None:
+        d18_identity = (
+            "--env", f"ICEFARM_D18_RUN_ID={plan['run_id']}",
+            "--env", f"ICEFARM_D18_PREP_ROOT=/results/d18-prep/{plan['run_id']}/{turn}/{client['name']}",
+        )
+        d18_environment = (
+            d18_identity + ("--env", "ICEFARM_D18_PHASE=prepare")
+            if d18_phase == "prepare"
+            else d18_identity + ("--env", "ICEFARM_D18_BARRIER=1")
+        )
     compiler_args = list(client["compiler_recipe"]["arguments"])
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300
+    if d18_phase == "prepare":
+        timeout_s = scenario.data["timeouts"]["turn_s"]
     argv = docker_argv(
         farm,
         client["host"],
@@ -333,7 +349,7 @@ def _driver_command(
                 ("--env", f"ICEFARM_S60_ADMIT_THROUGH={s60_admit_through}")
                 if s60_admit_through else ()
             ),
-            *(("--env", "ICEFARM_D18_BARRIER=1") if d18_role is not None else ()),
+            *d18_environment,
             *(
                 (
                     "--env",
@@ -378,13 +394,37 @@ def _driver_command(
         ),
     )
     return factory.make(
-        phase="run.workload",
+        phase="run.d18-prepare" if d18_phase == "prepare" else "run.workload",
         host=client["host"],
         instance=client["name"],
         transport=_docker_transport(farm, client["host"]),
         timeout_s=timeout_s,
         argv=argv,
     )
+
+
+def _run_d18_preparation(
+    commands: list[PlannedCommand], transport: RecordingTransport, timeout_s: int
+) -> None:
+    """Finish every D18 local-oracle preparation before measured drivers start."""
+    if not commands:
+        raise WorkloadError("D18 preparation has no client commands")
+    deadline = time.monotonic() + timeout_s
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = [executor.submit(transport.invoke, command) for command in commands]
+        for command, future in zip(commands, futures, strict=True):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkloadError("D18 local-oracle preparation timed out")
+            try:
+                result = future.result(timeout=remaining)
+            except TimeoutError as exc:
+                raise WorkloadError("D18 local-oracle preparation timed out") from exc
+            if result.returncode != 0:
+                detail = result.stderr.strip() or "no stderr"
+                raise WorkloadError(
+                    f"D18 local-oracle preparation failed for {command.instance}: {detail}"
+                )
 
 
 def _d18_docker_call(
@@ -1256,6 +1296,24 @@ def run_workload(
                     transport,
                     factory,
                     timeout_s=scenario.data["timeouts"]["turn_s"],
+                )
+            if isinstance(d18_roles, dict):
+                preparation_commands = [
+                    _driver_command(
+                        farm,
+                        scenario,
+                        plan,
+                        client,
+                        turn,
+                        factory,
+                        d18_phase="prepare",
+                    )
+                    for client in clients
+                ]
+                _run_d18_preparation(
+                    preparation_commands,
+                    transport,
+                    max(1, scenario.data["timeouts"]["turn_s"]),
                 )
             events.signal_turn_start(turn)
             if scenario.data["workload"]["driver"] == "p51-receipt-window":
