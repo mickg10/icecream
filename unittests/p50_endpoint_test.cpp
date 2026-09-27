@@ -7900,6 +7900,65 @@ asio::awaitable<void> r2_accept_every_partial_hello(
 
 enum class R2FrameDirection { ClientToF, FToClient };
 
+enum class R2CommitMutation : uint8_t {
+    RelationshipOrdinal,
+    BindingDigest,
+    EnvelopeTransactionDigest,
+    HistoryNonce,
+    RelSeq,
+    TuSeq,
+    InnerTransactionDigest,
+    RawDigest,
+    PostStateDigest,
+};
+
+void mutate_r2_commit(R2TxCommit& commit, R2CommitMutation mutation) {
+    switch (mutation) {
+    case R2CommitMutation::RelationshipOrdinal:
+        ++commit.relationship_ordinal;
+        break;
+    case R2CommitMutation::BindingDigest:
+        commit.binding_digest.bytes[0] ^= 0x80;
+        break;
+    case R2CommitMutation::EnvelopeTransactionDigest:
+        commit.transaction_digest.bytes[0] ^= 0x80;
+        break;
+    case R2CommitMutation::HistoryNonce:
+        ++commit.inner.history_nonce.value;
+        break;
+    case R2CommitMutation::RelSeq:
+        ++commit.inner.rel_seq.value;
+        break;
+    case R2CommitMutation::TuSeq:
+        ++commit.inner.tu_seq.value;
+        break;
+    case R2CommitMutation::InnerTransactionDigest:
+        commit.inner.transaction_digest.bytes[0] ^= 0x80;
+        break;
+    case R2CommitMutation::RawDigest:
+        commit.inner.raw_digest.bytes[0] ^= 0x80;
+        break;
+    case R2CommitMutation::PostStateDigest:
+        commit.inner.post_state_digest.bytes[0] ^= 0x80;
+        break;
+    }
+}
+
+std::string_view r2_commit_mutation_name(R2CommitMutation mutation) {
+    switch (mutation) {
+    case R2CommitMutation::RelationshipOrdinal: return "ordinal";
+    case R2CommitMutation::BindingDigest: return "binding-digest";
+    case R2CommitMutation::EnvelopeTransactionDigest: return "envelope-txn-digest";
+    case R2CommitMutation::HistoryNonce: return "history-nonce";
+    case R2CommitMutation::RelSeq: return "rel-seq";
+    case R2CommitMutation::TuSeq: return "tu-seq";
+    case R2CommitMutation::InnerTransactionDigest: return "inner-txn-digest";
+    case R2CommitMutation::RawDigest: return "raw-digest";
+    case R2CommitMutation::PostStateDigest: return "post-state-digest";
+    }
+    throw std::logic_error("unknown R2_TX_COMMIT mutation");
+}
+
 struct R2FrameCutSpec {
     MessageType type;
     size_t occurrence;
@@ -7909,12 +7968,14 @@ struct R2FrameCutSpec {
     bool cut_last_byte = false;
     size_t expected_frame_bytes = 0;
     std::optional<D15MalformedShape> malformed_shape = std::nullopt;
+    std::optional<R2CommitMutation> semantic_commit_mutation = std::nullopt;
 };
 
 struct R2ProxyCutResult {
     MessageType cut_frame_type{};
     size_t cut_prefix_bytes = 0;
     size_t cut_frame_bytes = 0;
+    bool semantic_mutation_forwarded = false;
 };
 
 asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
@@ -8816,6 +8877,33 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
         const bool target = header.type == cut.type &&
                             matching_occurrences++ == cut.occurrence;
         if (target) {
+            if (cut.semantic_commit_mutation) {
+                if (header.type != MessageType::R2_TX_COMMIT ||
+                    cut.direction != R2FrameDirection::FToClient ||
+                    cut.malformed_shape)
+                    throw std::logic_error(
+                        "semantic D15 mutation requires a complete F-to-C R2_TX_COMMIT");
+                std::vector<uint8_t> payload(header.payload_bytes);
+                if (!payload.empty())
+                    co_await asio::async_read(*source, asio::buffer(payload),
+                                              asio::use_awaitable);
+                R2TxCommit commit = std::get<R2TxCommit>(
+                    decode_payload(header.type, payload));
+                mutate_r2_commit(commit, *cut.semantic_commit_mutation);
+                const std::vector<uint8_t> mutated_frame =
+                    encode_frame(Message{commit});
+                result.cut_frame_type = header.type;
+                result.cut_frame_bytes = header_bytes.size() + payload.size();
+                result.cut_prefix_bytes = result.cut_frame_bytes;
+                co_await raw_write_bytes(*destination, mutated_frame);
+                result.semantic_mutation_forwarded = true;
+                boost::system::error_code ignored;
+                c_socket->shutdown(tcp::socket::shutdown_both, ignored);
+                c_socket->close(ignored);
+                f_socket->shutdown(tcp::socket::shutdown_both, ignored);
+                f_socket->close(ignored);
+                co_return result;
+            }
             if (cut.malformed_shape) {
                 std::vector<uint8_t> payload(header.payload_bytes);
                 if (!payload.empty())
@@ -8907,6 +8995,7 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     tcp::endpoint recovery_proxy, bool& recovery_cut_disconnected,
     std::string& malformed_recovery_detail,
     std::string& malformed_initial_detail,
+    std::string& semantic_commit_detail,
     std::chrono::steady_clock::time_point deadline,
     ServerRunResult& first_server_result, bool& first_server_done,
     std::string& phase,
@@ -8925,10 +9014,12 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
         cut.direction == R2FrameDirection::FToClient;
     const bool commit_ack_cut = cut.type == MessageType::COMMIT_ACK;
     std::optional<ClientRunResult> observed_before_recovery;
+    std::optional<R2SentBundle> initial_sent;
     try {
         phase = "initial-write";
-        const R2SentBundle sent = co_await client.write_r2_bundle(
+        initial_sent = co_await client.write_r2_bundle(
             interrupted_socket, initial_binding, prepared, deadline);
+        const R2SentBundle& sent = *initial_sent;
         if (commit_ack_cut) {
             phase = "initial-receipt";
             observed_before_recovery = co_await client.read_r2_receipt(
@@ -8976,10 +9067,28 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
         if (cut.malformed_shape)
             malformed_initial_detail = error.what();
     } catch (const std::exception& error) {
-        if (!cut.malformed_shape)
+        if (cut.semantic_commit_mutation) {
+            semantic_commit_detail = error.what();
+            require(semantic_commit_detail ==
+                        "R2 TX_COMMIT differs from exact sent witness",
+                    "semantic R2_TX_COMMIT mutation produced wrong client rejection: " +
+                        semantic_commit_detail);
+            require(initial_sent.has_value() &&
+                        client.r2_confirmed_prefix() == 0 &&
+                        client.r2_ack_written_prefix() == 0 &&
+                        client.state_digest() ==
+                            initial_sent->begin.inner.pre_state_digest &&
+                        client.next_rel_seq() ==
+                            initial_sent->begin.inner.rel_seq &&
+                        client.r2_pending_witnesses(0).size() == 1,
+                    "mutated R2_TX_COMMIT advanced client state or lost its witness");
+            writer_observed_disconnect = true;
+        } else if (!cut.malformed_shape) {
             throw;
-        writer_observed_disconnect = true;
-        malformed_initial_detail = error.what();
+        } else {
+            writer_observed_disconnect = true;
+            malformed_initial_detail = error.what();
+        }
     }
     boost::system::error_code ignored;
     interrupted_socket.shutdown(tcp::socket::shutdown_both, ignored);
@@ -9022,7 +9131,11 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     const uint64_t cut_identity =
         static_cast<uint64_t>(cut.type) * 100000 +
         static_cast<uint64_t>(cut.direction) * 10000000 +
-        cut.occurrence * 10000 + cut.frame_prefix_bytes;
+        cut.occurrence * 10000 + cut.frame_prefix_bytes +
+        (cut.semantic_commit_mutation
+             ? (static_cast<uint64_t>(*cut.semantic_commit_mutation) + 1) *
+                   100000000ULL
+             : 0);
     const Id128 reset_operation = Id128::from_u64(
         0xd0300000ULL + static_cast<uint64_t>(initial_hello.profile) * 1000000 +
         cut_identity);
@@ -9232,7 +9345,8 @@ void test_r2_fragmented_frame_interruption_recovery(
     bool exhaustive_f_to_c_commit_cuts = false,
     std::optional<R2FrameCutSpec> recovery_cut = std::nullopt,
     std::optional<ProfileId> only_profile = std::nullopt,
-    std::optional<D15MalformedShape> malformed_initial = std::nullopt) {
+    std::optional<D15MalformedShape> malformed_initial = std::nullopt,
+    std::optional<R2CommitMutation> semantic_commit_mutation = std::nullopt) {
     R2TxCommit commit_frame_shape;
     commit_frame_shape.relationship_ordinal = 1;
     commit_frame_shape.binding_digest = icecc::digest128("D03 binding");
@@ -9251,7 +9365,7 @@ void test_r2_fragmented_frame_interruption_recovery(
         if (only_profile && profile != *only_profile)
             continue;
         const auto profile_started = std::chrono::steady_clock::now();
-        const size_t base_case_count = malformed_initial
+        const size_t base_case_count = (malformed_initial || semantic_commit_mutation)
             ? 1
             : recovery_cut
             ? 1
@@ -9322,6 +9436,14 @@ void test_r2_fragmented_frame_interruption_recovery(
                               "D15 malformed F-to-C R2_TX_COMMIT",
                               R2FrameDirection::FToClient, false, 0,
                               malformed_initial}};
+            }
+            if (semantic_commit_mutation) {
+                R2FrameCutSpec semantic{
+                    MessageType::R2_TX_COMMIT, 0, 0,
+                    "D15 semantic F-to-C R2_TX_COMMIT",
+                    R2FrameDirection::FToClient};
+                semantic.semantic_commit_mutation = semantic_commit_mutation;
+                cut_cases = {semantic};
             }
             require(cut_cases.size() == case_count &&
                         case_index < cut_cases.size(),
@@ -9623,6 +9745,7 @@ void test_r2_fragmented_frame_interruption_recovery(
             bool recovery_cut_disconnected = false;
             std::string malformed_recovery_detail;
             std::string malformed_initial_detail;
+            std::string semantic_commit_detail;
             bool timed_out = false;
             std::optional<ClientRunResult> client_result;
             std::exception_ptr server_error;
@@ -9733,6 +9856,7 @@ void test_r2_fragmented_frame_interruption_recovery(
                     recovery_cut_disconnected,
                     malformed_recovery_detail,
                     malformed_initial_detail,
+                    semantic_commit_detail,
                     job_deadline.as_steady_time_point(), first_result,
                     first_done, client_phase, observed_reset_epoch, bind_count,
                     materializations, commit_count),
@@ -10001,7 +10125,9 @@ void test_r2_fragmented_frame_interruption_recovery(
                                     recovery_cut->type) ==
                      static_cast<std::ptrdiff_t>(recovery_cut->occurrence));
             const size_t expected_initial_cut_prefix =
-                cut.malformed_shape == D15MalformedShape::Truncated
+                cut.semantic_commit_mutation
+                    ? proxy_cut_result.cut_frame_bytes
+                : cut.malformed_shape == D15MalformedShape::Truncated
                     ? proxy_cut_result.cut_frame_bytes - 1
                 : cut.malformed_shape == D15MalformedShape::Oversized
                     ? 4
@@ -10121,6 +10247,10 @@ void test_r2_fragmented_frame_interruption_recovery(
                         proxy_cut_result.cut_frame_type == cut.type &&
                         proxy_cut_result.cut_prefix_bytes ==
                             expected_initial_cut_prefix &&
+                        (!cut.semantic_commit_mutation ||
+                         (proxy_cut_result.semantic_mutation_forwarded &&
+                          semantic_commit_detail ==
+                              "R2 TX_COMMIT differs from exact sent witness")) &&
                         (cut.malformed_shape
                              ? proxy_cut_result.cut_frame_bytes > 4
                              : proxy_cut_result.cut_frame_bytes >
@@ -10242,6 +10372,32 @@ void test_r2_d15_malformed_recovery_records() {
         }
     }
     std::puts("P51_D15_R2_WIRE malformed recovery records all directions/profiles: PASS");
+}
+
+void test_r2_d15_tx_commit_semantic_mutations() {
+    constexpr std::array<R2CommitMutation, 9> mutations{{
+        R2CommitMutation::RelationshipOrdinal,
+        R2CommitMutation::BindingDigest,
+        R2CommitMutation::EnvelopeTransactionDigest,
+        R2CommitMutation::HistoryNonce,
+        R2CommitMutation::RelSeq,
+        R2CommitMutation::TuSeq,
+        R2CommitMutation::InnerTransactionDigest,
+        R2CommitMutation::RawDigest,
+        R2CommitMutation::PostStateDigest,
+    }};
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE}) {
+        for (const R2CommitMutation mutation : mutations) {
+            test_r2_fragmented_frame_interruption_recovery(
+                false, std::nullopt, profile, std::nullopt, mutation);
+            std::cout << "P51_D15_R2_TX_COMMIT_SEMANTIC profile="
+                      << static_cast<unsigned>(profile)
+                      << " field=" << r2_commit_mutation_name(mutation)
+                      << " exact-reject/no-ack/recovered-commit: PASS\n"
+                      << std::flush;
+        }
+    }
 }
 
 void test_r2_silent_setup_cancelled_before_hello() {
@@ -12614,6 +12770,7 @@ int main(int argc, char** argv) {
     if (d15_wire_gate) {
         test_r2_d15_wire_faults_all_profiles();
         test_r2_d15_malformed_frame_matrix();
+        test_r2_d15_tx_commit_semantic_mutations();
         return 0;
     }
     if (std::getenv("ICECC_P50_CANCEL_UNWRITTEN_TAIL_FOCUS") != nullptr) {
