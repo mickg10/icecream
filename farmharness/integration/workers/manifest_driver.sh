@@ -115,6 +115,8 @@ event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}
 s60_admit_through=${ICEFARM_S60_ADMIT_THROUGH:-0}
 disk_fill_worker=${ICEFARM_DISK_FILL_WORKER:-}
 disk_fill_trigger=${ICEFARM_DISK_FILL_TRIGGER:-0}
+p51_link_map=${ICEFARM_P51_LINK_MAP:-}
+p51_link_window=${ICEFARM_P51_LINK_WINDOW:-}
 case "$s60_admit_through" in
     ''|*[!0-9]*) echo "invalid S60 admission boundary" >&2; exit 65 ;;
 esac
@@ -244,6 +246,72 @@ then
     sort -u "$unique" -o "$unique"
 else
     expected_jobs=$((base_tus * corpus_repeat * workload_repeat))
+fi
+
+# Multi-link receipt-window runs route every manifest ordinal to exactly one
+# declared F.  ICECC_PREFERRED_HOST remains a preference in icecc itself, so
+# compile_one also verifies the actual remote assignment before accepting an
+# output.  The single-link/legacy path leaves this map empty and unchanged.
+p51_expected_worker() {
+    local target=$1 entry worker first last
+    local match=""
+    local -a entries=()
+    IFS=',' read -r -a entries <<<"$p51_link_map"
+    for entry in "${entries[@]}"
+    do
+        if [[ "$entry" =~ ^([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9._-]+)$ ]]
+        then
+            first=${BASH_REMATCH[1]}
+            last=${BASH_REMATCH[2]}
+            worker=${BASH_REMATCH[3]}
+            if test "$target" -ge "$first" -a "$target" -le "$last"
+            then
+                test -z "$match" || return 1
+                match=$worker
+            fi
+        else
+            return 1
+        fi
+    done
+    test -n "$match" || return 1
+    printf '%s' "$match"
+}
+p51_validate_link_map() {
+    local entry first last mapped_index
+    local -a entries=()
+    IFS=',' read -r -a entries <<<"$p51_link_map"
+    test "${#entries[@]}" -gt 0 || return 1
+    for entry in "${entries[@]}"
+    do
+        if [[ "$entry" =~ ^([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9._-]+)$ ]]
+        then
+            first=${BASH_REMATCH[1]}
+            last=${BASH_REMATCH[2]}
+            if test "$first" -gt "$last" -o "$last" -gt "$expected_jobs"
+            then
+                return 1
+            fi
+        else
+            return 1
+        fi
+    done
+    for ((mapped_index=1; mapped_index<=expected_jobs; mapped_index++))
+    do
+        p51_expected_worker "$mapped_index" >/dev/null || return 1
+    done
+}
+if test -n "$p51_link_map"
+then
+    p51_validate_link_map || {
+        echo "P51 receipt route map is malformed, overlapping, or incomplete" >&2
+        exit 65
+    }
+    if test "$resume_mode" -ne 0 \
+        || ! [[ "$p51_link_window" =~ ^[1-9][0-9]*$ ]]
+    then
+        echo "P51 multi-link receipt dispatch requires a fresh run and enough bounded workers for each link window" >&2
+        exit 65
+    fi
 fi
 
 resume_indices="$result_root/.resume-indices"
@@ -782,6 +850,12 @@ compile_one() {
         compiler_arg_index=$((compiler_arg_index + 1))
     done
     test "$strict_p50" -eq 0 || strict=(ICECC_P50_C1F1_REQUIRED=1)
+    mapped_worker=""
+    if test -n "$p51_link_map"
+    then
+        mapped_worker=$(p51_expected_worker "$index")
+        preferred=(ICECC_PREFERRED_HOST="$mapped_worker" ICECC_REMOTE_REQUIRED=1)
+    fi
     if test "$disk_fill_trigger" -gt 0 -a "$index" -eq "$disk_fill_trigger"
     then
         preferred=(ICECC_PREFERRED_HOST="$disk_fill_worker")
@@ -840,6 +914,11 @@ compile_one() {
     remote=1
     if test -z "$selected" -o "$local_fallback" -eq 1
     then
+        remote=0
+    fi
+    if test -n "$mapped_worker" -a "$worker" != "$mapped_worker"
+    then
+        echo "P51 receipt route mismatch job=$index expected=$mapped_worker actual=$worker" >&2
         remote=0
     fi
     retries=$((assignment_count > 0 ? assignment_count - 1 : 0))
@@ -935,11 +1014,13 @@ compile_one() {
     trap - EXIT
     return 0
 }
-export -f read_boundary_release compile_one
+export -f read_boundary_release p51_expected_worker compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
 export gate_root gate_state gate_lock gate_active event_serial_through s60_admit_through
 export disk_fill_worker disk_fill_trigger
+export p51_link_map
+export p51_link_window
 export resume_mode resume_indices
 
 set +e
@@ -959,7 +1040,88 @@ then
         sleep 0.05
     done
 fi
-xargs -0 -n 5 -P "$jobs" /bin/bash -c 'compile_one "$@"' icefarm-job <"$worklist"
+dispatch_worklist=$worklist
+if test -n "$p51_link_map"
+then
+    dispatch_worklist="$result_root/.p51-dispatch-worklist"
+    python3 - "$worklist" "$dispatch_worklist" "$expected_jobs" "$jobs" \
+        "$p51_link_window" "$p51_link_map" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+source, destination, expected_text, concurrency_text, window_text, route_text = sys.argv[1:]
+expected = int(expected_text)
+concurrency = int(concurrency_text)
+window = int(window_text)
+routes = []
+for entry in route_text.split(","):
+    match = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)=([A-Za-z0-9._-]+)", entry)
+    if match is None:
+        raise SystemExit("invalid P51 route while constructing dispatch order")
+    first, last = int(match.group(1)), int(match.group(2))
+    if first > last or last > expected:
+        raise SystemExit("out-of-range P51 route while constructing dispatch order")
+    routes.append((first, last, match.group(3)))
+ordered_routes = sorted(routes)
+cursor = 1
+for first, last, _worker in ordered_routes:
+    if first != cursor:
+        raise SystemExit("P51 routes do not partition the manifest")
+    cursor = last + 1
+if cursor != expected + 1 or len({worker for _first, _last, worker in routes}) != len(routes):
+    raise SystemExit("P51 routes are incomplete or repeat a worker")
+if concurrency < len(routes) * window or any(last - first + 1 < window for first, last, _worker in routes):
+    raise SystemExit("P51 dispatch cannot admit every link's initial window")
+
+raw = pathlib.Path(source).read_bytes()
+fields = raw.split(b"\0")
+if fields[-1] != b"" or len(fields) != expected * 5 + 1:
+    raise SystemExit("P51 worklist has an invalid NUL record count")
+records = [fields[index:index + 5] for index in range(0, len(fields) - 1, 5)]
+by_ordinal = {}
+for record in records:
+    try:
+        ordinal = int(record[0])
+    except (ValueError, IndexError) as exc:
+        raise SystemExit("P51 worklist has an invalid ordinal") from exc
+    if ordinal in by_ordinal or not 1 <= ordinal <= expected:
+        raise SystemExit("P51 worklist has a duplicate or out-of-range ordinal")
+    by_ordinal[ordinal] = record
+if set(by_ordinal) != set(range(1, expected + 1)):
+    raise SystemExit("P51 worklist ordinals are incomplete")
+
+# Fill every held gate before allowing suffix work to compete for bounded
+# xargs slots.  The suffix remains in original ordinal order, so releasing
+# gates in range order lets that link finish before later held ranges launch.
+first_wave = []
+for offset in range(window):
+    for first, last, _worker in routes:
+        ordinal = first + offset
+        if ordinal <= last:
+            first_wave.append(ordinal)
+selected = set(first_wave)
+order = first_wave + [ordinal for ordinal in range(1, expected + 1) if ordinal not in selected]
+if len(order) != expected or len(set(order)) != expected:
+    raise SystemExit("P51 dispatch order does not contain each job exactly once")
+payload = b"".join(field + b"\0" for ordinal in order for field in by_ordinal[ordinal])
+temporary = pathlib.Path(destination + ".tmp")
+temporary.write_bytes(payload)
+os.replace(temporary, destination)
+print(
+    "P51_RECEIPT_DISPATCH_ORDER "
+    f"links={len(routes)} window={window} initial={len(first_wave)} jobs={expected}"
+)
+PY
+    dispatch_worklist_rc=$?
+    if test "$dispatch_worklist_rc" -ne 0
+    then
+        echo "P51 dispatch-worklist validation failed; refusing to start compiler jobs" >&2
+        exit "$dispatch_worklist_rc"
+    fi
+fi
+xargs -0 -n 5 -P "$jobs" /bin/bash -c 'compile_one "$@"' icefarm-job <"$dispatch_worklist"
 xargs_rc=$?
 set -e
 gate_mode=$(head -n 1 "$gate_state" | cut -f1)

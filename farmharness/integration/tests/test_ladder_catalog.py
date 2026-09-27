@@ -5,9 +5,12 @@ import copy
 import hashlib
 import json
 
+import pytest
+
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
+from farmharness.integration import receipt_window_matrix
 from farmharness.integration.events import EventProducer
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.farm_spec import FarmSpec
@@ -54,6 +57,7 @@ def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_p
         (INTEGRATION / "scenarios" / "S00-smoke.json").read_text(encoding="utf-8")
     )
     scenario_data["id"] = "P51-receipt-window-test"
+    scenario_data["instances"][0].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario_data["instances"][1]["slots"] = 31
     scenario_data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario_data["instances"][2]["env"]["ICECC_P51_MODE"] = "on"
@@ -103,6 +107,70 @@ def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_p
         item for item in negative_plan["commands"] if item["phase"] == "up.start-c"
     )
     assert "ICECC_P50_PIPELINE_WINDOW=1" in client["argv"]
+
+
+def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Path) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm_data = copy.deepcopy(farm.data)
+    for row in receipt_window_matrix.TOPOLOGY_ROWS:
+        farm_data["authority"]["topologies"][row["id"]] = {
+            "f_relationships": row["workers"], "slots_per_f": 120,
+        }
+    farm_path = tmp_path / "authorized-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    output = tmp_path / "matrix"
+    generated = receipt_window_matrix.generate_matrix(
+        farm_path=farm_path,
+        base_path=INTEGRATION / "scenarios" / "S00-smoke.json",
+        helper_path=Path("/bin/true"),
+        output_dir=output,
+    )
+    assert len(generated) == 6 * 2 * 3
+    assert receipt_window_matrix._load_json(
+        receipt_window_matrix.TEMPLATE_PATH
+    )["restart_extension"] == "pending-not-run"
+    assert {path.name for path in generated} == {
+        f"P51-receipt-{row['id']}-{profile}-W{window}.json"
+        for row in receipt_window_matrix.TOPOLOGY_ROWS
+        for profile in receipt_window_matrix.PROFILE_NAMES
+        for window in (1, 30)
+    }
+
+    max_plan = None
+    for path in generated:
+        scenario = load_scenario_spec(path, load_farm_spec(farm_path))
+        gate = scenario.data["workload"]["receipt_gate"]
+        window = gate["negotiated_window"]
+        clients = [item for item in scenario.data["instances"] if item["role"] == "C"]
+        workers = [item for item in scenario.data["instances"] if item["role"] == "F"]
+        assert gate["expect_observed"] is True
+        assert scenario.data["workload"]["jobs"] == len(gate["links"]) // len(clients) * window
+        assert len(gate["links"]) == len(clients) * len(workers)
+        for client in clients:
+            spans = sorted(
+                (link["first_job"], link["last_job"])
+                for link in gate["links"] if link["client"] == client["name"]
+            )
+            assert spans[0][0] == 1
+            assert spans[-1][1] == 100 * scenario.data["workload"]["repeat"]
+            assert all(a[1] + 1 == b[0] for a, b in zip(spans, spans[1:]))
+            assert all(last - first + 1 >= window for first, last in spans)
+        if scenario.data["id"] == "P51-receipt-C4F1-ZSTD_ROUTE-W30":
+            max_plan = farmtest.build_plan(load_farm_spec(farm_path), scenario, run_id="p51-matrix-c4f1")
+            assert [link["slots"] for link in max_plan["topology"]["instances"] if link["role"] == "F"] == [120]
+            assert len(max_plan["p51_receipt_gate"]["links"]) == 4
+    assert max_plan is not None
+
+
+def test_p51_multilink_matrix_refuses_unavailable_authority(tmp_path: Path) -> None:
+    farm_path = farm_fixture.example_farm_path()
+    with pytest.raises(receipt_window_matrix.MatrixError, match="must explicitly authorize C1F3"):
+        receipt_window_matrix.generate_matrix(
+            farm_path=farm_path,
+            base_path=INTEGRATION / "scenarios" / "S00-smoke.json",
+            helper_path=Path("/bin/true"),
+            output_dir=tmp_path / "matrix",
+        )
 
 
 def test_checked_in_harness_gate_suites_are_exact_and_complete() -> None:

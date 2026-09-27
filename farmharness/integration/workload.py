@@ -148,6 +148,10 @@ def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
     workload and verdict layers.
     """
 
+    # The receipt-window driver independently enforces exact per-link remote
+    # assignments; the legacy strict flag is specifically C1F1-only.
+    if scenario.data["workload"].get("receipt_gate", {}).get("links"):
+        return False
     # Only active scheduler loss permits the one authenticated fresh legacy
     # retry; all ordinary all-new P50 cells remain strict.
     if scenario.data.get("id") == "S70-b4-scheduler-active-loss":
@@ -302,6 +306,19 @@ def _driver_command(
         if match is None:
             raise WorkloadError("S95 disk fill needs a positive job trigger")
         disk_fill_trigger = int(match.group(1))
+    receipt_gate = workload.get("receipt_gate", {})
+    receipt_links = receipt_gate.get("links", [])
+    link_map = ""
+    link_window = ""
+    if receipt_links:
+        client_links = [link for link in receipt_links if link["client"] == client["name"]]
+        link_map = ",".join(
+            f"{link['first_job']}-{link['last_job']}={link['worker']}"
+            for link in client_links
+        )
+        if not link_map:
+            raise WorkloadError(f"no receipt-window route map for client {client['name']}")
+        link_window = str(receipt_gate["negotiated_window"])
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     d18_roles = workload.get("d18_roles")
     d18_role = (
@@ -350,6 +367,8 @@ def _driver_command(
                 if s60_admit_through else ()
             ),
             *d18_environment,
+            *(("--env", f"ICEFARM_P51_LINK_MAP={link_map}") if link_map else ()),
+            *(("--env", f"ICEFARM_P51_LINK_WINDOW={link_window}") if link_window else ()),
             *(
                 (
                     "--env",
@@ -496,6 +515,538 @@ def _p51_gate_call(
             f"{result.stderr.strip() or result.stdout.strip() or result.returncode}"
         )
     return result
+
+
+def _p51_check_held_marker(
+    held: str, *, expected: int, profile: str, negotiated_window: int,
+) -> dict[str, Any]:
+    match = re.fullmatch(
+        r"count=([0-9]+) first_ordinal=([0-9]+) last_ordinal=([0-9]+) "
+        r"profile=([1-3]) window=([1-9][0-9]*) "
+        r"relationship=([0-9a-f]{32}) reservation=([0-9a-f]{32}) "
+        r"epoch=([1-9][0-9]*) generation=([1-9][0-9]*)\n",
+        held,
+    )
+    if match is None:
+        raise WorkloadError("remote gate held marker has invalid exact-window evidence")
+    count, first, last = (int(match.group(i)) for i in (1, 2, 3))
+    profile_id, selected_window = int(match.group(4)), int(match.group(5))
+    if (
+        count != expected or last - first + 1 != expected or first != 1
+        or selected_window != negotiated_window
+        or profile_id != P51_PROFILE_IDS[profile]
+    ):
+        raise WorkloadError(f"remote gate observed unexpected negotiated window: {held.strip()}")
+    if match.group(6) == "0" * 32 or match.group(7) == "0" * 32:
+        raise WorkloadError("remote gate negotiated zero relationship/reservation identity")
+    return {
+        "count": count,
+        "first_ordinal": first,
+        "last_ordinal": last,
+        "profile": profile,
+        "negotiated_window": selected_window,
+        "relationship_id": match.group(6),
+        "reservation_id": match.group(7),
+        "epoch": int(match.group(8)),
+        "physical_link_generation": int(match.group(9)),
+    }
+
+
+def _p51_check_scoped_identity_marker(
+    identity: str, held: dict[str, Any],
+) -> dict[str, Any]:
+    match = re.fullmatch(
+        r"c_store=([0-9a-f]{32}) c_store_generation=([1-9][0-9]*) "
+        r"f_store=([0-9a-f]{32}) f_store_generation=([1-9][0-9]*) "
+        r"relationship=([0-9a-f]{32}) reservation=([0-9a-f]{32}) "
+        r"epoch=([1-9][0-9]*) generation=([1-9][0-9]*) "
+        r"profile=([1-3]) window=([1-9][0-9]*)\n",
+        identity,
+    )
+    if match is None or any(match.group(i) == "0" * 32 for i in (1, 3, 5, 6)):
+        raise WorkloadError("receipt gate lacks complete nonzero scoped link identity")
+    actual = {
+        "c_store_guid": match.group(1),
+        "c_store_generation": int(match.group(2)),
+        "f_store_guid": match.group(3),
+        "f_store_generation": int(match.group(4)),
+        "relationship_id": match.group(5),
+        "reservation_id": match.group(6),
+        "epoch": int(match.group(7)),
+        "physical_link_generation": int(match.group(8)),
+        "profile_id": int(match.group(9)),
+        "negotiated_window": int(match.group(10)),
+    }
+    if any(actual[key] != held[key] for key in (
+        "relationship_id", "reservation_id", "epoch", "physical_link_generation",
+        "negotiated_window",
+    )) or actual["profile_id"] != P51_PROFILE_IDS[held["profile"]]:
+        raise WorkloadError("receipt gate scoped identity differs from held receipt interval")
+    return actual
+
+
+def _p51_link_output_check_argv(
+    client: str, first_job: int, last_job: int, expected_worker: str, turn: str,
+) -> tuple[str, ...]:
+    # Check one bounded contiguous range using the manifest driver's stable
+    # result.tsv columns.  This observes exact local-SHA outputs and the
+    # actual remote worker, not merely ICECC_PREFERRED_HOST.
+    script = r'''
+set -eu
+root=$1
+first=$2
+last=$3
+worker=$4
+index=$first
+while test "$index" -le "$last"
+do
+    file=$(printf '%s/jobs/%06d/result.tsv' "$root" "$index")
+    test -f "$file" -a ! -L "$file"
+    test "$(cut -f6 "$file")" = "$worker"
+    test "$(cut -f9 "$file")" = 0
+    test "$(cut -f12 "$file")" = 1
+    test "$(cut -f13 "$file")" = 1
+    index=$((index + 1))
+done
+printf 'P51_LINK_OUTPUTS_OK client=%s worker=%s first=%s last=%s\n' "$5" "$worker" "$first" "$last"
+'''
+    return (
+        "/bin/sh", "-c", script, "check-link-outputs",
+        f"/results/workload/{turn}", str(first_job), str(last_job),
+        expected_worker, client,
+    )
+
+
+def _p51_require_sibling_held(
+    *, gate_done: bool, released_marker: str | None,
+    exit_marker: str | None, outputs_complete: bool,
+) -> None:
+    if gate_done or released_marker is not None or exit_marker is not None or outputs_complete:
+        raise WorkloadError("receipt sibling did not remain live and held during peer progress")
+
+
+def _run_p51_receipt_window_multilink(
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    clients: list[dict[str, Any]],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    turn: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run the existing receipt gate once per explicit C→F relationship."""
+    workload = scenario.data["workload"]
+    gate_spec = workload["receipt_gate"]
+    links = gate_spec["links"]
+    topology = plan["topology"]["instances"]
+    clients_by_name = {item["name"]: item for item in clients}
+    workers_by_name = {item["name"]: item for item in topology if item["role"] == "F"}
+    expected_profile = next(
+        item.get("env", {}).get("ICECC_P50_PROFILE")
+        for item in scenario.data["instances"] if item["role"] == "S"
+    )
+    gate_binary = plan["p51_receipt_gate"]["container_path"]
+    expected_gate_sha = plan["p51_receipt_gate"]["binary_sha256"]
+    timeout_s = int(gate_spec.get("command_timeout_s", 260))
+    gate_rows: list[dict[str, Any]] = []
+    for link_index, spec in enumerate(links):
+        client = clients_by_name[spec["client"]]
+        worker = workers_by_name[spec["worker"]]
+        gate_rows.append({
+            "index": link_index,
+            "spec": spec,
+            "client": client,
+            "worker": worker,
+            "port": plan["ports"]["instances"][worker["name"]],
+            "gate_dir": f"/results/p51-receipt-gate/links/{spec['client']}-{spec['worker']}",
+        })
+    # Within a C process, release gates in manifest-range order.  The driver
+    # dispatches every link's first negotiated window before any suffix, then
+    # naturally reaches suffix ranges in ordinal order.
+    gate_rows.sort(key=lambda row: (row["client"]["name"], row["spec"]["first_job"]))
+
+    gate_futures: dict[tuple[str, str], Any] = {}
+    completed = False
+    deadline_s = max(timeout_s, int(scenario.data["timeouts"]["turn_s"]))
+    try:
+        # Stage/install shared helper dependencies once in each C namespace.
+        for client in clients:
+            helper_probe = _p51_gate_call(
+                farm, plan, client, factory, transport, "verify-staged-helper",
+                (
+                    "/bin/sh", "-c",
+                    'set -eu; path=$1; expected=$2; test -x "$path"; '
+                    'actual=$(sha256sum "$path"); set -- $actual; '
+                    'test "$1" = "$expected"; printf "%s\\n" "$1"',
+                    "verify-helper", gate_binary, expected_gate_sha,
+                ),
+            )
+            if helper_probe.stdout != expected_gate_sha + "\n":
+                raise WorkloadError("staged P51 receipt-gate helper hash differs from pinned binary")
+            uid_result = _p51_gate_call(
+                farm, plan, client, factory, transport, "sidecar-uid",
+                ("/usr/bin/id", "-u", "nobody"),
+            )
+            try:
+                sidecar_uid = int(uid_result.stdout.strip())
+            except ValueError as exc:
+                raise WorkloadError("receipt gate could not identify the C sidecar UID") from exc
+            if sidecar_uid <= 0:
+                raise WorkloadError("receipt gate requires a distinct non-root C sidecar UID")
+            _stage_p51_iptables_bundle(farm, plan, client, factory, transport)
+            _p51_gate_call(
+                farm, plan, client, factory, transport, "install-test-iptables",
+                (
+                    "/bin/sh", "-c",
+                    "set -eu; cd /results/p51-receipt-gate/debs; "
+                    "echo d1d7980ebc0b342caea791cc4fc86be4a6dcfc44f89e6884f2e4fbc69fd5568a  SHA256SUMS | sha256sum -c -; "
+                    "sha256sum -c SHA256SUMS; dpkg -i ./*.deb; "
+                    "test \"$(dpkg-query -W -f='${Version}' iptables)\" = 1.8.9-2; "
+                    "iptables --version",
+                    "install-test-iptables",
+                ),
+                timeout_s=180,
+            )
+            _p51_gate_call(
+                farm, plan, client, factory, transport, "prepare-control-dir",
+                ("/bin/mkdir", "-p", "/results/p51-receipt-gate/links"),
+            )
+
+        # Each helper is the same existing remote receipt gate, scoped by its
+        # F address/port in the one C network namespace.  Rules are disjoint.
+        for row in gate_rows:
+            client, worker = row["client"], row["worker"]
+            client_name, worker_name = client["name"], worker["name"]
+            gate_dir = row["gate_dir"]
+            _p51_gate_call(
+                farm, plan, client, factory, transport, f"prepare-{client_name}-{worker_name}",
+                ("/bin/mkdir", "-p", gate_dir),
+            )
+            uid_result = _p51_gate_call(
+                farm, plan, client, factory, transport, "sidecar-uid",
+                ("/usr/bin/id", "-u", "nobody"),
+            )
+            sidecar_uid = int(uid_result.stdout.strip())
+            gate_shell = (
+                'gate_dir=$1; shift; set +e; "$@" 2> "$gate_dir/helper.stderr"; rc=$?; '
+                'cat "$gate_dir/helper.stderr" >&2; '
+                'printf "%s\\n" "$rc" > "$gate_dir/exit"; exit 0'
+            )
+            gate_argv = (
+                "exec", "--user", "0", "--env", "ICECC_TEST_POSITIVE_DAEMON=1",
+                f"icefarm-{plan['run_id']}-{client_name}", "/bin/sh", "-c", gate_shell,
+                "receipt-gate", gate_dir, gate_binary, "--p51-commit-receipt-gate-remote",
+                worker["address"], str(row["port"]), str(sidecar_uid),
+                str(gate_spec["expected_commits"]), "1", gate_dir,
+            )
+            command = factory.make(
+                phase=f"run.p51-receipt-window.start-gate.{client_name}.{worker_name}",
+                host=client["host"], instance=client_name,
+                transport=_docker_transport(farm, client["host"]), timeout_s=timeout_s,
+                argv=docker_argv(farm, client["host"], gate_argv),
+            )
+            key = (client_name, worker_name)
+            gate_futures[key] = command
+
+        # Construct driver commands only after all route maps have been
+        # validated by ScenarioSpec; one process per C handles its full
+        # manifest, with each ordinal pinned to exactly one declared F.
+        driver_commands = {
+            client["name"]: _driver_command(
+                farm, scenario, plan, client, turn, factory, exec_uid="1:1"
+            )
+            for client in clients
+        }
+        _p51_gate_call(
+            farm, plan, clients[0], factory, transport, "prepare-root-control-dir",
+            ("/bin/mkdir", "-p", "/results/p51-receipt-gate"),
+        )
+        with ThreadPoolExecutor(max_workers=len(gate_rows) + len(clients)) as executor:
+            running_gates = {
+                key: executor.submit(transport.invoke, command)
+                for key, command in gate_futures.items()
+            }
+            try:
+                for row in gate_rows:
+                    client = row["client"]
+                    ready = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{row['gate_dir']}/ready", timeout_s=20,
+                    )
+                    if ready is None:
+                        raise WorkloadError(
+                            f"receipt gate did not become ready for {client['name']}→{row['worker']['name']}"
+                        )
+                running_workloads = {
+                    name: executor.submit(transport.invoke, command)
+                    for name, command in driver_commands.items()
+                }
+                for row in gate_rows:
+                    client = row["client"]
+                    held = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{row['gate_dir']}/held-1", timeout_s=40,
+                    )
+                    if held is None:
+                        raise WorkloadError(
+                            f"receipt gate did not hold exact window for "
+                            f"{client['name']}→{row['worker']['name']}"
+                        )
+                    row["held"] = _p51_check_held_marker(
+                        held,
+                        expected=int(gate_spec["expected_commits"]),
+                        profile=expected_profile,
+                        negotiated_window=int(gate_spec["negotiated_window"]),
+                    )
+                    if row["held"]["physical_link_generation"] <= 0:
+                        raise WorkloadError("receipt gate lacks physical generation evidence")
+                    identity_text = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{row['gate_dir']}/identity-1", timeout_s=5,
+                    )
+                    if identity_text is None:
+                        raise WorkloadError("receipt gate did not publish scoped store identity")
+                    row["identity"] = _p51_check_scoped_identity_marker(
+                        identity_text, row["held"]
+                    )
+
+                # Relationship IDs are C-scoped: require different F links
+                # of the same C to have different complete link identity,
+                # without incorrectly demanding global numeric uniqueness
+                # across independent C stores.
+                identities: set[tuple[str, int, str, int, str, str, int, int]] = set()
+                c_stores: dict[str, tuple[str, int]] = {}
+                f_stores: dict[str, tuple[str, int]] = {}
+                c_processes: dict[tuple[str, int], str] = {}
+                f_processes: dict[tuple[str, int], str] = {}
+                for row in gate_rows:
+                    marker = row["held"]
+                    scoped = row["identity"]
+                    identity = (
+                        scoped["c_store_guid"], scoped["c_store_generation"],
+                        scoped["f_store_guid"], scoped["f_store_generation"],
+                        marker["relationship_id"], marker["reservation_id"],
+                        marker["epoch"], marker["physical_link_generation"],
+                    )
+                    if identity in identities:
+                        raise WorkloadError("duplicate scoped relationship identity in receipt matrix")
+                    identities.add(identity)
+                    c_key = (scoped["c_store_guid"], scoped["c_store_generation"])
+                    f_key = (scoped["f_store_guid"], scoped["f_store_generation"])
+                    client_name, worker_name = row["client"]["name"], row["worker"]["name"]
+                    if client_name in c_stores and c_stores[client_name] != c_key:
+                        raise WorkloadError("one C process changed store identity across its links")
+                    if worker_name in f_stores and f_stores[worker_name] != f_key:
+                        raise WorkloadError("one F process changed store identity across its links")
+                    if c_key in c_processes and c_processes[c_key] != client_name:
+                        raise WorkloadError("distinct C processes share one C store identity")
+                    if f_key in f_processes and f_processes[f_key] != worker_name:
+                        raise WorkloadError("distinct F processes share one F store identity")
+                    c_stores[client_name] = c_key
+                    f_stores[worker_name] = f_key
+                    c_processes[c_key] = client_name
+                    f_processes[f_key] = worker_name
+
+                summaries: list[dict[str, Any]] = []
+                output_progress: list[dict[str, Any]] = []
+                for row_index, row in enumerate(gate_rows):
+                    client = row["client"]
+                    gate_dir = row["gate_dir"]
+                    key = (client["name"], row["worker"]["name"])
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport,
+                        f"release-{key[0]}-{key[1]}",
+                        ("/usr/bin/touch", f"{gate_dir}/release-1"),
+                    )
+                    released = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{gate_dir}/released-1", timeout_s=35,
+                    )
+                    if released is None:
+                        raise WorkloadError(f"receipt gate release was not acknowledged for {key}")
+                    first, last = row["spec"]["first_job"], row["spec"]["last_job"]
+                    output_argv = _p51_link_output_check_argv(
+                        key[0], first, last, key[1], turn
+                    )
+                    output_deadline = time.monotonic() + deadline_s
+                    while time.monotonic() < output_deadline:
+                        output_command = factory.make(
+                            phase=f"run.p51-receipt-window.check-link-output.{key[0]}.{key[1]}",
+                            host=client["host"], instance=client["name"],
+                            transport=_docker_transport(farm, client["host"]),
+                            timeout_s=20,
+                            argv=docker_argv(farm, client["host"], (
+                                "exec", "--user", "0",
+                                f"icefarm-{plan['run_id']}-{client['name']}",
+                                *output_argv,
+                            )),
+                        )
+                        output_result = transport.invoke(output_command)
+                        if output_result.returncode == 0:
+                            break
+                        time.sleep(0.2)
+                    else:
+                        raise WorkloadError(
+                            f"exact output progress did not complete for released link {key}"
+                        )
+                    output_progress.append({
+                        "client": key[0], "worker": key[1], "first_job": first,
+                        "last_job": last, "verified": True,
+                    })
+                    # Prove un-released sibling links remained held while this
+                    # link made output progress.
+                    for sibling in gate_rows[row_index + 1:]:
+                        sibling_client = sibling["client"]
+                        sibling_key = (
+                            sibling_client["name"], sibling["worker"]["name"]
+                        )
+                        state = _p51_gate_call(
+                            farm, plan, sibling_client, factory, transport,
+                            f"verify-sibling-still-held-{sibling['worker']['name']}",
+                            ("/bin/sh", "-c",
+                             'set -eu; test -f "$1"; released=0; exited=0; '
+                             'test ! -e "$2" || released=1; '
+                             'test ! -e "$3" || exited=1; '
+                             'printf "held=1 released=%s exited=%s\\n" "$released" "$exited"',
+                             "check-held-sibling", f"{sibling['gate_dir']}/held-1",
+                             f"{sibling['gate_dir']}/released-1",
+                             f"{sibling['gate_dir']}/exit"),
+                        )
+                        marker_state = re.fullmatch(
+                            r"held=1 released=([01]) exited=([01])\n",
+                            state.stdout,
+                        )
+                        if marker_state is None:
+                            raise WorkloadError(
+                                "receipt sibling marker probe returned malformed state"
+                            )
+                        sibling_output_argv = _p51_link_output_check_argv(
+                            sibling_key[0],
+                            sibling["spec"]["first_job"],
+                            sibling["spec"]["last_job"],
+                            sibling_key[1],
+                            turn,
+                        )
+                        sibling_output_command = factory.make(
+                            phase=(
+                                "run.p51-receipt-window.probe-sibling-output."
+                                f"{sibling_key[0]}.{sibling_key[1]}"
+                            ),
+                            host=sibling_client["host"], instance=sibling_client["name"],
+                            transport=_docker_transport(farm, sibling_client["host"]),
+                            timeout_s=20,
+                            argv=docker_argv(farm, sibling_client["host"], (
+                                "exec", "--user", "0",
+                                f"icefarm-{plan['run_id']}-{sibling_client['name']}",
+                                *sibling_output_argv,
+                            )),
+                        )
+                        sibling_output = transport.invoke(sibling_output_command)
+                        _p51_require_sibling_held(
+                            gate_done=running_gates[sibling_key].done(),
+                            released_marker=("present" if marker_state.group(1) == "1" else None),
+                            exit_marker=("present" if marker_state.group(2) == "1" else None),
+                            outputs_complete=sibling_output.returncode == 0,
+                        )
+
+                manifest_jobs = (
+                    int(farm.data["corpora"][workload["corpus"]]["tus"])
+                    * int(farm.data["corpora"][workload["corpus"]].get("repeat", 1))
+                    * int(workload["repeat"])
+                )
+                for client in clients:
+                    name = client["name"]
+                    result = running_workloads[name].result()
+                    summary = _parse_summary(result, name)
+                    if summary["jobs"] != manifest_jobs or summary["failures"] != 0:
+                        raise WorkloadError(
+                            f"receipt-window manifest did not produce all exact outputs for {name}"
+                        )
+                    summaries.append(summary)
+
+                gate_evidence: list[dict[str, Any]] = []
+                for row in gate_rows:
+                    client = row["client"]
+                    gate_dir = row["gate_dir"]
+                    _p51_gate_call(
+                        farm, plan, client, factory, transport, "finish-link-gate",
+                        ("/usr/bin/touch", f"{gate_dir}/finish"),
+                    )
+                for row in gate_rows:
+                    client = row["client"]
+                    key = (client["name"], row["worker"]["name"])
+                    gate_result = running_gates[key].result()
+                    exit_text = _p51_wait_marker(
+                        farm, plan, client, factory, transport,
+                        f"{row['gate_dir']}/exit", timeout_s=5,
+                    )
+                    if (
+                        exit_text != "0\n"
+                        or P51_NEGOTIATED_RE.search(gate_result.stderr) is None
+                        or not _p51_negotiation_matches(
+                            P51_NEGOTIATED_RE.search(gate_result.stderr),
+                            profile=expected_profile,
+                            window=int(gate_spec["negotiated_window"]),
+                        )
+                    ):
+                        raise WorkloadError(f"receipt gate did not exit cleanly for {key}")
+                    gate_evidence.append({
+                        **row["held"],
+                        **row["identity"],
+                        "client": key[0], "worker": key[1],
+                        "worker_address": row["worker"]["address"],
+                        "worker_port": row["port"],
+                        "first_job": row["spec"]["first_job"],
+                        "last_job": row["spec"]["last_job"],
+                    })
+                completed = True
+            finally:
+                for row in gate_rows:
+                    client = row["client"]
+                    for marker in ("abort", "release-1", "finish"):
+                        try:
+                            _p51_gate_call(
+                                farm, plan, client, factory, transport,
+                                f"cleanup-{row['worker']['name']}-{marker}",
+                                ("/usr/bin/touch", f"{row['gate_dir']}/{marker}"),
+                            )
+                        except BaseException:
+                            pass
+                if not completed:
+                    for client in clients:
+                        try:
+                            transport.invoke(factory.make(
+                                phase="run.p51-receipt-window.abort-multilink-client",
+                                host=client["host"], instance=client["name"],
+                                transport=_docker_transport(farm, client["host"]), timeout_s=10,
+                                argv=docker_argv(
+                                    farm, client["host"],
+                                    ("kill", f"icefarm-{plan['run_id']}-{client['name']}"),
+                                ),
+                            ))
+                        except BaseException:
+                            pass
+
+        evidence = {
+            "profile": expected_profile,
+            "negotiated_window": int(gate_spec["negotiated_window"]),
+            "links": gate_evidence,
+            "release_order_output_progress": output_progress,
+            "restart_extension": "pending-not-run",
+        }
+        return summaries, evidence
+    except BaseException:
+        if not completed:
+            for row in gate_rows:
+                try:
+                    _p51_gate_call(
+                        farm, plan, row["client"], factory, transport,
+                        "abort-multilink-exception",
+                        ("/usr/bin/touch", f"{row['gate_dir']}/abort"),
+                    )
+                except BaseException:
+                    pass
+        raise
 
 
 def _stage_p51_iptables_bundle(
@@ -1324,6 +1875,23 @@ def run_workload(
                 )
             events.signal_turn_start(turn)
             if scenario.data["workload"]["driver"] == "p51-receipt-window":
+                receipt_gate = scenario.data["workload"]["receipt_gate"]
+                if receipt_gate.get("links"):
+                    summaries, window_evidence = _run_p51_receipt_window_multilink(
+                        farm, scenario, plan, clients, factory, transport, turn
+                    )
+                    for summary in summaries:
+                        total = totals[summary["client"]]
+                        for field in ("failures", "jobs", "samples"):
+                            total[field] += int(summary[field])
+                    turn_receipts.append({
+                        "clients": summaries,
+                        "p51_receipt_window": window_evidence,
+                        "turn": turn,
+                    })
+                    events.signal_turn_complete(turn)
+                    events.raise_if_failed()
+                    continue
                 summary, window_evidence = _run_p51_receipt_window(
                     farm, scenario, plan, clients[0], factory, transport, turn
                 )

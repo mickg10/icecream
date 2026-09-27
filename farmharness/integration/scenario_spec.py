@@ -258,34 +258,40 @@ def _validate_d18_role_mix(
 def _validate_p51_receipt_window(
     value: dict[str, Any], workload: dict[str, Any],
     role_instances: dict[str, list[dict[str, Any]]],
+    *, manifest_jobs: int,
 ) -> None:
+    links = workload["receipt_gate"].get("links")
+    multilink = links is not None
+    selected_clients = {item["name"] for item in role_instances["C"]}
+    selected_workers = {item["name"] for item in role_instances["F"]}
     if (
         len(role_instances["S"]) != 1
-        or len(role_instances["C"]) != 1
-        or len(role_instances["F"]) != 1
-        or workload["clients"] != [role_instances["C"][0]["name"]]
+        or (not multilink and (len(role_instances["C"]) != 1 or len(role_instances["F"]) != 1))
+        or set(workload["clients"]) != selected_clients
         or workload["turns"] != ["A"]
-        or workload["repeat"] != 1
+        or (not multilink and workload["repeat"] != 1)
         or value["timeline"]
         or value["controls"]
         or "fault" in value
     ):
         raise ScenarioSpecError(
-            "$.workload: p51-receipt-window requires one C/F/S, one A turn, and no controls"
+            "$.workload: p51-receipt-window requires one S, selected C clients, "
+            "one A turn, and no controls"
         )
     scheduler = role_instances["S"][0]
-    client, worker = role_instances["C"][0], role_instances["F"][0]
+    if not multilink and int(role_instances["F"][0].get("slots", 0)) < 31:
+        raise ScenarioSpecError(
+            "$.instances: single-link receipt-window requires at least 31 F slots"
+        )
     if (
         scheduler.get("env", {}).get("ICECC_P51_MODE") != "on"
         or scheduler.get("env", {}).get("ICECC_P50_PROFILE") not in PROFILES
-        or client.get("env", {}).get("ICECC_P50_MODE") != "on"
-        or client.get("env", {}).get("ICECC_P51_MODE") != "on"
-        or worker.get("env", {}).get("ICECC_P51_MODE") != "on"
-        or int(worker.get("slots", 0)) < 31
+        or any(item.get("env", {}).get("ICECC_P50_MODE") != "on" for item in role_instances["C"])
+        or any(item.get("env", {}).get("ICECC_P51_MODE") != "on" for item in role_instances["C"])
+        or any(item.get("env", {}).get("ICECC_P51_MODE") != "on" for item in role_instances["F"])
     ):
         raise ScenarioSpecError(
-            "$.instances: receipt-window requires selected-profile R2 scheduler, "
-            "P50/R2 C+F, and at least 31 F slots"
+            "$.instances: receipt-window requires selected-profile R2 scheduler and P50/R2 C+F"
         )
     gate = workload["receipt_gate"]
     binary = Path(gate["binary"])
@@ -319,6 +325,79 @@ def _validate_p51_receipt_window(
         raise ScenarioSpecError(
             "$.workload.receipt_gate: W1 negative control must offer and assert 30"
         )
+
+    if multilink:
+        if not gate["expect_observed"]:
+            raise ScenarioSpecError("$.workload.receipt_gate.links: multi-link gates are positive only")
+        if len(selected_clients) != 1 and len(selected_workers) != 1:
+            raise ScenarioSpecError(
+                "$.workload.receipt_gate.links: only one-to-many or many-to-one topologies are supported"
+            )
+        if len(links) < 2:
+            raise ScenarioSpecError("$.workload.receipt_gate.links: requires multiple links")
+        by_name = {item["name"]: item for item in role_instances["C"] + role_instances["F"]}
+        seen_pairs: set[tuple[str, str]] = set()
+        ranges_by_client: dict[str, list[tuple[int, int]]] = {name: [] for name in selected_clients}
+        windows_by_worker: dict[str, int] = {name: 0 for name in selected_workers}
+        windows_by_client: dict[str, int] = {name: 0 for name in selected_clients}
+        for index, link in enumerate(links):
+            client_name, worker_name = link["client"], link["worker"]
+            pair = (client_name, worker_name)
+            if client_name not in selected_clients or worker_name not in selected_workers:
+                raise ScenarioSpecError(
+                    f"$.workload.receipt_gate.links[{index}]: names must resolve to declared C/F instances"
+                )
+            if pair in seen_pairs:
+                raise ScenarioSpecError(
+                    f"$.workload.receipt_gate.links[{index}]: duplicate C/F relationship"
+                )
+            seen_pairs.add(pair)
+            first, last = link["first_job"], link["last_job"]
+            if first > last or last > manifest_jobs or last - first + 1 < negotiated:
+                raise ScenarioSpecError(
+                    f"$.workload.receipt_gate.links[{index}]: range must contain at least "
+                    "one negotiated window within the manifest"
+                )
+            ranges_by_client[client_name].append((first, last))
+            windows_by_client[client_name] += negotiated
+            windows_by_worker[worker_name] += negotiated
+
+        expected_pairs = {
+            (client_name, worker_name)
+            for client_name in selected_clients
+            for worker_name in selected_workers
+        }
+        if seen_pairs != expected_pairs:
+            raise ScenarioSpecError(
+                "$.workload.receipt_gate.links: must cover every selected C/F relationship exactly once"
+            )
+
+        for client_name, ranges in ranges_by_client.items():
+            ordered = sorted(ranges)
+            cursor = 1
+            for first, last in ordered:
+                if first != cursor:
+                    raise ScenarioSpecError(
+                        f"$.workload.receipt_gate.links: {client_name} job ranges must be "
+                        "contiguous, disjoint, and cover the full manifest"
+                    )
+                cursor = last + 1
+            if cursor - 1 != manifest_jobs:
+                raise ScenarioSpecError(
+                    f"$.workload.receipt_gate.links: {client_name} ranges do not cover "
+                    "the full manifest"
+                )
+        for client_name, total in windows_by_client.items():
+            if workload["jobs"] < total:
+                raise ScenarioSpecError(
+                    f"$.workload.jobs: concurrency must cover all receipt windows for {client_name}"
+                )
+        for worker_name, total in windows_by_worker.items():
+            if int(by_name[worker_name].get("slots", 0)) < total:
+                raise ScenarioSpecError(
+                    f"$.instances.{worker_name}.slots: must cover the aggregate receipt windows "
+                    "assigned to this F worker"
+                )
 
 
 def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
@@ -506,7 +585,14 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
     if is_receipt_window:
         if "receipt_gate" not in workload:
             raise ScenarioSpecError("$.workload.receipt_gate: required for receipt-window driver")
-        _validate_p51_receipt_window(value, workload, role_instances)
+        manifest_jobs = (
+            int(corpus["tus"])
+            * int(corpus.get("repeat", 1))
+            * int(workload["repeat"])
+        )
+        _validate_p51_receipt_window(
+            value, workload, role_instances, manifest_jobs=manifest_jobs
+        )
     elif "receipt_gate" in workload:
         raise ScenarioSpecError("$.workload.receipt_gate: valid only for receipt-window driver")
     allowed_turns = {"A"} if "manifest" in corpus else {"A", "B"}

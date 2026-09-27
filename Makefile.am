@@ -19,6 +19,7 @@ EXTRA_DIST = README.md \
 	tools/__init__.py \
 	tools/p50_regenerate_paired_corpus.py \
 	PROJECT_STATE.md \
+	doc/p50-transfer-concurrency.md \
 	research/README.md \
 	pytest.ini \
 	research/reports/BENCH \

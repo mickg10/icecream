@@ -1364,6 +1364,21 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
                 " epoch=" + std::to_string(link_state->relationship_epoch) +
                 " generation=" + std::to_string(
                     link_state->physical_link_generation);
+            const std::string scoped_identity =
+                "c_store=" + id_hex(link_state->c_store_guid) +
+                " c_store_generation=" + std::to_string(link_state->c_store_generation) +
+                " f_store=" + id_hex(link_state->f_store_guid) +
+                " f_store_generation=" + std::to_string(link_state->f_store_generation) +
+                " relationship=" + id_hex(link_state->relationship_id) +
+                " reservation=" + id_hex(link_state->reservation_id) +
+                " epoch=" + std::to_string(link_state->relationship_epoch) +
+                " generation=" + std::to_string(link_state->physical_link_generation) +
+                " profile=" + std::to_string(static_cast<unsigned>(link_state->profile)) +
+                " window=" + std::to_string(link_state->window) + "\n";
+            if (!p51_gate_write_marker(
+                    control_dir + "/identity-" + std::to_string(stage),
+                    scoped_identity))
+                return false;
         }
         summary += "\n";
         if (last - first + 1 != expected || !p51_gate_write_marker(

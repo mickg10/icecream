@@ -168,7 +168,22 @@
             "binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "expected_commits": {"type": "integer", "minimum": 1, "maximum": 30},
             "negotiated_window": {"type": "integer", "minimum": 1, "maximum": 30},
-            "expect_observed": {"type": "boolean"}
+            "expect_observed": {"type": "boolean"},
+            "links": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["client", "worker", "first_job", "last_job"],
+                "properties": {
+                  "client": {"$ref": "#/$defs/name"},
+                  "worker": {"$ref": "#/$defs/name"},
+                  "first_job": {"type": "integer", "minimum": 1},
+                  "last_job": {"type": "integer", "minimum": 1}
+                }
+              }
+            }
           }
         },
         "oracle": {"const": "local-sha"},

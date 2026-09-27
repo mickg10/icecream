@@ -39,6 +39,7 @@ farmharness/integration/mutants/scheduler-tail.patch
 farmharness/integration/netem.py
 farmharness/integration/performance.py
 farmharness/integration/r2_wire_trace.py
+farmharness/integration/receipt_window_matrix.py
 farmharness/integration/remote.py
 farmharness/integration/report.py
 farmharness/integration/retry_decision.py
@@ -99,6 +100,7 @@ farmharness/integration/scenarios/S80-zstd-tu.json
 farmharness/integration/scenarios/S90-revision-refusal-retry.json
 farmharness/integration/scenarios/S90-revision-skew.json
 farmharness/integration/scenarios/S95-cache-disk-full.json
+farmharness/integration/scenarios/p51-receipt-window-matrix.template.json
 farmharness/integration/schema_validation.py
 farmharness/integration/schemas/farm-v1.json
 farmharness/integration/schemas/scenario-v1.json

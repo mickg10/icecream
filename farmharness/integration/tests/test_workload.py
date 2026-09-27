@@ -36,6 +36,10 @@ from farmharness.integration.workload import (
     _d18_concurrent_witness,
     _driver_command,
     _parse_summary,
+    _p51_check_held_marker,
+    _p51_check_scoped_identity_marker,
+    _p51_link_output_check_argv,
+    _p51_require_sibling_held,
     _run_d18_preparation,
     _strict_p50_required,
     run_workload,
@@ -50,8 +54,519 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "24712cbf0acce5ac976acbfad357a4b79ad32446ee6f8bd169f9ea2cb5e5b1da"
+        "ef38b3316a7b8bd40b4fc9dd76a4e1b175df02d0b75989d00ac30a6642ad91c8"
     )
+
+
+def test_p51_shell_route_mapping_is_exact_in_child_bash() -> None:
+    match = re.search(
+        r"(?ms)^p51_expected_worker\(\) \{.*?^\}", MANIFEST_DRIVER
+    )
+    assert match is not None
+    prefix = match.group(0)
+    good = subprocess.run(
+        ["/bin/bash", "-c", prefix + '\np51_link_map="1-2=F1,3-5=F2"; p51_expected_worker 4'],
+        text=True, capture_output=True, check=False,
+    )
+    assert good.returncode == 0
+    assert good.stdout == "F2"
+    named_worker = subprocess.run(
+        ["/bin/bash", "-c", prefix + '\np51_link_map="1-2=F_R1,3-5=F_R2"; p51_expected_worker 2'],
+        text=True, capture_output=True, check=False,
+    )
+    assert named_worker.returncode == 0
+    assert named_worker.stdout == "F_R1"
+    exported_child = subprocess.run(
+        [
+            "/bin/bash", "-c",
+            prefix + '\np51_link_map="1-2=F_R1,3-5=F_R2"; '
+            'export p51_link_map; export -f p51_expected_worker; '
+            '/bin/bash -c "p51_expected_worker 4"',
+        ],
+        text=True, capture_output=True, check=False,
+    )
+    assert exported_child.returncode == 0
+    assert exported_child.stdout == "F_R2"
+    for link_map in ("1-3=F1,3-5=F2", "1-2=F1,4-5=F2", "1-2=F1,bad"):
+        overlap_or_hole = subprocess.run(
+            ["/bin/bash", "-c", prefix + f'\np51_link_map="{link_map}"; p51_expected_worker 3'],
+            text=True, capture_output=True, check=False,
+        )
+        assert overlap_or_hole.returncode != 0
+    assert "export -f read_boundary_release p51_expected_worker compile_one" in MANIFEST_DRIVER
+
+
+@pytest.mark.parametrize(
+    ("window", "jobs", "concurrency", "routes"),
+    [
+        (1, 31, 2, "1-16=F1,17-31=F2"),
+        (30, 62, 60, "1-31=F1,32-62=F2"),
+    ],
+)
+def test_multilink_dispatch_prefills_each_gate_before_suffix_jobs(
+    tmp_path: Path, window: int, jobs: int, concurrency: int, routes: str,
+) -> None:
+    match = re.search(
+        r"(?ms)^    python3 - \"\$worklist\" \"\$dispatch_worklist\" "
+        r"\"\$expected_jobs\" \"\$jobs\" \\\n        \"\$p51_link_window\" "
+        r"\"\$p51_link_map\" <<'PY'\n(.*?)\nPY$",
+        MANIFEST_DRIVER,
+    )
+    assert match is not None
+    source = tmp_path / "worklist.bin"
+    destination = tmp_path / "dispatch.bin"
+    records = [
+        "\0".join((str(ordinal), "A", "1", f"TU/{ordinal:03d}.cpp", "a" * 64)) + "\0"
+        for ordinal in range(1, jobs + 1)
+    ]
+    source.write_bytes("".join(records).encode())
+    completed = subprocess.run(
+        [
+            sys.executable, "-c", match.group(1), str(source), str(destination),
+            str(jobs), str(concurrency), str(window), routes,
+        ],
+        text=True, capture_output=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert f"initial={2 * window} jobs={jobs}" in completed.stdout
+    fields = destination.read_bytes().split(b"\0")
+    assert fields[-1] == b""
+    dispatched = [
+        fields[index:index + 5]
+        for index in range(0, len(fields) - 1, 5)
+    ]
+    ordinals = [int(row[0]) for row in dispatched]
+    assert len(ordinals) == jobs and len(set(ordinals)) == jobs
+    route_by_ordinal = {
+        **{index: "F1" for index in range(1, 17 if window == 1 else 32)},
+        **{index: "F2" for index in range(17 if window == 1 else 32, jobs + 1)},
+    }
+    first_wave = ordinals[: 2 * window]
+    assert sum(route_by_ordinal[index] == "F1" for index in first_wave) == window
+    assert sum(route_by_ordinal[index] == "F2" for index in first_wave) == window
+    assert ordinals[2 * window:] == sorted(ordinals[2 * window:])
+    if window == 30:
+        undersized = subprocess.run(
+            [
+                sys.executable, "-c", match.group(1), str(source), str(destination),
+                str(jobs), str(concurrency - 1), str(window), routes,
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        assert undersized.returncode != 0
+
+
+def test_multilink_dispatch_validation_failure_never_runs_xargs(
+    tmp_path: Path,
+) -> None:
+    start = MANIFEST_DRIVER.index("dispatch_worklist=$worklist")
+    end = MANIFEST_DRIVER.index("\nxargs -0 -n 5", start)
+    dispatch_shell = MANIFEST_DRIVER[start:end]
+    source = tmp_path / "worklist.bin"
+    destination = tmp_path / "dispatch.bin"
+    source.write_bytes(
+        b"".join(
+            b"\0".join(
+                (str(ordinal).encode(), b"A", b"1", f"TU/{ordinal}.cpp".encode(), b"digest")
+            ) + b"\0"
+            for ordinal in range(1, 5)
+        )
+    )
+    destination.write_bytes(b"preexisting-dispatch\n")
+    xargs_marker = tmp_path / "xargs-invoked"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").write_text(
+        f"#!/bin/sh\nexec {sys.executable} \"$@\"\n", encoding="utf-8"
+    )
+    (bin_dir / "xargs").write_text(
+        "#!/bin/sh\nprintf invoked > \"$XARGS_MARKER\"\n", encoding="utf-8"
+    )
+    (bin_dir / "python3").chmod(0o755)
+    (bin_dir / "xargs").chmod(0o755)
+    script = f'''set +e
+worklist={source}
+dispatch_worklist={destination}
+result_root={tmp_path}
+expected_jobs=4
+jobs=2
+p51_link_window=1
+p51_link_map=1-1=F1,3-4=F2
+export PATH={bin_dir}:"$PATH"
+export XARGS_MARKER={xargs_marker}
+{dispatch_shell}
+xargs -0 -n 5 /bin/bash -c 'echo compile' fixture <"$dispatch_worklist"
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", script], text=True, capture_output=True, check=False
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "dispatch-worklist validation failed" in result.stderr
+    assert not xargs_marker.exists(), "invalid worklist must never start compiler jobs"
+    assert destination.read_bytes() == b"preexisting-dispatch\n"
+
+
+def test_multilink_receipt_markers_keep_scoped_identity_and_sibling_hold() -> None:
+    held = (
+        "count=30 first_ordinal=1 last_ordinal=30 profile=3 window=30 "
+        f"relationship={'a' * 32} reservation={'b' * 32} epoch=8 generation=2\n"
+    )
+    parsed = _p51_check_held_marker(
+        held, expected=30, profile="ZSTD_ROUTE", negotiated_window=30
+    )
+    identity = (
+        f"c_store={'c' * 32} c_store_generation=4 "
+        f"f_store={'d' * 32} f_store_generation=7 "
+        f"relationship={'a' * 32} reservation={'b' * 32} "
+        "epoch=8 generation=2 profile=3 window=30\n"
+    )
+    assert _p51_check_scoped_identity_marker(identity, parsed)["f_store_generation"] == 7
+    with pytest.raises(WorkloadError, match="scoped identity"):
+        _p51_check_scoped_identity_marker(identity.replace("window=30", "window=1"), parsed)
+    with pytest.raises(WorkloadError, match="scoped identity"):
+        _p51_check_scoped_identity_marker(
+            identity.replace(f"relationship={'a' * 32}", f"relationship={'e' * 32}"),
+            parsed,
+        )
+
+    _p51_require_sibling_held(
+        gate_done=False, released_marker=None, exit_marker=None, outputs_complete=False
+    )
+    for state in (
+        {"gate_done": True},
+        {"released_marker": "present"},
+        {"exit_marker": "present"},
+        {"outputs_complete": True},
+    ):
+        args = {
+            "gate_done": False, "released_marker": None,
+            "exit_marker": None, "outputs_complete": False,
+        }
+        args.update(state)
+        with pytest.raises(WorkloadError, match="sibling"):
+            _p51_require_sibling_held(**args)
+
+
+def test_multilink_output_checker_rejects_an_actual_wrong_worker_row(tmp_path: Path) -> None:
+    result = tmp_path / "jobs" / "000001" / "result.tsv"
+    result.parent.mkdir(parents=True)
+    fields = ["field"] * 13
+    fields[5] = "F_WRONG"
+    fields[8] = "0"
+    fields[11] = "1"
+    fields[12] = "1"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    argv = _p51_link_output_check_argv(
+        "C1", 1, 1, "F_R1", "A"
+    )
+    command = list(argv)
+    command[4] = str(tmp_path)
+    rejected = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert rejected.returncode != 0
+
+    fields[5] = "F_R1"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    accepted = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert accepted.returncode == 0
+    assert "P51_LINK_OUTPUTS_OK client=C1 worker=F_R1 first=1 last=1" in accepted.stdout
+
+
+def _multilink_orchestrator_fixture(topology: str):
+    clients_count, workers_count = (1, 2) if topology == "C1F2" else (2, 1)
+    names_c = [f"C{i + 1}" for i in range(clients_count)]
+    names_f = [f"F{i + 1}" for i in range(workers_count)]
+    instances = [
+        {"role": "S", "name": "S", "env": {"ICECC_P50_PROFILE": "P29V1"}}
+    ]
+    instances += [
+        {"role": "C", "name": name, "host": "host"} for name in names_c
+    ]
+    instances += [
+        {"role": "F", "name": name, "address": f"10.0.0.{i + 2}", "slots": 1}
+        for i, name in enumerate(names_f)
+    ]
+    links = []
+    if topology == "C1F2":
+        links = [
+            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 2},
+            {"client": "C1", "worker": "F2", "first_job": 3, "last_job": 4},
+        ]
+        instances[-2]["slots"] = instances[-1]["slots"] = 1
+        jobs, tus = 4, 4
+    else:
+        links = [
+            {"client": name, "worker": "F1", "first_job": 1, "last_job": 2}
+            for name in names_c
+        ]
+        instances[-1]["slots"] = 2
+        jobs, tus = 2, 2
+    scenario = SimpleNamespace(data={
+        "workload": {
+            "corpus": "tiny", "repeat": 1, "jobs": jobs, "clients": names_c,
+            "turns": ["A"],
+            "receipt_gate": {
+                "links": links, "expected_commits": 1,
+                "negotiated_window": 1, "expect_observed": True,
+                "command_timeout_s": 1,
+            },
+        },
+        "instances": instances,
+        "timeouts": {"turn_s": 1},
+    })
+    clients = [{"role": "C", "name": name, "host": "host"} for name in names_c]
+    plan = {
+        "topology": {"instances": instances},
+        "ports": {"instances": {name: 23003 + i for i, name in enumerate(names_f)}},
+        "p51_receipt_gate": {
+            "container_path": "/results/p50daemonpositive", "binary_sha256": "a" * 64,
+        },
+        "run_id": "multilink-test",
+    }
+    farm = SimpleNamespace(
+        data={"corpora": {"tiny": {"tus": tus, "repeat": 1}}},
+    )
+    return farm, scenario, plan, clients
+
+
+@pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
+def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
+    monkeypatch: pytest.MonkeyPatch, topology: str,
+) -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture(topology)
+    links = scenario.data["workload"]["receipt_gate"]["links"]
+    releases: set[tuple[str, str]] = set()
+    finishes: set[tuple[str, str]] = set()
+    gate_calls: list[tuple[str, str]] = []
+    output_checks: list[tuple[str, str, bool]] = []
+    gate_events = {
+        (link["client"], link["worker"]): threading.Event() for link in links
+    }
+    gate_held = {
+        (link["client"], link["worker"]): threading.Event() for link in links
+    }
+    def gate_call(_farm, _plan, client, _factory, _transport, phase, argv, **_kw):
+        client_name = client["name"]
+        gate_calls.append((client_name, phase))
+        if phase == "verify-staged-helper":
+            return CommandResult(0, "a" * 64 + "\n", "")
+        if phase == "sidecar-uid":
+            return CommandResult(0, "65534\n", "")
+        if phase.startswith("release-"):
+            # Worker names in fixtures are simple F1/F2; extract from link table.
+            worker = next(
+                item["worker"] for item in links
+                if item["client"] == client_name and phase.endswith(item["worker"])
+            )
+            key = (client_name, worker)
+            releases.add(key)
+        if phase == "finish-link-gate" or phase.startswith("cleanup-"):
+            for link in links:
+                if link["client"] == client_name:
+                    finishes.add((client_name, link["worker"]))
+                    gate_events[(client_name, link["worker"])].set()
+        if phase.startswith("verify-sibling-still-held-"):
+            worker = phase.rsplit("-", 1)[1]
+            key = (client_name, worker)
+            released = int(key in releases)
+            exited = int(gate_events[key].is_set())
+            return CommandResult(
+                0, f"held=1 released={released} exited={exited}\n", ""
+            )
+        return CommandResult(0, "", "")
+
+    class Factory:
+        def make(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+    class Transport:
+        def invoke(self, command):
+            phase = command.phase
+            if ".start-gate." in phase:
+                link = next(
+                    item for item in links
+                    if f".{item['client']}.{item['worker']}" in phase
+                )
+                key = (link["client"], link["worker"])
+                gate_held[key].set()
+                gate_events[key].wait(timeout=3)
+                return CommandResult(
+                    0,
+                    "",
+                    "P51_RECEIPT_GATE_NEGOTIATED profile=1 window=1 epoch=1 generation=1\n",
+                )
+            if phase.startswith("run.p51-receipt-window.check-link-output."):
+                _, client_name, worker = phase.rsplit(".", 2)
+                key = (client_name, worker)
+                output_checks.append((client_name, worker, key in releases))
+                if key not in releases:
+                    return CommandResult(1, "", "not released")
+                return CommandResult(0, "P51_LINK_OUTPUTS_OK\n", "")
+            if phase.startswith("run.p51-receipt-window.probe-sibling-output."):
+                _, client_name, worker = phase.rsplit(".", 2)
+                output_checks.append((client_name, worker, False))
+                return CommandResult(1, "", "sibling output incomplete")
+            if phase.startswith("driver-"):
+                return CommandResult(0, "synthetic summary", "")
+            raise AssertionError(f"unexpected transport command {phase}")
+
+    def driver_command(_farm, _scenario, _plan, client, _turn, _factory, **_kwargs):
+        return SimpleNamespace(phase=f"driver-{client['name']}")
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", lambda *_a, **_k: None)
+    monkeypatch.setattr(workload_module, "_driver_command", driver_command)
+    monkeypatch.setattr(workload_module, "_parse_summary", lambda _r, name: {
+        "client": name, "jobs": scenario.data["workload"]["jobs"], "failures": 0,
+    })
+    monkeypatch.setattr(workload_module, "_docker_transport", lambda *_a, **_k: "docker")
+    monkeypatch.setattr(workload_module, "docker_argv", lambda _f, _h, argv: tuple(argv))
+    def link_ids(marker: str):
+        for index, link in enumerate(links, start=1):
+            link_dir = f"/{link['client']}-{link['worker']}/"
+            if link_dir in marker:
+                client_index = int(link["client"][1:])
+                worker_index = int(link["worker"][1:])
+                return (
+                    link, f"{client_index:032x}", f"{100 + worker_index:032x}",
+                    f"{200 + index:032x}", f"{300 + index:032x}",
+                )
+        raise AssertionError(f"marker has no route identity: {marker}")
+
+    def wait_marker(_farm, _plan, client, _factory, _transport, marker, **_kwargs):
+        if marker.endswith("/ready"):
+            return "ready\n"
+        if marker.endswith("/held-1"):
+            link, _c_guid, _f_guid, relationship, reservation = link_ids(marker)
+            key = (link["client"], link["worker"])
+            if key not in gate_held or not gate_held[key].wait(timeout=1):
+                return None
+            return (
+                "count=1 first_ordinal=1 last_ordinal=1 profile=1 window=1 "
+                f"relationship={relationship} reservation={reservation} epoch=1 generation=1\n"
+            )
+        if marker.endswith("/identity-1"):
+            _link, c_guid, f_guid, relationship, reservation = link_ids(marker)
+            return (
+                f"c_store={c_guid} c_store_generation=1 f_store={f_guid} "
+                f"f_store_generation=1 relationship={relationship} reservation={reservation} "
+                "epoch=1 generation=1 profile=1 window=1\n"
+            )
+        return "released\n" if marker.endswith("/released-1") else "0\n" if marker.endswith("/exit") else None
+
+    monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
+    clock = [0.0]
+    monkeypatch.setattr(workload_module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0],
+        sleep=lambda duration: clock.__setitem__(0, clock[0] + max(1.0, duration)),
+    ))
+
+    summaries, evidence = workload_module._run_p51_receipt_window_multilink(
+        farm, scenario, plan, clients, Factory(), Transport(), "A"
+    )
+    assert len(summaries) == len(clients)
+    assert len(evidence["links"]) == len(links)
+    assert len(evidence["release_order_output_progress"]) == len(links)
+    assert releases == set(gate_events)
+    assert all(gate_held[key].is_set() for key in gate_held)
+    assert finishes == set(gate_events)
+    assert all(done for _, _, done in output_checks if done)
+    assert any(not done for _, _, done in output_checks)
+    assert evidence["restart_extension"] == "pending-not-run"
+
+
+@pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
+@pytest.mark.parametrize(
+    "failure", ["misrouted-output", "early-gate-exit", "duplicate-identity"]
+)
+def test_multilink_receipt_orchestrator_rejects_failure_and_cleans_owned_processes(
+    monkeypatch: pytest.MonkeyPatch, topology: str, failure: str,
+) -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture(topology)
+    links = scenario.data["workload"]["receipt_gate"]["links"]
+    releases: set[tuple[str, str]] = set()
+    cleanup: list[tuple[str, str]] = []
+    kill_clients: list[str] = []
+    gate_events = {(row["client"], row["worker"]): threading.Event() for row in links}
+
+    def gate_call(_farm, _plan, client, _factory, _transport, phase, _argv, **_kw):
+        if phase == "verify-staged-helper":
+            return CommandResult(0, "a" * 64 + "\n", "")
+        if phase == "sidecar-uid":
+            return CommandResult(0, "65534\n", "")
+        if phase.startswith(("cleanup-", "abort-")) or phase in ("finish-link-gate",):
+            cleanup.append((client["name"], phase))
+            for row in links:
+                if row["client"] == client["name"]:
+                    gate_events[(row["client"], row["worker"])].set()
+        return CommandResult(0, "held=1 released=0 exited=0\n" if phase.startswith("verify-sibling") else "", "")
+
+    class Factory:
+        def make(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+    class Transport:
+        def invoke(self, command):
+            if command.phase.startswith("run.p51-receipt-window.start-gate."):
+                if failure == "early-gate-exit":
+                    return CommandResult(1, "", "forced helper failure")
+                client_name, worker = command.phase.rsplit(".", 2)[-2:]
+                gate_events[(client_name, worker)].wait(timeout=2)
+                return CommandResult(0, "", "P51_RECEIPT_GATE_NEGOTIATED profile=1 window=1 epoch=1 generation=1")
+            if command.phase.startswith("run.p51-receipt-window.check-link-output."):
+                client_name, worker = command.phase.rsplit(".", 2)[-2:]
+                releases.add((client_name, worker))
+                return CommandResult(1, "", "result.tsv worker mismatch")
+            if command.phase.startswith("run.p51-receipt-window.probe-sibling-output."):
+                return CommandResult(1, "", "still held")
+            if command.phase.startswith("driver-"):
+                return CommandResult(0, "synthetic summary", "")
+            if command.argv[:1] == ("kill",):
+                kill_clients.append(command.instance)
+                return CommandResult(0, "", "")
+            raise AssertionError(f"unexpected transport command {command.phase}")
+
+    def driver_command(_farm, _scenario, _plan, client, _turn, _factory, **_kwargs):
+        return SimpleNamespace(phase=f"driver-{client['name']}")
+
+    def wait_marker(_farm, _plan, client, _factory, _transport, marker, **_kwargs):
+        if failure == "early-gate-exit" and marker.endswith("/held-1"):
+            return None
+        if marker.endswith("/ready"):
+            return "ready\n"
+        if marker.endswith("/held-1"):
+            return (
+                "count=1 first_ordinal=1 last_ordinal=1 profile=1 window=1 "
+                f"relationship={'a' * 32} reservation={'b' * 32} epoch=1 generation=1\n"
+            )
+        if marker.endswith("/identity-1"):
+            return (
+                f"c_store={'c' * 32} c_store_generation=1 f_store={'d' * 32} "
+                f"f_store_generation=1 relationship={'a' * 32} reservation={'b' * 32} "
+                "epoch=1 generation=1 profile=1 window=1\n"
+            )
+        return "released\n" if marker.endswith("/released-1") else None
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", lambda *_a, **_k: None)
+    monkeypatch.setattr(workload_module, "_driver_command", driver_command)
+    monkeypatch.setattr(workload_module, "_parse_summary", lambda _r, name: {
+        "client": name, "jobs": scenario.data["workload"]["jobs"], "failures": 0,
+    })
+    monkeypatch.setattr(workload_module, "_docker_transport", lambda *_a, **_k: "docker")
+    monkeypatch.setattr(workload_module, "docker_argv", lambda _f, _h, argv: tuple(argv))
+    monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
+    clock = [0.0]
+    monkeypatch.setattr(workload_module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0],
+        sleep=lambda duration: clock.__setitem__(0, clock[0] + max(1.0, duration)),
+    ))
+
+    with pytest.raises(WorkloadError):
+        workload_module._run_p51_receipt_window_multilink(
+            farm, scenario, plan, clients, Factory(), Transport(), "A"
+        )
+    assert len(kill_clients) == len(clients)
+    assert {name for name, _phase in cleanup} == {row["client"] for row in links}
 
 
 def test_d18_overlap_requires_exact_persistent_worker_process_sets() -> None:

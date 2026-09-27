@@ -1102,6 +1102,8 @@ def build_plan(
                 "expected_commits": scenario.data["workload"]["receipt_gate"]["expected_commits"],
                 "negotiated_window": scenario.data["workload"]["receipt_gate"]["negotiated_window"],
                 "expect_observed": scenario.data["workload"]["receipt_gate"]["expect_observed"],
+                **({"links": scenario.data["workload"]["receipt_gate"]["links"]}
+                   if "links" in scenario.data["workload"]["receipt_gate"] else {}),
             }
         } if scenario.data["workload"]["driver"] == "p51-receipt-window" else {}),
         "network_shaping": {

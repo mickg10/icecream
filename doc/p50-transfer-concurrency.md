@@ -1265,6 +1265,38 @@ name. Publish code only after the mandatory gate; preserve Stage A evidence
 as evidence for Stage A. Roll out R2/W1, then W2/4/8/16/30 with an explicit
 legacy opt-out. Do not create a release tag or overwrite the release branch.
 
+#### External multi-link receipt-window scenarios
+
+The portable topology matrix template is
+`farmharness/integration/scenarios/p51-receipt-window-matrix.template.json`.
+Materialize its 36 base scenarios (six required one-to-many/many-to-one
+topologies × W1/W30 × all three profiles) with:
+
+```sh
+ICEFARM_TMPDIR=/approved/scratch sh dev/python.sh \
+  farmharness/integration/receipt_window_matrix.py \
+  --farm /approved/farm.json \
+  --base farmharness/integration/scenarios/S00-smoke.json \
+  --helper /approved/build/unittests/p50daemonpositive \
+  --output-dir /approved/scenarios/p51-receipt-matrix
+```
+
+The generator requires each topology in the supplied farm authority and
+validates every emitted scenario. Each C's entire manifest ordinal range is
+explicitly assigned to exactly one C→F relationship; `ICECC_PREFERRED_HOST`
+is checked against the actual remote assignment and local fallback is rejected.
+For one-C/many-F runs, separate destination-specific copies of the existing
+receipt helper gate that C namespace. The harness releases one relationship at
+a time, checks its exact output range, and verifies unreleased siblings remain
+held. Store GUIDs/generations, relationship/reservation identity, profile,
+window, epoch and physical generation are retained per link; numeric IDs are
+not treated as globally unique across independent C stores. F slot requests
+sum the windows assigned to that F, while each C's driver concurrency covers
+its assigned windows. The generator only prepares base receipt cases;
+restart-under-load remains explicitly pending and requires its own measured
+phase. The existing singleton W1 negative control is not changed by this
+matrix.
+
 ## 10. Full Chromium corpus without unbounded resource use
 
 ### 10.1 Define and pin the deliverable

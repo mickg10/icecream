@@ -1,0 +1,14 @@
+{
+  "schema": "icefarm-p51-receipt-matrix-v1",
+  "profiles": ["P29V1", "ZSTD_TU", "ZSTD_ROUTE"],
+  "windows": [1, 30],
+  "topologies": [
+    {"id": "C1F2", "clients": 1, "workers": 2},
+    {"id": "C1F3", "clients": 1, "workers": 3},
+    {"id": "C1F4", "clients": 1, "workers": 4},
+    {"id": "C2F1", "clients": 2, "workers": 1},
+    {"id": "C3F1", "clients": 3, "workers": 1},
+    {"id": "C4F1", "clients": 4, "workers": 1}
+  ],
+  "restart_extension": "pending-not-run"
+}
