@@ -3222,6 +3222,7 @@ struct P50ServerEndpoint::Impl {
         bool p51_managed = false;
         Id128 p51_relationship_id{};
         uint64_t p51_relationship_epoch = 0;
+        std::optional<Digest128> p51_initial_offer_identity;
         Digest128 c_system_source_fingerprint{};
         Digest128 f_system_source_fingerprint{};
         bool system_source_reuse = false;
@@ -4151,6 +4152,7 @@ struct P50ServerEndpoint::Impl {
             Route{.nonce = reset.history_nonce,
                             .next_rel = RelSeq{0},
                             .state = reset.initial_state_digest,
+                            .p51_initial_offer_identity = std::nullopt,
                             .c_system_source_fingerprint =
                                 session.candidate_c_fingerprint,
                             .f_system_source_fingerprint =
@@ -4697,6 +4699,13 @@ void require_outbound_profile_negotiated(uint32_t negotiated_profiles,
                                          const TxBegin& begin) {
     if ((negotiated_profiles & profile_bit(begin.profile)) == 0)
         throw std::logic_error("C selected a profile outside the negotiated mask");
+}
+
+Digest128 initial_link_offer_identity(LinkHello hello) {
+    // A response-loss retry is the same Initial offer on a new physical
+    // incarnation. Bind every immutable field, excluding only that number.
+    hello.physical_link_generation = 1;
+    return compute_r2_link_offer_digest(hello);
 }
 
 P50ClientEndpoint::P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> preparation,
@@ -7070,9 +7079,34 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 throw std::invalid_argument(
                     "R2 reconnect does not match retained relationship history");
         }
-        if (!link_lease->reconnect && staged.route_present)
-            throw std::invalid_argument(
-                "R2 initial link requires fresh history; recovery is not enabled");
+        bool retrying_empty_initial = false;
+        const auto initial_namespace = impl_->namespaces.find(hello.c_store_guid);
+        const auto* initial_route =
+            initial_namespace == impl_->namespaces.end()
+                ? nullptr
+                : impl_->find_route(initial_namespace->second, hello.profile);
+        if (!link_lease->reconnect &&
+            (staged.route_present || initial_route != nullptr)) {
+            const Digest128 offered_identity =
+                initial_link_offer_identity(hello);
+            if (!staged.route_present || initial_route == nullptr ||
+                !initial_route->p51_managed ||
+                initial_route->p51_relationship_id != hello.relationship_id ||
+                initial_route->p51_relationship_epoch !=
+                    link_lease->relationship_epoch ||
+                !initial_route->p51_initial_offer_identity ||
+                *initial_route->p51_initial_offer_identity != offered_identity ||
+                initial_route->nonce != hello.history_nonce ||
+                initial_route->next_rel.value != 0 ||
+                initial_route->state != initial_route_digest(
+                    hello.c_store_guid, hello.history_nonce) ||
+                initial_route->last_commit || initial_route->interrupted ||
+                initial_route->recovery_install || initial_route->pending ||
+                initial_route->codec_history_reset_required)
+                throw std::invalid_argument(
+                    "R2 initial retry does not match an empty retained route");
+            retrying_empty_initial = true;
+        }
         if (link_lease->reconnect && !staged.namespace_present)
             throw std::invalid_argument(
                 "R2 recovery requires the retained F namespace");
@@ -7107,7 +7141,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
                 throw std::logic_error(
                     "F retained pending decode work after link replacement");
         }
-        if (!link_lease->reconnect) {
+        if (!link_lease->reconnect && !retrying_empty_initial) {
             const HistoryReset initial{
                 hello.history_nonce,
                 initial_route_digest(hello.c_store_guid, hello.history_nonce)};
@@ -7117,9 +7151,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_r2_connected(
             route.p51_managed = true;
             route.p51_relationship_id = hello.relationship_id;
             route.p51_relationship_epoch = link_lease->relationship_epoch;
+            route.p51_initial_offer_identity =
+                initial_link_offer_identity(hello);
         }
         SessionState route_state = impl_->session_state(session, selection);
-        if (link_lease->reconnect) {
+        if (link_lease->reconnect || retrying_empty_initial) {
             const auto name_space = impl_->namespaces.find(hello.c_store_guid);
             const auto* retained_route = name_space == impl_->namespaces.end()
                 ? nullptr : impl_->find_route(name_space->second, hello.profile);

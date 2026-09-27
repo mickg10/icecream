@@ -12099,6 +12099,19 @@ void test_p51_reservation_profile_mask_mapping() {
         });
         CHECK(link_lease.has_value());
 
+        LinkHello initial_retry = hello;
+        ++initial_retry.physical_link_generation;
+        P51SourceLinkLookupResult retry_lookup;
+        runtime.run_owner_callback_for_test([&] {
+            runtime.release_p51_link_on_owner(hello);
+            retry_lookup = runtime.lookup_p51_link_reservation_on_owner(
+                initial_retry);
+        });
+        CHECK(retry_lookup.status == P51SourceLinkLookupStatus::Found);
+        CHECK(retry_lookup.lease.has_value());
+        CHECK(retry_lookup.lease->initial_armed == *result.armed);
+        hello = initial_retry;
+
         JobBind binding = test_p51_job_binding(
             *result.armed, hello.physical_link_generation, 1, 84 + index,
             "profile-mask-binding");
@@ -12118,6 +12131,99 @@ void test_p51_reservation_profile_mask_mapping() {
         CHECK(consumed.has_value());
     }
     std::puts("P51_RESERVATION_OWNER profile-mask-mapping/all-three: ok");
+}
+
+void test_p51_cancelled_empty_relationship_rearms_new_epoch() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 0x4f;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[15] = 0x50;
+    const CStoreGuid remote_c = c_store_guid_for_root(remote_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    service::SidecarRuntime runtime(std::move(config));
+
+    auto expired_request = test_p51_reservation_request(
+        remote_c, 91, launch.identity.generation, launch.identity.attempt,
+        9101, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(2));
+    const auto expired_result = runtime.reserve_p51_source_on_owner(
+        expired_request);
+    CHECK(expired_result.error_code == 0 && expired_result.armed.has_value());
+    const P51SourceArmedFields old_armed = *expired_result.armed;
+    StoreIdentityRoot sibling_root{};
+    sibling_root.bytes[15] = 0x51;
+    const CStoreGuid sibling_c = c_store_guid_for_root(sibling_root);
+    auto sibling_request = test_p51_reservation_request(
+        sibling_c, 92, launch.identity.generation, launch.identity.attempt,
+        9201, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(2));
+    const auto sibling_result = runtime.reserve_p51_source_on_owner(
+        sibling_request);
+    CHECK(sibling_result.error_code == 0 && sibling_result.armed.has_value());
+    const P51SourceArmedFields sibling_armed = *sibling_result.armed;
+
+    // A second live reservation means the old empty relationship is not
+    // eligible for retirement. Cancel it exactly before canceling the
+    // original ARM; no wall-clock expiry race is needed for this unit gate.
+    auto concurrent_request = test_p51_reservation_request(
+        remote_c, 91, launch.identity.generation, launch.identity.attempt,
+        9102, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(2));
+    const auto concurrent_result = runtime.reserve_p51_source_on_owner(
+        concurrent_request);
+    CHECK(concurrent_result.error_code == 0 &&
+          concurrent_result.armed.has_value());
+    CHECK(concurrent_result.armed->logical_relationship_id ==
+          old_armed.logical_relationship_id);
+    CHECK(concurrent_result.armed->relationship_epoch ==
+          old_armed.relationship_epoch);
+    CHECK(runtime.cancel_p51_source_on_owner(
+        concurrent_request.arm, concurrent_result.armed->reservation_id,
+        concurrent_request.absolute_deadline.as_steady_time_point()));
+    LinkHello old_initial = test_p51_link_hello(
+        old_armed, 701, HistoryNonce{0x910001});
+    runtime.run_owner_callback_for_test([&] {
+        const auto lookup =
+            runtime.lookup_p51_link_reservation_on_owner(old_initial);
+        CHECK(lookup.status == P51SourceLinkLookupStatus::Found &&
+              lookup.lease.has_value());
+        runtime.release_p51_link_on_owner(old_initial);
+    });
+    CHECK(runtime.cancel_p51_source_on_owner(
+        expired_request.arm, old_armed.reservation_id,
+        expired_request.absolute_deadline.as_steady_time_point()));
+
+    auto fresh_request = test_p51_reservation_request(
+        remote_c, 91, launch.identity.generation, launch.identity.attempt,
+        9103, CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(2));
+    const auto fresh_result = runtime.reserve_p51_source_on_owner(fresh_request);
+    CHECK(fresh_result.error_code == 0 && fresh_result.armed.has_value());
+    CHECK(fresh_result.armed->f_store_guid == old_armed.f_store_guid);
+    CHECK(fresh_result.armed->f_store_generation ==
+          old_armed.f_store_generation);
+    CHECK(fresh_result.armed->logical_relationship_id !=
+          old_armed.logical_relationship_id);
+    CHECK(fresh_result.armed->relationship_epoch > old_armed.relationship_epoch);
+    CHECK(fresh_result.armed->arm == fresh_request.arm);
+    CHECK(fresh_result.armed->arm.source.c_store_guid == remote_c.bytes);
+    LinkHello fresh_initial = test_p51_link_hello(
+        *fresh_result.armed, 702, HistoryNonce{0x910002});
+    runtime.run_owner_callback_for_test([&] {
+        const auto lookup =
+            runtime.lookup_p51_link_reservation_on_owner(fresh_initial);
+        CHECK(lookup.status == P51SourceLinkLookupStatus::Found &&
+              lookup.lease.has_value());
+    });
+    const auto sibling_retry = runtime.reserve_p51_source_on_owner(
+        sibling_request);
+    CHECK(sibling_retry.error_code == 0 && sibling_retry.armed.has_value());
+    CHECK(sibling_retry.armed->logical_relationship_id ==
+          sibling_armed.logical_relationship_id);
+    CHECK(sibling_retry.armed->relationship_epoch ==
+          sibling_armed.relationship_epoch);
+    std::puts("P51_RESERVATION_OWNER cancelled empty relationship/new ID+epoch: ok");
 }
 
 void test_p51_same_f_missing_relationship_reassignment_keeps_sibling() {
@@ -12275,7 +12381,9 @@ void test_p51_same_f_missing_relationship_reassignment_keeps_sibling() {
 
 void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
     bool established_link_reconnect = false,
-    bool interleaved_trace_only = false) {
+    bool interleaved_trace_only = false,
+    bool terminal_initial_cut = false,
+    bool cancel_initial_cut = false) {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x5b;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
@@ -12305,6 +12413,7 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
     const int listener = loopback_listener(port);
     std::atomic<bool> stopping{false};
     std::atomic<unsigned> accepted{0};
+    std::atomic<bool> close_initial_link_state{false};
     std::thread accept_thread([&] {
         while (!stopping.load(std::memory_order_acquire)) {
             pollfd ready{listener, POLLIN, 0};
@@ -12327,7 +12436,10 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                 // its fixture transport exactly as it was before adding the
                 // SidecarRuntime sender branch below.
                 accepted.fetch_add(1, std::memory_order_relaxed);
-                server.start_adopted_r2_endpoint(fd);
+                EndpointIoControl control;
+                if (close_initial_link_state.load(std::memory_order_acquire))
+                    control.close_before_write = MessageType::LINK_STATE;
+                server.start_adopted_r2_endpoint(fd, std::move(control));
                 continue;
             }
             // A production SidecarRuntime sender first negotiates the public
@@ -12383,7 +12495,10 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
             if (adopted_fd < 0)
                 continue;
             accepted.fetch_add(1, std::memory_order_relaxed);
-            server.start_adopted_r2_endpoint(adopted_fd);
+            EndpointIoControl control;
+            if (close_initial_link_state.load(std::memory_order_acquire))
+                control.close_before_write = MessageType::LINK_STATE;
+            server.start_adopted_r2_endpoint(adopted_fd, std::move(control));
         }
     });
 
@@ -12640,25 +12755,34 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
         }
         completion(fd);
     };
-    auto transfer = [&](P50CRouteOwner& route_owner,
-                        const CStoreGuid& c_guid,
-                        const P51SourceArmedFields& armed,
-                        const std::string& bytes) {
+    auto transfer_async = [&](P50CRouteOwner& route_owner,
+                              const CStoreGuid& c_guid,
+                              const P51SourceArmedFields& armed,
+                              const std::string& bytes,
+                              std::chrono::steady_clock::duration timeout,
+                              std::shared_ptr<P51RequestCancellation> cancellation) {
         const auto& source = armed.arm.source;
         const P50RouteRelationship relationship{
             c_guid, FStoreGuid{armed.f_store_guid},
             armed.f_store_generation, ProfileId::ZSTD_TU};
         const PrepareRequestKey request{source.assignment_epoch,
                                         source.assignment_nonce};
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(8);
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
         const auto raw = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
         return boost::asio::co_spawn(
             c_context,
             route_owner.transfer_p51(relationship, armed, connector,
-                                     request, deadline, raw),
-            boost::asio::use_future).get();
+                                     request, deadline, raw,
+                                     std::move(cancellation)),
+            boost::asio::use_future);
+    };
+    auto transfer = [&](P50CRouteOwner& route_owner,
+                        const CStoreGuid& c_guid,
+                        const P51SourceArmedFields& armed,
+                        const std::string& bytes) {
+        return transfer_async(route_owner, c_guid, armed, bytes,
+                              std::chrono::seconds(8), {}).get();
     };
 
     const auto [old_request, old_armed] = reserve(old_c, 91, 9101);
@@ -12673,6 +12797,8 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
               icecc::digest128(std::string_view(sibling_first)));
 
     uint64_t old_link_generation = 1;
+    bool initial_cut_rearm_case = false;
+    unsigned initial_cut_status = 0;
     if (established_link_reconnect) {
         const std::string old_first = "int established_old_link = 5;\n";
         const auto old_first_result =
@@ -12809,6 +12935,63 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                   compute_r2_link_offer_digest(stale_reconnect));
         CHECK(::shutdown(stale_fd, SHUT_RDWR) == 0);
         CHECK(::close(stale_fd) == 0);
+    } else if (terminal_initial_cut || cancel_initial_cut) {
+        CHECK(terminal_initial_cut != cancel_initial_cut);
+        const std::string abandoned_bytes =
+            "int initial_handshake_never_bound = 17;\n";
+        auto cancellation = std::make_shared<P51RequestCancellation>();
+        close_initial_link_state.store(true, std::memory_order_release);
+        auto abandoned = transfer_async(
+            old_owner, old_c, old_armed, abandoned_bytes,
+            cancel_initial_cut ? std::chrono::seconds(4)
+                               : std::chrono::milliseconds(350),
+            cancel_initial_cut ? cancellation : nullptr);
+        if (cancel_initial_cut) {
+            const auto accept_deadline = std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < accept_deadline &&
+                   accepted.load(std::memory_order_acquire) < 2)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            CHECK(accepted.load(std::memory_order_acquire) >= 2);
+            CHECK(cancellation->request_cancel());
+        }
+        CHECK(abandoned.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        const auto abandoned_result = abandoned.get();
+        close_initial_link_state.store(false, std::memory_order_release);
+        CHECK(abandoned_result.replacement_required);
+        CHECK(abandoned_result.route_local_failure);
+        CHECK(!abandoned_result.committed_input);
+        if (cancel_initial_cut) {
+            CHECK(abandoned_result.raw_bytes == abandoned_bytes.size() &&
+                  abandoned_result.raw_digest ==
+                      icecc::digest128(std::string_view(abandoned_bytes)));
+        } else {
+            CHECK(abandoned_result.raw_bytes == 0 &&
+                  abandoned_result.raw_digest == Digest128{});
+        }
+        CHECK(abandoned_result.status ==
+              (cancel_initial_cut ? ZstdSourceTransferStatus::Cancelled
+                                  : ZstdSourceTransferStatus::DeadlineExceeded));
+        initial_cut_rearm_case = true;
+        initial_cut_status = static_cast<unsigned>(abandoned_result.status);
+        CHECK(server.cancel_p51_source_on_owner(
+            old_request.arm, old_armed.reservation_id,
+            old_request.absolute_deadline.as_steady_time_point()));
+
+        // Terminal pre-LINK_STATE state is sticky only for the abandoned
+        // relationship. A queued retry of that exact old assignment must not
+        // reconnect, poison its sibling, or enter RECOVER without saved state.
+        const unsigned accepted_before_old_retry =
+            accepted.load(std::memory_order_acquire);
+        const auto old_retry = transfer(
+            old_owner, old_c, old_armed, abandoned_bytes);
+        CHECK(old_retry.replacement_required && old_retry.route_local_failure &&
+              old_retry.status != ZstdSourceTransferStatus::Committed &&
+              !old_retry.committed_input &&
+              accepted.load(std::memory_order_acquire) ==
+                  accepted_before_old_retry);
+
     } else {
         CHECK(server.cancel_p51_source_on_owner(
             old_request.arm, old_armed.reservation_id,
@@ -12844,13 +13027,49 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
               !stale_result.replacement_required);
     }
 
-    const auto [fresh_request, fresh_armed] = reserve(old_c, 91, 9102);
-    (void)fresh_request;
-    CHECK(fresh_armed.logical_relationship_id !=
+    local::P51SourceReservationRequest fresh_request;
+    std::optional<P51SourceArmedFields> fresh_armed;
+    if (initial_cut_rearm_case) {
+        fresh_request = test_p51_reservation_request(
+            old_c, 91, 71, 1, 9102, CACHE_PROFILE_ZSTD_TU, 30,
+            std::chrono::seconds(20));
+        fresh_request.arm.source.selected_f_host = "127.0.0.1";
+        fresh_request.arm.source.selected_f_cache_port = port;
+        fresh_request.arm.source.assignment_nonce = 9102;
+        const auto fresh_deadline =
+            fresh_request.absolute_deadline.as_steady_time_point();
+        while (std::chrono::steady_clock::now() < fresh_deadline) {
+            const auto fresh_reservation =
+                server.reserve_p51_source_on_owner(fresh_request);
+            if (fresh_reservation.armed) {
+                if (fresh_reservation.armed->logical_relationship_id !=
+                    old_armed.logical_relationship_id) {
+                    fresh_armed = *fresh_reservation.armed;
+                    break;
+                }
+                // Do not leave a transient successor reservation on the old
+                // row while the original endpoint session is quiescing: it
+                // would itself block the exact-empty-route retirement guard.
+                CHECK(server.cancel_p51_source_on_owner(
+                    fresh_request.arm,
+                    fresh_reservation.armed->reservation_id,
+                    fresh_deadline));
+                continue;
+            }
+            CHECK(fresh_reservation.error_code == 0x5103);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(fresh_armed.has_value());
+    } else {
+        auto reserved = reserve(old_c, 91, 9102);
+        fresh_request = std::move(reserved.first);
+        fresh_armed = std::move(reserved.second);
+    }
+    CHECK(fresh_armed->logical_relationship_id !=
               old_armed.logical_relationship_id &&
-          fresh_armed.relationship_epoch > old_armed.relationship_epoch);
+          fresh_armed->relationship_epoch > old_armed.relationship_epoch);
     const std::string fresh_bytes = "int fresh_same_f_assignment = 7;\n";
-    const auto fresh_result = transfer(old_owner, old_c, fresh_armed, fresh_bytes);
+    const auto fresh_result = transfer(old_owner, old_c, *fresh_armed, fresh_bytes);
     std::fprintf(stderr,
                  "same-F fresh result status=%u reject=%u reason=%u bytes=%llu "
                  "replacement=%u local=%u attempts=%u accepted=%u\n",
@@ -12868,6 +13087,15 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
           fresh_result.raw_bytes == fresh_bytes.size() &&
           fresh_result.raw_digest ==
               icecc::digest128(std::string_view(fresh_bytes)));
+    if (initial_cut_rearm_case) {
+        std::fprintf(stderr,
+                     "P51_R2_INITIAL_CUT_REARM cancel=%u status=%u accepted=%u "
+                     "route_local=1 fresh_id=1 fresh_epoch=%llu exact=1 PASS\n",
+                     cancel_initial_cut, initial_cut_status,
+                     accepted.load(std::memory_order_acquire),
+                     static_cast<unsigned long long>(
+                         fresh_armed->relationship_epoch));
+    }
 
     auto sibling_next = reserve(sibling_c, 92, 9202);
     CHECK(sibling_next.second.logical_relationship_id ==
@@ -12897,8 +13125,11 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
     c_retired.get();
     c_work.reset();
     cleanup.reset();
-    CHECK(accepted.load(std::memory_order_relaxed) ==
-          (established_link_reconnect ? 4u : 3u));
+    if (terminal_initial_cut || cancel_initial_cut)
+        CHECK(accepted.load(std::memory_order_relaxed) >= 3);
+    else
+        CHECK(accepted.load(std::memory_order_relaxed) ==
+              (established_link_reconnect ? 4u : 3u));
     std::puts(established_link_reconnect
                   ? "P51_R2_SERVICE established same-F reconnect/missing/reassignment/sibling: ok"
                   : "P51_R2_SERVICE same-F actual sender transfer/missing/reassignment/sibling: ok");
@@ -17291,6 +17522,24 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--same-f-initial-cut-rearm") == 0) {
+            test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+                false, false, true, false);
+            test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+                false, false, false, true);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--initial-link-retry-anchor") == 0) {
+            test_p51_reservation_profile_mask_mapping();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--cancelled-empty-relationship-rearm") == 0) {
+            test_p51_cancelled_empty_relationship_rearms_new_epoch();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--r2-trace-two-c-interleaved") == 0) {
             test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                 false, true);
@@ -17681,10 +17930,15 @@ int main(int argc, char** argv) {
         test_p51_interrupted_reservation_relationship_isolation(true);
         test_p51_reservation_expiry_before_bind_no_late_arm();
         test_p51_reservation_profile_mask_mapping();
+        test_p51_cancelled_empty_relationship_rearms_new_epoch();
         test_replacement_trigger_latches_once_and_is_opt_in();
         test_p51_same_f_missing_relationship_reassignment_keeps_sibling();
         test_p51_same_f_missing_real_sender_transfer_keeps_sibling();
         test_p51_same_f_missing_real_sender_transfer_keeps_sibling(true);
+        test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+            false, false, true, false);
+        test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+            false, false, false, true);
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_source_connect_protocol_slice_retries_before_arm();

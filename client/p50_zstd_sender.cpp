@@ -343,6 +343,10 @@ struct P50ZstdSourceSender::Impl {
         ZstdSourceTransferStatus status) noexcept {
         ZstdSourceTransferResult result = replacement(status, true);
         result.replacement_trigger = route_replacement_trigger;
+        // A failed initial handshake before LINK_STATE has not bound or
+        // published any TU. Quarantine only this exact relationship so the
+        // route owner can keep healthy siblings and install a fresh ARM.
+        result.route_local_failure = r2_initial_handshake_failed;
         std::lock_guard lock(r2_transfer_mutex);
         if (r2_terminal_rejection) {
             result.status = ZstdSourceTransferStatus::TerminalError;
@@ -724,6 +728,7 @@ struct P50ZstdSourceSender::Impl {
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
     bool route_replacement_required = false;
+    bool r2_initial_handshake_failed = false;
     ReplacementTrigger route_replacement_trigger =
         ReplacementTrigger::Unattributed;
     bool route_transport_quarantined = false;
@@ -2474,6 +2479,41 @@ P50ZstdSourceSender::transfer_p51_route(
         impl_->collect_r2_link_intervals(result);
         return result;
     };
+    auto cancel_initial_handshake = [&]() {
+        try {
+            if (impl_->authority->contains(prepared))
+                impl_->authority->cancel_unwritten_tail(prepared);
+        } catch (...) {
+        }
+        std::optional<R2WireLinkIdentity> retired;
+        {
+            std::lock_guard lock(impl_->r2_transfer_mutex);
+            retired = impl_->r2_active_socket_link;
+            impl_->r2_recovery_required = false;
+            impl_->r2_initial_handshake_failed = true;
+            impl_->route_replacement_trigger =
+                ReplacementTrigger::UnexpectedTransferException;
+            impl_->route_replacement_required = true;
+            impl_->route_transport_quarantined = true;
+        }
+        if (impl_->r2_socket) {
+            boost::system::error_code ignored;
+            impl_->r2_socket->close(ignored);
+            impl_->r2_socket.reset();
+        }
+        if (retired && impl_->r2_retirement_tracking_enabled())
+            impl_->emit_r2_physical_retirement(*retired);
+        ZstdSourceTransferResult cancelled =
+            impl_->invalid(ZstdSourceTransferStatus::Cancelled);
+        impl_->require_replacement(
+            cancelled, true, ReplacementTrigger::UnexpectedTransferException);
+        cancelled.route_local_failure = true;
+        cancelled.profile = binding.profile;
+        cancelled.raw_bytes = binding.raw_bytes;
+        cancelled.raw_digest = binding.raw_digest;
+        return cancelled;
+    };
+    std::optional<ZstdSourceTransferResult> cancelled_initial_handshake;
     try {
         if (impl_->route_replacement_required)
             co_return impl_->r2_route_replacement_result(
@@ -2484,66 +2524,129 @@ P50ZstdSourceSender::transfer_p51_route(
              impl_->r2_relationship_epoch != hello.relationship_epoch))
             throw std::invalid_argument("R2 relationship changed on retained socket");
         if (!impl_->r2_socket) {
-            int fd = -1;
             for (;;) {
-                if (!co_await wait_for_r2_connect_retry(deadline))
-                    throw boost::system::system_error(
-                        Clock::now() >= deadline
-                            ? boost::asio::error::timed_out
-                            : boost::asio::error::operation_aborted);
-                if (impl_->route_replacement_required)
-                    throw boost::system::system_error(
-                        boost::asio::error::operation_aborted);
-                fd = co_await await_connected_fd(connection, deadline);
-                if (fd >= 0) {
-                    if (impl_->route_replacement_required ||
-                        Clock::now() >= deadline) {
-                        (void)::close(fd);
-                        throw boost::system::system_error(
-                            impl_->route_replacement_required
-                                ? boost::asio::error::operation_aborted
-                                : boost::asio::error::timed_out);
+                int fd = -1;
+                for (;;) {
+                    if (cancellation && cancellation->state() ==
+                            P51RequestCancellation::State::Cancelled) {
+                        auto cancelled = cancel_initial_handshake();
+                        co_return finish_wire_accounting(
+                            std::move(cancelled), pending);
                     }
-                    connector_succeeded = true;
-                    break;
+                    if (!co_await wait_for_r2_connect_retry(deadline))
+                        throw boost::system::system_error(
+                            Clock::now() >= deadline
+                                ? boost::asio::error::timed_out
+                                : boost::asio::error::operation_aborted);
+                    if (cancellation && cancellation->state() ==
+                            P51RequestCancellation::State::Cancelled) {
+                        auto cancelled = cancel_initial_handshake();
+                        co_return finish_wire_accounting(
+                            std::move(cancelled), pending);
+                    }
+                    if (impl_->route_replacement_required)
+                        throw boost::system::system_error(
+                            boost::asio::error::operation_aborted);
+                    fd = co_await await_connected_fd(connection, deadline);
+                    if (fd >= 0) {
+                        if (impl_->route_replacement_required ||
+                            Clock::now() >= deadline) {
+                            (void)::close(fd);
+                            throw boost::system::system_error(
+                                impl_->route_replacement_required
+                                    ? boost::asio::error::operation_aborted
+                                    : boost::asio::error::timed_out);
+                        }
+                        connector_succeeded = true;
+                        break;
+                    }
+                    if (cancellation && cancellation->state() ==
+                            P51RequestCancellation::State::Cancelled) {
+                        auto cancelled = cancel_initial_handshake();
+                        co_return finish_wire_accounting(
+                            std::move(cancelled), pending);
+                    }
+                    if (Clock::now() >= deadline)
+                        throw boost::system::system_error(
+                            boost::asio::error::timed_out);
+                    // No connected socket means LINK_HELLO cannot have
+                    // escaped. Retry the connector with the same ARM and
+                    // immutable source deadline.
+                    impl_->note_r2_recovery_failure();
                 }
-                if (Clock::now() >= deadline)
-                    throw boost::system::system_error(
-                        boost::asio::error::timed_out);
-                // No LINK_HELLO escaped and no F state exists yet. Retry the
-                // connector under this same writer lease and absolute job
-                // deadline; do not invoke RECOVER or ask the authority to
-                // prepare another TU. The shared timer/backoff is also woken
-                // by retire_for_replacement().
-                impl_->note_r2_recovery_failure();
+                boost::system::error_code error;
+                auto socket = P50ClientEndpoint::adopt_connected_fd(
+                    executor, fd, error);
+                if (!socket) {
+                    if (!impl_->route_replacement_required)
+                        impl_->route_replacement_trigger =
+                            ReplacementTrigger::UnexpectedTransferException;
+                    impl_->route_replacement_required = true;
+                    impl_->wake_r2_completed_capacity_waiters();
+                    throw std::runtime_error("R2 link socket adoption failed");
+                }
+                impl_->r2_socket = std::move(*socket);
+                if (impl_->r2_retirement_tracking_enabled()) {
+                    std::lock_guard lock(impl_->r2_transfer_mutex);
+                    impl_->r2_active_socket_link =
+                        Impl::interval_identity(hello);
+                }
+                impl_->r2_physical_link_generation = physical_link_generation;
+                impl_->r2_attempted_physical_generation =
+                    std::max(impl_->r2_attempted_physical_generation,
+                             physical_link_generation);
+                impl_->r2_relationship_id = hello.relationship_id;
+                impl_->r2_relationship_epoch = hello.relationship_epoch;
+                impl_->r2_attempted_offer = hello;
+                try {
+                    const LinkState state = co_await impl_->endpoint->open_r2_link(
+                        *impl_->r2_socket, hello, deadline);
+                    if (state.f_store_guid != hello.f_store_guid ||
+                        state.f_store_generation != hello.f_store_generation)
+                        throw std::invalid_argument(
+                            "R2 F identity differs from ARMED");
+                    impl_->r2_hello = hello;
+                    impl_->reset_r2_recovery_backoff();
+                    break;
+                } catch (const boost::system::system_error& error) {
+                    const auto code = error.code();
+                    const bool retryable_cut =
+                        code == boost::asio::error::eof ||
+                        code == boost::asio::error::connection_reset ||
+                        code == boost::asio::error::connection_aborted ||
+                        code == boost::asio::error::broken_pipe;
+                    if (!retryable_cut || Clock::now() >= deadline ||
+                        impl_->route_replacement_required)
+                        throw;
+                    boost::system::error_code ignored;
+                    impl_->r2_socket->close(ignored);
+                    impl_->r2_socket.reset();
+                    if (impl_->r2_retirement_tracking_enabled())
+                        impl_->emit_r2_physical_retirement(
+                            Impl::interval_identity(hello));
+                    if (physical_link_generation ==
+                        std::numeric_limits<uint64_t>::max())
+                        throw std::overflow_error(
+                            "R2 physical generation exhausted before initial retry");
+                    ++physical_link_generation;
+                    binding.physical_link_generation = physical_link_generation;
+                    hello.physical_link_generation = physical_link_generation;
+                    impl_->r2_physical_link_generation =
+                        physical_link_generation;
+                    impl_->r2_attempted_physical_generation =
+                        physical_link_generation;
+                    impl_->r2_attempted_offer = hello;
+                    impl_->note_r2_recovery_failure();
+                    if (cancellation && cancellation->state() ==
+                            P51RequestCancellation::State::Cancelled) {
+                        cancelled_initial_handshake =
+                            cancel_initial_handshake();
+                    }
+                }
+                if (cancelled_initial_handshake)
+                    co_return finish_wire_accounting(
+                        std::move(*cancelled_initial_handshake), pending);
             }
-            boost::system::error_code error;
-            auto socket = P50ClientEndpoint::adopt_connected_fd(executor, fd, error);
-            if (!socket) {
-                if (!impl_->route_replacement_required)
-                    impl_->route_replacement_trigger =
-                        ReplacementTrigger::UnexpectedTransferException;
-                impl_->route_replacement_required = true;
-                impl_->wake_r2_completed_capacity_waiters();
-                throw std::runtime_error("R2 link socket adoption failed");
-            }
-            impl_->r2_socket = std::move(*socket);
-            if (impl_->r2_retirement_tracking_enabled()) {
-                std::lock_guard lock(impl_->r2_transfer_mutex);
-                impl_->r2_active_socket_link =
-                    Impl::interval_identity(hello);
-            }
-            impl_->r2_physical_link_generation = physical_link_generation;
-            impl_->r2_relationship_id = hello.relationship_id;
-            impl_->r2_relationship_epoch = hello.relationship_epoch;
-            impl_->r2_attempted_offer = hello;
-            impl_->reset_r2_recovery_backoff();
-            const LinkState state = co_await impl_->endpoint->open_r2_link(
-                *impl_->r2_socket, hello, deadline);
-            impl_->r2_hello = hello;
-            if (state.f_store_guid != hello.f_store_guid ||
-                state.f_store_generation != hello.f_store_generation)
-                throw std::invalid_argument("R2 F identity differs from ARMED");
         }
 
         // ACK control has priority at every complete-bundle boundary. The F
@@ -2917,15 +3020,32 @@ P50ZstdSourceSender::transfer_p51_route(
                 std::lock_guard lock(impl_->r2_transfer_mutex);
                 if (!terminal_rejection.has_value() &&
                     impl_->r2_physical_link_generation == error_generation) {
-                  impl_->r2_recovery_required = true;
-                  impl_->r2_failed_physical_generation = error_generation;
-                  impl_->r2_recovery_floor = confirmed_floor;
-                  impl_->route_transport_quarantined = true;
+                  if (!impl_->r2_hello && !has_staged_witness) {
+                    // Before the first complete LINK_STATE there is no
+                    // retained client recovery context. Do not leave a
+                    // future caller to enter RECOVER with a fabricated or
+                    // missing hello; require a cold relationship replacement.
+                    impl_->r2_recovery_required = false;
+                    impl_->r2_initial_handshake_failed = true;
+                    impl_->route_replacement_trigger =
+                        ReplacementTrigger::UnexpectedTransferException;
+                    impl_->route_replacement_required = true;
+                    impl_->route_transport_quarantined = true;
+                  } else {
+                    impl_->r2_recovery_required = true;
+                    impl_->r2_failed_physical_generation = error_generation;
+                    impl_->r2_recovery_floor = confirmed_floor;
+                    impl_->route_transport_quarantined = true;
+                  }
                   if (impl_->r2_socket) {
                     boost::system::error_code ignored;
                     impl_->r2_socket->close(ignored);
                   }
                 }
+              }
+              if (impl_->route_replacement_required) {
+                  impl_->wake_r2_recovery_waiters();
+                  impl_->wake_r2_completed_capacity_waiters();
               }
               recovery_needed =
                   !terminal_rejection.has_value() && pending &&
@@ -3115,6 +3235,13 @@ P50ZstdSourceSender::transfer_p51_route(
         rejected.r2_link_rejection = std::move(terminal_rejection);
         co_return finish_wire_accounting(std::move(rejected), pending);
     }
+    if (impl_->route_replacement_required)
+        co_return finish_wire_accounting(
+            impl_->r2_route_replacement_result(
+                Clock::now() >= deadline
+                    ? ZstdSourceTransferStatus::DeadlineExceeded
+                    : ZstdSourceTransferStatus::Unavailable),
+            pending);
     if (auto route_rejection = impl_->current_r2_route_rejection()) {
         ZstdSourceTransferResult rejected =
             impl_->invalid(ZstdSourceTransferStatus::TerminalError);

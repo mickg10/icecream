@@ -4766,16 +4766,50 @@ local::P51SourceReservationResult SidecarRuntime::reserve_p51_source_on_owner(
                     result.error_code = kInvalid;
                     return;
                 }
-                // Profile is fixed for the relationship's physical link. A
-                // drained-link retirement/reset API must explicitly replace
-                // this row before a different profile can be armed.
-                if (relationship->second.profile != profile ||
-                    request.arm.requested_window <
-                        relationship->second.selected_window) {
+                if (prior.profile != profile ||
+                    request.arm.requested_window < prior.selected_window) {
                     result.error_code = kCapacity;
                     return;
                 }
-            } else {
+                // A handshake can be abandoned after F has created the
+                // zero-progress managed route but before C receives a valid
+                // LINK_STATE. Once every reservation is gone and the exact
+                // route is inactive, retire only that empty history before
+                // assigning a fresh logical ID/epoch. Never retire a route
+                // that has advanced, retained receipts, or has live work.
+                bool has_prior_reservation = false;
+                bool anchor_reservation_present = false;
+                for (const auto& [id, row] : p51_source_reservations_) {
+                    if (id == prior.anchor_reservation_id.bytes)
+                        anchor_reservation_present = true;
+                    if (row.armed.logical_relationship_id == prior.logical_id &&
+                        row.armed.relationship_epoch == prior.epoch) {
+                        has_prior_reservation = true;
+                        break;
+                    }
+                }
+                const bool empty_unanchored_route =
+                    prior.next_relationship_ordinal == 1 &&
+                    prior.committed_prefix_k == 0 &&
+                    prior.acknowledged_prefix_q == 0 &&
+                    prior.pending_ordinal == 0 &&
+                    prior.pending_physical_link_generation == 0 &&
+                    prior.outstanding == 0 && !prior.link_active &&
+                    prior.physical_link_generation == 0 && !prior.has_receipts &&
+                    !prior.recovery_context && !prior.last_reset_ack &&
+                    !has_prior_reservation && !anchor_reservation_present;
+                if (empty_unanchored_route && endpoint_ &&
+                    prior.epoch != UINT64_MAX &&
+                    endpoint_->retire_idle_p51_route_history(
+                        c_guid, prior.profile, Id128{prior.logical_id},
+                        prior.epoch)) {
+                    next_p51_relationship_epoch_ = std::max(
+                        next_p51_relationship_epoch_, prior.epoch + 1);
+                    p51_source_relationships_.erase(relationship);
+                    relationship = p51_source_relationships_.end();
+                }
+            }
+            if (relationship == p51_source_relationships_.end()) {
                 if (p51_source_relationships_.size() >=
                     config_.max_route_relationships) {
                     for (auto it = p51_source_relationships_.begin();
@@ -5265,6 +5299,15 @@ SidecarRuntime::lookup_p51_link_reservation_on_owner(
         hello.window != armed.selected_window ||
         hello.f_store_guid.bytes != armed.f_store_guid ||
         hello.f_store_generation != armed.f_store_generation)
+        return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
+    // Once an Initial offer has established the physical relationship anchor,
+    // a zero-progress response-loss retry must use that exact reservation and
+    // ARM. A later reservation cannot impersonate the first offer merely
+    // because no receipt has yet been published.
+    if (relationship != p51_source_relationships_.end() &&
+        relationship->second.highest_physical_link_generation != 0 &&
+        (relationship->second.anchor_reservation_id != hello.reservation_id ||
+         relationship->second.anchor_armed != armed))
         return {P51SourceLinkLookupStatus::Invalid, std::nullopt};
     if (relationship == p51_source_relationships_.end() ||
         relationship->second.logical_id != armed.logical_relationship_id ||

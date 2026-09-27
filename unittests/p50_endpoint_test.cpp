@@ -7078,6 +7078,559 @@ asio::awaitable<void> r2_accept_every_partial_hello(
     final_result = co_await server.run_adopted_r2(std::move(socket));
 }
 
+enum class R2FrameDirection { ClientToF, FToClient };
+
+struct R2FrameCutSpec {
+    MessageType type;
+    size_t occurrence;
+    size_t frame_prefix_bytes;
+    std::string_view label;
+    R2FrameDirection direction = R2FrameDirection::ClientToF;
+};
+
+struct R2ProxyCutResult {
+    MessageType cut_frame_type{};
+    size_t cut_prefix_bytes = 0;
+    size_t cut_frame_bytes = 0;
+};
+
+asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
+    tcp::acceptor& proxy_acceptor, tcp::endpoint f_endpoint,
+    R2FrameCutSpec cut, std::vector<MessageType>& observed_frames,
+    std::vector<MessageType>& fully_forwarded_frames);
+
+asio::awaitable<R2ProxyCutResult> r2_expect_partial_link_state(
+    tcp::endpoint proxy_endpoint, tcp::endpoint remote,
+    tcp::acceptor& proxy_acceptor, P50ClientEndpoint& client,
+    const LinkHello& hello, size_t prefix,
+    std::chrono::steady_clock::time_point deadline) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(proxy_endpoint, asio::use_awaitable);
+    const bool trace = prefix == 0 || (prefix % 32) == 0;
+    if (trace)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << prefix
+                  << " phase=client-connected-to-proxy\n" << std::flush;
+    struct ProxyCompletion {
+        std::vector<MessageType> observed;
+        std::vector<MessageType> forwarded;
+        R2ProxyCutResult result;
+        std::exception_ptr error;
+        bool done = false;
+    };
+    const auto proxy = std::make_shared<ProxyCompletion>();
+    asio::co_spawn(
+        executor,
+        r2_proxy_cut_frame(
+            proxy_acceptor, remote,
+            R2FrameCutSpec{MessageType::LINK_STATE, 0, prefix,
+                           "F-to-C LINK_STATE byte offset",
+                           R2FrameDirection::FToClient},
+            proxy->observed, proxy->forwarded),
+        [proxy](std::exception_ptr error, R2ProxyCutResult observed_cut) {
+            proxy->error = error;
+            if (!error)
+                proxy->result = std::move(observed_cut);
+            proxy->done = true;
+        });
+    bool saw_expected_disconnect = false;
+    if (trace)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << prefix
+                  << " phase=open-link-start\n" << std::flush;
+    try {
+        (void)co_await client.open_r2_link(socket, hello, deadline);
+    } catch (const boost::system::system_error& error) {
+        if (error.code() != asio::error::eof &&
+            error.code() != asio::error::connection_reset) {
+            std::cerr << "D03_LINK_STATE_UNEXPECTED_CLIENT_ERROR prefix="
+                      << prefix << " detail=" << error.what() << '\n'
+                      << std::flush;
+            throw;
+        }
+        saw_expected_disconnect = true;
+    }
+    if (trace)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << prefix
+                  << " phase=client-observed-eof\n" << std::flush;
+    boost::system::error_code ignored;
+    socket.shutdown(tcp::socket::shutdown_both, ignored);
+    socket.close(ignored);
+    asio::steady_timer joined(executor);
+    for (size_t wait = 0; wait != 2000 && !proxy->done; ++wait) {
+        joined.expires_after(std::chrono::milliseconds(1));
+        co_await joined.async_wait(asio::use_awaitable);
+    }
+    if (trace)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << prefix
+                  << " phase=proxy-done=" << proxy->done
+                  << " type=" << static_cast<unsigned>(proxy->result.cut_frame_type)
+                  << " bytes=" << proxy->result.cut_frame_bytes << '\n'
+                  << std::flush;
+    if (proxy->error) {
+        try {
+            std::rethrow_exception(proxy->error);
+        } catch (const std::exception& error) {
+            std::cerr << "D03_LINK_STATE_PROXY_ERROR prefix=" << prefix
+                      << " detail=" << error.what() << " observed=";
+            for (const MessageType type : proxy->observed)
+                std::cerr << static_cast<unsigned>(type) << ',';
+            std::cerr << " forwarded=";
+            for (const MessageType type : proxy->forwarded)
+                std::cerr << static_cast<unsigned>(type) << ',';
+            std::cerr << '\n' << std::flush;
+        }
+        std::rethrow_exception(proxy->error);
+    }
+    require(proxy->done && saw_expected_disconnect &&
+                proxy->result.cut_frame_type == MessageType::LINK_STATE &&
+                proxy->result.cut_prefix_bytes == prefix &&
+                proxy->result.cut_frame_bytes > prefix &&
+                proxy->observed ==
+                    std::vector<MessageType>{MessageType::LINK_STATE} &&
+                proxy->forwarded.empty(),
+            "partial LINK_STATE did not fail before C admission");
+    co_return proxy->result;
+}
+
+asio::awaitable<void> r2_attempt_partial_link_state_retries(
+    tcp::endpoint proxy_endpoint, tcp::endpoint remote,
+    tcp::acceptor& proxy_acceptor, P50ClientEndpoint& client,
+    P50ClientEndpoint& progressed_initial_client,
+    LinkHello hello, JobBind binding, PreparedTuHandle prepared,
+    std::chrono::steady_clock::time_point deadline, bool& final_attempt,
+    bool& changed_offer_attempt,
+    std::vector<size_t>& cut_prefixes, size_t& frame_bytes,
+    LinkState& final_state, ClientRunResult& final_result,
+    bool& progressed_initial_rejected) {
+    size_t generation_delta = 0;
+    hello.physical_link_generation = 81;
+    std::cerr << "D03_LINK_STATE_ATTEMPT prefix=0 generation=81\n" << std::flush;
+    const R2ProxyCutResult zero_cut = co_await r2_expect_partial_link_state(
+        proxy_endpoint, remote, proxy_acceptor, client, hello, 0, deadline);
+    frame_bytes = zero_cut.cut_frame_bytes;
+    cut_prefixes.push_back(0);
+    bool changed_offer_rejected = false;
+    LinkHello changed_offer = hello;
+    changed_offer.physical_link_generation = 82;
+    ++changed_offer.max_output_bytes;
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket changed_socket(executor);
+    changed_offer_attempt = true;
+    co_await changed_socket.async_connect(remote, asio::use_awaitable);
+    try {
+        (void)co_await client.open_r2_link(changed_socket, changed_offer,
+                                           deadline);
+    } catch (const boost::system::system_error& error) {
+        changed_offer_rejected = error.code() == asio::error::eof ||
+            error.code() == asio::error::connection_reset;
+    }
+    boost::system::error_code changed_close_error;
+    changed_socket.close(changed_close_error);
+    require(changed_offer_rejected,
+            "empty-route Initial retry accepted a changed immutable offer");
+    generation_delta = 1;
+    for (size_t prefix = 1; prefix < frame_bytes; ++prefix) {
+        hello.physical_link_generation = 81 + ++generation_delta;
+        if ((prefix % 32) == 0)
+            std::cerr << "D03_LINK_STATE_ATTEMPT prefix=" << prefix
+                      << " generation=" << hello.physical_link_generation
+                      << '\n' << std::flush;
+        const R2ProxyCutResult cut = co_await r2_expect_partial_link_state(
+            proxy_endpoint, remote, proxy_acceptor, client, hello, prefix,
+            deadline);
+        require(cut.cut_frame_bytes == frame_bytes,
+                "LINK_STATE frame size changed across exact retries");
+        cut_prefixes.push_back(prefix);
+    }
+    hello.physical_link_generation = 82 + frame_bytes;
+    binding.physical_link_generation = hello.physical_link_generation;
+    final_attempt = true;
+    tcp::socket final_socket(executor);
+    co_await final_socket.async_connect(remote, asio::use_awaitable);
+    final_state = co_await client.open_r2_link(final_socket, hello, deadline);
+    const R2SentBundle sent = co_await client.write_r2_bundle(
+        final_socket, binding, prepared, deadline);
+    final_result = co_await client.read_r2_receipt(final_socket, sent, deadline);
+    co_await client.write_r2_ack(final_socket, 1, deadline);
+    co_await raw_write(final_socket, Message{CloseMessage{}});
+    boost::system::error_code ignored;
+    final_socket.shutdown(tcp::socket::shutdown_both, ignored);
+    final_socket.close(ignored);
+
+    // Once the route has committed a TU, a later Initial with the same
+    // logical history is not a zero-progress response-loss retry. The F
+    // endpoint must reject it rather than resetting committed route state.
+    LinkHello progressed_initial = hello;
+    ++progressed_initial.physical_link_generation;
+    tcp::socket progressed_socket(executor);
+    co_await progressed_socket.async_connect(remote, asio::use_awaitable);
+    try {
+        (void)co_await progressed_initial_client.open_r2_link(
+            progressed_socket, progressed_initial, deadline);
+    } catch (const boost::system::system_error& error) {
+        progressed_initial_rejected = error.code() == asio::error::eof ||
+            error.code() == asio::error::connection_reset;
+    }
+    progressed_socket.close(ignored);
+}
+
+asio::awaitable<void> r2_accept_partial_link_state_retries(
+    tcp::acceptor& acceptor, P50ServerEndpoint& server,
+    bool& final_attempt, bool& changed_offer_attempt,
+    std::vector<ServerRunStatus>& cut_statuses,
+    ServerRunResult& final_result,
+    ServerRunResult& progressed_initial_result) {
+    const auto executor = co_await asio::this_coro::executor;
+    for (;;) {
+        tcp::socket socket(executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        const bool this_is_final_attempt = final_attempt;
+        const bool this_is_changed_offer = changed_offer_attempt;
+        if (this_is_changed_offer)
+            changed_offer_attempt = false;
+        ServerRunResult result;
+        try {
+            result = co_await server.run_adopted_r2(std::move(socket));
+        } catch (const boost::system::system_error& error) {
+            if (error.code() != asio::error::eof &&
+                error.code() != asio::error::connection_reset)
+                throw;
+            result.status = ServerRunStatus::Disconnected;
+        }
+        if (this_is_final_attempt) {
+            final_result = result;
+            tcp::socket progressed_socket(executor);
+            co_await acceptor.async_accept(progressed_socket, asio::use_awaitable);
+            progressed_initial_result = co_await server.run_adopted_r2(
+                std::move(progressed_socket));
+            co_return;
+        }
+        if (this_is_changed_offer) {
+            require(result.status == ServerRunStatus::TerminalError,
+                    "changed Initial offer was not terminally rejected");
+            continue;
+        }
+        if (result.status != ServerRunStatus::Disconnected) {
+            const std::string detail = result.terminal_error
+                ? result.terminal_error->detail : "no terminal error detail";
+            throw std::runtime_error(
+                "LINK_STATE retry cut server ended with status=" +
+                std::to_string(static_cast<unsigned>(result.status)) +
+                ": " + detail);
+        }
+        cut_statuses.push_back(result.status);
+    }
+}
+
+void test_r2_partial_link_state_exhaustive_offsets() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE}) {
+        const auto started = std::chrono::steady_clock::now();
+        const P5coStoreGuids stores = p5co_store_guids(
+            0xb1 + static_cast<uint64_t>(profile));
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        PreparationAuthorityLimits limits;
+        limits.max_speculative_tus = 1;
+        limits.max_speculative_raw_bytes = 1U << 20;
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            stores.c, caps.zstd, limits, 1, profile);
+        const PreparationRouteKey route{stores.f, 23, profile};
+        const std::string text = "int d03_link_state_cut = 73;\n";
+        const std::vector<uint8_t> input(text.begin(), text.end());
+        const PreparedTuHandle prepared = authority->prepare_for_route(
+            route, PrepareRequestKey{9300, 10300}, input);
+        const PreparedInputPtr retained =
+            P50PreparationAuthorityTestAccess::resolve(*authority, prepared);
+        const P51SourceArmFields arm{
+            r2_test_arm(stores.c, 9300 + static_cast<uint64_t>(profile),
+                        10300 + static_cast<uint32_t>(profile), profile),
+            1};
+        const P51SourceArmedFields armed = r2_test_armed(
+            arm, stores.f, 0xd180 + static_cast<uint64_t>(profile));
+        const auto deadline = r2_test_deadline(std::chrono::seconds(25));
+        LinkHello hello;
+        hello.profile = profile;
+        hello.window = 1;
+        hello.max_frame_payload = kInitialMaxFramePayload;
+        hello.max_raw_bytes = 1U << 20;
+        hello.max_encoded_bytes = 1U << 20;
+        hello.max_output_bytes = 1U << 20;
+        hello.reservation_id = Id128{armed.reservation_id};
+        hello.relationship_id = Id128{armed.logical_relationship_id};
+        hello.relationship_epoch = armed.relationship_epoch;
+        hello.physical_link_generation = 81;
+        hello.c_store_guid = stores.c;
+        hello.c_store_generation = arm.source.c_store_generation;
+        hello.f_store_guid = stores.f;
+        hello.f_store_generation = armed.f_store_generation;
+        hello.c_control_generation = arm.source.c_control_generation;
+        hello.c_control_attempt = arm.source.c_control_attempt;
+        hello.system_source_fingerprint = profile == ProfileId::P29V1
+            ? authority->p29v1_system_source_fingerprint(prepared)
+            : icecc::digest128("D03 partial LINK_STATE");
+        hello.history_nonce = retained->begin.history_nonce;
+        hello.start_mode = LinkStartMode::Initial;
+        JobBind binding;
+        binding.reservation_id = hello.reservation_id;
+        binding.relationship_ordinal = 1;
+        binding.wire_job_id = arm.source.wire_job_id;
+        binding.assignment_epoch = arm.source.assignment_epoch;
+        binding.assignment_nonce = arm.source.assignment_nonce;
+        binding.logical_job = arm.source.logical_job;
+        binding.compiler_attempt = arm.source.compiler_attempt;
+        binding.source_request_id = arm.source.source_request_id;
+        binding.tu_seq = retained->begin.tu_seq;
+        binding.profile = profile;
+        binding.raw_bytes = retained->begin.raw_bytes;
+        binding.raw_digest = retained->begin.raw_digest;
+
+        unsigned link_lookups = 0;
+        uint64_t highest_generation = 0;
+        unsigned job_consumptions = 0;
+        unsigned materializations = 0;
+        unsigned commits = 0;
+        unsigned acknowledgements = 0;
+        P50ServerEndpointConfig config;
+        config.lookup_p51_link_reservation =
+            [&](const LinkHello& observed)
+                -> std::optional<P51SourceLinkLease> {
+            if (observed.start_mode != LinkStartMode::Initial ||
+                observed.reservation_id != hello.reservation_id ||
+                observed.relationship_id != hello.relationship_id ||
+                observed.c_store_guid != stores.c ||
+                observed.f_store_guid != stores.f ||
+                observed.physical_link_generation <= highest_generation)
+                return std::nullopt;
+            highest_generation = observed.physical_link_generation;
+            ++link_lookups;
+            if (link_lookups == 1 || (link_lookups % 32) == 0)
+                std::cerr << "D03_LINK_STATE_PHASE lookup=" << link_lookups
+                          << " generation=" << highest_generation << '\n'
+                          << std::flush;
+            P51SourceLinkLease lease{armed, deadline};
+            lease.relationship_epoch = hello.relationship_epoch;
+            lease.history_nonce = hello.history_nonce;
+            return lease;
+        };
+        config.consume_p51_job_reservation =
+            [&](const LinkHello& observed, const JobBind& offered)
+                -> std::optional<P51SourceJobLease> {
+            JobBind expected_binding = binding;
+            expected_binding.physical_link_generation =
+                observed.physical_link_generation;
+            if (observed.physical_link_generation != highest_generation ||
+                offered.reservation_id != binding.reservation_id ||
+                offered.physical_link_generation !=
+                    observed.physical_link_generation ||
+                offered != expected_binding || job_consumptions != 0)
+                return std::nullopt;
+            ++job_consumptions;
+            P51SourceJobLease lease;
+            lease.armed = armed;
+            lease.absolute_deadline = deadline;
+            lease.binding = offered;
+            lease.binding_digest = compute_r2_binding_digest(offered);
+            lease.input_key = InputRecordKey{stores.c, offered.tu_seq};
+            return lease;
+        };
+        config.input_job_state =
+            [&](CStoreGuid c_guid, const TxBegin&, const TxCommit& commit,
+                std::span<const uint8_t> bytes) {
+            require(c_guid == stores.c && commit.tu_seq == binding.tu_seq &&
+                        commit.raw_digest == icecc::digest128(input) &&
+                        std::ranges::equal(bytes, input),
+                    "LINK_STATE retries changed exact source bytes");
+            ++materializations;
+            return InputJobState::Open;
+        };
+        config.record_p51_job_commit =
+            [&](const LinkHello& observed, const JobBind& offered,
+                const R2TxCommit& commit) {
+            if (observed.physical_link_generation != highest_generation ||
+                offered.physical_link_generation !=
+                    observed.physical_link_generation ||
+                offered.relationship_ordinal != 1 ||
+                offered.reservation_id != binding.reservation_id ||
+                offered.wire_job_id != binding.wire_job_id ||
+                offered.assignment_epoch != binding.assignment_epoch ||
+                offered.assignment_nonce != binding.assignment_nonce ||
+                offered.logical_job != binding.logical_job ||
+                offered.compiler_attempt != binding.compiler_attempt ||
+                offered.source_request_id != binding.source_request_id ||
+                offered.tu_seq != binding.tu_seq ||
+                offered.raw_digest != binding.raw_digest ||
+                offered.profile != profile ||
+                commit.binding_digest != compute_r2_binding_digest(offered) ||
+                commit.inner.raw_digest != binding.raw_digest)
+                return false;
+            ++commits;
+            return true;
+        };
+        config.acknowledge_p51_receipt =
+            [&](const LinkHello& observed, const CommitAck& ack) {
+            if (observed.physical_link_generation != highest_generation ||
+                ack.relationship_id != hello.relationship_id ||
+                ack.relationship_epoch != hello.relationship_epoch ||
+                ack.physical_link_generation !=
+                    observed.physical_link_generation ||
+                ack.contiguous_verified_ordinal != 1)
+                return false;
+            ++acknowledgements;
+            return true;
+        };
+        P50ServerEndpoint server(stores.f, caps, nullptr, nullptr,
+                                 std::move(config));
+        P50ClientEndpoint client(authority, caps, hello.history_nonce,
+                                 nullptr, nullptr, std::nullopt, {}, {}, route);
+        P50ClientEndpoint progressed_initial_client(
+            authority, caps, hello.history_nonce, nullptr, nullptr,
+            std::nullopt, {}, {}, route);
+        asio::io_context context;
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        tcp::acceptor proxy_acceptor(
+            context, {asio::ip::address_v4::loopback(), 0});
+        bool final_attempt = false;
+        bool changed_offer_attempt = false;
+        std::vector<ServerRunStatus> cut_statuses;
+        std::vector<size_t> cut_prefixes;
+        size_t link_state_frame_bytes = 0;
+        ServerRunResult final_server_result;
+        ServerRunResult progressed_initial_server_result;
+        LinkState final_state;
+        ClientRunResult final_client_result;
+        bool progressed_initial_rejected = false;
+        std::exception_ptr server_error;
+        std::exception_ptr client_error;
+        bool server_done = false;
+        bool client_done = false;
+        bool timed_out = false;
+        asio::steady_timer watchdog(context);
+        watchdog.expires_after(std::chrono::seconds(25));
+        watchdog.async_wait([&](const boost::system::error_code& error) {
+            if (!error) {
+                timed_out = true;
+                std::cerr << "D03_LINK_STATE_WATCHDOG profile="
+                          << static_cast<unsigned>(profile)
+                          << " cuts=" << cut_prefixes.size()
+                          << '/' << link_state_frame_bytes
+                          << " server-cuts=" << cut_statuses.size()
+                          << " server-statuses=";
+                for (const ServerRunStatus status : cut_statuses)
+                    std::cerr << static_cast<unsigned>(status) << ',';
+                std::cerr
+                          << " lookups=" << link_lookups
+                          << " highest-generation=" << highest_generation
+                          << " final-attempt=" << final_attempt << '\n'
+                          << std::flush;
+                boost::system::error_code ignored;
+                acceptor.close(ignored);
+                proxy_acceptor.close(ignored);
+                context.stop();
+            }
+        });
+        const auto cancel_watchdog_if_done = [&] {
+            if (server_done && client_done) {
+                boost::system::error_code ignored;
+                watchdog.cancel(ignored);
+            }
+        };
+        asio::co_spawn(
+            context,
+            r2_accept_partial_link_state_retries(
+                acceptor, server, final_attempt, changed_offer_attempt,
+                cut_statuses,
+                final_server_result, progressed_initial_server_result),
+            [&](std::exception_ptr error) {
+                server_error = error;
+                if (error) {
+                    try {
+                        std::rethrow_exception(error);
+                    } catch (const std::exception& detail) {
+                        std::cerr << "D03_LINK_STATE_SERVER_ERROR profile="
+                                  << static_cast<unsigned>(profile)
+                                  << " detail=" << detail.what() << '\n'
+                                  << std::flush;
+                    }
+                }
+                server_done = true;
+                cancel_watchdog_if_done();
+            });
+        asio::co_spawn(
+            context,
+            r2_attempt_partial_link_state_retries(
+                proxy_acceptor.local_endpoint(), acceptor.local_endpoint(),
+                proxy_acceptor, client, progressed_initial_client, hello,
+                binding, prepared,
+                deadline.as_steady_time_point(), final_attempt,
+                changed_offer_attempt, cut_prefixes,
+                link_state_frame_bytes, final_state, final_client_result,
+                progressed_initial_rejected),
+            [&](std::exception_ptr error) {
+                client_error = error;
+                if (error) {
+                    try {
+                        std::rethrow_exception(error);
+                    } catch (const std::exception& detail) {
+                        std::cerr << "D03_LINK_STATE_CLIENT_ERROR profile="
+                                  << static_cast<unsigned>(profile)
+                                  << " detail=" << detail.what() << '\n'
+                                  << std::flush;
+                    }
+                }
+                client_done = true;
+                cancel_watchdog_if_done();
+            });
+        context.run();
+        if (server_error)
+            std::rethrow_exception(server_error);
+        if (client_error)
+            std::rethrow_exception(client_error);
+        require(!timed_out && server_done && client_done,
+                "D03 partial LINK_STATE fixture exceeded watchdog");
+        require(link_state_frame_bytes > 4 &&
+                    cut_prefixes.size() == link_state_frame_bytes &&
+                    cut_prefixes.front() == 0 &&
+                    cut_prefixes.back() == link_state_frame_bytes - 1 &&
+                    cut_statuses.size() == link_state_frame_bytes &&
+                    std::ranges::all_of(cut_statuses, [](ServerRunStatus status) {
+                        return status == ServerRunStatus::Disconnected;
+                    }) &&
+                    final_server_result.status == ServerRunStatus::Completed &&
+                    final_state.physical_link_generation ==
+                        82 + link_state_frame_bytes &&
+                    final_client_result.status == ClientRunStatus::Committed &&
+                    final_client_result.committed_commit &&
+                    final_client_result.committed_commit->raw_digest ==
+                        binding.raw_digest &&
+                    progressed_initial_rejected &&
+                    progressed_initial_server_result.status ==
+                        ServerRunStatus::TerminalError &&
+                    link_lookups == link_state_frame_bytes + 3 &&
+                    highest_generation == 83 + link_state_frame_bytes &&
+                    job_consumptions == 1 && materializations == 1 &&
+                    commits == 1 && acknowledgements == 1,
+                "partial LINK_STATE retries changed admission or job settlement");
+        InputCursor cursor = server.attach_input(
+            InputRecordKey{stores.c, binding.tu_seq});
+        std::vector<uint8_t> attached(input.size());
+        require(cursor && cursor.read(attached) == attached.size() &&
+                    attached == input,
+                "LINK_STATE retry changed exact attached bytes");
+        std::cout << "P51_R2_D03_LINK_STATE_CUTS profile="
+                  << static_cast<unsigned>(profile)
+                  << " prefixes=" << cut_prefixes.size()
+                  << " bytes=" << link_state_frame_bytes
+                  << " generations=" << link_state_frame_bytes + 1
+                  << " exact-one-job: ok elapsed-ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started).count()
+                  << '\n' << std::flush;
+    }
+}
+
 void test_r2_partial_hello_exhaustive_offsets() {
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
@@ -7365,20 +7918,20 @@ asio::awaitable<void> r2_proxy_reverse_frames(
     }
 }
 
-enum class R2FrameDirection { ClientToF, FToClient };
-
-struct R2FrameCutSpec {
-    MessageType type;
-    size_t occurrence;
-    size_t frame_prefix_bytes;
-    std::string_view label;
-    R2FrameDirection direction = R2FrameDirection::ClientToF;
-};
-
-struct R2ProxyCutResult {
-    MessageType cut_frame_type{};
-    size_t cut_prefix_bytes = 0;
-    size_t cut_frame_bytes = 0;
+struct R2ProxySocketCloseGuard {
+    std::shared_ptr<tcp::socket> client;
+    std::shared_ptr<tcp::socket> server;
+    ~R2ProxySocketCloseGuard() {
+        boost::system::error_code ignored;
+        if (client) {
+            client->shutdown(tcp::socket::shutdown_both, ignored);
+            client->close(ignored);
+        }
+        if (server) {
+            server->shutdown(tcp::socket::shutdown_both, ignored);
+            server->close(ignored);
+        }
+    }
 };
 
 const char* r2_cut_message_name(MessageType type) {
@@ -7406,10 +7959,19 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
     R2FrameCutSpec cut, std::vector<MessageType>& observed_frames,
     std::vector<MessageType>& fully_forwarded_frames) {
     const auto executor = co_await asio::this_coro::executor;
+    const bool trace_link_state = cut.type == MessageType::LINK_STATE &&
+        (cut.frame_prefix_bytes <= 1 || (cut.frame_prefix_bytes % 32) == 0);
     auto c_socket = std::make_shared<tcp::socket>(executor);
     co_await proxy_acceptor.async_accept(*c_socket, asio::use_awaitable);
+    if (trace_link_state)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << cut.frame_prefix_bytes
+                  << " phase=proxy-accepted\n" << std::flush;
     auto f_socket = std::make_shared<tcp::socket>(executor);
+    const R2ProxySocketCloseGuard close_guard{c_socket, f_socket};
     co_await f_socket->async_connect(f_endpoint, asio::use_awaitable);
+    if (trace_link_state)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << cut.frame_prefix_bytes
+                  << " phase=proxy-connected-to-F\n" << std::flush;
     const bool client_to_f = cut.direction == R2FrameDirection::ClientToF;
     asio::co_spawn(executor,
                    client_to_f
@@ -7431,12 +7993,15 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
         const bool target = header.type == cut.type &&
                             matching_occurrences++ == cut.occurrence;
         if (target) {
+            if (trace_link_state)
+                std::cerr << "D03_LINK_STATE_PHASE prefix="
+                          << cut.frame_prefix_bytes
+                          << " phase=proxy-read-target-header\n" << std::flush;
             const size_t frame_bytes = header_bytes.size() +
                                        header.payload_bytes;
-            if (cut.frame_prefix_bytes == 0 ||
-                cut.frame_prefix_bytes >= frame_bytes)
+            if (cut.frame_prefix_bytes >= frame_bytes)
                 throw std::logic_error(
-                    "R2 proxy cut must stop inside the selected frame");
+                    "R2 proxy cut must stop before the selected frame ends");
             const size_t header_prefix =
                 std::min(cut.frame_prefix_bytes, header_bytes.size());
             co_await asio::async_write(
@@ -7473,6 +8038,9 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
     c_socket->close(ignored);
     f_socket->shutdown(tcp::socket::shutdown_both, ignored);
     f_socket->close(ignored);
+    if (trace_link_state)
+        std::cerr << "D03_LINK_STATE_PHASE prefix=" << cut.frame_prefix_bytes
+                  << " phase=proxy-closed-links\n" << std::flush;
     co_return result;
 }
 
@@ -10837,6 +11405,11 @@ int main(int argc, char** argv) {
     if (std::getenv("ICECC_P50_R2_D03_HELLO_CUTS_FOCUS") != nullptr) {
         test_r2_partial_hello_exhaustive_offsets();
         std::cout << "p50_endpoint_test: focused D03 HELLO cuts all profiles PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_R2_D03_LINK_STATE_CUTS_FOCUS") != nullptr) {
+        test_r2_partial_link_state_exhaustive_offsets();
+        std::cout << "p50_endpoint_test: focused D03 LINK_STATE cuts all profiles PASS\n";
         return 0;
     }
     if (std::getenv("ICECC_P50_R2_D03_COMMIT_CUTS_FOCUS") != nullptr) {

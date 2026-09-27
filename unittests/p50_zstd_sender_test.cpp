@@ -1270,6 +1270,22 @@ asio::awaitable<ServerRunResult> sender_r2_accept(
                                                std::move(control));
 }
 
+asio::awaitable<std::array<ServerRunResult, 3>>
+sender_r2_accept_initial_retry_triplet(tcp::acceptor& acceptor,
+                                    P50ServerEndpoint& endpoint) {
+    std::array<ServerRunResult, 3> results{};
+    for (size_t index = 0; index != results.size(); ++index) {
+        tcp::socket socket(co_await asio::this_coro::executor);
+        co_await acceptor.async_accept(socket, asio::use_awaitable);
+        EndpointIoControl control;
+        if (index == 0)
+            control.close_before_write = MessageType::LINK_STATE;
+        results[index] = co_await endpoint.run_adopted_r2(
+            std::move(socket), std::move(control));
+    }
+    co_return results;
+}
+
 asio::awaitable<void> sender_r2_accept_after_idle_expiry(
     tcp::acceptor& acceptor, P50ServerEndpoint& endpoint,
     std::atomic<unsigned>& accepted, std::atomic<int>& first_status,
@@ -2002,6 +2018,505 @@ void test_p51_sender_typed_link_rejection_is_terminal_and_exact() {
         CHECK(result.r2_link_rejection->offered.relationship_id ==
               Id128{armed.logical_relationship_id});
     }
+}
+
+void test_p51_sender_retries_lost_initial_link_state_for_all_profiles() {
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE}) {
+        constexpr uint64_t kFirstGeneration = 41;
+        asio::io_context c_context;
+        asio::io_context f_context;
+        tcp::acceptor acceptor(f_context,
+            {asio::ip::address_v4::loopback(), 0});
+        const auto [c_guid, f_guid] = sender_r2_store_guids();
+        const Id128 relationship_id = Id128::from_u64(0x5102);
+        auto armed = sender_r2_armed(
+            sender_r2_arm(c_guid, 0xD031, 0xD032, 1, profile),
+            f_guid, 0xD033, 1);
+        const std::vector<uint8_t> source{
+            'i','n','t',' ','l','o','s','t','_','i','n','i','t','i','a','l',
+            '_','s','t','a','t','e',' ','=',' ','1',';','\n'};
+        const auto clock = sidecar::process_monotonic_clock_identity();
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(8),
+            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline_tp = deadline.as_steady_time_point();
+        const PrepareRequestKey request{
+            armed.arm.source.assignment_epoch,
+            armed.arm.source.assignment_nonce};
+
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        caps.zstd.max_raw_bytes = 1U << 20;
+        caps.zstd.max_encoded_body_bytes = 1U << 20;
+        PreparationAuthorityLimits limits;
+        limits.max_speculative_tus = 1;
+        limits.max_speculative_raw_bytes = 1U << 20;
+        limits.max_live_entries = 4;
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            c_guid, caps.zstd, limits, 1, profile);
+
+        std::mutex observations_mutex;
+        std::vector<LinkHello> offers;
+        std::mutex prior_session_mutex;
+        std::condition_variable prior_session_cv;
+        bool prior_session_terminal_waiting = false;
+        bool release_prior_session = false;
+        std::atomic<bool> prior_session_active{false};
+        std::atomic<bool> second_connect_during_prior_session{false};
+        std::atomic<bool> retirement_busy_once{true};
+        std::atomic<unsigned> bind_count{0};
+        std::atomic<unsigned> commit_count{0};
+        std::atomic<unsigned> ack_count{0};
+        std::atomic<unsigned> input_mismatches{0};
+        P50ServerEndpointConfig server_config;
+        server_config.lookup_p51_link_reservation =
+            [&, deadline](const LinkHello& hello) {
+                if (hello.start_mode != LinkStartMode::Initial ||
+                    hello.profile != profile || hello.window != 1 ||
+                    hello.relationship_id != relationship_id ||
+                    hello.reservation_id != Id128{armed.reservation_id} ||
+                    hello.relationship_epoch != armed.relationship_epoch ||
+                    hello.c_store_guid != c_guid || hello.f_store_guid != f_guid ||
+                    hello.physical_link_generation < kFirstGeneration)
+                    return P51SourceLinkLookupResult{
+                        P51SourceLinkLookupStatus::Invalid, std::nullopt};
+                {
+                    std::lock_guard lock(observations_mutex);
+                    offers.push_back(hello);
+                }
+                if (hello.physical_link_generation == kFirstGeneration + 1 &&
+                    retirement_busy_once.exchange(false,
+                                                  std::memory_order_acq_rel))
+                    return P51SourceLinkLookupResult{
+                        P51SourceLinkLookupStatus::Invalid, std::nullopt};
+                P51SourceLinkLease lease;
+                lease.initial_armed = armed;
+                lease.absolute_deadline = deadline;
+                lease.relationship_epoch = hello.relationship_epoch;
+                lease.history_nonce = hello.history_nonce;
+                return P51SourceLinkLookupResult{
+                    P51SourceLinkLookupStatus::Found, lease};
+            };
+        server_config.consume_p51_job_reservation =
+            [&, deadline](const LinkHello& hello, const JobBind& binding)
+                -> std::optional<P51SourceJobLease> {
+                if (hello.physical_link_generation != kFirstGeneration + 2 ||
+                    binding.physical_link_generation != hello.physical_link_generation ||
+                    binding.profile != profile || binding.tu_seq.value != 0 ||
+                    binding.relationship_ordinal != 1 ||
+                    binding.reservation_id != Id128{armed.reservation_id} ||
+                    binding.raw_bytes != source.size() ||
+                    binding.raw_digest != icecc::digest128(source) ||
+                    bind_count.fetch_add(1, std::memory_order_relaxed) != 0)
+                    return std::nullopt;
+                P51SourceJobLease lease;
+                lease.armed = armed;
+                lease.absolute_deadline = deadline;
+                lease.binding = binding;
+                lease.binding_digest = compute_r2_binding_digest(binding);
+                lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+                return lease;
+            };
+        server_config.input_job_state = [&](CStoreGuid guid, const TxBegin& begin,
+                                            const TxCommit& commit,
+                                            std::span<const uint8_t> bytes) {
+            if (guid != c_guid || begin.profile != profile ||
+                begin.tu_seq.value != 0 ||
+                commit.raw_digest != icecc::digest128(source) ||
+                bytes.size() != source.size() ||
+                !std::equal(bytes.begin(), bytes.end(), source.begin()))
+                input_mismatches.fetch_add(1, std::memory_order_relaxed);
+            return InputJobState::Open;
+        };
+        server_config.record_p51_job_commit =
+            [&](const LinkHello& hello, const JobBind& binding,
+                const R2TxCommit& commit) {
+                if (hello.physical_link_generation != kFirstGeneration + 2 ||
+                    binding.physical_link_generation != hello.physical_link_generation ||
+                    commit.relationship_ordinal != 1 ||
+                    commit.inner.tu_seq.value != 0 ||
+                    commit.inner.raw_digest != icecc::digest128(source))
+                    return false;
+                commit_count.fetch_add(1, std::memory_order_release);
+                return true;
+            };
+        server_config.acknowledge_p51_receipt =
+            [&](const LinkHello& hello, const CommitAck& ack) {
+                if (hello.physical_link_generation != kFirstGeneration + 2 ||
+                    ack.relationship_id != relationship_id ||
+                    ack.physical_link_generation != hello.physical_link_generation ||
+                    ack.contiguous_verified_ordinal != 1)
+                    return false;
+                ack_count.fetch_add(1, std::memory_order_release);
+                {
+                    std::lock_guard lock(prior_session_mutex);
+                }
+                prior_session_cv.notify_all();
+                return true;
+            };
+        server_config.settle_p51_interrupted_job =
+            [](const LinkHello&) { return false; };
+        server_config.on_p51_link_terminal =
+            [&](const LinkHello& hello, const std::optional<JobBind>&) {
+                if (hello.physical_link_generation == kFirstGeneration) {
+                    prior_session_active.store(true, std::memory_order_release);
+                    {
+                        std::lock_guard lock(prior_session_mutex);
+                        prior_session_terminal_waiting = true;
+                    }
+                    prior_session_cv.notify_all();
+                    std::unique_lock lock(prior_session_mutex);
+                    prior_session_cv.wait(lock, [&] {
+                        return release_prior_session;
+                    });
+                    prior_session_active.store(false, std::memory_order_release);
+                }
+            };
+        P50ServerEndpoint server(f_guid, caps, nullptr, nullptr,
+                                 std::move(server_config));
+        auto server_future = asio::co_spawn(
+            f_context, sender_r2_accept_initial_retry_triplet(acceptor, server),
+            asio::use_future);
+
+        ZstdSourceTransferConfig sender_config = config();
+        sender_config.endpoint_caps = caps;
+        sender_config.authority_limits = limits;
+        sender_config.maximum_duration = std::chrono::seconds(8);
+        auto sender = std::make_shared<P50ZstdSourceSender>(
+            authority, PreparationRouteKey{f_guid, 23, profile},
+            request, sender_config);
+        const tcp::endpoint remote = acceptor.local_endpoint();
+        std::atomic<unsigned> connector_calls{0};
+        AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+            const unsigned call = connector_calls.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (call == 2 && prior_session_active.load(std::memory_order_acquire)) {
+                {
+                    std::lock_guard lock(prior_session_mutex);
+                    second_connect_during_prior_session.store(
+                        true, std::memory_order_release);
+                }
+                prior_session_cv.notify_all();
+            }
+            completion(connect_fd(remote));
+        };
+        auto c_work = asio::make_work_guard(c_context);
+        auto transfer = asio::co_spawn(
+            c_context,
+            sender->transfer_p51_route(
+                armed, kFirstGeneration, connector,
+                request, deadline_tp, source),
+            asio::use_future);
+        std::thread c_thread([&] { c_context.run(); });
+        std::thread f_thread([&] { f_context.run(); });
+        struct Cleanup {
+            asio::io_context& c;
+            asio::io_context& f;
+            std::thread& ct;
+            std::thread& ft;
+            std::mutex& session_mutex;
+            std::condition_variable& session_cv;
+            bool& release_session;
+            ~Cleanup() {
+                {
+                    std::lock_guard lock(session_mutex);
+                    release_session = true;
+                }
+                session_cv.notify_all();
+                c.stop();
+                f.stop();
+                if (ct.joinable()) ct.join();
+                if (ft.joinable()) ft.join();
+            }
+        } cleanup{c_context, f_context, c_thread, f_thread,
+                  prior_session_mutex, prior_session_cv, release_prior_session};
+
+        {
+            std::unique_lock lock(prior_session_mutex);
+            CHECK(prior_session_cv.wait_until(lock, deadline_tp, [&] {
+                return prior_session_terminal_waiting &&
+                    second_connect_during_prior_session.load(
+                        std::memory_order_acquire);
+            }));
+            release_prior_session = true;
+        }
+        prior_session_cv.notify_all();
+
+        CHECK(transfer.wait_for(std::chrono::seconds(7)) ==
+              std::future_status::ready);
+        const ZstdSourceTransferResult result = transfer.get();
+        if (result.status != ZstdSourceTransferStatus::Committed) {
+            size_t observed_offers = 0;
+            {
+                std::lock_guard lock(observations_mutex);
+                observed_offers = offers.size();
+            }
+            std::cerr << "initial-link-state retry failed profile="
+                      << static_cast<unsigned>(profile)
+                      << " status=" << static_cast<unsigned>(result.status)
+                      << " connectors=" << connector_calls.load()
+                      << " offers=" << observed_offers
+                      << " binds=" << bind_count.load()
+                      << " commits=" << commit_count.load()
+                      << " acks=" << ack_count.load() << '\n';
+        }
+        CHECK(result.status == ZstdSourceTransferStatus::Committed);
+        CHECK(result.committed_input.has_value());
+        CHECK(result.committed_input->c_store_guid == Id128{c_guid.bytes});
+        CHECK(result.committed_input->tu_seq.value == 0);
+        CHECK(connector_calls.load(std::memory_order_acquire) == 3);
+        CHECK(second_connect_during_prior_session.load(
+            std::memory_order_acquire));
+        CHECK(bind_count.load(std::memory_order_acquire) == 1);
+        CHECK(commit_count.load(std::memory_order_acquire) == 1);
+        {
+            std::unique_lock lock(prior_session_mutex);
+            CHECK(prior_session_cv.wait_until(lock, deadline_tp, [&] {
+                return ack_count.load(std::memory_order_acquire) == 1;
+            }));
+        }
+        CHECK(ack_count.load(std::memory_order_acquire) == 1);
+        CHECK(input_mismatches.load(std::memory_order_relaxed) == 0);
+        {
+            std::lock_guard lock(observations_mutex);
+            CHECK(offers.size() == 3);
+            CHECK(offers[0].physical_link_generation == kFirstGeneration);
+            CHECK(offers[1].physical_link_generation == kFirstGeneration + 1);
+            CHECK(offers[2].physical_link_generation == kFirstGeneration + 2);
+            LinkHello first = offers[0];
+            LinkHello second = offers[1];
+            LinkHello third = offers[2];
+            first.physical_link_generation = 1;
+            second.physical_link_generation = 1;
+            third.physical_link_generation = 1;
+            CHECK(first == second);
+            CHECK(first == third);
+        }
+        sender->retire_for_replacement();
+        CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
+              std::future_status::ready);
+        const auto server_results = server_future.get();
+        CHECK(server_results[0].status == ServerRunStatus::Disconnected);
+        CHECK(server_results[1].status == ServerRunStatus::TerminalError);
+        CHECK(server_results[2].status == ServerRunStatus::Disconnected);
+        c_work.reset();
+        std::cerr << "P51_INITIAL_LINK_STATE_RETRY profile="
+                  << static_cast<unsigned>(profile)
+                  << " generations=" << kFirstGeneration << '/'
+                  << kFirstGeneration + 1 << '/' << kFirstGeneration + 2
+                  << " exact_offer=1 one_bind=1 one_commit=1 raw_exact=1 "
+                     "old_session_active_on_retry=1 simulated_invalid_lookup_eof=1 PASS\n";
+    }
+}
+
+asio::awaitable<ServerRunResult> sender_r2_accept_and_cut_initial_state(
+    tcp::acceptor& acceptor, P50ServerEndpoint& endpoint) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    EndpointIoControl control;
+    control.close_before_write = MessageType::LINK_STATE;
+    co_return co_await endpoint.run_adopted_r2(std::move(socket),
+                                               std::move(control));
+}
+
+asio::awaitable<void> sender_r2_accept_and_send_malformed_link_state(
+    tcp::acceptor& acceptor) {
+    tcp::socket socket(co_await asio::this_coro::executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    std::array<uint8_t, 4> header_bytes{};
+    co_await asio::async_read(socket, asio::buffer(header_bytes),
+                              asio::use_awaitable);
+    const FrameHeader header = decode_frame_header(header_bytes);
+    CHECK(header.type == MessageType::LINK_HELLO);
+    std::vector<uint8_t> payload(header.payload_bytes);
+    co_await asio::async_read(socket, asio::buffer(payload),
+                              asio::use_awaitable);
+    const Message decoded = decode_payload(header.type, payload);
+    const auto* hello = std::get_if<LinkHello>(&decoded);
+    CHECK(hello != nullptr);
+    LinkState malformed;
+    malformed.profile = hello->profile;
+    malformed.window = hello->window;
+    malformed.reservation_id = hello->reservation_id;
+    malformed.relationship_id = hello->relationship_id;
+    malformed.relationship_epoch = hello->relationship_epoch;
+    malformed.physical_link_generation =
+        hello->physical_link_generation + 1;  // Structurally valid, wrong offer.
+    malformed.c_store_guid = hello->c_store_guid;
+    malformed.c_store_generation = hello->c_store_generation;
+    malformed.f_store_guid = hello->f_store_guid;
+    malformed.f_store_generation = hello->f_store_generation;
+    malformed.c_control_generation = hello->c_control_generation;
+    malformed.c_control_attempt = hello->c_control_attempt;
+    malformed.selected_max_frame_payload = hello->max_frame_payload;
+    malformed.selected_max_raw_bytes = hello->max_raw_bytes;
+    malformed.selected_max_encoded_bytes = hello->max_encoded_bytes;
+    malformed.selected_max_output_bytes = hello->max_output_bytes;
+    malformed.history_nonce = hello->history_nonce;
+    const std::vector<uint8_t> frame = encode_frame(Message{malformed});
+    co_await asio::async_write(socket, asio::buffer(frame), asio::use_awaitable);
+}
+
+asio::awaitable<ServerRunResult>
+sender_r2_accept_and_send_malformed_link_state_result(
+    tcp::acceptor& acceptor) {
+    co_await sender_r2_accept_and_send_malformed_link_state(acceptor);
+    ServerRunResult result;
+    result.status = ServerRunStatus::Disconnected;
+    co_return result;
+}
+
+void test_p51_sender_terminal_initial_handshake_paths() {
+    const ProfileId profile = ProfileId::ZSTD_ROUTE;
+    const auto [c_guid, f_guid] = sender_r2_store_guids();
+    EndpointCaps caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    PreparationAuthorityLimits limits;
+    limits.max_speculative_tus = 2;
+    limits.max_speculative_raw_bytes = 1U << 20;
+    limits.max_live_entries = 8;
+    const std::vector<uint8_t> source{'i', 'n', 'i', 't', 'i', 'a', 'l'};
+
+    auto make_armed = [&](uint64_t nonce, uint64_t reservation) {
+        return sender_r2_armed(
+            sender_r2_arm(c_guid, nonce, static_cast<uint32_t>(nonce + 1),
+                          1, profile), f_guid, reservation, 1);
+    };
+    auto make_endpoint = [&](tcp::acceptor& acceptor,
+                             P50ServerEndpointConfig server_config) {
+        (void)acceptor;
+        return std::make_unique<P50ServerEndpoint>(
+            f_guid, caps, nullptr, nullptr, std::move(server_config));
+    };
+    const auto run_retry_terminal = [&](bool cancel, bool malformed) {
+        asio::io_context c_context;
+        asio::io_context f_context;
+        tcp::acceptor acceptor(
+            f_context, {asio::ip::address_v4::loopback(), 0});
+        auto armed = make_armed(cancel ? 0xD041 : malformed ? 0xD043 : 0xD042,
+                                cancel ? 0xD051 : malformed ? 0xD053 : 0xD052);
+        const PrepareRequestKey request{
+            armed.arm.source.assignment_epoch,
+            armed.arm.source.assignment_nonce};
+        const auto deadline = std::chrono::steady_clock::now() +
+                              (cancel ? std::chrono::seconds(3)
+                                      : std::chrono::milliseconds(400));
+        const auto clock = sidecar::process_monotonic_clock_identity();
+        const auto absolute_deadline =
+            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                deadline, clock.clock_domain_id, clock.time_namespace_id);
+        P50ServerEndpointConfig server_config;
+        server_config.lookup_p51_link_reservation =
+            [armed, absolute_deadline](const LinkHello& hello) {
+                if (hello.reservation_id != Id128{armed.reservation_id} ||
+                    hello.relationship_id !=
+                        Id128{armed.logical_relationship_id} ||
+                    hello.relationship_epoch != armed.relationship_epoch)
+                    return P51SourceLinkLookupResult{
+                        P51SourceLinkLookupStatus::Invalid, std::nullopt};
+                P51SourceLinkLease lease;
+                lease.initial_armed = armed;
+                lease.absolute_deadline = absolute_deadline;
+                lease.relationship_epoch = hello.relationship_epoch;
+                lease.history_nonce = hello.history_nonce;
+                return P51SourceLinkLookupResult{
+                    P51SourceLinkLookupStatus::Found, lease};
+            };
+        auto endpoint = make_endpoint(acceptor, std::move(server_config));
+        auto server_future = asio::co_spawn(
+            f_context,
+            malformed
+                ? sender_r2_accept_and_send_malformed_link_state_result(
+                      acceptor)
+                : sender_r2_accept_and_cut_initial_state(acceptor, *endpoint),
+            asio::use_future);
+        std::thread f_thread([&] { f_context.run(); });
+        struct FThreadGuard {
+            asio::io_context& context;
+            std::thread& thread;
+            ~FThreadGuard() {
+                context.stop();
+                if (thread.joinable()) thread.join();
+            }
+        } f_guard{f_context, f_thread};
+
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            c_guid, caps.zstd, limits, 1, profile);
+        ZstdSourceTransferConfig sender_config = config();
+        sender_config.endpoint_caps = caps;
+        sender_config.authority_limits = limits;
+        sender_config.maximum_duration = cancel
+            ? std::chrono::seconds(3) : std::chrono::milliseconds(400);
+        auto sender = std::make_shared<P50ZstdSourceSender>(
+            authority, PreparationRouteKey{f_guid, 23, profile}, request,
+            sender_config);
+        const tcp::endpoint remote = acceptor.local_endpoint();
+        std::atomic<unsigned> connector_calls{0};
+        AsyncConnectedFdFactory connector = [&](auto, auto completion) {
+            connector_calls.fetch_add(1, std::memory_order_relaxed);
+            completion(connect_fd(remote));
+        };
+        auto cancellation = std::make_shared<P51RequestCancellation>();
+        bool cancellation_requested = false;
+        if (cancel) {
+            sender_config.after_r2_recovery_waiter_registered_for_test =
+                [&](std::chrono::steady_clock::duration) {
+                    if (!cancellation_requested) {
+                        cancellation_requested =
+                            cancellation->request_cancel();
+                    }
+                };
+            sender = std::make_shared<P50ZstdSourceSender>(
+                authority, PreparationRouteKey{f_guid, 23, profile}, request,
+                sender_config);
+        }
+        auto first = asio::co_spawn(
+            c_context,
+            sender->transfer_p51_route(
+                armed, 81, connector, request, deadline, source,
+                cancellation),
+            asio::use_future);
+        const auto start = std::chrono::steady_clock::now();
+        c_context.run();
+        CHECK(first.wait_for(std::chrono::milliseconds(0)) ==
+              std::future_status::ready);
+        const ZstdSourceTransferResult result = first.get();
+        CHECK(result.replacement_required);
+        CHECK(result.route_local_failure);
+        CHECK(!result.committed_input);
+        CHECK(authority->live_entry_count() == 0);
+        if (cancel) {
+            CHECK(result.status == ZstdSourceTransferStatus::Cancelled);
+            CHECK(cancellation_requested);
+            CHECK(connector_calls.load() == 1);
+        } else if (malformed) {
+            CHECK(result.status == ZstdSourceTransferStatus::Unavailable);
+            CHECK(connector_calls.load() == 1);
+        } else {
+            CHECK(result.status == ZstdSourceTransferStatus::DeadlineExceeded);
+            CHECK(connector_calls.load() >= 1 && connector_calls.load() <= 3);
+            CHECK(std::chrono::steady_clock::now() - start <
+                  std::chrono::seconds(2));
+        }
+        CHECK(server_future.wait_for(std::chrono::seconds(2)) ==
+              std::future_status::ready);
+        CHECK(server_future.get().status == ServerRunStatus::Disconnected);
+        std::cerr << "P51_INITIAL_HANDSHAKE_TERMINAL kind="
+                  << (cancel ? "cancel" : malformed ? "malformed-state" :
+                                                       "expired")
+                  << " status=" << static_cast<unsigned>(result.status)
+                  << " connectors=" << connector_calls.load()
+                  << " route_local=1 no_bind=1 bounded=1 PASS\n";
+    };
+
+    run_retry_terminal(true, false);
+    run_retry_terminal(false, false);
+    run_retry_terminal(false, true);
 }
 
 void test_p51_sender_typed_rejection_is_shared_route_local() {
@@ -6459,6 +6974,18 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc == 2 &&
+        std::string_view(argv[1]) == "--lost-initial-link-state") {
+        test_p51_sender_retries_lost_initial_link_state_for_all_profiles();
+        std::cerr << "P51_SENDER_LOST_INITIAL_LINK_STATE_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--initial-handshake-terminal") {
+        test_p51_sender_terminal_initial_handshake_paths();
+        std::cerr << "P51_SENDER_INITIAL_HANDSHAKE_TERMINAL_SELECTOR PASS\n";
+        return 0;
+    }
+    if (argc == 2 &&
         std::string_view(argv[1]) == "--positive-after-rejection") {
         test_p51_sender_positive_commit_survives_later_typed_rejection();
         std::cerr << "P51_SENDER_POSITIVE_AFTER_REJECTION_SELECTOR PASS\n";
@@ -6517,6 +7044,10 @@ int main(int argc, char** argv) {
     run("initial_connector_bounds",
         test_p51_sender_initial_connector_retry_is_bounded_and_cancellable);
     run("typed_link_rejection", test_p51_sender_typed_link_rejection_is_terminal_and_exact);
+    run("lost_initial_link_state",
+        test_p51_sender_retries_lost_initial_link_state_for_all_profiles);
+    run("initial_handshake_terminal",
+        test_p51_sender_terminal_initial_handshake_paths);
     run("shared_typed_rejection", test_p51_sender_typed_rejection_is_shared_route_local);
     run("bad_link_reject_echo", test_p51_client_reject_echo_must_match_current_offer);
     run("positive_after_rejection", test_p51_sender_positive_commit_survives_later_typed_rejection);

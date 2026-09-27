@@ -1095,6 +1095,20 @@ from a local lock cycle using trace events and a bounded outer watchdog.
 Resource assertions use both exact internal accounting and peak process/
 cgroup memory; equality between raw-vector counters and RSS is not expected.
 
+An Initial `LINK_STATE` response lost before C validates it is a pre-bundle
+transport cut: C may retry `Initial` only with the same immutable offer and
+prepared job, changing only to a strictly newer physical-link generation.
+The F endpoint may reuse only the exact retained P51-managed route with no
+binding, pending job, commit, interruption, recovery install, or codec-history
+reset; it must not reset history or mint a new nonce. The retry must retain
+the same reservation/ARM and original absolute source deadline. A typed link
+rejection or malformed complete state remains terminal. If the bounded
+handshake deadline expires before a complete `LINK_STATE`, there is no saved
+client recovery context, so the sender requires route replacement instead of
+entering `RECOVER` with a fabricated offer. Runtime selectors cover this
+initial-response case; the current TLA+ recovery model starts after link
+establishment and does not prove it.
+
 For D09 ordered active-work coverage, establish and observe the affected W30
 cohort before each restart in the sequence. A restart between completed
 batches proves continuity, not interruption of active work. Retain exact
