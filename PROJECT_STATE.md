@@ -240,8 +240,25 @@ configured maximum of zero. The six cases follow the endpoint's 60-second
 idle timeout: one after the canary/preparation gap, five after the five long
 preceding compilations. The receipt reader exits on an empty queue, leaving
 idle EOF undetected until the next bundle starts. Each case has one compiler
-assignment and one F commit, but two source-bundle attempts. A pre-bundle
-idle-closure check is being implemented separately; it is not yet qualified.
+assignment and one F commit, but two source-bundle attempts. The pre-bundle
+idle-closure correction is now integrated as `6cffafa0`: under sole-writer,
+owner-executor control, it checks an otherwise idle socket without consuming
+bytes, then uses existing recovery before staging a new bundle. It does not
+probe while receipts or ACK work are outstanding. The public
+`p50zstdsender-idle-check` refreshes the client archive before relinking, then
+passes fast peer-EOF, no-EOF reuse and real 60-second expiry for all three
+profiles. Both closure cases assert one bundle attempt and zero replays;
+the no-EOF control retains one connection. Original deadlines are preserved.
+The full default sender suite and focused W30/recovery/retirement checks pass.
+Logs under `/tanksmall/scratch/tmp/luna-c06-idle-build/`:
+`c06-make-target-final-order.log` SHA256
+`fcebe87361c86fac3aa76599a1287577a672db59b4a00fa8afcc403f167bbaa9`;
+`c06-full-sender-final.log` SHA256
+`7b16bb82416b213f24d84af1e2647428601ad16540ff0f984ef20db67683b734`.
+Earlier apparent candidate failures linked a stale client archive and are
+retained as build-provenance failures, not evidence that the rebuilt fix
+failed. A fresh farm image and external mixed run with this correction are
+still required; the earlier D18 verdict remains FAIL.
 The retry limit and idle timeout have not been relaxed. Cell wall was
 1,283,935 ms. The runtime
 remains the older 9e image, not the newly built be667 image.
