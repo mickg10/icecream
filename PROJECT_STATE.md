@@ -132,8 +132,14 @@ Fresh retry `d18-p29-endpoint-20260927-4` passed the corrected worker check but
 failed collection: source-result v5 R2 measurements were unavailable or
 invalid for numeric accounting on assignment
 `(6, 5313725957874579522, 11485645625671867361)`. Its evidence is retained and
-teardown records DOWN without problems. The reporting/collector cause is
-under investigation; measurement checks have not been bypassed.
+teardown records DOWN without problems. The plan omitted
+`ICECC_P50_DIAGNOSTICS=1`: it incorrectly selected diagnostics using base wire
+revision 2 instead of the C/F runtime R2 settings. The selector now requires
+a positive cache relationship, a P50-or-newer C, and runtime R2 on both C/F.
+485 focused plan/collection/catalog tests pass with one skip, including actual
+D18 and receipt-window plans with diagnostics enabled despite base revision 1.
+Collector validity requirements are unchanged. Fresh measured execution is
+still required; existing unmeasured records cannot become numeric evidence.
 The multi-link driver now likewise separates preferred worker names from
 verified address:port endpoints. Its correction passes 301 focused harness
 tests, including same-host/wrong-port rejection; this is not a farm pass.
