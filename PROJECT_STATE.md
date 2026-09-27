@@ -12,6 +12,23 @@ retained artifact directories.
 
 ## Developer QA
 
+### Frozen QA and legacy build boundary
+
+Frozen source `ca40e89f` completed native QA (172 PASS, 6 SKIP), isolated-root
+service QA (2 PASS), and Python QA (1659 PASS, 7 SKIP). Overall `make qa`
+failed before mixed-image tests: the pinned P43 source has no Python project
+metadata, but the current SDK runner required it. Retained result:
+`/tanksmall/scratch/tmp/p51-d15-final-qa-ca40/icecream-qa-s79o_ru5/result.json`.
+Native skips require additional capabilities, explicit live-test switches,
+or a non-loopback worker host; the two root-service passes do not cover them.
+
+Commit `e7f54519` adds an explicit native-only `legacy-bootstrap` mode used
+by the pinned P43 build. It rejects Python metadata in that mode and retains
+the exact SDK metadata check for current sources. Its Python-sync result is
+explicitly skipped, not a fabricated pass. The focused runner/bootstrap suite
+passes 62 tests. Actual P43 build and mixed-image continuation are pending;
+the original QA remains failed and does not qualify the later lifecycle fix.
+
 ### Sidecar recovery budget
 
 Commit `9320f429` adapts Implementer's `45aa5d8d` correction: accepted READY
