@@ -216,6 +216,62 @@ def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
     # retry; all ordinary all-new P50 cells remain strict.
     if scenario.data.get("id") == "S70-b4-scheduler-active-loss":
         return False
+    workload = scenario.data.get("workload", {})
+    receipt_gate = workload.get("receipt_gate", {})
+    restart = receipt_gate.get("restart_extension")
+    role_instances = scenario.data.get("instances", [])
+    schedulers = [item for item in role_instances if item.get("role") == "S"]
+    clients = [item for item in role_instances if item.get("role") == "C"]
+    workers = [item for item in role_instances if item.get("role") == "F"]
+    scheduler_env = schedulers[0].get("env", {}) if len(schedulers) == 1 else {}
+    planned_instances = plan.get("topology", {}).get("instances", [])
+    scenario_role_keys = {
+        (item.get("role"), item.get("name"))
+        for item in role_instances
+        if isinstance(item, dict)
+    }
+    planned_role_keys = {
+        (item.get("role"), item.get("name"))
+        for item in planned_instances
+        if isinstance(item, dict)
+    }
+    receipt_links = receipt_gate.get("links", [])
+    receipt_link_pairs = {
+        (item.get("client"), item.get("worker"))
+        for item in receipt_links
+        if isinstance(item, dict)
+    }
+    d09_all_r2 = (
+        workload.get("driver") == "p51-receipt-window"
+        and isinstance(restart, dict)
+        and restart.get("kind") == "held-f-restart-v1"
+        and isinstance(receipt_gate.get("links"), list)
+        and len(receipt_gate["links"]) == 2
+        and receipt_gate.get("expect_observed") is True
+        and receipt_gate.get("negotiated_window") == 30
+        and not scenario.data.get("controls")
+        and not scenario.data.get("timeline")
+        and len(schedulers) == 1
+        and len(clients) == 1
+        and len(workers) == 2
+        and receipt_link_pairs
+        == {(clients[0].get("name"), item.get("name")) for item in workers}
+        and scenario_role_keys == planned_role_keys
+        and len(planned_instances) == len(planned_role_keys)
+        and all(
+            item.get("version") == 50
+            and item.get("cache_wire_revision") == 1
+            for item in planned_instances
+        )
+        and scheduler_env.get("ICECC_P51_MODE") == "on"
+        and scheduler_env.get("ICECC_P50_PROFILE") in PROFILES
+        and all(item.get("env", {}).get("ICECC_P50_MODE") == "on" for item in clients)
+        and all(item.get("env", {}).get("ICECC_P51_MODE") == "on" for item in clients + workers)
+    )
+    if d09_all_r2:
+        # ScenarioSpec validates the selected-profile R2 participants. The
+        # mixed label describes a multi-link topology, not legacy protocol.
+        return True
     if (
         scenario.data["shape"] != "S'C'F'"
         or scenario.data["controls"]

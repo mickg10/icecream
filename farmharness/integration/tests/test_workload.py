@@ -2401,6 +2401,94 @@ def test_all_new_multilink_receipt_driver_keeps_strict_p50_retry(
         assert command.argv[driver_index + 12] == "1"
 
 
+def _mixed_shape_held_f_restart_fixture(tmp_path: Path):
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json", farm
+    )
+    scenario.data["shape"] = "mixed"
+    scenario.data["timeline"] = []
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    scenario.data["workload"]["turns"] = ["A"]
+    for item in scenario.data["instances"]:
+        environment = item.setdefault("env", {})
+        environment["ICECC_P51_MODE"] = "on"
+        if item["role"] == "C":
+            environment["ICECC_P50_MODE"] = "on"
+    scenario.data["workload"]["receipt_gate"] = {
+        "binary": "/bin/true",
+        "binary_sha256": hashlib.sha256(Path("/bin/true").read_bytes()).hexdigest(),
+        "links": [
+            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
+            {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 69},
+        ],
+        "expected_commits": 30,
+        "negotiated_window": 30,
+        "expect_observed": True,
+        "command_timeout_s": 1800,
+        "restart_extension": {
+            "kind": "held-f-restart-v1",
+            "affected_link": {"client": "C1", "worker": "F2"},
+            "healthy_link": {"client": "C1", "worker": "F1"},
+        },
+    }
+    plan = farmtest.build_plan(farm, scenario, run_id="strict-d09-restart")
+    return farm, scenario, plan
+
+
+def test_mixed_shape_held_f_restart_keeps_strict_retry_and_phase2_route(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _mixed_shape_held_f_restart_fixture(tmp_path)
+    assert _strict_p50_required(scenario, plan) is True
+    client = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
+    command = _driver_command(farm, scenario, plan, client, "A", CommandFactory())
+    driver_index = command.argv.index(MANIFEST_DRIVER)
+    assert command.argv[driver_index + 12] == "1"
+    assert "ICEFARM_P51_PHASE2_FIRST=70" in command.argv
+    assert "ICEFARM_P51_PHASE2_RELEASE=/results/workload/A/d09-phase2-release" in command.argv
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["p51-off", "mixed-p43", "missing-worker", "missing-scheduler", "empty-participants"],
+)
+def test_mixed_shape_receipt_restart_does_not_make_non_r2_strict(
+    tmp_path: Path, mutation: str
+) -> None:
+    farm, scenario, plan = _mixed_shape_held_f_restart_fixture(tmp_path)
+    assert _strict_p50_required(scenario, plan) is True
+    if mutation == "p51-off":
+        next(item for item in scenario.data["instances"] if item["role"] == "F")["env"][
+            "ICECC_P51_MODE"
+        ] = "off"
+    elif mutation == "mixed-p43":
+        next(item for item in plan["topology"]["instances"] if item["role"] == "F")[
+            "version"
+        ] = 43
+    elif mutation == "missing-worker":
+        scenario.data["instances"] = [
+            item for item in scenario.data["instances"]
+            if not (item["role"] == "F" and item["name"] == "F2")
+        ]
+        plan["topology"]["instances"] = [
+            item for item in plan["topology"]["instances"]
+            if not (item["role"] == "F" and item["name"] == "F2")
+        ]
+    elif mutation == "missing-scheduler":
+        scenario.data["instances"] = [
+            item for item in scenario.data["instances"] if item["role"] != "S"
+        ]
+        plan["topology"]["instances"] = [
+            item for item in plan["topology"]["instances"] if item["role"] != "S"
+        ]
+    else:
+        scenario.data["instances"] = []
+        plan["topology"]["instances"] = []
+    assert _strict_p50_required(scenario, plan) is False
+
+
 @pytest.mark.parametrize("mutation", ["old-worker", "profile-off", "control"])
 def test_multilink_receipt_driver_downgrades_when_p50_is_not_run_wide(
     mutation: str,
