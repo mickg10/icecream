@@ -1107,7 +1107,9 @@ handshake deadline expires before a complete `LINK_STATE`, there is no saved
 client recovery context, so the sender requires route replacement instead of
 entering `RECOVER` with a fabricated offer. Runtime selectors cover this
 initial-response case; the current TLA+ recovery model starts after link
-establishment and does not prove it.
+establishment and does not prove it. The focused executable gate is
+`make -C "$BUILD/unittests" p50zstdsender-initial-link-check`; it remains
+opt-in rather than extending the default fast suite.
 
 After terminal Initial cancellation or expiry, replacement is route-local.
 F may retire the exact zero-progress relationship only after all reservations

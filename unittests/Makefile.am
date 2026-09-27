@@ -626,8 +626,23 @@ p50service-stop-pressure-check:
 
 # Opt-in D15 actual-wire malformed TU_END / cumulative ACK conformance cases.
 .PHONY: p50endpoint-d15-wire-check
-p50endpoint-d15-wire-check: p50endpoint
+p50endpoint-d15-wire-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpointtesthooks.a libp50endpoint.a libp50adoptedoutcomewriter.a libp50localtransport.a libprotocol50.a
+	$(MAKE) p50endpoint
 	timeout 120s ./p50endpoint --d15-r2-wire
+
+# Opt-in sender regressions for retrying a lost Initial LINK_STATE and for
+# terminal cancellation/expiry/malformed-state outcomes before JOB_BIND.
+.PHONY: p50zstdsender-initial-link-check
+p50zstdsender-initial-link-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpoint.a libp50adoptedoutcomewriter.a libprotocol50.a
+	$(MAKE) -C $(top_builddir)/client libp50zstdsender.a
+	$(MAKE) p50zstdsender
+	timeout 120s ./p50zstdsender --lost-initial-link-state
+	timeout 120s ./p50zstdsender --initial-handshake-terminal
+	timeout 120s ./p50zstdsender --typed-link-rejection
 
 connectivity_DEPENDENCIES = conn_shim.so
 

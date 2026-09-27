@@ -215,6 +215,18 @@ The target rebuilds its native dependencies and checks every profile marker.
 It is separate from default QA and sanitizer runs. Failed runs retain their
 logs and print the artifact directory; use an existing writable scratch path.
 
+The lost-Initial-response retry and terminal pre-bundle cases are available
+without adding them to the default fast suite:
+
+```sh
+make -C "$BUILD/unittests" p50zstdsender-initial-link-check
+```
+
+This rebuilds the focused sender closure and checks exact-offer retry after a
+lost `LINK_STATE`, bounded cancellation/expiry, malformed complete-state
+rejection, and typed link rejection. It does not claim the formal recovery
+model covers Initial establishment.
+
 ### Repository and offline inputs
 
 Set `image_repository` to a prepared SDK repository, or override it with
