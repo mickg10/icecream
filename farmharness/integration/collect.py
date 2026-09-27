@@ -9905,6 +9905,7 @@ def _validate_p51_held_f_restart_receipt(
     restart = window.get("restart_extension") if isinstance(window, Mapping) else None
     links = window.get("links") if isinstance(window, Mapping) else None
     healthy_progress = restart.get("healthy_progress") if isinstance(restart, Mapping) else None
+    old_cohort_drain = restart.get("old_cohort_drain") if isinstance(restart, Mapping) else None
     phase2 = restart.get("phase2") if isinstance(restart, Mapping) else None
     old_gate_loss = restart.get("old_gate_loss") if isinstance(restart, Mapping) else None
     if (
@@ -9916,6 +9917,8 @@ def _validate_p51_held_f_restart_receipt(
         or type(restart.get("stopped_interval_ms")) is not int
         or restart.get("stopped_interval_ms", 0) <= 0
         or not isinstance(healthy_progress, Mapping)
+        or not isinstance(old_cohort_drain, Mapping)
+        or restart.get("phase2_gate_ready_while_stopped") is not True
         or not isinstance(phase2, Mapping)
         or not isinstance(old_gate_loss, Mapping)
         or old_gate_loss.get("retirement") != "explicit-abort-after-f-stop"
@@ -10015,6 +10018,14 @@ def _validate_p51_held_f_restart_receipt(
         or healthy_progress.get("verified_while_stopped") is not True
     ):
         raise CollectError(f"{prefix} healthy progress does not bind the declared sibling")
+    if (
+        old_cohort_drain.get("client") != affected["client"]
+        or old_cohort_drain.get("first_job") != initial.get("first_job")
+        or old_cohort_drain.get("last_job") != initial.get("last_job")
+        or old_cohort_drain.get("retry_worker") != healthy["worker"]
+        or old_cohort_drain.get("verified_while_stopped") is not True
+    ):
+        raise CollectError(f"{prefix} old affected cohort did not drain onto the healthy worker")
     window_size = gate.get("negotiated_window")
     if type(window_size) is not int or window_size != 30 or not isinstance(window, Mapping):
         raise CollectError(f"{prefix} does not bind a W30 receipt window")
@@ -10090,7 +10101,8 @@ def _validate_p51_held_f_restart_receipt(
         ordinal = int(match.group(1))
         if initial["first_job"] <= ordinal <= initial["last_job"]:
             retry_ids.add(ordinal)
-    if not retry_ids:
+    expected_affected_ids = set(range(initial["first_job"], initial["last_job"] + 1))
+    if len(expected_affected_ids) != window_size or retry_ids != expected_affected_ids:
         raise CollectError(
-            f"{prefix} has no authenticated failed-F1→healthy-F2 strict retry in the affected initial cohort"
+            f"{prefix} does not bind every affected initial job to a strict retry on the healthy worker"
         )

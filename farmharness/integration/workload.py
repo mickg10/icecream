@@ -760,7 +760,7 @@ def _p51_check_scoped_identity_marker(
 
 def _p51_link_output_check_argv(
     client: str, first_job: int, last_job: int, expected_worker: str,
-    expected_endpoint: str, turn: str,
+    expected_endpoint: str, turn: str, *, require_retry: bool = False,
 ) -> tuple[str, ...]:
     # Check one bounded contiguous range using the manifest driver's stable
     # result.tsv columns.  This observes exact local-SHA outputs and the
@@ -773,6 +773,7 @@ last=$3
 worker=$4
 endpoint=$5
 client=$6
+require_retry=$7
 index=$first
 while test "$index" -le "$last"
 do
@@ -785,12 +786,15 @@ do
     if test -L "$file" || ! test -f "$file" \
         || test "$(wc -l < "$file")" -ne 1 \
         || ! awk -F '\t' \
-            -v expected_index="$index" -v expected_endpoint="$endpoint" '
+            -v expected_index="$index" -v expected_endpoint="$endpoint" \
+            -v expected_retry="$require_retry" '
             NR > 1 { bad = 1 }
             NF != 14 || $1 != expected_index || $6 != expected_endpoint \
                 || $9 != 0 || length($10) != 64 || $10 ~ /[^0-9a-f]/ \
                 || length($11) != 64 || $11 ~ /[^0-9a-f]/ || $10 != $11 \
-                || $12 != 1 || $13 != 1 { bad = 1 }
+                || $12 != 1 || $13 != 1 \
+                || (expected_retry == "1" \
+                    && ($14 !~ /^[0-9]+$/ || $14 + 0 < 1)) { bad = 1 }
             END { exit (NR == 1 && !bad ? 0 : 1) }
         ' "$file"
     then
@@ -806,6 +810,7 @@ printf 'P51_LINK_OUTPUTS_OK client=%s worker=%s endpoint=%s first=%s last=%s\n' 
         "/bin/sh", "-c", script, "check-link-outputs",
         f"/results/workload/{turn}", str(first_job), str(last_job),
         expected_worker, expected_endpoint, client,
+        ("1" if require_retry else "0"),
     )
 
 
@@ -1173,16 +1178,60 @@ def _run_p51_receipt_window_multilink(
                         "first_job": healthy_first, "last_job": healthy_last,
                         "while_worker_stopped": affected["worker"], "verified": True,
                     })
-                    stopped_interval_ms = int(time.time_ns() // 1_000_000) - stop_observed_ms
-                    restart_receipt = event_controller.start_worker_for_receipt_gate(restart_receipt)
-                    restart_receipt["old_gate_loss"] = old_gate_loss
-                    restart_receipt["healthy_progress"] = {
-                        "client": healthy["client"], "worker": healthy["worker"],
-                        "first_job": healthy_first, "last_job": healthy_last,
-                        "verified_while_stopped": True,
-                    }
-                    restart_receipt["stopped_interval_ms"] = stopped_interval_ms
 
+                    # The affected initial route is exactly one W30 cohort.
+                    # With the worker still stopped, strict retry must drain
+                    # every original job onto the healthy sibling before that
+                    # worker can rejoin; this prevents old assignments from
+                    # being mistaken for the fresh phase-2 cohort.
+                    affected_first = affected_row["spec"]["first_job"]
+                    affected_last = affected_row["spec"]["last_job"]
+                    healthy_endpoint = (
+                        f"{healthy_row['worker']['address']}:{healthy_row['port']}"
+                    )
+                    affected_drain_check = _p51_link_output_check_argv(
+                        affected["client"], affected_first, affected_last,
+                        healthy["worker"], healthy_endpoint, turn, require_retry=True,
+                    )
+                    drain_deadline = time.monotonic() + deadline_s
+                    while time.monotonic() < drain_deadline:
+                        probe = factory.make(
+                            phase="run.p51-receipt-window.d09-old-cohort-drain-while-stopped",
+                            host=affected_client["host"], instance=affected["client"],
+                            transport=_docker_transport(farm, affected_client["host"]),
+                            timeout_s=20,
+                            argv=docker_argv(farm, affected_client["host"], (
+                                "exec", "--user", "0",
+                                f"icefarm-{plan['run_id']}-{affected['client']}",
+                                *affected_drain_check,
+                            )),
+                        )
+                        drain_result = transport.invoke(probe)
+                        if _p51_link_outputs_complete(
+                            drain_result.stdout, client=affected["client"],
+                            first_job=affected_first, last_job=affected_last,
+                            expected_worker=healthy["worker"],
+                            expected_endpoint=healthy_endpoint,
+                        ):
+                            break
+                        time.sleep(0.2)
+                    else:
+                        raise WorkloadError(
+                            "D09 affected initial cohort did not strict-retry and drain "
+                            "onto the healthy F while the affected F was stopped"
+                        )
+                    output_progress.append({
+                        "client": affected["client"],
+                        "worker": affected["worker"],
+                        "first_job": affected_first,
+                        "last_job": affected_last,
+                        "retry_worker": healthy["worker"],
+                        "while_worker_stopped": affected["worker"],
+                        "strict_retry_drain_verified": True,
+                    })
+
+                    # Install the fresh interception before the stopped F is
+                    # started, so its new worker session cannot bypass phase 2.
                     phase2_first = max(row["spec"]["last_job"] for row in gate_rows) + 1
                     phase2_last = phase2_first + int(gate_spec["negotiated_window"])
                     client = affected_row["client"]
@@ -1224,7 +1273,25 @@ def _run_p51_receipt_window_multilink(
                         f"{phase2_dir}/ready", timeout_s=20,
                     )
                     if phase2_ready is None:
-                        raise WorkloadError("D09 replacement F receipt gate did not become ready")
+                        raise WorkloadError("D09 replacement F receipt gate did not become ready while F was stopped")
+                    stopped_interval_ms = int(time.time_ns() // 1_000_000) - stop_observed_ms
+                    restart_receipt = event_controller.start_worker_for_receipt_gate(restart_receipt)
+                    restart_receipt["old_gate_loss"] = old_gate_loss
+                    restart_receipt["old_cohort_drain"] = {
+                        "client": affected["client"],
+                        "first_job": affected_first,
+                        "last_job": affected_last,
+                        "retry_worker": healthy["worker"],
+                        "verified_while_stopped": True,
+                    }
+                    restart_receipt["phase2_gate_ready_while_stopped"] = True
+                    restart_receipt["healthy_progress"] = {
+                        "client": healthy["client"], "worker": healthy["worker"],
+                        "first_job": healthy_first, "last_job": healthy_last,
+                        "verified_while_stopped": True,
+                    }
+                    restart_receipt["stopped_interval_ms"] = stopped_interval_ms
+
                     release_path = f"{_manifest_workload_result_root(turn)}/d09-phase2-release"
                     _p51_gate_call(
                         farm, plan, client, factory, transport, "d09-release-phase2-worklist",

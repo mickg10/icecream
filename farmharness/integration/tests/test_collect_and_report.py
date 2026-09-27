@@ -5529,8 +5529,8 @@ def test_authenticated_rejoin_line_rejects_invalid_boundary(fault):
 
 
 def _d09_collector_fixture(*, affected_second: bool = True):
-    affected = {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 62}
-    healthy = {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31}
+    affected = {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69}
+    healthy = {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39}
     links = [healthy, affected] if affected_second else [affected, healthy]
     gate = {
         "negotiated_window": 30, "expected_commits": 30, "expect_observed": True,
@@ -5560,7 +5560,7 @@ def _d09_collector_fixture(*, affected_second: bool = True):
 
     old_f2 = link_evidence(affected, stopped=True, fstore="e" * 32, fgen=1)
     old_f1 = link_evidence(healthy, fstore="f" * 32, fgen=2)
-    new_f2 = link_evidence({"client": "C1", "worker": "F2", "first_job": 63, "last_job": 93}, after=True)
+    new_f2 = link_evidence({"client": "C1", "worker": "F2", "first_job": 70, "last_job": 100}, after=True)
     restart = {
         "schema": "icefarm-p51-held-f-restart-v1", "turn": "A", "instance": "F2",
         "stopped_interval_ms": 100,
@@ -5573,11 +5573,16 @@ def _d09_collector_fixture(*, affected_second: bool = True):
             "discarded_marker": "explicit abort discarded held COMMIT interval",
         },
         "healthy_progress": {
-            "client": "C1", "worker": "F1", "first_job": 1, "last_job": 31,
+            "client": "C1", "worker": "F1", "first_job": 1, "last_job": 39,
             "verified_while_stopped": True,
         },
+        "old_cohort_drain": {
+            "client": "C1", "first_job": 40, "last_job": 69,
+            "retry_worker": "F1", "verified_while_stopped": True,
+        },
+        "phase2_gate_ready_while_stopped": True,
         "phase2": {
-            "worker": "F2", "first_job": 63, "last_job": 93,
+            "worker": "F2", "first_job": 70, "last_job": 100,
             "held": {"count": 30, "profile": "ZSTD_TU", "negotiated_window": 30},
             "identity": {
                 "f_store_guid": "b" * 32, "f_store_generation": 3,
@@ -5590,10 +5595,13 @@ def _d09_collector_fixture(*, affected_second: bool = True):
         "profile": "ZSTD_TU", "negotiated_window": 30,
         "links": [old_f1, old_f2, new_f2], "restart_extension": restart,
     }}]}
-    observations = {"successful_strict_p50_retry_bindings": [{
-        "first_worker": "F2", "final_worker": "F1", "failure_reason": "source-transfer-loss",
-        "job_id": "C1:A:1:33",
-    }]}
+    observations = {"successful_strict_p50_retry_bindings": [
+        {
+            "first_worker": "F2", "final_worker": "F1",
+            "failure_reason": "source-transfer-loss", "job_id": f"C1:A:1:{ordinal}",
+        }
+        for ordinal in range(40, 70)
+    ]}
     return receipt, scenario, observations
 
 
@@ -5607,6 +5615,7 @@ def test_d09_collector_binds_exact_affected_link_in_either_order(affected_second
     "mutation", [
         "wrong-client", "wrong-retry-worker", "malformed-progress", "unfinished-phase2",
         "missing-abort-witness", "stale-after", "stale-f-store", "malformed-identity",
+        "missing-one-retry", "wrong-drain-worker", "phase2-not-ready-while-stopped",
     ]
 )
 def test_d09_collector_rejects_unbound_restart_evidence(mutation: str) -> None:
@@ -5630,6 +5639,12 @@ def test_d09_collector_rejects_unbound_restart_evidence(mutation: str) -> None:
                 link["f_store_generation"] = 1
     elif mutation == "missing-abort-witness":
         restart["old_gate_loss"]["discarded_marker"] = ""
+    elif mutation == "missing-one-retry":
+        observations["successful_strict_p50_retry_bindings"].pop()
+    elif mutation == "wrong-drain-worker":
+        restart["old_cohort_drain"]["retry_worker"] = "F2"
+    elif mutation == "phase2-not-ready-while-stopped":
+        restart["phase2_gate_ready_while_stopped"] = False
     else:
         restart["phase2"]["identity"] = ["not", "a", "mapping"]
     with pytest.raises(CollectError):

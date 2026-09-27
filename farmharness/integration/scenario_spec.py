@@ -418,19 +418,30 @@ def _validate_p51_receipt_window(
             healthy = restart["healthy_link"]
             affected_pair = (affected["client"], affected["worker"])
             healthy_pair = (healthy["client"], healthy["worker"])
+            affected_range = next(
+                (
+                    (item["first_job"], item["last_job"])
+                    for item in links
+                    if (item["client"], item["worker"]) == affected_pair
+                ),
+                None,
+            )
             if (
                 restart.get("kind") != "held-f-restart-v1"
                 or affected_pair not in seen_pairs
+                or affected_range is None
                 or healthy_pair not in seen_pairs
                 or affected_pair == healthy_pair
                 or affected["client"] != client_name
                 or healthy["client"] != client_name
                 or selected_workers != {affected["worker"], healthy["worker"]}
                 or manifest_jobs != initial_end + negotiated + 1
+                or affected_range[1] != initial_end
+                or affected_range[1] - affected_range[0] + 1 != negotiated
             ):
                 raise ScenarioSpecError(
                     "$.workload.receipt_gate.restart_extension: requires C1F2, two initial links, "
-                    "and one post-restart window plus trailing transfer"
+                    "an exact affected W30 cohort, and one post-restart window plus trailing transfer"
                 )
         for client_name, total in windows_by_client.items():
             if workload["jobs"] < total:

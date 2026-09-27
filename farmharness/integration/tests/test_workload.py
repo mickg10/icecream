@@ -340,11 +340,34 @@ def test_multilink_output_checker_polls_pending_to_complete_with_real_transport(
     fields[10] = "a" * 64
     fields[11] = "1"
     fields[12] = "1"
+    fields[13] = "0"
     result.write_text("\t".join(fields) + "\n", encoding="utf-8")
     complete = transport.invoke(command)
     assert complete.returncode == 0
     assert _p51_link_outputs_complete(
         complete.stdout, client="C1", first_job=1, last_job=1,
+        expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+    ) is True
+    retry_argv = list(_p51_link_output_check_argv(
+        "C1", 1, 1, "F_R1", "10.0.0.2:23005", "A", require_retry=True
+    ))
+    retry_argv[4] = str(tmp_path)
+    retry_command = PlannedCommand(
+        sequence=command.sequence, phase=command.phase, host=command.host,
+        instance=command.instance, transport=command.transport,
+        timeout_s=command.timeout_s, argv=tuple(retry_argv),
+    )
+    no_retry = transport.invoke(retry_command)
+    with pytest.raises(WorkloadError, match="output validation"):
+        _p51_link_outputs_complete(
+            no_retry.stdout, client="C1", first_job=1, last_job=1,
+            expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+        )
+    fields[13] = "1"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    retry_complete = transport.invoke(retry_command)
+    assert _p51_link_outputs_complete(
+        retry_complete.stdout, client="C1", first_job=1, last_job=1,
         expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
     ) is True
     with pytest.raises(WorkloadError, match="sibling"):
@@ -650,6 +673,54 @@ def test_d09_restart_extension_fails_closed_outside_multilink_w30(invalid: str) 
             )
 
 
+def test_d09_requires_affected_initial_route_to_be_exactly_one_w30_cohort() -> None:
+    _farm, scenario, plan, _clients = _multilink_orchestrator_fixture("C1F2")
+    gate = scenario.data["workload"]["receipt_gate"]
+    gate.update({"expected_commits": 30, "negotiated_window": 30})
+    gate.update({
+        "binary": "/bin/true",
+        "binary_sha256": hashlib.sha256(Path("/bin/true").read_bytes()).hexdigest(),
+        "command_timeout_s": 1800,
+    })
+    gate["links"] = [
+        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 38},
+        {"client": "C1", "worker": "F2", "first_job": 39, "last_job": 69},
+    ]
+    gate["restart_extension"] = {
+        "kind": "held-f-restart-v1",
+        "affected_link": {"client": "C1", "worker": "F2"},
+        "healthy_link": {"client": "C1", "worker": "F1"},
+    }
+    scenario.data["workload"].update({"jobs": 100, "clients": ["C1"], "turns": ["A"]})
+    roles = {
+        role: [dict(item) for item in plan["topology"]["instances"] if item["role"] == role]
+        for role in ("S", "C", "F")
+    }
+    roles["S"][0].setdefault("env", {}).update({"ICECC_P51_MODE": "on"})
+    roles["C"][0].setdefault("env", {}).update(
+        {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on"}
+    )
+    for worker in roles["F"]:
+        worker.setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    for worker in roles["F"]:
+        worker["slots"] = 31
+    with pytest.raises(ScenarioSpecError, match="exact affected W30 cohort"):
+        scenario_spec_module._validate_p51_receipt_window(
+            {"timeline": [], "controls": [], "timeouts": {"turn_s": 1800}},
+            scenario.data["workload"], roles,
+            manifest_jobs=100,
+        )
+    gate["links"] = [
+        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39},
+        {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
+    ]
+    gate["restart_extension"]["affected_link"]["worker"] = "missing-F"
+    with pytest.raises(ScenarioSpecError, match="C1F2, two initial links"):
+        scenario_spec_module._validate_p51_receipt_window(
+            {"timeline": [], "controls": [], "timeouts": {"turn_s": 1800}},
+            scenario.data["workload"], roles,
+            manifest_jobs=100,
+        )
 def test_d09_oracle_prepare_omits_measured_phase2_wait_and_driver_accepts_real_argv() -> None:
     farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
     scenario.data["workload"].update({"jobs": 100, "turns": ["A"]})
@@ -657,8 +728,8 @@ def test_d09_oracle_prepare_omits_measured_phase2_wait_and_driver_accepts_real_a
         "expected_commits": 30,
         "negotiated_window": 30,
         "links": [
-            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
-            {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 69},
+            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39},
+            {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
         ],
         "restart_extension": {
             "kind": "held-f-restart-v1",
@@ -1083,8 +1154,9 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
     assert evidence["restart_extension"] == "pending-not-run"
 
 
+@pytest.mark.parametrize("drain_case", ["complete", "wrong-worker", "pending"])
 def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, drain_case: str,
 ) -> None:
     farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
     gate = scenario.data["workload"]["receipt_gate"]
@@ -1093,16 +1165,16 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
         "command_timeout_s": 1800,
     })
     gate["links"] = [
-        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
-        {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 62},
+        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39},
+        {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
     ]
     gate["restart_extension"] = {
         "kind": "held-f-restart-v1",
         "affected_link": {"client": "C1", "worker": "F2"},
         "healthy_link": {"client": "C1", "worker": "F1"},
     }
-    scenario.data["workload"].update({"jobs": 93})
-    farm.data["corpora"]["tiny"].update({"tus": 31, "repeat": 3})
+    scenario.data["workload"].update({"jobs": 100})
+    farm.data["corpora"]["tiny"].update({"tus": 50, "repeat": 2})
     for worker in (item for item in plan["topology"]["instances"] if item["role"] == "F"):
         worker["slots"] = 31
     release_f1 = threading.Event()
@@ -1136,11 +1208,24 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
             if phase.startswith("run.p51-receipt-window.d09-healthy-output-while-stopped"):
                 assert stop_f2.is_set() and not any(x == "start-F2" for x in events)
                 events.append("healthy-output-while-F2-stopped")
-                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F1 endpoint=10.0.0.2:23003 first=1 last=31\n", "")
+                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F1 endpoint=10.0.0.2:23003 first=1 last=39\n", "")
+            if phase.startswith("run.p51-receipt-window.d09-old-cohort-drain-while-stopped"):
+                assert stop_f2.is_set() and not any(x == "start-F2" for x in events)
+                if drain_case == "pending":
+                    expire_drain["now"] = True
+                    return CommandResult(0, "P51_LINK_OUTPUTS_PENDING\n", "")
+                if drain_case == "wrong-worker":
+                    return CommandResult(
+                        0,
+                        "P51_LINK_OUTPUTS_BAD client=C1 worker=F2 endpoint=10.0.0.3:23004 job=40\n",
+                        "",
+                    )
+                events.append("old-cohort-drained-to-F1-while-F2-stopped")
+                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F1 endpoint=10.0.0.2:23003 first=40 last=69\n", "")
             if phase.startswith("run.p51-receipt-window.d09-phase2-output"):
                 assert "start-F2" in events
                 events.append("phase2-output")
-                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F2 endpoint=10.0.0.3:23004 first=63 last=93\n", "")
+                return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F2 endpoint=10.0.0.3:23004 first=70 last=100\n", "")
             if phase.startswith("driver-"):
                 return CommandResult(0, "summary", "")
             raise AssertionError(f"unexpected D09 command {phase}")
@@ -1158,7 +1243,21 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
             }
 
         def start_worker_for_receipt_gate(self, receipt):
+            assert set(receipt) == {
+                "instance", "turn", "before", "stopped",
+                "readiness_baseline", "scheduler_baseline",
+            }
+            if drain_case != "complete" and "phase2-gate-ready-while-F2-stopped" not in events:
+                events.append("cleanup-start-F2")
+                return {
+                    **receipt,
+                    "schema": "icefarm-receipt-worker-restart-v1",
+                    "after": {"container_id": "sha256:f2", "started_at": "new", "running": True},
+                    "coordination": {},
+                }
             assert stop_f2.is_set() and any("healthy-output" in x for x in events)
+            assert "old-cohort-drained-to-F1-while-F2-stopped" in events
+            assert "phase2-gate-ready-while-F2-stopped" in events
             events.append("start-F2")
             return {
                 **receipt,
@@ -1183,6 +1282,9 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
     def wait_marker(_farm, _plan, _client, _factory, _transport, marker, **_kwargs):
         if marker.endswith("/ready"):
             key = "phase2" if "-phase2/" in marker else "F1" if "C1-F1/" in marker else "F2"
+            if key == "phase2":
+                assert stop_f2.is_set() and "start-F2" not in events
+                events.append("phase2-gate-ready-while-F2-stopped")
             return "ready\n" if ready[key].wait(1) else None
         if marker.endswith("/held-1"):
             key = "phase2" if "-phase2/" in marker else "F1" if "C1-F1/" in marker else "F2"
@@ -1214,22 +1316,43 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
     monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
     monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", lambda *_a, **_k: None)
     monkeypatch.setattr(workload_module, "_driver_command", lambda *_a, **_k: SimpleNamespace(phase="driver-C1"))
-    monkeypatch.setattr(workload_module, "_parse_summary", lambda *_a: {"client": "C1", "jobs": 93, "failures": 0})
+    monkeypatch.setattr(workload_module, "_parse_summary", lambda *_a: {"client": "C1", "jobs": 100, "failures": 0})
     monkeypatch.setattr(workload_module, "_docker_transport", lambda *_a, **_k: "docker")
     monkeypatch.setattr(workload_module, "docker_argv", lambda _f, _h, argv: tuple(argv))
 
-    monkeypatch.setattr(workload_module, "_p51_link_outputs_complete", lambda output, **_kwargs: "P51_LINK_OUTPUTS_OK" in output)
-    summaries, evidence = workload_module._run_p51_receipt_window_multilink(
-        farm, scenario, plan, clients, Factory(), Transport(), "A",
-        event_controller=EventController(),
-    )
+    expire_drain = {"now": False}
+    if drain_case == "pending":
+        monkeypatch.setattr(
+            workload_module.time, "monotonic",
+            lambda: 10**9 if expire_drain["now"] else 0.0,
+        )
+        monkeypatch.setattr(workload_module.time, "sleep", lambda _seconds: None)
+    if drain_case == "complete":
+        summaries, evidence = workload_module._run_p51_receipt_window_multilink(
+            farm, scenario, plan, clients, Factory(), Transport(), "A",
+            event_controller=EventController(),
+        )
+    else:
+        expected_error = (
+            "output validation" if drain_case == "wrong-worker"
+            else "did not strict-retry and drain"
+        )
+        with pytest.raises(WorkloadError, match=expected_error):
+            workload_module._run_p51_receipt_window_multilink(
+                farm, scenario, plan, clients, Factory(), Transport(), "A",
+                event_controller=EventController(),
+            )
+        assert "start-F2" not in events
+        return
     assert summaries[0]["failures"] == 0
     assert [item for item in events if item in {
         "stop-F2", "abort-stopped-F2-gate", "healthy-output-while-F2-stopped",
-        "start-F2", "phase2-held", "phase2-output"
+        "old-cohort-drained-to-F1-while-F2-stopped",
+        "phase2-gate-ready-while-F2-stopped", "start-F2", "phase2-held", "phase2-output"
     }] == [
         "stop-F2", "abort-stopped-F2-gate", "healthy-output-while-F2-stopped",
-        "start-F2", "phase2-held", "phase2-output"
+        "old-cohort-drained-to-F1-while-F2-stopped",
+        "phase2-gate-ready-while-F2-stopped", "start-F2", "phase2-held", "phase2-output"
     ]
     assert evidence["restart_extension"]["phase2"]["gate_completed"] is True
     assert {command.phase for command in helper_commands} == {
@@ -2420,8 +2543,8 @@ def _mixed_shape_held_f_restart_fixture(tmp_path: Path):
         "binary": "/bin/true",
         "binary_sha256": hashlib.sha256(Path("/bin/true").read_bytes()).hexdigest(),
         "links": [
-            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
-            {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 69},
+            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39},
+            {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
         ],
         "expected_commits": 30,
         "negotiated_window": 30,
