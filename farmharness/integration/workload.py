@@ -1148,7 +1148,7 @@ def _run_p51_receipt_window_multilink(
                             "receipt-gate", phase2_dir, gate_binary, "--p51-commit-receipt-gate-remote",
                             worker["address"], str(phase2_row["port"]), str(uid),
                             str(gate_spec["expected_commits"]), "1", phase2_dir,
-                        ),
+                        ) + (() if helper_budget_s is None else (str(helper_budget_s),)),
                     )
                     phase2_command = factory.make(
                         phase="run.p51-receipt-window.d09-phase2-gate",

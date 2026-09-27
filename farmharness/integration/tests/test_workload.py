@@ -1034,7 +1034,10 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
 ) -> None:
     farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
     gate = scenario.data["workload"]["receipt_gate"]
-    gate.update({"expected_commits": 30, "negotiated_window": 30})
+    gate.update({
+        "expected_commits": 30, "negotiated_window": 30,
+        "command_timeout_s": 1800,
+    })
     gate["links"] = [
         {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
         {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 62},
@@ -1053,6 +1056,7 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
     finish_f2_phase2 = threading.Event()
     ready = {"F1": threading.Event(), "F2": threading.Event(), "phase2": threading.Event()}
     events: list[str] = []
+    helper_commands = []
 
     class Factory:
         def make(self, **kwargs):
@@ -1061,6 +1065,8 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
     class Transport:
         def invoke(self, command):
             phase = command.phase
+            if ".start-gate." in phase or phase.endswith("d09-phase2-gate"):
+                helper_commands.append(command)
             if ".start-gate.C1.F1" in phase:
                 ready["F1"].set()
                 assert release_f1.wait(2)
@@ -1172,6 +1178,13 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
         "start-F2", "phase2-held", "phase2-output"
     ]
     assert evidence["restart_extension"]["phase2"]["gate_completed"] is True
+    assert {command.phase for command in helper_commands} == {
+        "run.p51-receipt-window.start-gate.C1.F1",
+        "run.p51-receipt-window.start-gate.C1.F2",
+        "run.p51-receipt-window.d09-phase2-gate",
+    }
+    assert all(command.argv[-1] == "1770" for command in helper_commands)
+    assert all(command.timeout_s == 1800 for command in helper_commands)
 
 
 @pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
