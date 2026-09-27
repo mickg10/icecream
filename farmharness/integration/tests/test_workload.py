@@ -650,6 +650,60 @@ def test_d09_restart_extension_fails_closed_outside_multilink_w30(invalid: str) 
             )
 
 
+def test_d09_oracle_prepare_omits_measured_phase2_wait_and_driver_accepts_real_argv() -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
+    scenario.data["workload"].update({"jobs": 100, "turns": ["A"]})
+    scenario.data["workload"]["receipt_gate"].update({
+        "expected_commits": 30,
+        "negotiated_window": 30,
+        "links": [
+            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 31},
+            {"client": "C1", "worker": "F2", "first_job": 32, "last_job": 69},
+        ],
+        "restart_extension": {
+            "kind": "held-f-restart-v1",
+            "affected_link": {"client": "C1", "worker": "F2"},
+            "healthy_link": {"client": "C1", "worker": "F1"},
+        },
+    })
+    client = clients[0]
+    preparation = _driver_command(
+        farm, scenario, plan, client, "A", CommandFactory(),
+        d18_phase="prepare", exec_uid="1:1",
+    )
+    measured = _driver_command(
+        farm, scenario, plan, client, "A", CommandFactory(),
+        prepared_oracle=True, exec_uid="1:1",
+    )
+    assert not any(
+        item.startswith(("ICEFARM_P51_PHASE2_FIRST=", "ICEFARM_P51_PHASE2_RELEASE="))
+        for item in preparation.argv
+    )
+    assert "ICEFARM_P51_PHASE2_FIRST=70" in measured.argv
+    assert "ICEFARM_P51_PHASE2_RELEASE=/results/workload/A/d09-phase2-release" in measured.argv
+
+    # Execute the real manifest-driver argument/environment initialization
+    # through its phase-2 path guard, using the generated preparation argv.
+    guard_end = MANIFEST_DRIVER.index(
+        'else\n    test -z "$p51_phase2_release"\nfi\n'
+    ) + len('else\n    test -z "$p51_phase2_release"\nfi\n')
+    env = os.environ.copy()
+    for index, item in enumerate(preparation.argv[:-1]):
+        if item == "--env":
+            name, value = preparation.argv[index + 1].split("=", 1)
+            if name.startswith("ICEFARM_"):
+                env[name] = value
+    driver_index = preparation.argv.index(MANIFEST_DRIVER)
+    driver_argv = preparation.argv[driver_index + 1 :]
+    result = subprocess.run(
+        ["/bin/bash", "-c", MANIFEST_DRIVER[:guard_end]
+         + "printf 'PREPARATION_INIT_OK\\n'\n", *driver_argv],
+        env=env, text=True, capture_output=True, timeout=5, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "PREPARATION_INIT_OK\n"
+
+
 @pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
 def test_receipt_window_prepares_oracle_before_starting_gate_timer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, topology: str,

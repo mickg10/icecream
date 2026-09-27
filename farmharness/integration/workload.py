@@ -329,6 +329,11 @@ def _s60_admit_through(scenario: ScenarioSpec, corpus: dict[str, Any]) -> int:
     return boundary
 
 
+def _manifest_workload_result_root(turn: str) -> str:
+    """Return the exact result root passed to manifest_driver.sh for a turn."""
+    return f"/results/workload/{turn}"
+
+
 def _driver_command(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -375,6 +380,7 @@ def _driver_command(
     retry_endpoint_map = ""
     phase2_first = 0
     phase2_release = ""
+    workload_result_root = _manifest_workload_result_root(turn)
     if receipt_links:
         client_links = [link for link in receipt_links if link["client"] == client["name"]]
         workers_by_name = {
@@ -404,7 +410,7 @@ def _driver_command(
                     f"{phase2_first}-{phase2_last}="
                     f"{workers_by_name[affected['worker']]['address']}:{plan['ports']['instances'][affected['worker']]}"
                 )
-                phase2_release = f"/results/workload/{turn}/d09-phase2-release"
+                phase2_release = f"{workload_result_root}/d09-phase2-release"
                 healthy = restart["healthy_link"]
                 healthy_worker = workers_by_name[healthy["worker"]]
                 affected_spec = next(
@@ -475,7 +481,7 @@ def _driver_command(
             *(("--env", f"ICEFARM_P51_LINK_WINDOW={link_window}") if link_window else ()),
             *(("--env", f"ICEFARM_P51_PHASE2_FIRST={phase2_first}",
                "--env", f"ICEFARM_P51_PHASE2_RELEASE={phase2_release}")
-              if phase2_first and phase2_release else ()),
+              if phase2_first and phase2_release and d18_phase != "prepare" else ()),
             *(("--env", f"ICEFARM_P51_RETRY_ENDPOINT_MAP={retry_endpoint_map}")
               if retry_endpoint_map else ()),
             *(
@@ -493,7 +499,7 @@ def _driver_command(
             "-c",
             MANIFEST_DRIVER,
             "icefarm-manifest-driver",
-            f"/results/workload/{turn}",
+            workload_result_root,
             "/corpus",
             f"/oracle/{turn}",
             client["name"],
@@ -1163,7 +1169,7 @@ def _run_p51_receipt_window_multilink(
                     )
                     if phase2_ready is None:
                         raise WorkloadError("D09 replacement F receipt gate did not become ready")
-                    release_path = f"/results/workload/{turn}/d09-phase2-release"
+                    release_path = f"{_manifest_workload_result_root(turn)}/d09-phase2-release"
                     _p51_gate_call(
                         farm, plan, client, factory, transport, "d09-release-phase2-worklist",
                         ("/usr/bin/touch", release_path),
