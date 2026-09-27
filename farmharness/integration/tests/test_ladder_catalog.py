@@ -206,6 +206,67 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
     assert max_plan is not None
 
 
+def test_p51_multilink_matrix_preserves_explicit_caps_into_docker_plan(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm_data = copy.deepcopy(farm.data)
+    for row in receipt_window_matrix.TOPOLOGY_ROWS:
+        farm_data["authority"]["topologies"][row["id"]] = {
+            "f_relationships": row["workers"],
+            "slots_per_f": row["clients"] * 30 + int(row["clients"] == 1),
+        }
+    farm_path = tmp_path / "authorized-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+
+    base = json.loads((INTEGRATION / "scenarios" / "D18-P29V1.json").read_text())
+    role_caps = {"S1": (1, 2048), "C_R2": (1, 2048), "F_R2": (2, 32768)}
+    for name, (cpus, memory_mb) in role_caps.items():
+        instance = next(item for item in base["instances"] if item["name"] == name)
+        instance.update({"cpus": cpus, "memory_mb": memory_mb})
+    base_path = tmp_path / "capped-base.json"
+    base_path.write_text(json.dumps(base), encoding="utf-8")
+
+    generated = receipt_window_matrix.generate_matrix(
+        farm_path=farm_path,
+        base_path=base_path,
+        helper_path=Path("/bin/true"),
+        output_dir=tmp_path / "capped-matrix",
+    )
+    scenario_path = next(
+        path for path in generated
+        if path.name == "P51-receipt-C1F2-P29V1-W30.json"
+    )
+    scenario = load_scenario_spec(scenario_path, load_farm_spec(farm_path))
+    expected = {
+        "S1": (1, 2048), "F1": (2, 32768), "F2": (2, 32768), "C1": (1, 2048)
+    }
+    assert {
+        item["name"]: (item["cpus"], item["memory_mb"])
+        for item in scenario.data["instances"]
+    } == expected
+
+    plan = farmtest.build_plan(
+        load_farm_spec(farm_path), scenario, run_id="p51-capped-matrix-plan"
+    )
+    starts = [
+        command for command in plan["commands"]
+        if command["phase"] in {"up.start-s", "up.start-f", "up.start-c"}
+    ]
+    assert len(starts) == len(expected)
+    for command in starts:
+        argv = command["argv"]
+        image_index = argv.index("--entrypoint") + 2
+        assert "--cpus" in argv[:image_index]
+        assert "--memory" in argv[:image_index]
+        instance = next(
+            item for item in scenario.data["instances"]
+            if item["name"] == command["instance"]
+        )
+        assert argv[argv.index("--cpus") + 1] == str(instance["cpus"])
+        assert argv[argv.index("--memory") + 1] == f"{instance['memory_mb']}m"
+
+
 @pytest.mark.parametrize("role", ["S", "F"])
 @pytest.mark.parametrize("selection", ["missing", "ambiguous"])
 def test_p51_multilink_matrix_requires_one_p51_role_template(
