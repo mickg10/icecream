@@ -3393,6 +3393,10 @@ def collect_diagnostics(
             )
             local_output = host_dir / f"{instance['name']}.output"
             local_output.mkdir(parents=True, exist_ok=True)
+            output_kind = plan.get(
+                "diagnostic_capture_client_output_kind", "s95-canary"
+            )
+            include_patterns = _diagnostic_client_output_patterns(output_kind)
             try:
                 recorder.invoke(
                     _command(
@@ -3408,8 +3412,15 @@ def collect_diagnostics(
                             "--no-group",
                             "--omit-dir-times",
                             "--protect-args",
-                            f"{farm.hosts[host_name]['ssh']}:{remote_output}/canary/",
-                            str(local_output / "canary") + "/",
+                            *(
+                                argument
+                                for pattern in include_patterns
+                                for argument in ("--include", pattern)
+                            ),
+                            "--exclude",
+                            "*",
+                            f"{farm.hosts[host_name]['ssh']}:{remote_output}/",
+                            str(local_output) + "/",
                         ),
                     )
                 )
@@ -3418,6 +3429,61 @@ def collect_diagnostics(
                     f"{host_name}:{instance['name']}:sync-output:{exc}"
                 )
     return problems
+
+
+def _diagnostic_client_output_patterns(kind: Any) -> tuple[str, ...]:
+    """Allowlist only bounded failed-run receipts, not compiled objects/packages."""
+
+    common_workload = (
+        "/workload/",
+        "/workload/*/",
+        "/workload/*/summary.tsv",
+        "/workload/*/corpus-manifest.sha256",
+        "/workload/*/oracle-samples.tsv",
+        "/workload/*/oracle-summary.tsv",
+        "/workload/*/jobs/",
+        "/workload/*/jobs/*/",
+        "/workload/*/jobs/*/result.tsv",
+        "/workload/*/jobs/*/client-debug.log",
+        "/workload/*/jobs/*/client-output.log",
+    )
+    if kind == "s95-canary":
+        return ("/canary/", "/canary/***")
+    if kind == "d18-workload":
+        return common_workload + (
+            "/d18-prep/",
+            "/d18-prep/*/",
+            "/d18-prep/*/*/",
+            "/d18-prep/*/*/*/",
+            "/d18-prep/*/*/*/PREPARED.tsv",
+            "/d18-prep/*/*/*/oracle-samples.tsv",
+            "/d18-prep/*/*/*/oracle-summary.tsv",
+        )
+    if kind == "p51-receipt-window":
+        return common_workload + (
+            "/p51-receipt-gate/",
+            "/p51-receipt-gate/links/",
+            "/p51-receipt-gate/links/*/",
+            "/p51-receipt-gate/identity-*",
+            "/p51-receipt-gate/helper.stderr",
+            "/p51-receipt-gate/exit",
+            "/p51-receipt-gate/ready",
+            "/p51-receipt-gate/held*",
+            "/p51-receipt-gate/release*",
+            "/p51-receipt-gate/released*",
+            "/p51-receipt-gate/finish",
+            "/p51-receipt-gate/failed",
+            "/p51-receipt-gate/links/*/helper.stderr",
+            "/p51-receipt-gate/links/*/exit",
+            "/p51-receipt-gate/links/*/ready",
+            "/p51-receipt-gate/links/*/held*",
+            "/p51-receipt-gate/links/*/release*",
+            "/p51-receipt-gate/links/*/released*",
+            "/p51-receipt-gate/links/*/finish",
+            "/p51-receipt-gate/links/*/failed",
+            "/p51-receipt-gate/links/*/identity-*",
+        )
+    raise LifecycleError("client output diagnostic capture has an unknown allowlist")
 
 
 def _remove_netem_bridges(
@@ -3629,6 +3695,7 @@ def tear_down(
     factory: CommandFactory,
     *,
     protected_before: dict[str, dict[str, int]] | None = None,
+    preserve_output_instances: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     timeout_s = plan.get("timeouts", {}).get("down_s", 300)
     bindings = _netem_bindings(plan)
@@ -3641,6 +3708,10 @@ def tear_down(
         root = instance_root(farm, instance["host"], plan["run_id"], instance["name"])
         reference = instance["container_image"]["reference"]
         cleanup_name = f"icefarm-{plan['run_id']}-cleanup-{instance['name']}"
+        cleanup_paths = "/cleanup/cache /cleanup/tmp /cleanup/log /cleanup/input"
+        if instance["name"] not in preserve_output_instances:
+            cleanup_paths += " /cleanup/output"
+        cleanup_paths += " /cleanup/system-source"
         try:
             recorder.invoke(
                 _command(
@@ -3668,8 +3739,7 @@ def tear_down(
                             "/bin/sh",
                             reference,
                             "-c",
-                            "rm -rf -- /cleanup/cache /cleanup/tmp /cleanup/log "
-                            "/cleanup/input /cleanup/output /cleanup/system-source",
+                            "rm -rf -- " + cleanup_paths,
                         ),
                     ),
                 )
@@ -3713,6 +3783,7 @@ def tear_down(
         "run_id": plan["run_id"],
         "schema": LIFECYCLE_SCHEMA,
         "status": "DOWN" if not problems else "DOWN_WITH_ERRORS",
+        "preserved_output_instances": sorted(preserve_output_instances),
     }
     if problems:
         raise LifecycleError("teardown incomplete: " + "; ".join(problems))
@@ -4009,14 +4080,43 @@ def down_from_state(
             raise LifecycleError(
                 f"cannot load preflight state for down: {exc}"
             ) from exc
-    collect_diagnostics(farm, plan, transport, factory, bundle / "diagnostics")
+    diagnostic_errors = collect_diagnostics(
+        farm, plan, transport, factory, bundle / "diagnostics"
+    )
+    preserve_output_instances = frozenset(
+        instance["name"]
+        for instance in plan["topology"]["instances"]
+        if instance.get("role") == "C"
+        and any(
+            error.startswith(
+                f"{instance['host']}:{instance['name']}:sync-output:"
+            )
+            for error in diagnostic_errors
+        )
+    )
     receipt = tear_down(
         farm,
         plan,
         transport,
         factory,
         protected_before=protected_before,
+        preserve_output_instances=preserve_output_instances,
     )
     receipt["commands"] = _recorded_commands(transport)
+    receipt["diagnostic_errors"] = diagnostic_errors
+    receipt["preserved_outputs"] = [
+        {
+            "host": instance["host"],
+            "instance": instance["name"],
+            "path": str(
+                instance_root(
+                    farm, instance["host"], plan["run_id"], instance["name"]
+                )
+                / "output"
+            ),
+        }
+        for instance in plan["topology"]["instances"]
+        if instance["name"] in preserve_output_instances
+    ]
     _atomic_json(bundle / "down.json", receipt)
     return receipt

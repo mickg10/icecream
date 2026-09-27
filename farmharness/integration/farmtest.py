@@ -1109,11 +1109,19 @@ def build_plan(
             "schema": NETEM_PLAN_SCHEMA,
         },
         "run_id": selected_run_id,
-        # S95's readiness canary writes the client-side admission trace under
-        # the C container's /results mount.  Preserve that diagnostic output
-        # on a failed run; it is evidence only and never feeds a verdict.
-        **({"diagnostic_capture_client_output": True}
-           if scenario.data["id"] == "S95-cache-disk-full" else {}),
+        # Preserve narrowly selected client output during teardown. These
+        # files are diagnostic evidence, never inputs to a verdict.
+        **({
+            "diagnostic_capture_client_output": True,
+            "diagnostic_capture_client_output_kind": (
+                "s95-canary" if scenario.data["id"] == "S95-cache-disk-full"
+                else "d18-workload" if scenario.data["workload"]["driver"] == "d18-role-mix"
+                else "p51-receipt-window"
+            ),
+        } if (
+            scenario.data["id"] == "S95-cache-disk-full"
+            or scenario.data["workload"]["driver"] in ("d18-role-mix", "p51-receipt-window")
+        ) else {}),
         "scenario": str(scenario.path),
         "schema": PLAN_SCHEMA,
         "scenario_digest": scenario.digest,

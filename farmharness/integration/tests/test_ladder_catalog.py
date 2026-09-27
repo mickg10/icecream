@@ -32,6 +32,12 @@ def test_s95_plan_preserves_client_canary_output_for_failure_diagnostics() -> No
     plan = farmtest.build_plan(farm, scenario, run_id="s95-diagnostic-capture")
 
     assert plan["diagnostic_capture_client_output"] is True
+    assert plan["diagnostic_capture_client_output_kind"] == "s95-canary"
+
+    d18 = load_scenario_spec(INTEGRATION / "scenarios" / "D18-P29V1.json", farm)
+    d18_plan = farmtest.build_plan(farm, d18, run_id="d18-diagnostic-capture")
+    assert d18_plan["diagnostic_capture_client_output"] is True
+    assert d18_plan["diagnostic_capture_client_output_kind"] == "d18-workload"
 
     smoke = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     smoke_plan = farmtest.build_plan(farm, smoke, run_id="s00-no-diagnostic-capture")
@@ -51,6 +57,7 @@ def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_p
     scenario_data["instances"][1]["slots"] = 31
     scenario_data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario_data["instances"][2]["env"]["ICECC_P51_MODE"] = "on"
+    scenario_data["instances"][0].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario_data["workload"].update(
         {
             "driver": "p51-receipt-window",
@@ -82,6 +89,8 @@ def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_p
     assert plan["p51_receipt_gate"]["binary_sha256"] == hashlib.sha256(
         helper.read_bytes()
     ).hexdigest()
+    assert plan["diagnostic_capture_client_output"] is True
+    assert plan["diagnostic_capture_client_output_kind"] == "p51-receipt-window"
     assert plan["topology"]["relationships"][0]["cache_expected"] is True
 
     scenario_data["workload"]["receipt_gate"].update(

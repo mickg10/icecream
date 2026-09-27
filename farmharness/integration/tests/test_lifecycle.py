@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from farmharness.integration.lifecycle import (
     _run_canaries,
     _rotate_s30_canary_traces,
     _expected_image_labels,
+    _diagnostic_client_output_patterns,
 )
 from farmharness.integration.remote import (
     CommandResult,
@@ -107,6 +109,7 @@ class ScriptedLifecycle:
         free_bytes: int = 100_000_000_000,
         bad_role_hash: bool = False,
         client_cache_timeout: bool = False,
+        fail_output_capture: bool = False,
     ) -> None:
         self.farm = farm
         self.scheduler_interrupt = scheduler_interrupt
@@ -114,6 +117,7 @@ class ScriptedLifecycle:
         self.free_bytes = free_bytes
         self.bad_role_hash = bad_role_hash
         self.client_cache_timeout = client_cache_timeout
+        self.fail_output_capture = fail_output_capture
         runtime_closure = farm.data["runtime_image"]["closure_sha256"]
         matching_labels = [
             label
@@ -137,6 +141,8 @@ class ScriptedLifecycle:
         return [key for key, value in self.containers.items() if value["host"] == host]
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
+        if command.phase == "diagnostics.sync-output" and self.fail_output_capture:
+            raise RemoteError("injected output capture failure")
         if command.phase == "preflight.stale-list":
             return CommandResult(
                 0, "\n".join(self._containers_on(command.host)) + "\n", ""
@@ -857,6 +863,129 @@ def test_down_removes_containers_before_reporting_protected_count_change(
     for command in cleanups:
         assert "/cleanup/system-source" in command.argv[-1]
         assert "system-source-snapshots" not in " ".join(command.argv)
+
+
+def test_failed_client_output_capture_is_bounded_and_retained_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _farm_scenario_plan(tmp_path)
+    plan["diagnostic_capture_client_output"] = True
+    plan["diagnostic_capture_client_output_kind"] = "d18-workload"
+    scripted = ScriptedLifecycle(farm, fail_output_capture=True)
+    bring_up(farm, scenario, plan, recorder=RecordingTransport(scripted), probe_bytes=0)
+
+    teardown = RecordingTransport(scripted)
+    receipt = down_from_state(farm, plan, recorder=teardown)
+
+    phases = [command.phase for command in teardown.commands]
+    assert phases.index("diagnostics.sync-output") < phases.index("down.remove-scratch")
+    output_problem = next(
+        error for error in receipt["diagnostic_errors"]
+        if error.endswith(":sync-output:injected output capture failure")
+    )
+    client_host = next(
+        instance["host"]
+        for instance in plan["topology"]["instances"]
+        if instance["name"] == "C1"
+    )
+    assert output_problem.startswith(f"{client_host}:C1:")
+    assert receipt["preserved_output_instances"] == ["C1"]
+    assert receipt["preserved_outputs"] == [
+        {
+            "host": client_host,
+            "instance": "C1",
+            "path": str(
+                Path(farm.hosts[client_host]["scratch_root"])
+                / "icefarm/unit-run/C1/output"
+            ),
+        }
+    ]
+    client_cleanup = next(
+        command.argv[-1]
+        for command in teardown.commands
+        if command.phase == "down.remove-scratch"
+        and "/unit-run/C1" in " ".join(command.argv)
+    )
+    assert "/cleanup/output" not in client_cleanup
+    assert any(
+        command.phase == "down.remove-scratch"
+        and "/cleanup/cache" in command.argv[-1]
+        for command in teardown.commands
+    )
+    assert any(
+        command.phase == "down.remove-scratch"
+        and "/cleanup/tmp" in command.argv[-1]
+        for command in teardown.commands
+    )
+    assert any(
+        command.phase == "down.remove-scratch"
+        and "/cleanup/log" in command.argv[-1]
+        for command in teardown.commands
+    )
+
+
+def test_diagnostic_output_filter_keeps_receipts_not_compiled_payloads(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "remote-output"
+    destination = tmp_path / "captured-output"
+    files = {
+        "workload/A/corpus-manifest.sha256": "manifest\n",
+        "workload/A/oracle-samples.tsv": "sample\n",
+        "workload/A/oracle-summary.tsv": "summary\n",
+        "workload/A/summary.tsv": "jobs\t1\n",
+        "workload/A/jobs/000001/result.tsv": "row\n",
+        "workload/A/jobs/000001/client-debug.log": "debug\n",
+        "workload/A/jobs/000001/client-output.log": "output\n",
+        "workload/A/jobs/000001/remote.o": "compiled-object-must-not-copy\n",
+        "p51-receipt-gate/helper.stderr": "gate diagnostic\n",
+        "p51-receipt-gate/exit": "0\n",
+        "p51-receipt-gate/links/C1-F1/helper.stderr": "link diagnostic\n",
+        "p51-receipt-gate/links/C1-F1/held-1": "window=30\n",
+        "p51-receipt-gate/identity-1": "relationship=abc123 window=30\n",
+        "p51-receipt-gate/links/C1-F1/identity-1": "relationship=abc123 window=30\n",
+        "p51-receipt-gate/links/C1-F1/debs/iptables.deb": "package-must-not-copy\n",
+        "p51-receipt-gate/debs/iptables.deb": "package-must-not-copy\n",
+        "p50daemonpositive": "helper-must-not-copy\n",
+    }
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="ascii")
+    destination.mkdir()
+    patterns = _diagnostic_client_output_patterns("p51-receipt-window")
+    result = subprocess.run(
+        [
+            "rsync", "--archive", "--no-owner", "--no-group",
+            *(argument for pattern in patterns for argument in ("--include", pattern)),
+            "--exclude", "*", str(source) + "/", str(destination) + "/",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    for relative in (
+        "workload/A/summary.tsv",
+        "workload/A/corpus-manifest.sha256",
+        "workload/A/oracle-samples.tsv",
+        "workload/A/oracle-summary.tsv",
+        "workload/A/jobs/000001/result.tsv",
+        "workload/A/jobs/000001/client-debug.log",
+        "workload/A/jobs/000001/client-output.log",
+        "p51-receipt-gate/helper.stderr",
+        "p51-receipt-gate/exit",
+        "p51-receipt-gate/links/C1-F1/helper.stderr",
+        "p51-receipt-gate/links/C1-F1/held-1",
+        "p51-receipt-gate/identity-1",
+        "p51-receipt-gate/links/C1-F1/identity-1",
+    ):
+        assert (destination / relative).is_file(), relative
+    assert not (destination / "workload/A/jobs/000001/remote.o").exists()
+    assert not (destination / "p51-receipt-gate/debs/iptables.deb").exists()
+    assert not (destination / "p51-receipt-gate/links/C1-F1/debs/iptables.deb").exists()
+    assert not (destination / "p50daemonpositive").exists()
 
 
 def test_ports_are_unique_and_every_daemon_gets_an_explicit_port(

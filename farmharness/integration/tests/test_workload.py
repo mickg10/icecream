@@ -76,6 +76,34 @@ def test_d18_overlap_requires_exact_persistent_worker_process_sets() -> None:
     assert _d18_concurrent_witness(extra, extra, expected) is None
 
 
+def test_d18_remote_row_failure_reports_exact_worker_and_result_fields(
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "jobs"
+    job = jobs / "000007"
+    job.mkdir(parents=True)
+    (job / "result.tsv").write_text(
+        "7\tA\t0\tfiles/example.cc.ii\tjob-007\tF_R1\t10\t11\t0\t"
+        "remote-sha\tlocal-sha\t1\t1\t2\n",
+        encoding="ascii",
+    )
+
+    result = subprocess.run(
+        [
+            "/bin/bash", "-c", workload_module._D18_VERIFY_REMOTE_ROWS_SCRIPT,
+            "d18-verify", str(jobs), "F_R2", "1",
+        ],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode != 0
+    assert "index=7 job_id=job-007" in result.stderr
+    assert "expected_worker='F_R2' actual_worker='F_R1'" in result.stderr
+    assert "rc=0 remote_sha=remote-sha local_sha=local-sha exact=1 remote=1 retries=2" in result.stderr
+
+
 def test_d18_driver_uses_shared_barrier_without_changing_compiler_identity(
     tmp_path: Path,
 ) -> None:
