@@ -632,6 +632,14 @@ p50endpoint-d15-wire-check:
 	$(MAKE) p50endpoint
 	timeout 120s ./p50endpoint --d15-r2-wire
 
+# Opt-in D03 cuts in recovery, receipt, RESET and RESET_CONFIRM records.
+.PHONY: p50endpoint-d03-recovery-record-cuts-check
+p50endpoint-d03-recovery-record-cuts-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpointtesthooks.a libp50endpoint.a libp50adoptedoutcomewriter.a libp50localtransport.a libprotocol50.a
+	$(MAKE) p50endpoint
+	ICECC_P50_R2_D03_RECOVERY_RECORD_CUTS_FOCUS=1 timeout 1800s ./p50endpoint
+
 # Opt-in sender regressions for retrying a lost Initial LINK_STATE and for
 # terminal cancellation/expiry/malformed-state outcomes before JOB_BIND.
 .PHONY: p50zstdsender-initial-link-check

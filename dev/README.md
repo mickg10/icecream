@@ -227,6 +227,22 @@ lost `LINK_STATE`, bounded cancellation/expiry, malformed complete-state
 rejection, and typed link rejection. It does not claim the formal recovery
 model covers Initial establishment.
 
+The opt-in D03 recovery-record interruption check is:
+
+```sh
+make -C "$BUILD/unittests" p50endpoint-d03-recovery-record-cuts-check
+```
+
+It uses the scripted endpoint client over loopback, first creates one
+committed-but-unobserved receipt, then cuts RECOVER/RECEIPTS/RESET/RESET_ACK/
+RESET_CONFIRM exchanges and retries the same reset operation on a newer
+physical generation. RECOVER and RECEIPTS get representative header/payload
+boundary cuts; every pre-end byte offset is exercised for RESET, RESET_ACK and
+both RESET_CONFIRM directions, across all three profiles. It checks the cut
+identity, exact final raw input, one materialization/commit, reset identity and
+final K/Q. This is an endpoint fixture, not a production-sender retry proof;
+short-write/EAGAIN injection is not covered by this target.
+
 The same-F endpoint/service rearm path is also available as an opt-in check
 for all three transfer profiles:
 
