@@ -2425,6 +2425,366 @@ void test_concurrent_same_successor_joins_one_rebound_sender() {
     std::puts("P51_ROUTE_OWNER concurrent same-successor callers share one rebound link: ok");
 }
 
+void test_retired_old_generation_completion_after_successor(
+    ProfileId profile) {
+    const CStoreGuid c_guid{topology_guid(61, false)};
+    const FStoreGuid f_guid{topology_guid(161, true)};
+    constexpr uint64_t kOldGeneration = 91;
+    constexpr uint64_t kNewGeneration = 92;
+    const auto now = std::chrono::steady_clock::now();
+    const auto old_deadline = now + std::chrono::seconds(12);
+    const auto new_deadline = now + std::chrono::seconds(15);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto new_sidecar_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            new_deadline, clock.clock_domain_id, clock.time_namespace_id);
+
+    TopologyLink old_link;
+    old_link.c_guid = c_guid;
+    old_link.f_guid = f_guid;
+    old_link.relationship = Id128::from_u64(0xd100 +
+                                             static_cast<uint64_t>(profile));
+    old_link.relationship_epoch = 1;
+    old_link.c_generation = 81;
+    old_link.f_generation = kOldGeneration;
+    old_link.control_generation = 82;
+    old_link.control_attempt = 83;
+    auto old_arm = topology_arm(old_link, 8101, profile);
+    auto old_armed = topology_armed(old_link, std::move(old_arm), 8101);
+    old_armed.selected_window = 1;
+    const PrepareRequestKey old_request{
+        old_armed.arm.source.assignment_epoch,
+        old_armed.arm.source.source_request_id};
+    const P50RouteRelationship old_route{
+        c_guid, f_guid, kOldGeneration, profile};
+
+    TopologyLink new_link;
+    new_link.c_guid = old_link.c_guid;
+    new_link.f_guid = old_link.f_guid;
+    new_link.relationship_epoch = old_link.relationship_epoch;
+    new_link.c_generation = old_link.c_generation;
+    new_link.control_generation = old_link.control_generation;
+    new_link.control_attempt = old_link.control_attempt;
+    new_link.relationship = Id128::from_u64(0xd200 +
+                                             static_cast<uint64_t>(profile));
+    new_link.relationship_epoch = 1;
+    new_link.f_generation = kNewGeneration;
+    std::array<P51SourceArmedFields, 3> new_armed;
+    const std::array<std::vector<uint8_t>, 3> new_sources{
+        std::vector<uint8_t>{'n','e','w','-','g','e','n','-','0'},
+        std::vector<uint8_t>{'n','e','w','-','g','e','n','-','1'},
+        std::vector<uint8_t>{'n','e','w','-','g','e','n','-','2'}};
+    for (size_t i = 0; i != new_armed.size(); ++i) {
+        auto arm = topology_arm(new_link,
+                                static_cast<uint32_t>(8201 + i), profile);
+        new_armed[i] = topology_armed(
+            new_link, std::move(arm), 8201 + i);
+        new_armed[i].selected_window = 3;
+        CHECK(new_armed[i].valid());
+    }
+    const P50RouteRelationship new_route{
+        c_guid, f_guid, kNewGeneration, profile};
+
+    P50RouteOwnerConfig owner_config = config(profile);
+    owner_config.max_completed_requests = 8;
+    owner_config.max_relationships = 4;
+    owner_config.authority_limits.max_speculative_tus = 3;
+    owner_config.authority_limits.max_speculative_raw_bytes = 1U << 20;
+    owner_config.authority_limits.max_live_entries = 8;
+    const std::vector<uint8_t> old_source{'o','l','d','-','g','e','n'};
+    asio::io_context context;
+    P50CRouteOwner owner(std::move(owner_config));
+
+    EndpointCaps caps = config(profile).endpoint_caps;
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    P50ServerEndpointConfig server_config;
+    server_config.lookup_p51_link_reservation =
+        [&, new_sidecar_deadline](const LinkHello& hello)
+            -> std::optional<P51SourceLinkLease> {
+        if (hello.relationship_id != new_link.relationship ||
+            hello.c_store_guid != c_guid || hello.f_store_guid != f_guid ||
+            hello.f_store_generation != kNewGeneration ||
+            hello.relationship_epoch != new_link.relationship_epoch)
+            return std::nullopt;
+        P51SourceLinkLease lease;
+        lease.initial_armed = new_armed.front();
+        lease.absolute_deadline = new_sidecar_deadline;
+        lease.relationship_epoch = hello.relationship_epoch;
+        lease.history_nonce = hello.history_nonce;
+        return lease;
+    };
+    server_config.consume_p51_job_reservation =
+        [&, new_sidecar_deadline](const LinkHello& hello,
+                                  const JobBind& binding)
+            -> std::optional<P51SourceJobLease> {
+        size_t job = new_armed.size();
+        for (size_t i = 0; i != new_armed.size(); ++i) {
+            if (binding.reservation_id == Id128{new_armed[i].reservation_id}) {
+                job = i;
+                break;
+            }
+        }
+        if (job == new_armed.size() ||
+            hello.relationship_id != new_link.relationship ||
+            hello.f_store_generation != kNewGeneration ||
+            binding.profile != profile ||
+            binding.raw_bytes != new_sources[job].size() ||
+            binding.raw_digest != icecc::digest128(new_sources[job]))
+            return std::nullopt;
+        P51SourceJobLease lease;
+        lease.armed = new_armed[job];
+        lease.absolute_deadline = new_sidecar_deadline;
+        lease.binding = binding;
+        lease.binding_digest = compute_r2_binding_digest(binding);
+        lease.input_key = InputRecordKey{c_guid, binding.tu_seq};
+        return lease;
+    };
+    std::array<std::atomic<unsigned>, 3> publication_counts{};
+    std::atomic<unsigned> publication_mismatches{0};
+    server_config.input_job_state =
+        [&](CStoreGuid, const TxBegin&, const TxCommit& commit,
+            std::span<const uint8_t> bytes) {
+        bool matched = false;
+        for (size_t i = 0; i != new_sources.size(); ++i) {
+            if (commit.raw_digest == icecc::digest128(new_sources[i]) &&
+                bytes.size() == new_sources[i].size() &&
+                std::equal(bytes.begin(), bytes.end(), new_sources[i].begin())) {
+                publication_counts[i].fetch_add(1, std::memory_order_release);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            publication_mismatches.fetch_add(1, std::memory_order_release);
+        return InputJobState::Open;
+    };
+    std::array<std::atomic<unsigned>, 3> commit_counts{};
+    server_config.record_p51_job_commit =
+        [&](const LinkHello& hello, const JobBind& binding,
+            const R2TxCommit& commit) {
+        for (size_t i = 0; i != new_armed.size(); ++i) {
+            if (binding.reservation_id == Id128{new_armed[i].reservation_id} &&
+                hello.relationship_id == new_link.relationship &&
+                hello.physical_link_generation != 0 &&
+                commit.inner.raw_digest == icecc::digest128(new_sources[i])) {
+                commit_counts[i].fetch_add(1, std::memory_order_release);
+                return true;
+            }
+        }
+        return false;
+    };
+    server_config.acknowledge_p51_receipt =
+        [](const LinkHello& hello, const CommitAck& ack) {
+        return ack.relationship_id == hello.relationship_id &&
+               ack.relationship_epoch == hello.relationship_epoch &&
+               ack.physical_link_generation ==
+                   hello.physical_link_generation;
+    };
+    P50ServerEndpoint server(f_guid, caps, nullptr, nullptr,
+                             std::move(server_config));
+    tcp::acceptor successor_acceptor(
+        context, {asio::ip::address_v4::loopback(), 0});
+    auto accept_successor = [&]() -> asio::awaitable<ServerRunResult> {
+        tcp::socket socket(co_await asio::this_coro::executor);
+        co_await successor_acceptor.async_accept(socket, asio::use_awaitable);
+        co_return co_await server.run_adopted_r2(std::move(socket));
+    };
+
+    tcp::acceptor late_peer_acceptor(
+        context, {asio::ip::address_v4::loopback(), 0});
+    auto observe_late_fd_close = [&]() -> asio::awaitable<bool> {
+        tcp::socket peer(co_await asio::this_coro::executor);
+        co_await late_peer_acceptor.async_accept(peer, asio::use_awaitable);
+        asio::steady_timer watchdog(co_await asio::this_coro::executor);
+        watchdog.expires_at(old_deadline);
+        watchdog.async_wait([&peer](const boost::system::error_code& error) {
+            if (!error) {
+                boost::system::error_code ignored;
+                peer.close(ignored);
+            }
+        });
+        std::array<uint8_t, 1> byte{};
+        bool peer_closed = false;
+        try {
+            (void)co_await peer.async_read_some(
+                asio::buffer(byte), asio::use_awaitable);
+        } catch (const boost::system::system_error& error) {
+            peer_closed = error.code() == asio::error::eof ||
+                          error.code() == asio::error::connection_reset;
+        }
+        boost::system::error_code ignored;
+        watchdog.cancel(ignored);
+        co_return peer_closed;
+    };
+
+    std::mutex connector_mutex;
+    std::condition_variable connector_cv;
+    std::function<void(int)> old_completion;
+    std::chrono::steady_clock::time_point observed_old_deadline{};
+    bool old_connector_called = false;
+    AsyncConnectedFdFactory old_connector =
+        [&](auto deadline, auto completion) {
+        std::lock_guard lock(connector_mutex);
+        observed_old_deadline = deadline;
+        old_completion = std::move(completion);
+        old_connector_called = true;
+        connector_cv.notify_all();
+    };
+    AsyncConnectedFdFactory successor_connector =
+        [remote = successor_acceptor.local_endpoint()](auto, auto completion) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) { completion(-1); return; }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(remote.port());
+        const auto ip = remote.address().to_v4().to_bytes();
+        std::memcpy(&address.sin_addr, ip.data(), ip.size());
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address)) != 0) {
+            (void)::close(fd);
+            completion(-1);
+            return;
+        }
+        completion(fd);
+    };
+
+    // Declare the thread guard after all callback-referenced state above. On
+    // failure it must stop/join the owner executor before any captured state
+    // is destroyed.
+    auto work = asio::make_work_guard(context);
+    std::thread event_thread([&] { context.run(); });
+    struct Cleanup {
+        asio::io_context& context;
+        asio::executor_work_guard<asio::io_context::executor_type>& work;
+        std::thread& thread;
+        ~Cleanup() {
+            context.stop();
+            work.reset();
+            if (thread.joinable()) thread.join();
+        }
+    } cleanup{context, work, event_thread};
+
+    auto old_future = asio::co_spawn(
+        context, owner.transfer_p51(
+            old_route, old_armed, old_connector, old_request, old_deadline,
+            old_source), asio::use_future);
+    {
+        std::unique_lock lock(connector_mutex);
+        CHECK(connector_cv.wait_until(lock,
+              std::chrono::steady_clock::now() + std::chrono::seconds(3), [&] {
+                  return old_connector_called;
+              }));
+    }
+    CHECK(observed_old_deadline == old_deadline);
+
+    auto retire_old_promise = std::make_shared<std::promise<bool>>();
+    auto retire_old_future = retire_old_promise->get_future();
+    asio::post(context, [&, retire_old_promise] {
+        retire_old_promise->set_value(
+            owner.retire_f_store_exact_p51(f_guid, kOldGeneration));
+    });
+    CHECK(retire_old_future.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    CHECK(retire_old_future.get());
+
+    auto successor_server_future = asio::co_spawn(
+        context, accept_successor(), asio::use_future);
+    std::array<ZstdSourceTransferResult, 2> first_results;
+    for (size_t i = 0; i != first_results.size(); ++i) {
+        const PrepareRequestKey request{
+            new_armed[i].arm.source.assignment_epoch,
+            new_armed[i].arm.source.source_request_id};
+        auto result_future = asio::co_spawn(
+            context, owner.transfer_p51(
+                new_route, new_armed[i], successor_connector, request,
+                new_deadline, new_sources[i]), asio::use_future);
+        CHECK(result_future.wait_until(new_deadline) == std::future_status::ready);
+        first_results[i] = result_future.get();
+        CHECK(first_results[i].status == ZstdSourceTransferStatus::Committed);
+        CHECK(first_results[i].raw_bytes == new_sources[i].size());
+        CHECK(first_results[i].raw_digest == icecc::digest128(new_sources[i]));
+    }
+
+    auto late_peer_future = asio::co_spawn(
+        context, observe_late_fd_close(), asio::use_future);
+    const tcp::endpoint late_endpoint = late_peer_acceptor.local_endpoint();
+    const int late_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(late_fd >= 0);
+    sockaddr_in late_address{};
+    late_address.sin_family = AF_INET;
+    late_address.sin_port = htons(late_endpoint.port());
+    const auto late_ip = late_endpoint.address().to_v4().to_bytes();
+    std::memcpy(&late_address.sin_addr, late_ip.data(), late_ip.size());
+    CHECK(::connect(late_fd, reinterpret_cast<const sockaddr*>(&late_address),
+                    sizeof(late_address)) == 0);
+    {
+        std::lock_guard lock(connector_mutex);
+        CHECK(static_cast<bool>(old_completion));
+        CHECK(std::chrono::steady_clock::now() < observed_old_deadline);
+        old_completion(late_fd);
+        old_completion = {};
+    }
+    CHECK(late_peer_future.wait_for(std::chrono::seconds(3)) ==
+          std::future_status::ready);
+    CHECK(late_peer_future.get());
+    CHECK(old_future.wait_until(old_deadline) == std::future_status::ready);
+    const auto old_result = old_future.get();
+    CHECK(old_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(old_result.route_local_failure && !old_result.replacement_required);
+    CHECK(!old_result.committed_input);
+
+    auto owner_snapshot_promise =
+        std::make_shared<std::promise<std::pair<size_t, bool>>>();
+    auto owner_snapshot_future = owner_snapshot_promise->get_future();
+    asio::post(context, [&, owner_snapshot_promise] {
+        owner.reap_retired_p51();
+        owner_snapshot_promise->set_value(
+            {owner.owner_count(), owner.owns(new_route)});
+    });
+    CHECK(owner_snapshot_future.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    const auto [owner_count, owns_new_route] = owner_snapshot_future.get();
+    CHECK(owner_count == 1 && owns_new_route);
+
+    const PrepareRequestKey third_request{
+        new_armed[2].arm.source.assignment_epoch,
+        new_armed[2].arm.source.source_request_id};
+    auto third_future = asio::co_spawn(
+        context, owner.transfer_p51(
+            new_route, new_armed[2], successor_connector, third_request,
+            new_deadline, new_sources[2]), asio::use_future);
+    CHECK(third_future.wait_until(new_deadline) == std::future_status::ready);
+    const auto third_result = third_future.get();
+    CHECK(third_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(third_result.raw_bytes == new_sources[2].size());
+    CHECK(third_result.raw_digest == icecc::digest128(new_sources[2]));
+    for (size_t i = 0; i != new_sources.size(); ++i) {
+        CHECK(publication_counts[i].load(std::memory_order_acquire) == 1);
+        CHECK(commit_counts[i].load(std::memory_order_acquire) == 1);
+    }
+    CHECK(publication_mismatches.load(std::memory_order_acquire) == 0);
+
+    auto retire_new_promise = std::make_shared<std::promise<bool>>();
+    auto retire_new_future = retire_new_promise->get_future();
+    asio::post(context, [&, retire_new_promise] {
+        retire_new_promise->set_value(
+            owner.retire_f_store_exact_p51(f_guid, kNewGeneration));
+    });
+    CHECK(retire_new_future.wait_for(std::chrono::seconds(2)) ==
+          std::future_status::ready);
+    CHECK(retire_new_future.get());
+    CHECK(successor_server_future.wait_for(std::chrono::seconds(3)) ==
+          std::future_status::ready);
+    CHECK(successor_server_future.get().status == ServerRunStatus::Disconnected);
+    work.reset();
+    context.stop();
+    event_thread.join();
+    std::fprintf(stderr,
+        "P51_ROUTE_OWNER_OLD_GENERATION_COMPLETION profile=%s commits=3 old_route_local=1 late_fd_closed=1 PASS\n",
+        topology_profile_name(profile));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2437,6 +2797,13 @@ int main(int argc, char** argv) {
     if (argc == 2 &&
         std::strcmp(argv[1], "--same-successor-concurrency") == 0) {
         test_concurrent_same_successor_joins_one_rebound_sender();
+        return 0;
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--old-generation-completion") == 0) {
+        for (const ProfileId profile :
+             {ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+            test_retired_old_generation_completion_after_successor(profile);
         return 0;
     }
     test_source_transfer_operation_wire();
@@ -2465,4 +2832,7 @@ int main(int argc, char** argv) {
     }
     test_retired_route_reaped_when_background_reader_goes_idle();
     test_concurrent_same_successor_joins_one_rebound_sender();
+    for (const ProfileId profile :
+         {ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE})
+        test_retired_old_generation_completion_after_successor(profile);
 }
