@@ -26,9 +26,17 @@ Evidence root `/tanksmall/scratch/tmp/p51-c06-qa-80c0-run/icecream-qa-5iathr_0`;
 Focused diagnostics found that the preceding over-limit response can arrive
 before its pending-operation slot retires. Immediate fit admission then
 returns capacity-busy; the listener timeout is a consequence, not slow setup.
-A bounded slot-retirement synchronization fixes the diagnostic reproduction
-without changing product deadlines. Final-source registered sanitizer
-qualification is pending; this is not a whole-QA pass.
+A bounded slot-retirement synchronization is published as `1665050f`, with
+no product deadline change. Its exact source passes the normal all-profile
+selector and the registered ASan/UBSan/LSan suite, including D12 W30 for all
+three profiles. Source SHA256
+`55137978415d379f1e1048718c6bc844c6ef494a50b18baa38c994d6af0910fa`;
+registered log SHA256
+`a7b2c9ccf9fa2860f4bbfc8ea562abc3b77ae843e54d45ed36e229e2f8eb67d3`
+under `/tanksmall/scratch/tmp/p51-fit-sanitize-3Lz8ka/build-normal/unittests/`.
+The preceding focused registered attempt failed on scratch permissions before
+reaching D12 and is retained separately. This scoped pass does not supersede
+the frozen whole-QA failure or qualify later merged changes.
 
 Earlier fresh public QA on clean `0693ea6e`, with the rebuilt SDK including
 `rsync`, is terminal **FAIL**. Build/install passed; native tests finished
