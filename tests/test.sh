@@ -1659,23 +1659,31 @@ zero_local_jobs_test()
     fi
     rm -rf  "${libdir}"
 
-    # No compile slots, but local-only jobs still run side by side.
+    # No compile slots, but local-only jobs still run side by side, and all of them finish.
     if test "$(nproc)" -ge 2; then
         rm -rf "$testdir"/icerun
         mkdir -p "$testdir"/icerun
+        pids=
         for i in 1 2 3 4; do
             ICECC_TEST_SOCKET="$testdir"/socket-localice ICECC_TEST_REMOTEBUILD=1 \
                 $valgrind "${icerun}" ./icerun-test.sh "$testdir"/icerun $i &
+            pids="$pids $!"
         done
         seen2=
+        done4=
         for t in $(seq 500); do
             test $(ls -1 "$testdir"/icerun/running* 2>/dev/null | wc -l) -ge 2 && seen2=1
-            test $(ls -1 "$testdir"/icerun/done* 2>/dev/null | wc -l) -eq 4 && break
+            test $(ls -1 "$testdir"/icerun/done* 2>/dev/null | wc -l) -eq 4 && done4=1 && break
             sleep 0.1
         done
+        test -n "$done4" || kill $pids 2>/dev/null
+        failed=
+        for p in $pids; do
+            wait $p || failed=1
+        done
         rm -rf "$testdir"/icerun
-        if test -z "$seen2"; then
-            echo "Error, local-only jobs at -m 0 never ran two at a time"
+        if test -z "$seen2" -o -z "$done4" -o -n "$failed"; then
+            echo "Error, local-only jobs at -m 0: two at a time ${seen2:-no}, all four done ${done4:-no}, a job failed ${failed:-no}"
             stop_ice 0
             abort_tests
         fi
