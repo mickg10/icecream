@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p51-compiler-loss-w30|p50-live-core|p50-c02-channel}" >&2
+    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p51-compiler-loss-w30|p50-live-core|p50-c02-channel|p50-d15-r2-wire}" >&2
 }
 
 capture_gate_status() {
@@ -36,6 +36,31 @@ require_compiler_loss_w30_profiles() {
             echo "FAIL: expected exactly one compiler-loss W30 marker for profile=$profile, found $count; retained log=$log" >&2
             return 1
         fi
+    done
+}
+
+require_d15_r2_semantic_cells() {
+    local log=$1 profile field marker count log_contents
+    log_contents=$(cat -- "$log") || return 1
+    for marker in \
+        'P51_D15_R2_WIRE malformed recovery records all directions/profiles: PASS' \
+        'P51_D15_R2_WIRE malformed outer frames all-applicable-profiles: PASS'; do
+        count=$(grep -F -x -c "$marker" <<<"$log_contents" || true)
+        if [[ $count -ne 1 ]]; then
+            echo "FAIL: expected exactly one D15 malformed-matrix marker, found $count; retained log=$log" >&2
+            return 1
+        fi
+    done
+    for profile in 1 2 3; do
+        for field in ordinal binding-digest envelope-txn-digest history-nonce \
+                     rel-seq tu-seq inner-txn-digest raw-digest post-state-digest; do
+            marker="P51_D15_R2_TX_COMMIT_SEMANTIC profile=$profile field=$field "
+            count=$(grep -F -c "$marker" <<<"$log_contents" || true)
+            if [[ $count -ne 1 ]]; then
+                echo "FAIL: expected exactly one D15 semantic cell profile=$profile field=$field, found $count; retained log=$log" >&2
+                return 1
+            fi
+        done
     done
 }
 
@@ -125,6 +150,13 @@ case "$1" in
         esac
         marker="C02_CHANNEL_WITNESS profile=$c02_profile "
         expected_markers=1
+        ;;
+    p50-d15-r2-wire)
+        gate=$1
+        target=p50endpoint-d15-wire-check
+        timeout_s=420
+        marker='P51_D15_R2_TX_COMMIT_SEMANTIC profile='
+        expected_markers=27
         ;;
     *)
         echo "FAIL: unsupported opt-in gate: $1" >&2
@@ -510,5 +542,8 @@ if [[ "$gate" == p51-wrapper-compile ]]; then
 fi
 if [[ "$gate" == p51-compiler-loss-w30 ]]; then
     require_compiler_loss_w30_profiles "$log" || exit 1
+fi
+if [[ "$gate" == p50-d15-r2-wire ]]; then
+    require_d15_r2_semantic_cells "$log" || exit 1
 fi
 echo "GATE_PASS name=$gate log=$log"

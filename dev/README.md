@@ -87,7 +87,9 @@ restart chain), `p51-restart-chain-w30` (active F→C restart chain),
 `p51-compiler-loss-w30` (real compiler-owner loss while 30 source receipts are
 held, with an already-admitted C2 sibling required to finish before release), and
 `p50-live-core` (the two remote assignment gates, completion flow, compile
-end-to-end, daemon-positive, and live source-arm gates).
+end-to-end, daemon-positive, and live source-arm gates). It also allows
+`p50-d15-r2-wire` (actual-wire malformed R2 records and exact TX_COMMIT
+identity/digest rejection across all three profiles).
 It creates a private internal bridge, grants
 only `NET_ADMIN`, and retains uniquely named logs under the run's
 `/work/artifacts`. A missing prerequisite or skip result is a failure, not a
@@ -125,6 +127,11 @@ for both the initial toolchain installation and the already-installed case.
 It defaults to ZSTD_ROUTE; select another supported profile with
 `ICECC_TEST_P50_C02_PROFILE=P29V1` or `ZSTD_TU` on `make dev-gate`. The ordinary
 `p50-live-core` path remains unchanged and does not opt into R2.
+The opt-in `p50-d15-r2-wire` gate runs the existing bounded endpoint wire
+matrix. It checks malformed recovery records and nine independently mutated
+`R2_TX_COMMIT` identity/digest fields across P29V1, ZSTD_TU, and ZSTD_ROUTE;
+the semantic cases require exact client rejection, no premature ACK/state
+advance, and recovery of the server's original committed receipt.
 The restart gate currently covers ZSTD_TU C1F2/F-cache and C2F1/C-cache
 replacement, one affected transfer plus a healthy sibling. The separate
 `restart-w30` gate covers both replacements for all three profiles: 30 held

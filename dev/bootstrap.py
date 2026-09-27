@@ -32,6 +32,7 @@ GATE_TARGETS = {
     "p51-compiler-loss-w30": ("p51wrappercompile-compiler-loss-w30-check", 960),
     "p50-live-core": ("six required root/live P50 gates", 1200),
     "p50-c02-channel": ("C02 cold/warm R2 same-channel compile witness", 720),
+    "p50-d15-r2-wire": ("D15 R2 malformed-frame and TX_COMMIT semantic matrix", 420),
 }
 GATE_OFFLINE_ENV = (
     "UV_OFFLINE=1",
