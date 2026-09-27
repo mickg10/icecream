@@ -227,6 +227,18 @@ lost `LINK_STATE`, bounded cancellation/expiry, malformed complete-state
 rejection, and typed link rejection. It does not claim the formal recovery
 model covers Initial establishment.
 
+The same-F endpoint/service rearm path is also available as an opt-in check
+for all three transfer profiles:
+
+```sh
+make -C "$BUILD/unittests" p50cacheservice-initial-cut-rearm-check
+```
+
+It covers deadline expiry and explicit cancellation before the first
+`LINK_STATE`, then verifies route-local old-assignment handling, a fresh
+F-issued relationship on the same service, exact new-input commit, and an
+independent C sibling. It remains outside default fast QA.
+
 ### Repository and offline inputs
 
 Set `image_repository` to a prepared SDK repository, or override it with

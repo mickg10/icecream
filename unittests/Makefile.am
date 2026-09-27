@@ -644,6 +644,14 @@ p50zstdsender-initial-link-check:
 	timeout 120s ./p50zstdsender --initial-handshake-terminal
 	timeout 120s ./p50zstdsender --typed-link-rejection
 
+# Opt-in end-to-end Initial cut/rearm on one F service for every profile.
+.PHONY: p50cacheservice-initial-cut-rearm-check
+p50cacheservice-initial-cut-rearm-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpointtesthooks.a libp50endpoint.a libp50input.a libp50adoptedoutcomewriter.a libprotocol50.a libp50localtransport.a icecc-cache-service
+	$(MAKE) p50cacheservice readyclose_shim.so
+	timeout 180s ./p50cacheservice --same-f-initial-cut-rearm
+
 connectivity_DEPENDENCIES = conn_shim.so
 
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log

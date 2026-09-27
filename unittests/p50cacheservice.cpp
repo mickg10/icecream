@@ -12383,7 +12383,8 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
     bool established_link_reconnect = false,
     bool interleaved_trace_only = false,
     bool terminal_initial_cut = false,
-    bool cancel_initial_cut = false) {
+    bool cancel_initial_cut = false,
+    ProfileId profile = ProfileId::ZSTD_TU) {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x5b;
     const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
@@ -12395,14 +12396,20 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
     const CStoreGuid old_c = remote_c(0x5c);
     const CStoreGuid sibling_c = remote_c(0x5d);
 
+    uint32_t cache_profile = CACHE_PROFILE_ZSTD_TU;
+    switch (profile) {
+    case ProfileId::P29V1: cache_profile = CACHE_PROFILE_P29V1; break;
+    case ProfileId::ZSTD_TU: cache_profile = CACHE_PROFILE_ZSTD_TU; break;
+    case ProfileId::ZSTD_ROUTE: cache_profile = CACHE_PROFILE_ZSTD_ROUTE; break;
+    }
+
     service::RuntimeConfig server_config = test_runtime_config();
     server_config.c_store_guid = launch.c_store_guid;
     server_config.f_store_guid = launch.f_store_guid;
     server_config.f_store_generation = launch.store_generation;
     server_config.sidecar_launch = launch;
-    server_config.endpoint_caps.profile = ProfileId::ZSTD_TU;
-    server_config.endpoint_caps.supported_profiles =
-        profile_bit(ProfileId::ZSTD_TU);
+    server_config.endpoint_caps.profile = profile;
+    server_config.endpoint_caps.supported_profiles = profile_bit(profile);
     server_config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
     server_config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
     server_config.max_route_relationships = 2;
@@ -12559,9 +12566,8 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
             config.f_store_guid = client_launch.f_store_guid;
             config.f_store_generation = client_launch.store_generation;
             config.sidecar_launch = client_launch;
-            config.endpoint_caps.profile = ProfileId::ZSTD_TU;
-            config.endpoint_caps.supported_profiles =
-                profile_bit(ProfileId::ZSTD_TU);
+            config.endpoint_caps.profile = profile;
+            config.endpoint_caps.supported_profiles = profile_bit(profile);
             config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
             config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
             config.max_active_p51_source_transfers = 2;
@@ -12593,7 +12599,7 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                 client_launch.c_store_guid, client_launch.store_generation,
                 client_launch.identity.generation,
                 client_launch.identity.attempt, request_id,
-                CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(20));
+                cache_profile, 30, std::chrono::seconds(20));
             reservation.arm.source.assignment_nonce = request_id;
             reservation.arm.source.selected_f_host = "127.0.0.1";
             reservation.arm.source.selected_f_cache_port = port;
@@ -12725,7 +12731,7 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
                        uint64_t request_id) {
         auto request = test_p51_reservation_request(
             c_guid, c_generation, 71, 1, request_id,
-            CACHE_PROFILE_ZSTD_TU, 30, std::chrono::seconds(20));
+            cache_profile, 30, std::chrono::seconds(20));
         request.arm.source.selected_f_host = "127.0.0.1";
         request.arm.source.selected_f_cache_port = port;
         request.arm.source.assignment_nonce = request_id;
@@ -12764,7 +12770,7 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
         const auto& source = armed.arm.source;
         const P50RouteRelationship relationship{
             c_guid, FStoreGuid{armed.f_store_guid},
-            armed.f_store_generation, ProfileId::ZSTD_TU};
+            armed.f_store_generation, profile};
         const PrepareRequestKey request{source.assignment_epoch,
                                         source.assignment_nonce};
         const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -12827,7 +12833,7 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
 
         auto pressure_request = test_p51_reservation_request(
             remote_c(0x5e), 93, launch.identity.generation,
-            launch.identity.attempt, 9301, CACHE_PROFILE_ZSTD_TU, 30,
+            launch.identity.attempt, 9301, cache_profile, 30,
             std::chrono::seconds(20));
         pressure_request.arm.source.selected_f_host = "127.0.0.1";
         pressure_request.arm.source.selected_f_cache_port = port;
@@ -13031,7 +13037,7 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
     std::optional<P51SourceArmedFields> fresh_armed;
     if (initial_cut_rearm_case) {
         fresh_request = test_p51_reservation_request(
-            old_c, 91, 71, 1, 9102, CACHE_PROFILE_ZSTD_TU, 30,
+            old_c, 91, 71, 1, 9102, cache_profile, 30,
             std::chrono::seconds(20));
         fresh_request.arm.source.selected_f_host = "127.0.0.1";
         fresh_request.arm.source.selected_f_cache_port = port;
@@ -13088,10 +13094,14 @@ void test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
           fresh_result.raw_digest ==
               icecc::digest128(std::string_view(fresh_bytes)));
     if (initial_cut_rearm_case) {
+        const char* profile_name =
+            profile == ProfileId::P29V1
+                ? "P29V1"
+                : profile == ProfileId::ZSTD_TU ? "ZSTD_TU" : "ZSTD_ROUTE";
         std::fprintf(stderr,
-                     "P51_R2_INITIAL_CUT_REARM cancel=%u status=%u accepted=%u "
+                     "P51_R2_INITIAL_CUT_REARM profile=%s cancel=%u status=%u accepted=%u "
                      "route_local=1 fresh_id=1 fresh_epoch=%llu exact=1 PASS\n",
-                     cancel_initial_cut, initial_cut_status,
+                     profile_name, cancel_initial_cut, initial_cut_status,
                      accepted.load(std::memory_order_acquire),
                      static_cast<unsigned long long>(
                          fresh_armed->relationship_epoch));
@@ -17523,10 +17533,14 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 &&
             std::strcmp(argv[1], "--same-f-initial-cut-rearm") == 0) {
-            test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
-                false, false, true, false);
-            test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
-                false, false, false, true);
+            for (const ProfileId profile : {ProfileId::P29V1,
+                                            ProfileId::ZSTD_TU,
+                                            ProfileId::ZSTD_ROUTE}) {
+                test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+                    false, false, true, false, profile);
+                test_p51_same_f_missing_real_sender_transfer_keeps_sibling(
+                    false, false, false, true, profile);
+            }
             return 0;
         }
         if (argc == 2 &&

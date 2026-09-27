@@ -1110,6 +1110,9 @@ initial-response case; the current TLA+ recovery model starts after link
 establishment and does not prove it. The focused executable gate is
 `make -C "$BUILD/unittests" p50zstdsender-initial-link-check`; it remains
 opt-in rather than extending the default fast suite.
+The actual same-F service rearm after Initial cuts is covered for all three
+profiles by the separate opt-in target
+`make -C "$BUILD/unittests" p50cacheservice-initial-cut-rearm-check`.
 
 After terminal Initial cancellation or expiry, replacement is route-local.
 F may retire the exact zero-progress relationship only after all reservations
