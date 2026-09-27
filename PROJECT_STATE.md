@@ -59,8 +59,8 @@ original deadline. Terminal cancellation/expiry quarantines only that route;
 after its reservations and live session are gone, F can issue a new logical
 identity/epoch. The real TCP service test passes expiry and explicit cancel,
 then exact-byte commit through the same C route owner, while a second C
-remains usable. This service test covers ZSTD_TU and C2F1, not all profiles
-or C1F2. Adjacent sender and endpoint selectors cover all three profiles.
+remains usable. The original service run covered ZSTD_TU and C2F1, not all
+profiles or C1F2. Adjacent sender and endpoint selectors cover all three profiles.
 Private donor: `fe9793827567840c661ea2a1f2be9e8935e7a0fa`.
 Retained logs in `/tanksmall/scratch/tmp/p51-d03-linkstate-runtime/`:
 `initial-cut-rearm-r2.log` SHA256
@@ -97,8 +97,21 @@ Autotools helpers; its log is retained. Running `autogen.sh` and rebuilding
 the actual dependencies corrected setup. These native focused runs are not
 a new sanitizer pass, full QA, or full formal qualification.
 
+The subsequent parameterized real-service rearm target now passes all six
+profile/cancellation-mode cells (P29V1, ZSTD_TU, ZSTD_ROUTE × expiry/cancel).
+It reuses the same production archive closure; only the test fixture and
+opt-in target changed. Each case checks route-local failure, fresh F-issued
+identity/epoch, exact fresh input and a retained sibling C relationship.
+Topology remains C2F1; this does not add C1F2 or cross-host coverage.
+Final log `initial-cut-rearm-r2.log` records explicit exit 0 and has SHA256
+`e51d6d409f6505ac48da729dc7b463b532ed88fda2d25c0313f631dad40e7d92`;
+service-test binary SHA256:
+`08f7a7bc6d5a2474565aab28496e927e392914cd5d948ac60eeb0685b7c93f24`.
+
 The user-confirmed cross-machine farm is q2/q3/q5, with research6 available
-to launch C. Readiness checks are in progress; this is not a farm-test pass.
+to launch C. Read-only SSH/Docker readiness checks succeeded and the
+Implementer confirmed their benchmark farm is separate. Cross-host W30
+occupancy testing remains in development; this is not a farm-test pass.
 
 ### Third paired corpus: ClickHouse programs32
 
