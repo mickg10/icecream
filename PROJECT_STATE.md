@@ -12,6 +12,19 @@ retained artifact directories.
 
 ## Developer QA
 
+Latest fresh public QA on clean `0693ea6e`, with the rebuilt SDK including
+`rsync`, is terminal **FAIL**. Build/install passed; native tests finished
+170 PASS / 6 SKIP / 2 FAIL. Both failures are the terminal-reconnect
+`recovery_prepared_prefix_p == 32` assertion in normal and sanitized
+`p50cacheservice`. Python passed 1,763 tests with eight skips in 199.48 seconds.
+This is not a complete QA pass. The terminal test closes an idle link before
+enqueueing transfer 32; whether recovery legitimately precedes staging is
+under focused investigation. The preceding smoke test's printed P=31 is not
+the failing case's observed value.
+Evidence root `/tanksmall/scratch/tmp/p51-qa-0693ea6e/icecream-qa-ap3fncs4`;
+`result.json` SHA256
+`863bd0eac16c4716fb0781c93bf4472e4851b6f84a8409337e55becb0a027a1d`.
+
 Fresh public `ICEFARM_TMPDIR=... make qa` on clean `0bb7cc59` has exposed a
 default sender-test compile failure: `observed_c_fd` was incorrectly declared
 inside `ICECC_P50_ENDPOINT_TEST_HOOKS`, while ordinary connector/cleanup code
@@ -250,7 +263,25 @@ and at least 61 total F slots, not just a larger credit flag. All 302 tests in
 the three affected modules pass; retained log
 `/tanksmall/scratch/tmp/p51-dispatch-credit-evidence/pytest-302.log`, SHA256
 `17e3bfe3203c60704245bbbdaabd1f1c56e9a1e09bfe159d0f83fd55df487d8d`.
-The live credit-corrected run remains required; these are planning/test results.
+Credit-corrected runs C and D both reached exact held ordinals 1–30 on each
+link, but neither completed the gate. Run C exposed the output poller's
+incorrect assumption that real transport returns nonzero statuses instead
+of raising. `d73a252f` fixes that contract with explicit readiness responses
+and atomic result publication; all 124 workload tests pass.
+
+Run D on that correction failed after releasing F1: its input-attachment
+connections returned Disconnected for scheduler jobs 54, 59 and 62. Job 54
+retried remotely on F2, producing exact output but violating the baseline
+gate's required endpoint. The row's `remote=0` is not proof of local fallback.
+DOWN is clean; the attachment failure remains under investigation.
+Evidence root `/tanksmall/scratch/tmp/p51-local-receipt-credit-d`, run ID
+`p51-local-c1f2-p29-w30-credit-20260927d`; `run-d.log` SHA256
+`7d050423c44da76f5d214daf4ecdc67087f9d301d118abe4c09a04e36c2bf654`.
+
+`69615ee2` selects explicitly enabled role templates for the external matrix,
+including the R2 client rather than the first mixed-base client (P43).
+All 26 generator-module tests pass. Thirty-six helper-pinned external plans
+validate statically; runtime coverage remains open.
 
 `402d11fc` removes an incorrect multi-link exception to strict P50 policy.
 `ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
