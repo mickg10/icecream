@@ -587,6 +587,85 @@ def test_p50_c02_gate_forwards_validated_profile_through_private_lifecycle(
     assert rejected.commands == []
 
 
+def test_p50_d15_gate_is_registered_and_uses_the_private_gate_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    assert bootstrap.gate_spec("p50-d15-r2-wire") == (
+        "D15 R2 malformed-frame and TX_COMMIT semantic matrix", 420,
+    )
+    run = GateCommandRun(tmp_path)
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    work = tmp_path / "current"
+    (work / "tmp").mkdir(parents=True)
+
+    def fake_subprocess_run(
+        argv: list[str], **_kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        labels = {"icecream.dev.gate.id": run.gate_id}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(labels))
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_subprocess_run)
+    result = bootstrap.run_gate(
+        run, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+        "p50-d15-r2-wire",
+    )
+    network_name, network_argv = run.commands[0]
+    gate_name, gate_argv = run.commands[1]
+    assert network_name == "gate-network-create"
+    assert "--internal" in network_argv
+    assert gate_name == "gate-p50-d15-r2-wire"
+    assert gate_argv[-2:] == ["/source/dev/run-gate.sh", "p50-d15-r2-wire"]
+    assert gate_argv[gate_argv.index("--cpus") + 1] == "2"
+    assert gate_argv[gate_argv.index("--memory") + 1] == "8g"
+    assert result["target"] == "D15 R2 malformed-frame and TX_COMMIT semantic matrix"
+    assert result["timeout_s"] == 420
+    assert run.command_timeouts == [
+        ("gate-network-create", 30), ("gate-p50-d15-r2-wire", 480),
+    ]
+
+
+def test_d15_gate_rejects_missing_or_duplicate_profile_field_markers(
+    tmp_path: Path,
+) -> None:
+    marker = "P51_D15_R2_TX_COMMIT_SEMANTIC profile="
+    fields = (
+        "ordinal", "binding-digest", "envelope-txn-digest", "history-nonce",
+        "rel-seq", "tu-seq", "inner-txn-digest", "raw-digest",
+        "post-state-digest",
+    )
+    cells = [
+        f"{marker}{profile} field={field} exact-reject/no-ack/recovered-commit: PASS"
+        for profile in (1, 2, 3) for field in fields
+    ]
+    malformed = [
+        "P51_D15_R2_WIRE malformed recovery records all directions/profiles: PASS",
+        "P51_D15_R2_WIRE malformed outer frames all-applicable-profiles: PASS",
+    ]
+    script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    start = script.index("require_d15_r2_semantic_cells() {")
+    end = script.index("\n}", start) + 2
+    validator = script[start:end]
+    cases = (
+        ("positive", [*cells, *malformed], 0),
+        ("missing-cell", [line for line in cells if "profile=2 field=raw-digest " not in line] + malformed, 1),
+        ("duplicate-cell", [*cells, cells[0], *malformed], 1),
+        ("missing-malformed", cells + malformed[1:], 1),
+        ("duplicate-malformed", [*cells, *malformed, malformed[0]], 1),
+    )
+    for name, lines, expected in cases:
+        log = tmp_path / f"{name}.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-c", validator + "\nrequire_d15_r2_semantic_cells \"$1\"",
+             "test", str(log)],
+            capture_output=True, text=True, check=False,
+        )
+        assert (result.returncode == 0) is (expected == 0), (
+            name, result.stdout, result.stderr,
+        )
+
+
 def test_wrapper_compile_gate_uses_private_bridge_named_daemon_and_exact_six_cells(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
