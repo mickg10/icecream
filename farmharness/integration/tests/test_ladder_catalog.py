@@ -61,7 +61,6 @@ def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_p
     scenario_data["instances"][1]["slots"] = 31
     scenario_data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario_data["instances"][2]["env"]["ICECC_P51_MODE"] = "on"
-    scenario_data["instances"][0].setdefault("env", {})["ICECC_P51_MODE"] = "on"
     scenario_data["workload"].update(
         {
             "driver": "p51-receipt-window",
