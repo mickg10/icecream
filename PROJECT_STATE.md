@@ -57,9 +57,12 @@ unchanged limits. Log
 `3c9a931f8791ad828624c7dd03ecbedcf6cc661b4232a1c32974e73bbeb3bb1b`.
 Its final C4F1/ZSTD_ROUTE cell established four links after six attempts;
 no first-failure marker occurred. This does not explain or erase the earlier
-12-attempt failure. New local Docker receipt execution is separately running
-on the tiny31 corpus and labelled 9e product image; it is not a current-source
-farm or performance result.
+12-attempt failure. New local Docker receipt execution is prepared using
+the tiny31 corpus and labelled 9e product image, but is queued behind the
+intentional host-global farm lock held by D18. The first invocation used the
+workload-only command without an UP receipt; the corrected one-shot invocation
+was refused by that lock. Neither launched a local workload. This remains
+runner qualification, not a current-source farm or performance result.
 
 ### Frozen QA and legacy build boundary
 
