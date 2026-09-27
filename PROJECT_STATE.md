@@ -1,6 +1,6 @@
 # Sorbet 1.5.0: validation and remaining work
 
-Updated 2026-09-26. Package version is **1.5.0**; the release branch is
+Updated 2026-09-27. Package version is **1.5.0**; the release branch is
 `sorbet_v1.5`. The repository is public. The Docker bootstrap implementation
 was published as `de027cefc31d79d062c3158400951916a9aa5d63`.
 A pushed branch is not a published release tag or a newly qualified farm image.
@@ -11,6 +11,28 @@ agent log. Earlier diagnostic reports remain in Git history and their
 retained artifact directories.
 
 ## Developer QA
+
+### Delayed old-generation connector completion
+
+Donor `32fae46f` adds a default `p50routeowner` test for all three profiles:
+retain an old-generation connector callback, retire that exact F generation,
+commit two inputs on the new generation, then deliver the old callback before
+its original deadline. The late socket closes; the old result is unavailable
+and route-local, not a process-wide replacement. The new owner remains live
+and commits a third exact input. All three inputs publish and commit once.
+This tests a delayed connector completion, not every possible stale callback
+or direct credit conservation.
+
+Both the focused selector and default route-owner executable pass on the
+private `21eae5a4`-based source plus this test. The verified C05 dependency
+closure was reused only for unchanged sources; `libicecc` and the test were
+rebuilt. Logs under `/tanksmall/scratch/tmp/p51-d10-old-generation-build/logs/`:
+`old-generation-r2.log` SHA256
+`ac32ff6b886997406e7aea09eccc382e491d1660a6aad79cdcbaea7d5d8b86c9`;
+`default-r1.log` SHA256
+`849cb6303c43ce90d1a82b4235d0ecf0eebf098b735d477e2927981964ddd4e9`.
+Binary SHA256 `ba6d69bdc8f4137c0d68cb2b3b761db168137e43ae977f880ef9e3f0d379036a`.
+This does not replace final merged-source QA or sanitizer qualification.
 
 ### Actual-wire identity rejection and healthy siblings
 
