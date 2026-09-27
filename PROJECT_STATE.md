@@ -12,6 +12,27 @@ retained artifact directories.
 
 ## Developer QA
 
+### External receipt-window harness: implemented, workload not qualified
+
+`f60381ab` makes the R2 client's requested window selectable through
+`ICECC_P50_PIPELINE_WINDOW` (default 30). `162f744e` through `b740c5b6`
+add the single-link farm receipt gate, preserve the existing local marker
+format, execute helper staging, and separate compiler/helper/sidecar UIDs.
+The touched lifecycle, workload and ladder-catalog Python modules pass all
+104 tests on donor `de78212c`. This checks harness behavior, not successful
+end-to-end negotiation of W1/W30 or selector error handling in a real client.
+
+External attempt `w30-luna-w1-p29-20260926-j` passed preflight and startup,
+then failed because its helper required GLIBC_2.38 and GLIBCXX_3.4.31/32,
+while the pinned Debian client image supplies glibc 2.36 and GLIBCXX_3.4.30.
+The helper must be rebuilt compatibly and smoke-tested in that exact image
+before another farm attempt. Product image source remains `9e5692e4`;
+host-harness and helper changes do not relabel that immutable image.
+Receipts are under
+`/tanksmall/scratch/ictmp/experiments/icecream/integration/results/w30-luna-w1-p29-20260926-j/`.
+The earlier q5 storage refusal was followed by a bounded 313 MB/s recheck;
+the 200 MB/s threshold was not changed. No external W1/W30 pass is claimed.
+
 ### Malformed R2 records preserve committed inputs
 
 `05a5f0b7` integrates donor `19fc6cce`: 48 record/shape/profile combinations

@@ -564,13 +564,24 @@ corpus speedup, or renewed external S* qualification.
 
 ## 7. Persistent links and W30: implementation specification
 
-**Status: planned, not implemented.** This section extends stages C/D against
-the Stage A candidate `7e16cd0e10babfbc9e21c47a2edf2956cb8c1715`.
-It does not change the R1 format documents or establish a new passing gate.
+**Status: candidate implementation exists; full qualification incomplete.**
+This specification originally extended stages C/D against Stage A candidate
+`7e16cd0e10babfbc9e21c47a2edf2956cb8c1715`. Current evidence and remaining
+work are recorded in [PROJECT_STATE.md](../PROJECT_STATE.md); implementation
+or a passing focused test does not establish completion of the gates below.
+This section does not change the R1 format documents.
 The deliverable is persistent source connections and a configurable ordered
 window including W30 for P29V1, ZSTD_TU and ZSTD_ROUTE. W30 is an upper bound,
 not thirty concurrent compilers, thirty codec workers, or a memory allowance.
 Full Chromium capture is a separate resource-controlled deliverable (§10).
+
+For an already-selected R2 transfer, `ICECC_P50_PIPELINE_WINDOW=1..30` sets
+the client's requested window (default 30). The value must contain only
+decimal digits and be in range; invalid values fail before the source lease
+request. This variable neither enables R2 nor guarantees the requested
+window: record the actual negotiated and observed values. Existing links
+retain their negotiated parameters, so comparisons must start fresh C/F
+relationships. R1 transfers do not use this setting.
 
 ### 7.1 Decisions and explicit non-goals
 
