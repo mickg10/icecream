@@ -283,6 +283,26 @@ including the R2 client rather than the first mixed-base client (P43).
 All 26 generator-module tests pass. Thirty-six helper-pinned external plans
 validate statically; runtime coverage remains open.
 
+Local C1F2/P29V1/W30 run `p51-local-c1f2-p29-w30-canaryuid-20260927g`
+on harness `43686f21` is terminal **PASS** (30 clauses): both scoped links
+held exact ordinals 1–30, all 62 jobs produced exact remote outputs with
+zero retries, independent release/output progress was verified, and four
+oracle samples matched. DOWN reports no problems or diagnostic errors.
+Product `6cffafa0`, helper `10addf…f0c96a`, resource limits and deadlines
+are unchanged; F attachment debug logging was enabled. This qualifies only
+this local topology/profile/window, not the full matrix or restart extension.
+Run D's intermittent attachment losses remain unresolved.
+
+The successful run includes `43686f21`'s receipt-only canary UID correction:
+canaries and measured compilers now both use UID1, allowing workload jobs to
+append the mode0600 compile-identity trace. Run E had completed its workload
+but lacked those records; run F stopped before workload because its launch
+omitted the required tools-bundle environment. Both failures are retained.
+Evidence root `/tanksmall/scratch/tmp/p51-local-receipt-canaryuid-f/results/results/`
+under the run ID above; verdict SHA256
+`c5cbb5b7615c83bea12f61a0ef9a00327111ad95a1bfe1deeee4408bcd68e51f`,
+DOWN SHA256 `905b1fb21ebb24bd4e136a605ad29e4ce66bab1f64278c1bb165bd8e0f2f4ce0`.
+
 `402d11fc` removes an incorrect multi-link exception to strict P50 policy.
 `ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
 does not require a single client/worker topology. All-new receipt-link runs
