@@ -167,6 +167,8 @@ def test_d18_role_mix_plans_exact_three_role_routes(scenario_name: str) -> None:
         for item in instances.values()
         if item["role"] == "S"
     )
+    scheduler = next(item for item in instances.values() if item["role"] == "S")
+    assert scheduler["env"]["ICECC_P51_MODE"] == "on"
     assert instances[roles["clients"]["R1"]]["env"]["ICECC_P51_MODE"] == "off"
     assert instances[roles["clients"]["R2"]]["env"]["ICECC_P51_MODE"] == "on"
     starts = {
@@ -186,6 +188,38 @@ def test_d18_role_mix_plans_exact_three_role_routes(scenario_name: str) -> None:
         assert "ICECC_REMOTE_REQUIRED=1" in argv
         if role != "P43":
             assert f"ICECC_P50_PROFILE={profile}" in argv
+
+
+@pytest.mark.parametrize(
+    ("scenario_name", "mode"),
+    (
+        ("D18-P29V1.json", "off"),
+        ("D18-P29V1.json", None),
+        ("D18-ZSTD_TU.json", "off"),
+        ("D18-ZSTD_TU.json", None),
+        ("D18-ZSTD_ROUTE.json", "off"),
+        ("D18-ZSTD_ROUTE.json", None),
+    ),
+)
+def test_d18_requires_scheduler_r2_mode(
+    tmp_path: Path, scenario_name: str, mode: str | None
+) -> None:
+    scenario = json.loads(
+        (INTEGRATION / "scenarios" / scenario_name).read_text(encoding="utf-8")
+    )
+    scheduler = next(item for item in scenario["instances"] if item["role"] == "S")
+    if mode is None:
+        scheduler["env"].pop("ICECC_P51_MODE")
+    else:
+        scheduler["env"]["ICECC_P51_MODE"] = mode
+    farm_path, scenario_path = _write(
+        tmp_path,
+        json.loads(farm_fixture.example_farm_path().read_text(encoding="utf-8")),
+        scenario,
+    )
+    loaded_farm = load_farm_spec(farm_path)
+    with pytest.raises(ScenarioSpecError, match="D18 requires a P50/R2 scheduler"):
+        load_scenario_spec(scenario_path, loaded_farm)
 
 
 def test_d18_requires_explicit_c3f2_farm_authority(tmp_path: Path) -> None:

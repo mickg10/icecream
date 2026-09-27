@@ -221,8 +221,11 @@ def _validate_d18_role_mix(
     if (
         generations[scheduler["image"]] != 50
         or scheduler.get("env", {}).get("ICECC_P50_PROFILE") not in PROFILES
+        or scheduler.get("env", {}).get("ICECC_P51_MODE") != "on"
     ):
-        raise ScenarioSpecError("$.workload: D18 requires a P50 scheduler with a selected profile")
+        raise ScenarioSpecError(
+            "$.workload: D18 requires a P50/R2 scheduler with a selected profile"
+        )
 
     p43 = by_name[clients["P43"]]
     r1 = by_name[clients["R1"]]

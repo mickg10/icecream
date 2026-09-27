@@ -4,7 +4,7 @@
   "shape": "mixed",
   "images": {"p43": "p43-1.4.0", "new": "p50s4-diag-b269fad9"},
   "instances": [
-    {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "ZSTD_TU"}},
+    {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "ZSTD_TU", "ICECC_P51_MODE": "on"}},
     {"name": "F_R1", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 2, "env": {"ICECC_P51_MODE": "off"}},
     {"name": "F_R2", "role": "F", "host": "tt-quietbox5", "image": "new", "slots": 1, "env": {"ICECC_P51_MODE": "on"}},
     {"name": "C_P43", "role": "C", "host": "tt-quietbox2", "image": "p43", "client_environment": "debian-gcc"},
