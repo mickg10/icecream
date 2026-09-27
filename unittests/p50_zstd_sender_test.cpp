@@ -3791,8 +3791,8 @@ void run_p51_sender_writer_backpressure_case(
     std::atomic<bool> f_gate_returned{false};
     std::atomic<unsigned> jobs_consumed{0};
     std::atomic<int> observed_f_fd{-1};
-#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
     std::atomic<int> observed_c_fd{-1};
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
     std::atomic<bool> send_buffer_shrunk{false};
     std::atomic<int> effective_shrunk_send_buffer{0};
 #endif
