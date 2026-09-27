@@ -121,7 +121,17 @@ The registered run was explicitly forced after a UV setup failure and a
 Make no-op; neither earlier attempt counts as a pass. This is not a fresh
 full candidate QA or sanitizer qualification of the added fixture.
 
-### External receipt-window harness: P29 W1 and W30 passed
+### External receipt-window harness: all-profile single-link matrix passed
+
+| Profile | W1 positive | Thirty held COMMITs at W30 | W1 underfill control |
+| --- | --- | --- | --- |
+| P29V1 | PASS | PASS | PASS |
+| ZSTD_TU | PASS | PASS | PASS |
+| ZSTD_ROUTE | PASS | PASS | PASS |
+
+All nine runs complete 31 jobs with exact local-SHA outputs and zero failures;
+the negative controls additionally require a specific one-receipt underfill,
+not an arbitrary failure. This is the external C1F1 matrix only.
 
 `f60381ab` makes the R2 client's requested window selectable through
 `ICECC_P50_PIPELINE_WINDOW` (default 30). `162f744e` through `b740c5b6`
@@ -204,8 +214,12 @@ profile 3/window 30, exactly thirty held COMMITs at ordinals 1–30 on epoch/
 generation 1, helper exit zero, then 31 exact-output jobs with zero failures.
 Result `route-w30-run.json` in the same artifact directory.
 Thus all three profiles have actual external W1 and W30 positive witnesses.
-ZSTD_ROUTE negative, required topology/restart/mixed cases and full
-qualification remain open. These gates are not whole-build speed measurements.
+ZSTD_ROUTE's fresh W1-negative control `w1-luna-w1-route-20260927-b` passes:
+negotiated profile 3/window 1, exactly one held ordinal 1 (`commits=1 peak=1`)
+and typed underfill of the thirty-receipt assertion, then 31 exact-output
+jobs with zero failures. Result `route-neg-run.json` in the same directory.
+Required topology/restart/mixed cases and full qualification remain open.
+These gates are not whole-build speed measurements.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
