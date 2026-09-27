@@ -12,6 +12,31 @@ retained artifact directories.
 
 ## Developer QA
 
+### Recovery-record cuts: endpoint coverage
+
+`bd5881a1` integrates donor `5dba8445`, test-only coverage for interrupted
+RECOVER/RECEIPTS/RESET exchanges. The final-source run passed **1,197 cases**:
+representative offsets for RECOVER begin/witness/end and RECEIPTS row/end,
+and every pre-end byte offset for RESET, RESET_ACK and both RESET_CONFIRM
+directions, across P29V1, ZSTD_TU and ZSTD_ROUTE. Each case loses a commit
+reply, interrupts recovery, then requires exact input and one commit after
+a third connection. Reset application/identity and final K/Q are checked.
+The existing fragmented-frame recovery selector also passed all profiles.
+
+Run `make -C "$BUILD/unittests" p50endpoint-d03-recovery-record-cuts-check`.
+Evidence directory: `/tanksmall/scratch/tmp/p51-dbb010ba-qualified/runtime/`.
+`d03-recovery-record-full-r2.log` SHA256:
+`2bc6956b9929bd8dc5bf1b71c0ac68cdaea33aa26570a135c640c45bc402abad`.
+`d03-base-frame-recovery-r2.log` SHA256:
+`c21cfb42893c4150ec68e4d8ce117c2bd9c952f44629848c188ddb129ef3f9f3`.
+Test binary SHA256:
+`0f553f993920cb05a9c394f458d569f193c5175eb73f3c53b9a8c5545b321061`.
+Both commands exited zero in a 2-CPU/8-GiB SDK container. Production archives
+were reused unchanged from the qualified `dbb010ba` closure; this is a
+loopback endpoint fixture, not production-sender retry or cross-host evidence.
+Forced EAGAIN coverage remains open. Earlier failed fixture assertions and
+build attempts remain in the same artifact directory.
+
 ### Explicit local-job limit for matched benchmarks
 
 `2570a086` adds `iceccd --max-local-jobs N`. Defaults remain unchanged:
@@ -31,8 +56,15 @@ Artifacts: `/tanksmall/scratch/tmp/p51-local-jobs-zero-cap-run/`;
 installed daemon SHA256
 `46bc2b1218cac4cd3e370c13e7a3e85640a293aa19ce4081d89103391c00681c`.
 The disposable test container added `expect` and `libcap2-bin`; the developer
-SDK now declares those dependencies. A clean build of that new SDK and full
-candidate QA remain pending. The separate native-environment verification
+SDK now declares those dependencies. Clean public QA on frozen `182a3da3`
+built the new SDK, built/installed the product and passed endpoint/service
+checks, but found a reproducible sender initial-connector-retirement failure:
+`Unavailable` lacked the expected route-local failure flag. A narrow correction
+is under test; the original run remains failed evidence, not a qualified
+candidate. Its remaining native checks are still running. Artifacts:
+`/tanksmall/scratch/tmp/p51-local-jobs-full-qa-scratch/icecream-qa-70d0y2wp`.
+Remote optional skips are not counted as remote coverage.
+The separate native-environment verification
 skipped because sudo requested a password; the full legacy suite was not run.
 This is correctness evidence, not a measured whole-build speedup.
 
