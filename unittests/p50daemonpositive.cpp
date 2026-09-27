@@ -424,6 +424,11 @@ public:
         return link_state_observations_;
     }
 
+    bool remote_mode() const
+    {
+        return !match_ipv4_.empty();
+    }
+
     void release_commits()
     {
         {
@@ -1350,7 +1355,7 @@ static int run_p51_commit_receipt_gate(int endpoint_port, uid_t sidecar_uid,
         // Preserve the exact local marker contract consumed by the existing
         // C1F2 fixture. Remote farm mode additionally records the negotiated
         // relationship metadata needed to prove the external window.
-        if (!upstream_ipv4_.empty()) {
+        if (gate.remote_mode()) {
             summary += " profile=" + std::to_string(
                 static_cast<unsigned>(link_state->profile)) +
                 " window=" + std::to_string(link_state->window) +
