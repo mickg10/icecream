@@ -12,6 +12,28 @@ retained artifact directories.
 
 ## Developer QA
 
+### Independent pending-input caps across profiles
+
+Donor `ff922f7a` expands the existing real-service pending-budget fixture to
+all three profiles, W1/W30, and independently limiting encoded bytes, raw
+bytes and decoder-window charges: 18 focused cells pass. Each cell checks
+that the other limits permit the competing input, observes refusal without
+extra charge, releases the held work, and commits a fitting successor.
+P29 uses its actual source fingerprint and a 20-byte encoded cap against a
+measured 15-byte charge; the ZSTD profiles use 1536 against 1034 bytes.
+These cases are also registered in the default service executable.
+
+Test-only source is based on `f5df3756`, with unchanged production archives
+from the verified D10 closure. Focused log:
+`/tanksmall/scratch/tmp/p51-d11-pending-cap-profiles-build/logs/pending-caps-r3.log`,
+SHA256 `c9270bcb117ca06a7b1c449a7554f8a6eee55f8e2b5ad233d0d5686a1eb60e37`,
+with 18 PASS markers and `D11_PENDING_MATRIX_EXIT=0`. Binary SHA256:
+`ff8423fdb30d8afdb493290b5355ecf8a100ce09f9a399c2d82cf82969d61044`.
+This is four independent C links with charged decoder-window accounting,
+not 30 simultaneous decoder contexts or a measured process-memory bound.
+Independent retained-input-record-count saturation/refill and final merged
+QA remain open; existing byte-cap and receipt-ledger tests are unchanged.
+
 ### Delayed old-generation connector completion
 
 Donor `32fae46f` adds a default `p50routeowner` test for all three profiles:
@@ -72,8 +94,15 @@ end-to-end negotiation of W1/W30 or selector error handling in a real client.
 External attempt `w30-luna-w1-p29-20260926-j` passed preflight and startup,
 then failed because its helper required GLIBC_2.38 and GLIBCXX_3.4.31/32,
 while the pinned Debian client image supplies glibc 2.36 and GLIBCXX_3.4.30.
-The helper must be rebuilt compatibly and smoke-tested in that exact image
-before another farm attempt. Product image source remains `9e5692e4`;
+The rebuilt Debian-compatible helper now loads in that exact image, and a
+startup/abort smoke verified redirect installation and removal. Its SHA256
+is `b5b2d28d6bbb51d190c7274bf6e3ec3c3392c82c6dc3e0676a5d9b205cd92444`.
+Attempt `w30-luna-w1-p29-20260926-l` reached helper-ready but observed no
+COMMIT; client wrappers closed their local control channels. Earlier F
+admission timers preceded the workload and are not an established cause.
+A later attempt failed test-tool package provisioning before the workload;
+an offline pinned Debian package bundle is being used for the next attempt.
+Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
 `/tanksmall/scratch/ictmp/experiments/icecream/integration/results/w30-luna-w1-p29-20260926-j/`.
