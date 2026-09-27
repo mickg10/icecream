@@ -399,6 +399,11 @@ p50daemonpositive-p51-w30-check: p50daemonpositive
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
 	$(SHELL) '$(srcdir)/p50daemonpositive-p51-w30.sh'
+.PHONY: p50daemonpositive-p51-concurrent-attachments-check
+p50daemonpositive-p51-concurrent-attachments-check: p50daemonpositive
+	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
+	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)' \
+	$(SHELL) '$(srcdir)/p50daemonpositive-p51-concurrent-attachments.sh'
 .PHONY: p50daemonpositive-p51-multilink-check
 p50daemonpositive-p51-multilink-check: p50daemonpositive
 	ICECC_TEST_BUILDDIR='$(abs_builddir)' \
@@ -775,5 +780,6 @@ EXTRA_DIST += p50endpointcancel-run.sh \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 EXTRA_DIST += p51schedulerrestart-w30.sh p50daemonpositive-p51-restart-chain-w30.sh
+EXTRA_DIST += p50daemonpositive-p51-concurrent-attachments.sh
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

@@ -207,6 +207,71 @@ int main() {
         auto result = drive(operation);
         require(result.status == InputFdAttachmentStatus::HandshakeFailed,
                 "wrong identity was not rejected");
+        require(std::string(operation.failure_phase_name()) == "receive-hello-ack",
+                "wrong identity failure phase was not retained");
+    }
+
+    {
+        Server server = make_server("result-eof");
+        server.thread = std::thread([&] {
+            local::Status status = local::Status::InvalidArgument;
+            auto connection = local::accept_unix(server.listener, &status);
+            require(status == local::Status::Ok && connection.valid(),
+                    "result-eof server accept failed");
+            const auto deadline = std::chrono::steady_clock::now() + 2s;
+            local::Frame hello;
+            require(connection.receive_until(hello, deadline) == local::Status::Ok,
+                    "result-eof server failed to receive hello");
+            require(connection.send_until(local::make_hello_ack(local::PeerRole::Sidecar,
+                                                                 identity), deadline) ==
+                        local::Status::Ok,
+                    "result-eof acknowledgement failed");
+            local::Frame request_frame;
+            require(connection.receive_until(request_frame, deadline) == local::Status::Ok,
+                    "result-eof server failed to receive request");
+            // Closing without a result exercises the result-frame phase.
+        });
+        InputFdAttachmentOperation operation(
+            server.path, request, peer, std::chrono::steady_clock::now() + 2s);
+        auto result = drive(operation);
+        require(result.status == InputFdAttachmentStatus::Disconnected,
+                "missing result frame was not reported as disconnected");
+        require(std::string(operation.failure_phase_name()) == "receive-result",
+                "result EOF failure phase was not retained");
+    }
+
+    {
+        Server server = make_server("handoff-eof");
+        server.thread = std::thread([&] {
+            local::Status status = local::Status::InvalidArgument;
+            auto connection = local::accept_unix(server.listener, &status);
+            require(status == local::Status::Ok && connection.valid(),
+                    "handoff-eof server accept failed");
+            const auto deadline = std::chrono::steady_clock::now() + 2s;
+            local::Frame hello;
+            require(connection.receive_until(hello, deadline) == local::Status::Ok,
+                    "handoff-eof server failed to receive hello");
+            require(connection.send_until(local::make_hello_ack(local::PeerRole::Sidecar,
+                                                                 identity), deadline) ==
+                        local::Status::Ok,
+                    "handoff-eof acknowledgement failed");
+            local::Frame request_frame;
+            require(connection.receive_until(request_frame, deadline) == local::Status::Ok,
+                    "handoff-eof server failed to receive request");
+            require(connection.send_until(
+                        local::Frame{local::kProtocolVersion, local::MessageType::Data,
+                                     identity, accepted_result(1)}, deadline) ==
+                        local::Status::Ok,
+                    "handoff-eof server failed to send accepted result");
+            // Closing after acceptance but before descriptor transfer exercises Handoff.
+        });
+        InputFdAttachmentOperation operation(
+            server.path, request, peer, std::chrono::steady_clock::now() + 2s);
+        auto result = drive(operation);
+        require(result.status == InputFdAttachmentStatus::Disconnected,
+                "missing descriptor handoff was not reported as disconnected");
+        require(std::string(operation.failure_phase_name()) == "fd-handoff",
+                "descriptor EOF failure phase was not retained");
     }
 
     {

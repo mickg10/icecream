@@ -683,6 +683,7 @@ InputFdAttachmentOperation::~InputFdAttachmentOperation() noexcept { cancel(); }
 void InputFdAttachmentOperation::fail(InputFdAttachmentStatus status) noexcept {
     if (done_)
         return;
+    failed_phase_ = phase_;
     if (frame_)
         frame_->cancel();
     frame_.reset();
@@ -696,6 +697,20 @@ void InputFdAttachmentOperation::fail(InputFdAttachmentStatus status) noexcept {
     result_ = rejected(status);
     done_ = true;
     phase_ = Phase::Done;
+}
+
+const char* InputFdAttachmentOperation::failure_phase_name() const noexcept {
+    switch (failed_phase_) {
+    case Phase::Connect: return "connect";
+    case Phase::Verify: return "verify";
+    case Phase::SendHello: return "send-hello";
+    case Phase::ReceiveHelloAck: return "receive-hello-ack";
+    case Phase::SendRequest: return "send-request";
+    case Phase::ReceiveResult: return "receive-result";
+    case Phase::Handoff: return "fd-handoff";
+    case Phase::Done: return "none";
+    }
+    return "unknown";
 }
 
 void InputFdAttachmentOperation::finish_result(

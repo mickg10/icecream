@@ -2937,7 +2937,8 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
                             uint32_t profile_mask,
                             bool drop_lost_receipts = false,
                             P51CancelScenario cancel_scenario =
-                                P51CancelScenario::None)
+                                P51CancelScenario::None,
+                            bool concurrent_attachments = false)
 {
     struct EnvironmentRestore {
         std::optional<std::string> capture_stderr;
@@ -4237,6 +4238,57 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
     bool all_compilefile_sent = true;
     bool all_exactly_attached = true;
     bool all_compilefile_bounded = true;
+    pid_t paused_attach_sidecar = -1;
+    uint64_t attach_sidecar_start = 0;
+    bool attach_sidecar_paused = false;
+    struct ResumeAttachmentSidecar {
+        pid_t pid = -1;
+        uint64_t start = 0;
+        bool paused = false;
+        ~ResumeAttachmentSidecar() {
+            if (!paused || pid <= 1 || start == 0 ||
+                process_start_time_ticks(pid) != start)
+                return;
+            (void)::kill(pid, SIGCONT);
+        }
+    } resume_attachment_sidecar;
+    if (concurrent_attachments) {
+        paused_attach_sidecar = find_attachment_sidecar(f_pid, cache_service);
+        attach_sidecar_start = process_start_time_ticks(paused_attach_sidecar);
+        const bool pause_sent = paused_attach_sidecar > 1 &&
+            attach_sidecar_start != 0 &&
+            ::kill(paused_attach_sidecar, SIGSTOP) == 0;
+        if (pause_sent) {
+            resume_attachment_sidecar.pid = paused_attach_sidecar;
+            resume_attachment_sidecar.start = attach_sidecar_start;
+            resume_attachment_sidecar.paused = true;
+        }
+        const auto pause_deadline = Clock::now() + std::chrono::seconds(2);
+        while (pause_sent && Clock::now() < pause_deadline) {
+            std::ifstream status(std::string("/proc/") +
+                                 std::to_string(paused_attach_sidecar) + "/status");
+            std::string line;
+            while (std::getline(status, line))
+                if (line.rfind("State:", 0) == 0 &&
+                    line.find('T') != std::string::npos)
+                    attach_sidecar_paused = true;
+            if (attach_sidecar_paused) break;
+            ::usleep(10000);
+        }
+        REQUIRE(attach_sidecar_paused,
+                "concurrent-attachment fixture pauses the exact F sidecar before attachment requests");
+        if (!attach_sidecar_paused) return 2;
+    }
+    std::error_code common_attach_offset_error;
+    const uintmax_t common_attach_offset = concurrent_attachments
+        ? std::filesystem::file_size(fdir + "/iceccd.log",
+                                     common_attach_offset_error)
+        : 0;
+    REQUIRE(!concurrent_attachments || !common_attach_offset_error,
+            "concurrent-attachment fixture captures a common F log boundary");
+    if (concurrent_attachments && common_attach_offset_error) return 2;
+    const auto concurrent_attach_deadline =
+        Clock::now() + std::chrono::seconds(45);
     for (auto& item : jobs) {
         if (item.result.code != icecc::p50::local::SourceTransferResultCode::Committed ||
             item.compiler == nullptr) {
@@ -4268,6 +4320,56 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             item.compiler->send_msg(CompileFileMsg(&compile_job));
         all_compilefile_sent &= item.compile_sent;
     }
+    if (concurrent_attachments) {
+        bool all_exact_begins = false;
+        const auto begin_deadline = Clock::now() + std::chrono::seconds(2);
+        while (Clock::now() < begin_deadline) {
+            const std::string suffix = read_file_suffix(
+                fdir + "/iceccd.log", common_attach_offset);
+            std::set<uint32_t> begun;
+            for (const auto& item : jobs) {
+                const std::string marker = "P50_INPUT_ATTACH_BEGIN job=" +
+                    std::to_string(item.wire_id) + " epoch=" +
+                    std::to_string(epoch) + " nonce=" +
+                    std::to_string(item.nonce) + " request=" +
+                    std::to_string(item.nonce);
+                if (suffix.find(marker) != std::string::npos)
+                    begun.insert(item.wire_id);
+            }
+            all_exact_begins = begun.size() == jobs.size();
+            if (all_exact_begins) break;
+            ::usleep(10000);
+        }
+        const std::string suffix = read_file_suffix(
+            fdir + "/iceccd.log", common_attach_offset);
+        bool no_early_completion = true;
+        for (const auto& item : jobs) {
+            const std::string marker = "P50_INPUT_ATTACH_END job=" +
+                std::to_string(item.wire_id) + " epoch=" +
+                std::to_string(epoch) + " nonce=" +
+                std::to_string(item.nonce) + " request=" +
+                std::to_string(item.nonce);
+            no_early_completion &= suffix.find(marker) == std::string::npos;
+        }
+        const bool same_sidecar = attach_sidecar_paused &&
+            process_start_time_ticks(paused_attach_sidecar) == attach_sidecar_start;
+        std::fprintf(stderr,
+            "P51_CONCURRENT_ATTACHMENTS_PENDING profile=%u expected=%zu begun=%u early_completion=%u sidecar_pid=%ld start=%llu\n",
+            profile_mask, jobs.size(), all_exact_begins ? 1u : 0u,
+            no_early_completion ? 0u : 1u,
+            static_cast<long>(paused_attach_sidecar),
+            static_cast<unsigned long long>(attach_sidecar_start));
+        REQUIRE(all_exact_begins && no_early_completion && same_sidecar,
+                "all exact CompileFile attachments are concurrently pending in the real daemon before F resumes");
+        if (!all_exact_begins || !no_early_completion || !same_sidecar)
+            return 1;
+        const bool resumed = ::kill(paused_attach_sidecar, SIGCONT) == 0 &&
+            process_start_time_ticks(paused_attach_sidecar) == attach_sidecar_start;
+        if (resumed) resume_attachment_sidecar.paused = false;
+        REQUIRE(resumed,
+                "the same F sidecar incarnation resumes after all exact attachments are pending");
+        if (!resumed) return 1;
+    }
     for (auto& item : jobs) {
         if (!item.compile_sent) {
             all_exactly_attached = all_compilefile_bounded = false;
@@ -4278,8 +4380,13 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             " epoch=" + std::to_string(epoch) +
             " nonce=" + std::to_string(item.nonce) +
             " request=" + std::to_string(item.nonce) + " elapsed_ms=";
-        bool attached = wait_attachment_log(
-            fdir + "/iceccd.log", item.attach_log_offset, accepted_marker, 15000);
+        const auto attach_remaining = concurrent_attachments
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                  concurrent_attach_deadline - Clock::now()).count()
+            : 15000;
+        bool attached = attach_remaining > 0 && wait_attachment_log(
+            fdir + "/iceccd.log", item.attach_log_offset, accepted_marker,
+            static_cast<int>(std::min<int64_t>(attach_remaining, 15000)));
         if (attached) {
             const std::string suffix = read_file_suffix(
                 fdir + "/iceccd.log", item.attach_log_offset);
@@ -4289,7 +4396,13 @@ static int run_p51_vertical(const char *daemon_binary, const char *cache_service
             attached = status_pos != std::string::npos;
         }
         item.attached = attached;
-        item.compile_bounded = wait_eof(item.compiler, 15000);
+        const auto compile_remaining = concurrent_attachments
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                  concurrent_attach_deadline - Clock::now()).count()
+            : 15000;
+        item.compile_bounded = compile_remaining > 0 &&
+            wait_eof(item.compiler, static_cast<int>(std::min<int64_t>(
+                compile_remaining, 15000)));
         all_exactly_attached &= item.attached;
         all_compilefile_bounded &= item.compile_bounded;
     }
@@ -7103,6 +7216,8 @@ int main(int argc, char **argv)
         ::getenv("ICECC_TEST_P51_C03_SIDECAR_DEATH") != nullptr;
     const bool p51_c03_invalidation =
         p51_c03_client_eof || p51_c03_sidecar_death;
+    const bool p51_concurrent_attachments =
+        ::getenv("ICECC_TEST_P51_CONCURRENT_ATTACHMENTS") != nullptr;
     if (p51_c03_client_eof &&
         ::setenv("ICECC_P50_DEBUG_ATTACH", "1", 1) != 0) {
         std::fprintf(stderr,
@@ -7152,6 +7267,14 @@ int main(int argc, char **argv)
     for (const char *name : other_p51_modes)
         conflicting_p51_mode = conflicting_p51_mode ||
             ::getenv(name) != nullptr;
+    if (p51_concurrent_attachments &&
+        (conflicting_p51_mode || p51_expired_arm_wire_case ||
+         p51_c03_invalidation ||
+         p51_cancel_scenario != P51CancelScenario::None)) {
+        std::fprintf(stderr,
+            "FAIL: concurrent attachment fixture cannot be combined with another P51 mode\n");
+        return 2;
+    }
     if (p51_cancel_scenarios > 1) {
         std::fprintf(stderr,
             "FAIL: select one P51 exact-cancellation scenario\n");
@@ -7322,6 +7445,17 @@ int main(int argc, char **argv)
                                     ? 2u : 1u,
                                 profile_mask,
                                 false, p51_cancel_scenario);
+    }
+
+    if (p51_concurrent_attachments) {
+        const uint32_t profile_mask = selected_vertical_profile();
+        if (profile_mask == 0) {
+            std::fprintf(stderr,
+                "FAIL: ICECC_TEST_P51_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE\n");
+            return 2;
+        }
+        return run_p51_vertical(argv[1], argv[2], icecc, 30,
+            profile_mask, false, P51CancelScenario::None, true);
     }
 
     const bool restart_f_c1f2 =

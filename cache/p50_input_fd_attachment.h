@@ -160,6 +160,9 @@ public:
     void cancel() noexcept;
     [[nodiscard]] bool done() const noexcept { return done_; }
     [[nodiscard]] InputFdAttachmentStatus status() const noexcept { return result_.status; }
+    // Diagnostic-only state retained when an operation fails; it is not sent
+    // over the local attachment protocol.
+    [[nodiscard]] const char* failure_phase_name() const noexcept;
     [[nodiscard]] int poll_fd() const noexcept;
     [[nodiscard]] short poll_events() const noexcept;
     [[nodiscard]] std::chrono::steady_clock::time_point next_wakeup() const noexcept;
@@ -185,6 +188,7 @@ private:
     std::optional<local::Connection> connection_;
     std::unique_ptr<local::FrameOperation> frame_;
     std::unique_ptr<local::AsyncFdHandoffReceiver> handoff_;
+    Phase failed_phase_ = Phase::Done;
 };
 
 #if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)

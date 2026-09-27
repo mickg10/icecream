@@ -8666,7 +8666,23 @@ bool Daemon::advance_p50_attachments(const std::vector<pollfd>& pollfds)
                 revents |= descriptor.revents;
         client->p50_attachment->advance(revents);
         if (!client->p50_attachment->done()) continue;
+        const char* failure_phase =
+            client->p50_attachment->failure_phase_name();
         client->p50_attachment_result = client->p50_attachment->take_result();
+        if (client->p50_attachment_result.has_value() &&
+            client->p50_attachment_result->status !=
+                icecc::p50::InputFdAttachmentStatus::Accepted) {
+            const auto& request = client->p50_attachment->request();
+            trace() << "P50_INPUT_ATTACH_PHASE_FAIL job="
+                    << request.owner.logical_job
+                    << " epoch=" << request.owner.assignment_epoch
+                    << " nonce=" << request.owner.assignment_nonce
+                    << " request=" << request.request_id
+                    << " phase=" << failure_phase
+                    << " status=" << static_cast<unsigned>(
+                           client->p50_attachment_result->status)
+                    << endl;
+        }
         client->p50_attachment.reset();
         if (!client->p50_attachment_result || !client->p50_attachment_job) {
             handle_end(client, 146);
