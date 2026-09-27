@@ -4704,11 +4704,65 @@ enum class R2EndpointWireFault : uint8_t {
     AckBeyondCommittedPrefix,
 };
 
+enum class D15MalformedTarget : uint8_t {
+    None,
+    JobBind,
+    TuBegin,
+    Body,
+    Fill,
+    TuEnd,
+    CommitAck,
+};
+
+enum class D15MalformedShape : uint8_t { Truncated, Oversized, Trailing };
+
+struct D15MalformedFrame {
+    D15MalformedTarget target = D15MalformedTarget::None;
+    D15MalformedShape shape = D15MalformedShape::Truncated;
+    // The malformed frame follows one fully committed and ACKed transaction.
+    size_t target_job_index = 1;
+};
+
+asio::awaitable<void> raw_write_malformed_frame(
+    tcp::socket& socket, Message message, D15MalformedShape shape,
+    uint32_t frame_cap) {
+    std::vector<uint8_t> frame = encode_frame(message);
+    require(frame.size() > 4, "D15 malformed fixture needs a nonempty payload");
+    if (shape == D15MalformedShape::Truncated) {
+        co_await raw_write_bytes(socket,
+            std::span<const uint8_t>(frame.data(), frame.size() - 1));
+        boost::system::error_code ignored;
+        socket.shutdown(tcp::socket::shutdown_send, ignored);
+        co_return;
+    }
+    if (shape == D15MalformedShape::Oversized) {
+        const uint32_t too_large = frame_cap + 1;
+        require(too_large <= 0x00ffffffU,
+                "D15 oversize fixture length does not fit frame header");
+        frame[1] = static_cast<uint8_t>(too_large >> 16);
+        frame[2] = static_cast<uint8_t>(too_large >> 8);
+        frame[3] = static_cast<uint8_t>(too_large);
+        co_await raw_write_bytes(socket,
+            std::span<const uint8_t>(frame.data(), 4));
+        co_return;
+    }
+    const uint32_t old_size =
+        (uint32_t(frame[1]) << 16) | (uint32_t(frame[2]) << 8) | frame[3];
+    require(old_size < 0x00ffffffU,
+            "D15 trailing fixture cannot extend frame length");
+    frame[1] = static_cast<uint8_t>((old_size + 1) >> 16);
+    frame[2] = static_cast<uint8_t>((old_size + 1) >> 8);
+    frame[3] = static_cast<uint8_t>(old_size + 1);
+    frame.push_back(0xa5);
+    co_await raw_write_bytes(socket, frame);
+}
+
 asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
     tcp::endpoint endpoint, LinkHello hello,
     std::vector<R2EndpointTestJob> jobs,
     R2EndpointWireFault fault = R2EndpointWireFault::None,
-    bool* observed_terminal_close = nullptr) {
+    bool* observed_terminal_close = nullptr,
+    std::optional<D15MalformedFrame> malformed = std::nullopt) {
     tcp::socket socket(co_await asio::this_coro::executor);
     co_await socket.async_connect(endpoint, asio::use_awaitable);
     co_await raw_write(socket, Message{hello});
@@ -4725,7 +4779,8 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
             "R2 LINK_STATE did not echo the admitted link identity");
 
     std::vector<R2TxCommit> commits;
-    for (R2EndpointTestJob& job : jobs) {
+    for (size_t job_index = 0; job_index != jobs.size(); ++job_index) {
+        R2EndpointTestJob& job = jobs[job_index];
         TuBegin begin;
         begin.relationship_ordinal = job.binding.relationship_ordinal;
         begin.inner = job.prepared->begin;
@@ -4744,14 +4799,83 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
         TuEnd end{job.binding.relationship_ordinal, binding_digest,
                   transaction_digest};
 
-        co_await raw_write(socket, Message{job.binding});
-        co_await raw_write(socket, Message{begin});
-        co_await raw_write(socket, Message{bodies.front()});
-        for (const R2FillMessage& fill : job.fills)
-            co_await raw_write(socket, Message{fill});
+        const auto send_or_mutate = [&](Message message,
+                                        D15MalformedTarget target)
+            -> asio::awaitable<bool> {
+            if (malformed && malformed->target_job_index == job_index &&
+                malformed->target == target) {
+                co_await raw_write_malformed_frame(
+                    socket, std::move(message), malformed->shape,
+                    hello.max_frame_payload);
+                co_return true;
+            }
+            co_await raw_write(socket, std::move(message));
+            co_return false;
+        };
+        if (co_await send_or_mutate(Message{job.binding},
+                                    D15MalformedTarget::JobBind)) {
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
+        if (co_await send_or_mutate(Message{begin}, D15MalformedTarget::TuBegin)) {
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
+        if (co_await send_or_mutate(Message{bodies.front()},
+                                    D15MalformedTarget::Body)) {
+            if (malformed->shape != D15MalformedShape::Trailing) {
+                co_await raw_wait_for_close(socket);
+                if (observed_terminal_close != nullptr)
+                    *observed_terminal_close = true;
+                co_return commits;
+            }
+        }
+        bool malformed_fill_sent = false;
+        for (const R2FillMessage& fill : job.fills) {
+            if (malformed && malformed->target_job_index == job_index &&
+                malformed->target == D15MalformedTarget::Fill &&
+                !malformed_fill_sent) {
+                malformed_fill_sent = true;
+                co_await raw_write_malformed_frame(socket, Message{fill},
+                                                    malformed->shape,
+                                                    hello.max_frame_payload);
+                if (malformed->shape != D15MalformedShape::Trailing) {
+                    co_await raw_wait_for_close(socket);
+                    if (observed_terminal_close != nullptr)
+                        *observed_terminal_close = true;
+                    co_return commits;
+                }
+            } else {
+                co_await raw_write(socket, Message{fill});
+            }
+        }
+        if (malformed && malformed->target_job_index == job_index &&
+            malformed->target == D15MalformedTarget::Fill &&
+            !malformed_fill_sent)
+            throw std::logic_error("D15 P29 FILL mutation had no FILL frame");
         if (fault == R2EndpointWireFault::WrongTuEndDigest && commits.empty())
             end.transaction_digest.bytes[0] ^= 0x80;
-        co_await raw_write(socket, Message{end});
+        if (co_await send_or_mutate(Message{end}, D15MalformedTarget::TuEnd)) {
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
+        if (malformed && malformed->target_job_index == job_index &&
+            malformed->shape == D15MalformedShape::Trailing &&
+            (malformed->target == D15MalformedTarget::Body ||
+             malformed->target == D15MalformedTarget::Fill)) {
+            // BODY/FILL payloads are opaque. The appended byte is only
+            // rejected when the receiver checks the completed TU digest.
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
         if (fault == R2EndpointWireFault::WrongTuEndDigest && commits.empty()) {
             co_await raw_wait_for_close(socket);
             if (observed_terminal_close != nullptr)
@@ -4787,12 +4911,21 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
                     commits.size() == 1
                 ? job.binding.relationship_ordinal + 1
                 : job.binding.relationship_ordinal;
-        co_await raw_write(
-            socket,
-            Message{CommitAck{hello.relationship_id,
+        Message ack{CommitAck{hello.relationship_id,
                               hello.relationship_epoch,
                               hello.physical_link_generation,
-                              ack_ordinal}});
+                              ack_ordinal}};
+        if (malformed && malformed->target_job_index == job_index &&
+            malformed->target == D15MalformedTarget::CommitAck) {
+            co_await raw_write_malformed_frame(socket, std::move(ack),
+                                                malformed->shape,
+                                                hello.max_frame_payload);
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
+        co_await raw_write(socket, std::move(ack));
         if (fault == R2EndpointWireFault::AckBeyondCommittedPrefix &&
             commits.size() == 1) {
             co_await raw_wait_for_close(socket);
@@ -5059,44 +5192,64 @@ void test_r2_definite_missing_reservation_is_typed_only_for_absence() {
     std::puts("P51_R2_ENDPOINT definite ReservationMissing vs invalid lookup: ok");
 }
 
-void test_r2_endpoint_commits_two_jobs_on_one_link() {
+void test_r2_endpoint_commits_two_jobs_on_one_link(
+    ProfileId profile = ProfileId::ZSTD_TU,
+    std::optional<D15MalformedFrame> malformed = std::nullopt) {
     const P5coStoreGuids stores = p5co_store_guids(0x71);
     EndpointCaps caps;
-    caps.profile = ProfileId::ZSTD_TU;
-    caps.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
     PreparationAuthorityLimits authority_limits;
     authority_limits.max_speculative_tus = 2;
     authority_limits.max_speculative_raw_bytes = 1U << 20;
     P50PreparationAuthority authority(stores.c, caps.zstd,
-                                      authority_limits, 1,
-                                      ProfileId::ZSTD_TU);
-    const PreparationRouteKey route{stores.f, 23, ProfileId::ZSTD_TU};
+                                      authority_limits, 1, profile);
+    const PreparationRouteKey route{stores.f, 23, profile};
     const std::array<std::vector<uint8_t>, 2> inputs{
         std::vector<uint8_t>{'R','2',' ','f','i','r','s','t','\n'},
         std::vector<uint8_t>{'R','2',' ','s','e','c','o','n','d','\n'}};
     std::array<PreparedInputPtr, 2> prepared;
     std::array<PreparedTuHandle, 2> handles;
+    std::array<std::vector<R2FillMessage>, 2> fills;
     for (size_t index = 0; index != inputs.size(); ++index) {
         handles[index] = authority.prepare_for_route(
             route, PrepareRequestKey{100 + index, 200 + index}, inputs[index]);
-        authority.advance_speculative(handles[index]);
+        if (profile == ProfileId::P29V1) {
+            authority.pin_p29v1_system_source_reuse(handles[index], Digest128{});
+            const std::vector<uint8_t> need =
+                authority.predicted_p29v1_need(handles[index]);
+            const std::span<const uint8_t> fill =
+                authority.answer_p29v1_need(handles[index], need);
+            icecc::codec::P29WireLimits wire_limits;
+            wire_limits.max_tu_bytes =
+                static_cast<size_t>(caps.zstd.max_raw_bytes);
+            wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+            const auto encoded = encode_p29v1_fill_messages(
+                fill, kInitialMaxFramePayload,
+                icecc::codec::p29v1_fill_inner_bound(wire_limits));
+            for (const FillMessage& message : encoded)
+                fills[index].push_back(R2FillMessage{message.bytes});
+            authority.advance_p29v1_speculative(handles[index]);
+        } else {
+            authority.advance_speculative(handles[index]);
+        }
         prepared[index] = P50PreparationAuthorityTestAccess::resolve(
             authority, handles[index]);
     }
 
     const P51SourceArmFields first_arm{
-        r2_test_arm(stores.c, 301, 401), 1};
+        r2_test_arm(stores.c, 301, 401, profile), malformed ? 2U : 1U};
     const P51SourceArmFields second_arm{
-        r2_test_arm(stores.c, 302, 402), 1};
+        r2_test_arm(stores.c, 302, 402, profile), malformed ? 2U : 1U};
     const P51SourceArmedFields first_armed =
-        r2_test_armed(first_arm, stores.f, 0x5101);
+        r2_test_armed(first_arm, stores.f, 0x5101, malformed ? 2 : 1);
     const P51SourceArmedFields second_armed =
-        r2_test_armed(second_arm, stores.f, 0x5103);
+        r2_test_armed(second_arm, stores.f, 0x5103, malformed ? 2 : 1);
     const sidecar::AbsoluteMonotonicDeadline deadline = r2_test_deadline();
 
     LinkHello hello;
-    hello.profile = ProfileId::ZSTD_TU;
-    hello.window = 1;
+    hello.profile = profile;
+    hello.window = malformed ? 2 : 1;
     hello.max_frame_payload = kInitialMaxFramePayload;
     hello.max_raw_bytes = 1U << 20;
     hello.max_encoded_bytes = 1U << 20;
@@ -5111,7 +5264,9 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
     hello.f_store_generation = first_armed.f_store_generation;
     hello.c_control_generation = first_arm.source.c_control_generation;
     hello.c_control_attempt = first_arm.source.c_control_attempt;
-    hello.system_source_fingerprint = icecc::digest128("R2 endpoint fixture");
+    hello.system_source_fingerprint = profile == ProfileId::P29V1
+        ? authority.p29v1_system_source_fingerprint(handles[0])
+        : icecc::digest128("R2 endpoint fixture");
     hello.history_nonce = HistoryNonce{0x51f00d};
     hello.start_mode = LinkStartMode::Initial;
 
@@ -5132,7 +5287,7 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
         binding.compiler_attempt = source.source.compiler_attempt;
         binding.source_request_id = source.source.source_request_id;
         binding.tu_seq = prepared[index]->begin.tu_seq;
-        binding.profile = ProfileId::ZSTD_TU;
+        binding.profile = profile;
         binding.raw_bytes = inputs[index].size();
         binding.raw_digest = prepared[index]->begin.raw_digest;
 
@@ -5142,7 +5297,8 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
         lease.binding = binding;
         lease.binding_digest = compute_r2_binding_digest(binding);
         lease.input_key = InputRecordKey{stores.c, binding.tu_seq};
-        jobs.push_back(R2EndpointTestJob{binding, lease, prepared[index], {}});
+        jobs.push_back(R2EndpointTestJob{binding, lease, prepared[index],
+                                         std::move(fills[index])});
     }
 
     std::atomic<unsigned> lookup_calls{0};
@@ -5207,7 +5363,8 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
     auto accept_future = asio::co_spawn(
         context, r2_accept_one(acceptor, endpoint), asio::use_future);
     auto peer_future = asio::co_spawn(
-        context, r2_two_job_peer(acceptor.local_endpoint(), hello, jobs),
+        context, r2_two_job_peer(acceptor.local_endpoint(), hello, jobs,
+                                 R2EndpointWireFault::None, nullptr, malformed),
         asio::use_future);
     context.run();
     const ServerRunResult server_result = accept_future.get();
@@ -5221,12 +5378,33 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
         std::cerr << "R2 fixture peer error: " << error.what() << '\n';
         throw;
     }
-    require(server_result.status == ServerRunStatus::Completed &&
-                commits.size() == 2 && lookup_calls == 1 &&
-                consume_calls == 2 && commit_calls == 2 && ack_calls == 2 &&
-                terminal_calls == 1,
-            "R2 F endpoint did not keep one reservation through two commits and CLOSE");
-    for (size_t index = 0; index != inputs.size(); ++index) {
+    if (!malformed) {
+        require(server_result.status == ServerRunStatus::Completed &&
+                    commits.size() == 2 && lookup_calls == 1 &&
+                    consume_calls == 2 && commit_calls == 2 && ack_calls == 2 &&
+                    terminal_calls == 1,
+                "R2 F endpoint did not keep one reservation through two commits and CLOSE");
+    } else {
+        const bool malformed_eof =
+            malformed->shape == D15MalformedShape::Truncated &&
+            server_result.status == ServerRunStatus::Disconnected &&
+            !server_result.terminal_error;
+        const bool malformed_error =
+            malformed->shape != D15MalformedShape::Truncated &&
+            server_result.status == ServerRunStatus::TerminalError &&
+            server_result.terminal_error;
+        const size_t committed_prefix =
+            malformed->target == D15MalformedTarget::CommitAck ? 2 : 1;
+        require((malformed_eof || malformed_error) &&
+                    commits.size() == committed_prefix && lookup_calls == 1 &&
+                    consume_calls ==
+                        (malformed->target == D15MalformedTarget::JobBind ? 1 : 2) &&
+                    commit_calls == committed_prefix && ack_calls == 1 &&
+                    terminal_calls == 1,
+                "malformed second-job record did not preserve exactly the prior committed prefix");
+    }
+    const size_t prefix_to_check = malformed ? 1 : inputs.size();
+    for (size_t index = 0; index != prefix_to_check; ++index) {
         InputCursor cursor = endpoint.attach_input(
             InputRecordKey{stores.c, prepared[index]->begin.tu_seq});
         std::vector<uint8_t> recovered(inputs[index].size());
@@ -5234,7 +5412,29 @@ void test_r2_endpoint_commits_two_jobs_on_one_link() {
                     recovered == inputs[index],
                 "R2 F endpoint materialized different source bytes");
     }
-    std::puts("P51_R2_ENDPOINT two-jobs-one-link exact-input: ok");
+    if (malformed) {
+        if (malformed->target != D15MalformedTarget::CommitAck) {
+            bool bad_successor_published = false;
+            try {
+                (void)endpoint.attach_input(
+                    InputRecordKey{stores.c, prepared[1]->begin.tu_seq});
+                bad_successor_published = true;
+            } catch (const std::out_of_range&) {
+            }
+            require(!bad_successor_published,
+                    "malformed second-job record published its successor");
+        } else {
+            InputCursor committed_but_unacked = endpoint.attach_input(
+                InputRecordKey{stores.c, prepared[1]->begin.tu_seq});
+            std::vector<uint8_t> recovered(inputs[1].size());
+            require(committed_but_unacked.read(recovered) == recovered.size() &&
+                        recovered == inputs[1],
+                    "malformed ACK changed the already committed successor");
+        }
+        std::puts("P51_D15_R2_WIRE committed-prefix=1 malformed-successor: PASS");
+    } else {
+        std::puts("P51_R2_ENDPOINT two-jobs-one-link exact-input: ok");
+    }
 }
 
 void test_r2_wire_accounting_interval_conservation() {
@@ -6772,9 +6972,13 @@ asio::awaitable<ClientRunResult> r2_fragmented_single_job_client(
     co_return receipt;
 }
 
-void test_r2_endpoint_rejects_wire_fault(ProfileId profile,
-                                         R2EndpointWireFault fault) {
-    const uint64_t fault_id = static_cast<uint64_t>(fault);
+void test_r2_endpoint_rejects_wire_fault(
+    ProfileId profile, R2EndpointWireFault fault,
+    std::optional<D15MalformedFrame> malformed = std::nullopt) {
+    const uint64_t fault_id = static_cast<uint64_t>(fault) * 64 +
+        (malformed ? static_cast<uint64_t>(malformed->target) * 8 +
+                         static_cast<uint64_t>(malformed->shape) + 1
+                   : 0);
     const P5coStoreGuids stores = p5co_store_guids(
         0xd150 + static_cast<uint64_t>(profile) * 8 + fault_id);
     EndpointCaps caps;
@@ -6937,20 +7141,90 @@ void test_r2_endpoint_rejects_wire_fault(ProfileId profile,
     bool peer_observed_close = false;
     auto server_future = asio::co_spawn(
         context, r2_accept_one(acceptor, server), asio::use_future);
+    std::optional<D15MalformedFrame> first_job_malformed = malformed;
+    if (first_job_malformed)
+        first_job_malformed->target_job_index = 0;
     auto peer_future = asio::co_spawn(
         context,
         r2_two_job_peer(acceptor.local_endpoint(), hello, {job}, fault,
-                        &peer_observed_close),
+                        &peer_observed_close, first_job_malformed),
         asio::use_future);
     context.run();
     const ServerRunResult result = server_future.get();
     const std::vector<R2TxCommit> peer_commits = peer_future.get();
 
-    require(result.status == ServerRunStatus::TerminalError &&
-                result.terminal_error.has_value() && peer_observed_close &&
-                link_lookups == 1 && consumes == 1 && terminal_calls == 1,
+    const bool malformed_eof = malformed &&
+        malformed->shape == D15MalformedShape::Truncated &&
+        result.status == ServerRunStatus::Disconnected &&
+        !result.terminal_error.has_value();
+    const bool malformed_protocol_error = malformed &&
+        malformed->shape != D15MalformedShape::Truncated &&
+        result.status == ServerRunStatus::TerminalError &&
+        result.terminal_error.has_value();
+    if (malformed && malformed->shape == D15MalformedShape::Oversized)
+        require(result.terminal_error &&
+                    result.terminal_error->detail ==
+                        "frame payload exceeds configured cap",
+                "oversized D15 record did not report the configured frame cap");
+    if (malformed && malformed->shape == D15MalformedShape::Trailing) {
+        std::string_view expected_detail = "wire payload has trailing bytes";
+        if (malformed->target == D15MalformedTarget::Body) {
+            switch (profile) {
+            case ProfileId::P29V1:
+                expected_detail = "P29V1 BODY exceeds TX_BEGIN descriptor";
+                break;
+            case ProfileId::ZSTD_TU:
+                expected_detail = "ZSTD_TU BODY exceeds its declared encoded length";
+                break;
+            case ProfileId::ZSTD_ROUTE:
+                expected_detail = "ZSTD_ROUTE BODY exceeds its declared encoded length";
+                break;
+            }
+        } else if (malformed->target == D15MalformedTarget::Fill) {
+            expected_detail = "P29V1 stream exceeds its declared length";
+        }
+        require(result.terminal_error &&
+                    result.terminal_error->detail == expected_detail,
+                "trailing D15 record did not fail at its exact grammar/identity boundary");
+    }
+    require((malformed ? malformed_eof || malformed_protocol_error
+                       : result.status == ServerRunStatus::TerminalError &&
+                             result.terminal_error.has_value()) &&
+                peer_observed_close && link_lookups == 1 &&
+                terminal_calls == 1 &&
+                (malformed && malformed->target == D15MalformedTarget::JobBind
+                     ? consumes == 0
+                     : consumes == 1),
             "D15 malformed wire sequence was not terminal at the exact admitted link");
-    if (fault == R2EndpointWireFault::WrongTuEndDigest) {
+    if (malformed && malformed->target != D15MalformedTarget::CommitAck) {
+        bool no_input_record = false;
+        try {
+            (void)server.attach_input(lease.input_key);
+        } catch (const std::out_of_range&) {
+            no_input_record = true;
+        }
+        require(peer_commits.empty() && materializations == 0 && commits == 0 &&
+                    ack_callback_calls == 0 && acknowledgements == 0 &&
+                    !exact_commit.has_value() && no_input_record,
+                "malformed pre-commit record published or advanced a transaction");
+    } else if (malformed &&
+               malformed->target == D15MalformedTarget::CommitAck) {
+        require(peer_commits.size() == 1 && commits == 1 &&
+                    materializations == 1 && ack_callback_calls == 0 &&
+                    acknowledgements == 0 && exact_commit.has_value(),
+                "malformed ACK changed the already committed prefix: peer=" +
+                    std::to_string(peer_commits.size()) + " commits=" +
+                    std::to_string(commits.load()) + " materialized=" +
+                    std::to_string(materializations.load()) + " ack_calls=" +
+                    std::to_string(ack_callback_calls.load()) + " acked=" +
+                    std::to_string(acknowledgements.load()) + " exact=" +
+                    std::to_string(exact_commit.has_value()));
+        InputCursor cursor = server.attach_input(lease.input_key);
+        std::vector<uint8_t> recovered(input.size());
+        require(cursor && cursor.read(recovered) == recovered.size() &&
+                    recovered == input,
+                "malformed ACK changed exact previously committed input");
+    } else if (fault == R2EndpointWireFault::WrongTuEndDigest) {
         bool no_input_record = false;
         try {
             (void)server.attach_input(lease.input_key);
@@ -6985,11 +7259,62 @@ void test_r2_endpoint_rejects_wire_fault(ProfileId profile,
                         std::string::npos,
                     "duplicate TU_END did not terminate as an unexpected wire record");
     }
+    const char* status_name = "unknown";
+    switch (result.status) {
+    case ServerRunStatus::Completed: status_name = "Completed"; break;
+    case ServerRunStatus::Disconnected: status_name = "Disconnected"; break;
+    case ServerRunStatus::TerminalError: status_name = "TerminalError"; break;
+    case ServerRunStatus::DeadlineExceeded: status_name = "DeadlineExceeded"; break;
+    }
     std::cout << "P51_D15_R2_WIRE profile=" << static_cast<unsigned>(profile)
               << " fault=" << static_cast<unsigned>(fault)
-              << " status=TerminalError K=" << commits.load()
+              << " malformed="
+              << (malformed ? static_cast<unsigned>(malformed->target) * 8 +
+                                  static_cast<unsigned>(malformed->shape) + 1
+                            : 0)
+              << " status=" << status_name << " K=" << commits.load()
               << " Q=" << acknowledgements.load()
-              << " materialized=" << materializations.load() << "\n";
+              << " materialized=" << materializations.load()
+              << " detail="
+              << (result.terminal_error ? result.terminal_error->detail
+                                        : std::string("<none>"))
+              << "\n";
+}
+
+void test_r2_d15_malformed_frame_matrix() {
+    const std::array<ProfileId, 3> profiles{
+        ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
+    const std::array<D15MalformedShape, 3> shapes{
+        D15MalformedShape::Truncated, D15MalformedShape::Oversized,
+        D15MalformedShape::Trailing};
+    const std::array<D15MalformedTarget, 5> fixed_targets{
+        D15MalformedTarget::JobBind, D15MalformedTarget::TuBegin,
+        D15MalformedTarget::TuEnd, D15MalformedTarget::CommitAck,
+        D15MalformedTarget::Body};
+    for (const ProfileId profile : profiles) {
+        for (const D15MalformedTarget target : fixed_targets) {
+            // BODY is length-delimited opaque bytes: appended bytes reach the
+            // transaction-identity check rather than being a decoder error.
+            for (const D15MalformedShape shape : shapes)
+                test_r2_endpoint_rejects_wire_fault(
+                    profile, R2EndpointWireFault::None,
+                    D15MalformedFrame{target, shape});
+            for (const D15MalformedShape shape : shapes)
+                test_r2_endpoint_commits_two_jobs_on_one_link(
+                    profile, D15MalformedFrame{target, shape});
+        }
+        if (profile == ProfileId::P29V1) {
+            for (const D15MalformedShape shape : shapes)
+                test_r2_endpoint_rejects_wire_fault(
+                    profile, R2EndpointWireFault::None,
+                    D15MalformedFrame{D15MalformedTarget::Fill, shape});
+            for (const D15MalformedShape shape : shapes)
+                test_r2_endpoint_commits_two_jobs_on_one_link(
+                    profile,
+                    D15MalformedFrame{D15MalformedTarget::Fill, shape});
+        }
+    }
+    std::puts("P51_D15_R2_WIRE malformed outer frames all-applicable-profiles: PASS");
 }
 
 void test_r2_d15_wire_faults_all_profiles() {
@@ -11888,6 +12213,7 @@ int main(int argc, char** argv) {
         fail("usage: p50endpoint [--performance|--d15-r2-wire]");
     if (d15_wire_gate) {
         test_r2_d15_wire_faults_all_profiles();
+        test_r2_d15_malformed_frame_matrix();
         return 0;
     }
     if (std::getenv("ICECC_P50_CANCEL_UNWRITTEN_TAIL_FOCUS") != nullptr) {
