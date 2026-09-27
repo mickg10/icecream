@@ -1268,7 +1268,7 @@ legacy opt-out. Do not create a release tag or overwrite the release branch.
 #### External multi-link receipt-window scenarios
 
 The portable topology matrix template is
-`farmharness/integration/scenarios/p51-receipt-window-matrix.template.json`.
+`farmharness/integration/p51-receipt-window-matrix.template.json`.
 Materialize its 36 base scenarios (six required one-to-many/many-to-one
 topologies × W1/W30 × all three profiles) with:
 

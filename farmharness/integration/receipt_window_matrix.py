@@ -19,7 +19,7 @@ except ImportError:  # Direct execution from this directory.
 
 
 ROOT = Path(__file__).resolve().parent
-TEMPLATE_PATH = ROOT / "scenarios" / "p51-receipt-window-matrix.template.json"
+TEMPLATE_PATH = ROOT / "p51-receipt-window-matrix.template.json"
 PROFILE_NAMES = ("P29V1", "ZSTD_TU", "ZSTD_ROUTE")
 TOPOLOGY_ROWS = (
     {"id": "C1F2", "clients": 1, "workers": 2},
