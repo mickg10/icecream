@@ -38,6 +38,28 @@ d18_run_id=${ICEFARM_D18_RUN_ID:-}
 d18_prep_root=${ICEFARM_D18_PREP_ROOT:-}
 oracle_prepared=${ICEFARM_ORACLE_PREPARED:-0}
 
+# Oracle compilation is preparation work, not measured workload concurrency.
+# Keep its fanout independently bounded by the scenario's advertised jobs.
+resolve_oracle_jobs() {
+    local requested=${ICEFARM_ORACLE_JOBS:-1}
+    case "$requested" in
+        ''|*[!0-9]*) echo "invalid ICEFARM_ORACLE_JOBS (expected positive decimal integer)" >&2; return 65 ;;
+    esac
+    if test "${#requested}" -gt 9
+    then
+        echo "invalid ICEFARM_ORACLE_JOBS (must not exceed workload jobs)" >&2
+        return 65
+    fi
+    requested=$((10#$requested))
+    if test "$requested" -lt 1 -o "$requested" -gt "$jobs"
+    then
+        echo "invalid ICEFARM_ORACLE_JOBS (must be between 1 and workload jobs)" >&2
+        return 65
+    fi
+    printf '%s\n' "$requested"
+}
+oracle_jobs=$(resolve_oracle_jobs)
+
 read_boundary_release() {
     python3 -c '
 import os, stat, sys
@@ -575,7 +597,7 @@ then
     do
         printf '%s\0%s\0%s\0' "$digest" "$relative" "$source"
     done <"$unique" \
-        | xargs -0 -r -n 3 -P "$jobs" /bin/bash -c 'oracle_one "$@"' icefarm-oracle
+        | xargs -0 -r -n 3 -P "$oracle_jobs" /bin/bash -c 'oracle_one "$@"' icefarm-oracle
 fi
 
 while IFS=$'\t' read -r digest relative source

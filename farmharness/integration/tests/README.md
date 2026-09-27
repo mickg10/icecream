@@ -91,3 +91,9 @@ The harness checks the complete manifest against its pinned digest, stages the
 files to the disposable C container in bounded chunks, verifies the staged
 hashes, and installs offline. Do not install these packages on farm hosts or
 change the immutable product image for this test dependency.
+
+Oracle/reference object preparation is separately bounded by
+`ICEFARM_ORACLE_JOBS` (positive decimal, default `1`, and no greater than the
+scenario's measured `jobs` count). This controls only the prepare-only oracle
+pool; measured remote compilation continues to use the scenario's configured
+concurrency. Inline sample verification is serial.

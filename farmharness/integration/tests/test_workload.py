@@ -61,7 +61,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "6043584f7760a1eacdc25370364bb96c0b944c38a905fe848b00a15b3d3cdc59"
+        "729b90901e55bd5d794e4e3985454d54bf7c4e37e027cbed38e1c55643c7ca01"
     )
 
 
@@ -1766,7 +1766,8 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert MANIFEST_DRIVER.index('>"$result_temporary"') < MANIFEST_DRIVER.index(
         'mv -- "$result_temporary" "$job_dir/result.tsv"'
     )
-    assert 'xargs -0 -r -n 3 -P "$jobs"' in MANIFEST_DRIVER
+    assert 'xargs -0 -r -n 3 -P "$oracle_jobs"' in MANIFEST_DRIVER
+    assert 'xargs -0 -n 5 -P "$jobs"' in MANIFEST_DRIVER
     assert 'object="$oracle_root/.build-$key-$BASHPID.o"' in MANIFEST_DRIVER
     assert MANIFEST_DRIVER.index("xargs -0 -r -n 3") < MANIFEST_DRIVER.index(
         'printf \'%s\\n\' "$oracle_identity"'
@@ -2231,6 +2232,45 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
         check=True,
         capture_output=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected", "valid"),
+    [(None, "1", True), ("1", "1", True), ("4", "4", True),
+     ("0", "", False), ("-1", "", False), ("1x", "", False),
+     ("61", "", False)],
+)
+def test_oracle_prepare_fanout_is_separate_from_measured_jobs(
+    configured: str | None, expected: str, valid: bool,
+) -> None:
+    resolver = re.search(
+        r"(?ms)^resolve_oracle_jobs\(\) \{.*?^\}", MANIFEST_DRIVER
+    )
+    assert resolver is not None
+    env = {key: value for key, value in os.environ.items() if key != "ICEFARM_ORACLE_JOBS"}
+    if configured is not None:
+        env["ICEFARM_ORACLE_JOBS"] = configured
+    result = subprocess.run(
+        ["/bin/bash", "-c", "jobs=60\n" + resolver.group(0) + "\nresolve_oracle_jobs"],
+        env=env, text=True, capture_output=True, check=False, timeout=5,
+    )
+    if valid:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+    else:
+        assert result.returncode == 65
+        assert "invalid ICEFARM_ORACLE_JOBS" in result.stderr
+
+    # The first xargs is oracle preparation; the later one remains measured
+    # workload dispatch and must continue to use the scenario's jobs value.
+    oracle_dispatch = re.search(
+        r"(?m)^\s*\| xargs -0 -r -n 3 -P \"\$oracle_jobs\" .*oracle_one", MANIFEST_DRIVER
+    )
+    measured_dispatch = re.search(
+        r"(?m)^xargs -0 -n 5 -P \"\$jobs\" .*compile_one", MANIFEST_DRIVER
+    )
+    assert oracle_dispatch is not None
+    assert measured_dispatch is not None
 
 
 @pytest.mark.parametrize(
