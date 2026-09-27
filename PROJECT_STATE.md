@@ -12,6 +12,30 @@ retained artifact directories.
 
 ## Developer QA
 
+### P29 speculative history parity
+
+`ac6ff93a` integrates donor `5fb34d67`: the existing `codec_wire` control now
+cycles up to sixteen distinct input paths through 96 jobs, comparing
+speculative BODY/NEED/FILL and complete route state with an independent
+ordinary committed-R1 pair. Every job checks exact raw bytes and digests.
+Absent NEED and an actual zero-missing NEED frame are distinct witnesses;
+positive missing counts and repeated-input reuse are required. A third
+serializer rejects a validly framed wrong-Region NEED without changing its
+route state, then retries successfully with canonical bytes/state.
+
+Default eleven-input and 99-entry repeated-manifest runs both pass (the latter
+has eleven distinct inputs, not 99 distinct files). Evidence directory:
+`/tanksmall/scratch/tmp/p51-d13-speculative-diverse-runtime/`.
+`d13-speculative-diverse-default-final.log` SHA256:
+`09bd70b7dbe1dd70eac162c1377423c06ca37a74ab3dbd13e030a54b6db5906d`;
+`d13-speculative-diverse-over96-final.log` SHA256:
+`65b389d109a7d2728635c7b9eab75985c42c6a89de334d863ffd0a0a39a2ea6f`.
+Binary SHA256:
+`a53eff233d2fe1aa4e2fb24255d1908bc8c7f9f01550437a783830f175a4726e`.
+The configured build reused older `d8128299` source with byte-identical
+relevant P29/cache/services production inputs and the final test TU overlaid.
+These are focused codec results, not a fresh full build or external W30 gate.
+
 ### Recovery-record cuts: endpoint coverage
 
 `bd5881a1` integrates donor `5dba8445`, test-only coverage for interrupted
