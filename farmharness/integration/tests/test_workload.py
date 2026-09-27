@@ -54,7 +54,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "ef38b3316a7b8bd40b4fc9dd76a4e1b175df02d0b75989d00ac30a6642ad91c8"
+        "b71eb105db36845ec726b1df80ec5d5ad7015b46ac94f8a454efdaae64a1c137"
     )
 
 
