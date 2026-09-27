@@ -37,10 +37,14 @@ The new Docker receipt-driver matrix has not yet been executed.
 
 ### Frozen QA and legacy build boundary
 
-Fresh public `make qa` on `be66761c` has completed native checks: 178 total,
-172 PASS, 6 SKIP, zero failures/errors. The six skips have the same capability,
-live-test-switch and non-loopback-host requirements described below. Root,
-Python, legacy and mixed stages are not yet a completed overall result.
+Fresh public `make qa` on `be66761c` completed native checks: 178 total,
+172 PASS, 6 SKIP, zero failures/errors; root checks passed 2/2. Python then
+failed one fixture (1683 passed, 7 skipped): the receipt-window test omitted
+the scheduler's R2 setting. Overall QA is FAIL; image/legacy/mixed stages did
+not run. The current branch already supplies the missing fixture setting.
+The six native skips have the same capability, live-test-switch and
+non-loopback-host requirements described below. A current Python run and
+separately labelled continuation are pending; no native/root rerun is implied.
 This run includes the READY restart-budget and legacy bootstrap corrections,
 but not the later diagnostic-retention or private multi-link harness changes.
 Evidence directory:
@@ -84,9 +88,18 @@ the affected output directory and records its exact path and errors in
 `down.json`, while removing the run's other resources. The four focused
 harness modules pass 279 tests, including actual rsync filtering of identity
 marker files and copy-failure preservation. This is harness evidence, not a
-product pass. P29-only retry `d18-p29-diag-20260927-3` uses the same labelled
-product images; its result is pending. Exact previous-run containers are
-absent on q2/q3/q5.
+product pass. P29-only retry `d18-p29-diag-20260927-3` used the same labelled
+product images and failed the verifier's alias comparison: rows record the
+actual worker address and ordinary port, not the configured role name.
+All 300 retained rows have rc=0, exact=1 and remote=1. Corrected-checker
+re-evaluation finds 100 P43 and 100 R1 rows on F_R1 (`10.0.27.212:23005`),
+and 100 R2 rows on F_R2 (`10.0.27.212:23006`), matching the lifecycle snapshot.
+This is not a retroactive scenario PASS. The checker now compares the planned
+endpoint, retaining the role name for diagnostics; 283 focused tests cover
+the correction, including wrong-host/wrong-port/malformed endpoint rejection.
+Rows remain under that run's `diagnostics/tt-quietbox5/C_*.output/` directory.
+Teardown records DOWN with no cleanup or diagnostic errors. A fresh complete
+scenario verdict remains required.
 External mixed qualification remains open; unit tests do not establish it.
 
 ### Sidecar recovery budget
