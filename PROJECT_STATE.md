@@ -16,10 +16,18 @@ Fresh public `ICEFARM_TMPDIR=... make qa` on clean `0bb7cc59` has exposed a
 default sender-test compile failure: `observed_c_fd` was incorrectly declared
 inside `ICECC_P50_ENDPOINT_TEST_HOOKS`, while ordinary connector/cleanup code
 uses it without that macro. Build/install passed; `native-check` exited 2.
-Other stages continue, but this run cannot establish whole-QA success.
+Python also failed because the SDK omitted `rsync`: 1,762 passed, eight
+skipped, one failed. The public run is terminal FAIL after 632.45 seconds;
+legacy/image/mixed stages were not reached.
 Evidence root `/tanksmall/scratch/tmp/p51-qa-0bb7cc59/icecream-qa-doflwlzk`,
-`current/artifacts/native-check.log`. The correction is being tested separately;
-prior opt-in gate results do not prove a fresh macro-free sender build.
+`current/artifacts/native-check.log`; final `result.json` SHA256
+`874e0b0ec7c97c2e050f3e8146c96efb6a98d4361e2d2f20a53f5f7f8dbf024a`.
+`0693ea6e` moves the ordinary descriptor declaration outside the hook guard
+and adds `rsync` to the SDK recipe. Donor `83738701` passed a fresh build and
+execution of both macro-free default sender and opt-in EAGAIN selector.
+Log `/tanksmall/scratch/tmp/p51-qa-sender-fix/logs/build-and-tests.log`, SHA256
+`671cdf074fe9ed429727582fa6bf9e98adf16a21a570b7d4dec00cdace32e8dc`.
+This does not validate the rebuilt SDK or replace fresh whole QA.
 
 ### Real sender EAGAIN witness
 
@@ -215,8 +223,14 @@ including preparation ordering for both topology directions and extracted
 shell-path checks for valid/missing/stale markers. Log
 `/tanksmall/scratch/tmp/p51-d09-merged-validation-tmp/oracle-prep-workload-117.log`,
 SHA256 `c186ee3ae3b7ab47c0ededdb6a40edea489c6ca0f539fb7ad936c964fd9deab8`.
-These focused checks do not establish an end-to-end held-W30 pass; a fresh
-local run and full supported QA are next.
+These focused checks do not establish an end-to-end held-W30 pass. Fresh local
+run `p51-local-c1f2-p29-w30-20260927b` still fails: preparation completes before
+gate startup and both links negotiate W30, but only 14/18 commits are held,
+respectively. Relay durations are 22.2/22.6 seconds. The exact total of 32 and
+a pause in new source-control leases suggest an admission bottleneck; the
+cause is not yet established. No deadlines were increased. Evidence is under
+the same local results root, with run suffix `b`; DOWN is clean, SHA256
+`850a64577b6b56ecb75b9bfeed0104b1d2ceca802fb127acc0fa79fabc47dd61`.
 
 `402d11fc` removes an incorrect multi-link exception to strict P50 policy.
 `ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
