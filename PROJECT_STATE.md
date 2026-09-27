@@ -183,8 +183,12 @@ receipt at ordinal 1, window 1, epoch/generation 1, then 31 exact-output jobs
 with zero failures. Result:
 `/tanksmall/scratch/tmp/luna-w30-current-build/tu-w1-run.json`, SHA256
 `0d27b28f6cb754505e15fe8e18bb0fbdf41307037df03c0b19dceb2de47d52f5`.
-ZSTD_TU W30/negative, ZSTD_ROUTE cells, required topology/restart/mixed cases
-and full qualification remain open. These gates are not whole-build speed
+ZSTD_TU/W30 passes on fresh `w30-luna-w30-zstdtu-20260927-a`: negotiated
+profile 2/window 30, exactly thirty held COMMITs at ordinals 1–30 on epoch/
+generation 1, helper exit zero, and 31 exact-output jobs with zero failures.
+Result: `/tanksmall/scratch/tmp/luna-w30-current-build/tu-w30-run.json`.
+ZSTD_TU negative, ZSTD_ROUTE cells, required topology/restart/mixed cases and
+full qualification remain open. These gates are not whole-build speed
 measurements.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
