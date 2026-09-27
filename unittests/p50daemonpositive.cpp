@@ -33,6 +33,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -471,41 +472,67 @@ private:
         return std::filesystem::exists(abort_path_, error) && !error;
     }
 
-    bool write_relay_bytes(int fd, const void *buffer, size_t size)
+    bool write_relay_bytes(int fd, const void *buffer, size_t size,
+                           std::atomic<size_t> *sent = nullptr,
+                           std::string *failure = nullptr,
+                           const char *stage = "relay-write")
     {
         const auto *position = static_cast<const unsigned char *>(buffer);
         while (size != 0 && !stop_.load(std::memory_order_acquire)) {
             pollfd descriptor{fd, POLLOUT, 0};
             const int ready = ::poll(&descriptor, 1, 100);
             if (ready < 0 && errno == EINTR) continue;
-            if (ready < 0 || (ready > 0 &&
-                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))))
+            if (ready < 0) {
+                if (failure) *failure = std::string(stage) + ":poll-errno=" +
+                    std::to_string(errno);
                 return false;
+            }
+            if (ready > 0 &&
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                if (failure) *failure = std::string(stage) + ":poll-revents=" +
+                    std::to_string(descriptor.revents);
+                return false;
+            }
             if (ready == 0) continue;
             const ssize_t count = ::send(fd, position, size,
                                          MSG_NOSIGNAL | MSG_DONTWAIT);
             if (count > 0) {
+                if (sent) sent->fetch_add(static_cast<size_t>(count),
+                                          std::memory_order_relaxed);
                 position += count;
                 size -= static_cast<size_t>(count);
                 continue;
             }
             if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
                 continue;
+            if (failure) *failure = std::string(stage) + ":send-errno=" +
+                std::to_string(errno);
             return false;
         }
+        if (size != 0 && failure) *failure = std::string(stage) + ":stopped";
         return size == 0;
     }
 
-    bool read_relay_bytes(int fd, void *buffer, size_t size)
+    bool read_relay_bytes(int fd, void *buffer, size_t size,
+                          std::string *failure = nullptr,
+                          const char *stage = "relay-read")
     {
         auto *position = static_cast<unsigned char *>(buffer);
         while (size != 0 && !stop_.load(std::memory_order_acquire)) {
             pollfd descriptor{fd, POLLIN, 0};
             const int ready = ::poll(&descriptor, 1, 100);
             if (ready < 0 && errno == EINTR) continue;
-            if (ready < 0 || (ready > 0 &&
-                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))))
+            if (ready < 0) {
+                if (failure) *failure = std::string(stage) + ":poll-errno=" +
+                    std::to_string(errno);
                 return false;
+            }
+            if (ready > 0 &&
+                (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                if (failure) *failure = std::string(stage) + ":poll-revents=" +
+                    std::to_string(descriptor.revents);
+                return false;
+            }
             if (ready == 0) continue;
             const ssize_t count = ::recv(fd, position, size, 0);
             if (count > 0) {
@@ -514,9 +541,19 @@ private:
                 continue;
             }
             if (count < 0 && errno == EINTR) continue;
+            if (failure) *failure = count == 0
+                ? std::string(stage) + ":eof"
+                : std::string(stage) + ":recv-errno=" + std::to_string(errno);
             return false;
         }
+        if (size != 0 && failure) *failure = std::string(stage) + ":stopped";
         return size == 0;
+    }
+
+    static long long elapsed_ms(Clock::time_point started)
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - started).count();
     }
 
     void fail()
@@ -558,6 +595,19 @@ private:
         std::fprintf(stderr,
             "P51_RECEIPT_GATE_CONNECTION attempt=%u peer=%s:%u\n",
             attempt, peer_address, static_cast<unsigned>(peer_port));
+        const auto relay_started = Clock::now();
+        std::atomic<size_t> c_to_f_sent{0};
+        std::atomic<size_t> f_to_c_sent{0};
+        std::array<unsigned char, 4> c_to_f_first{};
+        size_t c_to_f_first_size = 0;
+        std::array<unsigned char, 4> f_to_c_first{};
+        size_t f_to_c_first_size = 0;
+        std::string client_pump_result = "running";
+        long long client_pump_terminal_ms = -1;
+        std::string terminal_io_result = "none";
+        long long server_terminal_ms = -1;
+        bool failed_before_cleanup = false;
+        bool stop_before_cleanup = false;
         server_fd_ = match_ipv4_.empty()
             ? connect_raw_tcp(endpoint_port_)
             : connect_raw_tcp(upstream_ipv4_, endpoint_port_);
@@ -572,25 +622,59 @@ private:
         bool link_reject_seen = false;
         bool protocol_error = false;
         std::string terminal_reason = "server-eof-before-r2";
-        std::thread client_to_server([this] {
+        std::thread client_to_server([this, &c_to_f_sent, &c_to_f_first,
+                                      &c_to_f_first_size,
+                                      &client_pump_result,
+                                      &client_pump_terminal_ms, &relay_started] {
+            const auto note_pump_exit = [&](std::string result) {
+                client_pump_result = std::move(result);
+                client_pump_terminal_ms = elapsed_ms(relay_started);
+            };
             char bytes[8192];
             for (;;) {
                 if (stop_.load(std::memory_order_acquire)) break;
                 pollfd descriptor{client_fd_, POLLIN, 0};
                 const int ready = ::poll(&descriptor, 1, 100);
                 if (ready < 0 && errno == EINTR) continue;
-                if (ready < 0 || (ready > 0 &&
-                    (descriptor.revents & (POLLERR | POLLNVAL)))) break;
+                if (ready < 0) {
+                    note_pump_exit("client-poll-errno=" + std::to_string(errno));
+                    break;
+                }
+                if (ready > 0 &&
+                    (descriptor.revents & (POLLERR | POLLNVAL))) {
+                    note_pump_exit("client-poll-revents=" +
+                                   std::to_string(descriptor.revents));
+                    break;
+                }
                 if (ready == 0) continue;
                 const ssize_t count = ::recv(client_fd_, bytes, sizeof(bytes), 0);
                 if (count > 0) {
-                    if (!write_relay_bytes(server_fd_, bytes,
-                                           static_cast<size_t>(count))) break;
+                    const size_t received = static_cast<size_t>(count);
+                    if (c_to_f_first_size < c_to_f_first.size()) {
+                        const size_t copy = std::min(
+                            c_to_f_first.size() - c_to_f_first_size, received);
+                        std::memcpy(c_to_f_first.data() + c_to_f_first_size,
+                                    bytes, copy);
+                        c_to_f_first_size += copy;
+                    }
+                    std::string write_failure;
+                    if (!write_relay_bytes(server_fd_, bytes, received,
+                                           &c_to_f_sent, &write_failure,
+                                           "client-to-server")) {
+                        note_pump_exit(write_failure);
+                        break;
+                    }
                     continue;
                 }
                 if (count < 0 && errno == EINTR) continue;
+                note_pump_exit(count == 0
+                    ? "client-eof-after-ms=" + std::to_string(elapsed_ms(relay_started))
+                    : "client-recv-errno=" + std::to_string(errno));
                 break;
             }
+            if (client_pump_result == "running")
+                note_pump_exit("stop-requested-after-ms=" +
+                               std::to_string(elapsed_ms(relay_started)));
             ::shutdown(server_fd_, SHUT_WR);
         });
 
@@ -598,18 +682,31 @@ private:
         // its first LINK_STATE frame.  Ordinary MsgChannel frame lengths stay
         // below 1 MiB and therefore cannot alias an R2 type byte.
         unsigned char header[4];
-        if (!read_relay_bytes(server_fd_, header, sizeof(header)) ||
-            !write_relay_bytes(client_fd_, header, sizeof(header))) {
+        std::string io_failure;
+        if (!read_relay_bytes(server_fd_, header, sizeof(header), &io_failure,
+                              "server-maximum-version")) {
             terminal_reason = "server-disconnected-before-version";
+            terminal_io_result = io_failure;
             fail();
         } else {
+            std::memcpy(f_to_c_first.data(), header, sizeof(header));
+            f_to_c_first_size = sizeof(header);
             std::fprintf(stderr,
                 "P51_RECEIPT_GATE_VERSION attempt=%u server_max=%u.%u.%u.%u\n",
                 attempt, header[0], header[1], header[2], header[3]);
+            if (!write_relay_bytes(client_fd_, header, sizeof(header),
+                                   &f_to_c_sent, &io_failure,
+                                   "server-maximum-to-client")) {
+                terminal_reason = "client-disconnected-after-server-version";
+                terminal_io_result = io_failure;
+                fail();
+            }
             // MsgChannel exchanges both the peer's maximum version and the
             // selected version in each direction before ordinary frames.
-            if (!read_relay_bytes(server_fd_, header, sizeof(header))) {
+            else if (!read_relay_bytes(server_fd_, header, sizeof(header),
+                                       &io_failure, "server-selected-version")) {
                 terminal_reason = "server-disconnected-before-selected-version";
+                terminal_io_result = io_failure;
                 fail();
             } else if (!(header[0] == 51 && header[1] == 0 &&
                          header[2] == 0 && header[3] == 0)) {
@@ -619,8 +716,11 @@ private:
                     "P51_RECEIPT_GATE_VERSION_MISMATCH attempt=%u selected=%u.%u.%u.%u\n",
                     attempt, header[0], header[1], header[2], header[3]);
                 fail();
-            } else if (!write_relay_bytes(client_fd_, header, sizeof(header))) {
+            } else if (!write_relay_bytes(client_fd_, header, sizeof(header),
+                                          &f_to_c_sent, &io_failure,
+                                          "server-selected-to-client")) {
                 terminal_reason = "client-disconnected-after-selected-version";
+                terminal_io_result = io_failure;
                 fail();
             }
             bool r2 = false;
@@ -745,7 +845,8 @@ private:
                                 static_cast<unsigned long long>(commit.relationship_ordinal),
                                 static_cast<unsigned long long>(commit.inner.tu_seq.value));
                             lock.unlock();
-                            if (!write_relay_bytes(client_fd_, frame.data(), frame.size()))
+                            if (!write_relay_bytes(client_fd_, frame.data(), frame.size(),
+                                                   &f_to_c_sent))
                                 break;
                             continue;
                         }
@@ -768,7 +869,8 @@ private:
                                 failed_ || discard_) break;
                             for (const auto& held : commits_) {
                                 if (!write_relay_bytes(
-                                        client_fd_, held.data(), held.size())) {
+                                        client_fd_, held.data(), held.size(),
+                                        &f_to_c_sent)) {
                                     failed_ = true;
                                     break;
                                 }
@@ -785,7 +887,8 @@ private:
                         break;
                     }
                 } else if (!write_relay_bytes(
-                               client_fd_, frame.data(), frame.size())) {
+                               client_fd_, frame.data(), frame.size(),
+                               &f_to_c_sent)) {
                     break;
                 }
                 if (report_link_state) {
@@ -796,10 +899,30 @@ private:
                 }
             }
         }
+        server_terminal_ms = elapsed_ms(relay_started);
+        failed_before_cleanup = failed_.load(std::memory_order_acquire);
+        stop_before_cleanup = stop_.load(std::memory_order_acquire);
         stop_.store(true, std::memory_order_release);
         ::shutdown(client_fd_, SHUT_WR);
         ::shutdown(server_fd_, SHUT_RDWR);
         if (client_to_server.joinable()) client_to_server.join();
+        std::fprintf(stderr,
+            "P51_RECEIPT_GATE_RELAY_DIAGNOSTIC attempt=%u server_terminal_ms=%lld "
+            "failed_before_cleanup=%u stop_before_cleanup=%u "
+            "c_to_f_bytes=%zu f_to_c_bytes=%zu c_to_f_first=%02x%02x%02x%02x "
+            "c_to_f_first_size=%zu f_to_c_first=%02x%02x%02x%02x "
+            "f_to_c_first_size=%zu client_pump_terminal_ms=%lld "
+            "client_pump=%s terminal_io=%s\n",
+            attempt, server_terminal_ms, failed_before_cleanup ? 1u : 0u,
+            stop_before_cleanup ? 1u : 0u,
+            c_to_f_sent.load(std::memory_order_relaxed),
+            f_to_c_sent.load(std::memory_order_relaxed),
+            c_to_f_first[0], c_to_f_first[1], c_to_f_first[2], c_to_f_first[3],
+            c_to_f_first_size,
+            f_to_c_first[0], f_to_c_first[1], f_to_c_first[2], f_to_c_first[3],
+            f_to_c_first_size, client_pump_terminal_ms,
+            client_pump_result.c_str(),
+            terminal_io_result.c_str());
         std::fprintf(stderr,
             "P51_RECEIPT_GATE_TERMINAL attempt=%u link_state=%u protocol_error=%u reason=%s\n",
             attempt, link_state_seen ? 1u : 0u, protocol_error ? 1u : 0u,
