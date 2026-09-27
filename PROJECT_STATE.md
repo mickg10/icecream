@@ -77,6 +77,24 @@ workload-only command without an UP receipt; the corrected one-shot invocation
 was refused by that lock. Neither launched a local workload. This remains
 runner qualification, not a current-source farm or performance result.
 
+Actual local execution now passes ZFS, image and dependency preflight, but
+the receipt gate has **not passed**. The diagnostic run
+`p51-local-c1f2-p29w30-zfs6255-diagnostic-r1` ends with zero held commits on
+both links. Test-helper diagnostics (`cb1f47c1`) show the accepted C-facing
+socket closing after 0–1 ms without sending any bytes; F closure follows.
+This identifies close direction, not the initiating process. Retained inspect
+also shows every role using host networking and the same sidecar UID. The
+gate's OUTPUT/UID redirect therefore cannot isolate C from other same-UID
+roles on this host. Per-client network isolation remains to be implemented
+and qualified; unexplained early connections are not simply ignored.
+Bundle:
+`/tanksmall/scratch/tmp/p51-local-multilink-run1/results/results/p51-local-c1f2-p29w30-zfs6255-diagnostic-r1/`.
+`down.json` reports DOWN with no problems or diagnostic errors, SHA256
+`553973358e26002aa5c622dc82204394f192f2951d3c4c79ec2f81b667e67cce`.
+The diagnostic helper SHA256 is
+`10addf73510ed4e7a78efa0c5cf6170420871ed07f35e07ac0b3241e30f0c96a`;
+the older helper and failed attempts remain preserved.
+
 ### Frozen QA and legacy build boundary
 
 A current-production farm role image has also been built locally from exact
