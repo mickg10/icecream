@@ -514,6 +514,26 @@ int main(int argc, char **argv)
        would be invisible. */
     MsgChannel *client_zero = connect_unix_bounded(socket_path, 5000);
     REQUIRE(client_zero != nullptr, "throwaway client zero connected to consume id 1");
+    const std::string supervisor_status = request_internals(client_zero, 5000);
+    const std::string supervisor_prefix =
+        "Cache sidecar supervisor: adapter_state=2 lifecycle_state=3 "
+        "authenticated=1 attempt=1 pid=";
+    const size_t supervisor_line = supervisor_status.find(supervisor_prefix);
+    REQUIRE(supervisor_line != std::string::npos,
+            "internal status exposes the live authenticated sidecar lifecycle");
+    if (supervisor_line != std::string::npos) {
+        const size_t pid_start = supervisor_line + supervisor_prefix.size();
+        char *pid_end = nullptr;
+        const long reported_pid = std::strtol(supervisor_status.c_str() + pid_start,
+                                              &pid_end, 10);
+        REQUIRE(pid_end != supervisor_status.c_str() + pid_start &&
+                    reported_pid > 1 &&
+                    supervisor_status.compare(
+                        static_cast<size_t>(pid_end - supervisor_status.c_str()),
+                        std::strlen(" last_error=0 post_ready_exits=0"),
+                        " last_error=0 post_ready_exits=0") == 0,
+                "READY status carries a valid child PID and clean restart counters");
+    }
     delete client_zero;
 
     /* This daemon selected as its OWN F (the 127.0.0.1 rewrite branch): a

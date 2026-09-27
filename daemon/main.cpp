@@ -6233,7 +6233,7 @@ string Daemon::dump_internals() const
     result += "Node Name: " + nodename + "\n";
     result += "  Remote name: " + remote_name + "\n";
     {
-        char handoff[160];
+        char handoff[256];
         snprintf(handoff, sizeof(handoff),
                  "  UseCS handoff: attempts=%lu committed=%lu exact_aborts=%lu dup_settlements_rejected=%lu\n",
                  usecs_delivery_attempts, usecs_frames_committed,
@@ -6267,6 +6267,21 @@ string Daemon::dump_internals() const
                      cache_handoff_clear_test_result_protocol,
                      cache_handoff_clear_test_result_mask);
             result += handoff_clear;
+        }
+        if (cache_adapter != nullptr) {
+            snprintf(handoff, sizeof(handoff),
+                     "  Cache sidecar supervisor: adapter_state=%u lifecycle_state=%u authenticated=%d attempt=%llu pid=%ld last_error=%u post_ready_exits=%llu\n",
+                     static_cast<unsigned int>(cache_adapter->state()),
+                     static_cast<unsigned int>(cache_adapter->outer_lifecycle_state()),
+                     cache_adapter->authenticated() ? 1 : 0,
+                     static_cast<unsigned long long>(cache_adapter->attempt()),
+                     static_cast<long>(cache_adapter->outer_child_pid()),
+                     static_cast<unsigned int>(cache_adapter->last_error()),
+                     static_cast<unsigned long long>(
+                         cache_adapter->cumulative_post_ready_exits()));
+            result += handoff;
+        } else {
+            result += "  Cache sidecar supervisor: absent\n";
         }
         char assignment[320];
         snprintf(assignment, sizeof(assignment),
