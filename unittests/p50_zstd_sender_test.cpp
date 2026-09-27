@@ -1293,10 +1293,19 @@ asio::awaitable<void> sender_r2_accept_after_idle_expiry(
     std::atomic<int>& second_status, std::atomic<uint64_t>& idle_committed,
     std::atomic<uint64_t>& idle_acknowledged,
     std::atomic<unsigned>& quiesced_links, std::mutex& observed_mutex,
-    std::chrono::steady_clock::time_point& first_quiesced_time) {
-    for (unsigned index = 0; index != 2; ++index) {
+    std::chrono::steady_clock::time_point& first_quiesced_time,
+    std::atomic<int>& first_server_fd, uint64_t close_after_ack_ordinal,
+    bool expect_reconnect) {
+    const unsigned link_count = expect_reconnect ? 2U : 1U;
+    for (unsigned index = 0; index != link_count; ++index) {
         tcp::socket socket(co_await asio::this_coro::executor);
         co_await acceptor.async_accept(socket, asio::use_awaitable);
+        if (index == 0 && close_after_ack_ordinal != 0) {
+            const int duplicate = ::dup(socket.native_handle());
+            if (duplicate < 0)
+                throw std::runtime_error("dup failed for idle server socket");
+            first_server_fd.store(duplicate, std::memory_order_release);
+        }
         accepted.fetch_add(1, std::memory_order_release);
         EndpointIoControl control;
         control.r2_link_io_quiesced_observer =
@@ -1323,7 +1332,12 @@ asio::awaitable<void> sender_r2_accept_after_idle_expiry(
     }
 }
 
-uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
+uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile,
+                                                  bool fast_idle_eof = false,
+                                                  bool no_eof_reuse = false) {
+    const uint64_t close_after_ack_ordinal = fast_idle_eof ? 1U :
+        no_eof_reuse ? 2U : 0U;
+    const bool deterministic_mode = fast_idle_eof || no_eof_reuse;
     constexpr uint32_t kWindow = 2;
     constexpr uint64_t kRequestedPhysicalGeneration = 27;
     constexpr uint64_t kRelationshipPrefix = 0x518600;
@@ -1373,6 +1387,8 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
     std::atomic<uint64_t> idle_committed{0};
     std::atomic<uint64_t> idle_acknowledged{0};
     std::atomic<unsigned> quiesced_links{0};
+    std::atomic<int> first_server_fd{-1};
+    std::atomic<int> first_client_fd{-1};
     std::array<std::atomic<unsigned>, 2> bind_calls{};
     std::array<std::atomic<unsigned>, 2> commit_calls{};
     std::atomic<unsigned> acknowledged{0};
@@ -1534,6 +1550,12 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
         acknowledged.store(static_cast<unsigned>(ack.contiguous_verified_ordinal),
                            std::memory_order_release);
         acknowledged_cv.notify_all();
+        if (close_after_ack_ordinal != 0 &&
+            ack.contiguous_verified_ordinal == close_after_ack_ordinal) {
+            const int fd = first_server_fd.load(std::memory_order_acquire);
+            if (fd >= 0)
+                (void)::shutdown(fd, SHUT_RDWR);
+        }
         return true;
     };
     server_config.settle_p51_interrupted_job =
@@ -1608,7 +1630,8 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
         sender_r2_accept_after_idle_expiry(
             acceptor, server, accepted, first_server_status,
             second_server_status, idle_committed, idle_acknowledged,
-            quiesced_links, observed_mutex, first_quiesced_time),
+            quiesced_links, observed_mutex, first_quiesced_time,
+            first_server_fd, close_after_ack_ordinal, !no_eof_reuse),
         asio::use_future);
 
     PreparationAuthorityLimits limits;
@@ -1621,6 +1644,8 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
     sender_config.maximum_duration = std::chrono::seconds(180);
     sender_config.endpoint_caps = caps;
     sender_config.authority_limits = limits;
+    sender_config.r2_interval_observer =
+        [](const R2WireControlSnapshot&) { return true; };
     if (profile == ProfileId::ZSTD_ROUTE)
         sender_config.compression_level = 3;
     auto sender = std::make_shared<P50ZstdSourceSender>(
@@ -1634,7 +1659,21 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
             std::lock_guard lock(observed_mutex);
             connector_deadlines.push_back(deadline);
         }
-        completion(connect_fd(remote));
+        const int fd = connect_fd(remote);
+        if (deterministic_mode) {
+            int expected = -1;
+            const int duplicate = ::dup(fd);
+            if (duplicate < 0) {
+                if (fd >= 0)
+                    (void)::close(fd);
+                completion(-1);
+                return;
+            }
+            if (!first_client_fd.compare_exchange_strong(
+                    expected, duplicate, std::memory_order_acq_rel))
+                (void)::close(duplicate);
+        }
+        completion(fd);
     };
     const auto first_deadline_tp = first_job_deadline.as_steady_time_point();
     auto first = asio::co_spawn(
@@ -1651,13 +1690,24 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
         asio::io_context& f;
         std::thread& c_thread;
         std::thread& f_thread;
+        std::atomic<int>& client_fd;
+        std::atomic<int>& server_fd;
         ~ContextCleanup() {
             c.stop();
             f.stop();
             if (c_thread.joinable()) c_thread.join();
             if (f_thread.joinable()) f_thread.join();
+            const int client = client_fd.exchange(-1,
+                                                  std::memory_order_acq_rel);
+            if (client >= 0)
+                (void)::close(client);
+            const int server = server_fd.exchange(-1,
+                                                  std::memory_order_acq_rel);
+            if (server >= 0)
+                (void)::close(server);
         }
-    } cleanup{c_context, f_context, c_thread, f_thread};
+    } cleanup{c_context, f_context, c_thread, f_thread,
+              first_client_fd, first_server_fd};
     f_thread = std::thread([&] { f_context.run(); });
     c_thread = std::thread([&] { c_context.run(); });
 
@@ -1676,8 +1726,13 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
     }
     CHECK(acknowledged.load(std::memory_order_acquire) == 1);
     CHECK(accepted.load(std::memory_order_acquire) == 1);
-    CHECK(quiesced_links.load(std::memory_order_acquire) == 0);
-    CHECK(first_server_status.load(std::memory_order_acquire) == -1);
+    if (no_eof_reuse) {
+        CHECK(quiesced_links.load(std::memory_order_acquire) == 0);
+        CHECK(first_server_status.load(std::memory_order_acquire) == -1);
+    } else if (!fast_idle_eof) {
+        CHECK(quiesced_links.load(std::memory_order_acquire) == 0);
+        CHECK(first_server_status.load(std::memory_order_acquire) == -1);
+    }
     {
         std::lock_guard lock(observed_mutex);
         CHECK(observed_hellos.size() == 1);
@@ -1686,25 +1741,63 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
               kRequestedPhysicalGeneration);
     }
 
-    const auto idle_wait_deadline = std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(70);
-    while (first_server_status.load(std::memory_order_acquire) == -1 &&
-           std::chrono::steady_clock::now() < idle_wait_deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    CHECK(first_server_status.load(std::memory_order_acquire) ==
-          static_cast<int>(ServerRunStatus::DeadlineExceeded));
-    CHECK(quiesced_links.load(std::memory_order_acquire) == 1);
-    CHECK(idle_committed.load(std::memory_order_acquire) == 1);
-    CHECK(idle_acknowledged.load(std::memory_order_acquire) == 1);
+    if (fast_idle_eof) {
+        const auto eof_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+        bool observed_eof = false;
+        while (!observed_eof &&
+               std::chrono::steady_clock::now() < eof_deadline) {
+            const int fd = first_client_fd.load(std::memory_order_acquire);
+            CHECK(fd >= 0);
+            pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+            const int ready = ::poll(&descriptor, 1, 50);
+            if (ready < 0 && errno != EINTR)
+                throw std::runtime_error("poll failed for idle peer EOF");
+            if (ready > 0) {
+                uint8_t byte = 0;
+                const ssize_t count = ::recv(fd, &byte, 1,
+                                             MSG_PEEK | MSG_DONTWAIT);
+                if (count == 0)
+                    observed_eof = true;
+                else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                         errno != EINTR)
+                    throw std::runtime_error("recv failed for idle peer EOF");
+            }
+        }
+        CHECK(observed_eof);
+        const auto quiesced_deadline = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(5);
+        while ((first_server_status.load(std::memory_order_acquire) == -1 ||
+                quiesced_links.load(std::memory_order_acquire) < 1) &&
+               std::chrono::steady_clock::now() < quiesced_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(first_server_status.load(std::memory_order_acquire) ==
+              static_cast<int>(ServerRunStatus::Disconnected));
+    } else if (!no_eof_reuse) {
+        const auto idle_wait_deadline = std::chrono::steady_clock::now() +
+                                        std::chrono::seconds(70);
+        while (first_server_status.load(std::memory_order_acquire) == -1 &&
+               std::chrono::steady_clock::now() < idle_wait_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK(first_server_status.load(std::memory_order_acquire) ==
+              static_cast<int>(ServerRunStatus::DeadlineExceeded));
+    }
+    if (!no_eof_reuse) {
+        CHECK(quiesced_links.load(std::memory_order_acquire) == 1);
+        CHECK(idle_committed.load(std::memory_order_acquire) == 1);
+        CHECK(idle_acknowledged.load(std::memory_order_acquire) == 1);
+    }
     std::chrono::steady_clock::duration actual_idle{};
-    {
+    if (!no_eof_reuse) {
         std::lock_guard lock(observed_mutex);
         CHECK(first_commit_time != std::chrono::steady_clock::time_point{});
         CHECK(first_quiesced_time >= first_commit_time);
         actual_idle = first_quiesced_time - first_commit_time;
     }
-    CHECK(actual_idle >= std::chrono::seconds(55));
-    CHECK(actual_idle <= std::chrono::seconds(70));
+    if (!deterministic_mode) {
+        CHECK(actual_idle >= std::chrono::seconds(55));
+        CHECK(actual_idle <= std::chrono::seconds(70));
+    }
 
     {
         std::lock_guard lock(observed_mutex);
@@ -1730,41 +1823,121 @@ uint64_t run_p51_sender_idle_link_reconnect_case(ProfileId profile) {
     CHECK(second_result.raw_bytes == inputs[1].size());
     CHECK(second_result.raw_digest == icecc::digest128(inputs[1]));
     CHECK(second_result.attempts >= 1);
+    CHECK(second_result.r2_wire_accounting.has_value());
+    CHECK(second_result.r2_wire_accounting->valid);
+    CHECK(second_result.r2_wire_accounting->bundle_attempts == 1);
+    CHECK(second_result.r2_wire_accounting->replay_attempts == 0);
+    // An already-observed idle EOF must be recovered before this request is
+    // prepared/accounted, so it has one original bundle and no replay.
+    if (deterministic_mode) {
+        std::cerr << "P51_IDLE_LINK_PROFILE="
+                  << static_cast<unsigned>(profile)
+                  << " bundle_attempts="
+                  << second_result.r2_wire_accounting->bundle_attempts
+                  << " replay_attempts="
+                  << second_result.r2_wire_accounting->replay_attempts
+                  << " exact_result=1 PASS\n";
+    }
     CHECK(server_future.wait_for(std::chrono::seconds(5)) ==
           std::future_status::ready);
     server_future.get();
-    CHECK(second_server_status.load(std::memory_order_acquire) ==
-          static_cast<int>(ServerRunStatus::Disconnected));
+    if (no_eof_reuse)
+        CHECK(first_server_status.load(std::memory_order_acquire) ==
+              static_cast<int>(ServerRunStatus::Disconnected));
+    else
+        CHECK(second_server_status.load(std::memory_order_acquire) ==
+              static_cast<int>(ServerRunStatus::Disconnected));
     c_work.reset();
-    CHECK(accepted.load(std::memory_order_acquire) == 2);
-    CHECK(quiesced_links.load(std::memory_order_acquire) == 2);
+    CHECK(accepted.load(std::memory_order_acquire) ==
+          (no_eof_reuse ? 1U : 2U));
+    CHECK(quiesced_links.load(std::memory_order_acquire) ==
+          (no_eof_reuse ? 1U : 2U));
     CHECK(commit_calls[0].load(std::memory_order_acquire) == 1);
     CHECK(commit_calls[1].load(std::memory_order_acquire) == 1);
     CHECK(bind_calls[0].load(std::memory_order_acquire) == 1);
-    CHECK(bind_calls[1].load(std::memory_order_acquire) >= 1);
-    CHECK(reset_commits.load(std::memory_order_acquire) == 1);
+    CHECK(bind_calls[1].load(std::memory_order_acquire) == 1);
+    CHECK(reset_commits.load(std::memory_order_acquire) ==
+          (no_eof_reuse ? 0U : 1U));
     CHECK(mismatches.load(std::memory_order_relaxed) == 0);
     {
         std::lock_guard lock(observed_mutex);
-        CHECK(observed_hellos.size() == 2);
+        CHECK(observed_hellos.size() == (no_eof_reuse ? 1U : 2U));
         CHECK(observed_hellos[0].start_mode == LinkStartMode::Initial);
-        CHECK(observed_hellos[1].start_mode == LinkStartMode::Reconnect);
         CHECK(observed_hellos[0].physical_link_generation ==
               kRequestedPhysicalGeneration);
-        CHECK(observed_hellos[1].physical_link_generation >
-              observed_hellos[0].physical_link_generation);
-        CHECK(connector_deadlines.size() == 2);
+        if (no_eof_reuse) {
+            CHECK(connector_deadlines.size() == 1);
+            CHECK(second_binding_generations.size() == 1);
+            CHECK(second_binding_generations.front() ==
+                  observed_hellos[0].physical_link_generation);
+        } else {
+            CHECK(observed_hellos[1].start_mode == LinkStartMode::Reconnect);
+            CHECK(observed_hellos[1].physical_link_generation >
+                  observed_hellos[0].physical_link_generation);
+            CHECK(connector_deadlines.size() == 2);
+        }
         CHECK(connector_deadlines[0] == first_deadline_tp);
-        CHECK(connector_deadlines[1] == second_deadline_tp);
-        CHECK(!second_binding_generations.empty());
-        for (uint64_t generation : second_binding_generations)
-            CHECK(generation == observed_hellos[1].physical_link_generation);
+        if (!no_eof_reuse) {
+            CHECK(connector_deadlines[1] == second_deadline_tp);
+            CHECK(!second_binding_generations.empty());
+            for (uint64_t generation : second_binding_generations)
+                CHECK(generation == observed_hellos[1].physical_link_generation);
+        }
     }
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(actual_idle).count());
 }
 
+void test_p51_sender_idle_eof_fast_all_profiles() {
+    ScopedP50Diagnostics diagnostics;
+    const std::array<ProfileId, 3> profiles{
+        ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
+    std::array<std::exception_ptr, profiles.size()> errors{};
+    std::array<std::thread, profiles.size()> workers;
+    for (size_t index = 0; index != profiles.size(); ++index) {
+        workers[index] = std::thread([&, index] {
+            try {
+                (void)run_p51_sender_idle_link_reconnect_case(
+                    profiles[index], true);
+            } catch (...) {
+                errors[index] = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers)
+        if (worker.joinable()) worker.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+    std::cerr << "P51_IDLE_EOF_FAST all_profiles=3 observed_peer_eof=1 "
+                 "prewrite_recovery=1 PASS\n";
+}
+
+void test_p51_sender_idle_no_eof_reuse_all_profiles() {
+    ScopedP50Diagnostics diagnostics;
+    const std::array<ProfileId, 3> profiles{
+        ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
+    std::array<std::exception_ptr, profiles.size()> errors{};
+    std::array<std::thread, profiles.size()> workers;
+    for (size_t index = 0; index != profiles.size(); ++index) {
+        workers[index] = std::thread([&, index] {
+            try {
+                (void)run_p51_sender_idle_link_reconnect_case(
+                    profiles[index], false, true);
+            } catch (...) {
+                errors[index] = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers)
+        if (worker.joinable()) worker.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+    std::cerr << "P51_IDLE_NO_EOF all_profiles=3 connectors=1 link_reuse=1 "
+                 "bundle_attempts=1 replay_attempts=0 PASS\n";
+}
+
 void test_p51_sender_idle_link_reconnect_all_profiles() {
+    ScopedP50Diagnostics diagnostics;
     const std::array<ProfileId, 3> profiles{
         ProfileId::P29V1, ProfileId::ZSTD_TU, ProfileId::ZSTD_ROUTE};
     std::array<std::exception_ptr, profiles.size()> errors{};
@@ -1789,6 +1962,7 @@ void test_p51_sender_idle_link_reconnect_all_profiles() {
                   << static_cast<unsigned>(profiles[index])
                   << " accepted=2 idle_kq=1/1 connectors=2 commits=2"
                   << " idle_seconds=" << idle_seconds[index]
+                  << " bundle_attempts=1 replay_attempts=0"
                   << " second_deadline_preserved=1 PASS\n";
     std::cerr << "P51_SENDER_IDLE_RECONNECT_SELECTOR PASS\n";
 }
@@ -7170,6 +7344,14 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--idle-reconnect") {
         test_p51_sender_idle_link_reconnect_all_profiles();
+        return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--idle-eof-fast") {
+        test_p51_sender_idle_eof_fast_all_profiles();
+        return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--idle-no-eof") {
+        test_p51_sender_idle_no_eof_reuse_all_profiles();
         return 0;
     }
     if (argc == 2 &&

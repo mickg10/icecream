@@ -341,7 +341,11 @@ p50zstdsender_eagain_LDADD = ../client/libp50zstdsendertesthooks.a \
 	$(MAKE) -C $(top_builddir)/cache libp50endpointfulltesthooks.a
 .PHONY: ../client/libp50zstdsendertesthooks.a ../cache/libp50endpointfulltesthooks.a
 .PHONY: p50zstdsender-idle-check
-p50zstdsender-idle-check: p50zstdsender
+p50zstdsender-idle-check:
+	$(MAKE) -C $(top_builddir)/client libp50zstdsender.a
+	$(MAKE) p50zstdsender
+	timeout 120s ./p50zstdsender --idle-eof-fast
+	timeout 120s ./p50zstdsender --idle-no-eof
 	timeout 110s ./p50zstdsender --idle-reconnect
 p50compilebinding_SOURCES = p50_compile_binding_test.cpp
 p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)

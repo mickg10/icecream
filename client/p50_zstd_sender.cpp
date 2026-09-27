@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -470,6 +471,52 @@ struct P50ZstdSourceSender::Impl {
         pending.wire_accounting = wire_completions.finish_r2_job(
             pending.wire_accounting_key);
         pending.wire_accounting_finished = true;
+    }
+
+    bool detect_closed_idle_r2_link(
+        uint64_t expected_physical_generation) noexcept {
+        std::unique_lock lock(r2_transfer_mutex);
+        if (r2_physical_link_generation != expected_physical_generation ||
+            r2_recovery_required || route_replacement_required || !r2_socket ||
+            !r2_socket->is_open() || !r2_receipt_queue.empty() ||
+            !r2_retained_jobs.empty() || r2_reader_running ||
+            r2_ack_pump_running || r2_pending_ack_ordinal != 0)
+            return false;
+        const int socket_fd = r2_socket->native_handle();
+        if (socket_fd < 0)
+            return false;
+
+        // This is one nonblocking syscall on the sender's owner executor,
+        // under the state lock and without an await. Production transfer and
+        // replacement both run on SidecarRuntime's single endpoint-owner
+        // thread; its shutdown path posts retire_for_replacement there too.
+        // Thus neither the socket nor its fd can be closed/reused mid-probe.
+        uint8_t byte = 0;
+        const ssize_t count = ::recv(socket_fd, &byte, sizeof(byte),
+                                     MSG_PEEK | MSG_DONTWAIT);
+        const int socket_error = count < 0 ? errno : 0;
+        if (count != 0) {
+            if (count > 0)
+                return false;
+            if (socket_error == EINTR || socket_error == EAGAIN ||
+                socket_error == EWOULDBLOCK)
+                return false;
+        }
+
+        const uint64_t confirmed_floor = endpoint->r2_confirmed_prefix();
+        // The sole writer owns this transition. No receipt or ACK reader is
+        // active, and MSG_PEEK leaves unexpected peer bytes for the regular
+        // framed parser. Only a proven EOF or hard socket error marks this
+        // generation for ordinary recovery before new bundle accounting.
+        r2_recovery_required = true;
+        r2_failed_physical_generation = expected_physical_generation;
+        r2_recovery_floor = confirmed_floor;
+        route_transport_quarantined = true;
+        boost::system::error_code ignored;
+        r2_socket->close(ignored);
+        lock.unlock();
+        wake_r2_completed_capacity_waiters();
+        return true;
     }
 
     void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
@@ -2357,6 +2404,11 @@ P50ZstdSourceSender::transfer_p51_route(
             failed.route_local_failure = true;
             impl_->wake_r2_completed_capacity_waiters();
             co_return failed;
+        }
+        if (impl_->detect_closed_idle_r2_link(
+                physical_link_generation)) {
+            writer_guard.reset();
+            continue;
         }
         if (impl_->endpoint->r2_window_available())
             break;

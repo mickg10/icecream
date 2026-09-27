@@ -340,6 +340,9 @@ public:
 
     // F-incarnation retirement fences the old physical link. Shared owner
     // references held by active calls/pumps keep this sender alive to drain.
+    // When transfers are active, call on the same owner executor that drives
+    // transfer_p51_route; production routes this through SidecarRuntime's
+    // endpoint-owner thread so socket close/probe operations are serialized.
     void retire_for_replacement() noexcept;
     [[nodiscard]] size_t retained_completion_records_for_test() const noexcept;
     // Owner-affine generation floor used when a strictly newer logical
