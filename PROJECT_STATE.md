@@ -161,8 +161,14 @@ underfill marker. The harness requires this failure, not a generic timeout
 or setup error; all 31 jobs subsequently complete with zero failures and
 exact outputs. Result:
 `/tanksmall/scratch/tmp/luna-w30-current-build/w1-p-run.json` (`COMPLETE`).
-Other-profile external cells, required topology/restart/mixed cases and full
-qualification remain open. These gates are not whole-build speed measurements.
+ZSTD_TU/W1 also passes on fresh `w1-luna-w1-zstdtu-20260927-a`: one held
+receipt at ordinal 1, window 1, epoch/generation 1, then 31 exact-output jobs
+with zero failures. Result:
+`/tanksmall/scratch/tmp/luna-w30-current-build/tu-w1-run.json`, SHA256
+`0d27b28f6cb754505e15fe8e18bb0fbdf41307037df03c0b19dceb2de47d52f5`.
+ZSTD_TU W30/negative, ZSTD_ROUTE cells, required topology/restart/mixed cases
+and full qualification remain open. These gates are not whole-build speed
+measurements.
 Product image source remains `9e5692e4`;
 host-harness and helper changes do not relabel that immutable image.
 Receipts are under
