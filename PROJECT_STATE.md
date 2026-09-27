@@ -50,8 +50,19 @@ out of the scenario catalog. Its full log is
 `4e539aa1f83da503c85db14534c3da16b3b2d29e8343e40f5b4be022b8c59ab6`.
 An additional focused UV test correction uses resolved path containment,
 not a string prefix that falsely rejects similarly named sibling directories.
-Earlier Python failures remain preserved. Separately labelled image/mixed
-continuation is pending; no native/root rerun or full-QA PASS is implied.
+Earlier Python failures remain preserved. The separately labelled image/mixed
+continuation passes five default cases (three P50 profiles and P43 worker/client)
+plus three explicit R2 profile cases. Summaries:
+`/tanksmall/scratch/tmp/e7e7-python-validation/mixed-default/summary.json`
+(SHA256 `8146c1f6ce5788a9954278c239ee5f08216fc908ac6395696f682af7cc6b5f32`),
+and `mixed-r2/summary.json` under the same root
+(SHA256 `55742aaaa1aa14e3ddb48f34447167044865b3720eb72a7fd21f29395965ae7b`).
+Current runtime tag `icecream-dev:current-be66761c` was built from the verified
+be667 install, image ID
+`sha256:995896c14ff49696e147c7ada8f1cc6cf1471021b0c37ffe912a6b8921ba3bac`.
+Pinned P43 used its previously successful native install with the same SDK.
+Production source equality was checked before reusing be667 artifacts;
+the new helper/harness work is separately qualified. No full-QA PASS is implied.
 This run includes the READY restart-budget and legacy bootstrap corrections,
 but not the later diagnostic-retention or private multi-link harness changes.
 Evidence directory:
