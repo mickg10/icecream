@@ -184,6 +184,19 @@ Teardown is clean, including removal of the exact created bridge. Evidence:
 `/tanksmall/scratch/tmp/p51-local-receipt-current-plan/results/results/p51-local-c1f2-p29-w30-20260927a/`;
 `down.json` SHA256 `fcc8b658a50094b2747239f5b28d8fbf6394431b324b0fb951f038bc079cb644`.
 
+`0bb7cc59` moves each receipt client's local-oracle preparation before any
+receipt helper starts. Measured drivers consume the existing identity-bound
+preparation certificate via `ICEFARM_ORACLE_PREPARED`, without entering D18's
+separate ready/go barrier. Preparation and measured receipt execution use
+the same UID so the oracle lock remains writable. Protocol/helper deadlines
+are unchanged. Donor `6cbe020f` passed 117 workload tests in 7.24 seconds,
+including preparation ordering for both topology directions and extracted
+shell-path checks for valid/missing/stale markers. Log
+`/tanksmall/scratch/tmp/p51-d09-merged-validation-tmp/oracle-prep-workload-117.log`,
+SHA256 `c186ee3ae3b7ab47c0ededdb6a40edea489c6ca0f539fb7ad936c964fd9deab8`.
+These focused checks do not establish an end-to-end held-W30 pass; a fresh
+local run and full supported QA are next.
+
 `402d11fc` removes an incorrect multi-link exception to strict P50 policy.
 `ICECC_P50_C1F1_REQUIRED` is a policy flag despite its historical name: it
 does not require a single client/worker topology. All-new receipt-link runs
