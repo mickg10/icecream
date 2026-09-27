@@ -74,7 +74,10 @@ leftovers instead of guessing. Repeated teardown is harmless. This addresses
 the shared host-network UID interception gap found in the failed local runs.
 Donor `8768a201` passed 366 focused tests covering planning, lifecycle, workload,
 partial creation, crash-leftover reporting and stale network state. Integrated
-as `e2deb92b`; a live isolated multi-link run remains required.
+as `e2deb92b`; its merged-source rerun also passed all 366 tests (18.84 s).
+Log `/tanksmall/scratch/tmp/p51-multilink-e2deb-focused.log`, SHA256
+`454b7efc285ad753167c19f2a11efb340bca28e4917de67c106bf410fd5c9cdb`.
+A live isolated multi-link run remains required.
 
 Same-host farm execution is now explicit (`hosts[].execution="local"` with
 Docker context `default`), without requiring local SSH. The runner verifies
