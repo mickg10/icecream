@@ -55,10 +55,13 @@ The 114,868,777-byte archive has SHA256
 `122f9cfa7d79f9f319832732b1805504b1be1cb62a673099003f535d9a11ab27`;
 receipt `d18/image-distribution.json` under the image evidence directory records
 all host image identities (which differ from the hub identity) and 28 successful
-commands. Fresh P29 mixed-version run `d18-c06-p29-20260927-1` is underway on
-C=q5, F=q2, S=q3, with the original zero-retry requirement. This is not a pass;
-the earlier runtime's retry-only D18 failure is unchanged. TU/ROUTE runs remain
-pending.
+commands. First P29 attempt `d18-c06-p29-20260927-1` stopped before UP because
+the workload-only `run` command was used without a lifecycle receipt; no role
+containers were created. Its host log is retained. A new attempt must use the
+one-shot `scenario` entrypoint on C=q5, F=q2, S=q3, with the original zero-retry
+requirement. Neither this setup failure nor successful image distribution is
+a product pass; the earlier runtime's retry-only D18 failure is unchanged.
+TU/ROUTE runs remain pending.
 
 ### Multi-link receipt-window harness
 
