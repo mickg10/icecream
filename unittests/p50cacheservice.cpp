@@ -12153,6 +12153,356 @@ void test_p51_reservation_profile_mask_mapping() {
     std::puts("P51_RESERVATION_OWNER profile-mask-mapping/all-three: ok");
 }
 
+void test_p51_wire_binding_identity(ProfileId profile) {
+    namespace asio = boost::asio;
+    using tcp = asio::ip::tcp;
+    const char* profile_name = profile == ProfileId::P29V1 ? "P29V1" :
+        profile == ProfileId::ZSTD_TU ? "ZSTD_TU" : "ZSTD_ROUTE";
+    const uint32_t cache_profile = profile == ProfileId::P29V1
+        ? CACHE_PROFILE_P29V1
+        : profile == ProfileId::ZSTD_TU
+              ? CACHE_PROFILE_ZSTD_TU : CACHE_PROFILE_ZSTD_ROUTE;
+
+    StoreIdentityRoot f_root{};
+    f_root.bytes[15] = 0x63;
+    const SidecarLaunchIdentity f_launch = test_sidecar_launch(f_root);
+    service::RuntimeConfig server_config = test_runtime_config();
+    server_config.c_store_guid = f_launch.c_store_guid;
+    server_config.f_store_guid = f_launch.f_store_guid;
+    server_config.f_store_generation = f_launch.store_generation;
+    server_config.sidecar_launch = f_launch;
+    server_config.endpoint_caps.profile = profile;
+    server_config.endpoint_caps.supported_profiles = profile_bit(profile);
+    server_config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
+    server_config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
+    server_config.max_route_relationships = 16;
+    server_config.max_pending_p51_source_reservations = 16;
+    std::atomic<size_t> publications{0};
+    std::mutex publication_mutex;
+    std::vector<std::vector<uint8_t>> published_inputs;
+    server_config.endpoint_config.input_job_state =
+        [&](CStoreGuid, const TxBegin& begin, const TxCommit&,
+            std::span<const uint8_t> bytes) {
+            std::lock_guard lock(publication_mutex);
+            CHECK(begin.raw_bytes == bytes.size() &&
+                  begin.raw_digest == icecc::digest128(bytes));
+            published_inputs.emplace_back(bytes.begin(), bytes.end());
+            publications.fetch_add(1, std::memory_order_release);
+            return InputJobState::Open;
+        };
+    std::atomic<size_t> quiesced_links{0};
+    service::SidecarRuntime server(std::move(server_config));
+
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    CHECK(listener >= 0 && port != 0);
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<size_t> accepted{0};
+    std::thread acceptor([&] {
+        while (!stop_accepting.load(std::memory_order_acquire)) {
+            pollfd ready{listener, POLLIN, 0};
+            int result;
+            do {
+                result = ::poll(&ready, 1, 100);
+            } while (result < 0 && errno == EINTR);
+            if (result <= 0)
+                continue;
+            sockaddr_storage peer{};
+            socklen_t peer_size = sizeof(peer);
+            int fd;
+            do {
+                fd = ::accept(listener,
+                              reinterpret_cast<sockaddr*>(&peer), &peer_size);
+            } while (fd < 0 && errno == EINTR);
+            if (fd < 0)
+                continue;
+            accepted.fetch_add(1, std::memory_order_release);
+            EndpointIoControl control;
+            control.r2_link_io_quiesced_observer =
+                [&](const LinkHello&, uint64_t, uint64_t) {
+                    quiesced_links.fetch_add(1, std::memory_order_release);
+                };
+            server.start_adopted_r2_endpoint(fd, std::move(control));
+        }
+    });
+    auto cleanup = std::unique_ptr<int, std::function<void(int*)>>(
+        reinterpret_cast<int*>(1), [&](int*) {
+            stop_accepting.store(true, std::memory_order_release);
+            (void)::shutdown(listener, SHUT_RDWR);
+            if (acceptor.joinable())
+                acceptor.join();
+            (void)::close(listener);
+            server.stop();
+        });
+
+    enum class Mutation {
+        AssignmentNonce,
+        AssignmentEpoch,
+        Profile,
+        Reservation,
+        TuSequence,
+        RawLength,
+        RawDigest,
+    };
+    const std::array<Mutation, 7> mutations{
+        Mutation::AssignmentNonce, Mutation::AssignmentEpoch,
+        Mutation::Profile, Mutation::Reservation, Mutation::TuSequence,
+        Mutation::RawLength, Mutation::RawDigest};
+    const std::array<const char*, 7> mutation_names{
+        "assignment_nonce", "assignment_epoch", "profile", "reservation",
+        "tu_sequence", "raw_length", "raw_digest"};
+    asio::io_context c_context;
+    auto bad_binding = [&](Mutation mutation, size_t index)
+        -> asio::awaitable<void> {
+        StoreIdentityRoot c_root{};
+        c_root.bytes[15] = static_cast<uint8_t>(0x70 + index);
+        const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+        auto request = test_p51_reservation_request(
+            c_launch.c_store_guid, c_launch.store_generation,
+            c_launch.identity.generation, c_launch.identity.attempt,
+            9700 + index, cache_profile, 1, std::chrono::seconds(20));
+        request.arm.source.assignment_nonce = 9700 + index;
+        request.arm.source.selected_f_host = "127.0.0.1";
+        request.arm.source.selected_f_cache_port = port;
+        request.arm.source.logical_job = 9800 + index;
+        const auto reserved = server.reserve_p51_source_on_owner(request);
+        CHECK(reserved.error_code == 0 && reserved.armed.has_value());
+        const P51SourceArmedFields armed = *reserved.armed;
+
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        caps.zstd.max_raw_bytes = 1U << 20;
+        caps.zstd.max_encoded_body_bytes = 1U << 20;
+        const PreparationRouteKey route{
+            FStoreGuid{armed.f_store_guid}, armed.f_store_generation, profile};
+        auto authority = std::make_shared<P50PreparationAuthority>(
+            c_launch.c_store_guid, caps.zstd, PreparationAuthorityLimits{},
+            1, profile);
+        const std::string raw = "int c05_wire_input_" +
+                                std::to_string(index) + " = 7;\n";
+        const PreparedTuHandle prepared = authority->prepare_for_route(
+            route, PrepareRequestKey{request.arm.source.assignment_epoch,
+                                     request.arm.source.assignment_nonce},
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(raw.data()), raw.size()));
+        const HistoryNonce history_nonce = profile == ProfileId::P29V1
+            ? HistoryNonce{1} : HistoryNonce{0xc050 + index};
+        P50ClientEndpoint client(authority, caps, history_nonce,
+                                 nullptr, nullptr, std::nullopt, {}, {}, route);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(8);
+        tcp::socket socket(co_await asio::this_coro::executor);
+        co_await socket.async_connect(
+            tcp::endpoint(asio::ip::address_v4::loopback(), port),
+            asio::use_awaitable);
+        LinkHello hello = test_p51_link_hello(
+            armed, 1, history_nonce);
+        hello.max_raw_bytes = 1U << 20;
+        hello.max_encoded_bytes = 1U << 20;
+        hello.max_output_bytes = 1U << 20;
+        if (profile == ProfileId::P29V1)
+            hello.system_source_fingerprint =
+                authority->p29v1_system_source_fingerprint(prepared);
+        const LinkState state = co_await client.open_r2_link(
+            socket, hello, deadline);
+        CHECK(state.profile == profile && state.window == 1);
+
+        JobBind binding = test_p51_job_binding(
+            armed, hello.physical_link_generation, 1,
+            authority->prepared_tu_seq(prepared).value, raw);
+        bool mutate_binding = true;
+        switch (mutation) {
+        case Mutation::AssignmentNonce: ++binding.assignment_nonce; break;
+        case Mutation::AssignmentEpoch: ++binding.assignment_epoch; break;
+        case Mutation::Profile:
+            binding.profile = profile == ProfileId::ZSTD_ROUTE
+                ? ProfileId::ZSTD_TU : ProfileId::ZSTD_ROUTE;
+            break;
+        case Mutation::Reservation:
+            binding.reservation_id = Id128::from_u64(0xc05bad00 + index);
+            break;
+        case Mutation::TuSequence:
+        case Mutation::RawLength:
+        case Mutation::RawDigest:
+            mutate_binding = false;
+            break;
+        }
+        if (mutate_binding) {
+            const auto frame = encode_frame(Message{binding});
+            co_await asio::async_write(socket, asio::buffer(frame),
+                                       asio::use_awaitable);
+        } else {
+            const auto bind_frame = encode_frame(Message{binding});
+            co_await asio::async_write(socket, asio::buffer(bind_frame),
+                                       asio::use_awaitable);
+            TxBegin begin = authority->r2_staged_begin(
+                prepared, hello.history_nonce, RelSeq{0}, state.state_digest);
+            if (mutation == Mutation::TuSequence)
+                ++begin.tu_seq.value;
+            else if (mutation == Mutation::RawLength)
+                ++begin.raw_bytes;
+            else
+                begin.raw_digest.bytes[0] ^= 0x80;
+            const auto frame = encode_frame(Message{
+                TuBegin{binding.relationship_ordinal, begin}});
+            co_await asio::async_write(socket, asio::buffer(frame),
+                                       asio::use_awaitable);
+        }
+
+        std::array<uint8_t, 1> response{};
+        bool close_timeout = false;
+        asio::steady_timer close_watch(co_await asio::this_coro::executor);
+        close_watch.expires_at(deadline);
+        close_watch.async_wait([&](const boost::system::error_code& error) {
+            if (!error) {
+                close_timeout = true;
+                boost::system::error_code ignored;
+                socket.close(ignored);
+            }
+        });
+        bool peer_closed = false;
+        try {
+            (void)co_await socket.async_read_some(
+                asio::buffer(response), asio::use_awaitable);
+        } catch (const boost::system::system_error& error) {
+            peer_closed = error.code() == asio::error::eof ||
+                          error.code() == asio::error::connection_reset;
+        }
+        boost::system::error_code timer_error;
+        close_watch.cancel(timer_error);
+        CHECK(!close_timeout && peer_closed);
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        const size_t expected_quiesced = index * 2 + 1;
+        const auto quiesce_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(2);
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        while (quiesced_links.load(std::memory_order_acquire) <
+                   expected_quiesced &&
+               std::chrono::steady_clock::now() < quiesce_deadline) {
+            timer.expires_after(std::chrono::milliseconds(2));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+        CHECK(quiesced_links.load(std::memory_order_acquire) ==
+              expected_quiesced);
+        CHECK(publications.load(std::memory_order_acquire) == index);
+        std::fprintf(stderr,
+                     "P51_C05_WIRE_REJECT profile=%s mutation=%s publications=%zu\n",
+                     profile_name, mutation_names[index], index);
+        std::fflush(stderr);
+    };
+
+    auto sibling_commit = [&](size_t index) -> asio::awaitable<void> {
+        StoreIdentityRoot c_root{};
+        c_root.bytes[15] = static_cast<uint8_t>(0x90 + index);
+        const SidecarLaunchIdentity c_launch = test_sidecar_launch(c_root);
+        auto request = test_p51_reservation_request(
+            c_launch.c_store_guid, c_launch.store_generation,
+            c_launch.identity.generation, c_launch.identity.attempt,
+            9799 + index, cache_profile, 1, std::chrono::seconds(20));
+        request.arm.source.assignment_nonce = 9799 + index;
+        request.arm.source.selected_f_host = "127.0.0.1";
+        request.arm.source.selected_f_cache_port = port;
+        const auto reserved = server.reserve_p51_source_on_owner(request);
+        CHECK(reserved.error_code == 0 && reserved.armed.has_value());
+        const P51SourceArmedFields armed = *reserved.armed;
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.supported_profiles = profile_bit(profile);
+        caps.zstd.max_raw_bytes = 1U << 20;
+        caps.zstd.max_encoded_body_bytes = 1U << 20;
+        P50RouteOwnerConfig owner_config;
+        owner_config.endpoint_caps = caps;
+        owner_config.authority_limits.max_speculative_tus = 1;
+        auto owner = std::make_unique<P50CRouteOwner>(owner_config);
+        const std::string raw = "int c05_healthy_sibling_" +
+                                std::to_string(index) + " = 9799;\n";
+        auto connector = [port](auto deadline, auto completion) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                completion(-1);
+                return;
+            }
+            const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0) {
+                completion(-1);
+                return;
+            }
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(port);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                          sizeof(address)) != 0) {
+                (void)::close(fd);
+                completion(-1);
+                return;
+            }
+            completion(fd);
+        };
+        const P50RouteRelationship relationship{
+            c_launch.c_store_guid, FStoreGuid{armed.f_store_guid},
+            armed.f_store_generation, profile};
+        const PrepareRequestKey key{request.arm.source.assignment_epoch,
+                                    request.arm.source.assignment_nonce};
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(8);
+        const auto result = co_await owner->transfer_p51(
+            relationship, armed, connector, key, deadline,
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(raw.data()), raw.size()));
+        CHECK(result.status == ZstdSourceTransferStatus::Committed &&
+              result.committed_input.has_value() &&
+              result.raw_bytes == raw.size() &&
+              result.raw_digest == icecc::digest128(std::string_view(raw)));
+        // The route owner intentionally keeps a successful link alive for
+        // reuse. Destroy this per-case owner before treating quiescence as a
+        // completed lifecycle witness.
+        owner.reset();
+        const size_t expected_quiesced = index * 2 + 2;
+        const auto quiesce_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(2);
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        while (quiesced_links.load(std::memory_order_acquire) <
+                   expected_quiesced &&
+               std::chrono::steady_clock::now() < quiesce_deadline) {
+            timer.expires_after(std::chrono::milliseconds(2));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+        CHECK(quiesced_links.load(std::memory_order_acquire) ==
+              expected_quiesced);
+        CHECK(publications.load(std::memory_order_acquire) == index + 1);
+        std::lock_guard lock(publication_mutex);
+        CHECK(published_inputs.size() == index + 1 &&
+              published_inputs.back() ==
+                  std::vector<uint8_t>(raw.begin(), raw.end()));
+    };
+
+    auto scenario = [&]() -> asio::awaitable<void> {
+        for (size_t index = 0; index != mutations.size(); ++index) {
+            co_await bad_binding(mutations[index], index);
+            co_await sibling_commit(index);
+        }
+    };
+    auto completed = asio::co_spawn(c_context, scenario(), asio::use_future);
+    c_context.run();
+    completed.get();
+    CHECK(accepted.load(std::memory_order_acquire) == mutations.size() * 2);
+    CHECK(publications.load(std::memory_order_acquire) == mutations.size());
+    {
+        std::lock_guard lock(publication_mutex);
+        CHECK(published_inputs.size() == mutations.size());
+        for (size_t index = 0; index != mutations.size(); ++index) {
+            const std::string raw = "int c05_healthy_sibling_" +
+                                    std::to_string(index) + " = 9799;\n";
+            CHECK(published_inputs[index] == std::vector<uint8_t>(
+                raw.begin(), raw.end()));
+        }
+    }
+    std::printf("P51_C05_WIRE_IDENTITY profile=%s rejects=7 sibling_exact=1\n",
+                profile_name);
+}
+
 void test_p51_cancelled_empty_relationship_rearms_new_epoch() {
     StoreIdentityRoot local_root{};
     local_root.bytes[15] = 0x4f;
@@ -17564,6 +17914,14 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--p51-wire-binding-identity") == 0) {
+            for (const ProfileId profile : {ProfileId::P29V1,
+                                            ProfileId::ZSTD_TU,
+                                            ProfileId::ZSTD_ROUTE})
+                test_p51_wire_binding_identity(profile);
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--initial-link-retry-anchor") == 0) {
             test_p51_reservation_profile_mask_mapping();
             return 0;
@@ -17910,6 +18268,10 @@ int main(int argc, char** argv) {
         test_runtime_store_identity_is_explicit_and_role_tagged();
         test_source_open_arm_timeout_bounds();
         test_p51_reservation_capacity_identity_and_window();
+        for (const ProfileId profile : {ProfileId::P29V1,
+                                        ProfileId::ZSTD_TU,
+                                        ProfileId::ZSTD_ROUTE})
+            test_p51_wire_binding_identity(profile);
         test_p51_async_transfer_reply_deadline_close_and_slot_reuse();
         test_p51_admitted_transfer_stop_releases_raw_credit();
         test_p51_peer_close_during_active_read_cancels_before_route();

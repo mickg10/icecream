@@ -669,6 +669,15 @@ p50cacheservice-initial-cut-rearm-check:
 	$(MAKE) p50cacheservice readyclose_shim.so
 	timeout 180s ./p50cacheservice --same-f-initial-cut-rearm
 
+# Opt-in actual-wire JOB_BIND/TU_BEGIN identity rejection against the real
+# SidecarRuntime reservation consumer, followed by an exact healthy C sibling.
+.PHONY: p50cacheservice-c05-wire-identity-check
+p50cacheservice-c05-wire-identity-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpointtesthooks.a libp50endpoint.a libp50input.a libp50adoptedoutcomewriter.a libprotocol50.a libp50localtransport.a icecc-cache-service
+	$(MAKE) p50cacheservice readyclose_shim.so
+	timeout 180s ./p50cacheservice --p51-wire-binding-identity
+
 connectivity_DEPENDENCIES = conn_shim.so
 
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log
