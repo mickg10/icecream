@@ -1036,11 +1036,14 @@ compile_one() {
             fi
         done
     fi
+    result_temporary="$job_dir/.result.tsv.tmp"
+    test ! -e "$result_temporary" -a ! -L "$result_temporary"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$index" "$turn" "$occurrence" "$relative" "$scheduler_job" "$worker" \
         "$started" "$finished" "$compile_rc" "$remote_sha" "$local_sha" "$exact" "$remote" \
         "$retries" \
-        >"$job_dir/result.tsv"
+        >"$result_temporary"
+    mv -- "$result_temporary" "$job_dir/result.tsv"
     # Keep a completed prefix boundary visible until the controller closes
     # admission. It requires a positive marker even if every compile finished
     # before polling. Release on PAUSE/QUIESCE, not resume: pause drains these

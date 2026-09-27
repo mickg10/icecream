@@ -659,24 +659,58 @@ first=$2
 last=$3
 worker=$4
 endpoint=$5
+client=$6
 index=$first
 while test "$index" -le "$last"
 do
     file=$(printf '%s/jobs/%06d/result.tsv' "$root" "$index")
-    test -f "$file" -a ! -L "$file"
-    test "$(cut -f6 "$file")" = "$endpoint"
-    test "$(cut -f9 "$file")" = 0
-    test "$(cut -f12 "$file")" = 1
-    test "$(cut -f13 "$file")" = 1
+    if ! test -e "$file" && ! test -L "$file"
+    then
+        printf 'P51_LINK_OUTPUTS_PENDING\n'
+        exit 0
+    fi
+    if test -L "$file" || ! test -f "$file" \
+        || test "$(wc -l < "$file")" -ne 1 \
+        || ! awk -F '\t' \
+            -v expected_index="$index" -v expected_endpoint="$endpoint" '
+            NR > 1 { bad = 1 }
+            NF != 14 || $1 != expected_index || $6 != expected_endpoint \
+                || $9 != 0 || length($10) != 64 || $10 ~ /[^0-9a-f]/ \
+                || length($11) != 64 || $11 ~ /[^0-9a-f]/ || $10 != $11 \
+                || $12 != 1 || $13 != 1 { bad = 1 }
+            END { exit (NR == 1 && !bad ? 0 : 1) }
+        ' "$file"
+    then
+        printf 'P51_LINK_OUTPUTS_BAD client=%s worker=%s endpoint=%s job=%s\n' \
+            "$client" "$worker" "$endpoint" "$index"
+        exit 0
+    fi
     index=$((index + 1))
 done
-printf 'P51_LINK_OUTPUTS_OK client=%s worker=%s endpoint=%s first=%s last=%s\n' "$6" "$worker" "$endpoint" "$first" "$last"
+printf 'P51_LINK_OUTPUTS_OK client=%s worker=%s endpoint=%s first=%s last=%s\n' "$client" "$worker" "$endpoint" "$first" "$last"
 '''
     return (
         "/bin/sh", "-c", script, "check-link-outputs",
         f"/results/workload/{turn}", str(first_job), str(last_job),
         expected_worker, expected_endpoint, client,
     )
+
+
+def _p51_link_outputs_complete(
+    stdout: str, *, client: str, first_job: int, last_job: int,
+    expected_worker: str, expected_endpoint: str,
+) -> bool:
+    if stdout == "P51_LINK_OUTPUTS_PENDING\n":
+        return False
+    expected = (
+        f"P51_LINK_OUTPUTS_OK client={client} worker={expected_worker} "
+        f"endpoint={expected_endpoint} first={first_job} last={last_job}\n"
+    )
+    if stdout == expected:
+        return True
+    if re.fullmatch(r"P51_LINK_OUTPUTS_BAD client=\S+ worker=\S+ endpoint=\S+ job=[1-9][0-9]*\n", stdout):
+        raise WorkloadError(f"exact output validation failed: {stdout.strip()}")
+    raise WorkloadError("exact output probe returned malformed readiness evidence")
 
 
 def _p51_require_sibling_held(
@@ -946,7 +980,12 @@ def _run_p51_receipt_window_multilink(
                             )),
                         )
                         output_result = transport.invoke(output_command)
-                        if output_result.returncode == 0:
+                        if _p51_link_outputs_complete(
+                            output_result.stdout,
+                            client=key[0], first_job=first, last_job=last,
+                            expected_worker=key[1],
+                            expected_endpoint=f"{row['worker']['address']}:{row['port']}",
+                        ):
                             break
                         time.sleep(0.2)
                     else:
@@ -1007,11 +1046,21 @@ def _run_p51_receipt_window_multilink(
                             )),
                         )
                         sibling_output = transport.invoke(sibling_output_command)
+                        sibling_outputs_complete = _p51_link_outputs_complete(
+                            sibling_output.stdout,
+                            client=sibling_key[0],
+                            first_job=sibling["spec"]["first_job"],
+                            last_job=sibling["spec"]["last_job"],
+                            expected_worker=sibling_key[1],
+                            expected_endpoint=(
+                                f"{sibling['worker']['address']}:{sibling['port']}"
+                            ),
+                        )
                         _p51_require_sibling_held(
                             gate_done=running_gates[sibling_key].done(),
                             released_marker=("present" if marker_state.group(1) == "1" else None),
                             exit_marker=("present" if marker_state.group(2) == "1" else None),
-                            outputs_complete=sibling_output.returncode == 0,
+                            outputs_complete=sibling_outputs_complete,
                         )
 
                 manifest_jobs = (

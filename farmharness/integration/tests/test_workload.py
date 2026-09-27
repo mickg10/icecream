@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ from farmharness.integration.events import EventProducer
 from farmharness.integration.remote import (
     CommandResult,
     PlannedCommand,
+    SubprocessTransport,
     decode_ssh_payload,
 )
 from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
@@ -41,6 +43,7 @@ from farmharness.integration.workload import (
     _p51_check_held_marker,
     _p51_check_scoped_identity_marker,
     _p51_link_output_check_argv,
+    _p51_link_outputs_complete,
     _p51_require_sibling_held,
     _strict_p50_required,
     run_workload,
@@ -55,7 +58,7 @@ def test_manifest_driver_file_keeps_the_reviewed_script_bytes() -> None:
 
     assert MANIFEST_DRIVER == driver_path.read_text(encoding="utf-8")
     assert hashlib.sha256(MANIFEST_DRIVER.encode("utf-8")).hexdigest() == (
-        "629f7f67709c6495fc651830619254ea1104bf66361c012d3b9931704341b079"
+        "6043584f7760a1eacdc25370364bb96c0b944c38a905fe848b00a15b3d3cdc59"
     )
 
 
@@ -296,34 +299,148 @@ def test_multilink_receipt_markers_keep_scoped_identity_and_sibling_hold() -> No
             _p51_require_sibling_held(**args)
 
 
-def test_multilink_output_checker_rejects_an_actual_wrong_worker_row(tmp_path: Path) -> None:
+def test_multilink_output_checker_polls_pending_to_complete_with_real_transport(
+    tmp_path: Path,
+) -> None:
     result = tmp_path / "jobs" / "000001" / "result.tsv"
-    result.parent.mkdir(parents=True)
-    fields = ["field"] * 13
-    fields[5] = "10.0.0.99:23005"
-    fields[8] = "0"
-    fields[11] = "1"
-    fields[12] = "1"
-    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
     argv = _p51_link_output_check_argv(
         "C1", 1, 1, "F_R1", "10.0.0.2:23005", "A"
     )
-    command = list(argv)
-    command[4] = str(tmp_path)
-    rejected = subprocess.run(command, text=True, capture_output=True, check=False)
-    assert rejected.returncode != 0
+    command_argv = list(argv)
+    command_argv[4] = str(tmp_path)
+    command = PlannedCommand(
+        sequence=1, phase="test.p51-output-check", host="localhost",
+        instance="C1", transport="local", timeout_s=5,
+        argv=tuple(command_argv),
+    )
+    transport = SubprocessTransport()
 
+    # A missing result is an expected poll state, not a nonzero command
+    # status that SubprocessTransport would turn into RemoteError.
+    pending = transport.invoke(command)
+    assert pending.returncode == 0
+    assert _p51_link_outputs_complete(
+        pending.stdout, client="C1", first_job=1, last_job=1,
+        expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+    ) is False
+    _p51_require_sibling_held(
+        gate_done=False, released_marker=None, exit_marker=None,
+        outputs_complete=False,
+    )
+
+    result.parent.mkdir(parents=True)
+    fields = ["field"] * 14
+    fields[0] = "1"
     fields[5] = "10.0.0.2:23005"
+    fields[8] = "0"
+    fields[9] = "a" * 64
+    fields[10] = "a" * 64
+    fields[11] = "1"
+    fields[12] = "1"
     result.write_text("\t".join(fields) + "\n", encoding="utf-8")
-    accepted = subprocess.run(command, text=True, capture_output=True, check=False)
-    assert accepted.returncode == 0
-    assert "P51_LINK_OUTPUTS_OK client=C1 worker=F_R1 endpoint=10.0.0.2:23005 first=1 last=1" in accepted.stdout
+    complete = transport.invoke(command)
+    assert complete.returncode == 0
+    assert _p51_link_outputs_complete(
+        complete.stdout, client="C1", first_job=1, last_job=1,
+        expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+    ) is True
+    with pytest.raises(WorkloadError, match="sibling"):
+        _p51_require_sibling_held(
+            gate_done=False, released_marker=None, exit_marker=None,
+            outputs_complete=True,
+        )
 
+    # A published but malformed row is terminal BAD, not an endlessly
+    # pending observation.
+    result.write_text("truncated\n", encoding="utf-8")
+    malformed = transport.invoke(command)
+    assert malformed.returncode == 0
+    with pytest.raises(WorkloadError, match="output validation"):
+        _p51_link_outputs_complete(
+            malformed.stdout, client="C1", first_job=1, last_job=1,
+            expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+        )
+
+    invalid_rows = []
+    wrong_index = fields.copy()
+    wrong_index[0] = "2"
+    invalid_rows.append(wrong_index)
+    wrong_hash = fields.copy()
+    wrong_hash[9] = "b" * 64
+    invalid_rows.append(wrong_hash)
     for wrong_endpoint in ("10.0.0.2:23006", "10.0.0.3:23005"):
-        fields[5] = wrong_endpoint
-        result.write_text("\t".join(fields) + "\n", encoding="utf-8")
-        wrong = subprocess.run(command, text=True, capture_output=True, check=False)
-        assert wrong.returncode != 0
+        wrong = fields.copy()
+        wrong[5] = wrong_endpoint
+        invalid_rows.append(wrong)
+    for row in invalid_rows:
+        result.write_text("\t".join(row) + "\n", encoding="utf-8")
+        wrong = transport.invoke(command)
+        assert wrong.returncode == 0
+        with pytest.raises(WorkloadError, match="output validation"):
+            _p51_link_outputs_complete(
+                wrong.stdout, client="C1", first_job=1, last_job=1,
+                expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+            )
+
+    result.write_text(
+        "\t".join(fields) + "\n" + "\t".join(fields) + "\n",
+        encoding="utf-8",
+    )
+    extra = transport.invoke(command)
+    with pytest.raises(WorkloadError, match="output validation"):
+        _p51_link_outputs_complete(
+            extra.stdout, client="C1", first_job=1, last_job=1,
+            expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+        )
+
+
+def test_manifest_result_publication_transitions_output_probe_atomically(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "jobs" / "000001"
+    job_dir.mkdir(parents=True)
+    argv = list(_p51_link_output_check_argv(
+        "C1", 1, 1, "F_R1", "10.0.0.2:23005", "A"
+    ))
+    argv[4] = str(tmp_path)
+    probe = PlannedCommand(
+        sequence=1, phase="test.output-probe", host="localhost", instance="C1",
+        transport="local", timeout_s=5, argv=tuple(argv),
+    )
+    initial = SubprocessTransport().invoke(probe)
+    assert initial.returncode == 0
+    assert initial.stdout == "P51_LINK_OUTPUTS_PENDING\n"
+    temporary = job_dir / ".result.tsv.tmp"
+    temporary.write_text("partial publication", encoding="utf-8")
+    while_publishing = SubprocessTransport().invoke(probe)
+    assert while_publishing.returncode == 0
+    assert while_publishing.stdout == "P51_LINK_OUTPUTS_PENDING\n"
+    temporary.unlink()
+
+    start = MANIFEST_DRIVER.index('    result_temporary="$job_dir/.result.tsv.tmp"')
+    end = MANIFEST_DRIVER.index("    # Keep a completed prefix boundary", start)
+    publish_script = textwrap.dedent(MANIFEST_DRIVER[start:end])
+    env = {
+        **os.environ,
+        "job_dir": str(job_dir), "index": "1", "turn": "A",
+        "occurrence": "1", "relative": "src/tiny.cc",
+        "scheduler_job": "7", "worker": "10.0.0.2:23005",
+        "started": "100", "finished": "101", "compile_rc": "0",
+        "remote_sha": "a" * 64, "local_sha": "a" * 64,
+        "exact": "1", "remote": "1", "retries": "0",
+    }
+    published = subprocess.run(
+        ["/bin/bash", "-c", publish_script], env=env,
+        text=True, capture_output=True, check=False,
+    )
+    assert published.returncode == 0, published.stderr
+    assert not (job_dir / ".result.tsv.tmp").exists()
+    complete = SubprocessTransport().invoke(probe)
+    assert complete.returncode == 0
+    assert _p51_link_outputs_complete(
+        complete.stdout, client="C1", first_job=1, last_job=1,
+        expected_worker="F_R1", expected_endpoint="10.0.0.2:23005",
+    ) is True
 
 
 def test_driver_keeps_worker_alias_preference_and_passes_endpoint_map() -> None:
@@ -791,12 +908,26 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
                 key = (client_name, worker)
                 output_checks.append((client_name, worker, key in releases))
                 if key not in releases:
-                    return CommandResult(1, "", "not released")
-                return CommandResult(0, "P51_LINK_OUTPUTS_OK\n", "")
+                    return CommandResult(0, "P51_LINK_OUTPUTS_PENDING\n", "")
+                link = next(
+                    item for item in links
+                    if item["client"] == client_name and item["worker"] == worker
+                )
+                worker_instance = next(
+                    item for item in plan["topology"]["instances"]
+                    if item["name"] == worker
+                )
+                endpoint = f"{worker_instance['address']}:{plan['ports']['instances'][worker]}"
+                return CommandResult(
+                    0,
+                    f"P51_LINK_OUTPUTS_OK client={client_name} worker={worker} "
+                    f"endpoint={endpoint} first={link['first_job']} last={link['last_job']}\n",
+                    "",
+                )
             if phase.startswith("run.p51-receipt-window.probe-sibling-output."):
                 _, client_name, worker = phase.rsplit(".", 2)
                 output_checks.append((client_name, worker, False))
-                return CommandResult(1, "", "sibling output incomplete")
+                return CommandResult(0, "P51_LINK_OUTPUTS_PENDING\n", "")
             if phase.startswith("driver-"):
                 return CommandResult(0, "synthetic summary", "")
             raise AssertionError(f"unexpected transport command {phase}")
@@ -907,9 +1038,14 @@ def test_multilink_receipt_orchestrator_rejects_failure_and_cleans_owned_process
             if command.phase.startswith("run.p51-receipt-window.check-link-output."):
                 client_name, worker = command.phase.rsplit(".", 2)[-2:]
                 releases.add((client_name, worker))
-                return CommandResult(1, "", "result.tsv worker mismatch")
+                return CommandResult(
+                    0,
+                    f"P51_LINK_OUTPUTS_BAD client={client_name} worker={worker} "
+                    f"endpoint=wrong job=1\n",
+                    "",
+                )
             if command.phase.startswith("run.p51-receipt-window.probe-sibling-output."):
-                return CommandResult(1, "", "still held")
+                return CommandResult(0, "P51_LINK_OUTPUTS_PENDING\n", "")
             if command.phase.startswith("driver-"):
                 return CommandResult(0, "synthetic summary", "")
             if command.argv[:1] == ("kill",):
@@ -1498,7 +1634,10 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
         'mkdir "$job_dir"'
     )
     assert MANIFEST_DRIVER.index('serial_boundary_released=0') < MANIFEST_DRIVER.index(
-        '>"$job_dir/result.tsv"'
+        'mv -- "$result_temporary" "$job_dir/result.tsv"'
+    )
+    assert MANIFEST_DRIVER.index('>"$result_temporary"') < MANIFEST_DRIVER.index(
+        'mv -- "$result_temporary" "$job_dir/result.tsv"'
     )
     assert 'xargs -0 -r -n 3 -P "$jobs"' in MANIFEST_DRIVER
     assert 'object="$oracle_root/.build-$key-$BASHPID.o"' in MANIFEST_DRIVER
