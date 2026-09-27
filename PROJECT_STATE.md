@@ -53,7 +53,12 @@ no sanitizer diagnostics). Its log `d16-sanitize-r1.log` has the same SHA256
 as the native D16 log because the emitted test output is identical; the
 instrumented executable has distinct SHA256
 `43e2cfa95d932c07a12ec4b134f4ce05ec1223c0f4911c83811ff5c7b5ed639c`.
-This is not a fresh full-suite qualification. The older D17 runs below did not assert the live-session
+Reusing that exact instrumented executable, the strengthened D17 nine-case
+selector also passes with leak detection and halt-on-error enabled (exit 0).
+Log `d17-sanitize-r1.log` SHA256:
+`12d12dd58ddb561e8ba3e0c9b128e740da9eed67fa4cf17504c3d11b63db23f6`.
+This is not a fresh full-suite qualification or proof of an unbounded memory
+plateau. The older D17 runs below did not assert the live-session
 bound and therefore did not detect this defect.
 
 The opt-in `make -C "$BUILD/unittests" p50service-stop-pressure-check`
