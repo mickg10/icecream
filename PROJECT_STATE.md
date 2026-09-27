@@ -12,6 +12,15 @@ retained artifact directories.
 
 ## Developer QA
 
+Fresh public `ICEFARM_TMPDIR=... make qa` on clean `0bb7cc59` has exposed a
+default sender-test compile failure: `observed_c_fd` was incorrectly declared
+inside `ICECC_P50_ENDPOINT_TEST_HOOKS`, while ordinary connector/cleanup code
+uses it without that macro. Build/install passed; `native-check` exited 2.
+Other stages continue, but this run cannot establish whole-QA success.
+Evidence root `/tanksmall/scratch/tmp/p51-qa-0bb7cc59/icecream-qa-doflwlzk`,
+`current/artifacts/native-check.log`. The correction is being tested separately;
+prior opt-in gate results do not prove a fresh macro-free sender build.
+
 ### Real sender EAGAIN witness
 
 The opt-in target `p50zstdsender-d03-kernel-eagain-check` now observes a real
@@ -85,6 +94,18 @@ Bundle: `/tanksmall/scratch/tmp/icefarm-role-c06-6cff/results/results/d18-c06-p2
 `down.json` SHA256 `c13f4d945d83507753d2cbc426d5e0152a72d07655c7f260847b89687d7109ad`.
 
 ### Current-source transfer measurements
+
+The corrected product also passes external mixed **ZSTD_TU** D18 run
+`d18-c06-zstd-tu-20260927-1`: 300 exact remote jobs (100 each P43/R1/R2),
+zero retries, 15 matching oracle samples and all 29 verdict clauses passing.
+All 101 successful R2 source-result records, including the canary, show one
+bundle attempt and zero replay. DOWN has no problems or diagnostic errors;
+the exact run containers are absent on q2/q3/q5. Evidence directory:
+`/tanksmall/scratch/tmp/icefarm-role-c06-6cff/results/results/d18-c06-zstd-tu-20260927-1/`.
+Verdict SHA256 `3a75af6c821942e07f5982d0d286ce7250a1555433d6461ebd3403452669be46`;
+DOWN SHA256 `757ec2347bf3055bfd1211919f8d2f31860e0e904fc916e09f61d15942a31e71`.
+Like P29 D18, this is serial work within each client, not a held-W30 test.
+External ZSTD_ROUTE remains outstanding.
 
 The `6cffafa0` production closure completed the Firefox **32-TU sample**:
 63/63 cells passed (three repetitions, three profiles, R1/W1 and R2 windows
