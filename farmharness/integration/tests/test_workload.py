@@ -366,6 +366,10 @@ def _multilink_orchestrator_fixture(topology: str):
         instances[-1]["slots"] = 2
         jobs, tus = 2, 2
     scenario = SimpleNamespace(data={
+        "id": "multilink-receipt-test",
+        "shape": "S'C'F'",
+        "controls": [],
+        "timeline": [],
         "workload": {
             "corpus": "tiny", "repeat": 1, "jobs": jobs, "clients": names_c,
             "turns": ["A"],
@@ -388,7 +392,7 @@ def _multilink_orchestrator_fixture(topology: str):
             },
         })
     plan = {
-        "topology": {"instances": instances},
+        "topology": {"instances": [dict(item, version=50) for item in instances]},
         "ports": {"instances": {name: 23003 + i for i, name in enumerate(names_f)}},
         "p51_receipt_gate": {
             "container_path": "/results/p50daemonpositive", "binary_sha256": "a" * 64,
@@ -1483,6 +1487,96 @@ def test_strict_p50_requires_the_s70_b6_off_transition() -> None:
     scenario.data["timeline"][0]["env"]["ICECC_P50_PROFILE"] = "P29V1"
 
     assert _strict_p50_required(scenario, plan) is True
+
+
+@pytest.mark.parametrize("topology", ["C1F2", "C2F1"])
+def test_all_new_multilink_receipt_driver_keeps_strict_p50_retry(
+    tmp_path: Path, topology: str
+) -> None:
+    """Receipt-link shape is not a reason to downgrade P50 retries to legacy."""
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id=f"strict-{topology}")
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    scenario.data["workload"]["turns"] = ["A"]
+    if topology == "C1F2":
+        scenario.data["workload"]["receipt_gate"] = {
+            "links": [
+                {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 24},
+                {"client": "C1", "worker": "F2", "first_job": 25, "last_job": 48},
+            ],
+            "expected_commits": 1,
+            "negotiated_window": 1,
+            "expect_observed": True,
+        }
+        client_names = ["C1"]
+    else:
+        c1_scenario = next(
+            item for item in scenario.data["instances"]
+            if item["role"] == "C" and item["name"] == "C1"
+        )
+        scenario.data["instances"].append({**c1_scenario, "name": "C2"})
+        scenario.data["workload"]["clients"] = ["C1", "C2"]
+        scenario.data["workload"]["receipt_gate"] = {
+            "links": [
+                {"client": name, "worker": "F1", "first_job": 1, "last_job": 48}
+                for name in ("C1", "C2")
+            ],
+            "expected_commits": 1,
+            "negotiated_window": 1,
+            "expect_observed": True,
+        }
+        c1_plan = next(
+            item for item in plan["topology"]["instances"]
+            if item["role"] == "C" and item["name"] == "C1"
+        )
+        plan["topology"]["instances"].append({**c1_plan, "name": "C2"})
+        scenario.data["instances"] = [
+            item for item in scenario.data["instances"]
+            if item["role"] != "F" or item["name"] == "F1"
+        ]
+        plan["topology"]["instances"] = [
+            item for item in plan["topology"]["instances"]
+            if item["role"] != "F" or item["name"] == "F1"
+        ]
+        client_names = ["C1", "C2"]
+
+    assert _strict_p50_required(scenario, plan) is True
+    for client_name in client_names:
+        client = next(
+            item for item in plan["topology"]["instances"]
+            if item["role"] == "C" and item["name"] == client_name
+        )
+        command = _driver_command(
+            farm, scenario, plan, client, "A", CommandFactory()
+        )
+        driver_index = command.argv.index(MANIFEST_DRIVER)
+        assert command.argv[driver_index + 12] == "1"
+
+
+@pytest.mark.parametrize("mutation", ["old-worker", "profile-off", "control"])
+def test_multilink_receipt_driver_downgrades_when_p50_is_not_run_wide(
+    mutation: str,
+) -> None:
+    farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    scenario.data["workload"]["turns"] = ["A"]
+    if mutation == "old-worker":
+        next(item for item in plan["topology"]["instances"] if item["role"] == "F")["version"] = 49
+    elif mutation == "profile-off":
+        scenario.data["instances"][0]["env"]["ICECC_P50_PROFILE"] = "OFF"
+    else:
+        scenario.data["controls"] = [{"kind": "bounded-control"}]
+
+    assert _strict_p50_required(scenario, plan) is False
+    command = _driver_command(
+        farm, scenario, plan, clients[0], "A", CommandFactory()
+    )
+    driver_index = command.argv.index(MANIFEST_DRIVER)
+    assert command.argv[driver_index + 12] == "0"
 
 
 def test_active_loss_serializes_exact_trigger_prefix_and_requires_remote(

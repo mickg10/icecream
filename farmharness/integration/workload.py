@@ -196,10 +196,6 @@ def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
     workload and verdict layers.
     """
 
-    # The receipt-window driver independently enforces exact per-link remote
-    # assignments; the legacy strict flag is specifically C1F1-only.
-    if scenario.data["workload"].get("receipt_gate", {}).get("links"):
-        return False
     # Only active scheduler loss permits the one authenticated fresh legacy
     # retry; all ordinary all-new P50 cells remain strict.
     if scenario.data.get("id") == "S70-b4-scheduler-active-loss":
