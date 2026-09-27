@@ -45,6 +45,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <errno.h>
+#include <algorithm>
 #include <string>
 #include <chrono>
 #include <atomic>
