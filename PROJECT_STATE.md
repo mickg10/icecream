@@ -12,6 +12,31 @@ retained artifact directories.
 
 ## Developer QA
 
+### Ordinary compiler-channel witness
+
+`520f63e6` integrates the opt-in C02 gate and dormant client trace hook.
+Run `ICEFARM_TMPDIR="$SCRATCH" make dev-gate GATE=p50-c02-channel`;
+`ICECC_TEST_P50_C02_PROFILE` selects P29V1, ZSTD_TU or ZSTD_ROUTE (default).
+It explicitly enables R2 before starting the test processes; normal defaults
+are unchanged. The parser requires exactly one ordinary channel-open event,
+then ARM and CompileFile on the same per-invocation PID/channel/fd and
+assignment identity, with environment absent and present in successive jobs.
+
+All three profiles pass focused real remote compilation with retained raw
+traces from donor `9b70e5d8593108618497fc13a49ef8a5aade8e19` on its earlier
+configured build. Trace directories (files `client-compile-env-warm.log`
+and `client-compile-env-ready.log`):
+
+- P29V1: `/tanksmall/scratch/tmp/c02-profile-p29b-tmp.zuSmW3/p5e.YCufj3`
+- ZSTD_TU: `/tanksmall/scratch/tmp/c02-profile-tu-tmp.eLLmLX/p5e.tyU0HD`
+- ZSTD_ROUTE: `/tanksmall/scratch/tmp/c02-profile-route-tmp.tPht7v/p5e.zoOKjO`
+
+These retained-build runs used explicit source/gate overlays and separate
+scratch mounts. They are not a fresh checkout/bootstrap pass of the combined
+candidate. That public-command qualification is being run separately.
+An earlier reused-temp permission failure and incorrectly selected profile
+are retained as setup mistakes, not product failures or P29 passes.
+
 ### Initial handshake recovery and invalid-message checks
 
 Candidate commits `6d9d8a1c` and `dbb010ba` integrate two separately tested
@@ -270,9 +295,11 @@ updated test source SHA256
 updated binary SHA256
 `48b09120a86c4ff722639fdf80a81bf7985add3cbd0c685245e63374b06ff1c3`.
 
-Remaining D03 work includes LINK_STATE, recovery/reset record
-interruptions and deterministic short-write/EAGAIN coverage. Bytewise
-successful writes are not evidence of those missing interruption cases.
+Initial LINK_STATE interruption coverage is now recorded above under
+"Initial handshake recovery and invalid-message checks". Remaining D03 work
+includes recovery/reset record interruptions and deterministic
+short-write/EAGAIN coverage. Bytewise successful writes are not evidence of
+those missing interruption cases.
 
 ### Scheduler-to-F recovery and ARM invalidation fix
 
