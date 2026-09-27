@@ -62,6 +62,13 @@ uint64_t percentile_us(std::vector<uint64_t> samples, unsigned percentile) {
     return samples[rank - 1];
 }
 
+size_t observed_peak_for_active_passes(
+    const std::array<size_t, 3>& peaks, size_t active_passes) {
+    require(active_passes > 0 && active_passes <= peaks.size(),
+            "invalid active pass count for peak aggregation");
+    return *std::max_element(peaks.begin(), peaks.begin() + active_passes);
+}
+
 struct IoThreadGuard {
     asio::io_context& c_context;
     asio::io_context& f_context;
@@ -852,7 +859,7 @@ void smoke_r2(const std::vector<std::vector<uint8_t>>& input,
               << " F_socket_c_to_f_bytes=" << f_socket_c_to_f
               << " F_socket_f_to_c_bytes=" << f_socket_f_to_c
               << " observed_peak_outstanding="
-              << std::max(peak_outstanding[0], peak_outstanding[1])
+              << observed_peak_for_active_passes(peak_outstanding, active_passes)
               << " fresh_peak_outstanding=" << peak_outstanding[0]
               << " retained_peak_outstanding=" << peak_outstanding[1]
               << " fresh_pass_raw_bytes=" << pass_raw[0]
@@ -1116,6 +1123,10 @@ void smoke_r1(const std::vector<std::vector<uint8_t>>& input, ProfileId profile,
 }
 
 void verify_paired_default_smoke() {
+    require(observed_peak_for_active_passes({2, 4, 8}, 3) == 8,
+            "three-pass aggregate omitted edited-pass peak");
+    require(observed_peak_for_active_passes({2, 4, 8}, 2) == 4,
+            "two-pass aggregate used inactive pass peak");
     const std::vector<std::string> a_ids = {
         "/bench/A/src/one.cpp.ii", "/bench/A/src/two.cpp.ii"};
     const std::vector<std::string> b_ids = {
