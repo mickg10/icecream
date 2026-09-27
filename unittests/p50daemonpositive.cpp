@@ -1672,11 +1672,59 @@ private:
         return size == 0;
     }
 
-    void fail()
+    enum class FailureReason {
+        AcceptPoll, AcceptSocket, PeerAddress, EndpointConnect, AttemptLimit,
+        GreetingRead, GreetingForward, VersionReplyRead, VersionReplyInvalid,
+        VersionReplyForward, FrameHeader, LegacyFrameTooLarge, StoreIdentity,
+        ActiveRelationship, TooManyRelationships, CommitBeforeLinkState,
+        DuplicateOrdinal, TooManyCommits, HeldCommitTimeout, HeldReceiptWrite,
+        FrameDecode
+    };
+
+    static const char *failure_reason_name(FailureReason reason)
+    {
+        switch (reason) {
+        case FailureReason::AcceptPoll: return "accept-poll";
+        case FailureReason::AcceptSocket: return "accept-socket";
+        case FailureReason::PeerAddress: return "peer-address";
+        case FailureReason::EndpointConnect: return "endpoint-connect";
+        case FailureReason::AttemptLimit: return "attempt-limit";
+        case FailureReason::GreetingRead: return "greeting-read";
+        case FailureReason::GreetingForward: return "greeting-forward";
+        case FailureReason::VersionReplyRead: return "version-reply-read";
+        case FailureReason::VersionReplyInvalid: return "version-reply-invalid";
+        case FailureReason::VersionReplyForward: return "version-reply-forward";
+        case FailureReason::FrameHeader: return "frame-header";
+        case FailureReason::LegacyFrameTooLarge: return "legacy-frame-too-large";
+        case FailureReason::StoreIdentity: return "store-identity";
+        case FailureReason::ActiveRelationship: return "active-relationship";
+        case FailureReason::TooManyRelationships: return "too-many-relationships";
+        case FailureReason::CommitBeforeLinkState: return "commit-before-link-state";
+        case FailureReason::DuplicateOrdinal: return "duplicate-ordinal";
+        case FailureReason::TooManyCommits: return "too-many-commits";
+        case FailureReason::HeldCommitTimeout: return "held-commit-timeout";
+        case FailureReason::HeldReceiptWrite: return "held-receipt-write";
+        case FailureReason::FrameDecode: return "frame-decode";
+        }
+        return "unknown";
+    }
+
+    void record_failure_locked(FailureReason reason, size_t attempt)
+    {
+        if (!failed_.exchange(true, std::memory_order_acq_rel)) {
+            std::fprintf(stderr,
+                "P51_MULTILINK_FIRST_FAILURE reason=%s attempt=%zu accepted=%zu expected=%zu\n",
+                failure_reason_name(reason), attempt, accepted_connections_,
+                expected_links_);
+            std::fflush(stderr);
+        }
+    }
+
+    void fail(FailureReason reason, size_t attempt = 0)
     {
         {
             std::lock_guard lock(mutex_);
-            failed_ = true;
+            record_failure_locked(reason, attempt);
         }
         changed_.notify_all();
     }
@@ -1692,21 +1740,21 @@ private:
             while (ready < 0 && errno == EINTR);
             if (stop_.load(std::memory_order_acquire)) return;
             if (ready == 0) continue;
-            if (ready < 0) { fail(); return; }
+            if (ready < 0) { fail(FailureReason::AcceptPoll); return; }
             const int client_fd = ::accept(listener_fd_, nullptr, nullptr);
-            if (client_fd < 0) { fail(); return; }
+            if (client_fd < 0) { fail(FailureReason::AcceptSocket); return; }
             sockaddr_in peer{};
             socklen_t peer_length = sizeof(peer);
             if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer),
                               &peer_length) != 0) {
                 ::close(client_fd);
-                fail();
+                fail(FailureReason::PeerAddress);
                 return;
             }
             const int server_fd = connect_raw_tcp(endpoint_port_);
             if (server_fd < 0) {
                 ::close(client_fd);
-                fail();
+                fail(FailureReason::EndpointConnect);
                 return;
             }
             {
@@ -1724,7 +1772,7 @@ private:
                     relay_connection(client_fd, server_fd, attempt);
                 });
             if (attempt >= attempt_limit) {
-                fail();
+                fail(FailureReason::AttemptLimit, attempt);
                 return;
             }
         }
@@ -1756,17 +1804,34 @@ private:
 
         unsigned char header[4];
         bool saw_link_state = false;
-        if (!read_bytes(server_fd, header, sizeof(header)) ||
-            !write_bytes(client_fd, header, sizeof(header)) ||
-            !read_bytes(server_fd, header, sizeof(header)) ||
-            !(header[0] == 51 && header[1] == 0 && header[2] == 0 && header[3] == 0) ||
-            !write_bytes(client_fd, header, sizeof(header))) {
-            fail();
+        if (!read_bytes(server_fd, header, sizeof(header))) {
+            fail(FailureReason::GreetingRead, attempt);
+        } else if (!write_bytes(client_fd, header, sizeof(header))) {
+            fail(FailureReason::GreetingForward, attempt);
+        } else if (!read_bytes(server_fd, header, sizeof(header))) {
+            fail(FailureReason::VersionReplyRead, attempt);
+        } else if (!(header[0] == 51 && header[1] == 0 &&
+                     header[2] == 0 && header[3] == 0)) {
+            fail(FailureReason::VersionReplyInvalid, attempt);
+        } else if (!write_bytes(client_fd, header, sizeof(header))) {
+            fail(FailureReason::VersionReplyForward, attempt);
         } else {
             bool r2 = false;
             std::optional<icecc::p50::Id128> relation;
+            bool eof_reported = false;
+            const auto report_read_end = [&](const char *stage) {
+                if (eof_reported) return;
+                eof_reported = true;
+                std::fprintf(stderr,
+                    "P51_MULTILINK_READ_END attempt=%zu stage=%s saw_link_state=%d\n",
+                    attempt, stage, saw_link_state);
+                std::fflush(stderr);
+            };
             while (!stop_.load(std::memory_order_acquire) && !failed_) {
-                if (!read_bytes(server_fd, header, sizeof(header))) break;
+                if (!read_bytes(server_fd, header, sizeof(header))) {
+                    report_read_end(saw_link_state ? "frame-header" : "await-link-state");
+                    break;
+                }
                 const uint8_t type = header[0];
                 const uint32_t word = (uint32_t(header[0]) << 24) |
                     (uint32_t(header[1]) << 16) |
@@ -1779,15 +1844,18 @@ private:
                     try {
                         payload_bytes = icecc::p50::decode_frame_header(
                             std::span<const uint8_t>(header, sizeof(header))).payload_bytes;
-                    } catch (...) { fail(); break; }
+                    } catch (...) { fail(FailureReason::FrameHeader, attempt); break; }
                 } else if (payload_bytes > (1u << 20)) {
-                    fail();
+                    fail(FailureReason::LegacyFrameTooLarge, attempt);
                     break;
                 }
                 std::vector<uint8_t> frame(header, header + sizeof(header));
                 frame.resize(4 + payload_bytes);
                 if (payload_bytes != 0 && !read_bytes(
-                        server_fd, frame.data() + 4, payload_bytes)) break;
+                        server_fd, frame.data() + 4, payload_bytes)) {
+                    report_read_end("frame-payload");
+                    break;
+                }
                 try {
                     if (type == static_cast<uint8_t>(icecc::p50::MessageType::LINK_STATE)) {
                         const auto decoded = icecc::p50::decode_payload(
@@ -1806,7 +1874,7 @@ private:
                                        state.c_store_guid.bytes ||
                                    entry->second.c_store_generation !=
                                        state.c_store_generation) {
-                            failed_ = true;
+                            record_failure_locked(FailureReason::StoreIdentity, attempt);
                         }
                         const auto active = active_link_attempts_.find(*relation);
                         if (active != active_link_attempts_.end() &&
@@ -1814,7 +1882,7 @@ private:
                             // A healthy relationship may have only one active
                             // physical stream. Sequential recovery is allowed
                             // after the earlier relay has been retired.
-                            failed_ = true;
+                            record_failure_locked(FailureReason::ActiveRelationship, attempt);
                         } else {
                             active_link_attempts_[*relation] = attempt;
                             attempt_relationships_[attempt] = *relation;
@@ -1835,14 +1903,14 @@ private:
                             static_cast<unsigned long long>(state.physical_link_generation));
                         std::fflush(stderr);
                         if (relation_commits_.size() > expected_links_) {
-                            failed_ = true;
+                            record_failure_locked(FailureReason::TooManyRelationships, attempt);
                             changed_.notify_all();
                             break;
                         }
                         changed_.notify_all();
                     } else if (type == static_cast<uint8_t>(
                                    icecc::p50::MessageType::R2_TX_COMMIT)) {
-                        if (!relation) { fail(); break; }
+                        if (!relation) { fail(FailureReason::CommitBeforeLinkState, attempt); break; }
                         const auto decoded = icecc::p50::decode_payload(
                             icecc::p50::MessageType::R2_TX_COMMIT,
                             std::span<const uint8_t>(frame.data() + 4, payload_bytes));
@@ -1853,7 +1921,7 @@ private:
                             std::unique_lock lock(mutex_);
                             auto& state = relation_commits_[*relation];
                             if (!state.ordinals.insert(commit.relationship_ordinal).second) {
-                                failed_ = true;
+                                record_failure_locked(FailureReason::DuplicateOrdinal, attempt);
                                 changed_.notify_all();
                                 break;
                             }
@@ -1861,7 +1929,7 @@ private:
                                 ++followup_commits_;
                                 ready_frames.emplace_back(std::move(frame));
                             } else if (state.frames.size() >= jobs_per_link_) {
-                                failed_ = true;
+                                record_failure_locked(FailureReason::TooManyCommits, attempt);
                                 changed_.notify_all();
                                 break;
                             } else {
@@ -1877,7 +1945,7 @@ private:
                                     if (!changed_.wait_for(lock, std::chrono::seconds(30), [&] {
                                             return release_held_ || failed_;
                                         }) || failed_) {
-                                        failed_ = true;
+                                        record_failure_locked(FailureReason::HeldCommitTimeout, attempt);
                                         changed_.notify_all();
                                         break;
                                     }
@@ -1890,12 +1958,12 @@ private:
                         }
                         for (const auto& held : ready_frames)
                             if (!write_bytes(client_fd, held.data(), held.size())) {
-                                fail();
+                                fail(FailureReason::HeldReceiptWrite, attempt);
                                 break;
                             }
                         continue;
                     }
-                } catch (...) { fail(); break; }
+                } catch (...) { fail(FailureReason::FrameDecode, attempt); break; }
                 if (!write_bytes(client_fd, frame.data(), frame.size())) break;
             }
         }
