@@ -9940,6 +9940,16 @@ struct D11OutputCapPause {
     std::exception_ptr error;
 };
 
+enum class D11OutputCapKind {
+    RetainedBytes,
+    RetainedRecords,
+};
+
+const char* d11_output_cap_kind_name(D11OutputCapKind kind) noexcept {
+    return kind == D11OutputCapKind::RetainedRecords
+        ? "retained-records" : "retained-bytes";
+}
+
 boost::asio::awaitable<void> d11_output_cap_client(
     uint16_t f_port, ProfileId profile, uint32_t window,
     bool expire_unpublished,
@@ -10281,7 +10291,9 @@ boost::asio::awaitable<void> d11_output_cap_client(
 
 void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
                                          uint32_t window,
-                                         bool expire_unpublished = false) {
+                                         bool expire_unpublished = false,
+                                         D11OutputCapKind cap_kind =
+                                             D11OutputCapKind::RetainedBytes) {
     CHECK(window == 1 || window == 30);
     const char* profile_name = profile == ProfileId::P29V1 ? "P29V1" :
         profile == ProfileId::ZSTD_TU ? "ZSTD_TU" : "ZSTD_ROUTE";
@@ -10292,6 +10304,10 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
               : CACHE_PROFILE_ZSTD_ROUTE;
     constexpr size_t kRawBytes = 96;
     constexpr uint64_t kOutputCap = 2 * kRawBytes;
+    constexpr uint64_t kRecordCapByteLimit = 1U << 20;
+    const uint64_t retained_byte_limit =
+        cap_kind == D11OutputCapKind::RetainedRecords
+            ? kRecordCapByteLimit : kOutputCap;
     const auto deadline_lifetime = std::chrono::seconds(60);
     StoreIdentityRoot c_root{};
     c_root.bytes[15] = 0xa1;
@@ -10320,8 +10336,14 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
     config.endpoint_caps.supported_profiles = profile_bit(profile);
     config.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
     config.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
-    config.endpoint_config.owner_limits.max_retained_input_records = 8;
-    config.endpoint_config.owner_limits.max_retained_input_bytes = kOutputCap;
+    // SidecarRuntime wires this retained-record count cap into both its
+    // lifecycle admission registry and InputRecordStore. The record mode
+    // keeps the independent byte budget at 1 MiB so refusal proves count
+    // admission, not exhaustion of retained bytes.
+    config.endpoint_config.owner_limits.max_retained_input_records =
+        cap_kind == D11OutputCapKind::RetainedRecords ? 2 : 8;
+    config.endpoint_config.owner_limits.max_retained_input_bytes =
+        retained_byte_limit;
     GlobalResourceTrace resource_trace;
     config.endpoint_config.global_resource_trace = &resource_trace;
     config.max_pending_p51_source_reservations = 8;
@@ -10520,7 +10542,9 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
           capped->acknowledged_prefix_q == 2 &&
           capped->pending_ordinal == 0 && capped->receipt_count == 0 &&
           capped->endpoint_usage.retained_input_records == 2 &&
-          capped->endpoint_usage.retained_input_bytes == kOutputCap &&
+          capped->endpoint_usage.retained_input_bytes == 2 * kRawBytes &&
+          (cap_kind != D11OutputCapKind::RetainedRecords ||
+           capped->endpoint_usage.retained_input_bytes < retained_byte_limit) &&
           capped->endpoint_usage.pending_encoded_bytes == 0 &&
           capped->endpoint_usage.pending_raw_bytes == 0);
     const auto lifecycle_before_cap =
@@ -10842,7 +10866,9 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
           refilled->acknowledged_prefix_q == 1 &&
           refilled->receipt_count == 0 &&
           refilled->endpoint_usage.retained_input_records == 2 &&
-          refilled->endpoint_usage.retained_input_bytes == kOutputCap &&
+          refilled->endpoint_usage.retained_input_bytes == 2 * kRawBytes &&
+          (cap_kind != D11OutputCapKind::RetainedRecords ||
+           refilled->endpoint_usage.retained_input_bytes < retained_byte_limit) &&
           refill_result.committed_input.has_value() &&
           refill_binding.raw_digest == icecc::digest128(refill_input));
     const InputFdRequest attach_refill{
@@ -10880,8 +10906,9 @@ void test_p51_d11_real_f_output_byte_cap(ProfileId profile,
     if (pause.error)
         std::rethrow_exception(pause.error);
     CHECK(accepted_connections.load(std::memory_order_acquire) == 4);
-    std::printf("P51_D11_REAL_F_OUTPUT_BYTE_CAP profile=%s window=%u cap/refusal/close/refill: PASS\n",
-                profile_name, window);
+    std::fprintf(stderr,
+                 "P51_D11_REAL_F_OUTPUT_CAP profile=%s window=%u kind=%s cap/refusal/release/refill: PASS\n",
+                 profile_name, window, d11_output_cap_kind_name(cap_kind));
 }
 
 enum class D11PendingBudgetKind {
@@ -18206,6 +18233,25 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--d11-real-f-retained-record-cap") == 0) {
+            for (const ProfileId profile : {
+                     ProfileId::P29V1, ProfileId::ZSTD_TU,
+                     ProfileId::ZSTD_ROUTE}) {
+                const char* name = profile == ProfileId::P29V1 ? "P29V1" :
+                    profile == ProfileId::ZSTD_TU ? "ZSTD_TU" : "ZSTD_ROUTE";
+                for (const uint32_t window : {1U, 30U}) {
+                    std::fprintf(stderr,
+                                 "P51_D11_RECORD_CAP_START profile=%s window=%u\n",
+                                 name, window);
+                    std::fflush(stderr);
+                    test_p51_d11_real_f_output_byte_cap(
+                        profile, window, false,
+                        D11OutputCapKind::RetainedRecords);
+                }
+            }
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--d11-real-f-output-byte-cap-expiry") == 0) {
             test_p51_d11_real_f_output_byte_cap(ProfileId::P29V1, 1, true);
             return 0;
@@ -18327,6 +18373,14 @@ int main(int argc, char** argv) {
                  ProfileId::ZSTD_ROUTE}) {
             test_p51_d11_real_f_output_byte_cap(profile, 1);
             test_p51_d11_real_f_output_byte_cap(profile, 30);
+        }
+        for (const ProfileId profile : {
+                 ProfileId::P29V1, ProfileId::ZSTD_TU,
+                 ProfileId::ZSTD_ROUTE}) {
+            test_p51_d11_real_f_output_byte_cap(
+                profile, 1, false, D11OutputCapKind::RetainedRecords);
+            test_p51_d11_real_f_output_byte_cap(
+                profile, 30, false, D11OutputCapKind::RetainedRecords);
         }
         test_p51_d11_real_f_output_byte_cap(ProfileId::P29V1, 1, true);
         for (const ProfileId profile : {
