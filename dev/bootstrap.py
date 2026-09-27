@@ -31,6 +31,7 @@ GATE_TARGETS = {
     "p51-capacity-w30": ("p51capacity-w30-run.sh", 600),
     "p51-compiler-loss-w30": ("p51wrappercompile-compiler-loss-w30-check", 960),
     "p50-live-core": ("six required root/live P50 gates", 1200),
+    "p50-c02-channel": ("C02 cold/warm R2 same-channel compile witness", 720),
 }
 GATE_OFFLINE_ENV = (
     "UV_OFFLINE=1",
@@ -328,6 +329,12 @@ def run_gate(run: Run, image: str, source: Path, work: Path,
         if profile:
             gate_profile_env = ["--env",
                 f"ICECC_TEST_P51_CAPACITY_W30_PROFILE={profile}"]
+    if name == "p50-c02-channel":
+        profile = os.environ.get("ICECC_TEST_P50_C02_PROFILE", "ZSTD_ROUTE")
+        if profile not in {"P29V1", "ZSTD_TU", "ZSTD_ROUTE"}:
+            raise BootstrapError(
+                "ICECC_TEST_P50_C02_PROFILE must be P29V1, ZSTD_TU, or ZSTD_ROUTE")
+        gate_profile_env = ["--env", f"ICECC_TEST_P50_C02_PROFILE={profile}"]
     try:
         run.command("gate-network-create", [
             "docker", "network", "create", "--driver", "bridge", "--internal",
@@ -349,9 +356,15 @@ def run_gate(run: Run, image: str, source: Path, work: Path,
             "--workdir", "/work", "--entrypoint", "/bin/bash", image,
             "/source/dev/run-gate.sh", name,
         ]
-        # The outer deadline leaves time for Docker to return and our finally
-        # block to remove only the uniquely labeled container/network.
-        run.command(f"gate-{name}", argv, timeout=timeout_s + 60)
+        # C02 has two separately bounded check-only helper builds and a source
+        # preflight before its own runtime deadline. Include those prerequisites
+        # in the Docker command budget so a clean public run is not killed while
+        # the inner gate is still within its documented per-step limits.
+        prerequisite_budget_s = 300 + 300 + 120 if name == "p50-c02-channel" else 0
+        # The outer deadline also leaves time for Docker to return and our
+        # finally block to remove only the uniquely labeled container/network.
+        run.command(f"gate-{name}", argv,
+                    timeout=timeout_s + prerequisite_budget_s + 60)
     except Exception as exc:
         failure = exc
     finally:

@@ -30,9 +30,14 @@ real_scheduler_f_restart_w30=${ICECC_P50_C1F1_REAL_SCHEDULER_F_RESTART_W30:-0}
 worker_session_loss=${ICECC_P50_C1F1_TEST_WORKER_SESSION_LOSS:-0}
 capacity_expiry=${ICECC_P50_C1F1_TEST_CAPACITY_EXPIRY:-0}
 compiler_loss_w30=${ICECC_P50_C1F1_TEST_COMPILER_LOSS_W30:-0}
+c02_r2_channel=${ICECC_P50_C02_R2_CHANNEL:-0}
 case "$compiler_loss_w30" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_C1F1_TEST_COMPILER_LOSS_W30 must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$c02_r2_channel" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_C02_R2_CHANNEL must be 0 or 1" >&2; exit 1 ;;
 esac
 case "$capacity_expiry" in
     0|1) ;;
@@ -77,6 +82,108 @@ receipt_gate_has_single_link_state() {
     test "$(grep -Ec '^P51_RECEIPT_GATE_LINK_STATE_DECODED attempt=[0-9]+$' "$receipt_state_log")" -eq 1 && \
         test "$(grep -Ec '^P51_RECEIPT_GATE_LINK_STATE port=[0-9]+$' "$receipt_state_log")" -eq 1
 }
+c02_channel_witness_valid() {
+    c02_log=$1
+    c02_expected_env=$2
+    awk -v expected_env="$c02_expected_env" '
+        index($0, "C02_CHANNEL ") {
+            start = index($0, "C02_CHANNEL ")
+            text = substr($0, start + length("C02_CHANNEL "))
+            count++
+            n = split(text, parts, /[[:space:]]+/)
+            for (i = 1; i <= n; ++i) {
+                equal = index(parts[i], "=")
+                if (equal > 1)
+                    values[substr(parts[i], 1, equal - 1)] = \
+                        substr(parts[i], equal + 1)
+            }
+            event = values["event"]
+            if (event != "ordinary_open" && event != "arm_sent" &&
+                event != "compilefile_sent") {
+                bad = 1
+                next
+            }
+            events[event]++
+            expected[1] = "ordinary_open"
+            expected[2] = "arm_sent"
+            expected[3] = "compilefile_sent"
+            if (event != expected[count])
+                bad = 1
+            keys[1] = "pid"; keys[2] = "channel"; keys[3] = "fd"
+            keys[4] = "job"; keys[5] = "epoch"; keys[6] = "nonce"
+            for (i = 1; i <= 6; ++i) {
+                key = keys[i]
+                if (values[key] == "")
+                    bad = 1
+                if (count == 1)
+                    first[key] = values[key]
+                else if (first[key] != values[key])
+                    bad = 1
+            }
+            if (values["got_env"] != expected_env)
+                bad = 1
+            if (count == 1)
+                first["got_env"] = values["got_env"]
+            else if (first["got_env"] != values["got_env"])
+                bad = 1
+            for (key in values)
+                delete values[key]
+        }
+        END {
+            if (count != 3 || events["ordinary_open"] != 1 ||
+                events["arm_sent"] != 1 || events["compilefile_sent"] != 1 ||
+                bad)
+                exit 1
+        }
+    ' "$c02_log"
+}
+if test "${ICECC_P50_C02_CHANNEL_PARSER_SELFTEST:-0}" = 1; then
+    c02_fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50-c02-channel.XXXXXX")
+    trap 'rm -rf "$c02_fixture_dir"' EXIT HUP INT TERM
+    printf '%s\n' \
+        'trace C02_CHANNEL event=ordinary_open pid=10 channel=0xabc fd=7 job=51 epoch=2 nonce=3 got_env=0' \
+        'trace C02_CHANNEL event=arm_sent pid=10 channel=0xabc fd=7 job=51 epoch=2 nonce=3 got_env=0' \
+        'trace C02_CHANNEL event=compilefile_sent pid=10 channel=0xabc fd=7 job=51 epoch=2 nonce=3 got_env=0' \
+        >"$c02_fixture_dir/good.log"
+    c02_channel_witness_valid "$c02_fixture_dir/good.log" 0 || {
+        echo "FAIL: C02 channel parser rejected a same-channel cold fixture" >&2
+        exit 1
+    }
+    sed 's/got_env=0/got_env=1/g' "$c02_fixture_dir/good.log" >"$c02_fixture_dir/warm.log"
+    c02_channel_witness_valid "$c02_fixture_dir/warm.log" 1 || {
+        echo "FAIL: C02 channel parser rejected a same-channel warm fixture" >&2
+        exit 1
+    }
+    sed '/event=compilefile_sent/ s/channel=0xabc/channel=0xdef/' \
+        "$c02_fixture_dir/good.log" >"$c02_fixture_dir/mismatch.log"
+    if c02_channel_witness_valid "$c02_fixture_dir/mismatch.log" 0; then
+        echo "FAIL: C02 channel parser accepted an ARM/CompileFile channel mismatch" >&2
+        exit 1
+    fi
+    printf '%s\n' \
+        'trace C02_CHANNEL event=ordinary_open pid=10 channel=0xabc fd=7 job=51 epoch=2 nonce=3 got_env=0' \
+        'trace C02_CHANNEL event=ordinary_open pid=10 channel=0xdef fd=8 job=51 epoch=2 nonce=3 got_env=0' \
+        'trace C02_CHANNEL event=arm_sent pid=10 channel=0xabc fd=7 job=51 epoch=2 nonce=3 got_env=0' \
+        'trace C02_CHANNEL event=compilefile_sent pid=10 channel=0xabc fd=7 job=51 epoch=2 nonce=3 got_env=0' \
+        >"$c02_fixture_dir/extra-open.log"
+    if c02_channel_witness_valid "$c02_fixture_dir/extra-open.log" 0; then
+        echo "FAIL: C02 channel parser accepted an extra ordinary channel open" >&2
+        exit 1
+    fi
+    awk 'NR == 1 { first = $0; next } NR == 2 { print; next } NR == 3 { print first; print }' \
+        "$c02_fixture_dir/good.log" >"$c02_fixture_dir/out-of-order.log"
+    if c02_channel_witness_valid "$c02_fixture_dir/out-of-order.log" 0; then
+        echo "FAIL: C02 channel parser accepted out-of-order ARM/CompileFile events" >&2
+        exit 1
+    fi
+    sed '/event=arm_sent/ s/ nonce=3//' "$c02_fixture_dir/good.log" >"$c02_fixture_dir/missing-field.log"
+    if c02_channel_witness_valid "$c02_fixture_dir/missing-field.log" 0; then
+        echo "FAIL: C02 channel parser accepted an event missing assignment identity" >&2
+        exit 1
+    fi
+    echo "C02_CHANNEL_PARSER_FIXTURES cold=PASS warm=PASS mismatched_channel=rejected extra_open=rejected out_of_order=rejected missing_identity=rejected"
+    exit 0
+fi
 if test "${ICECC_P50_C1F2_W30_PARSER_SELFTEST:-0}" = 1; then
     fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50-w30-parser.XXXXXX")
     trap 'rm -rf "$fixture_dir"' EXIT HUP INT TERM
@@ -242,6 +349,22 @@ case "$profile_marker" in
         exit 1
         ;;
 esac
+if test "$c02_r2_channel" = 1; then
+    if test "$suite" != C1F1/100000 || test "$cache_enabled" -ne 1 || \
+            test "$external_mode" != 0 || test "$warm" != 0 || \
+            test "$s2_process_loss" != 0 || test "$worker_session_loss" != 0 || \
+            test "$capacity_expiry" != 0 || test "$compiler_loss_w30" != 0 || \
+            test "$w30_f_loss" != 0 || test "$c1f2_baseline" != 0 || \
+            test "$real_scheduler_restart_w30" != 0 || \
+            test "$real_scheduler_f_restart_w30" != 0; then
+        echo "FAIL: C02 R2 channel witness requires an ordinary cache-enabled C1F1 cold/warm run without loss modes" >&2
+        exit 1
+    fi
+    # Revision selection is process-local at wrapper, scheduler, daemon and
+    # sidecar boundaries. Export before any of them are started; the default
+    # test path leaves the deployment default untouched (R1 when unset).
+    export ICECC_P51_MODE=on
+fi
 if test "$compiler_loss_w30" = 1; then
     if test "$external_mode" != 0 || test "$suite" != C1F1/100000 || \
             test "$cache_enabled" -ne 1 || test "$warm" != 0 || test "$passes" != 1 || \
@@ -1629,6 +1752,14 @@ compile_once() {
     remote_obj="$work/out/remote-$label.o"
     local_obj="$work/out/local-$label.o"
     client_log="$work/client-compile-$label.log"
+    c02_trace=0
+    if test "$c02_r2_channel" = 1 && test "$cache_enabled" -eq 1 && \
+            test "$suite" = C1F1/100000 && \
+            { test "$label" = env-warm || test "$label" = env-ready; } && \
+            test "$s2_process_loss" = 0 && test "$worker_session_loss" = 0 && \
+            test "$capacity_expiry" = 0 && test "$compiler_loss_w30" = 0; then
+        c02_trace=1
+    fi
     compile_include_args=""
     if test -n "$item_compile_db"; then
         # Depth batches stage the authenticated predictive .ii.  Remote and
@@ -1673,17 +1804,20 @@ compile_once() {
         ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture"
         ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace"
         ICECC_PREFERRED_HOST="$preferred_host"
+        ICECC_TEST_P50_C02_CHANNEL_TRACE="$c02_trace"
         ICECC_DEBUG=debug
         ICECC_LOGFILE="$client_log"
         export ICECC_TEST_SOCKET ICECC_TEST_REMOTEBUILD ICECC_VERSION \
             ICECC_P50_PREPROCESSED_CAPTURE \
-            ICECC_P50_C_LEGACY_WIRE_TRACE ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
+            ICECC_P50_C_LEGACY_WIRE_TRACE ICECC_PREFERRED_HOST \
+            ICECC_TEST_P50_C02_CHANNEL_TRACE ICECC_DEBUG ICECC_LOGFILE
         eval "run_client_with_timeout g++ $remote_compile_args"
     elif test "$cache_enabled" -eq 1; then
         ICECC_TEST_SOCKET="$compile_socket" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
+            ICECC_TEST_P50_C02_CHANNEL_TRACE="$c02_trace" \
             ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
             run_client_with_timeout g++ -std=c++17 -O2 -c \
             $compile_include_args "$input_path" -o "$remote_obj"
@@ -1691,6 +1825,7 @@ compile_once() {
         ICECC_TEST_SOCKET="$compile_socket" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
+            ICECC_TEST_P50_C02_CHANNEL_TRACE="$c02_trace" \
             ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
             run_client_with_timeout g++ -std=c++17 -O2 -c \
             $compile_include_args "$input_path" -o "$remote_obj"
@@ -1962,6 +2097,27 @@ else
         echo "FAIL: environment-bearing assignment was not observed" >&2
         exit 1
     }
+    if test "$c02_r2_channel" = 1; then
+        grep -F "$profile_marker source committed for P50 CompileFile:" \
+            "$work/client-compile-env-warm.log" >/dev/null || {
+            echo "FAIL: cold C02 assignment did not use the selected $profile_marker cache profile" >&2
+            exit 1
+        }
+        grep -F "$profile_marker source committed for P50 CompileFile:" \
+            "$work/client-compile-env-ready.log" >/dev/null || {
+            echo "FAIL: warm C02 assignment did not use the selected $profile_marker cache profile" >&2
+            exit 1
+        }
+        c02_channel_witness_valid "$work/client-compile-env-warm.log" 0 || {
+            echo "FAIL: cold R2 toolchain ARM and CompileFile did not share exactly one ordinary F channel" >&2
+            exit 1
+        }
+        c02_channel_witness_valid "$work/client-compile-env-ready.log" 1 || {
+            echo "FAIL: warm R2 toolchain ARM and CompileFile did not share exactly one ordinary F channel" >&2
+            exit 1
+        }
+        echo "C02_CHANNEL_WITNESS profile=$profile_marker wire_revision=2 cold_env_install=1 warm_env_present=1 same_client_channel=1 extra_arm_connection=0"
+    fi
     if test "$s2_process_loss" = 1; then
         s2_verify_process_loss
     fi

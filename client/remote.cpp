@@ -78,6 +78,31 @@
 namespace
 {
 
+bool c02_channel_trace_enabled()
+{
+    const char *enabled = ::getenv("ICECC_TEST_P50_C02_CHANNEL_TRACE");
+    return enabled != nullptr && std::string(enabled) == "1";
+}
+
+void trace_c02_channel(const char *event, const CompileJob &job,
+                       const MsgChannel &channel, bool got_env)
+{
+    if (!c02_channel_trace_enabled())
+        return;
+
+    /* Test-only witness for the ordinary F channel. The address identifies
+       this MsgChannel object and fd identifies its underlying socket; neither
+       the toolchain path nor source contents are logged. */
+    trace() << "C02_CHANNEL event=" << event
+            << " pid=" << ::getpid()
+            << " channel=" << static_cast<const void *>(&channel)
+            << " fd=" << channel.fd
+            << " job=" << job.jobID()
+            << " epoch=" << job.assignmentEpoch()
+            << " nonce=" << job.assignmentNonce()
+            << " got_env=" << (got_env ? 1 : 0) << std::endl;
+}
+
 using P50RemoteDiagnosticRecord =
     icecc::p50::diagnostics::RemoteAttemptRecord;
 
@@ -648,6 +673,7 @@ icecc::p50::local::P50SourceTransferResult transfer_p51_source(
             diagnostic->error_code = 4;
         return p50_transfer_error(4);
     }
+    trace_c02_channel("arm_sent", job, cserver, assignment.got_env);
     std::unique_ptr<Msg> response(cserver.get_msg_until(deadline));
     const auto* armed_message =
         dynamic_cast<const P51SourceArmedMsg*>(response.get());
@@ -1463,6 +1489,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                         << port << endl;
             throw client_error(2, "Error 2 - no server found at " + hostname);
         }
+        trace_c02_channel("ordinary_open", job, *cserver, got_env);
         cserver->set_p50_legacy_wire_role(P50LegacyWireRole::C);
         if (cache_advertised_assignment &&
             !cserver->setTcpUserTimeoutUntil(
@@ -1730,6 +1757,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     log_warning() << "write of job failed" << endl;
                     throw client_error(9, "Error 9 - error sending file to remote");
                 }
+                trace_c02_channel("compilefile_sent", job, *cserver, got_env);
             }
 
             if (!p50_input && !preproc_file) {

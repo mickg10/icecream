@@ -117,6 +117,14 @@ requires remote execution for both assignment tests, and uses the test-only
 `icecc` account for daemon lifecycle checks. A missing account, skipped test,
 stale result, or failed gate is fatal; detailed logs and retained scratch-backed
 work directories stay under the gate artifact run.
+The focused `p50-c02-channel` gate runs the same real C1F1 cold/warm toolchain
+fixture with CacheWire R2 explicitly enabled in the wrapper, scheduler, C/F
+daemons, and their sidecars. Its client trace binds the single ordinary F
+channel's open, P51 ARM, and CompileFile send to the same assignment identity
+for both the initial toolchain installation and the already-installed case.
+It defaults to ZSTD_ROUTE; select another supported profile with
+`ICECC_TEST_P50_C02_PROFILE=P29V1` or `ZSTD_TU` on `make dev-gate`. The ordinary
+`p50-live-core` path remains unchanged and does not opt into R2.
 The restart gate currently covers ZSTD_TU C1F2/F-cache and C2F1/C-cache
 replacement, one affected transfer plus a healthy sibling. The separate
 `restart-w30` gate covers both replacements for all three profiles: 30 held

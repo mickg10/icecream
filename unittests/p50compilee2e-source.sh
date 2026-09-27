@@ -23,6 +23,15 @@ require_text() {
 
 contract() {
     root=$1
+    # build_remote_int has two mutually exclusive API spellings for opening
+    # the same cserver (deadline retry versus legacy fallback). The C02 open
+    # witness is after that branch, so it counts either path exactly once.
+    test "$(grep -Fc 'Service::createChannelRetryUntil(' \
+        "$root/client/remote.cpp")" -eq 1 || return 1
+    test "$(grep -Fc 'Service::createChannel(hostname, port, 10)' \
+        "$root/client/remote.cpp")" -eq 1 || return 1
+    test "$(grep -Fc 'trace_c02_channel("ordinary_open"' \
+        "$root/client/remote.cpp")" -eq 1 || return 1
 
     # Daemon-side lifecycle ownership and cache-session bridge must be in the
     # production daemon, not only in standalone P50 unit tests.
@@ -62,6 +71,11 @@ contract() {
     require_text "$root/client/remote.cpp" 'P51SourceLeaseRequestMsg(lease_request)' || return 1
     require_text "$root/client/remote.cpp" 'receive_p51_cache_fd_reply' || return 1
     require_text "$root/client/remote.cpp" 'P51SourceArmMsg arm_message' || return 1
+    require_text "$root/client/remote.cpp" \
+        'CompileJob &job, const UseCSMsg &assignment, MsgChannel &cserver,' || return 1
+    require_text "$root/client/remote.cpp" \
+        'transfer_p51_source(job, *usecs, *cserver,' || return 1
+    require_text "$root/client/remote.cpp" 'cserver->send_msg(compile_file)' || return 1
     require_text "$root/client/remote.cpp" 'P51SourceTransferRequest transfer_request' || return 1
     require_text "$root/client/remote.cpp" 'make_p51_source_transfer_operation' || return 1
     require_text "$root/client/remote.cpp" 'transfer_p51_source(' || return 1
@@ -112,6 +126,12 @@ contract() {
     require_text "$root/unittests/p50compilee2e-run.sh" 'ZSTD_TU) profile_advertisement=zstd_tu' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 'ZSTD_ROUTE) profile_advertisement=zstd_route' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 'profile_advertisement' || return 1
+    # C02 opts into revision 2 across scheduler, daemons and sidecars before
+    # process startup; the ordinary default remains unchanged.
+    require_text "$root/unittests/p50compilee2e-run.sh" 'ICECC_P50_C02_R2_CHANNEL' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'export ICECC_P51_MODE=on' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'C02_CHANNEL_WITNESS profile=$profile_marker wire_revision=2' || return 1
     # S2's process-loss gate must stop the exact F sidecar only after its
     # complete TX_BEGIN witness is published, then require the original
     # compiler invocation and its replacement/replay to finish.
@@ -229,6 +249,9 @@ for pair in \
     "client/remote.cpp|P51SourceLeaseRequestMsg(lease_request)" \
     "client/remote.cpp|receive_p51_cache_fd_reply" \
     "client/remote.cpp|P51SourceArmMsg arm_message" \
+    "client/remote.cpp|MsgChannel &cserver," \
+    "client/remote.cpp|transfer_p51_source(job, *usecs, *cserver," \
+    "client/remote.cpp|cserver->send_msg(compile_file)" \
     "client/remote.cpp|make_p51_source_transfer_operation" \
     "client/remote.cpp|receive_p50_cache_fd_reply" \
     "client/remote.cpp|begin_authenticated" \
@@ -250,6 +273,8 @@ for pair in \
     "unittests/p50compilee2e-run.sh|ZSTD_TU) profile_advertisement=zstd_tu" \
     "unittests/p50compilee2e-run.sh|ZSTD_ROUTE) profile_advertisement=zstd_route" \
     "unittests/p50compilee2e-run.sh|profile_advertisement" \
+    "unittests/p50compilee2e-run.sh|ICECC_P50_C02_R2_CHANNEL" \
+    "unittests/p50compilee2e-run.sh|export ICECC_P51_MODE=on" \
     "cache/p50_actions.cpp|ICECC_P50_TEST_ACTION_HOLD" \
     "cache/p50_actions.cpp|sync_file(fd" \
     "cache/p50_actions.cpp|::rename(temporary.c_str(), marker)" \

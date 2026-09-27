@@ -349,6 +349,7 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
     ("p51-capacity-w30", "p51capacity-w30-run.sh", 600),
     ("p51-compiler-loss-w30", "p51wrappercompile-compiler-loss-w30-check", 960),
     ("p50-live-core", "six required root/live P50 gates", 1200),
+    ("p50-c02-channel", "C02 cold/warm R2 same-channel compile witness", 720),
 ])
 def test_opt_in_gate_names_are_fixed_and_bounded(
     gate: str, target: str, timeout_s: int,
@@ -531,6 +532,59 @@ def test_p50_live_core_routes_through_the_private_gate_lifecycle(
     assert gate_argv[gate_argv.index("--memory") + 1] == "8g"
     assert result["target"] == "six required root/live P50 gates"
     assert result["timeout_s"] == 1200
+
+
+def test_p50_c02_gate_forwards_validated_profile_through_private_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    run = GateCommandRun(tmp_path)
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    work = tmp_path / "current"
+    (work / "tmp").mkdir(parents=True)
+
+    def fake_subprocess_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        labels = {"icecream.dev.gate.id": run.gate_id}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(labels))
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setenv("ICECC_TEST_P50_C02_PROFILE", "ZSTD_TU")
+    result = bootstrap.run_gate(
+        run, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+        "p50-c02-channel",
+    )
+    gate_argv = run.commands[-1][1]
+    env_values = {
+        gate_argv[index + 1]
+        for index, value in enumerate(gate_argv[:-1]) if value == "--env"
+    }
+    assert gate_argv[-2:] == ["/source/dev/run-gate.sh", "p50-c02-channel"]
+    assert "ICECC_TEST_P50_C02_PROFILE=ZSTD_TU" in env_values
+    assert result["target"] == "C02 cold/warm R2 same-channel compile witness"
+    assert result["timeout_s"] == 720
+    assert run.command_timeouts == [
+        ("gate-network-create", 30), ("gate-p50-c02-channel", 1500),
+    ]
+    gate_script = (bootstrap.ROOT / "dev/run-gate.sh").read_text(encoding="utf-8")
+    c02_branch = gate_script.split('elif [[ "$gate" == p50-c02-channel ]]; then', 1)[1]
+    assert "ICECC_P50_C02_R2_CHANNEL=1 ICECC_P50_PROFILE=\"$c02_profile\"" in c02_branch
+    assert "ICECC_P50_C1F1_KEEP_WORK=1" in c02_branch
+    cache_helper = "make -C /work/build/cache icecc-cache-service-test"
+    daemon_helper = "make -C /work/build/unittests p50daemonpositive"
+    assert cache_helper in c02_branch
+    assert daemon_helper in c02_branch
+    assert c02_branch.index(cache_helper) < c02_branch.index(daemon_helper)
+    assert "p50compilee2e-source.log" in c02_branch
+    assert "p50compilee2e-run.log" in c02_branch
+
+    monkeypatch.setenv("ICECC_TEST_P50_C02_PROFILE", "ZSTD_TU; bad")
+    rejected = GateCommandRun(tmp_path)
+    with pytest.raises(bootstrap.BootstrapError, match="must be P29V1"):
+        bootstrap.run_gate(
+            rejected, "sdk:test", source, work, {"jobs": 2, "memory_gb": 8},
+            "p50-c02-channel",
+        )
+    assert rejected.commands == []
 
 
 def test_wrapper_compile_gate_uses_private_bridge_named_daemon_and_exact_six_cells(

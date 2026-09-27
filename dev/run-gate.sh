@@ -2,7 +2,7 @@
 set -uo pipefail
 
 usage() {
-    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p51-compiler-loss-w30|p50-live-core}" >&2
+    echo "usage: run-gate.sh {p51-wrapper-compile|p51-arm-expiry|p51-restart-w30|p51-scheduler-restart-w30|p51-scheduler-f-restart-w30|p51-restart-chain-w30|p51-capacity-w30|p51-compiler-loss-w30|p50-live-core|p50-c02-channel}" >&2
 }
 
 capture_gate_status() {
@@ -112,6 +112,18 @@ case "$1" in
         target="six required root/live P50 gates"
         timeout_s=1200
         marker=P50_LIVE_CORE_PASS=
+        expected_markers=1
+        ;;
+    p50-c02-channel)
+        gate=$1
+        target="C02 cold/warm R2 same-channel compile witness"
+        timeout_s=720
+        c02_profile=${ICECC_TEST_P50_C02_PROFILE:-ZSTD_ROUTE}
+        case "$c02_profile" in
+            P29V1|ZSTD_TU|ZSTD_ROUTE) ;;
+            *) echo "FAIL: unsupported C02 profile: $c02_profile" >&2; exit 2 ;;
+        esac
+        marker="C02_CHANNEL_WITNESS profile=$c02_profile "
         expected_markers=1
         ;;
     *)
@@ -326,6 +338,70 @@ PY
         export ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc
         capture_gate_status timeout --signal=TERM --kill-after=15s 1800s \
             make -C /work/build/unittests "$target" >"$log" 2>&1
+    fi
+elif [[ "$gate" == p50-c02-channel ]]; then
+    worker_scheduler_host=$(hostname -I | awk '{print $1}')
+    if ! python3 - "$worker_scheduler_host" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except (ipaddress.AddressValueError, IndexError):
+    raise SystemExit(1)
+if (address.is_loopback or address.is_unspecified or address.is_multicast or
+        address.is_reserved or address.is_link_local):
+    raise SystemExit(1)
+PY
+    then
+        echo "FAIL: could not derive an ordinary bridge IPv4 for C02 worker scheduler: $worker_scheduler_host" >>"$log"
+        status=2
+    else
+        export ICECC_P50_C1F1_WORKER_SCHEDULER_HOST="$worker_scheduler_host"
+        export ICECC_TEST_DAEMON_UID=icecc ICECC_TEST_DAEMON_GID=icecc
+        export ICECC_P50_C02_R2_CHANNEL=1 ICECC_P50_PROFILE="$c02_profile"
+        export ICECC_P50_C1F1_KEEP_WORK=1
+        build_status=0
+        timeout --signal=TERM --kill-after=15s 300s \
+            make -C /work/build/cache icecc-cache-service-test >>"$log" 2>&1 || build_status=$?
+        if [[ $build_status -eq 0 ]]; then
+            timeout --signal=TERM --kill-after=15s 300s \
+                make -C /work/build/unittests p50daemonpositive >>"$log" 2>&1 || build_status=$?
+        fi
+        if [[ $build_status -ne 0 ]]; then
+            status=$build_status
+            echo "FAIL: could not build required P51 helper prerequisites (exit=$build_status)" >>"$log"
+        else
+            source_status=0
+            timeout --signal=TERM --kill-after=15s 120s \
+                make -C /work/build/unittests \
+                -W /work/source/unittests/p50compilee2e-source.sh \
+                p50compilee2e-source.log >>"$log" 2>&1 || source_status=$?
+            source_trs=/work/build/unittests/p50compilee2e-source.trs
+            if [[ $source_status -ne 0 || ! -f "$source_trs" ]] || \
+                    ! grep -Fxq ':test-result: PASS' "$source_trs"; then
+                status=$source_status
+                [[ $status -eq 0 ]] && status=1
+                echo "FAIL: C02 production source preflight did not produce a fresh PASS .trs (exit=$source_status)" >>"$log"
+            fi
+        fi
+        if [[ $status -eq 0 ]]; then
+            test_status=0
+            timeout --signal=TERM --kill-after=15s "${timeout_s}s" \
+                make -C /work/build/unittests -W /work/source/unittests/p50compilee2e-run.sh \
+                p50compilee2e-run.log >>"$log" 2>&1 || test_status=$?
+            test_trs=/work/build/unittests/p50compilee2e-run.trs
+            test_log=/work/build/unittests/p50compilee2e-run.log
+            if [[ -f "$test_log" ]]; then
+                cat "$test_log" >>"$log"
+            fi
+            if [[ $test_status -ne 0 || ! -f "$test_trs" ]] || \
+                    ! grep -Fxq ':test-result: PASS' "$test_trs"; then
+                status=$test_status
+                [[ $status -eq 0 ]] && status=1
+                echo "FAIL: C02 compile gate did not produce a fresh PASS .trs (exit=$test_status)" >>"$log"
+            fi
+        fi
     fi
 elif [[ "$gate" == p51-capacity-w30 ]]; then
     profiles=(P29V1 ZSTD_TU ZSTD_ROUTE)
