@@ -59,11 +59,23 @@ The disposable test container added `expect` and `libcap2-bin`; the developer
 SDK now declares those dependencies. Clean public QA on frozen `182a3da3`
 built the new SDK, built/installed the product and passed endpoint/service
 checks, but found a reproducible sender initial-connector-retirement failure:
-`Unavailable` lacked the expected route-local failure flag. A narrow correction
-is under test; the original run remains failed evidence, not a qualified
-candidate. Its remaining native checks are still running. Artifacts:
+`Unavailable` lacked the expected route-local failure flag. The run is terminal:
+171 native passes, six skips and one failure; Python XML records 1,659 tests,
+zero failures/errors and eight skips. Root/mixed stages were not reached.
+The original run remains failed evidence, not a qualified candidate. Artifacts:
 `/tanksmall/scratch/tmp/p51-local-jobs-full-qa-scratch/icecream-qa-70d0y2wp`.
 Remote optional skips are not counted as remote coverage.
+
+`602dbc1e` integrates donor `b7283772`: the replacement-result branch is now
+limited to failed Initial handshakes, preserving other preconnect retirement
+results. Assertions were not weakened. Six focused selectors and the full
+rebuilt sender suite pass on donor source based on `182a3da3`; this does not
+retroactively make the frozen QA green or qualify unexecuted root/mixed gates.
+Patched sender binary SHA256:
+`59ea3c45c2bc9a3c11f0b20fab3f97fe1365bb92b81ffa87e820f5eae02540b2`.
+Full sender log under the scratch parent above:
+`fullsender-output/p50zstdsender-full.log`, SHA256
+`9f2edbf6060dde50d39f8885adbaa61e84962a21bcfa9c29a76d6939fc773863`.
 The separate native-environment verification
 skipped because sudo requested a password; the full legacy suite was not run.
 This is correctness evidence, not a measured whole-build speedup.
