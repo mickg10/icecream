@@ -118,14 +118,15 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
     farm_data = copy.deepcopy(farm.data)
     for row in receipt_window_matrix.TOPOLOGY_ROWS:
         farm_data["authority"]["topologies"][row["id"]] = {
-            "f_relationships": row["workers"], "slots_per_f": 120,
+            "f_relationships": row["workers"],
+            "slots_per_f": row["clients"] * 30 + int(row["clients"] == 1),
         }
     farm_path = tmp_path / "authorized-farm.json"
     farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
     output = tmp_path / "matrix"
     generated = receipt_window_matrix.generate_matrix(
         farm_path=farm_path,
-        base_path=INTEGRATION / "scenarios" / "S00-smoke.json",
+        base_path=INTEGRATION / "scenarios" / "D18-P29V1.json",
         helper_path=Path("/bin/true"),
         output_dir=output,
     )
@@ -145,6 +146,17 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
         scenario = load_scenario_spec(path, load_farm_spec(farm_path))
         gate = scenario.data["workload"]["receipt_gate"]
         window = gate["negotiated_window"]
+        clients = [item for item in scenario.data["instances"] if item["role"] == "C"]
+        assert all(item["image"] == "new" for item in clients)
+        assert all(item["env"]["ICECC_P50_MODE"] == "on" for item in clients)
+        assert all(item["env"]["ICECC_P51_MODE"] == "on" for item in clients)
+        workers = [item for item in scenario.data["instances"] if item["role"] == "F"]
+        assert all(item["image"] == "new" for item in workers)
+        assert all(item["env"]["ICECC_P51_MODE"] == "on" for item in workers)
+        scheduler = next(item for item in scenario.data["instances"] if item["role"] == "S")
+        assert scheduler["image"] == "new"
+        assert scheduler["env"]["ICECC_P51_MODE"] == "on"
+        assert "d18_roles" not in scenario.data["workload"]
         plan = farmtest.build_plan(
             load_farm_spec(farm_path), scenario, run_id=f"p51-matrix-{scenario.data['id']}"
         )
@@ -153,7 +165,6 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
             if command["phase"] == "up.start-s"
         )
         scheduler_argv = scheduler_command["argv"]
-        clients = [item for item in scenario.data["instances"] if item["role"] == "C"]
         workers = [item for item in scenario.data["instances"] if item["role"] == "F"]
         expected_credit = (
             len(workers) * window
@@ -187,6 +198,49 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
     assert max_plan is not None
 
 
+@pytest.mark.parametrize("role", ["S", "F"])
+@pytest.mark.parametrize("selection", ["missing", "ambiguous"])
+def test_p51_multilink_matrix_requires_one_p51_role_template(
+    tmp_path: Path, role: str, selection: str,
+) -> None:
+    farm_data = json.loads(farm_fixture.example_farm_path().read_text())
+    for row in receipt_window_matrix.TOPOLOGY_ROWS:
+        farm_data["authority"]["topologies"][row["id"]] = {
+            "f_relationships": row["workers"],
+            "slots_per_f": row["clients"] * 30 + int(row["clients"] == 1),
+        }
+    farm_path = tmp_path / "authorized-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    base = json.loads((INTEGRATION / "scenarios" / "D18-P29V1.json").read_text())
+    if role == "S":
+        selected = next(item for item in base["instances"] if item["role"] == "S")
+        env_key = "ICECC_P51_MODE"
+    else:
+        selected = next(item for item in base["instances"] if item["name"] == "F_R2")
+        env_key = "ICECC_P51_MODE"
+    if selection == "missing":
+        selected["env"][env_key] = "off"
+    else:
+        duplicate = copy.deepcopy(selected)
+        duplicate["name"] = f"{selected['name']}_DUP"
+        base["instances"].append(duplicate)
+    base_path = tmp_path / f"base-{role}-{selection}.json"
+    base_path.write_text(json.dumps(base), encoding="utf-8")
+    output = tmp_path / f"matrix-{role}-{selection}"
+
+    with pytest.raises(
+        receipt_window_matrix.MatrixError,
+        match="exactly one P51-enabled (scheduler|worker) template",
+    ):
+        receipt_window_matrix.generate_matrix(
+            farm_path=farm_path,
+            base_path=base_path,
+            helper_path=Path("/bin/true"),
+            output_dir=output,
+        )
+    assert not output.exists()
+
+
 def test_p51_multilink_matrix_refuses_unavailable_authority(tmp_path: Path) -> None:
     farm_path = farm_fixture.example_farm_path()
     with pytest.raises(receipt_window_matrix.MatrixError, match="must explicitly authorize C1F3"):
@@ -196,6 +250,47 @@ def test_p51_multilink_matrix_refuses_unavailable_authority(tmp_path: Path) -> N
             helper_path=Path("/bin/true"),
             output_dir=tmp_path / "matrix",
         )
+
+
+@pytest.mark.parametrize("selection", ["missing", "ambiguous"])
+def test_p51_multilink_matrix_requires_one_explicit_r2_client_template(
+    tmp_path: Path, selection: str,
+) -> None:
+    farm_data = json.loads(farm_fixture.example_farm_path().read_text())
+    for row in receipt_window_matrix.TOPOLOGY_ROWS:
+        farm_data["authority"]["topologies"][row["id"]] = {
+            "f_relationships": row["workers"],
+            "slots_per_f": row["clients"] * 30 + int(row["clients"] == 1),
+        }
+    farm_path = tmp_path / "authorized-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+
+    base = json.loads((INTEGRATION / "scenarios" / "D18-P29V1.json").read_text())
+    if selection == "missing":
+        next(item for item in base["instances"] if item["name"] == "C_R2")["env"][
+            "ICECC_P51_MODE"
+        ] = "off"
+    else:
+        duplicate = copy.deepcopy(
+            next(item for item in base["instances"] if item["name"] == "C_R2")
+        )
+        duplicate["name"] = "C_R2_DUP"
+        base["instances"].append(duplicate)
+    base_path = tmp_path / f"base-{selection}.json"
+    base_path.write_text(json.dumps(base), encoding="utf-8")
+    output = tmp_path / f"matrix-{selection}"
+
+    with pytest.raises(
+        receipt_window_matrix.MatrixError,
+        match="exactly one P50/R2 client template",
+    ):
+        receipt_window_matrix.generate_matrix(
+            farm_path=farm_path,
+            base_path=base_path,
+            helper_path=Path("/bin/true"),
+            output_dir=output,
+        )
+    assert not output.exists()
 
 
 def test_p51_multilink_matrix_refuses_aggregate_slots_at_dispatch_credit_clamp(

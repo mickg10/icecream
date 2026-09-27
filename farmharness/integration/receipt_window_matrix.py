@@ -86,17 +86,47 @@ def generate_matrix(
     output_dir = output_dir.resolve()
     if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
         raise MatrixError("output directory must be new or empty")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     instances = base.get("instances")
     if not isinstance(instances, list):
         raise MatrixError("base scenario has no instance list")
+    client_templates = [
+        item for item in instances
+        if item.get("role") == "C"
+        and isinstance(item.get("env"), dict)
+        and item["env"].get("ICECC_P50_MODE") == "on"
+        and item["env"].get("ICECC_P51_MODE") == "on"
+    ]
+    if len(client_templates) != 1:
+        raise MatrixError(
+            "base scenario must contain exactly one P50/R2 client template "
+            "(ICECC_P50_MODE=on and ICECC_P51_MODE=on)"
+        )
+    scheduler_templates = [
+        item for item in instances
+        if item.get("role") == "S"
+        and isinstance(item.get("env"), dict)
+        and item["env"].get("ICECC_P51_MODE") == "on"
+    ]
+    worker_templates = [
+        item for item in instances
+        if item.get("role") == "F"
+        and isinstance(item.get("env"), dict)
+        and item["env"].get("ICECC_P51_MODE") == "on"
+    ]
+    if len(scheduler_templates) != 1:
+        raise MatrixError(
+            "base scenario must contain exactly one P51-enabled scheduler template"
+        )
+    if len(worker_templates) != 1:
+        raise MatrixError(
+            "base scenario must contain exactly one P51-enabled worker template"
+        )
     role_templates = {
-        role: next((item for item in instances if item.get("role") == role), None)
-        for role in ("S", "C", "F")
+        "S": scheduler_templates[0],
+        "C": client_templates[0],
+        "F": worker_templates[0],
     }
-    if any(item is None for item in role_templates.values()):
-        raise MatrixError("base scenario must contain one S, C, and F template instance")
     corpus_name = base.get("workload", {}).get("corpus")
     corpus = farm.data["corpora"].get(corpus_name)
     if not isinstance(corpus, dict) or corpus.get("kind") != "tu-manifest":
@@ -105,6 +135,9 @@ def generate_matrix(
     if base_jobs < 1:
         raise MatrixError("base corpus must contain at least one manifest job")
 
+    # Validate template selection before creating the destination so failures
+    # leave no misleading output directory behind.
+    output_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for topology in TOPOLOGY_ROWS:
         for window in template["windows"]:
@@ -177,6 +210,7 @@ def generate_matrix(
                         "links": links,
                     },
                 })
+                scenario["workload"].pop("d18_roles", None)
                 destination = output_dir / f"{scenario['id']}.json"
                 if destination.exists():
                     raise MatrixError(f"refusing to overwrite {destination}")

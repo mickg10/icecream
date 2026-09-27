@@ -1283,15 +1283,18 @@ topologies × W1/W30 × all three profiles) with:
 
 ```sh
 ICEFARM_TMPDIR=/approved/scratch sh dev/python.sh \
-  farmharness/integration/receipt_window_matrix.py \
+  -m farmharness.integration.receipt_window_matrix \
   --farm /approved/farm.json \
-  --base farmharness/integration/scenarios/S00-smoke.json \
+  --base farmharness/integration/scenarios/D18-P29V1.json \
   --helper /approved/build/unittests/p50daemonpositive \
   --output-dir /approved/scenarios/p51-receipt-matrix
 ```
 
-The generator requires each topology in the supplied farm authority and
-validates every emitted scenario. Each C's entire manifest ordinal range is
+The base scenario must provide exactly one P50/R2-enabled C template and
+exactly one P51-enabled S and F template; role order is not used to infer
+capability; use a farm authority whose `new` image pin matches that base
+scenario. The generator requires each topology in the supplied farm
+authority and validates every emitted scenario. Each C's entire manifest ordinal range is
 explicitly assigned to exactly one C→F relationship; `ICECC_PREFERRED_HOST`
 is checked against the actual remote assignment and local fallback is rejected.
 For one-C/many-F runs, separate destination-specific copies of the existing
