@@ -1330,7 +1330,7 @@ void usage(const char *reason = nullptr)
         cerr << reason << endl;
     }
 
-    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-preprocess <max_preprocesses>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
+    cerr << "usage: iceccd [-n <netname>] [-m <max_processes>] [--max-local-jobs <jobs>] [--max-preprocess <max_preprocesses>] [--no-remote] [-d|--daemonize] [-l logfile] [-s <schedulerhost[:port]>]"
         " [-v[v[v]]] [-u|--user-uid <user_uid>] [-b <env-basedir>] [--cache-limit <MB>] [-N <node_name>] [-i|--interface <net_interface>] [-p|--port <port>]"
         " [--state-jsonl <path>] [--state-interval <sec>] [--state-log]"
         " [--webgui] [--webgui-port <port>] [--webgui-addr <addr>]"
@@ -1348,6 +1348,11 @@ int mem_limit = 100;
 const int min_mem_limit = 100;
 
 unsigned int max_kids = 0;
+// A fulljob reserves the complete local lane in addition to any already
+// active work. Keep the configurable lane below half the counter range so
+// that this reservation cannot overflow active_processes.
+const unsigned int max_local_jobs_limit =
+    std::numeric_limits<unsigned int>::max() / 2u;
 unsigned int max_preprocess_kids = 0;
 unsigned int preprocess_active_processes = 0;
 // number of running fulljob (compile-lane reservation) local jobs; while
@@ -1550,6 +1555,7 @@ struct Daemon {
     struct timeval icecream_usage;
     int current_load;
     int num_cpus;
+    unsigned int local_compile_limit;
     MsgChannel *scheduler;
     DiscoverSched *discover;
     string netname;
@@ -1665,6 +1671,7 @@ struct Daemon {
         icecream_usage.tv_sec = icecream_usage.tv_usec = 0;
         current_load = - 1000;
         num_cpus = 0;
+        local_compile_limit = 1;
         scheduler = nullptr;
         discover = nullptr;
         scheduler_port = 8765;
@@ -1707,6 +1714,7 @@ struct Daemon {
     bool reannounce_environments(
         const icecc::p50::advertisement::Snapshot *cache_transition = nullptr)
         __attribute_warn_unused_result__;
+    unsigned int local_job_limit() const noexcept { return local_compile_limit; }
     icecc::p50::advertisement::Snapshot cache_advertisement_snapshot() const noexcept;
     icecc::p50::advertisement::Snapshot scheduler_cache_advertisement_snapshot() const noexcept;
     void reconcile_cache_route_state() noexcept;
@@ -6328,6 +6336,7 @@ string Daemon::dump_internals() const
         + ", current_kids=" + toString(current_kids)
         + ", used=" + toString(current_kids + clients.active_processes)
         + ", max_kids=" + toString(max_kids)
+        + ", local_job_limit=" + toString(local_job_limit())
         + ", max_preprocess_kids=" + toString(max_preprocess_kids) + "\n";
 
     const FdSnapshot fd_snapshot = collect_fd_snapshot();
@@ -6651,6 +6660,7 @@ std::string Daemon::dump_state_json() const
 
     o << "\"slots\":{";
     o << "\"max_kids\":" << max_kids << ",";
+    o << "\"local_job_limit\":" << local_job_limit() << ",";
     o << "\"max_preprocess_kids\":" << max_preprocess_kids << ",";
     o << "\"fulljob_active\":" << fulljob_active << ",";
     // (telemetry health is emitted separately below, see "telemetry")
@@ -7996,7 +8006,7 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
             }
             cl->running_preprocess = false;
         } else if(cl->fulljob) {
-            clients.active_processes -= std::max((unsigned int)1, max_kids);
+            clients.active_processes -= local_job_limit();
             if (fulljob_active > 0) {
                 --fulljob_active;
             }
@@ -8102,7 +8112,7 @@ void Daemon::handle_old_request()
 {
     if (session_quiescence_pending() || child_ownership_gate.admission_blocked())
         return;
-    const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
+    const unsigned int compile_limit = local_job_limit();
     const unsigned int preprocess_limit = std::max((unsigned int)1, max_preprocess_kids);
 
     /* G4 (18:21): a LOGIN_ATTEMPT no longer freezes the local lane.  The
@@ -9298,7 +9308,7 @@ void Daemon::handle_end(Client *client, int exitcode)
             }
             client->running_preprocess = false;
         } else if(client->fulljob) {
-            clients.active_processes -= std::max((unsigned int)1, max_kids);
+            clients.active_processes -= local_job_limit();
             if (fulljob_active > 0) {
                 --fulljob_active;
             }
@@ -13070,6 +13080,8 @@ int main(int argc, char **argv)
 {
     int max_processes = -1;
     int max_preprocess_processes = -1;
+    unsigned int max_local_jobs = 0;
+    bool max_local_jobs_set = false;
     srand(time(nullptr) + getpid());
 
     Daemon d;
@@ -13084,6 +13096,7 @@ int main(int argc, char **argv)
         static const struct option long_options[] = {
             { "netname", 1, nullptr, 'n' },
             { "max-processes", 1, nullptr, 'm' },
+            { "max-local-jobs", 1, nullptr, 0 },
             { "max-preprocess", 1, nullptr, 0 },
             { "help", 0, nullptr, 'h' },
             { "daemonize", 0, nullptr, 'd'},
@@ -13157,6 +13170,26 @@ int main(int argc, char **argv)
                 } else {
                     usage("Error: --max-preprocess requires argument");
                 }
+            } else if (optname == "max-local-jobs") {
+                if (!optarg || !*optarg || *optarg < '0' || *optarg > '9') {
+                    usage("Error: --max-local-jobs requires a positive integer");
+                }
+                unsigned long long parsed = 0;
+                for (const char *p = optarg; *p; ++p) {
+                    if (*p < '0' || *p > '9') {
+                        usage("Error: --max-local-jobs requires a positive integer");
+                    }
+                    const unsigned int digit = static_cast<unsigned int>(*p - '0');
+                    if (parsed > (max_local_jobs_limit - digit) / 10ULL) {
+                        usage("Error: --max-local-jobs requires a positive integer");
+                    }
+                    parsed = parsed * 10ULL + digit;
+                }
+                if (parsed == 0) {
+                    usage("Error: --max-local-jobs requires a positive integer");
+                }
+                max_local_jobs = static_cast<unsigned int>(parsed);
+                max_local_jobs_set = true;
             } else if (optname == "state-jsonl") {
                 if (optarg && *optarg) {
                     d.state_jsonl_path = optarg;
@@ -13480,6 +13513,8 @@ int main(int argc, char **argv)
     } else {
         max_kids = max_processes;
     }
+    d.local_compile_limit = max_local_jobs_set
+        ? max_local_jobs : std::max(1u, max_kids);
 
     if (max_preprocess_processes > 0) {
         max_preprocess_kids = (unsigned int)max_preprocess_processes;
@@ -13493,7 +13528,8 @@ int main(int argc, char **argv)
         max_preprocess_kids = std::min(2u * std::max(1u, max_kids), 32u);
     }
 
-    log_info() << "allowing up to " << max_kids << " active compile jobs and "
+    log_info() << "allowing up to " << max_kids << " advertised compile jobs, "
+               << d.local_job_limit() << " local compile jobs and "
                << max_preprocess_kids << " active preprocess jobs" << endl;
 
     d.determine_supported_features();

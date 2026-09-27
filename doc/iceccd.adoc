@@ -56,6 +56,14 @@ Options
 *-m, --max-processes* _max-processes_::
     Maximum number of compile jobs started in parallel on machine running the daemon.
 
+*--max-local-jobs* _jobs_::
+    Set the local-job admission limit (including link jobs) without changing
+    *-m, --max-processes*, which continues to advertise remote worker capacity
+    to the scheduler. Scheduler-assigned work still participates in the
+    daemon's existing shared compile-capacity check. The default local limit
+    remains the historical value of at least one, even when remote capacity
+    is zero. Values must be positive and no greater than INT_MAX.
+
 *-N* _hostname_::
     The name of the icecream host on the network.
 

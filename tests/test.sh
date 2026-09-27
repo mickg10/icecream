@@ -1603,8 +1603,113 @@ zero_local_jobs_test()
 
     kill_daemon localice
 
-    start_iceccd localice --no-remote -m 0
+    for invalid_limit in "" 0 -1 junk 2147483648 4294967296; do
+        if "$iceccd" --max-local-jobs "$invalid_limit" >"$testdir/max-local-jobs-invalid.log" 2>&1; then
+            echo "Error, invalid --max-local-jobs value was accepted: '$invalid_limit'"
+            abort_tests
+        fi
+        if ! grep -q "Error: --max-local-jobs requires a positive integer" "$testdir/max-local-jobs-invalid.log"; then
+            echo "Error, invalid --max-local-jobs value had no range diagnostic: '$invalid_limit'"
+            cat "$testdir/max-local-jobs-invalid.log"
+            abort_tests
+        fi
+    done
+
+    state_file="$testdir/localice-state.jsonl"
+    rm -f "$state_file"
+    start_iceccd localice --no-remote -m 0 --max-local-jobs 2 \
+        --state-jsonl "$state_file" --state-interval 1
     wait_for_ice_startup_complete localice
+
+    # Hold the first two local jobs at a test barrier. The third and fourth
+    # cannot become ready until one of those exact slots is released.
+    local_run_dir="$testdir/local-cap"
+    local_gate_dir="$testdir/local-cap-gate"
+    rm -rf "$local_run_dir" "$local_gate_dir"
+    mkdir -p "$local_run_dir" "$local_gate_dir"
+    local_pids=()
+    for i in 1 2 3 4; do
+        ICECC_TEST_SOCKET="$testdir/socket-localice" ICECC_TEST_REMOTEBUILD=1 \
+            ICECC_DEBUG=debug ICECC_LOGFILE="$testdir/icecc.log" \
+            "$icerun" ./icerun-test.sh "$local_run_dir" "$i" "$local_gate_dir" &
+        local_pids[$i]=$!
+    done
+
+    ready_count=0
+    for attempt in $(seq 1 100); do
+        ready_count=$(find "$local_gate_dir" -maxdepth 1 -name 'ready*' -type f | wc -l)
+        test "$ready_count" -ge 2 && break
+        sleep 0.1
+    done
+    if test "$ready_count" -ne 2; then
+        echo "Error, local-job cap did not admit exactly two held jobs (ready=$ready_count)"
+        touch "$local_gate_dir/release-all"
+        for i in 1 2 3 4; do wait "${local_pids[$i]}" 2>/dev/null; done
+        stop_ice 0
+        abort_tests
+    fi
+    sleep 0.4
+    ready_count=$(find "$local_gate_dir" -maxdepth 1 -name 'ready*' -type f | wc -l)
+    running_count=$(find "$local_run_dir" -maxdepth 1 -name 'running*' -type f | wc -l)
+    all_waiting=1
+    for i in 1 2 3 4; do
+        if ! kill -0 "${local_pids[$i]}" 2>/dev/null; then
+            all_waiting=
+        fi
+    done
+    if test "$ready_count" -ne 2 -o "$running_count" -ne 2 -o -z "$all_waiting"; then
+        echo "Error, local-job limit was not exactly two while held (ready=$ready_count running=$running_count)"
+        touch "$local_gate_dir/release-all"
+        for i in 1 2 3 4; do wait "${local_pids[$i]}" 2>/dev/null; done
+        stop_ice 0
+        abort_tests
+    fi
+    for ready_file in "$local_gate_dir"/ready*; do
+        ready_id=${ready_file##*ready}
+        touch "$local_gate_dir/release$ready_id"
+    done
+    ready_count=0
+    for attempt in $(seq 1 200); do
+        ready_count=$(find "$local_gate_dir" -maxdepth 1 -name 'ready*' -type f | wc -l)
+        running_count=$(find "$local_run_dir" -maxdepth 1 -name 'running*' -type f | wc -l)
+        if test "$running_count" -gt 2; then
+            break
+        fi
+        test "$ready_count" -eq 4 && break
+        sleep 0.1
+    done
+    if test "$ready_count" -ne 4 -o "$running_count" -gt 2; then
+        echo "Error, local-job cap failed to admit the remaining jobs safely (ready=$ready_count running=$running_count)"
+        touch "$local_gate_dir/release-all"
+        for i in 1 2 3 4; do wait "${local_pids[$i]}" 2>/dev/null; done
+        stop_ice 0
+        abort_tests
+    fi
+    for ready_file in "$local_gate_dir"/ready*; do
+        ready_id=${ready_file##*ready}
+        if test ! -e "$local_gate_dir/release$ready_id"; then
+            touch "$local_gate_dir/release$ready_id"
+        fi
+    done
+    child_failed=
+    for i in 1 2 3 4; do
+        wait "${local_pids[$i]}"
+        if test $? -ne 0; then
+            echo "Error, local-cap icerun child $i failed"
+            child_failed=1
+        fi
+    done
+    if test -n "$child_failed"; then
+        stop_ice 0
+        abort_tests
+    fi
+    done_count=$(find "$local_run_dir" -maxdepth 1 -name 'done*' -type f | wc -l)
+    running_count=$(find "$local_run_dir" -maxdepth 1 -name 'running*' -type f | wc -l)
+    if test "$done_count" -ne 4 -o "$running_count" -ne 0; then
+        echo "Error, not all capped local jobs settled (done=$done_count running=$running_count)"
+        stop_ice 0
+        abort_tests
+    fi
 
     libdir="${testdir}/libs"
     rm -rf  "${libdir}"
@@ -1654,6 +1759,42 @@ zero_local_jobs_test()
     app_ret=$?
     if test ${app_ret} -ne 123; then
         echo "Error, failed to create a test app by building remotely and linking locally"
+        stop_ice 0
+        abort_tests
+    fi
+
+    # -m 0 remains the scheduler-facing remote capacity while the explicit
+    # local cap supports fulljob accounting. These two test link jobs must
+    # settle, and a post-link state snapshot must return every counter to zero.
+    ICECC_TEST_SOCKET="$testdir/socket-localice" ICECC_TEST_REMOTEBUILD=1 \
+        ICECC_DEBUG=debug ICECC_LOGFILE="$testdir/icecc.log" \
+        make -f Makefile.flto OUTDIR="$testdir" CXX="${icecc} ./flto-g++" -j2 -s \
+        2>>"$testdir/stderr.log"
+    if test $? -ne 0; then
+        echo "Error, fulljob links failed with --max-local-jobs 2 and -m 0"
+        stop_ice 0
+        abort_tests
+    fi
+    state_lines_before=$(wc -l < "$state_file")
+    check_log_message_count localice 2 "pushed full local job"
+    state_ready=
+    state_row=
+    for attempt in $(seq 1 50); do
+        state_lines_now=$(wc -l < "$state_file" 2>/dev/null)
+        if test -n "$state_lines_now" && test "$state_lines_now" -gt "$state_lines_before"; then
+            state_row=$(tail -n 1 "$state_file")
+            if echo "$state_row" | grep -q '"max_kids":0,"local_job_limit":2' \
+                    && echo "$state_row" | grep -q '"fulljob_active":0' \
+                    && echo "$state_row" | grep -q '"active_processes":0'; then
+                state_ready=1
+                break
+            fi
+        fi
+        sleep 0.1
+    done
+    if test -z "$state_ready"; then
+        echo "Error, local fulljob reservation did not return to zero with -m 0"
+        tail -n 3 "$state_file" 2>/dev/null
         stop_ice 0
         abort_tests
     fi
@@ -2119,6 +2260,15 @@ echo Starting icecream.
 reset_logs local "Starting"
 start_ice
 check_logs_for_generic_errors
+if test "${ICECC_TEST_ONLY:-}" = zero_local_jobs; then
+    echo "Running only the zero-local-jobs regression."
+    zero_local_jobs_test
+    reset_logs local "Closing down after zero-local-jobs regression"
+    stop_ice 1
+    check_logs_for_generic_errors
+    echo "Zero-local-jobs regression passed."
+    exit 0
+fi
 check_everything_is_idle
 echo Starting icecream successful.
 echo
