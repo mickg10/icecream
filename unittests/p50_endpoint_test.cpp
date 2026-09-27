@@ -4702,6 +4702,7 @@ enum class R2EndpointWireFault : uint8_t {
     WrongTuEndDigest,
     DuplicateTuEnd,
     AckBeyondCommittedPrefix,
+    DuplicateJobBind,
 };
 
 enum class D15MalformedTarget : uint8_t {
@@ -5009,6 +5010,14 @@ asio::awaitable<std::vector<R2TxCommit>> r2_two_job_peer(
                 *observed_terminal_close = true;
             co_return commits;
         }
+        if (fault == R2EndpointWireFault::DuplicateJobBind &&
+            commits.size() == 1) {
+            co_await raw_write(socket, Message{job.binding});
+            co_await raw_wait_for_close(socket);
+            if (observed_terminal_close != nullptr)
+                *observed_terminal_close = true;
+            co_return commits;
+        }
     }
     co_await raw_write(socket, Message{CloseMessage{}});
     boost::system::error_code ignored;
@@ -5270,7 +5279,8 @@ void test_r2_definite_missing_reservation_is_typed_only_for_absence() {
 
 void test_r2_endpoint_commits_two_jobs_on_one_link(
     ProfileId profile = ProfileId::ZSTD_TU,
-    std::optional<D15MalformedFrame> malformed = std::nullopt) {
+    std::optional<D15MalformedFrame> malformed = std::nullopt,
+    R2EndpointWireFault fault = R2EndpointWireFault::None) {
     const P5coStoreGuids stores = p5co_store_guids(0x71);
     EndpointCaps caps;
     caps.profile = profile;
@@ -5379,6 +5389,8 @@ void test_r2_endpoint_commits_two_jobs_on_one_link(
 
     std::atomic<unsigned> lookup_calls{0};
     std::atomic<unsigned> consume_calls{0};
+    std::atomic<unsigned> input_state_calls{0};
+    std::atomic<unsigned> input_open_calls{0};
     std::atomic<unsigned> commit_calls{0};
     std::atomic<unsigned> ack_calls{0};
     std::atomic<unsigned> terminal_calls{0};
@@ -5408,6 +5420,22 @@ void test_r2_endpoint_commits_two_jobs_on_one_link(
                 }
             }
             return std::nullopt;
+        };
+    config.input_job_state =
+        [&](CStoreGuid c_guid, const TxBegin&, const TxCommit& commit,
+            std::span<const uint8_t> exact) {
+            ++input_state_calls;
+            if (c_guid != stores.c)
+                return InputJobState::Closed;
+            for (size_t index = 0; index != jobs.size(); ++index) {
+                if (commit.tu_seq == jobs[index].binding.tu_seq &&
+                    commit.raw_digest == jobs[index].binding.raw_digest &&
+                    std::ranges::equal(exact, inputs[index])) {
+                    ++input_open_calls;
+                    return InputJobState::Open;
+                }
+            }
+            return InputJobState::Closed;
         };
     config.record_p51_job_commit =
         [&](const LinkHello& observed, const JobBind& binding,
@@ -5440,7 +5468,7 @@ void test_r2_endpoint_commits_two_jobs_on_one_link(
         context, r2_accept_one(acceptor, endpoint), asio::use_future);
     auto peer_future = asio::co_spawn(
         context, r2_two_job_peer(acceptor.local_endpoint(), hello, jobs,
-                                 R2EndpointWireFault::None, nullptr, malformed),
+                                 fault, nullptr, malformed),
         asio::use_future);
     context.run();
     const ServerRunResult server_result = accept_future.get();
@@ -5454,7 +5482,37 @@ void test_r2_endpoint_commits_two_jobs_on_one_link(
         std::cerr << "R2 fixture peer error: " << error.what() << '\n';
         throw;
     }
-    if (!malformed) {
+    if (!malformed && fault == R2EndpointWireFault::DuplicateJobBind) {
+        require(server_result.status == ServerRunStatus::TerminalError &&
+                    server_result.terminal_error &&
+                    server_result.terminal_error->detail ==
+                        "R2 JOB_BIND is outside the link window" &&
+                    commits.size() == 1 && lookup_calls == 1 &&
+                    consume_calls == 1 && commit_calls == 1 && ack_calls == 1 &&
+                    terminal_calls == 1 && input_state_calls == 1 &&
+                    input_open_calls == 1,
+                "same-epoch committed JOB_BIND replay was not rejected at K1/Q1");
+        const InputRecordKey expected_first_key{
+            stores.c, prepared[0]->begin.tu_seq};
+        require(server_result.committed_input == expected_first_key,
+                "committed first-job key differs from fixture binding");
+        InputCursor first_cursor = endpoint.attach_input(expected_first_key);
+        std::cerr << "D15 duplicate-input first attachment succeeded\n";
+        std::vector<uint8_t> first_bytes(inputs[0].size());
+        require(first_cursor.read(first_bytes) == first_bytes.size() &&
+                    first_bytes == inputs[0],
+                "same-ordinal replay changed the committed input prefix");
+        bool duplicate_published = false;
+        try {
+            (void)endpoint.attach_input(
+                InputRecordKey{stores.c, prepared[1]->begin.tu_seq});
+            duplicate_published = true;
+        } catch (const std::out_of_range&) {
+        }
+        require(!duplicate_published,
+                "same-ordinal replay published a second source input");
+        std::puts("P51_D15_R2_WIRE duplicate JOB_BIND K=1 Q=1: PASS");
+    } else if (!malformed) {
         require(server_result.status == ServerRunStatus::Completed &&
                     commits.size() == 2 && lookup_calls == 1 &&
                     consume_calls == 2 && commit_calls == 2 && ack_calls == 2 &&
@@ -5479,7 +5537,10 @@ void test_r2_endpoint_commits_two_jobs_on_one_link(
                     terminal_calls == 1,
                 "malformed second-job record did not preserve exactly the prior committed prefix");
     }
-    const size_t prefix_to_check = malformed ? 1 : inputs.size();
+    const size_t prefix_to_check =
+        !malformed && fault == R2EndpointWireFault::DuplicateJobBind
+            ? 0
+            : (malformed ? 1 : inputs.size());
     for (size_t index = 0; index != prefix_to_check; ++index) {
         InputCursor cursor = endpoint.attach_input(
             InputRecordKey{stores.c, prepared[index]->begin.tu_seq});
@@ -7367,6 +7428,7 @@ void test_r2_endpoint_rejects_wire_fault(
 void test_r2_d15_malformed_client_handshake(ProfileId profile,
                                             D15MalformedTarget target,
                                             D15MalformedShape shape);
+void test_r2_d15_malformed_recovery_records();
 
 void test_r2_d15_malformed_frame_matrix() {
     const std::array<ProfileId, 3> profiles{
@@ -7379,6 +7441,8 @@ void test_r2_d15_malformed_frame_matrix() {
         D15MalformedTarget::TuEnd, D15MalformedTarget::CommitAck,
         D15MalformedTarget::Body};
     for (const ProfileId profile : profiles) {
+        test_r2_endpoint_commits_two_jobs_on_one_link(
+            profile, std::nullopt, R2EndpointWireFault::DuplicateJobBind);
         for (const D15MalformedShape shape : shapes)
             test_r2_endpoint_rejects_wire_fault(
                 profile, R2EndpointWireFault::None,
@@ -7409,6 +7473,7 @@ void test_r2_d15_malformed_frame_matrix() {
                     D15MalformedFrame{D15MalformedTarget::Fill, shape});
         }
     }
+    test_r2_d15_malformed_recovery_records();
     std::puts("P51_D15_R2_WIRE malformed outer frames all-applicable-profiles: PASS");
 }
 
@@ -7843,6 +7908,7 @@ struct R2FrameCutSpec {
     R2FrameDirection direction = R2FrameDirection::ClientToF;
     bool cut_last_byte = false;
     size_t expected_frame_bytes = 0;
+    std::optional<D15MalformedShape> malformed_shape = std::nullopt;
 };
 
 struct R2ProxyCutResult {
@@ -8750,6 +8816,35 @@ asio::awaitable<R2ProxyCutResult> r2_proxy_cut_frame(
         const bool target = header.type == cut.type &&
                             matching_occurrences++ == cut.occurrence;
         if (target) {
+            if (cut.malformed_shape) {
+                std::vector<uint8_t> payload(header.payload_bytes);
+                if (!payload.empty())
+                    co_await asio::async_read(*source, asio::buffer(payload),
+                                              asio::use_awaitable);
+                const Message message = decode_payload(header.type, payload);
+                result.cut_frame_type = header.type;
+                result.cut_frame_bytes = header_bytes.size() + payload.size();
+                switch (*cut.malformed_shape) {
+                case D15MalformedShape::Truncated:
+                    result.cut_prefix_bytes = result.cut_frame_bytes - 1;
+                    break;
+                case D15MalformedShape::Oversized:
+                    result.cut_prefix_bytes = header_bytes.size();
+                    break;
+                case D15MalformedShape::Trailing:
+                    result.cut_prefix_bytes = result.cut_frame_bytes + 1;
+                    break;
+                }
+                co_await raw_write_malformed_frame(
+                    *destination, message, *cut.malformed_shape,
+                    kInitialMaxFramePayload);
+                boost::system::error_code ignored;
+                c_socket->shutdown(tcp::socket::shutdown_both, ignored);
+                c_socket->close(ignored);
+                f_socket->shutdown(tcp::socket::shutdown_both, ignored);
+                f_socket->close(ignored);
+                co_return result;
+            }
             if (trace_link_state)
                 std::cerr << "D03_LINK_STATE_PHASE prefix="
                           << cut.frame_prefix_bytes
@@ -8810,6 +8905,8 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
     const JobBind& initial_binding, PreparedTuHandle prepared,
     R2FrameCutSpec cut, std::optional<R2FrameCutSpec> recovery_cut,
     tcp::endpoint recovery_proxy, bool& recovery_cut_disconnected,
+    std::string& malformed_recovery_detail,
+    std::string& malformed_initial_detail,
     std::chrono::steady_clock::time_point deadline,
     ServerRunResult& first_server_result, bool& first_server_done,
     std::string& phase,
@@ -8845,8 +8942,10 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
             phase = "initial-commit-ack";
             try {
                 co_await client.write_r2_ack(interrupted_socket, 1, deadline);
-            } catch (const boost::system::system_error&) {
+            } catch (const boost::system::system_error& error) {
                 writer_observed_disconnect = true;
+                if (cut.malformed_shape)
+                    malformed_initial_detail = error.what();
             }
             if (!writer_observed_disconnect) {
                 try {
@@ -8866,12 +8965,21 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
                     interrupted_socket, sent, deadline);
                 throw std::logic_error(
                     "F returned a receipt for an intentionally partial R2 frame");
-            } catch (const boost::system::system_error&) {
+            } catch (const boost::system::system_error& error) {
                 writer_observed_disconnect = true;
+                if (cut.malformed_shape)
+                    malformed_initial_detail = error.what();
             }
         }
-    } catch (const boost::system::system_error&) {
+    } catch (const boost::system::system_error& error) {
         writer_observed_disconnect = true;
+        if (cut.malformed_shape)
+            malformed_initial_detail = error.what();
+    } catch (const std::exception& error) {
+        if (!cut.malformed_shape)
+            throw;
+        writer_observed_disconnect = true;
+        malformed_initial_detail = error.what();
     }
     boost::system::error_code ignored;
     interrupted_socket.shutdown(tcp::socket::shutdown_both, ignored);
@@ -8943,6 +9051,12 @@ asio::awaitable<ClientRunResult> r2_interrupt_frame_then_recover(
                 error.code() != asio::error::connection_reset)
                 throw;
             recovery_cut_disconnected = true;
+            malformed_recovery_detail = error.what();
+        } catch (const std::exception& error) {
+            if (!recovery_cut->malformed_shape)
+                throw;
+            recovery_cut_disconnected = true;
+            malformed_recovery_detail = error.what();
         }
         boost::system::error_code cut_close_error;
         cut_socket.shutdown(tcp::socket::shutdown_both, cut_close_error);
@@ -9116,7 +9230,9 @@ asio::awaitable<void> r2_two_accepts(
 
 void test_r2_fragmented_frame_interruption_recovery(
     bool exhaustive_f_to_c_commit_cuts = false,
-    std::optional<R2FrameCutSpec> recovery_cut = std::nullopt) {
+    std::optional<R2FrameCutSpec> recovery_cut = std::nullopt,
+    std::optional<ProfileId> only_profile = std::nullopt,
+    std::optional<D15MalformedShape> malformed_initial = std::nullopt) {
     R2TxCommit commit_frame_shape;
     commit_frame_shape.relationship_ordinal = 1;
     commit_frame_shape.binding_digest = icecc::digest128("D03 binding");
@@ -9132,8 +9248,12 @@ void test_r2_fragmented_frame_interruption_recovery(
             "D03 R2_TX_COMMIT frame unexpectedly small");
     for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
                                     ProfileId::ZSTD_ROUTE}) {
+        if (only_profile && profile != *only_profile)
+            continue;
         const auto profile_started = std::chrono::steady_clock::now();
-        const size_t base_case_count = recovery_cut
+        const size_t base_case_count = malformed_initial
+            ? 1
+            : recovery_cut
             ? 1
             : profile == ProfileId::P29V1 ? 9 : 8;
         const size_t commit_cut_count = exhaustive_f_to_c_commit_cuts
@@ -9196,6 +9316,12 @@ void test_r2_fragmented_frame_interruption_recovery(
                 cut_cases = {{MessageType::R2_TX_COMMIT, 0, 5,
                               "F-to-C committed receipt before recovery-record cut",
                               R2FrameDirection::FToClient}};
+            }
+            if (malformed_initial) {
+                cut_cases = {{MessageType::R2_TX_COMMIT, 0, 0,
+                              "D15 malformed F-to-C R2_TX_COMMIT",
+                              R2FrameDirection::FToClient, false, 0,
+                              malformed_initial}};
             }
             require(cut_cases.size() == case_count &&
                         case_index < cut_cases.size(),
@@ -9495,6 +9621,8 @@ void test_r2_fragmented_frame_interruption_recovery(
             bool proxy_done = false;
             bool recovery_proxy_done = !recovery_cut.has_value();
             bool recovery_cut_disconnected = false;
+            std::string malformed_recovery_detail;
+            std::string malformed_initial_detail;
             bool timed_out = false;
             std::optional<ClientRunResult> client_result;
             std::exception_ptr server_error;
@@ -9603,6 +9731,8 @@ void test_r2_fragmented_frame_interruption_recovery(
                     cut, recovery_cut,
                     recovery_proxy_acceptor.local_endpoint(),
                     recovery_cut_disconnected,
+                    malformed_recovery_detail,
+                    malformed_initial_detail,
                     job_deadline.as_steady_time_point(), first_result,
                     first_done, client_phase, observed_reset_epoch, bind_count,
                     materializations, commit_count),
@@ -9827,17 +9957,37 @@ void test_r2_fragmented_frame_interruption_recovery(
                 (cut.direction == R2FrameDirection::FToClient ||
                  commit_ack_cut) ? 0 : 1;
             const size_t expected_recovery_cut_prefix =
-                recovery_cut && recovery_cut->cut_last_byte
+                recovery_cut && recovery_cut->malformed_shape ==
+                                    D15MalformedShape::Truncated
+                    ? recovery_proxy_cut_result.cut_frame_bytes - 1
+                : recovery_cut && recovery_cut->malformed_shape ==
+                                      D15MalformedShape::Oversized
+                    ? 4
+                : recovery_cut && recovery_cut->malformed_shape ==
+                                      D15MalformedShape::Trailing
+                    ? recovery_proxy_cut_result.cut_frame_bytes + 1
+                : recovery_cut && recovery_cut->cut_last_byte
                     ? recovery_proxy_cut_result.cut_frame_bytes - 1
                     : recovery_cut ? recovery_cut->frame_prefix_bytes : 0;
+            const ServerRunStatus expected_second_status =
+                recovery_cut && recovery_cut->malformed_shape &&
+                        recovery_cut->direction ==
+                            R2FrameDirection::ClientToF &&
+                        *recovery_cut->malformed_shape !=
+                            D15MalformedShape::Truncated
+                    ? ServerRunStatus::TerminalError
+                    : recovery_cut ? ServerRunStatus::Disconnected
+                                   : ServerRunStatus::Completed;
             const bool recovery_cut_hit = !recovery_cut ||
                 (recovery_cut_disconnected &&
                  recovery_proxy_cut_result.cut_frame_type ==
                      recovery_cut->type &&
                  recovery_proxy_cut_result.cut_prefix_bytes ==
                      expected_recovery_cut_prefix &&
-                 recovery_proxy_cut_result.cut_frame_bytes >
-                     expected_recovery_cut_prefix &&
+                 (recovery_cut->malformed_shape
+                      ? recovery_proxy_cut_result.cut_frame_bytes > 4
+                      : recovery_proxy_cut_result.cut_frame_bytes >
+                            expected_recovery_cut_prefix) &&
                  (recovery_cut->expected_frame_bytes == 0 ||
                   recovery_proxy_cut_result.cut_frame_bytes ==
                       recovery_cut->expected_frame_bytes) &&
@@ -9850,15 +10000,59 @@ void test_r2_fragmented_frame_interruption_recovery(
                  std::ranges::count(recovery_proxy_fully_forwarded_frames,
                                     recovery_cut->type) ==
                      static_cast<std::ptrdiff_t>(recovery_cut->occurrence));
+            const size_t expected_initial_cut_prefix =
+                cut.malformed_shape == D15MalformedShape::Truncated
+                    ? proxy_cut_result.cut_frame_bytes - 1
+                : cut.malformed_shape == D15MalformedShape::Oversized
+                    ? 4
+                : cut.malformed_shape == D15MalformedShape::Trailing
+                    ? proxy_cut_result.cut_frame_bytes + 1
+                    : cut.frame_prefix_bytes;
+            if (cut.malformed_shape) {
+                const std::string_view expected_detail =
+                    *cut.malformed_shape == D15MalformedShape::Oversized
+                        ? "frame payload exceeds configured cap"
+                    : *cut.malformed_shape == D15MalformedShape::Trailing
+                        ? "wire payload has trailing bytes"
+                        : "End of file";
+                require(malformed_initial_detail.find(expected_detail) !=
+                            std::string::npos,
+                        "malformed initial receipt produced wrong parser result: " +
+                            malformed_initial_detail);
+            }
+            if (recovery_cut && recovery_cut->malformed_shape) {
+                const std::string_view expected_detail =
+                    *recovery_cut->malformed_shape ==
+                            D15MalformedShape::Oversized
+                        ? "frame payload exceeds configured cap"
+                    : *recovery_cut->malformed_shape ==
+                              D15MalformedShape::Trailing
+                        ? "wire payload has trailing bytes"
+                        : "End of file";
+                const std::string observed_detail =
+                    recovery_cut->direction == R2FrameDirection::ClientToF &&
+                            recovery_cut->malformed_shape !=
+                                D15MalformedShape::Truncated
+                        ? (second_result.terminal_error
+                               ? second_result.terminal_error->detail
+                               : std::string{})
+                        : malformed_recovery_detail;
+                require(observed_detail.find(expected_detail) !=
+                            std::string::npos,
+                        "malformed recovery record produced the wrong exact parser result: " +
+                            observed_detail);
+            }
             if (first_result.status != ServerRunStatus::Disconnected ||
-                second_result.status !=
-                    (recovery_cut ? ServerRunStatus::Disconnected
-                                  : ServerRunStatus::Completed) ||
+                second_result.status != expected_second_status ||
                 (recovery_cut &&
                  third_result.status != ServerRunStatus::Completed) ||
                 proxy_cut_result.cut_frame_type != cut.type ||
-                proxy_cut_result.cut_prefix_bytes != cut.frame_prefix_bytes ||
-                proxy_cut_result.cut_frame_bytes <= cut.frame_prefix_bytes ||
+                proxy_cut_result.cut_prefix_bytes !=
+                    expected_initial_cut_prefix ||
+                (cut.malformed_shape
+                     ? proxy_cut_result.cut_frame_bytes <= 4
+                     : proxy_cut_result.cut_frame_bytes <=
+                           cut.frame_prefix_bytes) ||
                 !expected_prefix || !client_result ||
                 client_result->status != ClientRunStatus::Committed ||
                 !retained_reset || bind_count != expected_bind_count ||
@@ -9921,16 +10115,16 @@ void test_r2_fragmented_frame_interruption_recovery(
                 }
             }
             require(first_result.status == ServerRunStatus::Disconnected &&
-                        second_result.status ==
-                            (recovery_cut ? ServerRunStatus::Disconnected
-                                          : ServerRunStatus::Completed) &&
+                        second_result.status == expected_second_status &&
                         (!recovery_cut ||
                          third_result.status == ServerRunStatus::Completed) &&
                         proxy_cut_result.cut_frame_type == cut.type &&
                         proxy_cut_result.cut_prefix_bytes ==
-                            cut.frame_prefix_bytes &&
-                        proxy_cut_result.cut_frame_bytes >
-                            cut.frame_prefix_bytes &&
+                            expected_initial_cut_prefix &&
+                        (cut.malformed_shape
+                             ? proxy_cut_result.cut_frame_bytes > 4
+                             : proxy_cut_result.cut_frame_bytes >
+                                   cut.frame_prefix_bytes) &&
                         expected_prefix &&
                         client_result &&
                         client_result->status == ClientRunStatus::Committed &&
@@ -10004,6 +10198,50 @@ void test_r2_fragmented_frame_interruption_recovery(
                       << " recovery-KQ=1/1 no-replay: ok\n" << std::flush;
         }
     }
+}
+
+void test_r2_d15_malformed_recovery_records() {
+    struct Target {
+        MessageType type;
+        R2FrameDirection direction;
+        size_t occurrence;
+    };
+    const std::array<Target, 9> targets{{
+        {MessageType::RECOVER, R2FrameDirection::ClientToF, 0},
+        {MessageType::RECOVER, R2FrameDirection::ClientToF, 1},
+        {MessageType::RECOVER, R2FrameDirection::ClientToF, 2},
+        {MessageType::RECEIPTS, R2FrameDirection::FToClient, 0},
+        {MessageType::RECEIPTS, R2FrameDirection::FToClient, 1},
+        {MessageType::RESET, R2FrameDirection::ClientToF, 0},
+        {MessageType::RESET_ACK, R2FrameDirection::FToClient, 0},
+        {MessageType::RESET_CONFIRM, R2FrameDirection::ClientToF, 0},
+        {MessageType::RESET_CONFIRM, R2FrameDirection::FToClient, 0},
+    }};
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE}) {
+        for (const D15MalformedShape shape : {
+                 D15MalformedShape::Truncated,
+                 D15MalformedShape::Oversized,
+                 D15MalformedShape::Trailing})
+            test_r2_fragmented_frame_interruption_recovery(
+                false, std::nullopt, profile, shape);
+        for (const Target& target : targets) {
+            for (const D15MalformedShape shape : {
+                     D15MalformedShape::Truncated,
+                     D15MalformedShape::Oversized,
+                     D15MalformedShape::Trailing}) {
+                R2FrameCutSpec malformed{
+                    target.type, target.occurrence, 0,
+                    "D15 malformed recovery record",
+                    target.direction};
+                malformed.malformed_shape = shape;
+                test_r2_fragmented_frame_interruption_recovery(false,
+                                                                malformed,
+                                                                profile);
+            }
+        }
+    }
+    std::puts("P51_D15_R2_WIRE malformed recovery records all directions/profiles: PASS");
 }
 
 void test_r2_silent_setup_cancelled_before_hello() {
