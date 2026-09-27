@@ -124,6 +124,26 @@ Current image `icecream-dev:current-corrected-ea496ad770495018` ID:
 `sha256:1e5927c3e6bc89a01e436029b64636ca37dc3ab5880971aa472da382baa3fb89`;
 pinned P43 image `icecream-dev:p43-cd74801e0fa4e83e` ID:
 `sha256:9140ad2c1a1afb2086bdfcc483d0b0d5d98bf1954168e0889d2e3ee05bc45050`.
+
+On those same images, explicit `--p51-r2 --only-p51-r2` passes all three
+profiles (jobs two, memory 8 GiB). Separate `--concurrent-mixed` runs pass
+P29V1, ZSTD_TU and ZSTD_ROUTE with the minimum supported three-job budget.
+Each concurrent run observes P43/R1/R2 compiler processes simultaneously on
+the shared local scheduler/pool, revalidates their identities, checks remote
+hosts and exact output, and proves R2 source lease/link adoption. This closes
+the local mixed-profile execution cells on this runtime; it does not prove
+W30 occupancy, external mixed farms or the full topology matrix.
+Summary SHA256 values, under the same scratch parent:
+
+- `mixed-ea496-r2-only/summary.json`:
+  `05c3e52fe9f97d11029d464cf7c18e8f6361a3a0346239dc114956761b1aeb17`.
+- `mixed-ea496-concurrent-p29/summary.json`:
+  `4c4dfc4a59a79f6e05015c69d444eaab7dea0680c3bd57fdf1270aa295afa42a`.
+- `mixed-ea496-concurrent-tu/summary.json`:
+  `91b31a592b9260134cd6e2d9bf52eb86f14892d51c3aee30c2b825f683c697b3`.
+- `mixed-ea496-concurrent-route/summary.json`:
+  `73a1467a4c9889b27e643962f088162899a210bbe75e02da7174d11f5aa6f711`.
+
 The separate native-environment verification
 skipped because sudo requested a password; the full legacy suite was not run.
 This is correctness evidence, not a measured whole-build speedup.
