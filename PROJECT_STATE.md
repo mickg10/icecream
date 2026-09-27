@@ -73,7 +73,16 @@ pinned, not represented as identical to the old snapshot. Evidence:
 `d18/foundation-reconciliation.json` under the image evidence directory,
 SHA256 `e2115d236a2156938121e74bd087d350cb2a2d2a32e469635a65aeb0c2c62da7`.
 Fresh run `d18-c06-p29-20260927-3` uses the revalidated private authority;
-its final verdict and teardown remain pending.
+it is now terminal **PASS** with clean **DOWN** (no problems or diagnostic
+errors). All 300 jobs are exact and remote: 100 legacy/P43, 100 R1 and 100 R2;
+zero compile failures, zero local fallbacks, zero retries under the unchanged
+zero-retry bound, and 15 matching oracle samples. Cell wall was 1,227,256 ms;
+C→F bytes 5,307,906 and F→C bytes 112,112. This closes the new P29 mixed-run
+attempt, not the pending TU/ROUTE or held-W30/restart matrices. The older
+runtime's failure remains recorded separately.
+Bundle: `/tanksmall/scratch/tmp/icefarm-role-c06-6cff/results/results/d18-c06-p29-20260927-3/`.
+`verdict.json` SHA256 `3ba57aaf6807f31494bf6f03a1e04ce565295609cf5765da290e7081113a4f7e`;
+`down.json` SHA256 `c13f4d945d83507753d2cbc426d5e0152a72d07655c7f260847b89687d7109ad`.
 
 ### Current-source transfer measurements
 
@@ -104,6 +113,22 @@ Exact source, production archive and executable identities are in the parent
 directory's `run-manifest.txt` (executable SHA256
 `1dac4d96afdca494e401669fa491cd42ec26b2a30706c7f2cd7fc9aab4c82c68`).
 
+The same executable also completed **RocksDB32**, 63/63 cells, with
+838,544,291 raw bytes checked per three-pass run (one edited TU, 31 unchanged).
+Its median total ms are:
+
+| Profile | R1/W1 | R2/W1 | R2/W30 | R2/W30 per-pass peak range |
+| --- | ---: | ---: | ---: | ---: |
+| ZSTD_TU | 6,122 | 4,892 | 2,519 | 1–2 |
+| P29V1 | 2,789 | 2,390 | 1,380 | 3–16 |
+| ZSTD_ROUTE | 36,404 | 36,395 | 30,495 | 1–2 |
+
+Matrix wall 14:11.75, maximum RSS 1,985,356 KiB; the same loopback, quota and
+cache caveats apply. ClickHouse remains pending. Under the same evidence root,
+`rocksdb/rocksdb32-paired-matrix.log` SHA256
+`ee385599701aa50c71e6a4a52bff54b9938ee8d1b1e53114c562383e845bd8d0`;
+input ledger SHA256 `49274d63bcce5da30308b9c9d1ec4162f4d8678b1c2f12e1dcca1b09e42d0f5f`.
+
 ### Multi-link receipt-window harness
 
 Receipt-window clients now automatically use one private Docker bridge each;
@@ -128,6 +153,9 @@ on retry; mixed-version/profile-off/control cases retain their prior policy.
 Donor `3b4bfc3f` passed all 110 workload-module tests, including both topology
 directions and actual driver arguments. This enables a truthful automatic
 P50 restart test; it does not itself prove restart recovery or fresh W30.
+The same 110 tests passed on merged `402d11fc` in 7.05 seconds; log
+`/tanksmall/scratch/tmp/p51-d09-merged-validation-workload.log`, SHA256
+`b26c8480e77bb73808916ad0634c2614ca13e66b9b1a318d9a1a8fdb3e5298c1`.
 
 The complete supported Python QA directory (`farmharness/integration/tests`)
 also passed on merged `e2deb92b`: 1,758 passed, one skipped, 233.53 seconds.
