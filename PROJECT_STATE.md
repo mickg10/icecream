@@ -34,8 +34,27 @@ Test binary SHA256:
 Both commands exited zero in a 2-CPU/8-GiB SDK container. Production archives
 were reused unchanged from the qualified `dbb010ba` closure; this is a
 loopback endpoint fixture, not production-sender retry or cross-host evidence.
-Forced EAGAIN coverage remains open. Earlier failed fixture assertions and
-build attempts remain in the same artifact directory.
+Sender-side EAGAIN coverage remains open. Earlier failed fixture assertions
+and build attempts remain in the same artifact directory.
+
+Donor `45be3141` adds successful kernel-backpressure resumption for all three
+profiles. The socket must first have queued bytes and be non-writable while
+the second transfer remains pending. Only then does the fixture enlarge F's
+receive buffer and release its gates. Both exact inputs commit once, F ACK
+reaches ordinal two and C authority entries drain within bounded waits.
+The original D16 shutdown/retirement selector also passes. No runtime code
+changed; production archives retain the earlier qualified closure.
+In the same evidence directory, `d03-kernel-backpressure-r5.log` SHA256 is
+`a3be5ce1794bbd70ebd49816c381dd6443eaaeebfcf409437cf8372f1bb8a541`;
+`d16-writer-backpressure-after-d03.log` SHA256 is
+`102b2e29553e0ee50c06945f97646f4d34e6e461fbdb13f3643252b59e1e4467`.
+A successful traced rerun observes partial C-to-F sends, not sender EAGAIN:
+`d03-kernel-backpressure-final.trace` SHA256
+`9776788fac482e3489e6e6fd9374c132d26a4fcc04de0a6dc732716ab084ef97`.
+The tested binary SHA256 is
+`eb1e9bd48ba7de3d93c04c21dfb5cf10896c8a5cc50117d32304197ed8c731d1`.
+Earlier fixed-small-receive-buffer runs missed the eight-second resume bound;
+their logs and diagnostic traces are retained, not counted as passes.
 
 ### Explicit local-job limit for matched benchmarks
 

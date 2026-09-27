@@ -197,8 +197,9 @@ make -C "$BUILD/unittests" p50zstdsender-d03-kernel-backpressure-check
 
 It uses the same bounded 512-KiB incompressible second TU, tiny socket buffers,
 and held F reader. Once the client socket is observably non-writable with
-queued bytes and the second sender future is still pending, it releases both
-gates and requires two exact committed inputs, two receipts, and drained
+queued bytes and the second sender future is still pending, it enlarges F's
+receive buffer, releases both gates, and requires two exact committed inputs,
+two receipts, F's acknowledged ordinal reaching two, and drained
 authority entries for each profile. This proves real loopback kernel
 backpressure and successful stream resumption. A separate bounded `strace`
 run on the same successful binary observed positive short `sendto` returns on
