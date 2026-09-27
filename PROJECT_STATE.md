@@ -12,6 +12,31 @@ retained artifact directories.
 
 ## Developer QA
 
+### Actual-wire identity rejection and healthy siblings
+
+Donor `fbcd3a63` adds seven JOB_BIND/TU_BEGIN identity mutations per profile:
+assignment nonce, assignment epoch, profile, reservation, TU sequence, raw
+length and raw digest. A real F SidecarRuntime rejects each before input
+publication; after each rejection, a distinct C sibling commits exact bytes
+through the same F runtime. All 21 cases run in the default `p50cacheservice`
+suite, with a focused `--p51-wire-binding-identity` selector also available.
+This is not a compiler-process test or duplicate JOB_BIND rejection coverage.
+
+The default registered service suite passes on the private `e19dde44`-based
+source plus the test changes. Its production dependency closure was rebuilt
+from the mounted source (confirmed in `build-r2.log`); an initial concern
+about stale copied objects was disproved by that compilation log.
+Artifacts: `/tanksmall/scratch/tmp/p51-c05-wire-identity-build/unittests/`.
+`p50cacheservice.log` SHA256
+`295b0212d3870841b0169aae89028b35791acfa05c2141f1645c1f8062d616ff`;
+`p50cacheservice.trs` SHA256
+`7f175f2f5d04511903d382671ba96ca623e127f57730d53966587cf2c2689229`;
+test binary SHA256
+`e04ec592404d253b5e4b9a7d1cb941c56872378ecc2649f32fa93f8313bfdabc`.
+The registered run was explicitly forced after a UV setup failure and a
+Make no-op; neither earlier attempt counts as a pass. This is not a fresh
+full candidate QA or sanitizer qualification of the added fixture.
+
 ### External receipt-window harness: implemented, workload not qualified
 
 `f60381ab` makes the R2 client's requested window selectable through
