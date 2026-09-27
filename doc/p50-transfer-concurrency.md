@@ -1109,6 +1109,13 @@ entering `RECOVER` with a fabricated offer. Runtime selectors cover this
 initial-response case; the current TLA+ recovery model starts after link
 establishment and does not prove it.
 
+After terminal Initial cancellation or expiry, replacement is route-local.
+F may retire the exact zero-progress relationship only after all reservations
+are gone and neither its service row nor endpoint retains live work or a
+session. A subsequent ARM then receives a fresh logical identity and epoch;
+an advanced relationship must not use this empty-history path. Other C
+relationships on that F remain intact.
+
 For D09 ordered active-work coverage, establish and observe the affected W30
 cohort before each restart in the sequence. A restart between completed
 batches proves continuity, not interruption of active work. Retain exact

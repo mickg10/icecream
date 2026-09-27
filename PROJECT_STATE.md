@@ -12,6 +12,40 @@ retained artifact directories.
 
 ## Developer QA
 
+### Initial handshake recovery and invalid-message checks
+
+Candidate commits `6d9d8a1c` and `dbb010ba` integrate two separately tested
+changes; qualification of their combined source with the cleanup fix is
+in progress. Neither is evidence of a new whole-build performance result.
+
+Initial response loss now retries the exact empty relationship under the
+original deadline. Terminal cancellation/expiry quarantines only that route;
+after its reservations and live session are gone, F can issue a new logical
+identity/epoch. The real TCP service test passes expiry and explicit cancel,
+then exact-byte commit through the same C route owner, while a second C
+remains usable. This service test covers ZSTD_TU and C2F1, not all profiles
+or C1F2. Adjacent sender and endpoint selectors cover all three profiles.
+Private donor: `fe9793827567840c661ea2a1f2be9e8935e7a0fa`.
+Retained logs in `/tanksmall/scratch/tmp/p51-d03-linkstate-runtime/`:
+`initial-cut-rearm-r2.log` SHA256
+`78e35fc58a4b224fdc506cf5fd7794ad8931e75ef1f0ae1e6844c7f307f405ca`;
+`initial-sender-endpoint-r1.log` SHA256
+`eaf671da7803f2dcc4c2d0f7ea9cf99bac71c541f7e8c862f0e00c452f765927`.
+The current formal recovery model starts after link establishment and does
+not cover this Initial transition.
+
+The opt-in `make -C "$BUILD/unittests" p50endpoint-d15-wire-check` passes
+nine real-wire cases: wrong transaction digest, duplicate TU_END after
+commit, and ACK beyond the committed prefix, across all three profiles.
+Assertions check terminal closure, callback counts and exact input publication
+or absence. Private donor: `0336df1fde2a4e2249095acae85f49f62082ae0c`;
+retained log:
+`/tanksmall/scratch/tmp/p51-d15-endpoint-wire-build/d15-r2-wire-run-r2.log`.
+This is not the entire D15 record-validation matrix.
+
+The user-confirmed cross-machine farm is q2/q3/q5, with research6 available
+to launch C. Readiness checks are in progress; this is not a farm-test pass.
+
 ### Third paired corpus: ClickHouse programs32
 
 The 63-cell ClickHouse paired transfer matrix passes with exact decoded
