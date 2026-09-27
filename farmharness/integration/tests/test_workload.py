@@ -18,6 +18,7 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest, workload as workload_module
+from farmharness.integration import scenario_spec as scenario_spec_module
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import CommandFactory, RecordingTransport
 from farmharness.integration.events import EventProducer
@@ -413,6 +414,91 @@ def _multilink_orchestrator_fixture(topology: str):
         data={"corpora": {"tiny": {"tus": tus, "repeat": 1}}},
     )
     return farm, scenario, plan, clients
+
+
+@pytest.mark.parametrize(
+    ("links", "clients", "window", "expected"),
+    (
+        (None, ["C1"], 30, None),
+        ([{"client": "C1", "worker": "F1"}, {"client": "C1", "worker": "F2"}], ["C1"], 30, 60),
+        ([{"client": "C1", "worker": "F1"}, {"client": "C2", "worker": "F1"}], ["C1", "C2"], 30, None),
+        ([{"client": "C1", "worker": "F1"}, {"client": "C1", "worker": "F2"}], ["C1"], 1, None),
+    ),
+)
+def test_receipt_window_derives_only_needed_scheduler_dispatch_credit(
+    links: list[dict[str, str]] | None, clients: list[str],
+    window: int, expected: int | None
+) -> None:
+    gate = {"expect_observed": True, "negotiated_window": window}
+    if links is not None:
+        gate["links"] = links
+    scenario = SimpleNamespace(data={"workload": {
+        "driver": "p51-receipt-window", "receipt_gate": gate, "clients": clients,
+    }})
+    assert farmtest._receipt_dispatch_credit(scenario) == expected
+
+
+def test_receipt_scheduler_launch_keeps_wrapper_or_pinned_binary_defaults() -> None:
+    wrapper, wrapper_args = farmtest._scheduler_launch(
+        port=36000, netname="run", assignment_fence_mode="strict-nonce",
+        receipt_dispatch_credit=None,
+    )
+    assert wrapper == "/opt/icecream/entry-scheduler.sh"
+    assert wrapper_args == [
+        "--port", "36000", "--netname", "run",
+        "--assignment-fence-mode", "strict-nonce",
+    ]
+
+    binary, direct_args = farmtest._scheduler_launch(
+        port=36000, netname="run", assignment_fence_mode="strict-nonce",
+        receipt_dispatch_credit=60,
+    )
+    assert binary == "/opt/icecream/sbin/icecc-scheduler"
+    assert direct_args == [
+        "-p", "36000", "-n", "run", "-u", "nobody",
+        "-l", "/var/log/icecream/scheduler.log", "-vvv",
+        "--assignment-fence-mode", "strict-nonce",
+        "--max-outstanding-dispatches", "60",
+    ]
+
+
+def test_receipt_window_requires_worker_capacity_beyond_credit_clamp(
+    tmp_path: Path,
+) -> None:
+    binary = Path("/bin/true")
+    gate = {
+        "binary": str(binary),
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "expect_observed": True,
+        "expected_commits": 30,
+        "negotiated_window": 30,
+    }
+    links = [
+        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 30},
+        {"client": "C1", "worker": "F2", "first_job": 31, "last_job": 60},
+    ]
+    workload = {
+        "receipt_gate": {**gate, "links": links},
+        "clients": ["C1"], "turns": ["A"], "repeat": 1, "jobs": 60,
+    }
+    value = {"timeline": [], "controls": []}
+    role_instances = {
+        "S": [{"name": "S1", "env": {"ICECC_P51_MODE": "on", "ICECC_P50_PROFILE": "P29V1"}}],
+        "C": [{"name": "C1", "env": {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on"}}],
+        "F": [
+            {"name": "F1", "slots": 30, "env": {"ICECC_P51_MODE": "on"}},
+            {"name": "F2", "slots": 30, "env": {"ICECC_P51_MODE": "on"}},
+        ],
+    }
+    with pytest.raises(ScenarioSpecError, match="aggregate F slots must exceed"):
+        scenario_spec_module._validate_p51_receipt_window(
+            value, workload, role_instances, manifest_jobs=60
+        )
+
+    role_instances["F"][1]["slots"] = 31
+    scenario_spec_module._validate_p51_receipt_window(
+        value, workload, role_instances, manifest_jobs=60
+    )
 
 
 @pytest.mark.parametrize("topology", ["C1F2", "C2F1"])

@@ -611,6 +611,51 @@ def _assignment_fence_mode(
     return "enforcing-compat"
 
 
+def _receipt_dispatch_credit(scenario: ScenarioSpec) -> int | None:
+    """Raise the scheduler's per-submitter bound only when receipt gates need it."""
+    workload = scenario.data["workload"]
+    gate = workload.get("receipt_gate")
+    if workload.get("driver") != "p51-receipt-window" or not gate:
+        return None
+    if not gate.get("expect_observed"):
+        return None
+    links = gate.get("links")
+    per_client: dict[str, int] = {}
+    if links is None:
+        # The legacy one-C/one-F form has one gate for the selected client.
+        per_client[workload["clients"][0]] = int(gate["negotiated_window"])
+    else:
+        for link in links:
+            client = link["client"]
+            per_client[client] = per_client.get(client, 0) + int(
+                gate["negotiated_window"]
+            )
+    required = max(per_client.values(), default=0)
+    # Retain the scheduler's existing default for workloads it already serves;
+    # increase only when one C's simultaneous held gates exceed it.
+    return required if required > 32 else None
+
+
+def _scheduler_launch(
+    *, port: int, netname: str, assignment_fence_mode: str | None,
+    receipt_dispatch_credit: int | None,
+) -> tuple[str, list[str]]:
+    """Keep the pinned wrapper for ordinary runs; pass the receipt-only credit directly."""
+    if receipt_dispatch_credit is None:
+        args = ["--port", str(port), "--netname", netname]
+        if assignment_fence_mode is not None:
+            args.extend(("--assignment-fence-mode", assignment_fence_mode))
+        return "/opt/icecream/entry-scheduler.sh", args
+    args = [
+        "-p", str(port), "-n", netname, "-u", "nobody",
+        "-l", "/var/log/icecream/scheduler.log", "-vvv",
+    ]
+    if assignment_fence_mode is not None:
+        args.extend(("--assignment-fence-mode", assignment_fence_mode))
+    args.extend(("--max-outstanding-dispatches", str(receipt_dispatch_credit)))
+    return "/opt/icecream/sbin/icecc-scheduler", args
+
+
 def _planned_commands(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -630,6 +675,7 @@ def _planned_commands(
     }
 
     scheduler = next(item for item in topology["instances"] if item["role"] == "S")
+    receipt_dispatch_credit = _receipt_dispatch_credit(scenario)
     scheduler_port = ports["scheduler"]
     scheduler_addr = f"{scheduler['address']}:{scheduler_port}"
     netname = f"{farm.data['netname_prefix']}-{run_id}"
@@ -1037,6 +1083,18 @@ def _planned_commands(
             "F": "/opt/icecream/entry-daemon.sh",
             "C": "/icefarm-entry-client.sh",
         }[instance["role"]]
+        scheduler_args: list[str] = []
+        if instance["role"] == "S":
+            if receipt_dispatch_credit is not None and instance["version"] != 50:
+                raise PlanError("receipt dispatch credit requires the P50 scheduler")
+            entrypoint, scheduler_args = _scheduler_launch(
+                port=scheduler_port,
+                netname=netname,
+                assignment_fence_mode=(
+                    assignment_fence_mode if instance["version"] == 50 else None
+                ),
+                receipt_dispatch_credit=receipt_dispatch_credit,
+            )
         args.extend(
             (
                 "--entrypoint",
@@ -1045,9 +1103,7 @@ def _planned_commands(
             )
         )
         if instance["role"] == "S":
-            args.extend(("--port", str(scheduler_port), "--netname", netname))
-            if instance["version"] == 50 and assignment_fence_mode is not None:
-                args.extend(("--assignment-fence-mode", assignment_fence_mode))
+            args.extend(scheduler_args)
         elif instance["role"] == "F":
             args.extend(
                 (

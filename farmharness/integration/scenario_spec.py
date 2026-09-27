@@ -398,6 +398,16 @@ def _validate_p51_receipt_window(
                     f"$.instances.{worker_name}.slots: must cover the aggregate receipt windows "
                     "assigned to this F worker"
                 )
+        max_client_window = max(windows_by_client.values(), default=0)
+        aggregate_worker_slots = sum(
+            int(by_name[worker_name].get("slots", 0))
+            for worker_name in selected_workers
+        )
+        if aggregate_worker_slots <= max_client_window:
+            raise ScenarioSpecError(
+                "$.instances: aggregate F slots must exceed the largest per-C "
+                "receipt window so scheduler dispatch credit is not clamped below it"
+            )
 
 
 def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:

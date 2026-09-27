@@ -867,6 +867,8 @@ def test_transition_plan_uses_expected_fence_across_all_epochs(
         assert scheduler["argv"][index + 1] == expected_mode
     else:
         assert "--assignment-fence-mode" not in scheduler["argv"]
+    assert "/opt/icecream/entry-scheduler.sh" in scheduler["argv"]
+    assert "--max-outstanding-dispatches" not in scheduler["argv"]
 
 
 @pytest.mark.parametrize("profile", ("P29V1", "ZSTD_TU", "ZSTD_ROUTE"))

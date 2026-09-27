@@ -70,6 +70,14 @@ def generate_matrix(
                 f"farm authority must explicitly authorize {row['id']} with "
                 f"{row['workers']} F roles"
             )
+    for row in TOPOLOGY_ROWS:
+        authority = topology_authority[row["id"]]
+        required_slots_per_f = row["clients"] * 30 + int(row["clients"] == 1)
+        if int(authority.get("slots_per_f", 0)) < required_slots_per_f:
+            raise MatrixError(
+                f"farm authority {row['id']} needs slots_per_f >= "
+                f"{required_slots_per_f} for simultaneous W30 gates and scheduler credit"
+            )
     helper_path = helper_path.resolve(strict=True)
     helper_stat = helper_path.stat()
     if not helper_path.is_file() or not helper_stat.st_mode & 0o111:
@@ -123,6 +131,12 @@ def generate_matrix(
                     worker = copy.deepcopy(role_templates["F"])
                     worker["name"] = name
                     worker["slots"] = worker_link_count[name] * window
+                    # One-C/many-F fills exactly the submitter's dispatch
+                    # credit with the gate cohort. Keep one additional
+                    # advertised slot so the scheduler's farm_slots-1
+                    # clamp does not reduce that cohort's credit.
+                    if topology["clients"] == 1 and index == 1:
+                        worker["slots"] += 1
                     worker.setdefault("env", {})["ICECC_P51_MODE"] = "on"
                     scenario["instances"].append(worker)
                 for name in client_names:

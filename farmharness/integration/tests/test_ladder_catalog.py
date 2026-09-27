@@ -145,8 +145,29 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
         scenario = load_scenario_spec(path, load_farm_spec(farm_path))
         gate = scenario.data["workload"]["receipt_gate"]
         window = gate["negotiated_window"]
+        plan = farmtest.build_plan(
+            load_farm_spec(farm_path), scenario, run_id=f"p51-matrix-{scenario.data['id']}"
+        )
+        scheduler_command = next(
+            command for command in plan["commands"]
+            if command["phase"] == "up.start-s"
+        )
+        scheduler_argv = scheduler_command["argv"]
         clients = [item for item in scenario.data["instances"] if item["role"] == "C"]
         workers = [item for item in scenario.data["instances"] if item["role"] == "F"]
+        expected_credit = (
+            len(workers) * window
+            if window == 30 and len(clients) == 1 and len(workers) > 1
+            else None
+        )
+        if expected_credit is None:
+            assert "/opt/icecream/entry-scheduler.sh" in scheduler_argv
+            assert "--max-outstanding-dispatches" not in scheduler_argv
+        else:
+            assert "/opt/icecream/sbin/icecc-scheduler" in scheduler_argv
+            assert "-u" in scheduler_argv
+            assert scheduler_argv[scheduler_argv.index("-u") + 1] == "nobody"
+            assert scheduler_argv[scheduler_argv.index("--max-outstanding-dispatches") + 1] == str(expected_credit)
         assert gate["expect_observed"] is True
         assert scenario.data["workload"]["jobs"] == len(gate["links"]) // len(clients) * window
         assert len(gate["links"]) == len(clients) * len(workers)
@@ -169,6 +190,26 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
 def test_p51_multilink_matrix_refuses_unavailable_authority(tmp_path: Path) -> None:
     farm_path = farm_fixture.example_farm_path()
     with pytest.raises(receipt_window_matrix.MatrixError, match="must explicitly authorize C1F3"):
+        receipt_window_matrix.generate_matrix(
+            farm_path=farm_path,
+            base_path=INTEGRATION / "scenarios" / "S00-smoke.json",
+            helper_path=Path("/bin/true"),
+            output_dir=tmp_path / "matrix",
+        )
+
+
+def test_p51_multilink_matrix_refuses_aggregate_slots_at_dispatch_credit_clamp(
+    tmp_path: Path,
+) -> None:
+    farm_data = json.loads(farm_fixture.example_farm_path().read_text())
+    for row in receipt_window_matrix.TOPOLOGY_ROWS:
+        farm_data["authority"]["topologies"][row["id"]] = {
+            "f_relationships": row["workers"],
+            "slots_per_f": 30 if row["id"] == "C1F2" else 120,
+        }
+    farm_path = tmp_path / "authorized-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    with pytest.raises(receipt_window_matrix.MatrixError, match="C1F2 needs slots_per_f >= 31"):
         receipt_window_matrix.generate_matrix(
             farm_path=farm_path,
             base_path=INTEGRATION / "scenarios" / "S00-smoke.json",

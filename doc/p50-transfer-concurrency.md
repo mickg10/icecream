@@ -1306,6 +1306,19 @@ restart-under-load remains explicitly pending and requires its own measured
 phase. The existing singleton W1 negative control is not changed by this
 matrix.
 
+The scheduler's default per-submitter unconfirmed-dispatch credit is 32 and
+its effective credit is clamped to one below aggregate advertised F slots.
+For a positive multi-link gate, the harness derives the required credit as the
+largest sum of negotiated windows assigned to any one C, raising the default
+only when that sum exceeds 32. Scenario validation also requires aggregate F
+slots to exceed that per-C credit; otherwise the scheduler clamp would make
+the requested held cohort impossible. Only raised-credit receipt cases launch
+the already-pinned scheduler binary directly with the same arguments as
+`entry-scheduler.sh`, plus `--max-outstanding-dispatches`; ordinary runs
+continue through the pinned entrypoint unchanged. For example, C1F2/W30 needs
+credit 60 and aggregate F slots greater than 60, whereas C4F1/W30 needs
+credit 30 and at least 120 F slots for its four simultaneous gates.
+
 For these receipt-window scenarios, the harness automatically creates one
 private Docker bridge per selected C container and starts that C with the
 pinned no-remote entrypoint. S and F retain their planned host networking and
