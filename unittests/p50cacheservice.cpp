@@ -2587,6 +2587,135 @@ void test_f_live_session_overflow_from_two_c_runtimes() {
     CHECK(second_later.code == local::SourceTransferResultCode::Committed);
 }
 
+// Parked arms hold one F route's whole armed window, so further uploads to that
+// F queue in ArmedAdmission.  One whose deadline passes there must fail on
+// time with no attempt and without reaching F, and must not keep the window
+// from the uploads after it; a stop must end every queued upload at once.
+void test_armed_window_queue_expiry_and_stop() {
+    constexpr size_t kArmedWindow = 8;
+    constexpr uint64_t kFStoreGeneration = 29;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x93;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xc1;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    const CStoreGuid c_store = c_config.c_store_guid;
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](uint64_t identity, std::chrono::milliseconds budget) {
+        const std::string text = "queued-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + budget, clock.clock_domain_id,
+            clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-armed-queue", source)));
+    };
+    using Results = std::vector<local::P50SourceTransferResult>;
+    const auto start = [&transfer](Results& results, uint64_t base,
+                                   std::chrono::milliseconds budget) {
+        std::vector<std::thread> threads;
+        for (size_t index = 0; index != results.size(); ++index)
+            threads.emplace_back([&transfer, out = &results[index],
+                                  identity = base + 10 * index, budget] {
+                *out = transfer(identity, budget);
+            });
+        return threads;
+    };
+    const auto join = [](std::vector<std::thread>& threads) {
+        for (std::thread& thread : threads)
+            thread.join();
+    };
+    const auto expired = [](const local::P50SourceTransferResult& result) {
+        return result.code == local::SourceTransferResultCode::Error &&
+               result.error_code == 7 && result.attempts == 0;
+    };
+
+    front.hold(c_store);
+    Results window(kArmedWindow);
+    std::vector<std::thread> window_threads = start(window, 1000, std::chrono::seconds(20));
+    const bool window_parked = eventually(
+        [&] { return front.parked() == kArmedWindow; }, std::chrono::seconds(10));
+
+    Results late(2);
+    const auto late_started = std::chrono::steady_clock::now();
+    std::vector<std::thread> late_threads = start(late, 2000, std::chrono::milliseconds(1000));
+    join(late_threads);
+    const auto late_elapsed = std::chrono::steady_clock::now() - late_started;
+    const bool still_parked = front.parked() == kArmedWindow;
+
+    const bool released = front.release();
+    join(window_threads);
+    const local::P50SourceTransferResult after = transfer(3000, std::chrono::seconds(20));
+
+    front.hold(c_store);
+    Results second_window(kArmedWindow);
+    std::vector<std::thread> second_threads =
+        start(second_window, 4000, std::chrono::seconds(20));
+    const bool second_parked = eventually(
+        [&] { return front.parked() == kArmedWindow; }, std::chrono::seconds(10));
+    Results queued(3);
+    std::array<std::chrono::steady_clock::time_point, 3> queued_done{};
+    std::vector<std::thread> queued_threads;
+    for (size_t index = 0; index != queued.size(); ++index)
+        queued_threads.emplace_back([&transfer, &queued, &queued_done, index] {
+            queued[index] = transfer(5000 + 10 * index, std::chrono::seconds(20));
+            queued_done[index] = std::chrono::steady_clock::now();
+        });
+    // Mid-turn: the queued waits poll in 50 ms turns and must end at the next.
+    std::this_thread::sleep_for(std::chrono::milliseconds(225));
+    const auto stopped_at = std::chrono::steady_clock::now();
+    c_runtime.stop();
+    join(queued_threads);
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stopped_at;
+    (void)front.release();
+    join(second_threads);
+    front.stop();
+
+    std::fprintf(stderr,
+                 "p50cacheservice: armed queue expiry %lld ms, stop %lld ms, after code=%u;"
+                 " queued ended at stop%+lld/%+lld/%+lld us\n",
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     late_elapsed).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     stop_elapsed).count()),
+                 static_cast<unsigned>(after.code),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                     queued_done[0] - stopped_at).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                     queued_done[1] - stopped_at).count()),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+                     queued_done[2] - stopped_at).count()));
+    CHECK(window_parked && still_parked);
+    for (const auto& result : late)
+        CHECK(expired(result));
+    CHECK(late_elapsed >= std::chrono::milliseconds(900) &&
+          late_elapsed < std::chrono::seconds(3));
+    CHECK(released);
+    for (const auto& result : window)
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+    CHECK(after.code == local::SourceTransferResultCode::Committed);
+    CHECK(second_parked);
+    for (const auto& result : queued)
+        CHECK(expired(result));
+    for (const auto& done : queued_done)
+        CHECK(done >= stopped_at);
+    CHECK(stop_elapsed < std::chrono::seconds(2));
+}
+
 // Sockets only: a runtime creates its reactor descriptors lazily.
 size_t open_socket_count() {
     size_t count = 0;
@@ -3372,6 +3501,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::strcmp(argv[1], "--f-live-capacity") == 0) {
             test_f_live_session_overflow_from_two_c_runtimes();
             test_reopen_busy_waits_only_for_the_same_f_store();
+            test_armed_window_queue_expiry_and_stop();
             return 0;
         }
         CHECK(argc == 1);

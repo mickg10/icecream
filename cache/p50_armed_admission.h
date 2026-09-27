@@ -31,7 +31,9 @@ namespace icecc::p50::service {
    saturated far F, a large TU (a long compile) that queued behind hundreds of
    small ones is admitted first instead of whenever it wins a polling race,
    and no waiter is overtaken by anything that arrived more than kMaxHeadStart
-   after it, which keeps every wait well inside the source budget.  */
+   after it.  That bounds the reordering only: a waiter still waits for every
+   slot ahead of it, and the caller's own deadline and stop checks end a wait
+   that the queue does not.  */
 class ArmedAdmission {
 public:
     using Clock = std::chrono::steady_clock;
