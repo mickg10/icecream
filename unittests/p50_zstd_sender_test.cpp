@@ -12,6 +12,7 @@
 
 #include <array>
 #include <algorithm>
+#include <arpa/inet.h>
 #include <chrono>
 #include <condition_variable>
 #include <cerrno>
@@ -3541,9 +3542,36 @@ asio::awaitable<void> sender_test_heartbeat(
     }
 }
 
+std::string sender_test_tcp_tuple(int fd) {
+    sockaddr_in local{};
+    sockaddr_in peer{};
+    socklen_t local_size = sizeof(local);
+    socklen_t peer_size = sizeof(peer);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &local_size) != 0 ||
+        ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_size) != 0 ||
+        local.sin_family != AF_INET || peer.sin_family != AF_INET)
+        throw std::runtime_error("D03 could not read the EAGAIN socket tuple");
+    char local_address[INET_ADDRSTRLEN] = {};
+    char peer_address[INET_ADDRSTRLEN] = {};
+    if (!::inet_ntop(AF_INET, &local.sin_addr, local_address,
+                     sizeof(local_address)) ||
+        !::inet_ntop(AF_INET, &peer.sin_addr, peer_address,
+                     sizeof(peer_address)))
+        throw std::runtime_error("D03 could not format the EAGAIN socket tuple");
+    char tuple[96] = {};
+    const int size = std::snprintf(
+        tuple, sizeof(tuple), "%s:%u->%s:%u", local_address,
+        static_cast<unsigned>(ntohs(local.sin_port)), peer_address,
+        static_cast<unsigned>(ntohs(peer.sin_port)));
+    if (size <= 0 || static_cast<size_t>(size) >= sizeof(tuple))
+        throw std::runtime_error("D03 EAGAIN socket tuple formatting overflow");
+    return std::string(tuple, static_cast<size_t>(size));
+}
+
 void run_p51_sender_writer_backpressure_case(
     ProfileId profile, bool retire_while_reader_and_writer_held = false,
-    bool resume_after_backpressure = false) {
+    bool resume_after_backpressure = false,
+    bool shrink_send_buffer_before_body = false) {
     CHECK(!(retire_while_reader_and_writer_held && resume_after_backpressure));
     ScopedP50Diagnostics diagnostics;
     constexpr size_t kLargeRawBytes = 512U << 10;
@@ -3589,6 +3617,11 @@ void run_p51_sender_writer_backpressure_case(
     std::atomic<bool> f_gate_returned{false};
     std::atomic<unsigned> jobs_consumed{0};
     std::atomic<int> observed_f_fd{-1};
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
+    std::atomic<int> observed_c_fd{-1};
+    std::atomic<bool> send_buffer_shrunk{false};
+    std::atomic<int> effective_shrunk_send_buffer{0};
+#endif
     std::atomic<unsigned> commit_count{0};
     std::array<std::atomic<unsigned>, 2> commits_by_tu{};
     std::atomic<unsigned> ack_count{0};
@@ -3735,11 +3768,42 @@ void run_p51_sender_writer_backpressure_case(
     sender_config.hold_r2_receipt_reader_for_test = [&] {
         return hold_receipt_reader.load(std::memory_order_acquire);
     };
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
+    if (shrink_send_buffer_before_body) {
+        sender_config.after_r2_write_fragment_for_test =
+            [&, profile](PrepareRequestKey request, const JobBind&,
+                         const Message& message, size_t offset, size_t total)
+                -> asio::awaitable<void> {
+            if (request.request_token == 31002 && offset == total &&
+                std::holds_alternative<TuBegin>(message) &&
+                !send_buffer_shrunk.exchange(true, std::memory_order_acq_rel)) {
+                const int fd = observed_c_fd.load(std::memory_order_acquire);
+                const int requested = 1024;
+                if (fd < 0 || ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                                           &requested, sizeof(requested)) != 0)
+                    throw std::runtime_error("D03 could not shrink C send buffer before BODY");
+                socklen_t option_size = sizeof(int);
+                int effective = 0;
+                if (::getsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                                 &effective, &option_size) != 0)
+                    throw std::runtime_error("D03 could not read shrunken C send buffer");
+                effective_shrunk_send_buffer.store(effective,
+                                                   std::memory_order_release);
+                const std::string tuple = sender_test_tcp_tuple(fd);
+                std::fprintf(stderr,
+                             "P51_D03_EAGAIN_ARM profile=%s tuple=%s sndbuf=%d\n",
+                             profile_name, tuple.c_str(), effective);
+            }
+            co_return;
+        };
+    }
+#else
+    (void)shrink_send_buffer_before_body;
+#endif
     auto sender = std::make_shared<P50ZstdSourceSender>(
         authority, route, PrepareRequestKey{3, 31001}, sender_config);
 
     auto c_work = asio::make_work_guard(c_context);
-    std::atomic<int> observed_c_fd{-1};
     std::atomic<unsigned> connector_calls{0};
     const tcp::endpoint remote = acceptor.local_endpoint();
     AsyncConnectedFdFactory connector = [&](auto, auto completion) {
@@ -4131,6 +4195,15 @@ void run_p51_sender_writer_backpressure_case(
         CHECK(receipts_validated.load(std::memory_order_acquire) == 2);
         CHECK(ack_count.load(std::memory_order_acquire) == 2);
         CHECK(connector_calls.load(std::memory_order_acquire) == 1);
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
+        if (shrink_send_buffer_before_body) {
+            CHECK(send_buffer_shrunk.load(std::memory_order_acquire));
+            CHECK(effective_shrunk_send_buffer.load(std::memory_order_acquire) > 0);
+            std::fprintf(stderr,
+                         "P51_D03_EAGAIN_CASE profile=%s exact=1 receipts=2 commits=2 credits=1 PASS\n",
+                         profile_name);
+        }
+#endif
     }
     CHECK(input_mismatches.load(std::memory_order_relaxed) == 0);
     CHECK(connector_calls.load(std::memory_order_acquire) <= 2);
@@ -4170,6 +4243,14 @@ void test_p51_sender_writer_backpressure_resumes() {
                                     ProfileId::ZSTD_ROUTE})
         run_p51_sender_writer_backpressure_case(profile, false, true);
 }
+
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
+void test_p51_sender_writer_backpressure_eagain_candidate() {
+    for (const ProfileId profile : {ProfileId::ZSTD_TU, ProfileId::P29V1,
+                                    ProfileId::ZSTD_ROUTE})
+        run_p51_sender_writer_backpressure_case(profile, false, true, true);
+}
+#endif
 #endif
 
 void run_p51_sender_recovery_case(bool repeat_interrupted_materialization,
@@ -7008,6 +7089,19 @@ int main(int argc, char** argv) {
         return 77;
 #endif
     }
+#if defined(ICECC_P50_ENDPOINT_TEST_HOOKS)
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--d03-kernel-eagain-candidate") {
+#if defined(__linux__)
+        test_p51_sender_writer_backpressure_eagain_candidate();
+        std::cerr << "P51_D03_KERNEL_EAGAIN_CANDIDATE_SELECTOR PASS\n";
+        return 0;
+#else
+        std::cerr << "UNSUPPORTED: D03 kernel EAGAIN witness requires Linux\n";
+        return 77;
+#endif
+    }
+#endif
     if (argc == 2 && std::string_view(argv[1]) == "--disconnected-retry") {
         test_disconnected_retry_is_bounded_and_exactly_once();
         std::cerr << "P50_SENDER_DISCONNECTED_RETRY_SELECTOR PASS\n";

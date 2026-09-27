@@ -2,6 +2,7 @@ noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecar.a libp50daemonsidecaradapter.a libp50input.a \
 	libp50adoptedoutcomewriter.a
 check_LIBRARIES = libp50endpointtesthooks.a
+EXTRA_LIBRARIES = libp50endpointfulltesthooks.a
 
 sbin_PROGRAMS = icecc-cache-service
 check_PROGRAMS = icecc-cache-service-test
@@ -74,6 +75,15 @@ libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 # by the legacy test binary and cannot provide a product cancellation path.
 libp50endpointtesthooks_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
 libp50endpointtesthooks_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_ENDPOINT_TEST_HOOKS
+
+# Full endpoint test-hook variant used only by the opt-in kernel EAGAIN
+# witness. Unlike the legacy endpoint-test archive, this includes run-cancel
+# definitions so the separate sender executable needs no production endpoint
+# archive compiled with a different macro ABI.
+libp50endpointfulltesthooks_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
+	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
+libp50endpointfulltesthooks_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
 	-DICECC_P50_ENDPOINT_TEST_HOOKS
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \

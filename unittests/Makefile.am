@@ -322,6 +322,24 @@ p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50zstdsender_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+# The syscall-level EAGAIN witness is deliberately an EXTRA_PROGRAMS target,
+# not part of TESTS or check_PROGRAMS. Its macro-enabled objects and archives
+# cannot change the default p50zstdsender executable or production libraries.
+EXTRA_PROGRAMS = p50zstdsender-eagain
+p50zstdsender_eagain_SOURCES = p50_zstd_sender_test.cpp
+p50zstdsender_eagain_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_ENDPOINT_TEST_HOOKS
+p50zstdsender_eagain_CXXFLAGS = -pthread
+p50zstdsender_eagain_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+p50zstdsender_eagain_LDADD = ../client/libp50zstdsendertesthooks.a \
+	../cache/libp50endpointfulltesthooks.a \
+	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+../client/libp50zstdsendertesthooks.a:
+	$(MAKE) -C $(top_builddir)/client libp50zstdsendertesthooks.a
+../cache/libp50endpointfulltesthooks.a:
+	$(MAKE) -C $(top_builddir)/cache libp50endpointfulltesthooks.a
+.PHONY: ../client/libp50zstdsendertesthooks.a ../cache/libp50endpointfulltesthooks.a
 .PHONY: p50zstdsender-idle-check
 p50zstdsender-idle-check: p50zstdsender
 	timeout 110s ./p50zstdsender --idle-reconnect
@@ -661,6 +679,29 @@ p50zstdsender-d03-kernel-backpressure-check:
 	$(MAKE) p50zstdsender
 	timeout 120s ./p50zstdsender --d03-kernel-backpressure-resume
 
+.PHONY: p50zstdsender-d03-kernel-eagain-check
+p50zstdsender-d03-kernel-eagain-check:
+	$(MAKE) -C $(top_builddir)/services libicecc.la
+	$(MAKE) -C $(top_builddir)/cache libp50endpointfulltesthooks.a libp50adoptedoutcomewriter.a libprotocol50.a
+	$(MAKE) -C $(top_builddir)/client libp50zstdsendertesthooks.a
+	$(MAKE) p50zstdsender-eagain
+	command -v strace >/dev/null 2>&1 || { echo "strace is required for the kernel EAGAIN witness" >&2; exit 1; }
+	sh "$(abs_top_srcdir)/dev/python.sh" --exec python "$(srcdir)/p50_eagain_trace_check.py" --self-test
+	set -eu; root=$${ICEFARM_TMPDIR:-}; \
+	test -n "$$root" || { echo "ICEFARM_TMPDIR is required for the EAGAIN witness" >&2; exit 1; }; \
+	test -d "$$root" && test -w "$$root" || { echo "ICEFARM_TMPDIR/TMPDIR must name a writable directory" >&2; exit 1; }; \
+	test_dir=$$(mktemp -d "$$root/p50-eagain.XXXXXX"); \
+	trap 'echo "EAGAIN witness artifacts: $$test_dir"' EXIT; \
+	trace_file=$$test_dir/strace.log; test_log=$$test_dir/test.log; \
+	if timeout 120s strace -f -ttt -yy -s 4096 -e trace=sendto,write \
+		-o "$$trace_file" ./p50zstdsender-eagain \
+		--d03-kernel-eagain-candidate >"$$test_log" 2>&1; then test_exit=0; \
+	else test_exit=$$?; fi; \
+	printf '%s\n' "$$test_exit" >"$$test_dir/exit"; \
+	sh "$(abs_top_srcdir)/dev/python.sh" --exec python "$(srcdir)/p50_eagain_trace_check.py" \
+		--trace "$$trace_file" --test-log "$$test_log" --exit-code "$$test_exit"; \
+	echo "EAGAIN witness validation PASS"
+
 # Opt-in end-to-end Initial cut/rearm on one F service for every profile.
 .PHONY: p50cacheservice-initial-cut-rearm-check
 p50cacheservice-initial-cut-rearm-check:
@@ -687,7 +728,7 @@ EXTRA_DIST += p51wrappercompile-run.sh
 EXTRA_DIST += p51capacity-w30-run.sh
 EXTRA_DIST += p50service-stop-pressure-run.sh
 
-EXTRA_DIST += p50service-metrics-run.sh p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50daemonpositive-p51-w30.sh p50daemonpositive-p51-multilink.sh p50daemonpositive-p51-restart.sh p50daemonpositive-p51-restart-w30.sh p50daemonpositive-p51-synthetic-scheduler-w30.sh p50daemonpositive-p51-arm-expiry.sh p50daemonpositive-p51-c03.sh p50zstdsender-source.sh
+EXTRA_DIST += p50service-metrics-run.sh p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50daemonpositive-p51-w30.sh p50daemonpositive-p51-multilink.sh p50daemonpositive-p51-restart.sh p50daemonpositive-p51-restart-w30.sh p50daemonpositive-p51-synthetic-scheduler-w30.sh p50daemonpositive-p51-arm-expiry.sh p50daemonpositive-p51-c03.sh p50zstdsender-source.sh p50_eagain_trace_check.py
 EXTRA_DIST += releaseidentity-source.sh
 EXTRA_DIST += releaseidentity-artifact.sh
 EXTRA_DIST += p50sourcearm-source.sh p50sourcearm-wait-mutants.sh p50phaseopen-source.sh

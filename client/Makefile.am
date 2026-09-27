@@ -8,6 +8,7 @@ bin_SCRIPTS = icecc-create-env icecc-test-env
 check_PROGRAMS = icecc-p50-completion-test
 
 noinst_LIBRARIES = libclient.a libp50zstdsender.a
+EXTRA_LIBRARIES = libp50zstdsendertesthooks.a
 libclient_a_SOURCES = \
         arg.cpp \
         argv.c \
@@ -68,6 +69,9 @@ libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h \
 	p50_route_owner.cpp p50_route_owner.h \
 	p50_compile_binding.cpp p50_compile_binding.h
 libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+libp50zstdsendertesthooks_a_SOURCES = $(libp50zstdsender_a_SOURCES)
+libp50zstdsendertesthooks_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_ENDPOINT_TEST_HOOKS
 
 EXTRA_DIST = $(bin_SCRIPTS) P50_ZSTD_SENDER.md
 

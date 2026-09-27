@@ -1106,6 +1106,15 @@ from a local lock cycle using trace events and a bounded outer watchdog.
 Resource assertions use both exact internal accounting and peak process/
 cgroup memory; equality between raw-vector counters and RSS is not expected.
 
+The opt-in `make -C "$BUILD/unittests" p50zstdsender-d03-kernel-eagain-check`
+is a narrow syscall-level supplement: it shrinks the real sender socket buffer,
+then uses `strace` to require a C-to-F `R2_BODY` header `sendto()` to return
+`EAGAIN` and the same bytes to succeed on retry for each profile. This proves
+the sender's kernel-backpressure resume path; it does not replace the broader
+D03 frame-cut, short-write, or reconnect matrix. It requires `strace` and a
+writable `ICEFARM_TMPDIR`; the trace, test output, and exit status are retained
+there for inspection.
+
 An Initial `LINK_STATE` response lost before C validates it is a pre-bundle
 transport cut: C may retry `Initial` only with the same immutable offer and
 prepared job, changing only to a strictly newer physical-link generation.
