@@ -12,6 +12,35 @@ retained artifact directories.
 
 ## Developer QA
 
+### Sidecar recovery budget
+
+Commit `9320f429` adapts Implementer's `45aa5d8d` correction: accepted READY
+resets the consecutive startup-attempt budget, not the monotonic launch
+identity allocator. Terminal/retry states clear stale startup deadlines.
+The separate three-restarts-per-ten-seconds limiter remains unchanged.
+Implementer's `fc165c44` already covered failure to reach READY; this branch
+adds seven-incarnation/stale-reap coverage and live adapter checks for six
+spaced incarnations and refusal of a fourth rapid replacement.
+
+Both focused executables pass as the normal unprivileged test user with fresh
+private temporary storage. Logs under
+`/tanksmall/scratch/tmp/p51-sidecar-restart-budget-run/logs/`:
+`final-lifecycle.log` SHA256
+`6bbc16a119ed04cfc86aca51bc5b6a573d41e23f5db49ad47c8cf79696fa2f6d`;
+`final-adapter.log` SHA256
+`ab4909c8632259e57bcf99998a8874b2f03da8c85aa2039960fba52e1db40ca5`.
+Removing only the READY counter reset from the corrected implementation
+reproduces fifth-launch refusal after four READY incarnations (exit 1):
+`old-control-lifecycle.log` SHA256
+`00b18c2711e425f060c0eee886582a4611ec488fc5a3d5a6a12ccb3591e0ef77`.
+This is a targeted old-behavior control, not a rebuild of the whole old branch.
+Clean product/focused builds used donor `d750ebed` on `f15a30e0` with an isolated
+2-CPU/8-GiB SDK container. Earlier build-directory/dependency and test-user
+setup failures are retained separately, not counted as product test failures.
+This addresses eventual failure to launch a successor; it does not explain
+s39's original process exits. Frozen `ca40e89f` QA and farm image `9e5692e4`
+do not contain this correction; final merged qualification remains open.
+
 ### Sidecar status diagnostics
 
 Donor `4790aaa3` adds a read-only `Cache sidecar supervisor` row to the
