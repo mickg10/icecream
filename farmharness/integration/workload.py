@@ -2082,24 +2082,10 @@ def _run_p51_receipt_window(
     with ThreadPoolExecutor(max_workers=2) as executor:
         gate_future = executor.submit(transport.invoke, gate_command)
         try:
-            ready = _p51_wait_marker(
-                farm, plan, client, factory, transport, f"{gate_dir}/ready", timeout_s=20
+            ready = _p51_wait_gate_ready(
+                farm, plan, client, factory, transport, gate_dir, gate_future,
+                timeout_s=20,
             )
-            if ready is None:
-                exit_probe = _p51_gate_call(
-                    farm, plan, client, factory, transport, "probe-gate-exit",
-                    ("/bin/sh", "-c", P51_GATE_READ_MARKER,
-                     "read-marker", f"{gate_dir}/exit"),
-                )
-                detail = "helper did not publish ready or exit"
-                if exit_probe.stdout != "__WAIT__\n":
-                    detail = f"helper exit={exit_probe.stdout.strip()}"
-                    if gate_future.done():
-                        gate_result = gate_future.result()
-                        output = (gate_result.stderr or gate_result.stdout).strip()
-                        if output:
-                            detail += f": {output[-1200:]}"
-                raise WorkloadError(f"remote P51 receipt gate did not become ready ({detail})")
             workload_future = executor.submit(transport.invoke, command)
             if gate_spec["expect_observed"]:
                 held = _p51_wait_marker(

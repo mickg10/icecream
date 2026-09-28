@@ -2464,6 +2464,99 @@ def test_p51_receipt_window_separates_driver_and_sidecar_uids(
     assert gate_commands[0]["timeout_s"] == 1800
 
 
+def test_p51_single_link_receipt_window_surfaces_helper_failure_and_drains_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan, client = _receipt_gate_stub_inputs()
+    scenario.data["workload"]["receipt_gate"]["expected_commits"] = 30
+    scenario.data["workload"]["receipt_gate"]["expect_observed"] = False
+    phases: list[str] = []
+    invoked: list[str] = []
+    helper_stderr = "p50daemonpositive: GLIBCXX_3.4.31 not found\n"
+
+    def gate_call(_farm, _plan, _client, _factory, _transport, phase, _argv, **_kwargs):
+        phases.append(phase)
+        if phase.endswith("verify-staged-helper"):
+            return CommandResult(0, "a" * 64 + "\n", "")
+        if phase.endswith("sidecar-uid"):
+            return CommandResult(0, "65534\n", "")
+        if phase.endswith("install-test-iptables"):
+            return CommandResult(0, "iptables v1.8.9 (nf_tables)\n", "")
+        if phase.endswith("prepare-control-dir"):
+            return CommandResult(0, "", "")
+        if phase.endswith("probe-gate-startup"):
+            # The helper did write its failure evidence, but the shell wrapper
+            # returns zero and therefore hides the child's exit status.
+            return CommandResult(0, json.dumps({
+                "ready": None,
+                "exit": "127\n",
+                "helper.stderr": helper_stderr,
+            }), "")
+        if phase.startswith("cleanup-"):
+            return CommandResult(0, "", "")
+        raise AssertionError(f"unexpected receipt gate call: {phase}")
+
+    class TrackingExecutor(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.submitted: list[concurrent.futures.Future] = []
+
+        def submit(self, *args, **kwargs):
+            future = super().submit(*args, **kwargs)
+            self.submitted.append(future)
+            return future
+
+    class CapturingFactory:
+        def make(self, **kwargs):
+            return SimpleNamespace(phase=kwargs["phase"])
+
+    class MaskingTransport:
+        def invoke(self, command):
+            invoked.append(command.phase)
+            if command.phase.endswith("start-gate"):
+                return CommandResult(0, "", "")
+            if command.phase.endswith("abort-client-container"):
+                return CommandResult(0, "", "")
+            raise AssertionError(f"unexpected direct transport invocation: {command.phase}")
+
+    executors: list[TrackingExecutor] = []
+
+    def tracking_executor(*args, **kwargs):
+        executor = TrackingExecutor(*args, **kwargs)
+        executors.append(executor)
+        return executor
+
+    monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
+    monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", lambda *_args: None)
+    monkeypatch.setattr(workload_module, "_driver_command", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(workload_module, "ThreadPoolExecutor", tracking_executor)
+
+    with pytest.raises(WorkloadError) as caught:
+        workload_module._run_p51_receipt_window(
+            farm, scenario, plan, client, CapturingFactory(), MaskingTransport(), "A"
+        )
+
+    message = str(caught.value)
+    assert "receipt helper exited before readiness" in message
+    assert "127\\n" in message
+    assert helper_stderr.rstrip() in message
+    assert "helper_stderr_sha256" in message
+    assert any(phase.endswith("probe-gate-startup") for phase in phases)
+    assert not any(phase.endswith("probe-gate-exit") for phase in phases)
+    assert phases[-3:] == [
+        "cleanup-abort",
+        "cleanup-release-1",
+        "cleanup-finish",
+    ]
+    assert invoked == [
+        "run.p51-receipt-window.start-gate",
+        "run.p51-receipt-window.abort-client-container",
+    ]
+    assert len(executors) == 1
+    assert len(executors[0].submitted) == 1
+    assert all(future.done() for future in executors[0].submitted)
+
+
 @pytest.mark.parametrize(
     ("gate_spec", "expected"),
     [

@@ -62,6 +62,19 @@ derived verdict in the isolated `offline-copy-r2`; the raw source run remains
 unchanged. No new live D09 run was made, and this does not qualify the separate
 held-F cache-store restart runtime.
 
+The retained external W1 startup failure exposed a one-link harness diagnostic
+gap: `_run_p51_receipt_window()` waited only for the `ready` marker, then
+performed a weaker exit probe, unlike the multilink path's startup probe. It
+now uses the shared `_p51_wait_gate_ready()` logic, which captures the helper's
+saved exit marker and stderr and drains the gate future on failure. A caller-
+level regression verifies the failure details, client abort, cleanup sequence,
+and future completion. Luna ran the focused set (4 passed) and the full Python
+integration suite (1,911 passed, 6 skipped, 166.17 s) on source base `5612f7db`
+plus this exact patch. Both changed-file hashes match this candidate working
+tree; `git diff --check` passed. This improves diagnosis of a pre-workload
+readiness failure; it does **not** establish whether the old host failure was
+the listener or iptables branch, nor qualify any external W1/W30 runtime.
+
 Plan-only W30 materialization now passes all 18 local base cells on the
 captured nas642 authority: C1F2, C2F1, C3F1, C4F1 × P29V1, ZSTD_TU, ZSTD_ROUTE.
 For C1F3/C1F4, F containers use an explicit 16-GiB cap (52 GiB / 8 CPUs and
