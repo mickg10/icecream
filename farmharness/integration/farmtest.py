@@ -105,7 +105,7 @@ try:
     from .suite_spec import SCHEMA_PATH as SUITE_SCHEMA_PATH
     from .suite_spec import SuiteSpec, SuiteSpecError, load_suite_spec
     from .verdict import F_INIT_LAUNCH_CONTRACT, evaluate_bundle, evaluate_control
-    from .workload import WorkloadError, run_workload
+    from .workload import WorkloadError, run_workload, validate_p51_iptables_bundle
 except ImportError:  # Executed as ./farmtest.py.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import newgen_farm_env
@@ -193,7 +193,7 @@ except ImportError:  # Executed as ./farmtest.py.
     from suite_spec import SCHEMA_PATH as SUITE_SCHEMA_PATH
     from suite_spec import SuiteSpec, SuiteSpecError, load_suite_spec
     from verdict import F_INIT_LAUNCH_CONTRACT, evaluate_bundle, evaluate_control
-    from workload import WorkloadError, run_workload
+    from workload import WorkloadError, run_workload, validate_p51_iptables_bundle
 
 
 PLAN_SCHEMA = "icefarm-plan-v1"
@@ -1343,6 +1343,8 @@ def run_scenario(
     up = False
     primary: BaseException | None = None
     try:
+        if scenario.data["workload"].get("driver") == "p51-receipt-window":
+            validate_p51_iptables_bundle()
         bring_up(
             farm,
             scenario,

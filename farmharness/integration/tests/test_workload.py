@@ -2581,6 +2581,40 @@ def test_p51_iptables_bundle_is_hash_checked_and_staged_in_bounded_chunks(
         )
 
 
+def test_p51_iptables_bundle_validator_checks_each_package_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "debs"
+    bundle.mkdir()
+    payloads = {
+        name: f"fixture:{name}".encode()
+        for name in workload_module.P51_IPTABLES_BUNDLE_FILES
+    }
+    manifest = (
+        "\n".join(
+            f"{hashlib.sha256(payload).hexdigest()}  {name}"
+            for name, payload in payloads.items()
+        )
+        + "\n"
+    ).encode("ascii")
+    (bundle / "SHA256SUMS").write_bytes(manifest)
+    for name, payload in payloads.items():
+        (bundle / name).write_bytes(payload)
+    first_name = workload_module.P51_IPTABLES_BUNDLE_FILES[0]
+    (bundle / first_name).write_bytes(b"corrupted package")
+    monkeypatch.setenv("ICEFARM_P51_IPTABLES_BUNDLE", str(bundle))
+    monkeypatch.setattr(
+        workload_module,
+        "P51_IPTABLES_BUNDLE_MANIFEST_SHA256",
+        hashlib.sha256(manifest).hexdigest(),
+    )
+
+    with pytest.raises(
+        WorkloadError, match=f"package hash differs from pin: {first_name}"
+    ):
+        workload_module.validate_p51_iptables_bundle()
+
+
 def test_manifest_driver_exports_boundary_dependencies_to_compiler_children(
     tmp_path: Path,
 ) -> None:

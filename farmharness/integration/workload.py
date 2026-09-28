@@ -108,6 +108,8 @@ def _p51_gate_budget(gate_spec: dict[str, Any]) -> tuple[int, int | None]:
             "P51 receipt gate command_timeout_s must leave a positive 30s cleanup margin"
         )
     return configured, helper_budget
+
+
 P51_IPTABLES_BUNDLE_FILES = (
     "iptables_1.8.9-2_amd64.deb",
     "libip6tc2_1.8.9-2_amd64.deb",
@@ -118,6 +120,62 @@ P51_IPTABLES_BUNDLE_FILES = (
     "libxtables12_1.8.9-2_amd64.deb",
     "netbase_6.4_all.deb",
 )
+
+
+def validate_p51_iptables_bundle() -> tuple[bytes, dict[str, str], dict[str, bytes]]:
+    """Read and verify the pinned P51 iptables package bundle on this host."""
+    bundle_dir = os.environ.get("ICEFARM_P51_IPTABLES_BUNDLE")
+    if not bundle_dir:
+        raise WorkloadError(
+            "P51 receipt gate requires ICEFARM_P51_IPTABLES_BUNDLE with the "
+            "pinned Debian bookworm iptables package closure"
+        )
+    root = Path(bundle_dir)
+    if not root.is_dir():
+        raise WorkloadError(
+            f"P51 iptables package bundle directory is absent: {root}"
+        )
+    try:
+        manifest = (root / "SHA256SUMS").read_bytes()
+    except OSError as exc:
+        raise WorkloadError(
+            f"cannot read P51 iptables package bundle manifest: {exc}"
+        ) from exc
+    if hashlib.sha256(manifest).hexdigest() != P51_IPTABLES_BUNDLE_MANIFEST_SHA256:
+        raise WorkloadError("P51 iptables package bundle manifest hash differs from pin")
+
+    expected: dict[str, str] = {}
+    try:
+        rows = manifest.decode("ascii").splitlines()
+        for line in rows:
+            digest, name = line.split(maxsplit=1)
+            name = name.strip()
+            if name.startswith("*"):
+                name = name[1:]
+            if name in expected:
+                raise ValueError(f"duplicate filename {name!r}")
+            expected[name] = digest
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkloadError(
+            f"P51 iptables package bundle manifest is malformed: {exc}"
+        ) from exc
+    if set(expected) != set(P51_IPTABLES_BUNDLE_FILES):
+        raise WorkloadError("P51 iptables package bundle has an unexpected file set")
+
+    payloads: dict[str, bytes] = {}
+    for name in P51_IPTABLES_BUNDLE_FILES:
+        try:
+            payload = (root / name).read_bytes()
+        except OSError as exc:
+            raise WorkloadError(
+                f"cannot read P51 iptables package bundle file {name}: {exc}"
+            ) from exc
+        if hashlib.sha256(payload).hexdigest() != expected[name]:
+            raise WorkloadError(f"P51 iptables package hash differs from pin: {name}")
+        payloads[name] = payload
+    return manifest, expected, payloads
+
+
 P51_NEGOTIATED_RE = re.compile(
     r"P51_RECEIPT_GATE_NEGOTIATED profile=([1-3]) window=([1-9][0-9]*) "
     r"epoch=([1-9][0-9]*) generation=([1-9][0-9]*)"
@@ -1787,22 +1845,7 @@ def _stage_p51_iptables_bundle(
     factory: CommandFactory,
     transport: RecordingTransport,
 ) -> None:
-    bundle_dir = os.environ.get("ICEFARM_P51_IPTABLES_BUNDLE")
-    if not bundle_dir:
-        raise WorkloadError(
-            "P51 receipt gate requires ICEFARM_P51_IPTABLES_BUNDLE with the "
-            "pinned Debian bookworm iptables package closure"
-        )
-    root = Path(bundle_dir)
-    manifest = (root / "SHA256SUMS").read_bytes()
-    if hashlib.sha256(manifest).hexdigest() != P51_IPTABLES_BUNDLE_MANIFEST_SHA256:
-        raise WorkloadError("P51 iptables package bundle manifest hash differs from pin")
-    expected: dict[str, str] = {}
-    for line in manifest.decode("ascii").splitlines():
-        digest, name = line.split(maxsplit=1)
-        expected[name.strip().lstrip("* ")] = digest
-    if set(expected) != set(P51_IPTABLES_BUNDLE_FILES):
-        raise WorkloadError("P51 iptables package bundle has an unexpected file set")
+    manifest, expected, payloads = validate_p51_iptables_bundle()
 
     remote_dir = "/results/p51-receipt-gate/debs"
     _p51_gate_call(
@@ -1812,9 +1855,7 @@ def _stage_p51_iptables_bundle(
     manifest_payload = base64.b64encode(manifest).decode("ascii")
     stage_items = [("SHA256SUMS", manifest_payload)]
     for name in P51_IPTABLES_BUNDLE_FILES:
-        payload = (root / name).read_bytes()
-        if hashlib.sha256(payload).hexdigest() != expected[name]:
-            raise WorkloadError(f"P51 iptables package hash differs from pin: {name}")
+        payload = payloads[name]
         stage_items.append((name, base64.b64encode(payload).decode("ascii")))
 
     # Keep each argv payload below Linux's per-argument limit after the

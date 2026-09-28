@@ -315,6 +315,62 @@ def test_scenario_orchestration_tears_down_after_workload_failure(
     assert order == ["up", "run", "down"]
 
 
+@pytest.mark.parametrize("bundle_state", ["missing", "invalid"])
+def test_p51_bundle_preflight_fails_before_bring_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bundle_state: str,
+) -> None:
+    farm, scenario, plan = _cell(tmp_path)
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    if bundle_state == "missing":
+        monkeypatch.delenv("ICEFARM_P51_IPTABLES_BUNDLE", raising=False)
+    else:
+        bundle = tmp_path / "invalid-bundle"
+        bundle.mkdir()
+        (bundle / "SHA256SUMS").write_text("not the pinned manifest\n", encoding="ascii")
+        monkeypatch.setenv("ICEFARM_P51_IPTABLES_BUNDLE", str(bundle))
+    monkeypatch.setattr(
+        farmtest,
+        "bring_up",
+        lambda *_args, **_kwargs: pytest.fail("bring_up ran before bundle preflight"),
+    )
+
+    with pytest.raises(
+        WorkloadError,
+        match="ICEFARM_P51_IPTABLES_BUNDLE|manifest hash differs from pin",
+    ):
+        farmtest.run_scenario(farm, scenario, plan)
+
+
+def test_p51_bundle_preflight_runs_before_bring_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, plan = _cell(tmp_path)
+    scenario.data["workload"]["driver"] = "p51-receipt-window"
+    order: list[str] = []
+    bundle = tmp_path / "stubbed-valid-bundle"
+    bundle.mkdir()
+    monkeypatch.setenv("ICEFARM_P51_IPTABLES_BUNDLE", str(bundle))
+
+    def validate_bundle():
+        order.append("validate-bundle")
+
+    class BringUpReached(Exception):
+        pass
+
+    def bring_up(*_args, **_kwargs):
+        order.append("up")
+        raise BringUpReached
+
+    monkeypatch.setattr(farmtest, "validate_p51_iptables_bundle", validate_bundle)
+    monkeypatch.setattr(farmtest, "bring_up", bring_up)
+    with pytest.raises(BringUpReached):
+        farmtest.run_scenario(farm, scenario, plan)
+
+    assert order == ["validate-bundle", "up"]
+
+
 def test_h1_preflight_refusal_becomes_a_replayable_zero_job_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
