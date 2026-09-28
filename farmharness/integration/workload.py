@@ -75,6 +75,20 @@ done'''
 P51_GATE_READ_MARKER = (
     'if test -f "$1"; then cat "$1"; else printf "__WAIT__\\n"; fi'
 )
+P51_GATE_STARTUP_PROBE = r'''import json, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+result = {}
+for name in ("ready", "exit", "helper.stderr"):
+    path = root / name
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        result[name] = None
+        continue
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        raise SystemExit("receipt helper startup evidence is not a regular file")
+    result[name] = path.read_bytes().decode("utf-8", "replace")
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))'''
 P51_IPTABLES_BUNDLE_MANIFEST_SHA256 = (
     "d1d7980ebc0b342caea791cc4fc86be4a6dcfc44f89e6884f2e4fbc69fd5568a"
 )
@@ -244,7 +258,9 @@ def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
     d09_all_r2 = (
         workload.get("driver") == "p51-receipt-window"
         and isinstance(restart, dict)
-        and restart.get("kind") == "held-f-restart-v1"
+        and restart.get("kind") in {
+            "held-f-restart-v1", "held-f-cache-store-restart-v1"
+        }
         and isinstance(receipt_gate.get("links"), list)
         and len(receipt_gate["links"]) == 2
         and receipt_gate.get("expect_observed") is True
@@ -758,6 +774,38 @@ def _p51_check_scoped_identity_marker(
     return actual
 
 
+def _p51_check_cache_store_matches_scoped_identity(
+    store_identity: Any, scoped_identity: dict[str, Any], *, phase: str,
+) -> dict[str, Any]:
+    """Require a live sidecar tuple to match the gate's C/F store witness."""
+    if not isinstance(store_identity, dict):
+        raise WorkloadError(f"D09 {phase} cache-store identity is malformed")
+    mapping = (
+        ("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", "c_store_guid"),
+        ("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", "c_store_generation"),
+        ("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", "f_store_guid"),
+        ("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION", "f_store_generation"),
+    )
+    normalized: dict[str, Any] = {}
+    for source, target in mapping:
+        raw, observed = store_identity.get(source), scoped_identity.get(target)
+        if target.endswith("_generation"):
+            if (not isinstance(raw, str) or not raw.isdigit()
+                    or type(observed) is not int or int(raw) <= 0
+                    or raw != str(int(raw)) or int(raw) != observed):
+                raise WorkloadError(
+                    f"D09 {phase} cache-store {target} differs from the receipt identity"
+                )
+            normalized[target] = int(raw)
+        else:
+            if not isinstance(raw, str) or raw != observed:
+                raise WorkloadError(
+                    f"D09 {phase} cache-store {target} differs from the receipt identity"
+                )
+            normalized[target] = raw
+    return normalized
+
+
 def _p51_link_output_check_argv(
     client: str, first_job: int, last_job: int, expected_worker: str,
     expected_endpoint: str, turn: str, *, require_retry: bool = False,
@@ -880,12 +928,17 @@ def _run_p51_receipt_window_multilink(
     # naturally reaches suffix ranges in ordinal order.
     gate_rows.sort(key=lambda row: (row["client"]["name"], row["spec"]["first_job"]))
     restart_spec = gate_spec.get("restart_extension")
+    cache_store_restart = (
+        isinstance(restart_spec, dict)
+        and restart_spec.get("kind") == "held-f-cache-store-restart-v1"
+    )
     restart_receipt: dict[str, Any] | None = None
     phase2_row: dict[str, Any] | None = None
 
     gate_futures: dict[tuple[str, str], Any] = {}
     sidecar_uids: dict[str, int] = {}
     completed = False
+    cleanup_error: BaseException | None = None
     deadline_s = max(timeout_s, int(scenario.data["timeouts"]["turn_s"]))
     try:
         # Stage/install shared helper dependencies once in each C namespace.
@@ -990,14 +1043,11 @@ def _run_p51_receipt_window_multilink(
             try:
                 for row in gate_rows:
                     client = row["client"]
-                    ready = _p51_wait_marker(
+                    ready = _p51_wait_gate_ready(
                         farm, plan, client, factory, transport,
-                        f"{row['gate_dir']}/ready", timeout_s=20,
+                        row["gate_dir"], running_gates[(client["name"], row["worker"]["name"])],
+                        timeout_s=20,
                     )
-                    if ready is None:
-                        raise WorkloadError(
-                            f"receipt gate did not become ready for {client['name']}→{row['worker']['name']}"
-                        )
                 running_workloads = {
                     name: executor.submit(transport.invoke, command)
                     for name, command in driver_commands.items()
@@ -1085,9 +1135,15 @@ def _run_p51_receipt_window_multilink(
                         row for row in gate_rows
                         if (row["spec"]["client"], row["spec"]["worker"]) == healthy_key
                     )
-                    restart_receipt = event_controller.stop_worker_for_receipt_gate(
-                        affected["worker"], turn
-                    )
+                    if cache_store_restart:
+                        restart_receipt = event_controller.stop_cache_store_for_receipt_gate(
+                            affected["worker"], turn,
+                            expected_scoped_identity=affected_row["identity"],
+                        )
+                    else:
+                        restart_receipt = event_controller.stop_worker_for_receipt_gate(
+                            affected["worker"], turn
+                        )
                     stop_observed_ms = int(time.time_ns() // 1_000_000)
                     affected_client = affected_row["client"]
                     affected_gate_dir = affected_row["gate_dir"]
@@ -1268,14 +1324,19 @@ def _run_p51_receipt_window_multilink(
                         argv=phase2_argv,
                     )
                     phase2_future = executor.submit(transport.invoke, phase2_command)
-                    phase2_ready = _p51_wait_marker(
+                    phase2_ready = _p51_wait_gate_ready(
                         farm, plan, client, factory, transport,
-                        f"{phase2_dir}/ready", timeout_s=20,
+                        phase2_dir, phase2_future, timeout_s=20,
                     )
-                    if phase2_ready is None:
-                        raise WorkloadError("D09 replacement F receipt gate did not become ready while F was stopped")
                     stopped_interval_ms = int(time.time_ns() // 1_000_000) - stop_observed_ms
-                    restart_receipt = event_controller.start_worker_for_receipt_gate(restart_receipt)
+                    if cache_store_restart:
+                        restart_receipt = event_controller.start_cache_store_for_receipt_gate(
+                            restart_receipt
+                        )
+                    else:
+                        restart_receipt = event_controller.start_worker_for_receipt_gate(
+                            restart_receipt
+                        )
                     restart_receipt["old_gate_loss"] = old_gate_loss
                     restart_receipt["old_cohort_drain"] = {
                         "client": affected["client"],
@@ -1319,6 +1380,12 @@ def _run_p51_receipt_window_multilink(
                         and phase2_identity["f_store_generation"] == affected_row["identity"]["f_store_generation"]
                     ):
                         raise WorkloadError("D09 F restart reused the old F store identity")
+                    if cache_store_restart:
+                        _p51_check_cache_store_matches_scoped_identity(
+                            restart_receipt["after"]["store_identity"],
+                            phase2_identity,
+                            phase="after-sidecar-restart",
+                        )
                     _p51_gate_call(
                         farm, plan, client, factory, transport, "d09-release-phase2-window",
                         ("/usr/bin/touch", f"{phase2_dir}/release-1"),
@@ -1385,6 +1452,41 @@ def _run_p51_receipt_window_multilink(
                     ):
                         raise WorkloadError("D09 replacement F gate did not exit cleanly")
                     restart_receipt["phase2"]["gate_completed"] = True
+                def wait_for_link_output(
+                    row: Mapping[str, Any], first: int, last: int, phase_name: str,
+                ) -> bool:
+                    client = row["client"]
+                    key = (client["name"], row["worker"]["name"])
+                    endpoint = f"{row['worker']['address']}:{row['port']}"
+                    output_argv = _p51_link_output_check_argv(
+                        key[0], first, last, key[1], endpoint, turn,
+                    )
+                    output_deadline = time.monotonic() + deadline_s
+                    while time.monotonic() < output_deadline:
+                        output_command = factory.make(
+                            phase=(
+                                f"run.p51-receipt-window.{phase_name}."
+                                f"{key[0]}.{key[1]}"
+                            ),
+                            host=client["host"], instance=client["name"],
+                            transport=_docker_transport(farm, client["host"]),
+                            timeout_s=20,
+                            argv=docker_argv(farm, client["host"], (
+                                "exec", "--user", "0",
+                                f"icefarm-{plan['run_id']}-{client['name']}",
+                                *output_argv,
+                            )),
+                        )
+                        output_result = transport.invoke(output_command)
+                        if _p51_link_outputs_complete(
+                            output_result.stdout,
+                            client=key[0], first_job=first, last_job=last,
+                            expected_worker=key[1], expected_endpoint=endpoint,
+                        ):
+                            return True
+                        time.sleep(0.2)
+                    return False
+
                 for row_index, row in enumerate([] if restart_spec is not None else gate_rows):
                     client = row["client"]
                     gate_dir = row["gate_dir"]
@@ -1401,40 +1503,11 @@ def _run_p51_receipt_window_multilink(
                     if released is None:
                         raise WorkloadError(f"receipt gate release was not acknowledged for {key}")
                     first, last = row["spec"]["first_job"], row["spec"]["last_job"]
-                    output_argv = _p51_link_output_check_argv(
-                        key[0], first, last, key[1],
-                        f"{row['worker']['address']}:{row['port']}", turn,
-                    )
-                    output_deadline = time.monotonic() + deadline_s
-                    while time.monotonic() < output_deadline:
-                        output_command = factory.make(
-                            phase=f"run.p51-receipt-window.check-link-output.{key[0]}.{key[1]}",
-                            host=client["host"], instance=client["name"],
-                            transport=_docker_transport(farm, client["host"]),
-                            timeout_s=20,
-                            argv=docker_argv(farm, client["host"], (
-                                "exec", "--user", "0",
-                                f"icefarm-{plan['run_id']}-{client['name']}",
-                                *output_argv,
-                            )),
-                        )
-                        output_result = transport.invoke(output_command)
-                        if _p51_link_outputs_complete(
-                            output_result.stdout,
-                            client=key[0], first_job=first, last_job=last,
-                            expected_worker=key[1],
-                            expected_endpoint=f"{row['worker']['address']}:{row['port']}",
-                        ):
-                            break
-                        time.sleep(0.2)
-                    else:
+                    if not wait_for_link_output(row, first, first, "first-output"):
                         raise WorkloadError(
-                            f"exact output progress did not complete for released link {key}"
+                            f"first exact output did not complete for released link {key}"
                         )
-                    output_progress.append({
-                        "client": key[0], "worker": key[1], "first_job": first,
-                        "last_job": last, "verified": True,
-                    })
+                    held_siblings: list[dict[str, str]] = []
                     # Prove un-released sibling links remained held while this
                     # link made output progress.
                     for sibling in gate_rows[row_index + 1:]:
@@ -1501,6 +1574,34 @@ def _run_p51_receipt_window_multilink(
                             exit_marker=("present" if marker_state.group(2) == "1" else None),
                             outputs_complete=sibling_outputs_complete,
                         )
+                        held_siblings.append({
+                            "client": sibling_key[0], "worker": sibling_key[1],
+                            "held_marker": "present", "released": False, "exited": False,
+                            "full_outputs_complete": False,
+                        })
+                    output_progress.append({
+                        "stage": "first-output-before-next-release",
+                        "client": key[0], "worker": key[1], "first_job": first,
+                        "last_job": first, "verified": True,
+                        "held_siblings": held_siblings,
+                    })
+
+                # Do not keep a later link's window held while an earlier link
+                # compiles its full range. Once every first exact output has
+                # been witnessed, release-order liveness is established; now
+                # verify every complete declared range under the same deadline.
+                for row in ([] if restart_spec is not None else gate_rows):
+                    key = (row["client"]["name"], row["worker"]["name"])
+                    first, last = row["spec"]["first_job"], row["spec"]["last_job"]
+                    if not wait_for_link_output(row, first, last, "full-range"):
+                        raise WorkloadError(
+                            f"exact full output range did not complete for released link {key}"
+                        )
+                    output_progress.append({
+                        "stage": "full-range-after-all-releases",
+                        "client": key[0], "worker": key[1], "first_job": first,
+                        "last_job": last, "verified": True,
+                    })
 
                 manifest_jobs = (
                     int(farm.data["corpora"][workload["corpus"]]["tus"])
@@ -1589,7 +1690,10 @@ def _run_p51_receipt_window_multilink(
                         "after_restart": True,
                     })
                 if restart_spec is not None and restart_receipt is not None:
-                    restart_receipt["schema"] = "icefarm-p51-held-f-restart-v1"
+                    restart_receipt["schema"] = (
+                        "icefarm-p51-held-f-cache-store-restart-v1"
+                        if cache_store_restart else "icefarm-p51-held-f-restart-v1"
+                    )
                 completed = True
             finally:
                 for row in gate_rows:
@@ -1627,10 +1731,8 @@ def _run_p51_receipt_window_multilink(
                             )
                         except BaseException:
                             pass
-                # A failure between stopping and authenticated restart must not
-                # strand the selected worker.  The start operation accepts the
-                # exact stop receipt and is idempotent if start succeeded but
-                # a later readiness check raised.
+                # Cleanup is idempotent and bound to the immutable stop receipt:
+                # start may have resumed the parent before readiness failed.
                 if (
                     restart_spec is not None
                     and restart_receipt is not None
@@ -1638,11 +1740,14 @@ def _run_p51_receipt_window_multilink(
                     and event_controller is not None
                 ):
                     try:
-                        event_controller.start_worker_for_receipt_gate(restart_receipt)
+                        if cache_store_restart:
+                            event_controller.ensure_cache_store_parent_resumed_for_receipt_gate(
+                                restart_receipt
+                            )
+                        else:
+                            event_controller.start_worker_for_receipt_gate(restart_receipt)
                     except BaseException as exc:
-                        raise WorkloadError(
-                            "D09 cleanup could not restore the stopped F worker"
-                        ) from exc
+                        cleanup_error = exc
 
         evidence = {
             "profile": expected_profile,
@@ -1652,7 +1757,11 @@ def _run_p51_receipt_window_multilink(
             "restart_extension": restart_receipt if restart_spec is not None else "pending-not-run",
         }
         return summaries, evidence
-    except BaseException:
+    except BaseException as primary_error:
+        if cleanup_error is not None and hasattr(primary_error, "add_note"):
+            primary_error.add_note(
+                f"D09 cleanup could not restore the stopped worker: {cleanup_error}"
+            )
         if not completed:
             for row in gate_rows:
                 try:
@@ -1664,6 +1773,11 @@ def _run_p51_receipt_window_multilink(
                 except BaseException:
                     pass
         raise
+
+    if cleanup_error is not None:
+        raise WorkloadError(
+            f"D09 cleanup could not restore the stopped worker: {cleanup_error}"
+        ) from cleanup_error
 
 
 def _stage_p51_iptables_bundle(
@@ -1759,6 +1873,70 @@ def _p51_wait_marker(
             return result.stdout
         time.sleep(0.2)
     return None
+
+
+def _p51_wait_gate_ready(
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    client: dict[str, Any],
+    factory: CommandFactory,
+    transport: RecordingTransport,
+    gate_dir: str,
+    gate_future: Any,
+    *,
+    timeout_s: int,
+) -> str:
+    """Wait for readiness, but surface helper death and retained stderr immediately."""
+    deadline = time.monotonic() + timeout_s
+    latest: dict[str, str | None] = {"ready": None, "exit": None, "helper.stderr": None}
+
+    def failure_detail(reason: str) -> str:
+        detail: dict[str, Any] = {"reason": reason, "markers": latest}
+        stderr = latest.get("helper.stderr")
+        if isinstance(stderr, str):
+            raw = stderr.encode("utf-8", "replace")
+            detail["helper_stderr_sha256"] = hashlib.sha256(raw).hexdigest()
+            detail["helper_stderr_bytes"] = len(raw)
+            detail["helper_stderr_tail"] = raw[-8192:].decode("utf-8", "replace")
+        if gate_future.done():
+            try:
+                result = gate_future.result()
+            except BaseException as exc:
+                detail["invocation_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                detail["invocation_returncode"] = result.returncode
+                if result.returncode != 0:
+                    detail["invocation_stderr"] = result.stderr[-8192:]
+        return json.dumps(detail, sort_keys=True, separators=(",", ":"))
+
+    while time.monotonic() < deadline:
+        probe = _p51_gate_call(
+            farm, plan, client, factory, transport, "probe-gate-startup",
+            ("/usr/bin/python3", "-c", P51_GATE_STARTUP_PROBE, gate_dir),
+            timeout_s=10,
+        )
+        try:
+            value = json.loads(probe.stdout)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WorkloadError(f"receipt helper startup probe returned malformed evidence: {exc}") from exc
+        if not isinstance(value, dict) or set(value) != {"ready", "exit", "helper.stderr"}:
+            raise WorkloadError("receipt helper startup probe returned an invalid evidence shape")
+        if any(item is not None and not isinstance(item, str) for item in value.values()):
+            raise WorkloadError("receipt helper startup probe returned non-text evidence")
+        latest = value
+        if latest["exit"] is not None:
+            raise WorkloadError("receipt helper exited before readiness: " + failure_detail("exit-marker"))
+        if gate_future.done():
+            raise WorkloadError(
+                "receipt helper command completed without readiness: "
+                + failure_detail("future-complete")
+            )
+        if latest["ready"] is not None:
+            return latest["ready"]
+        time.sleep(min(0.2, max(0.001, deadline - time.monotonic())))
+    raise WorkloadError(
+        "receipt helper readiness timed out: " + failure_detail("ready-deadline")
+    )
 
 
 def _run_p51_receipt_window(

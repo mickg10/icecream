@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -1094,6 +1095,7 @@ def snapshot(pid):
     ]
     status = (root / "status").read_text(encoding="ascii")
     uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+    uids = [int(value) for value in uid_line.split()[1:5]]
     try:
         executable = os.readlink(root / "exe")
         executable_evidence = "proc-exe"
@@ -1221,6 +1223,324 @@ print(json.dumps({
     "route_owner_count": len(owners),
     "schema": "icefarm-client-route-snapshot-v1",
 }, sort_keys=True))
+'''.strip()
+
+CACHE_STORE_IDENTITY_SCRIPT = r'''
+import json, os, pathlib, sys
+
+daemon_exe, sidecar_exe = sys.argv[1:]
+
+def snapshot(pid):
+    root = pathlib.Path("/proc") / str(pid)
+    raw = (root / "stat").read_text(encoding="ascii")
+    fields = raw.rsplit(") ", 1)[1].split()
+    argv = [value.decode("utf-8", "surrogateescape") for value in
+            (root / "cmdline").read_bytes().split(b"\0") if value]
+    status = (root / "status").read_text(encoding="ascii")
+    uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+    uids = [int(value) for value in uid_line.split()[1:5]]
+    comm = (root / "comm").read_text(encoding="ascii").rstrip("\n")
+    try:
+        executable = os.readlink(root / "exe")
+        evidence = "proc-exe"
+    except PermissionError as exc:
+        if exc.errno != 13 or not argv or not argv[0].startswith("/"):
+            raise
+        executable = argv[0]
+        evidence = "proc-cmdline+comm"
+    return {
+        "argv": argv, "comm": comm, "exe": executable, "exe_evidence": evidence,
+        "pid": pid, "ppid": int(fields[1]), "start_ticks": int(fields[19]),
+        "state": fields[0], "uid": uids[0], "uids": uids,
+    }
+
+def store_identity(argv):
+    names = {
+        "--generation": "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
+        "--attempt": "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+        "--c-store-guid": "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID",
+        "--f-store-guid": "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID",
+        "--f-store-generation": "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION",
+        "--store-derivation-version": "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION",
+        "--socket": "ICECC_CACHE_SERVICE_EXPECTED_SOCKET",
+    }
+    values = {}
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag in names:
+            key = names[flag]
+            if key in values or index + 1 >= len(argv):
+                raise SystemExit("cache-store argv has missing or duplicate identity arguments")
+            values[key] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    if set(values) != set(names.values()):
+        raise SystemExit("cache-store argv lacks complete identity arguments")
+    return values
+
+def daemon_cache_config(argv, expected_service):
+    values = {}
+    names = {
+        "--cache-service": "service",
+        "--cache-runtime-dir": "runtime_dir",
+    }
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag in names:
+            key = names[flag]
+            if key in values or index + 1 >= len(argv):
+                raise SystemExit("iceccd argv has missing or duplicate cache configuration")
+            values[key] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    if (set(values) != set(names.values()) or values["service"] != expected_service
+            or not values["runtime_dir"].startswith("/")
+            or pathlib.PurePosixPath(values["runtime_dir"]).as_posix() != values["runtime_dir"]
+            or values["runtime_dir"] == "/"):
+        raise SystemExit("iceccd argv lacks the expected cache service/runtime directory")
+    return values
+
+def validate_pair(daemon, sidecar):
+    config = daemon_cache_config(daemon["argv"], sidecar_exe)
+    identity = store_identity(sidecar["argv"])
+    expected_socket = (config["runtime_dir"] + "/attempt-"
+        + identity["ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT"] + "-"
+        + identity["ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"] + "/cache.sock")
+    if (sidecar["ppid"] != daemon["pid"] or sidecar["uids"] != daemon["uids"]
+            or identity["ICECC_CACHE_SERVICE_EXPECTED_SOCKET"] != expected_socket):
+        raise SystemExit("cache sidecar is not bound to the configured daemon runtime identity")
+    return identity
+
+def matching(executable):
+    result = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            item = snapshot(int(entry.name))
+        except (FileNotFoundError, PermissionError, ProcessLookupError, StopIteration, ValueError):
+            continue
+        if item["state"] not in {"Z", "X"} and item["argv"] and item["comm"] == item["argv"][0].rsplit("/", 1)[-1][:15] and (
+            item["exe"] == executable
+            or (
+                item["exe_evidence"] == "proc-cmdline+comm"
+                and item["argv"] and item["argv"][0] == executable
+            )
+        ):
+            result.append(item)
+    return result
+
+daemons = matching(daemon_exe)
+sidecar_rows = matching(sidecar_exe)
+sidecars = []
+store_environment = None
+if len(sidecar_rows) == 1:
+    sidecar = dict(sidecar_rows[0])
+    store_environment = validate_pair(daemons[0], sidecar) if len(daemons) == 1 else None
+    sidecars.append(sidecar)
+ready = (
+    len(daemons) == 1 and len(sidecars) == 1
+    and store_environment is not None
+)
+print(json.dumps({
+    "daemon": daemons[0] if len(daemons) == 1 else None,
+    "daemon_count": len(daemons), "ready": ready,
+    "sidecar": sidecars[0] if len(sidecars) == 1 else None,
+    "sidecar_count": len(sidecars), "store_environment": store_environment,
+    "schema": "icefarm-cache-store-process-v1",
+}, sort_keys=True))
+'''.strip()
+
+CACHE_STORE_CONTROL_SCRIPT = r'''
+import json, os, pathlib, signal, sys, time
+
+daemon_exe, sidecar_exe, operation = sys.argv[1:4]
+daemon_expected, sidecar_expected = map(json.loads, sys.argv[4:6])
+
+def store_identity(argv):
+    names = {
+        "--generation": "generation",
+        "--attempt": "attempt",
+        "--c-store-guid": "c_store_guid",
+        "--f-store-guid": "f_store_guid",
+        "--f-store-generation": "f_store_generation",
+        "--store-derivation-version": "derivation_version",
+        "--socket": "socket",
+    }
+    values = {}
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag in names:
+            key = names[flag]
+            if key in values or index + 1 >= len(argv):
+                raise SystemExit("cache-store argv has missing or duplicate identity arguments")
+            values[key] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    if set(values) != set(names.values()):
+        raise SystemExit("cache-store argv lacks complete identity arguments")
+    return values
+
+def daemon_cache_config(argv):
+    values = {}
+    names = {"--cache-service": "service", "--cache-runtime-dir": "runtime_dir"}
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag in names:
+            key = names[flag]
+            if key in values or index + 1 >= len(argv):
+                raise SystemExit("iceccd argv has missing or duplicate cache configuration")
+            values[key] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    if (set(values) != set(names.values()) or values["service"] != sidecar_exe
+            or not values["runtime_dir"].startswith("/")
+            or pathlib.PurePosixPath(values["runtime_dir"]).as_posix() != values["runtime_dir"]
+            or values["runtime_dir"] == "/"):
+        raise SystemExit("iceccd argv lacks the expected cache service/runtime directory")
+    return values
+
+def validate_pair(daemon_value, sidecar_value):
+    config = daemon_cache_config(daemon_value["argv"])
+    identity = store_identity(sidecar_value["argv"])
+    expected_socket = (config["runtime_dir"] + "/attempt-"
+        + identity["attempt"] + "-" + identity["c_store_guid"] + "/cache.sock")
+    if (sidecar_value["ppid"] != daemon_value["pid"]
+            or sidecar_value["uids"] != daemon_value["uids"]
+            or identity["socket"] != expected_socket):
+        raise SystemExit("cache sidecar is not bound to the configured daemon runtime identity")
+    return identity
+
+def snapshot(pid):
+    root = pathlib.Path("/proc") / str(pid)
+    raw = (root / "stat").read_text(encoding="ascii")
+    fields = raw.rsplit(") ", 1)[1].split()
+    argv = [value.decode("utf-8", "surrogateescape") for value in
+            (root / "cmdline").read_bytes().split(b"\0") if value]
+    try:
+        executable = os.readlink(root / "exe")
+        evidence = "proc-exe"
+    except PermissionError as exc:
+        if exc.errno != 13 or not argv or not argv[0].startswith("/"):
+            raise
+        executable = argv[0]
+        evidence = "proc-cmdline+comm"
+    status = (root / "status").read_text(encoding="ascii")
+    uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+    uids = [int(value) for value in uid_line.split()[1:5]]
+    return {
+        "argv": argv, "comm": (root / "comm").read_text(encoding="ascii").rstrip("\n"),
+        "exe": executable, "exe_evidence": evidence,
+        "pid": pid, "ppid": int(fields[1]), "start_ticks": int(fields[19]),
+        "state": fields[0], "uid": uids[0], "uids": uids,
+    }
+
+def exact(expected, executable):
+    expected_argv = expected.get("argv")
+    if (not isinstance(expected_argv, list) or not expected_argv
+            or any(not isinstance(item, str) or "\0" in item for item in expected_argv)):
+        raise SystemExit("cache-store control received a malformed process argv snapshot")
+    value = snapshot(expected["pid"])
+    if value["state"] in {"Z", "X"}:
+        raise SystemExit("cache-store control target is already exited")
+    identity_fields = ("pid", "ppid", "start_ticks", "exe", "exe_evidence",
+                       "comm", "uid", "uids", "argv")
+    if (any(value.get(key) != expected.get(key) for key in identity_fields)
+            or value["exe"] != executable
+            or value["exe_evidence"] not in {"proc-exe", "proc-cmdline+comm"}
+            or value["comm"] != expected["argv"][0].rsplit("/", 1)[-1][:15]
+            or not value["argv"] or value["argv"][0] != executable):
+        differing = [key for key in identity_fields if value.get(key) != expected.get(key)]
+        raise SystemExit("process identity changed before cache-store control: " + ",".join(differing))
+    if expected.get("pid") == sidecar_expected.get("pid"):
+        # Parsing validates exactly one copy of every identity field, so the
+        # whole store tuple is rechecked immediately before pidfd signaling.
+        store_identity(value["argv"])
+    return value
+
+daemon = exact(daemon_expected, daemon_exe)
+validate_pair(daemon, sidecar_expected)
+if operation == "stop-sidecar":
+    sidecar = exact(sidecar_expected, sidecar_exe)
+    validate_pair(daemon, sidecar)
+    if daemon["state"] in "Tt":
+        raise SystemExit("cache-store daemon/sidecar ownership is not stoppable")
+    daemon_fd = os.pidfd_open(daemon["pid"], 0)
+    sidecar_fd = os.pidfd_open(sidecar["pid"], 0)
+    stop_signal_sent = False
+    sidecar_killed = False
+    try:
+        current_daemon = exact(daemon_expected, daemon_exe)
+        current_sidecar = exact(sidecar_expected, sidecar_exe)
+        if (current_daemon != daemon or current_sidecar != sidecar):
+            raise SystemExit("cache-store process changed before stop signal")
+        validate_pair(current_daemon, current_sidecar)
+        signal.pidfd_send_signal(daemon_fd, signal.SIGSTOP)
+        stop_signal_sent = True
+        deadline = time.monotonic() + 3.0
+        stopped = None
+        while time.monotonic() < deadline:
+            try:
+                stopped = snapshot(daemon["pid"])
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            if stopped["state"] in "Tt":
+                break
+            time.sleep(0.01)
+        if (
+            stopped is None
+            or stopped["state"] not in "Tt"
+            or any(stopped[key] != daemon[key] for key in
+                   ("pid", "ppid", "start_ticks", "exe", "exe_evidence", "comm", "uid", "uids", "argv"))
+        ):
+            raise SystemExit("cache-store daemon did not stop as the same process")
+        current_daemon = exact(daemon_expected, daemon_exe)
+        current_sidecar = exact(sidecar_expected, sidecar_exe)
+        if current_sidecar != sidecar:
+            raise SystemExit("cache-store sidecar changed while parent stopped")
+        validate_pair(current_daemon, current_sidecar)
+        signal.pidfd_send_signal(sidecar_fd, signal.SIGKILL)
+        sidecar_killed = True
+    finally:
+        if stop_signal_sent and not sidecar_killed:
+            try:
+                signal.pidfd_send_signal(daemon_fd, signal.SIGCONT)
+            except (ProcessLookupError, PermissionError):
+                pass
+        os.close(sidecar_fd)
+        os.close(daemon_fd)
+    print(json.dumps({
+        "daemon": daemon, "operation": operation, "sidecar": sidecar,
+        "parent_stopped": True, "sidecar_kill_sent": True,
+        "schema": "icefarm-cache-store-control-v1",
+    }, sort_keys=True))
+elif operation in {"resume-parent", "ensure-parent-running"}:
+    daemon_fd = os.pidfd_open(daemon["pid"], 0)
+    try:
+        if exact(daemon_expected, daemon_exe) != daemon:
+            raise SystemExit("cache-store parent changed before resume signal")
+        already_running = daemon["state"] not in "Tt"
+        if operation == "resume-parent" and already_running:
+            raise SystemExit("cache-store parent is not stopped before resume")
+        if not already_running:
+            signal.pidfd_send_signal(daemon_fd, signal.SIGCONT)
+    finally:
+        os.close(daemon_fd)
+    print(json.dumps({
+        "daemon": daemon, "operation": operation, "resumed": True,
+        "already_running": already_running,
+        "schema": "icefarm-cache-store-control-v1",
+    }, sort_keys=True))
+else:
+    raise SystemExit("unsupported cache-store control operation")
 '''.strip()
 
 CLIENT_ROUTE_READINESS_SCRIPT = r'''
@@ -1644,6 +1964,9 @@ class EventProducer:
         self._last_job: int | None = None
         self._baseline_dispatches: tuple[int, ...] = ()
         self._dispatch_count = 0
+        self._cache_store_stop_receipts: dict[str, dict[str, Any]] = {}
+        self._cache_store_active_stop_tokens: dict[tuple[Any, ...], str] = {}
+        self._cache_store_lifecycle_lock = threading.RLock()
         self._job_trigger_floor = 0
         # For bounded disk-fill faults, remember the dispatch ceiling that
         # crossed the trigger and wait for those pre-event jobs to terminate.
@@ -4737,6 +5060,48 @@ class EventProducer:
             )
         )
 
+    @staticmethod
+    def _valid_cache_store_process_snapshot(value: Any, executable: str) -> bool:
+        """Authenticate the restricted service account via exe or cmdline+comm."""
+        if not isinstance(value, dict) or set(value) != {
+            "argv", "comm", "exe", "exe_evidence", "pid", "ppid", "start_ticks",
+            "state", "uid", "uids",
+        }:
+            return False
+        argv = value.get("argv")
+        if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+            return False
+        expected_comm = argv[0].rsplit("/", 1)[-1][:15]
+        common_valid = (
+            value.get("comm") == expected_comm
+            and value.get("state") not in {"Z", "X"}
+            and argv[0] == executable
+            and all(isinstance(item, str) and "\0" not in item for item in argv)
+            and all(
+                type(value.get(field)) is int and value[field] >= minimum
+                for field, minimum in (("pid", 1), ("ppid", 0), ("start_ticks", 1), ("uid", 0))
+            )
+            and isinstance(value.get("uids"), list)
+            and len(value["uids"]) == 4
+            and all(type(uid) is int and uid >= 0 for uid in value["uids"])
+            and value["uid"] == value["uids"][0]
+        )
+        if not common_valid:
+            return False
+        return (
+            value.get("exe") == executable
+            and value.get("exe_evidence") == "proc-exe"
+        ) or (
+            value.get("exe") == value["argv"][0]
+            and value.get("exe_evidence") == "proc-cmdline+comm"
+        )
+
+    @staticmethod
+    def _same_process_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        """Compare immutable /proc identity, deliberately excluding state."""
+        fields = ("pid", "ppid", "start_ticks", "exe", "exe_evidence", "comm", "uid", "uids", "argv")
+        return all(left.get(field) == right.get(field) for field in fields)
+
     def _signal_client_route_owner(self, instance: Mapping[str, Any]) -> dict[str, Any]:
         try:
             return self._signal_client_route_owner_impl(instance)
@@ -4843,6 +5208,142 @@ class EventProducer:
                 or snapshot["route_owner"]["uid"] != snapshot["daemon"]["uid"]):
             raise EventError("client route snapshot lacks one authenticated daemon/owner pair")
         return {"daemon": snapshot["daemon"], "route_owner": snapshot["route_owner"]}
+
+    def _cache_store_process_snapshot(
+        self, instance: Mapping[str, Any], container_id: str
+    ) -> dict[str, Any]:
+        """Read exact sidecar process and its declared C/F store identities."""
+        result = self._invoke(self.factory.make(
+            phase="event.receipt-gate-cache-store-snapshot",
+            host=instance["host"], instance=instance["name"],
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, instance["host"], (
+                "exec", "--user", "0", container_id, "python3", "-c",
+                CACHE_STORE_IDENTITY_SCRIPT,
+                "/opt/icecream/sbin/iceccd",
+                "/opt/icecream/sbin/icecc-cache-service",
+            )),
+        ))
+        try:
+            snapshot = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("cache-store process snapshot returned malformed JSON") from exc
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot) != {
+                "daemon", "daemon_count", "ready", "sidecar", "sidecar_count",
+                "store_environment", "schema"
+            }
+            or snapshot.get("schema") != "icefarm-cache-store-process-v1"
+            or snapshot.get("ready") is not True
+            or snapshot.get("daemon_count") != 1
+            or snapshot.get("sidecar_count") != 1
+        ):
+            raise EventError("cache-store process snapshot lacks one authenticated daemon/sidecar pair")
+        daemon = snapshot["daemon"]
+        sidecar = snapshot["sidecar"]
+        if (
+            not self._valid_cache_store_process_snapshot(daemon, "/opt/icecream/sbin/iceccd")
+            or not self._valid_cache_store_process_snapshot(
+                sidecar, "/opt/icecream/sbin/icecc-cache-service"
+            )
+            or sidecar.get("ppid") != daemon.get("pid")
+            or sidecar.get("uids") != daemon.get("uids")
+        ):
+            raise EventError("cache-store process snapshot has an invalid daemon/sidecar owner")
+        identity = snapshot.get("store_environment")
+        if (
+            not isinstance(identity, dict)
+            or set(identity) != {
+                "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
+                "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+                "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID",
+                "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID",
+                "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION",
+                "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION",
+                "ICECC_CACHE_SERVICE_EXPECTED_SOCKET",
+            }
+            or any(
+                not identity.get(key, "").isdigit()
+                or int(identity[key]) <= 0
+                for key in (
+                    "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
+                    "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+                    "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION",
+                )
+            )
+            or re.fullmatch(r"[0-9a-f]{32}", identity.get("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", "")) is None
+            or identity.get("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID") == "0" * 32
+            or re.fullmatch(r"[0-9a-f]{32}", identity.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", "")) is None
+            or identity.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID") == "0" * 32
+            or not identity.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION", "").isdigit()
+            or int(identity["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"]) <= 0
+            or not isinstance(identity.get("ICECC_CACHE_SERVICE_EXPECTED_SOCKET"), str)
+        ):
+            raise EventError("cache-store process snapshot has missing or malformed store identity")
+        daemon_argv = daemon["argv"]
+        sidecar_argv = sidecar["argv"]
+        def option_values(argv: list[str], option: str) -> list[str]:
+            values: list[str] = []
+            index = 1
+            while index < len(argv):
+                if argv[index] == option:
+                    if index + 1 >= len(argv):
+                        return []
+                    values.append(argv[index + 1])
+                    index += 2
+                else:
+                    index += 1
+            return values
+        service_paths = option_values(daemon_argv, "--cache-service")
+        runtime_dirs = option_values(daemon_argv, "--cache-runtime-dir")
+        sidecar_sockets = option_values(sidecar_argv, "--socket")
+        expected_socket = (
+            f"{runtime_dirs[0]}/attempt-"
+            f"{identity['ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT']}-"
+            f"{identity['ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID']}/cache.sock"
+            if len(runtime_dirs) == 1 else ""
+        )
+        if (
+            service_paths != ["/opt/icecream/sbin/icecc-cache-service"]
+            or len(runtime_dirs) != 1 or not runtime_dirs[0].startswith("/")
+            or PurePosixPath(runtime_dirs[0]).as_posix() != runtime_dirs[0]
+            or runtime_dirs[0] == "/"
+            or sidecar_sockets != [expected_socket]
+            or identity["ICECC_CACHE_SERVICE_EXPECTED_SOCKET"] != expected_socket
+            or expected_socket == ""
+        ):
+            raise EventError("cache-store process snapshot has an unbound daemon/socket identity")
+        return {"daemon": daemon, "sidecar": sidecar, "store_identity": dict(identity)}
+
+    @staticmethod
+    def _cache_store_identity_matches_scoped_marker(
+        store_identity: Mapping[str, Any], scoped_identity: Mapping[str, Any]
+    ) -> bool:
+        """Bind a live cache-service tuple to the exact gate identity marker."""
+        pairs = (
+            ("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", "c_store_guid"),
+            ("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", "c_store_generation"),
+            ("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", "f_store_guid"),
+            ("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION", "f_store_generation"),
+        )
+        if any(
+            store_key not in store_identity or marker_key not in scoped_identity
+            for store_key, marker_key in pairs
+        ):
+            return False
+        for source, target in pairs:
+            raw = store_identity[source]
+            observed = scoped_identity[target]
+            if target.endswith("_generation"):
+                if (not isinstance(raw, str) or not raw.isdigit()
+                        or type(observed) is not int or int(raw) <= 0
+                        or raw != str(int(raw)) or int(raw) != observed):
+                    return False
+            elif not isinstance(raw, str) or raw != observed:
+                return False
+        return True
 
     def _client_route_state(self, client: Mapping[str, Any]) -> dict[str, Any]:
         """Atomically authenticate C identity around an exact-ID process read."""
@@ -5358,6 +5859,541 @@ class EventProducer:
             "readiness_baseline": readiness_baseline,
             "scheduler_baseline": scheduler_baseline,
         }
+
+    def restart_scheduler_for_receipt_gate(self, name: str, turn: str) -> dict[str, Any]:
+        """Restart one authenticated S without pausing the held receipt-gate client."""
+        with self._lock:
+            if self._active_turn != turn:
+                raise EventError("receipt-gate scheduler restart is outside its active turn")
+        _container, instance = self._container(name)
+        if instance.get("role") != "S":
+            raise EventError("receipt-gate scheduler restart target is not an S instance")
+        state = self._state[name]
+        expected_runtime = str(runtime_root(self.farm, instance | {"image": state["image"]}))
+        before = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if before.get("running") is not True or not before.get("started_at"):
+            raise EventError("receipt-gate scheduler restart has no authenticated running pre-state")
+        readiness_baseline = self._readiness_baseline(instance)
+        self._invoke(self.factory.make(
+            phase="event.receipt-gate-restart-scheduler",
+            host=instance["host"], instance=name,
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(
+                self.farm, instance["host"],
+                ("container", "restart", "--time", "10", before["id"]),
+            ),
+        ))
+        after = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if (
+            after.get("id") != before.get("id")
+            or after.get("running") is not True
+            or not isinstance(after.get("started_at"), str)
+            or after.get("started_at") == before.get("started_at")
+        ):
+            raise EventError("receipt-gate scheduler restart lacks a fresh authenticated incarnation")
+        readiness = self._readiness_witness(instance, readiness_baseline)
+        deadline = min(
+            self._start + self.deadline_s,
+            self.monotonic() + float(self.scenario.data["timeouts"]["up_s"]),
+        )
+        scheduler_snapshot = _wait_scheduler(
+            self.farm, self.plan, self.recorder, self.factory,
+            deadline=deadline, monotonic=self.monotonic, sleeper=time.sleep,
+        )
+        worker_snapshot = _wait_workers(
+            self.farm, self.plan, self.recorder, self.factory,
+            deadline=deadline, monotonic=self.monotonic, sleeper=time.sleep,
+        )
+        return {
+            "schema": "icefarm-receipt-scheduler-restart-v1",
+            "instance": name,
+            "turn": turn,
+            "before": {"container_id": before["id"], "started_at": before["started_at"]},
+            "after": {"container_id": after["id"], "started_at": after["started_at"], "running": True},
+            "coordination": {
+                "readiness": readiness,
+                "scheduler_snapshot": scheduler_snapshot,
+                "worker_snapshot": worker_snapshot,
+            },
+        }
+
+    def _cache_store_control(
+        self, instance: Mapping[str, Any], container_id: str,
+        operation: str, daemon: Mapping[str, Any], sidecar: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if operation not in {"stop-sidecar", "resume-parent", "ensure-parent-running"}:
+            raise EventError("unsupported receipt-gate cache-store control operation")
+        result = self._invoke(self.factory.make(
+            phase=f"event.receipt-gate-cache-store-{operation}",
+            host=instance["host"], instance=instance["name"],
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, instance["host"], (
+                "exec", "--user", "0", container_id, "python3", "-c",
+                CACHE_STORE_CONTROL_SCRIPT,
+                "/opt/icecream/sbin/iceccd",
+                "/opt/icecream/sbin/icecc-cache-service",
+                operation,
+                json.dumps(dict(daemon), sort_keys=True, separators=(",", ":")),
+                json.dumps(dict(sidecar), sort_keys=True, separators=(",", ":")),
+            )),
+        ))
+        try:
+            receipt = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("cache-store control returned malformed JSON") from exc
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema") != "icefarm-cache-store-control-v1"
+            or receipt.get("operation") != operation
+            or not isinstance(receipt.get("daemon"), dict)
+        ):
+            raise EventError("cache-store control returned an invalid receipt")
+        return receipt
+
+    @staticmethod
+    def _cache_store_stop_receipt_fingerprint(receipt: Mapping[str, Any]) -> str:
+        payload = {
+            key: receipt[key]
+            for key in (
+                "instance", "role", "turn", "container", "before", "control",
+                "readiness_baseline", "coordination",
+            )
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _cache_store_stop_target_key(receipt: Mapping[str, Any]) -> tuple[Any, ...]:
+        container = receipt.get("container")
+        before = receipt.get("before")
+        daemon = before.get("daemon") if isinstance(before, Mapping) else None
+        if not isinstance(container, Mapping) or not isinstance(daemon, Mapping):
+            raise EventError("cache-store stop receipt lacks target identity")
+        container_id = container.get("container_id")
+        pid, start_ticks = daemon.get("pid"), daemon.get("start_ticks")
+        if (
+            not isinstance(receipt.get("instance"), str)
+            or not isinstance(container_id, str)
+            or type(pid) is not int or pid <= 0
+            or type(start_ticks) is not int or start_ticks <= 0
+        ):
+            raise EventError("cache-store stop receipt has malformed target identity")
+        return (receipt["instance"], container_id, pid, start_ticks)
+
+    def _consume_cache_store_stop_token(self, receipt: Mapping[str, Any]) -> None:
+        token = receipt.get("stop_token")
+        key = self._cache_store_stop_target_key(receipt)
+        with self._lock:
+            entry = self._cache_store_stop_receipts.get(token) if isinstance(token, str) else None
+            if entry is None or entry.get("state") != "active":
+                raise EventError("cache-store stop token is not active")
+            if self._cache_store_active_stop_tokens.get(key) != token:
+                raise EventError("cache-store stop token was superseded")
+            entry["state"] = "consumed"
+            self._cache_store_active_stop_tokens.pop(key, None)
+
+    def _validate_cache_store_stop_receipt(self, receipt: Mapping[str, Any]) -> None:
+        if not isinstance(receipt, Mapping) or set(receipt) != {
+            "schema", "stop_token", "instance", "role", "turn", "container", "before",
+            "control", "readiness_baseline", "coordination",
+        } or receipt.get("schema") != "icefarm-receipt-cache-store-stop-v1":
+            raise EventError("cache-store stop receipt has an invalid shape")
+        token = receipt.get("stop_token")
+        if not isinstance(token, str) or len(token) < 32:
+            raise EventError("cache-store stop receipt lacks its producer token")
+        with self._lock:
+            expected = self._cache_store_stop_receipts.get(token)
+        try:
+            actual = self._cache_store_stop_receipt_fingerprint(receipt)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EventError("cache-store stop receipt identity is malformed") from exc
+        try:
+            target_key = self._cache_store_stop_target_key(expected["receipt"])
+        except (KeyError, TypeError, EventError) as exc:
+            raise EventError("producer cache-store stop token is malformed") from exc
+        with self._lock:
+            active = self._cache_store_active_stop_tokens.get(target_key)
+        if (
+            expected is None
+            or expected.get("state") != "active"
+            or active != token
+            or not secrets.compare_digest(actual, expected["fingerprint"])
+        ):
+            raise EventError("cache-store stop receipt identity was changed or is stale")
+
+    def _producer_cache_store_stop_snapshot(
+        self, receipt: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool, str]:
+        token = receipt.get("stop_token") if isinstance(receipt, Mapping) else None
+        if not isinstance(token, str):
+            raise EventError("cache-store cleanup receipt has no producer token")
+        with self._lock:
+            entry = self._cache_store_stop_receipts.get(token)
+        if entry is None:
+            raise EventError("cache-store cleanup token is unknown or stale")
+        pinned = entry["receipt"]
+        if any(receipt.get(key) != pinned.get(key) for key in ("instance", "role", "turn", "container")):
+            raise EventError("cache-store cleanup target fields changed; manual recovery is required")
+        key = self._cache_store_stop_target_key(pinned)
+        with self._lock:
+            newer = self._cache_store_active_stop_tokens.get(key)
+        if entry.get("state") == "consumed":
+            if newer is not None and newer != token:
+                raise EventError("cache-store cleanup token is stale; a newer stop is active")
+            return pinned, True, "consumed"
+        if entry.get("state") != "active" or newer != token:
+            raise EventError("cache-store cleanup token is unknown or stale")
+        # If target binding itself was edited, do not restore any process: the
+        # caller may have substituted a different live container. Process
+        # snapshot/control edits with the same exact target can still be
+        # recovered from the producer-owned copy below.
+        try:
+            fingerprint = self._cache_store_stop_receipt_fingerprint(receipt)
+        except (KeyError, TypeError, ValueError):
+            fingerprint = ""
+        intact = (
+            set(receipt) == {
+                "schema", "stop_token", "instance", "role", "turn", "container",
+                "before", "control", "readiness_baseline", "coordination",
+            }
+            and secrets.compare_digest(fingerprint, entry["fingerprint"])
+        )
+        return pinned, intact, "active"
+
+    def stop_cache_store_for_receipt_gate(
+        self, name: str, turn: str,
+        expected_scoped_identity: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._cache_store_lifecycle_lock:
+            return self._stop_cache_store_for_receipt_gate(
+                name, turn, expected_scoped_identity
+            )
+
+    def _stop_cache_store_for_receipt_gate(
+        self, name: str, turn: str,
+        expected_scoped_identity: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stop one daemon parent and kill only its authenticated cache sidecar."""
+        with self._lock:
+            if self._active_turn != turn:
+                raise EventError("receipt-gate cache-store restart is outside its active turn")
+        _container, instance = self._container(name)
+        role = instance.get("role")
+        if role not in {"C", "F"}:
+            raise EventError("receipt-gate cache-store restart target must be C or F")
+        state = self._state[name]
+        expected_runtime = str(runtime_root(self.farm, instance | {"image": state["image"]}))
+        before_container = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if before_container.get("running") is not True:
+            raise EventError("receipt-gate cache-store restart has no authenticated running container")
+        container_id = before_container["id"]
+        before = self._cache_store_process_snapshot(instance, container_id)
+        if (
+            not isinstance(expected_scoped_identity, Mapping)
+            or not self._cache_store_identity_matches_scoped_marker(
+                before["store_identity"], expected_scoped_identity
+            )
+        ):
+            raise EventError(
+                "cache-store process identity does not match the held receipt marker"
+            )
+        readiness_baseline = self._readiness_baseline(instance)
+        route_before = self._client_route_state_from_inspect(instance, before_container)
+        if (
+            before["daemon"]["pid"] != route_before["daemon"]["pid"]
+            or before["daemon"]["start_ticks"] != route_before["daemon"]["start_ticks"]
+            or before["sidecar"]["pid"] != route_before["route_owner"]["pid"]
+            or before["sidecar"]["start_ticks"] != route_before["route_owner"]["start_ticks"]
+        ):
+            raise EventError("cache-store process identity changed before restart signal")
+        target_key = (
+            name, container_id, before["daemon"]["pid"], before["daemon"]["start_ticks"]
+        )
+        with self._lock:
+            if target_key in self._cache_store_active_stop_tokens:
+                raise EventError("cache-store daemon already has an active stop token")
+        try:
+            control = self._cache_store_control(
+                instance, container_id, "stop-sidecar", before["daemon"], before["sidecar"]
+            )
+            if (
+                set(control) != {
+                    "daemon", "operation", "parent_stopped", "sidecar",
+                    "sidecar_kill_sent", "schema",
+                }
+                or control.get("parent_stopped") is not True
+                or control.get("sidecar_kill_sent") is not True
+                or not self._same_process_identity(control["daemon"], before["daemon"])
+                or not self._same_process_identity(control["sidecar"], before["sidecar"])
+                or control["daemon"].get("state") not in {"T", "t"}
+            ):
+                raise EventError("cache-store stop did not hold the exact daemon and kill its child")
+        except BaseException:
+            # If control output is lost after SIGSTOP, restore only the same
+            # authenticated daemon before propagating the failure.
+            try:
+                self._cache_store_control(
+                    instance, container_id, "resume-parent", before["daemon"], before["sidecar"]
+                )
+            except BaseException:
+                self._mark_failure("event.receipt-gate-cache-store-resume-cleanup", EventError(name))
+            raise
+        try:
+            after_container = self._inspect(
+                name, expected_runtime=expected_runtime, expected_env=state["env"]
+            )
+            if (
+                after_container.get("id") != container_id
+                or after_container.get("running") is not True
+                or after_container.get("started_at") != before_container.get("started_at")
+            ):
+                raise EventError("cache-store stop changed its owning daemon container")
+            stop_receipt = {
+                "schema": "icefarm-receipt-cache-store-stop-v1",
+                "stop_token": secrets.token_urlsafe(32),
+                "instance": name,
+                "role": role,
+                "turn": turn,
+                "container": {
+                    "container_id": container_id,
+                    "started_at": before_container["started_at"],
+                    "preserved": True,
+                },
+                "before": before,
+                "control": control,
+                "readiness_baseline": readiness_baseline,
+                "coordination": {
+                    "route_before": route_before,
+                },
+            }
+            with self._lock:
+                self._cache_store_stop_receipts[stop_receipt["stop_token"]] = {
+                    "fingerprint": self._cache_store_stop_receipt_fingerprint(stop_receipt),
+                    "receipt": json.loads(json.dumps(stop_receipt)),
+                    "state": "active",
+                }
+                self._cache_store_active_stop_tokens[target_key] = stop_receipt["stop_token"]
+            return stop_receipt
+        except BaseException:
+            try:
+                self._cache_store_control(
+                    instance, container_id, "resume-parent", before["daemon"], before["sidecar"]
+                )
+            except BaseException:
+                self._mark_failure("event.receipt-gate-cache-store-resume-cleanup", EventError(name))
+            raise
+
+    def start_cache_store_for_receipt_gate(
+        self, stopped_receipt: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        with self._cache_store_lifecycle_lock:
+            return self._start_cache_store_for_receipt_gate(stopped_receipt)
+
+    def _start_cache_store_for_receipt_gate(
+        self, stopped_receipt: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Resume the exact daemon and authenticate its replacement sidecar/store."""
+        name = stopped_receipt.get("instance")
+        turn = stopped_receipt.get("turn")
+        with self._lock:
+            if not isinstance(name, str) or self._active_turn != turn:
+                raise EventError("cache-store start receipt is outside its active turn")
+        self._validate_cache_store_stop_receipt(stopped_receipt)
+        _container, instance = self._container(name)
+        role = instance.get("role")
+        if role not in {"C", "F"} or stopped_receipt.get("role") != role:
+            raise EventError("cache-store restart target role changed")
+        state = self._state[name]
+        expected_runtime = str(runtime_root(self.farm, instance | {"image": state["image"]}))
+        container = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        before_container = stopped_receipt["container"]
+        before = stopped_receipt["before"]
+        if (
+            not isinstance(before_container, Mapping)
+            or container.get("id") != before_container.get("container_id")
+            or container.get("started_at") != before_container.get("started_at")
+            or container.get("running") is not True
+        ):
+            raise EventError("cache-store start changed its authenticated container")
+        control = self._cache_store_control(
+            instance, container["id"], "resume-parent",
+            before["daemon"], before["sidecar"],
+        )
+        if (
+            set(control) != {"daemon", "operation", "resumed", "already_running", "schema"}
+            or control.get("resumed") is not True
+            or control.get("already_running") is not False
+            or not self._same_process_identity(control["daemon"], before["daemon"])
+        ):
+            raise EventError("cache-store start did not resume the exact daemon")
+        deadline = min(
+            self._start + self.deadline_s,
+            self.monotonic() + float(self.scenario.data["timeouts"]["up_s"]),
+        )
+        after = None
+        last_error: BaseException | None = None
+        while self.monotonic() < deadline:
+            try:
+                candidate = self._cache_store_process_snapshot(instance, container["id"])
+            except EventError as exc:
+                last_error = exc
+            else:
+                if candidate["daemon"] != before["daemon"]:
+                    raise EventError("cache-store daemon changed during sidecar restart")
+                if (
+                    candidate["sidecar"]["pid"] != before["sidecar"]["pid"]
+                    or candidate["sidecar"]["start_ticks"] != before["sidecar"]["start_ticks"]
+                ):
+                    after = candidate
+                    break
+            self._wake.wait(timeout=min(self.poll_interval_s, max(0.001, deadline - self.monotonic())))
+            self._wake.clear()
+        if after is None:
+            raise EventTimeout(
+                f"cache sidecar did not publish a fresh identity for {name!r}: {last_error}"
+            )
+        readiness = self._wait_scheduler_client_readiness(
+            instance,
+            stopped_receipt["readiness_baseline"],
+            route_before=stopped_receipt["coordination"]["route_before"],
+        )
+        after_container = self._inspect(
+            name, expected_runtime=expected_runtime, expected_env=state["env"]
+        )
+        if (
+            after_container.get("id") != container["id"]
+            or after_container.get("running") is not True
+            or after_container.get("started_at") != container.get("started_at")
+        ):
+            raise EventError("cache-store replacement changed its owning daemon container")
+        old_identity = before["store_identity"]
+        new_identity = after["store_identity"]
+        c_key = "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"
+        f_key = "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"
+        f_generation_key = "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"
+        c_generation_key = "ICECC_CACHE_SERVICE_EXPECTED_GENERATION"
+        changed_store = c_key if role == "C" else f_key
+        preserved_store = f_key if role == "C" else c_key
+        changed_generation = c_generation_key if role == "C" else f_generation_key
+        preserved_generation = f_generation_key if role == "C" else c_generation_key
+        if (
+            old_identity[changed_store] == new_identity[changed_store]
+            or old_identity[changed_generation] == new_identity[changed_generation]
+            or old_identity[preserved_store] != new_identity[preserved_store]
+            or old_identity[preserved_generation] != new_identity[preserved_generation]
+        ):
+            raise EventError("cache-store replacement did not rotate only its selected store identity")
+        restart_receipt = {
+            "schema": "icefarm-receipt-cache-store-restart-v1",
+            "instance": name,
+            "role": role,
+            "turn": turn,
+            "container": {
+                "container_id": container["id"],
+                "started_at": container["started_at"],
+                "preserved": True,
+            },
+            "container_before": {
+                "container_id": before_container["container_id"],
+                "started_at": before_container["started_at"],
+                "running": True,
+            },
+            "container_after": {
+                "container_id": after_container["id"],
+                "started_at": after_container["started_at"],
+                "running": True,
+            },
+            "before": before,
+            "after": after,
+            "control": control,
+            "coordination": {
+                "readiness": readiness,
+                "replaced_store": role,
+                "preserved_store": "F" if role == "C" else "C",
+                "parent_resumed_before_replacement_readiness": True,
+            },
+        }
+        self._consume_cache_store_stop_token(stopped_receipt)
+        return restart_receipt
+
+    def ensure_cache_store_parent_resumed_for_receipt_gate(
+        self, stopped_receipt: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        with self._cache_store_lifecycle_lock:
+            return self._ensure_cache_store_parent_resumed_for_receipt_gate(stopped_receipt)
+
+    def _ensure_cache_store_parent_resumed_for_receipt_gate(
+        self, stopped_receipt: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Idempotently restore only the daemon pinned by a stop receipt."""
+        trusted_receipt, receipt_intact, token_state = self._producer_cache_store_stop_snapshot(stopped_receipt)
+        name, turn = trusted_receipt.get("instance"), trusted_receipt.get("turn")
+        with self._lock:
+            if not isinstance(name, str) or self._active_turn != turn:
+                raise EventError("cache-store cleanup is outside its active turn")
+        _container, instance = self._container(name)
+        if instance.get("role") not in {"C", "F"} or trusted_receipt.get("role") != instance.get("role"):
+            raise EventError("cache-store cleanup target role changed")
+        container_pin = trusted_receipt.get("container")
+        before = trusted_receipt.get("before")
+        if not isinstance(container_pin, Mapping) or not isinstance(before, Mapping):
+            raise EventError("cache-store cleanup receipt lacks immutable pins")
+        daemon, sidecar = before.get("daemon"), before.get("sidecar")
+        if not isinstance(daemon, Mapping) or not isinstance(sidecar, Mapping):
+            raise EventError("cache-store cleanup receipt lacks process identities")
+        state = self._state[name]
+        expected_runtime = str(runtime_root(self.farm, instance | {"image": state["image"]}))
+        container = self._inspect(name, expected_runtime=expected_runtime, expected_env=state["env"])
+        if (
+            container.get("id") != container_pin.get("container_id")
+            or container.get("started_at") != container_pin.get("started_at")
+            or container.get("running") is not True
+        ):
+            raise EventError("cache-store cleanup refuses to signal a replacement container")
+        if token_state == "consumed":
+            current = self._cache_store_process_snapshot(instance, container["id"])
+            if not self._same_process_identity(current["daemon"], daemon) or current["daemon"].get("state") not in {"S", "R", "D", "I"}:
+                raise EventError("cache-store cleanup token was already consumed but daemon is not restored")
+            return {
+                "container_id": container["id"],
+                "daemon": current["daemon"],
+                "already_running": True,
+                "schema": "icefarm-receipt-cache-store-parent-restored-v1",
+            }
+        receipt = self._cache_store_control(
+            instance, container["id"], "ensure-parent-running", daemon, sidecar
+        )
+        if (
+            set(receipt) != {"daemon", "operation", "resumed", "already_running", "schema"}
+            or receipt.get("schema") != "icefarm-cache-store-control-v1"
+            or receipt.get("operation") != "ensure-parent-running"
+            or receipt.get("resumed") is not True
+            or type(receipt.get("already_running")) is not bool
+            or not self._same_process_identity(receipt["daemon"], daemon)
+        ):
+            raise EventError("cache-store cleanup did not restore the exact daemon")
+        restored = {
+            "container_id": container["id"],
+            "daemon": receipt["daemon"],
+            "already_running": receipt["already_running"],
+            "schema": "icefarm-receipt-cache-store-parent-restored-v1",
+        }
+        self._consume_cache_store_stop_token(trusted_receipt)
+        if not receipt_intact:
+            raise EventError(
+                "cache-store stop receipt was mutated; producer-pinned daemon was restored"
+            )
+        return restored
 
     def start_worker_for_receipt_gate(self, stopped_receipt: Mapping[str, Any]) -> dict[str, Any]:
         """Restart the exact stopped F and authenticate fresh readiness/rejoin."""

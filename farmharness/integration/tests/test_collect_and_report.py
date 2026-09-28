@@ -61,6 +61,8 @@ from farmharness.integration.collect import (
     _validate_preexposure_redispatches,
     _validate_orphan_recovery_markers,
     _validate_p51_held_f_restart_receipt,
+    _validate_p51_held_f_cache_store_restart_receipt,
+    _validate_p51_receipt_release_progress,
     _warm_hint_overrides,
     collect_bundle,
     load_verified_bundle,
@@ -5605,6 +5607,72 @@ def _d09_collector_fixture(*, affected_second: bool = True):
     return receipt, scenario, observations
 
 
+def _ordinary_multilink_release_fixture():
+    _d09_receipt, scenario, _observations = _d09_collector_fixture()
+    gate = scenario.data["workload"]["receipt_gate"]
+    gate.pop("restart_extension")
+    links = gate["links"]
+    receipt = {"turns": [{
+        "turn": "A",
+        "p51_receipt_window": {
+            "links": [],
+            "release_order_output_progress": [
+                {
+                    "stage": "first-output-before-next-release",
+                    "client": "C1", "worker": "F1", "first_job": 1,
+                    "last_job": 1, "verified": True,
+                    "held_siblings": [{
+                        "client": "C1", "worker": "F2", "held_marker": "present",
+                        "released": False, "exited": False,
+                        "full_outputs_complete": False,
+                    }],
+                },
+                {
+                    "stage": "first-output-before-next-release",
+                    "client": "C1", "worker": "F2", "first_job": 40,
+                    "last_job": 40, "verified": True, "held_siblings": [],
+                },
+                {
+                    "stage": "full-range-after-all-releases",
+                    "client": "C1", "worker": "F1", "first_job": 1,
+                    "last_job": 39, "verified": True,
+                },
+                {
+                    "stage": "full-range-after-all-releases",
+                    "client": "C1", "worker": "F2", "first_job": 40,
+                    "last_job": 69, "verified": True,
+                },
+            ],
+        },
+    }]}
+    return receipt, scenario
+
+
+def test_ordinary_multilink_release_requires_first_output_then_full_ranges() -> None:
+    receipt, scenario = _ordinary_multilink_release_fixture()
+    _validate_p51_receipt_release_progress(receipt, scenario)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing-first", "wrong-early-range", "sibling-released", "missing-full-range"]
+)
+def test_ordinary_multilink_release_rejects_incomplete_or_misordered_witnesses(
+    mutation: str,
+) -> None:
+    receipt, scenario = _ordinary_multilink_release_fixture()
+    progress = receipt["turns"][0]["p51_receipt_window"]["release_order_output_progress"]
+    if mutation == "missing-first":
+        progress.pop(0)
+    elif mutation == "wrong-early-range":
+        progress[0]["last_job"] = 39
+    elif mutation == "sibling-released":
+        progress[0]["held_siblings"][0]["released"] = True
+    else:
+        progress.pop()
+    with pytest.raises(CollectError):
+        _validate_p51_receipt_release_progress(receipt, scenario)
+
+
 @pytest.mark.parametrize("affected_second", [False, True])
 def test_d09_collector_binds_exact_affected_link_in_either_order(affected_second: bool) -> None:
     receipt, scenario, observations = _d09_collector_fixture(affected_second=affected_second)
@@ -5649,3 +5717,90 @@ def test_d09_collector_rejects_unbound_restart_evidence(mutation: str) -> None:
         restart["phase2"]["identity"] = ["not", "a", "mapping"]
     with pytest.raises(CollectError):
         _validate_p51_held_f_restart_receipt(receipt, scenario, observations)
+
+
+def _d09_cache_store_collector_fixture():
+    receipt, scenario, observations = _d09_collector_fixture()
+    gate = scenario.data["workload"]["receipt_gate"]
+    extension = gate["restart_extension"]
+    extension["kind"] = "held-f-cache-store-restart-v1"
+    restart = receipt["turns"][0]["p51_receipt_window"]["restart_extension"]
+    daemon = {
+        "pid": 1, "ppid": 0, "start_ticks": 10, "exe": "/opt/icecream/sbin/iceccd",
+        "exe_evidence": "proc-cmdline+comm", "comm": "iceccd", "uid": 65534,
+        "uids": [65534] * 4, "argv": ["/opt/icecream/sbin/iceccd", "--cache-service",
+            "/opt/icecream/sbin/icecc-cache-service", "--cache-runtime-dir", "/var/cache/p50"],
+    }
+    sidecar_before = {
+        "pid": 12, "ppid": 1, "start_ticks": 20, "exe": "/opt/icecream/sbin/icecc-cache-service",
+        "exe_evidence": "proc-cmdline+comm", "comm": "icecc-cache-ser", "uid": 65534,
+        "uids": [65534] * 4, "argv": ["/opt/icecream/sbin/icecc-cache-service"],
+    }
+    sidecar_after = {**sidecar_before, "pid": 13, "start_ticks": 21}
+    old_store = {
+        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": "a" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "1",
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": "e" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "1",
+    }
+    new_store = {
+        **old_store,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": "b" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "3",
+    }
+    new_scope = {
+        "c_store_guid": "a" * 32, "c_store_generation": 1,
+        "f_store_guid": "b" * 32, "f_store_generation": 3,
+        "relationship_id": "c" * 32, "reservation_id": "d" * 32,
+    }
+    restart.update({
+        "schema": "icefarm-p51-held-f-cache-store-restart-v1",
+        "instance": "F2",
+        "container": {"container_id": "sha256:old", "started_at": "old", "preserved": True},
+        "container_before": {"container_id": "sha256:old", "started_at": "old", "running": True},
+        "container_after": {"container_id": "sha256:old", "started_at": "old", "running": True},
+        "before": {"daemon": daemon, "sidecar": sidecar_before, "store_identity": old_store},
+        "after": {"daemon": dict(daemon), "sidecar": sidecar_after, "store_identity": new_store},
+        "coordination": {"readiness": {
+            "schema": "icefarm-client-scheduler-readiness-v2",
+            "connected_line": "Connected to scheduler (I am known as C1)",
+            "cache_fresh": True,
+            "route": {"before": {"daemon": daemon}, "after": {"daemon": daemon}},
+        }},
+        "phase2": {
+            **restart["phase2"], "identity": new_scope,
+        },
+    })
+    window = receipt["turns"][0]["p51_receipt_window"]
+    window["links"][2].update(new_scope)
+    window["release_order_output_progress"] = [
+        {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39,
+         "while_worker_stopped": "F2", "verified": True},
+        {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69,
+         "retry_worker": "F1", "while_worker_stopped": "F2",
+         "strict_retry_drain_verified": True},
+        {"client": "C1", "worker": "F2", "first_job": 70, "last_job": 100,
+         "store_restarted": True, "verified": True},
+    ]
+    return receipt, scenario, observations
+
+
+def test_d09_f_cache_store_collector_binds_process_and_scoped_identity() -> None:
+    receipt, scenario, observations = _d09_cache_store_collector_fixture()
+    _validate_p51_held_f_cache_store_restart_receipt(receipt, scenario, observations)
+
+
+@pytest.mark.parametrize("mutation", ["daemon-changed", "stale-sidecar", "old-store-mismatch", "new-store-mismatch"])
+def test_d09_f_cache_store_collector_rejects_unbound_identity(mutation: str) -> None:
+    receipt, scenario, observations = _d09_cache_store_collector_fixture()
+    restart = receipt["turns"][0]["p51_receipt_window"]["restart_extension"]
+    if mutation == "daemon-changed":
+        restart["after"]["daemon"]["start_ticks"] += 1
+    elif mutation == "stale-sidecar":
+        restart["after"]["sidecar"]["pid"] = restart["before"]["sidecar"]["pid"]
+    elif mutation == "old-store-mismatch":
+        receipt["turns"][0]["p51_receipt_window"]["links"][1]["f_store_guid"] = "0" * 32
+    else:
+        restart["after"]["store_identity"]["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"] = "f" * 32
+    with pytest.raises(CollectError):
+        _validate_p51_held_f_cache_store_restart_receipt(receipt, scenario, observations)

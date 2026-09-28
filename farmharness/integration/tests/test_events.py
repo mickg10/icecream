@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import ctypes
+import copy
 import hashlib
 import http.server
 import inspect
@@ -3909,6 +3910,40 @@ def _route_process(executable: str, pid: int, start_ticks: int, *, ppid: int) ->
     }
 
 
+def _cache_store_process_pair(*, daemon_pid: int = 1, sidecar_pid: int = 12) -> tuple[dict[str, object], dict[str, object], dict[str, str]]:
+    runtime = "/var/cache/icecream/p50-runtime"
+    c_guid, f_guid = "a" * 32, "b" * 32
+    socket = f"{runtime}/attempt-1-{c_guid}/cache.sock"
+    daemon = {
+        "argv": ["/opt/icecream/sbin/iceccd", "--cache-service",
+                 "/opt/icecream/sbin/icecc-cache-service", "--cache-runtime-dir", runtime],
+        "exe": "/opt/icecream/sbin/iceccd", "exe_evidence": "proc-cmdline+comm",
+        "comm": "iceccd", "pid": daemon_pid, "ppid": 0,
+        "start_ticks": 100, "state": "S", "uid": 65534, "uids": [65534] * 4,
+    }
+    sidecar = {
+        "argv": ["/opt/icecream/sbin/icecc-cache-service", "--peer-uid", "65534",
+                 "--peer-gid", "65534", "--socket", socket,
+                 "--generation", "7", "--attempt", "1", "--f-store-generation", "11",
+                 "--store-derivation-version", "1", "--c-store-guid", c_guid,
+                 "--f-store-guid", f_guid],
+        "exe": "/opt/icecream/sbin/icecc-cache-service",
+        "exe_evidence": "proc-cmdline+comm", "comm": "icecc-cache-ser",
+        "pid": sidecar_pid, "ppid": daemon_pid, "start_ticks": 101,
+        "state": "S", "uid": 65534, "uids": [65534] * 4,
+    }
+    identity = {
+        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "7",
+        "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT": "1",
+        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": c_guid,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": f_guid,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "11",
+        "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION": "1",
+        "ICECC_CACHE_SERVICE_EXPECTED_SOCKET": socket,
+    }
+    return daemon, sidecar, identity
+
+
 def test_route_process_snapshot_records_eacces_fallback_and_binds_argv0() -> None:
     value = _route_process("/opt/icecream/sbin/iceccd", 1, 5, ppid=0)
     assert EventProducer._valid_process_snapshot(
@@ -4078,6 +4113,709 @@ def test_client_restart_bounces_only_route_owner_after_drain(tmp_path: Path) -> 
         for command in recorder.commands
     )
     assert len(_event_log(tmp_path, scenario, farm=farm, plan=plan)) == 1
+
+
+@pytest.mark.parametrize(
+    ("role", "resume_already_running", "wrong_scoped_identity", "readiness_failure"),
+    (("C", False, False, False), ("F", False, False, False),
+     ("C", True, False, False), ("F", False, True, False),
+     ("F", False, False, True)),
+)
+def test_receipt_gate_cache_store_stop_and_resume_are_distinct_authenticated_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str,
+    resume_already_running: bool, wrong_scoped_identity: bool, readiness_failure: bool,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == role)
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    producer._start = time.monotonic()
+    daemon = _route_process("/opt/icecream/sbin/iceccd", 101, 1001, ppid=1)
+    old_sidecar = _route_process("/opt/icecream/sbin/icecc-cache-service", 102, 1002, ppid=101)
+    new_sidecar = _route_process("/opt/icecream/sbin/icecc-cache-service", 103, 1003, ppid=101)
+    c_guid = "a" * 32
+    f_guid = "b" * 32
+    replacement_guid = "c" * 32
+    identity_keys = (
+        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
+        "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID",
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID",
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION",
+        "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION",
+    )
+    before_identity = dict(zip(identity_keys, ("7", "1", c_guid, f_guid, "11", "1")))
+    if role == "C":
+        after_identity = dict(
+            zip(identity_keys, ("8", "1", replacement_guid, f_guid, "11", "1"))
+        )
+    else:
+        after_identity = dict(
+            zip(identity_keys, ("7", "1", c_guid, replacement_guid, "12", "1"))
+        )
+    snapshots = iter((
+        {"daemon": daemon, "sidecar": old_sidecar, "store_identity": before_identity},
+        {"daemon": daemon, "sidecar": new_sidecar, "store_identity": after_identity},
+    ))
+    inspect_states = iter(
+        {"id": "2" * 64, "running": True, "started_at": "2026-09-27T00:00:00Z"}
+        for _ in range(5)
+    )
+    monkeypatch.setattr(producer, "_inspect", lambda *_a, **_k: next(inspect_states))
+    monkeypatch.setattr(producer, "_cache_store_process_snapshot", lambda *_a: next(snapshots))
+    route_before = {"daemon": daemon, "route_owner": old_sidecar}
+    monkeypatch.setattr(producer, "_client_route_state_from_inspect", lambda *_a: route_before)
+    monkeypatch.setattr(producer, "_readiness_baseline", lambda *_a: {"host": "h", "path": "/tmp/log", "offset": 0})
+    monkeypatch.setattr(producer, "_client_route_state", lambda *_a: route_before)
+    monkeypatch.setattr(
+        producer,
+        "_wait_scheduler_client_readiness",
+        lambda *_a, **_k: {"schema": events_module.CLIENT_SCHEDULER_READINESS_SCHEMA,
+                           "connected_line": "Connected to scheduler (I am known as C1)",
+                           "cache_fresh": True},
+    )
+
+    controls = []
+    control_targets = []
+    parent_state = {"running": True}
+    def control(_instance, _container, operation, _daemon, expected_sidecar):
+        controls.append(operation)
+        control_targets.append((_daemon, expected_sidecar))
+        if operation == "stop-sidecar":
+            parent_state["running"] = False
+            return {
+                "schema": "icefarm-cache-store-control-v1",
+                "operation": operation,
+                "daemon": dict(daemon, state="T"),
+                "sidecar": expected_sidecar,
+                "parent_stopped": True,
+                "sidecar_kill_sent": True,
+            }
+        already_running = (
+            resume_already_running
+            if operation == "resume-parent"
+            else parent_state["running"]
+        )
+        parent_state["running"] = True
+        return {
+            "schema": "icefarm-cache-store-control-v1",
+            "operation": operation,
+            "daemon": daemon,
+            "resumed": True,
+            "already_running": already_running,
+        }
+    monkeypatch.setattr(producer, "_cache_store_control", control)
+
+    scoped_identity = {
+        "c_store_guid": c_guid, "c_store_generation": 7,
+        "f_store_guid": f_guid, "f_store_generation": 11,
+    }
+    if wrong_scoped_identity:
+        scoped_identity["f_store_guid"] = "d" * 32
+        with pytest.raises(EventError, match="does not match the held receipt marker"):
+            producer.stop_cache_store_for_receipt_gate(
+                instance["name"], "A", expected_scoped_identity=scoped_identity
+            )
+        assert controls == []
+        return
+    stopped = producer.stop_cache_store_for_receipt_gate(
+        instance["name"], "A", expected_scoped_identity=scoped_identity
+    )
+    assert controls == ["stop-sidecar"]
+    assert stopped["control"]["parent_stopped"] is True
+    assert stopped["control"]["sidecar_kill_sent"] is True
+    if readiness_failure:
+        monkeypatch.setattr(
+            producer, "_wait_scheduler_client_readiness",
+            lambda *_a, **_k: (_ for _ in ()).throw(EventTimeout("injected readiness failure")),
+        )
+        with pytest.raises(EventTimeout, match="injected readiness failure"):
+            producer.start_cache_store_for_receipt_gate(stopped)
+        # Resume succeeded, but readiness failed before start could consume the
+        # token. Workload's finally path can therefore restore it exactly once.
+        monkeypatch.setattr(
+            producer, "_inspect",
+            lambda *_a, **_k: {"id": "2" * 64, "running": True,
+                               "started_at": "2026-09-27T00:00:00Z"},
+        )
+        restored = producer.ensure_cache_store_parent_resumed_for_receipt_gate(stopped)
+        assert restored["already_running"] is True
+        assert controls == ["stop-sidecar", "resume-parent", "ensure-parent-running"]
+        assert control_targets[-1] == (stopped["before"]["daemon"], stopped["before"]["sidecar"])
+        monkeypatch.setattr(
+            producer, "_cache_store_process_snapshot",
+            lambda *_a: {"daemon": dict(daemon, state="S"), "sidecar": new_sidecar,
+                         "store_identity": after_identity},
+        )
+        replay = producer.ensure_cache_store_parent_resumed_for_receipt_gate(stopped)
+        assert replay["already_running"] is True
+        assert controls == ["stop-sidecar", "resume-parent", "ensure-parent-running"]
+        return
+    # The caller can now prove healthy-sibling progress before it resumes this
+    # exact daemon. The event helper itself makes no unsupported claim here.
+    if resume_already_running:
+        with pytest.raises(EventError, match="did not resume the exact daemon"):
+            producer.start_cache_store_for_receipt_gate(stopped)
+        assert controls == ["stop-sidecar", "resume-parent"]
+        return
+    receipt = producer.start_cache_store_for_receipt_gate(stopped)
+    assert controls == ["stop-sidecar", "resume-parent"]
+    assert receipt["schema"] == "icefarm-receipt-cache-store-restart-v1"
+    assert receipt["role"] == role
+    assert receipt["container"]["preserved"] is True
+    assert receipt["container_before"]["container_id"] == receipt["container_after"]["container_id"]
+    assert receipt["container_before"]["started_at"] == receipt["container_after"]["started_at"]
+    assert receipt["container_after"]["running"] is True
+    assert receipt["before"]["daemon"] == receipt["after"]["daemon"]
+    assert receipt["before"]["sidecar"] != receipt["after"]["sidecar"]
+    assert receipt["coordination"]["parent_resumed_before_replacement_readiness"] is True
+    # Successful start consumes the stop token. Cleanup replay is safe only as
+    # a read-only already-restored check and must not send another signal.
+    monkeypatch.setattr(
+        producer, "_cache_store_process_snapshot",
+        lambda *_a: {"daemon": dict(daemon, state="S"), "sidecar": new_sidecar,
+                     "store_identity": after_identity},
+    )
+    restored = producer.ensure_cache_store_parent_resumed_for_receipt_gate(stopped)
+    assert restored["already_running"] is True
+    assert controls == ["stop-sidecar", "resume-parent"]
+    with pytest.raises(EventError, match="identity was changed or is stale"):
+        producer.start_cache_store_for_receipt_gate(stopped)
+    assert controls == ["stop-sidecar", "resume-parent"]
+    # Stop B targets the same daemon/container tuple after A was restored.
+    # A's consumed token must not signal while B's stop is active.
+    monkeypatch.setattr(
+        producer, "_inspect",
+        lambda *_a, **_k: {"id": "2" * 64, "running": True,
+                           "started_at": "2026-09-27T00:00:00Z"},
+    )
+    monkeypatch.setattr(
+        producer, "_cache_store_process_snapshot",
+        lambda *_a: {"daemon": dict(daemon, state="S"), "sidecar": new_sidecar,
+                     "store_identity": after_identity},
+    )
+    route_after_a = {"daemon": daemon, "route_owner": new_sidecar}
+    monkeypatch.setattr(producer, "_client_route_state_from_inspect", lambda *_a: route_after_a)
+    monkeypatch.setattr(producer, "_client_route_state", lambda *_a: route_after_a)
+    stopped_b = producer.stop_cache_store_for_receipt_gate(
+        instance["name"], "A", expected_scoped_identity={
+            "c_store_guid": after_identity["ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"],
+            "c_store_generation": int(after_identity["ICECC_CACHE_SERVICE_EXPECTED_GENERATION"]),
+            "f_store_guid": after_identity["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"],
+            "f_store_generation": int(after_identity["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"]),
+        },
+    )
+    calls_before_stale_replay = list(controls)
+    with pytest.raises(EventError, match="stale; a newer stop is active"):
+        producer.ensure_cache_store_parent_resumed_for_receipt_gate(stopped)
+    assert controls == calls_before_stale_replay
+    resumed_b = producer.ensure_cache_store_parent_resumed_for_receipt_gate(stopped_b)
+    assert resumed_b["already_running"] is False
+    assert controls[-2:] == ["stop-sidecar", "ensure-parent-running"]
+    control_count_after_b = len(controls)
+    monkeypatch.setattr(
+        producer, "_cache_store_process_snapshot",
+        lambda *_a: {"daemon": dict(daemon, state="S"), "sidecar": new_sidecar,
+                     "store_identity": after_identity},
+    )
+    assert producer.ensure_cache_store_parent_resumed_for_receipt_gate(stopped_b)[
+        "already_running"
+    ] is True
+    assert len(controls) == control_count_after_b
+    old, new = receipt["before"]["store_identity"], receipt["after"]["store_identity"]
+    if role == "C":
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"] != new[
+            "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"
+        ]
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_GENERATION"] != new[
+            "ICECC_CACHE_SERVICE_EXPECTED_GENERATION"
+        ]
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"] == new[
+            "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"
+        ]
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"] == new[
+            "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"
+        ]
+    else:
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"] != new[
+            "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"
+        ]
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"] != new[
+            "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"
+        ]
+        assert old["ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"] == new[
+            "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"
+        ]
+
+
+@pytest.mark.parametrize("role", ("S", "C", "F"))
+def test_receipt_gate_cache_store_stop_rejects_wrong_role_and_turn(
+    tmp_path: Path, role: str,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == role)
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    if role == "S":
+        with pytest.raises(EventError, match="must be C or F"):
+            producer.stop_cache_store_for_receipt_gate(instance["name"], "A")
+    else:
+        with pytest.raises(EventError, match="outside its active turn"):
+            producer.stop_cache_store_for_receipt_gate(instance["name"], "B")
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+def test_cache_store_cleanup_resume_is_idempotent_and_exact_targeted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_running: bool,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "F")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    daemon = {
+        "pid": 1, "ppid": 0, "start_ticks": 11, "exe": "/opt/icecream/sbin/iceccd",
+        "exe_evidence": "proc-cmdline+comm", "comm": "iceccd", "uid": 65534,
+        "uids": [65534] * 4, "argv": ["/opt/icecream/sbin/iceccd", "--cache-service",
+        "/opt/icecream/sbin/icecc-cache-service", "--cache-runtime-dir", "/var/cache/p50"],
+    }
+    sidecar = {
+        "pid": 2, "ppid": 1, "start_ticks": 22,
+        "argv": ["/opt/icecream/sbin/icecc-cache-service", "--generation", "4"],
+    }
+    receipt = {
+        "schema": "icefarm-receipt-cache-store-stop-v1", "stop_token": "t" * 43,
+        "instance": instance["name"],
+        "role": "F", "turn": "A",
+        "container": {"container_id": "sha256:" + "a" * 64,
+                      "started_at": "2026-09-27T00:00:00Z", "preserved": True},
+        "before": {"daemon": daemon, "sidecar": sidecar},
+        "control": {}, "readiness_baseline": {}, "coordination": {},
+    }
+    producer._cache_store_stop_receipts[receipt["stop_token"]] = {
+        "fingerprint": producer._cache_store_stop_receipt_fingerprint(receipt),
+        "receipt": copy.deepcopy(receipt),
+        "state": "active",
+    }
+    producer._cache_store_active_stop_tokens[
+        producer._cache_store_stop_target_key(receipt)
+    ] = receipt["stop_token"]
+    monkeypatch.setattr(
+        producer, "_inspect",
+        lambda *_a, **_k: {"id": receipt["container"]["container_id"],
+                           "started_at": receipt["container"]["started_at"], "running": True},
+    )
+    calls = []
+
+    def control(_instance, container_id, operation, expected_daemon, expected_sidecar):
+        calls.append((container_id, operation, expected_daemon, expected_sidecar))
+        return {
+            "schema": "icefarm-cache-store-control-v1", "operation": operation,
+            "daemon": dict(daemon, state="S" if already_running else "T"),
+            "resumed": True, "already_running": already_running,
+        }
+
+    monkeypatch.setattr(producer, "_cache_store_control", control)
+    restored = producer.ensure_cache_store_parent_resumed_for_receipt_gate(receipt)
+    assert restored["already_running"] is already_running
+    assert len(calls) == 1
+    assert calls[0][:2] == (receipt["container"]["container_id"], "ensure-parent-running")
+    assert calls[0][2:] == (daemon, sidecar)
+
+
+def test_cache_store_old_consumed_token_cannot_resume_new_stop_same_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "F")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    daemon = {
+        "pid": 41, "start_ticks": 9001, "state": "T",
+        "argv": ["/opt/icecream/sbin/iceccd"],
+    }
+    sidecar = {
+        "pid": 42, "start_ticks": 9002, "ppid": 41,
+        "argv": ["/opt/icecream/sbin/icecc-cache-service"],
+    }
+    base = {
+        "schema": "icefarm-receipt-cache-store-stop-v1",
+        "instance": instance["name"], "role": "F", "turn": "A",
+        "container": {"container_id": "sha256:" + "a" * 64,
+                      "started_at": "same-container", "preserved": True},
+        "before": {"daemon": daemon, "sidecar": sidecar},
+        "control": {}, "readiness_baseline": {}, "coordination": {},
+    }
+    old = {**base, "stop_token": "old-token-" + "o" * 32}
+    new = {**base, "stop_token": "new-token-" + "n" * 32}
+    key = producer._cache_store_stop_target_key(old)
+    producer._cache_store_stop_receipts[old["stop_token"]] = {
+        "fingerprint": producer._cache_store_stop_receipt_fingerprint(old),
+        "receipt": copy.deepcopy(old), "state": "consumed",
+    }
+    producer._cache_store_stop_receipts[new["stop_token"]] = {
+        "fingerprint": producer._cache_store_stop_receipt_fingerprint(new),
+        "receipt": copy.deepcopy(new), "state": "active",
+    }
+    producer._cache_store_active_stop_tokens[key] = new["stop_token"]
+    calls = []
+    monkeypatch.setattr(producer, "_inspect", lambda *_a, **_k: calls.append("inspect"))
+    monkeypatch.setattr(producer, "_cache_store_control", lambda *_a: calls.append("signal"))
+
+    with pytest.raises(EventError, match="stale; a newer stop is active"):
+        producer.ensure_cache_store_parent_resumed_for_receipt_gate(old)
+    assert calls == []
+
+
+def test_cache_store_cleanup_refuses_malformed_receipt_or_replacement_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "F")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    base = {
+        "schema": "icefarm-receipt-cache-store-stop-v1", "stop_token": "x" * 43,
+        "instance": instance["name"],
+        "role": "F", "turn": "A",
+        "container": {"container_id": "sha256:" + "a" * 64,
+                      "started_at": "old", "preserved": True},
+        "before": {
+            "daemon": {"pid": 1, "start_ticks": 11},
+            "sidecar": {"pid": 2},
+        },
+        "control": {}, "readiness_baseline": {}, "coordination": {},
+    }
+    producer._cache_store_stop_receipts[base["stop_token"]] = {
+        "fingerprint": producer._cache_store_stop_receipt_fingerprint(base),
+        "receipt": copy.deepcopy(base),
+        "state": "active",
+    }
+    producer._cache_store_active_stop_tokens[
+        producer._cache_store_stop_target_key(base)
+    ] = base["stop_token"]
+    monkeypatch.setattr(
+        producer, "_inspect",
+        lambda *_a, **_k: {"id": base["container"]["container_id"], "started_at": "old", "running": True},
+    )
+    controls = []
+
+    def restore(_instance, container_id, operation, daemon, _sidecar):
+        controls.append((container_id, operation, daemon))
+        return {
+            "schema": "icefarm-cache-store-control-v1", "operation": operation,
+            "daemon": daemon, "resumed": True, "already_running": False,
+        }
+
+    monkeypatch.setattr(producer, "_cache_store_control", restore)
+    with pytest.raises(EventError, match="mutated; producer-pinned daemon was restored"):
+        producer.ensure_cache_store_parent_resumed_for_receipt_gate({**base, "extra": 1})
+    assert len(controls) == 1 and controls[0][1] == "ensure-parent-running"
+    controls.clear()
+    monkeypatch.setattr(
+        producer, "_inspect",
+        lambda *_a, **_k: {"id": "sha256:" + "b" * 64, "started_at": "new", "running": True},
+    )
+    with pytest.raises(EventError, match="replacement container"):
+        producer.ensure_cache_store_parent_resumed_for_receipt_gate(base)
+    assert controls == []
+
+
+@pytest.mark.parametrize("invalid_process", ("daemon", "sidecar"))
+def test_cache_store_snapshot_rejects_wrong_comm_even_with_argv_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_process: str,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "C")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    daemon = _route_process("/opt/icecream/sbin/iceccd", 101, 1001, ppid=1)
+    sidecar = _route_process("/opt/icecream/sbin/icecc-cache-service", 102, 1002, ppid=101)
+    daemon["comm"] = "iceccd"
+    sidecar["comm"] = "icecc-cache-ser"
+    daemon["comm"] = "iceccd"
+    sidecar["comm"] = "icecc-cache-ser"
+    daemon["state"] = sidecar["state"] = "S"
+    daemon["uids"] = [65534] * 4
+    sidecar["uids"] = [65534] * 4
+    if invalid_process == "daemon":
+        daemon["comm"] = "not-iceccd"
+    else:
+        sidecar["comm"] = "not-cache-service"
+    identity = {
+        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "7",
+        "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT": "1",
+        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": "a" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": "b" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "11",
+        "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION": "1",
+    }
+    result = {
+        "schema": "icefarm-cache-store-process-v1",
+        "daemon": daemon,
+        "daemon_count": 1,
+        "sidecar": sidecar,
+        "sidecar_count": 1,
+        "ready": True,
+        "store_environment": identity,
+    }
+    monkeypatch.setattr(producer, "_invoke", lambda _command: CommandResult(0, json.dumps(result), ""))
+    with pytest.raises(EventError, match="invalid daemon/sidecar owner"):
+        producer._cache_store_process_snapshot(instance, "2" * 64)
+
+
+@pytest.mark.parametrize("bad_argv", ([], None, [17], "not-an-argv"))
+def test_cache_store_process_snapshot_rejects_malformed_argv_shape(
+    bad_argv: object,
+) -> None:
+    value = {
+        "argv": bad_argv,
+        "comm": "iceccd", "exe": "/opt/icecream/sbin/iceccd",
+        "exe_evidence": "proc-exe", "pid": 1, "ppid": 0,
+        "start_ticks": 1, "state": "S", "uid": 65534, "uids": [65534] * 4,
+    }
+    assert not EventProducer._valid_cache_store_process_snapshot(
+        value, "/opt/icecream/sbin/iceccd"
+    )
+
+
+def test_cache_store_snapshot_accepts_verified_pid1_parent_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "C")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    daemon, sidecar, identity = _cache_store_process_pair(daemon_pid=1, sidecar_pid=12)
+    assert sidecar["ppid"] == daemon["pid"] == 1
+    result = {
+        "schema": "icefarm-cache-store-process-v1", "daemon": daemon,
+        "daemon_count": 1, "sidecar": sidecar, "sidecar_count": 1,
+        "ready": True, "store_environment": identity,
+    }
+    monkeypatch.setattr(
+        producer, "_invoke", lambda _command: CommandResult(0, json.dumps(result), "")
+    )
+    observed = producer._cache_store_process_snapshot(instance, "2" * 64)
+    assert observed["daemon"]["pid"] == 1
+    assert observed["sidecar"]["ppid"] == 1
+    assert observed["store_identity"]["ICECC_CACHE_SERVICE_EXPECTED_SOCKET"] == (
+        "/var/cache/icecream/p50-runtime/attempt-1-" + "a" * 32 + "/cache.sock"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ("daemon-service", "duplicate-runtime", "socket-guid", "socket-attempt"),
+)
+def test_cache_store_snapshot_rejects_unbound_daemon_or_socket_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "C")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    daemon, sidecar, identity = _cache_store_process_pair()
+    if mutation == "daemon-service":
+        daemon["argv"][2] = "/tmp/unrelated-cache-service"
+    elif mutation == "duplicate-runtime":
+        daemon["argv"].extend(["--cache-runtime-dir", "/tmp/other"])
+    elif mutation == "socket-guid":
+        sidecar["argv"][6] = "/var/cache/icecream/p50-runtime/attempt-1-" + "c" * 32 + "/cache.sock"
+    else:
+        sidecar["argv"][6] = "/var/cache/icecream/p50-runtime/attempt-2-" + "a" * 32 + "/cache.sock"
+    result = {
+        "schema": "icefarm-cache-store-process-v1", "daemon": daemon,
+        "daemon_count": 1, "sidecar": sidecar, "sidecar_count": 1,
+        "ready": True, "store_environment": identity,
+    }
+    monkeypatch.setattr(
+        producer, "_invoke", lambda _command: CommandResult(0, json.dumps(result), "")
+    )
+    with pytest.raises(EventError, match="unbound daemon/socket identity"):
+        producer._cache_store_process_snapshot(instance, "2" * 64)
+
+
+def test_cache_store_stop_restores_parent_if_post_signal_inspection_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    instance = next(item for item in scenario.data["instances"] if item["role"] == "F")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    producer._active_turn = "A"
+    daemon = _route_process("/opt/icecream/sbin/iceccd", 101, 1001, ppid=1)
+    sidecar = _route_process("/opt/icecream/sbin/icecc-cache-service", 102, 1002, ppid=101)
+    identity = {
+        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "7",
+        "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT": "1",
+        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": "a" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": "b" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "11",
+        "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION": "1",
+    }
+    monkeypatch.setattr(
+        producer, "_cache_store_process_snapshot",
+        lambda *_a: {"daemon": daemon, "sidecar": sidecar, "store_identity": identity},
+    )
+    inspections = iter((
+        {"id": "2" * 64, "running": True, "started_at": "2026-09-27T00:00:00Z"},
+        EventError("synthetic post-signal inspect failure"),
+    ))
+    def inspect(*_args, **_kwargs):
+        value = next(inspections)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+    monkeypatch.setattr(producer, "_inspect", inspect)
+    monkeypatch.setattr(
+        producer, "_client_route_state_from_inspect",
+        lambda *_a: {"daemon": daemon, "route_owner": sidecar},
+    )
+    monkeypatch.setattr(producer, "_readiness_baseline", lambda *_a: {"host": "h", "path": "/tmp/log", "offset": 0})
+    controls = []
+    def control(_instance, _container, operation, _daemon, _sidecar):
+        controls.append(operation)
+        if operation == "stop-sidecar":
+            return {
+                "schema": "icefarm-cache-store-control-v1",
+                "operation": operation,
+                "daemon": dict(daemon, state="T"),
+                "sidecar": sidecar,
+                "parent_stopped": True,
+                "sidecar_kill_sent": True,
+            }
+        return {
+            "schema": "icefarm-cache-store-control-v1",
+            "operation": operation,
+            "daemon": daemon,
+            "resumed": True,
+            "already_running": False,
+        }
+    monkeypatch.setattr(producer, "_cache_store_control", control)
+    with pytest.raises(EventError, match="synthetic post-signal"):
+        producer.stop_cache_store_for_receipt_gate(
+            instance["name"], "A", expected_scoped_identity={
+                "c_store_guid": identity["ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID"],
+                "c_store_generation": int(identity["ICECC_CACHE_SERVICE_EXPECTED_GENERATION"]),
+                "f_store_guid": identity["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"],
+                "f_store_generation": int(identity["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION"]),
+            }
+        )
+    assert controls == ["stop-sidecar", "resume-parent"]
+
+
+@pytest.mark.parametrize(
+    ("fail_after_stop", "argv0_fallback", "bad_comm"),
+    ((False, False, False), (True, False, False),
+     (False, True, False), (False, True, True)),
+)
+def test_cache_store_control_script_pidfd_stop_and_failure_cleanup(
+    tmp_path: Path, fail_after_stop: bool, argv0_fallback: bool, bad_comm: bool,
+) -> None:
+    helper_python = os.path.realpath("/usr/bin/python3")
+    if not Path(helper_python).is_file():
+        pytest.skip("system Python with pidfd support is unavailable")
+    parent_script = (
+        "import subprocess,sys,time; "
+        f"child=subprocess.Popen([{helper_python!r},'-c','import time; time.sleep(60)', "
+        "'--peer-uid','65534','--peer-gid','65534','--socket',"
+        "'/var/cache/icecream/p50-runtime/attempt-1-" + "a" * 32 + "/cache.sock',"
+        "'--generation','7','--attempt','1','--c-store-guid','" + "a" * 32 +
+        "','--f-store-guid','" + "b" * 32 + "','--f-store-generation','11',"
+        "'--store-derivation-version','1']); "
+        "print(child.pid,flush=True); time.sleep(60)"
+    )
+    parent = subprocess.Popen(
+        [helper_python, "-c", parent_script,
+         "--cache-service", helper_python,
+         "--cache-runtime-dir", "/var/cache/icecream/p50-runtime"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    child_pid = None
+    try:
+        assert parent.stdout is not None
+        child_pid = int(parent.stdout.readline().strip())
+
+        def identity(pid: int) -> dict[str, object]:
+            proc = Path("/proc") / str(pid)
+            raw = (proc / "stat").read_text(encoding="ascii")
+            fields = raw.rsplit(") ", 1)[1].split()
+            return {
+                "pid": pid,
+                "ppid": int(fields[1]),
+                "start_ticks": int(fields[19]),
+                "exe": os.readlink(proc / "exe"),
+                "exe_evidence": "proc-exe",
+                "comm": (proc / "comm").read_text(encoding="ascii").rstrip("\n"),
+                "argv": [x.decode() for x in (proc / "cmdline").read_bytes().split(b"\0") if x],
+                "state": fields[0],
+                "uid": int(next(line for line in (proc / "status").read_text().splitlines()
+                                 if line.startswith("Uid:")).split()[1]),
+                "uids": [int(x) for x in next(
+                    line for line in (proc / "status").read_text().splitlines()
+                    if line.startswith("Uid:")
+                ).split()[1:5]],
+            }
+
+        daemon, sidecar = identity(parent.pid), identity(child_pid)
+        script = events_module.CACHE_STORE_CONTROL_SCRIPT
+        if argv0_fallback:
+            daemon["exe_evidence"] = "proc-cmdline+comm"
+            sidecar["exe_evidence"] = "proc-cmdline+comm"
+            target = "    status = (root / \"status\").read_text(encoding=\"ascii\")"
+            assert script.count(target) == 1
+            script = script.replace(
+                target,
+                "    executable = argv[0]\n"
+                "    evidence = \"proc-cmdline+comm\"\n"
+                + target,
+            )
+        if bad_comm:
+            sidecar["comm"] = "not-cache-service"
+        if fail_after_stop:
+            target = (
+                "signal.pidfd_send_signal(daemon_fd, signal.SIGSTOP)\n"
+                "        stop_signal_sent = True"
+            )
+            assert script.count(target) == 1
+            script = script.replace(
+                target,
+                target + '\n        raise RuntimeError("injected after stop signal")',
+            )
+        result = subprocess.run(
+            [
+                helper_python, "-c", script,
+                str(daemon["exe"]), str(sidecar["exe"]), "stop-sidecar",
+                json.dumps(daemon, sort_keys=True, separators=(",", ":")),
+                json.dumps(sidecar, sort_keys=True, separators=(",", ":")),
+            ],
+            check=False, capture_output=True, text=True, timeout=8,
+        )
+        if fail_after_stop or bad_comm:
+            assert result.returncode != 0
+            state = (Path("/proc") / str(parent.pid) / "stat").read_text(encoding="ascii")
+            assert state.rsplit(") ", 1)[1].split()[0] not in {"T", "t"}
+            assert Path("/proc", str(child_pid)).exists()
+        else:
+            assert result.returncode == 0, result.stderr
+            receipt = json.loads(result.stdout)
+            assert receipt["parent_stopped"] is True
+            assert receipt["sidecar_kill_sent"] is True
+            state = (Path("/proc") / str(parent.pid) / "stat").read_text(encoding="ascii")
+            assert state.rsplit(") ", 1)[1].split()[0] in {"T", "t"}
+            child_stat = Path("/proc") / str(child_pid) / "stat"
+            if child_stat.exists():
+                child_fields = child_stat.read_text(encoding="ascii").rsplit(") ", 1)[1].split()
+                assert child_fields[0] in {"Z", "X"}
+    finally:
+        # These PIDs belong exclusively to this test's subprocess tree.
+        try:
+            os.kill(parent.pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        for pid in (child_pid, parent.pid):
+            if pid is None:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        parent.wait(timeout=3)
 
 
 @pytest.mark.parametrize(

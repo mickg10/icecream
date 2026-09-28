@@ -44,6 +44,7 @@ from farmharness.integration.workload import (
     _driver_command,
     _parse_summary,
     _p51_check_held_marker,
+    _p51_check_cache_store_matches_scoped_identity,
     _p51_check_scoped_identity_marker,
     _p51_link_output_check_argv,
     _p51_link_outputs_complete,
@@ -276,6 +277,28 @@ def test_multilink_receipt_markers_keep_scoped_identity_and_sibling_hold() -> No
         "epoch=8 generation=2 profile=3 window=30\n"
     )
     assert _p51_check_scoped_identity_marker(identity, parsed)["f_store_generation"] == 7
+    store_identity = {
+        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": "c" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "4",
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": "d" * 32,
+        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "7",
+    }
+    assert _p51_check_cache_store_matches_scoped_identity(
+        store_identity, _p51_check_scoped_identity_marker(identity, parsed), phase="before"
+    ) == {
+        "c_store_guid": "c" * 32, "c_store_generation": 4,
+        "f_store_guid": "d" * 32, "f_store_generation": 7,
+    }
+    with pytest.raises(WorkloadError, match="c_store_guid"):
+        _p51_check_cache_store_matches_scoped_identity(
+            {**store_identity, "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": "f" * 32},
+            _p51_check_scoped_identity_marker(identity, parsed), phase="before",
+        )
+    with pytest.raises(WorkloadError, match="f_store_generation"):
+        _p51_check_cache_store_matches_scoped_identity(
+            {**store_identity, "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "07"},
+            _p51_check_scoped_identity_marker(identity, parsed), phase="after",
+        )
     with pytest.raises(WorkloadError, match="scoped identity"):
         _p51_check_scoped_identity_marker(identity.replace("window=30", "window=1"), parsed)
     with pytest.raises(WorkloadError, match="scoped identity"):
@@ -710,6 +733,45 @@ def test_d09_requires_affected_initial_route_to_be_exactly_one_w30_cohort() -> N
             scenario.data["workload"], roles,
             manifest_jobs=100,
         )
+
+
+@pytest.mark.parametrize("kind", ["held-f-restart-v1", "held-f-cache-store-restart-v1"])
+def test_d09_f_store_restart_kinds_validate_same_explicit_w30_topology(kind: str) -> None:
+    _farm, scenario, plan, _clients = _multilink_orchestrator_fixture("C1F2")
+    gate = scenario.data["workload"]["receipt_gate"]
+    gate.update({
+        "expected_commits": 30, "negotiated_window": 30,
+        "binary": "/bin/true",
+        "binary_sha256": hashlib.sha256(Path("/bin/true").read_bytes()).hexdigest(),
+        "command_timeout_s": 1800,
+        "links": [
+            {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39},
+            {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
+        ],
+        "restart_extension": {
+            "kind": kind,
+            "affected_link": {"client": "C1", "worker": "F2"},
+            "healthy_link": {"client": "C1", "worker": "F1"},
+        },
+    })
+    scenario.data["workload"].update({"jobs": 100, "clients": ["C1"], "turns": ["A"]})
+    roles = {
+        role: [dict(item) for item in plan["topology"]["instances"] if item["role"] == role]
+        for role in ("S", "C", "F")
+    }
+    roles["S"][0].setdefault("env", {}).update({
+        "ICECC_P51_MODE": "on", "ICECC_P50_PROFILE": "P29V1",
+    })
+    roles["C"][0].setdefault("env", {}).update({
+        "ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on",
+    })
+    for worker in roles["F"]:
+        worker.setdefault("env", {})["ICECC_P51_MODE"] = "on"
+        worker["slots"] = 31
+    scenario_spec_module._validate_p51_receipt_window(
+        {"timeline": [], "controls": [], "timeouts": {"turn_s": 1800}},
+        scenario.data["workload"], roles, manifest_jobs=100,
+    )
     gate["links"] = [
         {"client": "C1", "worker": "F1", "first_job": 1, "last_job": 39},
         {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
@@ -1004,6 +1066,7 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
     finishes: set[tuple[str, str]] = set()
     gate_calls: list[tuple[str, str]] = []
     output_checks: list[tuple[str, str, bool]] = []
+    release_order_events: list[tuple[str, tuple[str, str]]] = []
     gate_events = {
         (link["client"], link["worker"]): threading.Event() for link in links
     }
@@ -1025,6 +1088,7 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
             )
             key = (client_name, worker)
             releases.add(key)
+            release_order_events.append(("release", key))
         if phase == "finish-link-gate" or phase.startswith("cleanup-"):
             for link in links:
                 if link["client"] == client_name:
@@ -1060,7 +1124,10 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
                     "",
                     "P51_RECEIPT_GATE_NEGOTIATED profile=1 window=1 epoch=1 generation=1\n",
                 )
-            if phase.startswith("run.p51-receipt-window.check-link-output."):
+            if (
+                phase.startswith("run.p51-receipt-window.first-output.")
+                or phase.startswith("run.p51-receipt-window.full-range.")
+            ):
                 _, client_name, worker = phase.rsplit(".", 2)
                 key = (client_name, worker)
                 output_checks.append((client_name, worker, key in releases))
@@ -1075,10 +1142,17 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
                     if item["name"] == worker
                 )
                 endpoint = f"{worker_instance['address']}:{plan['ports']['instances'][worker]}"
+                output_link_last = (
+                    link["first_job"]
+                    if phase.startswith("run.p51-receipt-window.first-output.")
+                    else link["last_job"]
+                )
+                if phase.startswith("run.p51-receipt-window.first-output."):
+                    release_order_events.append(("first-output", key))
                 return CommandResult(
                     0,
                     f"P51_LINK_OUTPUTS_OK client={client_name} worker={worker} "
-                    f"endpoint={endpoint} first={link['first_job']} last={link['last_job']}\n",
+                    f"endpoint={endpoint} first={link['first_job']} last={output_link_last}\n",
                     "",
                 )
             if phase.startswith("run.p51-receipt-window.probe-sibling-output."):
@@ -1134,6 +1208,11 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
         return "released\n" if marker.endswith("/released-1") else "0\n" if marker.endswith("/exit") else None
 
     monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
+    monkeypatch.setattr(
+        workload_module, "_p51_wait_gate_ready",
+        lambda farm, plan, client, factory, transport, gate_dir, _future, **kwargs:
+            wait_marker(farm, plan, client, factory, transport, f"{gate_dir}/ready", **kwargs),
+    )
     clock = [0.0]
     monkeypatch.setattr(workload_module, "time", SimpleNamespace(
         monotonic=lambda: clock[0],
@@ -1145,7 +1224,15 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
     )
     assert len(summaries) == len(clients)
     assert len(evidence["links"]) == len(links)
-    assert len(evidence["release_order_output_progress"]) == len(links)
+    assert len(evidence["release_order_output_progress"]) == 2 * len(links)
+    if topology == "C1F2":
+        assert release_order_events.index(("first-output", ("C1", "F1"))) < release_order_events.index(("release", ("C1", "F2")))
+    assert all(
+        item["stage"] in {
+            "first-output-before-next-release", "full-range-after-all-releases"
+        }
+        for item in evidence["release_order_output_progress"]
+    )
     assert releases == set(gate_events)
     assert all(gate_held[key].is_set() for key in gate_held)
     assert finishes == set(gate_events)
@@ -1154,10 +1241,19 @@ def test_multilink_receipt_orchestrator_runs_and_orders_real_link_checks(
     assert evidence["restart_extension"] == "pending-not-run"
 
 
-@pytest.mark.parametrize("drain_case", ["complete", "wrong-worker", "pending"])
+@pytest.mark.parametrize("drain_case", [
+    "complete", "wrong-worker", "pending", "sibling-error",
+    "phase2-setup-error", "readiness-after-resume", "cleanup-error",
+])
+@pytest.mark.parametrize("restart_kind", ["held-f-restart-v1", "held-f-cache-store-restart-v1"])
 def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window(
-    monkeypatch: pytest.MonkeyPatch, drain_case: str,
+    monkeypatch: pytest.MonkeyPatch, drain_case: str, restart_kind: str,
 ) -> None:
+    if (
+        drain_case in {"sibling-error", "phase2-setup-error", "readiness-after-resume", "cleanup-error"}
+        and restart_kind != "held-f-cache-store-restart-v1"
+    ):
+        pytest.skip("cache-store cleanup injection applies only to the sidecar restart kind")
     farm, scenario, plan, clients = _multilink_orchestrator_fixture("C1F2")
     gate = scenario.data["workload"]["receipt_gate"]
     gate.update({
@@ -1169,7 +1265,7 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
         {"client": "C1", "worker": "F2", "first_job": 40, "last_job": 69},
     ]
     gate["restart_extension"] = {
-        "kind": "held-f-restart-v1",
+        "kind": restart_kind,
         "affected_link": {"client": "C1", "worker": "F2"},
         "healthy_link": {"client": "C1", "worker": "F1"},
     }
@@ -1207,11 +1303,13 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
                 return CommandResult(0, "", "P51_RECEIPT_GATE_NEGOTIATED profile=1 window=30 epoch=2 generation=1\n")
             if phase.startswith("run.p51-receipt-window.d09-healthy-output-while-stopped"):
                 assert stop_f2.is_set() and not any(x == "start-F2" for x in events)
+                if drain_case == "sibling-error":
+                    raise WorkloadError("injected sibling probe failure")
                 events.append("healthy-output-while-F2-stopped")
                 return CommandResult(0, "P51_LINK_OUTPUTS_OK client=C1 worker=F1 endpoint=10.0.0.2:23003 first=1 last=39\n", "")
             if phase.startswith("run.p51-receipt-window.d09-old-cohort-drain-while-stopped"):
                 assert stop_f2.is_set() and not any(x == "start-F2" for x in events)
-                if drain_case == "pending":
+                if drain_case in {"pending", "cleanup-error"}:
                     expire_drain["now"] = True
                     return CommandResult(0, "P51_LINK_OUTPUTS_PENDING\n", "")
                 if drain_case == "wrong-worker":
@@ -1242,6 +1340,25 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
                 "readiness_baseline": {}, "scheduler_baseline": {},
             }
 
+        def stop_cache_store_for_receipt_gate(self, name, turn, *, expected_scoped_identity):
+            assert name == "F2" and turn == "A"
+            assert expected_scoped_identity["f_store_guid"] == f"{102:032x}"
+            events.append("stop-F2")
+            stop_f2.set()
+            return {
+                "schema": "icefarm-receipt-cache-store-stop-v1",
+                "instance": name, "role": "F", "turn": turn,
+                "container": {"container_id": "sha256:f2", "started_at": "old", "preserved": True},
+                "before": {"daemon": {"pid": 1}, "sidecar": {"pid": 2},
+                           "store_identity": {
+                               "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": f"{1:032x}",
+                               "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "1",
+                               "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": f"{102:032x}",
+                               "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "1",
+                           }},
+                "readiness_baseline": {}, "coordination": {"route_before": {}},
+            }
+
         def start_worker_for_receipt_gate(self, receipt):
             assert set(receipt) == {
                 "instance", "turn", "before", "stopped",
@@ -1266,6 +1383,49 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
                 "coordination": {},
             }
 
+        def start_cache_store_for_receipt_gate(self, receipt):
+            assert receipt["schema"] == "icefarm-receipt-cache-store-stop-v1"
+            if drain_case != "complete" and "phase2-gate-ready-while-F2-stopped" not in events:
+                events.append("cleanup-start-F2")
+            else:
+                assert stop_f2.is_set() and "old-cohort-drained-to-F1-while-F2-stopped" in events
+                assert "phase2-gate-ready-while-F2-stopped" in events
+                events.append("start-F2")
+            if drain_case == "readiness-after-resume":
+                # Model SIGCONT succeeding followed by a fresh-registration
+                # readiness timeout inside the measured start operation.
+                raise WorkloadError("injected post-resume readiness failure")
+            daemon = {"pid": 1, "start_ticks": 1, "argv": ["iceccd"]}
+            sidecar = {"pid": 3, "start_ticks": 3}
+            return {
+                "schema": "icefarm-receipt-cache-store-restart-v1",
+                "instance": "F2", "role": "F", "turn": "A",
+                "container": receipt["container"],
+                "before": {
+                    "daemon": daemon,
+                    "sidecar": {"pid": 2, "start_ticks": 2},
+                    "store_identity": receipt["before"]["store_identity"],
+                },
+                "after": {
+                    "daemon": daemon,
+                    "sidecar": sidecar,
+                    "store_identity": {
+                        "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID": f"{1:032x}",
+                        "ICECC_CACHE_SERVICE_EXPECTED_GENERATION": "1",
+                        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID": f"{901:032x}",
+                        "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION": "2",
+                    },
+                },
+                "coordination": {"readiness": {"connected_line": "fresh"}},
+            }
+
+        def ensure_cache_store_parent_resumed_for_receipt_gate(self, receipt):
+            assert receipt["schema"] == "icefarm-receipt-cache-store-stop-v1"
+            events.append("ensure-parent-resumed")
+            if drain_case == "cleanup-error":
+                raise WorkloadError("injected cleanup resume failure")
+            return {"already_running": drain_case == "readiness-after-resume"}
+
     def gate_call(_farm, _plan, client, _factory, _transport, phase, _argv, **_kw):
         if phase == "verify-staged-helper":
             return CommandResult(0, "a" * 64 + "\n", "")
@@ -1275,6 +1435,8 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
             release_f1.set()
         if phase.startswith("d09-abort-stopped"):
             events.append("abort-stopped-F2-gate")
+        if phase == "d09-prepare-phase2-dir" and drain_case == "phase2-setup-error":
+            raise WorkloadError("injected phase2 setup failure")
         if phase == "d09-finish-phase2-gate":
             finish_f2_phase2.set()
         return CommandResult(0, "", "")
@@ -1314,6 +1476,11 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
 
     monkeypatch.setattr(workload_module, "_p51_gate_call", gate_call)
     monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
+    monkeypatch.setattr(
+        workload_module, "_p51_wait_gate_ready",
+        lambda farm, plan, client, factory, transport, gate_dir, _future, **kwargs:
+            wait_marker(farm, plan, client, factory, transport, f"{gate_dir}/ready", **kwargs),
+    )
     monkeypatch.setattr(workload_module, "_stage_p51_iptables_bundle", lambda *_a, **_k: None)
     monkeypatch.setattr(workload_module, "_driver_command", lambda *_a, **_k: SimpleNamespace(phase="driver-C1"))
     monkeypatch.setattr(workload_module, "_parse_summary", lambda *_a: {"client": "C1", "jobs": 100, "failures": 0})
@@ -1321,7 +1488,7 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
     monkeypatch.setattr(workload_module, "docker_argv", lambda _f, _h, argv: tuple(argv))
 
     expire_drain = {"now": False}
-    if drain_case == "pending":
+    if drain_case in {"pending", "cleanup-error"}:
         monkeypatch.setattr(
             workload_module.time, "monotonic",
             lambda: 10**9 if expire_drain["now"] else 0.0,
@@ -1333,16 +1500,27 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
             event_controller=EventController(),
         )
     else:
-        expected_error = (
-            "output validation" if drain_case == "wrong-worker"
-            else "did not strict-retry and drain"
-        )
-        with pytest.raises(WorkloadError, match=expected_error):
+        expected_error = {
+            "wrong-worker": "output validation",
+            "pending": "did not strict-retry and drain",
+            "sibling-error": "injected sibling probe failure",
+            "phase2-setup-error": "injected phase2 setup failure",
+            "readiness-after-resume": "injected post-resume readiness failure",
+            "cleanup-error": "did not strict-retry and drain",
+        }[drain_case]
+        with pytest.raises(WorkloadError, match=expected_error) as raised:
             workload_module._run_p51_receipt_window_multilink(
                 farm, scenario, plan, clients, Factory(), Transport(), "A",
                 event_controller=EventController(),
             )
-        assert "start-F2" not in events
+        if drain_case != "readiness-after-resume":
+            assert "start-F2" not in events
+        if restart_kind == "held-f-cache-store-restart-v1":
+            assert "ensure-parent-resumed" in events
+        if drain_case == "cleanup-error":
+            assert any("injected cleanup resume failure" in note for note in getattr(raised.value, "__notes__", []))
+        if drain_case == "readiness-after-resume":
+            assert events.count("ensure-parent-resumed") == 1
         return
     assert summaries[0]["failures"] == 0
     assert [item for item in events if item in {
@@ -1355,6 +1533,10 @@ def test_d09_orchestration_orders_stop_sibling_progress_restart_and_fresh_window
         "phase2-gate-ready-while-F2-stopped", "start-F2", "phase2-held", "phase2-output"
     ]
     assert evidence["restart_extension"]["phase2"]["gate_completed"] is True
+    if restart_kind == "held-f-cache-store-restart-v1":
+        # A successful restart consumes its stop token; finally must not replay
+        # the emergency ensure-running operation against a later stop.
+        assert events.count("ensure-parent-resumed") == 0
     assert {command.phase for command in helper_commands} == {
         "run.p51-receipt-window.start-gate.C1.F1",
         "run.p51-receipt-window.start-gate.C1.F2",
@@ -1450,6 +1632,11 @@ def test_multilink_receipt_orchestrator_rejects_failure_and_cleans_owned_process
     monkeypatch.setattr(workload_module, "_docker_transport", lambda *_a, **_k: "docker")
     monkeypatch.setattr(workload_module, "docker_argv", lambda _f, _h, argv: tuple(argv))
     monkeypatch.setattr(workload_module, "_p51_wait_marker", wait_marker)
+    monkeypatch.setattr(
+        workload_module, "_p51_wait_gate_ready",
+        lambda farm, plan, client, factory, transport, gate_dir, _future, **kwargs:
+            wait_marker(farm, plan, client, factory, transport, f"{gate_dir}/ready", **kwargs),
+    )
     clock = [0.0]
     monkeypatch.setattr(workload_module, "time", SimpleNamespace(
         monotonic=lambda: clock[0],
@@ -2294,6 +2481,38 @@ def test_p51_receipt_gate_budget_preserves_legacy_and_reserves_cleanup(
 def test_p51_receipt_gate_budget_rejects_invalid_explicit_limits(value) -> None:
     with pytest.raises(WorkloadError, match="command_timeout_s"):
         workload_module._p51_gate_budget({"command_timeout_s": value})
+
+
+def test_p51_gate_ready_waiter_surfaces_helper_exit_and_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = {
+        "ready": None,
+        "exit": "127\n",
+        "helper.stderr": "p50daemonpositive: GLIBCXX_3.4.31 not found\n",
+    }
+    monkeypatch.setattr(
+        workload_module, "_p51_gate_call",
+        lambda *_args, **_kwargs: CommandResult(0, json.dumps(evidence), ""),
+    )
+
+    class Future:
+        def done(self) -> bool:
+            return True
+
+        def result(self):
+            return CommandResult(0, "", "")
+
+    with pytest.raises(WorkloadError) as caught:
+        workload_module._p51_wait_gate_ready(
+            object(), {}, {"name": "C1"}, object(), object(),
+            "/results/p51-receipt-gate/links/C1-F1", Future(), timeout_s=2,
+        )
+    message = str(caught.value)
+    assert "exit-marker" in message
+    assert "127\\n" in message
+    assert "GLIBCXX_3.4.31 not found" in message
+    assert "helper_stderr_sha256" in message
 
 
 def test_p51_iptables_bundle_is_hash_checked_and_staged_in_bounded_chunks(

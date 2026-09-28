@@ -201,7 +201,7 @@
               "additionalProperties": false,
               "required": ["kind", "affected_link", "healthy_link"],
               "properties": {
-                "kind": {"const": "held-f-restart-v1"},
+                "kind": {"enum": ["held-f-restart-v1", "held-f-cache-store-restart-v1"]},
                 "affected_link": {"$ref": "#/$defs/receiptLinkIdentity"},
                 "healthy_link": {"$ref": "#/$defs/receiptLinkIdentity"}
               }

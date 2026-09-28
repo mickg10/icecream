@@ -427,7 +427,9 @@ def _validate_p51_receipt_window(
                 None,
             )
             if (
-                restart.get("kind") != "held-f-restart-v1"
+                restart.get("kind") not in {
+                    "held-f-restart-v1", "held-f-cache-store-restart-v1"
+                }
                 or affected_pair not in seen_pairs
                 or affected_range is None
                 or healthy_pair not in seen_pairs

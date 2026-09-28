@@ -9389,6 +9389,7 @@ def collect_bundle(
         observations = _observations(
             farm, scenario, plan, evidence, rows, row_facts, events
         )
+        _validate_p51_receipt_release_progress(receipts["workload"], scenario)
         _validate_p51_held_f_restart_receipt(
             receipts["workload"], scenario, observations
         )
@@ -9877,10 +9878,366 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
     scenario = ScenarioSpec(
         path=path / "evidence" / "specs" / "scenario.json", data=bundle["scenario"]
     )
-    _validate_p51_held_f_restart_receipt(
-        receipt_bindings["workload"], scenario, observations
+    extension = scenario.data.get("workload", {}).get("receipt_gate", {}).get(
+        "restart_extension"
     )
+    _validate_p51_receipt_release_progress(receipt_bindings["workload"], scenario)
+    if isinstance(extension, Mapping) and extension.get("kind") == "held-f-cache-store-restart-v1":
+        _validate_p51_held_f_cache_store_restart_receipt(
+            receipt_bindings["workload"], scenario, observations
+        )
+    else:
+        _validate_p51_held_f_restart_receipt(
+            receipt_bindings["workload"], scenario, observations
+        )
     return bundle
+
+
+def _validate_p51_receipt_release_progress(
+    workload_receipt: Mapping[str, Any], scenario: ScenarioSpec,
+) -> None:
+    """Require early progress before sibling release, plus final exact ranges.
+
+    Restart scenarios have stronger, type-specific progress validators below;
+    this two-stage witness applies to ordinary multi-link receipt runs only.
+    """
+    workload = scenario.data.get("workload")
+    gate = workload.get("receipt_gate") if isinstance(workload, Mapping) else None
+    if not isinstance(gate, Mapping) or isinstance(gate.get("restart_extension"), Mapping):
+        return
+    declared = gate.get("links")
+    if not isinstance(declared, list) or len(declared) <= 1:
+        return
+    turns = workload_receipt.get("turns")
+    if not isinstance(turns, list) or len(turns) != 1 or not isinstance(turns[0], Mapping):
+        raise CollectError("receipt release-order progress has no single workload turn")
+    window = turns[0].get("p51_receipt_window")
+    progress = window.get("release_order_output_progress") if isinstance(window, Mapping) else None
+    if not isinstance(progress, list):
+        raise CollectError("receipt release-order progress is missing")
+    ordered = sorted(
+        (item for item in declared if isinstance(item, Mapping)),
+        key=lambda item: (str(item.get("client", "")), item.get("first_job", 0)),
+    )
+    if len(ordered) != len(declared):
+        raise CollectError("receipt release-order link descriptors are malformed")
+    first_rows = [
+        item for item in progress if isinstance(item, Mapping)
+        and item.get("stage") == "first-output-before-next-release"
+    ]
+    full_rows = [
+        item for item in progress if isinstance(item, Mapping)
+        and item.get("stage") == "full-range-after-all-releases"
+    ]
+    if len(first_rows) != len(ordered) or len(full_rows) != len(ordered) or len(progress) != 2 * len(ordered):
+        raise CollectError("receipt release-order progress lacks first-output or full-range witnesses")
+    for index, link in enumerate(ordered):
+        client, worker = link.get("client"), link.get("worker")
+        first, last = link.get("first_job"), link.get("last_job")
+        early = [
+            item for item in first_rows
+            if item.get("client") == client and item.get("worker") == worker
+        ]
+        complete = [
+            item for item in full_rows
+            if item.get("client") == client and item.get("worker") == worker
+        ]
+        if (
+            type(first) is not int or type(last) is not int or first <= 0 or last < first
+            or len(early) != 1 or len(complete) != 1
+            or early[0].get("first_job") != first or early[0].get("last_job") != first
+            or early[0].get("verified") is not True
+            or complete[0].get("first_job") != first or complete[0].get("last_job") != last
+            or complete[0].get("verified") is not True
+        ):
+            raise CollectError("receipt output witnesses do not bind the declared link range")
+        held = early[0].get("held_siblings")
+        later = ordered[index + 1:]
+        if not isinstance(held, list) or len(held) != len(later):
+            raise CollectError("receipt first-output witness lacks later held-sibling evidence")
+        held_keys = {
+            (item.get("client"), item.get("worker"))
+            for item in held if isinstance(item, Mapping)
+            and item.get("held_marker") == "present"
+            and item.get("released") is False
+            and item.get("exited") is False
+            and item.get("full_outputs_complete") is False
+        }
+        expected_keys = {(item.get("client"), item.get("worker")) for item in later}
+        if len(held_keys) != len(held) or held_keys != expected_keys:
+            raise CollectError("receipt first-output did not precede release of every later sibling")
+
+
+def _validate_p51_held_f_cache_store_restart_receipt(
+    workload_receipt: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    observations: Mapping[str, Any],
+) -> None:
+    """Require the F cache-service identity to rotate without replacing iceccd."""
+    workload = scenario.data.get("workload")
+    gate = workload.get("receipt_gate") if isinstance(workload, Mapping) else None
+    extension = gate.get("restart_extension") if isinstance(gate, Mapping) else None
+    prefix = "D09 held-F cache-store restart"
+    turns = workload_receipt.get("turns")
+    if not isinstance(extension, Mapping) or not isinstance(turns, list) or len(turns) != 1:
+        raise CollectError(f"{prefix} descriptor or workload turn is malformed")
+    turn_receipt = turns[0]
+    window = turn_receipt.get("p51_receipt_window") if isinstance(turn_receipt, Mapping) else None
+    restart = window.get("restart_extension") if isinstance(window, Mapping) else None
+    links = window.get("links") if isinstance(window, Mapping) else None
+    affected, healthy = extension.get("affected_link"), extension.get("healthy_link")
+    if (
+        not isinstance(restart, Mapping)
+        or restart.get("schema") != "icefarm-p51-held-f-cache-store-restart-v1"
+        or restart.get("turn") != turn_receipt.get("turn")
+        or not isinstance(links, list) or len(links) != 3
+        or not isinstance(affected, Mapping) or not isinstance(healthy, Mapping)
+        or type(restart.get("stopped_interval_ms")) is not int
+        or restart.get("stopped_interval_ms", 0) <= 0
+        or restart.get("phase2_gate_ready_while_stopped") is not True
+        or not isinstance(restart.get("healthy_progress"), Mapping)
+        or restart["healthy_progress"].get("verified_while_stopped") is not True
+        or restart["healthy_progress"].get("client") != healthy.get("client")
+        or restart["healthy_progress"].get("worker") != healthy.get("worker")
+        or not isinstance(restart.get("old_cohort_drain"), Mapping)
+        or restart["old_cohort_drain"].get("verified_while_stopped") is not True
+        or restart["old_cohort_drain"].get("client") != affected.get("client")
+        or restart["old_cohort_drain"].get("retry_worker") != healthy.get("worker")
+        or not isinstance(restart.get("old_gate_loss"), Mapping)
+        or restart["old_gate_loss"].get("retirement") != "explicit-abort-after-f-stop"
+        or type(restart["old_gate_loss"].get("helper_exit_status")) is not int
+        or restart["old_gate_loss"].get("helper_exit_status", 0) <= 0
+        or restart["old_gate_loss"].get("discarded_marker")
+        != "explicit abort discarded held COMMIT interval"
+    ):
+        raise CollectError(f"{prefix} lacks held, sibling-progress, or old-cohort evidence")
+    container = restart.get("container")
+    container_before = restart.get("container_before")
+    container_after = restart.get("container_after")
+    before, after = restart.get("before"), restart.get("after")
+    if (
+        not isinstance(container, Mapping) or container.get("preserved") is not True
+        or not isinstance(container.get("container_id"), str)
+        or not isinstance(container.get("started_at"), str)
+        or not isinstance(container_before, Mapping)
+        or not isinstance(container_after, Mapping)
+        or container_before.get("container_id") != container.get("container_id")
+        or container_before.get("started_at") != container.get("started_at")
+        or container_after.get("container_id") != container.get("container_id")
+        or container_after.get("started_at") != container.get("started_at")
+        or container_after.get("running") is not True
+        or not isinstance(before, Mapping) or not isinstance(after, Mapping)
+        or not isinstance(before.get("daemon"), Mapping)
+        or not isinstance(after.get("daemon"), Mapping)
+        or not isinstance(before.get("sidecar"), Mapping)
+        or not isinstance(after.get("sidecar"), Mapping)
+        or not isinstance(before.get("store_identity"), Mapping)
+        or not isinstance(after.get("store_identity"), Mapping)
+    ):
+        raise CollectError(f"{prefix} process snapshots are malformed")
+    coordination = restart.get("coordination")
+    readiness = coordination.get("readiness") if isinstance(coordination, Mapping) else None
+    if (
+        not isinstance(readiness, Mapping)
+            or readiness.get("schema") != "icefarm-client-scheduler-readiness-v2"
+        or not isinstance(readiness.get("connected_line"), str)
+        or "Connected to scheduler (I am known as " not in readiness.get("connected_line", "")
+        or readiness.get("cache_fresh") is not True
+        or not isinstance(readiness.get("route"), Mapping)
+        or not isinstance(readiness["route"].get("before"), Mapping)
+        or not isinstance(readiness["route"].get("after"), Mapping)
+    ):
+        raise CollectError(f"{prefix} lacks fresh scheduler-registration/route evidence")
+    daemon_fields = ("pid", "ppid", "start_ticks", "exe", "exe_evidence", "comm", "uid", "uids", "argv")
+    if (
+        any(before["daemon"].get(key) != after["daemon"].get(key) for key in daemon_fields)
+        or before["sidecar"].get("pid") == after["sidecar"].get("pid")
+        or before["sidecar"].get("start_ticks") == after["sidecar"].get("start_ticks")
+        or after["sidecar"].get("ppid") != after["daemon"].get("pid")
+        or after["sidecar"].get("uids") != after["daemon"].get("uids")
+    ):
+        raise CollectError(f"{prefix} did not preserve iceccd while replacing its sidecar")
+
+    def store_matches(store: Mapping[str, Any], scoped: Mapping[str, Any]) -> bool:
+        pairs = (
+            ("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", "c_store_guid"),
+            ("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", "c_store_generation"),
+            ("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", "f_store_guid"),
+            ("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION", "f_store_generation"),
+        )
+        for source, target in pairs:
+            raw, value = store.get(source), scoped.get(target)
+            if target.endswith("_generation"):
+                if not isinstance(raw, str) or not raw.isdigit() or int(raw) <= 0 or raw != str(int(raw)) or type(value) is not int or int(raw) != value:
+                    return False
+            elif not isinstance(raw, str) or raw != value:
+                return False
+        return True
+
+    affected_initial = [
+        link for link in links
+        if isinstance(link, Mapping)
+        and link.get("client") == affected.get("client")
+        and link.get("worker") == affected.get("worker")
+        and link.get("stopped_by_restart") is True
+    ]
+    healthy_initial = [
+        link for link in links
+        if isinstance(link, Mapping)
+        and link.get("client") == healthy.get("client")
+        and link.get("worker") == healthy.get("worker")
+        and link.get("after_restart") is not True
+    ]
+    phase2_links = [
+        link for link in links
+        if isinstance(link, Mapping)
+        and link.get("client") == affected.get("client")
+        and link.get("worker") == affected.get("worker")
+        and link.get("after_restart") is True
+    ]
+    phase2 = restart.get("phase2")
+    if len(affected_initial) != 1 or len(healthy_initial) != 1 or len(phase2_links) != 1 or not isinstance(phase2, Mapping):
+        raise CollectError(f"{prefix} lacks unique affected, healthy, or phase-2 link evidence")
+    old_scope = affected_initial[0]
+    new_scope = phase2.get("identity")
+    old_store = before["store_identity"]
+    new_store = after["store_identity"]
+    if (
+        not store_matches(old_store, old_scope)
+        or not isinstance(new_scope, Mapping)
+        or not store_matches(new_store, new_scope)
+        or old_store.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID")
+            == new_store.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID")
+        or old_store.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION")
+            == new_store.get("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION")
+        or old_store.get("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID")
+            != new_store.get("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID")
+        or old_store.get("ICECC_CACHE_SERVICE_EXPECTED_GENERATION")
+            != new_store.get("ICECC_CACHE_SERVICE_EXPECTED_GENERATION")
+    ):
+        raise CollectError(f"{prefix} old/new scoped store identities do not prove F-only replacement")
+    if (
+        phase2.get("verified") is not True
+        or phase2.get("gate_completed") is not True
+        or phase2.get("worker") != affected.get("worker")
+        or not isinstance(new_scope, Mapping)
+        or not store_matches(new_store, phase2_links[0])
+        or any(
+            phase2_links[0].get(key) != new_scope.get(key)
+            for key in (
+                "c_store_guid", "c_store_generation",
+                "f_store_guid", "f_store_generation",
+            )
+        )
+        or phase2_links[0].get("first_job") != phase2.get("first_job")
+        or phase2_links[0].get("last_job") != phase2.get("last_job")
+        or phase2_links[0].get("count") != 30
+        or phase2_links[0].get("negotiated_window") != 30
+        or phase2.get("first_job") != max(item["last_job"] for item in gate["links"]) + 1
+        or phase2.get("last_job") != phase2.get("first_job") + 30
+    ):
+        raise CollectError(f"{prefix} fresh phase-2 identity/output evidence is invalid")
+
+    declared = gate.get("links")
+    if not isinstance(declared, list):
+        raise CollectError(f"{prefix} declared link ranges are malformed")
+    affected_declared = [
+        item for item in declared if isinstance(item, Mapping)
+        and item.get("client") == affected.get("client")
+        and item.get("worker") == affected.get("worker")
+    ]
+    healthy_declared = [
+        item for item in declared if isinstance(item, Mapping)
+        and item.get("client") == healthy.get("client")
+        and item.get("worker") == healthy.get("worker")
+    ]
+    if len(affected_declared) != 1 or len(healthy_declared) != 1:
+        raise CollectError(f"{prefix} descriptors do not bind unique declared links")
+    if (
+        affected_initial[0].get("first_job") != affected_declared[0].get("first_job")
+        or affected_initial[0].get("last_job") != affected_declared[0].get("last_job")
+        or healthy_initial[0].get("first_job") != healthy_declared[0].get("first_job")
+        or healthy_initial[0].get("last_job") != healthy_declared[0].get("last_job")
+        or restart["healthy_progress"].get("first_job") != healthy_declared[0].get("first_job")
+        or restart["healthy_progress"].get("last_job") != healthy_declared[0].get("last_job")
+        or restart["old_cohort_drain"].get("first_job") != affected_declared[0].get("first_job")
+        or restart["old_cohort_drain"].get("last_job") != affected_declared[0].get("last_job")
+    ):
+        raise CollectError(f"{prefix} progress does not bind the declared full job ranges")
+    window_size = gate.get("negotiated_window")
+    profiles = {
+        item.get("env", {}).get("ICECC_P50_PROFILE")
+        for item in scenario.data.get("instances", [])
+        if isinstance(item, Mapping) and item.get("role") == "S"
+        and isinstance(item.get("env"), Mapping)
+    }
+    if (
+        window_size != 30 or len(profiles) != 1 or window.get("profile") not in profiles
+        or phase2.get("held", {}).get("profile") != window.get("profile")
+        or type(phase2.get("old_gate_exit_status")) is not int
+        or phase2.get("old_gate_exit_status", 0) <= 0
+    ):
+        raise CollectError(f"{prefix} is not bound to the selected profile and W30")
+    retries = observations.get("successful_strict_p50_retry_bindings")
+    if not isinstance(retries, list):
+        raise CollectError(f"{prefix} has no strict retry observation list")
+    retried_ordinals: set[int] = set()
+    for item in retries:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("first_worker") != affected.get("worker")
+            or item.get("final_worker") != healthy.get("worker")
+        ):
+            continue
+        match = re.fullmatch(
+            rf"{re.escape(str(affected.get('client')))}:{re.escape(str(turn_receipt.get('turn')))}:[1-9][0-9]*:([1-9][0-9]*)",
+            item.get("job_id") if isinstance(item.get("job_id"), str) else "",
+        )
+        if match is None or item.get("failure_reason") not in {
+            "source-transfer-loss", "uncommitted-transport-loss"
+        }:
+            continue
+        ordinal = int(match.group(1))
+        if affected_declared[0]["first_job"] <= ordinal <= affected_declared[0]["last_job"]:
+            retried_ordinals.add(ordinal)
+    expected_ordinals = set(range(
+        affected_declared[0]["first_job"], affected_declared[0]["last_job"] + 1
+    ))
+    if len(expected_ordinals) != 30 or retried_ordinals != expected_ordinals:
+        raise CollectError(f"{prefix} does not bind every affected ordinal to the healthy sibling retry")
+    progress = window.get("release_order_output_progress")
+    if not isinstance(progress, list):
+        raise CollectError(f"{prefix} has no exact output-progress receipts")
+    healthy_outputs = [
+        item for item in progress if isinstance(item, Mapping)
+        and item.get("client") == healthy.get("client")
+        and item.get("worker") == healthy.get("worker")
+        and item.get("first_job") == healthy_declared[0].get("first_job")
+        and item.get("last_job") == healthy_declared[0].get("last_job")
+        and item.get("while_worker_stopped") == affected.get("worker")
+        and item.get("verified") is True
+    ]
+    drained_outputs = [
+        item for item in progress if isinstance(item, Mapping)
+        and item.get("client") == affected.get("client")
+        and item.get("worker") == affected.get("worker")
+        and item.get("first_job") == affected_declared[0].get("first_job")
+        and item.get("last_job") == affected_declared[0].get("last_job")
+        and item.get("retry_worker") == healthy.get("worker")
+        and item.get("strict_retry_drain_verified") is True
+        and item.get("while_worker_stopped") == affected.get("worker")
+    ]
+    phase2_outputs = [
+        item for item in progress if isinstance(item, Mapping)
+        and item.get("client") == affected.get("client")
+        and item.get("worker") == affected.get("worker")
+        and item.get("first_job") == phase2.get("first_job")
+        and item.get("last_job") == phase2.get("last_job")
+        and item.get("store_restarted") is True
+        and item.get("verified") is True
+    ]
+    if len(healthy_outputs) != 1 or len(drained_outputs) != 1 or len(phase2_outputs) != 1:
+        raise CollectError(f"{prefix} lacks exact healthy, drained, or post-restart output proof")
 
 
 def _validate_p51_held_f_restart_receipt(
