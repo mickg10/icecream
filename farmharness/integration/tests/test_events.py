@@ -3547,7 +3547,10 @@ def test_receipt_gate_event_restart_receipt_is_accepted_by_collector(
         {"successful_strict_p50_retry_bindings": [
             {
                 "first_worker": "F1", "final_worker": "F2",
-                "failure_reason": "source-transfer-loss", "job_id": f"C1:A:1:{ordinal}",
+                "failure_reason": "source-transfer-loss",
+                # The third component is the workload ordinal; the fourth is
+                # the independent scheduler-assigned job ID.
+                "job_id": f"C1:A:{ordinal}:{ordinal + 100}",
             }
             for ordinal in range(31, 61)
         ]},

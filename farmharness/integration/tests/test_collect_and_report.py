@@ -3472,6 +3472,16 @@ def _source_transfer_failure_kwargs(
         if mutation == "noncommitted-source-wrong-profile"
         else {(2, 1, 1): {"status": 3, "attempts": 1, "profile": "P29V1"}}
         if mutation == "noncommitted-source-wrong-attempts"
+        else {
+            (2, 1, 1): {
+                "schema": "icecream-p50-source-result-v5",
+                "status": 6,
+                "attempts": None,
+                "attempts_measured": False,
+                "profile": "P29V1",
+            }
+        }
+        if mutation == "noncommitted-source-unmeasured-attempts"
         else {(2, 1, 1): {"status": 0}}
         if mutation == "committed-source-result"
         else {(2, 1, 1): {}}
@@ -3625,6 +3635,17 @@ def test_source_transfer_failure_accepts_noncommitted_source_result_diagnostic(
     assert record is not None
     assert record["source_result_present"] is False
     assert record["source_result_status"] == 3
+
+
+def test_source_transfer_failure_accepts_v5_noncommitted_result_with_unmeasured_attempts() -> None:
+    record = _source_transfer_failure_observation(
+        **_source_transfer_failure_kwargs(
+            mutation="noncommitted-source-unmeasured-attempts"
+        )
+    )
+
+    assert record is not None
+    assert record["source_result_status"] == 6
 
 
 @pytest.mark.parametrize(
@@ -5600,7 +5621,9 @@ def _d09_collector_fixture(*, affected_second: bool = True):
     observations = {"successful_strict_p50_retry_bindings": [
         {
             "first_worker": "F2", "final_worker": "F1",
-            "failure_reason": "source-transfer-loss", "job_id": f"C1:A:1:{ordinal}",
+            "failure_reason": "source-transfer-loss",
+            # Row IDs carry workload ordinal first and final scheduler job ID last.
+            "job_id": f"C1:A:{ordinal}:{ordinal + 33}",
         }
         for ordinal in range(40, 70)
     ]}
@@ -5684,6 +5707,7 @@ def test_d09_collector_binds_exact_affected_link_in_either_order(affected_second
         "wrong-client", "wrong-retry-worker", "malformed-progress", "unfinished-phase2",
         "missing-abort-witness", "stale-after", "stale-f-store", "malformed-identity",
         "missing-one-retry", "wrong-drain-worker", "phase2-not-ready-while-stopped",
+        "ordinal-matches-scheduler-id",
     ]
 )
 def test_d09_collector_rejects_unbound_restart_evidence(mutation: str) -> None:
@@ -5713,6 +5737,10 @@ def test_d09_collector_rejects_unbound_restart_evidence(mutation: str) -> None:
         restart["old_cohort_drain"]["retry_worker"] = "F2"
     elif mutation == "phase2-not-ready-while-stopped":
         restart["phase2_gate_ready_while_stopped"] = False
+    elif mutation == "ordinal-matches-scheduler-id":
+        for binding in observations["successful_strict_p50_retry_bindings"]:
+            _, _, raw_ordinal, _scheduler_job = binding["job_id"].split(":")
+            binding["job_id"] = f"C1:A:{int(raw_ordinal) + 100}:{raw_ordinal}"
     else:
         restart["phase2"]["identity"] = ["not", "a", "mapping"]
     with pytest.raises(CollectError):
@@ -5790,7 +5818,10 @@ def test_d09_f_cache_store_collector_binds_process_and_scoped_identity() -> None
     _validate_p51_held_f_cache_store_restart_receipt(receipt, scenario, observations)
 
 
-@pytest.mark.parametrize("mutation", ["daemon-changed", "stale-sidecar", "old-store-mismatch", "new-store-mismatch"])
+@pytest.mark.parametrize("mutation", [
+    "daemon-changed", "stale-sidecar", "old-store-mismatch", "new-store-mismatch",
+    "ordinal-matches-scheduler-id",
+])
 def test_d09_f_cache_store_collector_rejects_unbound_identity(mutation: str) -> None:
     receipt, scenario, observations = _d09_cache_store_collector_fixture()
     restart = receipt["turns"][0]["p51_receipt_window"]["restart_extension"]
@@ -5800,6 +5831,10 @@ def test_d09_f_cache_store_collector_rejects_unbound_identity(mutation: str) -> 
         restart["after"]["sidecar"]["pid"] = restart["before"]["sidecar"]["pid"]
     elif mutation == "old-store-mismatch":
         receipt["turns"][0]["p51_receipt_window"]["links"][1]["f_store_guid"] = "0" * 32
+    elif mutation == "ordinal-matches-scheduler-id":
+        for binding in observations["successful_strict_p50_retry_bindings"]:
+            _, _, raw_ordinal, _scheduler_job = binding["job_id"].split(":")
+            binding["job_id"] = f"C1:A:{int(raw_ordinal) + 100}:{raw_ordinal}"
     else:
         restart["after"]["store_identity"]["ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID"] = "f" * 32
     with pytest.raises(CollectError):

@@ -1462,10 +1462,16 @@ def _source_result_status(
         raise CollectError(
             f"{row_job_id}: {context} source-result status is malformed"
         )
+    attempts_measured = result.get("attempts_measured", True)
+    if type(attempts_measured) is not bool:
+        raise CollectError(
+            f"{row_job_id}: {context} source-result attempt availability is malformed"
+        )
     if status != 0 and (
         expected_profile is not None
         and result.get("profile") != expected_profile
         or expected_attempts is not None
+        and attempts_measured
         and result.get("attempts") != expected_attempts
     ):
         raise CollectError(
@@ -10190,7 +10196,7 @@ def _validate_p51_held_f_cache_store_restart_receipt(
         ):
             continue
         match = re.fullmatch(
-            rf"{re.escape(str(affected.get('client')))}:{re.escape(str(turn_receipt.get('turn')))}:[1-9][0-9]*:([1-9][0-9]*)",
+            rf"{re.escape(str(affected.get('client')))}:{re.escape(str(turn_receipt.get('turn')))}:([1-9][0-9]*):[1-9][0-9]*",
             item.get("job_id") if isinstance(item.get("job_id"), str) else "",
         )
         if match is None or item.get("failure_reason") not in {
@@ -10448,7 +10454,7 @@ def _validate_p51_held_f_restart_receipt(
         job_id = binding.get("job_id")
         match = re.fullmatch(
             rf"{re.escape(affected['client'])}:{re.escape(str(turn))}:"
-            r"[1-9][0-9]*:([1-9][0-9]*)",
+            r"([1-9][0-9]*):[1-9][0-9]*",
             job_id if isinstance(job_id, str) else "",
         )
         if match is None or binding.get("failure_reason") not in {

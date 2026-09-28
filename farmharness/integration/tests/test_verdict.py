@@ -3335,6 +3335,71 @@ def test_d09_strict_retry_uses_configured_non_p29_profile_and_fails_closed() -> 
         assert bad
 
 
+def _held_f_restart_retry_bundle(
+    *,
+    retries: int = 1,
+    restart_kind: str = "held-f-restart-v1",
+    with_extension: bool = True,
+):
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    scenario = fixture["scenario"]
+    scenario["timeline"] = []
+    scenario["expect"]["engagement"] = "expected(c,f)"
+    scenario["workload"] = {
+        "driver": "p51-receipt-window",
+        "receipt_gate": (
+            {"restart_extension": {"kind": restart_kind}}
+            if with_extension
+            else {}
+        ),
+    }
+    row = next(
+        item for item in fixture["rows"]
+        if item["job_id"]
+        == fixture["observations"]["successful_strict_p50_retry_bindings"][0]["job_id"]
+    )
+    row["retries"] = retries
+    return fixture
+
+
+@pytest.mark.parametrize(
+    "restart_kind",
+    ["held-f-restart-v1", "held-f-cache-store-restart-v1"],
+)
+def test_held_f_restart_extensions_allow_exactly_one_retry(restart_kind: str) -> None:
+    verdict = evaluate_bundle(
+        _held_f_restart_retry_bundle(restart_kind=restart_kind)
+    )
+    retry = next(item for item in verdict["clauses"] if item["id"] == "retries.bounded")
+
+    assert retry["status"] == "PASS", retry
+    assert "bounded by 1" in retry["detail"]
+
+
+@pytest.mark.parametrize(
+    "restart_kind",
+    ["held-f-restart-v1", "held-f-cache-store-restart-v1"],
+)
+def test_held_f_restart_extensions_reject_a_second_retry(restart_kind: str) -> None:
+    verdict = evaluate_bundle(
+        _held_f_restart_retry_bundle(retries=2, restart_kind=restart_kind)
+    )
+    retry = next(item for item in verdict["clauses"] if item["id"] == "retries.bounded")
+
+    assert retry["status"] == "FAIL"
+    assert retry["offending_job_ids"]
+
+
+def test_ordinary_steady_state_keeps_zero_retry_limit() -> None:
+    verdict = evaluate_bundle(
+        _held_f_restart_retry_bundle(with_extension=False)
+    )
+    retry = next(item for item in verdict["clauses"] if item["id"] == "retries.bounded")
+
+    assert retry["status"] == "FAIL"
+    assert "bounded by 0" in retry["detail"]
+
+
 @pytest.mark.parametrize("mutation", [
     None, "received", "line", "bool-line", "attempts", "bool-attempts",
     "missing-status", "committed", "error", "client-attempts", "missing-field",

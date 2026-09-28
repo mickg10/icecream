@@ -8209,12 +8209,30 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         isinstance(item, Mapping) and item.get("action") in bounce_actions
         for item in timeline
     )
+    workload = scenario.get("workload")
+    receipt_gate = workload.get("receipt_gate") if isinstance(workload, Mapping) else None
+    restart_extension = (
+        receipt_gate.get("restart_extension")
+        if isinstance(receipt_gate, Mapping)
+        else None
+    )
+    held_f_restart = (
+        isinstance(workload, Mapping)
+        and workload.get("driver") == "p51-receipt-window"
+        and isinstance(restart_extension, Mapping)
+        and restart_extension.get("kind") in {
+            "held-f-restart-v1",
+            "held-f-cache-store-restart-v1",
+        }
+    )
     # The client protocol permits one fresh legacy remote assignment after a
-    # failed P50 assignment.  A timeline transition can exercise that path;
-    # steady-state cells may not retry at all.
+    # failed P50 assignment. A timeline transition or either explicitly
+    # validated held-F P51 restart receipt can exercise that path; steady-state
+    # cells may not retry.
     retry_limit = (
         1
         if bounce
+        or held_f_restart
         or s30_mutant
         or engagement_mode in {
             S70_B5_ENGAGEMENT,
