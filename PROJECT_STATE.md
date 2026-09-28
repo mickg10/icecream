@@ -12,9 +12,9 @@ retained artifact directories.
 
 ## Verification updates — 2026-09-28
 
-The candidate branch `sorbet_1.5_pipeline` is pushed at HEAD `5f2129c3`;
+The candidate branch `sorbet_1.5_pipeline` is pushed at HEAD `5612f7db`;
 `8abe2de87d7225d142532952b0d41a07577624ab` is the D09 collector/verdict fix
-and `5f2129c3` records its verification state. The code commit fixes three
+and `5612f7db` records the verification updates. The code commit fixes three
 real D09 collection/verdict gaps: schema-v5 source results may truthfully mark
 attempt count as unmeasured; held-F validators now bind the workload ordinal
 rather than the independent scheduler job number; and the one-retry verdict
@@ -72,8 +72,10 @@ normalized digest after that field is removed. Plans and generated scenarios
 are under `/tanksmall/scratch/tmp/p51-captured-matrix-preflight-cKl0es/`, with
 the six capped plan logs under `/tanksmall/scratch/tmp/p51-c1f3f4-w30-plan.zFC0ZF/`.
 No role containers were started for these plan checks. The W30 protocol's
-live six-topology × three-profile matrix, its W1 counterpart, the external
-multi-host cells, and the full restart/cancellation sequence are still open.
+live matrix is still incomplete: C1F2/P29V1 and C2F1/P29V1 have local W30
+passes, while the other 16 topology/profile W30 cells, all 18 W1 cells, the
+external multi-host cells, and the full restart/cancellation sequence remain
+open.
 
 ## Fresh exact-candidate W30 integration
 
@@ -98,6 +100,34 @@ The run's `restart_extension` is explicitly `pending-not-run`: this is one
 local positive cell, not the D09 restart test, the 36-cell topology/profile/
 window matrix, or external multi-host qualification. It is a bounded synthetic
 correctness workload, not a CodebaseN performance result.
+
+The next same-machine live W30 cell passed for the other topology direction:
+C2F1/P29V1/W30, with two independent C stores sharing F1. The workload produced
+200/200 exact remote outputs (100 per C), zero compiler failures, local
+fallbacks or retries. Both C1→F1 and C2→F1 gates independently recorded
+`count=30`, ordinals 1–30, profile 1/window 30 before release. The exact
+scenario digest is
+`c2b0930b96a445aba0c59f1b4e022694651a06e76c671a7279c38f848251a922`; the
+captured product image/source is `0268ac7da57ab426a926fa56e6c223f1b9fe1caa`.
+The candidate harness was at `5f2129c3` when launched (the later `5612f7db`
+change is documentation-only). Cell wall was 603,211 ms. Independent
+verification passed all 29 clauses, all 1,358 bundle checksum entries
+revalidated, and `down.json` is DOWN with no problems; all exact run containers
+are absent. This is a correctness cell, not a throughput or CodebaseN result.
+
+Evidence bundle:
+`/tanksmall/scratch/tmp/p51-captured-matrix-preflight-cKl0es/farm-results/results/p51-local-C2F1-P29V1-W30-r1/`;
+scenario log
+`/tanksmall/scratch/tmp/p51-local-C2F1-P29V1-W30-r1.amTuPe/scenario.log`
+(SHA256 `f57a77969a137a0db4b717253079b2038ce180d3f591120a50272c7d3ef480b3`);
+independent verifier log SHA256
+`6d2fcd92558ed6545c157ea46c5e12586467e81db95d11eefc04d14b55000825`;
+`SHA256SUMS` SHA256
+`8b88dc0195c659e185b4bfed854b080f0cf3dccd85034f896aa218e3a1619801`;
+verdict SHA256
+`3ba57aaf6807f31494bf6f03a1e04ce565295609cf5765da290e7081113a4f7e`;
+DOWN receipt SHA256
+`e49e213582be97a8f843b0d6b35771f1e0a60f585a8ed55c33a55d43dbfd528f`.
 
 ## Developer QA
 
