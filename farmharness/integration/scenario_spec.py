@@ -656,6 +656,32 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
     d18_roles = workload.get("d18_roles")
     is_d18 = workload["driver"] == "d18-role-mix"
     is_receipt_window = workload["driver"] == "p51-receipt-window"
+    if is_receipt_window:
+        scheduler_host_name = role_instances["S"][0]["host"]
+        scheduler_host = farm_hosts[scheduler_host_name]
+        scheduler_lan_ip = ipaddress.ip_address(scheduler_host["lan_ip"])
+        scheduler_authority = farm.data["authority"]["hosts"].get(
+            scheduler_host_name
+        )
+        authority_ip = (
+            ipaddress.ip_address(scheduler_authority["address"])
+            if isinstance(scheduler_authority, dict)
+            else None
+        )
+        loopback_addresses = sorted(
+            {
+                str(address)
+                for address in (scheduler_lan_ip, authority_ip)
+                if address is not None and address.is_loopback
+            }
+        )
+        if loopback_addresses:
+            raise ScenarioSpecError(
+                "$.instances: P51 receipt-window isolated clients require the "
+                f"scheduler host {scheduler_host_name!r} to advertise a "
+                f"non-loopback LAN address (got loopback address(es) "
+                f"{', '.join(loopback_addresses)})"
+            )
     if is_d18 != (d18_roles is not None):
         raise ScenarioSpecError(
             "$.workload.d18_roles: required only for d18-role-mix workloads"

@@ -12,8 +12,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration import farmtest
 from farmharness.integration import receipt_window_matrix
 from farmharness.integration.events import EventProducer
-from farmharness.integration.farm_spec import load_farm_spec
-from farmharness.integration.farm_spec import FarmSpec
+from farmharness.integration.farm_spec import FarmSpec, load_farm_spec
 from farmharness.integration.images import RecordingTransport
 from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
 from farmharness.integration.suite_spec import (
@@ -45,6 +44,58 @@ def test_s95_plan_preserves_client_canary_output_for_failure_diagnostics() -> No
     smoke = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     smoke_plan = farmtest.build_plan(farm, smoke, run_id="s00-no-diagnostic-capture")
     assert "diagnostic_capture_client_output" not in smoke_plan
+
+
+def test_p51_receipt_window_rejects_loopback_scheduler_address(tmp_path: Path) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm_data = copy.deepcopy(farm.data)
+    farm_data["authority"]["topologies"]["C1F1"]["slots_per_f"] = 31
+
+    scenario_data = json.loads(
+        (INTEGRATION / "scenarios" / "S00-smoke.json").read_text(encoding="utf-8")
+    )
+    scenario_data["id"] = "P51-receipt-window-loopback-check"
+    scenario_data["instances"][0].setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    scenario_data["instances"][1]["slots"] = 31
+    scenario_data["instances"][1].setdefault("env", {})["ICECC_P51_MODE"] = "on"
+    scenario_data["instances"][2]["env"].update(
+        {"ICECC_P50_MODE": "on", "ICECC_P51_MODE": "on"}
+    )
+    helper = Path("/bin/true")
+    scenario_data["workload"].update(
+        {
+            "driver": "p51-receipt-window",
+            "jobs": 30,
+            "receipt_gate": {
+                "binary": str(helper),
+                "binary_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+                "expected_commits": 30,
+                "negotiated_window": 30,
+                "expect_observed": True,
+            },
+        }
+    )
+    scenario_path = tmp_path / "p51-receipt-window.json"
+    scenario_path.write_text(json.dumps(scenario_data), encoding="utf-8")
+
+    lan_farm = FarmSpec(farm.path, farm_data)
+    scenario = load_scenario_spec(scenario_path, lan_farm)
+    plan = farmtest.build_plan(lan_farm, scenario, run_id="p51-lan-address")
+    assert any(command["phase"] == "up.start-c" for command in plan["commands"])
+
+    loopback_farm_data = copy.deepcopy(farm_data)
+    scheduler_host = next(
+        host for host in loopback_farm_data["hosts"] if host["name"] == "tt-quietbox3"
+    )
+    scheduler_host["lan_ip"] = "127.0.0.1"
+    scheduler_host["shared_lan"] = "0.0.0.0/0"
+    loopback_farm_data["authority"]["hosts"]["tt-quietbox3"]["address"] = "127.0.0.1"
+    loopback_farm = FarmSpec(farm.path, loopback_farm_data)
+    with pytest.raises(
+        ScenarioSpecError,
+        match="P51 receipt-window isolated clients require.*non-loopback LAN address.*127.0.0.1",
+    ):
+        load_scenario_spec(scenario_path, loopback_farm)
 
 
 def test_p51_receipt_window_plan_stages_pinned_helper_and_scopes_net_admin(tmp_path: Path) -> None:
