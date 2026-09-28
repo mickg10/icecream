@@ -8,7 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 try:
     from .farm_spec import load_farm_spec
@@ -45,11 +45,31 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _select_dimensions(
+    canonical: Sequence[Any], requested: Sequence[Any] | None, label: str,
+) -> list[Any]:
+    if requested is None:
+        return list(canonical)
+    values = list(requested)
+    if not values:
+        raise MatrixError(f"{label} selector must not be empty")
+    if len(set(values)) != len(values):
+        raise MatrixError(f"{label} selectors must not contain duplicates")
+    unknown = [value for value in values if value not in canonical]
+    if unknown:
+        raise MatrixError(f"unsupported {label} selector(s): {unknown!r}")
+    selected = set(values)
+    return [value for value in canonical if value in selected]
+
+
 def generate_matrix(
     *, farm_path: Path, base_path: Path, helper_path: Path, output_dir: Path,
     template_path: Path = TEMPLATE_PATH,
+    topologies: Sequence[str] | None = None,
+    windows: Sequence[int] | None = None,
+    profiles: Sequence[str] | None = None,
 ) -> list[Path]:
-    """Write the exact 6-topology × 2-window × 3-profile scenario matrix."""
+    """Write the full matrix by default, or a selected subset of its cells."""
     template = _load_json(template_path)
     if template.get("schema") != "icefarm-p51-receipt-matrix-v1":
         raise MatrixError("unsupported matrix template schema")
@@ -60,23 +80,35 @@ def generate_matrix(
     if template.get("restart_extension") != "pending-not-run":
         raise MatrixError("restart extension must remain explicitly pending")
 
+    selected_topologies = _select_dimensions(
+        [row["id"] for row in TOPOLOGY_ROWS], topologies, "topology"
+    )
+    selected_windows = _select_dimensions(template["windows"], windows, "window")
+    selected_profiles = _select_dimensions(template["profiles"], profiles, "profile")
+    topology_by_id = {row["id"]: row for row in TOPOLOGY_ROWS}
+    selected_rows = [topology_by_id[topology] for topology in selected_topologies]
+
     farm = load_farm_spec(farm_path)
     base = _load_json(base_path)
     topology_authority = farm.data["authority"]["topologies"]
-    for row in TOPOLOGY_ROWS:
+    for row in selected_rows:
         authority = topology_authority.get(row["id"])
         if not isinstance(authority, dict) or authority.get("f_relationships") != row["workers"]:
             raise MatrixError(
                 f"farm authority must explicitly authorize {row['id']} with "
                 f"{row['workers']} F roles"
             )
-    for row in TOPOLOGY_ROWS:
+    required_window = max(selected_windows)
+    for row in selected_rows:
         authority = topology_authority[row["id"]]
-        required_slots_per_f = row["clients"] * 30 + int(row["clients"] == 1)
+        required_slots_per_f = (
+            row["clients"] * required_window
+            + int(row["clients"] == 1)
+        )
         if int(authority.get("slots_per_f", 0)) < required_slots_per_f:
             raise MatrixError(
                 f"farm authority {row['id']} needs slots_per_f >= "
-                f"{required_slots_per_f} for simultaneous W30 gates and scheduler credit"
+                f"{required_slots_per_f} for selected W{required_window} gates and scheduler credit"
             )
     helper_path = helper_path.resolve(strict=True)
     helper_stat = helper_path.stat()
@@ -139,8 +171,8 @@ def generate_matrix(
     # leave no misleading output directory behind.
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    for topology in TOPOLOGY_ROWS:
-        for window in template["windows"]:
+    for topology in selected_rows:
+        for window in selected_windows:
             links_per_client = topology["workers"] if topology["clients"] == 1 else 1
             repeat = max(1, math.ceil(links_per_client * window / base_jobs))
             manifest_jobs = base_jobs * repeat
@@ -151,7 +183,7 @@ def generate_matrix(
                 name: sum(1 for client in client_names for worker in worker_names if worker == name)
                 for name in worker_names
             }
-            for profile in template["profiles"]:
+            for profile in selected_profiles:
                 scenario = copy.deepcopy(base)
                 scenario["id"] = f"P51-receipt-{topology['id']}-{profile}-W{window}"
                 scenario["instances"] = []
@@ -237,11 +269,24 @@ def main() -> int:
     parser.add_argument("--helper", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--template", type=Path, default=TEMPLATE_PATH)
+    parser.add_argument(
+        "--topology", action="append", choices=[row["id"] for row in TOPOLOGY_ROWS],
+        help="limit generation to this topology (repeatable; default: all six)",
+    )
+    parser.add_argument(
+        "--window", action="append", type=int, choices=(1, 30),
+        help="limit generation to this negotiated window (repeatable; default: W1 and W30)",
+    )
+    parser.add_argument(
+        "--profile", action="append", choices=PROFILE_NAMES,
+        help="limit generation to this profile (repeatable; default: all three)",
+    )
     args = parser.parse_args()
     try:
         written = generate_matrix(
             farm_path=args.farm, base_path=args.base, helper_path=args.helper,
             output_dir=args.output_dir, template_path=args.template,
+            topologies=args.topology, windows=args.window, profiles=args.profile,
         )
     except MatrixError as exc:
         parser.error(str(exc))

@@ -1290,6 +1290,23 @@ ICEFARM_TMPDIR=/approved/scratch sh dev/python.sh \
   --output-dir /approved/scenarios/p51-receipt-matrix
 ```
 
+The default is the complete 36-cell matrix. Repeatable `--topology`,
+`--window`, and `--profile` selectors are for staged materialization only;
+they do not waive authority checks. Only selected topology capacity is needed
+for a selected subset, but each emitted scenario must still pass the normal
+`farmtest plan` against the supplied farm authority. For example, stage just
+C1F2/W1/P29V1 with:
+
+```sh
+ICEFARM_TMPDIR=/approved/scratch sh dev/python.sh \
+  -m farmharness.integration.receipt_window_matrix \
+  --farm /approved/farm.json \
+  --base farmharness/integration/scenarios/D18-P29V1.json \
+  --helper /approved/build/unittests/p50daemonpositive \
+  --output-dir /approved/scenarios/p51-receipt-C1F2-W1-P29V1 \
+  --topology C1F2 --window 1 --profile P29V1
+```
+
 The base scenario must provide exactly one P50/R2-enabled C template and
 exactly one P51-enabled S and F template; role order is not used to infer
 capability; use a farm authority whose `new` image pin matches that base

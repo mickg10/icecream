@@ -206,6 +206,88 @@ def test_p51_multilink_matrix_generates_all_required_portable_cells(tmp_path: Pa
     assert max_plan is not None
 
 
+def test_p51_multilink_matrix_selects_one_authorized_w1_cell(tmp_path: Path) -> None:
+    farm_data = json.loads(farm_fixture.example_farm_path().read_text())
+    farm_data["authority"]["topologies"] = {
+        "C1F2": {"f_relationships": 2, "slots_per_f": 24}
+    }
+    farm_path = tmp_path / "selected-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    output = tmp_path / "selected-matrix"
+
+    generated = receipt_window_matrix.generate_matrix(
+        farm_path=farm_path,
+        base_path=INTEGRATION / "scenarios" / "D18-P29V1.json",
+        helper_path=Path("/bin/true"),
+        output_dir=output,
+        topologies=("C1F2",),
+        windows=(1,),
+        profiles=("P29V1",),
+    )
+    assert [path.name for path in generated] == [
+        "P51-receipt-C1F2-P29V1-W1.json"
+    ]
+    scenario = load_scenario_spec(generated[0], load_farm_spec(farm_path))
+    assert scenario.data["workload"]["receipt_gate"]["negotiated_window"] == 1
+    assert scenario.data["workload"]["receipt_gate"]["expected_commits"] == 1
+    assert scenario.data["workload"]["jobs"] == 2
+    assert {item["name"]: item["slots"] for item in scenario.data["instances"] if item["role"] == "F"} == {
+        "F1": 2, "F2": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        ({"topologies": ("C9F1",)}, "unsupported topology selector"),
+        ({"windows": (2,)}, "unsupported window selector"),
+        ({"profiles": ("UNKNOWN",)}, "unsupported profile selector"),
+    ],
+)
+def test_p51_multilink_matrix_rejects_invalid_selectors_before_output(
+    tmp_path: Path, selection: dict[str, tuple[object, ...]], message: str,
+) -> None:
+    farm_data = json.loads(farm_fixture.example_farm_path().read_text())
+    farm_data["authority"]["topologies"] = {
+        "C1F2": {"f_relationships": 2, "slots_per_f": 24}
+    }
+    farm_path = tmp_path / "selected-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    output = tmp_path / "invalid-matrix"
+    with pytest.raises(receipt_window_matrix.MatrixError, match=message):
+        receipt_window_matrix.generate_matrix(
+            farm_path=farm_path,
+            base_path=INTEGRATION / "scenarios" / "D18-P29V1.json",
+            helper_path=Path("/bin/true"),
+            output_dir=output,
+            **selection,
+        )
+    assert not output.exists()
+
+
+def test_p51_multilink_matrix_selected_w30_still_requires_full_capacity(
+    tmp_path: Path,
+) -> None:
+    farm_data = json.loads(farm_fixture.example_farm_path().read_text())
+    farm_data["authority"]["topologies"] = {
+        "C1F2": {"f_relationships": 2, "slots_per_f": 24}
+    }
+    farm_path = tmp_path / "selected-farm.json"
+    farm_path.write_text(json.dumps(farm_data), encoding="utf-8")
+    output = tmp_path / "under-capacity"
+    with pytest.raises(receipt_window_matrix.MatrixError, match="C1F2 needs slots_per_f >= 31"):
+        receipt_window_matrix.generate_matrix(
+            farm_path=farm_path,
+            base_path=INTEGRATION / "scenarios" / "D18-P29V1.json",
+            helper_path=Path("/bin/true"),
+            output_dir=output,
+            topologies=("C1F2",),
+            windows=(30,),
+            profiles=("P29V1",),
+        )
+    assert not output.exists()
+
+
 def test_p51_multilink_matrix_preserves_explicit_caps_into_docker_plan(
     tmp_path: Path,
 ) -> None:
