@@ -1,6 +1,6 @@
 # Sorbet 1.5.0: validation and remaining work
 
-Updated 2026-09-27. Package version is **1.5.0**; the release branch is
+Updated 2026-09-28. Package version is **1.5.0**; the release branch is
 `sorbet_v1.5`. The repository is public. The Docker bootstrap implementation
 was published as `de027cefc31d79d062c3158400951916a9aa5d63`.
 A pushed branch is not a published release tag or a newly qualified farm image.
@@ -9,6 +9,49 @@ Use [README.md](README.md) and [dev/README.md](dev/README.md) for setup.
 This file records evidence boundaries and open work, not a chronological
 agent log. Earlier diagnostic reports remain in Git history and their
 retained artifact directories.
+
+## Verification updates — 2026-09-28
+
+The candidate branch `sorbet_1.5_pipeline` is pushed at
+`8abe2de87d7225d142532952b0d41a07577624ab`. This commit fixes three real D09
+collection/verdict gaps: schema-v5 source results may truthfully mark attempt
+count as unmeasured; held-F validators now bind the workload ordinal rather
+than the independent scheduler job number; and the one-retry verdict allowance
+recognizes both explicitly validated held-F restart variants. Mutants and
+positive/over-limit tests cover those behaviors.
+
+On a clean detached checkout, the full Python integration suite passed **1,910
+tests, 6 skipped** in 253 seconds (log SHA256
+`27996c9ccb703096fcb9e2b373d94d71c1b68e014a1ab9711b10e8e2ec0e877c`). The
+five changed source/test files have matching hashes in that tested tree and
+commit `8abe2de8`; `git diff --check` passed. The full suite in the working
+checkout instead had 5 catalog/manifest/Makefile failures because it discovers
+the user's untracked D09 scenario, which references an image label absent from
+the tracked catalog. That file remains byte-identical (SHA256
+`230f6f54ba0e889757247e12ca207788075742f2efdfcb07b81590a98a9fe9e3`) and was
+not staged or changed; those failures are not represented as a clean-checkout
+test result.
+
+The preserved local D09 F-restart runtime has now been collected and verified
+offline with the `8abe2de8` verifier: 100 jobs, zero workload failures, all 29
+verdict clauses PASS, all bundle checksums pass, and teardown remains DOWN
+with no cleanup problems or client network. Reverification wrote only the
+derived verdict in the isolated `offline-copy-r2`; the raw source run remains
+unchanged. No new live D09 run was made, and this does not qualify the separate
+held-F cache-store restart runtime.
+
+Plan-only W30 materialization now passes all 18 local base cells on the
+captured nas642 authority: C1F2, C2F1, C3F1, C4F1 × P29V1, ZSTD_TU, ZSTD_ROUTE.
+For C1F3/C1F4, F containers use an explicit 16-GiB cap (52 GiB / 8 CPUs and
+68 GiB / 10 CPUs respectively), fitting the captured 78-GiB / 16-core host;
+the other 12 plans retain the 32-GiB F template. The farm capture was changed
+only to redirect `hub.results_root`, whose derived authority has the same
+normalized digest after that field is removed. Plans and generated scenarios
+are under `/tanksmall/scratch/tmp/p51-captured-matrix-preflight-cKl0es/`, with
+the six capped plan logs under `/tanksmall/scratch/tmp/p51-c1f3f4-w30-plan.zFC0ZF/`.
+No role containers were started for these plan checks. The W30 protocol's
+live six-topology × three-profile matrix, its W1 counterpart, the external
+multi-host cells, and the full restart/cancellation sequence are still open.
 
 ## Fresh exact-candidate W30 integration
 
