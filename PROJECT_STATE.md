@@ -12,13 +12,14 @@ retained artifact directories.
 
 ## Verification updates — 2026-09-28
 
-The candidate branch `sorbet_1.5_pipeline` is pushed at
-`8abe2de87d7225d142532952b0d41a07577624ab`. This commit fixes three real D09
-collection/verdict gaps: schema-v5 source results may truthfully mark attempt
-count as unmeasured; held-F validators now bind the workload ordinal rather
-than the independent scheduler job number; and the one-retry verdict allowance
-recognizes both explicitly validated held-F restart variants. Mutants and
-positive/over-limit tests cover those behaviors.
+The candidate branch `sorbet_1.5_pipeline` is pushed at HEAD `5f2129c3`;
+`8abe2de87d7225d142532952b0d41a07577624ab` is the D09 collector/verdict fix
+and `5f2129c3` records its verification state. The code commit fixes three
+real D09 collection/verdict gaps: schema-v5 source results may truthfully mark
+attempt count as unmeasured; held-F validators now bind the workload ordinal
+rather than the independent scheduler job number; and the one-retry verdict
+allowance recognizes both explicitly validated held-F restart variants.
+Mutants and positive/over-limit tests cover those behaviors.
 
 On a clean detached checkout, the full Python integration suite passed **1,910
 tests, 6 skipped** in 253 seconds (log SHA256
@@ -31,6 +32,27 @@ the tracked catalog. That file remains byte-identical (SHA256
 `230f6f54ba0e889757247e12ca207788075742f2efdfcb07b81590a98a9fe9e3`) and was
 not staged or changed; those failures are not represented as a clean-checkout
 test result.
+
+The bounded pipeline TLA+ row coverage is now complete across
+`run_pipeline_window_sweep_tlc.sh` (20 unique configurations) and
+`run_pipeline_recovery_tlc.sh` (44 configurations, including two that exactly
+duplicate the W30 accounting and full-window witness rows from the sweep).
+The first retained set has 34 raw logs: all 20 sweep rows plus 14 other
+recovery rows. An independent audit matched those inputs to the candidate's
+formal files. The remaining 28 unique recovery configurations were run from
+an archived `8abe2de8` source snapshot; the formal files are unchanged at
+candidate HEAD. Of these, 22 exited on their named expected counterexample
+and six consumed-proof safety rows completed cleanly with empty queues. No
+timeout or unexpected diagnostic occurred. The second run's per-row receipt
+binds config/module/jar hashes, expected outcome, exit code, duration, state
+counts and log path; SHA256
+`8ddbfd1f0ae84f354484cff59babdaec555574d805968fe7d0205da851321eb1`.
+Its 28 raw logs and TLC state directories are under
+`/tanksmall/scratch/pipeline-recovery-gate-20260928.fnG0UD/`; the first set is
+under `/tanksmall/scratch/w30-formal-gate-20260928.jDHyet/`. The two shared
+W30 rows were counted once, not rerun. This completes bounded configuration
+coverage of those two runners, not an unbounded W30 proof or a C++/wire/codec
+safety claim.
 
 The preserved local D09 F-restart runtime has now been collected and verified
 offline with the `8abe2de8` verifier: 100 jobs, zero workload failures, all 29
