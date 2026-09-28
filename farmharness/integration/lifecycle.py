@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -3838,6 +3839,55 @@ def collect_diagnostics(
             local_output = host_dir / f"{instance['name']}.output"
             local_output.mkdir(parents=True, exist_ok=True)
             trace_patterns = _diagnostic_p51_trace_patterns(instance["role"])
+            if host_transport(farm, host_name) == "local":
+                # The local /results bind mount may contain root-only traces.
+                # Use Docker's engine copy API for each exact allowlisted
+                # path; local rsync cannot use --rsync-path to elevate reads.
+                for trace_pattern in trace_patterns:
+                    trace_name = PurePosixPath(trace_pattern).name
+                    host_trace = Path(remote_output / trace_name)
+                    try:
+                        trace_stat = host_trace.lstat()
+                    except FileNotFoundError:
+                        # Trace output is optional during teardown and partial
+                        # startup; preserve the prior rsync behavior for absence.
+                        continue
+                    except OSError as exc:
+                        problems.append(
+                            f"{host_name}:{instance['name']}:sync-p51-traces:"
+                            f"cannot inspect {host_trace}: {exc}"
+                        )
+                        continue
+                    if not stat.S_ISREG(trace_stat.st_mode):
+                        problems.append(
+                            f"{host_name}:{instance['name']}:sync-p51-traces:"
+                            f"refusing non-regular trace path {host_trace}"
+                        )
+                        continue
+                    try:
+                        recorder.invoke(
+                            _command(
+                                factory,
+                                phase="diagnostics.sync-p51-traces",
+                                host=host_name,
+                                transport=_docker_transport(farm, host_name),
+                                timeout_s=60,
+                                argv=docker_argv(
+                                    farm,
+                                    host_name,
+                                    (
+                                        "cp",
+                                        f"{container_target}:/results/{trace_name}",
+                                        str(local_output) + "/",
+                                    ),
+                                ),
+                            )
+                        )
+                    except RemoteError as exc:
+                        problems.append(
+                            f"{host_name}:{instance['name']}:sync-p51-traces:{exc}"
+                        )
+                continue
             try:
                 recorder.invoke(
                     _command(

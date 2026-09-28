@@ -1551,6 +1551,129 @@ def test_p51_trace_diagnostics_use_bounded_privileged_remote_rsync(
             assert "/source-result.jsonl" in command.argv
 
 
+def test_p51_trace_diagnostics_use_exact_docker_copies_on_local_hosts(
+    tmp_path: Path,
+) -> None:
+    farm, _scenario, plan = _farm_scenario_plan(tmp_path)
+    farm.hosts["tt-quietbox3"]["execution"] = "local"
+    farm.hosts["tt-quietbox3"]["docker_context"] = "default"
+    farm.hosts["tt-quietbox3"]["scratch_root"] = str(tmp_path / "local-q3")
+    farm.hosts["tt-quietbox2"]["execution"] = "local"
+    farm.hosts["tt-quietbox2"]["docker_context"] = "default"
+    farm.hosts["tt-quietbox2"]["scratch_root"] = str(tmp_path / "local-q2")
+    plan["diagnostic_capture_client_output"] = True
+    plan["diagnostic_capture_client_output_kind"] = "p51-receipt-window"
+
+    # The client and first worker trace exist, while the second optional
+    # worker trace is absent. Only existing regular files should be copied.
+    output_roots = {}
+    for instance in plan["topology"]["instances"]:
+        if instance["role"] not in ("C", "F"):
+            continue
+        output_root = (
+            Path(farm.hosts[instance["host"]]["scratch_root"])
+            / "icefarm"
+            / plan["run_id"]
+            / instance["name"]
+            / "output"
+        )
+        output_root.mkdir(parents=True)
+        output_roots[instance["name"]] = output_root
+    client_trace = output_roots["C1"] / "source-result.jsonl"
+    client_trace.write_text("client trace\n")
+    client_trace.chmod(0o600)
+    worker_trace = output_roots["F1"] / "f-action.jsonl"
+    worker_trace.write_text("worker action\n")
+    worker_trace.chmod(0o600)
+
+    transport = RecordingTransport(ScriptedLifecycle(farm))
+
+    problems = collect_diagnostics(
+        farm,
+        plan,
+        transport,
+        CommandFactory(),
+        tmp_path / "diagnostics",
+    )
+
+    assert not any(":sync-p51-traces:" in problem for problem in problems)
+    trace_commands = [
+        command for command in transport.commands
+        if command.phase == "diagnostics.sync-p51-traces"
+    ]
+    assert len(trace_commands) == 2
+    assert all(command.transport == "local-docker" for command in trace_commands)
+    assert all(
+        command.argv[:3] == ("docker", "--context", "default")
+        for command in trace_commands
+    )
+    assert all(command.argv[3] == "cp" for command in trace_commands)
+    assert all(
+        "sudo" not in command.argv and "rsync" not in command.argv
+        for command in trace_commands
+    )
+    assert sorted(
+        command.argv[-2].split(":/results/", maxsplit=1)[1]
+        for command in trace_commands
+    ) == ["f-action.jsonl", "source-result.jsonl"]
+    assert {
+        Path(command.argv[-1].rstrip("/")).name for command in trace_commands
+    } == {"C1.output", "F1.output"}
+    assert any(
+        command.argv[-2] == "icefarm-unit-run-C1:/results/source-result.jsonl"
+        for command in trace_commands
+    )
+    assert any(
+        command.argv[-2] == "icefarm-unit-run-F1:/results/f-action.jsonl"
+        for command in trace_commands
+    )
+
+
+@pytest.mark.parametrize("invalid_kind", ("symlink", "directory"))
+def test_local_p51_trace_diagnostics_reject_non_regular_paths(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    farm, _scenario, plan = _farm_scenario_plan(tmp_path)
+    farm.hosts["tt-quietbox3"]["execution"] = "local"
+    farm.hosts["tt-quietbox3"]["docker_context"] = "default"
+    farm.hosts["tt-quietbox3"]["scratch_root"] = str(tmp_path / "local-q3")
+    plan["diagnostic_capture_client_output"] = True
+    plan["diagnostic_capture_client_output_kind"] = "p51-receipt-window"
+    output_root = (
+        Path(farm.hosts["tt-quietbox3"]["scratch_root"])
+        / "icefarm"
+        / plan["run_id"]
+        / "C1"
+        / "output"
+    )
+    output_root.mkdir(parents=True)
+    trace_path = output_root / "source-result.jsonl"
+    if invalid_kind == "symlink":
+        trace_path.symlink_to(tmp_path / "outside-trace.jsonl")
+    else:
+        trace_path.mkdir()
+    transport = RecordingTransport(ScriptedLifecycle(farm))
+
+    problems = collect_diagnostics(
+        farm,
+        plan,
+        transport,
+        CommandFactory(),
+        tmp_path / "diagnostics",
+    )
+
+    assert any(
+        ":sync-p51-traces:refusing non-regular trace path " in problem
+        for problem in problems
+    )
+    assert not any(
+        command.phase == "diagnostics.sync-p51-traces"
+        and command.host == "tt-quietbox3"
+        for command in transport.commands
+    )
+
+
 def test_ports_are_unique_and_every_daemon_gets_an_explicit_port(
     tmp_path: Path,
 ) -> None:
