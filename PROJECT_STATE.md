@@ -12,9 +12,10 @@ retained artifact directories.
 
 ## Verification updates — 2026-09-28
 
-The candidate branch `sorbet_1.5_pipeline` is pushed at HEAD `5612f7db`;
-`8abe2de87d7225d142532952b0d41a07577624ab` is the D09 collector/verdict fix
-and `5612f7db` records the verification updates. The code commit fixes three
+The candidate branch `sorbet_1.5_pipeline` is pushed at HEAD `b19840f3`;
+`8abe2de87d7225d142532952b0d41a07577624ab` is the D09 collector/verdict fix,
+`5612f7db` records the preceding verification updates, and `b19840f3` fixes
+single-link receipt-gate startup diagnostics. The D09 code commit fixes three
 real D09 collection/verdict gaps: schema-v5 source results may truthfully mark
 attempt count as unmeasured; held-F validators now bind the workload ordinal
 rather than the independent scheduler job number; and the one-retry verdict
