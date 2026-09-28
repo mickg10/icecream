@@ -10,6 +10,30 @@ This file records evidence boundaries and open work, not a chronological
 agent log. Earlier diagnostic reports remain in Git history and their
 retained artifact directories.
 
+## Fresh exact-candidate W30 integration
+
+Candidate harness `448d7c933a3faa9319b47de8346e1b168de3c3ed` passes a fresh
+same-machine C1F2/P29V1/W30 `fmt-100` cell against product image/source
+`0268ac7da57ab426a926fa56e6c223f1b9fe1caa`. All 100 outputs are exact and
+remote, with zero compiler failures or local fallbacks. F1 and F2 each reached
+the negotiated 30 held receipts; F1's first output was proven while F2 remained
+held, then exact full output ranges 1–50 and 51–100 passed. The independent
+scenario verifier passed all 29 clauses; all 727 bundle checksum entries
+verify. Teardown is DOWN with no problems/diagnostic errors, and the exact run
+containers and receipt network are absent.
+
+Evidence:
+`/tanksmall/scratch/tmp/icefarm-local-w30-d7-r4/results/results/p51-local-C1F2-P29V1-W30-lan-r3/`
+(bundle manifest SHA256
+`22bcc4c8499d9138c31d0cf7dc1020844236852e5f7f30b702a0075eb855f06d`);
+independent verifier result
+`/tanksmall/scratch/tmp/p51-local-w30-d7-r6/verify-r3.json` (SHA256
+`6d2fcd92558ed6545c157ea46c5e12586467e81db95d11eefc04d14b55000825`).
+The run's `restart_extension` is explicitly `pending-not-run`: this is one
+local positive cell, not the D09 restart test, the 36-cell topology/profile/
+window matrix, or external multi-host qualification. It is a bounded synthetic
+correctness workload, not a CodebaseN performance result.
+
 ## Developer QA
 
 Latest fresh public QA on frozen `80c0bc24` is terminal **FAIL**. Build/install
