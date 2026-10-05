@@ -71,7 +71,8 @@ constexpr int hooked_get_seals_errno() noexcept
 
 }  // namespace
 
-bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
+bool capture_source_identity(int fd, SourceIdentity* identity,
+                             IdentityPolicy policy = IdentityPolicy::SealsRequired) noexcept {
     if (identity == nullptr)
         return false;
     struct stat info{};
@@ -82,6 +83,30 @@ bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
     captured.inode = static_cast<uint64_t>(info.st_ino);
     captured.mode = static_cast<uint64_t>(info.st_mode);
     captured.size = static_cast<uint64_t>(info.st_size);
+    captured.nlink = static_cast<uint64_t>(info.st_nlink);
+
+    if (policy == IdentityPolicy::CompatPrivateFile) {
+        // Kernel-3.10-class fallback (doc/p50-platform-compat.md, "M2 input
+        // artifact"): no seal bitmask is available on this kernel, so the
+        // admission check substitutes the daemon-private-file identity in
+        // full: unlinked (nlink == 0, so nothing else can still be holding
+        // this file open by path), mode exactly 0400, and the fd itself open
+        // O_RDONLY. Every other field (device, inode, size) is still checked
+        // exactly as strictly as the sealed path, via source_identity_equal.
+        if (captured.nlink != 0)
+            return false;
+        if ((captured.mode & 07777) != 0400)
+            return false;
+        errno = 0;
+        const int flags = ::fcntl(fd, F_GETFL);
+        if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY)
+            return false;
+        captured.has_seals = false;
+        captured.seals = 0;
+        *identity = captured;
+        return captured.valid();
+    }
+
 #if defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
     defined(F_SEAL_SHRINK)
     errno = 0;
@@ -117,13 +142,15 @@ bool source_identity_equal(const SourceIdentity& left,
                            const SourceIdentity& right) noexcept {
     return left.valid() && right.valid() && left.device == right.device &&
            left.inode == right.inode && left.mode == right.mode &&
-           left.size == right.size && left.has_seals == right.has_seals &&
+           left.size == right.size && left.nlink == right.nlink &&
+           left.has_seals == right.has_seals &&
            (!left.has_seals || left.seals == right.seals);
 }
 
-bool source_identity_matches(int fd, const SourceIdentity& expected) noexcept {
+bool source_identity_matches(int fd, const SourceIdentity& expected,
+                             IdentityPolicy policy = IdentityPolicy::SealsRequired) noexcept {
     SourceIdentity actual;
-    if (!capture_source_identity(fd, &actual))
+    if (!capture_source_identity(fd, &actual, policy))
         return false;
     return source_identity_equal(actual, expected);
 }
@@ -331,11 +358,13 @@ ForkSourceLease::ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                                  uint64_t expected_delivery_id, int owner_fd,
                                  int control_fd, SourceIdentity identity,
                                  uint64_t owner_cookie,
-                                 int proof_slot_fd) noexcept
+                                 int proof_slot_fd,
+                                 IdentityPolicy policy) noexcept
     : borrowed_handoff_fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
       expected_delivery_id_(expected_delivery_id), owned_proof_fd_(owner_fd),
       control_fd_(control_fd), proof_slot_fd_(proof_slot_fd),
-      identity_(identity), owner_cookie_(owner_cookie) {}
+      identity_(identity), owner_cookie_(owner_cookie),
+      identity_policy_(policy) {}
 
 ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
     : borrowed_handoff_fd_(other.borrowed_handoff_fd_), delivery_id_(other.delivery_id_),
@@ -345,7 +374,8 @@ ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
       control_fd_(other.control_fd_),
       proof_slot_fd_(other.proof_slot_fd_),
       identity_(other.identity_),
-      owner_cookie_(other.owner_cookie_) {
+      owner_cookie_(other.owner_cookie_),
+      identity_policy_(other.identity_policy_) {
     other.borrowed_handoff_fd_ = -1;
     other.delivery_id_ = 0;
     other.expected_fd_ = -1;
@@ -355,6 +385,7 @@ ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
     other.proof_slot_fd_ = -1;
     other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
+    other.identity_policy_ = IdentityPolicy::SealsRequired;
 }
 
 ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
@@ -372,6 +403,7 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         // move assignment cannot orphan the destination's open slot.
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
+        identity_policy_ = other.identity_policy_;
         other.borrowed_handoff_fd_ = -1;
         other.delivery_id_ = 0;
         other.expected_fd_ = -1;
@@ -380,6 +412,7 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         other.control_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
+        other.identity_policy_ = IdentityPolicy::SealsRequired;
     }
     return *this;
 }
@@ -413,9 +446,9 @@ bool ForkSourceLease::identity_matches_current() const noexcept {
         return owned_proof_fd_ != control_fd_ &&
                owned_proof_fd_ != borrowed_handoff_fd_ &&
                control_fd_ != borrowed_handoff_fd_ &&
-               source_identity_matches(owned_proof_fd_, identity_) &&
-               source_identity_matches(control_fd_, identity_) &&
-               source_identity_matches(borrowed_handoff_fd_, identity_);
+               source_identity_matches(owned_proof_fd_, identity_, identity_policy_) &&
+               source_identity_matches(control_fd_, identity_, identity_policy_) &&
+               source_identity_matches(borrowed_handoff_fd_, identity_, identity_policy_);
     }
     return same_open_file_description(owned_proof_fd_, control_fd_) &&
            source_identity_matches(owned_proof_fd_, identity_) &&
@@ -464,12 +497,13 @@ mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
 }
 
 std::optional<ForkSourceLease>
-mint_attached_input_source(int fd, uint64_t request_id) noexcept {
+mint_attached_input_source(int fd, uint64_t request_id,
+                           IdentityPolicy policy) noexcept {
     if (fd < 0 || request_id == 0)
         return std::nullopt;
 
     SourceIdentity identity;
-    if (!capture_source_identity(fd, &identity))
+    if (!capture_source_identity(fd, &identity, policy))
         return std::nullopt;
     // The accepted attachment already established the descriptor owner.
     // Keep two private duplicates so the child can re-check the same sealed
@@ -480,9 +514,9 @@ mint_attached_input_source(int fd, uint64_t request_id) noexcept {
     const bool valid = proof_fd >= 0 && control_fd >= 0 &&
                        proof_fd != fd && control_fd != fd &&
                        proof_fd != control_fd &&
-                       source_identity_matches(proof_fd, identity) &&
-                       source_identity_matches(control_fd, identity) &&
-                       source_identity_matches(fd, identity);
+                       source_identity_matches(proof_fd, identity, policy) &&
+                       source_identity_matches(control_fd, identity, policy) &&
+                       source_identity_matches(fd, identity, policy);
     if (!valid) {
         if (proof_fd >= 0)
             (void)::close(proof_fd);
@@ -491,7 +525,8 @@ mint_attached_input_source(int fd, uint64_t request_id) noexcept {
         return std::nullopt;
     }
     return ForkSourceLease(fd, request_id, fd, request_id, proof_fd,
-                           control_fd, identity, kAttachmentOwnerCookie);
+                           control_fd, identity, kAttachmentOwnerCookie,
+                           -1, policy);
 }
 
 namespace {

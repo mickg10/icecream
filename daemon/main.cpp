@@ -113,6 +113,7 @@
 #include "util.h"
 #include "getifaddrs.h"
 #include "p50_daemon_sidecar_adapter.h"
+#include "p50_platform_compat.h"
 #include "p50_completion_record.h"
 #include "p50_cache_recovery_policy.h"
 #include "p50_daemon_cache_dispatch.h"
@@ -1485,6 +1486,20 @@ struct Daemon {
     // PATH lookup and no implicit shared socket location.
     std::string cache_service_executable;
     std::string cache_runtime_directory;
+    // Decided once, before configure_cache_adapter() ever constructs a
+    // sidecar launch plan. See doc/p50-platform-compat.md. FailClosed on any
+    // one of the three mitigations means the cache sidecar is never
+    // configured on this daemon at all (cache_adapter stays null): no
+    // sidecar is launched, nothing is advertised to the scheduler, and the
+    // daemon keeps serving legacy FileChunk transfer exactly as it does
+    // today when no cache executable is configured. This is a startup-time
+    // gate in configure_cache_adapter(), not a per-job decision -- a
+    // platform FailClosed must never surface as a per-job failure/retry.
+    // When every mitigation resolves to Native or Compat, the input (M2)
+    // decision additionally selects the admission policy
+    // mint_attached_input_source() uses for every P50 job on this daemon.
+    icecc::p50::platform::PlatformDecision platform_decision;
+    bool platform_decision_computed = false;
 
     bool webgui_enabled;
     int webgui_port;
@@ -5281,6 +5296,39 @@ void Daemon::close_scheduler(bool orderly_shutdown)
 
 bool Daemon::configure_cache_adapter() noexcept
 {
+    // Decided exactly once, before any sidecar launch attempt below, and
+    // regardless of whether a cache sidecar is even configured on this
+    // daemon -- so the log line below is always emitted and
+    // mint_attached_input_source() call sites always have a real decision
+    // to read, never a default-constructed FailClosed-reason="unprobed".
+    // This function's own `false` return is reserved for configuration
+    // errors that should exit the daemon; a platform FailClosed is handled
+    // separately immediately below and always returns `true` (cache off,
+    // daemon up), never `false`.
+    if (!platform_decision_computed) {
+        platform_decision = icecc::p50::platform::decide_platform();
+        platform_decision_computed = true;
+        log_info() << icecc::p50::platform::format_platform_log_line(platform_decision)
+                   << endl;
+    }
+
+    // A platform FailClosed is a startup-time gate, not a per-job failure:
+    // if any one of the three mitigations cannot be resolved to a native or
+    // compat backend, this daemon never configures a cache sidecar at all --
+    // same posture as the "no executable configured" case just below, so
+    // every existing cache_adapter==nullptr call site already treats this
+    // correctly as "cache off, keep serving legacy." No sidecar is launched,
+    // nothing is advertised to the scheduler, and configure_cache_adapter()
+    // still returns true (this is not a daemon-exit condition).
+    if (icecc::p50::platform::any_fail_closed(platform_decision)) {
+        log_info() << "cache sidecar disabled: a required platform "
+                       "compatibility mitigation failed closed (see "
+                       "platform decision above); running with cache off"
+                   << endl;
+        cache_adapter.reset();
+        return true;
+    }
+
     if (cache_service_executable.empty() && cache_runtime_directory.empty())
         return true;
 
@@ -5328,6 +5376,25 @@ bool Daemon::configure_cache_adapter() noexcept
         config.central_reaper = &cache_child_reaper;
         config.clock_identity =
             icecc::p50::sidecar::process_monotonic_clock_identity();
+        // M1 (child), M2 (input), and M3 (random): the once-decided platform
+        // mitigation backends, threaded down to this adapter's own
+        // OuterKillDomainVerifier, the sidecar launch (--input-backend), and
+        // this adapter's own LaunchIdentityAllocator respectively.
+        // any_fail_closed() above already guarantees platform_decision has
+        // no FailClosed entry by the time this line runs, so only Native
+        // and Compat are possible here.
+        config.child_handle_backend =
+            platform_decision.child.backend == icecc::p50::platform::Backend::Compat
+                ? icecc::p50::ChildHandleBackend::Compat
+                : icecc::p50::ChildHandleBackend::Native;
+        config.input_backend =
+            platform_decision.input.backend == icecc::p50::platform::Backend::Compat
+                ? icecc::p50::InputMaterializationBackend::Compat
+                : icecc::p50::InputMaterializationBackend::Native;
+        config.entropy_provider =
+            platform_decision.random.backend == icecc::p50::platform::Backend::Compat
+                ? icecc::p50::platform::compat_store_identity_entropy
+                : icecc::p50::system_store_identity_entropy;
 
         if (!icecc::p50::daemon::DaemonSidecarAdapter::valid_config(config)) {
             /* R17a: name the failing check -- path, expected vs actual
@@ -8111,11 +8178,23 @@ void Daemon::handle_old_request()
 
             string envforjob = job->targetPlatform() + "/" + job->environmentVersion();
             received_environments[envforjob].last_use = time(nullptr);
-            const int compiler_input_fd = client->p50_input_fd;
+            const int sidecar_input_fd = client->p50_input_fd;
             client->p50_input_fd = -1;
+            // The fd actually admitted into mint_attached_input_source() and
+            // handed to handle_connection(). Equal to sidecar_input_fd for
+            // Native; for Compat it is replaced below with a daemon-owned
+            // verified copy, since the lease and the forked child's
+            // KeepSet::sweep() re-check must bind to the exact same
+            // descriptor that was minted (see
+            // icecc::p50::forkfd::mint_attached_input_source() and
+            // handle_connection()'s KeepSet construction in serve.cpp) and
+            // that descriptor must never be the sidecar's own raw handoff
+            // fd under CompatPrivateFile -- the sidecar is outside this
+            // daemon's trust/ownership boundary.
+            int effective_input_fd = sidecar_input_fd;
             std::optional<icecc::p50::forkfd::ForkSourceLease>
                 compiler_input_source;
-            if (job->usesP50Input() && compiler_input_fd >= 0 &&
+            if (job->usesP50Input() && sidecar_input_fd >= 0 &&
                 client->p50_input_lease.has_value()) {
                 const auto& attachment = *client->p50_input_lease;
                 const auto& input = job->compileInputIdentity();
@@ -8129,9 +8208,63 @@ void Daemon::handle_old_request()
                     attachment.owner == expected_owner &&
                     attachment.request_id == input.request_id;
                 if (attachment_matches) {
-                    compiler_input_source =
-                        icecc::p50::forkfd::mint_attached_input_source(
-                            compiler_input_fd, attachment.request_id);
+                    // Map the once-decided M2 (input) platform mitigation to
+                    // the admission policy mint_attached_input_source()
+                    // enforces. This job could only have reached
+                    // usesP50Input() if configure_cache_adapter() configured
+                    // and advertised a cache sidecar, which it never does
+                    // while platform_decision.input.backend is FailClosed
+                    // (see Daemon::platform_decision and
+                    // configure_cache_adapter()) -- so the FailClosed case
+                    // below is unreachable in practice, not a designed
+                    // per-job fallback.
+                    switch (platform_decision.input.backend) {
+                    case icecc::p50::platform::Backend::Native:
+                        compiler_input_source =
+                            icecc::p50::forkfd::mint_attached_input_source(
+                                effective_input_fd, attachment.request_id,
+                                icecc::p50::forkfd::IdentityPolicy::SealsRequired);
+                        break;
+                    case icecc::p50::platform::Backend::Compat: {
+                        // M2 compat consumer: copy+verify the sidecar's
+                        // handoff into a daemon-owned private file (length
+                        // plus a write/read-back digest round trip; see
+                        // icecc::p50::platform::copy_compat_input_from_sidecar())
+                        // before minting anything. The sidecar's fd is not
+                        // needed past this point -- close it now rather than
+                        // carrying it forward to handle_connection().
+                        const icecc::p50::platform::CompatInputCopy copy =
+                            icecc::p50::platform::copy_compat_input_from_sidecar(
+                                sidecar_input_fd);
+                        (void)::close(sidecar_input_fd);
+                        effective_input_fd = -1;
+                        if (copy.ok) {
+                            effective_input_fd = copy.fd;
+                            compiler_input_source =
+                                icecc::p50::forkfd::mint_attached_input_source(
+                                    effective_input_fd, attachment.request_id,
+                                    icecc::p50::forkfd::IdentityPolicy::CompatPrivateFile);
+                        } else {
+                            log_warning() << "P50 compat input copy failed for job "
+                                          << job->jobID() << " request "
+                                          << attachment.request_id << endl;
+                        }
+                        break;
+                    }
+                    case icecc::p50::platform::Backend::FailClosed:
+                        // Defensive only: the cache-off gate in
+                        // configure_cache_adapter() should make this
+                        // unreachable. Do not mint; the usesP50Input() check
+                        // just below logs and fails this one job, which is
+                        // the correct response to an unexpected programming
+                        // error here, not a routine per-job fallback.
+                        log_error() << "P50 input admission reached a "
+                                       "FailClosed backend for job "
+                                    << job->jobID()
+                                    << " despite cache-off gating; this is a bug"
+                                    << endl;
+                        break;
+                    }
                 } else {
                     log_warning() << "P50 compiler attachment binding mismatch for job "
                                   << job->jobID() << " request "
@@ -8142,14 +8275,14 @@ void Daemon::handle_old_request()
             if (job->usesP50Input() && !compiler_input_source.has_value()) {
                 log_warning() << "P50 attached input failed compiler-fork validation for job "
                               << job->jobID() << endl;
-                if (compiler_input_fd >= 0)
-                    (void)::close(compiler_input_fd);
+                if (effective_input_fd >= 0)
+                    (void)::close(effective_input_fd);
                 handle_end(client, 146);
                 continue;
             }
             pid = handle_connection(envbasedir, job, client->channel, sock,
                                     mem_limit, user_uid, user_gid,
-                                    compiler_input_fd,
+                                    effective_input_fd,
                                     std::move(compiler_input_source));
             trace() << "handle connection returned " << pid << endl;
 

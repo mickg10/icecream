@@ -240,6 +240,11 @@ int open_pidfd(pid_t pid) noexcept
 
 class OuterKillDomainVerifier final : public sidecar::KillDomainVerifier {
 public:
+    explicit OuterKillDomainVerifier(ChildHandleBackend backend) noexcept
+        : backend_(backend)
+    {
+    }
+
     ~OuterKillDomainVerifier() override
     {
         for (const Record& record : records_)
@@ -252,19 +257,32 @@ public:
     {
         if (pid <= 1 || pid != pgid)
             return std::nullopt;
-        const int pidfd = open_pidfd(pid);
-        if (pidfd < 0)
-            return std::nullopt;
+        int pidfd = -1;
+        platform::CompatChildHandle compat_handle;
+        if (backend_ == ChildHandleBackend::Compat) {
+            // M1 compat: (pid, starttime) capture replaces the pidfd. No fd
+            // is held, so there is nothing for the destructor to close for
+            // this record.
+            if (!compat_handle.arm(pid))
+                return std::nullopt;
+        } else {
+            pidfd = open_pidfd(pid);
+            if (pidfd < 0)
+                return std::nullopt;
+        }
         const uint64_t serial = next_serial_ == 0 ? ++next_serial_ : next_serial_++;
         sidecar::KillDomainLease lease = issue(pid, pgid, serial);
         if (!lease.valid()) {
-            (void)::close(pidfd);
+            if (pidfd >= 0)
+                (void)::close(pidfd);
             return std::nullopt;
         }
         try {
-            records_.push_back(Record{std::move(lease), pid, pgid, pidfd});
+            records_.push_back(
+                Record{std::move(lease), pid, pgid, pidfd, compat_handle});
         } catch (...) {
-            (void)::close(pidfd);
+            if (pidfd >= 0)
+                (void)::close(pidfd);
             return std::nullopt;
         }
         return records_.back().lease;
@@ -279,7 +297,7 @@ public:
                 return candidate.pid == pid && candidate.pgid == pgid &&
                        candidate.lease == lease;
             });
-        if (record == records_.end() || record->pidfd < 0 ||
+        if (record == records_.end() || !record->captured() ||
             observation.group != sidecar::GroupObservation::Gone ||
             observation.observed_pgid != pgid)
             return false;
@@ -288,7 +306,11 @@ public:
         // fcntl()/kill() pair here would turn one reducer advance into hidden
         // extra syscalls.  The cgroup-v2 no-descendant/singleton census and
         // OUTPUT_QUIESCENCE_GRANTED proof remain an explicit integration
-        // HOLD until the authoritative leaf owner is joined.
+        // HOLD until the authoritative leaf owner is joined. This holds
+        // identically for the M1 compat backend: record->captured() is a
+        // capture-succeeded gate (native: a held pidfd; compat: an armed
+        // (pid, starttime) handle), never a second gone-ness probe of its
+        // own, in either case.
         return true;
     }
 
@@ -310,9 +332,16 @@ private:
         pid_t pid = -1;
         pid_t pgid = -1;
         int pidfd = -1;
+        platform::CompatChildHandle compat_handle;
+
+        [[nodiscard]] bool captured() const noexcept
+        {
+            return pidfd >= 0 || compat_handle.armed();
+        }
     };
     std::vector<Record> records_;
     uint64_t next_serial_ = 1;
+    ChildHandleBackend backend_ = ChildHandleBackend::Native;
 };
 
 sidecar::State advertisement_state(sidecar::LifecycleState state) noexcept
@@ -346,8 +375,9 @@ DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
         if (!config_.clock_identity.valid())
             config_.clock_identity = sidecar::process_monotonic_clock_identity();
         launch_identities_ = std::make_shared<sidecar::LaunchIdentityAllocator>(
-            config_.generation, 1);
-        outer_kill_domain_ = std::make_shared<OuterKillDomainVerifier>();
+            config_.generation, 1, config_.entropy_provider);
+        outer_kill_domain_ = std::make_shared<OuterKillDomainVerifier>(
+            config_.child_handle_backend);
         sidecar::SidecarLifecycleConfig lifecycle_config;
         lifecycle_config.control_generation = config_.generation;
         lifecycle_config.private_root = config_.runtime_directory;
@@ -475,6 +505,8 @@ std::string DaemonSidecarAdapter::config_refusal_reason(const Config& config) no
     }
     if (!config.clock_identity.valid())
         return "clock identity is invalid";
+    if (config.entropy_provider == nullptr)
+        return "entropy provider is not set";
     if (!bounded_positive(config.readiness_timeout))
         return "readiness timeout is not a bounded positive duration";
     if (!bounded_positive(config.connect_timeout))
@@ -1646,6 +1678,11 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             outer_launch_argv_storage_.push_back(bytes_hex_local(identity.c_store_guid.bytes));
             outer_launch_argv_storage_.push_back("--f-store-guid");
             outer_launch_argv_storage_.push_back(bytes_hex_local(identity.f_store_guid.bytes));
+            outer_launch_argv_storage_.push_back("--input-backend");
+            outer_launch_argv_storage_.push_back(
+                config_.input_backend == InputMaterializationBackend::Compat
+                    ? "compat"
+                    : "native");
             outer_launch_argv_.reserve(outer_launch_argv_storage_.size() + 1);
             for (std::string& value : outer_launch_argv_storage_)
                 outer_launch_argv_.push_back(value.data());

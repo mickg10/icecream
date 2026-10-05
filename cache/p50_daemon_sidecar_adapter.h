@@ -7,6 +7,7 @@
 // daemon remains the owner of its public listener and reports that observation
 // through observe_public_listener(); this class never opens a public socket.
 
+#include "p50_compat_child_handle.h"
 #include "p50_daemon_cache_dispatch.h"
 #include "p50_daemon_control.h"
 #include "p50_input_fd_attachment.h"
@@ -69,6 +70,39 @@ struct Config {
 
     std::optional<uint64_t> drop_uid;
     std::optional<uint64_t> drop_gid;
+
+    // Which backend the launched sidecar's InputFdAttachmentService should
+    // use, passed down as --input-backend. The daemon's platform-compat
+    // module (daemon/p50_platform_compat.h) resolves this exactly once at
+    // daemon startup; configure_cache_adapter() never constructs this
+    // adapter at all when that decision is FailClosed (see
+    // doc/p50-platform-compat.md), so by the time a Config reaches this
+    // adapter the value here is always Native or Compat, never a third
+    // fail-closed state. Defaults to Native so any test or caller that
+    // does not set this field explicitly keeps today's exact behavior.
+    InputMaterializationBackend input_backend = InputMaterializationBackend::Native;
+
+    // Entropy source for LaunchIdentityAllocator's fresh store-identity
+    // roots (cache/p50_sidecar_identity.h), passed straight through to its
+    // constructor. Same provenance and same fail-closed-is-handled-upstream
+    // guarantee as input_backend immediately above: the daemon's
+    // platform-compat module (daemon/p50_platform_compat.h) resolves this
+    // exactly once at daemon startup from the M3 (random) mitigation
+    // decision, and configure_cache_adapter() never constructs this adapter
+    // at all when that decision is FailClosed. Defaults to the native
+    // getrandom()-backed provider so any test or caller that does not set
+    // this field explicitly keeps today's exact behavior.
+    StoreIdentityEntropyProvider entropy_provider = system_store_identity_entropy;
+
+    // M1 (child handle) backend for this adapter's OuterKillDomainVerifier.
+    // Same provenance and same fail-closed-is-handled-upstream guarantee as
+    // input_backend and entropy_provider above: the daemon's platform-compat
+    // module resolves this exactly once at daemon startup from the M1
+    // (child) mitigation decision, and configure_cache_adapter() never
+    // constructs this adapter at all when that decision is FailClosed.
+    // Defaults to the native pidfd-backed verifier so any test or caller
+    // that does not set this field explicitly keeps today's exact behavior.
+    ChildHandleBackend child_handle_backend = ChildHandleBackend::Native;
 
     // The adapter does not own this listener.  A present advertisement is
     // emitted only when observe_public_listener() reports this exact port.

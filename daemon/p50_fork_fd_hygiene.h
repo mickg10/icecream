@@ -12,6 +12,28 @@
 
 namespace icecc::p50::forkfd {
 
+// Which admission check capture_source_identity()/source_identity_matches()
+// enforce. See doc/p50-platform-compat.md, "M2 input artifact", for the
+// full rationale.
+//
+//   SealsRequired     -- native backend: the descriptor is a memfd carrying
+//                         the three immutable seals (SEAL|SHRINK|GROW|WRITE).
+//                         This is the default for every call site that does
+//                         not pass a different policy explicitly, so native
+//                         behavior is unchanged unless a caller opts in.
+//   CompatPrivateFile -- kernel-3.10-class fallback: the descriptor is a
+//                         daemon-private unlinked file instead of a sealed
+//                         memfd. Admission requires, in place of the seal
+//                         bitmask: nlink == 0 (unlinked -- nothing else can
+//                         still be holding it open by path), mode exactly
+//                         0400, and the fd open O_RDONLY. Every other field
+//                         (device, inode, size) is checked exactly as
+//                         strictly as the sealed path.
+enum class IdentityPolicy : uint8_t {
+    SealsRequired,
+    CompatPrivateFile,
+};
+
 struct SourceIdentity {
     uint64_t device = 0;
     uint64_t inode = 0;
@@ -19,6 +41,9 @@ struct SourceIdentity {
     uint64_t size = 0;
     uint64_t seals = 0;
     bool has_seals = false;
+    // Hard link count at capture time. Unused by the SealsRequired policy;
+    // the CompatPrivateFile policy requires this to be (and remain) 0.
+    uint64_t nlink = 0;
 
     [[nodiscard]] bool valid() const noexcept {
         return device != 0 && inode != 0 && mode != 0;
@@ -113,7 +138,8 @@ private:
     ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                     uint64_t expected_delivery_id, int owned_proof_fd,
                     int control_fd, SourceIdentity identity,
-                    uint64_t owner_cookie, int proof_slot_fd = -1) noexcept;
+                    uint64_t owner_cookie, int proof_slot_fd = -1,
+                    IdentityPolicy policy = IdentityPolicy::SealsRequired) noexcept;
     // The handoff descriptor is borrowed from the delivery caller.  A lease
     // may validate it and keep its number, but must never close it (including
     // when move-assignment replaces this lease).
@@ -130,6 +156,12 @@ private:
     int proof_slot_fd_ = -1;
     SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
+    // Which admission policy this lease was minted under. identity_matches_current()
+    // re-checks using this same policy, so a CompatPrivateFile lease is never
+    // silently re-validated against the stricter SealsRequired rule (or vice
+    // versa). Defaulted so every existing minting path that does not pass a
+    // policy keeps today's exact SealsRequired behavior.
+    IdentityPolicy identity_policy_ = IdentityPolicy::SealsRequired;
 
     bool retire_identity_proof() noexcept;
 
@@ -137,7 +169,8 @@ private:
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                            uint64_t delivery_id) noexcept;
     friend std::optional<ForkSourceLease>
-    mint_attached_input_source(int fd, uint64_t request_id) noexcept;
+    mint_attached_input_source(int fd, uint64_t request_id,
+                               IdentityPolicy policy) noexcept;
     friend Result sweep(KeepSet& keep) noexcept;
     friend int test_fork_source_lease_proof_fd(const ForkSourceLease&) noexcept;
 };
@@ -151,8 +184,13 @@ mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
 // Production entry from an already accepted InputFdAttachment. The caller
 // supplies that attachment's exact request id; this function verifies the
 // read-only sealed descriptor and prepares it for the first-fork keep set.
+// `policy` defaults to SealsRequired, so a caller that does not pass it gets
+// today's exact native behavior; a caller that resolved the platform
+// decision module's input mitigation to Compat passes
+// IdentityPolicy::CompatPrivateFile explicitly.
 [[nodiscard]] std::optional<ForkSourceLease>
-mint_attached_input_source(int fd, uint64_t request_id) noexcept;
+mint_attached_input_source(int fd, uint64_t request_id,
+                           IdentityPolicy policy = IdentityPolicy::SealsRequired) noexcept;
 
 struct KeepSet {
     int stat_pipe_fd = -1;

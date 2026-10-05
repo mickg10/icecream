@@ -76,7 +76,8 @@ libp50input_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h \
 libp50input_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50sidecar_a_SOURCES = p50_sidecar_identity.cpp p50_sidecar_identity.h \
 	p50_sidecar_lifecycle.cpp p50_sidecar_lifecycle.h \
-	p50_ready_advertisement.cpp p50_ready_advertisement.h
+	p50_ready_advertisement.cpp p50_ready_advertisement.h \
+	p50_compat_child_handle.cpp p50_compat_child_handle.h
 libp50sidecar_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
 	p50_daemon_sidecar_adapter.h

@@ -316,6 +316,15 @@ struct Options {
     std::optional<uint64_t> drop_uid;
     std::optional<uint64_t> drop_gid;
     int backlog = 1;
+    // Which backend this sidecar's InputFdAttachmentService should use to
+    // materialize compiler input snapshots. Defaults to Native, so a launch
+    // that omits --input-backend keeps today's exact sealed-memfd behavior.
+    // The daemon is the only decision-maker: it resolves its platform-compat
+    // module's input mitigation exactly once at its own startup and passes
+    // the result down via --input-backend; this sidecar never reads
+    // ICECC_P50_PLATFORM* or re-probes anything itself. See
+    // doc/p50-platform-compat.md, "M2 input artifact".
+    InputMaterializationBackend input_backend = InputMaterializationBackend::Native;
 };
 
 // Parses only the service's explicit options.  It never consults PATH,

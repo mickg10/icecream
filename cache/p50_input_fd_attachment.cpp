@@ -5,6 +5,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <span>
 #include <stdexcept>
@@ -279,6 +280,11 @@ int reopen_readonly_memfd(
     int writable_fd, size_t exact_size,
     std::chrono::steady_clock::time_point deadline,
     InputFdAttachmentStatus& status) noexcept {
+    // Despite the name (kept to minimize diff against the native path),
+    // this reopen-via-/proc/self/fd step is backend-agnostic: it works
+    // identically for the sealed memfd and for the compat private file,
+    // since both are just fds this same process already owns. It is
+    // reused unchanged by make_compat_private_file()'s caller below.
 #if defined(__linux__)
     if (writable_fd < 0 || std::chrono::steady_clock::now() >= deadline) {
         if (writable_fd >= 0)
@@ -328,8 +334,85 @@ int reopen_readonly_memfd(
 #endif
 }
 
+// Builds (idempotently; EEXIST is fine) a 0700 owner-only directory
+// `/dev/shm/icecc-p50-compat-<euid>` and returns a writable fd for a brand
+// new file inside it, created via mkstemp() and immediately unlink()ed so
+// no path to it ever outlives this call -- nothing else can open it by
+// name while it is being written. Deliberately not O_TMPFILE (Linux
+// 3.11+, may not exist on the kernel-3.10 class this backend targets);
+// mkstemp()+unlink() is the one path that works on every target kernel.
+int open_compat_private_write_fd() noexcept {
+    char dir_path[64];
+    const int dir_len = std::snprintf(dir_path, sizeof(dir_path),
+                                      "/dev/shm/icecc-p50-compat-%d",
+                                      static_cast<int>(::geteuid()));
+    if (dir_len <= 0 || static_cast<size_t>(dir_len) >= sizeof(dir_path))
+        return -1;
+    if (::mkdir(dir_path, 0700) != 0 && errno != EEXIST)
+        return -1;
+    struct stat dir_info{};
+    if (::lstat(dir_path, &dir_info) != 0 || !S_ISDIR(dir_info.st_mode) ||
+        (dir_info.st_mode & 0777) != 0700 || dir_info.st_uid != ::geteuid())
+        return -1;
+    char path[96];
+    const int path_len =
+        std::snprintf(path, sizeof(path), "%s/input-XXXXXX", dir_path);
+    if (path_len <= 0 || static_cast<size_t>(path_len) >= sizeof(path))
+        return -1;
+    const int fd = ::mkstemp(path);
+    if (fd < 0)
+        return -1;
+    if (::unlink(path) != 0) {
+        (void)::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Compat counterpart of make_sealed_memfd(): instead of a sealed memfd,
+// writes into an unlinked private file and tightens it to mode 0400 once
+// writing is complete. The CompatPrivateFile admission policy (see
+// p50_fork_fd_hygiene.h) checks nlink == 0, mode == 0400, device, inode,
+// and size in place of the seal bitmask -- exactly as strict a check, just
+// against different kernel-visible evidence of exclusivity.
+int make_compat_private_file(
+    std::span<const uint8_t> bytes,
+    std::chrono::steady_clock::time_point deadline,
+    InputFdAttachmentStatus& status) noexcept {
+    const int fd = open_compat_private_write_fd();
+    if (fd < 0)
+        return -1;
+    if (!write_complete(fd, bytes, deadline, status)) {
+        (void)::close(fd);
+        return -1;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        status = InputFdAttachmentStatus::Timeout;
+        (void)::close(fd);
+        return -1;
+    }
+    if (::lseek(fd, 0, SEEK_SET) != 0 || ::fchmod(fd, 0400) != 0) {
+        (void)::close(fd);
+        return -1;
+    }
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || info.st_nlink != 0 ||
+        (info.st_mode & 0777) != 0400 || info.st_size < 0 ||
+        static_cast<uintmax_t>(info.st_size) != bytes.size()) {
+        (void)::close(fd);
+        return -1;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        status = InputFdAttachmentStatus::Timeout;
+        (void)::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 int materialize(InputCursor cursor, size_t max_bytes,
                 std::chrono::steady_clock::time_point deadline,
+                InputMaterializationBackend backend,
                 InputFdAttachmentStatus& status) noexcept {
     try {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -382,11 +465,14 @@ int materialize(InputCursor cursor, size_t max_bytes,
             status = InputFdAttachmentStatus::Timeout;
             return -1;
         }
-        const int writable_fd = make_sealed_memfd(bytes, deadline, status);
+        const int writable_fd = backend == InputMaterializationBackend::Compat
+                                     ? make_compat_private_file(bytes, deadline, status)
+                                     : make_sealed_memfd(bytes, deadline, status);
         if (writable_fd < 0)
             status = status == InputFdAttachmentStatus::Timeout
                          ? status
-                         : kSealedMemfdBuildSupport
+                         : (backend == InputMaterializationBackend::Compat ||
+                            kSealedMemfdBuildSupport)
                                ? InputFdAttachmentStatus::MaterializationFailed
                                : InputFdAttachmentStatus::UnsupportedPlatform;
         if (writable_fd < 0)
@@ -462,9 +548,11 @@ void InputFd::reset() noexcept {
     fd_ = -1;
 }
 
-InputFdAttachmentService::InputFdAttachmentService(CursorProvider provider,
-                                                   size_t max_materialized_bytes)
-    : provider_(std::move(provider)), max_materialized_bytes_(max_materialized_bytes) {
+InputFdAttachmentService::InputFdAttachmentService(
+    CursorProvider provider, size_t max_materialized_bytes,
+    InputMaterializationBackend backend)
+    : provider_(std::move(provider)), max_materialized_bytes_(max_materialized_bytes),
+      backend_(backend) {
     if (!provider_ || max_materialized_bytes_ == 0)
         throw std::invalid_argument("input FD attachment service configuration");
 }
@@ -551,7 +639,7 @@ InputFdAttachmentResult InputFdAttachmentService::serve_request(
     InputFdAttachmentStatus materialization_status =
         InputFdAttachmentStatus::MaterializationFailed;
     const int fd = materialize(std::move(cursor), max_materialized_bytes_,
-                               deadline, materialization_status);
+                               deadline, backend_, materialization_status);
     if (fd < 0) {
         (void)send_attachment_result(connection, expected_identity,
                                      request.request_id,

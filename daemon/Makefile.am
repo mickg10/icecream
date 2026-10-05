@@ -7,6 +7,7 @@ iceccd_SOURCES = \
 	p50_fork_fd_hygiene.cpp \
 	p50_task_count.cpp \
 	p50_completion_record.cpp \
+	p50_platform_compat.cpp \
 	compiler_input.cpp \
 	workit.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp \
@@ -45,6 +46,7 @@ noinst_HEADERS = \
 	p50_task_count.h \
 	p50_fork_fd_hygiene.h \
 	p50_completion_record.h \
+	p50_platform_compat.h \
 	p50_cache_recovery_policy.h \
 	statewriter.h \
 	environment.h \
