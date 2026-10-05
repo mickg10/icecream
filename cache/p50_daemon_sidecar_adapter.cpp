@@ -2202,6 +2202,18 @@ bool DaemonSidecarAdapter::outer_advance_authentication(
                 }
                 outer_auth_phase_ = 4;
             }
+        } else if (count == 0) {
+            // A clean peer EOF before a complete HelloAck is a failed
+            // handshake, not a transient condition: unlike EAGAIN/EWOULDBLOCK,
+            // a zero-length recv() here can never become non-zero on a later
+            // turn. Without this branch, count == 0 matched neither the
+            // count > 0 nor the count < 0 arm, and because a clean EOF on a
+            // Unix stream socket sets POLLIN alongside POLLHUP, the universal
+            // early-exit gate above (POLLHUP/POLLERR without concurrent
+            // POLLIN/POLLOUT) did not fire either; the adapter spun
+            // re-attempting recv() every outer turn until connect_timeout.
+            close_owned(outer_auth_fd_);
+            outer_auth_phase_ = 0;
         } else if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
             close_owned(outer_auth_fd_);
             outer_auth_phase_ = 0;
