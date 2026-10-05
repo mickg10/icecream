@@ -21,6 +21,7 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
     ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
     "$top_src/unittests/p50_daemon_sidecar_adapter_test.cpp" \
     "$top_src/cache/p50_daemon_sidecar_adapter.cpp" \
+    "$top_src/cache/p50_compat_child_handle.cpp" \
     "$top_src/cache/p50_daemon_cache_dispatch.cpp" \
     "$top_src/cache/p50_input_fd_attachment.cpp" \
     "$top_src/cache/p50_input_lifecycle.cpp" \

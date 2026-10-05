@@ -14,6 +14,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <sys/syscall.h>
 #  include <sys/types.h>
@@ -240,10 +241,18 @@ PlatformDecision decide_platform() noexcept {
     const Mode input_mode = (input_raw != nullptr) ? parse_mode(input_raw) : shorthand;
     const Mode random_mode = (random_raw != nullptr) ? parse_mode(random_raw) : shorthand;
 
+    // When a per-mitigation override is absent, the effective mode falls
+    // back to the shorthand -- so the raw string that actually produced
+    // that mode (for an "invalid value '...'" message) is the shorthand's,
+    // not the per-mitigation variable's (which is null in that case).
+    const char* child_effective_raw = (child_raw != nullptr) ? child_raw : shorthand_raw;
+    const char* input_effective_raw = (input_raw != nullptr) ? input_raw : shorthand_raw;
+    const char* random_effective_raw = (random_raw != nullptr) ? random_raw : shorthand_raw;
+
     PlatformDecision decision;
-    decision.child = resolve_one(child_mode, child_raw, "pidfd ok", &probe_pidfd_child);
-    decision.input = resolve_one(input_mode, input_raw, "seal round-trip ok", &probe_sealed_memfd);
-    decision.random = resolve_one(random_mode, random_raw, "getrandom ok", &probe_getrandom);
+    decision.child = resolve_one(child_mode, child_effective_raw, "pidfd ok", &probe_pidfd_child);
+    decision.input = resolve_one(input_mode, input_effective_raw, "seal round-trip ok", &probe_sealed_memfd);
+    decision.random = resolve_one(random_mode, random_effective_raw, "getrandom ok", &probe_getrandom);
     return decision;
 }
 
