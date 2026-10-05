@@ -239,6 +239,10 @@ if grep -F 'std::min(' "$mutant" >/dev/null; then
     exit 1
 fi
 
-# A committed TU of any accepted size must reach the compiler.
-require "$impl" 'static_cast<size_t>(runtime.max_raw_bytes()));'
+# A committed TU of any accepted size must reach the compiler. The call site
+# gained a trailing options.input_backend argument (M2 compat wiring: the
+# daemon-resolved native/compat input-attachment backend selector), so the
+# max_raw_bytes() argument is no longer the last one and the literal no
+# longer ends in '));' -- match the argument itself, not its old position.
+require "$impl" 'static_cast<size_t>(runtime.max_raw_bytes()),'
 echo 'ok - cache service StoreIdentity/operation-control source gates hold'
