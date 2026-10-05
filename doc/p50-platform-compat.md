@@ -22,7 +22,7 @@ daemon at startup:
 
 | Mitigation | Native backend | Compat backend | Env override |
 |---|---|---|---|
-| M1 child handle | `pidfd_open` + `waitid(P_PIDFD)` | `(pid, /proc/PID/stat` starttime ticks`)` + SIGCHLD + bounded `WNOWAIT` poll | `ICECC_P50_PLATFORM_CHILD` |
+| M1 child handle | `pidfd_open` + `waitid(P_PIDFD)` | `waitid(P_PID, pid, WNOHANG\|WNOWAIT)` against the direct child's own zombie, discovered by the daemon's existing tick-driven reap sweep (no SIGCHLD handler added) | `ICECC_P50_PLATFORM_CHILD` |
 | M2 input artifact | sealed `memfd` (4 seals) | daemon-private unlinked read-only copy | `ICECC_P50_PLATFORM_INPUT` |
 | M3 random | `getrandom` | `/dev/urandom` | `ICECC_P50_PLATFORM_RANDOM` |
 
@@ -242,11 +242,26 @@ hold) during QA.
 
 ## What each compat backend weakens
 
-* **M1**: "same process" becomes a checked observation
-  (`(pid, starttime_ticks)` + a `/proc` re-check immediately before
-  kill/wait) instead of a kernel-enforced fact; the residual risk is a
-  `pid_max` wrap between the check and the use, treated as the compat
-  backend's one accepted non-zero-probability window.
+* **M1**: the guarantee is not `still_same_process()` -- it is the zombie
+  anchor. Our own direct child's zombie pins both its PID and its PGID
+  until we explicitly reap it, so there is **no** PID-reuse window while
+  that invariant holds, independent of any `/proc` re-check. The invariant
+  has exactly two preconditions, both enforced, not merely hoped for:
+  (a) every kill/killpg through the handle happens strictly before the
+  consuming reap -- after the consume the handle is dead and a signal
+  through it is a hard error; (b) nothing anywhere blindly reaps this
+  child out from under the registry (no `wait(`, `waitpid(-1`,
+  `waitid(P_ALL`, `waitid(P_PGID`, and no `SIG_IGN`/`SA_NOCLDWAIT` on
+  `SIGCHLD`, in `daemon/` or `cache/`), checked both by a standing guard
+  test and by a `sigaction(SIGCHLD)` check at decide-time (an installed
+  `IGN` or `NOCLDWAIT` disposition sends the daemon `FailClosed`, not
+  compat). `still_same_process()` (`(pid, starttime_ticks)` + a `/proc`
+  re-check) is retained only as a defense-in-depth assert on top of the
+  zombie anchor, not as the primary guarantee; it is not what closes the
+  `pid_max`-wrap case, because the zombie anchor already closes it. The
+  residual risk this leaves is a *future* blind reap introduced by code
+  that does not yet exist -- the guard test above exists specifically to
+  catch that before it ships, not to accept it as a standing window.
 * **M2**: the cross-process *producer-immutability* proof (seals: the
   producer physically cannot mutate the bytes) becomes a permission-model
   argument. The compat identity check that `mint_attached_input_source`'s
@@ -266,3 +281,54 @@ hold) during QA.
   writer of the compat file.
 * **M3**: nothing meaningful — `getrandom`'s only advantage over
   `/dev/urandom` is early-boot blocking, irrelevant to a farm daemon.
+
+## M1 reap-discovery mechanism (tick sweep, not a SIGCHLD self-pipe)
+
+An earlier draft of this design proposed a dedicated SIGCHLD handler
+(self-pipe pattern) as the compat substitute for `waitid(P_PIDFD, ...)`
+readiness notification. That design is **superseded**: a SIGCHLD handler
+in the main daemon process would put `EINTR` on every blocking syscall in
+the daemon, which the native path never has to tolerate today. Instead,
+compat reap discovery reuses the daemon's existing tick-driven sweep,
+`CentralChildReaperRegistry::publish_pending()` /
+`reap_one_unobserved()` (`cache/p50_sidecar_lifecycle.cpp`), which already
+polls every registered owner once per daemon tick with a non-blocking,
+non-consuming `waitid(..., WNOHANG|WNOWAIT)` probe. For a compat-backend
+entry, that probe is `waitid(P_PID, pid, &info, WEXITED|WNOHANG|WNOWAIT)`
+against the direct child's own zombie — the same zombie that anchors the
+identity guarantee above — zeroing `siginfo_t` first and treating
+`si_pid == 0` as "no change, try again next tick," per the kernel
+behavior of `waitid()`/`wait4()`, which (unlike `waitpid()`'s documented
+surface) accept `WNOWAIT` without `EINVAL`. The actual consuming reap is
+the same call shape without `WNOWAIT`.
+
+**Dependency this surfaced, not yet closed as of this writing:** the
+sidecar reap-dispatch block in `daemon/main.cpp` (including the call to
+`publish_pending()`) is itself gated on `cache_adapter->outer_pidfd() >=
+0`. Under compat, if `outer_pidfd_` were left at its native `-1`
+sentinel, this entire path — not just the pidfd-specific native probe —
+would never run for the sidecar, and reap discovery would never happen at
+all. The design direction to close this: give `outer_pidfd_` a
+non-negative surrogate value under compat (the child's own `pid_t` cast
+to `int`, which is always positive for a valid pid and satisfies every
+existing `>= 0`/equality check already written against it, with no new
+allocator or side-table), tag `Entry` and `ReapEvent` with a minimal
+`ChildHandleBackend backend` field so `reap_one()`'s two call sites into
+the pidfd-status probe can dispatch between the native `waitid(P_PIDFD,
+...)` and the compat `waitid(P_PID, ...)` shape above, and reject
+`register_direct_worker()` outright under compat (the DirectWorker/
+AttemptLeaf machinery it feeds has no production callers as of `c8bb615f`
+and is out of scope for this branch; it is not ported to compat at all).
+This is implementation in progress; it is recorded here before being
+coded, not after, per this branch's reporting discipline for any point
+where a compat path's guarantee needs a corrected mechanism to hold.
+
+Still open, to be closed before this section is considered final:
+measured bound on the daemon's per-tick poll timeout while a compat
+sidecar is registered (so the discovery latency has a stated worst case,
+not just "next tick"); confirmation that sidecar death also surfaces
+through the control socket (EOF/EPIPE) independently of the reap sweep,
+so a dead sidecar drives the adapter to `FailClosed` as a single state
+transition rather than failing jobs one at a time while the sweep catches
+up; and an H4-measured exit-to-detection latency figure once the surrogate
+`outer_pidfd_` wiring lands and compiles there.
