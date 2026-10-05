@@ -289,7 +289,8 @@ void case_lease_withdrawal_rotation() {
     CHECK(root_value != nullptr);
     const std::string root(root_value);
     CHECK(::chmod(root.c_str(), 0700) == 0);
-    const auto allocator = std::make_shared<LaunchIdentityAllocator>(601, 1);
+    const auto allocator = std::make_shared<LaunchIdentityAllocator>(
+        601, 1, icecc::p50::system_store_identity_entropy);
     Supervisor first(structured_config("structured", root, allocator));
     CHECK(first.start() && first.current_lease().has_value());
     const ReadyLease first_lease = *first.current_lease();

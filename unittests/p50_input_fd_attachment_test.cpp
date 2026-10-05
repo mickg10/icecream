@@ -129,7 +129,8 @@ int main() {
     const local::CredentialExpectation peer{
         static_cast<uint64_t>(current_uid()), std::nullopt, std::nullopt};
     InputFdAttachmentService service(
-        [&store](InputRecordKey requested) { return store.attach(requested); });
+        [&store](InputRecordKey requested) { return store.attach(requested); },
+        size_t{64} << 20, InputMaterializationBackend::Native);
 
     std::array<InputFdAttachmentResult, 5> server_results{};
     std::thread server([&] {

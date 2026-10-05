@@ -115,16 +115,18 @@ class InputFdAttachmentService {
 public:
     using CursorProvider = std::function<InputCursor(InputRecordKey)>;
 
-    // `backend` defaults to Native, so every existing caller that does not
-    // pass it keeps today's exact sealed-memfd behavior unconditionally.
+    // `backend` has no default: a missed call site must fail to compile
+    // rather than silently materialize sealed memfds under Compat, which on
+    // kernel 3.10 is a runtime failure instead of a build error. Every
+    // caller must name the backend explicitly.
     explicit InputFdAttachmentService(
-        CursorProvider provider, size_t max_materialized_bytes = size_t{64} << 20,
-        InputMaterializationBackend backend = InputMaterializationBackend::Native);
+        CursorProvider provider, size_t max_materialized_bytes,
+        InputMaterializationBackend backend);
 
     template <class Endpoint>
     static InputFdAttachmentService for_endpoint(
-        Endpoint& endpoint, size_t max_materialized_bytes = size_t{64} << 20,
-        InputMaterializationBackend backend = InputMaterializationBackend::Native) {
+        Endpoint& endpoint, size_t max_materialized_bytes,
+        InputMaterializationBackend backend) {
         return InputFdAttachmentService(
             [&endpoint](InputRecordKey key) { return endpoint.attach_input(key); },
             max_materialized_bytes, backend);
