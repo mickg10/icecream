@@ -68,6 +68,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 TESTS += codec_parity codec_provider codec_intern codec_wire
 TESTS += daemonqueue
 TESTS += pollreadiness
+TESTS += p50adapterautheofregression
 # Native executables and shell/Python helpers inherit the same locked Python.
 # Reference reducers are exercised here, never linked into shipped programs.
 check_LIBRARIES = libp50reference.a
@@ -94,6 +95,7 @@ AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_PKG_CONFIG_PATH='$(PKG_CONFIG_PATH)'; export ICECC_TEST_PKG_CONFIG_PATH; \
 	ICECC_TEST_PKG_CONFIG_LIBDIR='$(PKG_CONFIG_LIBDIR)'; export ICECC_TEST_PKG_CONFIG_LIBDIR; \
 	ICECC_TEST_CACHE_SERVICE='$(abs_top_builddir)/cache/icecc-cache-service'; export ICECC_TEST_CACHE_SERVICE; \
+	ICECC_TEST_FAKE_SIDECAR_EOF='$(abs_builddir)/p50fakesidecareof'; export ICECC_TEST_FAKE_SIDECAR_EOF; \
 	ICECC_TEST_READY_CLOSE_SHIM='$(abs_builddir)/readyclose_shim.so'; export ICECC_TEST_READY_CLOSE_SHIM; \
 	ICECC_TEST_CXX_STANDARD_FLAG='$(ICE_CXX_STANDARD_FLAG)'; export ICECC_TEST_CXX_STANDARD_FLAG; \
 	ICECC_TEST_CFLAGS='$(CFLAGS)'; export ICECC_TEST_CFLAGS; \
@@ -213,6 +215,7 @@ p50fsessionpayloads_LDADD = ../cache/libprotocol50.a
 p50fsessionsemantics_SOURCES = p50fsessionsemantics.cpp
 p50fsessionsemantics_LDADD = ../cache/libprotocol50.a
 check_PROGRAMS += p50daemonsidecaradapter p50daemonpositive
+check_PROGRAMS += p50fakesidecareof p50adapterautheofregression
 check_PROGRAMS += p50inputfd
 check_PROGRAMS += p50inputlifecycle
 check_PROGRAMS += p50resultdisposition
@@ -367,6 +370,36 @@ p50daemonsidecaradapter_DEPENDENCIES = \
 p50daemonpositive_SOURCES = p50daemonpositive.cpp
 p50daemonpositive_LDADD = ../services/libicecc.la
 p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service
+# p50fakesidecareof is a tiny freestanding fixture, never linked against any
+# icecc library: it only has to speak the READY v2 frame and then present a
+# clean EOF without a HelloAck. It is driven as a subprocess by
+# p50adapterautheofregression below, never run directly as a TEST.
+p50fakesidecareof_SOURCES = p50_fake_sidecar_eof.cpp
+# p50adapterautheofregression is the regression test for the phase-3
+# authentication EOF spin bug (outer_advance_authentication(), the HelloAck
+# recv()): it drives a real DaemonSidecarAdapter against p50fakesidecareof
+# and times how long the auth fd lingers in outer_append_pollfds() after the
+# fixture's EOF. It reuses the same public outer-loop API and
+# ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS build as p50daemonsidecaradapter
+# above; it adds no new private test hooks of its own.
+p50adapterautheofregression_SOURCES = p50_adapter_auth_eof_regression_test.cpp \
+	../cache/p50_daemon_cache_dispatch.cpp ../cache/p50_fd_handoff.cpp
+p50adapterautheofregression_CPPFLAGS = $(AM_CPPFLAGS) \
+	-DICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS
+p50adapterautheofregression_CXXFLAGS = -pthread
+p50adapterautheofregression_LDFLAGS = -pthread
+p50adapterautheofregression_LDADD = ../cache/libp50daemonsidecaradapter.a \
+	../cache/libp50sidecar.a \
+	../cache/libp50input.a \
+	../cache/libprotocol50.a \
+	../cache/libp50localtransport.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
+p50adapterautheofregression_DEPENDENCIES = \
+	../cache/libp50daemonsidecaradapter.a ../cache/libp50input.a \
+	../cache/libp50sidecar.a \
+	../cache/libprotocol50.a \
+	../cache/libp50localtransport.a \
+	../services/libicecc.la p50fakesidecareof
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
