@@ -165,6 +165,7 @@ p50sidecarsupervisor_LDFLAGS = -pthread
 p50sidecarsupervisor_LDADD = libp50reference.a ../cache/libp50sidecar.a \
 	../cache/libp50localtransport.a ../services/libicecc.la
 p50sidecarlifecycle_SOURCES = p50_sidecar_lifecycle_test.cpp
+p50sidecarlifecycle_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_SIDECAR_LIFECYCLE_TEST_HOOKS
 p50sidecarlifecycle_CXXFLAGS = -pthread
 p50sidecarlifecycle_LDFLAGS = -pthread
 p50sidecarlifecycle_LDADD = ../cache/libp50sidecar.a \

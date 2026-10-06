@@ -18,6 +18,16 @@ using icecc::p50::daemon::DaemonSidecarAdapter;
 
 namespace {
 
+// Slice-1 hardening requirement #2: DaemonSidecarAdapter::
+// outer_observe_child_reaped(const sidecar::ReapEvent&) must reject on
+// !event.exact_identity() and not merely on the four explicit field
+// comparisons it separately re-checks (owner/pid/pidfd/registry_generation).
+// Set false the first time a real, already-scheduled reap is tampered with
+// (incarnation zeroed -- a field exact_identity() requires valid() but which
+// the function never compares against anything else) and still accepted, or
+// still mutates an observable counter. Checked once at the end of main().
+bool g_exact_identity_hardening_ok = true;
+
 bool exact_node(const std::string& path, mode_t mode, bool directory,
                 uid_t uid, gid_t gid)
 {
@@ -102,8 +112,21 @@ bool outer_turn(DaemonSidecarAdapter& adapter,
         }
         if (ready) {
             const auto event = reaper.reap_one(pid, pidfd);
-            if (event.has_value())
+            if (event.has_value()) {
+                // See the g_exact_identity_hardening_ok comment above: this
+                // piggybacks on an already-scheduled real reap, so it adds
+                // no new process, wait, or timing window.
+                icecc::p50::sidecar::ReapEvent tampered = *event;
+                tampered.incarnation = icecc::p50::sidecar::LaunchIncarnation{};
+                const uint64_t exits_before = adapter.cumulative_post_ready_exits();
+                const bool authenticated_before = adapter.authenticated();
+                if (tampered.exact_identity() ||
+                    adapter.outer_observe_child_reaped(tampered) ||
+                    adapter.cumulative_post_ready_exits() != exits_before ||
+                    adapter.authenticated() != authenticated_before)
+                    g_exact_identity_hardening_ok = false;
                 (void)adapter.outer_observe_child_reaped(*event);
+            }
         }
         // This is an in-memory publication retry only; it never repeats the
         // exact pidfd waitid operation after a consumed event.
@@ -337,6 +360,8 @@ int main()
 
     if (!remove_p29_fingerprint_cache(root) || ::rmdir(directory) != 0)
         return 25;
+    if (!g_exact_identity_hardening_ok)
+        return 28;
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
 }

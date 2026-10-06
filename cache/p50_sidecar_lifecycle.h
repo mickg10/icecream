@@ -827,6 +827,17 @@ public:
         bool leaf_cleanup_complete,
         std::chrono::steady_clock::time_point now) const noexcept;
 
+#if defined(ICECC_P50_SIDECAR_LIFECYCLE_TEST_HOOKS)
+    // Compile-time-only seam exposing the private exact-identity gate on a
+    // single reap event, so unit tests can prove rejection/acceptance of a
+    // non-exact event directly without forking a real child to drive
+    // consume_reap_events(). The installed library is built without this
+    // macro and never exposes consume_reap() outside the class.
+    bool test_consume_reap(const ReapEvent& event) noexcept {
+        return consume_reap(event);
+    }
+#endif
+
 private:
     LifecycleActionResult result(LifecycleAction action) const noexcept;
     bool allocate_identity() noexcept;

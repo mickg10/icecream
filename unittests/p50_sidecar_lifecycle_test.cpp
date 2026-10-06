@@ -500,6 +500,180 @@ void test_lifecycle() {
         // time rather than by a runtime CHECK.
     }
 
+    // --- Slice-1 hardening requirement #2: ReapEvent::exact_identity() and
+    // the event-acceptance gates that depend on it. Requirement #1 above
+    // hardened registration; this hardens the orthogonal question of
+    // whether a *delivered* event is accepted. Three independent surfaces:
+    //   (a) exact_identity() itself, as a pure predicate -- every conjunct
+    //       flipped one at a time from a known-good baseline;
+    //   (b) AttemptLeafIdentity::matches(const ReapEvent&), which must
+    //       reject on !exact_identity() even when every field it compares
+    //       explicitly is already a match;
+    //   (c) SidecarLifecycle::consume_reap(), same shape as (b).
+    // CentralChildReaperRegistry::reap_one_direct_worker() (cache/
+    // p50_sidecar_lifecycle.cpp) and DaemonSidecarAdapter::
+    // outer_observe_child_reaped(const ReapEvent&) (cache/
+    // p50_daemon_sidecar_adapter.cpp) also gate on exact_identity(), but
+    // reaching their exact_identity()-false branch needs a live process:
+    // reap_one_direct_worker()'s event is assembled entirely from fields a
+    // register_direct_worker() call already validated (requirement #1), so
+    // the only way left to make it non-exact is a real wait() returning a
+    // non-terminal kernel_code -- that belongs with requirement #4's
+    // real-fork registry integration test, not here. The adapter's gate is
+    // covered directly in unittests/p50_daemon_sidecar_adapter_test.cpp
+    // (g_exact_identity_hardening_ok), piggybacked on that test's existing
+    // real reaps rather than introducing a new one here.
+    {
+        const ReaperOwnerKey exact_owner{50001, 1};
+        const LaunchIncarnation exact_incarnation = incarnation_for(first);
+        auto baseline_event = [&]() {
+            ReapEvent event;
+            event.owner = exact_owner;
+            event.pid = 50001;
+            event.status = 0;
+            event.echild = false;
+            event.pidfd = 1;
+            event.backend = ChildHandleBackend::Native;
+            event.registry_generation = 1;
+            event.incarnation = exact_incarnation;
+            event.kernel_code = CLD_EXITED;
+            event.kind = ReaperOwnerKind::Sidecar;
+            event.starttime_ticks = 0;
+            return event;
+        };
+        CHECK(baseline_event().exact_identity(),
+              "exact_identity baseline (Native Sidecar) is itself exact");
+
+        auto broken = baseline_event();
+        broken.owner = ReaperOwnerKey{};
+        CHECK(!broken.exact_identity(), "exact_identity rejects an invalid owner");
+
+        broken = baseline_event();
+        broken.pid = 1;
+        CHECK(!broken.exact_identity(), "exact_identity rejects pid <= 1");
+
+        broken = baseline_event();
+        broken.pidfd = -1;
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects a Native event with no pidfd");
+
+        broken = baseline_event();
+        broken.backend = ChildHandleBackend::Compat;
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects a Compat event that still carries a "
+              "non-negative pidfd");
+
+        broken = baseline_event();
+        broken.backend = ChildHandleBackend::Compat;
+        broken.pidfd = -1;
+        broken.starttime_ticks = 0;
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects a Compat event with a zero starttime");
+
+        broken = baseline_event();
+        broken.backend = ChildHandleBackend::Compat;
+        broken.pidfd = -1;
+        broken.starttime_ticks = 42;
+        CHECK(broken.exact_identity(),
+              "exact_identity accepts the one legitimate Compat shape "
+              "(pidfd<0, nonzero starttime)");
+
+        broken = baseline_event();
+        broken.registry_generation = 0;
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects a zero registry_generation");
+
+        broken = baseline_event();
+        broken.incarnation = LaunchIncarnation{};
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects an invalid incarnation");
+
+        broken = baseline_event();
+        broken.kernel_code = 0;
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects a kernel_code outside {EXITED, KILLED, "
+              "DUMPED}");
+
+        broken = baseline_event();
+        broken.kind = static_cast<ReaperOwnerKind>(2);
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects an out-of-range ReaperOwnerKind");
+
+        broken = baseline_event();
+        broken.kind = ReaperOwnerKind::DirectWorker;
+        broken.starttime_ticks = 0;
+        CHECK(!broken.exact_identity(),
+              "exact_identity rejects a DirectWorker event with a zero "
+              "starttime even when the backend is Native and carries a "
+              "pidfd");
+
+        broken = baseline_event();
+        broken.kind = ReaperOwnerKind::DirectWorker;
+        broken.starttime_ticks = 7;
+        CHECK(broken.exact_identity(),
+              "exact_identity accepts a Native DirectWorker event once "
+              "starttime is supplied alongside the pidfd");
+
+        // (b) AttemptLeafIdentity::matches(const ReapEvent&): construct a
+        // valid leaf identity and a ReapEvent that matches every field the
+        // function compares explicitly (owner, registry_generation, pidfd,
+        // pid, incarnation, starttime_ticks), but break exact_identity()
+        // through a field matches() never looks at directly (kernel_code).
+        // If matches() returned true here, the exact_identity() call inside
+        // it would be provably redundant with its own explicit comparisons.
+        AttemptLeafIdentity leaf;
+        leaf.owner = exact_owner;
+        leaf.registry_generation = 1;
+        leaf.incarnation = exact_incarnation;
+        leaf.pidfd = 1;
+        leaf.direct_worker_pid = 50001;
+        leaf.process_starttime_ticks = 7;
+        leaf.leaf_device = 1;
+        leaf.leaf_inode = 1;
+        leaf.leaf_path = "/tmp/icecc-p50-lifecycle-leaf";
+        CHECK(leaf.valid(), "constructed AttemptLeafIdentity is itself valid");
+
+        ReapEvent leaf_event = baseline_event();
+        leaf_event.kind = ReaperOwnerKind::DirectWorker;
+        leaf_event.starttime_ticks = 7;
+        CHECK(leaf.matches(leaf_event),
+              "AttemptLeafIdentity::matches accepts the fully exact event");
+
+        ReapEvent leaf_event_broken = leaf_event;
+        leaf_event_broken.kernel_code = 0;
+        CHECK(!leaf_event_broken.exact_identity() &&
+                  !leaf.matches(leaf_event_broken),
+              "AttemptLeafIdentity::matches rejects on exact_identity() "
+              "alone even though owner/registry_generation/pidfd/pid/"
+              "incarnation/starttime still all match");
+
+        // (c) SidecarLifecycle::consume_reap(): same shape as (b), using a
+        // fresh lifecycle driven to Forked so child_pid_/pidfd_/
+        // registry_generation_/identity_ are all bound, then breaking only
+        // exact_identity() (via the Compat/pidfd combination) while leaving
+        // every field consume_reap() compares explicitly unchanged.
+        SidecarLifecycle consume_reap_hardening(config);
+        (void)consume_reap_hardening.begin(t0);
+        move_to_forked(consume_reap_hardening, 50002, t0);
+        constexpr int consume_reap_pidfd = 1502;
+        consume_reap_hardening.bind_reaper_identity(consume_reap_pidfd, 1502);
+        const ReapEvent exact_consume_event = exact_reap_for(
+            consume_reap_hardening, 50002, consume_reap_pidfd, 1502);
+        CHECK(exact_consume_event.exact_identity(),
+              "consume_reap hardening baseline event is itself exact");
+
+        ReapEvent non_exact_consume_event = exact_consume_event;
+        non_exact_consume_event.backend = ChildHandleBackend::Compat;
+        CHECK(!non_exact_consume_event.exact_identity(),
+              "consume_reap hardening event is deliberately made non-exact "
+              "(Compat with a non-negative pidfd)");
+        CHECK(!consume_reap_hardening.test_consume_reap(non_exact_consume_event),
+              "consume_reap rejects a non-exact event even though owner/"
+              "pid/pidfd/registry_generation/incarnation all still match");
+        CHECK(consume_reap_hardening.test_consume_reap(exact_consume_event),
+              "consume_reap accepts the same event once it is exact again");
+    }
+
     ReapMailbox bounded_mailbox;
     const ReapEvent mailbox_event = exact_reap_for(
         lifecycle, 321, lifecycle_pidfd,
