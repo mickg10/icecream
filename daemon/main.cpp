@@ -121,6 +121,7 @@
 #include "connection_provenance.h"
 #include "p50_source_arm_wait_lease.h"
 #include "compiler_group_signal.h"
+#include "../services/stage_trace.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -5608,6 +5609,8 @@ void Daemon::poll_cache_adapter() noexcept
                     assignment.key.epoch, assignment.key.wire_id,
                     assignment.key.nonce)))
                 return;
+            icecc::stagetrace::stage_trace("fdaemon", "ready_sent",
+                (int64_t)assignment.key.epoch, (int64_t)assignment.key.wire_id);
             assignment.ready_announced = true;
             ++assignment_ready_replies;
         }
@@ -6759,6 +6762,8 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     Client *c = clients.find_by_client_id(msg->client_id);
     trace() << "scheduler_use_cs " << msg->job_id << " " << msg->client_id
             << " " << c << " " << msg->hostname << " " << remote_name <<  endl;
+    icecc::stagetrace::stage_trace("cdaemon", "usecs_recv",
+        (int64_t)msg->assignmentEpoch(), (int64_t)msg->job_id);
 
     if (!c) {
         if (send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
@@ -6860,6 +6865,8 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             handle_end(c, 143);
             return 0;
         }
+        icecc::stagetrace::stage_trace("cdaemon", "usecs_relayed",
+            (int64_t)msg->assignmentEpoch(), (int64_t)msg->job_id);
         ++c->getcs_delivered;
         c->job_id = msg->job_id;
         c->last_known_job_id = msg->job_id;
@@ -7054,6 +7061,8 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         }
 
         ++usecs_frames_committed;
+        icecc::stagetrace::stage_trace("cdaemon", "usecs_relayed",
+            (int64_t)msg->assignmentEpoch(), (int64_t)msg->job_id);
         /* Complete framed delivery: the assignment is now DELIVERY
            UNCERTAIN until the client claims it at the worker (JobBegin
            reaches the scheduler) or this connection ends.  */
@@ -8067,6 +8076,10 @@ void Daemon::handle_old_request()
                 if (preprocess_job) {
                     client->running_preprocess = true;
                     ++preprocess_active_processes;
+                    icecc::stagetrace::stage_trace("cdaemon", "local_preprocess_granted",
+                        icecc::stagetrace::kUnknown, (int64_t)client->client_id,
+                        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                        {{"depth", (int64_t)preprocess_active_processes}});
                     trace() << "pushed local preprocess job " << client->client_id << endl;
                 } else if (client->fulljob) { // reserve every compile slot
                     client->running_preprocess = false;
@@ -8105,6 +8118,8 @@ void Daemon::handle_old_request()
 
             if (client->channel->send_msg(*client->usecsmsg)) {
                 client->set_status(Client::CLIENTWORK, "handle_old_request: usecs delivered");
+                icecc::stagetrace::stage_trace("cdaemon", "usecs_relayed",
+                    icecc::stagetrace::kUnknown, (int64_t)client->usecsmsg->job_id);
                 /* we make sure we reserve a spot and the rest is done if the
                  * client contacts as back with a Compile request */
                 clients.active_processes++;
@@ -8279,6 +8294,8 @@ void Daemon::handle_old_request()
                                client->client_id);
                 mark_assignment_claimed_or_later(job->jobID());
                 current_kids++;
+                icecc::stagetrace::stage_trace("fdaemon", "compile_child_forked",
+                    (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
                 client->set_status(Client::WAITFORCHILD, "handle_old_request: compiling locally (child running)");
                 client->pipe_from_child = sock;
                 client->child_pid = pid;
@@ -8292,6 +8309,8 @@ void Daemon::handle_old_request()
                     log_info() << "failed sending scheduler about " << job->jobID() << endl;
                     return;
                 }
+                icecc::stagetrace::stage_trace("fdaemon", "jobbegin_sent",
+                    (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
             } else {
                 handle_end(client, 117);
             }
@@ -8832,6 +8851,8 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                         << job->jobID() << endl;
                 return false;
             }
+            icecc::stagetrace::stage_trace("cdaemon", "jobbegin_sent",
+                (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
         }
 
         // no scheduler is not an error case!
@@ -9105,6 +9126,8 @@ void Daemon::handle_end(Client *client, int exitcode)
             if (scheduler_owns_getcs_assignment(client)) {
                 for (uint32_t jid : client->getcs_batch_jobids) {
                     send_scheduler(JobDoneMsg(jid, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size()));
+                    icecc::stagetrace::stage_trace("cdaemon", "jobdone_sent",
+                        icecc::stagetrace::kUnknown, (int64_t)jid);
                 }
                 if (client->getcs_delivered < client->getcs_expected) {
                     JobDoneMsg cancel(0, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size());
@@ -9225,6 +9248,10 @@ void Daemon::handle_end(Client *client, int exitcode)
             if (emit_settlement) {
                 if (!send_scheduler(msg)) {
                     trace() << "failed to reach scheduler for remote job done msg!" << endl;
+                } else {
+                    icecc::stagetrace::stage_trace(
+                        flag == JobDoneMsg::FROM_SERVER ? "fdaemon" : "cdaemon",
+                        "jobdone_sent", (int64_t)assignment_epoch, (int64_t)job_id);
                 }
             }
             /* The settlement for this job id has been issued exactly once;
@@ -9319,6 +9346,8 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         trace() << "handle_get_cs count=0 no-op for client " << client->client_id << endl;
         return true;
     }
+    icecc::stagetrace::stage_trace("cdaemon", "client_request_in",
+        icecc::stagetrace::kUnknown, (int64_t)client->client_id);
     /* G4 (17:20#2 / bigoracle 18:45 P0): exactly one outstanding GetCS per
        client.  getcs_outstanding is set at accept and cleared only when the
        client is destroyed, so a second GetCS is rejected in EVERY non-terminal
@@ -9482,6 +9511,8 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     if (!send_scheduler(*umsg)) {
         return false;
     }
+    icecc::stagetrace::stage_trace("cdaemon", "getcs_sent",
+        icecc::stagetrace::kUnknown, (int64_t)umsg->client_id);
     /* G4 (17:20#1 / 18:45 P0): the GetCS reached S under the current ACTIVE
        generation, which now owns this request by client id.  A teardown before
        UseCS must settle it with a JobDone; and only a reply carrying this
@@ -9502,6 +9533,8 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
         ++assignment_stale_controls;
         return 1;
     }
+    icecc::stagetrace::stage_trace("fdaemon", "assign_prepare_recv",
+        (int64_t)msg->epoch(), (int64_t)msg->wire_id);
     const AssignmentKey key { msg->epoch(), msg->wire_id, msg->nonce() };
 
     auto terminal = assignment_terminals.find(key);
@@ -9560,6 +9593,8 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
     const bool sent = send_scheduler(AssignReadyMsg(key.epoch, key.wire_id,
                                                      key.nonce));
     if (sent) {
+        icecc::stagetrace::stage_trace("fdaemon", "ready_sent",
+            (int64_t)key.epoch, (int64_t)key.wire_id);
         auto ready = live_assignments.find(key.wire_id);
         if (ready != live_assignments.end() && ready->second.key == key)
             ready->second.ready_announced = true;
@@ -9719,6 +9754,10 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
         client->command_line = command_line_from_peer_socket(client->channel->fd);
         client->local_preprocess = classify_local_preprocess_job(m->local_flags, client->command_line, m->fulljob);
     }
+    icecc::stagetrace::stage_trace("cdaemon", "local_slot_requested",
+        icecc::stagetrace::kUnknown, (int64_t)client->client_id,
+        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+        {{"preprocess_only", client->local_preprocess ? 1 : 0}});
     return true;
 }
 
@@ -9957,6 +9996,11 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         handle_end(client, 121);
         return false;
     }
+    if (client->p50_source_arm_fields.has_value()) {
+        icecc::stagetrace::stage_trace("fdaemon", "cache_session_dispatched",
+            (int64_t)client->p50_source_arm_fields->assignment_epoch,
+            (int64_t)client->p50_source_arm_fields->wire_job_id);
+    }
 
     // The handoff consumed the public descriptor. Remove only its stale
     // poll-map entry: the Client and its exact source-arm claim remain in
@@ -10015,6 +10059,9 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
     }
 
     const P50SourceArmFields& arm = msg->arm;
+    icecc::stagetrace::stage_trace("fdaemon", "arm_recv",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
     if (client->status != Client::UNKNOWN ||
         client->p50_source_arm_fields.has_value() ||
         !client->source_wrapper_provenance_valid() ||
@@ -10117,6 +10164,9 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         finish_assignment_claim(arm.wire_job_id);
         return reject(&arm, 147);
     }
+    icecc::stagetrace::stage_trace("fdaemon", "arm_validated",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
     return true;
 }
 
