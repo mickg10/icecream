@@ -148,6 +148,7 @@ native_e2e_setcap_status=null
 native_e2e_clang_status=null
 native_e2e_check_status=null
 native_root_check_status=null
+native_proc_root_check_status=null
 pytest_status=null
 
 run_stage() {
@@ -155,7 +156,7 @@ run_stage() {
     local logfile="$ARTIFACTS/$name.log"
     local status
     local -a command=("$@")
-    if [[ -n "$run_as_user" && "$name" != native-root-check && "$name" != native-e2e-setcap && "$name" != native-proc-setcap ]]; then
+    if [[ -n "$run_as_user" && "$name" != native-root-check && "$name" != native-e2e-setcap && "$name" != native-proc-setcap && "$name" != native-proc-root-check ]]; then
         command=(runuser -u "$run_as_user" -- "${command[@]}")
     fi
     printf '\n== %s ==\n' "$name"
@@ -179,6 +180,7 @@ run_stage() {
         native-e2e-clang) native_e2e_clang_status=$status ;;
         native-e2e-check) native_e2e_check_status=$status ;;
         native-root-check) native_root_check_status=$status ;;
+        native-proc-root-check) native_proc_root_check_status=$status ;;
         python-pytest) pytest_status=$status ;;
     esac
     # Per-stage test logs: the make-check native stages share ONE
@@ -197,7 +199,7 @@ run_stage() {
     local stage_testdir=
     case "$name" in
         native-check|native-root-check|native-e2e-check) stage_testdir=$BUILD/unittests ;;
-        native-proc-check2) stage_testdir=$WORK_ROOT/tmp/build-proc/unittests ;;
+        native-proc-check2|native-proc-root-check) stage_testdir=$WORK_ROOT/tmp/build-proc/unittests ;;
     esac
     if [[ -n "$stage_testdir" && -d "$stage_testdir" ]]; then
         mkdir -p "$ARTIFACTS/$name" || true
@@ -294,6 +296,20 @@ else
                 run_stage native-proc-check2 env "${e2e_exports[@]}" bash -c \
                     'set -e; cd "$1/tmp/build-proc"; make -C . check TESTS="p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh p50forkfdhygiene-oot.sh p50forkfdhygiene-package.sh p50_fork_fd_hygiene_sanitize.sh p50compilee2e-run.sh"; ICECC_P50_C1F1_COMPILER=clang++ ICECC_P50_C1F1_COMPILER_REQUIRED=1 ICECC_P50_C1F1_TIMEOUT=300 ICECC_TEST_TOP_BUILDDIR="$PWD" ICECC_TEST_BUILDDIR="$PWD/unittests" bash "$2/unittests/p50compilee2e-run.sh"' \
                     _ "$WORK_ROOT" "$SRC"
+                # Task 4 (k310): stdfdsanitize-sidecar.sh is root-gated (exit 77
+                # under non-root) and native-proc-check2 above runs UNPRIVILEGED
+                # -- so without this stage the script never once exercises the
+                # forced-proc/fallback tree built just above, only the regular
+                # $BUILD tree via native-root-check further down.  This is the
+                # ONLY QA stage that proves the exact-fd-table assertion against
+                # the --enable-qa-force-proc-sweep binaries that ship the
+                # EPERM/ENOSYS/EINVAL -> /proc fallback path.  Exempt from
+                # runuser (like native-root-check) since the script needs root.
+                if [[ -n "$run_as_user" && "$native_proc_check_status" == 0 ]]; then
+                    run_stage native-proc-root-check bash -c \
+                        'set -e; cd "$1/tmp/build-proc"; make -C . check TESTS="stdfdsanitize-sidecar.sh"' \
+                        _ "$WORK_ROOT"
+                fi
             fi
         fi
         if [[ -n "$run_as_user" && "$native_check_status" == 0 ]]; then
@@ -393,13 +409,14 @@ else
     [[ "$native_e2e_check_status" == 0 || "$native_e2e_check_status" == null ]] || overall=1  # null = loud-skipped (no container IP); a skip must not fake green
     [[ "$native_e2e_clang_status" == 0 || "$native_e2e_clang_status" == null ]] || overall=1  # the clang leg is REQUIRED in qa: 77/skip must fail the run
     [[ -z "$run_as_user" || "$native_root_check_status" == 0 ]] || overall=1
+    [[ -z "$run_as_user" || "$native_proc_root_check_status" == 0 ]] || overall=1
     [[ "$pytest_status" == 0 ]] || overall=1
 fi
 
 summary_tmp="$ARTIFACTS/summary.json.tmp"
-printf '{"mode":"%s","source_commit":"%s","jobs":%s,"autogen_exit":%s,"configure_exit":%s,"build_exit":%s,"install_exit":%s,"python_sync_exit":%s,"native_check_exit":%s,"native_proc_check_exit":%s,"native_e2e_clang_exit":%s,"native_e2e_check_exit":%s,"native_root_check_exit":%s,"pytest_exit":%s,"overall_exit":%s}\n' \
+printf '{"mode":"%s","source_commit":"%s","jobs":%s,"autogen_exit":%s,"configure_exit":%s,"build_exit":%s,"install_exit":%s,"python_sync_exit":%s,"native_check_exit":%s,"native_proc_check_exit":%s,"native_e2e_clang_exit":%s,"native_e2e_check_exit":%s,"native_root_check_exit":%s,"native_proc_root_check_exit":%s,"pytest_exit":%s,"overall_exit":%s}\n' \
     "$MODE" "${ICECC_QA_SOURCE_COMMIT:-unknown}" "$JOBS" "$autogen_status" "$configure_status" "$build_status" \
-    "$install_status" "$python_sync_status" "$native_check_status" "$native_proc_check_status" "$native_e2e_clang_status" "$native_e2e_check_status" "$native_root_check_status" "$pytest_status" "$overall" > "$summary_tmp"
+    "$install_status" "$python_sync_status" "$native_check_status" "$native_proc_check_status" "$native_e2e_clang_status" "$native_e2e_check_status" "$native_root_check_status" "$native_proc_root_check_status" "$pytest_status" "$overall" > "$summary_tmp"
 mv -f "$summary_tmp" "$ARTIFACTS/summary.json"
 printf '\nSummary: %s/summary.json\nArtifacts: %s\n' "$ARTIFACTS" "$ARTIFACTS"
 exit "$overall"

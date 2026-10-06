@@ -200,6 +200,15 @@ public:
         return cumulative_post_ready_exits_;
     }
     [[nodiscard]] uint64_t attempt() const noexcept { return attempt_; }
+    // Unlike attempt() (only meaningful once a ready lease has been bound),
+    // this reflects the lifecycle's own relaunch counter even when every
+    // attempt fails closed before reaching READY (e.g. a sustained
+    // close-range dispatch failure never tolerates a child). Callers that
+    // need to confirm "a relaunch was attempted" without requiring READY
+    // must use this instead of attempt().
+    [[nodiscard]] uint32_t outer_lifecycle_attempts() const noexcept {
+        return outer_lifecycle_ ? outer_lifecycle_->attempts() : 0;
+    }
     [[nodiscard]] bool authenticated() const noexcept;
     [[nodiscard]] advertisement::Snapshot advertisement_snapshot() const noexcept {
         return controller_.snapshot();
@@ -368,7 +377,40 @@ public:
     void test_force_input_lifecycle_operation(uint64_t value) noexcept {
         next_input_lifecycle_operation_id_ = value;
     }
+    // Fork-path CLOEXEC-sweep fault injection (Task 4).  Takes effect only
+    // in the forked child, right before execve(); see
+    // cache/p50_daemon_sidecar_adapter.cpp's OuterLaunchPhase::Fork.
+    // force_close_range_errno: inject this errno instead of calling
+    // close_range(2) at all.  ENOSYS/EINVAL/EPERM must each take the proc
+    // fallback; any other value (e.g. EBADF) must fail closed.
+    void test_force_close_range_errno(int errno_value) noexcept {
+        test_force_close_range_errno_ = errno_value;
+    }
+    // force_proc_open_failure: make the proc fallback's own
+    // open("/proc/self/fd") fail, so the fallback-of-the-fallback path
+    // (fail closed) is reachable without root or seccomp.
+    void test_force_proc_open_failure(bool force) noexcept {
+        test_force_proc_open_failure_ = force;
+    }
 #endif
+    // Direct, no-fork unit entry point for the proc-fallback CLOEXEC sweep
+    // itself (Task 4).  Runs the exact same sweep the Fork-case child calls
+    // (sidecar_cloexec_sweep_proc_fallback(), itself always compiled in and
+    // used unconditionally by production code), but in the calling (test)
+    // process against whatever fds that process already has open: no fork,
+    // no execve, no seccomp/root dependency.  force_open_failure mirrors
+    // test_force_proc_open_failure above: when true, the sweep's internal
+    // open("/proc/self/fd") is made to fail and the function returns false
+    // without touching any fd.
+    //
+    // Deliberately NOT gated by ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS,
+    // unlike the fault-injection setters above: it touches no hook-only
+    // state, only forwards its own parameter into the always-present sweep
+    // function, so it stays linkable in a production (hooks-undefined)
+    // object -- which unittests/p50daemonsidecaradapter-source.sh relies on
+    // when it links the hook-compiled test harness against a production
+    // object to prove the two behave identically.
+    static bool test_sweep_cloexec_proc_fallback(bool force_open_failure) noexcept;
 
 private:
     bool reserve_outer_restart() noexcept;
@@ -403,6 +445,14 @@ private:
     uint64_t prior_supervisor_post_ready_exits_ = 0;
     bool prior_counter_observed_ = false;
     bool counter_failed_ = false;
+    // Always present (not macro-guarded) so the class layout is identical
+    // whether or not ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS is defined
+    // for this translation unit -- only the setter methods above are
+    // guarded.  Zero/false in every production object; read unconditionally
+    // by the fork-path CLOEXEC sweep in the .cpp, same convention as
+    // attempt_/cumulative_post_ready_exits_ above.
+    int test_force_close_range_errno_ = 0;
+    bool test_force_proc_open_failure_ = false;
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
     std::vector<InputLifecycleRequest> pending_input_lifecycle_;
     std::vector<InputLifecycleRequest> completed_input_lifecycle_;

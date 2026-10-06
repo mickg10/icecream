@@ -124,7 +124,50 @@ for fd in 0 1 2; do
     esac
 done
 
+# Task 4 (k310): assert the EXACT fd-table shape at exec, not just that
+# 0/1/2 are sane.  The sidecar hands the ready-write pipe and the listener
+# socket to the service as fd numbers via ICECC_CACHE_SERVICE_READY_FD /
+# ICECC_CACHE_SERVICE_LISTENER_FD in its environment (not argv); every
+# other fd the service inherited through the sidecar's fork+exec must have
+# been CLOEXEC'd by the launch-time sweep -- either close_range(2) or, on
+# an old seccomp profile / pre-5.9 kernel, the /proc fallback -- before the
+# service's own exec.  If that sweep ever regresses (misses an fd, or the
+# dispatch in p50_daemon_sidecar_adapter.cpp stops reaching the fallback on
+# EPERM), this is the stage that will see an extra fd here and fail.
+env_dump=$(setpriv --reuid "$service_uid" --regid "$service_gid" --clear-groups \
+    --inh-caps=-all cat "/proc/$service_pid/environ" 2>/dev/null | tr '\0' '\n')
+[ -n "$env_dump" ] || fail "cannot read /proc/$service_pid/environ same-uid (uid=$service_uid)"
+ready_fd=$(printf '%s\n' "$env_dump" | sed -n 's/^ICECC_CACHE_SERVICE_READY_FD=//p')
+listener_fd=$(printf '%s\n' "$env_dump" | sed -n 's/^ICECC_CACHE_SERVICE_LISTENER_FD=//p')
+case "$ready_fd" in
+    ''|*[!0-9]*) fail "ICECC_CACHE_SERVICE_READY_FD missing/non-numeric in service environ" ;;
+esac
+case "$listener_fd" in
+    ''|*[!0-9]*) fail "ICECC_CACHE_SERVICE_LISTENER_FD missing/non-numeric in service environ" ;;
+esac
+
+ready_link=$(probe_link "$ready_fd")
+[ "$ready_link" = "PROBE-FAIL" ] && fail "cannot probe ready-write fd $ready_fd same-uid"
+case "$ready_link" in
+    pipe:*) ;;
+    *) fail "ready-write fd $ready_fd in the cache service is not a pipe ($ready_link)" ;;
+esac
+listener_link=$(probe_link "$listener_fd")
+[ "$listener_link" = "PROBE-FAIL" ] && fail "cannot probe listener fd $listener_fd same-uid"
+case "$listener_link" in
+    socket:*) ;;
+    *) fail "listener fd $listener_fd in the cache service is not a socket ($listener_link)" ;;
+esac
+
+open_fds=$(setpriv --reuid "$service_uid" --regid "$service_gid" --clear-groups \
+    --inh-caps=-all sh -c 'ls "/proc/$1/fd"' _ "$service_pid" 2>/dev/null | sort -n)
+[ -n "$open_fds" ] || fail "cannot list /proc/$service_pid/fd same-uid (uid=$service_uid)"
+expected_fds=$(printf '%s\n' 0 1 2 "$ready_fd" "$listener_fd" | sort -n -u)
+if [ "$open_fds" != "$expected_fds" ]; then
+    fail "cache service fd table is not exactly {0,1,2,ready_write=$ready_fd,listener=$listener_fd}: got [$(printf '%s ' $open_fds)]"
+fi
+
 kill "$daemon_pid" 2>/dev/null
 kill "$service_pid" 2>/dev/null
-echo "stdfdsanitize-sidecar: OK (cache service keeps 0/1/2 open, no socket/pipe)"
+echo "stdfdsanitize-sidecar: OK (cache service fd table is exactly {0,1,2,ready_write=$ready_fd,listener=$listener_fd})"
 exit 0

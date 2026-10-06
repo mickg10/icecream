@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <unistd.h>
 
 #include "services/digest128.h"
+#include "services/sys_close_range.h"
 
 extern char **environ;
 
@@ -184,6 +186,142 @@ bool set_cloexec(int fd, bool enabled) noexcept
     const int wanted = enabled ? flags | FD_CLOEXEC : flags & ~FD_CLOEXEC;
     return wanted == flags || ::fcntl(fd, F_SETFD, wanted) == 0;
 }
+
+#if defined(__linux__)
+// Task 4 (k310): fork-safe CLOEXEC sweep used when close_range(2) is
+// unavailable (ENOSYS: kernel <5.9, the real k310 target; EINVAL: a kernel
+// that recognizes the syscall but rejects this flag/range; EPERM: an old
+// Docker seccomp profile -- the build0xx node image's actual shape --
+// denying an unrecognized syscall number outright, NOT with ENOSYS, which
+// is the k310 launch-failure gap this fixes).
+//
+// Mirrors daemon/p50_fork_fd_hygiene.cpp's proc_fallback() parsing (raw
+// getdents64 into a fixed stack buffer: no malloc, no STL growth, no
+// stdio -- this runs after fork(), before execve(), with every inherited
+// fd still open) but marks FD_CLOEXEC instead of closing: the call site's
+// child still needs every inherited fd to survive until execve(), only
+// its CLOEXEC bit changes.  Only the enumerating directory fd itself is
+// closed, by this function, before returning.  The two fds the caller
+// still needs un-CLOEXEC'd (ready_write, listener) are restored by the
+// existing set_cloexec(..., false) calls right after this returns.
+struct ProcFdDirent64 {
+    uint64_t ino;
+    int64_t off;
+    unsigned short reclen;
+    unsigned char type;
+    char name[];
+};
+
+// Mirrors daemon/p50_fork_fd_hygiene.cpp's parse_fd_name(): overflow-safe,
+// rejects a leading zero other than the single digit "0", caps at 10
+// digits (fits any 32-bit fd number with room to spare).
+bool parse_proc_fd_entry_name(const char* name, size_t length, int* fd) noexcept
+{
+    if (length == 0 || length > 10 || (name[0] == '0' && length != 1))
+        return false;
+    uint64_t value = 0;
+    for (size_t i = 0; i != length; ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (c < '0' || c > '9')
+            return false;
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+        if (value > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            return false;
+    }
+    *fd = static_cast<int>(value);
+    return true;
+}
+
+bool sidecar_cloexec_sweep_proc_fallback(bool force_open_failure) noexcept
+{
+    if (force_open_failure)
+        return false;
+
+    const int proc_fd = ::open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (proc_fd < 0)
+        return false;
+
+    char buffer[16 * 1024];
+    bool ok = true;
+    for (;;) {
+        long count;
+        for (;;) {
+            count = ::syscall(SYS_getdents64, proc_fd, buffer, sizeof(buffer));
+            if (count >= 0 || errno != EINTR)
+                break;
+        }
+        if (count == 0)
+            break;
+        if (count < 0) {
+            ok = false;
+            break;
+        }
+        size_t offset = 0;
+        while (offset < static_cast<size_t>(count)) {
+            if (static_cast<size_t>(count) - offset < sizeof(ProcFdDirent64)) {
+                ok = false;
+                break;
+            }
+            const auto* entry =
+                reinterpret_cast<const ProcFdDirent64*>(buffer + offset);
+            if (entry->reclen < sizeof(ProcFdDirent64) ||
+                offset + entry->reclen > static_cast<size_t>(count)) {
+                ok = false;
+                break;
+            }
+            const size_t name_capacity =
+                entry->reclen - offsetof(ProcFdDirent64, name);
+            size_t name_length = 0;
+            while (name_length < name_capacity && entry->name[name_length] != '\0')
+                ++name_length;
+            if (name_length == name_capacity) {
+                ok = false;
+                break;
+            }
+            const bool is_dot = name_length == 1 && entry->name[0] == '.';
+            const bool is_dotdot =
+                name_length == 2 && entry->name[0] == '.' && entry->name[1] == '.';
+            if (!is_dot && !is_dotdot) {
+                int fd = -1;
+                if (!parse_proc_fd_entry_name(entry->name, name_length, &fd)) {
+                    ok = false;
+                    break;
+                }
+                if (fd >= 3 && fd != proc_fd) {
+                    const int flags = ::fcntl(fd, F_GETFD);
+                    if (flags < 0) {
+                        // Enumeration is one syscall stale by construction;
+                        // a fd the child already closed on its own is not a
+                        // leak.  Anything other than EBADF is a real fault.
+                        if (errno != EBADF) {
+                            ok = false;
+                            break;
+                        }
+                    } else if ((flags & FD_CLOEXEC) == 0 &&
+                               ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0 &&
+                               errno != EBADF) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            offset += entry->reclen;
+        }
+        if (!ok)
+            break;
+    }
+
+    for (;;) {
+        if (::close(proc_fd) == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        ok = false;
+        break;
+    }
+    return ok;
+}
+#endif // defined(__linux__)
 
 // One-syscall launch-plan primitives.  The outer plan uses these variants so
 // a fallback fcntl sequence cannot hide behind pipe or socket creation.
@@ -579,6 +717,28 @@ bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
        with the named result -- there is exactly ONE clause chain. */
     return config_refusal_reason(config).empty();
 }
+
+#if defined(__linux__)
+bool DaemonSidecarAdapter::test_sweep_cloexec_proc_fallback(
+    bool force_open_failure) noexcept
+{
+    // Calls the anonymous-namespace sweep directly: no fork, no execve.
+    // Exercises exactly the code the Fork-case child runs, against whatever
+    // fds this (test) process already has open.
+    return sidecar_cloexec_sweep_proc_fallback(force_open_failure);
+}
+#else
+// The sweep itself only exists under __linux__ (see the Fork-case dispatch
+// above); keep the test entry point linkable everywhere the header declares
+// it, same as the always-present field convention this file follows.
+// Deliberately not gated by ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS: see
+// the header's declaration comment -- this must stay linkable from a
+// production (hooks-undefined) object too.
+bool DaemonSidecarAdapter::test_sweep_cloexec_proc_fallback(bool) noexcept
+{
+    return false;
+}
+#endif
 
 void DaemonSidecarAdapter::observe_public_listener(bool bound, uint32_t port) noexcept
 {
@@ -1723,11 +1883,44 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             constexpr uint32_t marker = 0x50355353u;
             if (!write_all_child(outer_launch_exec_write_fd_, &marker, sizeof(marker)))
                 _exit(127);
-#if defined(__linux__) && defined(SYS_close_range)
-            constexpr unsigned int close_range_cloexec = 1u << 2;
-            const long close_result = ::syscall(SYS_close_range, 3u, UINT_MAX,
-                                                close_range_cloexec);
-            if (close_result != 0 && errno != ENOSYS && errno != EINVAL)
+#if defined(__linux__)
+            bool cloexec_ok;
+#if defined(ICECC_FORCE_PROC_SWEEP) && !defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
+            // QA knob (same one daemon/p50_fork_fd_hygiene.cpp honors): force
+            // the /proc fallback so the forced-proc QA stage exercises it on
+            // f28-header builds too, even though close_range(2) would
+            // otherwise succeed there.
+            cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
+#elif defined(SYS_close_range)
+            long close_result = -1;
+            if (test_force_close_range_errno_ != 0)
+                errno = test_force_close_range_errno_;
+            else
+                close_result = ::syscall(SYS_close_range, 3u, UINT_MAX, CLOSE_RANGE_CLOEXEC);
+            if (close_result == 0) {
+                cloexec_ok = true;
+            } else if (errno == ENOSYS || errno == EINVAL || errno == EPERM) {
+                // ENOSYS: kernel <5.9.  EINVAL: syscall recognized, flag/range
+                // rejected.  EPERM: an old Docker seccomp profile denying an
+                // unrecognized syscall number outright (the build0xx node
+                // image's actual shape) -- NOT ENOSYS, which used to make
+                // this fail closed.  All three mean "backend unavailable,"
+                // same policy as daemon/p50_fork_fd_hygiene.cpp's
+                // close_range_sweep().
+                cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
+            } else {
+                // Any other errno (e.g. EBADF) is a real fault, not a
+                // missing-backend signal: fail closed, same as legacy
+                // behavior.
+                cloexec_ok = false;
+            }
+#else
+            // Old headers never defined SYS_close_range and
+            // services/sys_close_range.h could not supply it either (non-
+            // x86_64): go straight to the fallback.
+            cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
+#endif
+            if (!cloexec_ok)
                 _exit(127);
 #endif
             if (!set_cloexec(outer_launch_ready_write_fd_, false) ||

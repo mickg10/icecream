@@ -5,7 +5,17 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 source=$src/daemon/p50_fork_fd_hygiene.cpp
 test=$src/unittests/p50_fork_fd_hygiene_test.cpp
 header=$src/daemon/p50_fork_fd_hygiene.h
-test -s "$source" -a -s "$test" -a -s "$header"
+services_header=$src/services/sys_close_range.h
+test -s "$source" -a -s "$test" -a -s "$header" -a -s "$services_header"
+
+# p50_fork_fd_hygiene.cpp includes "services/sys_close_range.h"; every
+# scratch tree below that compiles a (possibly mutated) copy of that .cpp
+# needs the header staged alongside it, or the compile fails before the
+# mutant can be observed at all.
+stage_services_header() { # <dir>
+    mkdir -p "$1/services"
+    cp "$services_header" "$1/services/sys_close_range.h"
+}
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50forkfdhygiene.XXXXXX")
 identity_dir=
@@ -29,6 +39,7 @@ trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_
 #   0 -> proceed, and every kill check demands a REAL failure (not 77).
 baseline_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-baseline.XXXXXX")
 mkdir -p "$baseline_dir/daemon" "$baseline_dir/unittests"
+stage_services_header "$baseline_dir"
 cp "$source" "$baseline_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$baseline_dir/daemon/p50_fork_fd_hygiene.h"
 cp "$test" "$baseline_dir/unittests/p50_fork_fd_hygiene_test.cpp"
@@ -82,6 +93,7 @@ kill_or_fail() { # <test-binary> <mutant-name>
 mutant_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-mutant.XXXXXX")
 trap 'rm -rf "$mutant_dir" "$mutant"' EXIT HUP INT TERM
 mkdir -p "$mutant_dir/daemon" "$mutant_dir/unittests"
+stage_services_header "$mutant_dir"
 cp "$source" "$mutant_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$mutant_dir/daemon/p50_fork_fd_hygiene.h"
 sed 's/constexpr uint64_t kAcceptedDeliveryId = 77;/constexpr uint64_t kAcceptedDeliveryId = 88;/' \
@@ -99,6 +111,7 @@ kill_or_fail "$mutant_dir/test" "accepted DeliveryId 77->88"
 # same-number replacement through mint.
 identity_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-identity-mutant.XXXXXX")
 mkdir -p "$identity_dir/daemon" "$identity_dir/unittests"
+stage_services_header "$identity_dir"
 sed 's/return source_identity_equal(actual, expected);/return expected.valid() || source_identity_equal(actual, expected);/' \
     "$source" >"$identity_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$identity_dir/daemon/p50_fork_fd_hygiene.h"
@@ -115,6 +128,7 @@ rm -rf "$identity_dir"
 # destruction; deleting that distinction must redden the runtime regression.
 move_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-move-mutant.XXXXXX")
 mkdir -p "$move_dir/daemon" "$move_dir/unittests"
+stage_services_header "$move_dir"
 sed 's/borrowed_handoff_fd_ = other.borrowed_handoff_fd_;/if (borrowed_handoff_fd_ >= 0) { (void)::close(borrowed_handoff_fd_); } borrowed_handoff_fd_ = other.borrowed_handoff_fd_;/' \
     "$source" >"$move_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$move_dir/daemon/p50_fork_fd_hygiene.h"
@@ -131,6 +145,7 @@ rm -rf "$move_dir"
 # must catch the resulting close of a caller replacement.
 proof_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-proof-mutant.XXXXXX")
 mkdir -p "$proof_dir/daemon" "$proof_dir/unittests"
+stage_services_header "$proof_dir"
 sed -e 's/return owner\.proof_slot_fd_;/return owner.owned_proof_fd_;/' \
     -e 's/return lease\.proof_slot_fd_;/return lease.owned_proof_fd_;/' \
     "$source" >"$proof_dir/daemon/p50_fork_fd_hygiene.cpp"
@@ -148,6 +163,7 @@ rm -rf "$proof_dir"
 # observe the resulting private-handle leak.
 kcmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-kcmp-mutant.XXXXXX")
 mkdir -p "$kcmp_dir/daemon" "$kcmp_dir/unittests"
+stage_services_header "$kcmp_dir"
 sed 's/const bool proof_closed = proof < 0 || close_exact(proof);/const bool proof_closed = proof < 0 || (proved \&\& close_exact(proof));/' \
     "$source" >"$kcmp_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$kcmp_dir/daemon/p50_fork_fd_hygiene.h"
@@ -164,6 +180,7 @@ rm -rf "$kcmp_dir"
 # closing the caller's handoff without a test-only disarm.
 alias_reject_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-alias-reject-mutant.XXXXXX")
 mkdir -p "$alias_reject_dir/daemon" "$alias_reject_dir/unittests"
+stage_services_header "$alias_reject_dir"
 sed 's/owner\.disarm_rejected_alias(fd);/(void)fd;/' \
     "$source" >"$alias_reject_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$alias_reject_dir/daemon/p50_fork_fd_hygiene.h"
@@ -179,6 +196,7 @@ rm -rf "$alias_reject_dir"
 # checks both caller-owned observation slots and the final descriptor count.
 slot_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-slot-mutant.XXXXXX")
 mkdir -p "$slot_dir/daemon" "$slot_dir/unittests"
+stage_services_header "$slot_dir"
 sed '/        identity_ = other\.identity_;/i\        proof_slot_fd_ = other.proof_slot_fd_;' \
     "$source" >"$slot_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$slot_dir/daemon/p50_fork_fd_hygiene.h"
@@ -196,6 +214,7 @@ rm -rf "$slot_dir"
 # regression makes this true mutant fail at runtime.
 alias_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-alias-mutant.XXXXXX")
 mkdir -p "$alias_dir/daemon" "$alias_dir/unittests"
+stage_services_header "$alias_dir"
 sed -e 's/owner\.owned_proof_fd_ == fd/false/' \
     -e 's/proof_handoff != OpenFileComparison::Different/static_cast<int>(proof_handoff) + ::getpid() >= 0/' \
     -e 's/control_handoff != OpenFileComparison::Different/static_cast<int>(control_handoff) + ::getpid() >= 0/' \
@@ -214,6 +233,7 @@ rm -rf "$alias_dir"
 # regression must redden before such a source can reach sweep.
 mutable_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-mutable-mutant.XXXXXX")
 mkdir -p "$mutable_dir/daemon" "$mutable_dir/unittests"
+stage_services_header "$mutable_dir"
 sed 's/if (seals < 0)/if (false \&\& seals < 0)/' \
     "$source" >"$mutable_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$mutable_dir/daemon/p50_fork_fd_hygiene.h"

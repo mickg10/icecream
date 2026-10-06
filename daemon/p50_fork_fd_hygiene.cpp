@@ -14,23 +14,13 @@
 #include <unistd.h>
 #include <utility>
 
-#if defined(__linux__)
-#  include <sys/syscall.h>
-#  include <sys/types.h>
-#  if defined(SYS_close_range)
-#    include <linux/close_range.h>
-#  elif defined(__x86_64__)
-/* close_range(2) is x86_64 syscall 436 (kernel 5.9+).  Builds against old
-   distro headers (Fedora 28-era glibc, the build0xx node images) do not
-   define SYS_close_range, so close_range_sweep compiled OUT and the
-   unbounded proc_fallback backend ran on every job child -- the production
-   fd bug.  Supply the number for x86_64 the way pidfd-uapi does; on a
-   kernel without the syscall it returns ENOSYS and sweep() falls back to
-   the (now bounded) proc path. */
-#    define SYS_close_range 436
-#    define ICECC_SUPPLIED_CLOSE_RANGE_NR 1
-#  endif
-#endif
+// SYS_close_range's old-headers fallback is shared with
+// cache/p50_daemon_sidecar_adapter.cpp -- see services/sys_close_range.h for
+// why this must be the one place that supplies the syscall number.  (Builds
+// against old distro headers -- Fedora 28-era glibc, the build0xx node
+// images -- used to leave close_range_sweep() compiled OUT and the unbounded
+// proc_fallback backend running on every job child: the production fd bug.)
+#include "services/sys_close_range.h"
 
 namespace icecc::p50::forkfd {
 
