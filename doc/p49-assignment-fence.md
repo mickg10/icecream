@@ -10,17 +10,20 @@ same identity through `UseCS` and `CompileFile`; see
 ## Activation and the four modes
 
 `icecc-scheduler --assignment-fence-mode MODE` freezes one mode for its
-scheduler epoch and sends it in `ConfCSMsg`:
+scheduler epoch and sends it in `ConfCSMsg`.  With no flag at all, the
+scheduler runs `enforcing-compat`; `legacy` remains available as an explicit
+kill switch:
 
-- `legacy` / `Legacy` (0) is the default.  It sends no prepare, waits for no
-  ready, sends no ordered revoke, and preserves the inherited behavior.
+- `legacy` / `Legacy` (0) is the explicit kill switch.  It sends no prepare,
+  waits for no ready, sends no ordered revoke, and preserves the inherited
+  behavior.
 - `advisory` / `Advisory` (1) sends `PREPARE`, but does not wait for `READY`
   before sending the unchanged `UseCS`.  A nonce-less legacy claim that wins
   before `PREPARE` is recorded as claimed and is later bound to the complete
   identity without regressing its phase.
-- `enforcing-compat` / `EnforcingCompat` (2) waits for matching `READY` before
-  sending `UseCS`.  A nonce-less legacy claim is admitted only through the
-  current live prepared wire-id record.  The older
+- `enforcing-compat` / `EnforcingCompat` (2) is the default.  It waits for
+  matching `READY` before sending `UseCS`.  A nonce-less legacy claim is
+  admitted only through the current live prepared wire-id record.  The older
   `--assignment-fence-strict` spelling is an alias for this mode.
 - `strict-nonce` / `StrictNonce` (3) is reserved by Protocol 49 and becomes
   operational only on an explicitly selected all-Protocol-50 remote path. A
@@ -191,4 +194,5 @@ and duplicate controls, same-wire-id reuse, no early id release, late-claim
 rejection, submitter and link teardown, retained same-epoch rebind,
 clear-then-old-epoch refusal, claim evidence versus a delayed contradictory
 result, current-channel deletion during READY failure, epoch-lifetime records,
-bounded exhaustion, and default-disabled inheritance.
+bounded exhaustion, and default-enforcing-compat inheritance (the explicit
+`legacy` kill switch retains the old default-disabled inheritance path).

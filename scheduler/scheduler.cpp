@@ -145,9 +145,11 @@ struct SchedulerAssignmentKeyHash {
 static std::unordered_map<SchedulerAssignmentKey, Job *,
                           SchedulerAssignmentKeyHash> fenced_assignments;
 
-/* Assignment fencing is an explicit scheduler policy and stays LEGACY by
-   default.  Link versions constrain eligibility but never select a mode. */
-static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::Legacy;
+/* Assignment fencing is an explicit scheduler policy.  With no
+   --assignment-fence-mode flag the scheduler runs ENFORCING_COMPAT; LEGACY
+   remains available as an explicit kill switch.  Link versions constrain
+   eligibility but never select a mode. */
+static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::EnforcingCompat;
 static uint64_t scheduler_assignment_epoch = 0;
 static uint64_t next_tu_seq = 0;
 
@@ -5100,7 +5102,7 @@ static void usage(const std::string reason = "")
          << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
          << "  --dispatch-stall-report-after <sec>  report (do not remove) a submitter whose oldest unconfirmed dispatch exceeds this; its assignment and worker reservation are retained (10-3600, default 180)\n"
          << "  --assignment-fence-mode <legacy|advisory|enforcing-compat|strict-nonce>\n"
-         << "                                      P49 assignment policy (default legacy; strict-nonce requires P50)\n"
+         << "                                      P49 assignment policy (default enforcing-compat; legacy is the explicit kill switch; strict-nonce requires P50)\n"
          << "  --assignment-fence-strict          compatibility alias for enforcing-compat\n"
          << endl;
 

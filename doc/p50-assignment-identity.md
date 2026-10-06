@@ -40,10 +40,10 @@ configuration, so the worker remains in its legacy-compatible mode.
 
 ## Operator modes
 
-The default remains `legacy`. `advisory` and `enforcing-compat` retain their
-Protocol-49 meanings. Enforcing compatibility deliberately accepts either an
-exact nonce-bearing Protocol-50 claim or a nonce-less legacy claim for the
-currently live prepared wire ID.
+The default is now `enforcing-compat`. `legacy` is the explicit kill switch,
+and `advisory` retains its Protocol-49 meaning. Enforcing compatibility
+deliberately accepts either an exact nonce-bearing Protocol-50 claim or a
+nonce-less legacy claim for the currently live prepared wire ID.
 
 `strict-nonce` is now operational, but only when explicitly selected with
 `--assignment-fence-mode strict-nonce`. It is never selected by observing a

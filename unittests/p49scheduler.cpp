@@ -659,6 +659,8 @@ static pid_t start_cache_routing_scheduler_retry(
 
 static JobDoneMsg job_done_for(const UseCSMsg &use, int exitcode,
                                unsigned int flags);
+static AssignPrepareMsg *wait_prepare(MsgChannel *worker);
+static AssignPrepareMsg *wait_prepare_and_ready(MsgChannel *worker);
 
 static void run_remote_required_waits_for_worker(
     const std::string &binary, const std::string &directory)
@@ -685,6 +687,14 @@ static void run_remote_required_waits_for_worker(
     MsgChannel *worker = login_host(
         port, "remote-required-worker", true, worker_port, &worker_conf);
     delete worker_conf;
+
+    /* The scheduler runs under its EnforcingCompat default here, so the
+       queued job's assignment is a PREPARE on the newly available worker,
+       not an immediate UseCS -- see run_default_is_enforcing_compat. */
+    AssignPrepareMsg *prepare = wait_prepare_and_ready(worker);
+    REQUIRE(prepare != nullptr,
+            "newly available worker receives PREPARE for the queued "
+            "remote-required job");
     UseCSMsg *use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(worker && use,
@@ -695,6 +705,7 @@ static void run_remote_required_waits_for_worker(
     }
 
     delete use;
+    delete prepare;
     delete submitter;
     delete worker;
     if (worker_listener >= 0) close(worker_listener);
@@ -741,6 +752,21 @@ static AssignPrepareMsg *wait_prepare(MsgChannel *worker)
 {
     return dynamic_cast<AssignPrepareMsg *>(
         wait_type(worker, Msg::ASSIGN_PREPARE, 3000));
+}
+
+/* wait_prepare() plus the immediate READY reply that EnforcingCompat (now
+   the default fence mode) requires before UseCS can reach the submitter.
+   Equivalent to the manual wait_prepare()+send_msg() pairs used throughout
+   this file, for call sites that already know which worker the dispatch
+   landed on. */
+static AssignPrepareMsg *wait_prepare_and_ready(MsgChannel *worker)
+{
+    AssignPrepareMsg *prepare = wait_prepare(worker);
+    if (prepare) {
+        worker->send_msg(AssignReadyMsg(prepare->epoch(), prepare->wire_id,
+                                        prepare->nonce()));
+    }
+    return prepare;
 }
 
 static JobDoneMsg job_done_for(const UseCSMsg &use, int exitcode,
@@ -1868,12 +1894,72 @@ static void run_pre_exposure_worker_loss_redispatch(
             "pre-exposure worker-loss scheduler stopped cleanly");
 }
 
-static void run_disabled(const std::string &binary, const std::string &directory)
+/* No --assignment-fence-mode flag at all.  The scheduler must still default
+   to EnforcingCompat: PREPARE is sent and UseCS is withheld until the
+   matching READY arrives -- exactly the behavior of an explicit
+   "enforcing-compat" launch in run_enforcing() above. */
+static void run_default_is_enforcing_compat(const std::string &binary,
+                                             const std::string &directory)
 {
     const int port = reserve_port_pair();
-    const std::string log = directory + "/disabled-scheduler.log";
+    const std::string log = directory + "/default-mode-scheduler.log";
     pid_t scheduler = start_scheduler(binary, port, nullptr, log);
-    REQUIRE(port != 0 && scheduler > 0, "default-disabled scheduler launched");
+    REQUIRE(port != 0 && scheduler > 0, "no-flag-default scheduler launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(port, "default-worker", true, worker_port,
+                                    &worker_conf);
+    REQUIRE(worker && worker_conf && worker_conf->epoch() != 0
+                && worker_conf->fence_mode == ConfCSMsg::EnforcingCompat,
+            "no-flag default P49 discriminator is EnforcingCompat");
+    delete worker_conf;
+
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "default-submit", false, 0,
+                                       &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(submitter && request_job(submitter, 2001),
+            "no-flag-default assignment requested");
+
+    AssignPrepareMsg *prepare = wait_prepare(worker);
+    REQUIRE(prepare != nullptr,
+            "no-flag default sends PREPARE before any UseCS");
+    REQUIRE(no_type(submitter, Msg::USE_CS, 250),
+            "no-flag default withholds UseCS until matching READY");
+    if (prepare) {
+        worker->send_msg(AssignReadyMsg(prepare->epoch(), prepare->wire_id,
+                                        prepare->nonce()));
+    }
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(prepare && use && use->job_id == prepare->wire_id,
+            "matching READY exposes UseCS under the no-flag default");
+
+    if (use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use;
+    delete prepare;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(scheduler),
+            "no-flag-default scheduler stopped cleanly");
+}
+
+/* legacy stays the explicit kill switch: an operator must opt out of
+   EnforcingCompat by name to get back the original unfenced behavior. */
+static void run_explicit_legacy_kill_switch(const std::string &binary,
+                                            const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/explicit-legacy-scheduler.log";
+    pid_t scheduler = start_scheduler(binary, port, "legacy", log);
+    REQUIRE(port != 0 && scheduler > 0, "explicit-legacy scheduler launched");
 
     int worker_port = 0;
     int worker_listener = bind_port(0, &worker_port);
@@ -1883,20 +1969,23 @@ static void run_disabled(const std::string &binary, const std::string &directory
                                     &worker_conf);
     REQUIRE(worker && worker_conf && worker_conf->epoch() != 0
                 && worker_conf->fence_mode == ConfCSMsg::Legacy,
-            "default P49 inheritance discriminator is Legacy");
+            "explicit legacy kill switch still negotiates Legacy");
     delete worker_conf;
 
     ConfCSMsg *submitter_conf = nullptr;
     MsgChannel *submitter = login_host(port, "legacy-submit", false, 0,
                                        &submitter_conf);
     delete submitter_conf;
-    REQUIRE(submitter && request_job(submitter, 2001),
-            "default-disabled assignment requested");
+    REQUIRE(submitter && request_job(submitter, 2002),
+            "explicit-legacy assignment requested");
     UseCSMsg *use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
-    REQUIRE(use != nullptr, "default-disabled path sends legacy UseCS directly");
+    REQUIRE(use != nullptr, "explicit-legacy path sends legacy UseCS directly");
+    REQUIRE(use && !use->hasAssignmentIdentity()
+                && use->assignmentEpoch() == 0 && use->assignmentNonce() == 0,
+            "explicit-legacy UseCS carries zero epoch and nonce");
     REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 300),
-            "default-disabled path sends no PREPARE and waits for no READY");
+            "explicit-legacy path sends no PREPARE and waits for no READY");
 
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
@@ -1906,7 +1995,8 @@ static void run_disabled(const std::string &binary, const std::string &directory
     delete submitter;
     delete worker;
     if (worker_listener >= 0) close(worker_listener);
-    REQUIRE(stop_scheduler(scheduler), "default-disabled scheduler stopped cleanly");
+    REQUIRE(stop_scheduler(scheduler),
+            "explicit-legacy scheduler stopped cleanly");
 }
 
 static void run_cache_advertisement(const std::string &binary,
@@ -1950,22 +2040,30 @@ static void run_cache_advertisement(const std::string &binary,
     delete submitter_conf;
     REQUIRE(submitter && request_job(submitter, 5001),
             "ordinary assignment requested with advertised cache unavailable");
+    /* The scheduler runs under its EnforcingCompat default here, so this
+       job's assignment is a PREPARE on the cache-advertising worker before
+       any UseCS -- see run_default_is_enforcing_compat. */
+    AssignPrepareMsg *prepare = wait_prepare_and_ready(worker);
+    REQUIRE(prepare != nullptr,
+            "cache-advertising worker receives PREPARE before UseCS under "
+            "the default fence mode");
     UseCSMsg *use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(use && use->port == static_cast<uint32_t>(worker_port),
             "advertisement leaves ordinary UseCS selection unchanged");
-    /* S2: this scheduler runs in the DEFAULT (Legacy) fence mode, so this
-       job's assignment identity is never set (epoch/nonce stay 0 -- see
-       ASSIGNMENT_LEGACY in scheduler.cpp).  BigOracle steer: a present
-       cache triple additionally requires that complete nonzero identity,
-       so even a perfectly valid, faithfully-retained worker snapshot must
-       still project wholly absent here.  The genuinely-bound case (a mode
-       that DOES assign identity) is covered by
-       run_cache_handoff_identity_bound below. */
-    REQUIRE(use && !use->hasCacheAdvertisement()
-                && use->cache_protocol == 0 && use->cache_profile_mask == 0,
-            "S2: LEGACY fence mode projects a wholly-absent cache-handoff "
-            "tail even when the selected F's retained snapshot is valid");
+    /* S2: this scheduler runs under its EnforcingCompat default, so the
+       job's assignment identity is bound at PREPARE time (see the
+       scheduler state machine in doc/p49-assignment-fence.md) and must
+       appear verbatim on UseCS.  This is now the genuinely-bound case; the
+       fully-absent-identity shape belongs to the explicit legacy kill
+       switch instead (see run_explicit_legacy_kill_switch). */
+    REQUIRE(prepare && use
+                && use->assignmentEpoch() == prepare->epoch()
+                && use->assignmentNonce() == prepare->nonce()
+                && use->assignmentEpoch() != 0
+                && use->assignmentNonce() != 0,
+            "S2: EnforcingCompat UseCS carries exactly the PREPARE's "
+            "(epoch, nonce), non-zero");
     pollfd cache_probe { cache_sentinel, POLLIN, 0 };
     REQUIRE(poll(&cache_probe, 1, 300) == 0,
             "scheduler and submitter never connect to the inert cache endpoint");
@@ -1974,6 +2072,7 @@ static void run_cache_advertisement(const std::string &binary,
         worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
+    delete prepare;
 
     LoginMsg absent(static_cast<uint32_t>(worker_port), "cache-ad-worker",
                     "x86_64", 0);
@@ -1996,11 +2095,12 @@ static void run_cache_advertisement(const std::string &binary,
             "replacement Login atomically publishes cache absence");
     /* The identity-bound staleness/tracking proof (does a later UseCS ever
        reuse a value cached from an earlier Login rather than the CURRENT
-       retained snapshot?) needs a mode that actually assigns identity --
-       under this function's Legacy mode every UseCS projects absent
-       regardless of the worker's snapshot, so a before/after comparison
-       here would be confounded and prove nothing.  See
-       run_cache_handoff_identity_bound below. */
+       retained snapshot?) needs a second, distinct candidate F to swap
+       selection between, so the handoff tail's "tracks current snapshot"
+       can be told apart from "tracks first-seen snapshot".  This function
+       only ever has one candidate worker, so it cannot make that
+       distinction by itself even though it already runs under
+       EnforcingCompat.  See run_cache_handoff_identity_bound below. */
 
     delete submitter;
     delete worker;
@@ -2016,12 +2116,13 @@ static void run_cache_advertisement(const std::string &binary,
             "cache-advertisement scheduler stopped cleanly");
 }
 
-/* BigOracle steer: the Legacy-mode run_cache_advertisement above cannot
-   prove a present cache triple projects faithfully -- under Legacy every
-   UseCS is absent regardless of the worker's snapshot (see the assertion
-   there).  Advisory mode DOES assign a complete identity before dispatch
-   (immediately, without READY-gating -- see run_advisory), so it is used
-   here to prove, with two DISTINCT candidate F's:
+/* BigOracle steer: run_cache_advertisement above proves a present cache
+   triple requires the complete, non-zero, PREPARE-matching assignment
+   identity, but only ever has one candidate worker, so it cannot prove
+   post-selection binding or current-vs-stale snapshot tracking by itself.
+   EnforcingCompat's complete identity-before-dispatch (once the selected
+   worker's READY closes the gate) is used here, with two DISTINCT
+   candidate F's, to prove:
      (b) a present triple requires the complete identity AND actually
          happens once that identity exists;
      (c) post-selection binding -- forcing selection of F_B carries B's
@@ -2862,7 +2963,7 @@ static void run_legacy_cache_routing_neutrality(const std::string &binary,
 {
     const int port = reserve_port_pair();
     const std::string log = directory + "/cache-routing-legacy-neutrality.log";
-    pid_t scheduler = start_cache_routing_scheduler(binary, port, log, nullptr);
+    pid_t scheduler = start_cache_routing_scheduler(binary, port, log, "legacy");
     REQUIRE(port != 0 && scheduler > 0,
             "legacy least-busy scheduler process launched for cache-neutrality gate");
 
@@ -3186,7 +3287,8 @@ int main(int argc, char **argv)
     run_strict_nonce(argv[1], directory);
     run_strict_cache_withdraw(argv[1], directory);
     run_pre_exposure_worker_loss_redispatch(argv[1], directory);
-    run_disabled(argv[1], directory);
+    run_default_is_enforcing_compat(argv[1], directory);
+    run_explicit_legacy_kill_switch(argv[1], directory);
     run_cache_advertisement(argv[1], directory);
     run_cache_handoff_identity_bound(argv[1], directory);
     run_cache_routing_preference(argv[1], directory);
