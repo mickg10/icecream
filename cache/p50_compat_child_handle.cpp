@@ -30,7 +30,15 @@ bool read_proc_stat_starttime(long pid, unsigned long long* out) noexcept {
         return false;
     char buffer[4096];
     const size_t read_bytes = std::fread(buffer, 1, sizeof(buffer) - 1, file);
+    // Capture errno immediately after the read, before fclose() gets a
+    // chance to disturb it -- POSIX only guarantees fclose() sets errno on
+    // its own failure, not that it preserves whatever errno a prior short
+    // read left behind on success. This is what lets a genuine read failure
+    // (e.g. ESRCH/EIO because the process vanished mid-read) survive to the
+    // caller instead of being silently overwritten by a successful fclose().
+    const int read_errno = errno;
     std::fclose(file);
+    errno = read_errno;
     if (read_bytes == 0)
         return false;
     buffer[read_bytes] = '\0';

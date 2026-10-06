@@ -1064,6 +1064,15 @@ sidecar::LifecycleState DaemonSidecarAdapter::outer_lifecycle_state() const noex
                                        : sidecar::LifecycleState::Stopped;
 }
 
+const std::optional<sidecar::CompatInvariantViolation>&
+DaemonSidecarAdapter::outer_compat_invariant_violation() const noexcept
+{
+    static const std::optional<sidecar::CompatInvariantViolation> kNone;
+    return outer_lifecycle_ != nullptr
+        ? outer_lifecycle_->compat_invariant_violation()
+        : kNone;
+}
+
 bool DaemonSidecarAdapter::outer_shutdown_complete() const noexcept
 {
     if (!outer_shutdown_requested_)

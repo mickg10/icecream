@@ -1469,6 +1469,12 @@ struct Daemon {
     icecc::p50::sidecar::CentralChildReaperRegistry cache_child_reaper;
     std::unique_ptr<icecc::p50::daemon::DaemonSidecarAdapter> cache_adapter;
     bool cache_adapter_start_attempted;
+    // DaemonSidecarAdapter::outer_compat_invariant_violation() is sticky:
+    // once a Compat-backend starttime fence mismatch is observed it is never
+    // cleared and the adapter never retries. This flag makes the daemon's
+    // own loud log call fire exactly once for that one terminal event
+    // instead of repeating it on every subsequent poll turn.
+    bool cache_adapter_compat_violation_logged;
     uint64_t next_p50_arm_observation_id;
     icecc::p50::advertisement::Snapshot scheduler_cache_snapshot;
     bool scheduler_cache_snapshot_valid;
@@ -1541,6 +1547,7 @@ struct Daemon {
         next_scheduler_connect = 0;
         cache_size = 0;
         cache_adapter_start_attempted = false;
+        cache_adapter_compat_violation_logged = false;
         next_p50_arm_observation_id = 1;
         scheduler_cache_snapshot = {};
         scheduler_cache_snapshot_valid = false;
@@ -10873,6 +10880,47 @@ void Daemon::answer_client_requests()
         icecc::p50::advertisement::Update lifecycle_update;
         (void)cache_adapter->outer_advance_turn(
             std::chrono::steady_clock::now(), pollfds, &lifecycle_update);
+        // Requirement #3 (Slice 1 hardening): a Compat-backend starttime
+        // fence mismatch is a fail-closed invariant violation, never a
+        // retryable "no change yet" result.  It is sticky and the adapter
+        // never retries past it, so cache_adapter_compat_violation_logged
+        // makes this the one and only loud log line for the one and only
+        // occurrence, however many later turns keep observing it set.
+        if (!cache_adapter_compat_violation_logged) {
+            if (const auto& violation =
+                    cache_adapter->outer_compat_invariant_violation();
+                violation.has_value()) {
+                cache_adapter_compat_violation_logged = true;
+                if (!violation->observed_readable) {
+                    std::ostream &out = log_error();
+                    out << "P50 cache sidecar Compat starttime fence "
+                           "violated: pid="
+                        << violation->pid
+                        << " unreadable /proc/<pid>/stat (";
+                    if (violation->observed_errno != 0) {
+                        out << "errno " << violation->observed_errno << ": "
+                            << strerror(violation->observed_errno) << ")";
+                    } else {
+                        out << "unparseable, errno 0)";
+                    }
+                    out << " registry_generation="
+                        << violation->registry_generation
+                        << " -- failing closed, no retry" << endl;
+                } else {
+                    log_error()
+                        << "P50 cache sidecar Compat starttime fence "
+                           "violated: pid="
+                        << violation->pid
+                        << " starttime mismatch (expected "
+                        << violation->expected_starttime_ticks
+                        << ", observed "
+                        << violation->observed_starttime_ticks << ")"
+                        << " registry_generation="
+                        << violation->registry_generation
+                        << " -- failing closed, no retry" << endl;
+                }
+            }
+        }
         if (const auto result =
                 cache_adapter->take_outer_input_lifecycle_result();
             result.has_value()) {

@@ -1,6 +1,9 @@
 #include "cache/p50_sidecar_lifecycle.h"
 
+#include "cache/p50_compat_child_handle.h"
+
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -12,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -672,6 +676,273 @@ void test_lifecycle() {
               "pid/pidfd/registry_generation/incarnation all still match");
         CHECK(consume_reap_hardening.test_consume_reap(exact_consume_event),
               "consume_reap accepts the same event once it is exact again");
+    }
+
+    // --- Slice-1 hardening requirement #3: a starttime mismatch observed by
+    // CentralChildReaperRegistry::reap_one() for a Compat-backend owner is an
+    // invariant violation, not a "no change"/retryable outcome. It must
+    // reach SidecarLifecycle::advance() as a sticky, idempotent
+    // LifecycleAction::FailedClosed -- never retried, never silently
+    // swallowed as an ordinary (non-)reap. observe_compat_status() (cache/
+    // p50_sidecar_lifecycle.cpp) reads /proc/<pid>/stat's starttime and
+    // compares it to the caller-registered starttime_ticks *before* ever
+    // calling waitid(), so this fires on the very first observation --
+    // independent of whether the child has actually exited -- and a single
+    // reap_one() call against a real forked child with a deliberately wrong
+    // registered starttime is sufficient; no synchronized exit or WNOWAIT/
+    // consume two-step is required.
+    {
+        CentralChildReaperRegistry compat_registry;
+        SidecarLifecycleConfig compat_config = config;
+        SidecarLifecycle compat_lifecycle(compat_config);
+        CHECK(compat_lifecycle.begin(t0).action == LifecycleAction::LaunchPrepared,
+              "compat invariant-violation test: begin emits one launch "
+              "preparation");
+
+        const pid_t compat_child = ::fork();
+        CHECK(compat_child >= 0, "compat invariant-violation test: fork succeeds");
+        if (compat_child == 0)
+            ::_exit(0);
+
+        unsigned long long real_starttime = 0;
+        CHECK(icecc::p50::platform::read_starttime_ticks(compat_child,
+                                                          &real_starttime) &&
+                  real_starttime != 0,
+              "compat invariant-violation test: the real starttime is "
+              "readable for the live/zombie child");
+        const uint64_t wrong_starttime =
+            static_cast<uint64_t>(real_starttime) + 1;
+
+        move_to_forked(compat_lifecycle, compat_child, t0);
+        CHECK(compat_lifecycle.state() == LifecycleState::ForkedAwaitExecAndReady,
+              "compat invariant-violation test: lifecycle reaches the forked "
+              "state");
+
+        auto compat_registration = compat_registry.register_owner(
+            compat_child, compat_child, compat_lifecycle.owner_key(),
+            compat_lifecycle.reap_mailbox(), ChildHandleBackend::Compat, 0, 0,
+            /*pidfd=*/-1, incarnation_for(*compat_lifecycle.identity()),
+            ReaperOwnerKind::Sidecar, /*starttime_ticks=*/wrong_starttime);
+        CHECK(compat_registration.valid(),
+              "compat invariant-violation test: a Compat registration with "
+              "pid>1, pidfd<0 and a nonzero (if wrong) starttime is itself "
+              "accepted -- register_owner has no way to know the real value");
+
+        compat_lifecycle.bind_reaper_identity(
+            -1, compat_registration.registry_generation());
+        CHECK(compat_lifecycle.bound_registry_generation() ==
+                  compat_registration.registry_generation(),
+              "compat invariant-violation test: bind_reaper_identity binds "
+              "the registry generation for a Compat (pidfd<0) owner");
+
+        const auto violation_event =
+            compat_registry.reap_one(compat_child, -1);
+        CHECK(!violation_event.has_value(),
+              "compat invariant-violation test: reap_one on a starttime "
+              "mismatch publishes no ordinary ReapEvent");
+        CHECK(compat_registry.size() == 0,
+              "compat invariant-violation test: the registry drops the "
+              "owner the instant it publishes the violation");
+
+        CHECK(!compat_lifecycle.compat_invariant_violation().has_value(),
+              "compat invariant-violation test: not yet latched before an "
+              "advance() turn drains the mailbox");
+        const auto compat_result = compat_lifecycle.advance(t0);
+        CHECK(compat_result.action == LifecycleAction::FailedClosed &&
+                  compat_lifecycle.state() == LifecycleState::FailedClosed,
+              "compat invariant-violation test: a starttime mismatch fails "
+              "closed on the turn it is observed, rather than being retried "
+              "or treated as no change");
+        CHECK(compat_lifecycle.compat_invariant_violation().has_value() &&
+                  compat_lifecycle.compat_invariant_violation()->pid ==
+                      compat_child &&
+                  compat_lifecycle.compat_invariant_violation()
+                          ->expected_starttime_ticks == wrong_starttime &&
+                  compat_lifecycle.compat_invariant_violation()
+                          ->observed_starttime_ticks ==
+                      static_cast<uint64_t>(real_starttime),
+              "compat invariant-violation test: the latched violation "
+              "carries the exact expected (wrong) and observed (real) "
+              "starttime pair");
+
+        // Sticky and idempotent: a later turn must stay FailedClosed and
+        // must not re-derive, clear, or replace the latch.
+        const auto compat_second = compat_lifecycle.advance(t0);
+        CHECK(compat_second.action == LifecycleAction::None &&
+                  compat_lifecycle.state() == LifecycleState::FailedClosed,
+              "compat invariant-violation test: FailedClosed is sticky and "
+              "idempotent across a later turn");
+
+        int wait_status = 0;
+        CHECK(::waitpid(compat_child, &wait_status, 0) == compat_child,
+              "compat invariant-violation test: cleanup reaps the real "
+              "forked child so no zombie is leaked by the test itself");
+    }
+
+    // --- fixup! requirement (b): when /proc/<pid>/stat is genuinely
+    // unreadable (the child has already been fully reaped and its /proc
+    // entry is gone), the violation must carry the errno from the failed
+    // read.  observed_starttime_ticks alone cannot distinguish "unreadable"
+    // from a readable-but-zero stat line, so observed_errno is the
+    // authoritative signal and must be nonzero on this path. ---
+    {
+        CentralChildReaperRegistry errno_registry;
+        SidecarLifecycleConfig errno_config = config;
+        SidecarLifecycle errno_lifecycle(errno_config);
+        CHECK(errno_lifecycle.begin(t0).action == LifecycleAction::LaunchPrepared,
+              "compat errno-capture test: begin emits one launch preparation");
+
+        const pid_t errno_child = ::fork();
+        CHECK(errno_child >= 0, "compat errno-capture test: fork succeeds");
+        if (errno_child == 0)
+            ::_exit(0);
+
+        unsigned long long errno_child_starttime = 0;
+        CHECK(icecc::p50::platform::read_starttime_ticks(
+                  errno_child, &errno_child_starttime) &&
+                  errno_child_starttime != 0,
+              "compat errno-capture test: the real starttime is readable "
+              "before the child is fully reaped");
+
+        // Fully reap the child up front (no WNOWAIT): its /proc/<pid> entry
+        // disappears immediately, before the registry ever observes it, so
+        // the registered (once-real) starttime is now unreadable.
+        int errno_wait_status = 0;
+        CHECK(::waitpid(errno_child, &errno_wait_status, 0) == errno_child,
+              "compat errno-capture test: the test itself fully reaps the "
+              "child so /proc/<pid>/stat is gone before registration");
+
+        move_to_forked(errno_lifecycle, errno_child, t0);
+        CHECK(errno_lifecycle.state() == LifecycleState::ForkedAwaitExecAndReady,
+              "compat errno-capture test: lifecycle reaches the forked state");
+
+        auto errno_registration = errno_registry.register_owner(
+            errno_child, errno_child, errno_lifecycle.owner_key(),
+            errno_lifecycle.reap_mailbox(), ChildHandleBackend::Compat, 0, 0,
+            /*pidfd=*/-1, incarnation_for(*errno_lifecycle.identity()),
+            ReaperOwnerKind::Sidecar,
+            /*starttime_ticks=*/static_cast<uint64_t>(errno_child_starttime));
+        CHECK(errno_registration.valid(),
+              "compat errno-capture test: registration with the real "
+              "(now-unreadable) starttime is itself accepted");
+
+        errno_lifecycle.bind_reaper_identity(
+            -1, errno_registration.registry_generation());
+        CHECK(errno_lifecycle.bound_registry_generation() ==
+                  errno_registration.registry_generation(),
+              "compat errno-capture test: bind_reaper_identity binds the "
+              "registry generation for a Compat (pidfd<0) owner");
+
+        const auto errno_violation_event =
+            errno_registry.reap_one(errno_child, -1);
+        CHECK(!errno_violation_event.has_value(),
+              "compat errno-capture test: reap_one on an unreadable /proc "
+              "entry publishes no ordinary ReapEvent");
+        CHECK(errno_registry.size() == 0,
+              "compat errno-capture test: the registry drops the owner the "
+              "instant it publishes the violation");
+
+        const auto errno_result = errno_lifecycle.advance(t0);
+        CHECK(errno_result.action == LifecycleAction::FailedClosed &&
+                  errno_lifecycle.state() == LifecycleState::FailedClosed,
+              "compat errno-capture test: an unreadable /proc/<pid>/stat "
+              "fails closed exactly like a mismatch does");
+        const auto &errno_violation =
+            errno_lifecycle.compat_invariant_violation();
+        CHECK(errno_violation.has_value() &&
+                  errno_violation->pid == errno_child,
+              "compat errno-capture test: the latched violation names the "
+              "right pid");
+        // observed_readable, not observed_starttime_ticks or observed_errno,
+        // is the authoritative "unreadable" signal: a parse-only failure (no
+        // ')' found, or field 22 missing) leaves errno at 0, the same value a
+        // successful-but-mismatched read reports, and a readable stat line
+        // can itself report starttime 0. In the vanishingly unlikely race
+        // where the OS has already reused this pid for a new, readable
+        // process by the time the registry reads /proc/<pid>/stat, the
+        // read succeeds but must report a different (mismatched) starttime
+        // -- it is reusing the pid, not resurrecting the exact same process
+        // -- so that outcome is accepted too.
+        CHECK(errno_violation.has_value() &&
+                  (!errno_violation->observed_readable ||
+                   (errno_violation->observed_readable &&
+                    errno_violation->observed_starttime_ticks !=
+                        static_cast<uint64_t>(errno_child_starttime))),
+              "compat errno-capture test: the latched violation is either "
+              "genuinely unreadable, or (on pid-reuse) readable but "
+              "reporting a starttime that mismatches the original child's");
+        // Secondary, weaker check: when the read truly failed (the expected,
+        // overwhelmingly likely outcome here), errno should name a real
+        // "the process is gone" failure -- ENOENT (fopen on a vanished
+        // /proc/<pid>) or ESRCH -- not some unrelated errno left over from
+        // an unrelated call. A parse-only failure legitimately reports 0.
+        CHECK(!errno_violation.has_value() || errno_violation->observed_readable ||
+                  errno_violation->observed_errno == 0 ||
+                  errno_violation->observed_errno == ENOENT ||
+                  errno_violation->observed_errno == ESRCH,
+              "compat errno-capture test: when unreadable, observed_errno "
+              "is 0 (parse-only failure) or names the process actually "
+              "being gone (ENOENT/ESRCH), not an unrelated errno");
+    }
+
+    // --- fixup! requirement (a): a Compat invariant violation whose owner,
+    // pid, registry generation, or incarnation does not match this exact
+    // lifecycle's identity is a stale/foreign fact.  It must be dropped
+    // without being latched onto this owner (consume_reap_events() must not
+    // silently substitute or corrupt this owner's own state), and dropping
+    // it must not stop this owner's own, unrelated lifecycle from
+    // continuing normally. ---
+    {
+        SidecarLifecycleConfig mismatch_config = config;
+        SidecarLifecycle mismatch_lifecycle(mismatch_config);
+        CHECK(mismatch_lifecycle.begin(t0).action == LifecycleAction::LaunchPrepared,
+              "owner-mismatch test: begin emits one launch preparation");
+
+        move_to_forked(mismatch_lifecycle, 50001, t0);
+        CHECK(mismatch_lifecycle.state() == LifecycleState::ForkedAwaitExecAndReady,
+              "owner-mismatch test: lifecycle reaches the forked state");
+        mismatch_lifecycle.bind_reaper_identity(-1, 777);
+        CHECK(mismatch_lifecycle.bound_registry_generation() == 777,
+              "owner-mismatch test: bind_reaper_identity binds this owner's "
+              "own registry generation");
+
+        const auto mismatch_identity = *mismatch_lifecycle.identity();
+        const auto mismatch_mailbox = mismatch_lifecycle.reap_mailbox().lock();
+        CHECK(mismatch_mailbox != nullptr,
+              "owner-mismatch test: this owner's mailbox is alive");
+
+        // A well-formed (exact_identity()==true) but foreign violation: it
+        // carries a different pid, owner key, and registry generation than
+        // this exact lifecycle holds, modeling a stale fact delivered after
+        // some other owner already moved on.
+        CompatInvariantViolation foreign_violation;
+        foreign_violation.kind = ReaperOwnerKind::Sidecar;
+        foreign_violation.pid = 50002;
+        foreign_violation.owner = ReaperOwnerKey{999999, 1};
+        foreign_violation.registry_generation = 778;
+        foreign_violation.incarnation = incarnation_for(mismatch_identity);
+        foreign_violation.expected_starttime_ticks = 42;
+        foreign_violation.observed_starttime_ticks = 43;
+        foreign_violation.observed_readable = true;
+        foreign_violation.observed_errno = 0;
+        CHECK(foreign_violation.exact_identity(),
+              "owner-mismatch test: the fabricated violation is itself "
+              "well-formed -- the mismatch is identity, not malformation");
+        CHECK(mismatch_mailbox->enqueue_violation(foreign_violation),
+              "owner-mismatch test: the single-slot violation channel "
+              "accepts the fabricated foreign fact");
+
+        CHECK(!mismatch_lifecycle.compat_invariant_violation().has_value(),
+              "owner-mismatch test: not yet latched before an advance() "
+              "turn drains the mailbox");
+        const auto mismatch_result = mismatch_lifecycle.advance(t0);
+        CHECK(!mismatch_lifecycle.compat_invariant_violation().has_value(),
+              "owner-mismatch test: a foreign violation (wrong pid/owner/"
+              "generation) is dropped rather than latched onto this owner");
+        CHECK(mismatch_result.action != LifecycleAction::FailedClosed &&
+                  mismatch_lifecycle.state() != LifecycleState::FailedClosed,
+              "owner-mismatch test: this owner's own lifecycle is unaffected "
+              "by a foreign violation delivered into its mailbox");
     }
 
     ReapMailbox bounded_mailbox;

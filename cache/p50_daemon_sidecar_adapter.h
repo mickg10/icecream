@@ -242,6 +242,13 @@ public:
     [[nodiscard]] pid_t outer_child_pid() const noexcept;
     [[nodiscard]] int outer_pidfd() const noexcept { return outer_pidfd_; }
     [[nodiscard]] sidecar::LifecycleState outer_lifecycle_state() const noexcept;
+    // Sticky once set: forwards SidecarLifecycle::compat_invariant_violation().
+    // A Compat-backend starttime fence mismatch is a fail-closed invariant
+    // violation, never a retryable condition, so this accessor's empty-to-
+    // non-empty transition happens at most once per adapter instance -- the
+    // daemon's own one-shot loud-log site relies on exactly that property.
+    [[nodiscard]] const std::optional<sidecar::CompatInvariantViolation>&
+    outer_compat_invariant_violation() const noexcept;
     // True only after the shutdown request has been driven through the same
     // one-poll/one-reducer-turn path and every owned descriptor, registration,
     // and exact cleanup phase has reached its terminal state.  Destruction
