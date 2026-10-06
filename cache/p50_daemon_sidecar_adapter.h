@@ -144,6 +144,14 @@ public:
 
     static bool valid_config(const Config& config) noexcept;
 
+    /* R17a: the NAMED refusal -- the same predicate as valid_config, but
+       the first failing clause is returned as a human-readable reason
+       (field, path, expected vs actual owner/mode) so the daemon's
+       "invalid cache sidecar configuration" log names the check instead
+       of making the operator bisect the 25-clause chain by hand.  Empty
+       string = configuration valid. */
+    static std::string config_refusal_reason(const Config& config) noexcept;
+
     void shutdown(advertisement::Update* update = nullptr) noexcept;
 
     // The daemon supplies an observation of its already-bound public socket.

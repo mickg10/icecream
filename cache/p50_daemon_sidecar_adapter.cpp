@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <poll.h>
+#include <sstream>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -395,43 +396,156 @@ DaemonSidecarAdapter::~DaemonSidecarAdapter()
     outer_disarm_registration();
 }
 
+/* R17a: THE single named source of truth for the configuration check.
+   Every clause returns the reason for its own failure (field, and for
+   the private-pathname leg the path plus EXPECTED vs ACTUAL owner:group
+   and mode) built with std::ostringstream -- NO fixed-size buffers: the
+   runtime-directory paths reach 38+ chars in the tests and longer in
+   production, and a 64-byte snprintf cut the line exactly where the
+   useful information started.  valid_config below is DERIVED from this
+   function (empty reason = valid), so the two can never drift and the
+   boolean can never disagree with the named result.  Runs once at
+   startup; cost is irrelevant. */
+std::string DaemonSidecarAdapter::config_refusal_reason(const Config& config) noexcept
+{
+    std::ostringstream text;
+    auto digits = [](uint64_t value) {
+        std::ostringstream sub;
+        sub << value;
+        return sub.str();
+    };
+    if (!executable_file(config.executable)) {
+        text << "sidecar executable '" << config.executable
+             << "' is missing or not an absolute regular executable path";
+        return text.str();
+    }
+    if (config.runtime_directory.empty())
+        return "cache runtime directory is empty";
+    if (config.runtime_directory.front() != '/') {
+        text << "cache runtime directory '" << config.runtime_directory
+             << "' is not absolute";
+        return text.str();
+    }
+    if (has_nul(config.runtime_directory))
+        return "cache runtime directory contains a NUL byte";
+    if (config.runtime_directory.size() >= 180) {
+        text << "cache runtime directory path is " << config.runtime_directory.size()
+             << " bytes (>= 180)";
+        return text.str();
+    }
+    if (config.generation == 0)
+        return "sidecar generation is zero";
+    if (config.public_listener_port > std::numeric_limits<uint16_t>::max()) {
+        text << "public listener port " << config.public_listener_port
+             << " exceeds the uint16 range";
+        return text.str();
+    }
+    if (!valid_id(config.expected_daemon_uid))
+        return "expected daemon uid " + digits(config.expected_daemon_uid) +
+               " is not a valid user id";
+    if (!valid_gid(config.expected_daemon_gid))
+        return "expected daemon gid " + digits(config.expected_daemon_gid) +
+               " is not a valid group id";
+    if (!valid_id(config.expected_service_uid))
+        return "expected service uid " + digits(config.expected_service_uid) +
+               " is not a valid user id";
+    if (!valid_gid(config.expected_service_gid))
+        return "expected service gid " + digits(config.expected_service_gid) +
+               " is not a valid group id";
+    if (config.expected_daemon_uid != static_cast<uint64_t>(::geteuid())) {
+        text << "expected daemon uid " << config.expected_daemon_uid
+             << " does not match the effective uid " << ::geteuid();
+        return text.str();
+    }
+    if (config.expected_daemon_gid != static_cast<uint64_t>(::getegid())) {
+        text << "expected daemon gid " << config.expected_daemon_gid
+             << " does not match the effective gid " << ::getegid();
+        return text.str();
+    }
+    if (config.expected_service_uid != config.expected_daemon_uid) {
+        text << "expected service uid " << config.expected_service_uid
+             << " differs from the daemon uid " << config.expected_daemon_uid
+             << " (the local connector requires the same user)";
+        return text.str();
+    }
+    if (config.expected_service_gid != config.expected_daemon_gid) {
+        text << "expected service gid " << config.expected_service_gid
+             << " differs from the daemon gid " << config.expected_daemon_gid;
+        return text.str();
+    }
+    if (!config.clock_identity.valid())
+        return "clock identity is invalid";
+    if (!bounded_positive(config.readiness_timeout))
+        return "readiness timeout is not a bounded positive duration";
+    if (!bounded_positive(config.connect_timeout))
+        return "connect timeout is not a bounded positive duration";
+    if (!bounded_positive(config.handoff_timeout))
+        return "handoff timeout is not a bounded positive duration";
+    if (!bounded_positive(config.input_attachment_timeout))
+        return "input attachment timeout is not a bounded positive duration";
+    if (!bounded_positive(config.shutdown_timeout))
+        return "shutdown timeout is not a bounded positive duration";
+    if (!bounded_positive(config.restart_window))
+        return "restart window is not a bounded positive duration";
+    if (!bounded_positive(config.input_lifecycle_timeout))
+        return "input lifecycle timeout is not a bounded positive duration";
+    if (config.max_restarts == 0)
+        return "max restarts is zero";
+    if (config.max_restarts > 100000)
+        return "max restarts " + digits(config.max_restarts) + " exceeds 100000";
+    if (config.max_attempts_per_recovery == 0)
+        return "max attempts per recovery is zero";
+    if (config.max_attempts_per_recovery > 100000)
+        return "max attempts per recovery " +
+               digits(config.max_attempts_per_recovery) + " exceeds 100000";
+    if (config.max_pending_input_lifecycle == 0)
+        return "max pending input lifecycle is zero";
+    if (config.max_pending_input_lifecycle > 100000)
+        return "max pending input lifecycle " +
+               digits(config.max_pending_input_lifecycle) + " exceeds 100000";
+    if (config.drop_uid.has_value() != config.drop_gid.has_value())
+        return "drop uid and drop gid must be set together";
+    if (config.drop_uid.has_value()) {
+        text << "drop uid " << *config.drop_uid
+             << " is set: the local connector requires the daemon's own "
+                "effective identity for a valid SO_PEERCRED relationship "
+                "(pre-bind drop mode is not supported)";
+        return text.str();
+    }
+    /* The private-pathname leg, DESCRIBED (not re-checked): lstat once
+       for the description, but the VERDICT comes from
+       private_directory() itself, so this function returns empty
+       exactly when the boolean form accepts. */
+    if (private_directory(config)) {
+        return {};
+    }
+    struct stat info{};
+    if (::lstat(config.runtime_directory.c_str(), &info) != 0) {
+        const std::string why = ::strerror(errno);
+        text << "cache runtime directory '" << config.runtime_directory
+             << "' lstat failed: " << why;
+        return text.str();
+    }
+    if (!S_ISDIR(info.st_mode)) {
+        text << "cache runtime directory '" << config.runtime_directory
+             << "' mode " << std::oct << (info.st_mode & 07777) << std::dec
+             << " is not a directory";
+        return text.str();
+    }
+    text << "cache runtime directory '" << config.runtime_directory
+         << "' owner " << info.st_uid << ":" << info.st_gid
+         << " mode " << std::oct << (info.st_mode & 07777) << std::dec
+         << ", expected " << config.expected_daemon_uid << ":"
+         << config.expected_daemon_gid << " mode 0700";
+    return text.str();
+}
 bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
 {
-    if (!executable_file(config.executable) ||
-        config.runtime_directory.empty() ||
-        config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
-        config.runtime_directory.size() >= 180 ||
-        config.generation == 0 ||
-        config.public_listener_port > std::numeric_limits<uint16_t>::max() ||
-        !valid_id(config.expected_daemon_uid) || !valid_gid(config.expected_daemon_gid) ||
-        !valid_id(config.expected_service_uid) || !valid_gid(config.expected_service_gid) ||
-        config.expected_daemon_uid != static_cast<uint64_t>(::geteuid()) ||
-        config.expected_daemon_gid != static_cast<uint64_t>(::getegid()) ||
-        config.expected_service_uid != config.expected_daemon_uid ||
-        config.expected_service_gid != config.expected_daemon_gid ||
-        !config.clock_identity.valid() ||
-        !bounded_positive(config.readiness_timeout) ||
-        !bounded_positive(config.connect_timeout) ||
-        !bounded_positive(config.handoff_timeout) ||
-        !bounded_positive(config.input_attachment_timeout) ||
-        !bounded_positive(config.shutdown_timeout) ||
-        !bounded_positive(config.restart_window) ||
-        !bounded_positive(config.input_lifecycle_timeout) ||
-        config.max_restarts == 0 ||
-        config.max_restarts > 100000 || config.max_attempts_per_recovery == 0 ||
-        config.max_attempts_per_recovery > 100000 ||
-        config.max_pending_input_lifecycle == 0 ||
-        config.max_pending_input_lifecycle > 100000 ||
-        (config.drop_uid.has_value() != config.drop_gid.has_value()))
-        return false;
-    // The current local connector deliberately requires private pathname
-    // ownership by the daemon's effective identity.  iceccd is deployed as
-    // the unprivileged icecc user, so a distinct pre-bind drop would make a
-    // valid SO_PEERCRED relationship unreachable.  Keep the explicit fields
-    // for launch-argument compatibility but reject that impossible mode.
-    if (config.drop_uid.has_value())
-        return false;
-    return private_directory(config);
+    /* Derived from config_refusal_reason() (R17a): empty reason = valid.
+       Runs once at adapter creation, so the cost of formatting strings
+       for a rejection is irrelevant, and the boolean can never disagree
+       with the named result -- there is exactly ONE clause chain. */
+    return config_refusal_reason(config).empty();
 }
 
 void DaemonSidecarAdapter::observe_public_listener(bool bound, uint32_t port) noexcept

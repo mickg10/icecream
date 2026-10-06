@@ -5330,8 +5330,14 @@ bool Daemon::configure_cache_adapter() noexcept
             icecc::p50::sidecar::process_monotonic_clock_identity();
 
         if (!icecc::p50::daemon::DaemonSidecarAdapter::valid_config(config)) {
-            log_error() << "invalid cache sidecar configuration; refusing positive mode"
-                        << endl;
+            /* R17a: name the failing check -- path, expected vs actual
+               owner/mode -- instead of making the operator bisect the
+               25-clause chain by hand.  Behaviour identical: same refusal,
+               same positive-mode skip. */
+            const std::string reason =
+                icecc::p50::daemon::DaemonSidecarAdapter::config_refusal_reason(config);
+            log_error() << "invalid cache sidecar configuration; refusing positive mode: "
+                        << reason << endl;
             return false;
         }
         auto *created = new (std::nothrow)
@@ -11812,6 +11818,30 @@ int main(int argc, char **argv)
         } else {
             register_child(d.state_writer.pid(), d.state_writer.pid(),
                            ChildRecord::STATE_WRITER, 0);
+        }
+        /* R17c: probe the state-jsonl path ONCE as the DROPPED uid, right
+           here (the capng_change_id above already happened, and the state
+           writer child inherits this uid): a root-owned or otherwise
+           unwritable directory used to fail SILENTLY -- the writer child
+           retried its open for 60x5s and abandoned, the daemon reported
+           writer_alive=true, and telemetry just never landed.  WARN and
+           CONTINUE (telemetry must not take down a compile worker), but
+           name the path, the uid and the errno so the operator sees it at
+           startup, not after wondering where the jsonl went. */
+        if (!d.state_jsonl_path.empty()) {
+            const int probe_fd = ::open(d.state_jsonl_path.c_str(),
+                                       O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (probe_fd < 0) {
+                const int probe_errno = errno;
+                log_error() << "state-jsonl path '" << d.state_jsonl_path
+                            << "' is not writable by uid " << ::getuid()
+                            << " (gid " << ::getgid() << "): "
+                            << strerror(probe_errno)
+                            << " -- state telemetry WILL BE LOST; continuing without it"
+                            << endl;
+            } else {
+                ::close(probe_fd);
+            }
         }
     }
 
