@@ -2587,6 +2587,83 @@ void test_f_live_session_overflow_from_two_c_runtimes() {
     CHECK(second_later.code == local::SourceTransferResultCode::Committed);
 }
 
+// ICECC_P50_ARMED_WINDOW overrides one C runtime's own RouteGate window
+// (SidecarRuntime::RouteGate::armed_window_slots(), cache/p50_cache_service.cpp)
+// independently of F's live-session bound.  The override is read once, when
+// this route's gate is first created below, so it must be set before the
+// first transfer_source_on_owner() call for this (host, port) key and may be
+// cleared immediately afterward.  F's own bound is left generous so the gate
+// itself -- not F's live-session table -- is what holds the extra arms back;
+// that keeps this test independent of test_f_live_session_overflow_from_two_c_runtimes
+// above, which exercises F's shared bound instead.
+void test_armed_window_env_override_shifts_gate_capacity() {
+    constexpr size_t kOverrideWindow = 3;
+    constexpr size_t kAttempted = 5;
+    constexpr uint64_t kFStoreGeneration = 31;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x92;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xc1;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    const CStoreGuid c_store = c_config.c_store_guid;
+
+    CHECK(::setenv("ICECC_P50_ARMED_WINDOW", "3", 1) == 0);
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+    front.hold(c_store);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](uint64_t identity) {
+        const std::string text = "armed-window-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-armed-window", source)));
+    };
+
+    std::array<local::P50SourceTransferResult, kAttempted> results{};
+    std::vector<std::thread> transfers;
+    for (size_t index = 0; index != kAttempted; ++index)
+        transfers.emplace_back([&, index] { results[index] = transfer(700 + 10 * index); });
+
+    const bool window_parked = eventually(
+        [&] { return front.parked() == kOverrideWindow; }, std::chrono::seconds(10));
+    // The remaining (kAttempted - kOverrideWindow) waiters must stay behind
+    // the overridden window, not the default kArmedSessions=8: give them a
+    // moment they could use to park early, then sample once more.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const size_t parked_before_release = front.parked();
+
+    CHECK(::unsetenv("ICECC_P50_ARMED_WINDOW") == 0);
+
+    const bool released = front.release();
+    for (std::thread& thread : transfers)
+        thread.join();
+    front.stop();
+
+    std::fprintf(stderr,
+                 "p50cacheservice: ICECC_P50_ARMED_WINDOW=3 parked=%zu (want %zu)\n",
+                 parked_before_release, kOverrideWindow);
+    CHECK(window_parked);
+    CHECK(parked_before_release == kOverrideWindow);
+    CHECK(released);
+    for (const auto& result : results)
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+}
+
 // Sockets only: a runtime creates its reactor descriptors lazily.
 size_t open_socket_count() {
     size_t count = 0;
@@ -3372,6 +3449,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::strcmp(argv[1], "--f-live-capacity") == 0) {
             test_f_live_session_overflow_from_two_c_runtimes();
             test_reopen_busy_waits_only_for_the_same_f_store();
+            test_armed_window_env_override_shifts_gate_capacity();
             return 0;
         }
         CHECK(argc == 1);

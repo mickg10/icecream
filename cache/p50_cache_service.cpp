@@ -1483,6 +1483,17 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
 }
 
+std::ptrdiff_t SidecarRuntime::RouteGate::armed_window_slots() noexcept {
+    const char* raw = ::getenv("ICECC_P50_ARMED_WINDOW");
+    if (raw == nullptr || *raw == '\0')
+        return kArmedSessions;
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed <= 0)
+        return kArmedSessions;
+    return static_cast<std::ptrdiff_t>(parsed);
+}
+
 local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     local::P50SourceTransferRequest request,
     sidecar::AbsoluteMonotonicDeadline deadline,

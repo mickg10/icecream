@@ -263,7 +263,16 @@ private:
     // a bounded head start.
     struct RouteGate {
         static constexpr std::ptrdiff_t kArmedSessions = 8;
-        ArmedAdmission armed{kArmedSessions};
+        // ICECC_P50_ARMED_WINDOW overrides the window size below.  Unset,
+        // empty, non-numeric, or non-positive keeps kArmedSessions.  F's
+        // live-session table (P50ServerOwnerLimits::max_live_sessions,
+        // cache/p50_endpoint.h) is shared by every route an F endpoint
+        // serves, so a window set much larger than that table's capacity
+        // divided by the number of routes concurrently armed against the
+        // same F buys nothing but BUSY (kFSessionBusy) elsewhere; this does
+        // not change F's behaviour.
+        static std::ptrdiff_t armed_window_slots() noexcept;
+        ArmedAdmission armed{armed_window_slots()};
         std::timed_mutex transfer;
     };
     std::mutex source_route_mutex_;
