@@ -57,6 +57,7 @@
 #include <stdio.h>
 #include <pwd.h>
 #include "../services/comm.h"
+#include "../services/stage_trace.h"
 #include "../services/getifaddrs.h"
 #include "../services/logging.h"
 #include "../services/job.h"
@@ -1418,6 +1419,7 @@ static void debit_dispatch_credit(Job *job)
         const uint64_t now_msec = icecream_monotonic_msec();
         job->setDispatchDebitMsec(now_msec);
         job->submitter()->addOutstandingDispatch(now_msec);
+        icecc::stagetrace::stage_trace("scheduler", "dispatch_credit_debit", job->assignmentEpoch(), job->id());
     }
 }
 
@@ -1425,6 +1427,7 @@ static void credit_dispatch_credit(Job *job)
 {
     if (job && job->dispatchOutstanding() && job->submitter()) {
         job->setDispatchOutstanding(false);
+        icecc::stagetrace::stage_trace("scheduler", "dispatch_credit_released", job->assignmentEpoch(), job->id());
         if (!job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec())) {
             log_error() << "dispatch-credit invariant failure: job " << job->id()
                         << " debit " << job->dispatchDebitMsec()
@@ -1459,8 +1462,12 @@ static bool send_remote_dispatch_reply(Job *job)
                    job->dispatchMatchedJobId(), job->assignmentEpoch(),
                    job->assignmentNonce(), cache_port, cache_protocol, cache_mask);
     reply.setCompileIdentity(job->cGuid(), job->tuSeq());
-    return job->submitter()->send_msg(
+    const bool sent = job->submitter()->send_msg(
         reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+    if (sent) {
+        icecc::stagetrace::stage_trace("scheduler", "usecs_sent", job->assignmentEpoch(), job->id());
+    }
+    return sent;
 }
 
 /* Queue the revoke on the same ordered S->F stream as PREPARE.  A successful
@@ -1841,6 +1848,7 @@ static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion
                              m.cache_retry_avoid_port,
                              m.cache_retry_avoid_host);
         job->setRemoteRequired(m.remote_required == 1);
+        icecc::stagetrace::stage_trace("scheduler", "getcs_recv", 0, job->id(), job->localClientId());
         req.staged.push_back(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -2499,6 +2507,7 @@ static CompileServer *pick_server(Job *job,
 
     // Ignore ineligible servers
     list<CompileServer *> eligible = filter_ineligible_servers(job);
+    icecc::stagetrace::stage_trace("scheduler", "eligible_set_computed", 0, job->id(), icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown, {{"eligible", (int64_t)eligible.size()}});
 
 #if DEBUG_SCHEDULER > 1
     trace() << "pick_server " << job->id() << " " << job->targetPlatform() << endl;
@@ -2993,6 +3002,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
        protocol 37+ encodes it as NoCS, older peers as a UseCS naming the
        submitter itself, and both reserve zero remote farm capacity.  */
     const bool local_decision = (use_cs == job->submitter());
+    icecc::stagetrace::stage_trace("scheduler", "server_picked", 0, job->id(), icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown, {{"server_host_id", (int64_t)use_cs->hostId()}, {"local_decision", local_decision ? 1 : 0}});
 
     job->setDispatchProjection(host_platform, gotit, matched_job_id);
 
@@ -3050,6 +3060,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             handle_end(use_cs, nullptr);
             return true;
         }
+        icecc::stagetrace::stage_trace("scheduler", "assign_prepare_sent", job->assignmentEpoch(), job->id());
         /* Admission is the accepted PREPARE enqueue, not later READY or
            client exposure.  Charge exactly here for both prepared modes. */
         debit_dispatch_credit(job);
@@ -3412,6 +3423,7 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
     }
 
     job->setAssignmentPhase(Job::ASSIGNMENT_READY);
+    icecc::stagetrace::stage_trace("scheduler", "assign_ready_recv", m->epoch(), m->wire_id);
     ++assignment_ready_accepted;
     if (job->assignmentReadyGated()
             && getenv("ICECC_TESTS")
@@ -3603,6 +3615,7 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
        compile server, so this assignment no longer occupies a dispatch
        credit on its submitter, and whatever was stuck is moving again.  */
     credit_dispatch_credit(job);
+    icecc::stagetrace::stage_trace("scheduler", "jobbegin_recv", job->assignmentEpoch(), job->id());
 
     job->setState(Job::COMPILING);
     if (job->assignmentFenced()
@@ -3946,6 +3959,7 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
+    icecc::stagetrace::stage_trace("scheduler", "jobdone_recv", j->assignmentEpoch(), j->id(), icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown, {{"exitcode", m->exitcode}});
     credit_dispatch_credit(j);
     {
         map<unsigned int, Job *>::iterator dit = jobs.find(m->job_id);
