@@ -287,7 +287,12 @@ def test_build_source_mounts_read_only_snapshot_and_cleans_its_container(
         # default bridge and not --network=none
         assert any(str(a).startswith("--network=icecream-dev-qa-") for a in argv)
         assert "--network=none" not in argv
-        assert argv[argv.index("--cap-add") + 1] == "SYS_PTRACE"
+        # NO --cap-add SYS_PTRACE: the kcmp profile (asserted below), not
+        # the capability, is what unblocks kcmp, and the no-capability
+        # shape is the one production nodes have.  Until virtu2-diag the
+        # bootstrap argv carried the capability in direct contradiction of
+        # its own comment; it must stay absent.
+        assert "--cap-add" not in argv
         assert any(str(a).startswith("seccomp=") and str(a).endswith("seccomp-kcmp.json")
                     for a in argv)
     else:

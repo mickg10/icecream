@@ -246,14 +246,14 @@ def build_source(run: Run, image: str, source: Path, spec: dict, name: str, mode
     # without that capability.  dev/seccomp-kcmp.json is the stock moby
     # default with ONE change: kcmp allowed unconditionally -- it enforces
     # its own ptrace-mode-cred check in-kernel, so nothing is granted.
-    # The QA container keeps --cap-add SYS_PTRACE off: the profile, not the
-    # capability, is what unblocks kcmp now.
+    # The QA container runs WITHOUT --cap-add SYS_PTRACE: the profile, not
+    # the capability, is what unblocks kcmp, and the no-capability shape
+    # is the one production nodes actually have.  (Until virtu2-diag this
+    # argv still carried the --cap-add line inherited from c8bb615f, in
+    # direct contradiction of the comment above -- every QA round before
+    # ran WITH the capability and never exercised the shipped shape.)
     seccomp_profile = ROOT / "dev" / "seccomp-kcmp.json"
     argv = ["docker", "run", "--name", container, "--rm", "--pull=never",
-            # Native descriptor-identity checks require kcmp, which the
-            # default profile enables only with this capability. The
-            # container retains its own PID namespace; no host PID access.
-            *(["--cap-add", "SYS_PTRACE"] if mode == "qa" else []),
             *(["--security-opt", f"seccomp={seccomp_profile}"] if mode == "qa" else []),
             "--label", f"icecream.dev.run={run.root.name}",
             (f"--network={qa_network}" if qa_network is not None else "--network=none"),
