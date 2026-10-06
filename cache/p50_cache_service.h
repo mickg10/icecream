@@ -75,6 +75,13 @@ struct RuntimeConfig {
     // arm/CacheSession.  Test builds use this to prove owner poison reaches
     // SidecarRuntime's process-wide pre-open fence; production has no field.
     std::function<void()> before_route_prepare_for_test;
+    // Fired, in program order, immediately before the F-independent source
+    // read (read_source_fd) runs and immediately after armed-slot admission
+    // is granted -- regardless of whether ICECC_P50_PREP_AHEAD moved the read
+    // ahead of admission. Test builds use these two seams to prove the
+    // PREP_AHEAD reordering by recording call order; production has no field.
+    std::function<void()> before_source_read_for_test;
+    std::function<void()> after_admission_for_test;
 #endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like

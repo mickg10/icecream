@@ -2814,6 +2814,75 @@ private:
     std::thread acceptor_;
 };
 
+// ICECC_P50_PREP_AHEAD (lever 1): with the env var unset, a P29V1 transfer
+// with a live source_authority_ keeps the original ordering -- the
+// F-independent C-store intern (read + digest + prepare_source) runs after
+// armed-slot admission is granted. With the env var set, the same intern work
+// runs before admission instead, so the slot is held only for
+// arm -> lock -> CacheWire. Both orderings are observed, in program order, via
+// hooks fired immediately before read_source_fd and immediately after
+// admission; the transfer must still commit either way.
+void test_prep_ahead_env_reorders_source_intern_around_admission() {
+    const auto run_once = [](bool enable_prep_ahead) {
+        if (enable_prep_ahead)
+            CHECK(::setenv("ICECC_P50_PREP_AHEAD", "1", 1) == 0);
+        else
+            CHECK(::unsetenv("ICECC_P50_PREP_AHEAD") == 0);
+
+        StoreIdentityRoot f_root{};
+        f_root.bytes[14] = 0xa7;
+        service::RuntimeConfig f_config = test_runtime_config();
+        f_config.f_store_guid = f_store_guid_for_root(f_root);
+        f_config.f_store_generation = 51;
+        service::SidecarRuntime f_runtime(std::move(f_config));
+
+        StoreIdentityRoot c_root{};
+        c_root.bytes[15] = enable_prep_ahead ? 0xb1 : 0xb0;
+        const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+        service::RuntimeConfig c_config = test_runtime_config();
+        c_config.c_store_guid = launch.c_store_guid;
+        c_config.f_store_guid = launch.f_store_guid;
+        c_config.f_store_generation = launch.store_generation;
+        c_config.sidecar_launch = launch;
+
+        std::vector<std::string> order;
+        c_config.before_source_read_for_test = [&] {
+            order.push_back("source-read");
+        };
+        c_config.after_admission_for_test = [&] {
+            order.push_back("admission");
+        };
+        service::SidecarRuntime c_runtime(std::move(c_config));
+
+        ScriptedFront front(f_runtime, 51, {ScriptedFront::Step::Ready});
+
+        const std::string text = "prep-ahead\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto clock = sidecar::process_monotonic_clock_identity();
+        const auto deadline =
+            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                clock.clock_domain_id, clock.time_namespace_id);
+        const local::P50SourceTransferResult result =
+            c_runtime.transfer_source_on_owner(
+                source_transfer_request(front.port(),
+                                        enable_prep_ahead ? 801 : 800,
+                                        CACHE_PROFILE_P29V1),
+                deadline, local::HandoffFd(source_file("p50-prep-ahead", source)));
+        front.stop();
+
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+        CHECK(::unsetenv("ICECC_P50_PREP_AHEAD") == 0);
+        return order;
+    };
+
+    const std::vector<std::string> default_off = run_once(false);
+    CHECK((default_off == std::vector<std::string>{"admission", "source-read"}));
+
+    const std::vector<std::string> prep_ahead_on = run_once(true);
+    CHECK((prep_ahead_on == std::vector<std::string>{"source-read", "admission"}));
+}
+
 // C's first attempt commits on F but loses TX_COMMIT, so C reopens F for the
 // same operation.  BUSY from the same F store is capacity only: C waits and
 // reopens until F takes the session, then recovers the exact receipt without
@@ -3474,6 +3543,7 @@ int main(int argc, char** argv) {
         test_stalled_f_arm_is_bounded_before_healthy_transfer();
         test_route_poison_latches_before_successor_f_open();
         test_transport_loss_preserves_other_worker_service();
+        test_prep_ahead_env_reorders_source_intern_around_admission();
         test_interner_fault_returns_permanent_profile_unavailable();
         test_p29_fault_environment_is_exact();
         structured_launch_is_complete_and_fail_closed();

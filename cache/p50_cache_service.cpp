@@ -1395,6 +1395,16 @@ std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
     }
 }
 
+// ICECC_P50_PREP_AHEAD (default off): when set to a nonempty value other
+// than "0", the F-independent C-store intern (read + digest + prepare_source)
+// for a P29V1 source with a live source_authority_ runs before the armed-slot
+// admission wait instead of after it, so the slot is held only for
+// arm -> lock -> CacheWire. Checked once per transfer; no shared state.
+bool prep_ahead_enabled() noexcept {
+    const char* raw = ::getenv("ICECC_P50_PREP_AHEAD");
+    return raw != nullptr && *raw != '\0' && std::strcmp(raw, "0") != 0;
+}
+
 } // namespace
 
 SidecarRuntime::SidecarRuntime(RuntimeConfig config)
@@ -1727,10 +1737,52 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         ::fstat(source.get(), &source_stat) == 0 && source_stat.st_size > 0
             ? static_cast<uint64_t>(source_stat.st_size)
             : 0;
+    // PREP-BEFORE-ADMISSION (ICECC_P50_PREP_AHEAD, default off): for P29V1
+    // with a live source_authority_, do the F-independent C-store intern
+    // (read + digest + prepare_source) here, before the armed-slot admission
+    // wait below, so the slot is held only for arm -> lock -> CacheWire.
+    // Every other profile, and P29V1 without a live authority, is untouched
+    // and keeps the original post-admission ordering unconditionally.
+    const PrepareRequestKey route_request{arm.assignment_epoch,
+                                          arm.assignment_nonce};
+    const bool prep_ahead = profile == ProfileId::P29V1 &&
+                            source_authority_ != nullptr && prep_ahead_enabled();
+    std::optional<std::shared_ptr<const std::vector<uint8_t>>> source_bytes;
+    Digest128 source_digest{};
+    std::shared_ptr<const P50PreparationAuthority::PreparedSource> prepared_source;
+    if (prep_ahead) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (config_.before_source_read_for_test)
+            config_.before_source_read_for_test();
+#endif
+        const auto source_read_start = std::chrono::steady_clock::now();
+        source_bytes = read_source_fd(
+            source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
+        const auto source_read_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - source_read_start)
+                .count();
+        *source_read_ns = source_read_elapsed > 0
+                              ? static_cast<uint64_t>(source_read_elapsed)
+                              : 0;
+        if (source_bytes.has_value()) {
+            source_digest = digest128(**source_bytes);
+            try {
+                prepared_source = source_authority_->prepare_source(
+                    route_request, *source_bytes, source_digest);
+            } catch (...) {
+            }
+        }
+    }
+
     ArmedAdmission::Wait armed_slot{route_gate->armed, source_size_hint,
                                     source_mutex_wait_start};
     if (!wait_for([&](auto limit) { return armed_slot.acquire_until(limit); }))
         return source_transfer_error(7);
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    if (config_.after_admission_for_test)
+        config_.after_admission_for_test();
+#endif
 
     FStoreGuid remote_f_guid;
     uint64_t remote_f_generation = 0;
@@ -1744,15 +1796,22 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     auto first = std::make_shared<PendingFd>();
     first->fd = first_fd;
 
-    const auto source_read_start = std::chrono::steady_clock::now();
-    const auto source_bytes = read_source_fd(
-        source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
-    const auto source_read_elapsed =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - source_read_start)
-            .count();
-    *source_read_ns =
-        source_read_elapsed > 0 ? static_cast<uint64_t>(source_read_elapsed) : 0;
+    if (!prep_ahead) {
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        if (config_.before_source_read_for_test)
+            config_.before_source_read_for_test();
+#endif
+        const auto source_read_start = std::chrono::steady_clock::now();
+        source_bytes = read_source_fd(
+            source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
+        const auto source_read_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - source_read_start)
+                .count();
+        *source_read_ns = source_read_elapsed > 0
+                              ? static_cast<uint64_t>(source_read_elapsed)
+                              : 0;
+    }
     if (!source_bytes.has_value()) {
         std::fprintf(stderr,
                      "P50_SOURCE_TRANSFER_REFUSED stage=source-read request=%llu "
@@ -1766,16 +1825,15 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
 
     // Intern the source here, before the route gate, instead of on the owner
     // inside the route's serialized dialogue.  A failure is left for the
-    // transfer itself to report.
-    const PrepareRequestKey route_request{arm.assignment_epoch,
-                                          arm.assignment_nonce};
-    const Digest128 source_digest = digest128(**source_bytes);
-    std::shared_ptr<const P50PreparationAuthority::PreparedSource> prepared_source;
-    if (profile == ProfileId::P29V1 && source_authority_) {
-        try {
-            prepared_source = source_authority_->prepare_source(
-                route_request, *source_bytes, source_digest);
-        } catch (...) {
+    // transfer itself to report.  (Already done above when prep_ahead.)
+    if (!prep_ahead) {
+        source_digest = digest128(**source_bytes);
+        if (profile == ProfileId::P29V1 && source_authority_) {
+            try {
+                prepared_source = source_authority_->prepare_source(
+                    route_request, *source_bytes, source_digest);
+            } catch (...) {
+            }
         }
     }
 
