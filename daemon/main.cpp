@@ -4949,6 +4949,13 @@ static size_t assignment_terminal_limit()
 }
 static bool assignment_table_exhausted = false;
 static bool assignment_epoch_history_exhausted = false;
+/* Wire value 1 was Advisory, retired by virtu2 (see ConfCSMsg::FenceMode in
+   services/comm.h).  A pre-virtu2 scheduler may still send it; fail safe by
+   coercing it to Legacy and logging at most one warning per scheduler epoch,
+   rather than closing the connection (see handle_cs_conf()). */
+static const uint32_t RETIRED_FENCE_MODE_ADVISORY = 1;
+static bool have_warned_retired_fence_mode_epoch = false;
+static uint64_t last_warned_retired_fence_mode_epoch = 0;
 static unsigned long assignment_prepares = 0;
 static unsigned long assignment_ready_replies = 0;
 static unsigned long assignment_revoke_results = 0;
@@ -4956,17 +4963,20 @@ static unsigned long assignment_claims = 0;
 static unsigned long assignment_claim_rejects = 0;
 static unsigned long assignment_stale_controls = 0;
 
-static bool assignment_mode_prepares(ConfCSMsg::FenceMode mode)
-{
-    return mode == ConfCSMsg::Advisory
-        || mode == ConfCSMsg::EnforcingCompat
-        || mode == ConfCSMsg::StrictNonce;
-}
-
 static bool assignment_mode_enforces_prepare(ConfCSMsg::FenceMode mode)
 {
     return mode == ConfCSMsg::EnforcingCompat
         || mode == ConfCSMsg::StrictNonce;
+}
+
+/* Advisory was the only prepared mode that did not also wait for READY
+   before exposing UseCS; with it gone, every mode that prepares an
+   assignment also enforces the READY gate, so this is the same predicate
+   as assignment_mode_enforces_prepare().  Both names are kept at call
+   sites for readability. */
+static bool assignment_mode_prepares(ConfCSMsg::FenceMode mode)
+{
+    return assignment_mode_enforces_prepare(mode);
 }
 
 static bool replace_assignment_epoch()
@@ -5044,12 +5054,6 @@ static void finish_assignment_claim(uint32_t wire_id)
         return;
     }
     it->second.phase = WorkerAssignment::ClaimedOrLater;
-    /* In ADVISORY the client may win before PREPARE is consumed.  Keep that
-       nonce-zero placeholder live until PREPARE supplies its full identity;
-       deleting it here would let late PREPARE regress the claim to Reserved. */
-    if (it->second.key.nonce == 0) {
-        return;
-    }
     const AssignmentKey key = it->second.key;
     if (retain_assignment_terminal(
             key, RevokeResultMsg::ClaimedOrLater, true)) {
@@ -5063,17 +5067,10 @@ static void close_assignment_transport_session()
 {
     /* Link loss is an S-side terminal boundary, but the old client can still
        arrive at this daemon.  Close every known assignment and retain its
-       rejection identity for the whole epoch.  A nonce-zero ADVISORY
-       placeholder cannot be safely attributed after transport loss, so it
-       remains an explicit Orphaned fail-closed wire-id record. */
+       rejection identity for the whole epoch. */
     auto it = live_assignments.begin();
     while (it != live_assignments.end()) {
         WorkerAssignment &record = it->second;
-        if (record.key.nonce == 0) {
-            record.phase = WorkerAssignment::Orphaned;
-            ++it;
-            continue;
-        }
         const RevokeResultMsg::Result result =
             record.phase == WorkerAssignment::Reserved
                 ? RevokeResultMsg::Revoked
@@ -5158,7 +5155,7 @@ static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant,
     /* A remote claim never has authority without the scheduler-assigned wire
        identity.  CompileFile's wholly-absent P50 identity is frame-valid for
        the local CLIENTWORK path, but that path bypasses this function.  Reject
-       wire zero here, before even ADVISORY can create a live placeholder. */
+       wire zero here, before any live-assignment lookup. */
     if (wire_id == 0) {
         ++assignment_claim_rejects;
         return false;
@@ -5205,54 +5202,29 @@ static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant,
         ++assignment_claim_rejects;
         return false;
     }
-    if (assignment_mode_enforces_prepare(assignment_fence_mode)) {
-        /* ENFORCING_COMPAT deliberately keeps a real pre-v50 C interoperable
-           with a current F.  Such a peer cannot receive or carry the v50
-           assignment identity, so S correctly sends no PREPARE and its
-           CompileFile is wholly nonce-less.  Admit only that directly
-           negotiated legacy wire shape.  A v50 peer with a missing identity,
-           an identity-bearing unknown claim, and every STRICT_NONCE claim
-           remain fail-closed.  This is the historical legacy admission path,
-           not an ADVISORY placeholder: no late PREPARE can exist for it. */
-        const bool negotiated_legacy_claim =
-            assignment_fence_mode == ConfCSMsg::EnforcingCompat &&
-            claimant_protocol > 0 &&
-            claimant_protocol < PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
-            !job.hasAssignmentIdentity();
-        if (negotiated_legacy_claim) {
-            trace() << "admitting negotiated legacy assignment claim "
-                    << wire_id << " from protocol " << claimant_protocol
-                    << endl;
-            return true;
-        }
-        ++assignment_claim_rejects;
-        return false;
+    /* Advisory is gone, so EnforcingCompat and StrictNonce are the only
+       modes that can still reach this point (Legacy already returned
+       above) and assignment_mode_enforces_prepare() is unconditionally
+       true for both.  EnforcingCompat deliberately keeps a real pre-v50 C
+       interoperable with a current F.  Such a peer cannot receive or
+       carry the v50 assignment identity, so S correctly sends no PREPARE
+       and its CompileFile is wholly nonce-less.  Admit only that directly
+       negotiated legacy wire shape.  A v50 peer with a missing identity,
+       an identity-bearing unknown claim, and every STRICT_NONCE claim
+       remain fail-closed: there is no PREPARE-less admission path left. */
+    const bool negotiated_legacy_claim =
+        assignment_fence_mode == ConfCSMsg::EnforcingCompat &&
+        claimant_protocol > 0 &&
+        claimant_protocol < PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
+        !job.hasAssignmentIdentity();
+    if (negotiated_legacy_claim) {
+        trace() << "admitting negotiated legacy assignment claim "
+                << wire_id << " from protocol " << claimant_protocol
+                << endl;
+        return true;
     }
-
-    if (job.hasAssignmentIdentity()
-            && job.assignmentEpoch() != assignment_scheduler_epoch) {
-        ++assignment_claim_rejects;
-        return false;
-    }
-
-    /* ADVISORY admits an unknown nonce-less claim, but records ownership.
-       A later PREPARE binds the nonce into this same record without changing
-       Claimed/ClaimedOrLater back to Reserved. */
-    if (live_assignments.size() + assignment_terminals.size()
-            >= assignment_terminal_limit()) {
-        assignment_table_exhausted = true;
-        ++assignment_claim_rejects;
-        return false;
-    }
-    WorkerAssignment placeholder;
-    placeholder.phase = WorkerAssignment::Claimed;
-    placeholder.key = AssignmentKey {
-        assignment_scheduler_epoch, wire_id, job.assignmentNonce()
-    };
-    placeholder.claimant = claimant;
-    live_assignments.emplace(wire_id, placeholder);
-    ++assignment_claims;
-    return true;
+    ++assignment_claim_rejects;
+    return false;
 }
 
 /* G4 (bigoracle 20:13:59/20:32:36): the authority for whether a GetCS-derived
@@ -9543,23 +9515,6 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
     if (live != live_assignments.end()) {
         if (live->second.key == key) {
             /* Exact duplicate: preserve its current phase and re-READY. */
-        } else if (assignment_fence_mode == ConfCSMsg::Advisory
-                && live->second.key.epoch == key.epoch
-                && live->second.key.wire_id == key.wire_id
-                && live->second.key.nonce == 0
-                && live->second.phase != WorkerAssignment::Orphaned) {
-            /* Claim won the cross-channel race.  Bind PREPARE's full identity
-               into that same owner record; never regress to Reserved. */
-            live->second.key = key;
-            ++assignment_prepares;
-            if (live->second.phase == WorkerAssignment::ClaimedOrLater) {
-                if (!retain_assignment_terminal(
-                        key, RevokeResultMsg::ClaimedOrLater, true)) {
-                    live->second.phase = WorkerAssignment::Orphaned;
-                    return 1;
-                }
-                live_assignments.erase(live);
-            }
         } else {
             /* A wire id may be reused only after its earlier live record has
                reached a retained terminal.  Never replace live authority. */
@@ -9681,16 +9636,33 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
             scheduler_generation_exhausted = true;
         } else {
             if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, scheduler)) {
-                if (msg->epoch() == 0
-                        || (msg->fence_mode != ConfCSMsg::Legacy
-                            && msg->fence_mode != ConfCSMsg::Advisory
-                            && msg->fence_mode != ConfCSMsg::EnforcingCompat
-                            && msg->fence_mode != ConfCSMsg::StrictNonce)) {
+                if (msg->epoch() == 0) {
                     log_error() << "invalid protocol-49 assignment configuration" << endl;
                     return 1;
                 }
-                const ConfCSMsg::FenceMode requested =
-                    static_cast<ConfCSMsg::FenceMode>(msg->fence_mode);
+                ConfCSMsg::FenceMode requested;
+                if (msg->fence_mode == ConfCSMsg::Legacy
+                        || msg->fence_mode == ConfCSMsg::EnforcingCompat
+                        || msg->fence_mode == ConfCSMsg::StrictNonce) {
+                    requested = static_cast<ConfCSMsg::FenceMode>(msg->fence_mode);
+                } else if (msg->fence_mode == RETIRED_FENCE_MODE_ADVISORY) {
+                    /* Fail safe, not fail closed: a pre-virtu2 scheduler is
+                       not misbehaving, it simply predates this retirement.
+                       Keep the session and warn at most once per epoch. */
+                    if (!have_warned_retired_fence_mode_epoch
+                            || last_warned_retired_fence_mode_epoch != msg->epoch()) {
+                        log_warning() << "scheduler requested retired protocol-49 fence mode "
+                                      << RETIRED_FENCE_MODE_ADVISORY
+                                      << " (advisory) for epoch " << msg->epoch()
+                                      << "; treating as legacy" << endl;
+                        have_warned_retired_fence_mode_epoch = true;
+                        last_warned_retired_fence_mode_epoch = msg->epoch();
+                    }
+                    requested = ConfCSMsg::Legacy;
+                } else {
+                    log_error() << "invalid protocol-49 assignment configuration" << endl;
+                    return 1;
+                }
                 if (requested == ConfCSMsg::StrictNonce
                         && !IS_PROTOCOL_VERSION(
                             PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, scheduler)) {

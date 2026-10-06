@@ -171,7 +171,7 @@ def test_each_source_archive_matches_immutable_authority(
 def test_scheduler_entrypoint_accepts_only_named_assignment_fence_modes() -> None:
     entrypoint = (INTEGRATION / "docker" / "entry-scheduler.sh").read_text()
     assert "--assignment-fence-mode" in entrypoint
-    assert "legacy|advisory|enforcing-compat|strict-nonce" in entrypoint
+    assert "legacy|enforcing-compat|strict-nonce" in entrypoint
     assert 'set -- "$@" --assignment-fence-mode "$assignment_fence_mode"' in entrypoint
 
 

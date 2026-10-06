@@ -9,7 +9,7 @@ It separates:
 
   * scheduler incarnation and UseCS publication;
   * the worker's wire-id keyed reservation/tombstone table;
-  * legacy, nonce-bearing, and unknown/advisory claims; and
+  * legacy, nonce-bearing, and unknown claims; and
   * compiler-child attempts after one assignment claim has already won.
 
 The model is intentionally not a scheduler, capacity, or timing model.  It
@@ -89,7 +89,7 @@ ASSUME /\ Assignments # {}
        /\ MutantPrepareOverTombstone \in BOOLEAN
        /\ MutantReuseEpochAfterLoss \in BOOLEAN
 
-Modes == {"Legacy", "Advisory", "EnforcingCompat", "StrictNonce"}
+Modes == {"Legacy", "EnforcingCompat", "StrictNonce"}
 Phases == {"Absent", "Reserved", "Claimed", "Started", "Terminal"}
 ClaimKinds == {"None", "Unfenced", "Legacy", "Nonce"}
 RevokeResults == {"None", "Revoked", "ClaimedOrLater"}
@@ -195,18 +195,12 @@ Prepare(a) ==
     IN /\ workerEpoch = currentEpoch
        /\ EpochOf[a] = currentEpoch
        /\ AssignmentAt[currentEpoch][w] = a
-       /\ mode \in {"Advisory", "EnforcingCompat", "StrictNonce"}
+       /\ mode \in {"EnforcingCompat", "StrictNonce"}
        /\ (a \notin tombstone \/ MutantPrepareOverTombstone)
-       /\ \/ /\ record[w] = NoAssignment
-              /\ phase[w] = "Absent"
-              /\ record' = [record EXCEPT ![w] = a]
-              /\ phase' = [phase EXCEPT ![w] = "Reserved"]
-          \/ /\ mode = "Advisory"
-              /\ record[w] = a
-              /\ phase[w] \in LiveClaimPhases
-              /\ a \notin prepared
-              /\ record' = record
-              /\ phase' = phase
+       /\ record[w] = NoAssignment
+       /\ phase[w] = "Absent"
+       /\ record' = [record EXCEPT ![w] = a]
+       /\ phase' = [phase EXCEPT ![w] = "Reserved"]
        /\ prepared' = prepared \cup {a}
        /\ UNCHANGED <<currentEpoch, usedEpochs, workerEpoch, mode,
                        claimant, claimKind, ready, published, tombstone,
@@ -217,8 +211,7 @@ Prepare(a) ==
 Ready(a) ==
     LET w == WireOf[a]
     IN /\ record[w] = a
-       /\ (phase[w] = "Reserved" \/
-           (mode = "Advisory" /\ phase[w] \in LiveClaimPhases))
+       /\ phase[w] = "Reserved"
        /\ a \in prepared
        /\ ready' = ready \cup {a}
        /\ UNCHANGED <<currentEpoch, usedEpochs, workerEpoch, mode,
@@ -246,7 +239,7 @@ PublishUseCS(a) ==
                     resultAccepted>>
 
 (***************************************************************************
-Unknown claims are admitted only in LEGACY/ADVISORY.  They are attributed to
+Unknown claims are admitted only in LEGACY.  They are attributed to
 whatever assignment currently owns that wire id in workerEpoch.  This is the
 precise old-client ABA weakness: `arriving` may be an older published UseCS.
 ***************************************************************************)
@@ -254,7 +247,7 @@ UnknownClaim(arriving) ==
     LET w == WireOf[arriving]
         target == CurrentAssignment(w)
     IN /\ workerEpoch # NoEpoch
-       /\ mode \in {"Legacy", "Advisory"}
+       /\ mode = "Legacy"
        /\ arriving \in published
        /\ target # NoAssignment
        /\ record[w] = NoAssignment
@@ -279,7 +272,7 @@ KnownLegacyClaim(arriving) ==
        /\ phase[w] = "Reserved"
        /\ WireOf[target] = WireOf[arriving]
        /\ target \notin tombstone
-       /\ (mode \in {"Advisory", "EnforcingCompat"} \/
+       /\ (mode = "EnforcingCompat" \/
            (mode = "StrictNonce" /\ MutantAllowStrictLegacy))
        /\ phase' = [phase EXCEPT ![w] = "Claimed"]
        /\ claimant' = [claimant EXCEPT ![w] = arriving]
@@ -294,7 +287,7 @@ KnownNonceClaim(arriving) ==
     LET w == WireOf[arriving]
         target == record[w]
     IN /\ workerEpoch # NoEpoch
-       /\ mode \in {"Advisory", "EnforcingCompat", "StrictNonce"}
+       /\ mode \in {"EnforcingCompat", "StrictNonce"}
        /\ arriving \in published
        /\ target # NoAssignment
        /\ phase[w] = "Reserved"

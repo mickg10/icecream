@@ -2669,7 +2669,11 @@ class ConfCSMsg : public Msg
 public:
     enum FenceMode : uint32_t {
         Legacy = 0,
-        Advisory = 1,
+        /* 1 was Advisory, removed by virtu2.  The numeric wire value is
+           retired, not reassigned: an old (pre-virtu2) scheduler can still
+           send it, and the receiving daemon fails safe on it (treats it as
+           Legacy; see handle_cs_conf() in daemon/main.cpp) instead of
+           closing the connection.  Do not give this value a new meaning. */
         EnforcingCompat = 2,
         StrictNonce = 3
     };

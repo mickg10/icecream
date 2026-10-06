@@ -155,8 +155,7 @@ static uint64_t next_tu_seq = 0;
 
 static bool assignment_mode_prepares()
 {
-    return assignment_fence_mode == ConfCSMsg::Advisory
-        || assignment_fence_mode == ConfCSMsg::EnforcingCompat
+    return assignment_fence_mode == ConfCSMsg::EnforcingCompat
         || assignment_fence_mode == ConfCSMsg::StrictNonce;
 }
 
@@ -212,7 +211,6 @@ static const char *assignment_mode_name(ConfCSMsg::FenceMode mode)
 {
     switch (mode) {
     case ConfCSMsg::Legacy: return "legacy";
-    case ConfCSMsg::Advisory: return "advisory";
     case ConfCSMsg::EnforcingCompat: return "enforcing-compat";
     case ConfCSMsg::StrictNonce: return "strict-nonce";
     }
@@ -3022,16 +3020,13 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, use_cs)
         /* The identity must survive S -> C -> F -> S.  A legacy C cannot
            carry it in UseCS/CompileFile, so preparing only the new F leaves
-           S expecting a nonce that F can never echo.  Enforcing/advisory
+           S expecting a nonce that F can never echo.  Enforcing-compat
            mixed-peer traffic therefore uses the existing zero-identity
            legacy path; strict mode already rejects it above. */
         && identity_path_eligible
         && strict_path_eligible;
     if (prepared_assignment) {
         switch (assignment_fence_mode) {
-        case ConfCSMsg::Advisory:
-            job->setAssignmentPolicy(Job::ASSIGNMENT_ADVISORY);
-            break;
         case ConfCSMsg::EnforcingCompat:
             job->setAssignmentPolicy(Job::ASSIGNMENT_ENFORCING_COMPAT);
             break;
@@ -5101,7 +5096,7 @@ static void usage(const std::string reason = "")
          << "  -a, --algorithm <name>\n"
          << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
          << "  --dispatch-stall-report-after <sec>  report (do not remove) a submitter whose oldest unconfirmed dispatch exceeds this; its assignment and worker reservation are retained (10-3600, default 180)\n"
-         << "  --assignment-fence-mode <legacy|advisory|enforcing-compat|strict-nonce>\n"
+         << "  --assignment-fence-mode <legacy|enforcing-compat|strict-nonce>\n"
          << "                                      P49 assignment policy (default enforcing-compat; legacy is the explicit kill switch; strict-nonce requires P50)\n"
          << "  --assignment-fence-strict          compatibility alias for enforcing-compat\n"
          << endl;
@@ -5370,12 +5365,13 @@ int main(int argc, char *argv[])
             const string mode = optarg ? optarg : "";
             if (mode == "legacy") {
                 assignment_fence_mode = ConfCSMsg::Legacy;
-            } else if (mode == "advisory") {
-                assignment_fence_mode = ConfCSMsg::Advisory;
             } else if (mode == "enforcing-compat") {
                 assignment_fence_mode = ConfCSMsg::EnforcingCompat;
             } else if (mode == "strict-nonce") {
                 assignment_fence_mode = ConfCSMsg::StrictNonce;
+            } else if (mode == "advisory") {
+                usage("Error: --assignment-fence-mode advisory was removed; "
+                      "supported modes are legacy, enforcing-compat, strict-nonce");
             } else {
                 usage("Error: unknown --assignment-fence-mode: " + mode);
             }

@@ -89,8 +89,6 @@ run_expected_failure revoke-request-wire-mutant \
 run_expected_failure revoke-result-wire-mutant \
     Protocol50AssignmentRevokeResultWireMutant.cfg \
     RevokeResultHasMatchingWorkerProof
-run_expected_failure late-prepare-mutant \
-    Protocol50AssignmentLatePrepareMutant.cfg ClaimedPhaseNeverRegresses
 run_expected_failure revoke-claim-crossing-witness \
     Protocol50AssignmentRevokeClaimCrossingWitness.cfg \
     NoRevokeClaimCrossingWitness

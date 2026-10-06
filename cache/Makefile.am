@@ -143,8 +143,6 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentOrdering.tla \
 	formal/Protocol50AssignmentOrdering.cfg \
 	formal/Protocol50AssignmentOrderingEarlyCancelWitness.cfg \
-	formal/Protocol50AssignmentOrderingAdvisoryWitness.cfg \
-	formal/Protocol50AssignmentOrderingPrepareMutant.cfg \
 	formal/Protocol50AssignmentOrderingReadyMutant.cfg \
 	formal/Protocol50AssignmentOrderingRevokeMutant.cfg \
 	formal/Protocol50AssignmentDelivery.tla \
@@ -152,7 +150,6 @@ EXTRA_DIST = \
 	formal/Protocol50AssignmentReadyWireMutant.cfg \
 	formal/Protocol50AssignmentRevokeRequestWireMutant.cfg \
 	formal/Protocol50AssignmentRevokeResultWireMutant.cfg \
-	formal/Protocol50AssignmentLatePrepareMutant.cfg \
 	formal/Protocol50AssignmentRevokeClaimCrossingWitness.cfg \
 	formal/Protocol50AssignmentStaleRevokeResultWitness.cfg \
 	formal/Protocol50AssignmentDelivery.md \

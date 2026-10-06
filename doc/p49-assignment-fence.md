@@ -7,7 +7,7 @@ assignment shape. Protocol 50 is the separate successor which carries the
 same identity through `UseCS` and `CompileFile`; see
 `p50-assignment-identity.md`.
 
-## Activation and the four modes
+## Activation and the three modes
 
 `icecc-scheduler --assignment-fence-mode MODE` freezes one mode for its
 scheduler epoch and sends it in `ConfCSMsg`.  With no flag at all, the
@@ -17,10 +17,6 @@ kill switch:
 - `legacy` / `Legacy` (0) is the explicit kill switch.  It sends no prepare,
   waits for no ready, sends no ordered revoke, and preserves the inherited
   behavior.
-- `advisory` / `Advisory` (1) sends `PREPARE`, but does not wait for `READY`
-  before sending the unchanged `UseCS`.  A nonce-less legacy claim that wins
-  before `PREPARE` is recorded as claimed and is later bound to the complete
-  identity without regressing its phase.
 - `enforcing-compat` / `EnforcingCompat` (2) is the default.  It waits for
   matching `READY` before sending `UseCS`.  A nonce-less legacy claim is
   admitted only through the current live prepared wire-id record.  The older
@@ -30,6 +26,14 @@ kill switch:
   daemon whose scheduler link is below 50 refuses it; a Protocol-50 scheduler
   projects Legacy configuration to that old peer and excludes it from strict
   remote assignments.
+
+Wire value 1 (`Advisory`) is retired: it stays reserved so an old
+scheduler's wire byte never collides with a surviving mode, but it is no
+longer selectable.  `--assignment-fence-mode advisory` fails at startup,
+naming the three supported modes.  A daemon that still receives fence mode 1
+on its scheduler link, from an old, unupgraded scheduler, treats it as
+`Legacy` rather than closing the connection, and logs one warning per
+scheduler epoch.
 
 Local assignments remain on the existing `NoCS`/local path.  A remote choice
 whose worker link negotiated protocol 48 also uses the exact legacy path,
@@ -88,8 +92,8 @@ that retains the complete bounded table is a state-preserving rebind.
 
 ## Scheduler state machine
 
-For a remote prepared assignment in Advisory, EnforcingCompat, or the
-Protocol-50 StrictNonce mode, the
+For a remote prepared assignment in EnforcingCompat or the Protocol-50
+StrictNonce mode, the
 scheduler:
 
 1. selects and freezes the worker, legacy `UseCS` projection, policy, epoch,
@@ -102,8 +106,7 @@ scheduler:
 5. accepts `READY` only from that worker and only for the exact tuple in
    `Prepared` phase.
 
-Advisory sends the frozen `UseCS` immediately after step 3. EnforcingCompat
-and StrictNonce send it only after step 5. A stale, duplicate, wrong-worker, wrong-phase,
+EnforcingCompat and StrictNonce send it only after step 5.  A stale, duplicate, wrong-worker, wrong-phase,
 zero, or post-reuse `READY` is a bounded no-op.  In particular, a matching
 `READY` received after cancellation cannot publish `UseCS`.
 
@@ -135,11 +138,6 @@ to a client, queued, touches an environment, or can start a compiler.
 In EnforcingCompat, `PREPARE` first installs a `Reserved` record and only then
 emits `READY`.  A nonce-less client claim consumes only that current prepared
 wire-id record.  Unknown claims reject.
-
-In Advisory, an unknown nonce-less claim is allowed and atomically installs a
-claimed nonce-zero placeholder.  A later `PREPARE` for that epoch and wire id
-binds its nonce into the same record.  It never changes `Claimed` or
-`ClaimedOrLater` back to `Reserved`.
 
 Claim consumption and ordered revoke consumption form the race:
 
@@ -179,20 +177,20 @@ only when the daemon is explicitly in test mode.
 ## Compatibility boundary and gates
 
 Protocol 49 supports new scheduler + new worker + old client.  Because the old
-client presents only a wire id, Advisory and EnforcingCompat cannot reject an
+client presents only a wire id, EnforcingCompat cannot reject an
 arbitrarily delayed prior claim with the exactness of a nonce-bearing client.
 Protocol 50 supplies that end-to-end discriminator.  Protocol 49 does
 distinguish delayed scheduler-worker controls by their full tuple.
 
 The focused gates use the production message classes and real scheduler and
 daemon processes.  They cover literal protocol-48 bytes, negotiated-P48
-behavior, all four mode values, Advisory immediate exposure and
-claim-before-PREPARE, EnforcingCompat `PREPARE -> READY -> UseCS`, deterministic
+behavior, all three mode values, EnforcingCompat `PREPARE -> READY -> UseCS`, deterministic
 StrictNonce activation and mixed-path refusal, debit-at-PREPARE, the deferred-output worker gate,
 revoke-first and claim-first races, cancellation versus delayed READY, stale
 and duplicate controls, same-wire-id reuse, no early id release, late-claim
 rejection, submitter and link teardown, retained same-epoch rebind,
 clear-then-old-epoch refusal, claim evidence versus a delayed contradictory
 result, current-channel deletion during READY failure, epoch-lifetime records,
-bounded exhaustion, and default-enforcing-compat inheritance (the explicit
+bounded exhaustion, retired-mode-1 fail-safe on an old scheduler link, and
+default-enforcing-compat inheritance (the explicit
 `legacy` kill switch retains the old default-disabled inheritance path).

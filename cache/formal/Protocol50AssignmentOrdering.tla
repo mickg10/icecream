@@ -6,30 +6,24 @@ A one-assignment actor-local ordering lemma for Protocol 49/50.
 
 The main Protocol50Assignment model owns assignment identity, epoch reuse,
 claim compatibility, revocation proof, and compiler-child restart.  This
-module covers only two transport interleavings that need separate actor-local
+module covers one transport interleaving that needs separate actor-local
 state:
 
-  1. ADVISORY UseCS/claim may reach F before PREPARE.  Consuming the delayed
-     matching PREPARE may validate/enrich the claim but must never regress F
-     from CLAIMED to RESERVED.
-
-  2. S may enter cancellation after PREPARE is queued while READY is already
-     in flight.  Consuming that stale READY must not publish UseCS.  PREPARE
-     and REVOKE remain ordered on the same S->F stream.
+  S may enter cancellation after PREPARE is queued while READY is already
+  in flight.  Consuming that stale READY must not publish UseCS.  PREPARE
+  and REVOKE remain ordered on the same S->F stream.
 
 No timing, capacity, cache-source, environment, or compiler-pipe state is
 modeled here.
 ***************************************************************************)
 
-CONSTANTS MutantRegressClaimOnPrepare,
-          MutantPublishAfterCancel,
+CONSTANTS MutantPublishAfterCancel,
           MutantRevokeClaimAsRevoked
 
-ASSUME /\ MutantRegressClaimOnPrepare \in BOOLEAN
-       /\ MutantPublishAfterCancel \in BOOLEAN
+ASSUME /\ MutantPublishAfterCancel \in BOOLEAN
        /\ MutantRevokeClaimAsRevoked \in BOOLEAN
 
-Modes == {"Advisory", "EnforcingCompat", "StrictNonce"}
+Modes == {"EnforcingCompat", "StrictNonce"}
 ReadyGatedModes == {"EnforcingCompat", "StrictNonce"}
 SPhases == {"Idle", "PrepareQueued", "Ready", "Cancelling",
             "Released", "Owned"}
@@ -42,13 +36,13 @@ VARIABLES mode, sPhase, fPhase, s2f, f2s,
           usecsPublished, claimAccepted, claimRejected,
           cancelBeforePublication, prepareConsumed, readyObserved,
           revokeConsumed, releaseProof,
-          badRegression, badPublish, badRevoked
+          badPublish, badRevoked
 
 vars == <<mode, sPhase, fPhase, s2f, f2s,
           usecsPublished, claimAccepted, claimRejected,
           cancelBeforePublication, prepareConsumed, readyObserved,
           revokeConsumed, releaseProof,
-          badRegression, badPublish, badRevoked>>
+          badPublish, badRevoked>>
 
 Init ==
     /\ mode \in Modes
@@ -64,7 +58,6 @@ Init ==
     /\ readyObserved = FALSE
     /\ revokeConsumed = FALSE
     /\ releaseProof = "None"
-    /\ badRegression = FALSE
     /\ badPublish = FALSE
     /\ badRevoked = FALSE
 
@@ -76,13 +69,11 @@ QueuePrepare ==
                     claimAccepted, claimRejected,
                     cancelBeforePublication, prepareConsumed,
                     readyObserved, revokeConsumed, releaseProof,
-                    badRegression, badPublish, badRevoked>>
+                    badPublish, badRevoked>>
 
 PublishUseCS ==
     /\ ~usecsPublished
-    /\ \/ /\ mode = "Advisory"
-           /\ sPhase \in {"PrepareQueued", "Ready"}
-       \/ /\ mode \in ReadyGatedModes
+    /\ \/ /\ mode \in ReadyGatedModes
            /\ sPhase = "Ready"
        \/ /\ MutantPublishAfterCancel
            /\ sPhase = "Cancelling"
@@ -92,7 +83,7 @@ PublishUseCS ==
                     claimAccepted, claimRejected,
                     cancelBeforePublication, prepareConsumed,
                     readyObserved, revokeConsumed, releaseProof,
-                    badRegression, badRevoked>>
+                    badRevoked>>
 
 QueueCancel ==
     /\ sPhase \in {"PrepareQueued", "Ready"}
@@ -103,13 +94,10 @@ QueueCancel ==
     /\ UNCHANGED <<mode, fPhase, f2s, usecsPublished,
                     claimAccepted, claimRejected, prepareConsumed,
                     readyObserved, revokeConsumed, releaseProof,
-                    badRegression, badPublish, badRevoked>>
+                    badPublish, badRevoked>>
 
 ConsumePrepare ==
-    LET regresses == fPhase = "Claimed" /\ MutantRegressClaimOnPrepare
-        nextF == IF fPhase = "Absent" \/ regresses
-                 THEN "Reserved"
-                 ELSE "Claimed"
+    LET nextF == IF fPhase = "Absent" THEN "Reserved" ELSE "Claimed"
     IN /\ Len(s2f) > 0
        /\ Head(s2f) = "Prepare"
        /\ fPhase \in {"Absent", "Claimed"}
@@ -117,7 +105,6 @@ ConsumePrepare ==
        /\ f2s' = Append(f2s, "Ready")
        /\ fPhase' = nextF
        /\ prepareConsumed' = TRUE
-       /\ badRegression' = (badRegression \/ regresses)
        /\ UNCHANGED <<mode, sPhase, usecsPublished,
                        claimAccepted, claimRejected,
                        cancelBeforePublication, readyObserved,
@@ -134,20 +121,19 @@ ConsumeReady ==
                     claimAccepted, claimRejected,
                     cancelBeforePublication, prepareConsumed,
                     revokeConsumed, releaseProof,
-                    badRegression, badPublish, badRevoked>>
+                    badPublish, badRevoked>>
 
 AcceptClaim ==
     /\ usecsPublished
     /\ ~claimAccepted
     /\ ~claimRejected
-    /\ fPhase \in {"Absent", "Reserved"}
-    /\ (mode = "Advisory" \/ fPhase = "Reserved")
+    /\ fPhase = "Reserved"
     /\ fPhase' = "Claimed"
     /\ claimAccepted' = TRUE
     /\ UNCHANGED <<mode, sPhase, s2f, f2s, usecsPublished,
                     claimRejected, cancelBeforePublication,
                     prepareConsumed, readyObserved, revokeConsumed,
-                    releaseProof, badRegression, badPublish, badRevoked>>
+                    releaseProof, badPublish, badRevoked>>
 
 RejectClaimAfterRevocation ==
     /\ usecsPublished
@@ -159,7 +145,7 @@ RejectClaimAfterRevocation ==
                     usecsPublished, claimAccepted,
                     cancelBeforePublication, prepareConsumed,
                     readyObserved, revokeConsumed, releaseProof,
-                    badRegression, badPublish, badRevoked>>
+                    badPublish, badRevoked>>
 
 ConsumeRevoke ==
     LET claimWon == fPhase = "Claimed"
@@ -180,7 +166,7 @@ ConsumeRevoke ==
                        claimAccepted, claimRejected,
                        cancelBeforePublication, prepareConsumed,
                        readyObserved, releaseProof,
-                       badRegression, badPublish>>
+                       badPublish>>
 
 ConsumeRevokeResult ==
     /\ Len(f2s) > 0
@@ -193,7 +179,7 @@ ConsumeRevokeResult ==
                     claimAccepted, claimRejected,
                     cancelBeforePublication, prepareConsumed,
                     readyObserved, revokeConsumed,
-                    badRegression, badPublish, badRevoked>>
+                    badPublish, badRevoked>>
 
 Next ==
     \/ QueuePrepare
@@ -222,15 +208,10 @@ TypeOK ==
     /\ readyObserved \in BOOLEAN
     /\ revokeConsumed \in BOOLEAN
     /\ releaseProof \in ReleaseProofs
-    /\ badRegression \in BOOLEAN
     /\ badPublish \in BOOLEAN
     /\ badRevoked \in BOOLEAN
 
 QueueBound == Len(s2f) <= 2 /\ Len(f2s) <= 2
-
-ClaimNeverRegresses ==
-    /\ ~badRegression
-    /\ (claimAccepted => fPhase = "Claimed")
 
 CancelCutsPublication ==
     /\ ~badPublish
@@ -264,19 +245,11 @@ EarlyCancelCompleted ==
     /\ ~usecsPublished
     /\ fPhase = "Revoked"
 
-AdvisoryClaimBeforePrepareCompleted ==
-    /\ mode = "Advisory"
-    /\ claimAccepted
-    /\ prepareConsumed
-    /\ fPhase = "Claimed"
-
 NoEarlyCancelWitness == ~EarlyCancelCompleted
-NoAdvisoryClaimBeforePrepareWitness == ~AdvisoryClaimBeforePrepareCompleted
 
 Safety ==
     /\ TypeOK
     /\ QueueBound
-    /\ ClaimNeverRegresses
     /\ CancelCutsPublication
     /\ ClaimWinsRevoke
     /\ ReleaseHasProof

@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using Clock = std::chrono::steady_clock;
 static int failures = 0;
@@ -377,7 +378,7 @@ static pid_t start_scheduler(const std::string &binary, int port,
 
 static pid_t start_cache_routing_scheduler(const std::string &binary, int port,
                                            const std::string &log_path,
-                                           const char *mode = "advisory")
+                                           const char *mode = "enforcing-compat")
 {
     pid_t child = fork();
     if (child != 0) return child;
@@ -599,6 +600,56 @@ static bool wait_file_contains(const std::string &path,
     return file_contains(path, needle);
 }
 
+/* Counts complete ASSIGN_PREPARE frames currently sitting unread in a
+   channel's socket receive queue, without removing them.  MSG_PEEK leaves the
+   bytes in place, so the kernel's advertised receive window stays exactly as
+   closed as it was -- unlike get_msg()/next_message(), which would drain the
+   queue, reopen the window, and silently cure whatever backpressure (e.g. a
+   shrunk peer SNDBUF) the caller is trying to observe.  Frames use the
+   production wire header: a 4-byte big-endian length covering everything
+   after it (type + body), then a 4-byte big-endian type.
+
+   The peek buffer is sized from the socket's own SO_RCVBUF (plus a margin)
+   rather than a fixed guess: a fixed-size peek smaller than the kernel's
+   actual receive buffer would silently cap the count at whatever fits,
+   making a peek-size-limited artifact indistinguishable from a real
+   plateau. If recv() still fills the buffer exactly (have == size), that is
+   reported via *saturated so the caller can treat the sample as
+   inconclusive rather than trustworthy. */
+static unsigned int count_peeked_prepare_frames(MsgChannel *channel,
+                                                 bool *saturated = nullptr)
+{
+    if (saturated) *saturated = false;
+    if (!channel) return 0;
+    int rcvbuf = 0;
+    socklen_t rcvbuf_len = sizeof(rcvbuf);
+    size_t buffer_size = 65536;
+    if (getsockopt(channel->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rcvbuf_len) == 0 &&
+            rcvbuf > 0 &&
+            static_cast<size_t>(rcvbuf) + 4096 > buffer_size) {
+        buffer_size = static_cast<size_t>(rcvbuf) + 4096;
+    }
+    std::vector<unsigned char> buffer(buffer_size);
+    const ssize_t have = recv(channel->fd, buffer.data(), buffer.size(), MSG_PEEK);
+    if (have <= 0) return 0;
+    if (saturated && static_cast<size_t>(have) == buffer.size()) *saturated = true;
+    unsigned int count = 0;
+    size_t pos = 0;
+    while (pos + 8 <= static_cast<size_t>(have)) {
+        const uint32_t payload_len =
+            (uint32_t(buffer[pos]) << 24) | (uint32_t(buffer[pos + 1]) << 16) |
+            (uint32_t(buffer[pos + 2]) << 8) | uint32_t(buffer[pos + 3]);
+        const uint32_t type =
+            (uint32_t(buffer[pos + 4]) << 24) | (uint32_t(buffer[pos + 5]) << 16) |
+            (uint32_t(buffer[pos + 6]) << 8) | uint32_t(buffer[pos + 7]);
+        const size_t frame_len = 4 + static_cast<size_t>(payload_len);
+        if (pos + frame_len > static_cast<size_t>(have)) break;  // incomplete
+        if (type == static_cast<uint32_t>(Msg::ASSIGN_PREPARE)) ++count;
+        pos += frame_len;
+    }
+    return count;
+}
+
 /* Reservation sockets must be released before exec: the production scheduler
    does not accept inherited listeners. Retry only a confirmed startup bind
    collision, never a scenario failure or an unexplained readiness timeout. */
@@ -762,6 +813,30 @@ static AssignPrepareMsg *wait_prepare(MsgChannel *worker)
 static AssignPrepareMsg *wait_prepare_and_ready(MsgChannel *worker)
 {
     AssignPrepareMsg *prepare = wait_prepare(worker);
+    if (prepare) {
+        worker->send_msg(AssignReadyMsg(prepare->epoch(), prepare->wire_id,
+                                        prepare->nonce()));
+    }
+    return prepare;
+}
+
+/* Races a PREPARE against two candidate workers when the dispatch decision
+   under test is itself unknown ahead of time (a fallback or warm-affinity
+   choice between two compatible workers).  Reports which channel the
+   PREPARE actually arrived on via *out_worker and replies with READY on
+   that channel, same as wait_prepare_and_ready() above. */
+static AssignPrepareMsg *wait_prepare_either(
+    MsgChannel *first, MsgChannel *second, MsgChannel **out_worker)
+{
+    MsgChannel *worker = first;
+    AssignPrepareMsg *prepare = wait_prepare(first);
+    if (!prepare) {
+        worker = second;
+        prepare = wait_prepare(second);
+    }
+    if (out_worker) {
+        *out_worker = prepare ? worker : nullptr;
+    }
     if (prepare) {
         worker->send_msg(AssignReadyMsg(prepare->epoch(), prepare->wire_id,
                                         prepare->nonce()));
@@ -1380,55 +1455,12 @@ static void run_ready_nested_teardown(const std::string &binary,
             "READY nested-teardown scheduler stopped cleanly");
 }
 
-static void run_advisory(const std::string &binary,
-                         const std::string &directory)
-{
-    const int port = reserve_port_pair();
-    const std::string log = directory + "/advisory-scheduler.log";
-    pid_t scheduler = start_scheduler(binary, port, "advisory", log, 16, 16);
-    REQUIRE(port != 0 && scheduler > 0, "Advisory scheduler launched");
-
-    int worker_port = 0;
-    int worker_listener = bind_port(0, &worker_port);
-    if (worker_listener >= 0) listen(worker_listener, 16);
-    ConfCSMsg *worker_conf = nullptr;
-    MsgChannel *worker = login_host(port, "advisory-worker", true,
-                                    worker_port, &worker_conf);
-    REQUIRE(worker && worker_conf
-                && worker_conf->fence_mode == ConfCSMsg::Advisory
-                && worker_conf->epoch() != 0,
-            "Advisory policy is immutable for the scheduler epoch");
-    delete worker_conf;
-
-    ConfCSMsg *submitter_conf = nullptr;
-    MsgChannel *submitter = login_host(port, "advisory-submit", false, 0,
-                                       &submitter_conf);
-    delete submitter_conf;
-    REQUIRE(submitter && request_job(submitter, 4201),
-            "Advisory assignment requested");
-    AssignPrepareMsg *prepare = wait_prepare(worker);
-    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
-        wait_type(submitter, Msg::USE_CS, 3000));
-    REQUIRE(prepare && use && use->job_id == prepare->wire_id,
-            "Advisory sends PREPARE without READY-gating UseCS");
-    if (use) {
-        worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
-    }
-    delete use;
-    delete prepare;
-    delete submitter;
-    delete worker;
-    if (worker_listener >= 0) close(worker_listener);
-    REQUIRE(stop_scheduler(scheduler), "Advisory scheduler stopped cleanly");
-}
-
 static void run_prepare_backlog(const std::string &binary,
                                 const std::string &directory)
 {
     const int port = reserve_port_pair();
     const std::string log = directory + "/prepare-backlog-scheduler.log";
-    pid_t scheduler = start_scheduler(binary, port, "advisory", log,
+    pid_t scheduler = start_scheduler(binary, port, "enforcing-compat", log,
                                       2048, 1024, true);
     REQUIRE(port != 0 && scheduler > 0,
             "deferred-PREPARE scheduler launched");
@@ -1446,18 +1478,75 @@ static void run_prepare_backlog(const std::string &binary,
                                        &submitter_conf);
     delete submitter_conf;
     REQUIRE(worker && submitter && request_job(submitter, 4301, 1024),
-            "large Advisory batch admitted against a non-draining worker");
+            "large batch admitted against a non-draining worker");
 
-    unsigned int use_count = 0;
-    const auto deadline = Clock::now() + std::chrono::milliseconds(1500);
-    while (Clock::now() < deadline) {
-        Msg *msg = next_message(submitter, 50);
-        if (msg) {
-            if (*msg == Msg::USE_CS) ++use_count;
-            delete msg;
-        }
+    /* The worker channel is deliberately never read from -- draining it
+       would reopen the receive window and cure the very backlog this test
+       needs to hold open (see start_scheduler's shrink_send_buffer shim).
+       UseCS is therefore not a usable observable here: under
+       EnforcingCompat it is withheld until the worker's READY, and this
+       worker never sends one.  Count complete ASSIGN_PREPARE frames
+       sitting unread in the worker's receive queue instead, via MSG_PEEK,
+       which inspects without consuming them.
+
+       Wait for the scheduler to actually reach the deferral boundary --
+       its own log line is the strong observable -- rather than bailing out
+       the instant the queue holds one frame: a lone queued PREPARE only
+       proves one was sent, not that admission has stopped. */
+    REQUIRE(wait_file_contains(
+                log, "has deferred assignment-control output", 5000),
+            "scheduler reaches the deferred-PREPARE eligibility boundary");
+
+    /* The deferred-output log line fires on the scheduler's FIRST send
+       that would block, but its own output queue keeps draining
+       already-admitted PREPARE frames into the worker's kernel receive
+       buffer for a short while afterward -- observed on H1: the peeked
+       count holds flat at a low value for a stretch, then climbs to its
+       true ceiling, then holds flat there. A single repeated sample is
+       not enough to tell those two flat stretches apart -- it can latch
+       onto the early, pre-climb plateau. Require three consecutive
+       samples (~300ms apart) to agree before trusting the count as the
+       true, stable baseline. */
+    unsigned int first_count = 0;
+    unsigned int streak = 0;
+    bool any_saturated = false;
+    const auto settle_deadline = Clock::now() + std::chrono::milliseconds(8000);
+    for (;;) {
+        bool saturated = false;
+        const unsigned int sample = count_peeked_prepare_frames(worker, &saturated);
+        any_saturated = any_saturated || saturated;
+        streak = (streak > 0 && sample == first_count) ? streak + 1 : 1;
+        first_count = sample;
+        if (streak >= 3 || Clock::now() >= settle_deadline) break;
+        usleep(300 * 1000);
     }
-    REQUIRE(use_count > 0 && use_count < 1024,
+    /* A loop that merely exits when the deadline expires -- without ever
+       having seen three agreeing samples -- would let this test pass
+       having observed no plateau at all. Require the plateau itself. */
+    REQUIRE(streak >= 3,
+            "PREPARE backlog reaches a stable plateau (three consecutive "
+            "equal samples) before the settle deadline");
+
+    /* Now prove admission actually stopped: take one more sample ~300ms
+       after the backlog has plateaued. It must be nonzero (the backlog
+       is still held) and under the 1024-frame sanity ceiling, and must
+       not exceed the plateaued baseline -- i.e. no new PREPAREs are
+       being admitted while the worker's output is deferred. */
+    usleep(300 * 1000);
+    bool second_saturated = false;
+    const unsigned int second_count =
+        count_peeked_prepare_frames(worker, &second_saturated);
+    /* If any sample ever filled the peek buffer exactly, the count was
+       capped by our own buffer rather than by the real queue contents --
+       the "plateau" would be a peek-size artifact, not proof that
+       admission stopped. */
+    REQUIRE(!any_saturated && !second_saturated,
+            "peek buffer never saturates (receive queue stays below the "
+            "SO_RCVBUF-sized peek buffer, so counts reflect real queue "
+            "contents, not a peek-size cap)");
+    REQUIRE(first_count > 0 && first_count < 1024 &&
+                second_count > 0 && second_count < 1024 &&
+                second_count <= first_count,
             "new PREPARE admission stops while worker output is deferred");
 
     delete submitter;
@@ -1467,6 +1556,37 @@ static void run_prepare_backlog(const std::string &binary,
             "deferred-PREPARE scheduler stopped cleanly");
     REQUIRE(file_contains(log, "has deferred assignment-control output"),
             "scheduler records the deferred-PREPARE eligibility boundary");
+}
+
+/* The retired Advisory mode must refuse to start rather than silently fall
+   back to some other policy: a scheduler that mis-starts under a mode an
+   operator asked for and no longer exists is worse than one that exits with
+   a clear message naming the modes that do. */
+static void run_rejects_advisory_mode(const std::string &binary,
+                                      const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/rejects-advisory.log";
+    pid_t scheduler = start_scheduler(binary, port, "advisory", log);
+    REQUIRE(scheduler > 0, "legacy advisory-mode scheduler process forked");
+
+    int status = 0;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    pid_t reaped = 0;
+    while (Clock::now() < deadline) {
+        reaped = waitpid(scheduler, &status, WNOHANG);
+        if (reaped == scheduler) break;
+        usleep(20 * 1000);
+    }
+    if (reaped != scheduler) {
+        kill(scheduler, SIGKILL);
+        waitpid(scheduler, &status, 0);
+    }
+    REQUIRE(reaped == scheduler && WIFEXITED(status) && WEXITSTATUS(status) == 1,
+            "--assignment-fence-mode advisory refuses to start (exit 1)");
+    REQUIRE(file_contains(log, "advisory was removed") &&
+                file_contains(log, "legacy, enforcing-compat, strict-nonce"),
+            "advisory rejection names the supported fence modes");
 }
 
 static void run_strict_nonce(const std::string &binary,
@@ -2136,7 +2256,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
 {
     const int port = reserve_port_pair();
     const std::string log = directory + "/cache-handoff-identity-bound.log";
-    pid_t scheduler = start_scheduler(binary, port, "advisory", log, 16, 16);
+    pid_t scheduler = start_scheduler(binary, port, "enforcing-compat", log, 16, 16);
     REQUIRE(port != 0 && scheduler > 0,
             "identity-bound cache-handoff scheduler process launched");
 
@@ -2159,7 +2279,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
         port, "cache-bound-a", true, worker_a_port, &a_conf,
         nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
         CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
-    REQUIRE(worker_a && a_conf && a_conf->fence_mode == ConfCSMsg::Advisory,
+    REQUIRE(worker_a && a_conf && a_conf->fence_mode == ConfCSMsg::EnforcingCompat,
             "distractor candidate F_A logs in with its own valid cache advertisement");
     delete a_conf;
 
@@ -2168,7 +2288,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
         port, "cache-bound-b", true, worker_b_port, &b_conf,
         nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
         CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
-    REQUIRE(worker_b && b_conf && b_conf->fence_mode == ConfCSMsg::Advisory,
+    REQUIRE(worker_b && b_conf && b_conf->fence_mode == ConfCSMsg::EnforcingCompat,
             "candidate F_B logs in with its own DIFFERENT valid cache advertisement");
     delete b_conf;
 
@@ -2179,13 +2299,13 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
 
     REQUIRE(submitter && request_job_preferring(submitter, 6001, "cache-bound-b"),
             "assignment forced to F_B requested");
-    delete wait_type(worker_b, Msg::ASSIGN_PREPARE, 3000);
+    delete wait_prepare_and_ready(worker_b);
     UseCSMsg *use_b = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(use_b && use_b->port == static_cast<uint32_t>(worker_b_port),
             "S2: forced selection actually picked F_B, not F_A");
     REQUIRE(use_b && use_b->hasAssignmentIdentity(),
-            "S2: Advisory mode assigns a complete identity before dispatch");
+            "S2: EnforcingCompat assigns a complete identity before dispatch");
     REQUIRE(use_b && use_b->cache_endpoint_port == static_cast<uint32_t>(cache_b_port)
                 && use_b->cache_protocol == CACHE_WIRE_REVISION
                 && use_b->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
@@ -2223,7 +2343,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
 
     REQUIRE(submitter && request_job_preferring(submitter, 6002, "cache-bound-b"),
             "second assignment forced to F_B requested after the swap");
-    delete wait_type(worker_b, Msg::ASSIGN_PREPARE, 3000);
+    delete wait_prepare_and_ready(worker_b);
     UseCSMsg *use_b2 = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(use_b2 && use_b2->port == static_cast<uint32_t>(worker_b_port),
@@ -2307,7 +2427,7 @@ static void run_cache_routing_preference(const std::string &binary,
     REQUIRE(submitter && request_job_preferring(
                 submitter, 6097, "cache-route-b"),
             "compatible alternative B is occupied before the retry probe");
-    AssignPrepareMsg *busy_b_prepare = wait_prepare(worker_b);
+    AssignPrepareMsg *busy_b_prepare = wait_prepare_and_ready(worker_b);
     UseCSMsg *busy_b_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(busy_b_prepare && busy_b_use &&
@@ -2332,7 +2452,7 @@ static void run_cache_routing_preference(const std::string &binary,
     if (busy_b_use)
         worker_b->send_msg(job_done_for(
             *busy_b_use, 0, JobDoneMsg::FROM_SERVER));
-    AssignPrepareMsg *retry_b_prepare = wait_prepare(worker_b);
+    AssignPrepareMsg *retry_b_prepare = wait_prepare_and_ready(worker_b);
     UseCSMsg *retry_b_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(retry_b_prepare && retry_b_use &&
@@ -2361,12 +2481,11 @@ static void run_cache_routing_preference(const std::string &binary,
                 submitter, 6099, "127.0.0.1",
                 static_cast<uint32_t>(cache_a_port), CACHE_PROFILE_P29V1),
             "cache-capable C submits a stale ordinary-port affinity hint");
+    MsgChannel *stale_port_worker = nullptr;
+    AssignPrepareMsg *stale_port_prepare =
+        wait_prepare_either(worker_a, worker_b, &stale_port_worker);
     UseCSMsg *stale_port_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
-    MsgChannel *stale_port_worker = stale_port_use &&
-            stale_port_use->port == static_cast<uint32_t>(worker_b_port)
-        ? worker_b : worker_a;
-    AssignPrepareMsg *stale_port_prepare = wait_prepare(stale_port_worker);
     REQUIRE(stale_port_use && stale_port_prepare &&
                 stale_port_use->port != static_cast<uint32_t>(cache_a_port) &&
                 stale_port_use->hasCacheAdvertisement(),
@@ -2387,12 +2506,11 @@ static void run_cache_routing_preference(const std::string &binary,
                 submitter, 6100, "127.0.0.1",
                 static_cast<uint32_t>(worker_b_port), CACHE_PROFILE_ZSTD_TU),
             "cache-capable C submits an affinity hint for a non-selected profile");
+    MsgChannel *wrong_profile_worker = nullptr;
+    AssignPrepareMsg *wrong_profile_prepare =
+        wait_prepare_either(worker_a, worker_b, &wrong_profile_worker);
     UseCSMsg *wrong_profile_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
-    MsgChannel *wrong_profile_worker = wrong_profile_use &&
-            wrong_profile_use->port == static_cast<uint32_t>(worker_b_port)
-        ? worker_b : worker_a;
-    AssignPrepareMsg *wrong_profile_prepare = wait_prepare(wrong_profile_worker);
     REQUIRE(wrong_profile_use && wrong_profile_prepare &&
                 wrong_profile_use->cache_profile_mask == CACHE_PROFILE_P29V1,
             "profile-mismatched affinity falls back immediately without changing the selected profile");
@@ -2415,7 +2533,7 @@ static void run_cache_routing_preference(const std::string &binary,
                 submitter, 6101, "127.0.0.1",
                 static_cast<uint32_t>(worker_b_port), CACHE_PROFILE_P29V1),
             "cache-capable C requests its exact known warm worker endpoint");
-    AssignPrepareMsg *prepare_b = wait_prepare(worker_b);
+    AssignPrepareMsg *prepare_b = wait_prepare_and_ready(worker_b);
     UseCSMsg *use_b = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(prepare_b && use_b &&
@@ -2428,7 +2546,7 @@ static void run_cache_routing_preference(const std::string &binary,
 
     REQUIRE(submitter && request_cache_job(submitter, 6102),
             "cache-capable C requests while its warm worker is full");
-    AssignPrepareMsg *prepare_a = wait_prepare(worker_a);
+    AssignPrepareMsg *prepare_a = wait_prepare_and_ready(worker_a);
     UseCSMsg *use_a = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(prepare_a && use_a &&
@@ -2441,7 +2559,7 @@ static void run_cache_routing_preference(const std::string &binary,
 
     REQUIRE(submitter && request_cache_job(submitter, 6103),
             "cache-capable C requests after every compatible real slot is full");
-    AssignPrepareMsg *prepare_legacy = wait_prepare(legacy_worker);
+    AssignPrepareMsg *prepare_legacy = wait_prepare_and_ready(legacy_worker);
     UseCSMsg *use_legacy = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(prepare_legacy && use_legacy &&
@@ -2536,7 +2654,7 @@ static void run_cache_retry_pressure_and_preferred(
 
     REQUIRE(request_job_preferring(submitter, 6201, "retry-pressure-b"),
             "first job occupies B's real slot");
-    AssignPrepareMsg *busy_b1_prepare = wait_prepare(worker_b);
+    AssignPrepareMsg *busy_b1_prepare = wait_prepare_and_ready(worker_b);
     UseCSMsg *busy_b1 = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(busy_b1_prepare && busy_b1 &&
@@ -2546,7 +2664,7 @@ static void run_cache_retry_pressure_and_preferred(
 
     REQUIRE(request_job_preferring(submitter, 6202, "retry-pressure-b"),
             "second forced job occupies B's sole preload allowance");
-    AssignPrepareMsg *busy_b2_prepare = wait_prepare(worker_b);
+    AssignPrepareMsg *busy_b2_prepare = wait_prepare_and_ready(worker_b);
     UseCSMsg *busy_b2 = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(busy_b2_prepare && busy_b2 &&
@@ -2570,7 +2688,7 @@ static void run_cache_retry_pressure_and_preferred(
     REQUIRE(request_job_preferring(
                 other_submitter, 6204, "retry-pressure-a"),
             "ordinary work is queued behind the waiting retry");
-    AssignPrepareMsg *other_prepare = wait_prepare(worker_a);
+    AssignPrepareMsg *other_prepare = wait_prepare_and_ready(worker_a);
     UseCSMsg *other_use = dynamic_cast<UseCSMsg *>(
         wait_type(other_submitter, Msg::USE_CS, 3000));
     REQUIRE(other_prepare && other_use &&
@@ -2599,7 +2717,7 @@ static void run_cache_retry_pressure_and_preferred(
     if (busy_b2)
         worker_b->send_msg(job_done_for(
             *busy_b2, 0, JobDoneMsg::FROM_SERVER));
-    AssignPrepareMsg *retry_b_prepare = wait_prepare(worker_b);
+    AssignPrepareMsg *retry_b_prepare = wait_prepare_and_ready(worker_b);
     UseCSMsg *retry_b = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(retry_b_prepare && retry_b &&
@@ -2633,7 +2751,7 @@ static void run_cache_retry_pressure_and_preferred(
     delete forbidden_a;
     delete forbidden_local;
     REQUIRE(set_worker_load(worker_b, 0), "B clears its load boundary");
-    retry_b_prepare = wait_prepare(worker_b);
+    retry_b_prepare = wait_prepare_and_ready(worker_b);
     retry_b = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(retry_b_prepare && retry_b &&
@@ -2657,7 +2775,7 @@ static void run_cache_retry_pressure_and_preferred(
     REQUIRE(request_job_preferring(
                 submitter, 6209, "retry-pressure-b"),
             "initial saturated P50 probe is requested");
-    AssignPrepareMsg *probe_prepare = wait_prepare(worker_b);
+    AssignPrepareMsg *probe_prepare = wait_prepare_and_ready(worker_b);
     UseCSMsg *probe_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(probe_prepare && probe_use &&
@@ -2685,7 +2803,7 @@ static void run_cache_retry_pressure_and_preferred(
 
     REQUIRE(set_worker_load(worker_b, 0),
             "B load recovery reopens the latched P50 path");
-    AssignPrepareMsg *recovered_probe = wait_prepare(worker_b);
+    AssignPrepareMsg *recovered_probe = wait_prepare_and_ready(worker_b);
     UseCSMsg *recovered_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(recovered_probe && recovered_use &&
@@ -2703,7 +2821,7 @@ static void run_cache_retry_pressure_and_preferred(
                 submitter, 6206, "retry-pressure-a", "127.0.0.1",
                 static_cast<uint32_t>(worker_a_port)),
             "retry carries a preferredHost that names its failed A endpoint");
-    retry_b_prepare = wait_prepare(worker_b);
+    retry_b_prepare = wait_prepare_and_ready(worker_b);
     retry_b = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     forbidden_a = dynamic_cast<AssignPrepareMsg *>(
@@ -2747,7 +2865,7 @@ static void run_cache_retry_pressure_and_preferred(
     REQUIRE(worker_b->send_msg(b_without_cache),
             "B withdraws the compatible cache capability while retry waits");
     delete wait_type(worker_b, Msg::CS_CONF, 3000);
-    AssignPrepareMsg *same_a_prepare = wait_prepare(worker_a);
+    AssignPrepareMsg *same_a_prepare = wait_prepare_and_ready(worker_a);
     UseCSMsg *same_a = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(same_a_prepare && same_a &&
@@ -2767,7 +2885,7 @@ static void run_cache_retry_pressure_and_preferred(
     REQUIRE(request_job_preferring(
                 submitter, 6208, "retry-pressure-a"),
             "later ordinary request carries no retry exclusion");
-    same_a_prepare = wait_prepare(worker_a);
+    same_a_prepare = wait_prepare_and_ready(worker_a);
     same_a = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(same_a_prepare && same_a &&
@@ -2831,7 +2949,7 @@ static void run_cache_retry_single_worker(const std::string &binary,
                 submitter, 6210, std::string(), 0, 0, "127.0.0.1",
                 static_cast<uint32_t>(worker_port)),
             "single-worker retry requests its previous exact endpoint");
-    AssignPrepareMsg *prepare = wait_prepare(worker);
+    AssignPrepareMsg *prepare = wait_prepare_and_ready(worker);
     UseCSMsg *use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
     REQUIRE(prepare && use &&
@@ -2911,9 +3029,9 @@ static void run_cache_affinity_uses_exact_serialized_host(
     REQUIRE(submitter && request_job_preferring(
                 submitter, 6199, "affinity-real-a"),
             "one exact F-A slot is occupied before the collision probe");
+    AssignPrepareMsg *busy_prepare = wait_prepare_and_ready(worker_a);
     UseCSMsg *busy_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
-    AssignPrepareMsg *busy_prepare = wait_prepare(worker_a);
     REQUIRE(busy_use && busy_prepare && busy_use->hostname == "127.0.0.1" &&
                 busy_use->cache_endpoint_port ==
                     static_cast<uint32_t>(cache_a_port),
@@ -2926,11 +3044,11 @@ static void run_cache_affinity_uses_exact_serialized_host(
                 static_cast<uint32_t>(shared_worker_port),
                 CACHE_PROFILE_P29V1),
             "warm probe echoes F-A's serialized host/port/profile identity");
+    MsgChannel *selected_worker = nullptr;
+    AssignPrepareMsg *warm_prepare =
+        wait_prepare_either(worker_a, worker_b, &selected_worker);
     UseCSMsg *warm_use = dynamic_cast<UseCSMsg *>(
         wait_type(submitter, Msg::USE_CS, 3000));
-    MsgChannel *selected_worker =
-        warm_use && warm_use->hostname == "127.0.0.2" ? worker_b : worker_a;
-    AssignPrepareMsg *warm_prepare = wait_prepare(selected_worker);
     REQUIRE(warm_use && warm_prepare && warm_use->hostname == "127.0.0.1" &&
                 warm_use->cache_endpoint_port ==
                     static_cast<uint32_t>(cache_a_port),
@@ -3282,7 +3400,7 @@ int main(int argc, char **argv)
     run_enforcing(argv[1], directory);
     run_prepare_credit(argv[1], directory);
     run_ready_nested_teardown(argv[1], directory);
-    run_advisory(argv[1], directory);
+    run_rejects_advisory_mode(argv[1], directory);
     run_prepare_backlog(argv[1], directory);
     run_strict_nonce(argv[1], directory);
     run_strict_cache_withdraw(argv[1], directory);
