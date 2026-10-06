@@ -1294,11 +1294,18 @@ CentralChildReaperRegistry::register_owner(
     const bool handle_valid = (backend == ChildHandleBackend::Native)
                                    ? (pidfd >= 0)
                                    : (pidfd < 0 && starttime_ticks != 0);
+    // Direct-worker registrations are scoped to the Native handle primitive
+    // only.  The compat (pidfd-less, starttime-fenced) identity is exercised
+    // and tested solely through the real sidecar-launch path; a Compat
+    // direct worker has no covering observe/kill-domain path and must be
+    // rejected outright regardless of starttime_ticks, not merely when the
+    // starttime fence is unset.
     if (!state_ || pid <= 1 || pgid <= 1 || pid != pgid || !owner.valid() ||
         ((kind == ReaperOwnerKind::Sidecar) && mailbox.expired()) ||
         !handle_valid || !incarnation.valid() ||
         !reaper_owner_kind_valid(kind) ||
-        (kind == ReaperOwnerKind::DirectWorker && starttime_ticks == 0))
+        (kind == ReaperOwnerKind::DirectWorker &&
+         (starttime_ticks == 0 || backend == ChildHandleBackend::Compat)))
         return {};
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->owners.find(pid) != state_->owners.end() ||
