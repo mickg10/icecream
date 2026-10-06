@@ -217,13 +217,69 @@ void StateWriter::shutdown(unsigned int drain_msec)
    after a partial write cannot leave a prefix followed by a duplicate of
    the whole record (which would corrupt the JSONL stream).  Returns false
    only if the record had to be abandoned (fd trouble persisted).  */
+/* The daemon's log path, set once by the writer child before its loop:
+   the failure reporter appends there (the -l file) so the warning
+   SURVIVES the daemonized production config, where fd 2 is /dev/null
+   after the std-fd sanitize.  Empty means: report to stderr after all
+   (the no--l / test configurations). */
+static std::string state_writer_report_path;
+
+static bool write_record_offset(int &fd, const char *path, int open_flags,
+                                const std::string &payload, size_t &ofs);
+
+static void report_state_writer_failure(const char *text, size_t len) noexcept
+{
+    if (state_writer_report_path.empty() || len == 0) {
+        fputs(text, stderr);
+        return;
+    }
+    int fd = -1;
+    size_t ofs = 0;
+    const std::string payload(text, len);
+    /* Best-effort, once: if the log path itself is unreachable there is
+       nothing better to do than the stderr fallback below. */
+    if (!write_record_offset(fd, state_writer_report_path.c_str(),
+                             O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                             payload, ofs)) {
+        fputs(text, stderr);
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
 static bool write_record_offset(int &fd, const char *path, int open_flags,
                                 const std::string &payload, size_t &ofs)
 {
+    /* R17c: the FIRST failed open names the path and the captured errno
+       ONCE (the daemon probed the path at startup and already warned,
+       but a directory can go bad later -- chmod, a rotated mount, a full
+       tmpfs).  The line goes through the LOGGING ROUTE, not bare stderr:
+       in the daemonized production config (-d -l <log>) fd 2 is
+       /dev/null after the sanitize, so a fprintf(stderr) line is lost
+       exactly where it matters.  The writer child carries the daemon's
+       log path as its STATELOG sink (StateWriter::start passes it when
+       state-log is enabled) -- report there, falling back to stderr
+       only when there is no log path. */
+    bool open_failure_reported = false;
     for (int attempt = 0; attempt < 60; ++attempt) {
         if (fd < 0) {
             fd = open(path, open_flags, 0644);
             if (fd < 0) {
+                const int open_errno = errno;
+                if (!open_failure_reported) {
+                    open_failure_reported = true;
+                    char warning[512];
+                    const int warning_len = snprintf(
+                        warning, sizeof(warning),
+                        "state writer: cannot open '%s': %s (uid %d, gid %d)"
+                        " -- state records are being dropped; retrying\n",
+                        path, strerror(open_errno), (int)getuid(), (int)getgid());
+                    report_state_writer_failure(warning,
+                                                 warning_len > 0 && warning_len < (int)sizeof(warning)
+                                                     ? (size_t)warning_len : 0);
+                }
+                errno = open_errno;
                 struct timespec ts = { 5, 0 };
                 nanosleep(&ts, nullptr);
                 continue;
@@ -269,6 +325,11 @@ static bool read_full(int fd, char *buf, size_t want)
 void statewriter_child_loop(int pipe_fd, const std::string &jsonl_path,
                             const std::string &statelog_path)
 {
+    /* R17c: route the child's failure lines into the daemon's -l log
+       when the state-log sink carries it (StateWriter::start passes the
+       logfile as the statelog path exactly when the daemon logs to a
+       file).  Empty path -> stderr fallback (test/no--l shapes). */
+    state_writer_report_path = statelog_path;
     int jsonl_fd = -1;
     for (;;) {
         char header[kFrameHeader];
