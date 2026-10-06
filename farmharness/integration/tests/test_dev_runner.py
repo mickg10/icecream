@@ -173,22 +173,27 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     # root-side tests (the two e2e root gates, the sidecar leg, envchardev).
     # all, install, check, then (green) the proc tree's all+check, the
     # six-test e2e check (pinned via the preset host below), the root leg.
-    assert len(make_calls) == (7 if native_status == 0 else 3)
+    # green adds the k310 native-proc-root-check stage (one more check call
+    # in the forced-proc tree: stdfdsanitize-sidecar.sh, root-gated so it
+    # cannot ride in the unprivileged native-proc-check2)
+    assert len(make_calls) == (8 if native_status == 0 else 3)
     assert make_calls[0].endswith(" all")
     assert make_calls[1].endswith(" install")
     assert make_calls[2].endswith(" check")
     if native_status == 0:
         # 3: the forced-proc tree's full build (inside the proc stage's
-        # bash -c), 4: its hygiene+compilee2e check, 5: the six-test e2e
-        # check, 6: the root leg (the two root e2e gates, the sidecar leg,
-        # envchardev).
+        # bash -c), 4: its hygiene+compilee2e check, 5: the k310
+        # native-proc-root-check (stdfdsanitize-sidecar.sh against the
+        # forced-proc tree -- root-gated, so it cannot ride inside the
+        # unprivileged check2), 6: the root leg (the root e2e gates, the
+        # sidecar leg, envchardev), 7: the six-test e2e check (runs last).
         assert make_calls[3].startswith("-C . ")
         assert "p50forkfdhygiene" in make_calls[4]
-        # 5: the root leg, 6: the six-test e2e check (runs last)
-        assert "p50sourcearm-live-run.sh" in make_calls[5]
-        assert "stdfdsanitize-sidecar.sh" in make_calls[5]
-        assert "envchardev.c.sh" in make_calls[5]
-        assert "remoteice-quick.sh" in make_calls[6]
+        assert make_calls[5].endswith("check TESTS=stdfdsanitize-sidecar.sh")
+        assert "p50sourcearm-live-run.sh" in make_calls[6]
+        assert "stdfdsanitize-sidecar.sh" in make_calls[6]
+        assert "envchardev.c.sh" in make_calls[6]
+        assert "remoteice-quick.sh" in make_calls[7]
     user_stages = (tmp_path / "runuser.log").read_text().splitlines()
     # python-sync, autogen, configure, build, install, native-check, pytest
     # run as nobody (7); green adds the forced-proc build and its setcap'd
@@ -276,6 +281,12 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "native_e2e_clang_exit": None if native_status else 0,
         "native_e2e_check_exit": None if native_status else 0,
         "native_root_check_exit": None if native_status else 0,
+        # k310's native-proc-root-check rides the forced-proc tree and is
+        # gated on a green native-proc-check (not on native-check): the
+        # 9-shape never reaches the proc tree at all, so it stays null there
+        # -- but the 0-shape green proc build DID run, so the stage ran.
+        # (The stage is also exempt from runuser, so user_stages stays 11.)
+        "native_proc_root_check_exit": None if native_status else 0,
         "pytest_exit": 0,
         "overall_exit": 1 if native_status else 0,
     }
