@@ -405,6 +405,101 @@ void test_lifecycle() {
                    .valid(),
           "registry rejects the owner above its fixed total cap");
 
+    // --- Slice-1 hardening requirement #1: register_owner()/
+    // register_direct_worker() accept/reject matrix. The production fix
+    // landed separately; this exercises every branch of its validation
+    // gate (cache/p50_sidecar_lifecycle.cpp, register_owner()). ---
+    {
+        CentralChildReaperRegistry hardening_registry;
+        const auto hardening_mailbox = lifecycle.reap_mailbox();
+
+        CHECK(!hardening_registry
+                   .register_owner(40001, 40001, ReaperOwnerKey{40001, 1},
+                                    hardening_mailbox, ChildHandleBackend::Native,
+                                    0, 0, /*pidfd=*/-1, incarnation_for(first))
+                   .valid(),
+              "Native backend with no pidfd is rejected");
+
+        CHECK(!hardening_registry
+                   .register_owner(40002, 40002, ReaperOwnerKey{40002, 1},
+                                    hardening_mailbox, ChildHandleBackend::Compat,
+                                    0, 0, /*pidfd=*/-1, incarnation_for(first),
+                                    ReaperOwnerKind::DirectWorker,
+                                    /*starttime_ticks=*/0)
+                   .valid(),
+              "Compat DirectWorker via register_owner is rejected with a zero starttime");
+        CHECK(!hardening_registry
+                   .register_owner(40003, 40003, ReaperOwnerKey{40003, 1},
+                                    hardening_mailbox, ChildHandleBackend::Compat,
+                                    0, 0, /*pidfd=*/-1, incarnation_for(first),
+                                    ReaperOwnerKind::DirectWorker,
+                                    /*starttime_ticks=*/555)
+                   .valid(),
+              "Compat DirectWorker via register_owner is rejected even with a "
+              "nonzero starttime -- Compat has no covering observe/kill-domain "
+              "path for direct workers");
+
+        CHECK(!hardening_registry
+                   .register_direct_worker(40004, 40004, ReaperOwnerKey{40004, 1},
+                                            /*pidfd=*/-1, ChildHandleBackend::Compat,
+                                            incarnation_for(first),
+                                            /*starttime_ticks=*/0)
+                   .valid(),
+              "Compat DirectWorker via register_direct_worker is rejected with a "
+              "zero starttime");
+        CHECK(!hardening_registry
+                   .register_direct_worker(40005, 40005, ReaperOwnerKey{40005, 1},
+                                            /*pidfd=*/-1, ChildHandleBackend::Compat,
+                                            incarnation_for(first),
+                                            /*starttime_ticks=*/777)
+                   .valid(),
+              "Compat DirectWorker via register_direct_worker is rejected even "
+              "with a nonzero starttime");
+
+        CHECK(!hardening_registry
+                   .register_owner(40006, 40006, ReaperOwnerKey{40006, 1},
+                                    hardening_mailbox, ChildHandleBackend::Compat,
+                                    0, 0, /*pidfd=*/-1, incarnation_for(first),
+                                    ReaperOwnerKind::Sidecar,
+                                    /*starttime_ticks=*/0)
+                   .valid(),
+              "Compat Sidecar with a zero starttime is rejected");
+
+        CHECK(!hardening_registry
+                   .register_owner(1, 1, ReaperOwnerKey{40007, 1},
+                                    hardening_mailbox, ChildHandleBackend::Compat,
+                                    0, 0, /*pidfd=*/-1, incarnation_for(first),
+                                    ReaperOwnerKind::Sidecar,
+                                    /*starttime_ticks=*/999)
+                   .valid(),
+              "Compat Sidecar with pid<=1 is rejected");
+
+        CHECK(!hardening_registry
+                   .register_owner(40008, 40008, ReaperOwnerKey{40008, 1},
+                                    hardening_mailbox, ChildHandleBackend::Compat,
+                                    0, 0, /*pidfd=*/7, incarnation_for(first),
+                                    ReaperOwnerKind::Sidecar,
+                                    /*starttime_ticks=*/999)
+                   .valid(),
+              "Compat Sidecar with a non-negative pidfd is rejected");
+
+        auto hardening_accept = hardening_registry.register_owner(
+            40009, 40009, ReaperOwnerKey{40009, 1}, hardening_mailbox,
+            ChildHandleBackend::Compat, 0, 0, /*pidfd=*/-1,
+            incarnation_for(first), ReaperOwnerKind::Sidecar,
+            /*starttime_ticks=*/999);
+        CHECK(hardening_accept.valid(),
+              "Compat Sidecar with pid>1, pidfd<0 and a nonzero starttime is "
+              "the one legitimate Compat registration and is accepted");
+
+        // `backend` has no default value in register_owner()'s signature
+        // (cache/p50_sidecar_lifecycle.h): every call above, and every call
+        // elsewhere in this file, must name it explicitly. A call site that
+        // omitted it would fail to compile rather than silently defaulting
+        // to ChildHandleBackend::Native, so this is enforced at compile
+        // time rather than by a runtime CHECK.
+    }
+
     ReapMailbox bounded_mailbox;
     const ReapEvent mailbox_event = exact_reap_for(
         lifecycle, 321, lifecycle_pidfd,
