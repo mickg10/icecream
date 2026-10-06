@@ -53,6 +53,11 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     # the e2e setcap stage needs setcap/getcap on PATH (the qa image carries
     # libcap2-bin; this fake stands in for it)
     _executable(fake_bin / "setcap", "#!/bin/sh\nexit 0\n")
+    # placeholder source test: the REQUIRED clang leg invokes the
+    # compilee2e script directly (the TESTS mechanism cannot run one
+    # test twice); the fake harness only proves the stage wiring.
+    (source_mount / "unittests").mkdir(exist_ok=True)
+    _executable(source_mount / "unittests" / "p50compilee2e-run.sh", "#!/bin/sh\nexit 0\n")
     _executable(fake_bin / "getcap", "#!/bin/sh\nexit 0\n")
     _executable(
         fake_bin / "stat",
@@ -176,11 +181,11 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         assert "remoteice-quick.sh" in make_calls[6]
     user_stages = (tmp_path / "runuser.log").read_text().splitlines()
     # python-sync, autogen, configure, build, install, native-check, pytest
-    # run as nobody (7); green adds the forced-proc build, its setcap'd
-    # check and native-e2e-check (10); the root-side stages
-    # (native-e2e-setcap, native-proc-setcap, native-root-check) are
-    # exempt from runuser.
-    assert len(user_stages) == (10 if native_status == 0 else 7)
+    # run as nobody (7); green adds the forced-proc build and its setcap'd
+    # check, native-e2e-check and the REQUIRED clang leg (11); the
+    # root-side stages (native-e2e-setcap, native-proc-setcap,
+    # native-root-check) are exempt from runuser.
+    assert len(user_stages) == (11 if native_status == 0 else 7)
     assert all(line.startswith("-u nobody -- ") for line in user_stages)
     assert not any("native-root-check" in line for line in user_stages)
     assert not any("native-e2e-setcap" in line for line in user_stages)
@@ -213,9 +218,13 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     summary = json.loads((work_root / "artifacts" / "summary.json").read_text())
     assert summary == {
         "mode": "qa",
-        # the clean-tree commit recorded by bootstrap.py; the fake harness
-        # runs run-qa.sh directly, so no ICECC_QA_SOURCE_COMMIT is set
-        "source_commit": "unknown",
+        # the clean-tree commit recorded by bootstrap.py.  The fake harness
+        # runs run-qa.sh directly, so the field carries whatever the
+        # AMBIENT environment has: unset locally ("unknown"), or the exact
+        # sha the qa container exports (ICECC_QA_SOURCE_COMMIT) when this
+        # test itself runs inside a qa container.  Pin the ambient value
+        # so both shapes assert the same way.
+        "source_commit": os.environ.get("ICECC_QA_SOURCE_COMMIT", "unknown"),
         "jobs": 2,
         "autogen_exit": 0,
         "configure_exit": 0,
@@ -226,6 +235,8 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         # the proc/e2e stages are gated on a green native-check, so a failed
         # check leaves both null (never ran) and the root leg unrun
         "native_proc_check_exit": None if native_status else 0,
+        # the clang leg is REQUIRED in qa mode (skip fails the stage)
+        "native_e2e_clang_exit": None if native_status else 0,
         "native_e2e_check_exit": None if native_status else 0,
         "native_root_check_exit": None if native_status else 0,
         "pytest_exit": 0,

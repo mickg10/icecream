@@ -145,6 +145,7 @@ native_check_status=null
 native_proc_check_status=null
 native_proc_setcap_status=null
 native_e2e_setcap_status=null
+native_e2e_clang_status=null
 native_e2e_check_status=null
 native_root_check_status=null
 pytest_status=null
@@ -175,6 +176,7 @@ run_stage() {
         native-proc-check|native-proc-check2) native_proc_check_status=$status ;;
         native-proc-setcap) native_proc_setcap_status=$status ;;
         native-e2e-setcap) native_e2e_setcap_status=$status ;;
+        native-e2e-clang) native_e2e_clang_status=$status ;;
         native-e2e-check) native_e2e_check_status=$status ;;
         native-root-check) native_root_check_status=$status ;;
         python-pytest) pytest_status=$status ;;
@@ -266,7 +268,7 @@ else
             ' _ "$WORK_ROOT"
             if [[ "$native_proc_setcap_status" == 0 ]]; then
                 run_stage native-proc-check2 env "${e2e_exports[@]}" bash -c \
-                    'set -e; cd "$1/tmp/build-proc"; make -C . check TESTS="p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh p50forkfdhygiene-oot.sh p50forkfdhygiene-package.sh p50_fork_fd_hygiene_sanitize.sh p50compilee2e-run.sh"' \
+                    'set -e; cd "$1/tmp/build-proc"; make -C . check TESTS="p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh p50forkfdhygiene-oot.sh p50forkfdhygiene-package.sh p50_fork_fd_hygiene_sanitize.sh p50compilee2e-run.sh"; ICECC_P50_C1F1_COMPILER=clang++ ICECC_P50_C1F1_COMPILER_REQUIRED=1 ICECC_P50_C1F1_TIMEOUT=300 ICECC_TEST_TOP_BUILDDIR="$PWD" ICECC_TEST_BUILDDIR="$PWD/unittests" bash "$2/unittests/p50compilee2e-run.sh"' \
                     _ "$WORK_ROOT" "$SRC"
             fi
         fi
@@ -321,6 +323,22 @@ else
             run_stage native-e2e-check env "${e2e_exports[@]}" \
                 make -C "$BUILD" -j"$JOBS" check \
                 TESTS="remoteice-quick.sh p50assignment-remote.sh p50sourcearm-live-run.sh p50daemonpositive-run.sh p50compilee2e-run.sh p50completionflow-run.sh"
+            # The clang leg of p50compilee2e: the fd-defect class is
+            # clang-only (gcc ignores closed std fds; clang's
+            # FixupStandardFileDescriptors dies in a /dev/null-less chroot),
+            # so a gcc-only e2e suite can NEVER catch it.  REQUIRED mode:
+            # inside QA a missing tool FAILS the stage instead of skipping --
+            # its detector stayed dark through every release run before.
+            # The TESTS mechanism cannot run one test twice, so this is a
+            # direct second invocation of the same script with the clang
+            # env, same working dir shape as the make leg.
+            run_stage native-e2e-clang env "${e2e_exports[@]}" \
+                "ICECC_TEST_TOP_BUILDDIR=$BUILD" \
+                "ICECC_TEST_BUILDDIR=$BUILD/unittests" \
+                ICECC_P50_C1F1_COMPILER=clang++ \
+                ICECC_P50_C1F1_COMPILER_REQUIRED=1 \
+                ICECC_P50_C1F1_TIMEOUT=300 \
+                bash "$SRC/unittests/p50compilee2e-run.sh"
         else
             echo "native-e2e-check skipped: no non-loopback container IP (hostname -i gave '$e2e_host_ip')" >&2
         fi
@@ -349,14 +367,15 @@ else
     [[ "$native_check_status" == 0 && "$build_ok" == 1 ]] || overall=1
     [[ "$native_proc_check_status" == 0 ]] || overall=1
     [[ "$native_e2e_check_status" == 0 || "$native_e2e_check_status" == null ]] || overall=1  # null = loud-skipped (no container IP); a skip must not fake green
+    [[ "$native_e2e_clang_status" == 0 || "$native_e2e_clang_status" == null ]] || overall=1  # the clang leg is REQUIRED in qa: 77/skip must fail the run
     [[ -z "$run_as_user" || "$native_root_check_status" == 0 ]] || overall=1
     [[ "$pytest_status" == 0 ]] || overall=1
 fi
 
 summary_tmp="$ARTIFACTS/summary.json.tmp"
-printf '{"mode":"%s","source_commit":"%s","jobs":%s,"autogen_exit":%s,"configure_exit":%s,"build_exit":%s,"install_exit":%s,"python_sync_exit":%s,"native_check_exit":%s,"native_proc_check_exit":%s,"native_e2e_check_exit":%s,"native_root_check_exit":%s,"pytest_exit":%s,"overall_exit":%s}\n' \
+printf '{"mode":"%s","source_commit":"%s","jobs":%s,"autogen_exit":%s,"configure_exit":%s,"build_exit":%s,"install_exit":%s,"python_sync_exit":%s,"native_check_exit":%s,"native_proc_check_exit":%s,"native_e2e_clang_exit":%s,"native_e2e_check_exit":%s,"native_root_check_exit":%s,"pytest_exit":%s,"overall_exit":%s}\n' \
     "$MODE" "${ICECC_QA_SOURCE_COMMIT:-unknown}" "$JOBS" "$autogen_status" "$configure_status" "$build_status" \
-    "$install_status" "$python_sync_status" "$native_check_status" "$native_proc_check_status" "$native_e2e_check_status" "$native_root_check_status" "$pytest_status" "$overall" > "$summary_tmp"
+    "$install_status" "$python_sync_status" "$native_check_status" "$native_proc_check_status" "$native_e2e_clang_status" "$native_e2e_check_status" "$native_root_check_status" "$pytest_status" "$overall" > "$summary_tmp"
 mv -f "$summary_tmp" "$ARTIFACTS/summary.json"
 printf '\nSummary: %s/summary.json\nArtifacts: %s\n' "$ARTIFACTS" "$ARTIFACTS"
 exit "$overall"
