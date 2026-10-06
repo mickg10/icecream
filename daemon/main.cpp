@@ -5382,19 +5382,12 @@ bool Daemon::configure_cache_adapter() noexcept
         // this adapter's own LaunchIdentityAllocator respectively.
         // any_fail_closed() above already guarantees platform_decision has
         // no FailClosed entry by the time this line runs, so only Native
-        // and Compat are possible here.
-        config.child_handle_backend =
-            platform_decision.child.backend == icecc::p50::platform::Backend::Compat
-                ? icecc::p50::ChildHandleBackend::Compat
-                : icecc::p50::ChildHandleBackend::Native;
-        config.input_backend =
-            platform_decision.input.backend == icecc::p50::platform::Backend::Compat
-                ? icecc::p50::InputMaterializationBackend::Compat
-                : icecc::p50::InputMaterializationBackend::Native;
-        config.entropy_provider =
-            platform_decision.random.backend == icecc::p50::platform::Backend::Compat
-                ? icecc::p50::platform::compat_store_identity_entropy
-                : icecc::p50::system_store_identity_entropy;
+        // and Compat are possible here. The actual three-field copy is
+        // extracted into apply_platform_decision_to_config() (daemon/
+        // p50_platform_compat.{h,cpp}) specifically so it has its own direct
+        // unit test asserting all three fields land correctly -- see
+        // unittests/p50_platform_compat_test.cpp.
+        icecc::p50::platform::apply_platform_decision_to_config(platform_decision, config);
 
         if (!icecc::p50::daemon::DaemonSidecarAdapter::valid_config(config)) {
             /* R17a: name the failing check -- path, expected vs actual

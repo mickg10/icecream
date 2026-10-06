@@ -18,6 +18,7 @@
 // "native behavior on modern kernels is unchanged by default" is checked
 // directly against the real syscalls rather than through TestHooks.
 #include "../daemon/p50_platform_compat.h"
+#include "p50_daemon_sidecar_adapter.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -356,6 +357,55 @@ void test_copy_compat_input_from_sidecar()
     }
 }
 
+void test_apply_platform_decision_to_config_copies_all_three_backends()
+{
+    // Daemon::configure_cache_adapter() (daemon/main.cpp) delegates its
+    // three-field platform-decision-to-Config copy to this function. This
+    // test exercises all eight Native/Compat combinations of child, input,
+    // and random, with each Config field pre-seeded to the *wrong* value
+    // for that iteration, so a forgotten assignment inside
+    // apply_platform_decision_to_config() (one field silently left
+    // untouched) is caught here rather than masked by Config's own
+    // Native-biased field defaults.
+    using icecc::p50::daemon::Config;
+    using icecc::p50::ChildHandleBackend;
+    using icecc::p50::InputMaterializationBackend;
+
+    for (int mask = 0; mask < 8; ++mask) {
+        const bool child_compat = (mask & 1) != 0;
+        const bool input_compat = (mask & 2) != 0;
+        const bool random_compat = (mask & 4) != 0;
+
+        PlatformDecision decision;
+        decision.child.backend = child_compat ? Backend::Compat : Backend::Native;
+        decision.input.backend = input_compat ? Backend::Compat : Backend::Native;
+        decision.random.backend = random_compat ? Backend::Compat : Backend::Native;
+
+        Config config;
+        config.child_handle_backend =
+            child_compat ? ChildHandleBackend::Native : ChildHandleBackend::Compat;
+        config.input_backend = input_compat ? InputMaterializationBackend::Native
+                                             : InputMaterializationBackend::Compat;
+        config.entropy_provider =
+            random_compat ? icecc::p50::system_store_identity_entropy
+                          : icecc::p50::platform::compat_store_identity_entropy;
+
+        icecc::p50::platform::apply_platform_decision_to_config(decision, config);
+
+        CHECK(config.child_handle_backend ==
+                  (child_compat ? ChildHandleBackend::Compat : ChildHandleBackend::Native),
+              "apply_platform_decision_to_config sets child_handle_backend from decision.child");
+        CHECK(config.input_backend ==
+                  (input_compat ? InputMaterializationBackend::Compat
+                                : InputMaterializationBackend::Native),
+              "apply_platform_decision_to_config sets input_backend from decision.input");
+        CHECK(config.entropy_provider ==
+                  (random_compat ? icecc::p50::platform::compat_store_identity_entropy
+                                 : icecc::p50::system_store_identity_entropy),
+              "apply_platform_decision_to_config sets entropy_provider from decision.random");
+    }
+}
+
 } // namespace
 
 int main()
@@ -376,5 +426,6 @@ int main()
     test_format_platform_log_line();
     test_compat_store_identity_entropy();
     test_copy_compat_input_from_sidecar();
+    test_apply_platform_decision_to_config_copies_all_three_backends();
     return failures == 0 ? 0 : 1;
 }

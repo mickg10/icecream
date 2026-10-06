@@ -29,6 +29,16 @@
 #include <cstdint>
 #include <string>
 
+// Forward declaration only: icecc::p50::daemon::Config is defined in
+// cache/p50_daemon_sidecar_adapter.h. This header deliberately does not
+// include that header -- every existing includer of p50_platform_compat.h
+// would otherwise pick up the full cache/-level DaemonSidecarAdapter
+// dependency graph just to see a function declaration that only ever takes
+// a reference. The .cpp file includes the real header.
+namespace icecc::p50::daemon {
+struct Config;
+}
+
 namespace icecc::p50::platform {
 
 // Per-mitigation outcome. `FailClosed` means: the probe failed in a way that
@@ -156,6 +166,26 @@ struct CompatInputCopy {
 // needed (today: once this call returns, since mint_attached_input_source()
 // must bind to the returned copy, not to source_fd).
 [[nodiscard]] CompatInputCopy copy_compat_input_from_sidecar(int source_fd) noexcept;
+
+// ---- Config wiring: pure mapping, directly unit-testable ----
+//
+// Applies a resolved PlatformDecision's three backend fields onto an
+// icecc::p50::daemon::Config. This is the exact mapping
+// Daemon::configure_cache_adapter() (daemon/main.cpp) performs when
+// building the Config it hands to a new DaemonSidecarAdapter. It is
+// extracted here, as a free function with no dependency on Daemon's
+// internals, specifically so a unit test can assert all three fields land
+// correctly and a future forgotten assignment at the call site cannot
+// silently leave a field at its Native default.
+//
+// Caller contract: this function does not consult any_fail_closed() itself
+// and does not decide whether to construct a Config/adapter at all --
+// configure_cache_adapter() must keep performing that check (and skip
+// construction entirely on FailClosed) exactly as it does today. This
+// function only performs the three-field copy, unconditionally, from
+// whichever decision it is given.
+void apply_platform_decision_to_config(const PlatformDecision& decision,
+                                       icecc::p50::daemon::Config& config) noexcept;
 
 #if defined(ICECC_P50_PLATFORM_COMPAT_TEST_HOOKS)
 // Test-only fault injection, following the existing

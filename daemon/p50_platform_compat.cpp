@@ -1,6 +1,7 @@
 #include "p50_platform_compat.h"
 
 #include "digest128.h"
+#include "p50_daemon_sidecar_adapter.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -515,5 +516,21 @@ CompatInputCopy copy_compat_input_from_sidecar(int source_fd) noexcept {
 void set_test_hooks(TestHooks value) noexcept { hooks = value; }
 void reset_test_hooks() noexcept { hooks = TestHooks{}; }
 #endif
+
+void apply_platform_decision_to_config(const PlatformDecision& decision,
+                                       icecc::p50::daemon::Config& config) noexcept {
+    config.child_handle_backend =
+        decision.child.backend == Backend::Compat
+            ? icecc::p50::ChildHandleBackend::Compat
+            : icecc::p50::ChildHandleBackend::Native;
+    config.input_backend =
+        decision.input.backend == Backend::Compat
+            ? icecc::p50::InputMaterializationBackend::Compat
+            : icecc::p50::InputMaterializationBackend::Native;
+    config.entropy_provider =
+        decision.random.backend == Backend::Compat
+            ? compat_store_identity_entropy
+            : icecc::p50::system_store_identity_entropy;
+}
 
 } // namespace icecc::p50::platform
