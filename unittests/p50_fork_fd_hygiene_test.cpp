@@ -649,6 +649,55 @@ void test_fallback_and_injected_failures() {
             "/proc directory EBADF close failure was ignored");
 }
 
+/* R-mutants robustness (the tmpfs finding): the unsealed-mutable-source
+   rejection has TWO branches -- "seals < 0" (F_GET_SEALS failed; ext4) and
+   "seals present but not WRITE|GROW|SHRINK" (tmpfs returns F_SEAL_SEAL on
+   a plain shmem file).  Both must reject; neither may depend on the
+   filesystem the test dir lives on. */
+void test_get_seals_failure_rejects_source()
+{
+#if defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
+    defined(F_SEAL_SHRINK)
+    Inventory inventory = make_inventory(true);
+    // Force the "seals < 0" branch on ANY filesystem (ext4 reaches it
+    // naturally; tmpfs does not -- the k310 agent's container had /tmp on
+    // host /dev/shm and the mutant survived vacuously).
+    auto hooks = icecc::p50::forkfd::TestHooks{};
+    hooks.force_get_seals_errno = EINVAL;
+    icecc::p50::forkfd::set_test_hooks(hooks);
+    auto rejected = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    icecc::p50::forkfd::reset_test_hooks();
+    require(!rejected.has_value(),
+            "source with failing F_GET_SEALS was accepted at mint");
+#endif
+}
+
+void test_shmem_seal_only_source_rejected()
+{
+#if defined(__linux__) && defined(MFD_ALLOW_SEALING) && defined(F_ADD_SEALS) && \
+    defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
+    defined(F_SEAL_SHRINK)
+    /* The tmpfs shape explicitly: a shmem regular file carrying ONLY
+       F_SEAL_SEAL (what a plain memfd reports) must be rejected -- it
+       lacks the WRITE|GROW|SHRINK immutability triple whether
+       F_GET_SEALS returns the seals or -1.  Same syscall pattern as
+       make_sealed_source (no libc memfd_create dependency). */
+    const int mem = static_cast<int>(::syscall(
+        SYS_memfd_create, "fork-fd-seal-only", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    require(mem >= 0, "memfd_create failed");
+    const char byte = 'y';
+    require(::write(mem, &byte, 1) == 1, "seal-only source write failed");
+    require(::fcntl(mem, F_ADD_SEALS, F_SEAL_SEAL) == 0,
+            "F_ADD_SEALS F_SEAL_SEAL failed");
+    auto rejected = icecc::p50::forkfd::test_make_delivery_owner(
+        mem, kAcceptedDeliveryId);
+    require(!rejected.has_value(),
+            "shmem regular file with only F_SEAL_SEAL was accepted at mint");
+    (void)::close(mem);
+#endif
+}
+
 void test_kcmp_errors_retire_private_handles() {
 #if defined(__linux__)
     for (const int error : {ENOSYS, EPERM, EINTR}) {
@@ -862,6 +911,8 @@ int main() {
     guard("fallback_and_injected_failures", true, test_fallback_and_injected_failures);
     guard("kcmp_errors_retire_private_handles", true, test_kcmp_errors_retire_private_handles);
     guard("proc_fallback_keeps_std_fds", false, test_proc_fallback_keeps_std_fds);
+    guard("get_seals_failure_rejects_source", false, test_get_seals_failure_rejects_source);
+    guard("shmem_seal_only_source_rejected", false, test_shmem_seal_only_source_rejected);
     if (ran == 0) {
         /* Nothing ran at all: the historical whole-binary SKIP.  With the
            set above this is unreachable unless every case is

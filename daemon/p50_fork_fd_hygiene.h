@@ -192,6 +192,12 @@ struct TestHooks {
     // production path has no fallback for OFD comparison; retirement must
     // nevertheless dispose of its private ownership handles safely.
     int force_kcmp_errno = 0;
+    // If non-zero, make F_GET_SEALS fail with this errno.  On tmpfs a
+    // plain shmem file returns F_SEAL_SEAL (not -1 EINVAL), so the
+    // unsealed-mutable-source rejection path "seals < 0" can only be
+    // exercised deterministically through this hook -- ext4 gives -1,
+    // tmpfs does not, and the test must not depend on the filesystem.
+    int force_get_seals_errno = 0;
     // Number of successful comparison calls to permit before injecting the
     // errno above.  This lets fork tests reach retirement after validation.
     int force_kcmp_after_calls = 0;

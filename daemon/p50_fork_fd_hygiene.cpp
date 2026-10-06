@@ -50,6 +50,27 @@ bool close_exact(int fd) noexcept {
     }
 }
 
+/* Test-hook accessor for capture_source_identity, which lives OUTSIDE
+   the anonymous namespace that owns the guarded `hooks` global: same
+   pattern as the in-namespace kcmp reads, just through a tiny inline
+   (zero cost in production builds: returns 0 when the hooks are not
+   compiled in). */
+namespace {
+
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+int hooked_get_seals_errno() noexcept
+{
+    return hooks.force_get_seals_errno;
+}
+#else
+constexpr int hooked_get_seals_errno() noexcept
+{
+    return 0;
+}
+#endif
+
+}  // namespace
+
 bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
     if (identity == nullptr)
         return false;
@@ -64,7 +85,18 @@ bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
 #if defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
     defined(F_SEAL_SHRINK)
     errno = 0;
-    const int seals = ::fcntl(fd, F_GET_SEALS);
+    /* Test hook (same pattern as force_kcmp_errno): force the F_GET_SEALS
+       failure path regardless of the filesystem -- tmpfs returns
+       F_SEAL_SEAL on a plain shmem file where ext4 returns -1 EINVAL, so
+       the "seals < 0" rejection branch is unreachable on tmpfs without
+       this.  The hooks struct is only instantiated by the test binary. */
+    const int hooked_seals_errno = hooked_get_seals_errno();
+    int seals = -1;
+    if (hooked_seals_errno != 0) {
+        errno = hooked_seals_errno;
+    } else {
+        seals = ::fcntl(fd, F_GET_SEALS);
+    }
     if (seals < 0)
         return false;
     const int immutable_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
