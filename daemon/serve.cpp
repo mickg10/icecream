@@ -58,6 +58,7 @@
 #include "p50_completion_record.h"
 #include "p50_task_count.h"
 #include "p50_fork_fd_hygiene.h"
+#include "../services/stage_trace.h"
 
 #include <sys/time.h>
 
@@ -377,6 +378,8 @@ int handle_connection(const string &basedir, CompileJob *job,
         rmsg.setAssignmentIdentity(job->assignmentEpoch(), job->assignmentNonce());
         rmsg.setCompileIdentity(job->cGuid(), job->tuSeq());
         unsigned int job_id = job->jobID();
+        icecc::stagetrace::stage_trace("fdaemon", "compile_start",
+            (int64_t)job->assignmentEpoch(), (int64_t)job_id);
 
         char *tmp_output = nullptr;
         char prefix_output[32]; // 20 for 2^64 + 6 for "icecc-" + 1 for trailing NULL
@@ -512,6 +515,10 @@ int handle_connection(const string &basedir, CompileJob *job,
             log_info() << "write of result failed" << endl;
             throw myexception(EXIT_DISTCC_FAILED);
         }
+        icecc::stagetrace::stage_trace("fdaemon", "compile_result_sent",
+            (int64_t)job->assignmentEpoch(), (int64_t)job->jobID(),
+            icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+            {{"status", (int64_t)rmsg.status}});
 
         const bool p50_input = job->usesP50Input();
         if (!p50_input) {
@@ -532,6 +539,8 @@ int handle_connection(const string &basedir, CompileJob *job,
             if (rmsg.have_dwo_file) {
                 write_output_file(dwo_file, client);
             }
+            icecc::stagetrace::stage_trace("fdaemon", "object_sent",
+                (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
         }
 
         if (!p50_input && client->protocol >= PROTOCOL_VERSION &&
@@ -598,6 +607,11 @@ int handle_connection(const string &basedir, CompileJob *job,
         rmpath(tmp_path.c_str());
     }
 
+    icecc::stagetrace::stage_trace("fdaemon", "child_exit",
+        (int64_t)job->assignmentEpoch(), (int64_t)job->jobID(),
+        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+        {{"exit_code", (int64_t)exit_code}});
+    icecc::stagetrace::flush();
     delete job;
 
     _exit(exit_code);
