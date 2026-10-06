@@ -5,9 +5,11 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -50,6 +52,48 @@ ssize_t deterministic_entropy(void* destination, size_t size,
 std::shared_ptr<LaunchIdentityAllocator> allocator(uint64_t generation) {
     return std::make_shared<LaunchIdentityAllocator>(generation, 1,
                                                      deterministic_entropy);
+}
+
+// Reads the process-state character (e.g. 'Z' for zombie, 'R' for running,
+// 'S' for sleeping) from /proc/<pid>/stat. Returns 0 if the entry cannot be
+// read at all, mirroring the same "unreadable means gone" signal already
+// used by read_starttime_ticks(). The second field (comm) is itself
+// parenthesized and may contain ')' characters, so the state character is
+// taken as the first non-space character after the *last* ')' in the line,
+// exactly as the kernel's own proc(5) parsing advice recommends.
+char read_proc_state_char(pid_t pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+    FILE* file = std::fopen(path, "r");
+    if (file == nullptr)
+        return 0;
+    char buffer[512];
+    const size_t read_count = std::fread(buffer, 1, sizeof(buffer) - 1, file);
+    std::fclose(file);
+    buffer[read_count] = '\0';
+    const char* close_paren = std::strrchr(buffer, ')');
+    if (close_paren == nullptr || *(close_paren + 1) == '\0')
+        return 0;
+    const char* cursor = close_paren + 1;
+    while (*cursor == ' ')
+        ++cursor;
+    return *cursor;
+}
+
+// After a consuming reap, /proc/<pid> may already be fully gone (state
+// character 0), or -- far less likely, but possible under aggressive pid
+// reuse -- the kernel may have already recycled the pid for an unrelated
+// process by the time this is checked. Both outcomes mean "this exact
+// child is gone": the second is distinguished from "still our zombie" the
+// same way CompatInvariantViolation itself already does, by starttime --
+// a recycled pid cannot report the original child's starttime.
+bool proc_pid_gone(pid_t pid, unsigned long long original_starttime) {
+    if (read_proc_state_char(pid) == 0)
+        return true;
+    unsigned long long now_starttime = 0;
+    if (!icecc::p50::platform::read_starttime_ticks(pid, &now_starttime))
+        return true;
+    return now_starttime != original_starttime;
 }
 
 class TestKillDomainVerifier final : public KillDomainVerifier {
@@ -883,6 +927,157 @@ void test_lifecycle() {
               "compat errno-capture test: when unreadable, observed_errno "
               "is 0 (parse-only failure) or names the process actually "
               "being gone (ENOENT/ESRCH), not an unrelated errno");
+    }
+
+    // --- Slice-1 hardening requirement #4: a real-fork registry
+    // integration test. This targets CentralChildReaperRegistry's own
+    // two-call reap_one() protocol directly -- no adapter
+    // (SidecarLifecycle::advance()/consume_reap_events()) is in the loop;
+    // SidecarLifecycle is used here only exactly as the requirement #3 test
+    // above already does, as the established way to mint a real
+    // owner_key()/reap_mailbox()/incarnation() triple.
+    //
+    // Fork a child, register it as (Compat, Sidecar), and let it exit. The
+    // first reap_one() call is the WNOWAIT peek: it must observe the child
+    // while its zombie is still present (/proc/<pid>/stat state 'Z'), and
+    // must not reap it -- the zombie must still be visible immediately
+    // afterward. The caller's own process-group kill is then issued,
+    // strictly before the consuming reap. The second reap_one() call is the
+    // real kernel reap (WNOWAIT cleared): it must return a populated,
+    // exact_identity() ReapEvent, and /proc/<pid> must be gone immediately
+    // afterward. A third reap_one() call -- a second consume attempt, with
+    // the entry still registered but already observed -- must be rejected
+    // (nullopt). Only then is the Registration token dropped, and the
+    // registry must end empty.
+    {
+        CentralChildReaperRegistry fork_registry;
+        SidecarLifecycleConfig fork_config = config;
+        SidecarLifecycle fork_lifecycle(fork_config);
+        CHECK(fork_lifecycle.begin(t0).action == LifecycleAction::LaunchPrepared,
+              "real-fork registry test: begin emits one launch preparation");
+
+        const pid_t fork_child = ::fork();
+        CHECK(fork_child >= 0, "real-fork registry test: fork succeeds");
+        if (fork_child == 0) {
+            // Become our own process-group leader so the parent's later
+            // group-kill step targets a real, meaningful kernel group
+            // rather than relying on caller-asserted pid==pgid alone.
+            ::setpgid(0, 0);
+            ::_exit(0);
+        }
+
+        unsigned long long fork_starttime = 0;
+        CHECK(icecc::p50::platform::read_starttime_ticks(fork_child,
+                                                           &fork_starttime) &&
+                  fork_starttime != 0,
+              "real-fork registry test: the real starttime is readable for "
+              "the live/zombie child");
+
+        move_to_forked(fork_lifecycle, fork_child, t0);
+        CHECK(fork_lifecycle.state() == LifecycleState::ForkedAwaitExecAndReady,
+              "real-fork registry test: lifecycle reaches the forked state");
+
+        auto fork_registration = fork_registry.register_owner(
+            fork_child, fork_child, fork_lifecycle.owner_key(),
+            fork_lifecycle.reap_mailbox(), ChildHandleBackend::Compat, 0, 0,
+            /*pidfd=*/-1, incarnation_for(*fork_lifecycle.identity()),
+            ReaperOwnerKind::Sidecar,
+            /*starttime_ticks=*/static_cast<uint64_t>(fork_starttime));
+        CHECK(fork_registration.valid(),
+              "real-fork registry test: a Compat Sidecar registration for "
+              "the real forked child, with its real starttime, is accepted");
+        CHECK(fork_registry.size() == 1,
+              "real-fork registry test: the registry holds exactly the one "
+              "owner just registered");
+
+        // Bounded wait for the child to actually become a zombie before the
+        // WNOWAIT peek, so the peek below is proven against a real zombie,
+        // not a still-running child. setpgid() in the child happens-before
+        // its _exit(), so by the time it is a zombie the process-group
+        // change below is guaranteed to already be in effect. The deadline
+        // is wall-clock (monotonic), not an attempt count, since H1 can be
+        // heavily loaded under concurrent QA runs.
+        bool became_zombie = false;
+        const auto zombie_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < zombie_deadline) {
+            if (read_proc_state_char(fork_child) == 'Z') {
+                became_zombie = true;
+                break;
+            }
+            ::usleep(1000);
+        }
+        CHECK(became_zombie,
+              "real-fork registry test: the child reaches zombie state "
+              "within the bounded wait");
+
+        // First reap_one() call: the WNOWAIT peek. Must observe but not
+        // reap -- no ReapEvent yet, and the zombie must still be present.
+        const auto peek_event = fork_registry.reap_one(fork_child, -1);
+        CHECK(!peek_event.has_value(),
+              "real-fork registry test: the first reap_one() call (the "
+              "WNOWAIT peek) emits no ReapEvent yet");
+        CHECK(read_proc_state_char(fork_child) == 'Z',
+              "real-fork registry test: the zombie is still present "
+              "immediately after the WNOWAIT peek -- it was observed, not "
+              "reaped");
+        CHECK(fork_registry.size() == 1,
+              "real-fork registry test: the owner remains registered after "
+              "the WNOWAIT peek");
+
+        // The group kill: issued strictly before the consuming reap below.
+        // The child is already a zombie and cannot act on any signal, so
+        // this call is about ordering, not effect; it must not disturb the
+        // zombie's presence or the registry's state either way.
+        const int group_kill_result = ::kill(-fork_child, SIGKILL);
+        CHECK(group_kill_result == 0 || errno == ESRCH,
+              "real-fork registry test: the group kill targeting the "
+              "child's own process group completes before the consuming "
+              "reap (a zombie cannot receive it, so success or ESRCH are "
+              "both acceptable)");
+        CHECK(read_proc_state_char(fork_child) == 'Z',
+              "real-fork registry test: the zombie survives the group kill "
+              "-- only the consuming reap below may remove it");
+
+        // Second reap_one() call: the real, consuming reap (WNOWAIT
+        // cleared). Must return a populated, well-formed ReapEvent, and the
+        // zombie must be gone immediately afterward.
+        const auto consume_event = fork_registry.reap_one(fork_child, -1);
+        CHECK(consume_event.has_value() &&
+                  consume_event->exact_identity() &&
+                  consume_event->pid == fork_child &&
+                  consume_event->backend == ChildHandleBackend::Compat &&
+                  consume_event->kind == ReaperOwnerKind::Sidecar,
+              "real-fork registry test: the second reap_one() call (the "
+              "consuming reap) returns a populated, well-formed ReapEvent "
+              "for exactly this child");
+        CHECK(proc_pid_gone(fork_child, fork_starttime),
+              "real-fork registry test: /proc/<pid> is gone (or, under "
+              "pid-reuse, now reports a different starttime) immediately "
+              "after the consuming reap -- no zombie remains");
+        CHECK(fork_registry.size() == 1,
+              "real-fork registry test: the owner entry itself is still "
+              "present (now fully observed) until its Registration token "
+              "is dropped");
+
+        // Third reap_one() call: a second consume attempt, with the entry
+        // still registered but already observed. Must be rejected outright.
+        const auto second_consume_event =
+            fork_registry.reap_one(fork_child, -1);
+        CHECK(!second_consume_event.has_value(),
+              "real-fork registry test: a second consume attempt on an "
+              "already-observed entry is rejected");
+        CHECK(fork_registry.size() == 1,
+              "real-fork registry test: rejecting the second consume "
+              "attempt does not disturb the still-registered entry");
+
+        // Only now drop the Registration token: observed==true alone does
+        // not erase the entry, so the registry only "ends empty" once the
+        // RAII token itself is released.
+        fork_registration.reset();
+        CHECK(fork_registry.size() == 0,
+              "real-fork registry test: the registry ends empty once the "
+              "Registration token is dropped");
     }
 
     // --- fixup! requirement (a): a Compat invariant violation whose owner,
