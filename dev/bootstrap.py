@@ -27,6 +27,11 @@ class BootstrapError(RuntimeError):
     pass
 
 
+# Set in main() once the clean-tree check has produced the exact commit the
+# snapshot tests; consumed by build_source's qa container env below.
+QA_SOURCE_COMMIT = ""
+
+
 def load_spec(path: Path, repository: str | None = None) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or set(data) - FIELDS:
@@ -217,15 +222,46 @@ def build_source(run: Run, image: str, source: Path, spec: dict, name: str, mode
     temporary.mkdir()
     temporary.chmod(0o1777)
     container = "icecream-dev-" + uuid.uuid4().hex[:16]
+    # QA needs a REAL non-loopback IP: the six end-to-end remote-compile
+    # tests (native-e2e-check) gate on ICECC_P50_C1F1_WORKER_SCHEDULER_HOST
+    # being an ordinary IPv4 the container OWNS, and the two root-side
+    # tests chown their scratch to the icecc user -- a --network=none
+    # container has only loopback, so they all SKIPped in every official
+    # run.  A user-defined network gives the qa container its own bridge
+    # IP while staying off the production farm's default bridge (the
+    # daemons broadcast-discover by netname; an isolated network cannot
+    # join it -- same isolation property as --network=none).
+    qa_network = "icecream-dev-qa-" + uuid.uuid4().hex[:12] if mode == "qa" else None
+    if qa_network is not None:
+        # inside the try: a failed network create must still run the
+        # finally (the container rm -f of a never-created name is a
+        # harmless no-op, and the network rm cleans a partial create)
+        try:
+            run.command("network-" + name, ["docker", "network", "create", qa_network])
+        except BootstrapError:
+            pass
+    # Docker's default seccomp profile gates kcmp behind CAP_SYS_PTRACE, so
+    # the fork-fd descriptor-identity checks (and with them the whole hygiene
+    # suite, before its per-case restructure) silently SKIP under a profile
+    # without that capability.  dev/seccomp-kcmp.json is the stock moby
+    # default with ONE change: kcmp allowed unconditionally -- it enforces
+    # its own ptrace-mode-cred check in-kernel, so nothing is granted.
+    # The QA container keeps --cap-add SYS_PTRACE off: the profile, not the
+    # capability, is what unblocks kcmp now.
+    seccomp_profile = ROOT / "dev" / "seccomp-kcmp.json"
     argv = ["docker", "run", "--name", container, "--rm", "--pull=never",
-            # Native descriptor-identity checks require kcmp, which Docker's
-            # default runtime profile enables with this capability. The
+            # Native descriptor-identity checks require kcmp, which the
+            # default profile enables only with this capability. The
             # container retains its own PID namespace; no host PID access.
             *(["--cap-add", "SYS_PTRACE"] if mode == "qa" else []),
-            "--label", f"icecream.dev.run={run.root.name}", "--network=none",
+            *(["--security-opt", f"seccomp={seccomp_profile}"] if mode == "qa" else []),
+            "--label", f"icecream.dev.run={run.root.name}",
+            (f"--network={qa_network}" if qa_network is not None else "--network=none"),
             "--cpus", str(spec["jobs"]), "--memory", f"{spec['memory_gb']}g",
             "--env", f"ICEFARM_OUTPUT_UID={os.getuid()}",
             "--env", f"ICEFARM_OUTPUT_GID={os.getgid()}",
+            *(["--env", f"ICECC_QA_SOURCE_COMMIT={QA_SOURCE_COMMIT}"]
+              if mode == "qa" and QA_SOURCE_COMMIT else []),
             "--mount", f"type=bind,src={source},dst=/source,readonly",
             "--mount", f"type=bind,src={work},dst=/work",
             # Older native probes use literal /tmp, ignoring TMPDIR.
@@ -236,6 +272,8 @@ def build_source(run: Run, image: str, source: Path, spec: dict, name: str, mode
     finally:
         # Only the unique container created by this invocation can be removed.
         subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=30)
+        if qa_network is not None:
+            subprocess.run(["docker", "network", "rm", qa_network], capture_output=True, timeout=30)
     return work
 
 
@@ -294,8 +332,28 @@ def main(argv: list[str] | None = None) -> int:
             raise BootstrapError("use a local Docker daemon: DockerRootDir is not accessible on this host")
         if shutil.disk_usage(storage).free < 8 * 1024**3:
             raise BootstrapError("DockerRootDir requires at least 8 GiB free")
+        # QA must run a COMMITTED tree: the snapshot copies tracked files
+        # INCLUDING uncommitted edits, so a dirty worktree would silently
+        # test something that exists nowhere.  A round-6 stale-file sync
+        # (run-qa.sh updated, its farmharness expectations not) shipped
+        # exactly that divergence; the commit sha recorded below is the
+        # only honest acceptance claim.
+        source_commit = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        if args.action == "qa":
+            dirty = subprocess.run(
+                ["git", "-C", str(ROOT), "status", "--porcelain"],
+                capture_output=True, check=True).stdout
+            if dirty:
+                raise BootstrapError(
+                    "qa requires a clean committed tree; commit or stash first "
+                    "(the snapshot would otherwise include uncommitted edits)")
         source = run.root / "source-snapshot"
         identity = snapshot(ROOT, source)
+        report["source_commit"] = source_commit
+        global QA_SOURCE_COMMIT
+        QA_SOURCE_COMMIT = source_commit
         sdk = sdk_image(run, spec)
         report.update(source_sha256=identity, sdk_image_id=sdk, profile=spec["profile"],
                       sdk_reference=run.sdk_reference,

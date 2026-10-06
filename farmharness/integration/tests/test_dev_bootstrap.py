@@ -277,13 +277,21 @@ def test_build_source_mounts_read_only_snapshot_and_cleans_its_container(
     work = bootstrap.build_source(run, "sha256:sdk", source, spec, "current", mode)
 
     assert work == tmp_path / "current"
-    assert len(run.commands) == 1
-    argv = run.commands[0][1]
-    assert "--network=none" in argv
-    assert "--pull=never" in argv
+    # qa mode: TWO commands -- the user-defined network is created (and torn
+    # down in the finally) before the run; bootstrap mode: one command.
+    assert len(run.commands) == (2 if mode == "qa" else 1)
+    argv = run.commands[-1][1]
     if mode == "qa":
+        # the qa container needs a real non-loopback IP (the e2e remote-
+        # compile gates) -- its own isolated user-defined network, not the
+        # default bridge and not --network=none
+        assert any(str(a).startswith("--network=icecream-dev-qa-") for a in argv)
+        assert "--network=none" not in argv
         assert argv[argv.index("--cap-add") + 1] == "SYS_PTRACE"
+        assert any(str(a).startswith("seccomp=") and str(a).endswith("seccomp-kcmp.json")
+                    for a in argv)
     else:
+        assert "--network=none" in argv
         assert "--cap-add" not in argv
     assert f"type=bind,src={source},dst=/source,readonly" in argv
     assert f"type=bind,src={work},dst=/work" in argv
@@ -292,7 +300,14 @@ def test_build_source_mounts_read_only_snapshot_and_cleans_its_container(
     assert f"type=bind,src={temporary},dst=/tmp" in argv
     assert argv[-2:] == [mode, "2"]
     container = argv[argv.index("--name") + 1]
-    assert cleanup == [["docker", "rm", "-f", container]]
+    # qa tears down BOTH the container and its user-defined network;
+    # bootstrap mode has no network to remove.
+    if mode == "qa":
+        network = next(a for a in argv if str(a).startswith("--network="))
+        assert cleanup == [["docker", "rm", "-f", container],
+                           ["docker", "network", "rm", network.split("=", 1)[1]]]
+    else:
+        assert cleanup == [["docker", "rm", "-f", container]]
 
 
 def test_build_source_cleans_its_container_after_docker_run_failure(
@@ -315,8 +330,18 @@ def test_build_source_cleans_its_container_after_docker_run_failure(
     run.command = fail_command  # type: ignore[method-assign]
     with pytest.raises(bootstrap.BootstrapError, match="mock docker run failed"):
         bootstrap.build_source(run, "sha256:sdk", source, {"jobs": 2, "memory_gb": 8}, "current", "qa")
-    container = next(item for item in cleanup[0] if item.startswith("icecream-dev-"))
-    assert cleanup == [["docker", "rm", "-f", container]]
+    container = next(
+        item
+        for call in cleanup
+        for item in call
+        if str(item).startswith("icecream-dev-") and "qa-" not in str(item)
+    )
+    # the finally removes BOTH the container and the qa network
+    assert ["docker", "rm", "-f", container] in cleanup
+    assert any(
+        call[:3] == ["docker", "network", "rm"] and str(call[3]).startswith("icecream-dev-qa-")
+        for call in cleanup
+    )
 
 
 def test_product_image_build_uses_installed_tree_and_sdk_without_network(

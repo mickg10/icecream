@@ -755,7 +755,23 @@ Result proc_fallback(const KeepSet& keep) noexcept {
 }
 
 Result close_range_sweep(const KeepSet& keep) noexcept {
-#if defined(SYS_close_range)
+/* QA knob (configure --enable-qa-force-proc-sweep): compile the close_range
+   backend OUT of the PRODUCTION daemon so the whole native suite exercises
+   the proc_fallback path -- the backend the f28-header builds (the node
+   image and the rpm) run in production, where SYS_close_range is not
+   defined by the distro headers.  Release QA on a modern SDK would
+   otherwise never run that path end to end; this is the cheap
+   test-what-we-ship variant (the full variant is an f28-SDK QA leg).
+   The TEST-HOOKS binary is exempt: it compiles this file with
+   ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS to exercise BOTH backends'
+   injected-failure paths (force_close_range_failure et al), and a knob'd
+   short-circuit here made those cases exit without the explicit failure
+   they assert ("close_range failure was not explicit", the round-3 proc
+   tree).  The hooks macro is never defined in the daemon. */
+#if defined(ICECC_FORCE_PROC_SWEEP) && !defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+    (void)keep;
+    return {Failure::BackendUnavailable, 0};
+#elif defined(SYS_close_range)
 #  if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
     if (hooks.force_close_range_failure)
         return {Failure::CloseFailure, 0};

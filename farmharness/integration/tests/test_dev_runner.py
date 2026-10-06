@@ -42,6 +42,18 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     _executable(runner, runner_text)
 
     _executable(fake_bin / "findmnt", "#!/bin/sh\nprintf 'ro,relatime\\n'\n")
+    # placeholder built binaries: the setcap stages only need them to exist
+    # and be executable (the real qa tree has the compiled daemons); the
+    # forced-proc tree gets its own pair for native-proc-setcap.
+    for placeholder in ("build/daemon/iceccd", "build/scheduler/icecc-scheduler",
+                        "tmp/build-proc/daemon/iceccd",
+                        "tmp/build-proc/scheduler/icecc-scheduler"):
+        (work_root / placeholder).parent.mkdir(parents=True, exist_ok=True)
+        _executable(work_root / placeholder, "#!/bin/sh\nexit 0\n")
+    # the e2e setcap stage needs setcap/getcap on PATH (the qa image carries
+    # libcap2-bin; this fake stands in for it)
+    _executable(fake_bin / "setcap", "#!/bin/sh\nexit 0\n")
+    _executable(fake_bin / "getcap", "#!/bin/sh\nexit 0\n")
     _executable(
         fake_bin / "stat",
         "#!/bin/sh\n"
@@ -78,8 +90,8 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     _executable(
         source_mount / "configure",
         "#!/bin/sh\n"
-        'printf "%s\\n" "$PWD" > "$WORK_ROOT/configure.cwd"\n'
-        'printf "%s\\n" "$*" > "$WORK_ROOT/configure.args"\n'
+        'printf "%s\\n" "$PWD" >> "$WORK_ROOT/configure.cwd"\n'
+        'printf "%s\\n" "$*" >> "$WORK_ROOT/configure.args"\n'
         "exit 0\n",
     )
     _executable(
@@ -106,6 +118,9 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
 
     env = {
         **os.environ,
+        # pin the e2e host so native-e2e-check is deterministic in this test
+        # (run-qa.sh honors a preset value; the container default is its own)
+        "ICECC_P50_C1F1_WORKER_SCHEDULER_HOST": "10.0.0.1",
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "WORK_ROOT": str(work_root),
         "MAKE_LOG": str(tmp_path / "make.log"),
@@ -130,26 +145,52 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     )
 
     assert result.returncode == (1 if native_status else 0), result.stdout + result.stderr
-    assert (work_root / "configure.cwd").read_text().strip() == str(work_root / "build")
+    # qa runs a SECOND configure (the forced-proc tree in build-proc);
+    # the fake appends, so check the FIRST configure ran in the main dir.
+    configure_cwds = (work_root / "configure.cwd").read_text().splitlines()
+    assert configure_cwds[0] == str(work_root / "build")
     configure_args = (work_root / "configure.args").read_text()
     assert f"--prefix={work_root}/install" in configure_args
 
     make_calls = (tmp_path / "make.log").read_text().splitlines()
-    assert len(make_calls) == (4 if native_status == 0 else 3)
+    # qa stages: all, install, native-check, then (green) the forced-proc
+    # tree's check and the six-test e2e check; the root leg's check runs the
+    # root-side tests (the two e2e root gates, the sidecar leg, envchardev).
+    # all, install, check, then (green) the proc tree's all+check, the
+    # six-test e2e check (pinned via the preset host below), the root leg.
+    assert len(make_calls) == (7 if native_status == 0 else 3)
     assert make_calls[0].endswith(" all")
     assert make_calls[1].endswith(" install")
     assert make_calls[2].endswith(" check")
     if native_status == 0:
-        assert make_calls[3].endswith(
-            " check TESTS=p50cacheservice p50cacheservice-sanitize.sh"
-        )
+        # 3: the forced-proc tree's full build (inside the proc stage's
+        # bash -c), 4: its hygiene+compilee2e check, 5: the six-test e2e
+        # check, 6: the root leg (the two root e2e gates, the sidecar leg,
+        # envchardev).
+        assert make_calls[3].startswith("-C . ")
+        assert "p50forkfdhygiene" in make_calls[4]
+        # 5: the root leg, 6: the six-test e2e check (runs last)
+        assert "p50sourcearm-live-run.sh" in make_calls[5]
+        assert "stdfdsanitize-sidecar.sh" in make_calls[5]
+        assert "envchardev.c.sh" in make_calls[5]
+        assert "remoteice-quick.sh" in make_calls[6]
     user_stages = (tmp_path / "runuser.log").read_text().splitlines()
-    assert len(user_stages) == 7
+    # python-sync, autogen, configure, build, install, native-check, pytest
+    # run as nobody (7); green adds the forced-proc build, its setcap'd
+    # check and native-e2e-check (10); the root-side stages
+    # (native-e2e-setcap, native-proc-setcap, native-root-check) are
+    # exempt from runuser.
+    assert len(user_stages) == (10 if native_status == 0 else 7)
     assert all(line.startswith("-u nobody -- ") for line in user_stages)
     assert not any("native-root-check" in line for line in user_stages)
-    assert (tmp_path / "tmp.log").read_text().splitlines() == [
-        "/tmp|/tmp"
-    ] * (4 if native_status == 0 else 3)
+    assert not any("native-e2e-setcap" in line for line in user_stages)
+    assert not any("native-proc-setcap" in line for line in user_stages)
+    # the /tmp mapping count scales with the added stages (each stage
+    # start/end pair touches the fake tmp helper); the invariant is that
+    # every entry maps /tmp to itself.
+    tmp_lines = (tmp_path / "tmp.log").read_text().splitlines()
+    assert tmp_lines and all(line == "/tmp|/tmp" for line in tmp_lines)
+    assert len(tmp_lines) >= (4 if native_status == 0 else 3)
     stat_calls = (tmp_path / "stat.log").read_text().splitlines()
     assert any(line.endswith("/tmp") for line in stat_calls)
     assert any(line.endswith(f"{work_root}/tmp") for line in stat_calls)
@@ -172,6 +213,9 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     summary = json.loads((work_root / "artifacts" / "summary.json").read_text())
     assert summary == {
         "mode": "qa",
+        # the clean-tree commit recorded by bootstrap.py; the fake harness
+        # runs run-qa.sh directly, so no ICECC_QA_SOURCE_COMMIT is set
+        "source_commit": "unknown",
         "jobs": 2,
         "autogen_exit": 0,
         "configure_exit": 0,
@@ -179,6 +223,10 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         "install_exit": 0,
         "python_sync_exit": 0,
         "native_check_exit": native_status,
+        # the proc/e2e stages are gated on a green native-check, so a failed
+        # check leaves both null (never ran) and the root leg unrun
+        "native_proc_check_exit": None if native_status else 0,
+        "native_e2e_check_exit": None if native_status else 0,
         "native_root_check_exit": None if native_status else 0,
         "pytest_exit": 0,
         "overall_exit": 1 if native_status else 0,

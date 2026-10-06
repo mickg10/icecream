@@ -879,6 +879,10 @@ for _ in $(seq 1 30); do
 done
 test "$cache_ready" -eq 1 || {
     echo "FAIL: production F cache endpoint was not advertised READY" >&2
+    echo "--- scheduler log (login/RELOGIN tail):" >&2
+    grep -aE "login |RELOGIN |broadcast|accepted" "$work/scheduler.log" 2>/dev/null | tail -12 >&2
+    echo "--- F daemon log (sidecar/auth tail):" >&2
+    grep -avE "lifecycle turn: action_taken=0" "$work/f.log" 2>/dev/null | tail -12 >&2
     exit 1
 }
 fi
