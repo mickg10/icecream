@@ -53,6 +53,16 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
     # the e2e setcap stage needs setcap/getcap on PATH (the qa image carries
     # libcap2-bin; this fake stands in for it)
     _executable(fake_bin / "setcap", "#!/bin/sh\nexit 0\n")
+    # per-stage test-log copies: the real make check writes per-test
+    # .log/.trs + test-suite.log into build/unittests and each later
+    # native-* stage overwrites them; the fakes never write them, so the
+    # pre-created sentinels stand in for the stage's own outputs and must
+    # land under artifacts/<stage>/ the moment each stage finishes.
+    fake_unittests = work_root / "build" / "unittests"
+    fake_unittests.mkdir(parents=True, exist_ok=True)
+    (fake_unittests / "some-test.log").write_text("log-sentinel\n", encoding="utf-8")
+    (fake_unittests / "some-test.trs").write_text("trs-sentinel\n", encoding="utf-8")
+    (fake_unittests / "test-suite.log").write_text("suite-sentinel\n", encoding="utf-8")
     # placeholder source test: the REQUIRED clang leg invokes the
     # compilee2e script directly (the TESTS mechanism cannot run one
     # test twice); the fake harness only proves the stage wiring.
@@ -206,6 +216,33 @@ def test_dev_qa_separates_unprivileged_checks_and_root_only_gate(
         f"{work_root}/python-env",
         f"-R --no-dereference 1234:5678 {work_root}",
     ]
+
+    # every make-check native stage copied the per-test logs out before
+    # the next stage overwrote them; a failed native-check stops the later
+    # native stages, so only native-check's own copy exists in that shape.
+    # The copy comes from the tree the stage CHECKED: the main-tree stages
+    # see the sentinel sentinels; native-proc-check2 checks the forced-proc
+    # tree, whose fake build never created tmp/build-proc/unittests, so its
+    # copy is legitimately absent (the -d guard) -- proving a stage dir is
+    # created only from the stage's OWN logs, never another stage's.
+    expected_stage_copies = (
+        ["native-check"] if native_status else
+        ["native-check", "native-root-check", "native-e2e-check"]
+    )
+    for stage in expected_stage_copies:
+        stage_dir = work_root / "artifacts" / stage
+        assert (stage_dir / "some-test.log").read_text(encoding="utf-8") == "log-sentinel\n"
+        assert (stage_dir / "some-test.trs").read_text(encoding="utf-8") == "trs-sentinel\n"
+        assert (stage_dir / "test-suite.log").read_text(encoding="utf-8") == "suite-sentinel\n"
+    # stages that run no make check of their own keep NO directory
+    # (setcap, the clang leg, the proc-tree build), and a failed
+    # native-check leaves none of the gated later stage dirs either.
+    assert not (work_root / "artifacts" / "build").is_dir()
+    assert not (work_root / "artifacts" / "native-proc-check2").is_dir()
+    assert not (work_root / "artifacts" / "native-e2e-setcap").is_dir()
+    assert not (work_root / "artifacts" / "native-e2e-clang").is_dir()
+    if native_status:
+        assert not (work_root / "artifacts" / "native-root-check").is_dir()
 
     pytest_args = (tmp_path / "pytest.log").read_text()
     assert "-m pytest" in pytest_args

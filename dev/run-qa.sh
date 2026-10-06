@@ -181,6 +181,30 @@ run_stage() {
         native-root-check) native_root_check_status=$status ;;
         python-pytest) pytest_status=$status ;;
     esac
+    # Per-stage test logs: the make-check native stages share ONE
+    # unittests dir and each later stage OVERWRITES the per-test
+    # .log/.trs and test-suite.log -- after the round only the LAST
+    # stage's skip reasons survive (the k310 gate on H1 hit exactly
+    # that: the native-check SKIP text for the e2e/root tests was
+    # unrecoverable, native-check.log rolls up "SKIP: <name>" only).
+    # Copy each stage's logs out the moment it finishes, from the tree
+    # that stage actually CHECKED (native-proc-check2 checks the
+    # forced-proc tree, not $BUILD).  Stages that run no make check
+    # (setcap, the clang leg's direct script) keep no directory: a
+    # stage dir carrying another stage's logs would be worse than none.
+    # The copy is best-effort (|| true): a stage's verdict is its own
+    # exit status, never the copy's.
+    local stage_testdir=
+    case "$name" in
+        native-check|native-root-check|native-e2e-check) stage_testdir=$BUILD/unittests ;;
+        native-proc-check2) stage_testdir=$WORK_ROOT/tmp/build-proc/unittests ;;
+    esac
+    if [[ -n "$stage_testdir" && -d "$stage_testdir" ]]; then
+        mkdir -p "$ARTIFACTS/$name" || true
+        cp "$stage_testdir/"*.log "$ARTIFACTS/$name/" 2>/dev/null || true
+        cp "$stage_testdir/"*.trs "$ARTIFACTS/$name/" 2>/dev/null || true
+        cp "$stage_testdir/test-suite.log" "$ARTIFACTS/$name/" 2>/dev/null || true
+    fi
     return 0
 }
 
