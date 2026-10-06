@@ -38,6 +38,7 @@ EXTRA_DIST = \
 	icecc-create-env.adoc \
 	icecream.adoc \
 	p49-assignment-fence.md \
+	fd-bug-2026-10-05.md \
 	p50-assignment-identity.md \
 	p50-cache-advertisement.md \
 	p50-input-attachment.md
