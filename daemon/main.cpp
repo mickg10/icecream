@@ -98,6 +98,7 @@
 
 #include "ncpus.h"
 #include "exitcode.h"
+#include "fd_guards.h"
 #include "serve.h"
 #include "workit.h"
 #include "logging.h"
@@ -11330,6 +11331,21 @@ int main(int argc, char **argv)
     int max_processes = -1;
     int max_preprocess_processes = -1;
     srand(time(nullptr) + getpid());
+
+    /* First thing after entry, before any other code runs: a container start
+       or a supervisor may exec us with fds 1/2 closed, and every job child
+       inherits that state -- workit's pipe() then squats onto the closed
+       descriptors (pipe(sock_err) lands exactly on (1,2)) and the compiler
+       ends up exec'd with stdout/stderr closed.  Re-open /dev/null onto any
+       closed std fd NOW, from the host fs, before any chroot could hide it;
+       an already-open std fd (a real pipe) is never touched.  Failure here is
+       logged but not fatal: a healthy start never even reaches the open(). */
+    if (!icecc::sanitize_standard_fds()) {
+        static const char msg[] =
+            "iceccd: warning: could not sanitize standard fds (/dev/null "
+            "unavailable); closed std fds may break remote compiles\n";
+        (void)!::write(2, msg, sizeof(msg) - 1);
+    }
 
     Daemon d;
 

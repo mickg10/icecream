@@ -45,6 +45,7 @@
 #include <job.h>
 #include <comm.h>
 
+#include "fd_guards.h"
 #include "environment.h"
 #include "exitcode.h"
 #include "tempfile.h"
@@ -300,6 +301,24 @@ int handle_connection(const string &basedir, CompileJob *job,
     if (!hygiene.ok()) {
         report_fork_hygiene_failure(out_fd, job, hygiene.failure);
         _exit(EXIT_IO_ERROR);
+    }
+
+    /* The job child may have inherited CLOSED std fds (the sweep above starts
+       at fd 3 by design and never touches 0/1/2 -- see fd_guards.h).  workit's
+       pipe() sequence squats onto closed low descriptors: with 1/2 closed,
+       pipe(sock_err) lands exactly on (1,2) and the compiler ends up exec'd
+       with stdout/stderr closed.  Re-open /dev/null onto any closed std fd
+       HERE, before the environment chdir/chroot below hides the host fs; an
+       open std fd is never touched, so a healthy child pays three fcntls.
+       The child's real std redirection (workit's pipes) happens later, as
+       always -- this only guarantees the descriptors EXIST. */
+    if (!icecc::sanitize_standard_fds()) {
+        /* No std fds and no /dev/null: fail this job loudly rather than exec a
+           compiler that cannot report anything. */
+        log_error() << "iceccd job child could not sanitize standard fds "
+                       "(no /dev/null before the environment transition)"
+                    << endl;
+        _exit(EXIT_DISTCC_FAILED);
     }
 
     reset_debug();

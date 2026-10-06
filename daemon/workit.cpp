@@ -28,6 +28,7 @@
 #include "tempfile.h"
 #include "assert.h"
 #include "exitcode.h"
+#include "fd_guards.h"
 #include "logging.h"
 #include "pipes.h"
 #include <sys/select.h>
@@ -213,6 +214,26 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         return EXIT_DISTCC_FAILED;
     }
 
+    /* FD SQUAT GUARD (see fd_guards.h): move every pipe end off any standard
+       slot it squatted, BEFORE the child-side dup2/close sequence runs --
+       otherwise a workit forked with 1/2 closed self-clobbers (the sequence
+       closes the stdout it just installed; dup2(2,2) is a no-op; fd 2 goes
+       down with close(sock_err[1])).  The daemon's startup sanitize keeps
+       0/1/2 open in the first place; this is the belt to that braces. */
+    {
+        int *fd_list[] = {
+            &sock_err[0], &sock_err[1],
+            &sock_out[0], &sock_out[1],
+            &sock_in[0], &sock_in[1],
+            &main_sock[0], &main_sock[1],
+            &death_pipe[0], &death_pipe[1],
+            nullptr,
+        };
+        if (!icecc::move_pipe_ends_off_standard_fds(fd_list)) {
+            return EXIT_DISTCC_FAILED;
+        }
+    }
+
     if (fcntl(sock_in[1], F_SETFL, O_NONBLOCK)) {
         return EXIT_DISTCC_FAILED;
     }
@@ -386,53 +407,13 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
 
         close_debug();
 
-        if ((-1 == close(sock_out[0])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if (-1 == dup2(sock_out[1], STDOUT_FILENO)){
-            log_perror("dup2 failed");
-        }
-
-        if ((-1 == close(sock_out[1])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if ((-1 == close(sock_err[0])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if (-1 == dup2(sock_err[1], STDERR_FILENO)){
-            log_perror("dup2 failed");
-        }
-
-        if ((-1 == close(sock_err[1])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if ((-1 == close(sock_in[1])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if (-1 == dup2(sock_in[0], STDIN_FILENO)){
-            log_perror("dup2 failed");
-        }
-
-        if ((-1 == close(sock_in[0])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if ((-1 == close(main_sock[0])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-        fcntl(main_sock[1], F_SETFD, FD_CLOEXEC);
-
-        if ((-1 == close(death_pipe[0])) && (errno != EBADF)){
-            log_perror("close failed");
-        }
-
-        if ((-1 == close(death_pipe[1])) && (errno != EBADF)){
-            log_perror("close failed");
+        /* The std-fd installation and the socketpair/death-pipe teardown are
+           the shared fd_guards.h sequence (see install_pipe_fds_as_standard
+           there for why the pipe ends must already be off the std slots --
+           the FD SQUAT GUARD above moved them). */
+        if (!icecc::install_pipe_fds_as_standard(sock_out, sock_err, sock_in,
+                                                 main_sock, death_pipe)) {
+            log_perror("std fd installation failed (dup2 or CLOEXEC fcntl)");
         }
 
 #ifdef ICECC_DEBUG

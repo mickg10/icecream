@@ -19,6 +19,16 @@
 #  include <sys/types.h>
 #  if defined(SYS_close_range)
 #    include <linux/close_range.h>
+#  elif defined(__x86_64__)
+/* close_range(2) is x86_64 syscall 436 (kernel 5.9+).  Builds against old
+   distro headers (Fedora 28-era glibc, the build0xx node images) do not
+   define SYS_close_range, so close_range_sweep compiled OUT and the
+   unbounded proc_fallback backend ran on every job child -- the production
+   fd bug.  Supply the number for x86_64 the way pidfd-uapi does; on a
+   kernel without the syscall it returns ENOSYS and sweep() falls back to
+   the (now bounded) proc path. */
+#    define SYS_close_range 436
+#    define ICECC_SUPPLIED_CLOSE_RANGE_NR 1
 #  endif
 #endif
 
@@ -623,6 +633,20 @@ bool parse_fd_name(const char* name, size_t length, int* fd) noexcept {
 }
 
 Result proc_fallback(const KeepSet& keep) noexcept {
+    /* The sweep's contract is "every fd the child does not need" -- and the
+       child ALWAYS needs its standard fds: workit's pipe()/dup2 sequence
+       squats onto any closed std slot (pipe(sock_err) landing exactly on
+       (1,2) when they are closed execs the compiler with stdout/stderr
+       shut; in a chroot without /dev/null clang dies instantly).  The
+       close_range backend honours that by construction (it starts at
+       kFirstNonstandardFd); THIS backend enumerated /proc/self/fd
+       unbounded and closed 0/1/2 as well -- the production fd bug on the
+       build0xx-shaped nodes, where SYS_close_range is not defined at build
+       time (old glibc headers) so proc_fallback is the ONLY backend that
+       ever runs: the job child closed its own std fds in every job.  Bound
+       the inventory at kFirstNonstandardFd: std fds are never sweepable,
+       and validate_keep_set() already guarantees nothing kept sits below
+       kFirstNonstandardFd, so this cannot leak a needed fd. */
     if (injected_proc_failure())
         return {Failure::EnumerationFailure, 0};
 
@@ -685,7 +709,8 @@ Result proc_fallback(const KeepSet& keep) noexcept {
                     failure = Failure::ParseFailure;
                     break;
                 }
-                if (fd != proc_fd && !is_kept(fd, keep)) {
+                if (fd >= kFirstNonstandardFd &&
+                    fd != proc_fd && !is_kept(fd, keep)) {
                     if (inventory_size == kMaxEnumeratedFds) {
                         failure = Failure::EnumerationFailure;
                         break;
