@@ -68,7 +68,10 @@ if id -u icecc >/dev/null 2>&1; then icecc_user=icecc; fi
 SCHED_ADDR=${ICECC_TEST_SCHED_ADDR:-127.0.0.1}
 
 workdir=$(mktemp -d /tmp/p5failrep.XXXXXX) || fail mktemp
-trap 'kill $sched_pid $daemonA_pid $daemonB_pid 2>/dev/null; rm -rf "$workdir"' EXIT INT TERM
+# keep_workdir=1 (set by the startup gate when a process died) preserves the
+# evidence for diagnosis; every other exit path cleans up as before.
+keep_workdir=
+trap 'kill $sched_pid $daemonA_pid $daemonB_pid 2>/dev/null; [ -n "$keep_workdir" ] || rm -rf "$workdir"' EXIT INT TERM
 
 # A REAL env via icecc-create-env, then the env's ./usr/bin/{gcc,g++}
 # REPLACED with a real ELF fixture: prints "no space left on device" to
@@ -114,21 +117,70 @@ tar -C "$workdir/envpack/root" -czf "$workdir/env.tgz" . || fail "tar fixture fa
 mkdir -p "$workdir/envsA" "$workdir/envsB" "$workdir/homeA" "$workdir/homeB"
 chown -R "${icecc_user:-nobody}" "$workdir"
 
-ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$SCHEDULER" -vvv -n failrepnet -l "$workdir/sched.log" &
+# Each process's stderr goes to its OWN file next to its -l log: the -l
+# log is opened by the process itself, so a process that dies BEFORE
+# startup logging (arg parsing, an early exit path) leaves the -l file
+# absent or empty and the round-11 shape ("a daemon exited early: "
+# with NOTHING after the colon, because the glob matched zero files)
+# is undiagnosable from the artifacts.  The stderr files are written by
+# the SHELL from the first redirected byte, so they exist and hold the
+# death text even when -l never opened.
+ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" \
+    "$SCHEDULER" -vvv -n failrepnet -l "$workdir/sched.log" \
+    > "$workdir/sched.stderr" 2>&1 &
 sched_pid=$!
 sleep 1
-ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$ICECCD" -vvv -n failrepnet -N localnode -p 10255 \
-    -b "$workdir/envsA" -l "$workdir/daemonA.log" &
+ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" \
+    "$ICECCD" -vvv -n failrepnet -N localnode -p 10255 \
+    -b "$workdir/envsA" -l "$workdir/daemonA.log" \
+    > "$workdir/daemonA.stderr" 2>&1 &
 daemonA_pid=$!
 # No -s: the daemons discover the scheduler by broadcast on the netname
 # (the same shape envchardev.c.sh runs); SCHED_ADDR only matters for the
 # strict-localhost rows and is kept for parity, unused here.
-ICECC_TEST_SOCKET="$workdir/b.sock" HOME="$workdir/homeB" "$ICECCD" -vvv -n failrepnet -N remotenode -p 10256 \
-    -b "$workdir/envsB" -l "$workdir/daemonB.log" &
+ICECC_TEST_SOCKET="$workdir/b.sock" HOME="$workdir/homeB" \
+    "$ICECCD" -vvv -n failrepnet -N remotenode -p 10256 \
+    -b "$workdir/envsB" -l "$workdir/daemonB.log" \
+    > "$workdir/daemonB.stderr" 2>&1 &
 daemonB_pid=$!
 sleep 5
+# Startup gate: a dead process must leave a DIAGNOSIS, not silence.  The
+# -l logs hold the daemon's own early lines when it got that far; the
+# .stderr files hold the death text when it did not (arg-parse exit,
+# pre-logging abort).  Zero log files is called out explicitly so the
+# glob can never again swallow the emptiness.
 for pid in $sched_pid $daemonA_pid $daemonB_pid; do
-    kill -0 "$pid" 2>/dev/null || fail "a daemon exited early: $(tail -3 "$workdir"/*.log 2>/dev/null)"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        # The exit status survives only until the pid is reaped, and this
+        # pid is a child of this shell: wait NOW (it is dead, so wait
+        # returns immediately) and print the raw status before the tails.
+        # st > 128 is death by signal -- 137 = SIGKILL (the OOM killer or
+        # an external kill: BOTH the -l log and the .stderr file stay
+        # empty, and this line is then the only evidence), 139 = SIGSEGV,
+        # anything else = a real exit code from the process itself.
+        wait "$pid" 2>/dev/null
+        st=$?
+        if [ "$st" -gt 128 ]; then
+            echo "p50remote-failreport: pid $pid exited status=$st (signal $((st-128)))" 1>&2
+        else
+            echo "p50remote-failreport: pid $pid exited status=$st" 1>&2
+        fi
+        echo "p50remote-failreport: a process exited early; log tails follow" 1>&2
+        any_log=0
+        for f in "$workdir"/sched.log "$workdir"/sched.stderr \
+                 "$workdir"/daemonA.log "$workdir"/daemonA.stderr \
+                 "$workdir"/daemonB.log "$workdir"/daemonB.stderr; do
+            if [ -s "$f" ]; then
+                any_log=1
+                echo "--- $f:" 1>&2
+                tail -6 "$f" 1>&2
+            fi
+        done
+        [ "$any_log" = 1 ] || \
+            echo "p50remote-failreport: NO log files have content -- all six are absent or empty" 1>&2
+        keep_workdir=1
+        fail "a daemon/scheduler exited early (see the tails above; workdir kept: $workdir)"
+    fi
 done
 
 printf 'int main(void){return 0;}\n' > "$workdir/t.c"
