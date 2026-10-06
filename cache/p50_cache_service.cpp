@@ -31,6 +31,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "services/digest128.h"
+#include "services/stage_trace.h"
 #include "p50_incarnation_identity.h"
 
 #include <utility>
@@ -1444,6 +1445,13 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
             // This runs before TX_COMMIT is written, so an F-side attachment
             // cannot observe the record in its pre-commit state.
             const bool observed = input_lifecycle_.observe_route_commit(key, retained);
+            // No (assignment_epoch, wire_job_id) at this cache-identity layer:
+            // the input lifecycle table is keyed by (c_store_guid, tu_seq)
+            // only. Stamp what is known; epoch/wire_id stay kUnknown.
+            icecc::stagetrace::stage_trace("fsidecar", "input_committed",
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                {{"tu_seq", (int64_t)key.tu_seq.value}, {"retained", (int64_t)retained}});
             if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr)
                 std::fprintf(stderr, "P50 sidecar lifecycle commit tu=%llu retained=%d observed=%d\n",
                              static_cast<unsigned long long>(key.tu_seq.value),
@@ -1490,6 +1498,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     local::P50SourceTransferRequest request,
     sidecar::AbsoluteMonotonicDeadline deadline,
     local::HandoffFd source) noexcept {
+    icecc::stagetrace::stage_trace("csidecar", "transfer_request_received",
+        (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
+        (int64_t)request.logical_job, (int64_t)request.compiler_attempt);
     const auto clock = sidecar::process_monotonic_clock_identity();
     if (!route_owner_ || !request.valid() || !config_.sidecar_launch.has_value() ||
         !config_.sidecar_launch->valid() ||
@@ -1886,6 +1897,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 append_source_result_trace(
                     request, expected_c_guid, relationship.profile, observed,
                     source_mutex_wait_ns, source_mutex_service_ns);
+                icecc::stagetrace::stage_trace("csidecar", "transfer_completed",
+                    (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
+                    (int64_t)request.logical_job, (int64_t)request.compiler_attempt,
+                    {{"status", (int64_t)observed.status}});
                 if (source_authority_)
                     source_authority_->release_source(route_request);
                 completion->set_value(value);
@@ -2553,6 +2568,12 @@ void SidecarRuntime::route_fsession_connection(int connection_fd) noexcept {
             fsession_pumps_.push_back(pump);
             fsession_live_.store(fsession_owner_.live_operations(),
                                  std::memory_order_release);
+            // Raw accept of a C sidecar's connection: the wire protocol
+            // (and thus assignment_epoch/wire_job_id) is not parsed yet.
+            icecc::stagetrace::stage_trace("fsidecar", "session_accepted",
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                {{"cid", (int64_t)cid}});
             fsession_arm_read(std::move(pump));
         });
     } catch (...) {
