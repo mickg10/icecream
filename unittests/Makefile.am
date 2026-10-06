@@ -38,6 +38,11 @@ TESTS += p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh
 TESTS += p50completionflow-source.py
 TESTS += p50compilerquiescence
 TESTS += p50-runtime-evidence-test.py
+# stdfd regression (the remote-compile fd bug): workit-level (farm-free) and
+# daemon-level (starts the real daemon with 1/2 closed).
+TESTS += stdfdworkit stdfdsanitize-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh
+
+stdfdworkit_SOURCES = stdfdworkit.cpp
 TESTS += p50completionrecord-sanitize.sh
 TESTS += p50completionflow-run.sh
 TESTS += p50profile p50profile-source.sh p50_profile_sanitize.sh
@@ -187,7 +192,7 @@ p50cachefdseam_LDADD = ../services/libicecc.la
 p50readyadvertisement_LDADD = ../cache/libp50sidecar.a
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest armedadmissiontest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest armedadmissiontest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics stdfdworkit
 check_PROGRAMS += s3persistence
 check_PROGRAMS += dumpmachinecache
 check_PROGRAMS += p50s3realprocess
