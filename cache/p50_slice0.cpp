@@ -1,6 +1,7 @@
 #include "p50_slice0.h"
 #include "codec/p29_intern.h"
 #include "codec/p29_wire.h"
+#include "services/stage_trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2483,6 +2484,14 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
             route.p29v1->deserializer.pending_segment_digest();
         pending.p29v1_materialized = true;
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+        // (c_store_guid, tu_seq) is this layer's identity; no
+        // (assignment_epoch, wire_job_id) is threaded this deep into the
+        // F-store materialize path without a protocol change.
+        icecc::stagetrace::stage_trace("fsidecar", "input_materialized",
+            icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+            icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+            {{"tu_seq", (int64_t)pending.begin.tu_seq.value},
+             {"raw_bytes", (int64_t)pending.begin.raw_bytes}});
         return result;
     } catch (...) {
         route.p29v1->terminal = true;
