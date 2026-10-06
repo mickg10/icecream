@@ -40,7 +40,7 @@ TESTS += p50compilerquiescence
 TESTS += p50-runtime-evidence-test.py
 # stdfd regression (the remote-compile fd bug): workit-level (farm-free) and
 # daemon-level (starts the real daemon with 1/2 closed).
-TESTS += stdfdworkit stdfdsanitize-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh
+TESTS += stdfdworkit stdfdsanitize-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh p50remote-failreport.sh
 
 stdfdworkit_SOURCES = stdfdworkit.cpp
 TESTS += p50completionrecord-sanitize.sh

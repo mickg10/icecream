@@ -32,6 +32,8 @@
 #include "logging.h"
 #include "pipes.h"
 #include <sys/select.h>
+#include <cerrno>
+#include <cstring>
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
@@ -167,8 +169,10 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
             trace() << "ZSTD_TU compiler input cursor validated byte-exact at offset zero"
                     << endl;
         } catch (const std::exception &error) {
-            log_warning() << "P50 compiler input validation failed: "
-                          << error.what() << endl;
+            log_warning() << "worker-side I/O error: P50 compiler input"
+                              " validation failed: " << error.what()
+                          << " (errno " << errno << ", " << strerror(errno)
+                          << ")" << endl;
             error_client(client, "P50 compiler input validation failed");
             return EXIT_IO_ERROR;
         }
@@ -499,14 +503,18 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                 }
                 break;
             case CompilerInputReadResult::UnexpectedMessage:
-                log_error() << "protocol error while reading preprocessed file" << endl;
+                log_error() << "worker-side I/O error: protocol error while"
+                               " reading the preprocessed file (errno "
+                            << errno << ", " << strerror(errno) << ")" << endl;
                 return_value = EXIT_IO_ERROR;
                 input.disable();
                 kill(pid, SIGTERM);
                 input.discard_pending();
                 break;
             case CompilerInputReadResult::UnexpectedEof:
-                log_warning() << "unexpected EOF while reading preprocessed file" << endl;
+                log_warning() << "worker-side I/O error: unexpected EOF while"
+                                  " reading the preprocessed file (errno "
+                              << errno << ", " << strerror(errno) << ")" << endl;
                 return_value = EXIT_IO_ERROR;
                 input.disable();
                 kill(pid, SIGTERM);
@@ -577,7 +585,12 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
         case 0:
 
             if (!input.complete()) {
-                log_warning() << "timeout while reading preprocessed file" << endl;
+                /* R15: the honest class name for this EXIT_IO_ERROR source --
+                   the client sees a remote I/O error line (not OOM) and this
+                   worker log line is the one it points at. */
+                log_warning() << "worker-side I/O error: 60s input-read timeout"
+                                  " while reading the preprocessed file (errno "
+                              << errno << ", " << strerror(errno) << ")" << endl;
                 kill(pid, SIGTERM); // Won't need it any more ...
                 return_value = EXIT_IO_ERROR;
                 input.disable();

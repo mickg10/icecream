@@ -1391,7 +1391,26 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             if (p50_input && getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
                 log_warning() << "P50 server reported a resource failure" << endl;
             } else {
-                log_warning() << "the server ran out of memory, recompiling locally" << endl;
+                /* Honest reporting (R15): the OOM bit is the LOCAL-FALLBACK
+                   trigger and stays set for both EXIT_OUT_OF_MEMORY (105,
+                   a real ENOMEM kill) and EXIT_IO_ERROR (107 -- worker input
+                   read timeout, EOF, open failure), because an old peer
+                   falls back on the bit and would otherwise surface a
+                   worker IO hiccup as a user-visible compile failure.  The
+                   worker binds status = 105/107 on that path (ours since
+                   c8bb615f), so pick the text from status instead of
+                   faking OOM for both; a stock/old worker may leave the
+                   status at 0 or stale, which lands in the neutral text. */
+                if (status == 105 /* EXIT_OUT_OF_MEMORY */) {
+                    log_warning() << "the server " << remote_daemon
+                                  << " ran out of memory, recompiling locally" << endl;
+                } else if (status == 107 /* EXIT_IO_ERROR */) {
+                    log_warning() << "remote I/O error on " << remote_daemon
+                                  << " (see that worker's log), recompiling locally" << endl;
+                } else {
+                    log_warning() << "remote job failed on " << remote_daemon
+                                  << " (out of memory or I/O error), recompiling locally" << endl;
+                }
             }
             throw remote_error(101, "Error 101 - the server ran out of memory, recompiling locally");
         }

@@ -455,11 +455,37 @@ int handle_connection(const string &basedir, CompileJob *job,
         if (ret) {
             if (ret == EXIT_OUT_OF_MEMORY) {   // we catch that as special case
                 rmsg.was_out_of_memory = true;
+                log_warning() << "job " << job->jobID()
+                              << ": compile child killed by the memory limit"
+                              << " (reported to the client as retryable for"
+                              << " compatibility; the client logs it as OOM)"
+                              << endl;
             } else if (ret == EXIT_IO_ERROR) {
                 // This was probably running out of disk space.
                 // Fake that as running out of memory, since it's in practice
                 // a very similar problem.
                 rmsg.was_out_of_memory = true;
+                /* R15: the bit stays set (it is the LOCAL-FALLBACK trigger;
+                   old peers fall back on it and would otherwise surface a
+                   worker IO hiccup as a user-visible compile failure), but
+                   say what actually happened: the worker-side IO paths
+                   that return EXIT_IO_ERROR -- the 60s input-read timeout,
+                   EOF/protocol error while reading the preprocessed file,
+                   a failing open/socket, or the compile child failing with
+                   a no-space-left report (workit's disk heuristic) -- have
+                   already logged their named line with errno in workit;
+                   this line names the class and the real status the client
+                   receives (107), so the worker's log and the client's
+                   line can be correlated. */
+                log_warning() << "job " << job->jobID()
+                              << ": worker-side I/O error (input read timeout,"
+                              << " EOF/protocol error, open/socket failure, or"
+                              << " the compiler reported no space left on"
+                              << " device -- see the lines above from work_it"
+                              << " for the named path and errno); status " << ret
+                              << " (EXIT_IO_ERROR) reported to the client as"
+                              << " retryable for compatibility, the client"
+                              << " logs it as a remote I/O error" << endl;
             } else {
                 throw myexception(ret);
             }
