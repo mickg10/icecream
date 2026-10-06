@@ -353,17 +353,19 @@ void test_lifecycle() {
     CentralChildReaperRegistry reaper;
     constexpr int lifecycle_pidfd = 1321;
     auto lifecycle_registration = reaper.register_owner(
-        321, 321, lifecycle.owner_key(), lifecycle.reap_mailbox(), 0, 0,
-        lifecycle_pidfd, incarnation_for(first));
+        321, 321, lifecycle.owner_key(), lifecycle.reap_mailbox(),
+        ChildHandleBackend::Native, 0, 0, lifecycle_pidfd,
+        incarnation_for(first));
     CHECK(lifecycle_registration.valid(), "central registry owns one pid");
     CHECK(!reaper.register_owner(321, 321, lifecycle.owner_key(),
-                                 lifecycle.reap_mailbox(), 0, 0,
+                                 lifecycle.reap_mailbox(),
+                                 ChildHandleBackend::Native, 0, 0,
                                  lifecycle_pidfd, incarnation_for(first)).valid(),
           "one PID has one owner");
     SidecarLifecycle sentinel(config);
     auto sentinel_registration = reaper.register_owner(
-        322, 322, sentinel.owner_key(), sentinel.reap_mailbox(), 0, 0,
-        1322, incarnation_for(first));
+        322, 322, sentinel.owner_key(), sentinel.reap_mailbox(),
+        ChildHandleBackend::Native, 0, 0, 1322, incarnation_for(first));
     CHECK(sentinel_registration.valid(), "central registry accepts sentinel owner");
     CHECK(reaper.next_unobserved_pid().value_or(-1) == 321,
           "central reaper starts at the first owner");
@@ -389,15 +391,16 @@ void test_lifecycle() {
         const pid_t pid = static_cast<pid_t>(10000 + index);
         auto token = capacity_registry.register_owner(
             pid, pid, ReaperOwnerKey{static_cast<uint64_t>(pid), 1},
-            lifecycle.reap_mailbox(), 0, 0, 20000 + static_cast<int>(index),
-            incarnation_for(first));
+            lifecycle.reap_mailbox(), ChildHandleBackend::Native, 0, 0,
+            20000 + static_cast<int>(index), incarnation_for(first));
         CHECK(token.valid(), "registry accepts an owner below its fixed cap");
         registrations.push_back(std::move(token));
     }
     CHECK(capacity_registry.size() == 256 &&
               !capacity_registry
                    .register_owner(20000, 20000, ReaperOwnerKey{20000, 1},
-                                    lifecycle.reap_mailbox(), 0, 0, 20256,
+                                    lifecycle.reap_mailbox(),
+                                    ChildHandleBackend::Native, 0, 0, 20256,
                                     incarnation_for(first))
                    .valid(),
           "registry rejects the owner above its fixed total cap");
@@ -662,8 +665,9 @@ void test_lifecycle() {
     const ReaperOwnerKey old_key = owner->owner_key();
     constexpr int old_pidfd = 1700;
     auto registration = lifetime_registry.register_owner(
-        700, 700, old_key, owner->reap_mailbox(), first_device, first_inode,
-        old_pidfd, incarnation_for(*owner->identity()));
+        700, 700, old_key, owner->reap_mailbox(), ChildHandleBackend::Native,
+        first_device, first_inode, old_pidfd,
+        incarnation_for(*owner->identity()));
     CHECK(registration.valid() && lifetime_registry.size() == 1,
           "RAII registration owns exact PID/generation");
     const auto captured_node = lifetime_registry.listener_node(700, old_key);
@@ -680,8 +684,9 @@ void test_lifecycle() {
     const ReaperOwnerKey new_key = reused->owner_key();
     constexpr int reused_pidfd = 1701;
     auto reused_registration = lifetime_registry.register_owner(
-        700, 700, new_key, reused->reap_mailbox(), first_device, first_inode,
-        reused_pidfd, incarnation_for(*reused->identity()));
+        700, 700, new_key, reused->reap_mailbox(), ChildHandleBackend::Native,
+        first_device, first_inode, reused_pidfd,
+        incarnation_for(*reused->identity()));
     reused->bind_reaper_identity(
         reused_pidfd, reused_registration.registry_generation());
     auto reused_mailbox = reused->reap_mailbox().lock();
@@ -705,8 +710,8 @@ void test_lifecycle() {
     move_to_forked(*dying, 701, t0);
     const ReaperOwnerKey dying_key = dying->owner_key();
     auto dying_registration = lifetime_registry.register_owner(
-        701, 701, dying_key, dying->reap_mailbox(), first_device, first_inode,
-        1702, incarnation_for(*dying->identity()));
+        701, 701, dying_key, dying->reap_mailbox(), ChildHandleBackend::Native,
+        first_device, first_inode, 1702, incarnation_for(*dying->identity()));
     dying.reset();
     CHECK(!lifetime_registry.observe_child_reaped(701, dying_key, 0, true),
           "destroyed owner rejects reap without UAF");

@@ -9,6 +9,7 @@
 // action returned by each call.
 
 #include "p50_sidecar_identity.h"
+#include "p50_compat_child_handle.h"
 
 #include <chrono>
 #include <cstdint>
@@ -187,6 +188,14 @@ struct ReapEvent {
     // authority: a lifecycle accepts an event only when the snapshot still
     // names its bound pidfd, registry slot, and LaunchIncarnation.
     int pidfd = -1;
+    // Which child-identity primitive this event's `pidfd`/`starttime_ticks`
+    // pair was observed through.  Native events carry an exact pidfd and
+    // leave starttime_ticks as supplementary (direct-worker only); Compat
+    // events carry no pidfd (ENOSYS on kernel 3.10-class hosts) and instead
+    // are exact only when `starttime_ticks` still matches the registered
+    // (pid, starttime) pair at delivery -- see
+    // icecc::p50::platform::CompatChildHandle in p50_compat_child_handle.h.
+    ChildHandleBackend backend = ChildHandleBackend::Native;
     uint64_t registry_generation = 0;
     LaunchIncarnation incarnation{};
     // Raw kernel wait classification captured by the exact pidfd probe.  The
@@ -201,7 +210,10 @@ struct ReapEvent {
     uint64_t starttime_ticks = 0;
 
     [[nodiscard]] bool exact_identity() const noexcept {
-        return owner.valid() && pid > 1 && pidfd >= 0 &&
+        const bool handle_exact = (backend == ChildHandleBackend::Native)
+                                       ? (pidfd >= 0)
+                                       : (pidfd < 0 && starttime_ticks != 0);
+        return owner.valid() && pid > 1 && handle_exact &&
                registry_generation != 0 && incarnation.valid() &&
                (kernel_code == CLD_EXITED || kernel_code == CLD_KILLED ||
                 kernel_code == CLD_DUMPED) && reaper_owner_kind_valid(kind) &&
@@ -896,8 +908,14 @@ public:
 
     // Preferred value-event API.  The returned token unregisters exactly this
     // PID/generation when destroyed, even if the registry itself is gone.
+    // `backend` is mandatory (not defaulted) and placed ahead of every
+    // defaulted parameter below so a caller can never silently fall back to
+    // Native: Native requires a real `pidfd`; Compat requires `pidfd < 0`
+    // and a non-zero `starttime_ticks` (see
+    // icecc::p50::platform::CompatChildHandle, p50_compat_child_handle.h).
     Registration register_owner(pid_t pid, pid_t pgid, ReaperOwnerKey owner,
                                 std::weak_ptr<ReapMailbox> mailbox,
+                                ChildHandleBackend backend,
                                 dev_t listener_device = 0,
                                 ino_t listener_inode = 0, int pidfd = -1,
                                 LaunchIncarnation incarnation = {},
@@ -911,7 +929,8 @@ public:
     // process-wide wait sweep.
     Registration register_direct_worker(
         pid_t pid, pid_t pgid, ReaperOwnerKey owner, int pidfd,
-        LaunchIncarnation incarnation, uint64_t starttime_ticks = 0) noexcept;
+        ChildHandleBackend backend, LaunchIncarnation incarnation,
+        uint64_t starttime_ticks = 0) noexcept;
 
     bool unregister_owner(pid_t pid, ReaperOwnerKey owner) noexcept;
     bool observe_child_reaped(pid_t pid, ReaperOwnerKey owner, int status,
@@ -948,6 +967,7 @@ private:
         dev_t listener_device = 0;
         ino_t listener_inode = 0;
         int pidfd = -1;
+        ChildHandleBackend backend = ChildHandleBackend::Native;
         LaunchIncarnation incarnation{};
         uint64_t registry_generation = 0;
         bool wait_observed = false;

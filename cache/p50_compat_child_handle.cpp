@@ -58,6 +58,10 @@ bool read_proc_stat_starttime(long pid, unsigned long long* out) noexcept {
 
 } // namespace
 
+bool read_starttime_ticks(long pid, unsigned long long* out) noexcept {
+    return read_proc_stat_starttime(pid, out);
+}
+
 bool CompatChildHandle::arm(long pid) noexcept {
     unsigned long long starttime = 0;
     if (!read_proc_stat_starttime(pid, &starttime))

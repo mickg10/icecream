@@ -81,4 +81,13 @@ private:
 [[nodiscard]] bool compat_wait_bounded(long pid, const CompatChildHandle& handle,
                                        int timeout_ms, int* exit_status) noexcept;
 
+// Thin wrapper over the same /proc/<pid>/stat starttime parser CompatChildHandle
+// uses internally, exposed so callers that already hold a previously-captured
+// starttime_ticks value (e.g. CentralChildReaperRegistry's Entry/ReapEvent) can
+// re-check it against a fresh read without constructing/arming a new
+// CompatChildHandle, which would re-baseline rather than compare against the
+// original value. False if the process cannot be read (already gone, or /proc
+// is unavailable).
+[[nodiscard]] bool read_starttime_ticks(long pid, unsigned long long* out) noexcept;
+
 } // namespace icecc::p50::platform

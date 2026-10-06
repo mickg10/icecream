@@ -1787,8 +1787,9 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
         incarnation.f_store_guid = outer_launch_identity_.f_store_guid;
         outer_registration_ = outer_reaper_->register_owner(
             outer_pid_, outer_pgid_, outer_lifecycle_->owner_key(),
-            outer_lifecycle_->reap_mailbox(), outer_listener_device_,
-            outer_listener_inode_, outer_pidfd_, std::move(incarnation));
+            outer_lifecycle_->reap_mailbox(), config_.child_handle_backend,
+            outer_listener_device_, outer_listener_inode_, outer_pidfd_,
+            std::move(incarnation));
         if (!outer_registration_.valid()) {
             fail_setup();
             return true;
