@@ -20,6 +20,7 @@ ice_HEADERS = \
 
 noinst_HEADERS = \
 	p50_cache_session_wire.h \
+	env_install_check.h \
 	exitcode.h \
 	fd_guards.h \
 	getifaddrs.h \

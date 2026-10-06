@@ -35,6 +35,7 @@
 #include <signal.h>
 
 #include "comm.h"
+#include "env_install_check.h"
 #include "exitcode.h"
 #include "util.h"
 
@@ -555,7 +556,33 @@ pid_t start_install_environment(const std::string &basename, const std::string &
         const char* currentFile = archive_entry_pathname(entry);
         const std::string fullOutputPath = dirname + "/"+currentFile;
         archive_entry_set_pathname(entry, fullOutputPath.c_str());
+        /* A character-device entry (the env's ./dev/null) extracts ONLY
+           with CAP_MKNOD, which the unprivileged daemon never has:
+           libarchive reports the failed mknod as a WARNING and the entry
+           silently goes missing.  That is LOUD here (the stock loop
+           tolerated the warning without a word) but NOT fatal: since the
+           fd fix, a chroot without /dev/null no longer breaks the
+           compiler (the daemon re-opens std fds from the host fs and
+           workit never execs with them closed), so an env whose dev
+           entries could not be created still WORKS -- an install that
+           would have "succeeded brokenly" before now succeeds with a
+           named warning.  Failing the install instead would reject every
+           dev-carrying env on every uid-dropped node for no gain. */
+        const bool is_chardev = (archive_entry_filetype(entry) == AE_IFCHR);
         r = archive_write_header(ext, entry);
+        if (is_chardev) {
+            if (!icecc::chardev_extract_is_complete(fullOutputPath.c_str())) {
+                log_warning() << "start_install_environment: character device "
+                               << currentFile << " could not be created"
+                               << " (no CAP_MKNOD after the drop: "
+                               << archive_error_string(ext) << "); "
+                               << "environment " << name
+                               << " installs WITHOUT " << currentFile
+                               << " (safe since the std-fd fix; legacy "
+                               << "compilers needing it in the chroot will "
+                               << "report it)" << endl;
+            }
+        }
 
         if(archive_entry_size(entry) > 0){
             r= copy_data(a, ext);

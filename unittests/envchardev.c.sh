@@ -21,8 +21,9 @@
 # - Pin ICECC_PREFERRED_HOST to the env-less node: fresh nets pick randomly.
 # - Wait >= 4s after both logins (fresh login reports load 1000 until the
 #   first stats ping clears eligibility).
-# - Pin ICECC_TEST_SOCKET per daemon (both bind the same $HOME socket path;
-#   the later starter unlinks the earlier one).
+# - Pin ICECC_TEST_SOCKET per daemon: a root-started daemon (CAP_SYS_CHROOT)
+#   binds the DEFAULT /var/run/icecc path, not $HOME/.iceccd.socket -- and
+#   two daemons would unlink each other's default socket.
 # - Root-STARTED daemons (capng drops to icecc internally): an unprivileged
 #   start sets noremote and never accepts the transfer.  The extract child
 #   then runs as icecc WITHOUT CAP_MKNOD -- the condition the warning names.
@@ -53,14 +54,28 @@ if id -u icecc >/dev/null 2>&1; then icecc_user=icecc; fi
 workdir=$(mktemp -d /tmp/envchardev.XXXXXX) || fail mktemp
 trap 'kill $sched_pid $daemonA_pid $daemonB_pid 2>/dev/null; rm -rf "$workdir"' EXIT INT TERM
 
-# A minimal env whose ./dev/null is a real char device (>= 500 bytes: the
-# client's lstat floor rejects smaller tarballs).  The compiler in the env
-# is the REAL gcc: the remote job must actually run and exit 0 on it.
-mkdir -p "$workdir/envroot/dev" "$workdir/envroot/bin"
-cp "$(command -v gcc)" "$workdir/envroot/bin/gcc" 2>/dev/null || fail "no gcc for the fixture"
-head -c 2048 /dev/urandom > "$workdir/envroot/pad"
-mknod "$workdir/envroot/dev/null" c 1 3 || fail "mknod fixture failed"
-tar -C "$workdir/envroot" -czf "$workdir/env.tgz" . || fail "tar fixture failed"
+# A REAL env via icecc-create-env (the compiler + its lib deps -- a bare
+# copied gcc binary cannot exec inside the env chroot, missing libs), then
+# ./dev/null added as a REAL char device (>= 500 bytes: the client's lstat
+# floor).  The remote job must actually run and exit 0 on this env.
+create_env="$top_build_dir/client/icecc-create-env"
+[ -f "$create_env" ] || create_env="$top_build_dir/client/icecc-create-env.in"
+[ -f "$create_env" ] || fail "no icecc-create-env in $top_build_dir/client"
+mkdir -p "$workdir/envpack"
+(cd "$workdir/envpack" && bash "$create_env" --gcc "$(command -v gcc)" "$(command -v g++)" \
+    > "$workdir/create-env.log" 2>&1) || {
+    cat "$workdir/create-env.log" >&2
+    fail "icecc-create-env fixture failed"
+}
+built_tar=$(awk '{print $NF}' "$workdir/create-env.log" | grep -E '\.tar\.gz$' | tail -1)
+[ -n "$built_tar" ] && [ -s "$workdir/envpack/$built_tar" ] || \
+    fail "create-env produced no tarball"
+tar -xzf "$workdir/envpack/$built_tar" -C "$workdir/envpack/root" 2>/dev/null || {
+    mkdir -p "$workdir/envpack/root" && \
+    tar -xzf "$workdir/envpack/$built_tar" -C "$workdir/envpack/root"; }
+mkdir -p "$workdir/envpack/root/dev"
+mknod "$workdir/envpack/root/dev/null" c 1 3 || fail "mknod fixture failed"
+tar -C "$workdir/envpack/root" -czf "$workdir/env.tgz" . || fail "tar fixture failed"
 tar -tzf "$workdir/env.tgz" | grep -q "dev/null" || fail "fixture lacks dev/null"
 [ "$(wc -c < "$workdir/env.tgz")" -ge 500 ] || fail "fixture under the client's 500-byte floor"
 
@@ -68,13 +83,17 @@ tar -tzf "$workdir/env.tgz" | grep -q "dev/null" || fail "fixture lacks dev/null
 mkdir -p "$workdir/envsA" "$workdir/envsB" "$workdir/homeA" "$workdir/homeB"
 chown -R "$icecc_user" "$workdir"
 
-HOME="$workdir/homeA" "$SCHEDULER" -vv -n envchardevnet -l "$workdir/sched.log" &
+# ICECC_TEST_SOCKET on EACH daemon pins its unix socket (a root-started
+# daemon with CAP_SYS_CHROOT binds the DEFAULT /var/run/icecc path, NOT
+# $HOME/.iceccd.socket -- and both daemons would race the same default;
+# the client below connects to daemon A's pinned path).
+ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$SCHEDULER" -vvv -n envchardevnet -l "$workdir/sched.log" &
 sched_pid=$!
 sleep 1
-HOME="$workdir/homeA" "$ICECCD" -vv -n envchardevnet -N localnode -p 10245 \
+ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$ICECCD" -vv -n envchardevnet -N localnode -p 10245 \
     -b "$workdir/envsA" -l "$workdir/daemonA.log" &
 daemonA_pid=$!
-HOME="$workdir/homeB" "$ICECCD" -vv -n envchardevnet -N remotenode -p 10246 \
+ICECC_TEST_SOCKET="$workdir/b.sock" HOME="$workdir/homeB" "$ICECCD" -vv -n envchardevnet -N remotenode -p 10246 \
     -b "$workdir/envsB" -l "$workdir/daemonB.log" &
 daemonB_pid=$!
 sleep 5
@@ -85,7 +104,7 @@ done
 # One remote compile pinned to node B: it pulls the env install, then RUNS.
 printf 'int main(void){return 0;}\n' > "$workdir/t.c"
 chown "$icecc_user" "$workdir/t.c"
-ICECC_TEST_SOCKET="$workdir/homeA/iceccd.socket" \
+ICECC_TEST_SOCKET="$workdir/a.sock" \
 ICECC_VERSION="$workdir/env.tgz" \
 ICECC_PREFERRED_HOST=remotenode CCACHE_DISABLE=1 HOME="$workdir/homeA" \
     "$ICECC" /usr/bin/gcc -c "$workdir/t.c" -o "$workdir/t.o" \
