@@ -75,6 +75,25 @@ static Msg *wait_type(MsgChannel *channel, Msg::Value wanted, int timeout_msec)
     return nullptr;
 }
 
+/* TAP99: wait for EITHER of two message types (the late-PREPARE outcome
+   race -- READY when the claim's job is still live, REVOKE_RESULT
+   when its END was handled first).  Returns the first match, with its
+   type left for the caller to inspect, or nullptr on timeout/EOF. */
+static Msg *wait_either(MsgChannel *channel, Msg::Value first,
+                        Msg::Value second, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    while (channel && Clock::now() < deadline) {
+        Msg *msg = channel->get_msg(1, true);
+        if (msg) {
+            if (*msg == first || *msg == second) return msg;
+            delete msg;
+        }
+        if (channel->at_eof()) break;
+    }
+    return nullptr;
+}
+
 static bool no_type(MsgChannel *channel, Msg::Value unwanted, int timeout_msec)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
@@ -687,13 +706,40 @@ int main(int argc, char **argv)
     REQUIRE(scheduler->send_msg(AssignPrepareMsg(
                 advisory_epoch, advisory_id, advisory_nonce, 9)),
             "late PREPARE binds the Advisory claim identity");
-    ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
-    ready = dynamic_cast<AssignReadyMsg *>(ready_wire);
-    REQUIRE(ready && ready->epoch() == advisory_epoch
-                && ready->wire_id == advisory_id
-                && ready->nonce() == advisory_nonce,
-            "late PREPARE installs the full identity and emits READY");
-    delete ready_wire;
+    /* TAP99 (the k310 agent's strace finding): this PREPARE races the
+       fixture job's teardown.  The fixture env has no toolchain, so the
+       job's compiler fails fast and its END may already have been
+       handled before this PREPARE lands -- under load the END won ~25%
+       of the time and this wait_type(ASSIGN_READY) timed out IN VAIN.
+       There is no daemon bug: per doc/p49-assignment-fence.md the
+       terminal is one immutable outcome and an EXACT duplicate replay
+       (this PREPARE) replays REVOKE_RESULT(ClaimedOrLater), never
+       READY.  So the correct expectation is ORDER-INDEPENDENT: READY
+       with the full identity when the job was still live, or the
+       ClaimedOrLater replay when END won the race.  (Keeping the job
+       alive instead would need a full create-env fixture with a blocked
+       compiler -- the fixture daemon here has no toolchain env at all.)
+       Both arms are pinned deterministically below: the held-open case
+       proves the READY arm with the job provably live, and the
+       explicit END-first case proves the replay arm. */
+    Msg *late_prepare_outcome =
+        wait_either(scheduler, Msg::ASSIGN_READY, Msg::REVOKE_RESULT, 3000);
+    if (late_prepare_outcome != nullptr
+            && *late_prepare_outcome == Msg::REVOKE_RESULT) {
+        RevokeResultMsg *replayed =
+            dynamic_cast<RevokeResultMsg *>(late_prepare_outcome);
+        REQUIRE(replayed && replayed->result == RevokeResultMsg::ClaimedOrLater,
+                "END-first race replays ClaimedOrLater, never READY");
+        delete late_prepare_outcome;
+        /* The terminal is consumed; the explicit revoke below replays it. */
+    } else {
+        ready = dynamic_cast<AssignReadyMsg *>(late_prepare_outcome);
+        REQUIRE(ready && ready->epoch() == advisory_epoch
+                    && ready->wire_id == advisory_id
+                    && ready->nonce() == advisory_nonce,
+                "late PREPARE installs the full identity and emits READY");
+        delete late_prepare_outcome;
+    }
     REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
                 advisory_epoch, advisory_id, advisory_nonce)),
             "Advisory claim and revoke race resolved by the one owner");
@@ -934,6 +980,122 @@ int main(int argc, char **argv)
             "strict mode leaves local CLIENTWORK admission exempt");
     delete local_begin;
     delete local;
+
+    /* TAP99, the READY arm (the k310 agent's strace finding, anchored on
+       the nonce bytes): a claim whose job is STILL LIVE when its late
+       PREPARE arrives must answer ASSIGN_READY with the full identity.
+       The old racy case above could not pin this arm because its
+       fixture job dies immediately (no toolchain env) and its END won
+       the ordering ~25% under load; this case keeps the claim channel
+       OPEN -- no client JobDone on it -- so the job stays live and the
+       READY arm is exercised deterministically.  This is a TEST race,
+       not a daemon bug: the daemon's answers are correct in both
+       orders. */
+    {
+        const uint32_t held_id = 1451;
+        const uint64_t held_nonce = UINT64_C(0x9200000000001451);
+        REQUIRE(prepare_strict(held_id, held_nonce),
+                "strict assignment installed for the held-open probe");
+        MsgChannel *held_claim = connect_daemon(socket_path);
+        REQUIRE(held_claim && send_claim(
+                    held_claim, held_id, strict_epoch, held_nonce),
+                "held-open strict claim sent");
+        Msg *held_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+        JobBeginMsg *held_begin_typed = dynamic_cast<JobBeginMsg *>(held_begin);
+        REQUIRE(held_begin_typed
+                    && held_begin_typed->job_id == held_id,
+                "held-open claim reaches admission");
+        delete held_begin;
+
+        /* The PREPARE arrives while the job is ALIVE (admitted, not yet
+           done): the buffered READY must surface WITHOUT any further
+           event on this channel -- no JobDone, no next claim, nothing.
+           RED at c8bb615f under load: the READY strands in the read
+           buffer until an unrelated wakeup ~4 s later; the 3 s wait
+           times out. */
+        REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                    strict_epoch, held_id, held_nonce, 17)),
+                "late PREPARE sent while the claim's job is held open");
+        Msg *held_ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+        AssignReadyMsg *held_ready =
+            dynamic_cast<AssignReadyMsg *>(held_ready_wire);
+        REQUIRE(held_ready && held_ready->epoch() == strict_epoch
+                    && held_ready->wire_id == held_id
+                    && held_ready->nonce() == held_nonce,
+                "buffered late PREPARE surfaces READY without an unrelated event");
+        delete held_ready_wire;
+
+        /* The explicit after-JobDone case: complete the held job, then
+           REVOKE the identity -- a CONSUMED claim must resolve
+           ClaimedOrLater, never regress to reserved.  (The JobDone is
+           what a real client sends on its channel; the REVOKE that
+           follows is the scheduler-side loss path for the same id.) */
+        REQUIRE(held_claim->send_msg(JobDoneMsg(held_id, 0)),
+                "held-open job completes with an explicit JobDone");
+        REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
+                    strict_epoch, held_id, held_nonce)),
+                "REVOKE sent for the JobDone-consumed identity");
+        Msg *held_revoke_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
+        RevokeResultMsg *held_revoke =
+            dynamic_cast<RevokeResultMsg *>(held_revoke_wire);
+        REQUIRE(held_revoke
+                    && held_revoke->result == RevokeResultMsg::ClaimedOrLater,
+                "revoke after JobDone resolves ClaimedOrLater, never reserved");
+        delete held_revoke_wire;
+        Msg *held_end = wait_type(held_claim, Msg::END, 3000);
+        REQUIRE(held_end || (held_claim && held_claim->at_eof()),
+                "held-open claim channel closes after its JobDone");
+        delete held_end;
+        delete held_claim;
+    }
+
+    /* TAP99, the REPLAY arm, deterministic (forced ordering, no
+       stress): the documented semantics of the one immutable terminal
+       (doc/p49-assignment-fence.md) -- an EXACT late PREPARE for an
+       identity whose claim's END was already handled replays
+       REVOKE_RESULT(ClaimedOrLater) and NEVER emits ASSIGN_READY.
+       This is the outcome the old racy case hit under load when its
+       fixture job's END won the ordering, and it is CORRECT daemon
+       behaviour, not a bug: the claim was consumed. */
+    {
+        const uint32_t ended_id = 1452;
+        const uint64_t ended_nonce = UINT64_C(0x9200000000001452);
+        REQUIRE(prepare_strict(ended_id, ended_nonce),
+                "strict assignment installed for the END-first replay probe");
+        MsgChannel *ended_claim = connect_daemon(socket_path);
+        REQUIRE(ended_claim && send_claim(
+                    ended_claim, ended_id, strict_epoch, ended_nonce),
+                "END-first claim sent");
+        Msg *ended_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+        JobBeginMsg *ended_begin_typed =
+            dynamic_cast<JobBeginMsg *>(ended_begin);
+        REQUIRE(ended_begin_typed
+                    && ended_begin_typed->job_id == ended_id,
+                "END-first claim reaches admission");
+        delete ended_begin;
+        /* Force the ordering: wait for the claim's OWN END first (the
+           fixture job fails fast -- no toolchain env), so the terminal
+           is retained BEFORE the late PREPARE lands. */
+        Msg *claim_end = wait_type(ended_claim, Msg::END, 3000);
+        REQUIRE(claim_end || (ended_claim && ended_claim->at_eof()),
+                "END-first claim's job finished before the late PREPARE");
+        delete claim_end;
+        REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                    strict_epoch, ended_id, ended_nonce, 17)),
+                "EXACT late PREPARE sent after the claim's END was handled");
+        Msg *replay_wire = wait_either(
+            scheduler, Msg::REVOKE_RESULT, Msg::ASSIGN_READY, 3000);
+        REQUIRE(replay_wire, "late PREPARE after END produced no outcome");
+        REQUIRE(*replay_wire == Msg::REVOKE_RESULT,
+                "late PREPARE after END answered ASSIGN_READY (must replay the terminal)");
+        RevokeResultMsg *replay = dynamic_cast<RevokeResultMsg *>(replay_wire);
+        REQUIRE(replay && replay->result == RevokeResultMsg::ClaimedOrLater,
+                "END-first exact replay is ClaimedOrLater");
+        delete replay_wire;
+        delete ended_claim;
+        REQUIRE(no_type(scheduler, Msg::ASSIGN_READY, 400),
+                "consumed identity never publishes READY afterwards");
+    }
 
     /* A fresh session demonstrates EnforcingCompat's intentional dual
        admission: nonce-less legacy claims and exact P50 claims. */
