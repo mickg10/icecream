@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyze import (  # noqa: E402
+    FResultSample,
     Record,
+    SourceResultSample,
     check_clock_sanity,
     derive_ntp_offsets,
     print_ntp_offsets,
@@ -111,15 +113,15 @@ def _sample(guid: str, tu_seq: int, t1: int, up_ns: int, delta_ns: int,
     t2 = t1 + up_ns + delta_ns
     t3 = t2 + processing_ns
     t4 = (t3 - delta_ns) + down_ns
-    c_rec = {"c_store_guid": guid, "tu_seq": tu_seq, "t1": t1, "t4": t4}
-    f_rec = {"c_store_guid": guid, "tu_seq": tu_seq, "t2": t2, "t3": t3}
+    c_rec = SourceResultSample(c_store_guid=guid, tu_seq=tu_seq, t1=t1, t4=t4)
+    f_rec = FResultSample(c_store_guid=guid, tu_seq=tu_seq, t2=t2, t3=t3)
     return c_rec, f_rec
 
 
 def test_derive_ntp_offsets_recovers_exact_offset_from_symmetric_samples():
     delta_ns = 50_000_000  # fhost1's clock reads 50ms ahead of chost
-    c_records: List[Dict[str, int]] = []
-    f_records: List[Dict[str, int]] = []
+    c_records: List[SourceResultSample] = []
+    f_records: List[FResultSample] = []
     base_t1 = 1_000_000_000_000
     # 18 "good" samples: symmetric 5ms one-way latency each direction, so
     # the sample offset recovers delta_ns exactly (see module derivation).
@@ -154,11 +156,11 @@ def test_derive_ntp_offsets_recovers_exact_offset_from_symmetric_samples():
 
 
 def test_derive_ntp_offsets_omits_host_with_no_joinable_samples():
-    c_records = [{"c_store_guid": "route-a", "tu_seq": 0,
-                   "t1": 1_000_000_000, "t4": 1_000_020_000}]
+    c_records = [SourceResultSample(c_store_guid="route-a", tu_seq=0,
+                                     t1=1_000_000_000, t4=1_000_020_000)]
     # Different c_store_guid -- never joins against the C record above.
-    f_records = [{"c_store_guid": "route-b", "tu_seq": 0,
-                   "t2": 1_000_005_000, "t3": 1_000_006_000}]
+    f_records = [FResultSample(c_store_guid="route-b", tu_seq=0,
+                                t2=1_000_005_000, t3=1_000_006_000)]
     results = derive_ntp_offsets(c_records, {"fhost1": f_records})
     assert results == {}
 
@@ -167,10 +169,10 @@ def test_derive_ntp_offsets_omits_host_when_a_timestamp_is_missing():
     # Joined on (c_store_guid, tu_seq), but F never captured t3 (0 means
     # "not captured", matching ICECC_P50_F_RESULT_TRACE being off or the
     # field predating this instrumentation).
-    c_records = [{"c_store_guid": "route-a", "tu_seq": 0,
-                   "t1": 1_000_000_000, "t4": 1_000_020_000}]
-    f_records = [{"c_store_guid": "route-a", "tu_seq": 0,
-                   "t2": 1_000_005_000, "t3": 0}]
+    c_records = [SourceResultSample(c_store_guid="route-a", tu_seq=0,
+                                     t1=1_000_000_000, t4=1_000_020_000)]
+    f_records = [FResultSample(c_store_guid="route-a", tu_seq=0,
+                                t2=1_000_005_000, t3=0)]
     results = derive_ntp_offsets(c_records, {"fhost1": f_records})
     assert results == {}
 
@@ -178,10 +180,10 @@ def test_derive_ntp_offsets_omits_host_when_a_timestamp_is_missing():
 def test_derive_ntp_offsets_drops_physically_impossible_negative_delay():
     # t4 - t1 - (t3 - t2) < 0 can only happen if the clocks/timestamps are
     # too broken to trust; such samples must never be averaged in.
-    c_records = [{"c_store_guid": "route-a", "tu_seq": 0,
-                   "t1": 1_000_000_000, "t4": 1_000_000_100}]
-    f_records = [{"c_store_guid": "route-a", "tu_seq": 0,
-                   "t2": 1_000_000_200, "t3": 1_000_050_000}]
+    c_records = [SourceResultSample(c_store_guid="route-a", tu_seq=0,
+                                     t1=1_000_000_000, t4=1_000_000_100)]
+    f_records = [FResultSample(c_store_guid="route-a", tu_seq=0,
+                                t2=1_000_000_200, t3=1_000_050_000)]
     results = derive_ntp_offsets(c_records, {"fhost1": f_records})
     assert results == {}
 

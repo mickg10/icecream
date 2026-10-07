@@ -208,17 +208,49 @@ def corrected_ts(rec: Record, offsets: Dict[str, int]) -> int:
 # to an existing offsets.json entry for the same host. Both traces are
 # diagnostic-only and env-gated; neither is required for correct operation,
 # and nothing here changes wire bytes or behavior.
+#
+# t2 is sampled on F immediately after the BEGIN frame read completes, so it
+# is F's receipt time for the BEGIN bytes, not F's dispatch time for them.
+# In pipelined mode the BEGIN frame can simply sit in F's socket receive
+# buffer for a while before F gets around to reading it (F is still busy
+# finishing an earlier session's HELLO/STATE exchange) -- that shows up as
+# one-way delay, which cancels out of the offset formula and only widens
+# the error bound, so the lowest-delay-decile filter in derive_ntp_offsets()
+# already handles it without special-casing pipelined mode.
 NTP_DISAGREEMENT_WARN_NS = 5_000_000  # 5ms, see review item 3
 
 
-def load_v5_source_results(path: str) -> List[Dict[str, int]]:
+@dataclass
+class SourceResultSample:
+    """One parsed icecream-p50-source-result-v5 record (C-side), reduced to
+    just the join key and the two wall-clock stamps derive_ntp_offsets()
+    needs. A plain Dict[str, int] can't hold c_store_guid (a str) alongside
+    the int timestamps without lying to the type checker, so this is a
+    dataclass instead."""
+    c_store_guid: str
+    tu_seq: int
+    t1: int  # c_begin_write_wall_ns
+    t4: int  # c_commit_read_wall_ns
+
+
+@dataclass
+class FResultSample:
+    """One parsed icecream-p50-f-result-v1 record (F-side); see
+    SourceResultSample above."""
+    c_store_guid: str
+    tu_seq: int
+    t2: int  # f_begin_recv_wall_ns
+    t3: int  # wall_clock_ns, taken at TX_COMMIT write
+
+
+def load_v5_source_results(path: str) -> List[SourceResultSample]:
     """Load icecream-p50-source-result-v5 records (ICECC_P50_SOURCE_RESULT_TRACE).
 
     C-side, diagnostic-only. Extracts only the join key and the two
     absolute wall-clock samples needed for derive_ntp_offsets(); never
     touches source bytes or paths.
     """
-    out: List[Dict[str, int]] = []
+    out: List[SourceResultSample] = []
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, start=1):
             line = line.strip()
@@ -233,24 +265,24 @@ def load_v5_source_results(path: str) -> List[Dict[str, int]]:
             if obj.get("schema") != "icecream-p50-source-result-v5":
                 continue
             try:
-                out.append({
-                    "c_store_guid": str(obj["c_store_guid"]),
-                    "tu_seq": int(obj["tu_seq"]),
-                    "t1": int(obj.get("c_begin_write_wall_ns", 0)),
-                    "t4": int(obj.get("c_commit_read_wall_ns", 0)),
-                })
+                out.append(SourceResultSample(
+                    c_store_guid=str(obj["c_store_guid"]),
+                    tu_seq=int(obj["tu_seq"]),
+                    t1=int(obj.get("c_begin_write_wall_ns", 0)),
+                    t4=int(obj.get("c_commit_read_wall_ns", 0)),
+                ))
             except (KeyError, TypeError, ValueError) as exc:
                 print(f"warning: {path}:{lineno}: skipping v5 record ({exc})",
                       file=sys.stderr)
     return out
 
 
-def load_v1_f_results(path: str) -> List[Dict[str, int]]:
+def load_v1_f_results(path: str) -> List[FResultSample]:
     """Load icecream-p50-f-result-v1 records (ICECC_P50_F_RESULT_TRACE).
 
     F-side, diagnostic-only. See load_v5_source_results() above.
     """
-    out: List[Dict[str, int]] = []
+    out: List[FResultSample] = []
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, start=1):
             line = line.strip()
@@ -265,12 +297,12 @@ def load_v1_f_results(path: str) -> List[Dict[str, int]]:
             if obj.get("schema") != "icecream-p50-f-result-v1":
                 continue
             try:
-                out.append({
-                    "c_store_guid": str(obj["c_store_guid"]),
-                    "tu_seq": int(obj["tu_seq"]),
-                    "t2": int(obj.get("f_begin_recv_wall_ns", 0)),
-                    "t3": int(obj.get("wall_clock_ns", 0)),
-                })
+                out.append(FResultSample(
+                    c_store_guid=str(obj["c_store_guid"]),
+                    tu_seq=int(obj["tu_seq"]),
+                    t2=int(obj.get("f_begin_recv_wall_ns", 0)),
+                    t3=int(obj.get("wall_clock_ns", 0)),
+                ))
             except (KeyError, TypeError, ValueError) as exc:
                 print(f"warning: {path}:{lineno}: skipping f-v1 record ({exc})",
                       file=sys.stderr)
@@ -286,8 +318,8 @@ class NtpOffsetResult:
 
 
 def derive_ntp_offsets(
-        c_records: List[Dict[str, int]],
-        f_records_by_host: Dict[str, List[Dict[str, int]]],
+        c_records: List[SourceResultSample],
+        f_records_by_host: Dict[str, List[FResultSample]],
 ) -> Dict[str, "NtpOffsetResult"]:
     """Derive one NTP-style clock offset per F host from joined C v5/F v1 traces.
 
@@ -298,6 +330,16 @@ def derive_ntp_offsets(
     physically plausible (positive) round-trip delay, computes the sample
     offset/delay per the module-level comment above.
 
+    t2 (f_begin_recv_wall_ns) is sampled immediately after the BEGIN frame
+    read completes, before it is decoded -- see cache/p50_endpoint.cpp. In
+    pipelined mode the BEGIN frame may simply be sitting in F's socket
+    receive buffer for a while before F gets to read it (F is still busy
+    with an earlier session's HELLO/STATE exchange), which inflates delay
+    for that sample without biasing offset -- any one-way delay in either
+    direction cancels out of the offset formula and only widens the error
+    bound. The lowest-delay-decile filter below naturally favors samples
+    without that queuing, so pipelining does not need special-casing here.
+
     Applies NTP-style clock filtering: keeps only the lowest-delay decile
     of samples per host (at least one), since low-delay samples carry the
     least queueing-induced asymmetry error, then reports the median offset
@@ -306,19 +348,19 @@ def derive_ntp_offsets(
     """
     results: Dict[str, NtpOffsetResult] = {}
     for host, f_records in f_records_by_host.items():
-        f_index: Dict[Tuple[str, int], Dict[str, int]] = {}
+        f_index: Dict[Tuple[str, int], FResultSample] = {}
         for rec in f_records:
-            f_index.setdefault((rec["c_store_guid"], rec["tu_seq"]), rec)
+            f_index.setdefault((rec.c_store_guid, rec.tu_seq), rec)
 
         samples: List[Tuple[float, float]] = []  # (offset_ns, delay_ns)
         n_total = 0
         for c_rec in c_records:
-            f_rec = f_index.get((c_rec["c_store_guid"], c_rec["tu_seq"]))
+            f_rec = f_index.get((c_rec.c_store_guid, c_rec.tu_seq))
             if f_rec is None:
                 continue
             n_total += 1
-            t1, t4 = c_rec["t1"], c_rec["t4"]
-            t2, t3 = f_rec["t2"], f_rec["t3"]
+            t1, t4 = c_rec.t1, c_rec.t4
+            t2, t3 = f_rec.t2, f_rec.t3
             if not (t1 and t2 and t3 and t4):
                 continue  # one of the four wall-clock stamps wasn't captured
             delay = (t4 - t1) - (t3 - t2)
@@ -1002,7 +1044,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.c_result_trace and args.f_result_trace:
         c_v5_records = load_v5_source_results(args.c_result_trace)
-        f_v1_records_by_host: Dict[str, List[Dict[str, int]]] = {}
+        f_v1_records_by_host: Dict[str, List[FResultSample]] = {}
         for host, path in args.f_result_trace:
             f_v1_records_by_host.setdefault(host, []).extend(
                 load_v1_f_results(path))

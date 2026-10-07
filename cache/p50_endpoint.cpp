@@ -4329,9 +4329,31 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             next = co_await async_read_frame(socket, selection.limits.max_frame_payload,
                                              impl_->stamp(session, AsyncOperationKind::ReadHeader),
                                              impl_->completions, verify);
+            // Diagnostic-only: sampled immediately after the BEGIN frame read
+            // completes, before decode_as<TxBegin>, so this is F's receipt
+            // time for the BEGIN bytes and excludes prepare/activate/install
+            // work below. See ICECC_P50_F_RESULT_TRACE and the NTP-offset
+            // derivation in tools/stagetrace/analyze.py.
+            {
+                struct timespec wall_ts{};
+                if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                    result.f_begin_recv_wall_ns =
+                        static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                        static_cast<uint64_t>(wall_ts.tv_nsec);
+            }
             const TxBegin begin = decode_as<TxBegin>(next);
             impl_->begin(session, begin, selection.negotiated_profiles);
         } else {
+            // Same placement rationale as above: this `next` is the frame
+            // already read before the HISTORY_RESET check, and is the BEGIN
+            // frame on this branch.
+            {
+                struct timespec wall_ts{};
+                if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                    result.f_begin_recv_wall_ns =
+                        static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                        static_cast<uint64_t>(wall_ts.tv_nsec);
+            }
             const TxBegin begin = decode_as<TxBegin>(next);
             Impl::PreparedBegin prepared = impl_->prepare_begin_candidate(
                 session, begin, selection.negotiated_profiles);
@@ -4339,13 +4361,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             impl_->install_begin(session, std::move(prepared));
         }
         f_begin_done = std::chrono::steady_clock::now();
-        {
-            struct timespec wall_ts{};
-            if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
-                result.f_begin_recv_wall_ns =
-                    static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
-                    static_cast<uint64_t>(wall_ts.tv_nsec);
-        }
         if (f_hello_done)
             result.f_hello_to_begin_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

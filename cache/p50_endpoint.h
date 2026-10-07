@@ -447,8 +447,12 @@ struct ServerRunResult {
     uint64_t f_run_total_ns = 0;
     uint64_t f_begin_to_commit_written_ns = 0;
     uint64_t f_wall_clock_ns = 0;
-    // Diagnostic-only absolute CLOCK_REALTIME wall-clock sample taken at the
-    // same point as f_begin_done (TX_BEGIN decoded/installed). Paired with
+    // Diagnostic-only absolute CLOCK_REALTIME wall-clock sample taken
+    // immediately after the BEGIN frame read completes, before it is
+    // decoded as TxBegin -- i.e. F's receipt time for the BEGIN bytes,
+    // excluding any prepare/activate/install work that follows. Taking the
+    // sample later (after that work) would bias the derived offset by
+    // roughly +work/2; see tools/stagetrace/analyze.py. Paired with
     // f_wall_clock_ns (taken at TX_COMMIT write) and ClientRunResult's
     // c_begin_write_wall_ns/c_commit_read_wall_ns to derive C/F clock offsets
     // via the classic four-timestamp NTP algorithm. Never sent over the
