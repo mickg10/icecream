@@ -48,7 +48,32 @@ icecc_uid=$(id -u "$icecc_user")
 icecc_gid=$(id -g "$icecc_user")
 
 workdir=$(mktemp -d /tmp/p5scref.XXXXXX) || fail mktemp
-trap 'kill $sched_pid $daemon_pid 2>/dev/null; rm -rf "$workdir"' EXIT INT TERM
+
+# Real teardown for the per-leg scheduler+daemon: signal, then wait
+# (bounded) for actual exit, then kill -9 + reap.  A scheduler that is
+# only SIGNALED keeps its 8765/8766 listeners open until its poll loop
+# notices; with SO_REUSEADDR a LIVE listener still blocks the next bind,
+# so the next test in the same make-check run (p50remote-failreport.sh,
+# p50statejsonl-warn.sh's daemons broadcast-discover on 8765) races a
+# dying-but-alive scheduler if this teardown only fires a kill.
+stop_processes() { # <pids...>
+    for pid in "$@"; do
+        kill "$pid" 2>/dev/null || :
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in "$@"; do
+            kill -0 "$pid" 2>/dev/null && live=1
+        done
+        [ "$live" -eq 0 ] && break
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        kill -9 "$pid" 2>/dev/null || :
+        wait "$pid" 2>/dev/null || :
+    done
+}
+trap 'stop_processes "$sched_pid" "$daemon_pid"; rm -rf "$workdir"' EXIT INT TERM
 
 mkdir -p "$workdir/envs" "$workdir/home"
 # Leg 1: the runtime dir at the WRONG MODE (0755, correct owner).
@@ -104,8 +129,7 @@ check_refusal_named leg1 "invalid cache sidecar configuration" \
 # parented by our daemon).
 children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l)
 [ "$children" -eq 0 ] || fail "positive mode was not refused (service child exists)"
-kill "$sched_pid" "$daemon_pid" 2>/dev/null
-sleep 1
+stop_processes "$sched_pid" "$daemon_pid"
 
 # ---- leg 2: wrong owner ----
 run_leg "$workdir/cache-rt-wrongowner" leg2
@@ -119,5 +143,5 @@ check_refusal_named leg2 "invalid cache sidecar configuration" \
 children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l)
 [ "$children" -eq 0 ] || fail "positive mode was not refused (service child exists)"
 
-kill "$sched_pid" "$daemon_pid" 2>/dev/null
+stop_processes "$sched_pid" "$daemon_pid"
 echo "p50sidecarrefusal: OK (refusal names the path, owner and mode; positive mode still refused)"

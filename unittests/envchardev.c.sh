@@ -42,6 +42,32 @@ ICECC=${ICECC:-$top_build_dir/client/icecc}
 
 fail() { echo "envchardev: FAIL: $*" 1>&2; exit 1; }
 
+# Stop a set of background PIDS for REAL: signal, then wait (bounded) for
+# each to actually EXIT, then kill -9 anything that ignored the signal,
+# then reap with wait.  A scheduler that is only SIGNALED keeps its
+# listeners open until its poll loop notices -- and with SO_REUSEADDR a
+# live listener still blocks the next bind -- so the next test in the
+# same make-check run (p50remote-failreport.sh starts a scheduler on the
+# same default port) loses the bind race if this test's teardown only
+# fires a kill and exits.  The round-14 root stage failed exactly there.
+stop_processes() { # <pids...>
+    for pid in "$@"; do
+        kill "$pid" 2>/dev/null || :
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in "$@"; do
+            kill -0 "$pid" 2>/dev/null && live=1
+        done
+        [ "$live" -eq 0 ] && break
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        kill -9 "$pid" 2>/dev/null || :
+        wait "$pid" 2>/dev/null || :
+    done
+}
+
 # The fixture (mknod) needs root; the daemons run root-started (capng drop).
 if [ "$(id -u)" != "0" ]; then
     echo "envchardev: skipping (needs root: mknod fixture + root-started daemons)" >&2
@@ -52,7 +78,7 @@ if id -u icecc >/dev/null 2>&1; then icecc_user=icecc; fi
 [ -n "$icecc_user" ] || fail "no icecc user (the capng drop target)"
 
 workdir=$(mktemp -d /tmp/envchardev.XXXXXX) || fail mktemp
-trap 'kill $sched_pid $daemonA_pid $daemonB_pid 2>/dev/null; rm -rf "$workdir"' EXIT INT TERM
+trap 'stop_processes "$sched_pid" "$daemonA_pid" "$daemonB_pid"; rm -rf "$workdir"' EXIT INT TERM
 
 # A REAL env via icecc-create-env (the compiler + its lib deps -- a bare
 # copied gcc binary cannot exec inside the env chroot, missing libs), then

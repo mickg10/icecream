@@ -71,7 +71,32 @@ workdir=$(mktemp -d /tmp/p5failrep.XXXXXX) || fail mktemp
 # keep_workdir=1 (set by the startup gate when a process died) preserves the
 # evidence for diagnosis; every other exit path cleans up as before.
 keep_workdir=
-trap 'kill $sched_pid $daemonA_pid $daemonB_pid 2>/dev/null; [ -n "$keep_workdir" ] || rm -rf "$workdir"' EXIT INT TERM
+
+# Real teardown: signal, then wait (bounded) for actual exit, then kill -9
+# and reap.  A scheduler that is only SIGNALED keeps its 8765/8766
+# listeners open until its poll loop notices; with SO_REUSEADDR a LIVE
+# listener still blocks the next bind, so the NEXT test in the same
+# make-check run (p50sidecarrefusal-run.sh, p50statejsonl-warn.sh)
+# races a dying-but-alive scheduler of ours if this teardown only fires
+# a kill -- the same defect this leg was itself the victim of in round 14.
+stop_processes() { # <pids...>
+    for pid in "$@"; do
+        kill "$pid" 2>/dev/null || :
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in "$@"; do
+            kill -0 "$pid" 2>/dev/null && live=1
+        done
+        [ "$live" -eq 0 ] && break
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        kill -9 "$pid" 2>/dev/null || :
+        wait "$pid" 2>/dev/null || :
+    done
+}
+trap 'stop_processes "$sched_pid" "$daemonA_pid" "$daemonB_pid"; [ -n "$keep_workdir" ] || rm -rf "$workdir"' EXIT INT TERM
 
 # A REAL env via icecc-create-env, then the env's ./usr/bin/{gcc,g++}
 # REPLACED with a real ELF fixture: prints "no space left on device" to
@@ -116,6 +141,45 @@ tar -C "$workdir/envpack/root" -czf "$workdir/env.tgz" . || fail "tar fixture fa
 
 mkdir -p "$workdir/envsA" "$workdir/envsB" "$workdir/homeA" "$workdir/homeB"
 chown -R "${icecc_user:-nobody}" "$workdir"
+
+# Port guard, MIRRORING the scheduler's own bind: SO_REUSEADDR set, then
+# bind, then listen, on BOTH 8765 (jobs) and 8766 (text endpoint) -- the
+# scheduler's open_tcp_listener (scheduler/scheduler.cpp) sets SO_REUSEADDR
+# and binds both, so a port that blocks THIS probe also blocks the
+# scheduler (a TIME_WAIT remnant does NOT block either, reuse or no
+# reuse).  If a port is held, wait bounded for it to clear, then FAIL
+# with the holders NAMED (ss + pgrep) -- never proceed into a bind race:
+# with broadcast discovery, a leaked foreign scheduler on 8765 would be
+# FOUND by this leg's daemons and the test would silently prove
+# something else entirely.
+port_guard_busy=
+for p in 8765 8766; do
+    waited=0
+    while :; do
+        if python3 -c "
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(('', $p))
+    s.listen(1)
+except OSError:
+    sys.exit(1)
+s.close()" 2>/dev/null; then
+            break
+        fi
+        waited=$((waited + 1))
+        [ "$waited" -ge 30 ] && { port_guard_busy="$port_guard_busy $p"; break; }
+        sleep 1
+    done
+done
+if [ -n "$port_guard_busy" ]; then
+    echo "p50remote-failreport: scheduler port(s)$port_guard_busy held by another process after 30s:" 1>&2
+    ss -ltnp '( sport = :8765 or sport = :8766 )' 1>&2 || true
+    pgrep -a icecc-scheduler 1>&2 || true
+    keep_workdir=1
+    fail "scheduler port(s)$port_guard_busy busy (see ss/pgrep output above; workdir kept: $workdir)"
+fi
 
 # Each process's stderr goes to its OWN file next to its -l log: the -l
 # log is opened by the process itself, so a process that dies BEFORE
