@@ -88,6 +88,12 @@ struct ZstdSourceTransferResult {
     uint64_t c_state_wait_ns = 0;
     uint64_t c_state_to_commit_ns = 0;
     uint64_t c_post_commit_ns = 0;
+    // Diagnostic-only absolute CLOCK_REALTIME wall-clock samples mirrored
+    // from ClientRunResult; see that struct's comment. Used offline to
+    // derive C/F clock offsets. Never sent over the wire; populated only
+    // for ICECC_P50_SOURCE_RESULT_TRACE.
+    uint64_t c_begin_write_wall_ns = 0;
+    uint64_t c_commit_read_wall_ns = 0;
 };
 
 // Where reopens run their blocking connect/arm/session round trip, off the

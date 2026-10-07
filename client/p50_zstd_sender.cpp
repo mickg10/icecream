@@ -289,6 +289,8 @@ struct P50ZstdSourceSender::Impl {
         result.c_state_wait_ns = run.c_state_wait_ns;
         result.c_state_to_commit_ns = run.c_state_to_commit_ns;
         result.c_post_commit_ns = run.c_post_commit_ns;
+        result.c_begin_write_wall_ns = run.c_begin_write_wall_ns;
+        result.c_commit_read_wall_ns = run.c_commit_read_wall_ns;
         return result;
     }
 

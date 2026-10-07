@@ -221,6 +221,8 @@ void append_source_result_trace(
         "\"c_state_wait_ns\":%llu,"
         "\"c_state_to_commit_ns\":%llu,"
         "\"c_post_commit_ns\":%llu,"
+        "\"c_begin_write_wall_ns\":%llu,"
+        "\"c_commit_read_wall_ns\":%llu,"
         "\"wall_clock_ns\":%llu,"
         "\"transfer_start_mono_ns\":%lld}\n",
         static_cast<unsigned long long>(request.wire_job_id),
@@ -249,6 +251,8 @@ void append_source_result_trace(
         static_cast<unsigned long long>(transfer.c_state_wait_ns),
         static_cast<unsigned long long>(transfer.c_state_to_commit_ns),
         static_cast<unsigned long long>(transfer.c_post_commit_ns),
+        static_cast<unsigned long long>(transfer.c_begin_write_wall_ns),
+        static_cast<unsigned long long>(transfer.c_commit_read_wall_ns),
         static_cast<unsigned long long>(wall_clock_ns),
         static_cast<long long>(transfer_start_mono_ns));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
@@ -308,6 +312,7 @@ void append_f_result_trace(const ServerRunResult& run) noexcept {
         "\"f_wait_peer_close_ns\":%llu,"
         "\"f_run_total_ns\":%llu,"
         "\"f_begin_to_commit_written_ns\":%llu,"
+        "\"f_begin_recv_wall_ns\":%llu,"
         "\"wall_clock_ns\":%llu}\n",
         c_guid.c_str(),
         static_cast<unsigned long long>(tu_seq),
@@ -323,6 +328,7 @@ void append_f_result_trace(const ServerRunResult& run) noexcept {
         static_cast<unsigned long long>(run.f_wait_peer_close_ns),
         static_cast<unsigned long long>(run.f_run_total_ns),
         static_cast<unsigned long long>(run.f_begin_to_commit_written_ns),
+        static_cast<unsigned long long>(run.f_begin_recv_wall_ns),
         static_cast<unsigned long long>(run.f_wall_clock_ns));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;

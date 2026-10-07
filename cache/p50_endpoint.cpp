@@ -3495,6 +3495,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                      impl_->completions, control, verify);
         trace_write_phase_start = std::chrono::steady_clock::now();
         trace_last_write_done = *trace_write_phase_start;
+        {
+            struct timespec wall_ts{};
+            if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                result.c_begin_write_wall_ns =
+                    static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                    static_cast<uint64_t>(wall_ts.tv_nsec);
+        }
 
         // Only fresh work on an exact retained route: anything else needs
         // STATE first.  STATE must then confirm that route or the run fails.
@@ -3820,6 +3827,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             socket, frame_cap, impl_->stamp(session, AsyncOperationKind::ReadHeader),
             impl_->completions, verify);
         trace_commit_read_done = std::chrono::steady_clock::now();
+        {
+            struct timespec wall_ts{};
+            if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                result.c_commit_read_wall_ns =
+                    static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                    static_cast<uint64_t>(wall_ts.tv_nsec);
+        }
         if (trace_state_read_done)
             result.c_state_to_commit_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -4325,6 +4339,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             impl_->install_begin(session, std::move(prepared));
         }
         f_begin_done = std::chrono::steady_clock::now();
+        {
+            struct timespec wall_ts{};
+            if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                result.f_begin_recv_wall_ns =
+                    static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                    static_cast<uint64_t>(wall_ts.tv_nsec);
+        }
         if (f_hello_done)
             result.f_hello_to_begin_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -400,6 +400,14 @@ struct ClientRunResult {
     uint64_t c_state_wait_ns = 0;
     uint64_t c_state_to_commit_ns = 0;
     uint64_t c_post_commit_ns = 0;
+    // Diagnostic-only absolute CLOCK_REALTIME wall-clock samples, taken at
+    // the same two points as trace_write_phase_start/trace_commit_read_done
+    // above (BEGIN write-phase start, TX_COMMIT frame read). Used offline to
+    // derive C/F clock offsets via the classic four-timestamp NTP algorithm
+    // against ServerRunResult::f_begin_recv_wall_ns/f_wall_clock_ns. Never
+    // sent over the wire; populated only for ICECC_P50_SOURCE_RESULT_TRACE.
+    uint64_t c_begin_write_wall_ns = 0;
+    uint64_t c_commit_read_wall_ns = 0;
 };
 
 enum class ServerRunStatus : uint8_t {
@@ -439,6 +447,13 @@ struct ServerRunResult {
     uint64_t f_run_total_ns = 0;
     uint64_t f_begin_to_commit_written_ns = 0;
     uint64_t f_wall_clock_ns = 0;
+    // Diagnostic-only absolute CLOCK_REALTIME wall-clock sample taken at the
+    // same point as f_begin_done (TX_BEGIN decoded/installed). Paired with
+    // f_wall_clock_ns (taken at TX_COMMIT write) and ClientRunResult's
+    // c_begin_write_wall_ns/c_commit_read_wall_ns to derive C/F clock offsets
+    // via the classic four-timestamp NTP algorithm. Never sent over the
+    // wire; populated only for ICECC_P50_F_RESULT_TRACE.
+    uint64_t f_begin_recv_wall_ns = 0;
 };
 
 enum class InputJobState : uint8_t {
