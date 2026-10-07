@@ -25,6 +25,10 @@
 #include <sys/resource.h>
 #endif
 
+#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
+#include <sys/mman.h>
+#endif
+
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
 extern "C" unsigned
 icecc_p50sim_p29_allocation_scope_enter(unsigned entry) noexcept;
@@ -1559,8 +1563,26 @@ public:
       fail("P29 deserializer received FILL twice");
     if (expected_materialized_bytes > provider_.wire_limits().max_tu_bytes)
       fail("P29 expected materialization exceeds provider TU limit");
-    if (expected_materialized_bytes > pending_.materialized.capacity())
+    if (expected_materialized_bytes > pending_.materialized.capacity()) {
       pending_.materialized.reserve(expected_materialized_bytes);
+#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
+      // Opt-3 candidate (wire-neutral): hint the kernel to back this
+      // freshly-reserved buffer with transparent huge pages before the
+      // first-touch writes below (inside parse_fill) fault it in. madvise()
+      // is a best-effort kernel hint only -- it cannot change the contents
+      // of pending_.materialized, so it cannot change the materialized
+      // bytes, the digests computed over them, or anything on the
+      // CacheWire/P29 wire. Gated behind a macro so it is never enabled in
+      // a default build; A/B-benched before any default-on decision.
+      if (const std::size_t extent = pending_.materialized.capacity();
+          extent > 0) {
+        if (void *const base =
+                static_cast<void *>(pending_.materialized.data());
+            base != nullptr)
+          ::madvise(base, extent, MADV_HUGEPAGE);
+      }
+#endif
+    }
     parse_fill(fill, close_entropy);
     if (expected_materialized_bytes != 0 &&
         pending_.materialized.size() != expected_materialized_bytes)
