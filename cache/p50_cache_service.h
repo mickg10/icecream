@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include "p50_incarnation_identity.h"
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <future>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "p50_endpoint.h"
 #include "p50_armed_admission.h"
@@ -279,8 +281,56 @@ private:
         // same F buys nothing but BUSY (kFSessionBusy) elsewhere; this does
         // not change F's behaviour.
         static std::ptrdiff_t armed_window_slots() noexcept;
-        ArmedAdmission armed{armed_window_slots()};
-        std::timed_mutex transfer;
+        // ICECC_P50_ROUTE_LANES overrides the lane count below.  Unset,
+        // empty, non-numeric, or non-positive keeps 1 (byte-identical to no
+        // lanes at all).  A request above what max_live_sessions can hold
+        // alongside the window is clamped down to the largest value that
+        // fits lanes * armed_window_slots() within max_live_sessions, with a
+        // P50_ROUTE_LANES_CLAMPED warning on stderr.
+        static uint32_t route_lane_count(size_t max_live_sessions) noexcept;
+
+        // One lane's armed-window admission and transfer serialization. Each
+        // lane presents its own derived C-store GUID to F (see
+        // derive_lane_c_store_guid in p50_cache_service.cpp), so F treats
+        // every lane as an independent session/namespace with its own "one
+        // uncommitted successor" slot -- the mechanism that lets N lanes'
+        // CacheWire exchanges to the same F endpoint overlap.
+        struct Lane {
+            ArmedAdmission armed{armed_window_slots()};
+            std::timed_mutex transfer;
+        };
+
+        explicit RouteGate(uint32_t lane_count = 1)
+        {
+            const uint32_t count = std::max<uint32_t>(1, lane_count);
+            lanes.reserve(count);
+            for (uint32_t i = 0; i < count; ++i)
+                lanes.push_back(std::make_unique<Lane>());
+        }
+
+        // Picks the least-loaded lane (most free armed-window slots); ties
+        // and an all-full window fall back to round robin. With one lane
+        // (the default), always and only selects lane 0.
+        [[nodiscard]] size_t select_lane() noexcept
+        {
+            if (lanes.size() == 1)
+                return 0;
+            size_t best = 0;
+            std::ptrdiff_t best_free = lanes[0]->armed.free_slots();
+            for (size_t i = 1; i < lanes.size(); ++i) {
+                const std::ptrdiff_t free = lanes[i]->armed.free_slots();
+                if (free > best_free) {
+                    best_free = free;
+                    best = i;
+                }
+            }
+            if (best_free > 0)
+                return best;
+            return next_lane.fetch_add(1, std::memory_order_relaxed) % lanes.size();
+        }
+
+        std::vector<std::unique_ptr<Lane>> lanes;
+        std::atomic<size_t> next_lane{0};
     };
     std::mutex source_route_mutex_;
     std::map<RouteEndpointKey, std::shared_ptr<RouteGate>> source_route_gates_;

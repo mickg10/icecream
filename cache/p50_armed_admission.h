@@ -93,6 +93,14 @@ public:
         bool held_ = false;
     };
 
+    // Current free armed-window slots. Used only for load comparisons (e.g.
+    // ROUTE_LANES least-loaded lane selection); never for admission itself.
+    [[nodiscard]] std::ptrdiff_t free_slots() const noexcept
+    {
+        std::lock_guard lock(mutex_);
+        return free_;
+    }
+
 private:
     void wake_head()
     {
@@ -101,7 +109,7 @@ private:
         }
     }
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::ptrdiff_t free_;
     uint64_t sequence_ = 0;
     std::map<std::pair<int64_t, uint64_t>, std::condition_variable *> waiting_;

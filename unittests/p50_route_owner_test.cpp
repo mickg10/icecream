@@ -130,8 +130,10 @@ void test_same_request_route_fork_wire() {
     P50PreparationAuthority authority(
         Id128::from_u64(190), config().endpoint_caps.zstd,
         config().authority_limits, config().compression_level, ProfileId::P29V1);
-    const PreparationRouteKey route0{Id128::from_u64(290), 1, ProfileId::P29V1};
-    const PreparationRouteKey route1{Id128::from_u64(291), 1, ProfileId::P29V1};
+    const PreparationRouteKey route0{Id128::from_u64(190), Id128::from_u64(290), 1,
+                                     ProfileId::P29V1};
+    const PreparationRouteKey route1{Id128::from_u64(190), Id128::from_u64(291), 1,
+                                     ProfileId::P29V1};
     const PrepareRequestKey fork_request{7900, 1};
     const std::vector<uint8_t> source{'f', 'o', 'r', 'k', '\n'};
     const auto h0 = authority.prepare_for_route(route0, fork_request, source);
@@ -233,7 +235,7 @@ void test_multiroute_release_lifetime() {
     handles.reserve(20);
     for (uint64_t index = 0; index != 20; ++index) {
         routes.push_back(
-            {Id128::from_u64(300 + index), 1, ProfileId::P29V1});
+            {Id128::from_u64(191), Id128::from_u64(300 + index), 1, ProfileId::P29V1});
         handles.push_back(authority.prepare_for_route(routes.back(), request, source));
         CHECK(authority.prepared_tu_seq(handles.back()).value == 0);
     }
@@ -255,7 +257,7 @@ void test_tu_seq_reservation_and_exhaustion() {
     P50PreparationAuthority authority(
         Id128::from_u64(192), tight, config().authority_limits,
         config().compression_level, ProfileId::ZSTD_TU);
-    const PreparationRouteKey route{Id128::from_u64(392), 1,
+    const PreparationRouteKey route{Id128::from_u64(192), Id128::from_u64(392), 1,
                                     ProfileId::ZSTD_TU};
     const PrepareRequestKey request{7902, 1};
     std::vector<uint8_t> incompressible(4096);
@@ -295,7 +297,7 @@ void test_tu_seq_reservation_and_exhaustion() {
     P50PreparationAuthority post_admission(
         Id128::from_u64(194), config().endpoint_caps.zstd, post_limits,
         config().compression_level, ProfileId::P29V1);
-    const PreparationRouteKey post_route{Id128::from_u64(394), 1,
+    const PreparationRouteKey post_route{Id128::from_u64(194), Id128::from_u64(394), 1,
                                          ProfileId::P29V1};
     std::vector<uint8_t> p29_many_regions;
     for (size_t index = 0; index != 256; ++index) {
@@ -327,9 +329,9 @@ void test_tu_seq_reservation_and_exhaustion() {
         Id128::from_u64(193), config().endpoint_caps.zstd,
         config().authority_limits, config().compression_level,
         ProfileId::ZSTD_TU, TuSeq{std::numeric_limits<uint64_t>::max()});
-    const PreparationRouteKey zstd_route{Id128::from_u64(393), 1,
+    const PreparationRouteKey zstd_route{Id128::from_u64(193), Id128::from_u64(393), 1,
                                          ProfileId::ZSTD_TU};
-    const PreparationRouteKey p29_route{Id128::from_u64(394), 1,
+    const PreparationRouteKey p29_route{Id128::from_u64(193), Id128::from_u64(394), 1,
                                         ProfileId::P29V1};
     const std::vector<uint8_t> source{'m', 'a', 'x', '\n'};
     const auto max_zstd = exhausted.prepare_for_route(
@@ -499,9 +501,9 @@ void test_long_lived_relationship_owner() {
         Id128::from_u64(180), config().endpoint_caps.zstd,
         config().authority_limits, config().compression_level,
         ProfileId::ZSTD_TU);
-    const PreparationRouteKey direct_zstd{Id128::from_u64(280), 1,
+    const PreparationRouteKey direct_zstd{Id128::from_u64(180), Id128::from_u64(280), 1,
                                           ProfileId::ZSTD_TU};
-    const PreparationRouteKey direct_p29{Id128::from_u64(281), 1,
+    const PreparationRouteKey direct_p29{Id128::from_u64(180), Id128::from_u64(281), 1,
                                          ProfileId::P29V1};
     const PrepareRequestKey fork_request{7800, 1};
     const auto zstd_view = direct_authority.prepare_for_route(
@@ -862,13 +864,13 @@ void test_interned_tu_after_interner_fault_is_typed() {
     const std::vector<uint8_t> other{
         '#', ' ', '1', ' ', '"', 'l', 'o', 's', 't', '"', '\n', 't', 'w', 'o', '\n'};
     const PreparedTuHandle first = authority.prepare_for_route(
-        {Id128::from_u64(391), 1, ProfileId::P29V1}, {7701, 1}, source);
+        {Id128::from_u64(193), Id128::from_u64(391), 1, ProfileId::P29V1}, {7701, 1}, source);
     CHECK(authority.prepared_profile(first) == ProfileId::P29V1);
 
     bool failed_typed = false;
     try {
         (void)authority.prepare_for_route(
-            {Id128::from_u64(392), 1, ProfileId::P29V1}, {7701, 2}, other);
+            {Id128::from_u64(193), Id128::from_u64(392), 1, ProfileId::P29V1}, {7701, 2}, other);
     } catch (const P29V1CapabilityUnavailable&) {
         failed_typed = true;
     }
@@ -878,7 +880,7 @@ void test_interned_tu_after_interner_fault_is_typed() {
     bool reused_typed = false;
     try {
         (void)authority.prepare_for_route(
-            {Id128::from_u64(393), 1, ProfileId::P29V1}, {7701, 1}, source);
+            {Id128::from_u64(193), Id128::from_u64(393), 1, ProfileId::P29V1}, {7701, 1}, source);
     } catch (const P29V1CapabilityUnavailable&) {
         reused_typed = true;
     }
@@ -891,7 +893,7 @@ void test_interned_tu_after_interner_fault_is_typed() {
     CHECK(authority.fill_p29v1_before_need(first).has_value());
     authority.commit(first);
     const PreparedTuHandle zstd = authority.prepare_for_route(
-        {Id128::from_u64(394), 1, ProfileId::ZSTD_TU}, {7701, 3}, other);
+        {Id128::from_u64(193), Id128::from_u64(394), 1, ProfileId::ZSTD_TU}, {7701, 3}, other);
     CHECK(authority.prepared_profile(zstd) == ProfileId::ZSTD_TU);
     authority.commit(zstd);
 }
@@ -904,7 +906,8 @@ void test_consecutive_history_resets_of_one_successor() {
     P50PreparationAuthority authority(
         Id128::from_u64(210), config().endpoint_caps.zstd,
         config().authority_limits, config().compression_level, ProfileId::P29V1);
-    const PreparationRouteKey route{Id128::from_u64(211), 1, ProfileId::P29V1};
+    const PreparationRouteKey route{Id128::from_u64(210), Id128::from_u64(211), 1,
+                                    ProfileId::P29V1};
     const std::vector<uint8_t> source{
         '#', ' ', '1', ' ', '"', 'r', '"', '\n', 'x', '\n'};
     const PreparedTuHandle successor =
@@ -931,7 +934,7 @@ void test_interner_fault_is_sticky_only_for_p29v1() {
         owner_config.authority_limits, owner_config.compression_level,
         ProfileId::P29V1, TuSeq{}, P29InternerFaultInjection::FailOnce);
     const PreparationRouteKey p29_route{
-        Id128::from_u64(291), 1, ProfileId::P29V1};
+        Id128::from_u64(191), Id128::from_u64(291), 1, ProfileId::P29V1};
     const std::vector<uint8_t> source{
         '#', ' ', '1', ' ', '"', 'f', 'a', 'u', 'l', 't', '"', '\n',
         's', 'a', 'm', 'e', '\n', 's', 'a', 'm', 'e', '\n'};
@@ -953,13 +956,68 @@ void test_interner_fault_is_sticky_only_for_p29v1() {
     CHECK(second_typed);
 
     const PreparationRouteKey zstd_route{
-        Id128::from_u64(292), 1, ProfileId::ZSTD_TU};
+        Id128::from_u64(191), Id128::from_u64(292), 1, ProfileId::ZSTD_TU};
     const PreparedTuHandle zstd =
         authority.prepare_for_route(zstd_route, {7601, 3}, source);
     CHECK(authority.prepared_profile(zstd) == ProfileId::ZSTD_TU);
     CHECK(authority.prepared_tu_seq(zstd) == TuSeq{0});
     authority.commit(zstd);
     CHECK(authority.release(zstd) == 0);
+}
+
+// ROUTE_LANES correctness, owner level: a lane-derived C-store GUID must
+// never reach ensure_authority(), only the registered-lane membership check
+// in get_or_create(). authority() is the one call path that forces a GUID
+// through ensure_authority(); it must keep rejecting the lane GUID exactly
+// as it would reject any other foreign C store, both before and after
+// register_lane(), while get_or_create()'s membership path (reached via
+// seed_relationship_for_test()) admits a relationship keyed on the lane GUID
+// without ever touching the authority.
+void test_lane_guid_never_reaches_ensure_authority() {
+    P50CRouteOwner owner(config());
+    const CStoreGuid base_guid = Id128::from_u64(950);
+    const CStoreGuid lane_guid = Id128::from_u64(951);
+
+    const auto authority = owner.authority(base_guid);
+    CHECK(authority != nullptr);
+    CHECK(authority->c_store_guid() == base_guid);
+
+    bool rejected_before_registration = false;
+    try {
+        (void)owner.authority(lane_guid);
+    } catch (const std::invalid_argument&) {
+        rejected_before_registration = true;
+    }
+    CHECK(rejected_before_registration);
+
+    owner.register_lane(lane_guid);
+
+    // register_lane() only inserts into lane_guids_; it must not call
+    // ensure_authority(lane_guid), so authority() still rejects the lane
+    // GUID exactly as before registration, and the authority instance is
+    // untouched.
+    bool rejected_after_registration = false;
+    try {
+        (void)owner.authority(lane_guid);
+    } catch (const std::invalid_argument&) {
+        rejected_after_registration = true;
+    }
+    CHECK(rejected_after_registration);
+    CHECK(authority->c_store_guid() == base_guid);
+
+    // Yet get_or_create()'s membership path admits a relationship keyed on
+    // the lane GUID, reached only through lane_guids_.contains() -- never
+    // through ensure_authority().
+    const P50RouteRelationship lane_relationship =
+        relationship(/*c=*/951, /*f=*/952, /*generation=*/1);
+    CHECK(lane_relationship.c_store_guid == lane_guid);
+    CHECK(owner.seed_relationship_for_test(lane_relationship));
+    CHECK(owner.owns(lane_relationship));
+
+    // The shared authority is still the one seeded with the base GUID: the
+    // lane never created, replaced, or re-seeded it.
+    CHECK(authority->c_store_guid() == base_guid);
+    CHECK(owner.owner_count() == 1);
 }
 
 }  // namespace
@@ -979,4 +1037,5 @@ int main() {
     test_interner_fault_is_sticky_only_for_p29v1();
     test_interned_tu_after_interner_fault_is_typed();
     test_consecutive_history_resets_of_one_successor();
+    test_lane_guid_never_reaches_ensure_authority();
 }

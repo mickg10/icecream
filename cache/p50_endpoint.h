@@ -197,7 +197,14 @@ struct PrepareRequestKey {
 
 // C-wide preparation is shared, but route-profile planning is relationship
 // scoped.  The F generation fences a replacement route from its predecessor.
+// c_store_guid is the base C-store GUID for the whole relationship unless
+// ROUTE_LANES (ICECC_P50_ROUTE_LANES) is enabled, in which case it carries a
+// lane-derived GUID so each lane gets its own "one uncommitted successor"
+// slot inside P50PreparationAuthority.  Lane 0 always reuses the base GUID,
+// so a default (K=1) build's key is byte-identical to a build with no lane
+// field at all once the base GUID is in the same position.
 struct PreparationRouteKey {
+    CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     uint64_t f_store_generation = 0;
     ProfileId profile = ProfileId::ZSTD_TU;

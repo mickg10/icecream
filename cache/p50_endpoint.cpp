@@ -974,7 +974,7 @@ struct P50PreparationAuthority::Impl {
     }
 
     static PreparationRouteKey legacy_route(ProfileId profile) {
-        return {FStoreGuid::from_u64(UINT64_C(0x503239434c49454e)), 1,
+        return {CStoreGuid{}, FStoreGuid::from_u64(UINT64_C(0x503239434c49454e)), 1,
                 profile};
     }
 
@@ -1726,14 +1726,25 @@ struct P50ClientEndpoint::Impl {
         }
         if (!preparation)
             throw std::invalid_argument("C endpoint requires its preparation authority");
-        c_guid = preparation->c_store_guid();
+        // route->c_store_guid carries a ROUTE_LANES lane GUID (or the base
+        // GUID at lane 0). This endpoint's own identity -- and therefore the
+        // SessionHello it sends F -- must follow the same lane GUID: F then
+        // treats each lane as its own session/namespace, which is what gives
+        // every lane an independent "one uncommitted successor" slot on F's
+        // side too, with no wire-format change (the field's content is still
+        // a plain CStoreGuid, just a derived one). Without this, F would
+        // always echo back the base GUID while the sender compares against
+        // the lane GUID, so every lane above 0 would fail
+        // committed_from_witness() permanently.
+        c_guid = (route && route->c_store_guid != CStoreGuid{})
+                     ? route->c_store_guid
+                     : preparation->c_store_guid();
         validate_caps(caps);
         if (caps.zstd != preparation->zstd_limits())
             throw std::invalid_argument(
                 "C endpoint and preparation authority use different ZSTD_TU caps");
         if (first_nonce.value == 0)
             throw std::invalid_argument("first endpoint HISTORY_NONCE must be nonzero");
-        (void)route;
     }
 
     uint64_t allocate_session() {

@@ -201,7 +201,15 @@ struct P50ZstdSourceSender::Impl {
     Impl(std::shared_ptr<P50PreparationAuthority> authority_value,
          PreparationRouteKey route_value, PrepareRequestKey request_value,
          ZstdSourceTransferConfig config_value)
-        : c_guid(authority_value ? authority_value->c_store_guid() : CStoreGuid{}),
+        // route_value.c_store_guid carries a ROUTE_LANES lane GUID (or the
+        // base GUID at lane 0, in which case this is identical to the
+        // authority's own GUID). Member order below declares c_guid before
+        // route, so reading route_value here -- before it is moved into
+        // route -- is well-defined.
+        : c_guid(route_value.c_store_guid != CStoreGuid{}
+                     ? route_value.c_store_guid
+                     : (authority_value ? authority_value->c_store_guid()
+                                        : CStoreGuid{})),
           request(request_value), config(std::move(config_value)),
           authority(std::move(authority_value)), route(std::move(route_value)),
           route_bound(true) {

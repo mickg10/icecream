@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -85,6 +86,15 @@ public:
     [[nodiscard]] std::shared_ptr<P50PreparationAuthority> authority(
         CStoreGuid c_store_guid);
 
+    // Registers a ROUTE_LANES lane-derived C-store GUID as valid for this
+    // owner's one real base C-store. The authority must already be seeded
+    // with the base GUID (via authority() or an earlier transfer()) before
+    // any lane is registered; a lane GUID is never passed to
+    // ensure_authority(), only tested for membership here. With no lanes
+    // ever registered (ROUTE_LANES default of 1), get_or_create()'s
+    // same-C-store check is byte-identical to the pre-lanes behavior.
+    void register_lane(CStoreGuid lane_guid);
+
     // Drops every profile view for one exact retired F incarnation.  False
     // means at least one route still owns an uncommitted preparation; callers
     // must replace the whole C sidecar and must not admit the successor.
@@ -118,6 +128,9 @@ private:
     P50RouteOwnerConfig config_{};
     std::shared_ptr<P50PreparationAuthority> authority_;
     std::map<P50RouteRelationship, Sender> owners_;
+    // Lane-derived C-store GUIDs (ROUTE_LANES) registered as valid aliases
+    // of authority_'s one real base GUID. Empty when lanes are unused.
+    std::set<CStoreGuid> lane_guids_;
     // The supervisor replaces this whole C sidecar, not one relationship.
     // Once any sender reports ambiguous state, no other relationship may
     // open F even if the wrapper that observed the first failure disappears.

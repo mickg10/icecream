@@ -1003,7 +1003,8 @@ void run_batch(const Arguments& arguments) {
         const FStoreGuid f_guid = relation_guid(arguments.f_store_guid, relation);
         relations.emplace_back();
         BatchRelation& item = relations.back();
-        item.route = PreparationRouteKey{f_guid, 1, profile};
+        item.route =
+            PreparationRouteKey{arguments.c_store_guid, f_guid, 1, profile};
         P50ServerEndpointConfig config;
         config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
                                     std::span<const uint8_t>) { return InputJobState::Open; };

@@ -158,7 +158,9 @@ void append_source_result_trace(
     ProfileId profile,
     const ZstdSourceTransferResult& transfer,
     uint64_t source_mutex_wait_ns,
-    uint64_t source_mutex_service_ns) noexcept {
+    uint64_t source_mutex_service_ns,
+    uint32_t lane,
+    uint64_t gate_wait_ns) noexcept {
     const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
     if (path == nullptr || *path == '\0')
         return;
@@ -185,10 +187,11 @@ void append_source_result_trace(
     char line[1024];
     const int length = std::snprintf(
         line, sizeof(line),
-        "{\"schema\":\"icecream-p50-source-result-v2\","
+        "{\"schema\":\"icecream-p50-source-result-v3\","
         "\"wire_job_id\":%llu,\"logical_job\":%llu,"
         "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
         "\"c_store_guid\":\"%s\","
+        "\"lane\":%u,\"gate_wait_ns\":%llu,"
         "\"profile\":\"%.*s\",\"status\":%u,\"attempts\":%u,"
         "\"tu_seq\":%llu,\"raw_bytes\":%llu,"
         "\"raw_digest\":\"%s\","
@@ -203,6 +206,7 @@ void append_source_result_trace(
         static_cast<unsigned long long>(request.assignment_epoch),
         static_cast<unsigned long long>(request.assignment_nonce),
         c_guid.c_str(),
+        lane, static_cast<unsigned long long>(gate_wait_ns),
         static_cast<int>(label.size()), label.data(),
         static_cast<unsigned>(transfer.status),
         static_cast<unsigned>(transfer.attempts),
@@ -1405,6 +1409,42 @@ bool prep_ahead_enabled() noexcept {
     return raw != nullptr && *raw != '\0' && std::strcmp(raw, "0") != 0;
 }
 
+// ICECC_P50_ROUTE_LANES (default off/1): lane != 0 derives its own
+// CStoreGuid from the base guid plus the lane index.  This is not a new
+// wire concept -- it is the same CStoreGuid field everywhere (SessionHello
+// to F, the arm's c_store_guid, CompileInputIdentity.c_store_guid) just
+// carrying a different, still store-identity-valid value per lane, which is
+// exactly what gives each lane its own session/namespace and therefore its
+// own "one uncommitted successor" slot on F, with no change to any field's
+// layout or type. Lane 0 always reuses the base guid unchanged, so default
+// behaviour (lane count 1) is byte-identical to before lanes existed.
+constexpr uint8_t kLaneGuidTagByte = 0x4C;  // 'L'
+
+CStoreGuid derive_lane_c_store_guid(CStoreGuid base, uint32_t lane) noexcept {
+    if (lane == 0)
+        return base;
+    icecc::Digest128Builder builder;
+    builder.append(std::span<const uint8_t>(base.bytes.data(), base.bytes.size()));
+    builder.append_u8(kLaneGuidTagByte);
+    builder.append_u32(lane);
+    const icecc::Digest128 digest = builder.finish();
+    CStoreGuid derived{};
+    derived.bytes = digest.bytes;
+    // Byte 0's top bit is the fixed C/F store-identity role bit (see
+    // services/p50_store_identity_wire.h: C is root||0, F is root||1).  A
+    // raw hash byte has no reason to already carry the client role, so it
+    // is forced here -- never left to chance -- the same way the base guid
+    // itself always carries it.
+    derived.bytes[0] &= static_cast<uint8_t>(~icecc::p50::kStoreIdentityRoleMask);
+    // The 127-bit root excluding the role bit must stay nonzero, and must
+    // not collide with the base guid's own root; both are astronomically
+    // unlikely for a hash output but are forced explicitly rather than
+    // trusted to chance.
+    if (derived == CStoreGuid{} || derived == base)
+        derived.bytes[1] ^= 0x01;
+    return derived;
+}
+
 } // namespace
 
 SidecarRuntime::SidecarRuntime(RuntimeConfig config)
@@ -1504,6 +1544,36 @@ std::ptrdiff_t SidecarRuntime::RouteGate::armed_window_slots() noexcept {
     return static_cast<std::ptrdiff_t>(parsed);
 }
 
+uint32_t SidecarRuntime::RouteGate::route_lane_count(
+    size_t max_live_sessions) noexcept {
+    const char* raw = ::getenv("ICECC_P50_ROUTE_LANES");
+    uint32_t requested = 1;
+    if (raw != nullptr && *raw != '\0') {
+        char* end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end != raw && *end == '\0' && parsed > 0)
+            requested = static_cast<uint32_t>(parsed);
+    }
+    if (requested <= 1)
+        return 1;
+    const std::ptrdiff_t window = armed_window_slots();
+    if (window <= 0 || max_live_sessions <= static_cast<size_t>(window))
+        return 1;
+    const size_t budget = max_live_sessions - static_cast<size_t>(window);
+    const size_t max_lanes_by_budget =
+        std::max<size_t>(1, budget / static_cast<size_t>(window));
+    if (static_cast<size_t>(requested) > max_lanes_by_budget) {
+        std::fprintf(stderr,
+                     "P50_ROUTE_LANES_CLAMPED requested=%u window=%lld "
+                     "max_live_sessions=%zu clamped_to=%zu\n",
+                     requested, static_cast<long long>(window),
+                     max_live_sessions, max_lanes_by_budget);
+        std::fflush(stderr);
+        return static_cast<uint32_t>(max_lanes_by_budget);
+    }
+    return requested;
+}
+
 local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     local::P50SourceTransferRequest request,
     sidecar::AbsoluteMonotonicDeadline deadline,
@@ -1555,12 +1625,19 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             auto& gate = source_route_gates_[RouteEndpointKey{
                 request.selected_f_host, request.selected_f_cache_port}];
             if (!gate)
-                gate = std::make_shared<RouteGate>();
+                gate = std::make_shared<RouteGate>(RouteGate::route_lane_count(
+                    config_.endpoint_config.owner_limits.max_live_sessions));
             route_gate = gate;
         } catch (...) {
             return source_transfer_error(4);
         }
     }
+    // Lane 0 (the only lane unless ICECC_P50_ROUTE_LANES asks for more) is
+    // always config_.c_store_guid unchanged, so default behaviour below is
+    // byte-identical to before lanes existed.
+    const size_t selected_lane = route_gate->select_lane();
+    const CStoreGuid lane_guid = derive_lane_c_store_guid(
+        config_.c_store_guid, static_cast<uint32_t>(selected_lane));
 
     P50SourceArmFields arm;
     arm.wire_job_id = request.wire_job_id;
@@ -1575,7 +1652,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     arm.compiler_attempt = request.compiler_attempt;
     arm.c_store_generation = config_.sidecar_launch->store_generation;
     arm.c_store_derivation_version = kStoreIdentityDerivationVersion;
-    arm.c_store_guid = config_.c_store_guid.bytes;
+    arm.c_store_guid = lane_guid.bytes;
     arm.source_request_id = request.source_request_id;
     arm.source_mode = request.source_mode;
     arm.c_control_generation = config_.sidecar_launch->identity.generation;
@@ -1601,7 +1678,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // the authenticated arm acknowledgement.
     if (known_endpoint_identity.has_value()) {
         const P50RouteRelationship known_relationship{
-            config_.c_store_guid, known_endpoint_identity->guid,
+            lane_guid, known_endpoint_identity->guid,
             known_endpoint_identity->generation, profile};
         // route_owner_ belongs to the owner executor.
         auto room = std::make_shared<std::promise<bool>>();
@@ -1775,10 +1852,17 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         }
     }
 
-    ArmedAdmission::Wait armed_slot{route_gate->armed, source_size_hint,
-                                    source_mutex_wait_start};
+    const auto armed_wait_start = std::chrono::steady_clock::now();
+    ArmedAdmission::Wait armed_slot{route_gate->lanes[selected_lane]->armed,
+                                    source_size_hint, source_mutex_wait_start};
     if (!wait_for([&](auto limit) { return armed_slot.acquire_until(limit); }))
         return source_transfer_error(7);
+    const auto armed_wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - armed_wait_start)
+            .count();
+    const uint64_t gate_wait_ns = armed_wait_elapsed > 0
+                                      ? static_cast<uint64_t>(armed_wait_elapsed)
+                                      : 0;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     if (config_.after_admission_for_test)
         config_.after_admission_for_test();
@@ -1837,8 +1921,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         }
     }
 
-    std::unique_lock<std::timed_mutex> source_transfer_lock(route_gate->transfer,
-                                                            std::defer_lock);
+    std::unique_lock<std::timed_mutex> source_transfer_lock(
+        route_gate->lanes[selected_lane]->transfer, std::defer_lock);
     if (!wait_for([&](auto limit) { return source_transfer_lock.try_lock_until(limit); }))
         return source_transfer_error(7);
     struct ActiveTransfer {
@@ -1863,7 +1947,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             local::SourceTransferErrorCode::RouteReplacementRequired));
 
     const P50RouteRelationship relationship{
-        config_.c_store_guid, remote_f_guid, remote_f_generation, profile};
+        lane_guid, remote_f_guid, remote_f_generation, profile};
     const ConnectedFdFactory connection =
         [this, first, open_armed, expected_guid = remote_f_guid,
          expected_generation = remote_f_generation](
@@ -1899,8 +1983,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             context_,
             [this, relationship, request, connection, transfer_deadline,
              source_bytes = *source_bytes, source_digest, completion, route_request,
-             prepared_source,
-             expected_c_guid = config_.c_store_guid, source_mutex_wait_ns,
+             prepared_source, selected_lane, gate_wait_ns,
+             expected_c_guid = relationship.c_store_guid, source_mutex_wait_ns,
              source_mutex_service_start]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
@@ -1911,6 +1995,16 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     const RouteStoreIdentity store_identity{
                         relationship.f_store_guid,
                         relationship.f_store_generation};
+                    // route_owner_ is single-threaded like
+                    // P50PreparationAuthority: this lambda runs on the
+                    // owner executor, so registering here (rather than back
+                    // on the control worker) keeps lane_guids_ membership
+                    // ordered with every other owner-affine access. Lane 0
+                    // reuses the base guid and is never registered as a
+                    // lane: ensure_authority() keeps seeing exactly what it
+                    // always has.
+                    if (selected_lane != 0)
+                        route_owner_->register_lane(expected_c_guid);
                     if (prepared_source)
                         source_authority_->install_source(route_request,
                                                           prepared_source);
@@ -1951,7 +2045,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                         : 0;
                 append_source_result_trace(
                     request, expected_c_guid, relationship.profile, observed,
-                    source_mutex_wait_ns, source_mutex_service_ns);
+                    source_mutex_wait_ns, source_mutex_service_ns,
+                    static_cast<uint32_t>(selected_lane), gate_wait_ns);
                 if (source_authority_)
                     source_authority_->release_source(route_request);
                 completion->set_value(value);

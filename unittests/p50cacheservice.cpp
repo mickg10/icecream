@@ -28,6 +28,7 @@
 
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_future.hpp>
@@ -2332,6 +2333,14 @@ public:
         return parked_.size();
     }
 
+    // Wire-level c_store_guid observed on each accepted arm, in arrival
+    // order.  With ROUTE_LANES active, a lane>0 session presents its derived
+    // guid here instead of the base store guid.
+    [[nodiscard]] std::vector<CStoreGuid> observed_guids() {
+        std::lock_guard lock(mutex_);
+        return observed_;
+    }
+
     // Reports whether F would answer one more session BUSY.
     [[nodiscard]] bool probe_refused() {
         if (!f_runtime_.try_reserve_session())
@@ -2450,6 +2459,7 @@ private:
             {
                 std::lock_guard lock(mutex_);
                 park = held_ == c_store;
+                observed_.push_back(c_store);
             }
             if (!park) {
                 f_runtime_.start_adopted_endpoint(raw_fd);
@@ -2477,6 +2487,7 @@ private:
     std::mutex mutex_;
     std::optional<CStoreGuid> held_;
     std::vector<std::pair<int, int>> parked_;
+    std::vector<CStoreGuid> observed_;
     std::vector<std::thread> workers_;
     std::thread acceptor_;
 };
@@ -3014,6 +3025,191 @@ void test_reopen_busy_waits_only_for_the_same_f_store() {
     }
 }
 
+// Mirrors the TU-local bytes_hex() in cache/p50_cache_service.cpp (same
+// digit table, two hex characters per byte, no separators): that symbol is
+// declared inside an anonymous namespace there and so has internal linkage,
+// unreachable from this translation unit even though both files are built
+// into this same test binary.
+std::string guid_hex(const CStoreGuid& guid) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(guid.bytes.size() * 2);
+    for (const uint8_t byte : guid.bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
+// ICECC_P50_ROUTE_LANES (lever: ROUTE_LANES): two concurrent transfers to one
+// F endpoint, with ICECC_P50_ROUTE_LANES=2, must select distinct lanes and
+// run their CacheWire exchanges concurrently with no cursor/replacement
+// cross-talk. The first transfer's after_admission_for_test hook blocks --
+// holding its lane's armed-window slot open -- until the main thread has
+// observed it enter the hook; only then is the second transfer launched.
+// That ordering guarantees the second transfer's select_lane() call
+// (RouteGate::select_lane(), cache/p50_cache_service.h) observes the first
+// lane's reduced free_slots() and is forced onto the other lane, entirely
+// deterministically and without touching F. CapacityFront never holds here,
+// so neither session parks: both run the real F endpoint pipeline, and a
+// Committed result from both -- with two distinct wire-level c_store_guid
+// values, exactly one equal to the unchanged base guid (lane 0) -- is proof
+// that F authority stayed single while the two lanes were cross-talk-free.
+void test_route_lanes_concurrent_transfers_use_distinct_lanes() {
+    constexpr uint64_t kFStoreGeneration = 31;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x95;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xd1;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    const CStoreGuid c_store = c_config.c_store_guid;
+
+    std::mutex sync_mutex;
+    std::condition_variable sync_cv;
+    bool first_in_hook = false;
+    bool release_first = false;
+    c_config.after_admission_for_test = [&] {
+        std::unique_lock<std::mutex> lock(sync_mutex);
+        if (!first_in_hook) {
+            first_in_hook = true;
+            sync_cv.notify_all();
+            sync_cv.wait(lock, [&] { return release_first; });
+        } else {
+            release_first = true;
+            sync_cv.notify_all();
+        }
+    };
+
+    CHECK(::setenv("ICECC_P50_ROUTE_LANES", "2", 1) == 0);
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](uint64_t identity) {
+        const std::string text = "route-lanes-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-route-lanes", source)));
+    };
+
+    local::P50SourceTransferResult result_a{};
+    local::P50SourceTransferResult result_b{};
+    std::thread thread_a([&] { result_a = transfer(900); });
+    bool first_seen = false;
+    {
+        std::unique_lock<std::mutex> lock(sync_mutex);
+        first_seen = sync_cv.wait_for(lock, std::chrono::seconds(10),
+                                      [&] { return first_in_hook; });
+    }
+    CHECK(first_seen);
+    std::thread thread_b([&] { result_b = transfer(910); });
+    thread_a.join();
+    thread_b.join();
+    front.stop();
+
+    CHECK(::unsetenv("ICECC_P50_ROUTE_LANES") == 0);
+
+    CHECK(result_a.code == local::SourceTransferResultCode::Committed);
+    CHECK(result_b.code == local::SourceTransferResultCode::Committed);
+
+    const std::vector<CStoreGuid> observed = front.observed_guids();
+    std::fprintf(stderr, "p50cacheservice: ROUTE_LANES=2 observed %zu guids\n",
+                 observed.size());
+    CHECK(observed.size() == 2);
+    CHECK(!(observed[0] == observed[1]));
+    const bool first_is_base = observed[0] == c_store;
+    const bool second_is_base = observed[1] == c_store;
+    CHECK(first_is_base != second_is_base);
+}
+
+// K=1 (default, unset) must be byte-identical to pre-lanes behaviour: the
+// ICECC_P50_SOURCE_RESULT_TRACE line for an ordinary transfer still reports
+// lane 0 and the unchanged base c_store_guid, proving a lane guid never
+// reaches the trace -- or, by the same construction confirmed by direct
+// source reading (expected_c_guid = relationship.c_store_guid, which for
+// lane 0 is derive_lane_c_store_guid(base, 0) == base), ensure_authority()
+// -- under default configuration.
+void test_route_lanes_default_off_trace_matches_base_guid() {
+    constexpr uint64_t kFStoreGeneration = 31;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x96;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xd2;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    const CStoreGuid c_store = c_config.c_store_guid;
+
+    CHECK(::unsetenv("ICECC_P50_ROUTE_LANES") == 0);
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+
+    char template_path[] = "/tmp/icecc-p50-route-lanes-trace-XXXXXX";
+    const int trace_fd = ::mkstemp(template_path);
+    CHECK(trace_fd >= 0);
+    (void)::close(trace_fd);
+    const std::string trace_path = template_path;
+    CHECK(::setenv("ICECC_P50_SOURCE_RESULT_TRACE", trace_path.c_str(), 1) == 0);
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const std::string text = "route-lanes-default\n";
+    const std::vector<uint8_t> source(text.begin(), text.end());
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(20),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const local::P50SourceTransferResult result = c_runtime.transfer_source_on_owner(
+        source_transfer_request(front.port(), 920, CACHE_PROFILE_P29V1),
+        deadline, local::HandoffFd(source_file("p50-route-lanes-default", source)));
+    front.stop();
+
+    CHECK(::unsetenv("ICECC_P50_SOURCE_RESULT_TRACE") == 0);
+    CHECK(result.code == local::SourceTransferResultCode::Committed);
+
+    const std::vector<CStoreGuid> observed = front.observed_guids();
+    CHECK(observed.size() == 1);
+    CHECK(observed[0] == c_store);
+
+    std::array<char, 4096> buffer{};
+    const int read_fd = ::open(trace_path.c_str(), O_RDONLY | O_CLOEXEC);
+    CHECK(read_fd >= 0);
+    const ssize_t bytes_read = ::read(read_fd, buffer.data(), buffer.size() - 1);
+    (void)::close(read_fd);
+    (void)::unlink(trace_path.c_str());
+    CHECK(bytes_read > 0);
+    const std::string trace(buffer.data(), static_cast<size_t>(bytes_read));
+
+    const std::string expected_guid_field =
+        "\"c_store_guid\":\"" + guid_hex(c_store) + "\"";
+    std::fprintf(stderr, "p50cacheservice: ROUTE_LANES default-off trace: %s", trace.c_str());
+    CHECK(trace.find("\"schema\":\"icecream-p50-source-result-v3\"") != std::string::npos);
+    CHECK(trace.find("\"lane\":0,") != std::string::npos);
+    CHECK(trace.find(expected_guid_field) != std::string::npos);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -3519,6 +3715,8 @@ int main(int argc, char** argv) {
             test_f_live_session_overflow_from_two_c_runtimes();
             test_reopen_busy_waits_only_for_the_same_f_store();
             test_armed_window_env_override_shifts_gate_capacity();
+            test_route_lanes_concurrent_transfers_use_distinct_lanes();
+            test_route_lanes_default_off_trace_matches_base_guid();
             return 0;
         }
         CHECK(argc == 1);

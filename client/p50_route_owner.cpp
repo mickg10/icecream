@@ -68,7 +68,19 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
     if (owners_.size() >= config_.max_relationships)
         throw std::length_error("route relationship table is full");
 
-    ensure_authority(relationship.c_store_guid);
+    // The shared authority is pinned to the one real base C-store GUID
+    // (seeded by SidecarRuntime, or lazily by the first transfer, before any
+    // lane is ever used). A ROUTE_LANES lane-derived GUID must never reach
+    // ensure_authority() -- only the registered-lane membership check below
+    // sees it. With no lanes registered (default), this check is exactly
+    // the pre-lanes equality test: byte-identical default behavior.
+    if (authority_) {
+        if (relationship.c_store_guid != authority_->c_store_guid() &&
+            !lane_guids_.contains(relationship.c_store_guid))
+            throw std::invalid_argument("route belongs to another C store");
+    } else {
+        ensure_authority(relationship.c_store_guid);
+    }
     ZstdSourceTransferConfig config =
         sender_config(config_, relationship.profile, deadline);
     auto sender = std::make_unique<P50ZstdSourceSender>(
@@ -97,10 +109,17 @@ std::shared_ptr<P50PreparationAuthority> P50CRouteOwner::authority(
     return authority_;
 }
 
+void P50CRouteOwner::register_lane(CStoreGuid lane_guid) {
+    lane_guids_.insert(lane_guid);
+}
+
 PreparationRouteKey P50CRouteOwner::route_key(
     const P50RouteRelationship& relationship) const noexcept {
-    return {relationship.f_store_guid, relationship.f_store_generation,
-            relationship.profile};
+    // relationship.c_store_guid carries the lane GUID (or the base GUID at
+    // lane 0), so each lane gets its own preparation-route entry -- its own
+    // "one uncommitted successor" slot -- inside the one shared authority.
+    return {relationship.c_store_guid, relationship.f_store_guid,
+            relationship.f_store_generation, relationship.profile};
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
