@@ -2480,12 +2480,44 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
 #endif
         std::vector<uint8_t> result =
             route.p29v1->deserializer.take_materialized();
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+        // Sim-only: time the two hash computations below individually
+        // instead of letting them run unattributed inside the surrounding
+        // (untimed) chain. This mirrors the original short-circuit
+        // evaluation order and throw point exactly -- only the attribution
+        // of CPU time changes, not the control flow or the wire bytes.
+        bool materialize_mismatch = result.size() != pending.begin.raw_bytes;
+        if (!materialize_mismatch) {
+            Digest128 materialized_digest{};
+            {
+                codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                    codec::p29_wire_detail::P29StageTimerEntry::ReceiverMaterializedDigest);
+                materialized_digest = digest128(result);
+            }
+            materialize_mismatch = materialized_digest != pending.begin.raw_digest;
+        }
+        if (!materialize_mismatch) {
+            Digest128 transaction_digest{};
+            {
+                codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                    codec::p29_wire_detail::P29StageTimerEntry::ReceiverTransactionDigest);
+                transaction_digest =
+                    compute_transaction_digest(pending.begin, pending.body);
+            }
+            materialize_mismatch =
+                transaction_digest != pending.begin.transaction_digest;
+        }
+        if (materialize_mismatch)
+            throw std::logic_error(
+                "P29V1 materialized input does not match TX_BEGIN exactly");
+#else
         if (result.size() != pending.begin.raw_bytes ||
             digest128(result) != pending.begin.raw_digest ||
             compute_transaction_digest(pending.begin, pending.body) !=
                 pending.begin.transaction_digest)
             throw std::logic_error(
                 "P29V1 materialized input does not match TX_BEGIN exactly");
+#endif
         const std::span<const uint8_t> segment =
             route.p29v1->deserializer.pending_segment();
         if (segment.size() > result.size())

@@ -21,6 +21,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+#include <sys/resource.h>
+#endif
+
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
 extern "C" unsigned
 icecc_p50sim_p29_allocation_scope_enter(unsigned entry) noexcept;
@@ -37,6 +41,17 @@ icecc_p50sim_p29_allocation_scope_leave(unsigned previous) noexcept;
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
 extern "C" void icecc_p50sim_p29_stage_timer_add(
     unsigned entry, std::uint64_t nanoseconds) noexcept;
+#endif
+
+// Sim-only minor-page-fault delta per named stage, layered on top of
+// ICECC_P50SIM_STAGE_TIMERS (requires both macros). Used to test whether a
+// stage's wall-clock cost is dominated by first-touch page faults on freshly
+// allocated buffers (getrusage(RUSAGE_THREAD) minflt), as opposed to CPU
+// work. Compiled out of production and out of every build that does not
+// define both macros.
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+extern "C" void icecc_p50sim_p29_stage_minflt_add(
+    unsigned entry, long minflt_delta) noexcept;
 #endif
 
 namespace icecc::codec {
@@ -273,6 +288,10 @@ class P29StageTimerScope {
 public:
   explicit P29StageTimerScope(P29StageTimerEntry entry) noexcept
       : entry_(entry), start_(std::chrono::steady_clock::now()) {
+#if defined(ICECC_P50SIM_MINFLT_STAGES)
+    struct rusage ru {};
+    start_minflt_ = (getrusage(RUSAGE_THREAD, &ru) == 0) ? ru.ru_minflt : 0;
+#endif
   }
   ~P29StageTimerScope() {
     const auto elapsed = std::chrono::steady_clock::now() - start_;
@@ -281,6 +300,13 @@ public:
         static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
                 .count()));
+#if defined(ICECC_P50SIM_MINFLT_STAGES)
+    struct rusage ru {};
+    const long end_minflt =
+        (getrusage(RUSAGE_THREAD, &ru) == 0) ? ru.ru_minflt : start_minflt_;
+    icecc_p50sim_p29_stage_minflt_add(static_cast<unsigned>(entry_),
+                                       end_minflt - start_minflt_);
+#endif
   }
   P29StageTimerScope(const P29StageTimerScope &) = delete;
   P29StageTimerScope &operator=(const P29StageTimerScope &) = delete;
@@ -288,6 +314,9 @@ public:
 private:
   P29StageTimerEntry entry_;
   std::chrono::steady_clock::time_point start_;
+#if defined(ICECC_P50SIM_MINFLT_STAGES)
+  long start_minflt_ = 0;
+#endif
 };
 #endif
 

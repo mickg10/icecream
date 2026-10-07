@@ -125,6 +125,27 @@ extern "C" void icecc_p50sim_p29_stage_timer_add(
 }
 #endif
 
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+namespace {
+// Same entry ordering as p50sim_p29_stage_timer_ns above. Signed because an
+// individual scope's delta is, in principle, allowed to be reported as 0 or
+// (in a pathological scheduler-noise case) negative when accumulated across
+// concurrent uses of RUSAGE_THREAD; stored as int64_t so fetch_add on a
+// std::atomic<int64_t> handles that without wrapping the way an unsigned
+// subtraction would.
+constexpr unsigned p50sim_p29_stage_minflt_entry_count = 7;
+std::array<std::atomic<int64_t>, p50sim_p29_stage_minflt_entry_count>
+    p50sim_p29_stage_minflt{};
+}  // namespace
+
+extern "C" void icecc_p50sim_p29_stage_minflt_add(
+    unsigned entry, long minflt_delta) noexcept {
+    if (entry < p50sim_p29_stage_minflt_entry_count)
+        p50sim_p29_stage_minflt[entry].fetch_add(
+            static_cast<int64_t>(minflt_delta), std::memory_order_relaxed);
+}
+#endif
+
 #if defined(ICECC_P50SIM_FRAME_SHA)
 namespace {
 
@@ -978,6 +999,8 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                          p29v1_codec_allocation_entries,
                      std::optional<std::array<uint64_t, 7>>
                          p29v1_codec_stage_ns,
+                     std::optional<std::array<int64_t, 7>>
+                         p29v1_codec_stage_minflt,
                      const std::optional<std::string>& c_to_f_sha256,
                      const std::optional<std::string>& f_to_c_sha256) {
     Digest128 tx_digest{};
@@ -1121,6 +1144,22 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         }
         output << '}';
     }
+    if (p29v1_codec_stage_minflt) {
+        static constexpr std::array<std::string_view, 7> stage_names{
+            "receiver_receive_fill_minflt", "receiver_take_materialized_minflt",
+            "receiver_materialized_digest_minflt",
+            "receiver_transaction_digest_minflt",
+            "receiver_pending_segment_digest_minflt",
+            "sender_intern_and_match_minflt", "sender_encode_minflt"};
+        output << ",\"p29v1_codec_stage_minflt\":{";
+        for (size_t index = 0; index != stage_names.size(); ++index) {
+            if (index != 0)
+                output << ',';
+            output << '\"' << stage_names[index] << "\":"
+                   << (*p29v1_codec_stage_minflt)[index];
+        }
+        output << '}';
+    }
     if (c_to_f_sha256)
         output << ",\"c_to_f_sha256\":\"" << *c_to_f_sha256 << '"';
     if (f_to_c_sha256)
@@ -1260,6 +1299,15 @@ void run_batch(const Arguments& arguments) {
                     p50sim_p29_stage_timer_ns[entry].load(
                         std::memory_order_relaxed);
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+            std::array<int64_t, p50sim_p29_stage_minflt_entry_count>
+                p29v1_codec_stage_minflt_before{};
+            for (size_t entry = 0;
+                 entry != p29v1_codec_stage_minflt_before.size(); ++entry)
+                p29v1_codec_stage_minflt_before[entry] =
+                    p50sim_p29_stage_minflt[entry].load(
+                        std::memory_order_relaxed);
+#endif
             const auto prepare_started = std::chrono::steady_clock::now();
             auto prepared = authority->prepare_for_route(
                 relation.route,
@@ -1361,6 +1409,20 @@ void run_batch(const Arguments& arguments) {
 #else
             std::optional<std::array<uint64_t, 7>> p29v1_codec_stage_ns;
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+            std::optional<std::array<int64_t, 7>> p29v1_codec_stage_minflt;
+            p29v1_codec_stage_minflt.emplace();
+            for (size_t entry = 0; entry != p29v1_codec_stage_minflt->size();
+                 ++entry) {
+                const int64_t entry_after =
+                    p50sim_p29_stage_minflt[entry].load(
+                        std::memory_order_relaxed);
+                (*p29v1_codec_stage_minflt)[entry] =
+                    entry_after - p29v1_codec_stage_minflt_before[entry];
+            }
+#else
+            std::optional<std::array<int64_t, 7>> p29v1_codec_stage_minflt;
+#endif
 #if defined(ICECC_P50SIM_FRAME_SHA)
             // Both hashers are finalized here regardless of outcome: if the
             // TU didn't commit cleanly below, write_batch_row() is never
@@ -1418,6 +1480,7 @@ void run_batch(const Arguments& arguments) {
                             profile, allocations, p29v1_codec_allocations,
                             p29v1_codec_allocation_entries,
                             p29v1_codec_stage_ns,
+                            p29v1_codec_stage_minflt,
                             c_to_f_sha256, f_to_c_sha256);
             output.flush();
             if (!output)
