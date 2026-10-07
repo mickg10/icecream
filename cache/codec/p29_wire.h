@@ -6,6 +6,7 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,17 @@ extern "C" unsigned
 icecc_p50sim_p29_allocation_scope_enter(unsigned entry) noexcept;
 extern "C" void
 icecc_p50sim_p29_allocation_scope_leave(unsigned previous) noexcept;
+#endif
+
+// Sim-only wall-clock sub-stage timing. Compiled out of production and out
+// of every build that does not define ICECC_P50SIM_STAGE_TIMERS; the bench
+// build defines it to break materialize/prepare down into named stages
+// (receive_fill, take_materialized, materialized-digest, transaction-digest,
+// pending-segment-digest on the F side; intern+match, encode on the C side)
+// without adding any steady_clock calls to the normal build.
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+extern "C" void icecc_p50sim_p29_stage_timer_add(
+    unsigned entry, std::uint64_t nanoseconds) noexcept;
 #endif
 
 namespace icecc::codec {
@@ -238,6 +250,44 @@ public:
 
 private:
   unsigned previous_;
+};
+#endif
+
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+// Named stages for the bench build's sub-stage timing split. Receiver*
+// entries correspond to FStore::materialize_and_verify's sub-steps;
+// Sender* entries correspond to the C-side prepare path (confirmed call
+// sites: SenderInternAndMatch = P29V1 interner.process(...), SenderEncode
+// = P29V1 serializer.begin_tu(...)).
+enum class P29StageTimerEntry : unsigned {
+  ReceiverReceiveFill,
+  ReceiverTakeMaterialized,
+  ReceiverMaterializedDigest,
+  ReceiverTransactionDigest,
+  ReceiverPendingSegmentDigest,
+  SenderInternAndMatch,
+  SenderEncode,
+};
+
+class P29StageTimerScope {
+public:
+  explicit P29StageTimerScope(P29StageTimerEntry entry) noexcept
+      : entry_(entry), start_(std::chrono::steady_clock::now()) {
+  }
+  ~P29StageTimerScope() {
+    const auto elapsed = std::chrono::steady_clock::now() - start_;
+    icecc_p50sim_p29_stage_timer_add(
+        static_cast<unsigned>(entry_),
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
+                .count()));
+  }
+  P29StageTimerScope(const P29StageTimerScope &) = delete;
+  P29StageTimerScope &operator=(const P29StageTimerScope &) = delete;
+
+private:
+  P29StageTimerEntry entry_;
+  std::chrono::steady_clock::time_point start_;
 };
 #endif
 
@@ -1471,6 +1521,10 @@ public:
     p29_wire_detail::P29AllocationScope allocation_scope(
         p29_wire_detail::P29AllocationEntry::ReceiverReceiveFill);
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+    p29_wire_detail::P29StageTimerScope stage_timer_scope(
+        p29_wire_detail::P29StageTimerEntry::ReceiverReceiveFill);
+#endif
     require_pending();
     if (pending_.fill_ready)
       fail("P29 deserializer received FILL twice");
@@ -1492,6 +1546,10 @@ public:
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
     p29_wire_detail::P29AllocationScope allocation_scope(
         p29_wire_detail::P29AllocationEntry::ReceiverTakeMaterialized);
+#endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+    p29_wire_detail::P29StageTimerScope stage_timer_scope(
+        p29_wire_detail::P29StageTimerEntry::ReceiverTakeMaterialized);
 #endif
     require_pending();
     if (!pending_.fill_ready)

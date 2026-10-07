@@ -1770,7 +1770,13 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
     try {
         auto prepared = std::make_shared<PreparedTU>();
         prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
-        p29v1_->interner.process(exact_input, prepared->dense_regions);
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderInternAndMatch);
+#endif
+            p29v1_->interner.process(exact_input, prepared->dense_regions);
+        }
         if (p29v1_->prepares == p29v1_->inject_failure_after) {
             std::fprintf(stderr,
                          "{\"schema\":\"icecream-p50-fault-v1\","
@@ -1885,7 +1891,13 @@ const CActiveTx& CRoute::begin_v1(
     try {
         CActiveTx active;
         active.prepared = prepared;
-        active.body = p29v1_->serializer.begin_tu(prepared->dense_regions);
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderEncode);
+#endif
+            active.body = p29v1_->serializer.begin_tu(prepared->dense_regions);
+        }
         active.region_count = prepared->dense_regions.size();
         active.begin.history_nonce = history_nonce_;
         active.begin.rel_seq = next_rel_seq_;
@@ -2479,8 +2491,14 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
         if (segment.size() > result.size())
             throw std::logic_error(
                 "P29V1 staged segment exceeds materialized input");
-        pending.p29v1_segment_digest =
-            route.p29v1->deserializer.pending_segment_digest();
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::ReceiverPendingSegmentDigest);
+#endif
+            pending.p29v1_segment_digest =
+                route.p29v1->deserializer.pending_segment_digest();
+        }
         pending.p29v1_materialized = true;
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
         return result;

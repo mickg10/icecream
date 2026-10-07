@@ -107,6 +107,22 @@ void operator delete[](void* value, std::size_t, std::align_val_t) noexcept {
 }
 #endif
 
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+namespace {
+// Must match the ordering of codec::p29_wire_detail::P29StageTimerEntry.
+constexpr unsigned p50sim_p29_stage_timer_entry_count = 7;
+std::array<std::atomic<uint64_t>, p50sim_p29_stage_timer_entry_count>
+    p50sim_p29_stage_timer_ns{};
+}  // namespace
+
+extern "C" void icecc_p50sim_p29_stage_timer_add(
+    unsigned entry, std::uint64_t nanoseconds) noexcept {
+    if (entry < p50sim_p29_stage_timer_entry_count)
+        p50sim_p29_stage_timer_ns[entry].fetch_add(nanoseconds,
+                                                     std::memory_order_relaxed);
+}
+#endif
+
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 using namespace icecc::p50;
@@ -800,7 +816,9 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      std::optional<uint64_t> allocations,
                      std::optional<uint64_t> p29v1_codec_allocations,
                      std::optional<std::array<uint64_t, 9>>
-                         p29v1_codec_allocation_entries) {
+                         p29v1_codec_allocation_entries,
+                     std::optional<std::array<uint64_t, 7>>
+                         p29v1_codec_stage_ns) {
     Digest128 tx_digest{};
     Digest128 begin_tx_digest{};
     Digest128 action_raw_digest{};
@@ -927,6 +945,21 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         }
         output << '}';
     }
+    if (p29v1_codec_stage_ns) {
+        static constexpr std::array<std::string_view, 7> stage_names{
+            "receiver_receive_fill_ns", "receiver_take_materialized_ns",
+            "receiver_materialized_digest_ns", "receiver_transaction_digest_ns",
+            "receiver_pending_segment_digest_ns", "sender_intern_and_match_ns",
+            "sender_encode_ns"};
+        output << ",\"p29v1_codec_stage_ns\":{";
+        for (size_t index = 0; index != stage_names.size(); ++index) {
+            if (index != 0)
+                output << ',';
+            output << '\"' << stage_names[index] << "\":"
+                   << (*p29v1_codec_stage_ns)[index];
+        }
+        output << '}';
+    }
     if (profile == ProfileId::ZSTD_ROUTE) {
         output << ",\"committed_raw_prefix_before_descriptor\":{\"schema\":\"icecream-s8-route-prefix-descriptor-v1\",\"bytes\":"
                << prefix_before_bytes << ",\"digest128\":\""
@@ -1050,6 +1083,18 @@ void run_batch(const Arguments& arguments) {
                     p50sim_p29_allocation_entries[entry].load(
                         std::memory_order_relaxed);
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            // Snapshot before prepare_for_route() so the delta captures both
+            // the sender-side stages (inside prepare_for_route, below) and
+            // the receiver-side stages (inside context.run(), further down).
+            std::array<uint64_t, p50sim_p29_stage_timer_entry_count>
+                p29v1_codec_stage_ns_before{};
+            for (size_t entry = 0; entry != p29v1_codec_stage_ns_before.size();
+                 ++entry)
+                p29v1_codec_stage_ns_before[entry] =
+                    p50sim_p29_stage_timer_ns[entry].load(
+                        std::memory_order_relaxed);
+#endif
             const auto prepare_started = std::chrono::steady_clock::now();
             auto prepared = authority->prepare_for_route(
                 relation.route,
@@ -1115,6 +1160,20 @@ void run_batch(const Arguments& arguments) {
                 }
             }
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            std::optional<std::array<uint64_t, 7>> p29v1_codec_stage_ns;
+            p29v1_codec_stage_ns.emplace();
+            for (size_t entry = 0; entry != p29v1_codec_stage_ns->size();
+                 ++entry) {
+                const uint64_t entry_after =
+                    p50sim_p29_stage_timer_ns[entry].load(
+                        std::memory_order_relaxed);
+                (*p29v1_codec_stage_ns)[entry] =
+                    entry_after - p29v1_codec_stage_ns_before[entry];
+            }
+#else
+            std::optional<std::array<uint64_t, 7>> p29v1_codec_stage_ns;
+#endif
             if (client_result.status != ClientRunStatus::Committed ||
                 server_result.status != ServerRunStatus::Completed ||
                 !client_result.committed_input || !server_result.committed_input ||
@@ -1158,7 +1217,8 @@ void run_batch(const Arguments& arguments) {
                             authority->p29v1_interner_reserved_bytes(),
                             authority->p29v1_interner_committed_bytes(),
                             profile, allocations, p29v1_codec_allocations,
-                            p29v1_codec_allocation_entries);
+                            p29v1_codec_allocation_entries,
+                            p29v1_codec_stage_ns);
             output.flush();
             if (!output)
                 throw std::runtime_error("cannot flush batch output before input reclamation");
