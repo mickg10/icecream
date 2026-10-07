@@ -1858,6 +1858,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 return refused("f-protocol", channel->protocol);
             if (std::chrono::steady_clock::now() >= limit)
                 return refused("f-connect-deadline");
+            icecc::stagetrace::stage_trace("csidecar", "f_connect_done",
+                (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+                (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
             stage_start = std::chrono::steady_clock::now();
             const P50SourceArmMsg request_message(arm);
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
@@ -1871,6 +1874,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 return refused("f-arm-reply");
             if (!acknowledgement->acknowledges(request_message))
                 return refused("f-arm-mismatch");
+            icecc::stagetrace::stage_trace("csidecar", "arm_ack_received",
+                (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+                (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
             if (std::chrono::steady_clock::now() >= limit)
                 return refused("f-arm-deadline");
             stage_start = std::chrono::steady_clock::now();
@@ -1887,7 +1893,12 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 refused("f-cache-session-busy");
                 return kFSessionBusy;
             }
-            return ready_fd >= 0 ? ready_fd : refused("f-cache-session-ready");
+            if (ready_fd < 0)
+                return refused("f-cache-session-ready");
+            icecc::stagetrace::stage_trace("csidecar", "cache_session_ready",
+                (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+                (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+            return ready_fd;
         } catch (...) {
             return refused("f-open-exception");
         }
@@ -1941,6 +1952,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         *source_read_ns = source_read_elapsed > 0
                               ? static_cast<uint64_t>(source_read_elapsed)
                               : 0;
+        icecc::stagetrace::stage_trace("csidecar", "source_read_done",
+            (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+            (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
+            {{"ok", source_bytes.has_value() ? 1 : 0}});
         if (source_bytes.has_value()) {
             source_digest = digest128(**source_bytes);
             try {
@@ -1948,6 +1963,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     route_request, *source_bytes, source_digest);
             } catch (...) {
             }
+            icecc::stagetrace::stage_trace("csidecar", "prepare_source_done",
+                (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+                (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
+                {{"ok", prepared_source != nullptr ? 1 : 0}});
         }
     }
 
@@ -1956,6 +1975,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                                     source_size_hint, source_mutex_wait_start};
     if (!wait_for([&](auto limit) { return armed_slot.acquire_until(limit); }))
         return source_transfer_error(7);
+    icecc::stagetrace::stage_trace("csidecar", "armed_slot_acquired",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
     const auto armed_wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - armed_wait_start)
             .count();
@@ -1994,6 +2016,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         *source_read_ns = source_read_elapsed > 0
                               ? static_cast<uint64_t>(source_read_elapsed)
                               : 0;
+        icecc::stagetrace::stage_trace("csidecar", "source_read_done",
+            (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+            (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
+            {{"ok", source_bytes.has_value() ? 1 : 0}});
     }
     if (!source_bytes.has_value()) {
         std::fprintf(stderr,
@@ -2017,6 +2043,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     route_request, *source_bytes, source_digest);
             } catch (...) {
             }
+            icecc::stagetrace::stage_trace("csidecar", "prepare_source_done",
+                (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+                (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
+                {{"ok", prepared_source != nullptr ? 1 : 0}});
         }
     }
 
@@ -2024,6 +2054,21 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         route_gate->lanes[selected_lane]->transfer, std::defer_lock);
     if (!wait_for([&](auto limit) { return source_transfer_lock.try_lock_until(limit); }))
         return source_transfer_error(7);
+    icecc::stagetrace::stage_trace("csidecar", "transfer_lock_acquired",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+    // Destructs (in reverse declaration order) immediately before
+    // source_transfer_lock's own destructor runs, so this traces the
+    // real unlock point without altering it.
+    struct TransferLockReleaseTrace {
+        const P50SourceArmFields &req;
+        ~TransferLockReleaseTrace()
+        {
+            icecc::stagetrace::stage_trace("csidecar", "transfer_lock_released",
+                (int64_t)req.assignment_epoch, (int64_t)req.wire_job_id,
+                (int64_t)req.logical_job, (int64_t)req.compiler_attempt);
+        }
+    } transfer_lock_release_trace{arm};
     struct ActiveTransfer {
         std::atomic<size_t>& count;
         explicit ActiveTransfer(std::atomic<size_t>& value) : count(value) { ++count; }
