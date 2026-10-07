@@ -182,6 +182,189 @@ def corrected_ts(rec: Record, offsets: Dict[str, int]) -> int:
     return rec.realtime_ns + offsets.get(rec.host, 0)
 
 
+# Protocol-level NTP-style clock offset derivation (review item 3).
+#
+# offsets.sh/load_offsets() above estimate a host's clock skew from an SSH
+# round trip -- useful, but a separate measurement from the actual P50
+# traffic. The C-side icecream-p50-source-result-v5 trace
+# (ICECC_P50_SOURCE_RESULT_TRACE) and the F-side icecream-p50-f-result-v1
+# trace (ICECC_P50_F_RESULT_TRACE) each stamp absolute CLOCK_REALTIME wall
+# clock samples around the same BEGIN/COMMIT round trip that already
+# crosses the wire for every transfer, so the same round trip can be
+# treated as its own NTP exchange and used to derive a clock offset without
+# any extra probe traffic:
+#
+#   t1 = c_begin_write_wall_ns   -- C writes BEGIN, timestamped on C's clock
+#   t2 = f_begin_recv_wall_ns    -- F receives BEGIN, timestamped on F's clock
+#   t3 = wall_clock_ns (F v1)    -- F writes COMMIT, timestamped on F's clock
+#   t4 = c_commit_read_wall_ns   -- C reads COMMIT, timestamped on C's clock
+#
+#   offset = ((t2 - t1) + (t3 - t4)) / 2   -- classic NTP clock offset
+#   delay  = (t4 - t1) - (t3 - t2)         -- classic NTP round-trip delay
+#   error <= delay / 2
+#
+# offset is denominated exactly like offsets.sh's output: the amount the F
+# host's clock reads ahead of the reference (C1) clock, directly comparable
+# to an existing offsets.json entry for the same host. Both traces are
+# diagnostic-only and env-gated; neither is required for correct operation,
+# and nothing here changes wire bytes or behavior.
+NTP_DISAGREEMENT_WARN_NS = 5_000_000  # 5ms, see review item 3
+
+
+def load_v5_source_results(path: str) -> List[Dict[str, int]]:
+    """Load icecream-p50-source-result-v5 records (ICECC_P50_SOURCE_RESULT_TRACE).
+
+    C-side, diagnostic-only. Extracts only the join key and the two
+    absolute wall-clock samples needed for derive_ntp_offsets(); never
+    touches source bytes or paths.
+    """
+    out: List[Dict[str, int]] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"warning: {path}:{lineno}: skipping malformed JSON ({exc})",
+                      file=sys.stderr)
+                continue
+            if obj.get("schema") != "icecream-p50-source-result-v5":
+                continue
+            try:
+                out.append({
+                    "c_store_guid": str(obj["c_store_guid"]),
+                    "tu_seq": int(obj["tu_seq"]),
+                    "t1": int(obj.get("c_begin_write_wall_ns", 0)),
+                    "t4": int(obj.get("c_commit_read_wall_ns", 0)),
+                })
+            except (KeyError, TypeError, ValueError) as exc:
+                print(f"warning: {path}:{lineno}: skipping v5 record ({exc})",
+                      file=sys.stderr)
+    return out
+
+
+def load_v1_f_results(path: str) -> List[Dict[str, int]]:
+    """Load icecream-p50-f-result-v1 records (ICECC_P50_F_RESULT_TRACE).
+
+    F-side, diagnostic-only. See load_v5_source_results() above.
+    """
+    out: List[Dict[str, int]] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"warning: {path}:{lineno}: skipping malformed JSON ({exc})",
+                      file=sys.stderr)
+                continue
+            if obj.get("schema") != "icecream-p50-f-result-v1":
+                continue
+            try:
+                out.append({
+                    "c_store_guid": str(obj["c_store_guid"]),
+                    "tu_seq": int(obj["tu_seq"]),
+                    "t2": int(obj.get("f_begin_recv_wall_ns", 0)),
+                    "t3": int(obj.get("wall_clock_ns", 0)),
+                })
+            except (KeyError, TypeError, ValueError) as exc:
+                print(f"warning: {path}:{lineno}: skipping f-v1 record ({exc})",
+                      file=sys.stderr)
+    return out
+
+
+@dataclass
+class NtpOffsetResult:
+    offset_ns: float
+    error_ns: float
+    n_kept: int
+    n_total: int
+
+
+def derive_ntp_offsets(
+        c_records: List[Dict[str, int]],
+        f_records_by_host: Dict[str, List[Dict[str, int]]],
+) -> Dict[str, "NtpOffsetResult"]:
+    """Derive one NTP-style clock offset per F host from joined C v5/F v1 traces.
+
+    Joins c_records (icecream-p50-source-result-v5) against each host's
+    f_records (icecream-p50-f-result-v1) on (c_store_guid, tu_seq) -- the
+    only key both schemas carry (c_store_guid is "route" in the review's
+    wording). For each joined pair with all four of t1..t4 present and a
+    physically plausible (positive) round-trip delay, computes the sample
+    offset/delay per the module-level comment above.
+
+    Applies NTP-style clock filtering: keeps only the lowest-delay decile
+    of samples per host (at least one), since low-delay samples carry the
+    least queueing-induced asymmetry error, then reports the median offset
+    and the max per-sample error bound over that kept decile. A host with
+    zero usable joined samples is omitted from the result.
+    """
+    results: Dict[str, NtpOffsetResult] = {}
+    for host, f_records in f_records_by_host.items():
+        f_index: Dict[Tuple[str, int], Dict[str, int]] = {}
+        for rec in f_records:
+            f_index.setdefault((rec["c_store_guid"], rec["tu_seq"]), rec)
+
+        samples: List[Tuple[float, float]] = []  # (offset_ns, delay_ns)
+        n_total = 0
+        for c_rec in c_records:
+            f_rec = f_index.get((c_rec["c_store_guid"], c_rec["tu_seq"]))
+            if f_rec is None:
+                continue
+            n_total += 1
+            t1, t4 = c_rec["t1"], c_rec["t4"]
+            t2, t3 = f_rec["t2"], f_rec["t3"]
+            if not (t1 and t2 and t3 and t4):
+                continue  # one of the four wall-clock stamps wasn't captured
+            delay = (t4 - t1) - (t3 - t2)
+            if delay <= 0:
+                continue  # not a physically plausible round trip -- drop
+            offset = ((t2 - t1) + (t3 - t4)) / 2.0
+            samples.append((offset, delay))
+
+        if not samples:
+            continue
+
+        samples.sort(key=lambda s: s[1])  # ascending delay
+        decile_n = max(1, len(samples) // 10)
+        kept = samples[:decile_n]
+        offsets_kept = sorted(o for o, _ in kept)
+        median_offset = offsets_kept[len(offsets_kept) // 2]
+        max_error = max(d / 2.0 for _, d in kept)
+        results[host] = NtpOffsetResult(
+            offset_ns=median_offset, error_ns=max_error,
+            n_kept=len(kept), n_total=n_total)
+    return results
+
+
+def print_ntp_offsets(derived: Dict[str, "NtpOffsetResult"],
+                       existing_offsets: Dict[str, int]) -> None:
+    if not derived:
+        print("\n=== NTP-derived clock offsets: no joined "
+              "C-v5/F-v1 samples found ===")
+        return
+    print("\n=== NTP-derived clock offsets (protocol-level, see "
+          "derive_ntp_offsets) -- next to offsets.json ===")
+    for host in sorted(derived):
+        r = derived[host]
+        line = (f"  {host}: offset={r.offset_ns:+.0f}ns "
+                f"error<={r.error_ns:.0f}ns "
+                f"(n={r.n_kept}/{r.n_total} samples, lowest-delay decile)")
+        existing = existing_offsets.get(host)
+        if existing is not None:
+            disagreement_ns = abs(r.offset_ns - existing)
+            line += (f" vs offsets.json={existing:+d}ns "
+                      f"diff={disagreement_ns:.0f}ns")
+            if disagreement_ns > NTP_DISAGREEMENT_WARN_NS:
+                line += " WARNING: disagreement > 5ms"
+        print(line)
+
+
 @dataclass
 class NinjaEdge:
     """One .ninja_log data line, path-free by construction.
@@ -190,10 +373,18 @@ class NinjaEdge:
     reference, as written by ninja -- NOT absolute wall-clock. Use
     compute_ninja_epoch() to place them on the same absolute timeline as
     stage_trace's realtime_ns.
+
+    mtime_ns is .ninja_log v7's restat field: the output file's mtime, in
+    epoch nanoseconds, as read by ninja on C1's own clock right after the
+    edge finished. It is 0 for older log versions or restat-less edges (see
+    parse_ninja_log). Unlike start_ms/end_ms, it is already an absolute
+    C1-clock timestamp, so it gives a second, join-free epoch anchor -- see
+    compute_ninja_epoch_mtime().
     """
     output_hash: int
     start_ms: int
     end_ms: int
+    mtime_ns: int
     cmd_hash: str
 
 
@@ -216,12 +407,13 @@ def parse_ninja_log(path: str) -> List[NinjaEdge]:
                 print(f"warning: {path}:{lineno}: skipping malformed ninja_log line",
                       file=sys.stderr)
                 continue
-            start_ms, end_ms, _restat_mtime, out_path, cmd_hash = parts[:5]
+            start_ms, end_ms, restat_mtime, out_path, cmd_hash = parts[:5]
             try:
                 edges.append(NinjaEdge(
                     output_hash=fnv1a64_path(out_path),
                     start_ms=int(start_ms),
                     end_ms=int(end_ms),
+                    mtime_ns=int(restat_mtime),
                     cmd_hash=cmd_hash,
                 ))
             except ValueError:
@@ -264,6 +456,41 @@ def compute_ninja_epoch(edges: List[NinjaEdge], jobs: Dict[Tuple[int, int], List
             if rec.component == "iceccclient" and rec.stage == "source_prepare_start":
                 anchors.append(corrected_ts(rec, offsets) - edge.start_ms * 1_000_000)
                 break
+    if not anchors:
+        return None
+    anchors.sort()
+    return anchors[len(anchors) // 2]
+
+
+# Disagreement threshold between the two independent ninja epoch anchors
+# (join-based and mtime-based) above which main() flags a warning. 50ms is
+# generous relative to filesystem mtime granularity and the join anchor's
+# own fork/exec jitter -- it is meant to catch a wrong epoch pick (wrong
+# log, wrong host clock), not day-to-day noise.
+NINJA_EPOCH_DISAGREEMENT_WARN_NS = 50_000_000
+
+
+def compute_ninja_epoch_mtime(edges: List[NinjaEdge]) -> Optional[int]:
+    """Estimates the absolute realtime_ns matching ninja_log's t=0, using
+    only the log file itself -- no stage_trace join required.
+
+    .ninja_log's restat field (NinjaEdge.mtime_ns) is the output file's
+    mtime in epoch nanoseconds, stamped on C1's own clock when the edge's
+    compiler/linker closed the file -- i.e. already an absolute timestamp.
+    Since end_ms is that same instant on ninja's elapsed-ms clock, each
+    edge gives an independent epoch estimate `mtime_ns - end_ms * 1e6`.
+    The median across all edges with a nonzero mtime is returned. Edges
+    with mtime_ns == 0 (older log versions, or restat-less edges that
+    never had their output touched) are skipped entirely, per edge --
+    they do not count as zero in the median.
+
+    This anchor is intentionally independent of compute_ninja_epoch(): it
+    needs no output_path_mapped join and no --offsets, so it also serves
+    as a cross-check that the join-based anchor picked the right log file
+    and the right host's clock offset. See NINJA_EPOCH_DISAGREEMENT_WARN_NS.
+    """
+    anchors = [edge.mtime_ns - edge.end_ms * 1_000_000
+               for edge in edges if edge.mtime_ns != 0]
     if not anchors:
         return None
     anchors.sort()
@@ -419,23 +646,68 @@ def summarize(jobs: Dict[Tuple[int, int], List[Record]],
 # correction between the two hosts involved is wrong (or missing) --
 # genuine reordering of the underlying events is not possible given the
 # protocol's own synchronous handoffs.
+#
+# Only adjacent *present* entries whose hosts differ are ever compared (see
+# the loop below), so consecutive same-host entries are always safe to
+# insert for extra resolution -- they never add a spurious check. Entries
+# are grounded directly in the call sites that emit them:
+#   - scheduler's fenced-assignment admission control (assign_prepare_sent
+#     -> F's assign_prepare_recv/ready_sent -> assign_ready_recv) must
+#     complete, with F signaling READY, before the scheduler is allowed to
+#     expose the assignment to C via UseCS.
+#   - the ARM/CACHE_SESSION handshake (csidecar's open_armed()) is a
+#     synchronous round trip over the ordinary wrapper connection, strictly
+#     *after* source_read_done/prepare_source_done and *before*
+#     transfer_lock_acquired (this reorders the previous, incorrect
+#     placement of source_read_done/prepare_source_done after
+#     transfer_lock_acquired).
+#   - the remote compile-done cluster (compile_start/compile_result_sent/
+#     object_sent on F) brackets the existing iceccclient receive stages.
+# fdaemon.child_exit is deliberately omitted: it has no synchronous
+# handoff partner on another host (it is F-local cleanup after object_sent
+# returns), so pairing it with any C-side stage would encode an empirical
+# ordering, not a true causal one, and could false-positive under normal
+# network jitter. The three fsidecar stages (session_accepted,
+# input_committed, input_materialized) are deliberately excluded too: per
+# this file's module docstring they carry no wire identity and cannot be
+# keyed to a job_key, so group_uncorrelated() -- not this table -- is where
+# they belong.
 CANONICAL_STAGE_ORDER: List[Tuple[str, str]] = [
     ("scheduler", "getcs_recv"),
+    ("scheduler", "assign_prepare_sent"),
+    ("fdaemon", "assign_prepare_recv"),
+    ("fdaemon", "ready_sent"),
+    ("scheduler", "assign_ready_recv"),
     ("scheduler", "usecs_sent"),
+    ("cdaemon", "usecs_recv"),
+    ("cdaemon", "usecs_relayed"),
     ("iceccclient", "source_prepare_start"),
     ("iceccclient", "source_prepare_done"),
     ("iceccclient", "connected_to_f"),
     ("csidecar", "transfer_request_received"),
-    ("csidecar", "transfer_lock_acquired"),
     ("csidecar", "source_read_done"),
     ("csidecar", "prepare_source_done"),
+    ("csidecar", "armed_slot_acquired"),
+    ("csidecar", "f_connect_done"),
+    ("fdaemon", "arm_recv"),
+    ("fdaemon", "arm_validated"),
+    ("csidecar", "arm_ack_received"),
+    ("fdaemon", "cache_session_dispatched"),
+    ("csidecar", "cache_session_ready"),
+    ("csidecar", "transfer_lock_acquired"),
     ("csidecar", "transfer_lock_released"),
     ("iceccclient", "source_transferred"),
     ("iceccclient", "compile_file_sent"),
+    ("fdaemon", "compile_child_forked"),
+    ("fdaemon", "jobbegin_sent"),
     ("scheduler", "jobbegin_recv"),
+    ("fdaemon", "compile_start"),
+    ("fdaemon", "compile_result_sent"),
     ("iceccclient", "compile_result_received"),
     ("iceccclient", "output_path_mapped"),
+    ("fdaemon", "object_sent"),
     ("iceccclient", "object_received"),
+    ("cdaemon", "jobdone_sent"),
     ("scheduler", "jobdone_recv"),
     ("iceccclient", "job_complete"),
 ]
@@ -456,23 +728,24 @@ def check_clock_sanity(jobs: Dict[Tuple[int, int], List[Record]],
             key = (rec.component, rec.stage)
             if key not in by_stage:  # first occurrence only (ignore retries here)
                 by_stage[key] = rec
-        prev_key = None
-        prev_rec = None
+        prev: Optional[Tuple[Tuple[str, str], Record]] = None
         for key in CANONICAL_STAGE_ORDER:
             rec = by_stage.get(key)
             if rec is None:
                 continue
-            if prev_rec is not None and prev_rec.host != rec.host:
-                prev_ts = corrected_ts(prev_rec, offsets)
-                ts = corrected_ts(rec, offsets)
-                if ts < prev_ts:
-                    warnings.append(
-                        f"job epoch={job_key[0]} wire_id={job_key[1]}: "
-                        f"{prev_key[0]}.{prev_key[1]} (host={prev_rec.host}) "
-                        f"-> {key[0]}.{key[1]} (host={rec.host}) is "
-                        f"{fmt_ms(ts - prev_ts)} backwards -- check offsets.json "
-                        f"for these two hosts")
-            prev_key, prev_rec = key, rec
+            if prev is not None:
+                prev_key, prev_rec = prev
+                if prev_rec.host != rec.host:
+                    prev_ts = corrected_ts(prev_rec, offsets)
+                    ts = corrected_ts(rec, offsets)
+                    if ts < prev_ts:
+                        warnings.append(
+                            f"job epoch={job_key[0]} wire_id={job_key[1]}: "
+                            f"{prev_key[0]}.{prev_key[1]} (host={prev_rec.host}) "
+                            f"-> {key[0]}.{key[1]} (host={rec.host}) is "
+                            f"{fmt_ms(ts - prev_ts)} backwards -- check offsets.json "
+                            f"for these two hosts")
+            prev = (key, rec)
     return warnings
 
 
@@ -588,6 +861,14 @@ def parse_job_arg(value: str) -> Tuple[int, int]:
             f"--job expects EPOCH:WIREID, got {value!r}") from exc
 
 
+def parse_host_path_arg(value: str) -> Tuple[str, str]:
+    host, _, path = value.partition("=")
+    if not host or not path:
+        raise argparse.ArgumentTypeError(
+            f"--f-result-trace expects HOST=FILE, got {value!r}")
+    return host, path
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -624,6 +905,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                               "timestamps come out backwards (see "
                               "CANONICAL_STAGE_ORDER); unlike --summary this "
                               "can actually detect clock-offset problems")
+    parser.add_argument("--c-result-trace", default=None, metavar="FILE",
+                         help="path to a C-side ICECC_P50_SOURCE_RESULT_TRACE "
+                              "(icecream-p50-source-result-v5) JSONL file; "
+                              "combine with one or more --f-result-trace to "
+                              "derive protocol-level NTP clock offsets "
+                              "(see derive_ntp_offsets)")
+    parser.add_argument("--f-result-trace", action="append", default=[],
+                         type=parse_host_path_arg, metavar="HOST=FILE",
+                         help="HOST=FILE pair for an F-side "
+                              "ICECC_P50_F_RESULT_TRACE "
+                              "(icecream-p50-f-result-v1) JSONL file; repeat "
+                              "once per F host")
     args = parser.parse_args(argv)
 
     records = load_records(args.trace_dir)
@@ -654,6 +947,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 job_key = hash_to_job.get(edge.output_hash)
                 if job_key is not None:
                     job_to_edge[job_key] = edge
+        mtime_epoch_ns = compute_ninja_epoch_mtime(ninja_edges)
+        print(f"  ninja epoch anchor (join via output_path_mapped): "
+              f"{'n/a' if ninja_epoch_ns is None else ninja_epoch_ns}")
+        print(f"  ninja epoch anchor (restat mtime, join-free): "
+              f"{'n/a' if mtime_epoch_ns is None else mtime_epoch_ns}")
+        if ninja_epoch_ns is not None and mtime_epoch_ns is not None:
+            disagreement_ns = abs(ninja_epoch_ns - mtime_epoch_ns)
+            if disagreement_ns > NINJA_EPOCH_DISAGREEMENT_WARN_NS:
+                print(f"  WARNING: the two ninja epoch anchors disagree by "
+                      f"{fmt_ms(disagreement_ns)} (> "
+                      f"{fmt_ms(NINJA_EPOCH_DISAGREEMENT_WARN_NS)}) -- check "
+                      f"that --ninja-log matches this trace dir and host",
+                      file=sys.stderr)
         print_ninja_summary(ninja_edges, jobs)
 
     def ninja_edge_for(job_key: Tuple[int, int]) -> Optional[NinjaEdge]:
@@ -693,6 +999,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.no_uncorrelated:
         print_uncorrelated(records, args.tu_seq, args.limit)
+
+    if args.c_result_trace and args.f_result_trace:
+        c_v5_records = load_v5_source_results(args.c_result_trace)
+        f_v1_records_by_host: Dict[str, List[Dict[str, int]]] = {}
+        for host, path in args.f_result_trace:
+            f_v1_records_by_host.setdefault(host, []).extend(
+                load_v1_f_results(path))
+        derived_offsets = derive_ntp_offsets(c_v5_records, f_v1_records_by_host)
+        print_ntp_offsets(derived_offsets, offsets)
+    elif args.f_result_trace and not args.c_result_trace:
+        print("warning: --f-result-trace given without --c-result-trace -- "
+              "skipping NTP offset derivation", file=sys.stderr)
 
     return 0
 
