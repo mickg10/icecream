@@ -846,6 +846,27 @@ constexpr int kRemoteCompileResultWaitSeconds = 12 * 60;
 constexpr auto kP50CompilerOperationBudget =
     std::chrono::seconds(kRemoteCompileResultWaitSeconds);
 
+// Diagnostic-only FNV-1a 64-bit hash of a path string, used solely to let
+// tools/stagetrace/analyze.py join ninja's .ninja_log output-path edges to
+// a job id offline without ever writing the path itself into a stage_trace
+// record (stage_trace output is best-effort/local and must not carry
+// CodebaseN paths). Same constants as the existing invocation-path hash in
+// client/local.cpp; analyze.py re-implements this exact algorithm in
+// Python so the two sides agree without sharing code.
+static uint64_t fnv1a64_path(const string &s) noexcept
+{
+    uint64_t h = 1469598103934665603ULL; // FNV-1a offset basis
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL; // FNV-1a prime
+    }
+    // Masked to 63 bits so the value fits the KV extra's signed int64_t
+    // without sign ambiguity: analyze.py computes the identical mask in
+    // Python (`h & 0x7fffffffffffffff`) rather than having to replicate
+    // C++'s two's-complement narrowing of the full 64-bit hash.
+    return h & 0x7fffffffffffffffULL;
+}
+
 static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_daemon,
                             const string &environment, const string &version_file,
                             const char *preproc_file, bool output,
@@ -1480,6 +1501,16 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         delete crmsg;
 
         assert(!job.outputFile().empty());
+
+        // Maps this job to the ninja-produced output object path, as a
+        // non-reversible hash rather than the path itself (see
+        // fnv1a64_path above), so tools/stagetrace/analyze.py can join
+        // .ninja_log edges to jobs/wire ids offline. Recorded unconditionally
+        // (not gated on status == 0) so failed/retried jobs still join.
+        icecc::stagetrace::stage_trace("iceccclient", "output_path_mapped",
+            (int64_t)job.assignmentEpoch(), (int64_t)job_id, icecc::stagetrace::kUnknown,
+            icecc::stagetrace::kUnknown,
+            {{"output_path_hash", (int64_t)fnv1a64_path(job.outputFile())}});
 
         if (status == 0) {
             receive_file(job.outputFile(), cserver);
