@@ -269,7 +269,7 @@ struct P50ZstdSourceSender::Impl {
 
     ZstdSourceTransferResult committed_from_witness(
         const ClientRunResult& run, uint64_t raw_bytes, Digest128 raw_digest,
-        uint8_t attempts) const {
+        uint8_t attempts, uint64_t c_prepare_route_ns = 0) const {
         if (!run.committed_commit.has_value() || !run.committed_input.has_value() ||
             run.committed_input->c_store_guid != c_guid ||
             run.committed_input->tu_seq != run.committed_commit->tu_seq ||
@@ -282,6 +282,13 @@ struct P50ZstdSourceSender::Impl {
         result.raw_bytes = raw_bytes;
         result.raw_digest = raw_digest;
         result.attempts = attempts;
+        // Diagnostic-only; see ZstdSourceTransferResult's field comments.
+        result.c_prepare_route_ns = c_prepare_route_ns;
+        result.c_fill_ns = run.c_fill_ns;
+        result.c_write_ns = run.c_write_ns;
+        result.c_state_wait_ns = run.c_state_wait_ns;
+        result.c_state_to_commit_ns = run.c_state_to_commit_ns;
+        result.c_post_commit_ns = run.c_post_commit_ns;
         return result;
     }
 
@@ -561,12 +568,18 @@ P50ZstdSourceSender::transfer_bytes(
     impl_->wire_completions.clear();
 
     PreparedTuHandle prepared;
+    uint64_t prepare_route_ns = 0;
     try {
         if (impl_->config.before_prepare_for_route_for_test)
             impl_->config.before_prepare_for_route_for_test();
+        const auto prepare_start = Clock::now();
         prepared = impl_->route_bound
             ? impl_->authority->prepare_for_route(impl_->route, request, *source)
             : impl_->authority->prepare(request, *source);
+        prepare_route_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now() - prepare_start)
+                .count());
     } catch (const P50RoutePoisoned&) {
         // begin_v1() throws this only after terminalizing retained route
         // state.  Preserve that typed ownership boundary: a wrapper cannot
@@ -656,7 +669,7 @@ P50ZstdSourceSender::transfer_bytes(
         // never discard it.
         if (run.status == ClientRunStatus::Committed) {
             ZstdSourceTransferResult result = impl_->committed_from_witness(
-                run, source->size(), raw_digest, attempt);
+                run, source->size(), raw_digest, attempt, prepare_route_ns);
             impl_->bind_wire_evidence(result);
             if (result.status == ZstdSourceTransferStatus::Committed &&
                 result.profile == ProfileId::P29V1) {

@@ -391,6 +391,15 @@ struct ClientRunResult {
     std::optional<TxCommit> committed_commit;
     std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
+    // Diagnostic-only per-run timing (steady_clock durations, ns). Populated
+    // only along the paths named in each field's comment at the call site;
+    // zero otherwise. These never gate behavior and exist solely for
+    // ICECC_P50_SOURCE_RESULT_TRACE.
+    uint64_t c_fill_ns = 0;
+    uint64_t c_write_ns = 0;
+    uint64_t c_state_wait_ns = 0;
+    uint64_t c_state_to_commit_ns = 0;
+    uint64_t c_post_commit_ns = 0;
 };
 
 enum class ServerRunStatus : uint8_t {
@@ -415,6 +424,21 @@ struct ServerRunResult {
     std::optional<InputRecordKey> completed_input;
     std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
+    // Diagnostic-only per-run timing (steady_clock durations, ns, plus one
+    // CLOCK_REALTIME wall-clock sample) for ICECC_P50_F_RESULT_TRACE.
+    // Populated only along the ordinary Completed path; zero otherwise.
+    // These never gate behavior.
+    RelSeq f_rel_seq{};
+    uint64_t f_raw_bytes = 0;
+    uint64_t f_hello_ns = 0;
+    uint64_t f_hello_to_begin_ns = 0;
+    uint64_t f_begin_to_body_complete_ns = 0;
+    uint64_t f_commit_ns = 0;
+    uint64_t f_commit_write_ns = 0;
+    uint64_t f_wait_peer_close_ns = 0;
+    uint64_t f_run_total_ns = 0;
+    uint64_t f_begin_to_commit_written_ns = 0;
+    uint64_t f_wall_clock_ns = 0;
 };
 
 enum class InputJobState : uint8_t {

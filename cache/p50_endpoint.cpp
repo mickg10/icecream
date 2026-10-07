@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace icecc::p50 {
@@ -3444,6 +3445,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     };
     ClientRunResult result;
     uint32_t terminal_cap = impl_->caps.wire.max_frame_payload;
+    // Diagnostic-only timestamps for ICECC_P50_SOURCE_RESULT_TRACE. Each is
+    // populated only when the corresponding wire step is actually reached on
+    // this run; unreached steps leave the related result field at zero.
+    std::optional<std::chrono::steady_clock::time_point> trace_write_phase_start;
+    std::optional<std::chrono::steady_clock::time_point> trace_last_write_done;
+    std::optional<std::chrono::steady_clock::time_point> trace_state_read_done;
+    std::optional<std::chrono::steady_clock::time_point> trace_commit_read_done;
     const auto verify = [&](const CompletionStamp& expected) {
         impl_->owner.require();
         require_deadline();
@@ -3485,6 +3493,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         co_await async_write_message(socket, hello, impl_->caps.wire.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
+        trace_write_phase_start = std::chrono::steady_clock::now();
+        trace_last_write_done = *trace_write_phase_start;
 
         // Only fresh work on an exact retained route: anything else needs
         // STATE first.  STATE must then confirm that route or the run fails.
@@ -3506,14 +3516,22 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                          impl_->route_limits.max_frame_payload,
                                          impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                          impl_->completions, control, verify);
+            trace_last_write_done = std::chrono::steady_clock::now();
             co_await async_write_component<BodyMessage>(
                 socket, impl_->active->prepared->body, impl_->route_limits.max_frame_payload,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment),
                 impl_->completions, control, verify);
+            trace_last_write_done = std::chrono::steady_clock::now();
             // FILL never depends on NEED's bytes, so send it now too; NEED is
             // still read and checked before TX_COMMIT is accepted.
-            if (const auto inner_fill = impl_->preparation->fill_p29v1_before_need(
-                    impl_->active->handle)) {
+            const auto trace_fill_lookup_start = std::chrono::steady_clock::now();
+            const auto inner_fill = impl_->preparation->fill_p29v1_before_need(
+                impl_->active->handle);
+            result.c_fill_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - trace_fill_lookup_start)
+                    .count());
+            if (inner_fill) {
                 for (const FillMessage& fill : encode_p29v1_fill_messages(
                          *inner_fill, impl_->route_limits.max_frame_payload,
                          codec::p29v1_fill_inner_bound(wire_limits)))
@@ -3522,12 +3540,23 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                         impl_->stamp(session, AsyncOperationKind::WriteFragment),
                         impl_->completions, control, verify);
                 fill_sent = true;
+                trace_last_write_done = std::chrono::steady_clock::now();
             }
         }
 
+        result.c_write_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                *trace_last_write_done - *trace_write_phase_start)
+                .count());
         Frame state_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+        trace_state_read_done = std::chrono::steady_clock::now();
+        result.c_state_wait_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                *trace_state_read_done - *trace_last_write_done)
+                .count());
+
         SessionState peer = client_checked(impl_->caps.wire.max_frame_payload, [&] {
             if (state_frame.type == MessageType::ERROR)
                 throw ClientTerminalResult(decode_as<ErrorMessage>(state_frame),
@@ -3790,6 +3819,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         Frame commit_frame = co_await async_read_frame(
             socket, frame_cap, impl_->stamp(session, AsyncOperationKind::ReadHeader),
             impl_->completions, verify);
+        trace_commit_read_done = std::chrono::steady_clock::now();
+        if (trace_state_read_done)
+            result.c_state_to_commit_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    *trace_commit_read_done - *trace_state_read_done)
+                    .count());
         client_checked(frame_cap, [&] {
             if (commit_frame.type == MessageType::ERROR)
                 throw ClientTerminalResult(decode_as<ErrorMessage>(commit_frame), frame_cap);
@@ -3858,6 +3893,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         (result.status == ClientRunStatus::Disconnected ||
          result.status == ClientRunStatus::DeadlineExceeded))
         impl_->active->p29v1_transport_retry = true;
+    if (result.status == ClientRunStatus::Committed && trace_commit_read_done)
+        result.c_post_commit_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - *trace_commit_read_done)
+                .count());
     cancel_quietly(io->timer);
     if (impl_->active_session == serial)
         impl_->active_session = 0;
@@ -4077,6 +4117,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     Impl::Session session = registration.session();
     ServerRunResult result;
     result.session_serial = session.serial;
+    // Diagnostic-only; see ServerRunResult's field comments. Populated
+    // unconditionally (cheap steady_clock samples); only the gated JSONL
+    // writer in p50_cache_service.cpp decides whether these are observed.
+    const auto f_run_start = std::chrono::steady_clock::now();
+    std::optional<std::chrono::steady_clock::time_point> f_hello_done;
+    std::optional<std::chrono::steady_clock::time_point> f_begin_done;
+    std::optional<std::chrono::steady_clock::time_point> f_body_complete_done;
     auto io = std::make_shared<ServerIoState>(
         std::move(socket_value), session.operation, session.deadline);
     tcp::socket& socket_for_run = io->socket;
@@ -4233,6 +4280,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         Frame hello_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+        f_hello_done = std::chrono::steady_clock::now();
+        result.f_hello_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                *f_hello_done - f_run_start)
+                .count());
         SessionHello hello = decode_as<SessionHello>(hello_frame);
         if (expected_c_store_guid.has_value() &&
             hello.c_store_guid != *expected_c_store_guid)
@@ -4272,6 +4324,12 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             impl_->activate(session);
             impl_->install_begin(session, std::move(prepared));
         }
+        f_begin_done = std::chrono::steady_clock::now();
+        if (f_hello_done)
+            result.f_hello_to_begin_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    *f_begin_done - *f_hello_done)
+                    .count());
 
         do {
             Frame component = co_await async_read_frame(
@@ -4313,6 +4371,12 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                 throw std::invalid_argument("unexpected profile component message");
             }
         } while (!impl_->body_complete(session));
+        f_body_complete_done = std::chrono::steady_clock::now();
+        if (f_begin_done)
+            result.f_begin_to_body_complete_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    *f_body_complete_done - *f_begin_done)
+                    .count());
 
         ServerMaterializationJob materialization =
             impl_->begin_materialization(
@@ -4335,26 +4399,64 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         // immediately before the allocation-free owner publication seam.
         require_operation();
         const TxBegin committed_begin = materialized.begin;
+        result.f_rel_seq = committed_begin.rel_seq;
+        result.f_raw_bytes = committed_begin.raw_bytes;
+        const auto commit_start = std::chrono::steady_clock::now();
         const TxCommit commit = impl_->commit_materialized(
             session, std::move(materialized), job_state,
             result.candidate_input,
             result.completed_input, result.committed_input);
+        const auto commit_done = std::chrono::steady_clock::now();
+        result.f_commit_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                commit_done - commit_start)
+                .count());
         impl_->live_sessions.at(session.serial).committed = true;
         co_await async_write_message(
             socket, commit, selection.limits.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::WriteFragment, &committed_begin),
             impl_->completions, control, verify);
+        const auto commit_write_done = std::chrono::steady_clock::now();
+        result.f_commit_write_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                commit_write_done - commit_done)
+                .count());
+        if (f_begin_done)
+            result.f_begin_to_commit_written_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    commit_write_done - *f_begin_done)
+                    .count());
+        {
+            struct timespec wall_ts{};
+            if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                result.f_wall_clock_ns =
+                    static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                    static_cast<uint64_t>(wall_ts.tv_nsec);
+        }
+        const auto wait_peer_close_start = std::chrono::steady_clock::now();
         co_await async_wait_peer_close(
             socket, impl_->stamp(session, AsyncOperationKind::WaitPeerClose, &committed_begin),
             impl_->completions, verify);
+        result.f_wait_peer_close_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_peer_close_start)
+                .count());
         impl_->disconnect(session, false);
         result.status = ServerRunStatus::Completed;
         close_now(socket);
+        result.f_run_total_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - f_run_start)
+                .count());
         co_return result;
     } catch (const StaleCompletion&) {
         close_now(socket);
         impl_->disconnect(session, true);
         result.status = ServerRunStatus::Disconnected;
+        result.f_run_total_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - f_run_start)
+                .count());
         co_return result;
     } catch (const boost::system::system_error&) {
         close_now(socket);
@@ -4362,6 +4464,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         result.status = io->expired || deadline_crossed()
                             ? ServerRunStatus::DeadlineExceeded
                             : ServerRunStatus::Disconnected;
+        result.f_run_total_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - f_run_start)
+                .count());
         co_return result;
     } catch (const ProtocolError& error) {
         terminal_error = bounded_error(static_cast<uint16_t>(error.code()),
@@ -4377,6 +4483,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         close_now(socket);
         impl_->disconnect(session, true);
         result.status = ServerRunStatus::DeadlineExceeded;
+        result.f_run_total_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - f_run_start)
+                .count());
         co_return result;
     }
     try {
@@ -4391,6 +4501,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     impl_->disconnect(session, true);
     result.status = ServerRunStatus::TerminalError;
     result.terminal_error = std::move(*terminal_error);
+    result.f_run_total_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - f_run_start)
+            .count());
     co_return result;
 }
 

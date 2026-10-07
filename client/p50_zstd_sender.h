@@ -79,6 +79,15 @@ struct ZstdSourceTransferResult {
     // must not retire the shared C owner or reject other F relationships.
     // Never set for typed preparation poison or uncertain local state.
     bool route_local_failure = false;
+    // Diagnostic-only per-transfer timing (steady_clock durations, ns).
+    // Populated only on the committed path; zero otherwise. These never
+    // gate behavior and exist solely for ICECC_P50_SOURCE_RESULT_TRACE.
+    uint64_t c_prepare_route_ns = 0;
+    uint64_t c_fill_ns = 0;
+    uint64_t c_write_ns = 0;
+    uint64_t c_state_wait_ns = 0;
+    uint64_t c_state_to_commit_ns = 0;
+    uint64_t c_post_commit_ns = 0;
 };
 
 // Where reopens run their blocking connect/arm/session round trip, off the
