@@ -7,6 +7,7 @@
 // daemon remains the owner of its public listener and reports that observation
 // through observe_public_listener(); this class never opens a public socket.
 
+#include "p50_compat_child_handle.h"
 #include "p50_daemon_cache_dispatch.h"
 #include "p50_daemon_control.h"
 #include "p50_input_fd_attachment.h"
@@ -69,6 +70,39 @@ struct Config {
 
     std::optional<uint64_t> drop_uid;
     std::optional<uint64_t> drop_gid;
+
+    // Which backend the launched sidecar's InputFdAttachmentService should
+    // use, passed down as --input-backend. The daemon's platform-compat
+    // module (daemon/p50_platform_compat.h) resolves this exactly once at
+    // daemon startup; configure_cache_adapter() never constructs this
+    // adapter at all when that decision is FailClosed (see
+    // doc/p50-platform-compat.md), so by the time a Config reaches this
+    // adapter the value here is always Native or Compat, never a third
+    // fail-closed state. Defaults to Native so any test or caller that
+    // does not set this field explicitly keeps today's exact behavior.
+    InputMaterializationBackend input_backend = InputMaterializationBackend::Native;
+
+    // Entropy source for LaunchIdentityAllocator's fresh store-identity
+    // roots (cache/p50_sidecar_identity.h), passed straight through to its
+    // constructor. Same provenance and same fail-closed-is-handled-upstream
+    // guarantee as input_backend immediately above: the daemon's
+    // platform-compat module (daemon/p50_platform_compat.h) resolves this
+    // exactly once at daemon startup from the M3 (random) mitigation
+    // decision, and configure_cache_adapter() never constructs this adapter
+    // at all when that decision is FailClosed. Defaults to the native
+    // getrandom()-backed provider so any test or caller that does not set
+    // this field explicitly keeps today's exact behavior.
+    StoreIdentityEntropyProvider entropy_provider = system_store_identity_entropy;
+
+    // M1 (child handle) backend for this adapter's OuterKillDomainVerifier.
+    // Same provenance and same fail-closed-is-handled-upstream guarantee as
+    // input_backend and entropy_provider above: the daemon's platform-compat
+    // module resolves this exactly once at daemon startup from the M1
+    // (child) mitigation decision, and configure_cache_adapter() never
+    // constructs this adapter at all when that decision is FailClosed.
+    // Defaults to the native pidfd-backed verifier so any test or caller
+    // that does not set this field explicitly keeps today's exact behavior.
+    ChildHandleBackend child_handle_backend = ChildHandleBackend::Native;
 
     // The adapter does not own this listener.  A present advertisement is
     // emitted only when observe_public_listener() reports this exact port.
@@ -144,6 +178,14 @@ public:
 
     static bool valid_config(const Config& config) noexcept;
 
+    /* R17a: the NAMED refusal -- the same predicate as valid_config, but
+       the first failing clause is returned as a human-readable reason
+       (field, path, expected vs actual owner/mode) so the daemon's
+       "invalid cache sidecar configuration" log names the check instead
+       of making the operator bisect the 25-clause chain by hand.  Empty
+       string = configuration valid. */
+    static std::string config_refusal_reason(const Config& config) noexcept;
+
     void shutdown(advertisement::Update* update = nullptr) noexcept;
 
     // The daemon supplies an observation of its already-bound public socket.
@@ -158,6 +200,15 @@ public:
         return cumulative_post_ready_exits_;
     }
     [[nodiscard]] uint64_t attempt() const noexcept { return attempt_; }
+    // Unlike attempt() (only meaningful once a ready lease has been bound),
+    // this reflects the lifecycle's own relaunch counter even when every
+    // attempt fails closed before reaching READY (e.g. a sustained
+    // close-range dispatch failure never tolerates a child). Callers that
+    // need to confirm "a relaunch was attempted" without requiring READY
+    // must use this instead of attempt().
+    [[nodiscard]] uint32_t outer_lifecycle_attempts() const noexcept {
+        return outer_lifecycle_ ? outer_lifecycle_->attempts() : 0;
+    }
     [[nodiscard]] bool authenticated() const noexcept;
     [[nodiscard]] advertisement::Snapshot advertisement_snapshot() const noexcept {
         return controller_.snapshot();
@@ -200,6 +251,13 @@ public:
     [[nodiscard]] pid_t outer_child_pid() const noexcept;
     [[nodiscard]] int outer_pidfd() const noexcept { return outer_pidfd_; }
     [[nodiscard]] sidecar::LifecycleState outer_lifecycle_state() const noexcept;
+    // Sticky once set: forwards SidecarLifecycle::compat_invariant_violation().
+    // A Compat-backend starttime fence mismatch is a fail-closed invariant
+    // violation, never a retryable condition, so this accessor's empty-to-
+    // non-empty transition happens at most once per adapter instance -- the
+    // daemon's own one-shot loud-log site relies on exactly that property.
+    [[nodiscard]] const std::optional<sidecar::CompatInvariantViolation>&
+    outer_compat_invariant_violation() const noexcept;
     // True only after the shutdown request has been driven through the same
     // one-poll/one-reducer-turn path and every owned descriptor, registration,
     // and exact cleanup phase has reached its terminal state.  Destruction
@@ -319,7 +377,40 @@ public:
     void test_force_input_lifecycle_operation(uint64_t value) noexcept {
         next_input_lifecycle_operation_id_ = value;
     }
+    // Fork-path CLOEXEC-sweep fault injection (Task 4).  Takes effect only
+    // in the forked child, right before execve(); see
+    // cache/p50_daemon_sidecar_adapter.cpp's OuterLaunchPhase::Fork.
+    // force_close_range_errno: inject this errno instead of calling
+    // close_range(2) at all.  ENOSYS/EINVAL/EPERM must each take the proc
+    // fallback; any other value (e.g. EBADF) must fail closed.
+    void test_force_close_range_errno(int errno_value) noexcept {
+        test_force_close_range_errno_ = errno_value;
+    }
+    // force_proc_open_failure: make the proc fallback's own
+    // open("/proc/self/fd") fail, so the fallback-of-the-fallback path
+    // (fail closed) is reachable without root or seccomp.
+    void test_force_proc_open_failure(bool force) noexcept {
+        test_force_proc_open_failure_ = force;
+    }
 #endif
+    // Direct, no-fork unit entry point for the proc-fallback CLOEXEC sweep
+    // itself (Task 4).  Runs the exact same sweep the Fork-case child calls
+    // (sidecar_cloexec_sweep_proc_fallback(), itself always compiled in and
+    // used unconditionally by production code), but in the calling (test)
+    // process against whatever fds that process already has open: no fork,
+    // no execve, no seccomp/root dependency.  force_open_failure mirrors
+    // test_force_proc_open_failure above: when true, the sweep's internal
+    // open("/proc/self/fd") is made to fail and the function returns false
+    // without touching any fd.
+    //
+    // Deliberately NOT gated by ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS,
+    // unlike the fault-injection setters above: it touches no hook-only
+    // state, only forwards its own parameter into the always-present sweep
+    // function, so it stays linkable in a production (hooks-undefined)
+    // object -- which unittests/p50daemonsidecaradapter-source.sh relies on
+    // when it links the hook-compiled test harness against a production
+    // object to prove the two behave identically.
+    static bool test_sweep_cloexec_proc_fallback(bool force_open_failure) noexcept;
 
 private:
     bool reserve_outer_restart() noexcept;
@@ -354,6 +445,14 @@ private:
     uint64_t prior_supervisor_post_ready_exits_ = 0;
     bool prior_counter_observed_ = false;
     bool counter_failed_ = false;
+    // Always present (not macro-guarded) so the class layout is identical
+    // whether or not ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS is defined
+    // for this translation unit -- only the setter methods above are
+    // guarded.  Zero/false in every production object; read unconditionally
+    // by the fork-path CLOEXEC sweep in the .cpp, same convention as
+    // attempt_/cumulative_post_ready_exits_ above.
+    int test_force_close_range_errno_ = 0;
+    bool test_force_proc_open_failure_ = false;
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
     std::vector<InputLifecycleRequest> pending_input_lifecycle_;
     std::vector<InputLifecycleRequest> completed_input_lifecycle_;

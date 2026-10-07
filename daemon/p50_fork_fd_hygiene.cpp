@@ -14,13 +14,13 @@
 #include <unistd.h>
 #include <utility>
 
-#if defined(__linux__)
-#  include <sys/syscall.h>
-#  include <sys/types.h>
-#  if defined(SYS_close_range)
-#    include <linux/close_range.h>
-#  endif
-#endif
+// SYS_close_range's old-headers fallback is shared with
+// cache/p50_daemon_sidecar_adapter.cpp -- see services/sys_close_range.h for
+// why this must be the one place that supplies the syscall number.  (Builds
+// against old distro headers -- Fedora 28-era glibc, the build0xx node
+// images -- used to leave close_range_sweep() compiled OUT and the unbounded
+// proc_fallback backend running on every job child: the production fd bug.)
+#include "services/sys_close_range.h"
 
 namespace icecc::p50::forkfd {
 
@@ -40,7 +40,29 @@ bool close_exact(int fd) noexcept {
     }
 }
 
-bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
+/* Test-hook accessor for capture_source_identity, which lives OUTSIDE
+   the anonymous namespace that owns the guarded `hooks` global: same
+   pattern as the in-namespace kcmp reads, just through a tiny inline
+   (zero cost in production builds: returns 0 when the hooks are not
+   compiled in). */
+namespace {
+
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+int hooked_get_seals_errno() noexcept
+{
+    return hooks.force_get_seals_errno;
+}
+#else
+constexpr int hooked_get_seals_errno() noexcept
+{
+    return 0;
+}
+#endif
+
+}  // namespace
+
+bool capture_source_identity(int fd, SourceIdentity* identity,
+                             IdentityPolicy policy = IdentityPolicy::SealsRequired) noexcept {
     if (identity == nullptr)
         return false;
     struct stat info{};
@@ -51,10 +73,45 @@ bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
     captured.inode = static_cast<uint64_t>(info.st_ino);
     captured.mode = static_cast<uint64_t>(info.st_mode);
     captured.size = static_cast<uint64_t>(info.st_size);
+    captured.nlink = static_cast<uint64_t>(info.st_nlink);
+
+    if (policy == IdentityPolicy::CompatPrivateFile) {
+        // Kernel-3.10-class fallback (doc/p50-platform-compat.md, "M2 input
+        // artifact"): no seal bitmask is available on this kernel, so the
+        // admission check substitutes the daemon-private-file identity in
+        // full: unlinked (nlink == 0, so nothing else can still be holding
+        // this file open by path), mode exactly 0400, and the fd itself open
+        // O_RDONLY. Every other field (device, inode, size) is still checked
+        // exactly as strictly as the sealed path, via source_identity_equal.
+        if (captured.nlink != 0)
+            return false;
+        if ((captured.mode & 07777) != 0400)
+            return false;
+        errno = 0;
+        const int flags = ::fcntl(fd, F_GETFL);
+        if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY)
+            return false;
+        captured.has_seals = false;
+        captured.seals = 0;
+        *identity = captured;
+        return captured.valid();
+    }
+
 #if defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
     defined(F_SEAL_SHRINK)
     errno = 0;
-    const int seals = ::fcntl(fd, F_GET_SEALS);
+    /* Test hook (same pattern as force_kcmp_errno): force the F_GET_SEALS
+       failure path regardless of the filesystem -- tmpfs returns
+       F_SEAL_SEAL on a plain shmem file where ext4 returns -1 EINVAL, so
+       the "seals < 0" rejection branch is unreachable on tmpfs without
+       this.  The hooks struct is only instantiated by the test binary. */
+    const int hooked_seals_errno = hooked_get_seals_errno();
+    int seals = -1;
+    if (hooked_seals_errno != 0) {
+        errno = hooked_seals_errno;
+    } else {
+        seals = ::fcntl(fd, F_GET_SEALS);
+    }
     if (seals < 0)
         return false;
     const int immutable_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
@@ -75,13 +132,15 @@ bool source_identity_equal(const SourceIdentity& left,
                            const SourceIdentity& right) noexcept {
     return left.valid() && right.valid() && left.device == right.device &&
            left.inode == right.inode && left.mode == right.mode &&
-           left.size == right.size && left.has_seals == right.has_seals &&
+           left.size == right.size && left.nlink == right.nlink &&
+           left.has_seals == right.has_seals &&
            (!left.has_seals || left.seals == right.seals);
 }
 
-bool source_identity_matches(int fd, const SourceIdentity& expected) noexcept {
+bool source_identity_matches(int fd, const SourceIdentity& expected,
+                             IdentityPolicy policy = IdentityPolicy::SealsRequired) noexcept {
     SourceIdentity actual;
-    if (!capture_source_identity(fd, &actual))
+    if (!capture_source_identity(fd, &actual, policy))
         return false;
     return source_identity_equal(actual, expected);
 }
@@ -289,11 +348,13 @@ ForkSourceLease::ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                                  uint64_t expected_delivery_id, int owner_fd,
                                  int control_fd, SourceIdentity identity,
                                  uint64_t owner_cookie,
-                                 int proof_slot_fd) noexcept
+                                 int proof_slot_fd,
+                                 IdentityPolicy policy) noexcept
     : borrowed_handoff_fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
       expected_delivery_id_(expected_delivery_id), owned_proof_fd_(owner_fd),
       control_fd_(control_fd), proof_slot_fd_(proof_slot_fd),
-      identity_(identity), owner_cookie_(owner_cookie) {}
+      identity_(identity), owner_cookie_(owner_cookie),
+      identity_policy_(policy) {}
 
 ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
     : borrowed_handoff_fd_(other.borrowed_handoff_fd_), delivery_id_(other.delivery_id_),
@@ -303,7 +364,8 @@ ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
       control_fd_(other.control_fd_),
       proof_slot_fd_(other.proof_slot_fd_),
       identity_(other.identity_),
-      owner_cookie_(other.owner_cookie_) {
+      owner_cookie_(other.owner_cookie_),
+      identity_policy_(other.identity_policy_) {
     other.borrowed_handoff_fd_ = -1;
     other.delivery_id_ = 0;
     other.expected_fd_ = -1;
@@ -313,6 +375,7 @@ ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
     other.proof_slot_fd_ = -1;
     other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
+    other.identity_policy_ = IdentityPolicy::SealsRequired;
 }
 
 ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
@@ -330,6 +393,7 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         // move assignment cannot orphan the destination's open slot.
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
+        identity_policy_ = other.identity_policy_;
         other.borrowed_handoff_fd_ = -1;
         other.delivery_id_ = 0;
         other.expected_fd_ = -1;
@@ -338,6 +402,7 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         other.control_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
+        other.identity_policy_ = IdentityPolicy::SealsRequired;
     }
     return *this;
 }
@@ -371,9 +436,9 @@ bool ForkSourceLease::identity_matches_current() const noexcept {
         return owned_proof_fd_ != control_fd_ &&
                owned_proof_fd_ != borrowed_handoff_fd_ &&
                control_fd_ != borrowed_handoff_fd_ &&
-               source_identity_matches(owned_proof_fd_, identity_) &&
-               source_identity_matches(control_fd_, identity_) &&
-               source_identity_matches(borrowed_handoff_fd_, identity_);
+               source_identity_matches(owned_proof_fd_, identity_, identity_policy_) &&
+               source_identity_matches(control_fd_, identity_, identity_policy_) &&
+               source_identity_matches(borrowed_handoff_fd_, identity_, identity_policy_);
     }
     return same_open_file_description(owned_proof_fd_, control_fd_) &&
            source_identity_matches(owned_proof_fd_, identity_) &&
@@ -422,12 +487,13 @@ mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
 }
 
 std::optional<ForkSourceLease>
-mint_attached_input_source(int fd, uint64_t request_id) noexcept {
+mint_attached_input_source(int fd, uint64_t request_id,
+                           IdentityPolicy policy) noexcept {
     if (fd < 0 || request_id == 0)
         return std::nullopt;
 
     SourceIdentity identity;
-    if (!capture_source_identity(fd, &identity))
+    if (!capture_source_identity(fd, &identity, policy))
         return std::nullopt;
     // The accepted attachment already established the descriptor owner.
     // Keep two private duplicates so the child can re-check the same sealed
@@ -438,9 +504,9 @@ mint_attached_input_source(int fd, uint64_t request_id) noexcept {
     const bool valid = proof_fd >= 0 && control_fd >= 0 &&
                        proof_fd != fd && control_fd != fd &&
                        proof_fd != control_fd &&
-                       source_identity_matches(proof_fd, identity) &&
-                       source_identity_matches(control_fd, identity) &&
-                       source_identity_matches(fd, identity);
+                       source_identity_matches(proof_fd, identity, policy) &&
+                       source_identity_matches(control_fd, identity, policy) &&
+                       source_identity_matches(fd, identity, policy);
     if (!valid) {
         if (proof_fd >= 0)
             (void)::close(proof_fd);
@@ -449,7 +515,8 @@ mint_attached_input_source(int fd, uint64_t request_id) noexcept {
         return std::nullopt;
     }
     return ForkSourceLease(fd, request_id, fd, request_id, proof_fd,
-                           control_fd, identity, kAttachmentOwnerCookie);
+                           control_fd, identity, kAttachmentOwnerCookie,
+                           -1, policy);
 }
 
 namespace {
@@ -623,6 +690,20 @@ bool parse_fd_name(const char* name, size_t length, int* fd) noexcept {
 }
 
 Result proc_fallback(const KeepSet& keep) noexcept {
+    /* The sweep's contract is "every fd the child does not need" -- and the
+       child ALWAYS needs its standard fds: workit's pipe()/dup2 sequence
+       squats onto any closed std slot (pipe(sock_err) landing exactly on
+       (1,2) when they are closed execs the compiler with stdout/stderr
+       shut; in a chroot without /dev/null clang dies instantly).  The
+       close_range backend honours that by construction (it starts at
+       kFirstNonstandardFd); THIS backend enumerated /proc/self/fd
+       unbounded and closed 0/1/2 as well -- the production fd bug on the
+       build0xx-shaped nodes, where SYS_close_range is not defined at build
+       time (old glibc headers) so proc_fallback is the ONLY backend that
+       ever runs: the job child closed its own std fds in every job.  Bound
+       the inventory at kFirstNonstandardFd: std fds are never sweepable,
+       and validate_keep_set() already guarantees nothing kept sits below
+       kFirstNonstandardFd, so this cannot leak a needed fd. */
     if (injected_proc_failure())
         return {Failure::EnumerationFailure, 0};
 
@@ -685,7 +766,8 @@ Result proc_fallback(const KeepSet& keep) noexcept {
                     failure = Failure::ParseFailure;
                     break;
                 }
-                if (fd != proc_fd && !is_kept(fd, keep)) {
+                if (fd >= kFirstNonstandardFd &&
+                    fd != proc_fd && !is_kept(fd, keep)) {
                     if (inventory_size == kMaxEnumeratedFds) {
                         failure = Failure::EnumerationFailure;
                         break;
@@ -730,7 +812,23 @@ Result proc_fallback(const KeepSet& keep) noexcept {
 }
 
 Result close_range_sweep(const KeepSet& keep) noexcept {
-#if defined(SYS_close_range)
+/* QA knob (configure --enable-qa-force-proc-sweep): compile the close_range
+   backend OUT of the PRODUCTION daemon so the whole native suite exercises
+   the proc_fallback path -- the backend the f28-header builds (the node
+   image and the rpm) run in production, where SYS_close_range is not
+   defined by the distro headers.  Release QA on a modern SDK would
+   otherwise never run that path end to end; this is the cheap
+   test-what-we-ship variant (the full variant is an f28-SDK QA leg).
+   The TEST-HOOKS binary is exempt: it compiles this file with
+   ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS to exercise BOTH backends'
+   injected-failure paths (force_close_range_failure et al), and a knob'd
+   short-circuit here made those cases exit without the explicit failure
+   they assert ("close_range failure was not explicit", the round-3 proc
+   tree).  The hooks macro is never defined in the daemon. */
+#if defined(ICECC_FORCE_PROC_SWEEP) && !defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+    (void)keep;
+    return {Failure::BackendUnavailable, 0};
+#elif defined(SYS_close_range)
 #  if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
     if (hooks.force_close_range_failure)
         return {Failure::CloseFailure, 0};

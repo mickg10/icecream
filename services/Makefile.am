@@ -1,6 +1,6 @@
 lib_LTLIBRARIES = libicecc.la
 AM_CPPFLAGS = $(XXHASH_CFLAGS)
-libicecc_la_SOURCES = job.cpp comm.cpp p50_cache_session_wire.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp digest128.cpp
+libicecc_la_SOURCES = job.cpp comm.cpp p50_cache_session_wire.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp digest128.cpp stage_trace.cpp
 libicecc_la_LIBADD = \
 	$(LZO_LDADD) \
 	$(LIBZSTD_LIBS) \
@@ -20,16 +20,20 @@ ice_HEADERS = \
 
 noinst_HEADERS = \
 	p50_cache_session_wire.h \
+	env_install_check.h \
 	exitcode.h \
+	fd_guards.h \
 	getifaddrs.h \
 	logging.h \
 	digest128.h \
 	ncpus.h \
 	pipes.h \
+	sys_close_range.h \
 	tempfile.h \
 	platform.h \
 	utf8.h \
-	util.h
+	util.h \
+	stage_trace.h
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = icecc.pc

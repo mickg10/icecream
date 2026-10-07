@@ -158,9 +158,13 @@ struct LaunchIncarnation {
 
 class LaunchIdentityAllocator {
 public:
-    LaunchIdentityAllocator(uint64_t generation, uint64_t first_attempt = 1,
-                            StoreIdentityEntropyProvider entropy_provider =
-                                system_store_identity_entropy) noexcept;
+    // No defaults: a missed call site must fail to compile rather than
+    // silently allocate store identities with the native getrandom()-backed
+    // entropy provider under Compat (M3, random), which on kernel 3.10 is a
+    // runtime failure instead of a build error. Every caller must name the
+    // entropy provider explicitly.
+    LaunchIdentityAllocator(uint64_t generation, uint64_t first_attempt,
+                            StoreIdentityEntropyProvider entropy_provider) noexcept;
     std::optional<LaunchIncarnation> allocate() noexcept;
 
 private:

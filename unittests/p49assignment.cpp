@@ -87,7 +87,7 @@ static void test_new_round_trips()
     static_assert(Msg::REVOKE_BEFORE_START == 0x49f00002);
     static_assert(Msg::REVOKE_RESULT == 0x49f00003);
     static_assert(ConfCSMsg::Legacy == 0);
-    static_assert(ConfCSMsg::Advisory == 1);
+    /* 1 is reserved for the retired Advisory mode -- see services/comm.h. */
     static_assert(ConfCSMsg::EnforcingCompat == 2);
     static_assert(ConfCSMsg::StrictNonce == 3);
     static_assert(RevokeResultMsg::Revoked == 0);

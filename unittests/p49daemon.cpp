@@ -75,6 +75,25 @@ static Msg *wait_type(MsgChannel *channel, Msg::Value wanted, int timeout_msec)
     return nullptr;
 }
 
+/* TAP99: wait for EITHER of two message types (the late-PREPARE outcome
+   race -- READY when the claim's job is still live, REVOKE_RESULT
+   when its END was handled first).  Returns the first match, with its
+   type left for the caller to inspect, or nullptr on timeout/EOF. */
+static Msg *wait_either(MsgChannel *channel, Msg::Value first,
+                        Msg::Value second, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    while (channel && Clock::now() < deadline) {
+        Msg *msg = channel->get_msg(1, true);
+        if (msg) {
+            if (*msg == first || *msg == second) return msg;
+            delete msg;
+        }
+        if (channel->at_eof()) break;
+    }
+    return nullptr;
+}
+
 static bool no_type(MsgChannel *channel, Msg::Value unwanted, int timeout_msec)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
@@ -586,7 +605,7 @@ int main(int argc, char **argv)
     REQUIRE(scheduler && login, "daemon reconnects for same-epoch mode probe");
     delete login;
     REQUIRE(scheduler && scheduler->send_msg(
-                ConfCSMsg(epoch, ConfCSMsg::Advisory)),
+                ConfCSMsg(epoch, ConfCSMsg::Legacy)),
             "changed mode delivered for the live epoch");
     no_type(scheduler, Msg::STATUS_TEXT, 1000);
     REQUIRE(scheduler->at_eof(),
@@ -646,18 +665,21 @@ int main(int argc, char **argv)
     delete scheduler;
     scheduler = nullptr;
 
-    const uint64_t advisory_epoch = epoch + 1;
+    const uint64_t reopened_epoch = epoch + 1;
     scheduler = accept_channel(listener, 8000);
     login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon reconnects for a fresh epoch");
     delete login;
     REQUIRE(scheduler && scheduler->send_msg(
-                ConfCSMsg(advisory_epoch, ConfCSMsg::Advisory)),
-            "fresh ADVISORY epoch resets the bounded table");
+                ConfCSMsg(reopened_epoch, ConfCSMsg::EnforcingCompat)),
+            "fresh EnforcingCompat epoch resets the bounded table");
 
+    /* Wire id zero is rejected before any admission check, independent of
+       fence mode; this is the only place that behavior is exercised, so it
+       is kept here rather than duplicated under every mode. */
     MsgChannel *zero_claim = connect_daemon(socket_path);
     REQUIRE(zero_claim && send_claim(zero_claim, 0),
-            "remote ADVISORY claim with wholly absent identity sent");
+            "remote claim with wholly absent identity sent");
     Msg *zero_end = wait_type(zero_claim, Msg::END, 3000);
     REQUIRE(zero_end || (zero_claim && zero_claim->at_eof()),
             "remote zero-wire claim is rejected before admission");
@@ -666,81 +688,22 @@ int main(int argc, char **argv)
     REQUIRE(no_type(scheduler, Msg::JOB_BEGIN, 400),
             "remote zero-wire rejection emits no JobBegin(0)");
     const std::string after_zero_claim = request_internals(socket_path);
-    const std::string empty_advisory_epoch =
-        "Assignment fence: mode=1 epoch=" + std::to_string(advisory_epoch)
+    const std::string empty_reopened_epoch =
+        "Assignment fence: mode=2 epoch=" + std::to_string(reopened_epoch)
         + " live=0 retained=0 closed=0";
-    REQUIRE(after_zero_claim.find(empty_advisory_epoch) != std::string::npos,
+    REQUIRE(after_zero_claim.find(empty_reopened_epoch) != std::string::npos,
             "remote zero-wire rejection creates no live assignment entry");
 
-    const uint32_t advisory_id = 1201;
-    const uint64_t advisory_nonce = UINT64_C(0x8100000000001201);
-    MsgChannel *advisory_claim = connect_daemon(socket_path);
-    REQUIRE(advisory_claim && send_claim(advisory_claim, advisory_id),
-            "legitimate nonzero ADVISORY claim follows zero rejection");
-    Msg *advisory_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
-    JobBeginMsg *advisory_begin_typed =
-        dynamic_cast<JobBeginMsg *>(advisory_begin);
-    REQUIRE(advisory_begin_typed
-                && advisory_begin_typed->job_id == advisory_id,
-            "legitimate nonzero claim still reaches real daemon admission");
-    delete advisory_begin;
-    REQUIRE(scheduler->send_msg(AssignPrepareMsg(
-                advisory_epoch, advisory_id, advisory_nonce, 9)),
-            "late PREPARE binds the Advisory claim identity");
-    ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
-    ready = dynamic_cast<AssignReadyMsg *>(ready_wire);
-    REQUIRE(ready && ready->epoch() == advisory_epoch
-                && ready->wire_id == advisory_id
-                && ready->nonce() == advisory_nonce,
-            "late PREPARE installs the full identity and emits READY");
-    delete ready_wire;
-    REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
-                advisory_epoch, advisory_id, advisory_nonce)),
-            "Advisory claim and revoke race resolved by the one owner");
-    terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
-    terminal = dynamic_cast<RevokeResultMsg *>(terminal_wire);
-    REQUIRE(terminal && terminal->result == RevokeResultMsg::ClaimedOrLater,
-            "late PREPARE never regresses a consumed claim to reserved");
-    delete terminal_wire;
-    delete advisory_claim;
-
-    const uint32_t advisory_full_id = 1211;
-    const uint64_t advisory_full_nonce = UINT64_C(0x8100000000001211);
-    MsgChannel *advisory_full_claim = connect_daemon(socket_path);
-    REQUIRE(advisory_full_claim && send_claim(
-                advisory_full_claim, advisory_full_id, advisory_epoch,
-                advisory_full_nonce),
-            "ADVISORY admits an unknown full P50 claim before PREPARE");
-    Msg *advisory_full_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
-    JobBeginMsg *advisory_full_begin_typed =
-        dynamic_cast<JobBeginMsg *>(advisory_full_begin);
-    REQUIRE(advisory_full_begin_typed
-                && advisory_full_begin_typed->job_id == advisory_full_id,
-            "full Advisory claim reaches admission before delayed PREPARE");
-    delete advisory_full_begin;
-    REQUIRE(scheduler->send_msg(AssignPrepareMsg(
-                advisory_epoch, advisory_full_id, advisory_full_nonce, 9)),
-            "late PREPARE matches the already consumed full Advisory claim");
-    ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
-    ready = dynamic_cast<AssignReadyMsg *>(ready_wire);
-    REQUIRE(ready && ready->wire_id == advisory_full_id
-                && ready->nonce() == advisory_full_nonce,
-            "late exact PREPARE preserves full Advisory claim ownership");
-    delete ready_wire;
-    REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
-                advisory_epoch, advisory_full_id, advisory_full_nonce)),
-            "full Advisory claim/revoke outcome requested");
-    terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
-    terminal = dynamic_cast<RevokeResultMsg *>(terminal_wire);
-    REQUIRE(terminal && terminal->result == RevokeResultMsg::ClaimedOrLater,
-            "full Advisory claim cannot regress to Revoked");
-    delete terminal_wire;
-    delete advisory_full_claim;
-
+    /* REVOKE may legitimately win a race against a delayed PREPARE that
+       never arrives in time, or arrives after the identity is already
+       cancelled; both outcomes must retain exactly the revoked terminal,
+       never READY, and a later nonce-less claim for the same wire id must
+       be rejected the same way an already-claimed id is (see the "late
+       claim is rejected after revoked terminal" case above). */
     const uint32_t cancel_id = 1202;
     const uint64_t cancel_nonce = UINT64_C(0x8100000000001202);
     REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
-                advisory_epoch, cancel_id, cancel_nonce)),
+                reopened_epoch, cancel_id, cancel_nonce)),
             "REVOKE may win before delayed PREPARE is consumed");
     terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
     terminal = dynamic_cast<RevokeResultMsg *>(terminal_wire);
@@ -748,7 +711,7 @@ int main(int argc, char **argv)
             "revoke-first race retains the revoked outcome");
     delete terminal_wire;
     REQUIRE(scheduler->send_msg(AssignPrepareMsg(
-                advisory_epoch, cancel_id, cancel_nonce, 9)),
+                reopened_epoch, cancel_id, cancel_nonce, 9)),
             "delayed PREPARE arrives after cancellation");
     terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
     terminal = dynamic_cast<RevokeResultMsg *>(terminal_wire);
@@ -760,17 +723,17 @@ int main(int argc, char **argv)
 
     MsgChannel *cancelled_claim = connect_daemon(socket_path);
     REQUIRE(cancelled_claim && send_claim(cancelled_claim, cancel_id),
-            "late Advisory claim for cancelled identity sent");
+            "late claim for cancelled identity sent");
     Msg *cancelled_end = wait_type(cancelled_claim, Msg::END, 3000);
     REQUIRE(cancelled_end || (cancelled_claim && cancelled_claim->at_eof()),
-            "closed Advisory identity rejects its late nonce-less claim");
+            "closed identity rejects its late nonce-less claim");
     delete cancelled_end;
     delete cancelled_claim;
 
     REQUIRE(scheduler->send_msg(AssignPrepareMsg(0, 1300, 1, 9)),
-            "Advisory session closed at the reserved-zero boundary");
+            "session closed at the reserved-zero boundary");
     no_type(scheduler, Msg::STATUS_TEXT, 1000);
-    REQUIRE(scheduler->at_eof(), "Advisory loss reaches reconnect boundary");
+    REQUIRE(scheduler->at_eof(), "zero-identity control reaches reconnect boundary");
     delete scheduler;
     scheduler = nullptr;
 
@@ -791,7 +754,7 @@ int main(int argc, char **argv)
     login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon reconnects for STRICT_NONCE probe");
     delete login;
-    const uint64_t strict_epoch = advisory_epoch + 1;
+    const uint64_t strict_epoch = reopened_epoch + 1;
     REQUIRE(scheduler && scheduler->send_msg(
                 ConfCSMsg(strict_epoch, ConfCSMsg::StrictNonce)),
             "explicit STRICT_NONCE configuration activates on P50");
@@ -934,6 +897,122 @@ int main(int argc, char **argv)
             "strict mode leaves local CLIENTWORK admission exempt");
     delete local_begin;
     delete local;
+
+    /* TAP99, the READY arm (the k310 agent's strace finding, anchored on
+       the nonce bytes): a claim whose job is STILL LIVE when its late
+       PREPARE arrives must answer ASSIGN_READY with the full identity.
+       The old racy case above could not pin this arm because its
+       fixture job dies immediately (no toolchain env) and its END won
+       the ordering ~25% under load; this case keeps the claim channel
+       OPEN -- no client JobDone on it -- so the job stays live and the
+       READY arm is exercised deterministically.  This is a TEST race,
+       not a daemon bug: the daemon's answers are correct in both
+       orders. */
+    {
+        const uint32_t held_id = 1451;
+        const uint64_t held_nonce = UINT64_C(0x9200000000001451);
+        REQUIRE(prepare_strict(held_id, held_nonce),
+                "strict assignment installed for the held-open probe");
+        MsgChannel *held_claim = connect_daemon(socket_path);
+        REQUIRE(held_claim && send_claim(
+                    held_claim, held_id, strict_epoch, held_nonce),
+                "held-open strict claim sent");
+        Msg *held_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+        JobBeginMsg *held_begin_typed = dynamic_cast<JobBeginMsg *>(held_begin);
+        REQUIRE(held_begin_typed
+                    && held_begin_typed->job_id == held_id,
+                "held-open claim reaches admission");
+        delete held_begin;
+
+        /* The PREPARE arrives while the job is ALIVE (admitted, not yet
+           done): the buffered READY must surface WITHOUT any further
+           event on this channel -- no JobDone, no next claim, nothing.
+           RED at c8bb615f under load: the READY strands in the read
+           buffer until an unrelated wakeup ~4 s later; the 3 s wait
+           times out. */
+        REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                    strict_epoch, held_id, held_nonce, 17)),
+                "late PREPARE sent while the claim's job is held open");
+        Msg *held_ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+        AssignReadyMsg *held_ready =
+            dynamic_cast<AssignReadyMsg *>(held_ready_wire);
+        REQUIRE(held_ready && held_ready->epoch() == strict_epoch
+                    && held_ready->wire_id == held_id
+                    && held_ready->nonce() == held_nonce,
+                "buffered late PREPARE surfaces READY without an unrelated event");
+        delete held_ready_wire;
+
+        /* The explicit after-JobDone case: complete the held job, then
+           REVOKE the identity -- a CONSUMED claim must resolve
+           ClaimedOrLater, never regress to reserved.  (The JobDone is
+           what a real client sends on its channel; the REVOKE that
+           follows is the scheduler-side loss path for the same id.) */
+        REQUIRE(held_claim->send_msg(JobDoneMsg(held_id, 0)),
+                "held-open job completes with an explicit JobDone");
+        REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
+                    strict_epoch, held_id, held_nonce)),
+                "REVOKE sent for the JobDone-consumed identity");
+        Msg *held_revoke_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
+        RevokeResultMsg *held_revoke =
+            dynamic_cast<RevokeResultMsg *>(held_revoke_wire);
+        REQUIRE(held_revoke
+                    && held_revoke->result == RevokeResultMsg::ClaimedOrLater,
+                "revoke after JobDone resolves ClaimedOrLater, never reserved");
+        delete held_revoke_wire;
+        Msg *held_end = wait_type(held_claim, Msg::END, 3000);
+        REQUIRE(held_end || (held_claim && held_claim->at_eof()),
+                "held-open claim channel closes after its JobDone");
+        delete held_end;
+        delete held_claim;
+    }
+
+    /* TAP99, the REPLAY arm, deterministic (forced ordering, no
+       stress): the documented semantics of the one immutable terminal
+       (doc/p49-assignment-fence.md) -- an EXACT late PREPARE for an
+       identity whose claim's END was already handled replays
+       REVOKE_RESULT(ClaimedOrLater) and NEVER emits ASSIGN_READY.
+       This is the outcome the old racy case hit under load when its
+       fixture job's END won the ordering, and it is CORRECT daemon
+       behaviour, not a bug: the claim was consumed. */
+    {
+        const uint32_t ended_id = 1452;
+        const uint64_t ended_nonce = UINT64_C(0x9200000000001452);
+        REQUIRE(prepare_strict(ended_id, ended_nonce),
+                "strict assignment installed for the END-first replay probe");
+        MsgChannel *ended_claim = connect_daemon(socket_path);
+        REQUIRE(ended_claim && send_claim(
+                    ended_claim, ended_id, strict_epoch, ended_nonce),
+                "END-first claim sent");
+        Msg *ended_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+        JobBeginMsg *ended_begin_typed =
+            dynamic_cast<JobBeginMsg *>(ended_begin);
+        REQUIRE(ended_begin_typed
+                    && ended_begin_typed->job_id == ended_id,
+                "END-first claim reaches admission");
+        delete ended_begin;
+        /* Force the ordering: wait for the claim's OWN END first (the
+           fixture job fails fast -- no toolchain env), so the terminal
+           is retained BEFORE the late PREPARE lands. */
+        Msg *claim_end = wait_type(ended_claim, Msg::END, 3000);
+        REQUIRE(claim_end || (ended_claim && ended_claim->at_eof()),
+                "END-first claim's job finished before the late PREPARE");
+        delete claim_end;
+        REQUIRE(scheduler->send_msg(AssignPrepareMsg(
+                    strict_epoch, ended_id, ended_nonce, 17)),
+                "EXACT late PREPARE sent after the claim's END was handled");
+        Msg *replay_wire = wait_either(
+            scheduler, Msg::REVOKE_RESULT, Msg::ASSIGN_READY, 3000);
+        REQUIRE(replay_wire, "late PREPARE after END produced no outcome");
+        REQUIRE(*replay_wire == Msg::REVOKE_RESULT,
+                "late PREPARE after END answered ASSIGN_READY (must replay the terminal)");
+        RevokeResultMsg *replay = dynamic_cast<RevokeResultMsg *>(replay_wire);
+        REQUIRE(replay && replay->result == RevokeResultMsg::ClaimedOrLater,
+                "END-first exact replay is ClaimedOrLater");
+        delete replay_wire;
+        delete ended_claim;
+        REQUIRE(no_type(scheduler, Msg::ASSIGN_READY, 400),
+                "consumed identity never publishes READY afterwards");
+    }
 
     /* A fresh session demonstrates EnforcingCompat's intentional dual
        admission: nonce-less legacy claims and exact P50 claims. */

@@ -46,6 +46,22 @@ enum class InputFdAttachmentStatus : uint8_t {
 const char* input_fd_attachment_status_name(
     InputFdAttachmentStatus status) noexcept;
 
+// Which backend the sidecar's materializer uses to hand an input snapshot
+// to the daemon. Deliberately independent of icecc::p50::platform::Backend:
+// per doc/p50-platform-compat.md the sidecar never reads ICECC_P50_PLATFORM*
+// and never re-probes anything itself -- the daemon resolves the platform
+// decision exactly once at its own startup and passes the result down via
+// this plain argv-derived enum, so the sidecar's translation unit stays
+// decoupled from the daemon's platform-compat module.
+//   Native -- sealed, immutable memfd (today's exact behavior).
+//   Compat -- kernel-3.10-class fallback: an unlinked, 0400, owner-only
+//             regular file under /dev/shm instead of a sealed memfd. See
+//             doc/p50-platform-compat.md, "M2 input artifact".
+enum class InputMaterializationBackend : uint8_t {
+    Native,
+    Compat,
+};
+
 // A compiler-consumer-owned descriptor.  The descriptor names a complete,
 // sealed snapshot, not the store's mutable backing.  It is independent for
 // every request and starts at byte zero.
@@ -99,15 +115,21 @@ class InputFdAttachmentService {
 public:
     using CursorProvider = std::function<InputCursor(InputRecordKey)>;
 
-    explicit InputFdAttachmentService(CursorProvider provider,
-                                      size_t max_materialized_bytes = size_t{64} << 20);
+    // `backend` has no default: a missed call site must fail to compile
+    // rather than silently materialize sealed memfds under Compat, which on
+    // kernel 3.10 is a runtime failure instead of a build error. Every
+    // caller must name the backend explicitly.
+    explicit InputFdAttachmentService(
+        CursorProvider provider, size_t max_materialized_bytes,
+        InputMaterializationBackend backend);
 
     template <class Endpoint>
     static InputFdAttachmentService for_endpoint(
-        Endpoint& endpoint, size_t max_materialized_bytes = size_t{64} << 20) {
+        Endpoint& endpoint, size_t max_materialized_bytes,
+        InputMaterializationBackend backend) {
         return InputFdAttachmentService(
             [&endpoint](InputRecordKey key) { return endpoint.attach_input(key); },
-            max_materialized_bytes);
+            max_materialized_bytes, backend);
     }
 
     // Handles exactly one authenticated request.  deadline is absolute and
@@ -131,6 +153,7 @@ public:
 private:
     CursorProvider provider_;
     size_t max_materialized_bytes_ = 0;
+    InputMaterializationBackend backend_ = InputMaterializationBackend::Native;
 };
 
 class InputFdAttachmentClient {

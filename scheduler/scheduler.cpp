@@ -57,6 +57,7 @@
 #include <stdio.h>
 #include <pwd.h>
 #include "../services/comm.h"
+#include "../services/stage_trace.h"
 #include "../services/getifaddrs.h"
 #include "../services/logging.h"
 #include "../services/job.h"
@@ -145,16 +146,17 @@ struct SchedulerAssignmentKeyHash {
 static std::unordered_map<SchedulerAssignmentKey, Job *,
                           SchedulerAssignmentKeyHash> fenced_assignments;
 
-/* Assignment fencing is an explicit scheduler policy and stays LEGACY by
-   default.  Link versions constrain eligibility but never select a mode. */
-static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::Legacy;
+/* Assignment fencing is an explicit scheduler policy.  With no
+   --assignment-fence-mode flag the scheduler runs ENFORCING_COMPAT; LEGACY
+   remains available as an explicit kill switch.  Link versions constrain
+   eligibility but never select a mode. */
+static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::EnforcingCompat;
 static uint64_t scheduler_assignment_epoch = 0;
 static uint64_t next_tu_seq = 0;
 
 static bool assignment_mode_prepares()
 {
-    return assignment_fence_mode == ConfCSMsg::Advisory
-        || assignment_fence_mode == ConfCSMsg::EnforcingCompat
+    return assignment_fence_mode == ConfCSMsg::EnforcingCompat
         || assignment_fence_mode == ConfCSMsg::StrictNonce;
 }
 
@@ -210,7 +212,6 @@ static const char *assignment_mode_name(ConfCSMsg::FenceMode mode)
 {
     switch (mode) {
     case ConfCSMsg::Legacy: return "legacy";
-    case ConfCSMsg::Advisory: return "advisory";
     case ConfCSMsg::EnforcingCompat: return "enforcing-compat";
     case ConfCSMsg::StrictNonce: return "strict-nonce";
     }
@@ -1418,6 +1419,7 @@ static void debit_dispatch_credit(Job *job)
         const uint64_t now_msec = icecream_monotonic_msec();
         job->setDispatchDebitMsec(now_msec);
         job->submitter()->addOutstandingDispatch(now_msec);
+        icecc::stagetrace::stage_trace("scheduler", "dispatch_credit_debit", job->assignmentEpoch(), job->id());
     }
 }
 
@@ -1425,6 +1427,7 @@ static void credit_dispatch_credit(Job *job)
 {
     if (job && job->dispatchOutstanding() && job->submitter()) {
         job->setDispatchOutstanding(false);
+        icecc::stagetrace::stage_trace("scheduler", "dispatch_credit_released", job->assignmentEpoch(), job->id());
         if (!job->submitter()->removeOutstandingDispatch(job->dispatchDebitMsec())) {
             log_error() << "dispatch-credit invariant failure: job " << job->id()
                         << " debit " << job->dispatchDebitMsec()
@@ -1459,8 +1462,12 @@ static bool send_remote_dispatch_reply(Job *job)
                    job->dispatchMatchedJobId(), job->assignmentEpoch(),
                    job->assignmentNonce(), cache_port, cache_protocol, cache_mask);
     reply.setCompileIdentity(job->cGuid(), job->tuSeq());
-    return job->submitter()->send_msg(
+    const bool sent = job->submitter()->send_msg(
         reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
+    if (sent) {
+        icecc::stagetrace::stage_trace("scheduler", "usecs_sent", job->assignmentEpoch(), job->id());
+    }
+    return sent;
 }
 
 /* Queue the revoke on the same ordered S->F stream as PREPARE.  A successful
@@ -1841,6 +1848,7 @@ static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion
                              m.cache_retry_avoid_port,
                              m.cache_retry_avoid_host);
         job->setRemoteRequired(m.remote_required == 1);
+        icecc::stagetrace::stage_trace("scheduler", "getcs_recv", 0, job->id(), job->localClientId());
         req.staged.push_back(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -2499,6 +2507,7 @@ static CompileServer *pick_server(Job *job,
 
     // Ignore ineligible servers
     list<CompileServer *> eligible = filter_ineligible_servers(job);
+    icecc::stagetrace::stage_trace("scheduler", "eligible_set_computed", 0, job->id(), icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown, {{"eligible", (int64_t)eligible.size()}});
 
 #if DEBUG_SCHEDULER > 1
     trace() << "pick_server " << job->id() << " " << job->targetPlatform() << endl;
@@ -2993,6 +3002,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
        protocol 37+ encodes it as NoCS, older peers as a UseCS naming the
        submitter itself, and both reserve zero remote farm capacity.  */
     const bool local_decision = (use_cs == job->submitter());
+    icecc::stagetrace::stage_trace("scheduler", "server_picked", 0, job->id(), icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown, {{"server_host_id", (int64_t)use_cs->hostId()}, {"local_decision", local_decision ? 1 : 0}});
 
     job->setDispatchProjection(host_platform, gotit, matched_job_id);
 
@@ -3020,16 +3030,13 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, use_cs)
         /* The identity must survive S -> C -> F -> S.  A legacy C cannot
            carry it in UseCS/CompileFile, so preparing only the new F leaves
-           S expecting a nonce that F can never echo.  Enforcing/advisory
+           S expecting a nonce that F can never echo.  Enforcing-compat
            mixed-peer traffic therefore uses the existing zero-identity
            legacy path; strict mode already rejects it above. */
         && identity_path_eligible
         && strict_path_eligible;
     if (prepared_assignment) {
         switch (assignment_fence_mode) {
-        case ConfCSMsg::Advisory:
-            job->setAssignmentPolicy(Job::ASSIGNMENT_ADVISORY);
-            break;
         case ConfCSMsg::EnforcingCompat:
             job->setAssignmentPolicy(Job::ASSIGNMENT_ENFORCING_COMPAT);
             break;
@@ -3053,6 +3060,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
             handle_end(use_cs, nullptr);
             return true;
         }
+        icecc::stagetrace::stage_trace("scheduler", "assign_prepare_sent", job->assignmentEpoch(), job->id());
         /* Admission is the accepted PREPARE enqueue, not later READY or
            client exposure.  Charge exactly here for both prepared modes. */
         debit_dispatch_credit(job);
@@ -3415,6 +3423,7 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
     }
 
     job->setAssignmentPhase(Job::ASSIGNMENT_READY);
+    icecc::stagetrace::stage_trace("scheduler", "assign_ready_recv", m->epoch(), m->wire_id);
     ++assignment_ready_accepted;
     if (job->assignmentReadyGated()
             && getenv("ICECC_TESTS")
@@ -3606,6 +3615,7 @@ static bool handle_job_begin(CompileServer *cs, Msg *_m)
        compile server, so this assignment no longer occupies a dispatch
        credit on its submitter, and whatever was stuck is moving again.  */
     credit_dispatch_credit(job);
+    icecc::stagetrace::stage_trace("scheduler", "jobbegin_recv", job->assignmentEpoch(), job->id());
 
     job->setState(Job::COMPILING);
     if (job->assignmentFenced()
@@ -3949,6 +3959,7 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
 
     add_job_stats(j, m);
     notify_monitors(new MonJobDoneMsg(*m));
+    icecc::stagetrace::stage_trace("scheduler", "jobdone_recv", j->assignmentEpoch(), j->id(), icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown, {{"exitcode", m->exitcode}});
     credit_dispatch_credit(j);
     {
         map<unsigned int, Job *>::iterator dit = jobs.find(m->job_id);
@@ -5099,8 +5110,8 @@ static void usage(const std::string reason = "")
          << "  -a, --algorithm <name>\n"
          << "  --max-outstanding-dispatches <n>   per-submitter unconfirmed dispatch credit (1-1024, default 32)\n"
          << "  --dispatch-stall-report-after <sec>  report (do not remove) a submitter whose oldest unconfirmed dispatch exceeds this; its assignment and worker reservation are retained (10-3600, default 180)\n"
-         << "  --assignment-fence-mode <legacy|advisory|enforcing-compat|strict-nonce>\n"
-         << "                                      P49 assignment policy (default legacy; strict-nonce requires P50)\n"
+         << "  --assignment-fence-mode <legacy|enforcing-compat|strict-nonce>\n"
+         << "                                      P49 assignment policy (default enforcing-compat; legacy is the explicit kill switch; strict-nonce requires P50)\n"
          << "  --assignment-fence-strict          compatibility alias for enforcing-compat\n"
          << endl;
 
@@ -5368,12 +5379,13 @@ int main(int argc, char *argv[])
             const string mode = optarg ? optarg : "";
             if (mode == "legacy") {
                 assignment_fence_mode = ConfCSMsg::Legacy;
-            } else if (mode == "advisory") {
-                assignment_fence_mode = ConfCSMsg::Advisory;
             } else if (mode == "enforcing-compat") {
                 assignment_fence_mode = ConfCSMsg::EnforcingCompat;
             } else if (mode == "strict-nonce") {
                 assignment_fence_mode = ConfCSMsg::StrictNonce;
+            } else if (mode == "advisory") {
+                usage("Error: --assignment-fence-mode advisory was removed; "
+                      "supported modes are legacy, enforcing-compat, strict-nonce");
             } else {
                 usage("Error: unknown --assignment-fence-mode: " + mode);
             }

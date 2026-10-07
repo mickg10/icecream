@@ -98,6 +98,7 @@
 
 #include "ncpus.h"
 #include "exitcode.h"
+#include "fd_guards.h"
 #include "serve.h"
 #include "workit.h"
 #include "logging.h"
@@ -112,6 +113,7 @@
 #include "util.h"
 #include "getifaddrs.h"
 #include "p50_daemon_sidecar_adapter.h"
+#include "p50_platform_compat.h"
 #include "p50_completion_record.h"
 #include "p50_cache_recovery_policy.h"
 #include "p50_daemon_cache_dispatch.h"
@@ -119,6 +121,7 @@
 #include "connection_provenance.h"
 #include "p50_source_arm_wait_lease.h"
 #include "compiler_group_signal.h"
+#include "../services/stage_trace.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -1467,6 +1470,12 @@ struct Daemon {
     icecc::p50::sidecar::CentralChildReaperRegistry cache_child_reaper;
     std::unique_ptr<icecc::p50::daemon::DaemonSidecarAdapter> cache_adapter;
     bool cache_adapter_start_attempted;
+    // DaemonSidecarAdapter::outer_compat_invariant_violation() is sticky:
+    // once a Compat-backend starttime fence mismatch is observed it is never
+    // cleared and the adapter never retries. This flag makes the daemon's
+    // own loud log call fire exactly once for that one terminal event
+    // instead of repeating it on every subsequent poll turn.
+    bool cache_adapter_compat_violation_logged;
     uint64_t next_p50_arm_observation_id;
     icecc::p50::advertisement::Snapshot scheduler_cache_snapshot;
     bool scheduler_cache_snapshot_valid;
@@ -1484,6 +1493,20 @@ struct Daemon {
     // PATH lookup and no implicit shared socket location.
     std::string cache_service_executable;
     std::string cache_runtime_directory;
+    // Decided once, before configure_cache_adapter() ever constructs a
+    // sidecar launch plan. See doc/p50-platform-compat.md. FailClosed on any
+    // one of the three mitigations means the cache sidecar is never
+    // configured on this daemon at all (cache_adapter stays null): no
+    // sidecar is launched, nothing is advertised to the scheduler, and the
+    // daemon keeps serving legacy FileChunk transfer exactly as it does
+    // today when no cache executable is configured. This is a startup-time
+    // gate in configure_cache_adapter(), not a per-job decision -- a
+    // platform FailClosed must never surface as a per-job failure/retry.
+    // When every mitigation resolves to Native or Compat, the input (M2)
+    // decision additionally selects the admission policy
+    // mint_attached_input_source() uses for every P50 job on this daemon.
+    icecc::p50::platform::PlatformDecision platform_decision;
+    bool platform_decision_computed = false;
 
     bool webgui_enabled;
     int webgui_port;
@@ -1525,6 +1548,7 @@ struct Daemon {
         next_scheduler_connect = 0;
         cache_size = 0;
         cache_adapter_start_attempted = false;
+        cache_adapter_compat_violation_logged = false;
         next_p50_arm_observation_id = 1;
         scheduler_cache_snapshot = {};
         scheduler_cache_snapshot_valid = false;
@@ -4926,6 +4950,13 @@ static size_t assignment_terminal_limit()
 }
 static bool assignment_table_exhausted = false;
 static bool assignment_epoch_history_exhausted = false;
+/* Wire value 1 was Advisory, retired by virtu2 (see ConfCSMsg::FenceMode in
+   services/comm.h).  A pre-virtu2 scheduler may still send it; fail safe by
+   coercing it to Legacy and logging at most one warning per scheduler epoch,
+   rather than closing the connection (see handle_cs_conf()). */
+static const uint32_t RETIRED_FENCE_MODE_ADVISORY = 1;
+static bool have_warned_retired_fence_mode_epoch = false;
+static uint64_t last_warned_retired_fence_mode_epoch = 0;
 static unsigned long assignment_prepares = 0;
 static unsigned long assignment_ready_replies = 0;
 static unsigned long assignment_revoke_results = 0;
@@ -4933,17 +4964,20 @@ static unsigned long assignment_claims = 0;
 static unsigned long assignment_claim_rejects = 0;
 static unsigned long assignment_stale_controls = 0;
 
-static bool assignment_mode_prepares(ConfCSMsg::FenceMode mode)
-{
-    return mode == ConfCSMsg::Advisory
-        || mode == ConfCSMsg::EnforcingCompat
-        || mode == ConfCSMsg::StrictNonce;
-}
-
 static bool assignment_mode_enforces_prepare(ConfCSMsg::FenceMode mode)
 {
     return mode == ConfCSMsg::EnforcingCompat
         || mode == ConfCSMsg::StrictNonce;
+}
+
+/* Advisory was the only prepared mode that did not also wait for READY
+   before exposing UseCS; with it gone, every mode that prepares an
+   assignment also enforces the READY gate, so this is the same predicate
+   as assignment_mode_enforces_prepare().  Both names are kept at call
+   sites for readability. */
+static bool assignment_mode_prepares(ConfCSMsg::FenceMode mode)
+{
+    return assignment_mode_enforces_prepare(mode);
 }
 
 static bool replace_assignment_epoch()
@@ -5021,12 +5055,6 @@ static void finish_assignment_claim(uint32_t wire_id)
         return;
     }
     it->second.phase = WorkerAssignment::ClaimedOrLater;
-    /* In ADVISORY the client may win before PREPARE is consumed.  Keep that
-       nonce-zero placeholder live until PREPARE supplies its full identity;
-       deleting it here would let late PREPARE regress the claim to Reserved. */
-    if (it->second.key.nonce == 0) {
-        return;
-    }
     const AssignmentKey key = it->second.key;
     if (retain_assignment_terminal(
             key, RevokeResultMsg::ClaimedOrLater, true)) {
@@ -5040,17 +5068,10 @@ static void close_assignment_transport_session()
 {
     /* Link loss is an S-side terminal boundary, but the old client can still
        arrive at this daemon.  Close every known assignment and retain its
-       rejection identity for the whole epoch.  A nonce-zero ADVISORY
-       placeholder cannot be safely attributed after transport loss, so it
-       remains an explicit Orphaned fail-closed wire-id record. */
+       rejection identity for the whole epoch. */
     auto it = live_assignments.begin();
     while (it != live_assignments.end()) {
         WorkerAssignment &record = it->second;
-        if (record.key.nonce == 0) {
-            record.phase = WorkerAssignment::Orphaned;
-            ++it;
-            continue;
-        }
         const RevokeResultMsg::Result result =
             record.phase == WorkerAssignment::Reserved
                 ? RevokeResultMsg::Revoked
@@ -5135,7 +5156,7 @@ static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant,
     /* A remote claim never has authority without the scheduler-assigned wire
        identity.  CompileFile's wholly-absent P50 identity is frame-valid for
        the local CLIENTWORK path, but that path bypasses this function.  Reject
-       wire zero here, before even ADVISORY can create a live placeholder. */
+       wire zero here, before any live-assignment lookup. */
     if (wire_id == 0) {
         ++assignment_claim_rejects;
         return false;
@@ -5182,54 +5203,29 @@ static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant,
         ++assignment_claim_rejects;
         return false;
     }
-    if (assignment_mode_enforces_prepare(assignment_fence_mode)) {
-        /* ENFORCING_COMPAT deliberately keeps a real pre-v50 C interoperable
-           with a current F.  Such a peer cannot receive or carry the v50
-           assignment identity, so S correctly sends no PREPARE and its
-           CompileFile is wholly nonce-less.  Admit only that directly
-           negotiated legacy wire shape.  A v50 peer with a missing identity,
-           an identity-bearing unknown claim, and every STRICT_NONCE claim
-           remain fail-closed.  This is the historical legacy admission path,
-           not an ADVISORY placeholder: no late PREPARE can exist for it. */
-        const bool negotiated_legacy_claim =
-            assignment_fence_mode == ConfCSMsg::EnforcingCompat &&
-            claimant_protocol > 0 &&
-            claimant_protocol < PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
-            !job.hasAssignmentIdentity();
-        if (negotiated_legacy_claim) {
-            trace() << "admitting negotiated legacy assignment claim "
-                    << wire_id << " from protocol " << claimant_protocol
-                    << endl;
-            return true;
-        }
-        ++assignment_claim_rejects;
-        return false;
+    /* Advisory is gone, so EnforcingCompat and StrictNonce are the only
+       modes that can still reach this point (Legacy already returned
+       above) and assignment_mode_enforces_prepare() is unconditionally
+       true for both.  EnforcingCompat deliberately keeps a real pre-v50 C
+       interoperable with a current F.  Such a peer cannot receive or
+       carry the v50 assignment identity, so S correctly sends no PREPARE
+       and its CompileFile is wholly nonce-less.  Admit only that directly
+       negotiated legacy wire shape.  A v50 peer with a missing identity,
+       an identity-bearing unknown claim, and every STRICT_NONCE claim
+       remain fail-closed: there is no PREPARE-less admission path left. */
+    const bool negotiated_legacy_claim =
+        assignment_fence_mode == ConfCSMsg::EnforcingCompat &&
+        claimant_protocol > 0 &&
+        claimant_protocol < PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
+        !job.hasAssignmentIdentity();
+    if (negotiated_legacy_claim) {
+        trace() << "admitting negotiated legacy assignment claim "
+                << wire_id << " from protocol " << claimant_protocol
+                << endl;
+        return true;
     }
-
-    if (job.hasAssignmentIdentity()
-            && job.assignmentEpoch() != assignment_scheduler_epoch) {
-        ++assignment_claim_rejects;
-        return false;
-    }
-
-    /* ADVISORY admits an unknown nonce-less claim, but records ownership.
-       A later PREPARE binds the nonce into this same record without changing
-       Claimed/ClaimedOrLater back to Reserved. */
-    if (live_assignments.size() + assignment_terminals.size()
-            >= assignment_terminal_limit()) {
-        assignment_table_exhausted = true;
-        ++assignment_claim_rejects;
-        return false;
-    }
-    WorkerAssignment placeholder;
-    placeholder.phase = WorkerAssignment::Claimed;
-    placeholder.key = AssignmentKey {
-        assignment_scheduler_epoch, wire_id, job.assignmentNonce()
-    };
-    placeholder.claimant = claimant;
-    live_assignments.emplace(wire_id, placeholder);
-    ++assignment_claims;
-    return true;
+    ++assignment_claim_rejects;
+    return false;
 }
 
 /* G4 (bigoracle 20:13:59/20:32:36): the authority for whether a GetCS-derived
@@ -5280,6 +5276,39 @@ void Daemon::close_scheduler(bool orderly_shutdown)
 
 bool Daemon::configure_cache_adapter() noexcept
 {
+    // Decided exactly once, before any sidecar launch attempt below, and
+    // regardless of whether a cache sidecar is even configured on this
+    // daemon -- so the log line below is always emitted and
+    // mint_attached_input_source() call sites always have a real decision
+    // to read, never a default-constructed FailClosed-reason="unprobed".
+    // This function's own `false` return is reserved for configuration
+    // errors that should exit the daemon; a platform FailClosed is handled
+    // separately immediately below and always returns `true` (cache off,
+    // daemon up), never `false`.
+    if (!platform_decision_computed) {
+        platform_decision = icecc::p50::platform::decide_platform();
+        platform_decision_computed = true;
+        log_info() << icecc::p50::platform::format_platform_log_line(platform_decision)
+                   << endl;
+    }
+
+    // A platform FailClosed is a startup-time gate, not a per-job failure:
+    // if any one of the three mitigations cannot be resolved to a native or
+    // compat backend, this daemon never configures a cache sidecar at all --
+    // same posture as the "no executable configured" case just below, so
+    // every existing cache_adapter==nullptr call site already treats this
+    // correctly as "cache off, keep serving legacy." No sidecar is launched,
+    // nothing is advertised to the scheduler, and configure_cache_adapter()
+    // still returns true (this is not a daemon-exit condition).
+    if (icecc::p50::platform::any_fail_closed(platform_decision)) {
+        log_info() << "cache sidecar disabled: a required platform "
+                       "compatibility mitigation failed closed (see "
+                       "platform decision above); running with cache off"
+                   << endl;
+        cache_adapter.reset();
+        return true;
+    }
+
     if (cache_service_executable.empty() && cache_runtime_directory.empty())
         return true;
 
@@ -5327,10 +5356,28 @@ bool Daemon::configure_cache_adapter() noexcept
         config.central_reaper = &cache_child_reaper;
         config.clock_identity =
             icecc::p50::sidecar::process_monotonic_clock_identity();
+        // M1 (child), M2 (input), and M3 (random): the once-decided platform
+        // mitigation backends, threaded down to this adapter's own
+        // OuterKillDomainVerifier, the sidecar launch (--input-backend), and
+        // this adapter's own LaunchIdentityAllocator respectively.
+        // any_fail_closed() above already guarantees platform_decision has
+        // no FailClosed entry by the time this line runs, so only Native
+        // and Compat are possible here. The actual three-field copy is
+        // extracted into apply_platform_decision_to_config() (daemon/
+        // p50_platform_compat.{h,cpp}) specifically so it has its own direct
+        // unit test asserting all three fields land correctly -- see
+        // unittests/p50_platform_compat_test.cpp.
+        icecc::p50::platform::apply_platform_decision_to_config(platform_decision, config);
 
         if (!icecc::p50::daemon::DaemonSidecarAdapter::valid_config(config)) {
-            log_error() << "invalid cache sidecar configuration; refusing positive mode"
-                        << endl;
+            /* R17a: name the failing check -- path, expected vs actual
+               owner/mode -- instead of making the operator bisect the
+               25-clause chain by hand.  Behaviour identical: same refusal,
+               same positive-mode skip. */
+            const std::string reason =
+                icecc::p50::daemon::DaemonSidecarAdapter::config_refusal_reason(config);
+            log_error() << "invalid cache sidecar configuration; refusing positive mode: "
+                        << reason << endl;
             return false;
         }
         auto *created = new (std::nothrow)
@@ -5562,6 +5609,8 @@ void Daemon::poll_cache_adapter() noexcept
                     assignment.key.epoch, assignment.key.wire_id,
                     assignment.key.nonce)))
                 return;
+            icecc::stagetrace::stage_trace("fdaemon", "ready_sent",
+                (int64_t)assignment.key.epoch, (int64_t)assignment.key.wire_id);
             assignment.ready_announced = true;
             ++assignment_ready_replies;
         }
@@ -6713,6 +6762,8 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     Client *c = clients.find_by_client_id(msg->client_id);
     trace() << "scheduler_use_cs " << msg->job_id << " " << msg->client_id
             << " " << c << " " << msg->hostname << " " << remote_name <<  endl;
+    icecc::stagetrace::stage_trace("cdaemon", "usecs_recv",
+        (int64_t)msg->assignmentEpoch(), (int64_t)msg->job_id);
 
     if (!c) {
         if (send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
@@ -6814,6 +6865,8 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             handle_end(c, 143);
             return 0;
         }
+        icecc::stagetrace::stage_trace("cdaemon", "usecs_relayed",
+            (int64_t)msg->assignmentEpoch(), (int64_t)msg->job_id);
         ++c->getcs_delivered;
         c->job_id = msg->job_id;
         c->last_known_job_id = msg->job_id;
@@ -7008,6 +7061,8 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         }
 
         ++usecs_frames_committed;
+        icecc::stagetrace::stage_trace("cdaemon", "usecs_relayed",
+            (int64_t)msg->assignmentEpoch(), (int64_t)msg->job_id);
         /* Complete framed delivery: the assignment is now DELIVERY
            UNCERTAIN until the client claims it at the worker (JobBegin
            reaches the scheduler) or this connection ends.  */
@@ -8021,6 +8076,10 @@ void Daemon::handle_old_request()
                 if (preprocess_job) {
                     client->running_preprocess = true;
                     ++preprocess_active_processes;
+                    icecc::stagetrace::stage_trace("cdaemon", "local_preprocess_granted",
+                        icecc::stagetrace::kUnknown, (int64_t)client->client_id,
+                        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                        {{"depth", (int64_t)preprocess_active_processes}});
                     trace() << "pushed local preprocess job " << client->client_id << endl;
                 } else if (client->fulljob) { // reserve every compile slot
                     client->running_preprocess = false;
@@ -8059,6 +8118,8 @@ void Daemon::handle_old_request()
 
             if (client->channel->send_msg(*client->usecsmsg)) {
                 client->set_status(Client::CLIENTWORK, "handle_old_request: usecs delivered");
+                icecc::stagetrace::stage_trace("cdaemon", "usecs_relayed",
+                    icecc::stagetrace::kUnknown, (int64_t)client->usecsmsg->job_id);
                 /* we make sure we reserve a spot and the rest is done if the
                  * client contacts as back with a Compile request */
                 clients.active_processes++;
@@ -8104,11 +8165,23 @@ void Daemon::handle_old_request()
 
             string envforjob = job->targetPlatform() + "/" + job->environmentVersion();
             received_environments[envforjob].last_use = time(nullptr);
-            const int compiler_input_fd = client->p50_input_fd;
+            const int sidecar_input_fd = client->p50_input_fd;
             client->p50_input_fd = -1;
+            // The fd actually admitted into mint_attached_input_source() and
+            // handed to handle_connection(). Equal to sidecar_input_fd for
+            // Native; for Compat it is replaced below with a daemon-owned
+            // verified copy, since the lease and the forked child's
+            // KeepSet::sweep() re-check must bind to the exact same
+            // descriptor that was minted (see
+            // icecc::p50::forkfd::mint_attached_input_source() and
+            // handle_connection()'s KeepSet construction in serve.cpp) and
+            // that descriptor must never be the sidecar's own raw handoff
+            // fd under CompatPrivateFile -- the sidecar is outside this
+            // daemon's trust/ownership boundary.
+            int effective_input_fd = sidecar_input_fd;
             std::optional<icecc::p50::forkfd::ForkSourceLease>
                 compiler_input_source;
-            if (job->usesP50Input() && compiler_input_fd >= 0 &&
+            if (job->usesP50Input() && sidecar_input_fd >= 0 &&
                 client->p50_input_lease.has_value()) {
                 const auto& attachment = *client->p50_input_lease;
                 const auto& input = job->compileInputIdentity();
@@ -8122,9 +8195,63 @@ void Daemon::handle_old_request()
                     attachment.owner == expected_owner &&
                     attachment.request_id == input.request_id;
                 if (attachment_matches) {
-                    compiler_input_source =
-                        icecc::p50::forkfd::mint_attached_input_source(
-                            compiler_input_fd, attachment.request_id);
+                    // Map the once-decided M2 (input) platform mitigation to
+                    // the admission policy mint_attached_input_source()
+                    // enforces. This job could only have reached
+                    // usesP50Input() if configure_cache_adapter() configured
+                    // and advertised a cache sidecar, which it never does
+                    // while platform_decision.input.backend is FailClosed
+                    // (see Daemon::platform_decision and
+                    // configure_cache_adapter()) -- so the FailClosed case
+                    // below is unreachable in practice, not a designed
+                    // per-job fallback.
+                    switch (platform_decision.input.backend) {
+                    case icecc::p50::platform::Backend::Native:
+                        compiler_input_source =
+                            icecc::p50::forkfd::mint_attached_input_source(
+                                effective_input_fd, attachment.request_id,
+                                icecc::p50::forkfd::IdentityPolicy::SealsRequired);
+                        break;
+                    case icecc::p50::platform::Backend::Compat: {
+                        // M2 compat consumer: copy+verify the sidecar's
+                        // handoff into a daemon-owned private file (length
+                        // plus a write/read-back digest round trip; see
+                        // icecc::p50::platform::copy_compat_input_from_sidecar())
+                        // before minting anything. The sidecar's fd is not
+                        // needed past this point -- close it now rather than
+                        // carrying it forward to handle_connection().
+                        const icecc::p50::platform::CompatInputCopy copy =
+                            icecc::p50::platform::copy_compat_input_from_sidecar(
+                                sidecar_input_fd);
+                        (void)::close(sidecar_input_fd);
+                        effective_input_fd = -1;
+                        if (copy.ok) {
+                            effective_input_fd = copy.fd;
+                            compiler_input_source =
+                                icecc::p50::forkfd::mint_attached_input_source(
+                                    effective_input_fd, attachment.request_id,
+                                    icecc::p50::forkfd::IdentityPolicy::CompatPrivateFile);
+                        } else {
+                            log_warning() << "P50 compat input copy failed for job "
+                                          << job->jobID() << " request "
+                                          << attachment.request_id << endl;
+                        }
+                        break;
+                    }
+                    case icecc::p50::platform::Backend::FailClosed:
+                        // Defensive only: the cache-off gate in
+                        // configure_cache_adapter() should make this
+                        // unreachable. Do not mint; the usesP50Input() check
+                        // just below logs and fails this one job, which is
+                        // the correct response to an unexpected programming
+                        // error here, not a routine per-job fallback.
+                        log_error() << "P50 input admission reached a "
+                                       "FailClosed backend for job "
+                                    << job->jobID()
+                                    << " despite cache-off gating; this is a bug"
+                                    << endl;
+                        break;
+                    }
                 } else {
                     log_warning() << "P50 compiler attachment binding mismatch for job "
                                   << job->jobID() << " request "
@@ -8135,14 +8262,14 @@ void Daemon::handle_old_request()
             if (job->usesP50Input() && !compiler_input_source.has_value()) {
                 log_warning() << "P50 attached input failed compiler-fork validation for job "
                               << job->jobID() << endl;
-                if (compiler_input_fd >= 0)
-                    (void)::close(compiler_input_fd);
+                if (effective_input_fd >= 0)
+                    (void)::close(effective_input_fd);
                 handle_end(client, 146);
                 continue;
             }
             pid = handle_connection(envbasedir, job, client->channel, sock,
                                     mem_limit, user_uid, user_gid,
-                                    compiler_input_fd,
+                                    effective_input_fd,
                                     std::move(compiler_input_source));
             trace() << "handle connection returned " << pid << endl;
 
@@ -8167,6 +8294,8 @@ void Daemon::handle_old_request()
                                client->client_id);
                 mark_assignment_claimed_or_later(job->jobID());
                 current_kids++;
+                icecc::stagetrace::stage_trace("fdaemon", "compile_child_forked",
+                    (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
                 client->set_status(Client::WAITFORCHILD, "handle_old_request: compiling locally (child running)");
                 client->pipe_from_child = sock;
                 client->child_pid = pid;
@@ -8180,6 +8309,8 @@ void Daemon::handle_old_request()
                     log_info() << "failed sending scheduler about " << job->jobID() << endl;
                     return;
                 }
+                icecc::stagetrace::stage_trace("fdaemon", "jobbegin_sent",
+                    (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
             } else {
                 handle_end(client, 117);
             }
@@ -8720,6 +8851,8 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                         << job->jobID() << endl;
                 return false;
             }
+            icecc::stagetrace::stage_trace("cdaemon", "jobbegin_sent",
+                (int64_t)job->assignmentEpoch(), (int64_t)job->jobID());
         }
 
         // no scheduler is not an error case!
@@ -8993,6 +9126,8 @@ void Daemon::handle_end(Client *client, int exitcode)
             if (scheduler_owns_getcs_assignment(client)) {
                 for (uint32_t jid : client->getcs_batch_jobids) {
                     send_scheduler(JobDoneMsg(jid, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size()));
+                    icecc::stagetrace::stage_trace("cdaemon", "jobdone_sent",
+                        icecc::stagetrace::kUnknown, (int64_t)jid);
                 }
                 if (client->getcs_delivered < client->getcs_expected) {
                     JobDoneMsg cancel(0, exitcode, JobDoneMsg::FROM_SUBMITTER, clients.size());
@@ -9113,6 +9248,10 @@ void Daemon::handle_end(Client *client, int exitcode)
             if (emit_settlement) {
                 if (!send_scheduler(msg)) {
                     trace() << "failed to reach scheduler for remote job done msg!" << endl;
+                } else {
+                    icecc::stagetrace::stage_trace(
+                        flag == JobDoneMsg::FROM_SERVER ? "fdaemon" : "cdaemon",
+                        "jobdone_sent", (int64_t)assignment_epoch, (int64_t)job_id);
                 }
             }
             /* The settlement for this job id has been issued exactly once;
@@ -9207,6 +9346,8 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         trace() << "handle_get_cs count=0 no-op for client " << client->client_id << endl;
         return true;
     }
+    icecc::stagetrace::stage_trace("cdaemon", "client_request_in",
+        icecc::stagetrace::kUnknown, (int64_t)client->client_id);
     /* G4 (17:20#2 / bigoracle 18:45 P0): exactly one outstanding GetCS per
        client.  getcs_outstanding is set at accept and cleared only when the
        client is destroyed, so a second GetCS is rejected in EVERY non-terminal
@@ -9370,6 +9511,8 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     if (!send_scheduler(*umsg)) {
         return false;
     }
+    icecc::stagetrace::stage_trace("cdaemon", "getcs_sent",
+        icecc::stagetrace::kUnknown, (int64_t)umsg->client_id);
     /* G4 (17:20#1 / 18:45 P0): the GetCS reached S under the current ACTIVE
        generation, which now owns this request by client id.  A teardown before
        UseCS must settle it with a JobDone; and only a reply carrying this
@@ -9390,6 +9533,8 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
         ++assignment_stale_controls;
         return 1;
     }
+    icecc::stagetrace::stage_trace("fdaemon", "assign_prepare_recv",
+        (int64_t)msg->epoch(), (int64_t)msg->wire_id);
     const AssignmentKey key { msg->epoch(), msg->wire_id, msg->nonce() };
 
     auto terminal = assignment_terminals.find(key);
@@ -9403,23 +9548,6 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
     if (live != live_assignments.end()) {
         if (live->second.key == key) {
             /* Exact duplicate: preserve its current phase and re-READY. */
-        } else if (assignment_fence_mode == ConfCSMsg::Advisory
-                && live->second.key.epoch == key.epoch
-                && live->second.key.wire_id == key.wire_id
-                && live->second.key.nonce == 0
-                && live->second.phase != WorkerAssignment::Orphaned) {
-            /* Claim won the cross-channel race.  Bind PREPARE's full identity
-               into that same owner record; never regress to Reserved. */
-            live->second.key = key;
-            ++assignment_prepares;
-            if (live->second.phase == WorkerAssignment::ClaimedOrLater) {
-                if (!retain_assignment_terminal(
-                        key, RevokeResultMsg::ClaimedOrLater, true)) {
-                    live->second.phase = WorkerAssignment::Orphaned;
-                    return 1;
-                }
-                live_assignments.erase(live);
-            }
         } else {
             /* A wire id may be reused only after its earlier live record has
                reached a retained terminal.  Never replace live authority. */
@@ -9465,6 +9593,8 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
     const bool sent = send_scheduler(AssignReadyMsg(key.epoch, key.wire_id,
                                                      key.nonce));
     if (sent) {
+        icecc::stagetrace::stage_trace("fdaemon", "ready_sent",
+            (int64_t)key.epoch, (int64_t)key.wire_id);
         auto ready = live_assignments.find(key.wire_id);
         if (ready != live_assignments.end() && ready->second.key == key)
             ready->second.ready_announced = true;
@@ -9541,16 +9671,33 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
             scheduler_generation_exhausted = true;
         } else {
             if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, scheduler)) {
-                if (msg->epoch() == 0
-                        || (msg->fence_mode != ConfCSMsg::Legacy
-                            && msg->fence_mode != ConfCSMsg::Advisory
-                            && msg->fence_mode != ConfCSMsg::EnforcingCompat
-                            && msg->fence_mode != ConfCSMsg::StrictNonce)) {
+                if (msg->epoch() == 0) {
                     log_error() << "invalid protocol-49 assignment configuration" << endl;
                     return 1;
                 }
-                const ConfCSMsg::FenceMode requested =
-                    static_cast<ConfCSMsg::FenceMode>(msg->fence_mode);
+                ConfCSMsg::FenceMode requested;
+                if (msg->fence_mode == ConfCSMsg::Legacy
+                        || msg->fence_mode == ConfCSMsg::EnforcingCompat
+                        || msg->fence_mode == ConfCSMsg::StrictNonce) {
+                    requested = static_cast<ConfCSMsg::FenceMode>(msg->fence_mode);
+                } else if (msg->fence_mode == RETIRED_FENCE_MODE_ADVISORY) {
+                    /* Fail safe, not fail closed: a pre-virtu2 scheduler is
+                       not misbehaving, it simply predates this retirement.
+                       Keep the session and warn at most once per epoch. */
+                    if (!have_warned_retired_fence_mode_epoch
+                            || last_warned_retired_fence_mode_epoch != msg->epoch()) {
+                        log_warning() << "scheduler requested retired protocol-49 fence mode "
+                                      << RETIRED_FENCE_MODE_ADVISORY
+                                      << " (advisory) for epoch " << msg->epoch()
+                                      << "; treating as legacy" << endl;
+                        have_warned_retired_fence_mode_epoch = true;
+                        last_warned_retired_fence_mode_epoch = msg->epoch();
+                    }
+                    requested = ConfCSMsg::Legacy;
+                } else {
+                    log_error() << "invalid protocol-49 assignment configuration" << endl;
+                    return 1;
+                }
                 if (requested == ConfCSMsg::StrictNonce
                         && !IS_PROTOCOL_VERSION(
                             PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, scheduler)) {
@@ -9607,6 +9754,10 @@ bool Daemon::handle_local_job(Client *client, Msg *msg)
         client->command_line = command_line_from_peer_socket(client->channel->fd);
         client->local_preprocess = classify_local_preprocess_job(m->local_flags, client->command_line, m->fulljob);
     }
+    icecc::stagetrace::stage_trace("cdaemon", "local_slot_requested",
+        icecc::stagetrace::kUnknown, (int64_t)client->client_id,
+        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+        {{"preprocess_only", client->local_preprocess ? 1 : 0}});
     return true;
 }
 
@@ -9845,6 +9996,11 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         handle_end(client, 121);
         return false;
     }
+    if (client->p50_source_arm_fields.has_value()) {
+        icecc::stagetrace::stage_trace("fdaemon", "cache_session_dispatched",
+            (int64_t)client->p50_source_arm_fields->assignment_epoch,
+            (int64_t)client->p50_source_arm_fields->wire_job_id);
+    }
 
     // The handoff consumed the public descriptor. Remove only its stale
     // poll-map entry: the Client and its exact source-arm claim remain in
@@ -9903,6 +10059,9 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
     }
 
     const P50SourceArmFields& arm = msg->arm;
+    icecc::stagetrace::stage_trace("fdaemon", "arm_recv",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
     if (client->status != Client::UNKNOWN ||
         client->p50_source_arm_fields.has_value() ||
         !client->source_wrapper_provenance_valid() ||
@@ -10005,6 +10164,9 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         finish_assignment_claim(arm.wire_job_id);
         return reject(&arm, 147);
     }
+    icecc::stagetrace::stage_trace("fdaemon", "arm_validated",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
     return true;
 }
 
@@ -10740,6 +10902,47 @@ void Daemon::answer_client_requests()
         icecc::p50::advertisement::Update lifecycle_update;
         (void)cache_adapter->outer_advance_turn(
             std::chrono::steady_clock::now(), pollfds, &lifecycle_update);
+        // Requirement #3 (Slice 1 hardening): a Compat-backend starttime
+        // fence mismatch is a fail-closed invariant violation, never a
+        // retryable "no change yet" result.  It is sticky and the adapter
+        // never retries past it, so cache_adapter_compat_violation_logged
+        // makes this the one and only loud log line for the one and only
+        // occurrence, however many later turns keep observing it set.
+        if (!cache_adapter_compat_violation_logged) {
+            if (const auto& violation =
+                    cache_adapter->outer_compat_invariant_violation();
+                violation.has_value()) {
+                cache_adapter_compat_violation_logged = true;
+                if (!violation->observed_readable) {
+                    std::ostream &out = log_error();
+                    out << "P50 cache sidecar Compat starttime fence "
+                           "violated: pid="
+                        << violation->pid
+                        << " unreadable /proc/<pid>/stat (";
+                    if (violation->observed_errno != 0) {
+                        out << "errno " << violation->observed_errno << ": "
+                            << strerror(violation->observed_errno) << ")";
+                    } else {
+                        out << "unparseable, errno 0)";
+                    }
+                    out << " registry_generation="
+                        << violation->registry_generation
+                        << " -- failing closed, no retry" << endl;
+                } else {
+                    log_error()
+                        << "P50 cache sidecar Compat starttime fence "
+                           "violated: pid="
+                        << violation->pid
+                        << " starttime mismatch (expected "
+                        << violation->expected_starttime_ticks
+                        << ", observed "
+                        << violation->observed_starttime_ticks << ")"
+                        << " registry_generation="
+                        << violation->registry_generation
+                        << " -- failing closed, no retry" << endl;
+                }
+            }
+        }
         if (const auto result =
                 cache_adapter->take_outer_input_lifecycle_result();
             result.has_value()) {
@@ -11331,6 +11534,21 @@ int main(int argc, char **argv)
     int max_preprocess_processes = -1;
     srand(time(nullptr) + getpid());
 
+    /* First thing after entry, before any other code runs: a container start
+       or a supervisor may exec us with fds 1/2 closed, and every job child
+       inherits that state -- workit's pipe() then squats onto the closed
+       descriptors (pipe(sock_err) lands exactly on (1,2)) and the compiler
+       ends up exec'd with stdout/stderr closed.  Re-open /dev/null onto any
+       closed std fd NOW, from the host fs, before any chroot could hide it;
+       an already-open std fd (a real pipe) is never touched.  Failure here is
+       logged but not fatal: a healthy start never even reaches the open(). */
+    if (!icecc::sanitize_standard_fds()) {
+        static const char msg[] =
+            "iceccd: warning: could not sanitize standard fds (/dev/null "
+            "unavailable); closed std fds may break remote compiles\n";
+        (void)!::write(2, msg, sizeof(msg) - 1);
+    }
+
     Daemon d;
 
     int debug_level = Error;
@@ -11796,6 +12014,30 @@ int main(int argc, char **argv)
         } else {
             register_child(d.state_writer.pid(), d.state_writer.pid(),
                            ChildRecord::STATE_WRITER, 0);
+        }
+        /* R17c: probe the state-jsonl path ONCE as the DROPPED uid, right
+           here (the capng_change_id above already happened, and the state
+           writer child inherits this uid): a root-owned or otherwise
+           unwritable directory used to fail SILENTLY -- the writer child
+           retried its open for 60x5s and abandoned, the daemon reported
+           writer_alive=true, and telemetry just never landed.  WARN and
+           CONTINUE (telemetry must not take down a compile worker), but
+           name the path, the uid and the errno so the operator sees it at
+           startup, not after wondering where the jsonl went. */
+        if (!d.state_jsonl_path.empty()) {
+            const int probe_fd = ::open(d.state_jsonl_path.c_str(),
+                                       O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (probe_fd < 0) {
+                const int probe_errno = errno;
+                log_error() << "state-jsonl path '" << d.state_jsonl_path
+                            << "' is not writable by uid " << ::getuid()
+                            << " (gid " << ::getgid() << "): "
+                            << strerror(probe_errno)
+                            << " -- state telemetry WILL BE LOST; continuing without it"
+                            << endl;
+            } else {
+                ::close(probe_fd);
+            }
         }
     }
 

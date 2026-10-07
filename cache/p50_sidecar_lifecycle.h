@@ -9,6 +9,7 @@
 // action returned by each call.
 
 #include "p50_sidecar_identity.h"
+#include "p50_compat_child_handle.h"
 
 #include <chrono>
 #include <cstdint>
@@ -187,6 +188,14 @@ struct ReapEvent {
     // authority: a lifecycle accepts an event only when the snapshot still
     // names its bound pidfd, registry slot, and LaunchIncarnation.
     int pidfd = -1;
+    // Which child-identity primitive this event's `pidfd`/`starttime_ticks`
+    // pair was observed through.  Native events carry an exact pidfd and
+    // leave starttime_ticks as supplementary (direct-worker only); Compat
+    // events carry no pidfd (ENOSYS on kernel 3.10-class hosts) and instead
+    // are exact only when `starttime_ticks` still matches the registered
+    // (pid, starttime) pair at delivery -- see
+    // icecc::p50::platform::CompatChildHandle in p50_compat_child_handle.h.
+    ChildHandleBackend backend = ChildHandleBackend::Native;
     uint64_t registry_generation = 0;
     LaunchIncarnation incarnation{};
     // Raw kernel wait classification captured by the exact pidfd probe.  The
@@ -201,11 +210,62 @@ struct ReapEvent {
     uint64_t starttime_ticks = 0;
 
     [[nodiscard]] bool exact_identity() const noexcept {
-        return owner.valid() && pid > 1 && pidfd >= 0 &&
+        const bool handle_exact = (backend == ChildHandleBackend::Native)
+                                       ? (pidfd >= 0)
+                                       : (pidfd < 0 && starttime_ticks != 0);
+        return owner.valid() && pid > 1 && handle_exact &&
                registry_generation != 0 && incarnation.valid() &&
                (kernel_code == CLD_EXITED || kernel_code == CLD_KILLED ||
                 kernel_code == CLD_DUMPED) && reaper_owner_kind_valid(kind) &&
                (kind != ReaperOwnerKind::DirectWorker || starttime_ticks != 0);
+    }
+};
+
+// A Compat-backend starttime mismatch observed by the central registry is an
+// invariant violation, not a benign "no change yet" result: the kernel-3.10
+// (pid, starttime_ticks) fence that identifies this exact child no longer
+// matches, which means a blind reap happened somewhere outside the central
+// registry's two-phase protocol (the child exited and its /proc entry aged
+// out, or the pid was reused by an unrelated process). This can never be
+// retried or treated as a transient absence, and it carries no kernel wait-
+// status classification -- there is no real exit code to report -- so it
+// cannot be shaped as a ReapEvent (see ReapEvent::exact_identity() above,
+// which requires a genuine CLD_* origin). It is delivered through its own
+// single-slot channel on the same per-owner mailbox the lifecycle already
+// holds from registration.
+struct CompatInvariantViolation {
+    ReaperOwnerKind kind = ReaperOwnerKind::Sidecar;
+    pid_t pid = -1;
+    ReaperOwnerKey owner{};
+    uint64_t registry_generation = 0;
+    LaunchIncarnation incarnation{};
+    uint64_t expected_starttime_ticks = 0;
+    // 0 means /proc's entry for this pid was already gone (exited past
+    // /proc's reach); nonzero-but-mismatched means the numeric pid was
+    // reused by an unrelated process.
+    uint64_t observed_starttime_ticks = 0;
+    // Whether the /proc/<pid>/stat read-and-parse itself succeeded. This,
+    // not observed_errno below, is the authoritative signal for
+    // distinguishing "unreadable/unparseable" from "mismatched":
+    // observed_starttime_ticks alone cannot tell them apart (a readable stat
+    // line can itself report starttime 0), and observed_errno alone cannot
+    // either, because a parse-only failure (no ')' found, or field 22
+    // missing from an otherwise-readable line) leaves errno at 0 -- the same
+    // value a successful, merely-mismatched read reports.
+    bool observed_readable = false;
+    // errno captured from the failed read of /proc/<pid>/stat. Only
+    // meaningful when observed_readable is false: 0 then means the
+    // underlying read syscalls succeeded but the content was unparseable
+    // (no ')' found, or field 22 missing), while nonzero names the real
+    // failure (e.g. ENOENT once /proc/<pid> itself is gone). When
+    // observed_readable is true this is always 0 and carries no
+    // information -- observed_starttime_ticks is the genuine, readable,
+    // mismatched value instead.
+    int observed_errno = 0;
+
+    [[nodiscard]] bool exact_identity() const noexcept {
+        return owner.valid() && pid > 1 && registry_generation != 0 &&
+               incarnation.valid() && reaper_owner_kind_valid(kind);
     }
 };
 
@@ -668,12 +728,23 @@ public:
     bool enqueue(ReapEvent event) noexcept;
     bool dequeue(ReapEvent& event) noexcept;
 
+    // A Compat invariant violation is a single terminal fact: the registry
+    // removes the owner immediately after recording one (see
+    // CentralChildReaperRegistry::publish_compat_invariant_violation()), so
+    // at most one can ever matter for a given owner incarnation and a
+    // one-slot channel is sufficient. It is intentionally delivered through
+    // the same mailbox the owner already holds a weak_ptr to from
+    // registration -- no new wiring at register_owner() is needed.
+    bool enqueue_violation(CompatInvariantViolation violation) noexcept;
+    bool dequeue_violation(CompatInvariantViolation& violation) noexcept;
+
 private:
     static constexpr size_t kMaximumEvents = 16;
     std::array<ReapEvent, kMaximumEvents> events_{};
     std::mutex mutex_;
     size_t head_ = 0;
     size_t count_ = 0;
+    std::optional<CompatInvariantViolation> violation_;
 };
 
 struct LifecycleIdentity {
@@ -768,15 +839,28 @@ public:
     [[nodiscard]] ReaperOwnerKey owner_key() const noexcept {
         return ReaperOwnerKey{owner_id_, owner_generation_};
     }
-    // The outer loop binds the descriptor returned by pidfd_open and the
-    // registry generation minted for this exact registration.  A lifecycle
-    // event without this exact binding is rejected; the old scalar observer
-    // remains only as a fail-closed source-compatibility seam.
+    // The outer loop binds the registry generation minted for this exact
+    // registration, and -- for the Native backend only -- the descriptor
+    // returned by pidfd_open.  A lifecycle event without this exact binding
+    // is rejected; the old scalar observer remains only as a fail-closed
+    // source-compatibility seam.
+    //
+    // register_owner()'s own contract requires pidfd >= 0 for
+    // ChildHandleBackend::Native and pidfd < 0 for ::Compat (the
+    // pidfd-less, starttime-fenced handle); pidfd_ already defaults to -1,
+    // so a Compat caller correctly leaves it untouched here while still
+    // needing registry_generation_ bound -- consume_reap_events()'s
+    // violation cross-check (the only acceptance path a Compat owner has)
+    // requires identity_.has_value() && registry_generation_ != 0 and does
+    // not consult pidfd_ at all. Gating this whole bind on pidfd >= 0 would
+    // silently leave registry_generation_ at 0 for every Compat owner and
+    // make every one of its invariant violations look stale forever.
     void bind_reaper_identity(int pidfd, uint64_t registry_generation) noexcept {
-        if (pidfd >= 0 && registry_generation != 0) {
+        if (registry_generation == 0)
+            return;
+        if (pidfd >= 0)
             pidfd_ = pidfd;
-            registry_generation_ = registry_generation;
-        }
+        registry_generation_ = registry_generation;
     }
     // The outer launcher captures the private listener node before forking.
     // Bind that exact device/inode to the allocator-issued identity even when
@@ -798,6 +882,15 @@ public:
     [[nodiscard]] std::weak_ptr<ReapMailbox> reap_mailbox() const noexcept {
         return reap_mailbox_;
     }
+    // Sticky once set: a Compat invariant violation forces FailClosed on the
+    // very turn it is observed (see consume_reap_events()/advance()) and is
+    // never cleared afterward, so a caller that only wants to log the fact
+    // once can safely treat a transition from empty to non-empty as the one
+    // and only occurrence for this lifecycle instance.
+    [[nodiscard]] const std::optional<CompatInvariantViolation>&
+    compat_invariant_violation() const noexcept {
+        return compat_invariant_violation_;
+    }
     // The positive OUTPUT_QUIESCENCE_GRANTED and final direct-worker join
     // capabilities are minted by the configured leaf authority only.  These
     // adapters are pure routing hooks and perform no syscall or wait.
@@ -814,6 +907,17 @@ public:
         bool empty_after_population,
         bool leaf_cleanup_complete,
         std::chrono::steady_clock::time_point now) const noexcept;
+
+#if defined(ICECC_P50_SIDECAR_LIFECYCLE_TEST_HOOKS)
+    // Compile-time-only seam exposing the private exact-identity gate on a
+    // single reap event, so unit tests can prove rejection/acceptance of a
+    // non-exact event directly without forking a real child to drive
+    // consume_reap_events(). The installed library is built without this
+    // macro and never exposes consume_reap() outside the class.
+    bool test_consume_reap(const ReapEvent& event) noexcept {
+        return consume_reap(event);
+    }
+#endif
 
 private:
     LifecycleActionResult result(LifecycleAction action) const noexcept;
@@ -857,6 +961,7 @@ private:
     std::shared_ptr<ReapMailbox> reap_mailbox_;
     int pidfd_ = -1;
     uint64_t registry_generation_ = 0;
+    std::optional<CompatInvariantViolation> compat_invariant_violation_;
 };
 
 // Central-reaper ownership seam.  The reaper calls observe_child_reaped once
@@ -896,8 +1001,14 @@ public:
 
     // Preferred value-event API.  The returned token unregisters exactly this
     // PID/generation when destroyed, even if the registry itself is gone.
+    // `backend` is mandatory (not defaulted) and placed ahead of every
+    // defaulted parameter below so a caller can never silently fall back to
+    // Native: Native requires a real `pidfd`; Compat requires `pidfd < 0`
+    // and a non-zero `starttime_ticks` (see
+    // icecc::p50::platform::CompatChildHandle, p50_compat_child_handle.h).
     Registration register_owner(pid_t pid, pid_t pgid, ReaperOwnerKey owner,
                                 std::weak_ptr<ReapMailbox> mailbox,
+                                ChildHandleBackend backend,
                                 dev_t listener_device = 0,
                                 ino_t listener_inode = 0, int pidfd = -1,
                                 LaunchIncarnation incarnation = {},
@@ -911,7 +1022,8 @@ public:
     // process-wide wait sweep.
     Registration register_direct_worker(
         pid_t pid, pid_t pgid, ReaperOwnerKey owner, int pidfd,
-        LaunchIncarnation incarnation, uint64_t starttime_ticks = 0) noexcept;
+        ChildHandleBackend backend, LaunchIncarnation incarnation,
+        uint64_t starttime_ticks = 0) noexcept;
 
     bool unregister_owner(pid_t pid, ReaperOwnerKey owner) noexcept;
     bool observe_child_reaped(pid_t pid, ReaperOwnerKey owner, int status,
@@ -948,6 +1060,7 @@ private:
         dev_t listener_device = 0;
         ino_t listener_inode = 0;
         int pidfd = -1;
+        ChildHandleBackend backend = ChildHandleBackend::Native;
         LaunchIncarnation incarnation{};
         uint64_t registry_generation = 0;
         bool wait_observed = false;
@@ -974,6 +1087,23 @@ private:
     };
     [[nodiscard]] std::optional<ReapEvent> publish_observed(
         pid_t pid, ReaperOwnerKey owner) noexcept;
+
+    // A kernel-3.10-class Compat-backend observation found the owner's
+    // (pid, starttime_ticks) fence broken -- either the /proc entry is gone
+    // or the pid has already been recycled by the kernel. This is an
+    // invariant violation, never a benign "no change yet" result: it is
+    // delivered through the owner's mailbox (if one is live) as a
+    // CompatInvariantViolation, and the owner slot is unconditionally
+    // removed here (inlining unregister_owner()'s erase logic rather than
+    // calling it, since the caller already holds state_->mutex and the lock
+    // is non-reentrant). DirectWorker owners never have a live mailbox
+    // (register_direct_worker() always passes an expired one), so for them
+    // this call degrades to pid-slot hygiene only -- consistent with
+    // DirectWorker's existing "never retried" contract.
+    void publish_compat_invariant_violation(
+        pid_t pid, ReaperOwnerKey owner, uint64_t observed_starttime_ticks,
+        bool observed_readable, int observed_errno) noexcept;
+
     std::shared_ptr<SharedState> state_;
 };
 

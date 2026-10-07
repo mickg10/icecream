@@ -438,7 +438,8 @@ void validation_and_exec_failure() {
 
 void structured_lease_rotates_across_restart_and_controller_recreation() {
     const std::string root = make_private_root();
-    auto allocator = std::make_shared<LaunchIdentityAllocator>(71, 1);
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(
+        71, 1, icecc::p50::system_store_identity_entropy);
     Config config = structured_config("structured-live", root, allocator, 4);
     Supervisor first(config);
     CHECK(first.start());
@@ -498,7 +499,8 @@ void structured_actual_service_publishes_prebound_ready() {
     const char* service_path = std::getenv("ICECC_TEST_CACHE_SERVICE");
     CHECK(service_path != nullptr && service_path[0] == '/');
     const std::string root = make_private_root();
-    auto allocator = std::make_shared<LaunchIdentityAllocator>(73, 1);
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(
+        73, 1, icecc::p50::system_store_identity_entropy);
     Config config = structured_config("unused", root, allocator, 0);
     config.executable = service_path;
     // Unlike the in-process fake children, the real service performs the
@@ -531,7 +533,8 @@ void structured_dead_or_malformed_ready_is_never_current() {
     for (const char* mode : {"structured-exit", "structured-wrong-pid",
                              "structured-trailing-space", "structured-double-space"}) {
         const std::string root = make_private_root();
-        auto allocator = std::make_shared<LaunchIdentityAllocator>(81, 1);
+        auto allocator = std::make_shared<LaunchIdentityAllocator>(
+            81, 1, icecc::p50::system_store_identity_entropy);
         Config config = structured_config(mode, root, allocator, 0);
         config.max_attempts_per_recovery = 1;
         Supervisor supervisor(config);
@@ -547,7 +550,8 @@ void structured_dead_or_malformed_ready_is_never_current() {
 
 void cleanup_never_deletes_replaced_socket() {
     const std::string root = make_private_root();
-    auto allocator = std::make_shared<LaunchIdentityAllocator>(91, 1);
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(
+        91, 1, icecc::p50::system_store_identity_entropy);
     Supervisor supervisor(structured_config("structured-live", root, allocator));
     CHECK(supervisor.start());
     const ReadyLease lease = *supervisor.current_lease();
@@ -571,7 +575,8 @@ void cleanup_never_deletes_replaced_socket() {
 
 void cleanup_never_deletes_replaced_directory() {
     const std::string root = make_private_root();
-    auto allocator = std::make_shared<LaunchIdentityAllocator>(92, 1);
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(
+        92, 1, icecc::p50::system_store_identity_entropy);
     Supervisor supervisor(structured_config("structured-live", root, allocator));
     CHECK(supervisor.start());
     const ReadyLease lease = *supervisor.current_lease();
@@ -601,16 +606,23 @@ void launch_allocator_refuses_reserved_and_exhausted_identities() {
     CHECK(repeated.allocate().has_value());
     CHECK(!repeated.allocate().has_value());
 
-    LaunchIdentityAllocator zero_generation(0, 1);
+    LaunchIdentityAllocator zero_generation(
+        0, 1, icecc::p50::system_store_identity_entropy);
     CHECK(!zero_generation.allocate().has_value());
-    LaunchIdentityAllocator max_generation(std::numeric_limits<uint64_t>::max(), 1);
+    LaunchIdentityAllocator max_generation(
+        std::numeric_limits<uint64_t>::max(), 1,
+        icecc::p50::system_store_identity_entropy);
     CHECK(!max_generation.allocate().has_value());
-    LaunchIdentityAllocator zero_attempt(1, 0);
+    LaunchIdentityAllocator zero_attempt(
+        1, 0, icecc::p50::system_store_identity_entropy);
     CHECK(!zero_attempt.allocate().has_value());
-    LaunchIdentityAllocator max_attempt(1, std::numeric_limits<uint64_t>::max());
+    LaunchIdentityAllocator max_attempt(
+        1, std::numeric_limits<uint64_t>::max(),
+        icecc::p50::system_store_identity_entropy);
     CHECK(!max_attempt.allocate().has_value());
-    LaunchIdentityAllocator last_usable(9,
-                                        std::numeric_limits<uint64_t>::max() - 1);
+    LaunchIdentityAllocator last_usable(
+        9, std::numeric_limits<uint64_t>::max() - 1,
+        icecc::p50::system_store_identity_entropy);
     const auto allocated = last_usable.allocate();
     CHECK(allocated.has_value());
     CHECK(allocated->identity.attempt == std::numeric_limits<uint64_t>::max() - 1);

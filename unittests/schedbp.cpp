@@ -128,7 +128,8 @@ static const char *kEnv = "testenv";
 static pid_t start_scheduler(const std::string &binary, const std::string &shim,
                              int port, const std::string &logfile,
                              const char *verbosity, const char *extra_arg = nullptr,
-                             const char *extra_arg2 = nullptr)
+                             const char *extra_arg2 = nullptr,
+                             const char *extra_arg3 = nullptr)
 {
     pid_t pid = fork();
     if (pid != 0) {
@@ -149,15 +150,13 @@ static pid_t start_scheduler(const std::string &binary, const std::string &shim,
     }
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    if (extra_arg && extra_arg2) {
-        execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, extra_arg, extra_arg2,
-              (char *)nullptr);
-    } else if (extra_arg) {
-        execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, extra_arg, (char *)nullptr);
-    } else {
-        execl(binary.c_str(), binary.c_str(), "-p", portbuf, verbosity, (char *)nullptr);
-    }
-    perror("execl icecc-scheduler");
+    std::vector<const char *> args = { binary.c_str(), "-p", portbuf, verbosity };
+    if (extra_arg) { args.push_back(extra_arg); }
+    if (extra_arg2) { args.push_back(extra_arg2); }
+    if (extra_arg3) { args.push_back(extra_arg3); }
+    args.push_back(nullptr);
+    execv(binary.c_str(), const_cast<char *const *>(args.data()));
+    perror("execv icecc-scheduler");
     _exit(127);
 }
 
@@ -535,6 +534,15 @@ int main(int argc, char **argv)
        credit) while other submitters keep being served.  It does not wait
        for any teardown deadline.  */
     const bool gate_mode = argc > 5 && strcmp(argv[5], "gate") == 0;
+    /* "gateready": the SAME BP-1 admission-invariant assertions as "gate",
+       but run at the PRODUCTION default assignment-fence-mode (EnforcingCompat,
+       no override below) with a fake worker that completes the
+       ASSIGN_PREPARE/ASSIGN_READY handshake.  This is the enforcing-compat
+       liveness/fairness coverage the default flip must not lose; "gate"
+       itself stays pinned to legacy (see sched_extra3) so its pre-existing,
+       already-reviewed assertions keep validating the exact behaviour they
+       always have.  */
+    const bool gate_ready_mode = argc > 5 && strcmp(argv[5], "gateready") == 0;
     /* "perf": the measurement mode for perfgate.sh.  Identical workload, but
        the scheduler runs at production verbosity -- at -vvv the trace stream
        (a flushed write per line, several lines per job) dominates the
@@ -702,6 +710,13 @@ int main(int argc, char **argv)
             ? "--dispatch-stall-report-after=10"
         : (leastbusy_mode ? "--algorithm=least_busy" : nullptr);
     const char *sched_extra2 = noreader_mode ? "--max-outstanding-dispatches=1" : nullptr;
+    /* Every mode here was written and last reviewed against ASSIGNMENT_LEGACY
+       dispatch-reply timing; pin them there explicitly so the production
+       default (EnforcingCompat) cannot silently change their semantics.
+       "gateready" is the deliberate exception: it exercises the production
+       default on purpose (see gate_ready_mode above), so it passes no
+       override and the scheduler's own default applies.  */
+    const char *sched_extra3 = gate_ready_mode ? nullptr : "--assignment-fence-mode=legacy";
 
     /* Allocation and startup are ONE bounded attempt loop.  The probe below
        closes its sockets before the child binds, so another process can
@@ -741,7 +756,8 @@ int main(int argc, char **argv)
                 return 2;
             }
             pid_t child = start_scheduler(scheduler_bin, shim, chosen, sched_log,
-                                          perf_mode ? "-v" : "-vvv", sched_extra, sched_extra2);
+                                          perf_mode ? "-v" : "-vvv", sched_extra, sched_extra2,
+                                          sched_extra3);
             if (child < 0) {
                 perror("fork");
                 return 2;
@@ -949,6 +965,20 @@ int main(int argc, char **argv)
         Clock::time_point last_stats = Clock::now();
         while (!shutdown) {
             Msg *m = cs->get_msg(0, true);
+            /* Under EnforcingCompat/StrictNonce the scheduler withholds the
+               UseCS/NoCS reply until this worker completes the
+               ASSIGN_PREPARE/ASSIGN_READY handshake (see
+               scheduler.cpp handle_assignment_ready()).  Every mode routed
+               through this shared fake worker is pinned to
+               --assignment-fence-mode=legacy (sched_extra3) specifically so
+               this never fires there; "gateready" is the one mode that runs
+               at the production default and needs the echo to make
+               progress at all.  Echoing unconditionally is a no-op under
+               Legacy, since the scheduler never sends ASSIGN_PREPARE there.  */
+            if (m && MSG_IS(m, ASSIGN_PREPARE)) {
+                AssignPrepareMsg *prep = static_cast<AssignPrepareMsg *>(m);
+                cs->send_msg(AssignReadyMsg(prep->epoch(), prep->wire_id, prep->nonce()));
+            }
             delete m;
             if (cs->at_eof()) {
                 cs_alive = false;
@@ -4681,8 +4711,9 @@ int main(int argc, char **argv)
     ingress_duration_s = secs_since(t_prog) - phase_start_s.load();
     probe_phase = 1;   // scheduler has admitted the flood: drain begins
 
-    if (gate_mode) {
-        fprintf(stderr, "# gate mode: submitter stops reading for %ds\n", clog_s);
+    if (gate_mode || gate_ready_mode) {
+        fprintf(stderr, "# gate%s mode: submitter stops reading for %ds\n",
+                gate_ready_mode ? " (enforcing-compat, READY-aware)" : "", clog_s);
         /* Count assignments PER SUBMITTER from the scheduler's own log.
            "put <id> in joblist of <cs>" names the COMPILE SERVER, so the
            submitter is recovered through the job id: "NEW <id>

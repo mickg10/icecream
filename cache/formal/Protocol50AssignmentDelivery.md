@@ -34,23 +34,23 @@ change while an older response remains unread.
 The added eight bytes per control message avoid imposing a scheduler rule that
 a job id may never return to one worker during an epoch.
 
-## Advisory claim before PREPARE
+## Claim after PREPARE races REVOKE
 
-In ADVISORY mode an unknown legacy claim is permitted. The following order is
-therefore valid:
+A claim can only land once `ASSIGN_PREPARE` has reserved the assignment: the
+surviving `ENFORCING_COMPAT` and `STRICT_NONCE` modes both require a
+nonce-bearing claim, and there is no mode left that admits a claim ahead of
+PREPARE. The model's `ClaimAfterPrepareCurrent` action therefore only fires
+once the assignment's phase is `Reserved`:
 
 ```text
+ASSIGN_PREPARE arrives, worker records RESERVED
 UseCS / CompileFile claim arrives
 worker records CLAIMED
-ASSIGN_PREPARE arrives later
 ```
 
-The late PREPARE validates/enriches the existing claim and may produce READY,
-but it cannot change the phase from CLAIMED back to RESERVED. A subsequent
-REVOKE must still return `CLAIMED_OR_LATER`.
-
-The revoke decision belongs to the worker's single assignment-record owner and
-is made when that owner consumes the request, not when the scheduler queues it.
+That claim may still race an in-flight `REVOKE_BEFORE_START`. The revoke
+decision belongs to the worker's single assignment-record owner and is made
+when that owner consumes the request, not when the scheduler queues it.
 `Absent` or `Reserved` may advance to `Revoked` and return `Revoked` as a
 positive pre-claim proof. `Claimed`, `Started`, or `Terminal` is preserved and
 returns `ClaimedOrLater`. The scheduler releases immediately only for the
@@ -60,7 +60,7 @@ until the ordinary terminal settlement.
 This distinction covers the positive crossing
 
 ```text
-SendRevoke -> AdvisoryClaim -> DeliverRevokeRequest
+SendRevoke -> ClaimAfterPrepare -> DeliverRevokeRequest
 ```
 
 where the claim wins even though the revoke was queued first. It aligns this
@@ -95,9 +95,6 @@ ClaimedOrLaterPreservesWorkerState / CrossedClaimWinsRevoke
 StaleNonceResultDoesNotReleaseCurrent
     a delayed result for the old nonce cannot release the same-wire current
     assignment.
-
-ClaimedPhaseNeverRegresses
-    late PREPARE cannot move an accepted advisory claim backward.
 ```
 
 Two reachability configurations require TLC to exhibit the send-before-claim
@@ -107,14 +104,13 @@ negated witness predicates only when the discriminating states are reached.
 
 ## Mutants
 
-The fail-closed runner requires these four unsafe variants to violate their
+The fail-closed runner requires these three unsafe variants to violate their
 named invariants:
 
 ```text
 READY resolved by current wire id rather than nonce
 REVOKE request resolved by current wire id rather than nonce
 REVOKE result resolved by current wire id rather than nonce
-late advisory PREPARE regresses CLAIMED to RESERVED
 ```
 
 Every variant still transports the complete assignment identity. The three
@@ -134,7 +130,7 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar \
 The model is intentionally small. It does not duplicate scheduling, credit,
 capacity, compiler input, or Protocol-50 cache state. Its only purpose is to
 make the assignment-keyed formal actions realizable by the wire and to cover
-the advisory claim/PREPARE race.
+the claim-after-PREPARE-vs-REVOKE race.
 
 ## Cache-withdraw revocation and requeue
 

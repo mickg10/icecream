@@ -22,16 +22,12 @@ A compiler-child restart is not another scheduler assignment and does not
 repeat `ASSIGN_PREPARE`, `ASSIGN_READY`, `UseCS`, or the worker claim.  It is a
 new compiler attempt under the already-authorized assignment.
 
-## Four admission modes
+## Three admission modes
 
 ```text
 LEGACY
     no prepare table is required; unknown wire ids may claim the assignment
     currently occupying that id in the worker's scheduler epoch
-
-ADVISORY
-    prepare is sent but UseCS is not READY-gated; known records are checked,
-    unknown claims remain compatibility-admissible
 
 ENFORCING_COMPAT
     UseCS is READY-gated and unknown ids are rejected, but nonce-less old
@@ -42,16 +38,16 @@ STRICT_NONCE
     (epoch, wire_id, nonce) claim
 ```
 
-Protocol 49 reserves all four values but can operate only `LEGACY`,
-`ADVISORY`, and `ENFORCING_COMPAT`, because its client claim carries no nonce.
-Selecting `STRICT_NONCE` on a protocol-49-only path must be refused.  Protocol
-50 makes the already-modeled strict transition operational by carrying the
-full assignment identity through `UseCS` and `CompileFile`.
+The wire enum reserves four values (`LEGACY` = 0, a retired value = 1,
+`ENFORCING_COMPAT` = 2, `STRICT_NONCE` = 3) so an old scheduler's wire value
+never collides with a surviving mode, but only three modes are selectable.
+Protocol 49 can operate only `LEGACY` and `ENFORCING_COMPAT`, because its
+client claim carries no nonce.  Selecting `STRICT_NONCE` on a
+protocol-49-only path must be refused.  Protocol 50 makes the
+already-modeled strict transition operational by carrying the full
+assignment identity through `UseCS` and `CompileFile`.
 
-In `ADVISORY`, a client claim may arrive before `ASSIGN_PREPARE`.  The worker
-installs a claimed placeholder; a later matching PREPARE binds that record and
-may produce READY without moving the record back to RESERVED.  Once revocation
-has begun, READY cannot publish a new UseCS in any mode.
+Once revocation has begun, READY cannot publish a new UseCS in any mode.
 
 The critical distinction is:
 
@@ -133,11 +129,11 @@ this with `usedEpochs` and permits restart only to a not-yet-used epoch value.
 
 ## READY latency and credit
 
-ENFORCING_COMPAT and STRICT_NONCE necessarily add the S -> F -> S READY round trip before
-UseCS.  ADVISORY is the zero-added-latency compatibility mode but provides a
-weaker claim guarantee.  The default operating mode should be selected from
-physical p95/p99 dispatch measurements; the formal model does not hide that
-latency tradeoff.
+ENFORCING_COMPAT and STRICT_NONCE both add the S -> F -> S READY round trip
+before UseCS.  LEGACY has no prepare table and therefore no READY-gating
+cost, but it also has no per-assignment ownership proof.  The default
+operating mode should be selected from physical p95/p99 dispatch
+measurements; the formal model does not hide that latency tradeoff.
 
 Dispatch credit should be debited when the scheduler commits to PREPARE, not
 later at UseCS, so PREPARED assignments remain inside the existing outstanding

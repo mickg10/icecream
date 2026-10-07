@@ -41,4 +41,14 @@ ENV VIRTUAL_ENV=/opt/icecream-python \
 COPY run-qa.sh /usr/local/bin/run-qa.sh
 RUN chmod 0755 /usr/local/bin/run-qa.sh
 
+# The icecc service identity: the root-side daemon tests (sourcearm-live,
+# daemonpositive) and the e2e daemons' capng privilege drop both require a
+# NON-ROOT icecc user to exist (getpwnam("icecc"), uid/gid != 0) or they
+# skip -- the exact skips that hid the shipped fd bug.
+RUN groupadd --system icecc 2>/dev/null || true \
+    && useradd --system --gid icecc --home-dir /var/cache/icecc --shell /usr/sbin/nologin icecc 2>/dev/null || true \
+    && mkdir -p /var/cache/icecc \
+    && chown icecc:icecc /var/cache/icecc \
+    && (command -v setcap >/dev/null || apt-get update -qq && apt-get install -y -qq --no-install-recommends libcap2-bin)
+
 ENTRYPOINT ["/usr/local/bin/run-qa.sh"]

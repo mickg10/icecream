@@ -44,7 +44,6 @@ public:
 
     enum AssignmentPolicy {
         ASSIGNMENT_LEGACY,
-        ASSIGNMENT_ADVISORY,
         ASSIGNMENT_ENFORCING_COMPAT,
         ASSIGNMENT_STRICT_NONCE
     };

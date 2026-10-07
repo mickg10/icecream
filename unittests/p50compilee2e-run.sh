@@ -7,6 +7,28 @@
 # invocation is required to produce positive selected-profile evidence and a
 # byte-identical local reference. No fake peer or legacy FileChunk fallback
 # is accepted.
+#
+# ICECC_P50_C1F1_COMPILER selects the remote compile leg (default: g++,
+# the current behavior untouched).  Set it to clang++ for the opt-in
+# clang leg.  The 1.5.0-virtu1 fd-defect class is clang-only: gcc ignores
+# closed std fds while clang's FixupStandardFileDescriptors dies instantly
+# in a /dev/null-less chroot, so a gcc-only e2e suite can NEVER catch it
+# (see doc/fd-bug-2026-10-05.md).  The clang leg exists so at least one
+# REAL clang remote compile runs end to end in the native suite and a
+# regression of that class fails make check.  It is deliberately not in
+# dev/run-qa.sh's native-e2e TESTS list: the QA stage can add it after
+# its first runtime verification.  clang mode rejects the batch/
+# compile_db/reference-reuse cells (they have their own g++ assumptions).
+#
+# TODO(reviewer, live run): everything above is source-verified only.  The
+# first real clang leg needs one live e2e run to confirm (a) the
+# icecc-create-env --clang tarball (the full ldd closure of the resolved
+# clang, its /usr/bin/clang and the wrapper) installs on F and /usr/bin/clang
+# execs in the chroot with workit's exact argv, and (b) create-env finishes
+# inside $timeout_s -- the LLVM closure can be much larger than gcc's, so a
+# slow machine may need ICECC_P50_C1F1_TIMEOUT raised.  The byte-identity
+# compare itself is NOT a live-run question: see the CLANG IDENTITY NOTE at
+# the local reference compile below.
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -119,10 +141,47 @@ command -v timeout >/dev/null 2>&1 || {
     echo "SKIP: timeout(1) is required for bounded C1F1 cleanup" >&2
     exit 77
 }
+compiler_selector=${ICECC_P50_C1F1_COMPILER:-}
+case "$compiler_selector" in
+    "") compiler_cmd=g++ ;;
+    clang++) compiler_cmd=clang++ ;;
+    *) echo "FAIL: ICECC_P50_C1F1_COMPILER must be empty or clang++" >&2; exit 1 ;;
+esac
 command -v g++ >/dev/null 2>&1 || {
     echo "SKIP: g++ is required for the C1F1 compile" >&2
     exit 77
 }
+if test "$compiler_cmd" = clang++; then
+    # Release QA runs this leg with ICECC_P50_C1F1_COMPILER_REQUIRED=1:
+    # a missing tool in the QA image must FAIL the stage, not SKIP it --
+    # the fd defect this leg exists to catch shipped green exactly
+    # because its only detector was dark in every release QA run.
+    # Everywhere else the gate stays a skip (77) so a developer without
+    # clang still gets the gcc leg.
+    required=${ICECC_P50_C1F1_COMPILER_REQUIRED:-0}
+    miss() {
+        if test "$required" = 1; then
+            echo "FAIL (required mode): $1" >&2
+            exit 1
+        fi
+        echo "SKIP: $1" >&2
+        exit 77
+    }
+    # The remote workit resolves a clang C++ job to /usr/bin/clang (see
+    # CompileFileMsg::remote_compiler_name), so both names must exist here;
+    # the tarball carries /usr/bin/clang and the wrapper dispatches to it.
+    command -v clang++ >/dev/null 2>&1 || \
+        miss "clang++ is required for the opt-in clang C1F1 compile leg"
+    command -v clang >/dev/null 2>&1 || \
+        miss "clang is required for the opt-in clang C1F1 compile leg"
+    # create-env's --clang form packages the compilerwrapper as the legacy
+    # /usr/bin/{gcc,g++} names and refuses to run without an executable
+    # wrapper.  The configured default is @PKGLIBEXECDIR@/compilerwrapper,
+    # which only exists after an install; this gate runs from the build
+    # tree, so require the built one and pass it explicitly below.
+    test -x "$build/compilerwrapper/compilerwrapper" || \
+        miss "missing built executable $build/compilerwrapper/compilerwrapper (required by icecc-create-env --clang)"
+fi
 command -v bash >/dev/null 2>&1 || {
     echo "SKIP: bash is required for the generated icecc-create-env tool" >&2
     exit 77
@@ -342,6 +401,25 @@ include_root=${ICECC_P50_C1F1_INCLUDE_ROOT:-}
 compile_db=${ICECC_P50_C1F1_COMPILE_DB:-}
 compile_source=${ICECC_P50_C1F1_COMPILE_SOURCE:-}
 batch_manifest=${ICECC_P50_C1F1_BATCH_MANIFEST:-}
+if test "$compiler_cmd" = clang++; then
+    # The clang leg is the single-input smoke shape only: the batch,
+    # compile-database, and reference-reuse cells have their own g++
+    # assumptions (the -gno-record-gcc-switches injection in
+    # compile_args_for, the local-pending/external witness plumbing) and
+    # are out of scope until they are re-derived for clang.
+    test -z "$batch_manifest" || {
+        echo "FAIL: clang leg does not support batch mode" >&2
+        exit 1
+    }
+    test -z "$compile_db" && test -z "$compile_source" || {
+        echo "FAIL: clang leg does not support compile-database mode" >&2
+        exit 1
+    }
+    test -z "$reference_witness" || {
+        echo "FAIL: clang leg does not support reference-reuse mode" >&2
+        exit 1
+    }
+fi
 if test -n "$batch_manifest"; then
     test -z "$source_root" && test -z "$source_relative" && test -z "$source_input" || {
         echo "FAIL: batch manifest cannot be combined with single-input fields" >&2
@@ -599,9 +677,25 @@ fi
 
 # The environment is made by the real icecc tool, then shipped to the real F
 # daemon. This is deliberately not replaced by the host compiler PATH.
-(cd "$work/toolchain" && timeout "$timeout_s" \
-    bash "$build/client/icecc-create-env" "$(command -v g++)" \
-    >"$work/create-env.log" 2>&1)
+# The clang leg uses the tool's --clang form: the resolved clang binary is
+# packaged as /usr/bin/clang (one path per its usage line) and the
+# compilerwrapper is packaged as BOTH /usr/bin/gcc and /usr/bin/g++ -- the
+# legacy remote resolves a clang C++ job to /usr/bin/clang via
+# CompileFileMsg::remote_compiler_name, and workit's clang argv assembly
+# (daemon/workit.cpp) execs exactly that name, so the tarball carries
+# bin/clang and the wrapper, never bin/clang++ as a separate binary.
+if test "$compiler_cmd" = clang++; then
+    # The wrapper is passed explicitly because the configured default is the
+    # installed @PKGLIBEXECDIR@ path, which does not exist in a build tree.
+    (cd "$work/toolchain" && timeout "$timeout_s" \
+        bash "$build/client/icecc-create-env" --clang "$(command -v clang++)" \
+        "$build/compilerwrapper/compilerwrapper" \
+        >"$work/create-env.log" 2>&1)
+else
+    (cd "$work/toolchain" && timeout "$timeout_s" \
+        bash "$build/client/icecc-create-env" "$(command -v g++)" \
+        >"$work/create-env.log" 2>&1)
+fi
 envtar=$(find "$work/toolchain" -maxdepth 1 -type f \( \
     -name '*.tar.gz' -o -name '*.tar.xz' -o -name '*.tar.zst' -o \
     -name '*.tar.bz2' -o -name '*.tgz' -o -name '*.tar' \
@@ -879,6 +973,10 @@ for _ in $(seq 1 30); do
 done
 test "$cache_ready" -eq 1 || {
     echo "FAIL: production F cache endpoint was not advertised READY" >&2
+    echo "--- scheduler log (login/RELOGIN tail):" >&2
+    grep -aE "login |RELOGIN |broadcast|accepted" "$work/scheduler.log" 2>/dev/null | tail -12 >&2
+    echo "--- F daemon log (sidecar/auth tail):" >&2
+    grep -avE "lifecycle turn: action_taken=0" "$work/f.log" 2>/dev/null | tail -12 >&2
     exit 1
 }
 fi
@@ -1053,21 +1151,21 @@ compile_once() {
         export ICECC_TEST_SOCKET ICECC_TEST_REMOTEBUILD ICECC_VERSION \
             ICECC_P50_PREPROCESSED_CAPTURE \
             ICECC_P50_C_LEGACY_WIRE_TRACE ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
-        eval "run_client_with_timeout g++ $remote_compile_args"
+        eval "run_client_with_timeout $compiler_cmd $remote_compile_args"
     elif test "$cache_enabled" -eq 1; then
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
             ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
-            run_client_with_timeout g++ -std=c++17 -O2 -c \
+            run_client_with_timeout "$compiler_cmd" -std=c++17 -O2 -c \
             $compile_include_args "$input_path" -o "$remote_obj"
     else
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
-            run_client_with_timeout g++ -std=c++17 -O2 -c \
+            run_client_with_timeout "$compiler_cmd" -std=c++17 -O2 -c \
             $compile_include_args "$input_path" -o "$remote_obj"
     fi
     compile_end_ns=$(date +%s%N)
@@ -1084,13 +1182,25 @@ compile_once() {
         # the remote result at the batch barrier below; no compiler is run.
         cp -- "$remote_obj" "$local_obj"
     elif test -n "$item_compile_db"; then
-        eval "g++ $local_compile_args"
+        eval "$compiler_cmd $local_compile_args"
     else
         # Mirror the real client invocation for preparation compiles.  Feeding
         # the same bytes through stdin changes GCC's FILE symbol to <stdin>,
         # so a correct remote object would fail this byte-exact witness solely
         # because its source basename is retained.
-        g++ -std=c++17 -O2 -c $compile_include_args \
+        # CLANG IDENTITY NOTE: the local reference stays a DIRECT compiler run
+        # (no icecc wrapper) in clang mode too.  That is only sound because
+        # workit's clang argv assembly (daemon/workit.cpp) re-applies
+        # -Xclang -main-file-name <input path> and -Xclang
+        # -fdebug-compilation-dir <client cwd> on the remote side, which makes
+        # the remote object record the same source identity a direct compile
+        # from this absolute path already records; the -target triple comes
+        # from the client's -dumpmachine (client/arg.cpp) so it is the local
+        # default too.  Verified byte-identical against the shipped clang for
+        # both the plain and -g shapes of this TU (see the commit message for
+        # the measured hashes); if a future clang starts differing, the
+        # compare still fails closed here, never silently.
+        "$compiler_cmd" -std=c++17 -O2 -c $compile_include_args \
             "$input_path" -o "$local_obj"
     fi
     test -s "$preprocessed_capture" || {

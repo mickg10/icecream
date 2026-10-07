@@ -1,4 +1,4 @@
-TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest armedadmissiontest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50daemoncachedispatch p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics p50_trace_check.sh
+TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest armedadmissiontest stagetracetest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50daemoncachedispatch p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics p50_trace_check.sh
 TESTS += releaseidentity-source.sh
 TESTS += releaseidentity-artifact.sh
 TESTS += s3persistence
@@ -19,6 +19,7 @@ TESTS += p50_s2_restart_replay_sanitize.sh
 TESTS += p50sidecarsupervisor-sanitize.sh
 TESTS += p50sidecarlifecycle p50sidecarlifecycle-source.sh p50sidecarlifecycle-mutants.sh p50sidecarlifecycle-sanitize.sh
 TESTS += p50connectionprovenance
+TESTS += p50platformcompat
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
 TESTS += s1bcachepath-source.sh
@@ -38,6 +39,11 @@ TESTS += p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh
 TESTS += p50completionflow-source.py
 TESTS += p50compilerquiescence
 TESTS += p50-runtime-evidence-test.py
+# stdfd regression (the remote-compile fd bug): workit-level (farm-free) and
+# daemon-level (starts the real daemon with 1/2 closed).
+TESTS += stdfdworkit stdfdsanitize-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh p50remote-failreport.sh p50sidecarrefusal-run.sh p50statejsonl-warn.sh
+
+stdfdworkit_SOURCES = stdfdworkit.cpp
 TESTS += p50completionrecord-sanitize.sh
 TESTS += p50completionflow-run.sh
 TESTS += p50profile p50profile-source.sh p50_profile_sanitize.sh
@@ -63,6 +69,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 TESTS += codec_parity codec_provider codec_intern codec_wire
 TESTS += daemonqueue
 TESTS += pollreadiness
+TESTS += p50adapterautheofregression
 # Native executables and shell/Python helpers inherit the same locked Python.
 # Reference reducers are exercised here, never linked into shipped programs.
 check_LIBRARIES = libp50reference.a
@@ -89,6 +96,7 @@ AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_PKG_CONFIG_PATH='$(PKG_CONFIG_PATH)'; export ICECC_TEST_PKG_CONFIG_PATH; \
 	ICECC_TEST_PKG_CONFIG_LIBDIR='$(PKG_CONFIG_LIBDIR)'; export ICECC_TEST_PKG_CONFIG_LIBDIR; \
 	ICECC_TEST_CACHE_SERVICE='$(abs_top_builddir)/cache/icecc-cache-service'; export ICECC_TEST_CACHE_SERVICE; \
+	ICECC_TEST_FAKE_SIDECAR_EOF='$(abs_builddir)/p50fakesidecareof'; export ICECC_TEST_FAKE_SIDECAR_EOF; \
 	ICECC_TEST_READY_CLOSE_SHIM='$(abs_builddir)/readyclose_shim.so'; export ICECC_TEST_READY_CLOSE_SHIM; \
 	ICECC_TEST_CXX_STANDARD_FLAG='$(ICE_CXX_STANDARD_FLAG)'; export ICECC_TEST_CXX_STANDARD_FLAG; \
 	ICECC_TEST_CFLAGS='$(CFLAGS)'; export ICECC_TEST_CFLAGS; \
@@ -157,6 +165,7 @@ p50sidecarsupervisor_LDFLAGS = -pthread
 p50sidecarsupervisor_LDADD = libp50reference.a ../cache/libp50sidecar.a \
 	../cache/libp50localtransport.a ../services/libicecc.la
 p50sidecarlifecycle_SOURCES = p50_sidecar_lifecycle_test.cpp
+p50sidecarlifecycle_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_SIDECAR_LIFECYCLE_TEST_HOOKS
 p50sidecarlifecycle_CXXFLAGS = -pthread
 p50sidecarlifecycle_LDFLAGS = -pthread
 p50sidecarlifecycle_LDADD = ../cache/libp50sidecar.a \
@@ -187,7 +196,7 @@ p50cachefdseam_LDADD = ../services/libicecc.la
 p50readyadvertisement_LDADD = ../cache/libp50sidecar.a
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest armedadmissiontest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest armedadmissiontest stagetracetest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics stdfdworkit
 check_PROGRAMS += s3persistence
 check_PROGRAMS += dumpmachinecache
 check_PROGRAMS += p50s3realprocess
@@ -208,6 +217,7 @@ p50fsessionpayloads_LDADD = ../cache/libprotocol50.a
 p50fsessionsemantics_SOURCES = p50fsessionsemantics.cpp
 p50fsessionsemantics_LDADD = ../cache/libprotocol50.a
 check_PROGRAMS += p50daemonsidecaradapter p50daemonpositive
+check_PROGRAMS += p50fakesidecareof p50adapterautheofregression
 check_PROGRAMS += p50inputfd
 check_PROGRAMS += p50inputlifecycle
 check_PROGRAMS += p50resultdisposition
@@ -216,6 +226,7 @@ check_PROGRAMS += p50daemontaskcount
 check_PROGRAMS += p50forkfdhygiene
 check_PROGRAMS += p50compilerquiescence
 check_PROGRAMS += p50connectionprovenance
+check_PROGRAMS += p50platformcompat
 check_PROGRAMS += p50profile
 testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
@@ -344,19 +355,20 @@ p50resultdisposition_LDFLAGS = -pthread
 p50resultdisposition_LDADD = ../services/libicecc.la
 p50readyadvertisement_SOURCES = p50_ready_advertisement_test.cpp
 p50daemonsidecaradapter_SOURCES = p50_daemon_sidecar_adapter_test.cpp \
+	../cache/p50_daemon_sidecar_adapter.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp ../cache/p50_fd_handoff.cpp
 p50daemonsidecaradapter_CPPFLAGS = $(AM_CPPFLAGS) \
 	-DICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS
 p50daemonsidecaradapter_CXXFLAGS = -pthread
 p50daemonsidecaradapter_LDFLAGS = -pthread
-p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
+p50daemonsidecaradapter_LDADD = \
 	../cache/libp50sidecar.a \
 	../cache/libp50input.a \
 	../cache/libprotocol50.a \
 	../cache/libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50daemonsidecaradapter_DEPENDENCIES = \
-	../cache/libp50daemonsidecaradapter.a ../cache/libp50input.a \
+	../cache/libp50input.a \
 	../cache/libp50sidecar.a \
 	../cache/libprotocol50.a \
 	../cache/libp50localtransport.a \
@@ -364,6 +376,36 @@ p50daemonsidecaradapter_DEPENDENCIES = \
 p50daemonpositive_SOURCES = p50daemonpositive.cpp
 p50daemonpositive_LDADD = ../services/libicecc.la
 p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service
+# p50fakesidecareof is a tiny freestanding fixture, never linked against any
+# icecc library: it only has to speak the READY v2 frame and then present a
+# clean EOF without a HelloAck. It is driven as a subprocess by
+# p50adapterautheofregression below, never run directly as a TEST.
+p50fakesidecareof_SOURCES = p50_fake_sidecar_eof.cpp
+# p50adapterautheofregression is the regression test for the phase-3
+# authentication EOF spin bug (outer_advance_authentication(), the HelloAck
+# recv()): it drives a real DaemonSidecarAdapter against p50fakesidecareof
+# and times how long the auth fd lingers in outer_append_pollfds() after the
+# fixture's EOF. It reuses the same public outer-loop API and
+# ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS build as p50daemonsidecaradapter
+# above; it adds no new private test hooks of its own.
+p50adapterautheofregression_SOURCES = p50_adapter_auth_eof_regression_test.cpp \
+	../cache/p50_daemon_cache_dispatch.cpp ../cache/p50_fd_handoff.cpp
+p50adapterautheofregression_CPPFLAGS = $(AM_CPPFLAGS) \
+	-DICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS
+p50adapterautheofregression_CXXFLAGS = -pthread
+p50adapterautheofregression_LDFLAGS = -pthread
+p50adapterautheofregression_LDADD = ../cache/libp50daemonsidecaradapter.a \
+	../cache/libp50sidecar.a \
+	../cache/libp50input.a \
+	../cache/libprotocol50.a \
+	../cache/libp50localtransport.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
+p50adapterautheofregression_DEPENDENCIES = \
+	../cache/libp50daemonsidecaradapter.a ../cache/libp50input.a \
+	../cache/libp50sidecar.a \
+	../cache/libprotocol50.a \
+	../cache/libp50localtransport.a \
+	../services/libicecc.la p50fakesidecareof
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
 lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
@@ -415,6 +457,11 @@ fastesttest_SOURCES = fastesttest.cpp
 hallflowtest_SOURCES = hallflowtest.cpp
 armedadmissiontest_SOURCES = armedadmissiontest.cpp
 
+stagetracetest_SOURCES = stagetracetest.cpp
+stagetracetest_LDADD = ../services/libicecc.la
+stagetracetest_CXXFLAGS = -pthread
+stagetracetest_LDFLAGS = -pthread
+
 jobidalloctest_SOURCES = jobidalloctest.cpp
 p49assignment_SOURCES = p49assignment.cpp
 p49assignment_CXXFLAGS = -pthread
@@ -451,6 +498,9 @@ p50daemoncachedispatch_LDFLAGS = -pthread
 p50daemoncachedispatch_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50connectionprovenance_SOURCES = p50_connection_provenance_test.cpp ../daemon/connection_provenance.cpp
 p50connectionprovenance_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_CONNECTION_PROVENANCE_TEST_HOOKS
+p50platformcompat_SOURCES = p50_platform_compat_test.cpp ../daemon/p50_platform_compat.cpp
+p50platformcompat_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_PLATFORM_COMPAT_TEST_HOOKS -I$(top_srcdir)/cache
+p50platformcompat_LDADD = ../services/libicecc.la
 p50sourcearm_SOURCES = p50_source_arm_wait_test.cpp \
 	../cache/p50_source_identity.cpp ../cache/p50_input_wait.cpp
 p50sourcearm_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/cache

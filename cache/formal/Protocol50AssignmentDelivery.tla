@@ -2,15 +2,17 @@
 EXTENDS TLC
 
 (***************************************************************************
-Focused refinement model for two assignment-delivery interleavings abstracted
+Focused refinement model for one assignment-delivery interleaving abstracted
 by Protocol50Assignment.tla:
 
-  1. successive assignments may reuse one scheduler wire id in one epoch but
-     carry different assignment nonces. Delayed READY/REVOKE traffic must be
-     bound to the exact assignment, not looked up by wire id at delivery time;
-  2. in ADVISORY mode a legacy claim may win before PREPARE arrives. The late
-     PREPARE may enrich and acknowledge that claim but may never regress it to
-     RESERVED.
+  successive assignments may reuse one scheduler wire id in one epoch but
+  carry different assignment nonces. Delayed READY/REVOKE traffic must be
+  bound to the exact assignment, not looked up by wire id at delivery time.
+
+A claim can only land once PREPARE has reserved the assignment (the surviving
+EnforcingCompat/StrictNonce modes both require a nonce-bearing claim; there is
+no mode left that admits a claim ahead of PREPARE).  That claim may still race
+an in-flight REVOKE: the send-before-claim crossing is covered below.
 
 OldA and NewA represent two generations with the same epoch and wire id but
 distinct nonces. Therefore PREPARE, READY, REVOKE request, and REVOKE result
@@ -21,19 +23,17 @@ already carries wire_id plus the protocol-50 (epoch, nonce) capability.
 CONSTANTS OldA, NewA, NoA,
           MutantReadyByWireOnly,
           MutantRevokeRequestByWireOnly,
-          MutantRevokeResultByWireOnly,
-          MutantLatePrepareRegresses
+          MutantRevokeResultByWireOnly
 
 ASSUME /\ OldA # NewA
        /\ NoA \notin {OldA, NewA}
        /\ MutantReadyByWireOnly \in BOOLEAN
        /\ MutantRevokeRequestByWireOnly \in BOOLEAN
        /\ MutantRevokeResultByWireOnly \in BOOLEAN
-       /\ MutantLatePrepareRegresses \in BOOLEAN
 
 Assignments == {OldA, NewA}
 Phases == {"Absent", "Reserved", "Claimed", "Started", "Terminal", "Revoked"}
-ClaimKinds == {"None", "Unfenced", "Nonce"}
+ClaimKinds == {"None", "Nonce"}
 RevokeResults == {"Revoked", "ClaimedOrLater"}
 NoResult == "NoResult"
 
@@ -101,11 +101,11 @@ PrepareCurrent ==
                        published, revokedReleased, claimedRetained,
                        ordinarySettled, released>>
 
-AdvisoryClaimCurrent ==
+ClaimAfterPrepareCurrent ==
     LET a == current
-    IN /\ phase[a] = "Absent"
+    IN /\ phase[a] = "Reserved"
        /\ phase' = [phase EXCEPT ![a] = "Claimed"]
-       /\ claimKind' = [claimKind EXCEPT ![a] = "Unfenced"]
+       /\ claimKind' = [claimKind EXCEPT ![a] = "Nonce"]
        /\ claimCrossedRevoke' =
               IF revokeRequestInFlight = a
               THEN claimCrossedRevoke \cup {a}
@@ -118,26 +118,6 @@ AdvisoryClaimCurrent ==
                        revokeResultsDelivered,
                        published, revokedReleased, claimedRetained,
                        ordinarySettled, released>>
-
-PrepareAfterUnfencedClaim(a) ==
-    /\ a \in Assignments
-    /\ phase[a] = "Claimed"
-    /\ claimKind[a] = "Unfenced"
-    /\ a \notin workerPrepared
-    /\ readyInFlight = NoA
-    /\ workerPrepared' = workerPrepared \cup {a}
-    /\ readyInFlight' = a
-    /\ phase' = [phase EXCEPT
-                    ![a] = IF MutantLatePrepareRegresses
-                           THEN "Reserved" ELSE @]
-    /\ UNCHANGED <<current, claimKind,
-                    workerRevoked, workerClaimedOrLater,
-                    schedulerRevokeSent, readyAccepted,
-                    revokeRequestInFlight,
-                    revokeResultInFlight, revokeResultKind,
-                    revokeResultsDelivered, claimCrossedRevoke,
-                    published, revokedReleased, claimedRetained,
-                    ordinarySettled, released>>
 
 SwitchToNew ==
     /\ current = OldA
@@ -297,8 +277,7 @@ OrdinarySettle(a) ==
 
 Next ==
     \/ PrepareCurrent
-    \/ AdvisoryClaimCurrent
-    \/ \E a \in Assignments : PrepareAfterUnfencedClaim(a)
+    \/ ClaimAfterPrepareCurrent
     \/ SwitchToNew
     \/ DeliverReady
     \/ PublishCurrent
@@ -367,11 +346,6 @@ StaleNonceResultDoesNotReleaseCurrent ==
      /\ OldA \in revokeResultsDelivered
      /\ NewA \notin workerRevoked) =>
         NewA \notin revokedReleased
-
-ClaimedPhaseNeverRegresses ==
-    \A a \in Assignments :
-        claimKind[a] # "None" =>
-            phase[a] \in {"Claimed", "Started", "Terminal"}
 
 RevokeClaimCrossingCompleted ==
     \E a \in Assignments :

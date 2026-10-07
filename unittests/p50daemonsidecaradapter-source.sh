@@ -826,7 +826,13 @@ cmp -s "$src" "$exact_mode_mutant" && {
 compile_and_expect_red exact-mode "$exact_mode_mutant" 7
 
 same_identity_mutant="$tmp_root/same-identity.cpp"
-sed 's/config.expected_service_uid != config.expected_daemon_uid ||/false ||/' \
+# R17a moved the service-uid identity clause out of the old valid_config
+# boolean chain into config_refusal_reason() (valid_config is now derived:
+# empty reason = valid, so the two can never disagree).  The mutant must
+# target the new site: neutralize the clause in the ONE chain, and the
+# unit test still detects it (valid_config accepts a service-uid
+# mismatch -> exit 6).
+sed 's/if (config.expected_service_uid != config.expected_daemon_uid) {/if (false) {/' \
     "$src" >"$same_identity_mutant"
 cmp -s "$src" "$same_identity_mutant" && {
     echo 'FAIL: same-identity mutant was not applied' >&2

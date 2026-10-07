@@ -62,6 +62,7 @@
 #include "cache/p50_sidecar_identity.h"
 #include "services/digest128.h"
 #include "services/util.h"
+#include "services/stage_trace.h"
 #include "pipes.h"
 
 #include <chrono>
@@ -273,6 +274,8 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     CompileJob &job, const char *preproc_file, int &cpp_status)
 {
     cpp_status = 0;
+    icecc::stagetrace::stage_trace("iceccclient", "source_prepare_start",
+        (int64_t)job.assignmentEpoch(), (int64_t)job.jobID());
     if (preproc_file != nullptr) {
         if (!retain_p50_preprocessed_capture(preproc_file))
             throw client_error(
@@ -343,6 +346,9 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
                 "Error 103 - local cpp invocation failed, trying to recompile locally");
         return icecc::p50::OwnedSourceFd(-1);
     }
+
+    icecc::stagetrace::stage_trace("iceccclient", "source_prepare_done",
+        (int64_t)job.assignmentEpoch(), (int64_t)job.jobID());
 
     if (use_memfd) {
         // The child's writes moved the shared offset; readers start at 0.
@@ -1055,6 +1061,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                         << port << endl;
             throw client_error(2, "Error 2 - no server found at " + hostname);
         }
+        icecc::stagetrace::stage_trace("iceccclient", "connected_to_f",
+            (int64_t)job.assignmentEpoch(), (int64_t)job_id);
         cserver->set_p50_legacy_wire_role(P50LegacyWireRole::C);
         if (cache_advertised_assignment &&
             !cserver->setTcpUserTimeoutUntil(
@@ -1210,6 +1218,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 const icecc::p50::local::P50SourceTransferResult transfer =
                     transfer_p50_source(job, *usecs, *local_daemon,
                                         std::move(source), p50_profile);
+                icecc::stagetrace::stage_trace("iceccclient", "source_transferred",
+                    (int64_t)job.assignmentEpoch(), (int64_t)job_id,
+                    icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                    {{"transfer_code", (int64_t)transfer.code}});
                 const std::optional<CompileInputIdentity> identity =
                     icecc::p50::bind_compile_input(job, p50_profile, transfer);
                 if (!identity.has_value()) {
@@ -1284,6 +1296,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     throw client_error(9, "Error 9 - error sending file to remote");
                 }
             }
+            icecc::stagetrace::stage_trace("iceccclient", "compile_file_sent",
+                (int64_t)job.assignmentEpoch(), (int64_t)job_id);
 
             if (!p50_input && !preproc_file) {
                 int sockets[2];
@@ -1384,6 +1398,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         p50_result_received = p50_input;
 
         status = crmsg->status;
+        icecc::stagetrace::stage_trace("iceccclient", "compile_result_received",
+            (int64_t)job.assignmentEpoch(), (int64_t)job_id,
+            icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+            {{"status", (int64_t)status}});
 
         if (status && crmsg->was_out_of_memory) {
             (void)send_p50_disposition(ResultDispositionMsg::DefinitiveCancel);
@@ -1391,7 +1409,26 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             if (p50_input && getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
                 log_warning() << "P50 server reported a resource failure" << endl;
             } else {
-                log_warning() << "the server ran out of memory, recompiling locally" << endl;
+                /* Honest reporting (R15): the OOM bit is the LOCAL-FALLBACK
+                   trigger and stays set for both EXIT_OUT_OF_MEMORY (105,
+                   a real ENOMEM kill) and EXIT_IO_ERROR (107 -- worker input
+                   read timeout, EOF, open failure), because an old peer
+                   falls back on the bit and would otherwise surface a
+                   worker IO hiccup as a user-visible compile failure.  The
+                   worker binds status = 105/107 on that path (ours since
+                   c8bb615f), so pick the text from status instead of
+                   faking OOM for both; a stock/old worker may leave the
+                   status at 0 or stale, which lands in the neutral text. */
+                if (status == 105 /* EXIT_OUT_OF_MEMORY */) {
+                    log_warning() << "the server " << remote_daemon
+                                  << " ran out of memory, recompiling locally" << endl;
+                } else if (status == 107 /* EXIT_IO_ERROR */) {
+                    log_warning() << "remote I/O error on " << remote_daemon
+                                  << " (see that worker's log), recompiling locally" << endl;
+                } else {
+                    log_warning() << "remote job failed on " << remote_daemon
+                                  << " (out of memory or I/O error), recompiling locally" << endl;
+                }
             }
             throw remote_error(101, "Error 101 - the server ran out of memory, recompiling locally");
         }
@@ -1450,6 +1487,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 string dwo_output = job.outputFile().substr(0, job.outputFile().rfind('.')) + ".dwo";
                 receive_file(dwo_output, cserver);
             }
+            icecc::stagetrace::stage_trace("iceccclient", "object_received",
+                (int64_t)job.assignmentEpoch(), (int64_t)job_id);
         }
 
         if (!p50_input && cserver->protocol >= PROTOCOL_VERSION &&
@@ -1491,6 +1530,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         throw;
     }
 
+    icecc::stagetrace::stage_trace("iceccclient", "job_complete",
+        (int64_t)job.assignmentEpoch(), (int64_t)job_id,
+        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+        {{"status", (int64_t)status}});
     delete cserver;
     return status;
 }

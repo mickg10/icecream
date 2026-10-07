@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <initializer_list>
 #include <poll.h>
 #include <string>
 #include <sys/stat.h>
@@ -17,6 +19,16 @@ using icecc::p50::sidecar::CentralChildReaperRegistry;
 using icecc::p50::daemon::DaemonSidecarAdapter;
 
 namespace {
+
+// Slice-1 hardening requirement #2: DaemonSidecarAdapter::
+// outer_observe_child_reaped(const sidecar::ReapEvent&) must reject on
+// !event.exact_identity() and not merely on the four explicit field
+// comparisons it separately re-checks (owner/pid/pidfd/registry_generation).
+// Set false the first time a real, already-scheduled reap is tampered with
+// (incarnation zeroed -- a field exact_identity() requires valid() but which
+// the function never compares against anything else) and still accepted, or
+// still mutates an observable counter. Checked once at the end of main().
+bool g_exact_identity_hardening_ok = true;
 
 bool exact_node(const std::string& path, mode_t mode, bool directory,
                 uid_t uid, gid_t gid)
@@ -102,8 +114,21 @@ bool outer_turn(DaemonSidecarAdapter& adapter,
         }
         if (ready) {
             const auto event = reaper.reap_one(pid, pidfd);
-            if (event.has_value())
+            if (event.has_value()) {
+                // See the g_exact_identity_hardening_ok comment above: this
+                // piggybacks on an already-scheduled real reap, so it adds
+                // no new process, wait, or timing window.
+                icecc::p50::sidecar::ReapEvent tampered = *event;
+                tampered.incarnation = icecc::p50::sidecar::LaunchIncarnation{};
+                const uint64_t exits_before = adapter.cumulative_post_ready_exits();
+                const bool authenticated_before = adapter.authenticated();
+                if (tampered.exact_identity() ||
+                    adapter.outer_observe_child_reaped(tampered) ||
+                    adapter.cumulative_post_ready_exits() != exits_before ||
+                    adapter.authenticated() != authenticated_before)
+                    g_exact_identity_hardening_ok = false;
                 (void)adapter.outer_observe_child_reaped(*event);
+            }
         }
         // This is an in-memory publication retry only; it never repeats the
         // exact pidfd waitid operation after a consumed event.
@@ -158,6 +183,190 @@ bool hold_after_ready()
         ::usleep(1000);
     return ::access(path, F_OK) != 0;
 }
+
+#if defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
+// Task 4 (k310) requirement: unit-test the proc-fallback CLOEXEC sweep in
+// isolation, with no fork and no execve, so the sweep's own correctness
+// (every non-exempt fd gains FD_CLOEXEC, the internal /proc dir fd is not
+// leaked, a forced open() failure returns false and touches nothing) is
+// proven directly, independent of the Fork-case dispatch logic exercised
+// separately below by run_close_range_dispatch_tests().
+bool run_sweep_unit_tests()
+{
+    int pipe_a[2];
+    int pipe_b[2];
+    if (::pipe(pipe_a) != 0)
+        return false;
+    if (::pipe(pipe_b) != 0) {
+        ::close(pipe_a[0]);
+        ::close(pipe_a[1]);
+        return false;
+    }
+    const std::vector<int> synthetic{pipe_a[0], pipe_a[1], pipe_b[0], pipe_b[1]};
+    bool failed = false;
+    for (int fd : synthetic) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags < 0 || ::fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) != 0)
+            failed = true;
+    }
+    // One fd starts with CLOEXEC already set, to confirm the sweep leaves an
+    // already-correct bit alone rather than, say, toggling it off.
+    {
+        const int flags = ::fcntl(pipe_b[0], F_GETFD);
+        if (flags < 0 || ::fcntl(pipe_b[0], F_SETFD, flags | FD_CLOEXEC) != 0)
+            failed = true;
+    }
+
+    auto open_fd_snapshot = [] {
+        std::vector<int> open_fds;
+        for (int fd = 0; fd < 1024; ++fd) {
+            if (::fcntl(fd, F_GETFD) >= 0)
+                open_fds.push_back(fd);
+        }
+        return open_fds;
+    };
+
+    const std::vector<int> before = open_fd_snapshot();
+    if (!DaemonSidecarAdapter::test_sweep_cloexec_proc_fallback(false))
+        failed = true;
+    const std::vector<int> after = open_fd_snapshot();
+    // No fd gained or lost: the sweep's own /proc/self/fd dir fd must not
+    // leak, and it must not have closed anything it was not supposed to.
+    if (before != after)
+        failed = true;
+    for (int fd : synthetic) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags < 0 || (flags & FD_CLOEXEC) == 0)
+            failed = true;
+    }
+
+    // force_open_failure: must return false and must not touch any fd.
+    // Clear CLOEXEC on one synthetic fd again so a spurious mutation would
+    // be observable.
+    {
+        const int flags = ::fcntl(pipe_a[0], F_GETFD);
+        if (flags < 0 || ::fcntl(pipe_a[0], F_SETFD, flags & ~FD_CLOEXEC) != 0)
+            failed = true;
+    }
+    if (DaemonSidecarAdapter::test_sweep_cloexec_proc_fallback(true))
+        failed = true;
+    {
+        const int flags = ::fcntl(pipe_a[0], F_GETFD);
+        if (flags < 0 || (flags & FD_CLOEXEC) != 0)
+            failed = true;
+    }
+
+    for (int fd : synthetic)
+        ::close(fd);
+    return !failed;
+}
+
+// Task 4 (k310) requirement: prove the Fork-case dispatch itself, through a
+// real fork+exec of the cache-service binary (the dispatch lives inline in
+// OuterLaunchPhase::Fork's child branch, not in a separately callable
+// function, so only a real launch exercises it).  ENOSYS/EINVAL/EPERM must
+// each take the proc fallback and still reach a fully authenticated, READY
+// sidecar; any other errno (EBADF here) must fail closed; and
+// force_proc_open_failure stacked on a fallback-triggering errno must also
+// fail closed (the fallback-of-the-fallback failing is equivalent to the
+// fallback itself being broken).
+bool run_close_range_dispatch_tests(
+    const std::string& temp_root, CentralChildReaperRegistry& reaper,
+    const DaemonSidecarAdapter::Config& base_config)
+{
+    auto make_root = [&](const char* suffix) -> std::string {
+        const std::string pattern = temp_root + "/p50cr-" + suffix + "-XXXXXX";
+        std::vector<char> buffer(pattern.begin(), pattern.end());
+        buffer.push_back('\0');
+        if (::mkdtemp(buffer.data()) == nullptr || ::chmod(buffer.data(), 0700) != 0)
+            return std::string();
+        return std::string(buffer.data());
+    };
+
+    for (int injected_errno : {ENOSYS, EINVAL, EPERM}) {
+        const std::string root = make_root("fb");
+        if (root.empty())
+            return false;
+        auto config = base_config;
+        config.runtime_directory = root;
+        DaemonSidecarAdapter adapter(config);
+        adapter.observe_public_listener(true, config.public_listener_port);
+        adapter.outer_set_scheduler_owner(true);
+        adapter.test_force_close_range_errno(injected_errno);
+        icecc::p50::advertisement::Update update;
+        const bool reached_ready =
+            drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
+                return adapter.authenticated() &&
+                       adapter.advertisement_snapshot().present();
+            });
+        const bool shut_down = reached_ready &&
+                               drive_shutdown(adapter, reaper, update);
+        const bool cleaned = remove_p29_fingerprint_cache(root) &&
+                             ::rmdir(root.c_str()) == 0;
+        if (!reached_ready || !shut_down || !cleaned)
+            return false;
+    }
+
+    {
+        const std::string root = make_root("fc");
+        if (root.empty())
+            return false;
+        auto config = base_config;
+        config.runtime_directory = root;
+        DaemonSidecarAdapter adapter(config);
+        adapter.observe_public_listener(true, config.public_listener_port);
+        adapter.outer_set_scheduler_owner(true);
+        adapter.test_force_close_range_errno(EBADF);
+        icecc::p50::advertisement::Update update;
+        const bool reached_ready =
+            drive_until(adapter, reaper, update, std::chrono::seconds(3), [&] {
+                return adapter.authenticated() &&
+                       adapter.advertisement_snapshot().present();
+            });
+        // attempt() only becomes non-zero once a ready lease is bound; this
+        // scenario is specifically designed so READY is never reached (every
+        // forked child self-exits on the untolerated EBADF before execve),
+        // so attempt() stays 0 by construction. Use the lifecycle's own
+        // relaunch counter instead to confirm a relaunch really happened.
+        const bool actually_attempted = adapter.outer_lifecycle_attempts() > 0;
+        adapter.outer_set_scheduler_owner(false);
+        const bool shut_down = drive_shutdown(adapter, reaper, update);
+        ::rmdir(root.c_str());
+        if (reached_ready || !actually_attempted || !shut_down)
+            return false;
+    }
+
+    {
+        const std::string root = make_root("fo");
+        if (root.empty())
+            return false;
+        auto config = base_config;
+        config.runtime_directory = root;
+        DaemonSidecarAdapter adapter(config);
+        adapter.observe_public_listener(true, config.public_listener_port);
+        adapter.outer_set_scheduler_owner(true);
+        adapter.test_force_close_range_errno(ENOSYS);
+        adapter.test_force_proc_open_failure(true);
+        icecc::p50::advertisement::Update update;
+        const bool reached_ready =
+            drive_until(adapter, reaper, update, std::chrono::seconds(3), [&] {
+                return adapter.authenticated() &&
+                       adapter.advertisement_snapshot().present();
+            });
+        // Same rationale as the EBADF block above: the fallback-of-the-
+        // fallback is forced to fail too, so READY (and attempt()) is never
+        // reached by design. Use the lifecycle's relaunch counter instead.
+        const bool actually_attempted = adapter.outer_lifecycle_attempts() > 0;
+        adapter.outer_set_scheduler_owner(false);
+        const bool shut_down = drive_shutdown(adapter, reaper, update);
+        ::rmdir(root.c_str());
+        if (reached_ready || !actually_attempted || !shut_down)
+            return false;
+    }
+
+    return true;
+}
+#endif // defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
 
 } // namespace
 
@@ -337,6 +546,16 @@ int main()
 
     if (!remove_p29_fingerprint_cache(root) || ::rmdir(directory) != 0)
         return 25;
+    if (!g_exact_identity_hardening_ok)
+        return 28;
+
+    // Task 4 (k310): fork-safe CLOEXEC-sweep hardening.  See the function
+    // comments above for exactly what each proves.
+    if (!run_sweep_unit_tests())
+        return 29;
+    if (!run_close_range_dispatch_tests(temp_root, reaper, config))
+        return 30;
+
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
 }

@@ -67,6 +67,7 @@ for mutant_name in pgid store-generation allocator-store-generation lease-store-
         -c "$tmp/mutant.cpp" -o "$tmp/mutant.o"
     compiled_count=$((compiled_count + 1))
     "$cxx" -std=c++20 -pthread -I"$root" -I"$root/services" \
+        -DICECC_P50_SIDECAR_LIFECYCLE_TEST_HOOKS \
         "$root/unittests/p50_sidecar_lifecycle_test.cpp" "$tmp/mutant.o" \
         "$build/../cache/libp50sidecar.a" "$build/../cache/libp50localtransport.a" \
         "$build/../services/.libs/libicecc.a" \

@@ -6,6 +6,7 @@ cxx="${ICECC_TEST_CXX:-c++}"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/p50-sidecar-lifecycle-san.XXXXXX")"
 trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
 "$cxx" -std=c++20 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread \
+    -DICECC_P50_SIDECAR_LIFECYCLE_TEST_HOOKS \
     -I"$root" -I"$root/cache" -I"$root/services" \
     "$root/unittests/p50_sidecar_lifecycle_test.cpp" \
     "$root/cache/p50_sidecar_lifecycle.cpp" \

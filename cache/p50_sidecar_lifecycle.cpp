@@ -1,5 +1,7 @@
 #include "p50_sidecar_lifecycle.h"
 
+#include "services/logging.h"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -239,6 +241,82 @@ bool observe_pidfd_status(int pidfd, pid_t expected_pid, bool consume,
     (void)consume;
     (void)code;
     (void)status;
+    return false;
+#endif
+}
+
+// Compat counterpart of observe_pidfd_status() for kernel-3.10-class hosts
+// where pidfd_open()/waitid(P_PIDFD) is ENOSYS (see
+// cache/p50_compat_child_handle.h and doc/p50-platform-compat.md). Exactly
+// one bounded syscall, no retry: a retry is a later outer-loop turn, same as
+// the Native primitive above. Unlike compat_wait_bounded() in
+// p50_compat_child_handle.cpp, this never sleeps or loops in a tight poll --
+// it is called once per outer turn by the registry, which already owns the
+// turn-by-turn scheduling. The starttime re-check immediately precedes the
+// syscall rather than following it: once a WNOWAIT peek or a consuming wait
+// succeeds, the kernel may remove the zombie's /proc entry from under a
+// later re-check (consume) or a concurrent actor (peek), so checking after
+// would reject successes this call itself just produced. This accepts the
+// same pid_max-wrap residual risk CompatChildHandle::still_same_process()
+// documents, and no more.
+// invariant_violation is set true only when the (pid, starttime_ticks) fence
+// itself is broken -- the /proc entry is gone past its bounded reach, or the
+// pid has already been recycled by the kernel for an unrelated process.
+// observed_starttime_ticks carries the mismatched value for diagnostics (0
+// when the /proc entry could not be read at all). This is distinct from, and
+// never set alongside, the benign "no change yet" result below (a WNOHANG
+// waitid() that simply has nothing to report): a mismatched fence is a fatal
+// invariant violation that must fail closed and never be retried, while an
+// empty waitid() result is an ordinary not-yet-exited outcome polled again on
+// a later outer turn. Callers must zero-initialize both out-params; this
+// function only ever sets invariant_violation to true, never resets it.
+bool observe_compat_status(pid_t pid, uint64_t starttime_ticks, bool consume,
+                           int& code, int& status, bool& invariant_violation,
+                           uint64_t& observed_starttime_ticks,
+                           bool& observed_readable,
+                           int& observed_errno) noexcept {
+#if defined(__linux__) && defined(WEXITED) && defined(WNOHANG) && defined(WNOWAIT)
+    if (pid <= 1 || starttime_ticks == 0)
+        return false;
+    unsigned long long current_starttime = 0;
+    errno = 0;
+    const bool stat_readable =
+        icecc::p50::platform::read_starttime_ticks(pid, &current_starttime);
+    const int stat_errno = errno;
+    if (!stat_readable || current_starttime != starttime_ticks) {
+        // fail closed: exited past /proc's reach, or pid reused
+        invariant_violation = true;
+        observed_starttime_ticks = current_starttime;
+        observed_readable = stat_readable;
+        // Only meaningful when !stat_readable: 0 there means a parse-only
+        // failure (the read syscalls succeeded, but the content was
+        // unparseable), nonzero names the real read failure. observed_readable
+        // above, not this field, is what the caller must branch on.
+        observed_errno = stat_readable ? 0 : stat_errno;
+        return false;
+    }
+    siginfo_t information{};
+    int flags = WEXITED | WNOHANG;
+    if (!consume)
+        flags |= WNOWAIT;
+    const int result =
+        ::waitid(P_PID, static_cast<id_t>(pid), &information, flags);
+    if (result != 0 || information.si_pid != pid ||
+        !valid_kernel_exit_code(information.si_code))
+        return false;
+    code = information.si_code;
+    status = wait_status_from_siginfo(information);
+    return true;
+#else
+    (void)pid;
+    (void)starttime_ticks;
+    (void)consume;
+    (void)code;
+    (void)status;
+    (void)invariant_violation;
+    (void)observed_starttime_ticks;
+    (void)observed_readable;
+    (void)observed_errno;
     return false;
 #endif
 }
@@ -486,6 +564,37 @@ bool ReapMailbox::dequeue(ReapEvent& event) noexcept {
     }
     head_ = (head_ + 1) % kMaximumEvents;
     --count_;
+    return true;
+}
+
+bool ReapMailbox::enqueue_violation(CompatInvariantViolation violation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (violation_.has_value())
+        return false;
+    try {
+        violation_ = std::move(violation);
+    } catch (...) {
+        // Same allocator-failure contract as enqueue(): a delivery failure
+        // here is a bounded retry condition, not a reason to terminate the
+        // daemon from this noexcept boundary.
+        violation_.reset();
+        return false;
+    }
+    return true;
+}
+
+bool ReapMailbox::dequeue_violation(CompatInvariantViolation& violation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!violation_.has_value())
+        return false;
+    try {
+        violation = *violation_;
+    } catch (...) {
+        // Keep the single-slot violation in place so a later turn can retry
+        // the publication rather than losing the only exact invariant fact.
+        return false;
+    }
+    violation_.reset();
     return true;
 }
 
@@ -869,6 +978,63 @@ bool SidecarLifecycle::consume_reap(const ReapEvent& event) noexcept {
 void SidecarLifecycle::consume_reap_events() noexcept {
     if (!reap_mailbox_)
         return;
+    // A Compat invariant violation is a single terminal fact about this
+    // exact owner/incarnation (the registry removes the owner the moment it
+    // publishes one -- see
+    // CentralChildReaperRegistry::publish_compat_invariant_violation()), so
+    // it is drained and cross-checked ahead of the bounded ReapEvent quota
+    // below rather than folded into that quota. Detection only latches
+    // compat_invariant_violation_ here; it deliberately does NOT call
+    // fail_closed() itself. This function returns void, and fail_closed()'s
+    // LifecycleActionResult (LifecycleAction::FailedClosed) must reach the
+    // adapter so it performs real cleanup (disable_relationship(), closing
+    // owned fds, resetting auth state) -- discarding that return value here
+    // would silently skip all of it the moment advance() flips state_ to
+    // FailedClosed and its very next statement short-circuits on that state.
+    // advance() issues the actual fail-closing return once this latch is
+    // observed. A violation that does not match this exact owner generation,
+    // pid, and incarnation is stale (e.g. from an owner this object already
+    // moved on from) and is discarded exactly like consume_reap() discards a
+    // mismatched ReapEvent.
+    if (!compat_invariant_violation_.has_value()) {
+        CompatInvariantViolation violation;
+        if (reap_mailbox_->dequeue_violation(violation)) {
+            if (violation.owner == owner_key() &&
+                violation.kind == ReaperOwnerKind::Sidecar &&
+                violation.pid > 1 && violation.pid == child_pid_ &&
+                identity_.has_value() && registry_generation_ != 0 &&
+                violation.registry_generation == registry_generation_ &&
+                violation.incarnation.identity == identity_->control &&
+                violation.incarnation.store_generation ==
+                    identity_->store_generation &&
+                violation.incarnation.store_root == identity_->store_root &&
+                violation.incarnation.c_store_guid ==
+                    identity_->c_store_guid &&
+                violation.incarnation.f_store_guid ==
+                    identity_->f_store_guid) {
+                compat_invariant_violation_ = violation;
+            } else {
+                // Stale/foreign fact: it must not be silently dropped, even
+                // though it cannot be latched onto this owner. Log both the
+                // expected identity this owner holds and the actual identity
+                // the violation carried, so a mismatch is still visible for
+                // diagnosis.
+                log_warning()
+                    << "P50 Compat invariant violation dropped: owner "
+                       "mismatch (expected pid="
+                    << child_pid_ << " registry_generation="
+                    << registry_generation_ << " owner_id="
+                    << owner_key().owner_id << " owner_generation="
+                    << owner_key().generation
+                    << "; got pid=" << violation.pid
+                    << " registry_generation=" << violation.registry_generation
+                    << " owner_id=" << violation.owner.owner_id
+                    << " owner_generation=" << violation.owner.generation
+                    << " kind=" << static_cast<int>(violation.kind) << ")"
+                    << std::endl;
+            }
+        }
+    }
     // A central reaper gets a fixed delivery quota per owner turn.  Stale
     // events are discarded by owner generation and cannot poison a new PID.
     // One bounded pure in-memory mailbox advance per daemon turn.  A larger
@@ -922,6 +1088,16 @@ LifecycleActionResult SidecarLifecycle::advance(
         deadline_ = now + config_.exec_timeout;
     }
     consume_reap_events();
+    // A latched Compat invariant violation is fatal and must fail closed on
+    // the very next turn that observes it, exactly once (the state_ guard
+    // makes this idempotent across every later turn, since the latch itself
+    // is never cleared). This must be the explicit `return fail_closed();`
+    // call -- not a flag flip inside consume_reap_events() -- so its
+    // LifecycleActionResult reaches the adapter's real cleanup rather than
+    // being swallowed by the state_ == FailedClosed early return just below.
+    if (compat_invariant_violation_.has_value() &&
+        state_ != LifecycleState::FailedClosed)
+        return fail_closed();
     if (state_ == LifecycleState::DegradedLegacy ||
         state_ == LifecycleState::FailedClosed || state_ == LifecycleState::Stopped) {
         deadline_ = {};
@@ -1242,14 +1418,25 @@ void CentralChildReaperRegistry::Registration::reset() noexcept {
 CentralChildReaperRegistry::Registration
 CentralChildReaperRegistry::register_owner(
     pid_t pid, pid_t pgid, ReaperOwnerKey owner,
-    std::weak_ptr<ReapMailbox> mailbox, dev_t listener_device,
-    ino_t listener_inode, int pidfd, LaunchIncarnation incarnation,
-    ReaperOwnerKind kind, uint64_t starttime_ticks) noexcept {
+    std::weak_ptr<ReapMailbox> mailbox, ChildHandleBackend backend,
+    dev_t listener_device, ino_t listener_inode, int pidfd,
+    LaunchIncarnation incarnation, ReaperOwnerKind kind,
+    uint64_t starttime_ticks) noexcept {
+    const bool handle_valid = (backend == ChildHandleBackend::Native)
+                                   ? (pidfd >= 0)
+                                   : (pidfd < 0 && starttime_ticks != 0);
+    // Direct-worker registrations are scoped to the Native handle primitive
+    // only.  The compat (pidfd-less, starttime-fenced) identity is exercised
+    // and tested solely through the real sidecar-launch path; a Compat
+    // direct worker has no covering observe/kill-domain path and must be
+    // rejected outright regardless of starttime_ticks, not merely when the
+    // starttime fence is unset.
     if (!state_ || pid <= 1 || pgid <= 1 || pid != pgid || !owner.valid() ||
         ((kind == ReaperOwnerKind::Sidecar) && mailbox.expired()) ||
-        pidfd < 0 || !incarnation.valid() ||
+        !handle_valid || !incarnation.valid() ||
         !reaper_owner_kind_valid(kind) ||
-        (kind == ReaperOwnerKind::DirectWorker && starttime_ticks == 0))
+        (kind == ReaperOwnerKind::DirectWorker &&
+         (starttime_ticks == 0 || backend == ChildHandleBackend::Compat)))
         return {};
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->owners.find(pid) != state_->owners.end() ||
@@ -1282,7 +1469,8 @@ CentralChildReaperRegistry::register_owner(
         const uint64_t registry_generation = state_->next_registry_generation++;
         state_->owners.emplace(pid, Entry{pgid, owner, std::move(mailbox),
                                           listener_device, listener_inode, pidfd,
-                                          std::move(incarnation), registry_generation,
+                                          backend, std::move(incarnation),
+                                          registry_generation,
                                           false, false, 0, 0, false, slot,
                                           kind, starttime_ticks});
     } catch (...) {
@@ -1301,8 +1489,9 @@ CentralChildReaperRegistry::register_owner(
 CentralChildReaperRegistry::Registration
 CentralChildReaperRegistry::register_direct_worker(
     pid_t pid, pid_t pgid, ReaperOwnerKey owner, int pidfd,
-    LaunchIncarnation incarnation, uint64_t starttime_ticks) noexcept {
-    return register_owner(pid, pgid, owner, {}, 0, 0, pidfd,
+    ChildHandleBackend backend, LaunchIncarnation incarnation,
+    uint64_t starttime_ticks) noexcept {
+    return register_owner(pid, pgid, owner, {}, backend, 0, 0, pidfd,
                            std::move(incarnation), ReaperOwnerKind::DirectWorker,
                            starttime_ticks);
 }
@@ -1346,7 +1535,11 @@ std::optional<ReapEvent> CentralChildReaperRegistry::publish_observed(
     if (iterator == state_->owners.end() || iterator->second.owner != owner ||
         iterator->second.kind != ReaperOwnerKind::Sidecar ||
         iterator->second.observed || !iterator->second.wait_consumed ||
-        iterator->second.pidfd < 0 || !iterator->second.incarnation.valid())
+        (iterator->second.backend == ChildHandleBackend::Native
+             ? iterator->second.pidfd < 0
+             : (iterator->second.pidfd >= 0 ||
+                iterator->second.starttime_ticks == 0)) ||
+        !iterator->second.incarnation.valid())
         return std::nullopt;
     const auto target = iterator->second.mailbox.lock();
     if (!target) {
@@ -1364,8 +1557,9 @@ std::optional<ReapEvent> CentralChildReaperRegistry::publish_observed(
     ReapEvent event;
     try {
         event = ReapEvent{owner, pid, entry.observed_status, false, entry.pidfd,
-                          entry.registry_generation, entry.incarnation,
-                          entry.observed_code};
+                          entry.backend, entry.registry_generation,
+                          entry.incarnation, entry.observed_code, entry.kind,
+                          entry.starttime_ticks};
         if (!target->enqueue(event))
             return std::nullopt;
     } catch (...) {
@@ -1378,12 +1572,53 @@ std::optional<ReapEvent> CentralChildReaperRegistry::publish_observed(
     return event;
 }
 
+void CentralChildReaperRegistry::publish_compat_invariant_violation(
+    pid_t pid, ReaperOwnerKey owner, uint64_t observed_starttime_ticks,
+    bool observed_readable, int observed_errno) noexcept {
+    if (!state_ || pid <= 1 || !owner.valid())
+        return;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto iterator = state_->owners.find(pid);
+    if (iterator == state_->owners.end() || iterator->second.owner != owner ||
+        iterator->second.backend != ChildHandleBackend::Compat)
+        return;
+    const Entry& entry = iterator->second;
+    CompatInvariantViolation violation{};
+    violation.kind = entry.kind;
+    violation.pid = pid;
+    violation.owner = owner;
+    violation.registry_generation = entry.registry_generation;
+    violation.incarnation = entry.incarnation;
+    violation.expected_starttime_ticks = entry.starttime_ticks;
+    violation.observed_starttime_ticks = observed_starttime_ticks;
+    violation.observed_readable = observed_readable;
+    violation.observed_errno = observed_errno;
+    const auto target = iterator->second.mailbox.lock();
+    if (target) {
+        // Best-effort delivery.  Whether or not it lands, the owner slot
+        // below is removed unconditionally: an invariant violation is never
+        // retried, so there is no reason to keep the pid slot occupied
+        // waiting for a mailbox that might stay full or expired (e.g. a
+        // DirectWorker owner, which never has a live mailbox at all -- see
+        // register_direct_worker()). This gives DirectWorker's "never
+        // retried" contract pid-slot hygiene even with no state machine to
+        // deliver a FailClosed signal into.
+        (void)target->enqueue_violation(violation);
+    }
+    const size_t slot = iterator->second.slot;
+    if (slot < state_->slots.size())
+        state_->slots[slot] = -1;
+    state_->owners.erase(iterator);
+}
+
 std::optional<ReapEvent> CentralChildReaperRegistry::reap_one(
     pid_t pid, int pidfd) noexcept {
-    if (!state_ || pid <= 1 || pidfd < 0)
+    if (!state_ || pid <= 1)
         return std::nullopt;
 
     ReaperOwnerKey owner{};
+    ChildHandleBackend backend = ChildHandleBackend::Native;
+    uint64_t starttime_ticks = 0;
     bool wait_observed = false;
     bool wait_consumed = false;
     {
@@ -1395,21 +1630,44 @@ std::optional<ReapEvent> CentralChildReaperRegistry::reap_one(
             iterator->second.pidfd != pidfd || !iterator->second.incarnation.valid())
             return std::nullopt;
         owner = iterator->second.owner;
+        backend = iterator->second.backend;
+        starttime_ticks = iterator->second.starttime_ticks;
         wait_observed = iterator->second.wait_observed;
         wait_consumed = iterator->second.wait_consumed;
     }
+    if (backend == ChildHandleBackend::Compat && starttime_ticks == 0)
+        return std::nullopt;
 
     if (wait_consumed)
         return publish_observed(pid, owner);
 
     if (!wait_observed) {
         // First exact observation: WNOWAIT leaves the status anchored to the
-        // pidfd, so a later numeric PID reuse cannot be mistaken for this
-        // incarnation.  No event is emitted until the bounded consume step.
+        // pidfd (Native) or re-checked starttime (Compat), so a later
+        // numeric PID reuse cannot be mistaken for this incarnation.  No
+        // event is emitted until the bounded consume step.
         int code = 0;
         int status = 0;
-        if (!observe_pidfd_status(pidfd, pid, false, code, status))
+        bool invariant_violation = false;
+        uint64_t observed_starttime_ticks = 0;
+        bool observed_readable = false;
+        int observed_errno = 0;
+        const bool observed = (backend == ChildHandleBackend::Native)
+                                   ? observe_pidfd_status(pidfd, pid, false,
+                                                          code, status)
+                                   : observe_compat_status(
+                                         pid, starttime_ticks, false, code,
+                                         status, invariant_violation,
+                                         observed_starttime_ticks,
+                                         observed_readable, observed_errno);
+        if (!observed) {
+            if (backend == ChildHandleBackend::Compat && invariant_violation)
+                publish_compat_invariant_violation(pid, owner,
+                                                    observed_starttime_ticks,
+                                                    observed_readable,
+                                                    observed_errno);
             return std::nullopt;
+        }
         std::lock_guard<std::mutex> lock(state_->mutex);
         const auto iterator = state_->owners.find(pid);
         if (iterator == state_->owners.end() ||
@@ -1424,13 +1682,32 @@ std::optional<ReapEvent> CentralChildReaperRegistry::reap_one(
         return std::nullopt;
     }
 
-    // Second exact operation: consume the status from the same pidfd.  EINTR,
-    // ECHILD, an unready status, and every identity mismatch remain failures;
-    // none is converted into a lifecycle reap event.
+    // Second exact operation: consume the status from the same pidfd (Native)
+    // or the same re-checked starttime (Compat).  EINTR, ECHILD, an unready
+    // status, and every identity mismatch remain failures; none is converted
+    // into a lifecycle reap event.
     int code = 0;
     int status = 0;
-    if (!observe_pidfd_status(pidfd, pid, true, code, status))
+    bool invariant_violation = false;
+    uint64_t observed_starttime_ticks = 0;
+    bool observed_readable = false;
+    int observed_errno = 0;
+    const bool observed = (backend == ChildHandleBackend::Native)
+                               ? observe_pidfd_status(pidfd, pid, true, code,
+                                                      status)
+                               : observe_compat_status(
+                                     pid, starttime_ticks, true, code, status,
+                                     invariant_violation,
+                                     observed_starttime_ticks,
+                                     observed_readable, observed_errno);
+    if (!observed) {
+        if (backend == ChildHandleBackend::Compat && invariant_violation)
+            publish_compat_invariant_violation(pid, owner,
+                                               observed_starttime_ticks,
+                                               observed_readable,
+                                               observed_errno);
         return std::nullopt;
+    }
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         const auto iterator = state_->owners.find(pid);
@@ -1484,7 +1761,10 @@ std::optional<ReapEvent> CentralChildReaperRegistry::publish_pending() noexcept 
             if (candidate > 1 && iterator != state_->owners.end() &&
                 iterator->second.kind == ReaperOwnerKind::Sidecar &&
                 iterator->second.wait_consumed && !iterator->second.observed &&
-                iterator->second.pidfd >= 0 && iterator->second.incarnation.valid()) {
+                (iterator->second.backend == ChildHandleBackend::Native
+                     ? iterator->second.pidfd >= 0
+                     : iterator->second.starttime_ticks != 0) &&
+                iterator->second.incarnation.valid()) {
                 pid = candidate;
                 owner = iterator->second.owner;
                 state_->cursor = (index + 1) % state_->slots.size();
@@ -1510,10 +1790,12 @@ CentralChildReaperRegistry::reap_one_direct_worker(pid_t pid,
     // returning that same status to a compiler reducer would create two
     // consumers for one child.  A direct-worker registration reserves the
     // consumed event for this move-only result instead.
-    if (!state_ || pid <= 1 || pidfd < 0)
+    if (!state_ || pid <= 1)
         return std::nullopt;
 
     ReaperOwnerKey owner{};
+    ChildHandleBackend backend = ChildHandleBackend::Native;
+    uint64_t starttime_ticks = 0;
     bool wait_observed = false;
     bool wait_consumed = false;
     {
@@ -1526,18 +1808,40 @@ CentralChildReaperRegistry::reap_one_direct_worker(pid_t pid,
             !iterator->second.incarnation.valid())
             return std::nullopt;
         owner = iterator->second.owner;
+        backend = iterator->second.backend;
+        starttime_ticks = iterator->second.starttime_ticks;
         wait_observed = iterator->second.wait_observed;
         wait_consumed = iterator->second.wait_consumed;
     }
+    if (backend == ChildHandleBackend::Compat && starttime_ticks == 0)
+        return std::nullopt;
     if (wait_consumed)
         return std::nullopt;
 
     int observed_code = 0;
     int observed_status = 0;
     if (!wait_observed) {
-        if (!observe_pidfd_status(pidfd, pid, false, observed_code,
-                                  observed_status))
+        bool invariant_violation = false;
+        uint64_t observed_starttime_ticks = 0;
+        bool observed_readable = false;
+        int observed_errno = 0;
+        const bool observed =
+            (backend == ChildHandleBackend::Native)
+                ? observe_pidfd_status(pidfd, pid, false, observed_code,
+                                       observed_status)
+                : observe_compat_status(pid, starttime_ticks, false,
+                                        observed_code, observed_status,
+                                        invariant_violation,
+                                        observed_starttime_ticks,
+                                        observed_readable, observed_errno);
+        if (!observed) {
+            if (backend == ChildHandleBackend::Compat && invariant_violation)
+                publish_compat_invariant_violation(pid, owner,
+                                                    observed_starttime_ticks,
+                                                    observed_readable,
+                                                    observed_errno);
             return std::nullopt;
+        }
         std::lock_guard<std::mutex> lock(state_->mutex);
         const auto iterator = state_->owners.find(pid);
         if (iterator == state_->owners.end() ||
@@ -1571,9 +1875,26 @@ CentralChildReaperRegistry::reap_one_direct_worker(pid_t pid,
     // The caller's first direct invocation observed WNOWAIT in a prior turn.
     // Consume that exact status now; no numeric PID or anonymous wait is ever
     // accepted as a substitute.
-    if (!observe_pidfd_status(pidfd, pid, true, observed_code,
-                              observed_status))
+    bool invariant_violation = false;
+    uint64_t observed_starttime_ticks = 0;
+    bool observed_readable = false;
+    int observed_errno = 0;
+    const bool consumed =
+        (backend == ChildHandleBackend::Native)
+            ? observe_pidfd_status(pidfd, pid, true, observed_code,
+                                   observed_status)
+            : observe_compat_status(pid, starttime_ticks, true, observed_code,
+                                    observed_status, invariant_violation,
+                                    observed_starttime_ticks,
+                                    observed_readable, observed_errno);
+    if (!consumed) {
+        if (backend == ChildHandleBackend::Compat && invariant_violation)
+            publish_compat_invariant_violation(pid, owner,
+                                               observed_starttime_ticks,
+                                               observed_readable,
+                                               observed_errno);
         return std::nullopt;
+    }
     ReapEvent event;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
@@ -1591,6 +1912,7 @@ CentralChildReaperRegistry::reap_one_direct_worker(pid_t pid,
         try {
             event = ReapEvent{owner, pid, observed_status, false,
                               iterator->second.pidfd,
+                              iterator->second.backend,
                               iterator->second.registry_generation,
                               iterator->second.incarnation,
                               iterator->second.observed_code,
@@ -1647,7 +1969,10 @@ std::optional<pid_t> CentralChildReaperRegistry::next_unobserved_pid() noexcept 
         const auto iterator = state_->owners.find(pid);
         if (pid > 1 && iterator != state_->owners.end() &&
             iterator->second.kind == ReaperOwnerKind::Sidecar &&
-            !iterator->second.observed && iterator->second.pidfd >= 0 &&
+            !iterator->second.observed &&
+            (iterator->second.backend == ChildHandleBackend::Native
+                 ? iterator->second.pidfd >= 0
+                 : iterator->second.starttime_ticks != 0) &&
             iterator->second.incarnation.valid()) {
             state_->cursor = (index + 1) % state_->slots.size();
             return pid;

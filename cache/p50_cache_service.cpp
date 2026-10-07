@@ -31,6 +31,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "services/digest128.h"
+#include "services/stage_trace.h"
 #include "p50_incarnation_identity.h"
 
 #include <utility>
@@ -1302,7 +1303,10 @@ bool handle_connection(local::Connection connection, const Options& options,
                 },
                 // The compiler must be able to attach every TU the endpoint
                 // accepted; the 64 MiB default refused larger Firefox TUs.
-                static_cast<size_t>(runtime.max_raw_bytes()));
+                static_cast<size_t>(runtime.max_raw_bytes()),
+                // Resolved once by the daemon at its own startup and handed
+                // down via --input-backend; see Options::input_backend.
+                options.input_backend);
             const InputFdAttachmentResult result = attachment.serve_request(
                 connection, options.identity, options.expected_peer, request,
                 deadline);
@@ -1576,6 +1580,13 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
             // This runs before TX_COMMIT is written, so an F-side attachment
             // cannot observe the record in its pre-commit state.
             const bool observed = input_lifecycle_.observe_route_commit(key, retained);
+            // No (assignment_epoch, wire_job_id) at this cache-identity layer:
+            // the input lifecycle table is keyed by (c_store_guid, tu_seq)
+            // only. Stamp what is known; epoch/wire_id stay kUnknown.
+            icecc::stagetrace::stage_trace("fsidecar", "input_committed",
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                {{"tu_seq", (int64_t)key.tu_seq.value}, {"retained", (int64_t)retained}});
             if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr)
                 std::fprintf(stderr, "P50 sidecar lifecycle commit tu=%llu retained=%d observed=%d\n",
                              static_cast<unsigned long long>(key.tu_seq.value),
@@ -1663,6 +1674,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     local::P50SourceTransferRequest request,
     sidecar::AbsoluteMonotonicDeadline deadline,
     local::HandoffFd source) noexcept {
+    icecc::stagetrace::stage_trace("csidecar", "transfer_request_received",
+        (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
+        (int64_t)request.logical_job, (int64_t)request.compiler_attempt);
     const auto clock = sidecar::process_monotonic_clock_identity();
     if (!route_owner_ || !request.valid() || !config_.sidecar_launch.has_value() ||
         !config_.sidecar_launch->valid() ||
@@ -2132,6 +2146,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     request, expected_c_guid, relationship.profile, observed,
                     source_mutex_wait_ns, source_mutex_service_ns,
                     static_cast<uint32_t>(selected_lane), gate_wait_ns);
+                icecc::stagetrace::stage_trace("csidecar", "transfer_completed",
+                    (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
+                    (int64_t)request.logical_job, (int64_t)request.compiler_attempt,
+                    {{"status", (int64_t)observed.status}});
                 if (source_authority_)
                     source_authority_->release_source(route_request);
                 completion->set_value(value);
@@ -2800,6 +2818,12 @@ void SidecarRuntime::route_fsession_connection(int connection_fd) noexcept {
             fsession_pumps_.push_back(pump);
             fsession_live_.store(fsession_owner_.live_operations(),
                                  std::memory_order_release);
+            // Raw accept of a C sidecar's connection: the wire protocol
+            // (and thus assignment_epoch/wire_job_id) is not parsed yet.
+            icecc::stagetrace::stage_trace("fsidecar", "session_accepted",
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+                {{"cid", (int64_t)cid}});
             fsession_arm_read(std::move(pump));
         });
     } catch (...) {
@@ -3046,6 +3070,7 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
         bool have_store_derivation_version = false;
         bool have_c_store_guid = false;
         bool have_f_store_guid = false;
+        bool have_input_backend = false;
         for (int index = 1; index < argc; ++index) {
             if (argv[index] == nullptr)
                 return false;
@@ -3062,6 +3087,23 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
                     return false;
                 options.socket_path = value;
                 have_socket = true;
+                continue;
+            }
+            // Plain-value flag, not a uint: kept out of parse_option_uint's
+            // combined numeric-flag block below so a non-numeric value here
+            // cannot be silently coerced or confused with a parse failure in
+            // that path.
+            if (name == "--input-backend") {
+                if (!next_value(argc, argv, index, value) || have_input_backend)
+                    return false;
+                if (value == "native") {
+                    options.input_backend = InputMaterializationBackend::Native;
+                } else if (value == "compat") {
+                    options.input_backend = InputMaterializationBackend::Compat;
+                } else {
+                    return false;
+                }
+                have_input_backend = true;
                 continue;
             }
             if (name == "--generation" || name == "--attempt" || name == "--f-store-generation" ||
@@ -3423,12 +3465,14 @@ int main(int argc, char** argv) {
     if (!icecc::p50::service::parse_options(argc, argv, options, show_help)) {
         std::fprintf(stderr,
                      "usage: icecc-cache-service --socket ABSOLUTE --peer-uid UID "
-                     "--peer-gid GID --generation N --attempt N [--drop-uid UID --drop-gid GID]\n");
+                     "--peer-gid GID --generation N --attempt N [--drop-uid UID --drop-gid GID] "
+                     "[--input-backend native|compat]\n");
         return 2;
     }
     if (show_help) {
         std::puts("usage: icecc-cache-service --socket ABSOLUTE --peer-uid UID --peer-gid GID "
-                  "--generation N --attempt N [--drop-uid UID --drop-gid GID]");
+                  "--generation N --attempt N [--drop-uid UID --drop-gid GID] "
+                  "[--input-backend native|compat]");
         return 0;
     }
     return icecc::p50::service::run(options);

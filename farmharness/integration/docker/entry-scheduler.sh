@@ -20,7 +20,7 @@ do
         --assignment-fence-mode)
             test "$#" -ge 2
             case "$2" in
-                legacy|advisory|enforcing-compat|strict-nonce)
+                legacy|enforcing-compat|strict-nonce)
                     assignment_fence_mode=$2
                     ;;
                 *)

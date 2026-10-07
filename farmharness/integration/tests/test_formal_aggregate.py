@@ -110,7 +110,18 @@ def test_packaged_manifest_selects_every_formal_lane_and_preflights() -> None:
         "global",
         "zstd-route-finput",
     ]
-    assert [len(lane["rows"]) for lane in prepared] == [35, 7, 29, 17, 9]
+    # 26322613 removed the Advisory fence mode and, with it, the three lane
+    # rows that existed only to exercise/witness Advisory-specific behavior
+    # (none cover any surviving Legacy/EnforcingCompat/StrictNonce path):
+    #   core: assignment-ordering-advisory-witness (NoAdvisoryClaimBeforePrepareWitness,
+    #         defined only in terms of AdvisoryClaimBeforePrepareCompleted, which
+    #         requires mode = "Advisory"), and assignment-ordering-prepare-mutant
+    #         (ClaimNeverRegresses, whose MutantRegressClaimOnPrepare regression
+    #         only applies on the mode = "Advisory" branch)      -- 35 -> 33 rows
+    #   assignment-delivery: late-prepare-mutant (ClaimedPhaseNeverRegresses'
+    #         AdvisoryClaimCurrent disjunct); claim-races-revoke coverage for the
+    #         surviving modes continues via ClaimAfterPrepareCurrent  -- 7 -> 6 rows
+    assert [len(lane["rows"]) for lane in prepared] == [33, 6, 29, 17, 9]
     assert manifest["tool"]["sha256"] == (
         "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
     )

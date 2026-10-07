@@ -5,12 +5,14 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
 #include <limits>
 #include <poll.h>
+#include <sstream>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -21,6 +23,7 @@
 #include <unistd.h>
 
 #include "services/digest128.h"
+#include "services/sys_close_range.h"
 
 extern char **environ;
 
@@ -184,6 +187,142 @@ bool set_cloexec(int fd, bool enabled) noexcept
     return wanted == flags || ::fcntl(fd, F_SETFD, wanted) == 0;
 }
 
+#if defined(__linux__)
+// Task 4 (k310): fork-safe CLOEXEC sweep used when close_range(2) is
+// unavailable (ENOSYS: kernel <5.9, the real k310 target; EINVAL: a kernel
+// that recognizes the syscall but rejects this flag/range; EPERM: an old
+// Docker seccomp profile -- the build0xx node image's actual shape --
+// denying an unrecognized syscall number outright, NOT with ENOSYS, which
+// is the k310 launch-failure gap this fixes).
+//
+// Mirrors daemon/p50_fork_fd_hygiene.cpp's proc_fallback() parsing (raw
+// getdents64 into a fixed stack buffer: no malloc, no STL growth, no
+// stdio -- this runs after fork(), before execve(), with every inherited
+// fd still open) but marks FD_CLOEXEC instead of closing: the call site's
+// child still needs every inherited fd to survive until execve(), only
+// its CLOEXEC bit changes.  Only the enumerating directory fd itself is
+// closed, by this function, before returning.  The two fds the caller
+// still needs un-CLOEXEC'd (ready_write, listener) are restored by the
+// existing set_cloexec(..., false) calls right after this returns.
+struct ProcFdDirent64 {
+    uint64_t ino;
+    int64_t off;
+    unsigned short reclen;
+    unsigned char type;
+    char name[];
+};
+
+// Mirrors daemon/p50_fork_fd_hygiene.cpp's parse_fd_name(): overflow-safe,
+// rejects a leading zero other than the single digit "0", caps at 10
+// digits (fits any 32-bit fd number with room to spare).
+bool parse_proc_fd_entry_name(const char* name, size_t length, int* fd) noexcept
+{
+    if (length == 0 || length > 10 || (name[0] == '0' && length != 1))
+        return false;
+    uint64_t value = 0;
+    for (size_t i = 0; i != length; ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (c < '0' || c > '9')
+            return false;
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+        if (value > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            return false;
+    }
+    *fd = static_cast<int>(value);
+    return true;
+}
+
+bool sidecar_cloexec_sweep_proc_fallback(bool force_open_failure) noexcept
+{
+    if (force_open_failure)
+        return false;
+
+    const int proc_fd = ::open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (proc_fd < 0)
+        return false;
+
+    char buffer[16 * 1024];
+    bool ok = true;
+    for (;;) {
+        long count;
+        for (;;) {
+            count = ::syscall(SYS_getdents64, proc_fd, buffer, sizeof(buffer));
+            if (count >= 0 || errno != EINTR)
+                break;
+        }
+        if (count == 0)
+            break;
+        if (count < 0) {
+            ok = false;
+            break;
+        }
+        size_t offset = 0;
+        while (offset < static_cast<size_t>(count)) {
+            if (static_cast<size_t>(count) - offset < sizeof(ProcFdDirent64)) {
+                ok = false;
+                break;
+            }
+            const auto* entry =
+                reinterpret_cast<const ProcFdDirent64*>(buffer + offset);
+            if (entry->reclen < sizeof(ProcFdDirent64) ||
+                offset + entry->reclen > static_cast<size_t>(count)) {
+                ok = false;
+                break;
+            }
+            const size_t name_capacity =
+                entry->reclen - offsetof(ProcFdDirent64, name);
+            size_t name_length = 0;
+            while (name_length < name_capacity && entry->name[name_length] != '\0')
+                ++name_length;
+            if (name_length == name_capacity) {
+                ok = false;
+                break;
+            }
+            const bool is_dot = name_length == 1 && entry->name[0] == '.';
+            const bool is_dotdot =
+                name_length == 2 && entry->name[0] == '.' && entry->name[1] == '.';
+            if (!is_dot && !is_dotdot) {
+                int fd = -1;
+                if (!parse_proc_fd_entry_name(entry->name, name_length, &fd)) {
+                    ok = false;
+                    break;
+                }
+                if (fd >= 3 && fd != proc_fd) {
+                    const int flags = ::fcntl(fd, F_GETFD);
+                    if (flags < 0) {
+                        // Enumeration is one syscall stale by construction;
+                        // a fd the child already closed on its own is not a
+                        // leak.  Anything other than EBADF is a real fault.
+                        if (errno != EBADF) {
+                            ok = false;
+                            break;
+                        }
+                    } else if ((flags & FD_CLOEXEC) == 0 &&
+                               ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0 &&
+                               errno != EBADF) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            offset += entry->reclen;
+        }
+        if (!ok)
+            break;
+    }
+
+    for (;;) {
+        if (::close(proc_fd) == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        ok = false;
+        break;
+    }
+    return ok;
+}
+#endif // defined(__linux__)
+
 // One-syscall launch-plan primitives.  The outer plan uses these variants so
 // a fallback fcntl sequence cannot hide behind pipe or socket creation.
 bool make_pipe_once(int fds[2]) noexcept
@@ -239,6 +378,11 @@ int open_pidfd(pid_t pid) noexcept
 
 class OuterKillDomainVerifier final : public sidecar::KillDomainVerifier {
 public:
+    explicit OuterKillDomainVerifier(ChildHandleBackend backend) noexcept
+        : backend_(backend)
+    {
+    }
+
     ~OuterKillDomainVerifier() override
     {
         for (const Record& record : records_)
@@ -251,19 +395,32 @@ public:
     {
         if (pid <= 1 || pid != pgid)
             return std::nullopt;
-        const int pidfd = open_pidfd(pid);
-        if (pidfd < 0)
-            return std::nullopt;
+        int pidfd = -1;
+        platform::CompatChildHandle compat_handle;
+        if (backend_ == ChildHandleBackend::Compat) {
+            // M1 compat: (pid, starttime) capture replaces the pidfd. No fd
+            // is held, so there is nothing for the destructor to close for
+            // this record.
+            if (!compat_handle.arm(pid))
+                return std::nullopt;
+        } else {
+            pidfd = open_pidfd(pid);
+            if (pidfd < 0)
+                return std::nullopt;
+        }
         const uint64_t serial = next_serial_ == 0 ? ++next_serial_ : next_serial_++;
         sidecar::KillDomainLease lease = issue(pid, pgid, serial);
         if (!lease.valid()) {
-            (void)::close(pidfd);
+            if (pidfd >= 0)
+                (void)::close(pidfd);
             return std::nullopt;
         }
         try {
-            records_.push_back(Record{std::move(lease), pid, pgid, pidfd});
+            records_.push_back(
+                Record{std::move(lease), pid, pgid, pidfd, compat_handle});
         } catch (...) {
-            (void)::close(pidfd);
+            if (pidfd >= 0)
+                (void)::close(pidfd);
             return std::nullopt;
         }
         return records_.back().lease;
@@ -278,7 +435,7 @@ public:
                 return candidate.pid == pid && candidate.pgid == pgid &&
                        candidate.lease == lease;
             });
-        if (record == records_.end() || record->pidfd < 0 ||
+        if (record == records_.end() || !record->captured() ||
             observation.group != sidecar::GroupObservation::Gone ||
             observation.observed_pgid != pgid)
             return false;
@@ -287,7 +444,11 @@ public:
         // fcntl()/kill() pair here would turn one reducer advance into hidden
         // extra syscalls.  The cgroup-v2 no-descendant/singleton census and
         // OUTPUT_QUIESCENCE_GRANTED proof remain an explicit integration
-        // HOLD until the authoritative leaf owner is joined.
+        // HOLD until the authoritative leaf owner is joined. This holds
+        // identically for the M1 compat backend: record->captured() is a
+        // capture-succeeded gate (native: a held pidfd; compat: an armed
+        // (pid, starttime) handle), never a second gone-ness probe of its
+        // own, in either case.
         return true;
     }
 
@@ -309,9 +470,16 @@ private:
         pid_t pid = -1;
         pid_t pgid = -1;
         int pidfd = -1;
+        platform::CompatChildHandle compat_handle;
+
+        [[nodiscard]] bool captured() const noexcept
+        {
+            return pidfd >= 0 || compat_handle.armed();
+        }
     };
     std::vector<Record> records_;
     uint64_t next_serial_ = 1;
+    ChildHandleBackend backend_ = ChildHandleBackend::Native;
 };
 
 sidecar::State advertisement_state(sidecar::LifecycleState state) noexcept
@@ -345,8 +513,9 @@ DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
         if (!config_.clock_identity.valid())
             config_.clock_identity = sidecar::process_monotonic_clock_identity();
         launch_identities_ = std::make_shared<sidecar::LaunchIdentityAllocator>(
-            config_.generation, 1);
-        outer_kill_domain_ = std::make_shared<OuterKillDomainVerifier>();
+            config_.generation, 1, config_.entropy_provider);
+        outer_kill_domain_ = std::make_shared<OuterKillDomainVerifier>(
+            config_.child_handle_backend);
         sidecar::SidecarLifecycleConfig lifecycle_config;
         lifecycle_config.control_generation = config_.generation;
         lifecycle_config.private_root = config_.runtime_directory;
@@ -395,44 +564,181 @@ DaemonSidecarAdapter::~DaemonSidecarAdapter()
     outer_disarm_registration();
 }
 
+/* R17a: THE single named source of truth for the configuration check.
+   Every clause returns the reason for its own failure (field, and for
+   the private-pathname leg the path plus EXPECTED vs ACTUAL owner:group
+   and mode) built with std::ostringstream -- NO fixed-size buffers: the
+   runtime-directory paths reach 38+ chars in the tests and longer in
+   production, and a 64-byte snprintf cut the line exactly where the
+   useful information started.  valid_config below is DERIVED from this
+   function (empty reason = valid), so the two can never drift and the
+   boolean can never disagree with the named result.  Runs once at
+   startup; cost is irrelevant. */
+std::string DaemonSidecarAdapter::config_refusal_reason(const Config& config) noexcept
+{
+    std::ostringstream text;
+    auto digits = [](uint64_t value) {
+        std::ostringstream sub;
+        sub << value;
+        return sub.str();
+    };
+    if (!executable_file(config.executable)) {
+        text << "sidecar executable '" << config.executable
+             << "' is missing or not an absolute regular executable path";
+        return text.str();
+    }
+    if (config.runtime_directory.empty())
+        return "cache runtime directory is empty";
+    if (config.runtime_directory.front() != '/') {
+        text << "cache runtime directory '" << config.runtime_directory
+             << "' is not absolute";
+        return text.str();
+    }
+    if (has_nul(config.runtime_directory))
+        return "cache runtime directory contains a NUL byte";
+    if (config.runtime_directory.size() >= 180) {
+        text << "cache runtime directory path is " << config.runtime_directory.size()
+             << " bytes (>= 180)";
+        return text.str();
+    }
+    if (config.generation == 0)
+        return "sidecar generation is zero";
+    if (config.public_listener_port > std::numeric_limits<uint16_t>::max()) {
+        text << "public listener port " << config.public_listener_port
+             << " exceeds the uint16 range";
+        return text.str();
+    }
+    if (!valid_id(config.expected_daemon_uid))
+        return "expected daemon uid " + digits(config.expected_daemon_uid) +
+               " is not a valid user id";
+    if (!valid_gid(config.expected_daemon_gid))
+        return "expected daemon gid " + digits(config.expected_daemon_gid) +
+               " is not a valid group id";
+    if (!valid_id(config.expected_service_uid))
+        return "expected service uid " + digits(config.expected_service_uid) +
+               " is not a valid user id";
+    if (!valid_gid(config.expected_service_gid))
+        return "expected service gid " + digits(config.expected_service_gid) +
+               " is not a valid group id";
+    if (config.expected_daemon_uid != static_cast<uint64_t>(::geteuid())) {
+        text << "expected daemon uid " << config.expected_daemon_uid
+             << " does not match the effective uid " << ::geteuid();
+        return text.str();
+    }
+    if (config.expected_daemon_gid != static_cast<uint64_t>(::getegid())) {
+        text << "expected daemon gid " << config.expected_daemon_gid
+             << " does not match the effective gid " << ::getegid();
+        return text.str();
+    }
+    if (config.expected_service_uid != config.expected_daemon_uid) {
+        text << "expected service uid " << config.expected_service_uid
+             << " differs from the daemon uid " << config.expected_daemon_uid
+             << " (the local connector requires the same user)";
+        return text.str();
+    }
+    if (config.expected_service_gid != config.expected_daemon_gid) {
+        text << "expected service gid " << config.expected_service_gid
+             << " differs from the daemon gid " << config.expected_daemon_gid;
+        return text.str();
+    }
+    if (!config.clock_identity.valid())
+        return "clock identity is invalid";
+    if (config.entropy_provider == nullptr)
+        return "entropy provider is not set";
+    if (!bounded_positive(config.readiness_timeout))
+        return "readiness timeout is not a bounded positive duration";
+    if (!bounded_positive(config.connect_timeout))
+        return "connect timeout is not a bounded positive duration";
+    if (!bounded_positive(config.handoff_timeout))
+        return "handoff timeout is not a bounded positive duration";
+    if (!bounded_positive(config.input_attachment_timeout))
+        return "input attachment timeout is not a bounded positive duration";
+    if (!bounded_positive(config.shutdown_timeout))
+        return "shutdown timeout is not a bounded positive duration";
+    if (!bounded_positive(config.restart_window))
+        return "restart window is not a bounded positive duration";
+    if (!bounded_positive(config.input_lifecycle_timeout))
+        return "input lifecycle timeout is not a bounded positive duration";
+    if (config.max_restarts == 0)
+        return "max restarts is zero";
+    if (config.max_restarts > 100000)
+        return "max restarts " + digits(config.max_restarts) + " exceeds 100000";
+    if (config.max_attempts_per_recovery == 0)
+        return "max attempts per recovery is zero";
+    if (config.max_attempts_per_recovery > 100000)
+        return "max attempts per recovery " +
+               digits(config.max_attempts_per_recovery) + " exceeds 100000";
+    if (config.max_pending_input_lifecycle == 0)
+        return "max pending input lifecycle is zero";
+    if (config.max_pending_input_lifecycle > 100000)
+        return "max pending input lifecycle " +
+               digits(config.max_pending_input_lifecycle) + " exceeds 100000";
+    if (config.drop_uid.has_value() != config.drop_gid.has_value())
+        return "drop uid and drop gid must be set together";
+    if (config.drop_uid.has_value()) {
+        text << "drop uid " << *config.drop_uid
+             << " is set: the local connector requires the daemon's own "
+                "effective identity for a valid SO_PEERCRED relationship "
+                "(pre-bind drop mode is not supported)";
+        return text.str();
+    }
+    /* The private-pathname leg, DESCRIBED (not re-checked): lstat once
+       for the description, but the VERDICT comes from
+       private_directory() itself, so this function returns empty
+       exactly when the boolean form accepts. */
+    if (private_directory(config)) {
+        return {};
+    }
+    struct stat info{};
+    if (::lstat(config.runtime_directory.c_str(), &info) != 0) {
+        const std::string why = ::strerror(errno);
+        text << "cache runtime directory '" << config.runtime_directory
+             << "' lstat failed: " << why;
+        return text.str();
+    }
+    if (!S_ISDIR(info.st_mode)) {
+        text << "cache runtime directory '" << config.runtime_directory
+             << "' mode " << std::oct << (info.st_mode & 07777) << std::dec
+             << " is not a directory";
+        return text.str();
+    }
+    text << "cache runtime directory '" << config.runtime_directory
+         << "' owner " << info.st_uid << ":" << info.st_gid
+         << " mode " << std::oct << (info.st_mode & 07777) << std::dec
+         << ", expected " << config.expected_daemon_uid << ":"
+         << config.expected_daemon_gid << " mode 0700";
+    return text.str();
+}
 bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
 {
-    if (!executable_file(config.executable) ||
-        config.runtime_directory.empty() ||
-        config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
-        config.runtime_directory.size() >= 180 ||
-        config.generation == 0 ||
-        config.public_listener_port > std::numeric_limits<uint16_t>::max() ||
-        !valid_id(config.expected_daemon_uid) || !valid_gid(config.expected_daemon_gid) ||
-        !valid_id(config.expected_service_uid) || !valid_gid(config.expected_service_gid) ||
-        config.expected_daemon_uid != static_cast<uint64_t>(::geteuid()) ||
-        config.expected_daemon_gid != static_cast<uint64_t>(::getegid()) ||
-        config.expected_service_uid != config.expected_daemon_uid ||
-        config.expected_service_gid != config.expected_daemon_gid ||
-        !config.clock_identity.valid() ||
-        !bounded_positive(config.readiness_timeout) ||
-        !bounded_positive(config.connect_timeout) ||
-        !bounded_positive(config.handoff_timeout) ||
-        !bounded_positive(config.input_attachment_timeout) ||
-        !bounded_positive(config.shutdown_timeout) ||
-        !bounded_positive(config.restart_window) ||
-        !bounded_positive(config.input_lifecycle_timeout) ||
-        config.max_restarts == 0 ||
-        config.max_restarts > 100000 || config.max_attempts_per_recovery == 0 ||
-        config.max_attempts_per_recovery > 100000 ||
-        config.max_pending_input_lifecycle == 0 ||
-        config.max_pending_input_lifecycle > 100000 ||
-        (config.drop_uid.has_value() != config.drop_gid.has_value()))
-        return false;
-    // The current local connector deliberately requires private pathname
-    // ownership by the daemon's effective identity.  iceccd is deployed as
-    // the unprivileged icecc user, so a distinct pre-bind drop would make a
-    // valid SO_PEERCRED relationship unreachable.  Keep the explicit fields
-    // for launch-argument compatibility but reject that impossible mode.
-    if (config.drop_uid.has_value())
-        return false;
-    return private_directory(config);
+    /* Derived from config_refusal_reason() (R17a): empty reason = valid.
+       Runs once at adapter creation, so the cost of formatting strings
+       for a rejection is irrelevant, and the boolean can never disagree
+       with the named result -- there is exactly ONE clause chain. */
+    return config_refusal_reason(config).empty();
 }
+
+#if defined(__linux__)
+bool DaemonSidecarAdapter::test_sweep_cloexec_proc_fallback(
+    bool force_open_failure) noexcept
+{
+    // Calls the anonymous-namespace sweep directly: no fork, no execve.
+    // Exercises exactly the code the Fork-case child runs, against whatever
+    // fds this (test) process already has open.
+    return sidecar_cloexec_sweep_proc_fallback(force_open_failure);
+}
+#else
+// The sweep itself only exists under __linux__ (see the Fork-case dispatch
+// above); keep the test entry point linkable everywhere the header declares
+// it, same as the always-present field convention this file follows.
+// Deliberately not gated by ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS: see
+// the header's declaration comment -- this must stay linkable from a
+// production (hooks-undefined) object too.
+bool DaemonSidecarAdapter::test_sweep_cloexec_proc_fallback(bool) noexcept
+{
+    return false;
+}
+#endif
 
 void DaemonSidecarAdapter::observe_public_listener(bool bound, uint32_t port) noexcept
 {
@@ -916,6 +1222,15 @@ sidecar::LifecycleState DaemonSidecarAdapter::outer_lifecycle_state() const noex
 {
     return outer_lifecycle_ != nullptr ? outer_lifecycle_->state()
                                        : sidecar::LifecycleState::Stopped;
+}
+
+const std::optional<sidecar::CompatInvariantViolation>&
+DaemonSidecarAdapter::outer_compat_invariant_violation() const noexcept
+{
+    static const std::optional<sidecar::CompatInvariantViolation> kNone;
+    return outer_lifecycle_ != nullptr
+        ? outer_lifecycle_->compat_invariant_violation()
+        : kNone;
 }
 
 bool DaemonSidecarAdapter::outer_shutdown_complete() const noexcept
@@ -1532,6 +1847,11 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             outer_launch_argv_storage_.push_back(bytes_hex_local(identity.c_store_guid.bytes));
             outer_launch_argv_storage_.push_back("--f-store-guid");
             outer_launch_argv_storage_.push_back(bytes_hex_local(identity.f_store_guid.bytes));
+            outer_launch_argv_storage_.push_back("--input-backend");
+            outer_launch_argv_storage_.push_back(
+                config_.input_backend == InputMaterializationBackend::Compat
+                    ? "compat"
+                    : "native");
             outer_launch_argv_.reserve(outer_launch_argv_storage_.size() + 1);
             for (std::string& value : outer_launch_argv_storage_)
                 outer_launch_argv_.push_back(value.data());
@@ -1563,11 +1883,44 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             constexpr uint32_t marker = 0x50355353u;
             if (!write_all_child(outer_launch_exec_write_fd_, &marker, sizeof(marker)))
                 _exit(127);
-#if defined(__linux__) && defined(SYS_close_range)
-            constexpr unsigned int close_range_cloexec = 1u << 2;
-            const long close_result = ::syscall(SYS_close_range, 3u, UINT_MAX,
-                                                close_range_cloexec);
-            if (close_result != 0 && errno != ENOSYS && errno != EINVAL)
+#if defined(__linux__)
+            bool cloexec_ok;
+#if defined(ICECC_FORCE_PROC_SWEEP) && !defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
+            // QA knob (same one daemon/p50_fork_fd_hygiene.cpp honors): force
+            // the /proc fallback so the forced-proc QA stage exercises it on
+            // f28-header builds too, even though close_range(2) would
+            // otherwise succeed there.
+            cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
+#elif defined(SYS_close_range)
+            long close_result = -1;
+            if (test_force_close_range_errno_ != 0)
+                errno = test_force_close_range_errno_;
+            else
+                close_result = ::syscall(SYS_close_range, 3u, UINT_MAX, CLOSE_RANGE_CLOEXEC);
+            if (close_result == 0) {
+                cloexec_ok = true;
+            } else if (errno == ENOSYS || errno == EINVAL || errno == EPERM) {
+                // ENOSYS: kernel <5.9.  EINVAL: syscall recognized, flag/range
+                // rejected.  EPERM: an old Docker seccomp profile denying an
+                // unrecognized syscall number outright (the build0xx node
+                // image's actual shape) -- NOT ENOSYS, which used to make
+                // this fail closed.  All three mean "backend unavailable,"
+                // same policy as daemon/p50_fork_fd_hygiene.cpp's
+                // close_range_sweep().
+                cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
+            } else {
+                // Any other errno (e.g. EBADF) is a real fault, not a
+                // missing-backend signal: fail closed, same as legacy
+                // behavior.
+                cloexec_ok = false;
+            }
+#else
+            // Old headers never defined SYS_close_range and
+            // services/sys_close_range.h could not supply it either (non-
+            // x86_64): go straight to the fallback.
+            cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
+#endif
+            if (!cloexec_ok)
                 _exit(127);
 #endif
             if (!set_cloexec(outer_launch_ready_write_fd_, false) ||
@@ -1636,8 +1989,9 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
         incarnation.f_store_guid = outer_launch_identity_.f_store_guid;
         outer_registration_ = outer_reaper_->register_owner(
             outer_pid_, outer_pgid_, outer_lifecycle_->owner_key(),
-            outer_lifecycle_->reap_mailbox(), outer_listener_device_,
-            outer_listener_inode_, outer_pidfd_, std::move(incarnation));
+            outer_lifecycle_->reap_mailbox(), config_.child_handle_backend,
+            outer_listener_device_, outer_listener_inode_, outer_pidfd_,
+            std::move(incarnation));
         if (!outer_registration_.valid()) {
             fail_setup();
             return true;
@@ -2051,6 +2405,18 @@ bool DaemonSidecarAdapter::outer_advance_authentication(
                 }
                 outer_auth_phase_ = 4;
             }
+        } else if (count == 0) {
+            // A clean peer EOF before a complete HelloAck is a failed
+            // handshake, not a transient condition: unlike EAGAIN/EWOULDBLOCK,
+            // a zero-length recv() here can never become non-zero on a later
+            // turn. Without this branch, count == 0 matched neither the
+            // count > 0 nor the count < 0 arm, and because a clean EOF on a
+            // Unix stream socket sets POLLIN alongside POLLHUP, the universal
+            // early-exit gate above (POLLHUP/POLLERR without concurrent
+            // POLLIN/POLLOUT) did not fire either; the adapter spun
+            // re-attempting recv() every outer turn until connect_timeout.
+            close_owned(outer_auth_fd_);
+            outer_auth_phase_ = 0;
         } else if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
             close_owned(outer_auth_fd_);
             outer_auth_phase_ = 0;

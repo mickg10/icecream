@@ -493,9 +493,9 @@ int main(int argc, char **argv)
     const uint32_t observed_daemon_port = login ? login->port : 0;
     delete login_wire;
     if (scheduler) {
-        const ConfCSMsg advisory_config(UINT64_C(0x5200000000000001),
-                                        ConfCSMsg::Advisory);
-        REQUIRE(scheduler->send_msg(advisory_config),
+        const ConfCSMsg activation_config(UINT64_C(0x5200000000000001),
+                                          ConfCSMsg::EnforcingCompat);
+        REQUIRE(scheduler->send_msg(activation_config),
                 "fake scheduler activated the session");
     }
     REQUIRE(wait_file_contains(daemon_log, "cache sidecar adapter state=2", 10000),
@@ -1140,7 +1140,7 @@ int main(int argc, char **argv)
             "post-bounce client submitted a P50-capable GetCS before ConfCS");
 
     const ConfCSMsg bounce_config(UINT64_C(0x5200000000000003),
-                                  ConfCSMsg::Advisory);
+                                  ConfCSMsg::EnforcingCompat);
     REQUIRE(scheduler && scheduler->send_msg(bounce_config),
             "fake S activated the replacement scheduler session");
     Msg *forwarded_bounce_wire = scheduler
@@ -1230,7 +1230,7 @@ int main(int argc, char **argv)
     usleep(500 * 1000);
 
     const ConfCSMsg changed_lease_config(UINT64_C(0x5200000000000004),
-                                         ConfCSMsg::Advisory);
+                                         ConfCSMsg::EnforcingCompat);
     REQUIRE(scheduler && scheduler->send_msg(changed_lease_config),
             "fake S activated only after the C-sidecar lease was lost");
     Msg *forwarded_changed_wire = scheduler

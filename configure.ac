@@ -100,6 +100,18 @@ fi
 AC_ARG_ENABLE(debug,
     AS_HELP_STRING([--enable-debug],
         [Enable debug mode (enable asserts, disable optimizations).]))
+AC_ARG_ENABLE(qa-force-proc-sweep,
+    AS_HELP_STRING([--enable-qa-force-proc-sweep],
+        [QA only: compile the fd-hygiene close_range backend out so the
+         native suite runs the proc_fallback path -- the backend the
+         f28-header builds (node image, rpm) use in production.]))
+AC_MSG_CHECKING([whether to force the proc fd-hygiene backend for QA])
+if test "x$enable_qa_force_proc_sweep" = "xyes"; then
+    CXXFLAGS="$CXXFLAGS -DICECC_FORCE_PROC_SWEEP"
+    AC_MSG_RESULT(yes)
+else
+    AC_MSG_RESULT(no)
+fi
 AC_MSG_CHECKING([whether to enable debug module])
 if test "$enable_debug" = "yes"; then
     CFLAGS="$CFLAGS -g -O0"

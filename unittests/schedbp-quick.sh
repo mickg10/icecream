@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fast deterministic scheduler-integration tests for `make check` (~35s).
+# Fast deterministic scheduler-integration tests for `make check` (~45s).
 #
 # Run 1 -- big farm: 600 jobs, one submitter stops reading for 8s while a
 # second stays healthy.  Asserts the BP-1 admission invariant with direct
@@ -13,6 +13,8 @@
 # otherwise reserve the entire farm before a second submitter is served.
 #
 # The long transient/stall/deadline modes remain manual (see schedbp.cpp).
+# Run 7 (gateready) is the enforcing-compat counterpart to Run 1 -- see its
+# comment below.
 src_dir=$(dirname "$0")
 build_dir=${ICECC_TEST_BUILDDIR:-$src_dir}
 top_build_dir=${ICECC_TEST_TOP_BUILDDIR:-$build_dir/..}
@@ -33,4 +35,12 @@ top_build_dir=${ICECC_TEST_TOP_BUILDDIR:-$build_dir/..}
 # leaves nothing behind, and the sibling chain survives resume steps
 # (asserted from the NEW ... master= log lines).  100 > the 64-per-step
 # bound, so expansion genuinely resumes.
-exec "$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 100 5 contract
+"$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 100 5 contract || exit 1
+# Run 7 -- gateready: the SAME BP-1 admission invariant as Run 1, but at the
+# PRODUCTION default assignment-fence-mode (EnforcingCompat) with a fake
+# worker that completes the ASSIGN_PREPARE/ASSIGN_READY handshake.  Run 1-3
+# stay pinned to --assignment-fence-mode=legacy (schedbp.cpp sched_extra3)
+# so their long-reviewed assertions keep validating exactly what they always
+# have; this run is the enforcing-compat liveness/fairness coverage the
+# default flip (9921f768) must not lose.
+exec "$build_dir/schedbp" "$top_build_dir/scheduler/icecc-scheduler" "$build_dir/sndbuf_shim.so" 600 8 gateready

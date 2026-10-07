@@ -162,14 +162,6 @@ run_expected_failure assignment-ordering-early-cancel-witness \
     Protocol50AssignmentOrdering.tla \
     Protocol50AssignmentOrderingEarlyCancelWitness.cfg \
     NoEarlyCancelWitness
-run_expected_failure assignment-ordering-advisory-witness \
-    Protocol50AssignmentOrdering.tla \
-    Protocol50AssignmentOrderingAdvisoryWitness.cfg \
-    NoAdvisoryClaimBeforePrepareWitness
-run_expected_failure assignment-ordering-prepare-mutant \
-    Protocol50AssignmentOrdering.tla \
-    Protocol50AssignmentOrderingPrepareMutant.cfg \
-    ClaimNeverRegresses
 run_expected_failure assignment-ordering-ready-mutant \
     Protocol50AssignmentOrdering.tla \
     Protocol50AssignmentOrderingReadyMutant.cfg \

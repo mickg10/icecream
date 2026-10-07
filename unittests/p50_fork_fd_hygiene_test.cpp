@@ -649,6 +649,55 @@ void test_fallback_and_injected_failures() {
             "/proc directory EBADF close failure was ignored");
 }
 
+/* R-mutants robustness (the tmpfs finding): the unsealed-mutable-source
+   rejection has TWO branches -- "seals < 0" (F_GET_SEALS failed; ext4) and
+   "seals present but not WRITE|GROW|SHRINK" (tmpfs returns F_SEAL_SEAL on
+   a plain shmem file).  Both must reject; neither may depend on the
+   filesystem the test dir lives on. */
+void test_get_seals_failure_rejects_source()
+{
+#if defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
+    defined(F_SEAL_SHRINK)
+    Inventory inventory = make_inventory(true);
+    // Force the "seals < 0" branch on ANY filesystem (ext4 reaches it
+    // naturally; tmpfs does not -- the k310 agent's container had /tmp on
+    // host /dev/shm and the mutant survived vacuously).
+    auto hooks = icecc::p50::forkfd::TestHooks{};
+    hooks.force_get_seals_errno = EINVAL;
+    icecc::p50::forkfd::set_test_hooks(hooks);
+    auto rejected = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    icecc::p50::forkfd::reset_test_hooks();
+    require(!rejected.has_value(),
+            "source with failing F_GET_SEALS was accepted at mint");
+#endif
+}
+
+void test_shmem_seal_only_source_rejected()
+{
+#if defined(__linux__) && defined(MFD_ALLOW_SEALING) && defined(F_ADD_SEALS) && \
+    defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
+    defined(F_SEAL_SHRINK)
+    /* The tmpfs shape explicitly: a shmem regular file carrying ONLY
+       F_SEAL_SEAL (what a plain memfd reports) must be rejected -- it
+       lacks the WRITE|GROW|SHRINK immutability triple whether
+       F_GET_SEALS returns the seals or -1.  Same syscall pattern as
+       make_sealed_source (no libc memfd_create dependency). */
+    const int mem = static_cast<int>(::syscall(
+        SYS_memfd_create, "fork-fd-seal-only", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    require(mem >= 0, "memfd_create failed");
+    const char byte = 'y';
+    require(::write(mem, &byte, 1) == 1, "seal-only source write failed");
+    require(::fcntl(mem, F_ADD_SEALS, F_SEAL_SEAL) == 0,
+            "F_ADD_SEALS F_SEAL_SEAL failed");
+    auto rejected = icecc::p50::forkfd::test_make_delivery_owner(
+        mem, kAcceptedDeliveryId);
+    require(!rejected.has_value(),
+            "shmem regular file with only F_SEAL_SEAL was accepted at mint");
+    (void)::close(mem);
+#endif
+}
+
 void test_kcmp_errors_retire_private_handles() {
 #if defined(__linux__)
     for (const int error : {ENOSYS, EPERM, EINTR}) {
@@ -779,18 +828,100 @@ static bool kcmp_available() noexcept {
 #endif
 }
 
+/* The production fd bug (virtu-fdfix): on the build0xx-shaped nodes the
+   daemon is built with glibc headers that predate SYS_close_range, so
+   close_range_sweep compiles out and proc_fallback is the ONLY backend
+   that ever runs -- and proc_fallback enumerated /proc/self/fd unbounded,
+   closing 0/1/2 in every job child (verified live: strace of a remote
+   compile on the node shows the child closing its own std fds right after
+   the /proc/self/fd enumeration, then workit's pipe(sock_err) landing
+   exactly on (1,2)).  The fix bounds the inventory at kFirstNonstandardFd.
+   This test forces the proc backend (the hook that makes sweep() take the
+   same path a header-old build takes) and asserts the child's std fds
+   SURVIVE the sweep while the residue fd is still closed. */
+void test_proc_fallback_keeps_std_fds() {
+    Inventory inventory = make_inventory(false);
+    int std_pipe[2] = {-1, -1};
+    require(::pipe(std_pipe) == 0, "std pipe failed");
+    const pid_t pid = ::fork();
+    require(pid >= 0, "fork failed");
+    if (pid == 0) {
+        /* The child's std fds are REAL fds here (the test harness's pipes,
+           standing in for the daemon's docker pipes).  Redirect them so the
+           assertion is meaningful, then run the sweep with the proc
+           backend forced. */
+        if (::dup2(std_pipe[0], STDIN_FILENO) < 0 ||
+            ::dup2(std_pipe[1], STDOUT_FILENO) < 0)
+            _exit(64);
+        (void)::close(std_pipe[0]);
+        (void)::close(std_pipe[1]);
+        icecc::p50::forkfd::TestHooks hooks;
+        hooks.force_close_range_unsupported = true;
+        icecc::p50::forkfd::set_test_hooks(hooks);
+        KeepSet keep = keeps(inventory, false);
+        const Result result = icecc::p50::forkfd::sweep(keep);
+        if (!result.ok())
+            _exit(100 + static_cast<int>(result.failure));
+        int code = 0;
+        for (int fd = 0; fd <= 2; ++fd) {
+            if (::fcntl(fd, F_GETFD) < 0)
+                code |= 1 << fd;  /* std fd was swept */
+        }
+        if (::fcntl(inventory.unrelated, F_GETFD) >= 0)
+            code |= 8;  /* residue survived -- the sweep DID run */
+        _exit(code);
+    }
+    int status = 0;
+    require(::waitpid(pid, &status, 0) == pid, "waitpid failed");
+    require(WIFEXITED(status), "proc-fallback child did not exit normally");
+    const int code = WEXITSTATUS(status);
+    require(code == 0, "proc_fallback swept a standard fd (or did not sweep)");
+    (void)::close(std_pipe[0]);
+    (void)::close(std_pipe[1]);
+}
+
 int main() {
-    if (!kcmp_available()) {
-        std::cout << "SKIP - kcmp unavailable (seccomp blocks SYS_kcmp)\n";
+    /* kcmp (the delivery-owner identity proof) is blocked by docker's
+       DEFAULT seccomp profile, which is exactly what release QA runs
+       under.  The old main() SKIPped the whole binary in that case, so
+       the entire hygiene suite -- including the proc_fallback std-fd
+       regression -- never ran in standard QA, and the production fd bug
+       shipped green.  Only the kcmp-DEPENDENT cases may skip now, each
+       reported individually; everything else always runs.  And the
+       binary can never report SKIP overall while any kcmp-independent
+       case exists: the guard below turns a would-be skip into a
+       pass-with-note when at least one case ran. */
+    const bool kcmp = kcmp_available();
+    int skipped = 0;
+    int ran = 0;
+    auto guard = [&](const char* name, bool needs_kcmp, void (*fn)()) {
+        if (needs_kcmp && !kcmp) {
+            std::cout << "skip - " << name << " (kcmp unavailable: seccomp blocks SYS_kcmp)\n";
+            ++skipped;
+            return;
+        }
+        fn();
+        ++ran;
+    };
+    guard("real_sweep_and_residue", true, test_real_sweep_and_residue);
+    guard("exact_two_and_source_omission", false, test_exact_two_and_source_omission);
+    guard("validation", true, test_validation);
+    guard("same_number_replacement_and_transfer", true, test_same_number_replacement_and_transfer);
+    guard("move_assignment_and_proof_reuse", true, test_move_assignment_and_proof_reuse);
+    guard("fallback_and_injected_failures", true, test_fallback_and_injected_failures);
+    guard("kcmp_errors_retire_private_handles", true, test_kcmp_errors_retire_private_handles);
+    guard("proc_fallback_keeps_std_fds", false, test_proc_fallback_keeps_std_fds);
+    guard("get_seals_failure_rejects_source", false, test_get_seals_failure_rejects_source);
+    guard("shmem_seal_only_source_rejected", false, test_shmem_seal_only_source_rejected);
+    if (ran == 0) {
+        /* Nothing ran at all: the historical whole-binary SKIP.  With the
+           set above this is unreachable unless every case is
+           kcmp-dependent, but keep the escape hatch honest. */
+        std::cout << "SKIP - no kcmp-independent case exists\n";
         return 77;
     }
-    test_real_sweep_and_residue();
-    test_exact_two_and_source_omission();
-    test_validation();
-    test_same_number_replacement_and_transfer();
-    test_move_assignment_and_proof_reuse();
-    test_fallback_and_injected_failures();
-    test_kcmp_errors_retire_private_handles();
+    if (skipped > 0)
+        std::cout << "note - " << skipped << " kcmp-dependent case(s) skipped\n";
     std::cout << "ok - exact first-fork descriptor hygiene\n";
     return 0;
 }

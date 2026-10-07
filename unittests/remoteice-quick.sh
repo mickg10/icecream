@@ -57,9 +57,59 @@ sockdir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/iceq.XXXXXX") || exit 99
 work=$(mktemp -d "${TMPDIR:-/tmp}/iceremote.XXXXXX") || exit 99
 
 # PID-derived defaults so concurrent runs (or a developer's own scheduler)
-# cannot collide on a fixed port.
-SCHED_PORT=${ICECC_TEST_SCHED_PORT:-$((21000 + $$ % 9000))}
-REMOTE_PORT=${ICECC_TEST_REMOTE_PORT:-$((11000 + $$ % 9000))}
+# cannot collide on a fixed port.  The pid-derived value is only a SEED:
+# another instance of this same formula (the strict row execs THIS script
+# and the qa e2e stage runs both rows concurrently under -j2) lands on the
+# same port whenever the two pids differ by a multiple of 9000 -- a live
+# collision observed as "bind(): Address already in use" in the round-3 e2e
+# stage.  Probe-bind from the seed instead: the first free port wins.
+pick_seed_port() {  # <seed> -> first bindable port at or after it
+    python3 - "$1" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+for _ in range(9000):
+    probe = socket.socket()
+    try:
+        probe.bind(("", port))
+        probe.close()
+        print(port)
+        raise SystemExit(0)
+    except OSError:
+        probe.close()
+        port += 1
+        if port > 29999:
+            port = 21000
+        continue
+raise SystemExit("no free scheduler port in 21000-29999")
+PY
+}
+seed_sched=$((21000 + $$ % 9000))
+seed_remote=$((11000 + $$ % 9000))
+if [ -z "${ICECC_TEST_SCHED_PORT:-}" ]; then
+    SCHED_PORT=$(pick_seed_port "$seed_sched") || fail "no free scheduler port in 21000-29999"
+else
+    SCHED_PORT=$ICECC_TEST_SCHED_PORT
+fi
+# The scheduler binds its TEXT endpoint at SCHED_PORT+1 (compilee2e's
+# "the scheduler owns TCP base + 1"), so the worker may NEVER be seeded
+# there: a probe sees the port free (the scheduler has not bound yet)
+# and the worker then retries "Address already in use" for its whole
+# startup.  Start the walk at SCHED_PORT+2 and skip +1 by construction.
+if [ -z "${ICECC_TEST_REMOTE_PORT:-}" ]; then
+    REMOTE_PORT=$(pick_seed_port $((SCHED_PORT + 2))) || fail "no free remote port after the scheduler text endpoint"
+else
+    REMOTE_PORT=$ICECC_TEST_REMOTE_PORT
+fi
+# The address the daemons CONNECT to the scheduler on.  The scheduler
+# records each daemon by the TCP peer address of that connection and the
+# client's UseCS carries it verbatim -- so a strict all-P50 run
+# (ICECC_P50_C1F1_REQUIRED) connected via loopback sees hostname
+# 127.0.0.1, the protocol sentinel for scheduler-selected LOCAL, and
+# correctly refuses.  On a real farm the worker's peer address is its
+# real IP and the row works from 127.0.0.1; a container (the qa e2e leg)
+# must pass its own eth0 address so the worker's UseCS is a real
+# reachable host instead of the local sentinel.
+SCHED_ADDR=${ICECC_TEST_SCHED_ADDR:-127.0.0.1}
 NETNAME=remoteq$$
 ASSIGNMENT_FENCE_MODE=${ICECC_TEST_ASSIGNMENT_FENCE_MODE:-legacy}
 case "$ASSIGNMENT_FENCE_MODE" in
@@ -190,20 +240,24 @@ fi
 SCHED_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/remote" \
-"$top/daemon/iceccd" -p "$REMOTE_PORT" -m 2 -s "127.0.0.1:$SCHED_PORT" \
+"$top/daemon/iceccd" -p "$REMOTE_PORT" -m 2 -s "$SCHED_ADDR:$SCHED_PORT" \
     -n "$NETNAME" -N remoteq -b "$work/envs-remote" $USERFLAG \
     "${REMOTE_CACHE_ARGS[@]}" \
     -l "$work/remote.log" -vvv &
 REMOTE_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/local" \
-"$top/daemon/iceccd" --no-remote -m 0 -s "127.0.0.1:$SCHED_PORT" \
+"$top/daemon/iceccd" --no-remote -m 0 -s "$SCHED_ADDR:$SCHED_PORT" \
     -n "$NETNAME" -N localq -b "$work/envs-local" $USERFLAG \
     "${LOCAL_CACHE_ARGS[@]}" \
     -l "$work/local.log" -vvv &
 LOCAL_PID=$!
 
-# Both daemons must register before the compile is submitted.
+# Both daemons must register before the compile is submitted.  30s: the
+# round-5 "never registered" was NOT slow registration -- the worker's own
+# listen bind had collided with the scheduler's TEXT endpoint port
+# (sched+1; fixed above by seeding the worker walk at sched+2), so the
+# worker could not even start accepting while the gate expired.
 for _ in $(seq 1 60); do
     logins=$(grep -c "login" "$work/sched.log" 2>/dev/null) || logins=0
     [ "$logins" -ge 2 ] && break
