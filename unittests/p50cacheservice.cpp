@@ -3175,6 +3175,17 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     const std::string trace_path = template_path;
     CHECK(::setenv("ICECC_P50_SOURCE_RESULT_TRACE", trace_path.c_str(), 1) == 0);
 
+    // ICECC_P50_F_RESULT_TRACE is diagnostic-only and must be a no-op when
+    // unset: pick a path that is never created, confirm the gate first with
+    // the env var absent, then set it for the real transfer below.
+    char f_template_path[] = "/tmp/icecc-p50-f-result-trace-XXXXXX";
+    const int f_trace_fd = ::mkstemp(f_template_path);
+    CHECK(f_trace_fd >= 0);
+    (void)::close(f_trace_fd);
+    const std::string f_trace_path = f_template_path;
+    CHECK(::unlink(f_trace_path.c_str()) == 0);
+    CHECK(::unsetenv("ICECC_P50_F_RESULT_TRACE") == 0);
+
     const auto clock = sidecar::process_monotonic_clock_identity();
     const std::string text = "route-lanes-default\n";
     const std::vector<uint8_t> source(text.begin(), text.end());
@@ -3184,16 +3195,38 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     const local::P50SourceTransferResult result = c_runtime.transfer_source_on_owner(
         source_transfer_request(front.port(), 920, CACHE_PROFILE_P29V1),
         deadline, local::HandoffFd(source_file("p50-route-lanes-default", source)));
+
+    CHECK(result.code == local::SourceTransferResultCode::Committed);
+
+    // With ICECC_P50_F_RESULT_TRACE unset, the committed transfer above must
+    // not have created the file: the gate is a true no-op, not just an empty
+    // write.
+    struct stat f_trace_stat_before{};
+    CHECK(::stat(f_trace_path.c_str(), &f_trace_stat_before) != 0);
+    CHECK(errno == ENOENT);
+
+    // Now exercise the same code path with the env var set, via a second
+    // real transfer through the same C/F runtimes, and confirm both the
+    // v4 C-side trace and the new v1 F-side trace are well-formed and carry
+    // their new diagnostic fields.
+    CHECK(::setenv("ICECC_P50_F_RESULT_TRACE", f_trace_path.c_str(), 1) == 0);
+    const std::string text2 = "route-lanes-default-f-trace\n";
+    const std::vector<uint8_t> source2(text2.begin(), text2.end());
+    const local::P50SourceTransferResult result2 = c_runtime.transfer_source_on_owner(
+        source_transfer_request(front.port(), 921, CACHE_PROFILE_P29V1),
+        deadline, local::HandoffFd(source_file("p50-route-lanes-default-2", source2)));
     front.stop();
 
     CHECK(::unsetenv("ICECC_P50_SOURCE_RESULT_TRACE") == 0);
-    CHECK(result.code == local::SourceTransferResultCode::Committed);
+    CHECK(::unsetenv("ICECC_P50_F_RESULT_TRACE") == 0);
+    CHECK(result2.code == local::SourceTransferResultCode::Committed);
 
     const std::vector<CStoreGuid> observed = front.observed_guids();
-    CHECK(observed.size() == 1);
+    CHECK(observed.size() == 2);
     CHECK(observed[0] == c_store);
+    CHECK(observed[1] == c_store);
 
-    std::array<char, 4096> buffer{};
+    std::array<char, 8192> buffer{};
     const int read_fd = ::open(trace_path.c_str(), O_RDONLY | O_CLOEXEC);
     CHECK(read_fd >= 0);
     const ssize_t bytes_read = ::read(read_fd, buffer.data(), buffer.size() - 1);
@@ -3205,9 +3238,43 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     const std::string expected_guid_field =
         "\"c_store_guid\":\"" + guid_hex(c_store) + "\"";
     std::fprintf(stderr, "p50cacheservice: ROUTE_LANES default-off trace: %s", trace.c_str());
-    CHECK(trace.find("\"schema\":\"icecream-p50-source-result-v3\"") != std::string::npos);
+    CHECK(trace.find("\"schema\":\"icecream-p50-source-result-v4\"") != std::string::npos);
     CHECK(trace.find("\"lane\":0,") != std::string::npos);
     CHECK(trace.find(expected_guid_field) != std::string::npos);
+    CHECK(trace.find("\"c_prepare_route_ns\":") != std::string::npos);
+    CHECK(trace.find("\"c_fill_ns\":") != std::string::npos);
+    CHECK(trace.find("\"c_write_ns\":") != std::string::npos);
+    CHECK(trace.find("\"c_state_wait_ns\":") != std::string::npos);
+    CHECK(trace.find("\"c_state_to_commit_ns\":") != std::string::npos);
+    CHECK(trace.find("\"c_post_commit_ns\":") != std::string::npos);
+
+    std::array<char, 4096> f_buffer{};
+    const int f_read_fd = ::open(f_trace_path.c_str(), O_RDONLY | O_CLOEXEC);
+    CHECK(f_read_fd >= 0);
+    const ssize_t f_bytes_read = ::read(f_read_fd, f_buffer.data(), f_buffer.size() - 1);
+    (void)::close(f_read_fd);
+    (void)::unlink(f_trace_path.c_str());
+    CHECK(f_bytes_read > 0);
+    const std::string f_trace(f_buffer.data(), static_cast<size_t>(f_bytes_read));
+
+    std::fprintf(stderr, "p50cacheservice: F_RESULT_TRACE: %s", f_trace.c_str());
+    CHECK(f_trace.front() == '{');
+    CHECK(f_trace.find("\"schema\":\"icecream-p50-f-result-v1\"") != std::string::npos);
+    CHECK(f_trace.find(expected_guid_field) != std::string::npos);
+    CHECK(f_trace.find("\"tu_seq\":") != std::string::npos);
+    CHECK(f_trace.find("\"rel_seq\":") != std::string::npos);
+    CHECK(f_trace.find("\"raw_bytes\":") != std::string::npos);
+    CHECK(f_trace.find("\"status\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_hello_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_hello_to_begin_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_begin_to_body_complete_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_apply_materialize_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_commit_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_commit_write_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_wait_peer_close_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_run_total_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"f_begin_to_commit_written_ns\":") != std::string::npos);
+    CHECK(f_trace.find("\"wall_clock_ns\":") != std::string::npos);
 }
 
 int connect_after_sidecar_ready(uint16_t port) {
