@@ -161,7 +161,8 @@ void append_source_result_trace(
     uint64_t source_mutex_wait_ns,
     uint64_t source_mutex_service_ns,
     uint32_t lane,
-    uint64_t gate_wait_ns) noexcept {
+    uint64_t gate_wait_ns,
+    int64_t transfer_start_mono_ns) noexcept {
     const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
     if (path == nullptr || *path == '\0')
         return;
@@ -185,10 +186,22 @@ void append_source_result_trace(
     const std::string c_guid = bytes_hex(std::span<const uint8_t>(
         c_store_guid.bytes.data(), c_store_guid.bytes.size()));
     const std::string raw_digest = icecc::digest128_hex(transfer.raw_digest);
+    // CLOCK_REALTIME snapshot taken at trace-write time (i.e. close to
+    // transfer completion), same convention as f_wall_clock_ns in
+    // append_f_result_trace below -- an absolute anchor so the two
+    // diagnostic-only trace streams can be correlated across hosts
+    // despite NTP skew (see tools/stagetrace/offsets.sh).
+    uint64_t wall_clock_ns = 0;
+    {
+        struct timespec wall_ts{};
+        if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+            wall_clock_ns = static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                            static_cast<uint64_t>(wall_ts.tv_nsec);
+    }
     char line[1536];
     const int length = std::snprintf(
         line, sizeof(line),
-        "{\"schema\":\"icecream-p50-source-result-v4\","
+        "{\"schema\":\"icecream-p50-source-result-v5\","
         "\"wire_job_id\":%llu,\"logical_job\":%llu,"
         "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
         "\"c_store_guid\":\"%s\","
@@ -207,7 +220,9 @@ void append_source_result_trace(
         "\"c_write_ns\":%llu,"
         "\"c_state_wait_ns\":%llu,"
         "\"c_state_to_commit_ns\":%llu,"
-        "\"c_post_commit_ns\":%llu}\n",
+        "\"c_post_commit_ns\":%llu,"
+        "\"wall_clock_ns\":%llu,"
+        "\"transfer_start_mono_ns\":%lld}\n",
         static_cast<unsigned long long>(request.wire_job_id),
         static_cast<unsigned long long>(request.logical_job),
         static_cast<unsigned long long>(request.assignment_epoch),
@@ -233,7 +248,9 @@ void append_source_result_trace(
         static_cast<unsigned long long>(transfer.c_write_ns),
         static_cast<unsigned long long>(transfer.c_state_wait_ns),
         static_cast<unsigned long long>(transfer.c_state_to_commit_ns),
-        static_cast<unsigned long long>(transfer.c_post_commit_ns));
+        static_cast<unsigned long long>(transfer.c_post_commit_ns),
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<long long>(transfer_start_mono_ns));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
@@ -1677,6 +1694,19 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     icecc::stagetrace::stage_trace("csidecar", "transfer_request_received",
         (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
         (int64_t)request.logical_job, (int64_t)request.compiler_attempt);
+    // Monotonic anchor for this transfer, taken at the same point as the
+    // transfer_request_received stage_trace event above so the v5
+    // source-result trace (diagnostic-only, see append_source_result_trace)
+    // can be joined offline against mono_ns timestamps recorded by
+    // stage_trace() in this and other processes.
+    int64_t transfer_start_mono_ns = 0;
+    {
+        struct timespec start_ts{};
+        if (::clock_gettime(CLOCK_MONOTONIC, &start_ts) == 0)
+            transfer_start_mono_ns =
+                static_cast<int64_t>(start_ts.tv_sec) * 1000000000LL +
+                start_ts.tv_nsec;
+    }
     const auto clock = sidecar::process_monotonic_clock_identity();
     if (!route_owner_ || !request.valid() || !config_.sidecar_launch.has_value() ||
         !config_.sidecar_launch->valid() ||
@@ -2129,7 +2159,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
              source_bytes = *source_bytes, source_digest, completion, route_request,
              prepared_source, selected_lane, gate_wait_ns,
              expected_c_guid = relationship.c_store_guid, source_mutex_wait_ns,
-             source_mutex_service_start]() mutable
+             source_mutex_service_start, transfer_start_mono_ns]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
                 ZstdSourceTransferResult observed;
@@ -2190,7 +2220,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 append_source_result_trace(
                     request, expected_c_guid, relationship.profile, observed,
                     source_mutex_wait_ns, source_mutex_service_ns,
-                    static_cast<uint32_t>(selected_lane), gate_wait_ns);
+                    static_cast<uint32_t>(selected_lane), gate_wait_ns,
+                    transfer_start_mono_ns);
                 icecc::stagetrace::stage_trace("csidecar", "transfer_completed",
                     (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
                     (int64_t)request.logical_job, (int64_t)request.compiler_attempt,

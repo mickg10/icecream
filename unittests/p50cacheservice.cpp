@@ -3207,7 +3207,7 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
 
     // Now exercise the same code path with the env var set, via a second
     // real transfer through the same C/F runtimes, and confirm both the
-    // v4 C-side trace and the new v1 F-side trace are well-formed and carry
+    // v5 C-side trace and the v1 F-side trace are well-formed and carry
     // their new diagnostic fields.
     CHECK(::setenv("ICECC_P50_F_RESULT_TRACE", f_trace_path.c_str(), 1) == 0);
     const std::string text2 = "route-lanes-default-f-trace\n";
@@ -3238,7 +3238,7 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     const std::string expected_guid_field =
         "\"c_store_guid\":\"" + guid_hex(c_store) + "\"";
     std::fprintf(stderr, "p50cacheservice: ROUTE_LANES default-off trace: %s", trace.c_str());
-    CHECK(trace.find("\"schema\":\"icecream-p50-source-result-v4\"") != std::string::npos);
+    CHECK(trace.find("\"schema\":\"icecream-p50-source-result-v5\"") != std::string::npos);
     CHECK(trace.find("\"lane\":0,") != std::string::npos);
     CHECK(trace.find(expected_guid_field) != std::string::npos);
     CHECK(trace.find("\"c_prepare_route_ns\":") != std::string::npos);
@@ -3247,6 +3247,13 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     CHECK(trace.find("\"c_state_wait_ns\":") != std::string::npos);
     CHECK(trace.find("\"c_state_to_commit_ns\":") != std::string::npos);
     CHECK(trace.find("\"c_post_commit_ns\":") != std::string::npos);
+    // v5 additions: an absolute wall-clock anchor (CLOCK_REALTIME, taken at
+    // trace-write time, same convention as the F-side wall_clock_ns) plus a
+    // monotonic anchor taken at the start of this transfer, so offline
+    // analysis can place every *_ns duration in this record on an absolute
+    // timeline and join it with mono_ns timestamps from stage_trace().
+    CHECK(trace.find("\"wall_clock_ns\":") != std::string::npos);
+    CHECK(trace.find("\"transfer_start_mono_ns\":") != std::string::npos);
 
     std::array<char, 4096> f_buffer{};
     const int f_read_fd = ::open(f_trace_path.c_str(), O_RDONLY | O_CLOEXEC);
