@@ -57,7 +57,32 @@ if [ -n "$icecc_user" ]; then
     chown "$icecc_user:$icecc_user" "$workdir/cache-rt"
     chmod 0700 "$workdir/cache-rt"
 fi
-trap 'kill $daemon_pid 2>/dev/null; kill $service_pid 2>/dev/null; kill $sched_pid 2>/dev/null; rm -rf "$workdir"' EXIT INT TERM
+# Real teardown: signal, then wait (bounded) for ACTUAL exit, then kill -9
+# and reap (the p50completionflow-run.sh pattern).  A scheduler that is
+# only SIGNALED keeps its 8765/8766 listeners open until its poll loop
+# notices -- with SO_REUSEADDR a LIVE listener still blocks the next
+# bind -- so a signal-only trap makes the NEXT make-check test
+# (envchardev.c.sh, p50remote-failreport.sh) lose the bind race against
+# this test's dying scheduler.  Same for the daemon's own listener.
+# Round 14 failed exactly there (see 99f6c17c for the full story).
+stop_processes() { # <pids...>
+    for pid in "$@"; do
+        kill "$pid" 2>/dev/null || :
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in "$@"; do
+            kill -0 "$pid" 2>/dev/null && live=1
+        done
+        [ "$live" -eq 0 ] && break
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        kill -9 "$pid" 2>/dev/null || :
+        wait "$pid" 2>/dev/null || :
+    done
+}
+trap 'stop_processes "$daemon_pid" "$service_pid" "$sched_pid"; rm -rf "$workdir"' EXIT INT TERM
 
 cat >"$workdir/closefd-helper.sh" <<'HELPER'
 #!/bin/sh
@@ -337,7 +362,6 @@ done
 [ -z "$inet_sockets" ] || fail "cache service holds an INET socket fd -- exactly what a broken launch-time CLOEXEC sweep would leak (an inherited scheduler connection or an inherited daemon listening port): $inet_sockets"
 [ -z "$unclassified" ] || fail "cache service holds extra fd(s) of a kind the launch-time CLOEXEC sweep should never let through (not the self-pipe, not an anon_inode, not an AF_UNIX accepted connection on its own listener, not the static /dev/null log sink, not under this service's own cache-rt tree, and not a still-running P29 system-source scan): $unclassified"
 
-kill "$daemon_pid" 2>/dev/null
-kill "$service_pid" 2>/dev/null
+stop_processes "$daemon_pid" "$service_pid"
 echo "stdfdsanitize-sidecar: OK (0/1/2 sane, ready_write=$ready_fd pipe, listener=$listener_fd socket, no inet-socket or unexplained fd in the service$([ -n "$extra_fds" ] && echo ", service also holds self-opened fd(s) [$(for fd in $extra_fds; do printf '%s:%s ' "$fd" "$(probe_link "$fd")"; done)]"))"
 exit 0
