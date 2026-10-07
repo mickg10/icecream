@@ -190,11 +190,36 @@ case "$listener_fd" in
     ''|*[!0-9]*) fail "ICECC_CACHE_SERVICE_LISTENER_FD missing/non-numeric in service environ" ;;
 esac
 
+# The service CLOSES the ready fd immediately after publishing ready
+# (cache/p50_cache_service.cpp:~3074, '(void)::close(ready.fd)' right
+# after the write_ready write), and the number this test read from
+# ICECC_CACHE_SERVICE_READY_FD is the EXEC-TIME value from
+# /proc/<svc>/environ -- so by the time this probe runs the ready write
+# has usually already happened and the number is CLOSED or REUSED by
+# the service's own later opens (observed: reused by a socket).  That
+# reuse is NOT a defect: being alive at all proves the ready fd was a
+# pipe at launch -- parse_ready_fd (p50_cache_service.cpp:~500-516)
+# fails closed unless it is S_ISFIFO, and the service refuses to start
+# otherwise.  So a non-pipe readlink here means "published then closed"
+# (or reused), not "launch shape wrong" -- and it only counts as that
+# while the service itself is still alive.
+ready_state=published-closed
+ready_pipe_inode=
 ready_link=$(probe_link "$ready_fd")
-[ "$ready_link" = "PROBE-FAIL" ] && fail "cannot probe ready-write fd $ready_fd same-uid"
 case "$ready_link" in
-    pipe:*) ;;
-    *) fail "ready-write fd $ready_fd in the cache service is not a pipe ($ready_link)" ;;
+    pipe:*)
+        ready_state=open
+        ready_pipe_inode=$ready_link
+        ;;
+    PROBE-FAIL)
+        # same-uid probe of a dead service's fd table cannot work either
+        kill -0 "$service_pid" 2>/dev/null || \
+            fail "cannot probe ready-write fd $ready_fd and the service is gone"
+        ;;
+    *)
+        kill -0 "$service_pid" 2>/dev/null || \
+            fail "ready-write fd $ready_fd is not a pipe ($ready_link) and the service is gone"
+        ;;
 esac
 listener_link=$(probe_link "$listener_fd")
 [ "$listener_link" = "PROBE-FAIL" ] && fail "cannot probe listener fd $listener_fd same-uid"
@@ -274,7 +299,14 @@ while :; do
         case "$fd" in
             0|1|2) continue ;;
         esac
-        [ "$fd" = "$ready_fd" ] && continue
+        # Skip the ready fd ONLY while it still readlinks to the SAME
+        # pipe:[ino] captured above: once the service has published and
+        # closed it (or let the number be reused), that fd number is just
+        # another one of the service's own opens and must be classified
+        # by the same gate as every other extra fd.
+        if [ "$fd" = "$ready_fd" ] && [ -n "$ready_pipe_inode" ]; then
+            [ "$(probe_link "$fd")" = "$ready_pipe_inode" ] && continue
+        fi
         [ "$fd" = "$listener_fd" ] && continue
         extra_fds="$extra_fds $fd"
     done
@@ -363,5 +395,5 @@ done
 [ -z "$unclassified" ] || fail "cache service holds extra fd(s) of a kind the launch-time CLOEXEC sweep should never let through (not the self-pipe, not an anon_inode, not an AF_UNIX accepted connection on its own listener, not the static /dev/null log sink, not under this service's own cache-rt tree, and not a still-running P29 system-source scan): $unclassified"
 
 stop_processes "$daemon_pid" "$service_pid"
-echo "stdfdsanitize-sidecar: OK (0/1/2 sane, ready_write=$ready_fd pipe, listener=$listener_fd socket, no inet-socket or unexplained fd in the service$([ -n "$extra_fds" ] && echo ", service also holds self-opened fd(s) [$(for fd in $extra_fds; do printf '%s:%s ' "$fd" "$(probe_link "$fd")"; done)]"))"
+echo "stdfdsanitize-sidecar: OK (0/1/2 sane, ready_write=$ready_fd $ready_state, listener=$listener_fd socket, no inet-socket or unexplained fd in the service$([ -n "$extra_fds" ] && echo ", service also holds self-opened fd(s) [$(for fd in $extra_fds; do printf '%s:%s ' "$fd" "$(probe_link "$fd")"; done)]"))"
 exit 0
