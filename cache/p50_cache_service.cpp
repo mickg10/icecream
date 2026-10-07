@@ -184,10 +184,10 @@ void append_source_result_trace(
     const std::string c_guid = bytes_hex(std::span<const uint8_t>(
         c_store_guid.bytes.data(), c_store_guid.bytes.size()));
     const std::string raw_digest = icecc::digest128_hex(transfer.raw_digest);
-    char line[1024];
+    char line[1536];
     const int length = std::snprintf(
         line, sizeof(line),
-        "{\"schema\":\"icecream-p50-source-result-v3\","
+        "{\"schema\":\"icecream-p50-source-result-v4\","
         "\"wire_job_id\":%llu,\"logical_job\":%llu,"
         "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
         "\"c_store_guid\":\"%s\","
@@ -200,7 +200,13 @@ void append_source_result_trace(
         "\"source_mutex_service_ns\":%llu,"
         "\"terminal_error_code\":%u,"
         "\"terminal_error_name\":%s,"
-        "\"system_source_reuse\":%s}\n",
+        "\"system_source_reuse\":%s,"
+        "\"c_prepare_route_ns\":%llu,"
+        "\"c_fill_ns\":%llu,"
+        "\"c_write_ns\":%llu,"
+        "\"c_state_wait_ns\":%llu,"
+        "\"c_state_to_commit_ns\":%llu,"
+        "\"c_post_commit_ns\":%llu}\n",
         static_cast<unsigned long long>(request.wire_job_id),
         static_cast<unsigned long long>(request.logical_job),
         static_cast<unsigned long long>(request.assignment_epoch),
@@ -220,7 +226,86 @@ void append_source_result_trace(
         static_cast<unsigned long long>(transfer.f_to_c_bytes),
         static_cast<unsigned long long>(source_mutex_wait_ns),
         static_cast<unsigned long long>(source_mutex_service_ns),
-        static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse);
+        static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse,
+        static_cast<unsigned long long>(transfer.c_prepare_route_ns),
+        static_cast<unsigned long long>(transfer.c_fill_ns),
+        static_cast<unsigned long long>(transfer.c_write_ns),
+        static_cast<unsigned long long>(transfer.c_state_wait_ns),
+        static_cast<unsigned long long>(transfer.c_state_to_commit_ns),
+        static_cast<unsigned long long>(transfer.c_post_commit_ns));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
+// One record per F run (ICECC_P50_F_RESULT_TRACE), diagnostic-only: no-op
+// unless the env var is set, and never gates behavior. Companion to
+// append_source_result_trace above; f_rel_seq/tu_seq let the two trace
+// lines for the same transfer be joined offline.
+void append_f_result_trace(const ServerRunResult& run) noexcept {
+    const char* path = ::getenv("ICECC_P50_F_RESULT_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    const std::string c_guid =
+        run.c_store_guid.has_value()
+            ? bytes_hex(std::span<const uint8_t>(
+                  run.c_store_guid->bytes.data(), run.c_store_guid->bytes.size()))
+            : std::string();
+    const uint64_t tu_seq =
+        run.committed_input.has_value()
+            ? run.committed_input->tu_seq.value
+            : run.completed_input.has_value()
+                  ? run.completed_input->tu_seq.value
+                  : 0;
+    char line[1024];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-f-result-v1\","
+        "\"c_store_guid\":\"%s\","
+        "\"tu_seq\":%llu,\"rel_seq\":%llu,\"raw_bytes\":%llu,"
+        "\"status\":%u,"
+        "\"f_hello_ns\":%llu,"
+        "\"f_hello_to_begin_ns\":%llu,"
+        "\"f_begin_to_body_complete_ns\":%llu,"
+        "\"f_apply_materialize_ns\":%llu,"
+        "\"f_commit_ns\":%llu,"
+        "\"f_commit_write_ns\":%llu,"
+        "\"f_wait_peer_close_ns\":%llu,"
+        "\"f_run_total_ns\":%llu,"
+        "\"f_begin_to_commit_written_ns\":%llu,"
+        "\"wall_clock_ns\":%llu}\n",
+        c_guid.c_str(),
+        static_cast<unsigned long long>(tu_seq),
+        static_cast<unsigned long long>(run.f_rel_seq.value),
+        static_cast<unsigned long long>(run.f_raw_bytes),
+        static_cast<unsigned>(run.status),
+        static_cast<unsigned long long>(run.f_hello_ns),
+        static_cast<unsigned long long>(run.f_hello_to_begin_ns),
+        static_cast<unsigned long long>(run.f_begin_to_body_complete_ns),
+        static_cast<unsigned long long>(run.f_apply_materialize_ns),
+        static_cast<unsigned long long>(run.f_commit_ns),
+        static_cast<unsigned long long>(run.f_commit_write_ns),
+        static_cast<unsigned long long>(run.f_wait_peer_close_ns),
+        static_cast<unsigned long long>(run.f_run_total_ns),
+        static_cast<unsigned long long>(run.f_begin_to_commit_written_ns),
+        static_cast<unsigned long long>(run.f_wall_clock_ns));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
@@ -2178,6 +2263,7 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
         std::fflush(stderr);
         const ServerRunResult endpoint_result =
             co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
+        append_f_result_trace(endpoint_result);
         std::fprintf(stderr,
                      "P50_CACHE_SESSION_ENDPOINT_DONE status=%u completed=%u "
                      "committed=%u\n",
