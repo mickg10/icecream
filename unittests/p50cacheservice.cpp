@@ -3284,6 +3284,71 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     CHECK(f_trace.find("\"wall_clock_ns\":") != std::string::npos);
 }
 
+// Round-3 owner-lag probe (ICECC_P50_OWNER_LAG_TRACE): confirms the
+// per-second icecream-p50-owner-lag-v1 line fires unconditionally off
+// endpoint_owner_thread_'s 20ms steady_timer -- independent of any real
+// transfer activity -- and that the gate is a true no-op when unset (per
+// SidecarRuntime's ctor, owner_lag_trace_enabled_ is read once from the
+// environment and latched for the runtime's lifetime, so arm_owner_lag_timer
+// is never posted at all if the env var was absent at construction). The
+// per-op icecream-p50-owner-lag-op-v1 schema (attach/finish_attach/
+// apply_lifecycle) is exercised and parsed against the exact field names
+// append_owner_lag_op_trace emits by tools/stagetrace/test_analyze.py; see
+// that file for schema-level coverage of the per-op record.
+void test_owner_lag_trace_default_off_then_emits_per_second_line() {
+    char template_path[] = "/tmp/icecc-p50-owner-lag-trace-XXXXXX";
+    const int trace_fd = ::mkstemp(template_path);
+    CHECK(trace_fd >= 0);
+    (void)::close(trace_fd);
+    const std::string trace_path = template_path;
+    CHECK(::unlink(trace_path.c_str()) == 0);
+
+    // Phase 1: default off. With the env var unset at construction time,
+    // owner_lag_trace_enabled_ is latched false for this runtime's entire
+    // lifetime, so arm_owner_lag_timer() is never posted. Give the owner
+    // thread well over a second to prove the file truly never appears, not
+    // just that it would have been empty.
+    CHECK(::unsetenv("ICECC_P50_OWNER_LAG_TRACE") == 0);
+    {
+        service::SidecarRuntime runtime(test_runtime_config());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+    }
+    struct stat trace_stat_before{};
+    CHECK(::stat(trace_path.c_str(), &trace_stat_before) != 0);
+    CHECK(errno == ENOENT);
+
+    // Phase 2: enabled. The env var must be set before construction so the
+    // ctor's one-time read of owner_lag_trace_enabled_ latches true.
+    CHECK(::setenv("ICECC_P50_OWNER_LAG_TRACE", trace_path.c_str(), 1) == 0);
+    {
+        service::SidecarRuntime runtime(test_runtime_config());
+        // The first per-second flush requires >=1s of accumulated samples
+        // from the first timer tick (see arm_owner_lag_timer()); no real
+        // transfer or compiler activity is needed since the timer runs
+        // unconditionally on endpoint_owner_thread_.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+    }
+    CHECK(::unsetenv("ICECC_P50_OWNER_LAG_TRACE") == 0);
+
+    std::array<char, 4096> buffer{};
+    const int read_fd = ::open(trace_path.c_str(), O_RDONLY | O_CLOEXEC);
+    CHECK(read_fd >= 0);
+    const ssize_t bytes_read = ::read(read_fd, buffer.data(), buffer.size() - 1);
+    (void)::close(read_fd);
+    (void)::unlink(trace_path.c_str());
+    CHECK(bytes_read > 0);
+    const std::string trace(buffer.data(), static_cast<size_t>(bytes_read));
+
+    std::fprintf(stderr, "p50cacheservice: OWNER_LAG_TRACE: %s", trace.c_str());
+    CHECK(trace.find("\"schema\":\"icecream-p50-owner-lag-v1\"") != std::string::npos);
+    CHECK(trace.find("\"pid\":") != std::string::npos);
+    CHECK(trace.find("\"wall_clock_ns\":") != std::string::npos);
+    CHECK(trace.find("\"n\":") != std::string::npos);
+    CHECK(trace.find("\"max_lag_ns\":") != std::string::npos);
+    CHECK(trace.find("\"p99_lag_ns\":") != std::string::npos);
+    CHECK(trace.find("\"owner_cpu_ns\":") != std::string::npos);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -3791,6 +3856,7 @@ int main(int argc, char** argv) {
             test_armed_window_env_override_shifts_gate_capacity();
             test_route_lanes_concurrent_transfers_use_distinct_lanes();
             test_route_lanes_default_off_trace_matches_base_guid();
+            test_owner_lag_trace_default_off_then_emits_per_second_line();
             return 0;
         }
         CHECK(argc == 1);

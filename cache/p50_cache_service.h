@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "p50_endpoint.h"
@@ -36,6 +37,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
 
 namespace icecc::p50::service {
@@ -351,6 +353,36 @@ private:
     std::atomic<int> active_control_cancel_fd_{-1};
     mutable std::mutex endpoint_cancel_mutex_;
     std::optional<EndpointCancelPermit> endpoint_cancel_permit_;
+
+    // --- owner-lag diagnostic probe (ICECC_P50_OWNER_LAG_TRACE) -----------
+    // Entirely diagnostic and shared by both the C and F sidecar roles,
+    // since both are the same SidecarRuntime. Disabled unless the env var
+    // names a file; when disabled, arm_owner_lag_timer() is never posted (no
+    // timer ever runs) and the per-op bookkeeping in attach_input_on_owner /
+    // finish_input_attachment_on_owner / apply_input_lifecycle_on_owner is
+    // skipped, so there is no behavior, timing, or memory-growth change on
+    // the production path. See append_owner_lag_second_trace and
+    // append_owner_lag_op_trace in p50_cache_service.cpp for the two emitted
+    // JSONL schemas: a once-per-second lag/CPU aggregate from the timer, and
+    // one record per lifecycle op from the three functions above.
+    const bool owner_lag_trace_enabled_;
+    boost::asio::steady_timer owner_lag_timer_{context_};
+    std::chrono::steady_clock::time_point owner_lag_timer_scheduled_{};
+    std::chrono::steady_clock::time_point owner_lag_second_started_{};
+    uint64_t owner_lag_second_n_ = 0;
+    int64_t owner_lag_second_max_ns_ = 0;
+    std::vector<int64_t> owner_lag_second_samples_;
+    int64_t owner_lag_prev_cpu_ns_ = 0;
+    void arm_owner_lag_timer() noexcept;
+    // Local proxy for "this retained input has an in-flight attachment right
+    // now": present between a successful attach_input_on_owner and its
+    // matching finish_input_attachment_on_owner call for the same key.
+    // Diagnostic only -- mutated and read exclusively inside context_-posted
+    // lambdas, all of which run on endpoint_owner_thread_, so no additional
+    // lock is needed. Only ever populated when owner_lag_trace_enabled_.
+    std::unordered_map<InputRecordKey, std::chrono::steady_clock::time_point,
+                        InputRecordKeyHash>
+        owner_lag_tx_inflight_;
 
     // --- dedicated F-session control connections (owner-affine) -----------
     struct FSessionPump;

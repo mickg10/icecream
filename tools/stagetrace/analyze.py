@@ -310,6 +310,178 @@ def load_v1_f_results(path: str) -> List[FResultSample]:
 
 
 @dataclass
+class OwnerLagSecondSample:
+    """One parsed icecream-p50-owner-lag-v1 record (ICECC_P50_OWNER_LAG_TRACE).
+
+    Emitted once per second by SidecarRuntime::arm_owner_lag_timer's 20ms
+    steady_timer, on both C and F sidecars (same SidecarRuntime class
+    handles both roles). max_lag_ns/p99_lag_ns summarize that second's
+    (actual_fire - scheduled_fire) samples; owner_cpu_ns is that second's
+    CLOCK_THREAD_CPUTIME_ID delta on endpoint_owner_thread_. Diagnostic
+    only -- see cache/p50_cache_service.cpp.
+    """
+    pid: int
+    wall_clock_ns: int
+    n: int
+    max_lag_ns: int
+    p99_lag_ns: int
+    owner_cpu_ns: int
+
+
+@dataclass
+class OwnerLagOpSample:
+    """One parsed icecream-p50-owner-lag-op-v1 record (same env var, same
+    file as OwnerLagSecondSample -- the two schemas are interleaved).
+
+    One record per lifecycle op (attach / finish_attach / apply_lifecycle)
+    posted to the owner's io_context. post_to_start_ns is scheduling lag
+    (asio::post() to the posted lambda actually starting on
+    endpoint_owner_thread_); owner_exec_ns is how long the lambda body then
+    ran. in_flight_tx/in_flight_tx_age_ns report whether this exact job had
+    an open local attach/finish window at the time -- see
+    SidecarRuntime::owner_lag_tx_inflight_ in cache/p50_cache_service.cpp.
+    job_identity_hash is the FNV-1a hash of (c_store_guid, tu_seq); no raw
+    store GUID or path is ever in this file.
+    """
+    pid: int
+    wall_clock_ns: int
+    op: str
+    job_identity_hash: int
+    post_to_start_ns: int
+    owner_exec_ns: int
+    result_status: int
+    in_flight_tx: bool
+    in_flight_tx_age_ns: int
+
+
+def load_owner_lag_trace(
+        path: str,
+) -> Tuple[List[OwnerLagSecondSample], List[OwnerLagOpSample]]:
+    """Load ICECC_P50_OWNER_LAG_TRACE.
+
+    Both the per-second (icecream-p50-owner-lag-v1) and per-op
+    (icecream-p50-owner-lag-op-v1) schemas are appended to the same file by
+    the C++ side, interleaved in emission order, so this reads it once and
+    splits by the "schema" field. Diagnostic-only; never touches source
+    bytes or paths.
+    """
+    seconds: List[OwnerLagSecondSample] = []
+    ops: List[OwnerLagOpSample] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"warning: {path}:{lineno}: skipping malformed JSON ({exc})",
+                      file=sys.stderr)
+                continue
+            schema = obj.get("schema")
+            try:
+                if schema == "icecream-p50-owner-lag-v1":
+                    seconds.append(OwnerLagSecondSample(
+                        pid=int(obj["pid"]),
+                        wall_clock_ns=int(obj["wall_clock_ns"]),
+                        n=int(obj["n"]),
+                        max_lag_ns=int(obj["max_lag_ns"]),
+                        p99_lag_ns=int(obj["p99_lag_ns"]),
+                        owner_cpu_ns=int(obj["owner_cpu_ns"]),
+                    ))
+                elif schema == "icecream-p50-owner-lag-op-v1":
+                    ops.append(OwnerLagOpSample(
+                        pid=int(obj["pid"]),
+                        wall_clock_ns=int(obj["wall_clock_ns"]),
+                        op=str(obj["op"]),
+                        job_identity_hash=int(obj["job_identity_hash"]),
+                        post_to_start_ns=int(obj["post_to_start_ns"]),
+                        owner_exec_ns=int(obj["owner_exec_ns"]),
+                        result_status=int(obj["result_status"]),
+                        in_flight_tx=bool(obj["in_flight_tx"]),
+                        in_flight_tx_age_ns=int(obj["in_flight_tx_age_ns"]),
+                    ))
+            except (KeyError, TypeError, ValueError) as exc:
+                print(f"warning: {path}:{lineno}: skipping owner-lag record "
+                      f"({exc})", file=sys.stderr)
+    return seconds, ops
+
+
+def print_owner_lag_summary(seconds: List[OwnerLagSecondSample],
+                             ops: List[OwnerLagOpSample]) -> None:
+    """--owner-lag summary: lag distribution plus seconds with max_lag > 1s,
+    then per-op scheduling-lag vs. execution-time vs. in-flight-tx
+    breakdowns -- see the owner-lag probe design notes in
+    cache/p50_cache_service.h/.cpp for what each field settles."""
+    def pct(data: List[int], p: float) -> float:
+        if not data:
+            return float("nan")
+        data = sorted(data)
+        k = (len(data) - 1) * p
+        f, c = int(k), min(int(k) + 1, len(data) - 1)
+        return data[f] + (data[c] - data[f]) * (k - f)
+
+    print(f"\n=== owner-lag summary ({len(seconds)} per-second samples, "
+          f"{len(ops)} per-op samples) ===")
+    if not seconds:
+        print("  no icecream-p50-owner-lag-v1 records found")
+    else:
+        for pid in sorted({s.pid for s in seconds}):
+            pid_seconds = [s for s in seconds if s.pid == pid]
+            max_lags = [s.max_lag_ns for s in pid_seconds]
+            p99_lags = [s.p99_lag_ns for s in pid_seconds]
+            cpu_ns = [s.owner_cpu_ns for s in pid_seconds]
+            print(f"  pid={pid} n_seconds={len(pid_seconds)}")
+            print(f"    max_lag_ns: p50={pct(max_lags,0.5):.0f} "
+                  f"p90={pct(max_lags,0.9):.0f} p99={pct(max_lags,0.99):.0f} "
+                  f"max={max(max_lags):.0f}")
+            print(f"    p99_lag_ns: p50={pct(p99_lags,0.5):.0f} "
+                  f"p90={pct(p99_lags,0.9):.0f} max={max(p99_lags):.0f}")
+            mean_cpu_pct = (sum(cpu_ns) / len(cpu_ns)) / 1e9 * 100.0
+            print(f"    owner_cpu_ns: mean={mean_cpu_pct:.1f}% of 1 core "
+                  f"(per-second CLOCK_THREAD_CPUTIME_ID delta)")
+            stalls = [s for s in pid_seconds if s.max_lag_ns > 1_000_000_000]
+            if stalls:
+                print(f"    seconds with max_lag_ns > 1s: {len(stalls)}")
+                for s in stalls:
+                    print(f"      wall_clock_ns={s.wall_clock_ns} "
+                          f"max_lag_ns={s.max_lag_ns} n={s.n} "
+                          f"owner_cpu_ns={s.owner_cpu_ns}")
+            else:
+                print("    seconds with max_lag_ns > 1s: none")
+
+    if not ops:
+        print("  no icecream-p50-owner-lag-op-v1 records found")
+        return
+
+    by_op: Dict[str, List[OwnerLagOpSample]] = defaultdict(list)
+    for sample in ops:
+        by_op[sample.op].append(sample)
+    print("\n  per-op scheduling lag vs. execution time (ns), by op:")
+    for op in sorted(by_op):
+        samples = by_op[op]
+        post_to_start = [s.post_to_start_ns for s in samples]
+        owner_exec = [s.owner_exec_ns for s in samples]
+        in_flight = [s for s in samples if s.in_flight_tx]
+        print(f"    {op}: n={len(samples)}")
+        print(f"      post_to_start_ns: p50={pct(post_to_start,0.5):.0f} "
+              f"p90={pct(post_to_start,0.9):.0f} "
+              f"p99={pct(post_to_start,0.99):.0f} "
+              f"max={max(post_to_start):.0f}")
+        print(f"      owner_exec_ns:    p50={pct(owner_exec,0.5):.0f} "
+              f"p90={pct(owner_exec,0.9):.0f} "
+              f"p99={pct(owner_exec,0.99):.0f} "
+              f"max={max(owner_exec):.0f}")
+        if in_flight:
+            ages = [s.in_flight_tx_age_ns for s in in_flight]
+            print(f"      in_flight_tx: {len(in_flight)}/{len(samples)} had "
+                  f"a concurrent attach/finish window open (age "
+                  f"p50={pct(ages,0.5):.0f} max={max(ages):.0f} ns)")
+        else:
+            print("      in_flight_tx: none observed")
+
+
+@dataclass
 class NtpOffsetResult:
     offset_ns: float
     error_ns: float
@@ -959,6 +1131,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                               "ICECC_P50_F_RESULT_TRACE "
                               "(icecream-p50-f-result-v1) JSONL file; repeat "
                               "once per F host")
+    parser.add_argument("--owner-lag", default=None, metavar="FILE",
+                         help="path to an ICECC_P50_OWNER_LAG_TRACE JSONL "
+                              "file (icecream-p50-owner-lag-v1 per-second "
+                              "records interleaved with "
+                              "icecream-p50-owner-lag-op-v1 per-op "
+                              "records); prints a lag distribution, "
+                              "flags seconds with max_lag_ns > 1s, and "
+                              "breaks down post_to_start_ns/owner_exec_ns/"
+                              "in_flight_tx per lifecycle op -- works for "
+                              "either the C or the F sidecar's file")
     args = parser.parse_args(argv)
 
     records = load_records(args.trace_dir)
@@ -1053,6 +1235,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.f_result_trace and not args.c_result_trace:
         print("warning: --f-result-trace given without --c-result-trace -- "
               "skipping NTP offset derivation", file=sys.stderr)
+
+    if args.owner_lag:
+        lag_seconds, lag_ops = load_owner_lag_trace(args.owner_lag)
+        print_owner_lag_summary(lag_seconds, lag_ops)
 
     return 0
 

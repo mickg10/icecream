@@ -23,11 +23,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyze import (  # noqa: E402
     FResultSample,
+    OwnerLagOpSample,
+    OwnerLagSecondSample,
     Record,
     SourceResultSample,
     check_clock_sanity,
     derive_ntp_offsets,
+    load_owner_lag_trace,
     print_ntp_offsets,
+    print_owner_lag_summary,
 )
 
 
@@ -206,3 +210,101 @@ def test_print_ntp_offsets_no_warning_within_5ms(capsys):
     print_ntp_offsets(derived, existing_offsets={"fhost1": 49_000_000})
     out = capsys.readouterr().out
     assert "WARNING" not in out
+
+
+# --- owner-lag probe (ICECC_P50_OWNER_LAG_TRACE) ----------------------------
+#
+# Covers the Round 3 owner-lag diagnostic: the per-second
+# icecream-p50-owner-lag-v1 schema (an asio steady_timer's scheduling lag
+# plus owner-thread CPU time, emitted once a second) and the per-op
+# icecream-p50-owner-lag-op-v1 schema (post_to_start_ns / owner_exec_ns /
+# in_flight_tx per attach/finish_attach/apply_lifecycle call), both written
+# interleaved into the same file named by ICECC_P50_OWNER_LAG_TRACE. See
+# append_owner_lag_second_trace / append_owner_lag_op_trace in
+# cache/p50_cache_service.cpp for the producing side.
+
+def test_load_owner_lag_trace_parses_both_interleaved_schemas(tmp_path):
+    path = tmp_path / "owner_lag.jsonl"
+    path.write_text(
+        '{"schema":"icecream-p50-owner-lag-v1","pid":111,'
+        '"wall_clock_ns":1000000000,"n":50,"max_lag_ns":500000,'
+        '"p99_lag_ns":400000,"owner_cpu_ns":470000000}\n'
+        '{"schema":"icecream-p50-owner-lag-op-v1","pid":111,'
+        '"wall_clock_ns":1000000500,"op":"attach",'
+        '"job_identity_hash":123456789,"post_to_start_ns":20000,'
+        '"owner_exec_ns":5000,"result_status":3,'
+        '"in_flight_tx":false,"in_flight_tx_age_ns":0}\n'
+        # A line from an unrelated schema sharing nothing but valid JSON --
+        # must be silently skipped, not treated as a parse failure.
+        '{"schema":"icecream-p50-source-result-v5","c_store_guid":"g",'
+        '"tu_seq":0}\n'
+        # Malformed JSON -- must be skipped with a warning, not raise.
+        'not even json\n'
+    )
+    seconds, ops = load_owner_lag_trace(str(path))
+    assert len(seconds) == 1
+    assert seconds[0] == OwnerLagSecondSample(
+        pid=111, wall_clock_ns=1_000_000_000, n=50, max_lag_ns=500_000,
+        p99_lag_ns=400_000, owner_cpu_ns=470_000_000)
+    assert len(ops) == 1
+    assert ops[0] == OwnerLagOpSample(
+        pid=111, wall_clock_ns=1_000_000_500, op="attach",
+        job_identity_hash=123456789, post_to_start_ns=20_000,
+        owner_exec_ns=5_000, result_status=3, in_flight_tx=False,
+        in_flight_tx_age_ns=0)
+
+
+def test_print_owner_lag_summary_flags_second_over_one_second(capsys):
+    seconds = [
+        OwnerLagSecondSample(pid=1, wall_clock_ns=1_000_000_000, n=50,
+                              max_lag_ns=200_000, p99_lag_ns=150_000,
+                              owner_cpu_ns=300_000_000),
+        # This second's owner lagged its scheduled 20ms fire by over 1s --
+        # exactly the condition the coordinator asked be flagged.
+        OwnerLagSecondSample(pid=1, wall_clock_ns=2_000_000_000, n=10,
+                              max_lag_ns=1_500_000_000, p99_lag_ns=900_000_000,
+                              owner_cpu_ns=50_000_000),
+    ]
+    print_owner_lag_summary(seconds, ops=[])
+    out = capsys.readouterr().out
+    assert "seconds with max_lag_ns > 1s: 1" in out
+    assert "wall_clock_ns=2000000000" in out
+    assert "max_lag_ns=1500000000" in out
+
+
+def test_print_owner_lag_summary_no_stalls_reports_none(capsys):
+    seconds = [
+        OwnerLagSecondSample(pid=1, wall_clock_ns=1_000_000_000, n=50,
+                              max_lag_ns=200_000, p99_lag_ns=150_000,
+                              owner_cpu_ns=300_000_000),
+    ]
+    print_owner_lag_summary(seconds, ops=[])
+    out = capsys.readouterr().out
+    assert "seconds with max_lag_ns > 1s: none" in out
+
+
+def test_print_owner_lag_summary_handles_no_records(capsys):
+    print_owner_lag_summary([], [])
+    out = capsys.readouterr().out
+    assert "no icecream-p50-owner-lag-v1 records found" in out
+    assert "no icecream-p50-owner-lag-op-v1 records found" in out
+
+
+def test_print_owner_lag_summary_per_op_breakdown_reports_in_flight_tx(capsys):
+    ops = [
+        OwnerLagOpSample(pid=1, wall_clock_ns=1_000_000_000, op="attach",
+                          job_identity_hash=1, post_to_start_ns=10_000,
+                          owner_exec_ns=2_000, result_status=3,
+                          in_flight_tx=False, in_flight_tx_age_ns=0),
+        OwnerLagOpSample(pid=1, wall_clock_ns=1_000_000_100,
+                          op="apply_lifecycle", job_identity_hash=1,
+                          post_to_start_ns=15_000, owner_exec_ns=3_000,
+                          result_status=0, in_flight_tx=True,
+                          in_flight_tx_age_ns=4_000_000_000),
+    ]
+    print_owner_lag_summary(seconds=[], ops=ops)
+    out = capsys.readouterr().out
+    assert "attach: n=1" in out
+    assert "apply_lifecycle: n=1" in out
+    assert "in_flight_tx: 1/1 had a concurrent attach/finish window open" in out
+    assert "in_flight_tx: none observed" in out

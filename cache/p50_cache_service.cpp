@@ -3,6 +3,7 @@
 #include "p50_input_fd_attachment.h"
 #include "services/comm.h"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cerrno>
@@ -393,6 +394,159 @@ void append_terminal_lifecycle_test_trace(
         return;
 
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
+// --- owner-lag diagnostic probe (ICECC_P50_OWNER_LAG_TRACE) ---------------
+//
+// Round-3 diagnostic for the sidecar retirement cascade: lifecycle RPCs
+// (attach_input_on_owner / finish_input_attachment_on_owner /
+// apply_input_lifecycle_on_owner, all above) are posted onto the single
+// owner io_context (SidecarRuntime::context_, serviced only by
+// endpoint_owner_thread_ via endpoint_owner_loop) and must complete inside
+// InputLifecycleRegistry's input_lifecycle_timeout; missing it drops the
+// reply and the daemon retires the whole sidecar on Timeout/Disconnected.
+// This probe answers "is the owner CPU-starved or just stalled on
+// something" without changing any behavior: a 20 ms steady_timer measures
+// how late its own fire is (owner scheduling lag) and samples the owner
+// thread's own CPU time between fires (owner_cpu_ns), and the three
+// lifecycle functions record how long their work sat between asio::post()
+// and the posted lambda actually starting (post_to_start_ns) versus how
+// long the lambda itself then ran (owner_exec_ns). Both are no-ops --
+// nothing is even measured, let alone written -- unless the env var names
+// a file.
+bool owner_lag_trace_enabled() noexcept {
+    const char* path = ::getenv("ICECC_P50_OWNER_LAG_TRACE");
+    return path != nullptr && *path != '\0';
+}
+
+// Same FNV-1a convention tools/stagetrace/analyze.py already uses for path
+// hashing: a short, stable, non-reversible job identity so per-op trace
+// lines don't need to print a raw store GUID on every line.
+uint64_t fnv1a_input_record_key(const InputRecordKey& key) noexcept {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const uint8_t byte : key.c_store_guid.bytes) {
+        hash ^= byte;
+        hash *= 0x100000001b3ULL;
+    }
+    uint64_t tu_seq = key.tu_seq.value;
+    for (int i = 0; i < 8; ++i) {
+        hash ^= static_cast<uint8_t>(tu_seq & 0xff);
+        hash *= 0x100000001b3ULL;
+        tu_seq >>= 8;
+    }
+    return hash;
+}
+
+// One record per second while ICECC_P50_OWNER_LAG_TRACE is set, fed by
+// SidecarRuntime::arm_owner_lag_timer's 20 ms steady_timer. max_lag_ns /
+// p99_lag_ns summarize that second's (actual_fire - scheduled_fire)
+// samples; owner_cpu_ns is that second's CLOCK_THREAD_CPUTIME_ID delta on
+// endpoint_owner_thread_. Companion to append_owner_lag_op_trace below;
+// wall_clock_ns on both lines lets them be correlated offline.
+void append_owner_lag_second_trace(uint64_t wall_clock_ns, uint64_t n,
+                                    int64_t max_lag_ns, int64_t p99_lag_ns,
+                                    int64_t owner_cpu_ns) noexcept {
+    const char* path = ::getenv("ICECC_P50_OWNER_LAG_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    char line[512];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-owner-lag-v1\","
+        "\"pid\":%lld,\"wall_clock_ns\":%llu,\"n\":%llu,"
+        "\"max_lag_ns\":%lld,\"p99_lag_ns\":%lld,"
+        "\"owner_cpu_ns\":%lld}\n",
+        static_cast<long long>(::getpid()),
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<unsigned long long>(n),
+        static_cast<long long>(max_lag_ns),
+        static_cast<long long>(p99_lag_ns),
+        static_cast<long long>(owner_cpu_ns));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
+// One record per lifecycle op (attach / finish_attach / apply_lifecycle)
+// while ICECC_P50_OWNER_LAG_TRACE is set. post_to_start_ns is the time
+// between the owning call's asio::post(context_, ...) and the posted lambda
+// actually starting to run on endpoint_owner_thread_; owner_exec_ns is how
+// long that lambda body then took. in_flight_tx / in_flight_tx_age_ns report
+// whether this exact key had an open local attach/finish window at the
+// time (see SidecarRuntime::owner_lag_tx_inflight_) and for how long --
+// splitting "waiting to be scheduled" from "the task itself ran long" from
+// "blocked behind something else holding this input" settles whether the
+// owner thread is CPU-starved, running long tasks, or stalled.
+void append_owner_lag_op_trace(std::string_view op, const InputRecordKey& key,
+                                int64_t post_to_start_ns,
+                                int64_t owner_exec_ns, uint32_t result_status,
+                                bool in_flight_tx,
+                                int64_t in_flight_tx_age_ns) noexcept {
+    const char* path = ::getenv("ICECC_P50_OWNER_LAG_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    uint64_t wall_clock_ns = 0;
+    {
+        struct timespec wall_ts{};
+        if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+            wall_clock_ns = static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                            static_cast<uint64_t>(wall_ts.tv_nsec);
+    }
+    const uint64_t job_identity_hash = fnv1a_input_record_key(key);
+    char line[640];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-owner-lag-op-v1\","
+        "\"pid\":%lld,\"wall_clock_ns\":%llu,\"op\":\"%.*s\","
+        "\"job_identity_hash\":%llu,"
+        "\"post_to_start_ns\":%lld,\"owner_exec_ns\":%lld,"
+        "\"result_status\":%u,"
+        "\"in_flight_tx\":%s,\"in_flight_tx_age_ns\":%lld}\n",
+        static_cast<long long>(::getpid()),
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<int>(op.size()), op.data(),
+        static_cast<unsigned long long>(job_identity_hash),
+        static_cast<long long>(post_to_start_ns),
+        static_cast<long long>(owner_exec_ns), result_status,
+        in_flight_tx ? "true" : "false",
+        static_cast<long long>(in_flight_tx_age_ns));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                          0600);
     if (fd < 0)
         return;
     size_t offset = 0;
@@ -1565,6 +1719,11 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
           config_.endpoint_config.owner_limits.max_retained_input_records,
           config_.max_input_lifecycle_replays),
       endpoint_work_guard_(asio::make_work_guard(context_)),
+      // Round-3 owner-lag diagnostic: resolved once at construction so the
+      // flag is const and every later check is a plain bool read. See the
+      // owner-lag block near SidecarRuntime's declaration for what this
+      // gates (nothing on the production path when unset).
+      owner_lag_trace_enabled_(owner_lag_trace_enabled()),
       // One C sidecar may serve twenty persistent relationships, with two
       // compile slots per F.  Keep the operation table bounded while leaving
       // room for every concurrently admitted C/F session (40) plus control
@@ -1649,7 +1808,72 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
         } catch (...) {
         }
     }
+    if (owner_lag_trace_enabled_)
+        asio::post(context_, [this] { arm_owner_lag_timer(); });
     endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
+}
+
+// Round-3 owner-lag probe (ICECC_P50_OWNER_LAG_TRACE). Runs only when
+// owner_lag_trace_enabled_ is true, in which case it is first posted from
+// the constructor and thereafter reschedules itself every 20 ms on
+// context_, i.e. always on endpoint_owner_thread_ -- the same thread whose
+// scheduling lateness and CPU time this measures, so no cross-thread clock
+// access is needed. See append_owner_lag_second_trace above for what gets
+// emitted once per second.
+void SidecarRuntime::arm_owner_lag_timer() noexcept {
+    if (stop_requested_.load(std::memory_order_acquire))
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (owner_lag_timer_scheduled_ == std::chrono::steady_clock::time_point{}) {
+        owner_lag_timer_scheduled_ = now;
+        owner_lag_second_started_ = now;
+        struct timespec cpu_ts{};
+        if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_ts) == 0)
+            owner_lag_prev_cpu_ns_ =
+                static_cast<int64_t>(cpu_ts.tv_sec) * 1000000000LL + cpu_ts.tv_nsec;
+    }
+    owner_lag_timer_scheduled_ += std::chrono::milliseconds(20);
+    owner_lag_timer_.expires_at(owner_lag_timer_scheduled_);
+    owner_lag_timer_.async_wait([this](const boost::system::error_code& error) {
+        if (error || stop_requested_.load(std::memory_order_acquire))
+            return;
+        const auto fire_time = std::chrono::steady_clock::now();
+        const int64_t lag_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            fire_time - owner_lag_timer_scheduled_).count();
+        owner_lag_second_samples_.push_back(lag_ns);
+        owner_lag_second_n_ += 1;
+        if (lag_ns > owner_lag_second_max_ns_)
+            owner_lag_second_max_ns_ = lag_ns;
+        if (fire_time - owner_lag_second_started_ >= std::chrono::seconds(1)) {
+            struct timespec cpu_ts{};
+            int64_t cpu_now_ns = owner_lag_prev_cpu_ns_;
+            if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_ts) == 0)
+                cpu_now_ns = static_cast<int64_t>(cpu_ts.tv_sec) * 1000000000LL +
+                             cpu_ts.tv_nsec;
+            const int64_t owner_cpu_ns = cpu_now_ns - owner_lag_prev_cpu_ns_;
+            owner_lag_prev_cpu_ns_ = cpu_now_ns;
+            std::sort(owner_lag_second_samples_.begin(),
+                      owner_lag_second_samples_.end());
+            const size_t count = owner_lag_second_samples_.size();
+            const size_t p99_index = count == 0 ? 0 : (count * 99) / 100;
+            const int64_t p99_lag_ns =
+                count == 0 ? 0
+                           : owner_lag_second_samples_[std::min(p99_index, count - 1)];
+            struct timespec wall_ts{};
+            uint64_t wall_clock_ns = 0;
+            if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+                wall_clock_ns = static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                                static_cast<uint64_t>(wall_ts.tv_nsec);
+            append_owner_lag_second_trace(wall_clock_ns, owner_lag_second_n_,
+                                           owner_lag_second_max_ns_, p99_lag_ns,
+                                           owner_cpu_ns);
+            owner_lag_second_started_ = fire_time;
+            owner_lag_second_n_ = 0;
+            owner_lag_second_max_ns_ = 0;
+            owner_lag_second_samples_.clear();
+        }
+        arm_owner_lag_timer();
+    });
 }
 
 std::ptrdiff_t SidecarRuntime::RouteGate::armed_window_slots() noexcept {
@@ -2694,28 +2918,52 @@ std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
         return std::nullopt;
     auto completion = std::make_shared<std::promise<std::optional<InputCursor>>>();
     std::future<std::optional<InputCursor>> result = completion->get_future();
+    const auto post_time = std::chrono::steady_clock::now();
     try {
-        asio::post(context_, [this, request, deadline, completion] {
+        asio::post(context_, [this, request, deadline, completion, post_time] {
+            const auto owner_start = std::chrono::steady_clock::now();
+            // Diagnostic-only (owner_lag_trace_enabled_) result_status for
+            // append_owner_lag_op_trace: 0=rejected (stop/deadline),
+            // 1=begin_attachment refused, 2=exception during attach,
+            // 3=attached. Coarse by design -- it never feeds back into
+            // control flow below, only into the trace line.
+            uint32_t result_status = 0;
             if (stop_requested_.load(std::memory_order_acquire) ||
                 std::chrono::steady_clock::now() >= deadline) {
                 completion->set_value(std::nullopt);
-                return;
-            }
-            try {
-                if (!input_lifecycle_.begin_attachment(
-                        request.key, request.owner, request.request_id)) {
-                    completion->set_value(std::nullopt);
-                    return;
-                }
+            } else {
                 try {
-                    completion->set_value(endpoint_->attach_input(request.key));
+                    if (!input_lifecycle_.begin_attachment(
+                            request.key, request.owner, request.request_id)) {
+                        result_status = 1;
+                        completion->set_value(std::nullopt);
+                    } else {
+                        try {
+                            auto cursor = endpoint_->attach_input(request.key);
+                            result_status = 3;
+                            completion->set_value(std::move(cursor));
+                        } catch (...) {
+                            input_lifecycle_.finish_attachment(
+                                request.key, request.owner, request.request_id, false);
+                            throw;
+                        }
+                    }
                 } catch (...) {
-                    input_lifecycle_.finish_attachment(
-                        request.key, request.owner, request.request_id, false);
-                    throw;
+                    result_status = 2;
+                    completion->set_value(std::nullopt);
                 }
-            } catch (...) {
-                completion->set_value(std::nullopt);
+            }
+            if (owner_lag_trace_enabled_) {
+                const auto now = std::chrono::steady_clock::now();
+                if (result_status == 3)
+                    owner_lag_tx_inflight_[request.key] = owner_start;
+                append_owner_lag_op_trace(
+                    "attach", request.key,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        owner_start - post_time).count(),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - owner_start).count(),
+                    result_status, false, 0);
             }
         });
     } catch (...) {
@@ -2737,13 +2985,34 @@ void SidecarRuntime::finish_input_attachment_on_owner(
         return;
     auto completion = std::make_shared<std::promise<void>>();
     std::future<void> result = completion->get_future();
+    const auto post_time = std::chrono::steady_clock::now();
     try {
-        asio::post(context_, [this, request, authorized, completion] {
+        asio::post(context_, [this, request, authorized, completion, post_time] {
+            const auto owner_start = std::chrono::steady_clock::now();
             input_lifecycle_.finish_attachment(
                 request.key, request.owner, request.request_id, authorized);
             try {
                 endpoint_->collect_input_garbage();
             } catch (...) {
+            }
+            if (owner_lag_trace_enabled_) {
+                bool in_flight = false;
+                int64_t in_flight_age_ns = 0;
+                const auto inflight_it = owner_lag_tx_inflight_.find(request.key);
+                if (inflight_it != owner_lag_tx_inflight_.end()) {
+                    in_flight = true;
+                    in_flight_age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        owner_start - inflight_it->second).count();
+                    owner_lag_tx_inflight_.erase(inflight_it);
+                }
+                const auto now = std::chrono::steady_clock::now();
+                append_owner_lag_op_trace(
+                    "finish_attach", request.key,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        owner_start - post_time).count(),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - owner_start).count(),
+                    authorized ? 1u : 0u, in_flight, in_flight_age_ns);
             }
             completion->set_value();
         });
@@ -2768,14 +3037,38 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
     auto completion =
         std::make_shared<std::promise<InputLifecycleApplyStatus>>();
     std::future<InputLifecycleApplyStatus> result = completion->get_future();
+    const auto post_time = std::chrono::steady_clock::now();
     try {
-        asio::post(context_, [this, request, completion] {
+        asio::post(context_, [this, request, completion, post_time] {
+            const auto owner_start = std::chrono::steady_clock::now();
+            const auto emit_op_trace = [this, &request, owner_start, post_time](
+                                            InputLifecycleApplyStatus status) {
+                if (!owner_lag_trace_enabled_)
+                    return;
+                bool in_flight = false;
+                int64_t in_flight_age_ns = 0;
+                const auto inflight_it = owner_lag_tx_inflight_.find(request.key);
+                if (inflight_it != owner_lag_tx_inflight_.end()) {
+                    in_flight = true;
+                    in_flight_age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        owner_start - inflight_it->second).count();
+                }
+                const auto now = std::chrono::steady_clock::now();
+                append_owner_lag_op_trace(
+                    "apply_lifecycle", request.key,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        owner_start - post_time).count(),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - owner_start).count(),
+                    static_cast<uint32_t>(status), in_flight, in_flight_age_ns);
+            };
             const P50ServerOwnerUsage before = endpoint_->owner_usage();
             InputLifecycleApplyResult decision =
                 input_lifecycle_.begin_apply(request);
             if (decision.status != InputLifecycleApplyStatus::Applied) {
                 append_terminal_lifecycle_test_trace(
                     request, decision.status, before, endpoint_->owner_usage());
+                emit_op_trace(decision.status);
                 completion->set_value(decision.status);
                 return;
             }
@@ -2826,6 +3119,7 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
             }
             append_terminal_lifecycle_test_trace(
                 request, status, before, endpoint_->owner_usage());
+            emit_op_trace(status);
             completion->set_value(status);
         });
     } catch (...) {
