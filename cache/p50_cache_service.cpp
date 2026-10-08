@@ -2046,6 +2046,66 @@ uint32_t SidecarRuntime::RouteGate::route_lane_count(
     return requested;
 }
 
+uint32_t SidecarRuntime::RouteGate::route_pipeline_depth(
+    uint32_t cache_profile) noexcept {
+    const char* raw = ::getenv("ICECC_P50_ROUTE_PIPELINE_DEPTH");
+    uint32_t requested = 1;
+    if (raw != nullptr && *raw != '\0') {
+        char* end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end != raw && *end == '\0' && parsed > 0)
+            requested = static_cast<uint32_t>(parsed);
+    }
+    if (requested <= 1)
+        return 1;
+
+    // SAFETY GATE: no F-side sequencer exists yet (design doc, step 5), so
+    // a request above 1 stays inert outside this step's own tests.
+    const char* unsafe =
+        ::getenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE");
+    const bool test_unsafe =
+        unsafe != nullptr && *unsafe != '\0' && std::strcmp(unsafe, "0") != 0;
+    if (!test_unsafe) {
+        std::fprintf(stderr,
+                     "P50_ROUTE_PIPELINE_DEPTH_CLAMPED requested=%u "
+                     "reason=no-f-sequencer clamped_to=1\n",
+                     requested);
+        std::fflush(stderr);
+        return 1;
+    }
+
+    uint32_t depth = requested;
+    if (depth > kMaxPipelineDepth) {
+        std::fprintf(stderr,
+                     "P50_ROUTE_PIPELINE_DEPTH_CLAMPED requested=%u "
+                     "reason=max clamped_to=%u\n",
+                     requested, kMaxPipelineDepth);
+        std::fflush(stderr);
+        depth = kMaxPipelineDepth;
+    }
+    const std::ptrdiff_t window = armed_window_slots();
+    if (window > 0 && depth > static_cast<uint32_t>(window)) {
+        std::fprintf(stderr,
+                     "P50_ROUTE_PIPELINE_DEPTH_CLAMPED requested=%u "
+                     "reason=window window=%lld clamped_to=%lld\n",
+                     requested, static_cast<long long>(window),
+                     static_cast<long long>(window));
+        std::fflush(stderr);
+        depth = static_cast<uint32_t>(window);
+    }
+    if (cache_profile != CACHE_PROFILE_P29V1) {
+        if (depth > 1) {
+            std::fprintf(stderr,
+                         "P50_ROUTE_PIPELINE_DEPTH_CLAMPED requested=%u "
+                         "reason=profile clamped_to=1\n",
+                         requested);
+            std::fflush(stderr);
+        }
+        depth = 1;
+    }
+    return depth;
+}
+
 local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     local::P50SourceTransferRequest request,
     sidecar::AbsoluteMonotonicDeadline deadline,
@@ -2112,9 +2172,28 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         try {
             auto& gate = source_route_gates_[RouteEndpointKey{
                 request.selected_f_host, request.selected_f_cache_port}];
-            if (!gate)
-                gate = std::make_shared<RouteGate>(RouteGate::route_lane_count(
-                    config_.endpoint_config.owner_limits.max_live_sessions));
+            if (!gate) {
+                const uint32_t pipeline_depth =
+                    RouteGate::route_pipeline_depth(request.cache_profile);
+                uint32_t lane_count = RouteGate::route_lane_count(
+                    config_.endpoint_config.owner_limits.max_live_sessions);
+                // Pipelining and lanes would both multiply this route's
+                // armed F-session budget; combining them is out of scope
+                // (design doc's settled decisions), so a pipelined route is
+                // forced back to one lane even if ICECC_P50_ROUTE_LANES
+                // also asked for more. pipeline_depth is 1 by default (and
+                // always 1 without the step-1 test-only safety-gate env
+                // var), so this is a no-op today.
+                if (pipeline_depth > 1 && lane_count > 1) {
+                    std::fprintf(stderr,
+                                 "P50_ROUTE_LANES_CLAMPED requested=%u "
+                                 "reason=pipeline-depth clamped_to=1\n",
+                                 lane_count);
+                    std::fflush(stderr);
+                    lane_count = 1;
+                }
+                gate = std::make_shared<RouteGate>(lane_count);
+            }
             route_gate = gate;
         } catch (...) {
             return source_transfer_error(4);
