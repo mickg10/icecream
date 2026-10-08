@@ -232,3 +232,142 @@ prototyped as a result; the instrumentation added to make this
 determination is kept (see Candidate ledger context above) since it is
 zero-cost when its macros are off and may be useful for future
 measurement rounds.
+
+## Infra finding: Decision 4's stage timers never actually fired
+
+Before any new data in this section can be trusted, a build-tooling
+defect has to be called out plainly: **the stage-timer macro never
+reached the library build in either this round's new instrumentation or
+the prior Decision 4 round.** `cache/Makefile`/`services/Makefile` are
+autoconf/automake-generated and both hardcode `CXX = g++` as a plain
+assignment. Per ordinary `make` precedence rules, a plain assignment
+inside a Makefile silently overrides an inherited `CXX` environment
+variable (short of `make -e`). The bench build script sets the
+macro-injecting compiler wrapper only via the `CXX` environment
+variable before invoking `make -C <lib dir> ...`, so that step always
+quietly fell back to plain `g++` with none of the stage-timer macros
+defined — while the final link step (invoked directly, not through
+`make`) did see the wrapper correctly. Net effect: every stage-timer
+call site inside the library-built translation units compiled to
+nothing, and the one translation unit that did see the macro
+(`p50sim.cpp` itself) held a counter array that nothing ever
+incremented. Every `p29v1_codec_stage_ns` field in every prior batch
+file, including Decision 4's `d4.jsonl`, reads back as exactly zero —
+confirmed directly on the raw JSON, not just through the analysis
+scripts. **Decision 4's own conclusion is unaffected**, because it was
+reached from the reserve-call's own dedicated timer and allocation
+counter, which are a different code path and were unaffected by this.
+But any implied claim that the surrounding `sender_intern_and_match_ns`/
+`sender_encode_ns` figures quoted there reflected real measurement
+should be read as not measured, not as measured-and-small.
+
+**Fix applied for this round, no tracked file touched:** the same two
+`make` steps were re-run with `CXX=<wrapper>` passed as a `make`
+command-line variable assignment instead of an environment variable —
+highest precedence, correctly overrides the Makefile's own plain
+assignment — after forcing a rebuild (stale `.a` outputs removed,
+sources touched to defeat `make`'s up-to-date check). Confirmed via `nm`
+that the stage-timer hook symbol is now actually referenced in the
+rebuilt library. Full wire/digest identity (60/60 against the existing
+reference batch, matching `raw_digest`/`state_before_digest`/
+`state_digest`/`transaction_digest` row-for-row) was re-verified before
+trusting any of the numbers below. **Recommendation for the build script
+itself** (not applied here, since it is not one of this branch's three
+sim-only-instrumentation files): pass `CXX=` as a `make` command-line
+argument rather than relying on environment inheritance, so this class
+of defect cannot recur silently for any future stage-timer or
+allocation-counter work that touches the library build.
+
+## C-side candidate: SenderEncode sub-stage split (Decision 5)
+
+Scope: C's `SenderEncode` stage (the whole body of the P29 serializer's
+per-TU encode call) runs at roughly 4.3-4.5 ms p50 for a ~3-70 KB output.
+Four new sim-only sub-stage timers were added inside it to find where
+that time goes: match-prepare, root-walk, root-frame-encode, and
+block-frame-encode. All four are purely additive measurement — same
+gating discipline as every other stage timer in this report, confined to
+the same three files, zero effect on the wire when the macro is off.
+
+With the infra fix above in place, the real split (pooled across three
+measurement shapes — single pass, 5x interleaved solo, 8-way concurrent;
+n=840 total) is:
+
+| Sub-stage | p50 | p90 | Share of `SenderEncode` |
+|---|---|---|---|
+| match-prepare | ~3.7-3.9 ms | — | **~85-90%** |
+| root-walk | ~0.18 ms | — | ~4% |
+| root-frame-encode | ~0.03 ms | — | <1% |
+| block-frame-encode | ~0.04 ms | — | ~1% |
+| (root-walk + root-frame-encode + block-frame-encode) / `SenderEncode` | 0.060 | 0.086 | ~6% combined |
+
+The sum of all four sub-stages tracks `SenderEncode`'s own measured time
+closely (e.g. 3.7 + 0.18 + 0.03 + 0.04 ≈ 3.95 ms against a measured
+`SenderEncode` p50 of 4.39 ms for the single-pass shape), so the split is
+internally consistent and not an artifact of double-counting or a
+missing stage.
+
+**Where the time actually goes:** match-prepare is the one call that
+asks the per-route matcher to build its plan for the current TU — a
+hash-chain-based longest-previous-factor search over the TU's full
+occurrence sequence (bounded chain depth per position, minimum match
+length 3, over a multi-million-bucket hash table). The three stages
+originally expected to matter most (serializing the resulting plan into
+wire tags, and the two one-shot compress calls) are confirmed cheap: a
+plain forward walk over an already-built plan, and two one-shot
+compress calls over small inputs. **The original hypothesis in the
+governing task — that region serialization, literal gathering, compress,
+and frame build would divide up the 4 ms — is not what the data shows.**
+Literal gathering and the streaming compress of the literal/control
+streams run entirely outside this call's scope (a separate call, outside
+the per-TU encode path), so they are correctly absent from this split.
+
+This stage is distinct from the pre-existing `sender_intern_and_match_ns`
+stage (p50 ~5.5 ms, outside this call's scope entirely): that one wraps a
+separate interning call against a shared/global catalogue; this one is
+the per-route selected matcher's own search over the same kind of input,
+run a second time for a different purpose (building the actual plan this
+route will encode). Both are instances of the same underlying
+hash-chain search; they are not literally duplicate work on identical
+inputs, but they are the same expensive operation run twice, for two
+different reasons, on every TU.
+
+**Candidate proposed for a future A/B round (not implemented or
+measured this round):** vectorize the longest-common-run comparison
+loop inside the per-route matcher's candidate walk — the loop that, for
+each hash-chain candidate, extends a tentative match length one unit at
+a time until a mismatch or the TU's end is reached. Replacing the
+scalar one-unit-at-a-time comparison with a wide (SIMD or word-at-a-time)
+equality scan that still stops at the first true mismatch is a strict
+drop-in: it computes exactly the same best-length/best-source winner at
+every tie, so the resulting plan — and therefore every byte this call
+puts on the wire — is unchanged by construction, not just unchanged by
+re-verification. This is the only sub-stage with enough share of the
+budget (~85-90%) for a win there to move `SenderEncode`'s wall time
+meaningfully. A secondary, much lower-confidence candidate also worth a
+cheap try in the same round: a one-ahead software prefetch of the next
+hash-chain candidate before touching the current one, since the chain
+walk is a scattered pointer-chasing access pattern over
+multi-megabyte-scale tables; same "produces an identical decision"
+argument applies, since prefetch has no effect on program semantics.
+**Explicitly out of scope / disqualified:** lowering the matcher's
+maximum chain depth would also cut this stage's cost, but it changes
+*which* matches get found, which changes `plan.root` and therefore the
+wire bytes — it fails the byte-identical requirement outright and is not
+a candidate under this report's rules.
+
+## Reverse-direction size check: `f_to_c_bytes` p99 exceeds expectation
+
+Requested alongside the above: `f_to_c_bytes` (the reverse-direction
+payload size) across the 60-TU corpus does **not** stay under the ~14 KB
+ceiling expected going into this round. Observed p99 across the three
+measurement shapes ranges **~47,486-56,109 bytes** (max 56,109 bytes) —
+roughly 3.5-4x the expected ceiling. This is a straightforward
+reconfirmation of a finding already in hand before this round's build-fix
+work (the fix only affected the stage-timer fields, not the byte-count
+fields, which were never affected by the Makefile defect since they come
+from the wire payloads themselves, not from the stage-timer counters).
+Flagging prominently rather than folding into the headline table above,
+since it contradicts an explicit expectation in the governing task and
+is a direct answer to "report `f_to_c` bytes p99 ... to check the reverse
+direction never exceeds ~14 KB": by this corpus's measurement, it does
+exceed it, by a wide margin, consistently across shapes.

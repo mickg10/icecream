@@ -112,7 +112,7 @@ void operator delete[](void* value, std::size_t, std::align_val_t) noexcept {
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
 namespace {
 // Must match the ordering of codec::p29_wire_detail::P29StageTimerEntry.
-constexpr unsigned p50sim_p29_stage_timer_entry_count = 9;
+constexpr unsigned p50sim_p29_stage_timer_entry_count = 13;
 std::array<std::atomic<uint64_t>, p50sim_p29_stage_timer_entry_count>
     p50sim_p29_stage_timer_ns{};
 }  // namespace
@@ -133,7 +133,7 @@ namespace {
 // concurrent uses of RUSAGE_THREAD; stored as int64_t so fetch_add on a
 // std::atomic<int64_t> handles that without wrapping the way an unsigned
 // subtraction would.
-constexpr unsigned p50sim_p29_stage_minflt_entry_count = 9;
+constexpr unsigned p50sim_p29_stage_minflt_entry_count = 13;
 std::array<std::atomic<int64_t>, p50sim_p29_stage_minflt_entry_count>
     p50sim_p29_stage_minflt{};
 }  // namespace
@@ -1025,9 +1025,9 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      std::optional<uint64_t> p29v1_codec_allocations,
                      std::optional<std::array<uint64_t, 10>>
                          p29v1_codec_allocation_entries,
-                     std::optional<std::array<uint64_t, 9>>
+                     std::optional<std::array<uint64_t, 13>>
                          p29v1_codec_stage_ns,
-                     std::optional<std::array<int64_t, 9>>
+                     std::optional<std::array<int64_t, 13>>
                          p29v1_codec_stage_minflt,
                      std::optional<int64_t> anon_hugepages_delta_kb,
                      const std::optional<std::string>& c_to_f_sha256,
@@ -1160,12 +1160,14 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         output << '}';
     }
     if (p29v1_codec_stage_ns) {
-        static constexpr std::array<std::string_view, 9> stage_names{
+        static constexpr std::array<std::string_view, 13> stage_names{
             "receiver_receive_fill_ns", "receiver_take_materialized_ns",
             "receiver_materialized_digest_ns", "receiver_transaction_digest_ns",
             "receiver_pending_segment_digest_ns", "sender_intern_and_match_ns",
             "sender_encode_ns", "receiver_materialize_copyback_ns",
-            "sender_prepare_reserve_ns"};
+            "sender_prepare_reserve_ns", "sender_match_prepare_ns",
+            "sender_build_root_ns", "sender_encode_root_ns",
+            "sender_encode_blocks_ns"};
         output << ",\"p29v1_codec_stage_ns\":{";
         for (size_t index = 0; index != stage_names.size(); ++index) {
             if (index != 0)
@@ -1176,14 +1178,16 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         output << '}';
     }
     if (p29v1_codec_stage_minflt) {
-        static constexpr std::array<std::string_view, 9> stage_names{
+        static constexpr std::array<std::string_view, 13> stage_names{
             "receiver_receive_fill_minflt", "receiver_take_materialized_minflt",
             "receiver_materialized_digest_minflt",
             "receiver_transaction_digest_minflt",
             "receiver_pending_segment_digest_minflt",
             "sender_intern_and_match_minflt", "sender_encode_minflt",
             "receiver_materialize_copyback_minflt",
-            "sender_prepare_reserve_minflt"};
+            "sender_prepare_reserve_minflt", "sender_match_prepare_minflt",
+            "sender_build_root_minflt", "sender_encode_root_minflt",
+            "sender_encode_blocks_minflt"};
         output << ",\"p29v1_codec_stage_minflt\":{";
         for (size_t index = 0; index != stage_names.size(); ++index) {
             if (index != 0)
@@ -1435,7 +1439,7 @@ void run_batch(const Arguments& arguments) {
             }
 #endif
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
-            std::optional<std::array<uint64_t, 9>> p29v1_codec_stage_ns;
+            std::optional<std::array<uint64_t, 13>> p29v1_codec_stage_ns;
             p29v1_codec_stage_ns.emplace();
             for (size_t entry = 0; entry != p29v1_codec_stage_ns->size();
                  ++entry) {
@@ -1446,10 +1450,10 @@ void run_batch(const Arguments& arguments) {
                     entry_after - p29v1_codec_stage_ns_before[entry];
             }
 #else
-            std::optional<std::array<uint64_t, 9>> p29v1_codec_stage_ns;
+            std::optional<std::array<uint64_t, 13>> p29v1_codec_stage_ns;
 #endif
 #if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
-            std::optional<std::array<int64_t, 9>> p29v1_codec_stage_minflt;
+            std::optional<std::array<int64_t, 13>> p29v1_codec_stage_minflt;
             p29v1_codec_stage_minflt.emplace();
             for (size_t entry = 0; entry != p29v1_codec_stage_minflt->size();
                  ++entry) {
@@ -1460,7 +1464,7 @@ void run_batch(const Arguments& arguments) {
                     entry_after - p29v1_codec_stage_minflt_before[entry];
             }
 #else
-            std::optional<std::array<int64_t, 9>> p29v1_codec_stage_minflt;
+            std::optional<std::array<int64_t, 13>> p29v1_codec_stage_minflt;
 #endif
 #if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
             std::optional<int64_t> anon_hugepages_delta_kb;
