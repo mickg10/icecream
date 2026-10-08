@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -232,6 +233,39 @@ private:
     };
     using Records =
         std::unordered_map<InputRecordKey, Entry, InputRecordKeyHash>;
+
+#if defined(ICECC_P50_INPUT_RECORD_TEST_HOOKS)
+public:
+    // Compile-time-only seam: insert an already-closed record directly,
+    // bypassing publish()'s digest/transaction validation, so unit tests can
+    // supply a backing with a deliberately slow custom deleter and observe
+    // collect_garbage()'s graveyard-deferral behavior without touching any
+    // production validation path. Performs the same retained_bytes_
+    // accounting the product publish path performs. The installed library is
+    // built without this macro and never exposes this insertion outside
+    // tests.
+    void test_only_insert_closed_record(
+        InputRecordKey key, uint64_t raw_bytes,
+        std::shared_ptr<const std::vector<uint8_t>> backing) {
+        if (records_.size() >= max_records_)
+            throw std::length_error("InputRecordStore record limit exceeded");
+        if (raw_bytes > max_retained_bytes_ - retained_bytes_)
+            throw std::length_error("InputRecordStore byte limit exceeded");
+        Entry entry;
+        entry.raw_bytes = raw_bytes;
+        entry.backing = std::move(backing);
+        entry.logical_job_open = false;
+        const auto [position, inserted] =
+            records_.emplace(key, std::move(entry));
+        (void)position;
+        if (!inserted)
+            throw std::logic_error(
+                "test_only_insert_closed_record: duplicate key");
+        retained_bytes_ += raw_bytes;
+    }
+
+private:
+#endif
 
     static void validate_commit_identity(const TxBegin& begin,
                                          const TxCommit& commit,
