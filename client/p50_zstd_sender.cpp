@@ -41,6 +41,21 @@ bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration
            deadline - now <= maximum_duration;
 }
 
+// Marks *flag true for the lifetime of the coroutine frame that constructs
+// it, regardless of how that frame exits (normal co_return, exception, or
+// cancellation-driven unwind): the local object is destroyed exactly once
+// when the frame itself is destroyed. Used to give transfer_in_flight() an
+// accurate view of whether transfer_bytes() is currently running.
+struct InFlightGuard {
+    explicit InFlightGuard(bool* flag) noexcept : flag_(flag) { *flag_ = true; }
+    ~InFlightGuard() { *flag_ = false; }
+    InFlightGuard(const InFlightGuard&) = delete;
+    InFlightGuard& operator=(const InFlightGuard&) = delete;
+
+private:
+    bool* flag_;
+};
+
 bool route_history_profile(ProfileId profile) noexcept {
     return profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_ROUTE;
 }
@@ -383,6 +398,10 @@ struct P50ZstdSourceSender::Impl {
     bool used = false;
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
+    // Set for the entire duration of one transfer_bytes() coroutine call,
+    // across every co_await suspension; see InFlightGuard above and
+    // P50ZstdSourceSender::transfer_in_flight().
+    bool transfer_in_flight = false;
 };
 
 P50ZstdSourceSender::P50ZstdSourceSender(CStoreGuid c_store_guid,
@@ -398,6 +417,10 @@ P50ZstdSourceSender::P50ZstdSourceSender(
                                    std::move(config))) {}
 
 P50ZstdSourceSender::~P50ZstdSourceSender() = default;
+
+bool P50ZstdSourceSender::transfer_in_flight() const noexcept {
+    return impl_->transfer_in_flight;
+}
 
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
@@ -530,6 +553,7 @@ P50ZstdSourceSender::transfer_bytes(
     std::shared_ptr<const std::vector<uint8_t>> source,
     std::optional<Digest128> known_digest,
     std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+    InFlightGuard in_flight_guard(&impl_->transfer_in_flight);
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||

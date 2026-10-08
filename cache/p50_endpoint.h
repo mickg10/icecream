@@ -351,6 +351,18 @@ public:
     // C-wide immutable catalogue or TU allocator.
     [[nodiscard]] bool reset_route(PreparationRouteKey route) noexcept;
 
+    // Force variant for a route whose F incarnation is provably dead: used
+    // only when the caller has independently proven (via f_store_generation)
+    // that this route's F incarnation can never be observed again, so any
+    // still-live Entry here was orphaned by a sender that already reached a
+    // terminal transfer outcome without releasing its handle. Unconditionally
+    // erases every live Entry for this route plus the route state itself,
+    // bypassing the live-reference check reset_route() performs. Callers
+    // must not call this while that sender's transfer is still in flight; see
+    // P50CRouteOwner::reset_f_store_exact and P50ZstdSourceSender::
+    // transfer_in_flight for the full argument.
+    [[nodiscard]] bool discard_route(PreparationRouteKey route) noexcept;
+
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
     void validate_begin(const TxBegin& begin) const;

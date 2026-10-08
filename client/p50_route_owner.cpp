@@ -194,6 +194,59 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     co_return result;
 }
 
+// --- Design note: safe force-discard of a superseded F incarnation --------
+//
+// Problem: every non-Committed exit of P50ZstdSourceSender::transfer_bytes
+// (RetryExhausted, TerminalError, DeadlineExceeded) leaves its
+// PreparedTuHandle un-released. The orphaned Entry makes
+// P50PreparationAuthority::reset_route(key) return false forever, so once
+// SidecarRuntime::bind_route_endpoint_identity (cache/p50_cache_service.cpp)
+// observes a new (guid, generation) at the same host:port,
+// reset_f_store_exact() below never clears the old relationship and the
+// whole C sidecar gets replaced -- for every later route, not just the one
+// that actually failed.
+//
+// Safety argument (why no old-incarnation history can reach the new one):
+// PreparationRouteKey embeds f_store_generation, so the predecessor's route
+// key and the successor's route key are structurally different map keys in
+// impl_->routes / impl_->entries (cache/p50_endpoint.cpp). Each
+// P50RouteRelationship maps 1:1 to exactly one P50ZstdSourceSender (owners_
+// below) and exactly one PreparationRouteKey (route_key()). Only that one
+// sender could ever have created an Entry under the old key, so
+// force-erasing every Entry still filed under the old key cannot touch the
+// new incarnation's entries, any other relationship's entries, or any other
+// route's RouteState. discard_route() is scoped to a single route_key and is
+// therefore safe to call once that key's F incarnation is known dead.
+//
+// In-flight argument (why the whole reset is gated on transfer_in_flight,
+// checked before either reset_route or discard_route is even attempted):
+// erasing owners_'s entry for a relationship destroys its Sender (and the
+// Impl any of its coroutine frames access via `this`). That is only safe
+// once nothing can resume into it. An Entry can be missing or already
+// released for two different reasons: (1) the sender's transfer already
+// reached a terminal result (Committed and released, or non-Committed and
+// orphaned) -- in both cases the Sender is quiescent and safe to erase --
+// or (2) its transfer_bytes() coroutine is still running or suspended and
+// may not have created, or may already have released, its Entry at this
+// exact instant, racing this reset. transfer_in_flight() distinguishes the
+// two regardless of Entry state, so case (2) is always refused up front,
+// before reset_route()/discard_route() are consulted. Case (2) should be
+// rare to impossible here: per the class comment above, "the owner is
+// single-threaded ... callers serialize operations for one relationship on
+// their compiler-wrapper owner" (lanes=1), so a given relationship's sender
+// runs at most one transfer at a time, and bind_route_endpoint_identity()
+// only calls reset_f_store_exact() between assignments, never nested inside
+// one of its own transfer() calls. When in-flight is nonetheless observed,
+// this function keeps today's behavior: return false and let the caller set
+// replacement_required_.
+//
+// Unchanged: reset_route() (same-incarnation path; protects lost-commit
+// reconcile), P50CRouteOwner::reset() (full teardown), and RouteState's
+// field shape -- discard_route() only touches the single
+// uncommitted_route_entry optional the same way release() already does, so
+// a later merge with the perf-pipe deque conversion stays local to that one
+// field in cache/p50_endpoint.cpp.
+// ---------------------------------------------------------------------------
 bool P50CRouteOwner::reset_f_store_exact(
     FStoreGuid old_f_store_guid,
     uint64_t old_f_store_generation) noexcept {
@@ -201,17 +254,24 @@ bool P50CRouteOwner::reset_f_store_exact(
         return false;
     bool reset = true;
     for (auto position = owners_.begin(); position != owners_.end();) {
-        if (position->first.f_store_guid == old_f_store_guid &&
-            position->first.f_store_generation == old_f_store_generation) {
-            const PreparationRouteKey key = route_key(position->first);
-            if (!authority_ || authority_->reset_route(key))
-                position = owners_.erase(position);
-            else {
-                reset = false;
-                ++position;
-            }
-        } else
+        if (position->first.f_store_guid != old_f_store_guid ||
+            position->first.f_store_generation != old_f_store_generation) {
             ++position;
+            continue;
+        }
+        if (position->second && position->second->transfer_in_flight()) {
+            reset = false;
+            ++position;
+            continue;
+        }
+        const PreparationRouteKey key = route_key(position->first);
+        if (!authority_ || authority_->reset_route(key) ||
+            authority_->discard_route(key))
+            position = owners_.erase(position);
+        else {
+            reset = false;
+            ++position;
+        }
     }
     if (!reset)
         replacement_required_ = true;
