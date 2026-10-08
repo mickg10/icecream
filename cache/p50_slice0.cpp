@@ -1771,7 +1771,13 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
     try {
         auto prepared = std::make_shared<PreparedTU>();
         prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
-        p29v1_->interner.process(exact_input, prepared->dense_regions);
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderInternAndMatch);
+#endif
+            p29v1_->interner.process(exact_input, prepared->dense_regions);
+        }
         if (p29v1_->prepares == p29v1_->inject_failure_after) {
             std::fprintf(stderr,
                          "{\"schema\":\"icecream-p50-fault-v1\","
@@ -1886,7 +1892,13 @@ const CActiveTx& CRoute::begin_v1(
     try {
         CActiveTx active;
         active.prepared = prepared;
-        active.body = p29v1_->serializer.begin_tu(prepared->dense_regions);
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderEncode);
+#endif
+            active.body = p29v1_->serializer.begin_tu(prepared->dense_regions);
+        }
         active.region_count = prepared->dense_regions.size();
         active.begin.history_nonce = history_nonce_;
         active.begin.rel_seq = next_rel_seq_;
@@ -2467,21 +2479,58 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
             throw std::logic_error(
                 "P29V1 mutant rematerialization does not match TX_BEGIN");
 #endif
-        std::vector<uint8_t> result =
-            route.p29v1->deserializer.take_materialized();
+        auto result = route.p29v1->deserializer.take_materialized();
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+        // Sim-only: time the two hash computations below individually
+        // instead of letting them run unattributed inside the surrounding
+        // (untimed) chain. This mirrors the original short-circuit
+        // evaluation order and throw point exactly -- only the attribution
+        // of CPU time changes, not the control flow or the wire bytes.
+        bool materialize_mismatch = result.size() != pending.begin.raw_bytes;
+        if (!materialize_mismatch) {
+            Digest128 materialized_digest{};
+            {
+                codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                    codec::p29_wire_detail::P29StageTimerEntry::ReceiverMaterializedDigest);
+                materialized_digest = digest128(result);
+            }
+            materialize_mismatch = materialized_digest != pending.begin.raw_digest;
+        }
+        if (!materialize_mismatch) {
+            Digest128 transaction_digest{};
+            {
+                codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                    codec::p29_wire_detail::P29StageTimerEntry::ReceiverTransactionDigest);
+                transaction_digest =
+                    compute_transaction_digest(pending.begin, pending.body);
+            }
+            materialize_mismatch =
+                transaction_digest != pending.begin.transaction_digest;
+        }
+        if (materialize_mismatch)
+            throw std::logic_error(
+                "P29V1 materialized input does not match TX_BEGIN exactly");
+#else
         if (result.size() != pending.begin.raw_bytes ||
             digest128(result) != pending.begin.raw_digest ||
             compute_transaction_digest(pending.begin, pending.body) !=
                 pending.begin.transaction_digest)
             throw std::logic_error(
                 "P29V1 materialized input does not match TX_BEGIN exactly");
+#endif
         const std::span<const uint8_t> segment =
             route.p29v1->deserializer.pending_segment();
         if (segment.size() > result.size())
             throw std::logic_error(
                 "P29V1 staged segment exceeds materialized input");
-        pending.p29v1_segment_digest =
-            route.p29v1->deserializer.pending_segment_digest();
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::ReceiverPendingSegmentDigest);
+#endif
+            pending.p29v1_segment_digest =
+                route.p29v1->deserializer.pending_segment_digest();
+        }
         pending.p29v1_materialized = true;
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
         // (c_store_guid, tu_seq) is this layer's identity; no
@@ -2492,7 +2541,35 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
             icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
             {{"tu_seq", (int64_t)pending.begin.tu_seq.value},
              {"raw_bytes", (int64_t)pending.begin.raw_bytes}});
+#if defined(ICECC_P29V1_ALIGNED_HUGEPAGE_MATERIALIZED)
+        // Opt-4: result's underlying storage may use a custom 2-MiB-aligned
+        // allocator so the kernel can back it with transparent huge pages
+        // from the first write. This function's return type is a fixed
+        // public signature (std::vector<uint8_t>) that must not change, so
+        // this is one explicit, benching-only copy back to the plain
+        // allocator, performed here at the very end -- after all 5 timed
+        // Receiver* stages above have already run directly against
+        // `result`. The copy allocates a fresh buffer and re-faults its
+        // pages, so it is itself timed (ReceiverMaterializeCopyback) rather
+        // than left to run unattributed: a minor-fault drop seen in the
+        // Receiver* stages above could otherwise just mean the faults moved
+        // into this copy instead of being eliminated, which would make the
+        // allocator change look like a win on minflt while being a wash or
+        // a loss on wall time. It does not read, write, or alter any byte
+        // already checked above, so it cannot change the wire bytes, the
+        // digests, or anything on the CacheWire/P29 wire.
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+        {
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::ReceiverMaterializeCopyback);
+            return std::vector<uint8_t>(result.begin(), result.end());
+        }
+#else
+        return std::vector<uint8_t>(result.begin(), result.end());
+#endif
+#else
         return result;
+#endif
     } catch (...) {
         route.p29v1->terminal = true;
         if (route.p29v1->deserializer.has_pending()) {

@@ -10,12 +10,14 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -105,6 +107,200 @@ void operator delete(void* value, std::size_t, std::align_val_t) noexcept {
 void operator delete[](void* value, std::size_t, std::align_val_t) noexcept {
     std::free(value);
 }
+#endif
+
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+namespace {
+// Must match the ordering of codec::p29_wire_detail::P29StageTimerEntry.
+constexpr unsigned p50sim_p29_stage_timer_entry_count = 8;
+std::array<std::atomic<uint64_t>, p50sim_p29_stage_timer_entry_count>
+    p50sim_p29_stage_timer_ns{};
+}  // namespace
+
+extern "C" void icecc_p50sim_p29_stage_timer_add(
+    unsigned entry, std::uint64_t nanoseconds) noexcept {
+    if (entry < p50sim_p29_stage_timer_entry_count)
+        p50sim_p29_stage_timer_ns[entry].fetch_add(nanoseconds,
+                                                     std::memory_order_relaxed);
+}
+#endif
+
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+namespace {
+// Same entry ordering as p50sim_p29_stage_timer_ns above. Signed because an
+// individual scope's delta is, in principle, allowed to be reported as 0 or
+// (in a pathological scheduler-noise case) negative when accumulated across
+// concurrent uses of RUSAGE_THREAD; stored as int64_t so fetch_add on a
+// std::atomic<int64_t> handles that without wrapping the way an unsigned
+// subtraction would.
+constexpr unsigned p50sim_p29_stage_minflt_entry_count = 8;
+std::array<std::atomic<int64_t>, p50sim_p29_stage_minflt_entry_count>
+    p50sim_p29_stage_minflt{};
+}  // namespace
+
+extern "C" void icecc_p50sim_p29_stage_minflt_add(
+    unsigned entry, long minflt_delta) noexcept {
+    if (entry < p50sim_p29_stage_minflt_entry_count)
+        p50sim_p29_stage_minflt[entry].fetch_add(
+            static_cast<int64_t>(minflt_delta), std::memory_order_relaxed);
+}
+#endif
+
+#if defined(ICECC_P50SIM_FRAME_SHA)
+namespace {
+
+// Self-contained SHA-256, ported verbatim from the Sha256/sha256_hex helpers
+// already used by unittests/codec_parity_test.cpp for corpus identity
+// checks. Reused here (rather than reimplemented from scratch) because it
+// has no external dependency beyond <bit>'s std::rotr, so it drops into the
+// p50sim build target with no new link requirement.
+//
+// This hashes the exact bytes placed on the wire. encode_frame() (declared
+// in protocol50.h, a pure, deterministic production function) is called on
+// the decoded Message that EndpointIoControl::outbound_message_observer
+// already receives, in both P50ClientEndpoint and P50ServerEndpoint, strictly
+// *after* that same encode_frame() output has been written to the socket
+// (see the async_write_message sequence in p50_endpoint.cpp: encode_frame ->
+// asio::async_write -> outbound_message_observer). Calling encode_frame()
+// again on the same Message therefore reproduces the identical wire bytes.
+// Both the observer field and encode_frame() are pre-existing production
+// code; nothing in p50_endpoint.cpp, p50_endpoint.h, or
+// p50_cache_service.cpp is modified for this.
+class Sha256 {
+  public:
+    void update(const std::uint8_t* input, std::size_t size) {
+        total_bytes_ += size;
+        absorb(input, size);
+    }
+
+    [[nodiscard]] std::array<std::uint8_t, 32> finish() {
+        const std::uint64_t bit_count = total_bytes_ * 8;
+        const std::uint8_t marker = 0x80;
+        absorb(&marker, 1);
+        const std::uint8_t zero = 0;
+        while (used_ != 56)
+            absorb(&zero, 1);
+        std::array<std::uint8_t, 8> length{};
+        for (unsigned i = 0; i != length.size(); ++i)
+            length[length.size() - 1 - i] =
+                static_cast<std::uint8_t>(bit_count >> (8 * i));
+        absorb(length.data(), length.size());
+
+        std::array<std::uint8_t, 32> result{};
+        for (std::size_t i = 0; i != state_.size(); ++i) {
+            result[i * 4] = static_cast<std::uint8_t>(state_[i] >> 24);
+            result[i * 4 + 1] = static_cast<std::uint8_t>(state_[i] >> 16);
+            result[i * 4 + 2] = static_cast<std::uint8_t>(state_[i] >> 8);
+            result[i * 4 + 3] = static_cast<std::uint8_t>(state_[i]);
+        }
+        return result;
+    }
+
+  private:
+    static constexpr std::array<std::uint32_t, 64> constants_{
+        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U,
+        0xab1c5ed5U, 0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU,
+        0x9bdc06a7U, 0xc19bf174U, 0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU,
+        0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU, 0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+        0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU,
+        0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U, 0xa2bfe8a1U, 0xa81a664bU,
+        0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U, 0x19a4c116U,
+        0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U,
+        0xc67178f2U,
+    };
+
+    // Shared by update() (which must also grow total_bytes_) and finish()'s
+    // padding (which must not): both route through this so the compression
+    // function itself exists in exactly one place.
+    void absorb(const std::uint8_t* input, std::size_t size) {
+        while (size != 0) {
+            const std::size_t take = std::min(size, block_.size() - used_);
+            std::copy_n(input, take, block_.begin() + used_);
+            input += take;
+            size -= take;
+            used_ += take;
+            if (used_ == block_.size()) {
+                transform();
+                used_ = 0;
+            }
+        }
+    }
+
+    void transform() {
+        std::array<std::uint32_t, 64> words{};
+        for (std::size_t i = 0; i != 16; ++i) {
+            words[i] = (std::uint32_t{block_[i * 4]} << 24) |
+                       (std::uint32_t{block_[i * 4 + 1]} << 16) |
+                       (std::uint32_t{block_[i * 4 + 2]} << 8) |
+                       std::uint32_t{block_[i * 4 + 3]};
+        }
+        for (std::size_t i = 16; i != words.size(); ++i) {
+            const std::uint32_t s0 =
+                std::rotr(words[i - 15], 7) ^ std::rotr(words[i - 15], 18) ^
+                (words[i - 15] >> 3);
+            const std::uint32_t s1 =
+                std::rotr(words[i - 2], 17) ^ std::rotr(words[i - 2], 19) ^
+                (words[i - 2] >> 10);
+            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+        }
+
+        std::uint32_t a = state_[0];
+        std::uint32_t b = state_[1];
+        std::uint32_t c = state_[2];
+        std::uint32_t d = state_[3];
+        std::uint32_t e = state_[4];
+        std::uint32_t f = state_[5];
+        std::uint32_t g = state_[6];
+        std::uint32_t h = state_[7];
+        for (std::size_t i = 0; i != words.size(); ++i) {
+            const std::uint32_t sum1 =
+                std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
+            const std::uint32_t choose = (e & f) ^ (~e & g);
+            const std::uint32_t temporary1 =
+                h + sum1 + choose + constants_[i] + words[i];
+            const std::uint32_t sum0 =
+                std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
+            const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+            const std::uint32_t temporary2 = sum0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temporary1;
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1 + temporary2;
+        }
+        state_[0] += a;
+        state_[1] += b;
+        state_[2] += c;
+        state_[3] += d;
+        state_[4] += e;
+        state_[5] += f;
+        state_[6] += g;
+        state_[7] += h;
+    }
+
+    std::array<std::uint32_t, 8> state_{
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
+    };
+    std::array<std::uint8_t, 64> block_{};
+    std::uint64_t total_bytes_ = 0;
+    std::size_t used_ = 0;
+};
+
+std::string frame_sha256_hex(Sha256& hasher) {
+    const std::array<std::uint8_t, 32> digest = hasher.finish();
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const std::uint8_t byte : digest)
+        output << std::setw(2) << static_cast<unsigned>(byte);
+    return output.str();
+}
+
+}  // namespace
 #endif
 
 namespace asio = boost::asio;
@@ -781,6 +977,34 @@ std::string bounded_context(std::string_view value) {
     return std::string(value.substr(0, kContextLimit)) + "...";
 }
 
+#if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
+// Opt-4 verification helper (sim-only, diagnostic): reads the AnonHugePages
+// field from this process's own /proc/self/smaps_rollup. This is read-only
+// introspection of the process's own page tables -- it never touches, nor
+// can it influence, any CacheWire/P29 wire bytes, materialized bytes, or
+// digests. Used only to confirm whether a candidate allocator actually
+// causes the kernel to back materialize buffers with transparent huge
+// pages; returns std::nullopt if the kernel/build doesn't expose the field
+// (e.g. no smaps_rollup support).
+std::optional<int64_t> read_anon_hugepages_kb() {
+    std::ifstream rollup("/proc/self/smaps_rollup");
+    if (!rollup)
+        return std::nullopt;
+    std::string line;
+    while (std::getline(rollup, line)) {
+        constexpr std::string_view kPrefix = "AnonHugePages:";
+        if (line.rfind(kPrefix, 0) == 0) {
+            std::istringstream fields(line.substr(kPrefix.size()));
+            int64_t kilobytes = 0;
+            if (fields >> kilobytes)
+                return kilobytes;
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+#endif
+
 void write_batch_row(std::ostream& output, std::string_view segment,
                      std::string_view relation_id, size_t index,
                      size_t expected_tu_seq,
@@ -800,7 +1024,14 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      std::optional<uint64_t> allocations,
                      std::optional<uint64_t> p29v1_codec_allocations,
                      std::optional<std::array<uint64_t, 9>>
-                         p29v1_codec_allocation_entries) {
+                         p29v1_codec_allocation_entries,
+                     std::optional<std::array<uint64_t, 8>>
+                         p29v1_codec_stage_ns,
+                     std::optional<std::array<int64_t, 8>>
+                         p29v1_codec_stage_minflt,
+                     std::optional<int64_t> anon_hugepages_delta_kb,
+                     const std::optional<std::string>& c_to_f_sha256,
+                     const std::optional<std::string>& f_to_c_sha256) {
     Digest128 tx_digest{};
     Digest128 begin_tx_digest{};
     Digest128 action_raw_digest{};
@@ -927,6 +1158,44 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         }
         output << '}';
     }
+    if (p29v1_codec_stage_ns) {
+        static constexpr std::array<std::string_view, 8> stage_names{
+            "receiver_receive_fill_ns", "receiver_take_materialized_ns",
+            "receiver_materialized_digest_ns", "receiver_transaction_digest_ns",
+            "receiver_pending_segment_digest_ns", "sender_intern_and_match_ns",
+            "sender_encode_ns", "receiver_materialize_copyback_ns"};
+        output << ",\"p29v1_codec_stage_ns\":{";
+        for (size_t index = 0; index != stage_names.size(); ++index) {
+            if (index != 0)
+                output << ',';
+            output << '\"' << stage_names[index] << "\":"
+                   << (*p29v1_codec_stage_ns)[index];
+        }
+        output << '}';
+    }
+    if (p29v1_codec_stage_minflt) {
+        static constexpr std::array<std::string_view, 8> stage_names{
+            "receiver_receive_fill_minflt", "receiver_take_materialized_minflt",
+            "receiver_materialized_digest_minflt",
+            "receiver_transaction_digest_minflt",
+            "receiver_pending_segment_digest_minflt",
+            "sender_intern_and_match_minflt", "sender_encode_minflt",
+            "receiver_materialize_copyback_minflt"};
+        output << ",\"p29v1_codec_stage_minflt\":{";
+        for (size_t index = 0; index != stage_names.size(); ++index) {
+            if (index != 0)
+                output << ',';
+            output << '\"' << stage_names[index] << "\":"
+                   << (*p29v1_codec_stage_minflt)[index];
+        }
+        output << '}';
+    }
+    if (anon_hugepages_delta_kb)
+        output << ",\"anon_hugepages_delta_kb\":" << *anon_hugepages_delta_kb;
+    if (c_to_f_sha256)
+        output << ",\"c_to_f_sha256\":\"" << *c_to_f_sha256 << '"';
+    if (f_to_c_sha256)
+        output << ",\"f_to_c_sha256\":\"" << *f_to_c_sha256 << '"';
     if (profile == ProfileId::ZSTD_ROUTE) {
         output << ",\"committed_raw_prefix_before_descriptor\":{\"schema\":\"icecream-s8-route-prefix-descriptor-v1\",\"bytes\":"
                << prefix_before_bytes << ",\"digest128\":\""
@@ -1050,6 +1319,31 @@ void run_batch(const Arguments& arguments) {
                     p50sim_p29_allocation_entries[entry].load(
                         std::memory_order_relaxed);
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            // Snapshot before prepare_for_route() so the delta captures both
+            // the sender-side stages (inside prepare_for_route, below) and
+            // the receiver-side stages (inside context.run(), further down).
+            std::array<uint64_t, p50sim_p29_stage_timer_entry_count>
+                p29v1_codec_stage_ns_before{};
+            for (size_t entry = 0; entry != p29v1_codec_stage_ns_before.size();
+                 ++entry)
+                p29v1_codec_stage_ns_before[entry] =
+                    p50sim_p29_stage_timer_ns[entry].load(
+                        std::memory_order_relaxed);
+#endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+            std::array<int64_t, p50sim_p29_stage_minflt_entry_count>
+                p29v1_codec_stage_minflt_before{};
+            for (size_t entry = 0;
+                 entry != p29v1_codec_stage_minflt_before.size(); ++entry)
+                p29v1_codec_stage_minflt_before[entry] =
+                    p50sim_p29_stage_minflt[entry].load(
+                        std::memory_order_relaxed);
+#endif
+#if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
+            const std::optional<int64_t> anon_hugepages_kb_before =
+                read_anon_hugepages_kb();
+#endif
             const auto prepare_started = std::chrono::steady_clock::now();
             auto prepared = authority->prepare_for_route(
                 relation.route,
@@ -1065,12 +1359,34 @@ void run_batch(const Arguments& arguments) {
             const uint64_t allocations_before =
                 p50sim_allocation_count.load(std::memory_order_relaxed);
 #endif
+#if defined(ICECC_P50SIM_FRAME_SHA)
+            Sha256 c_to_f_hasher;
+            Sha256 f_to_c_hasher;
+#endif
             EndpointIoControl server_control;
             EndpointIoControl client_control;
+#if defined(ICECC_P50SIM_FRAME_SHA)
+            {
+#else
             if (inner_trace) {
-                const auto observe = [&inner_trace](ActorSide actor,
-                                                    const Message& message) {
-                    inner_trace->observe(actor, message);
+#endif
+                const auto observe = [&inner_trace
+#if defined(ICECC_P50SIM_FRAME_SHA)
+                                       , &c_to_f_hasher, &f_to_c_hasher
+#endif
+                ](ActorSide actor, const Message& message) {
+                    if (inner_trace)
+                        inner_trace->observe(actor, message);
+#if defined(ICECC_P50SIM_FRAME_SHA)
+                    // encode_frame() is the same pure production function
+                    // p50_endpoint.cpp's async_write_message already called
+                    // immediately before this observer fired with this exact
+                    // message, so this reproduces the exact wire bytes.
+                    const std::vector<uint8_t> frame = encode_frame(message);
+                    Sha256& hasher =
+                        (actor == ActorSide::C) ? c_to_f_hasher : f_to_c_hasher;
+                    hasher.update(frame.data(), frame.size());
+#endif
                 };
                 server_control.outbound_message_observer = observe;
                 client_control.outbound_message_observer = observe;
@@ -1115,6 +1431,58 @@ void run_batch(const Arguments& arguments) {
                 }
             }
 #endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            std::optional<std::array<uint64_t, 8>> p29v1_codec_stage_ns;
+            p29v1_codec_stage_ns.emplace();
+            for (size_t entry = 0; entry != p29v1_codec_stage_ns->size();
+                 ++entry) {
+                const uint64_t entry_after =
+                    p50sim_p29_stage_timer_ns[entry].load(
+                        std::memory_order_relaxed);
+                (*p29v1_codec_stage_ns)[entry] =
+                    entry_after - p29v1_codec_stage_ns_before[entry];
+            }
+#else
+            std::optional<std::array<uint64_t, 8>> p29v1_codec_stage_ns;
+#endif
+#if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
+            std::optional<std::array<int64_t, 8>> p29v1_codec_stage_minflt;
+            p29v1_codec_stage_minflt.emplace();
+            for (size_t entry = 0; entry != p29v1_codec_stage_minflt->size();
+                 ++entry) {
+                const int64_t entry_after =
+                    p50sim_p29_stage_minflt[entry].load(
+                        std::memory_order_relaxed);
+                (*p29v1_codec_stage_minflt)[entry] =
+                    entry_after - p29v1_codec_stage_minflt_before[entry];
+            }
+#else
+            std::optional<std::array<int64_t, 8>> p29v1_codec_stage_minflt;
+#endif
+#if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
+            std::optional<int64_t> anon_hugepages_delta_kb;
+            if (anon_hugepages_kb_before) {
+                const std::optional<int64_t> anon_hugepages_kb_after =
+                    read_anon_hugepages_kb();
+                if (anon_hugepages_kb_after)
+                    anon_hugepages_delta_kb =
+                        *anon_hugepages_kb_after - *anon_hugepages_kb_before;
+            }
+#else
+            std::optional<int64_t> anon_hugepages_delta_kb;
+#endif
+#if defined(ICECC_P50SIM_FRAME_SHA)
+            // Both hashers are finalized here regardless of outcome: if the
+            // TU didn't commit cleanly below, write_batch_row() is never
+            // reached and these values are simply discarded.
+            std::optional<std::string> c_to_f_sha256 =
+                frame_sha256_hex(c_to_f_hasher);
+            std::optional<std::string> f_to_c_sha256 =
+                frame_sha256_hex(f_to_c_hasher);
+#else
+            std::optional<std::string> c_to_f_sha256;
+            std::optional<std::string> f_to_c_sha256;
+#endif
             if (client_result.status != ClientRunStatus::Committed ||
                 server_result.status != ServerRunStatus::Completed ||
                 !client_result.committed_input || !server_result.committed_input ||
@@ -1158,7 +1526,11 @@ void run_batch(const Arguments& arguments) {
                             authority->p29v1_interner_reserved_bytes(),
                             authority->p29v1_interner_committed_bytes(),
                             profile, allocations, p29v1_codec_allocations,
-                            p29v1_codec_allocation_entries);
+                            p29v1_codec_allocation_entries,
+                            p29v1_codec_stage_ns,
+                            p29v1_codec_stage_minflt,
+                            anon_hugepages_delta_kb,
+                            c_to_f_sha256, f_to_c_sha256);
             output.flush();
             if (!output)
                 throw std::runtime_error("cannot flush batch output before input reclamation");
