@@ -465,7 +465,126 @@ parked connection's socket must never be allowed to block the owner thread.
 
 ## 4. Interactions (ARM admission, route lock, deadlines, lifecycle RPCs, telemetry)
 
-(TODO)
+**ARM admission window — resolving a figure discrepancy.** The admission
+window is `RouteGate::kArmedSessions = 8` (`cache/p50_cache_service.h:276`),
+overridable via `ICECC_P50_ARMED_WINDOW` (`armed_window_slots()`,
+`cache/p50_cache_service.cpp:2008-2017`). An earlier draft of this task's
+brief cited "16" for this window; that figure is a *different*, unrelated
+constant — `kMaxBacklog = 16` (`cache/p50_cache_service.cpp:93`), which only
+bounds the `--backlog` CLI argument (TCP listen backlog) validated at
+`cache/p50_cache_service.cpp:3698-3702`. **The correct, authoritative ARM
+window default is 8**, and this document uses that figure throughout.
+
+**What "ARM admission window" actually does today, precisely, and how K
+interacts with it.** It is easy to conflate with this design's `K`, but it is
+a different, complementary mechanism operating one layer up: a *lane* (one of
+possibly several derived C-store-GUID identities multiplexed onto one logical
+C/F/profile relationship, `RouteGate::Lane`, `cache/p50_cache_service.h:300-303`)
+is allowed to hold up to `armed_window_slots()` (8) *pre-connected, HELLO'd*
+F sessions **open ahead of its own transfer gate**, purely to amortize
+connection-setup RTT (the header comment: "arming costs four round trips
+before the gate, so a far F needs a window of about eight to keep its gate
+busy"). Critically, at `K=1` **only one** of those armed sessions is ever
+mid-transfer (holding `Lane::transfer`, the `std::timed_mutex` that is the
+"per-route lock" referenced throughout §1) at a time — the other up-to-7 armed
+sessions sit idle-but-connected, waiting their turn at the gate one at a time.
+`route_lane_count()` (`cache/p50_cache_service.cpp:2019-2032`) already clamps
+`lanes * armed_window_slots() <= max_live_sessions` (F's shared live-session
+table capacity, `P50ServerOwnerLimits::max_live_sessions`,
+`cache/p50_endpoint.h`) so that arming-ahead never oversubscribes F.
+
+This design's `K` changes how many of a lane's already-armed sessions may be
+**simultaneously past BEGIN** (i.e. actually outstanding/parked per §1, not
+just idle-connected) rather than strictly serialized one-at-a-time through the
+gate. The key resource-budget consequence: **every outstanding TX under this
+design still needs its own live F session**, exactly as an armed-but-idle one
+does today — so `K` consumes from the *same* `armed_window_slots()` budget a
+lane already has, rather than requiring a new, additional budget. The natural
+and simplest admission rule is therefore: **`K` must not exceed
+`armed_window_slots()` for the lane** (default 8 ≫ default `K=1`, so there is
+no practical pressure at today's defaults, but this must be an explicit
+validation/clamp — analogous to `route_lane_count()`'s existing
+`P50_ROUTE_LANES_CLAMPED` warning pattern — rather than an unenforced
+assumption). No change to `route_lane_count()`'s formula is required *if* `K`
+is clamped to fit inside the existing per-lane window; if a future tuning
+wants `K` and `lanes` to both grow independently beyond what one shared
+`armed_window_slots()` budget allows, the clamp formula would need to become
+`lanes * armed_window_slots() <= max_live_sessions` **and** `K <=
+armed_window_slots()` jointly — flagged as a §7 open question only if `K`
+default/tuning is ever expected to approach 8; out of scope for an initial
+`K` in the 2-4 range.
+
+**Per-route lock.** Already covered in depth in §1.1/§1.2/§2 invariant 11:
+`Lane::transfer` narrows from guarding prepare+encode+write+wait end-to-end to
+guarding prepare+encode+write only. No change to the lock's *type*
+(`std::timed_mutex`) or its *existing* timeout-based `fail_stop()` escape
+hatch (§3 P7) — only the *scope* of what is held under it shrinks. Because the
+lock no longer orders "is TX n+1 safe to start" (that is now `rel_seq`
+sequencing, §1.2), the lock's sole remaining job is: never interleave two
+TXs' wire writes on the same lane. This is a strictly smaller job than today,
+so no new failure mode is introduced by the lock itself.
+
+**Transfer deadlines.** `transfer_deadline`/`cancellation_grace`
+(`cache/p50_cache_service.cpp:2083`/`2623-2626`) are reused unchanged as each
+outstanding TX's own deadline (§1.2 "Timeout for a parked TX"), including for
+the park wait itself. No new deadline concept. One consequence worth stating
+explicitly: with `K>1`, up to `K` deadline timers are concurrently armed per
+lane instead of ≤1 — this is a quantitative increase in timer-wheel load
+proportional to `K`, not a new mechanism, and should be included in the farm
+A/B's resource-overhead checks (§5.4) rather than treated as a correctness
+risk.
+
+**Lifecycle RPCs.** `apply_input_lifecycle_on_owner` and friends are posted
+onto the *same* single `endpoint_owner_thread_`/`context_` that services every
+route's transfers for that sidecar (`cache/p50_cache_service.cpp:2709-2722`,
+`:1926`, `:3241`), and must complete inside `input_lifecycle_timeout` (250 ms
+default, 5000 ms production override,
+`cache/p50_daemon_sidecar_adapter.h:118`, `daemon/main.cpp:5349`) or
+`retire_input_lifecycle_relationship` fires via the `Timeout` path
+(`cache/p50_daemon_sidecar_adapter.cpp:3265-3287`) — this is the mechanism
+behind failure-matrix row P8. The one interaction this design must guarantee
+by construction: **no operation added for parking (staging-buffer writes,
+sequencer park/signal, the generalized `FStore::begin` check) may block the
+owner thread** — all of it must be ordinary non-blocking coroutine logic
+posted on the same `context_`, exactly like today's single-TX path, so that
+lifecycle RPCs interleave with it exactly as they do today and never see
+additional latency attributable to pipelining. §5.2/§5.4 must specifically
+test lifecycle-RPC latency under a fully-saturated (`K`-deep, all lanes armed)
+sidecar to confirm this.
+
+**Telemetry / trace additions.** Production trace emission already lives
+inline in the protocol code — `record(ActionType::TX_BEGIN, ...)` at
+`cache/p50_slice0.cpp:1918` and `:2354`, `cache/p50_endpoint.cpp:1869`,
+`:2939`, and `record(..., ActionType::COMMIT_ACCEPTED, ...)` at
+`cache/p50_endpoint.cpp:3859` — consumed by both the production-side checker
+`cache/p50_actions.cpp` (an in-process C++ port of the same per-action
+state-machine checks `cache/formal/check_trace.py` applies to replayed JSONL)
+and by `check_trace.py` itself for offline/CI replay. `ActionType` (`cache/p50_actions.h:14-29`)
+has 15 members: `SESSION_OPENED, SESSION_REPLACED, SESSION_DISCONNECTED,
+HISTORY_RESET, TX_BEGIN, TX_ABORTED, BODY_COMPLETE, NEED_RECORDED,
+OBJECT_APPLIED, INPUT_MATERIALIZED, INPUT_COMMITTED, COMMIT_ACCEPTED,
+ACTIVE_REPLAYED, LOST_COMMIT_ACCEPTED, F_STORE_INCAR_REPLACED` — a superset of
+(and, confirmed, identical in spirit to) `check_trace.py`'s 14-action
+vocabulary (that file lacks `F_STORE_INCAR_REPLACED`, a C++-side-only action).
+No new `ActionType` is required by this design — every lifecycle event under
+K>1 is still exactly one of these 15 (a parked TX still eventually emits
+`TX_BEGIN`, then either `INPUT_MATERIALIZED`→`INPUT_COMMITTED`→`COMMIT_ACCEPTED`
+or `TX_ABORTED`, just later than it would at K=1). What **does** need a new
+field is `ActionRecord` itself (`cache/p50_actions.h:37+`): today's checkers
+assume at most one outstanding `rel_seq` per side and infer ordering purely
+from arrival order on one shared stream per connection; under K>1, trace
+consumers need an explicit way to tell "TX n+1's `TX_BEGIN` arrived while
+parked, before n's `COMMIT_ACCEPTED`" apart from a same-shaped trace at K=1
+(where that interleaving cannot occur) — otherwise `check_trace.py`'s
+generalized queue-membership checks (§2 invariant 8, §5.1) cannot distinguish
+"successor admitted" from "successor already active," which they must, since
+only one of those states is allowed per TX to touch `materialize_and_verify`.
+The minimal addition: a boolean or small enum `parked: bool` (or
+`stage: {PARKED, SEQUENCED}`) alongside each F-side `TX_BEGIN` record,
+set at the exact point `FStore::begin`'s generalized admission check (§1.2)
+places it in the staging map rather than handing it directly to the shared
+deserializer. No digest/codec/frame change — purely an added observability
+field on the existing action-log plumbing.
 
 ## 5. Test plan
 
