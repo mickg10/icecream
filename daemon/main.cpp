@@ -5349,6 +5349,31 @@ bool Daemon::configure_cache_adapter() noexcept
         config.handoff_timeout = std::chrono::milliseconds(250);
         config.input_attachment_timeout = std::chrono::milliseconds(5000);
         config.input_lifecycle_timeout = std::chrono::milliseconds(5000);
+        // Diagnostic-only override for the sidecar-retirement investigation:
+        // ICECC_P50_INPUT_LIFECYCLE_TIMEOUT_MS lets an operator widen (or,
+        // for forced-reproduction testing, narrow) the input-lifecycle RPC
+        // budget without a rebuild. Unset/empty/unparseable/out-of-range
+        // leaves the 5000ms production default above untouched -- this is
+        // purely an operator knob, not a protocol change, and the clamp
+        // bounds are deliberately generous (1s floor so a sidecar can never
+        // be starved to zero budget; 120s ceiling so a misconfigured value
+        // cannot wedge client-visible behavior indefinitely).
+        {
+            const char *timeout_env = getenv("ICECC_P50_INPUT_LIFECYCLE_TIMEOUT_MS");
+            if (timeout_env != nullptr && *timeout_env != '\0') {
+                char *end = nullptr;
+                const long long parsed = strtoll(timeout_env, &end, 10);
+                if (end != timeout_env && *end == '\0' && parsed >= 1000 && parsed <= 120000) {
+                    config.input_lifecycle_timeout = std::chrono::milliseconds(parsed);
+                } else {
+                    log_error() << "ignoring malformed/out-of-range ICECC_P50_INPUT_LIFECYCLE_TIMEOUT_MS='"
+                                << timeout_env << "' (must be an integer in [1000, 120000]); using "
+                                << config.input_lifecycle_timeout.count() << "ms" << endl;
+                }
+            }
+            log_info() << "cache sidecar input_lifecycle_timeout effective value: "
+                       << config.input_lifecycle_timeout.count() << "ms" << endl;
+        }
         // Robustness fix: 1000ms gave the sidecar only 2s total to tear down
         // (this value feeds both grace_timeout and kill_timeout, see
         // DaemonSidecarAdapter's constructor in cache/p50_daemon_sidecar_adapter.cpp
