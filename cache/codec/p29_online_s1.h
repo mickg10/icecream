@@ -10,6 +10,18 @@
 #include <utility>
 #include <vector>
 
+// Sim-only diagnostic histograms for the hash-chain match search in
+// OnlineS1::build() (below). Compiled out of production and out of every
+// build that does not define ICECC_P50SIM_MATCH_HISTOGRAM; used once, ahead
+// of a SIMD vectorization attempt on the inner extend-match compare, to
+// measure (a) how far that compare typically gets before the first
+// mismatch and (b) how many chain candidates a position typically visits --
+// so the vectorization decision is measurement-first rather than assumed.
+#if defined(ICECC_P50SIM_MATCH_HISTOGRAM)
+extern "C" void icecc_p50sim_p29_match_extend_sample(unsigned length) noexcept;
+extern "C" void icecc_p50sim_p29_match_chain_sample(unsigned candidates) noexcept;
+#endif
+
 namespace p29 {
 
 enum class RefKind : uint8_t { Region = 0, Block = 1 };
@@ -226,6 +238,9 @@ private:
                                occurrences_[candidate + length] == occurrences_[position + length]) {
                             ++length;
                         }
+#if defined(ICECC_P50SIM_MATCH_HISTOGRAM)
+                        icecc_p50sim_p29_match_extend_sample(length);
+#endif
                         if (length >= config_.min_match && length > best_length) {
                             best_length = length;
                             best_source = candidate;
@@ -235,6 +250,9 @@ private:
                     candidate = predecessors_[candidate];
                     ++chain;
                 }
+#if defined(ICECC_P50SIM_MATCH_HISTOGRAM)
+                icecc_p50sim_p29_match_chain_sample(chain);
+#endif
             }
 
             uint32_t step = 1;

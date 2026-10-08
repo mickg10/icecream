@@ -146,6 +146,82 @@ extern "C" void icecc_p50sim_p29_stage_minflt_add(
 }
 #endif
 
+#if defined(ICECC_P50SIM_MATCH_HISTOGRAM)
+namespace {
+// Diagnostic-only, printed once at process exit to stderr. Bucket i>=5 holds
+// values in (2^(i-5)*4, 2^(i-4)*4] i.e. (4,8],(8,16],(16,32],... -- buckets
+// 0..4 are exact counts for 0,1,2,3,4. Not wired into the JSONL schema: this
+// exists purely to decide whether the extend-match compare is worth
+// vectorizing, not as a published metric.
+constexpr unsigned p50sim_p29_match_histogram_buckets = 16;
+
+unsigned match_histogram_bucket(unsigned n) noexcept {
+    if (n <= 4) return n;
+    unsigned bucket = 5;
+    unsigned threshold = 8;
+    while (n > threshold && bucket < p50sim_p29_match_histogram_buckets - 1) {
+        threshold *= 2;
+        ++bucket;
+    }
+    return bucket;
+}
+
+const char* match_histogram_label(unsigned bucket) {
+    static const char* const labels[p50sim_p29_match_histogram_buckets] = {
+        "0", "1", "2", "3", "4", "5-8", "9-16", "17-32", "33-64", "65-128",
+        "129-256", "257-512", "513-1024", "1025-2048", "2049-4096", ">4096"};
+    return labels[bucket];
+}
+
+std::array<std::atomic<uint64_t>, p50sim_p29_match_histogram_buckets>
+    p50sim_p29_match_extend_histogram{};
+std::array<std::atomic<uint64_t>, p50sim_p29_match_histogram_buckets>
+    p50sim_p29_match_chain_histogram{};
+std::atomic<uint64_t> p50sim_p29_match_extend_samples{0};
+std::atomic<uint64_t> p50sim_p29_match_chain_samples{0};
+
+void dump_match_histogram(const char* title,
+                           const std::array<std::atomic<uint64_t>,
+                                             p50sim_p29_match_histogram_buckets>& histogram,
+                           uint64_t samples) {
+    std::cerr << "[match-histogram] " << title << " samples=" << samples << "\n";
+    for (unsigned bucket = 0; bucket < p50sim_p29_match_histogram_buckets; ++bucket) {
+        const uint64_t count = histogram[bucket].load(std::memory_order_relaxed);
+        if (count == 0) continue;
+        const double pct = samples ? (100.0 * double(count) / double(samples)) : 0.0;
+        std::cerr << "[match-histogram]   " << match_histogram_label(bucket) << ": "
+                  << count << " (" << pct << "%)\n";
+    }
+}
+
+struct MatchHistogramDumper {
+    ~MatchHistogramDumper() {
+        dump_match_histogram(
+            "extend-length (per chain candidate compared)",
+            p50sim_p29_match_extend_histogram,
+            p50sim_p29_match_extend_samples.load(std::memory_order_relaxed));
+        dump_match_histogram(
+            "chain-candidates-visited (per position)",
+            p50sim_p29_match_chain_histogram,
+            p50sim_p29_match_chain_samples.load(std::memory_order_relaxed));
+    }
+};
+MatchHistogramDumper match_histogram_dumper_instance;
+}  // namespace
+
+extern "C" void icecc_p50sim_p29_match_extend_sample(unsigned length) noexcept {
+    p50sim_p29_match_extend_histogram[match_histogram_bucket(length)].fetch_add(
+        1, std::memory_order_relaxed);
+    p50sim_p29_match_extend_samples.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void icecc_p50sim_p29_match_chain_sample(unsigned candidates) noexcept {
+    p50sim_p29_match_chain_histogram[match_histogram_bucket(candidates)].fetch_add(
+        1, std::memory_order_relaxed);
+    p50sim_p29_match_chain_samples.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
+
 #if defined(ICECC_P50SIM_FRAME_SHA)
 namespace {
 
