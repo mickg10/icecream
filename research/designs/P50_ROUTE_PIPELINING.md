@@ -14,11 +14,18 @@ implementation code in this tree change; this document only.
 
 **Errata (2026-10-08, during Step 2 implementation):** §1.1 diff item 3 and
 §2 invariant 2's "same 4 layers" claim were wrong about `P29Serializer`.
-`P29Serializer` stays **scalar** — it is never ring-buffered, and
-`OnlineS1::matcher_`'s single-pending reentrancy guard
-(`cache/codec/p29_online_s1.h`: `prepare()` throws `std::logic_error("S1
-prepare while a transaction is already pending")` if called again before
-`commit()`/`abort()`) is not touched. This is not a gap: §1.1 point 2's
+`P29Serializer` stays **scalar** — it is never ring-buffered. The guard that
+actually fires, observably, on a second `begin_tu()` is `P29Serializer`'s
+own `pending_.active` check (`cache/codec/p29_wire.h`, in `begin_tu()`):
+it runs before any mutation and before `OnlineS1::matcher_.prepare()` is
+ever reached, and calls `fail("P29 serializer already has a pending TU")`,
+which throws `std::runtime_error`. `OnlineS1::matcher_`'s own single-pending
+reentrancy guard (`cache/codec/p29_online_s1.h`: `prepare()` throws
+`std::logic_error("S1 prepare while a transaction is already pending")` if
+called again before `commit()`/`abort()`) is a secondary, normally
+unreachable defense-in-depth layer underneath it — it would only fire if
+`P29Serializer`'s own flag were ever desynced from `matcher_`'s state.
+Neither guard is touched by this design. This is not a gap: §1.1 point 2's
 `predicted_cursor_` already advances "immediately after each *local*
 `P29Serializer::commit()`," and point 5 already gates TX `n+1`'s BEGIN on
 "TX `n` already committed *locally* on C" — so under K>1, TX `n`'s
@@ -26,9 +33,9 @@ prepare while a transaction is already pending")` if called again before
 `begin_tu()`. Serializer `Pending` occupancy is therefore ≤1 by
 construction for any `K`, and the existing single-pending guard is exactly
 the invariant the whole design leans on at this layer, pinned by a test
-(§5.1/`unittests/p50_wire_test.cpp`) rather than widened. See the corrected
-diff item 3 and invariant 2 below, and the new paragraph after diff item 6
-on where `P29Serializer::commit()`'s call site moves under K>1.
+(§5.1/`unittests/codec_wire_test.cpp`) rather than widened. See the
+corrected diff item 3 and invariant 2 below, and the new paragraph after
+diff item 6 on where `P29Serializer::commit()`'s call site moves under K>1.
 
 Branch: `perf-pipe`, off `a348414e` ("services/sys_close_range.h: guard the UAPI
 include with `__has_include`"), the current farm "perf-combo" build
@@ -854,13 +861,20 @@ The existing `unittests/` tree already has targeted coverage for every layer
 this design touches; the plan is to extend each in place (parameterize by
 `K`), not add a parallel test tree:
 
-- **New (2026-10-08 errata): `unittests/p50_wire_test.cpp`** (`P29Serializer`,
-  §1.1 diff item 3 as corrected): two tests, added in Step 2, with no
-  production change to `cache/codec/p29_wire.h`/`cache/codec/p29_online_s1.h`.
+- **New (2026-10-08 errata): `unittests/codec_wire_test.cpp`**
+  (`P29Serializer`, §1.1 diff item 3 as corrected; note this corrects the
+  filename from an earlier draft of this errata, which wrongly named
+  `unittests/p50_wire_test.cpp` — that file only tests digest-math helpers
+  and never instantiates `P29Serializer`; `codec_wire_test.cpp` is the file
+  that already exercises `begin_tu`/`answer_need`/`commit`/`abandon`): two
+  tests, added in Step 2, with no production change to
+  `cache/codec/p29_wire.h`/`cache/codec/p29_online_s1.h`.
   (1) *Pin the reentrancy guard*: call `begin_tu()` twice in a row without an
   intervening `commit()`/`abandon()` and assert it still throws
-  `std::logic_error("S1 prepare while a transaction is already pending")` —
-  proves the serializer layer's bound stays at 1 regardless of `K`. (2)
+  `std::runtime_error("P29 serializer already has a pending TU")` —
+  `P29Serializer`'s own guard, which fires before `OnlineS1::matcher_` is
+  ever reached (see Status-block errata above) — proves the serializer
+  layer's bound stays at 1 regardless of `K`. (2)
   *Commit-timing equivalence*: for a sequence of TUs, assert
   `begin_tu()`→encode→`commit()`-immediately (the `K>1` timing, where commit
   runs locally right after encode) produces byte-identical encoded output and
@@ -1099,7 +1113,7 @@ working, `K=1`-identical system.
 | Step | Files | Est. LOC | What lands |
 |---|---|---|---|
 | 1 | `cache/p50_cache_service.h`/`.cpp` | ~50 | `ICECC_P50_ROUTE_PIPELINE_DEPTH` env parsing (mirrors the existing `ICECC_P50_ARMED_WINDOW`/`ICECC_P50_ROUTE_LANES` pattern exactly). Three clamps land here, all `*_CLAMPED`-style warnings mirroring `route_lane_count()`'s pattern (`cache/p50_cache_service.cpp:2019-2032`): (a) `K <= armed_window_slots()` — the farm's actual runtime value is `ICECC_P50_ARMED_WINDOW=16`, not the compiled-in default of 8 (§4); (b) hard max clamp `K <= 4` regardless of (a) (§7(2)); (c) profile-scoped clamp — `K>1` is only honored when the route's negotiated profile is `P29V1`, every other profile is forced to `K=1` (§7(1)). `K>1` also forces `lanes=1` with its own clamp-with-warning (§4, §7(4)). No behavioral change yet — `K` is parsed and clamped but nothing consumes it. Pure plumbing, trivially reviewable. |
-| 2 | `research/designs/P50_ROUTE_PIPELINING.md`, `unittests/p50_wire_test.cpp` | ~30 (tests only; errata is docs) | **Corrected 2026-10-08** (was: ring-buffer `P29Serializer::Pending`, now dropped — see errata). `P29Serializer` stays scalar; `cache/codec/p29_wire.h` is not touched by this step. Lands: (1) a test pinning `OnlineS1::matcher_`'s existing single-pending guard (second `begin_tu()` before `commit()`/`abandon()` still throws); (2) a `K=1`-vs-eager-commit equivalence test (begin→encode→commit-immediately produces byte-identical encodings/digests to today's commit-on-ack timing). No production code unless the equivalence test exposes a missing accessor, in which case the addition is minimal and justified in the commit message. |
+| 2 | `research/designs/P50_ROUTE_PIPELINING.md`, `unittests/codec_wire_test.cpp` | ~30 (tests only; errata is docs) | **Corrected 2026-10-08** (was: ring-buffer `P29Serializer::Pending`, now dropped — see errata; test file corrected from an earlier `unittests/p50_wire_test.cpp` typo to the file that actually instantiates `P29Serializer`). `P29Serializer` stays scalar; `cache/codec/p29_wire.h` is not touched by this step. Lands: (1) a test pinning `P29Serializer`'s own existing single-pending guard (second `begin_tu()` before `commit()`/`abandon()` still throws `std::runtime_error`); (2) a `K=1`-vs-eager-commit equivalence test (begin→encode→commit-immediately produces byte-identical encodings/digests to today's commit-on-ack timing). No production code unless the equivalence test exposes a missing accessor, in which case the addition is minimal and justified in the commit message. |
 | 3 | `cache/p50_slice0.h`/`.cpp` | ~130 | **C side only**: `CRoute::active_` → `active_queue_` FIFO (§1.1 point 2); `accept_commit` generalized to retire strictly in `rel_seq` order via a reorder buffer in front of the FIFO head (review point 2b) — a commit that arrives out of order waits in the reorder buffer rather than retiring early. `FStore`/`Namespace::Route.pending` (the F side) is explicitly **not** touched in this step or any other — it stays the exact `K=1` scalar, per the revised §1.2 and §2 invariant 8. Covered by extending `p50_slice0_test.cpp` per §5.1 (including the new regression case proving `FStore::begin` is unchanged). |
 | 4 | `cache/p50_endpoint.h`/`.cpp`, `cache/p50_cache_service.cpp` | ~300 | Client-side (`P50ClientEndpoint`) changes: `Impl::RouteState::uncommitted_route_entry` → bounded FIFO (§1.1 point 1); scalar `active_session`/`active`/`queued` → ordered map keyed by `rel_seq`, each with its own `ClientIoState`/socket (§1.1 point 4); extend `pipelined_begin` (§1.1 point 5) to fire for TX `n+1` once `predicted_cursor_` is valid. The **write-complete signal split** (review point 2c): inside `transfer_source_on_owner`'s `co_spawn(context_, ...)` lambda (`cache/p50_cache_service.cpp:~2534`), add a second promise/signal set immediately after the FILL write completes (`~2570-2574`), decoupled from the existing final-result signal (`completion->set_value(value)`, `~2611-2612`); the route lock releases on the **write-complete** signal, not the final result — this is the mechanism that actually lets TX `n+1`'s FILL write start before TX `n`'s STATE/COMMIT confirms. This is the step that changes **C-side wire behavior** for the first time, gated end-to-end behind `K>1` (at `K=1` the new map/FIFO/signal-split code degenerates to exactly the old scalar/single-signal logic, verified by the `p50_endpoint_test.cpp` `K=1`-identity regression from §5.1). Largest and highest-risk step; budget the most review time here, including a direct check against the existing `wait_until`/`fail_stop`/`_Exit(125)` watchdog (`cache/p50_cache_service.cpp:~2624-2668`) to confirm it still fires per *outstanding* TX rather than per route (review point 2c). |
 | 5 | `cache/p50_endpoint.cpp` (server side, `run_connected`) | ~170 | The F-side **raw frame buffer + sequencer**, parking before any semantic processing (revised §1.2): per-connection raw buffer bound to frame boundaries via the existing `FrameParser`; a peek-only `decode_as<TxBegin>` to read `rel_seq` without touching STATE or calling `stage()`; a per-route sequencer that holds the buffered frames until release; the three release triggers (predecessor `commit_input`, bulk release on abort/disconnect/route-terminal/`HISTORY_RESET`/cold-store/sidecar-stop, and park-deadline reuse of `transfer_deadline`/`cancellation_grace`); on release, replay the buffered frames through the **completely unchanged** STATE → [HISTORY_RESET] → BEGIN → BODY/NEED/FILL → materialize → COMMIT path. This is the step that makes F-side parking real and safe to enable at `K>1` — steps 1-4 are inert without it. |

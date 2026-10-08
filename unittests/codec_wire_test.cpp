@@ -1178,6 +1178,124 @@ void run_wire_controls(const Corpus &corpus,
     answered_f.abandon();
     answered.abandon();
   }
+
+  // Errata (2026-10-08, P50_ROUTE_PIPELINING.md Step 2): P29Serializer stays
+  // scalar.  A second begin_tu() before the first TU's commit()/abandon()
+  // must still fail closed, and the still-pending TU must remain
+  // completable afterward, untouched by the rejected re-entrant attempt.
+  {
+    ResearchProvider sender_provider;
+    ResearchProvider receiver_provider;
+    const P29SenderRouteState sender_before = sender_provider.sender_route();
+    P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>> serializer(
+        sender_provider, interner);
+    P29Deserializer<ResearchProvider> deserializer(receiver_provider);
+
+    const std::vector<std::uint8_t> pending_body =
+        serializer.begin_tu(one_region);
+    bool rejected = false;
+    std::string reason;
+    try {
+      (void)serializer.begin_tu(one_region);
+    } catch (const std::exception &error) {
+      rejected = true;
+      reason = error.what();
+    }
+    require(rejected && reason == "P29 serializer already has a pending TU",
+            "re-entrant begin_tu did not fail closed with the expected "
+            "reason");
+    require(serializer.has_pending() &&
+                sender_provider.sender_route() == sender_before,
+            "rejected re-entrant begin_tu disturbed the still-pending TU");
+
+    const std::vector<std::uint8_t> pending_need =
+        deserializer.receive_body(pending_body);
+    const std::vector<std::uint8_t> pending_fill =
+        serializer.answer_need(pending_need, true);
+    const std::span<const std::uint8_t> materialized =
+        deserializer.receive_fill(pending_fill, true);
+    require(materialized.size() == expected_region.size() &&
+                std::equal(materialized.begin(), materialized.end(),
+                           expected_region.begin()),
+            "TU pending across a rejected re-entrant begin_tu did not "
+            "complete normally");
+    deserializer.commit();
+    serializer.commit();
+  }
+
+  // Errata (2026-10-08, P50_ROUTE_PIPELINING.md Step 2/3): under K>1,
+  // P29Serializer::commit() moves to run locally right after the FILL write
+  // completes ("eager"), instead of waiting for the receiver's own commit()
+  // ("deferred", today's K=1 ack-gated timing).  Invariant 3 claims this is
+  // only a change in *when* commit() runs, never in *what* it computes: the
+  // same TU sequence must produce byte-identical wire frames and an
+  // identical post-commit sender route state under either timing.
+  {
+    std::vector<std::uint32_t> sequence;
+    for (const LogicalTu &tu : corpus.tus) {
+      for (std::uint32_t region : *tu.regions) {
+        if (sequence.empty() || sequence.back() != region)
+          sequence.push_back(region);
+        if (sequence.size() >= 4)
+          break;
+      }
+      if (sequence.size() >= 4)
+        break;
+    }
+    require(sequence.size() >= 2,
+            "commit-timing equivalence needs at least two distinct Regions");
+
+    const auto run_sequence =
+        [&](bool eager, std::vector<std::uint8_t> &trace,
+            P29SenderRouteState &final_sender_state) {
+          ResearchProvider sender_provider;
+          ResearchProvider receiver_provider;
+          P29Serializer<ResearchProvider, P29Interner<MmapInternProvider>>
+              seq_serializer(sender_provider, interner);
+          P29Deserializer<ResearchProvider> seq_deserializer(
+              receiver_provider);
+          for (std::uint32_t region : sequence) {
+            const std::array<std::uint32_t, 1> one{region};
+            const std::vector<std::uint8_t> tu_body =
+                seq_serializer.begin_tu(one);
+            const std::vector<std::uint8_t> tu_need =
+                seq_deserializer.receive_body(tu_body);
+            const std::vector<std::uint8_t> tu_fill =
+                seq_serializer.answer_need(tu_need, true);
+            const std::span<const std::uint8_t> tu_materialized =
+                seq_deserializer.receive_fill(tu_fill, true);
+            trace.insert(trace.end(), tu_body.begin(), tu_body.end());
+            trace.insert(trace.end(), tu_need.begin(), tu_need.end());
+            trace.insert(trace.end(), tu_fill.begin(), tu_fill.end());
+            trace.insert(trace.end(), tu_materialized.begin(),
+                         tu_materialized.end());
+            if (eager) {
+              // K>1 timing: local commit right after the FILL write,
+              // feeding predicted_cursor_ ahead of the receiver's ack.
+              seq_serializer.commit();
+              seq_deserializer.commit();
+            } else {
+              // K=1 timing: unchanged, commit only after the
+              // ack-equivalent point (the receiver's own commit()).
+              seq_deserializer.commit();
+              seq_serializer.commit();
+            }
+          }
+          final_sender_state = sender_provider.sender_route();
+        };
+
+    std::vector<std::uint8_t> deferred_trace;
+    P29SenderRouteState deferred_state;
+    run_sequence(false, deferred_trace, deferred_state);
+    std::vector<std::uint8_t> eager_trace;
+    P29SenderRouteState eager_state;
+    run_sequence(true, eager_trace, eager_state);
+    require(deferred_trace == eager_trace,
+            "eager commit timing produced different wire frames");
+    require(deferred_state == eager_state,
+            "eager commit timing produced a different post-commit sender "
+            "route state");
+  }
 }
 
 void run_golden_comparison_controls() {
