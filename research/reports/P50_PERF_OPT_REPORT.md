@@ -371,3 +371,71 @@ since it contradicts an explicit expectation in the governing task and
 is a direct answer to "report `f_to_c` bytes p99 ... to check the reverse
 direction never exceeds ~14 KB": by this corpus's measurement, it does
 exceed it, by a wide margin, consistently across shapes.
+
+## Audit (2026-10-08): instrumentation provenance re-verified, build-script fix now closes the gap
+
+Scope: before any further measurement work, every historical round's own
+raw batch output was re-inspected directly (first JSON row of each
+round's own files, read as raw JSON, not through any analysis script) to
+classify every metric this report relies on as one of:
+
+- **production-field** — a top-level field (`f_apply_materialize_ns`,
+  `prepare_ns`, `simulator_execution_ns`, `allocations`, `f_to_c_bytes`,
+  the digest fields) that is never gated behind a sim-only instrumentation
+  macro. These are unaffected by the `CXX`/`make` defect described above,
+  regardless of which build produced the file.
+- **real-stage-timer** — a macro-gated `p29v1_codec_stage_ns`/
+  `p29v1_codec_stage_minflt`/`p29v1_codec_allocations` field, confirmed
+  nonzero and internally varying in the raw JSON for that round's own
+  files.
+- **all-zero** — the same macro-gated fields, confirmed to read back as
+  exactly zero across the board — i.e. produced by a build where the
+  macro did not reach the library (the defect described above).
+
+Round-by-round classification, confirmed against the raw JSON:
+
+| Round | Classification | Note |
+|---|---|---|
+| Headline F-side materialize round (baseline / opt-4 / opt-5) | **real-stage-timer** | `p29v1_codec_stage_ns`/`minflt` fields confirmed nonzero and internally varying across this round's own files (distinct, plausible per-row values for `receiver_receive_fill_ns`, `sender_intern_and_match_ns`, `sender_encode_ns`, etc.). Not affected by the Makefile defect. |
+| Decision 4, pre-fix file | **all-zero** | Every `p29v1_codec_stage_ns`/`minflt` value and `p29v1_codec_allocations` reads back as exactly 0. This is the raw demonstration of the defect, not a source of any number published above. |
+| Decision 4, post ad-hoc-fix file | **real-stage-timer** (+ production-field) | `sender_prepare_reserve_ns`/`minflt` and the allocation-entry counter for the reserve call are populated and consistent with the reserve-call table published above (single-row spot check: 8.41 us, within the published 4.1-13.2 us p50/p99 band). **This file, not the pre-fix one, is what the Decision 4 table above actually rests on.** |
+| Decision 5, pre-fix files | **all-zero** | All four new sub-stage fields (match-prepare / root-walk / root-frame-encode / block-frame-encode), plus the pre-existing stage fields in the same rows, are exactly 0 — this is the round where the defect was caught, matching the "Infra finding" section above. |
+| Decision 5, post ad-hoc-fix files | **real-stage-timer** | All four sub-stage fields plus the pre-existing stage fields are populated and mutually consistent (the four sub-stages sum to within the margin already noted above of the measured `sender_encode_ns`/`SenderEncode` time). **These files, not the pre-fix ones, are what the Decision 5 table and the "~85-90% share" conclusion above actually rest on.** |
+
+**Headline verdict confirmed:** opt-5's "~35% better" claim rests entirely
+on `f_apply_materialize_ns` — confirmed present and populated as a
+top-level, non-macro-gated production field in every row checked for
+that round (spot-checked: two different rows, both in the
+25.3-25.6 ms range, both plausible, both structurally independent of the
+stage-timer defect). The headline conclusion was never at risk from the
+Makefile defect, by construction — it was never computed from a
+macro-gated field. The supporting "why" narrative (receive-fill
+minor-fault drop, zero copy-back cost) does use macro-gated fields, and
+this audit confirms those are real/nonzero for this round, not
+zero-by-defect, so the supporting evidence is sound as well, not just
+the top-level number.
+
+**What changed since those rounds, and why it matters going forward:**
+both the Decision 4 and Decision 5 post-fix files relied on an ad-hoc
+`make`-command-line fix that was never committed to any tracked file —
+it was redone by hand on the bench host each time a round needed real
+stage-timer data, as this report's own "Infra finding" section already
+describes. Commit `b7c3caabafae3c0cbcc4eaaf02a27a6f16f6db07` on this
+branch makes that fix permanent and automatic inside
+`cache/sim/build_p50sim.sh` itself: it passes `CXX=` as a `make`
+command-line variable assignment (not an environment variable) to both
+library builds, and — discovered while building the guard described
+next — also fixes a second, deeper trap: naively passing `CXXFLAGS=`
+wholesale on the command line (the obvious fix for the first trap) does
+deliver the requested macro, but it also clobbers the Makefiles' own
+baked-in `-std=c++23`/`-DNDEBUG`/warning flags and breaks the build
+outright (observed: a `std::variant`/`visit` overload-resolution error).
+Macro defines are instead delivered via the additive `CPPFLAGS`
+variable, leaving `CXXFLAGS` at the Makefile's own default. The same
+commit adds a guard that fails the build loudly, with a message pointing
+at this defect, if a stage-timer macro was requested but the resulting
+binary's own synthetic, corpus-independent self-test still reads back
+all-zero — verified to correctly fail on the broken form of the fix and
+correctly pass on the corrected form. This class of silent,
+round-specific, hand-redone fix cannot recur unnoticed for any future
+round.
