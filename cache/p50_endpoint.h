@@ -210,6 +210,13 @@ struct EndpointIoControl {
     // written successfully. It receives an immutable message copy and cannot
     // change product framing or endpoint state.
     std::function<void(ActorSide, const Message&)> outbound_message_observer;
+    // Step 4 sub-step 4c (research/designs/P50_ROUTE_PIPELINING.md): fires
+    // exactly once per run_connected() dialogue, immediately after this TX's
+    // last FILL byte (or, for non-P29V1 profiles, its BODY) has been written
+    // to the wire and before this endpoint starts waiting on a peer reply it
+    // can no longer influence by writing more. Null by default: every
+    // existing caller is unaffected.
+    std::function<void()> write_complete;
 };
 
 struct PrepareRequestKey {

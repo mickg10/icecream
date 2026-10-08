@@ -3586,6 +3586,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 *trace_last_write_done - *trace_write_phase_start)
                 .count());
+        // Step 4 sub-step 4c: fill_sent here means the pipelined fast path
+        // above already wrote BEGIN+BODY+FILL before this (the first) STATE
+        // read, so this TX's last write has already happened.
+        if (fill_sent && control.write_complete)
+            control.write_complete();
         Frame state_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
@@ -3822,6 +3827,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             if (control.stall_stage)
                 control.stall_stage->store(ClientStallStage::BeginWritten,
                                            std::memory_order_relaxed);
+            // Step 4 sub-step 4c: non-P29V1 profiles have no further FILL
+            // round trip, so BODY above is this TX's last write. P29V1 is
+            // deferred to the NEED/FILL exchange below (Site B).
+            if (sent_profile != ProfileId::P29V1 && control.write_complete)
+                control.write_complete();
         }
 
         if (sent_profile == ProfileId::P29V1) {
@@ -3858,6 +3868,10 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                         socket, fill, frame_cap,
                         impl_->stamp(session, AsyncOperationKind::WriteFragment),
                         impl_->completions, control, verify);
+                // Step 4 sub-step 4c: this is this TX's last write -- Site A
+                // above did not fire (fill_sent was still false on entry).
+                if (control.write_complete)
+                    control.write_complete();
             }
         }
         Frame commit_frame = co_await async_read_frame(

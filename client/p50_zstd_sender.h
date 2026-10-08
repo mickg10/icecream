@@ -194,13 +194,17 @@ public:
     // raw_digest, when known, is digest128(*source). stall_stage, when
     // non-null (only under ICECC_P50_OWNER_LAG_TRACE), receives relaxed
     // atomic stores of the last stage this transfer reached; see
-    // ClientStallStage in cache/p50_endpoint.h.
+    // ClientStallStage in cache/p50_endpoint.h. write_complete, when set
+    // (research/designs/P50_ROUTE_PIPELINING.md, Step 4 sub-step 4c), is
+    // invoked exactly once when this TX's last byte has been written to the
+    // wire, strictly no later than this call's own completion.
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
         ConnectedFdFactory connection, PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
         std::shared_ptr<const std::vector<uint8_t>> source,
         std::optional<Digest128> raw_digest = std::nullopt,
-        std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr);
+        std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr,
+        std::function<void()> write_complete = nullptr);
 
 private:
     using ConnectionTarget =
@@ -213,7 +217,8 @@ private:
         bool explicit_route,
         std::shared_ptr<const std::vector<uint8_t>> source,
         std::optional<Digest128> raw_digest = std::nullopt,
-        std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr);
+        std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr,
+        std::function<void()> write_complete = nullptr);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

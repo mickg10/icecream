@@ -513,12 +513,13 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                                     Clock::time_point deadline,
                                     std::shared_ptr<const std::vector<uint8_t>> source,
                                     std::optional<Digest128> raw_digest,
-                                    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+                                    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
+                                    std::function<void()> write_complete) {
     if (source && source->size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
         source.reset();
     return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
                           deadline, true, std::move(source), raw_digest,
-                          std::move(stall_stage));
+                          std::move(stall_stage), std::move(write_complete));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -529,7 +530,8 @@ P50ZstdSourceSender::transfer_bytes(
     bool explicit_route,
     std::shared_ptr<const std::vector<uint8_t>> source,
     std::optional<Digest128> known_digest,
-    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
+    std::function<void()> write_complete) {
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||
@@ -615,6 +617,7 @@ P50ZstdSourceSender::transfer_bytes(
         try {
             EndpointIoControl io_control;
             io_control.stall_stage = stall_stage.get();
+            io_control.write_complete = write_complete;
             if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
                 run = co_await impl_->endpoint->run(
                     std::get<boost::asio::ip::tcp::endpoint>(target), prepared,

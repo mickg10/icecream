@@ -169,7 +169,8 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     std::chrono::steady_clock::time_point deadline,
     std::shared_ptr<const std::vector<uint8_t>> source,
     std::optional<Digest128> raw_digest,
-    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
+    std::function<void()> write_complete) {
     if (!relationship.valid() ||
         request.producer_session == 0 ||
         request.request_token == 0 || !connection)
@@ -188,7 +189,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     }
     ZstdSourceTransferResult result = co_await sender->transfer_route(
         std::move(connection), request, deadline, source, raw_digest,
-        std::move(stall_stage));
+        std::move(stall_stage), std::move(write_complete));
     if (result.replacement_required && !result.route_local_failure)
         replacement_required_ = true;
     co_return result;
