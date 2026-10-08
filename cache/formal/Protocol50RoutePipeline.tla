@@ -54,7 +54,18 @@ CONSTANTS PipelineDepth, MaxRelSeq
 ASSUME PipelineDepth \in Nat /\ PipelineDepth >= 1
 ASSUME MaxRelSeq \in Nat /\ MaxRelSeq >= PipelineDepth
 
-NoTx == -1
+\* NoTx is deliberately the SAME record shape as a real [relSeq, epoch]
+\* transaction (not a bare scalar sentinel like -1).  TLC's record
+\* equality implementation throws "Attempted to check equality of
+\* record ... with non-record ..." whenever one side of = (or \in
+\* against a record-set, or # once a record exists) is a genuine
+\* record and the other is a plain integer -- it does not fall back to
+\* "unequal because different shapes" the way untyped set theory would.
+\* Every comparison in this spec is written generically as
+\* fActive = NoTx / fActive # NoTx / victim = NoTx etc., so giving NoTx
+\* the same field set makes all of them record-vs-record and sidesteps
+\* the crash everywhere at once, including inside fParked \cup {NoTx}.
+NoTx == [relSeq |-> -1, epoch |-> -1]
 RelSeqs == 0..MaxRelSeq
 
 VARIABLES
@@ -200,8 +211,7 @@ TypeOK ==
     /\ \A i \in 1..Len(cQueue) : cQueue[i].relSeq \in RelSeqs /\ cQueue[i].epoch \in Nat
     /\ cConfirmedCursor \in Nat
     /\ cPredictedCursor \in Nat
-    /\ IF fActive = NoTx THEN TRUE
-       ELSE fActive.relSeq \in RelSeqs /\ fActive.epoch \in Nat
+    /\ fActive = NoTx \/ (fActive.relSeq \in RelSeqs /\ fActive.epoch \in Nat)
     /\ \A p \in fParked : p.relSeq \in RelSeqs /\ p.epoch \in Nat
     /\ Cardinality(fParked) <= PipelineDepth - 1
     /\ fRouteCursor \in Nat
