@@ -22,6 +22,8 @@ from typing import List
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyze import (  # noqa: E402
+    DaemonLifecycleOpSample,
+    DaemonTurnSample,
     FResultSample,
     OwnerLagOpSample,
     OwnerLagSecondSample,
@@ -30,8 +32,12 @@ from analyze import (  # noqa: E402
     SourceResultSample,
     check_clock_sanity,
     client_stall_stage_name,
+    daemon_lifecycle_action_name,
+    daemon_lifecycle_status_name,
     derive_ntp_offsets,
+    load_daemon_lifecycle_trace,
     load_owner_lag_trace,
+    print_daemon_lifecycle_summary,
     print_ntp_offsets,
     print_owner_lag_summary,
 )
@@ -428,3 +434,158 @@ def test_print_owner_lag_summary_no_stall_records_reports_none(capsys):
     out = capsys.readouterr().out
     assert "no icecream-p50-owner-lag-stall-v1 records found" in out
     assert "no observed fail_stop stall" in out
+
+
+# --- --daemon-lifecycle (ICECC_P50_DAEMON_LIFECYCLE_TRACE) ------------------
+#
+# Synthetic fixtures only -- see load_daemon_lifecycle_trace()/
+# print_daemon_lifecycle_summary() in analyze.py and
+# append_daemon_lifecycle_trace()/append_daemon_turn_trace() in
+# cache/p50_daemon_sidecar_adapter.cpp / daemon/main.cpp for the producing
+# side.
+
+def test_daemon_lifecycle_action_and_status_name_tables():
+    assert daemon_lifecycle_action_name(2) == "CloseAcceptedJob"
+    assert daemon_lifecycle_action_name(99) == "UNKNOWN(99)"
+    assert daemon_lifecycle_status_name(13) == "Timeout"
+    assert daemon_lifecycle_status_name(14) == "Disconnected"
+    assert daemon_lifecycle_status_name(99) == "UNKNOWN(99)"
+
+
+def test_load_daemon_lifecycle_trace_parses_both_interleaved_schemas(tmp_path):
+    path = tmp_path / "daemon_lifecycle.jsonl"
+    path.write_text(
+        '{"schema":"icecream-p50-daemon-lifecycle-v1","wall_clock_ns":1000,'
+        '"operation_id":7,"action":2,"status":13,'
+        '"job_identity_hash":"deadbeefcafef00d",'
+        '"pending_depth_at_enqueue":3,"turns_before_first_attempt":1,'
+        '"enqueue_to_first_attempt_ns":1500000000,'
+        '"enqueue_to_connect_done_ns":-1,'
+        '"enqueue_to_request_sent_ns":-1,'
+        '"enqueue_to_response_received_ns":-1,'
+        '"enqueue_to_ack_sent_ns":-1,'
+        '"enqueue_to_terminal_ns":5000000000}\n'
+        '{"schema":"icecream-p50-daemon-turn-v1","wall_clock_ns":2000,'
+        '"turns_in_second":42,"max_turn_duration_ns":1200000000,'
+        '"p99_turn_duration_ns":900000000,'
+        '"max_poll_return_to_dispatch_ns":50000,"active_job_count":5}\n'
+        # Unrelated schema sharing the same file -- must be silently
+        # skipped, not treated as a parse failure.
+        '{"schema":"icecream-p50-owner-lag-v1","pid":1}\n'
+        # Malformed JSON -- must be skipped with a warning, not raise.
+        'not even json\n'
+    )
+    ops, turns = load_daemon_lifecycle_trace(str(path))
+    assert len(ops) == 1
+    assert ops[0] == DaemonLifecycleOpSample(
+        wall_clock_ns=1000, operation_id=7, action=2, status=13,
+        job_identity_hash="deadbeefcafef00d", pending_depth_at_enqueue=3,
+        turns_before_first_attempt=1, enqueue_to_first_attempt_ns=1_500_000_000,
+        enqueue_to_connect_done_ns=-1, enqueue_to_request_sent_ns=-1,
+        enqueue_to_response_received_ns=-1, enqueue_to_ack_sent_ns=-1,
+        enqueue_to_terminal_ns=5_000_000_000)
+    assert len(turns) == 1
+    assert turns[0] == DaemonTurnSample(
+        wall_clock_ns=2000, turns_in_second=42, max_turn_duration_ns=1_200_000_000,
+        p99_turn_duration_ns=900_000_000, max_poll_return_to_dispatch_ns=50_000,
+        active_job_count=5)
+
+
+def test_load_daemon_lifecycle_trace_skips_record_missing_a_field(tmp_path, capsys):
+    path = tmp_path / "daemon_lifecycle.jsonl"
+    path.write_text(
+        # Missing "status" -- must be skipped with a warning, not raise.
+        '{"schema":"icecream-p50-daemon-lifecycle-v1","wall_clock_ns":1000,'
+        '"operation_id":7,"action":2,'
+        '"job_identity_hash":"deadbeefcafef00d",'
+        '"pending_depth_at_enqueue":3,"turns_before_first_attempt":1,'
+        '"enqueue_to_first_attempt_ns":-1,"enqueue_to_connect_done_ns":-1,'
+        '"enqueue_to_request_sent_ns":-1,'
+        '"enqueue_to_response_received_ns":-1,'
+        '"enqueue_to_ack_sent_ns":-1,"enqueue_to_terminal_ns":0}\n'
+    )
+    ops, turns = load_daemon_lifecycle_trace(str(path))
+    assert ops == []
+    assert turns == []
+    assert "skipping daemon-lifecycle record" in capsys.readouterr().err
+
+
+def test_print_daemon_lifecycle_summary_per_status_counts(capsys):
+    ops = [
+        DaemonLifecycleOpSample(
+            wall_clock_ns=1000, operation_id=1, action=2, status=0,
+            job_identity_hash="aaaa", pending_depth_at_enqueue=0,
+            turns_before_first_attempt=0, enqueue_to_first_attempt_ns=10_000,
+            enqueue_to_connect_done_ns=20_000, enqueue_to_request_sent_ns=30_000,
+            enqueue_to_response_received_ns=40_000, enqueue_to_ack_sent_ns=50_000,
+            enqueue_to_terminal_ns=60_000),
+        DaemonLifecycleOpSample(
+            wall_clock_ns=2000, operation_id=2, action=2, status=13,
+            job_identity_hash="bbbb", pending_depth_at_enqueue=4,
+            turns_before_first_attempt=9,
+            # This RPC's budget was burned before the sidecar ever saw it --
+            # exactly the enqueue-to-first-attempt > 1s condition this
+            # summary must flag.
+            enqueue_to_first_attempt_ns=4_900_000_000,
+            enqueue_to_connect_done_ns=-1, enqueue_to_request_sent_ns=-1,
+            enqueue_to_response_received_ns=-1, enqueue_to_ack_sent_ns=-1,
+            enqueue_to_terminal_ns=5_000_000_000),
+    ]
+    print_daemon_lifecycle_summary(ops, turns=[])
+    out = capsys.readouterr().out
+    assert "Applied (0): 1" in out
+    assert "Timeout (13): 1" in out
+    assert "RPCs with enqueue_to_first_attempt_ns > 1s: 1" in out
+    assert "operation_id=2" in out
+    assert "action=CloseAcceptedJob" in out
+    assert "status=Timeout" in out
+    assert "job_identity_hash=bbbb" in out
+    assert "enqueue_to_first_attempt_ns=4900000000" in out
+
+
+def test_print_daemon_lifecycle_summary_excludes_unset_deltas_from_distribution(capsys):
+    ops = [
+        DaemonLifecycleOpSample(
+            wall_clock_ns=1000, operation_id=1, action=1, status=0,
+            job_identity_hash="aaaa", pending_depth_at_enqueue=0,
+            turns_before_first_attempt=0, enqueue_to_first_attempt_ns=10_000,
+            # Cancelled before a connect was ever attempted: every later
+            # milestone field is the -1 "never reached" sentinel and must
+            # be excluded from that field's distribution, not counted as a
+            # 0ns or negative sample.
+            enqueue_to_connect_done_ns=-1, enqueue_to_request_sent_ns=-1,
+            enqueue_to_response_received_ns=-1, enqueue_to_ack_sent_ns=-1,
+            enqueue_to_terminal_ns=10_500),
+    ]
+    print_daemon_lifecycle_summary(ops, turns=[])
+    out = capsys.readouterr().out
+    assert "enqueue_to_first_attempt_ns: n=1" in out
+    assert "enqueue_to_connect_done_ns: no recorded samples" in out
+
+
+def test_print_daemon_lifecycle_summary_flags_slow_turn_latency_second(capsys):
+    turns = [
+        DaemonTurnSample(
+            wall_clock_ns=1000, turns_in_second=10, max_turn_duration_ns=50_000,
+            p99_turn_duration_ns=40_000, max_poll_return_to_dispatch_ns=1_000,
+            active_job_count=2),
+        # The daemon main loop itself stalled for over 1s on one turn in
+        # this second -- exactly the condition this summary must flag.
+        DaemonTurnSample(
+            wall_clock_ns=2000, turns_in_second=3, max_turn_duration_ns=1_300_000_000,
+            p99_turn_duration_ns=1_100_000_000,
+            max_poll_return_to_dispatch_ns=900_000_000, active_job_count=7),
+    ]
+    print_daemon_lifecycle_summary(ops=[], turns=turns)
+    out = capsys.readouterr().out
+    assert "turn-latency seconds with max_turn_duration_ns > 1s: 1" in out
+    assert "wall_clock_ns=2000 " in out
+    assert "max_turn_duration_ns=1300000000" in out
+    assert "active_job_count=7" in out
+
+
+def test_print_daemon_lifecycle_summary_handles_no_records(capsys):
+    print_daemon_lifecycle_summary([], [])
+    out = capsys.readouterr().out
+    assert "no icecream-p50-daemon-lifecycle-v1 records found" in out
+    assert "no icecream-p50-daemon-turn-v1 records found" in out

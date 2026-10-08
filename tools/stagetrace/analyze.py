@@ -581,6 +581,251 @@ def print_owner_lag_summary(seconds: List[OwnerLagSecondSample],
             print("      in_flight_tx: none observed")
 
 
+# --- --daemon-lifecycle (ICECC_P50_DAEMON_LIFECYCLE_TRACE) ------------------
+#
+# Two interleaved schemas written to the same file: the per-RPC
+# icecream-p50-daemon-lifecycle-v1 (append_daemon_lifecycle_trace() in
+# cache/p50_daemon_sidecar_adapter.cpp) and the per-second
+# icecream-p50-daemon-turn-v1 (append_daemon_turn_trace() in
+# daemon/main.cpp), both gated on the same ICECC_P50_DAEMON_LIFECYCLE_TRACE
+# env var. See cache/p50_input_lifecycle.h for the InputLifecycleAction and
+# InputLifecycleStatus enum definitions mirrored by the name tables below.
+
+_DAEMON_LIFECYCLE_ACTION_NAMES = {
+    0: "None",
+    1: "CancelAttempt",
+    2: "CloseAcceptedJob",
+    3: "CancelJob",
+    4: "PrepareAttemptRetirement",
+    5: "CommitAttemptReplacement",
+    6: "CloseLogicalInputLease",
+}
+
+_DAEMON_LIFECYCLE_STATUS_NAMES = {
+    0: "Applied",
+    1: "AlreadyApplied",
+    2: "StoreReplaced",
+    3: "InvalidArgument",
+    4: "PeerUnauthenticated",
+    5: "HandshakeFailed",
+    6: "MalformedResponse",
+    7: "StaleIdentity",
+    8: "UnknownRecord",
+    9: "StaleOwner",
+    10: "ConflictingReplay",
+    11: "CapacityExceeded",
+    12: "Rejected",
+    13: "Timeout",
+    14: "Disconnected",
+    15: "AttemptQuiescedRecordRetained",
+    16: "ReplacementInstalledRecordRetained",
+    17: "JobClosedRecordRetained",
+    18: "JobClosedRecordReclaimed",
+    19: "RetirementProofRequired",
+    20: "GenerationMismatch",
+}
+
+
+def daemon_lifecycle_action_name(action: int) -> str:
+    """Mirrors InputLifecycleAction (cache/p50_input_lifecycle.h)."""
+    return _DAEMON_LIFECYCLE_ACTION_NAMES.get(action, f"UNKNOWN({action})")
+
+
+def daemon_lifecycle_status_name(status: int) -> str:
+    """Mirrors InputLifecycleStatus (cache/p50_input_lifecycle.h)."""
+    return _DAEMON_LIFECYCLE_STATUS_NAMES.get(status, f"UNKNOWN({status})")
+
+
+@dataclass
+class DaemonLifecycleOpSample:
+    """One parsed icecream-p50-daemon-lifecycle-v1 record
+    (ICECC_P50_DAEMON_LIFECYCLE_TRACE).
+
+    One record per terminal input-lifecycle RPC outcome, emitted by
+    append_daemon_lifecycle_trace() in
+    cache/p50_daemon_sidecar_adapter.cpp. job_identity_hash is an FNV-1a
+    64-bit hash (hex string) of the job's identity fields -- no raw
+    c_store_guid is ever written. action/status are the raw
+    InputLifecycleAction/InputLifecycleStatus numeric ordinals (see
+    daemon_lifecycle_action_name()/daemon_lifecycle_status_name() above).
+    Every enqueue_to_*_ns field is -1 ("milestone never reached") unless
+    that milestone was actually recorded before the terminal state; -1 can
+    legitimately appear on every field except enqueue_to_terminal_ns, which
+    is only ever written once a terminal state is known.
+    """
+    wall_clock_ns: int
+    operation_id: int
+    action: int
+    status: int
+    job_identity_hash: str
+    pending_depth_at_enqueue: int
+    turns_before_first_attempt: int
+    enqueue_to_first_attempt_ns: int
+    enqueue_to_connect_done_ns: int
+    enqueue_to_request_sent_ns: int
+    enqueue_to_response_received_ns: int
+    enqueue_to_ack_sent_ns: int
+    enqueue_to_terminal_ns: int
+
+
+@dataclass
+class DaemonTurnSample:
+    """One parsed icecream-p50-daemon-turn-v1 record (same env var/file as
+    DaemonLifecycleOpSample -- the two schemas are interleaved).
+
+    One record per wall-clock second that saw at least one
+    answer_client_requests() turn, emitted by append_daemon_turn_trace() in
+    daemon/main.cpp. max_turn_duration_ns/p99_turn_duration_ns are the
+    steady-clock delta from one poll() return to the next; p99 is drawn
+    from a bounded (4096-sample) per-second reservoir, an approximation
+    under a zero-timeout turn spin. max_poll_return_to_dispatch_ns is the
+    max delta from a poll() return to the start of that turn's
+    cache-adapter lifecycle dispatch.
+    """
+    wall_clock_ns: int
+    turns_in_second: int
+    max_turn_duration_ns: int
+    p99_turn_duration_ns: int
+    max_poll_return_to_dispatch_ns: int
+    active_job_count: int
+
+
+def load_daemon_lifecycle_trace(
+        path: str,
+) -> Tuple[List[DaemonLifecycleOpSample], List[DaemonTurnSample]]:
+    """Load ICECC_P50_DAEMON_LIFECYCLE_TRACE.
+
+    The per-RPC (icecream-p50-daemon-lifecycle-v1) and per-second
+    (icecream-p50-daemon-turn-v1) schemas are both appended to the same
+    file (lifecycle RPC trace in cache/p50_daemon_sidecar_adapter.cpp,
+    turn-latency trace in daemon/main.cpp), interleaved in emission order,
+    so this reads it once and splits by the "schema" field.
+    Diagnostic-only; never touches source bytes or paths -- job identity is
+    an FNV-1a hash string, never a raw c_store_guid.
+    """
+    ops: List[DaemonLifecycleOpSample] = []
+    turns: List[DaemonTurnSample] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"warning: {path}:{lineno}: skipping malformed JSON ({exc})",
+                      file=sys.stderr)
+                continue
+            schema = obj.get("schema")
+            try:
+                if schema == "icecream-p50-daemon-lifecycle-v1":
+                    ops.append(DaemonLifecycleOpSample(
+                        wall_clock_ns=int(obj["wall_clock_ns"]),
+                        operation_id=int(obj["operation_id"]),
+                        action=int(obj["action"]),
+                        status=int(obj["status"]),
+                        job_identity_hash=str(obj["job_identity_hash"]),
+                        pending_depth_at_enqueue=int(obj["pending_depth_at_enqueue"]),
+                        turns_before_first_attempt=int(obj["turns_before_first_attempt"]),
+                        enqueue_to_first_attempt_ns=int(obj["enqueue_to_first_attempt_ns"]),
+                        enqueue_to_connect_done_ns=int(obj["enqueue_to_connect_done_ns"]),
+                        enqueue_to_request_sent_ns=int(obj["enqueue_to_request_sent_ns"]),
+                        enqueue_to_response_received_ns=int(obj["enqueue_to_response_received_ns"]),
+                        enqueue_to_ack_sent_ns=int(obj["enqueue_to_ack_sent_ns"]),
+                        enqueue_to_terminal_ns=int(obj["enqueue_to_terminal_ns"]),
+                    ))
+                elif schema == "icecream-p50-daemon-turn-v1":
+                    turns.append(DaemonTurnSample(
+                        wall_clock_ns=int(obj["wall_clock_ns"]),
+                        turns_in_second=int(obj["turns_in_second"]),
+                        max_turn_duration_ns=int(obj["max_turn_duration_ns"]),
+                        p99_turn_duration_ns=int(obj["p99_turn_duration_ns"]),
+                        max_poll_return_to_dispatch_ns=int(obj["max_poll_return_to_dispatch_ns"]),
+                        active_job_count=int(obj["active_job_count"]),
+                    ))
+            except (KeyError, TypeError, ValueError) as exc:
+                print(f"warning: {path}:{lineno}: skipping daemon-lifecycle record "
+                      f"({exc})", file=sys.stderr)
+    return ops, turns
+
+
+def print_daemon_lifecycle_summary(ops: List[DaemonLifecycleOpSample],
+                                    turns: List[DaemonTurnSample]) -> None:
+    """--daemon-lifecycle summary: per-status counts, each enqueue_to_*_ns
+    delta's distribution (unset/-1 milestones excluded), RPCs whose
+    enqueue-to-first-attempt delay exceeded 1s (the hypothesis under test:
+    the 5s input-lifecycle timeout budget being burned on the daemon side
+    before the sidecar ever saw the RPC), and turn-latency seconds whose
+    max_turn_duration_ns exceeded 1s (the daemon main loop itself
+    stalling). See the lifecycle RPC trace in
+    cache/p50_daemon_sidecar_adapter.cpp and the turn-latency trace in
+    daemon/main.cpp for the producing side."""
+    def pct(data: List[int], p: float) -> float:
+        if not data:
+            return float("nan")
+        data = sorted(data)
+        k = (len(data) - 1) * p
+        f, c = int(k), min(int(k) + 1, len(data) - 1)
+        return data[f] + (data[c] - data[f]) * (k - f)
+
+    print(f"\n=== daemon-lifecycle summary ({len(ops)} lifecycle-RPC "
+          f"samples, {len(turns)} turn-latency samples) ===")
+    if not ops:
+        print("  no icecream-p50-daemon-lifecycle-v1 records found")
+    else:
+        print("  per-status counts:")
+        counts: Dict[int, int] = defaultdict(int)
+        for op in ops:
+            counts[op.status] += 1
+        for status in sorted(counts):
+            print(f"    {daemon_lifecycle_status_name(status)} ({status}): "
+                  f"{counts[status]}")
+
+        delta_fields = [
+            "enqueue_to_first_attempt_ns", "enqueue_to_connect_done_ns",
+            "enqueue_to_request_sent_ns", "enqueue_to_response_received_ns",
+            "enqueue_to_ack_sent_ns", "enqueue_to_terminal_ns",
+        ]
+        print("  delta distributions (unset/-1 milestones excluded):")
+        for field_name in delta_fields:
+            values = [v for v in (getattr(op, field_name) for op in ops) if v >= 0]
+            if not values:
+                print(f"    {field_name}: no recorded samples")
+                continue
+            print(f"    {field_name}: n={len(values)} p50={pct(values,0.5):.0f} "
+                  f"p90={pct(values,0.9):.0f} p99={pct(values,0.99):.0f} "
+                  f"max={max(values)}")
+
+        slow_first_attempt = [op for op in ops
+                               if op.enqueue_to_first_attempt_ns > 1_000_000_000]
+        print(f"  RPCs with enqueue_to_first_attempt_ns > 1s: "
+              f"{len(slow_first_attempt)}")
+        for op in slow_first_attempt:
+            print(f"    operation_id={op.operation_id} "
+                  f"action={daemon_lifecycle_action_name(op.action)} "
+                  f"status={daemon_lifecycle_status_name(op.status)} "
+                  f"job_identity_hash={op.job_identity_hash} "
+                  f"enqueue_to_first_attempt_ns={op.enqueue_to_first_attempt_ns} "
+                  f"pending_depth_at_enqueue={op.pending_depth_at_enqueue} "
+                  f"turns_before_first_attempt={op.turns_before_first_attempt}")
+
+    if not turns:
+        print("  no icecream-p50-daemon-turn-v1 records found")
+    else:
+        slow_turn_seconds = [t for t in turns
+                              if t.max_turn_duration_ns > 1_000_000_000]
+        print(f"  turn-latency seconds with max_turn_duration_ns > 1s: "
+              f"{len(slow_turn_seconds)}")
+        for t in slow_turn_seconds:
+            print(f"    wall_clock_ns={t.wall_clock_ns} "
+                  f"turns_in_second={t.turns_in_second} "
+                  f"max_turn_duration_ns={t.max_turn_duration_ns} "
+                  f"p99_turn_duration_ns={t.p99_turn_duration_ns} "
+                  f"max_poll_return_to_dispatch_ns={t.max_poll_return_to_dispatch_ns} "
+                  f"active_job_count={t.active_job_count}")
+# --- end --daemon-lifecycle --------------------------------------------------
+
+
 @dataclass
 class NtpOffsetResult:
     offset_ns: float
@@ -1247,12 +1492,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                               "per lifecycle op, and lists any fail_stop "
                               "stall-diagnosis record -- works for either "
                               "the C or the F sidecar's file")
+    parser.add_argument("--daemon-lifecycle", default=None, metavar="FILE",
+                         help="path to an ICECC_P50_DAEMON_LIFECYCLE_TRACE "
+                              "JSONL file (icecream-p50-daemon-lifecycle-v1 "
+                              "per-RPC records interleaved with "
+                              "icecream-p50-daemon-turn-v1 per-second "
+                              "main-loop turn-latency records); prints "
+                              "per-status counts, each enqueue_to_*_ns "
+                              "delta's distribution, lifecycle RPCs whose "
+                              "enqueue-to-first-attempt delay exceeded 1s, "
+                              "and turn-latency seconds whose "
+                              "max_turn_duration_ns exceeded 1s -- the "
+                              "daemon-side half of the input-lifecycle "
+                              "sidecar-retirement investigation")
     args = parser.parse_args(argv)
 
-    flag_only = args.owner_lag or args.c_result_trace or args.f_result_trace
+    flag_only = (args.owner_lag or args.c_result_trace or args.f_result_trace
+                 or args.daemon_lifecycle)
     if args.trace_dir is None and not flag_only:
         print("error: trace_dir is required unless --owner-lag, "
-              "--c-result-trace, or --f-result-trace is given",
+              "--c-result-trace, --f-result-trace, or --daemon-lifecycle "
+              "is given",
               file=sys.stderr)
         return 1
 
@@ -1354,6 +1614,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.owner_lag:
         lag_seconds, lag_ops, lag_stalls = load_owner_lag_trace(args.owner_lag)
         print_owner_lag_summary(lag_seconds, lag_ops, lag_stalls)
+
+    if args.daemon_lifecycle:
+        lifecycle_ops, turn_samples = load_daemon_lifecycle_trace(args.daemon_lifecycle)
+        print_daemon_lifecycle_summary(lifecycle_ops, turn_samples)
 
     return 0
 
