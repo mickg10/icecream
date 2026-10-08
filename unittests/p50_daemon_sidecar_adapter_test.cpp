@@ -409,6 +409,18 @@ bool run_kill_domain_release_bound_test(
 
     auto config = base_config;
     config.runtime_directory = root;
+    // This test's whole point is to drive several real kill/relaunch cycles
+    // back-to-back with no pacing, so it can observe the kill-domain record
+    // (and pidfd) count settle into a steady state. The production default
+    // of max_restarts=3 within a 10s restart_window is a legitimate
+    // crash-loop throttle, but it is tuned for organic failures, not a
+    // deliberate same-process test driving kCycles relaunches in a few
+    // hundred milliseconds; left at the default, the adapter degrades to
+    // legacy mid-test and the test fails on an unrelated timeout rather than
+    // exercising the release() bound it is meant to check. Raise the budget
+    // for this local config copy only (not base_config, not any other
+    // test's adapter) so every cycle gets a real relaunch.
+    config.max_restarts = 64;
     DaemonSidecarAdapter adapter(config);
     adapter.observe_public_listener(true, config.public_listener_port);
     adapter.outer_set_scheduler_owner(true);
@@ -439,6 +451,23 @@ bool run_kill_domain_release_bound_test(
                          steady_state_count, count, cycle);
             ok = false;
         }
+    }
+
+    // All kCycles relaunches must actually have happened (not merely the
+    // first one or two before some unrelated timeout cut the loop short);
+    // otherwise a plateau of "whatever we saw before giving up" would pass
+    // trivially without exercising release() at all.
+    if (ok && steady_state_count < 0) {
+        std::fprintf(stderr,
+                     "kill-domain release regression: steady state was never"
+                     " established (loop exited before cycle 1)\n");
+        ok = false;
+    }
+    if (ok) {
+        std::fprintf(stderr,
+                     "kill-domain release bound: open pidfd count held at %d"
+                     " through %d relaunch cycles\n",
+                     steady_state_count, kCycles - 1);
     }
 
     ok = ok && drive_shutdown(adapter, reaper, update);
