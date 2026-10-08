@@ -403,14 +403,16 @@ NoCrossEpochRetire ==
 -----------------------------------------------------------------------------
 (* Liveness *)
 
-LeadsTo(P, Q) == [](P => <>Q)
-
 ParkedRelSeqs == {p.relSeq : p \in fParked}
 
 \* A parked transaction is eventually released (or discarded by a fault),
-\* under the WF_vars(Next) fairness already built into Spec.
+\* under the WF_vars(Next) fairness already built into Spec.  Written
+\* inline (not routed through a higher-order "LeadsTo(P, Q)" helper):
+\* TLC's temporal-formula translator rejects box/diamond combinators
+\* that reach it through a user-defined operator application instead of
+\* appearing literally in the property's syntax.
 ParkedEventuallyResolved ==
-    \A r \in RelSeqs : LeadsTo(r \in ParkedRelSeqs, r \notin ParkedRelSeqs)
+    \A r \in RelSeqs : [](r \in ParkedRelSeqs => <>(r \notin ParkedRelSeqs))
 
 -----------------------------------------------------------------------------
 (* Mutants -- each must FAIL with the named invariant.  Each mutant swaps
