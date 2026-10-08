@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <poll.h>
@@ -152,6 +153,19 @@ void append_ready_test_trace(std::string_view message) noexcept {
 
 void append_fingerprint_test_trace(std::string_view message) noexcept {
     append_test_trace("ICECC_P50_TEST_FINGERPRINT_TRACE", message);
+}
+
+// Diagnostic-only: shared CLOCK_REALTIME helper so every new diagnostic
+// line added to this file reports the same wall-clock basis without each
+// call site re-typing the clock_gettime boilerplate already duplicated
+// above (append_source_result_trace et al. keep their own pre-existing
+// inline copy; this helper is only for call sites added after it).
+uint64_t wall_clock_ns_now() noexcept {
+    struct timespec wall_ts{};
+    if (::clock_gettime(CLOCK_REALTIME, &wall_ts) != 0)
+        return 0;
+    return static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(wall_ts.tv_nsec);
 }
 
 void append_source_result_trace(
@@ -677,6 +691,66 @@ void append_owner_lag_stall_trace(uint64_t route_identity_hash,
     (void)::close(fd);
 }
 
+// Diagnostic-only: emitted immediately before every supervised
+// fail_stop()/std::_Exit(125) call site below, regardless of which one
+// reached it. Distinct from append_owner_lag_stall_trace above (schema
+// "...-stall-v1", which fires only for transfer_source_on_owner's
+// wait_limit timeout): this one fires at every call site that can take
+// this process down via _Exit(125), including run_one's
+// endpoint-owner-failed and quiescence-deadline paths, so the stderr line
+// and optional JSON record are distinguishable by `site`/`reason`. Called
+// on the thread about to _Exit the whole process, so it must not
+// allocate: every value is plain arithmetic or an already-computed
+// caller-supplied value, and the JSON record uses the same stack-buffer
+// snprintf + direct ::write discipline as every other trace in this file.
+void emit_fail_stop_diagnostic(const char* site, const char* reason,
+                                uint64_t route_identity_hash,
+                                int64_t elapsed_ns) noexcept {
+    const uint64_t wall_clock_ns = wall_clock_ns_now();
+    std::fprintf(stderr,
+                 "FAIL_STOP site=%s reason=%s route_identity_hash=%llu"
+                 " elapsed_ns=%lld wall_clock_ns=%llu\n",
+                 site, reason,
+                 static_cast<unsigned long long>(route_identity_hash),
+                 static_cast<long long>(elapsed_ns),
+                 static_cast<unsigned long long>(wall_clock_ns));
+    std::fflush(stderr);
+    const char* path = ::getenv("ICECC_P50_OWNER_LAG_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    char line[384];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-owner-lag-failstop-v1\","
+        "\"pid\":%lld,\"wall_clock_ns\":%llu,\"site\":\"%s\","
+        "\"reason\":\"%s\",\"route_identity_hash\":%llu,"
+        "\"elapsed_ns\":%lld}\n",
+        static_cast<long long>(::getpid()),
+        static_cast<unsigned long long>(wall_clock_ns), site, reason,
+        static_cast<unsigned long long>(route_identity_hash),
+        static_cast<long long>(elapsed_ns));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
 volatile sig_atomic_t g_stop_requested = 0;
 volatile sig_atomic_t g_signal_wake_fd = -1;
 
@@ -749,6 +823,90 @@ struct SignalGuard {
     SignalGuard(const SignalGuard&) = delete;
     SignalGuard& operator=(const SignalGuard&) = delete;
 };
+
+// Diagnostic-only: fatal-signal reporting. None of SIGSEGV/SIGBUS/SIGFPE/
+// SIGILL/SIGABRT had any handler installed anywhere in this process before
+// this change, so a crash on any of them produced no trace at all beyond
+// whatever the kernel/shell printed for the core dump. The handler below
+// writes one fixed-size, async-signal-safe line (no fprintf/malloc/locale),
+// then restores whatever disposition preceded it (SIG_DFL, or a handler
+// installed by some other component) and re-raises, so the previous
+// behavior is fully preserved after the trace line is emitted.
+struct FatalSignalEntry {
+    int signum = 0;
+    struct sigaction old_action{};
+};
+
+FatalSignalEntry g_fatal_signal_entries[] = {
+    {SIGSEGV, {}}, {SIGBUS, {}}, {SIGFPE, {}}, {SIGILL, {}}, {SIGABRT, {}},
+};
+
+void fatal_signal_handler(int signum) noexcept {
+    static const char prefix[] = "P50_SIDECAR_FATAL_SIGNAL signum=";
+    char buf[64];
+    size_t pos = 0;
+    for (; prefix[pos] != '\0' && pos < sizeof(buf) - 1; ++pos)
+        buf[pos] = prefix[pos];
+    char digits[16];
+    int digit_count = 0;
+    unsigned value = signum > 0 ? static_cast<unsigned>(signum)
+                                : static_cast<unsigned>(-signum);
+    if (value == 0) {
+        digits[digit_count++] = '0';
+    } else {
+        while (value > 0 && digit_count < static_cast<int>(sizeof(digits))) {
+            digits[digit_count++] = static_cast<char>('0' + (value % 10));
+            value /= 10;
+        }
+    }
+    for (int i = digit_count - 1; i >= 0 && pos < sizeof(buf) - 1; --i)
+        buf[pos++] = digits[static_cast<size_t>(i)];
+    if (pos < sizeof(buf))
+        buf[pos++] = '\n';
+    const ssize_t ignored = ::write(2, buf, pos);
+    (void)ignored;
+
+    for (auto& entry : g_fatal_signal_entries) {
+        if (entry.signum == signum) {
+            (void)::sigaction(signum, &entry.old_action, nullptr);
+            break;
+        }
+    }
+    (void)::raise(signum);
+}
+
+bool install_fatal_signal_handlers() noexcept {
+    struct sigaction action{};
+    action.sa_handler = fatal_signal_handler;
+    if (::sigemptyset(&action.sa_mask) != 0)
+        return false;
+    // SA_NODEFER: the handler restores the prior disposition and re-raises
+    // the same signal number from inside itself, so that signal must not
+    // still be blocked when it is re-delivered.
+    action.sa_flags = SA_NODEFER;
+    bool all_installed = true;
+    for (auto& entry : g_fatal_signal_entries) {
+        if (::sigaction(entry.signum, &action, &entry.old_action) != 0)
+            all_installed = false;
+    }
+    return all_installed;
+}
+
+// Diagnostic-only: chain the previously-installed std::terminate handler
+// (the default one if nothing else installed one) behind a trace line, so
+// cases like EndpointCodecPool::release()'s unconditional std::terminate()
+// on double-release (cache/p50_endpoint.cpp) stop being silent before the
+// process goes down exactly as it would have before this change.
+std::terminate_handler g_previous_terminate_handler = nullptr;
+
+void fatal_terminate_handler() noexcept {
+    std::fprintf(stderr, "P50_SIDECAR_TERMINATE wall_clock_ns=%llu\n",
+                 static_cast<unsigned long long>(wall_clock_ns_now()));
+    std::fflush(stderr);
+    if (g_previous_terminate_handler != nullptr)
+        g_previous_terminate_handler();
+    std::abort();
+}
 
 struct OwnedFd {
     int fd = -1;
@@ -1478,7 +1636,7 @@ bool handle_connection(local::Connection connection, const Options& options,
                     "source=%u valid=%u clock_match=%u expired=%u now_ns=%lld "
                     "expires_ns=%lld operation_clock=%llu "
                     "operation_time_namespace=%llu local_clock=%llu "
-                    "local_time_namespace=%llu\n",
+                    "local_time_namespace=%llu wall_clock_ns=%llu\n",
                     static_cast<unsigned long long>(operation.request_id),
                     source_present ? 1u : 0u, deadline_valid ? 1u : 0u,
                     clock_matches ? 1u : 0u, deadline_expired ? 1u : 0u,
@@ -1489,7 +1647,8 @@ bool handle_connection(local::Connection connection, const Options& options,
                     static_cast<unsigned long long>(
                         operation.absolute_deadline.time_namespace_id),
                     static_cast<unsigned long long>(clock.clock_domain_id),
-                    static_cast<unsigned long long>(clock.time_namespace_id));
+                    static_cast<unsigned long long>(clock.time_namespace_id),
+                    static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
                 return true;
             }
@@ -1500,10 +1659,11 @@ bool handle_connection(local::Connection connection, const Options& options,
             if (handoff.status != local::FdHandoffStatus::Accepted) {
                 std::fprintf(stderr,
                              "P50_SOURCE_TRANSFER_REFUSED stage=fd-handoff "
-                             "request=%llu status=%s state=%u\n",
+                             "request=%llu status=%s state=%u wall_clock_ns=%llu\n",
                              static_cast<unsigned long long>(operation.request_id),
                              local::fd_handoff_status_name(handoff.status),
-                             static_cast<unsigned>(handoff.sender_state));
+                             static_cast<unsigned>(handoff.sender_state),
+                             static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
                 return true;
             }
@@ -1515,11 +1675,13 @@ bool handle_connection(local::Connection connection, const Options& options,
             if (transfer.code != local::SourceTransferResultCode::Committed) {
                 std::fprintf(stderr,
                              "P50_SOURCE_TRANSFER_REFUSED stage=owner-result "
-                             "request=%llu code=%u error=%u attempts=%u\n",
+                             "request=%llu code=%u error=%u attempts=%u "
+                             "wall_clock_ns=%llu\n",
                              static_cast<unsigned long long>(operation.request_id),
                              static_cast<unsigned>(transfer.code),
                              static_cast<unsigned>(transfer.error_code),
-                             static_cast<unsigned>(transfer.attempts));
+                             static_cast<unsigned>(transfer.attempts),
+                             static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
             }
             const std::vector<uint8_t> response_payload =
@@ -1528,8 +1690,9 @@ bool handle_connection(local::Connection connection, const Options& options,
             if (response_payload.empty()) {
                 std::fprintf(stderr,
                              "P50_SOURCE_TRANSFER_REFUSED stage=response-encode "
-                             "request=%llu\n",
-                             static_cast<unsigned long long>(operation.request_id));
+                             "request=%llu wall_clock_ns=%llu\n",
+                             static_cast<unsigned long long>(operation.request_id),
+                             static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
                 return true;
             }
@@ -1542,9 +1705,10 @@ bool handle_connection(local::Connection connection, const Options& options,
             if (response_status != local::Status::Ok) {
                 std::fprintf(stderr,
                              "P50_SOURCE_TRANSFER_REFUSED stage=response-send "
-                             "request=%llu status=%s\n",
+                             "request=%llu status=%s wall_clock_ns=%llu\n",
                              static_cast<unsigned long long>(operation.request_id),
-                             local::status_name(response_status));
+                             local::status_name(response_status),
+                             static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
                 return true;
             }
@@ -1562,12 +1726,13 @@ bool handle_connection(local::Connection connection, const Options& options,
                 std::fprintf(stderr,
                              "P50_SOURCE_TRANSFER_REFUSED stage=response-ack "
                              "request=%llu receive=%s type=%u payload_bytes=%zu "
-                             "identity=%s\n",
+                             "identity=%s wall_clock_ns=%llu\n",
                              static_cast<unsigned long long>(operation.request_id),
                              local::status_name(acknowledgement_status),
                              static_cast<unsigned>(acknowledgement.type),
                              acknowledgement.payload.size(),
-                             local::status_name(acknowledgement_identity));
+                             local::status_name(acknowledgement_identity),
+                             static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
                 return true;
             }
@@ -2231,7 +2396,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                          "P50_SOURCE_TRANSFER_REFUSED stage=%s request=%llu "
                          "f_host=%s f_cache_port=%u detail=%lld "
                          "source_read_ns=%llu open_arm_budget_ms=%lld "
-                         "open_arm_elapsed_ns=%llu stage_elapsed_ns=%llu\n",
+                         "open_arm_elapsed_ns=%llu stage_elapsed_ns=%llu "
+                         "wall_clock_ns=%llu\n",
                          stage,
                          static_cast<unsigned long long>(arm.source_request_id),
                          arm.selected_f_host.c_str(), arm.selected_f_cache_port,
@@ -2241,7 +2407,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                          static_cast<unsigned long long>(
                              open_arm_elapsed > 0 ? open_arm_elapsed : 0),
                          static_cast<unsigned long long>(
-                             stage_elapsed > 0 ? stage_elapsed : 0));
+                             stage_elapsed > 0 ? stage_elapsed : 0),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
             std::fflush(stderr);
             return -1;
         };
@@ -2432,10 +2599,12 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     if (!source_bytes.has_value()) {
         std::fprintf(stderr,
                      "P50_SOURCE_TRANSFER_REFUSED stage=source-read request=%llu "
-                     "f_host=%s f_cache_port=%u source_read_ns=%llu\n",
+                     "f_host=%s f_cache_port=%u source_read_ns=%llu "
+                     "wall_clock_ns=%llu\n",
                      static_cast<unsigned long long>(arm.source_request_id),
                      arm.selected_f_host.c_str(), arm.selected_f_cache_port,
-                     static_cast<unsigned long long>(*source_read_ns));
+                     static_cast<unsigned long long>(*source_read_ns),
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
         std::fflush(stderr);
         return source_transfer_error(3);
     }
@@ -2661,6 +2830,12 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             stall_stage ? stall_stage->load(std::memory_order_relaxed)
                         : ClientStallStage::Connecting,
             /*tu_seq=*/0, /*rel_seq=*/0);
+        emit_fail_stop_diagnostic(
+            "transfer_source_on_owner", "owner_lag_wait_limit",
+            fnv1a_route_relationship(relationship),
+            transfer_start_mono_ns > 0
+                ? stall_now_mono_ns - transfer_start_mono_ns
+                : 0);
         if (config_.fail_stop)
             config_.fail_stop();
         std::_Exit(125);
@@ -2711,6 +2886,19 @@ void SidecarRuntime::endpoint_owner_loop() noexcept {
         if (config_.owner_failure)
             config_.owner_failure();
         context_.run();
+    } catch (const std::exception& e) {
+        // Diagnostic-only: same recovery as the catch (...) below, but
+        // identifies the escaped exception's what() before taking it, since
+        // std::exception is the common case and the message is otherwise
+        // lost the instant this handler's catch (...) sibling runs.
+        std::fprintf(stderr,
+                     "P50_ENDPOINT_OWNER_LOOP_EXCEPTION what=%s"
+                     " wall_clock_ns=%llu\n",
+                     e.what(),
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
+        std::fflush(stderr);
+        endpoint_owner_failed_.store(true, std::memory_order_release);
+        context_.stop();
     } catch (...) {
         // Every endpoint coroutine converts its own failure into a result. If
         // an unexpected executor failure still escapes, let teardown drain
@@ -2946,7 +3134,9 @@ RuntimeResult SidecarRuntime::run_one(
             cancel_endpoint_run();
         }
     };
-    const auto fail_stop = [&]() noexcept {
+    const auto fail_stop = [&](const char* reason) noexcept {
+        emit_fail_stop_diagnostic("run_one", reason, /*route_identity_hash=*/0,
+                                   /*elapsed_ns=*/0);
         if (config_.fail_stop)
             config_.fail_stop();
         // A policy that returns cannot make it safe to return from run_one:
@@ -2978,11 +3168,11 @@ RuntimeResult SidecarRuntime::run_one(
             // not return while its coroutine/session registration might still
             // reference this runtime; the supervised sidecar fail-stop is the
             // only bounded safe outcome for this ownership violation.
-            fail_stop();
+            fail_stop("endpoint_owner_failed");
         }
         if (cancellation != RuntimeCancellationReason::None &&
             std::chrono::steady_clock::now() >= quiescence_deadline)
-            fail_stop();
+            fail_stop("quiescence_deadline");
         if (cancellation == RuntimeCancellationReason::None) {
             uint8_t probe = 0;
             const ssize_t peeked = ::recv(control.native_handle(), &probe, 1,
@@ -3803,6 +3993,17 @@ int run(const Options& options) noexcept {
     g_stop_requested = 0;
     if (!signals.install(wake.write.fd))
         return 2;
+    // Diagnostic-only: neither of these existed anywhere in this process
+    // before this change. Installed as early as possible so that anything
+    // which crashes or terminate()s later in run() (including during the
+    // structured-launch/listener/privilege-drop steps below) is still
+    // caught by them.
+    (void)install_fatal_signal_handlers();
+    g_previous_terminate_handler = std::set_terminate(fatal_terminate_handler);
+    std::fprintf(stderr, "P50_SIDECAR_START pid=%lld wall_clock_ns=%llu\n",
+                 static_cast<long long>(::getpid()),
+                 static_cast<unsigned long long>(wall_clock_ns_now()));
+    std::fflush(stderr);
 
     local::Status listen_status = local::Status::Ok;
     OwnedFd listener_owner;
