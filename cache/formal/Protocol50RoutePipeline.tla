@@ -292,11 +292,15 @@ SpecM1 == Init /\ [][NextM1]_vars /\ WF_vars(NextM1)
 \* M2: release of n+2 on n's commit -- on commit, release an arbitrary
 \* parked successor instead of specifically committed+1.  Needs
 \* PipelineDepth = 3 to have two parked entries to pick the wrong one from.
+\* victim is explored nondeterministically over every member of fParked
+\* (plus NoTx when nothing is parked) rather than picked once via CHOOSE,
+\* so TLC's search is guaranteed to visit the wrong-victim branch instead
+\* of silently settling on whichever element CHOOSE happens to return.
 \* Expected violation: ActiveIsNextExpected.
-FCommitMutantEarlyRelease ==
+FCommitMutantEarlyRelease(victim) ==
     /\ fActive # NoTx
+    /\ victim \in (fParked \cup {NoTx})
     /\ LET committed == fActive.relSeq
-           victim == IF fParked # {} THEN CHOOSE p \in fParked : TRUE ELSE NoTx
        IN
            /\ appliedLog' = Append(appliedLog, committed)
            /\ fRouteCursor' = committed + 1
@@ -311,7 +315,7 @@ NextM2 ==
     \/ CBegin
     \/ (\E relSeq \in RelSeqs : FArriveProceed(relSeq))
     \/ (\E relSeq \in RelSeqs : FArrivePark(relSeq))
-    \/ FCommitMutantEarlyRelease
+    \/ (\E victim \in (fParked \cup {NoTx}) : FCommitMutantEarlyRelease(victim))
     \/ CRetireCommit
     \/ Fault
 SpecM2 == Init /\ [][NextM2]_vars /\ WF_vars(NextM2)
