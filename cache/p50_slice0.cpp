@@ -2540,11 +2540,24 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
         // this is one explicit, benching-only copy back to the plain
         // allocator, performed here at the very end -- after all 5 timed
         // Receiver* stages above have already run directly against
-        // `result`. The copy is pure overhead this diagnostic variant adds
-        // outside every measured stage; it does not read, write, or alter
-        // any byte already checked above, so it cannot change the wire
-        // bytes, the digests, or anything on the CacheWire/P29 wire.
+        // `result`. The copy allocates a fresh buffer and re-faults its
+        // pages, so it is itself timed (ReceiverMaterializeCopyback) rather
+        // than left to run unattributed: a minor-fault drop seen in the
+        // Receiver* stages above could otherwise just mean the faults moved
+        // into this copy instead of being eliminated, which would make the
+        // allocator change look like a win on minflt while being a wash or
+        // a loss on wall time. It does not read, write, or alter any byte
+        // already checked above, so it cannot change the wire bytes, the
+        // digests, or anything on the CacheWire/P29 wire.
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+        {
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::ReceiverMaterializeCopyback);
+            return std::vector<uint8_t>(result.begin(), result.end());
+        }
+#else
         return std::vector<uint8_t>(result.begin(), result.end());
+#endif
 #else
         return result;
 #endif

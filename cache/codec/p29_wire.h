@@ -25,7 +25,8 @@
 #include <sys/resource.h>
 #endif
 
-#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
+#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED) || \
+    defined(ICECC_P29V1_MADVISE_HUGEPAGE_INTERIOR_MATERIALIZED)
 #include <sys/mman.h>
 #endif
 
@@ -284,6 +285,16 @@ private:
 // Sender* entries correspond to the C-side prepare path (confirmed call
 // sites: SenderInternAndMatch = P29V1 interner.process(...), SenderEncode
 // = P29V1 serializer.begin_tu(...)).
+//
+// ReceiverMaterializeCopyback times the macro-gated copy of the
+// materialize buffer into a plain std::vector<uint8_t> at the end of
+// materialize_and_verify() (only compiled when
+// ICECC_P29V1_ALIGNED_HUGEPAGE_MATERIALIZED is on, since that is the only
+// configuration where the materialize buffer's type differs from the
+// plain std::vector the rest of the pipeline expects). This exists so a
+// minor-fault drop measured in the earlier Receiver* stages can't be
+// mistaken for a net win if the same faults simply moved into this
+// untimed copy -- see perf-opt report for why this stage was added.
 enum class P29StageTimerEntry : unsigned {
   ReceiverReceiveFill,
   ReceiverTakeMaterialized,
@@ -292,6 +303,7 @@ enum class P29StageTimerEntry : unsigned {
   ReceiverPendingSegmentDigest,
   SenderInternAndMatch,
   SenderEncode,
+  ReceiverMaterializeCopyback,
 };
 
 class P29StageTimerScope {
@@ -1651,7 +1663,43 @@ public:
       fail("P29 expected materialization exceeds provider TU limit");
     if (expected_materialized_bytes > pending_.materialized.capacity()) {
       pending_.materialized.reserve(expected_materialized_bytes);
-#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
+#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_INTERIOR_MATERIALIZED)
+      // Opt-5 candidate (wire-neutral, no allocator-type change, no
+      // copy-back): keep pending_.materialized as the plain
+      // std::vector<uint8_t> the rest of the pipeline already expects.
+      // glibc's allocator mmaps allocations above its mmap threshold, so a
+      // single reserve() of this size is already page-aligned at both
+      // ends; madvise() the 2-MiB-aligned INTERIOR of that reservation --
+      // [round_up(data()), round_down(data()+capacity())) -- to MADV_HUGEPAGE
+      // before any write below faults it in. The unaligned head and tail
+      // (each under 2 MiB) are left alone and still fault at the normal
+      // 4 KiB granularity, so this should cut minor faults by roughly the
+      // ratio of interior to total size rather than the ~370x the opt-4
+      // (2-MiB-aligned allocator) candidate gets by aligning the whole
+      // allocation -- but at zero copies and with the return type
+      // unchanged. madvise() is a best-effort kernel hint only -- it
+      // cannot change the contents of pending_.materialized, so it cannot
+      // change the materialized bytes, the digests computed over them, or
+      // anything on the CacheWire/P29 wire. Gated behind a macro so it is
+      // never enabled in a default build; A/B-benched before any
+      // default-on decision.
+      if (const std::size_t capacity = pending_.materialized.capacity();
+          capacity > 0) {
+        if (void *const base =
+                static_cast<void *>(pending_.materialized.data());
+            base != nullptr) {
+          constexpr std::uintptr_t kHugePageSize = 2u * 1024 * 1024;
+          const auto base_addr = reinterpret_cast<std::uintptr_t>(base);
+          const auto end_addr = base_addr + capacity;
+          const std::uintptr_t aligned_begin =
+              (base_addr + kHugePageSize - 1) & ~(kHugePageSize - 1);
+          const std::uintptr_t aligned_end = end_addr & ~(kHugePageSize - 1);
+          if (aligned_end > aligned_begin)
+            ::madvise(reinterpret_cast<void *>(aligned_begin),
+                      aligned_end - aligned_begin, MADV_HUGEPAGE);
+        }
+      }
+#elif defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
       // Opt-3 candidate (wire-neutral): hint the kernel to back this
       // freshly-reserved buffer with transparent huge pages before the
       // first-touch writes below (inside parse_fill) fault it in. madvise()
