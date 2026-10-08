@@ -115,6 +115,7 @@
 #include "util.h"
 #include "getifaddrs.h"
 #include "p50_daemon_sidecar_adapter.h"
+#include "p50_lifecycle_timeout_override.h"
 #include "p50_platform_compat.h"
 #include "p50_completion_record.h"
 #include "p50_cache_recovery_policy.h"
@@ -5359,17 +5360,16 @@ bool Daemon::configure_cache_adapter() noexcept
         // be starved to zero budget; 120s ceiling so a misconfigured value
         // cannot wedge client-visible behavior indefinitely).
         {
-            const char *timeout_env = getenv("ICECC_P50_INPUT_LIFECYCLE_TIMEOUT_MS");
-            if (timeout_env != nullptr && *timeout_env != '\0') {
-                char *end = nullptr;
-                const long long parsed = strtoll(timeout_env, &end, 10);
-                if (end != timeout_env && *end == '\0' && parsed >= 1000 && parsed <= 120000) {
-                    config.input_lifecycle_timeout = std::chrono::milliseconds(parsed);
-                } else {
-                    log_error() << "ignoring malformed/out-of-range ICECC_P50_INPUT_LIFECYCLE_TIMEOUT_MS='"
-                                << timeout_env << "' (must be an integer in [1000, 120000]); using "
-                                << config.input_lifecycle_timeout.count() << "ms" << endl;
-                }
+            // Parse-and-clamp logic lives in daemon/p50_lifecycle_timeout_override.{h,cpp}
+            // as a free function with no Daemon dependency, specifically so
+            // unittests/p50_lifecycle_timeout_override_test.cpp can exercise every
+            // outcome (unset, valid, malformed, out-of-range) directly.
+            const auto resolved = icecc::p50::daemon_diag::resolve_input_lifecycle_timeout_override(
+                getenv("ICECC_P50_INPUT_LIFECYCLE_TIMEOUT_MS"), config.input_lifecycle_timeout);
+            config.input_lifecycle_timeout = resolved.effective_value;
+            if (resolved.override_rejected) {
+                log_error() << "ignoring " << resolved.rejection_reason << "; using "
+                            << config.input_lifecycle_timeout.count() << "ms" << endl;
             }
             log_info() << "cache sidecar input_lifecycle_timeout effective value: "
                        << config.input_lifecycle_timeout.count() << "ms" << endl;

@@ -20,6 +20,7 @@ TESTS += p50sidecarsupervisor-sanitize.sh
 TESTS += p50sidecarlifecycle p50sidecarlifecycle-source.sh p50sidecarlifecycle-mutants.sh p50sidecarlifecycle-sanitize.sh
 TESTS += p50connectionprovenance
 TESTS += p50platformcompat
+TESTS += p50lifecycletimeoutoverride
 TESTS += p50syscallshim-source.sh
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
@@ -228,6 +229,7 @@ check_PROGRAMS += p50forkfdhygiene
 check_PROGRAMS += p50compilerquiescence
 check_PROGRAMS += p50connectionprovenance
 check_PROGRAMS += p50platformcompat
+check_PROGRAMS += p50lifecycletimeoutoverride
 check_PROGRAMS += p50profile
 testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
@@ -502,6 +504,10 @@ p50connectionprovenance_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_CONNECTION_PROVENANCE_
 p50platformcompat_SOURCES = p50_platform_compat_test.cpp ../daemon/p50_platform_compat.cpp
 p50platformcompat_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_PLATFORM_COMPAT_TEST_HOOKS -I$(top_srcdir)/cache
 p50platformcompat_LDADD = ../services/libicecc.la
+p50lifecycletimeoutoverride_SOURCES = p50_lifecycle_timeout_override_test.cpp \
+	../daemon/p50_lifecycle_timeout_override.cpp
+p50lifecycletimeoutoverride_CPPFLAGS = $(AM_CPPFLAGS)
+p50lifecycletimeoutoverride_LDADD = ../services/libicecc.la
 p50sourcearm_SOURCES = p50_source_arm_wait_test.cpp \
 	../cache/p50_source_identity.cpp ../cache/p50_input_wait.cpp
 p50sourcearm_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/cache
