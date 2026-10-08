@@ -196,12 +196,13 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 (* Invariants *)
 
 TypeOK ==
-    /\ cQueue \in Seq([relSeq: RelSeqs, epoch: Nat])
     /\ Len(cQueue) <= PipelineDepth
+    /\ \A i \in 1..Len(cQueue) : cQueue[i].relSeq \in RelSeqs /\ cQueue[i].epoch \in Nat
     /\ cConfirmedCursor \in Nat
     /\ cPredictedCursor \in Nat
-    /\ IF fActive = NoTx THEN TRUE ELSE fActive \in [relSeq: RelSeqs, epoch: Nat]
-    /\ fParked \subseteq [relSeq: RelSeqs, epoch: Nat]
+    /\ IF fActive = NoTx THEN TRUE
+       ELSE fActive.relSeq \in RelSeqs /\ fActive.epoch \in Nat
+    /\ \A p \in fParked : p.relSeq \in RelSeqs /\ p.epoch \in Nat
     /\ Cardinality(fParked) <= PipelineDepth - 1
     /\ fRouteCursor \in Nat
     /\ fStateSent \subseteq RelSeqs
