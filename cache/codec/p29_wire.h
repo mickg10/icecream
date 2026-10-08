@@ -6,10 +6,12 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -17,23 +19,23 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// sys/mman.h and cstdlib are always needed now: the opt-5 interior
+// MADV_HUGEPAGE hint (ICECC_P29V1_MATERIALIZE_THP) is a runtime switch,
+// default OFF, read via std::getenv -- see p29_wire_detail below -- so the
+// madvise() call site and the getenv() read are both unconditionally
+// compiled into every build, not just a macro-gated bench build.
 
 #if defined(ICECC_P50SIM_STAGE_TIMERS) && defined(ICECC_P50SIM_MINFLT_STAGES)
 #include <sys/resource.h>
 #endif
 
-#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED) || \
-    defined(ICECC_P29V1_MADVISE_HUGEPAGE_INTERIOR_MATERIALIZED)
-#include <sys/mman.h>
-#endif
-
 #if defined(ICECC_P29V1_ALIGNED_HUGEPAGE_MATERIALIZED)
-#include <cstdlib>
 #include <new>
-#include <sys/mman.h>
 #endif
 
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
@@ -630,7 +632,15 @@ public:
           break;
         throw std::invalid_argument("P29 zstd decoder made no progress");
       }
-      again = input.pos < input.size || output.pos == output.size;
+      // A frame can finish decoding (remaining == 0) on the exact same
+      // call that happens to fill the output buffer completely (total
+      // decoded size an exact multiple of the buffer size). Without the
+      // remaining != 0 guard, output.pos == output.size alone would spin
+      // one more time on an already-finished frame with no input left;
+      // zstd would then report bytes needed to start parsing a next,
+      // nonexistent frame, which looks like "stream did not close".
+      again = remaining != 0 &&
+              (input.pos < input.size || output.pos == output.size);
     } while (again);
     if (input.pos != input.size)
       throw std::invalid_argument("P29 zstd stream has trailing bytes");
@@ -889,6 +899,81 @@ using MaterializedBuffer =
 #else
 using MaterializedBuffer = std::vector<std::uint8_t>;
 #endif
+
+// Opt-5 runtime switch (wire-neutral; see perf-opt report): the interior-
+// aligned MADV_HUGEPAGE hint over pending_.materialized's reservation
+// (receive_fill() below) is controlled by ICECC_P29V1_MATERIALIZE_THP=1 at
+// runtime rather than by a compile-time macro, so one farm binary can A/B
+// it per worker without a rebuild. The decision is read from the
+// environment once per process (first use), not re-parsed per call, since
+// this sits on every reserve() that crosses capacity; unset, empty, or any
+// value other than exactly "1" leaves it off (default OFF). This is always
+// compiled -- not gated behind any ICECC_P50SIM_* macro -- because it is a
+// real production feature, not sim-only instrumentation. madvise() is a
+// best-effort kernel hint only: it cannot change the materialized bytes,
+// the digests computed over them, or anything on the CacheWire/P29 wire,
+// so toggling this switch cannot affect wire-visible state either way.
+enum class P29MaterializeThpOverride : unsigned {
+  Unset,
+  ForceOn,
+  ForceOff,
+};
+
+inline std::atomic<P29MaterializeThpOverride> &
+p29v1_materialize_thp_override_slot() noexcept {
+  static std::atomic<P29MaterializeThpOverride> slot{
+      P29MaterializeThpOverride::Unset};
+  return slot;
+}
+
+// Test-only escape hatch: codec_wire_test.cpp needs to exercise both the
+// on and off state of the switch within a single process, after the
+// cached environment read below may already have run. Never called from
+// production code paths.
+inline void p29v1_materialize_thp_test_override(
+    P29MaterializeThpOverride value) noexcept {
+  p29v1_materialize_thp_override_slot().store(value,
+                                               std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline bool p29v1_materialize_thp_enabled() noexcept {
+  switch (p29v1_materialize_thp_override_slot().load(
+      std::memory_order_relaxed)) {
+  case P29MaterializeThpOverride::ForceOn:
+    return true;
+  case P29MaterializeThpOverride::ForceOff:
+    return false;
+  case P29MaterializeThpOverride::Unset:
+    break;
+  }
+  static const bool from_env = [] {
+    const char *value = std::getenv("ICECC_P29V1_MATERIALIZE_THP");
+    return value != nullptr && std::string_view(value) == "1";
+  }();
+  return from_env;
+}
+
+inline std::atomic<std::uint64_t> &
+p29v1_materialize_thp_madvise_calls_slot() noexcept {
+  static std::atomic<std::uint64_t> counter{0};
+  return counter;
+}
+
+// Observability hook for codec_wire_test.cpp: counts attempts to apply the
+// interior-aligned MADV_HUGEPAGE hint (i.e. how many times the runtime-
+// switch code path actually ran), not whether the kernel honored the
+// hint. Always compiled, zero cost beyond one relaxed atomic increment on
+// the already-cold reserve-crossing-capacity path.
+[[nodiscard]] inline std::uint64_t
+p29v1_materialize_thp_madvise_calls() noexcept {
+  return p29v1_materialize_thp_madvise_calls_slot().load(
+      std::memory_order_relaxed);
+}
+
+inline void p29v1_materialize_thp_note_madvise_call() noexcept {
+  p29v1_materialize_thp_madvise_calls_slot().fetch_add(
+      1, std::memory_order_relaxed);
+}
 
 } // namespace p29_wire_detail
 
@@ -1663,57 +1748,65 @@ public:
       fail("P29 expected materialization exceeds provider TU limit");
     if (expected_materialized_bytes > pending_.materialized.capacity()) {
       pending_.materialized.reserve(expected_materialized_bytes);
-#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_INTERIOR_MATERIALIZED)
-      // Opt-5 candidate (wire-neutral, no allocator-type change, no
-      // copy-back): keep pending_.materialized as the plain
-      // std::vector<uint8_t> the rest of the pipeline already expects.
-      // glibc's allocator mmaps allocations above its mmap threshold, so a
-      // single reserve() of this size is already page-aligned at both
-      // ends; madvise() the 2-MiB-aligned INTERIOR of that reservation --
-      // [round_up(data()), round_down(data()+capacity())) -- to MADV_HUGEPAGE
-      // before any write below faults it in. The unaligned head and tail
-      // (each under 2 MiB) are left alone and still fault at the normal
-      // 4 KiB granularity, so this should cut minor faults by roughly the
-      // ratio of interior to total size rather than the ~370x the opt-4
-      // (2-MiB-aligned allocator) candidate gets by aligning the whole
-      // allocation -- but at zero copies and with the return type
-      // unchanged. madvise() is a best-effort kernel hint only -- it
-      // cannot change the contents of pending_.materialized, so it cannot
-      // change the materialized bytes, the digests computed over them, or
-      // anything on the CacheWire/P29 wire. Gated behind a macro so it is
-      // never enabled in a default build; A/B-benched before any
-      // default-on decision.
-      if (const std::size_t capacity = pending_.materialized.capacity();
-          capacity > 0) {
-        if (void *const base =
-                static_cast<void *>(pending_.materialized.data());
-            base != nullptr) {
-          constexpr std::uintptr_t kHugePageSize = 2u * 1024 * 1024;
-          const auto base_addr = reinterpret_cast<std::uintptr_t>(base);
-          const auto end_addr = base_addr + capacity;
-          const std::uintptr_t aligned_begin =
-              (base_addr + kHugePageSize - 1) & ~(kHugePageSize - 1);
-          const std::uintptr_t aligned_end = end_addr & ~(kHugePageSize - 1);
-          if (aligned_end > aligned_begin)
-            ::madvise(reinterpret_cast<void *>(aligned_begin),
-                      aligned_end - aligned_begin, MADV_HUGEPAGE);
+      // Opt-5 (wire-neutral, no allocator-type change, no copy-back): keep
+      // pending_.materialized as the plain std::vector<uint8_t> the rest of
+      // the pipeline already expects. glibc's allocator mmaps allocations
+      // above its mmap threshold, so a single reserve() of this size is
+      // already page-aligned at both ends; madvise() the 2-MiB-aligned
+      // INTERIOR of that reservation -- [round_up(data()),
+      // round_down(data()+capacity())) -- to MADV_HUGEPAGE before any write
+      // below faults it in. The unaligned head and tail (each under 2 MiB)
+      // are left alone and still fault at the normal 4 KiB granularity, so
+      // this should cut minor faults by roughly the ratio of interior to
+      // total size rather than the ~370x the opt-4 (2-MiB-aligned
+      // allocator) candidate gets by aligning the whole allocation -- but
+      // at zero copies and with the return type unchanged. madvise() is a
+      // best-effort kernel hint only -- it cannot change the contents of
+      // pending_.materialized, so it cannot change the materialized bytes,
+      // the digests computed over them, or anything on the CacheWire/P29
+      // wire. Controlled by the ICECC_P29V1_MATERIALIZE_THP runtime switch
+      // (default OFF) rather than a compile-time macro, so one farm binary
+      // can A/B it per worker without a rebuild.
+      if (p29_wire_detail::p29v1_materialize_thp_enabled()) {
+        if (const std::size_t capacity = pending_.materialized.capacity();
+            capacity > 0) {
+          if (void *const base =
+                  static_cast<void *>(pending_.materialized.data());
+              base != nullptr) {
+            constexpr std::uintptr_t kHugePageSize = 2u * 1024 * 1024;
+            const auto base_addr = reinterpret_cast<std::uintptr_t>(base);
+            const auto end_addr = base_addr + capacity;
+            const std::uintptr_t aligned_begin =
+                (base_addr + kHugePageSize - 1) & ~(kHugePageSize - 1);
+            const std::uintptr_t aligned_end =
+                end_addr & ~(kHugePageSize - 1);
+            if (aligned_end > aligned_begin) {
+              ::madvise(reinterpret_cast<void *>(aligned_begin),
+                        aligned_end - aligned_begin, MADV_HUGEPAGE);
+              p29_wire_detail::p29v1_materialize_thp_note_madvise_call();
+            }
+          }
         }
       }
-#elif defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
-      // Opt-3 candidate (wire-neutral): hint the kernel to back this
-      // freshly-reserved buffer with transparent huge pages before the
-      // first-touch writes below (inside parse_fill) fault it in. madvise()
-      // is a best-effort kernel hint only -- it cannot change the contents
-      // of pending_.materialized, so it cannot change the materialized
-      // bytes, the digests computed over them, or anything on the
-      // CacheWire/P29 wire. Gated behind a macro so it is never enabled in
-      // a default build; A/B-benched before any default-on decision.
-      if (const std::size_t extent = pending_.materialized.capacity();
-          extent > 0) {
-        if (void *const base =
-                static_cast<void *>(pending_.materialized.data());
-            base != nullptr)
-          ::madvise(base, extent, MADV_HUGEPAGE);
+#if defined(ICECC_P29V1_MADVISE_HUGEPAGE_MATERIALIZED)
+      else {
+        // Opt-3 candidate (wire-neutral): hint the kernel to back this
+        // freshly-reserved buffer with transparent huge pages before the
+        // first-touch writes below (inside parse_fill) fault it in.
+        // madvise() is a best-effort kernel hint only -- it cannot change
+        // the contents of pending_.materialized, so it cannot change the
+        // materialized bytes, the digests computed over them, or anything
+        // on the CacheWire/P29 wire. Gated behind a macro so it is never
+        // enabled in a default build; A/B-benched before any default-on
+        // decision. Mutually exclusive with the opt-5 runtime switch
+        // above: if that switch is on, opt-5 wins for this reserve.
+        if (const std::size_t extent = pending_.materialized.capacity();
+            extent > 0) {
+          if (void *const base =
+                  static_cast<void *>(pending_.materialized.data());
+              base != nullptr)
+            ::madvise(base, extent, MADV_HUGEPAGE);
+        }
       }
 #endif
     }

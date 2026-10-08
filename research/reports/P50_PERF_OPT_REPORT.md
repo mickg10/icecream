@@ -98,12 +98,28 @@ comes in ~35% below baseline at p50, consistently across the single-run,
   Net ~2x regression in `f_apply_materialize_ns` once the copy-back it
   requires is timed; the minor-fault win it reports is real but is paid
   back with the copy-back's own fault count plus the copy's own CPU time.
-- **This commit** — opt-5, reserve + 2-MiB-aligned interior `madvise`,
-  macro `ICECC_P29V1_MADVISE_HUGEPAGE_INTERIOR_MATERIALIZED`. **Winner.**
-  No allocator-type change, no copy-back, smaller fault-count win than
-  opt-4 claimed in isolation, but a real and the only net-positive
-  wall-time win measured this round. Still gated behind its macro; not
-  enabled in any default build by this commit.
+- **This commit** — opt-5, reserve + 2-MiB-aligned interior `madvise`.
+  **Winner.** No allocator-type change, no copy-back, smaller fault-count
+  win than opt-4 claimed in isolation, but a real and the only
+  net-positive wall-time win measured this round. The compile-time macro
+  from the prior round is replaced by a runtime switch,
+  `ICECC_P29V1_MATERIALIZE_THP=1` (default OFF, read once per process),
+  so a single binary can be A/B'd per worker on the farm without a
+  rebuild. A unit test (`run_materialize_thp_switch_controls`, in
+  `unittests/codec_wire_test.cpp`) forces the switch on and off via a
+  test-only override slot and confirms the `madvise()` call site is taken
+  only when forced on, with materialized bytes unaffected either way.
+  Building that test surfaced and fixed an unrelated, genuine decode-side
+  bug in `ContinuingDecoder::decode()` (`p29_wire.h`): its loop-exit test
+  did not check whether the current zstd frame had already finished
+  before continuing on `output.pos == output.size` alone, so a decoded
+  payload landing on an exact multiple of the internal output-buffer size
+  triggered one spurious extra iteration, which read as "stream did not
+  close" even though the frame was already complete. The fix only changes
+  how many times the decode loop iterates in that exact-multiple edge
+  case; it cannot and does not change a single byte on the wire. Full
+  wire/digest identity was re-verified after the fix (see Methodology
+  notes).
 
 ## Independent lever: `hugetlb=1`
 
