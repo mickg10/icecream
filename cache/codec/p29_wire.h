@@ -262,6 +262,12 @@ enum class P29AllocationEntry : unsigned {
   ReceiverTakeMaterialized,
   ReceiverCommit,
   ReceiverAbandon,
+  // Appended, not inserted among the above: existing indices must stay
+  // stable so prior batch-output rows remain comparable by position.
+  // Isolates CAuthority::prepare_p29v1_at_seq()'s dense_regions.reserve()
+  // call (cache/p50_slice0.cpp) from the SenderInternAndMatch stage it
+  // used to be lumped into, for the Decision 4 measurement.
+  SenderPrepareReserve,
 };
 
 class P29AllocationScope {
@@ -306,6 +312,53 @@ enum class P29StageTimerEntry : unsigned {
   SenderInternAndMatch,
   SenderEncode,
   ReceiverMaterializeCopyback,
+  // Appended, not inserted among the above, for the same stable-index
+  // reason as P29AllocationEntry::SenderPrepareReserve. Times only the
+  // dense_regions.reserve() call in CAuthority::prepare_p29v1_at_seq()
+  // (previously unmeasured; SenderInternAndMatch wraps only the
+  // following interner.process() call), to drive a measurement-first
+  // Decision 4 verdict rather than guessing at reserve()'s share of
+  // prepare_ns.
+  SenderPrepareReserve,
+  // Appended, not inserted, for the same stable-index reason. These four
+  // split open P29Serializer::begin_tu() -- the entire body SenderEncode
+  // wraps -- to find where its ~4ms p50 goes. Confirmed call sites, in
+  // execution order within begin_tu():
+  //   SenderMatchPrepare    = matcher_.prepare(current) (OnlineS1::build():
+  //                           hash-chain match search over the TU's region-
+  //                           id occurrence sequence, min_match/max_chain/
+  //                           hash_bits config; this is the "matching" half
+  //                           of what used to be measured jointly with
+  //                           interning as SenderInternAndMatch upstream of
+  //                           begin_tu -- here it is begin_tu's own,
+  //                           separate matcher_.prepare() call).
+  //   SenderBuildRoot       = the loop in build_body() that walks
+  //                           pending_.plan->root (require_region/
+  //                           require_block bookkeeping, root_raw varint
+  //                           tags, manifest/missing-region accounting) --
+  //                           up to but not including the first
+  //                           messages_.encode() call.
+  //   SenderEncodeRoot      = messages_.encode(pending_.root_raw) + the
+  //                           Root append_frame() -- a one-shot
+  //                           ZSTD_compress2() call (MessageCodec::encode)
+  //                           on the Root frame's raw bytes.
+  //   SenderEncodeBlocks    = the BlockDefinition raw-byte build (when
+  //                           manifest_blocks is non-empty) plus its
+  //                           messages_.encode() one-shot ZSTD_compress2()
+  //                           call and append_frame(). Zero-cost per TU
+  //                           when manifest_blocks is empty (the whole
+  //                           block is skipped, scope still entered/exited
+  //                           but with trivial body).
+  // Note: encode_missing_regions() (literal/control-stream gathering) and
+  // the control_encoder_/literal_encoder_ ContinuingEncoder zstd-stream
+  // compression both run inside build_fill(), called from answer_need()/
+  // fill_before_need() -- a different call, outside begin_tu() and outside
+  // the SenderEncode scope entirely. They are not part of the ~4ms budget
+  // under investigation here and are not touched by this change.
+  SenderMatchPrepare,
+  SenderBuildRoot,
+  SenderEncodeRoot,
+  SenderEncodeBlocks,
 };
 
 class P29StageTimerScope {
@@ -1072,7 +1125,13 @@ public:
         raw_bytes += size;
       }
       const std::vector<std::uint32_t> current(regions.begin(), regions.end());
-      pending_.plan = &matcher_.prepare(current);
+      {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+        p29_wire_detail::P29StageTimerScope match_timer_scope(
+            p29_wire_detail::P29StageTimerEntry::SenderMatchPrepare);
+#endif
+        pending_.plan = &matcher_.prepare(current);
+      }
 #if defined(ICECC_P29V1_SENDER_BODY_RESERVE_HINT)
       if (body_capacity_hint_ > pending_.body.capacity())
         pending_.body.reserve(body_capacity_hint_);
@@ -1313,36 +1372,52 @@ private:
     const P29WireLimits limits = provider_.wire_limits();
     if (pending_.plan->root.size() > limits.max_occurrences)
       fail("P29 Root exceeds provider occurrence limit");
-    for (const p29::Ref &reference : pending_.plan->root) {
-      if (reference.kind == p29::RefKind::Region) {
-        if (reference.id >= limits.max_regions)
-          fail("P29 Root Region exceeds provider limit");
-        put_varint(pending_.root_raw, make_tag(reference.id, false));
-        require_region(reference.id);
-      } else {
-        if (reference.id >= limits.max_blocks)
-          fail("P29 Root Block exceeds provider limit");
-        put_varint(pending_.root_raw, make_tag(reference.id, true));
-        require_block(reference.id);
-        const auto &block = matcher_.catalogue().block(reference.id);
-        for (std::uint32_t child : block.regions) {
-          if (child >= limits.max_regions)
-            fail("P29 Block child exceeds provider limit");
-          require_region(child);
+    {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+      p29_wire_detail::P29StageTimerScope build_root_timer_scope(
+          p29_wire_detail::P29StageTimerEntry::SenderBuildRoot);
+#endif
+      for (const p29::Ref &reference : pending_.plan->root) {
+        if (reference.kind == p29::RefKind::Region) {
+          if (reference.id >= limits.max_regions)
+            fail("P29 Root Region exceeds provider limit");
+          put_varint(pending_.root_raw, make_tag(reference.id, false));
+          require_region(reference.id);
+        } else {
+          if (reference.id >= limits.max_blocks)
+            fail("P29 Root Block exceeds provider limit");
+          put_varint(pending_.root_raw, make_tag(reference.id, true));
+          require_block(reference.id);
+          const auto &block = matcher_.catalogue().block(reference.id);
+          for (std::uint32_t child : block.regions) {
+            if (child >= limits.max_regions)
+              fail("P29 Block child exceeds provider limit");
+            require_region(child);
+          }
         }
       }
+      for (std::uint32_t block : pending_.required_blocks)
+        if (!known_block(block))
+          pending_.manifest_blocks.push_back(block);
+      for (std::uint32_t region : pending_.required_regions)
+        if (!known_region(region))
+          pending_.missing_regions.push_back(region);
     }
-    for (std::uint32_t block : pending_.required_blocks)
-      if (!known_block(block))
-        pending_.manifest_blocks.push_back(block);
-    for (std::uint32_t region : pending_.required_regions)
-      if (!known_region(region))
-        pending_.missing_regions.push_back(region);
 
-    const std::vector<std::uint8_t> root_encoded =
-        messages_.encode(pending_.root_raw);
-    append_frame(pending_.body, P29WireKind::Root, root_encoded);
+    {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+      p29_wire_detail::P29StageTimerScope encode_root_timer_scope(
+          p29_wire_detail::P29StageTimerEntry::SenderEncodeRoot);
+#endif
+      const std::vector<std::uint8_t> root_encoded =
+          messages_.encode(pending_.root_raw);
+      append_frame(pending_.body, P29WireKind::Root, root_encoded);
+    }
     if (!pending_.manifest_blocks.empty()) {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+      p29_wire_detail::P29StageTimerScope encode_blocks_timer_scope(
+          p29_wire_detail::P29StageTimerEntry::SenderEncodeBlocks);
+#endif
       std::vector<std::uint8_t> raw;
       put_varint(raw, pending_.manifest_blocks.size());
       for (std::uint32_t id : pending_.manifest_blocks) {

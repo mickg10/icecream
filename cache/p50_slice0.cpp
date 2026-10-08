@@ -1770,7 +1770,17 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
         throw std::length_error("P29V1 input exceeds its TU limit");
     try {
         auto prepared = std::make_shared<PreparedTU>();
-        prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
+        {
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+            codec::p29_wire_detail::P29StageTimerScope reserve_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderPrepareReserve);
+#endif
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+            codec::p29_wire_detail::P29AllocationScope reserve_allocation_scope(
+                codec::p29_wire_detail::P29AllocationEntry::SenderPrepareReserve);
+#endif
+            prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
+        }
         {
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
             codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(

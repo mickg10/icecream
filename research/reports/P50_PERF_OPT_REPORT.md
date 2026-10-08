@@ -187,3 +187,548 @@ just here.
   single-process runs x 60 TUs) rows respectively; all three shapes agree
   in direction and rough magnitude, so only the range across shapes is
   quoted in the headline table rather than each shape individually.
+
+## C-side candidate: per-TU dense-region reserve (Decision 4)
+
+Scope: investigate whether C's per-TU heap allocation for its dense-region
+scratch buffer (the mirror, on the sender/encode side, of the F-side
+materialize-buffer work above) is worth pooling or recycling across TUs.
+
+To answer this with data rather than guesswork, the single `reserve()`
+call for that buffer was given its own dedicated stage-timer and
+allocation-counter scope, isolated from the surrounding intern/match work
+it used to be lumped into untimed. This required no behavior change at
+all — the call site, its argument, and its effect on the wire are
+byte-identical before and after; only measurement granularity changed.
+
+Measured over the full 60-TU corpus, single pass, `--count-allocations`:
+
+| Metric | p50 | p99 | mean |
+|---|---|---|---|
+| reserve-call time | 4.1 us | 13.2 us | 4.3 us |
+| surrounding intern/match stage time | 5.53 ms | 22.6 ms | 6.15 ms |
+| total per-TU prepare time | 21.5 ms | 57.1 ms | 23.0 ms |
+| reserve-call allocation count | 1 | 1 | 1.00 |
+| total per-TU allocation-scope count (all stages) | 12,630 | - | 23,843 |
+
+The reserve call's share of total per-TU prepare time is **~0.02%**
+(mean 0.022%, p50 0.018%); its share of the surrounding intern/match
+stage alone is **~0.08%**. Minor-fault counts for the reserve call are
+effectively zero (p50 0, mean 0.12, p99 1) — consistent with a single
+small arena allocation, not a page-faulting large/aligned one, so there
+is no hidden fault cost analogous to the F-side opt-4 copy-back trap.
+It accounts for exactly one allocation-scope entry per TU, out of a
+total that averages in the tens of thousands.
+
+**Verdict: not worth optimizing. Rejected without a code candidate.**
+Unlike the F-side materialize buffer (which dominated its own stage and
+had a real, measurable alternative), this allocation is already three to
+four orders of magnitude smaller than the stage that contains it and than
+the per-TU prepare budget as a whole. Pooling or recycling it could not
+plausibly move total prepare time by more than noise, and would add a
+lifetime-management surface (recycled-buffer staleness, thread-safety of
+a shared pool) for no measurable return. No pooling/arena candidate was
+prototyped as a result; the instrumentation added to make this
+determination is kept (see Candidate ledger context above) since it is
+zero-cost when its macros are off and may be useful for future
+measurement rounds.
+
+## Infra finding: Decision 4's stage timers never actually fired
+
+Before any new data in this section can be trusted, a build-tooling
+defect has to be called out plainly: **the stage-timer macro never
+reached the library build in either this round's new instrumentation or
+the prior Decision 4 round.** `cache/Makefile`/`services/Makefile` are
+autoconf/automake-generated and both hardcode `CXX = g++` as a plain
+assignment. Per ordinary `make` precedence rules, a plain assignment
+inside a Makefile silently overrides an inherited `CXX` environment
+variable (short of `make -e`). The bench build script sets the
+macro-injecting compiler wrapper only via the `CXX` environment
+variable before invoking `make -C <lib dir> ...`, so that step always
+quietly fell back to plain `g++` with none of the stage-timer macros
+defined — while the final link step (invoked directly, not through
+`make`) did see the wrapper correctly. Net effect: every stage-timer
+call site inside the library-built translation units compiled to
+nothing, and the one translation unit that did see the macro
+(`p50sim.cpp` itself) held a counter array that nothing ever
+incremented. Every `p29v1_codec_stage_ns` field in every prior batch
+file, including Decision 4's `d4.jsonl`, reads back as exactly zero —
+confirmed directly on the raw JSON, not just through the analysis
+scripts. **Decision 4's own conclusion is unaffected**, because it was
+reached from the reserve-call's own dedicated timer and allocation
+counter, which are a different code path and were unaffected by this.
+But any implied claim that the surrounding `sender_intern_and_match_ns`/
+`sender_encode_ns` figures quoted there reflected real measurement
+should be read as not measured, not as measured-and-small.
+
+**Fix applied for this round, no tracked file touched:** the same two
+`make` steps were re-run with `CXX=<wrapper>` passed as a `make`
+command-line variable assignment instead of an environment variable —
+highest precedence, correctly overrides the Makefile's own plain
+assignment — after forcing a rebuild (stale `.a` outputs removed,
+sources touched to defeat `make`'s up-to-date check). Confirmed via `nm`
+that the stage-timer hook symbol is now actually referenced in the
+rebuilt library. Full wire/digest identity (60/60 against the existing
+reference batch, matching `raw_digest`/`state_before_digest`/
+`state_digest`/`transaction_digest` row-for-row) was re-verified before
+trusting any of the numbers below. **Recommendation for the build script
+itself** (not applied here, since it is not one of this branch's three
+sim-only-instrumentation files): pass `CXX=` as a `make` command-line
+argument rather than relying on environment inheritance, so this class
+of defect cannot recur silently for any future stage-timer or
+allocation-counter work that touches the library build.
+
+## C-side candidate: SenderEncode sub-stage split (Decision 5)
+
+Scope: C's `SenderEncode` stage (the whole body of the P29 serializer's
+per-TU encode call) runs at roughly 4.3-4.5 ms p50 for a ~3-70 KB output.
+Four new sim-only sub-stage timers were added inside it to find where
+that time goes: match-prepare, root-walk, root-frame-encode, and
+block-frame-encode. All four are purely additive measurement — same
+gating discipline as every other stage timer in this report, confined to
+the same three files, zero effect on the wire when the macro is off.
+
+With the infra fix above in place, the real split (pooled across three
+measurement shapes — single pass, 5x interleaved solo, 8-way concurrent;
+n=840 total) is:
+
+| Sub-stage | p50 | p90 | Share of `SenderEncode` |
+|---|---|---|---|
+| match-prepare | ~3.7-3.9 ms | — | **~85-90%** |
+| root-walk | ~0.18 ms | — | ~4% |
+| root-frame-encode | ~0.03 ms | — | <1% |
+| block-frame-encode | ~0.04 ms | — | ~1% |
+| (root-walk + root-frame-encode + block-frame-encode) / `SenderEncode` | 0.060 | 0.086 | ~6% combined |
+
+The sum of all four sub-stages tracks `SenderEncode`'s own measured time
+closely (e.g. 3.7 + 0.18 + 0.03 + 0.04 ≈ 3.95 ms against a measured
+`SenderEncode` p50 of 4.39 ms for the single-pass shape), so the split is
+internally consistent and not an artifact of double-counting or a
+missing stage.
+
+**Where the time actually goes:** match-prepare is the one call that
+asks the per-route matcher to build its plan for the current TU — a
+hash-chain-based longest-previous-factor search over the TU's full
+occurrence sequence (bounded chain depth per position, minimum match
+length 3, over a multi-million-bucket hash table). The three stages
+originally expected to matter most (serializing the resulting plan into
+wire tags, and the two one-shot compress calls) are confirmed cheap: a
+plain forward walk over an already-built plan, and two one-shot
+compress calls over small inputs. **The original hypothesis in the
+governing task — that region serialization, literal gathering, compress,
+and frame build would divide up the 4 ms — is not what the data shows.**
+Literal gathering and the streaming compress of the literal/control
+streams run entirely outside this call's scope (a separate call, outside
+the per-TU encode path), so they are correctly absent from this split.
+
+This stage is distinct from the pre-existing `sender_intern_and_match_ns`
+stage (p50 ~5.5 ms, outside this call's scope entirely): that one wraps a
+separate interning call against a shared/global catalogue; this one is
+the per-route selected matcher's own search over the same kind of input,
+run a second time for a different purpose (building the actual plan this
+route will encode). Both are instances of the same underlying
+hash-chain search; they are not literally duplicate work on identical
+inputs, but they are the same expensive operation run twice, for two
+different reasons, on every TU.
+
+**Candidate proposed for a future A/B round (not implemented or
+measured this round):** vectorize the longest-common-run comparison
+loop inside the per-route matcher's candidate walk — the loop that, for
+each hash-chain candidate, extends a tentative match length one unit at
+a time until a mismatch or the TU's end is reached. Replacing the
+scalar one-unit-at-a-time comparison with a wide (SIMD or word-at-a-time)
+equality scan that still stops at the first true mismatch is a strict
+drop-in: it computes exactly the same best-length/best-source winner at
+every tie, so the resulting plan — and therefore every byte this call
+puts on the wire — is unchanged by construction, not just unchanged by
+re-verification. This is the only sub-stage with enough share of the
+budget (~85-90%) for a win there to move `SenderEncode`'s wall time
+meaningfully. A secondary, much lower-confidence candidate also worth a
+cheap try in the same round: a one-ahead software prefetch of the next
+hash-chain candidate before touching the current one, since the chain
+walk is a scattered pointer-chasing access pattern over
+multi-megabyte-scale tables; same "produces an identical decision"
+argument applies, since prefetch has no effect on program semantics.
+**Explicitly out of scope / disqualified:** lowering the matcher's
+maximum chain depth would also cut this stage's cost, but it changes
+*which* matches get found, which changes `plan.root` and therefore the
+wire bytes — it fails the byte-identical requirement outright and is not
+a candidate under this report's rules.
+
+## Reverse-direction size check: `f_to_c_bytes` p99 exceeds expectation
+
+Requested alongside the above: `f_to_c_bytes` (the reverse-direction
+payload size) across the 60-TU corpus does **not** stay under the ~14 KB
+ceiling expected going into this round. Observed p99 across the three
+measurement shapes ranges **~47,486-56,109 bytes** (max 56,109 bytes) —
+roughly 3.5-4x the expected ceiling. This is a straightforward
+reconfirmation of a finding already in hand before this round's build-fix
+work (the fix only affected the stage-timer fields, not the byte-count
+fields, which were never affected by the Makefile defect since they come
+from the wire payloads themselves, not from the stage-timer counters).
+Flagging prominently rather than folding into the headline table above,
+since it contradicts an explicit expectation in the governing task and
+is a direct answer to "report `f_to_c` bytes p99 ... to check the reverse
+direction never exceeds ~14 KB": by this corpus's measurement, it does
+exceed it, by a wide margin, consistently across shapes.
+
+## Audit (2026-10-08): instrumentation provenance re-verified, build-script fix now closes the gap
+
+Scope: before any further measurement work, every historical round's own
+raw batch output was re-inspected directly (first JSON row of each
+round's own files, read as raw JSON, not through any analysis script) to
+classify every metric this report relies on as one of:
+
+- **production-field** — a top-level field (`f_apply_materialize_ns`,
+  `prepare_ns`, `simulator_execution_ns`, `allocations`, `f_to_c_bytes`,
+  the digest fields) that is never gated behind a sim-only instrumentation
+  macro. These are unaffected by the `CXX`/`make` defect described above,
+  regardless of which build produced the file.
+- **real-stage-timer** — a macro-gated `p29v1_codec_stage_ns`/
+  `p29v1_codec_stage_minflt`/`p29v1_codec_allocations` field, confirmed
+  nonzero and internally varying in the raw JSON for that round's own
+  files.
+- **all-zero** — the same macro-gated fields, confirmed to read back as
+  exactly zero across the board — i.e. produced by a build where the
+  macro did not reach the library (the defect described above).
+
+Round-by-round classification, confirmed against the raw JSON:
+
+| Round | Classification | Note |
+|---|---|---|
+| Headline F-side materialize round (baseline / opt-4 / opt-5) | **real-stage-timer** | `p29v1_codec_stage_ns`/`minflt` fields confirmed nonzero and internally varying across this round's own files (distinct, plausible per-row values for `receiver_receive_fill_ns`, `sender_intern_and_match_ns`, `sender_encode_ns`, etc.). Not affected by the Makefile defect. |
+| Decision 4, pre-fix file | **all-zero** | Every `p29v1_codec_stage_ns`/`minflt` value and `p29v1_codec_allocations` reads back as exactly 0. This is the raw demonstration of the defect, not a source of any number published above. |
+| Decision 4, post ad-hoc-fix file | **real-stage-timer** (+ production-field) | `sender_prepare_reserve_ns`/`minflt` and the allocation-entry counter for the reserve call are populated and consistent with the reserve-call table published above (single-row spot check: 8.41 us, within the published 4.1-13.2 us p50/p99 band). **This file, not the pre-fix one, is what the Decision 4 table above actually rests on.** |
+| Decision 5, pre-fix files | **all-zero** | All four new sub-stage fields (match-prepare / root-walk / root-frame-encode / block-frame-encode), plus the pre-existing stage fields in the same rows, are exactly 0 — this is the round where the defect was caught, matching the "Infra finding" section above. |
+| Decision 5, post ad-hoc-fix files | **real-stage-timer** | All four sub-stage fields plus the pre-existing stage fields are populated and mutually consistent (the four sub-stages sum to within the margin already noted above of the measured `sender_encode_ns`/`SenderEncode` time). **These files, not the pre-fix ones, are what the Decision 5 table and the "~85-90% share" conclusion above actually rest on.** |
+
+**Headline verdict confirmed:** opt-5's "~35% better" claim rests entirely
+on `f_apply_materialize_ns` — confirmed present and populated as a
+top-level, non-macro-gated production field in every row checked for
+that round (spot-checked: two different rows, both in the
+25.3-25.6 ms range, both plausible, both structurally independent of the
+stage-timer defect). The headline conclusion was never at risk from the
+Makefile defect, by construction — it was never computed from a
+macro-gated field. The supporting "why" narrative (receive-fill
+minor-fault drop, zero copy-back cost) does use macro-gated fields, and
+this audit confirms those are real/nonzero for this round, not
+zero-by-defect, so the supporting evidence is sound as well, not just
+the top-level number.
+
+**What changed since those rounds, and why it matters going forward:**
+both the Decision 4 and Decision 5 post-fix files relied on an ad-hoc
+`make`-command-line fix that was never committed to any tracked file —
+it was redone by hand on the bench host each time a round needed real
+stage-timer data, as this report's own "Infra finding" section already
+describes. Commit `b7c3caabafae3c0cbcc4eaaf02a27a6f16f6db07` on this
+branch makes that fix permanent and automatic inside
+`cache/sim/build_p50sim.sh` itself: it passes `CXX=` as a `make`
+command-line variable assignment (not an environment variable) to both
+library builds, and — discovered while building the guard described
+next — also fixes a second, deeper trap: naively passing `CXXFLAGS=`
+wholesale on the command line (the obvious fix for the first trap) does
+deliver the requested macro, but it also clobbers the Makefiles' own
+baked-in `-std=c++23`/`-DNDEBUG`/warning flags and breaks the build
+outright (observed: a `std::variant`/`visit` overload-resolution error).
+Macro defines are instead delivered via the additive `CPPFLAGS`
+variable, leaving `CXXFLAGS` at the Makefile's own default. The same
+commit adds a guard that fails the build loudly, with a message pointing
+at this defect, if a stage-timer macro was requested but the resulting
+binary's own synthetic, corpus-independent self-test still reads back
+all-zero — verified to correctly fail on the broken form of the fix and
+correctly pass on the corrected form. This class of silent,
+round-specific, hand-redone fix cannot recur unnoticed for any future
+round.
+
+## SIMD vectorization of the hash-chain match-extension compare (2026-10-08)
+
+Scope: this round follows up on the candidate proposed, but explicitly
+not implemented or measured, at the end of the "C-side candidate:
+SenderEncode sub-stage split (Decision 5)" section above — vectorizing
+the longest-common-run comparison loop inside `OnlineS1::build()`'s
+hash-chain candidate walk (`cache/codec/p29_online_s1.h`). That loop
+compares `uint32_t` region/occurrence IDs one element at a time to
+extend a tentative match until a mismatch or the TU's end, and was
+identified as the dominant share (~85-90%) of the `SenderEncode`
+sub-stage split. Per that section's own rule, any candidate here must
+compute exactly the same best-length/best-source winner at every tie, so
+the resulting plan — and every byte this call puts on the wire — is
+unchanged by construction, not just by re-verification after the fact.
+
+### Measurement-first gate (commit `32d73020f0b91879258eecd17307d619171c684c`)
+
+Before writing any SIMD, two sim-only histograms (gated behind
+`ICECC_P50SIM_MATCH_HISTOGRAM`, same discipline as the other
+instrumentation macros in this report; never compiled into production)
+were added to measure, over the real 60-TU corpus: (1) how long each
+successful match-extension actually runs once started, and (2) how many
+chain candidates get walked per hash-table position before a match (or
+no match) is found. The decision gate from the governing methodology:
+if most extensions end within the first 1-2 elements, the compare itself
+cannot be the bottleneck and SIMD cannot win — the cost would be the
+chain walk's pointer-chasing cache misses, pointing at a prefetch
+candidate instead.
+
+**Result: the "SIMD can't win" trigger does not fire.** The
+extend-length histogram's buckets 1 and 2 are structurally empty — any
+genuine chain hit already shares its first `min_match = 3` elements by
+construction of the anchor hash, so a real match can only ever be
+measured starting at 3+ elements, never 1 or 2. The bulk of the mass
+sits at 9 through 128+ elements per candidate compared, with a long tail
+past 1024. True hash collisions (content that hashed alike but isn't
+actually a match) fail at element 0 essentially always, since a
+collision scrambles content and gives no reason to agree past the first
+element — this bucket carries roughly 8.8% of all extension attempts.
+This is the regime where a wider per-step compare wins outright, not a
+chain-walk/cache-miss-bound case; the SIMD path was selected over the
+prefetch fallback on this data, not by default.
+
+### Implementation (commit `bd64a753cf7b7ad05c9075ca4ecb4e019fe5c797`)
+
+Added `p29::match_detail::extend_match_length()` in
+`cache/codec/p29_online_s1.h`:
+
+- **AVX2** path: 8 `uint32_t` lanes per step via `_mm256_cmpeq_epi32` +
+  `movemask_epi8`, compiled under a function-level
+  `__attribute__((target("avx2")))` and selected only at runtime via
+  `__builtin_cpu_supports("avx2")` (cached once in a `static const
+  bool`) — this keeps the rest of the translation unit on the default
+  baseline instruction set and requires no build-flag change anywhere
+  else in the project, preserving portability to hosts without AVX2.
+- **SSE2** fallback: 4 lanes, unconditionally available on the x86-64
+  baseline ABI, no runtime gating needed.
+- **Scalar** fallback for non-x86 targets.
+
+Both vector paths find the first mismatching lane as `ctz(~mask) / 4`
+from the byte-granularity comparison mask, exactly the technique
+specified by the governing methodology. Each loop only runs full-width
+vector steps strictly inside `[0, maximum)`, with a scalar tail for any
+remainder, so the returned length matches the scalar reference exactly
+at every boundary — including a `maximum` that is not an exact multiple
+of the vector width. `OnlineS1::build()`'s inner extend-match loop was
+rewired to call this dispatcher in place of the prior one-element-at-a-
+time scan; the pre-existing histogram sample call immediately after it
+is unchanged.
+
+A dedicated correctness test, `check_match_extend_simd()`, was added to
+`unittests/codec_intern_test.cpp`: fixed boundary cases (mismatch at
+every offset through past twice the AVX2 width, at totals shorter than,
+equal to, and several multiples of a vector width plus a remainder) plus
+20000 randomized trials, each comparing `extend_match_sse2`/
+`extend_match_avx2`/`extend_match_length` against the scalar reference
+for exact equality.
+
+### Verification this round
+
+- **Unit test, run on H1 (AVX2 present):**
+  `codec_intern: match_extend_simd check PASS (20000 random trials + 20
+  boundary totals, avx2=yes)`, followed by the pre-existing
+  `codec_intern` corpus-intern pass (`PASS tus=11 ... seconds=0.112962`)
+  — both green, `EXIT=0` for the whole binary.
+- **Build identity:** both arms were built from this branch with
+  `build_p50sim.sh` itself (no manual flag overrides beyond `CXX=g++`),
+  one at commit `1a1172dacd9ec09d700f63351cc373b8a0243846` (last commit
+  before the SIMD change — the "baseline" arm) and one at `bd64a753`
+  (the "variant" arm). Each build's own receipt
+  (`.p50sim-build.json`) confirms `source.head` matches the intended
+  commit and `tracked_clean: true` for that build.
+- **Wire/output identity, full 60-TU corpus, run 1:** every field other
+  than the three timing-only fields (`prepare_ns`,
+  `simulator_execution_ns`, `f_apply_materialize_ns`) compared
+  row-for-row between baseline and variant — including `raw_digest`,
+  `state_before_digest`, `state_digest`, `transaction_digest`,
+  `c_to_f_bytes`, `f_to_c_bytes`, `encoded_source_bytes`, and
+  `negotiated_profile_mask` — with **zero mismatches across all 60/60
+  rows**. The SIMD change does not move a single byte on the wire, as
+  required.
+- **Timing, 4 interleaved baseline/variant run pairs over the full
+  60-TU corpus, `ICECC_P50_PROFILE=P29V1`, `taskset -c 0-7`:**
+
+  | Run | Baseline wall | Variant wall |
+  |---|---|---|
+  | 1 | 9.19 s | 8.93 s |
+  | 2 | 9.36 s | 9.01 s |
+  | 3 | 9.23 s | 9.02 s |
+  | 4 | 9.26 s | 9.10 s |
+
+  The variant is faster than the baseline in every one of the 4 pairs
+  (mean 9.26 s vs 9.02 s, ~2.6% faster end to end). Isolating the
+  specific stage this change touches (`prepare_ns`, summed across all
+  60 TUs per run) shows a cleaner and larger signal, since it excludes
+  I/O and other unrelated per-run overhead:
+
+  | Run | Baseline `sum(prepare_ns)` | Variant `sum(prepare_ns)` |
+  |---|---|---|
+  | 1 | 3204.1 ms | 2862.0 ms |
+  | 2 | 3278.7 ms | 2877.6 ms |
+  | 3 | 3206.9 ms | 2892.2 ms |
+  | 4 | 3196.1 ms | 2889.0 ms |
+
+  Mean 3221.5 ms vs 2880.2 ms — a consistent **~10.6% reduction** in the
+  stage containing the vectorized loop, agreeing in direction across
+  all 4 runs.
+
+**Verdict: accepted.** The decision gate's data-driven call to pursue
+SIMD over prefetch is borne out: `bd64a753` is wire/digest-identical to
+the pre-SIMD baseline on 60/60 TUs with zero exceptions, passes a
+dedicated 20020-case correctness test, and delivers a consistent,
+repeatable win — ~10.6% on the targeted `prepare_ns` stage and ~2.6% on
+end-to-end wall time, in the same direction on every one of 4 interleaved
+run pairs. No prefetch fallback was needed.
+
+## Follow-up round on the SIMD change (2026-10-08): stage re-split, a second-site rejection, and a one-ahead prefetch
+
+Scope: re-measure the per-stage split on top of the now-accepted SIMD
+build (`bd64a753`), decide whether the hash-chain *walk* itself (as
+opposed to the per-step compare, already handled above) is now the
+dominant cost, and — conditional on that — try a software-prefetch
+variant. Also checked whether the same SIMD helper applies to the
+*other* hash-chain search in this path, `sender_intern_and_match_ns`.
+
+### Stage re-split on the SIMD build
+
+`bd64a753` was rebuilt with both sim-only instrumentation macros
+(`ICECC_P50SIM_STAGE_TIMERS`, `ICECC_P50SIM_MATCH_HISTOGRAM`) and run
+over the full 60-TU corpus. Restricting to the sender-side sub-stages
+that fall inside the `prepare_ns` window (the receiver-side stages are
+timed across a wider span that also includes `context.run()`, so their
+raw `ns` figures are not comparable as a share of `prepare_ns` — this
+matches the pre-existing scope note on the stage-timer instrumentation):
+
+| Sub-stage | Sum over 60 TUs | Share of `prepare_ns` |
+|---|---|---|
+| `sender_encode_ns` (parent of the four Decision-5 sub-stages) | 1257.3 ms | 44.2% |
+| `sender_match_prepare_ns` | 920.7 ms | **32.4%** |
+| `sender_intern_and_match_ns` | 667.9 ms | 23.5% |
+| `sender_build_root_ns` | 121.0 ms | 4.3% |
+| `sender_encode_blocks_ns` | 44.9 ms | 1.6% |
+| `sender_encode_root_ns` | 3.2 ms | 0.1% |
+| `sender_prepare_reserve_ns` | 0.2 ms | ~0.0% |
+
+`sender_match_prepare_ns` is now the single largest named sub-stage,
+ahead of `sender_intern_and_match_ns` — unchanged in relative rank from
+before the SIMD change, consistent with the SIMD win landing inside this
+stage without displacing it from the top spot.
+
+The two match-histograms, pooled over the full corpus (112,563 total
+match-attempted positions, 1,310,452 total chain-candidate compares):
+
+- **Chain-candidates-visited per position** is sharply skewed: **91.9%**
+  of positions visit **zero** additional candidates beyond the first
+  (i.e. resolve immediately), but a long tail walks much deeper chains
+  — candidate counts past 1024 account for the remainder, with the
+  per-bucket mass thinning gradually rather than cutting off (0.97% of
+  positions alone fall in the 513-1024 bucket).
+- **Extend-length per candidate compared** (i.e. per step of that chain
+  walk) stays dominated by the same 9-128-element mass identified in the
+  SIMD gate above (16.6% + 14.3% + 19.6% + 17.1% ≈ 67.6% of all 1.31M
+  compares), so the SIMD win from the prior round is still being
+  exercised at full volume — the chain walk did not get shorter, each
+  step just got cheaper.
+
+**Decision: the chain walk is now the governing cost pattern worth a
+prefetch try.** 91.9% of positions already terminate in one step (no
+win possible there, nothing to prefetch into), but the ~8% tail that
+walks deep chains is exactly where `predecessors_[candidate]` is an
+unpredictable pointer-chase the hardware prefetcher cannot anticipate —
+and this tail now dominates the 1.31M-compare aggregate even though it
+is a minority of positions, per the coordinator's conditional for
+trying the one-ahead prefetch variant.
+
+### Second-site check: does the SIMD helper apply to `SenderInternAndMatch`?
+
+`sender_intern_and_match_ns` (667.9 ms / 23.5% of `prepare_ns`) wraps
+`P29Interner::process()` — a region-level interning/dedup loop against
+a shared catalogue, called once per TU from the authority's prepare
+path. It is structurally a hash-chain search like `OnlineS1::build()`,
+but **not the same comparison problem** `extend_match_length()` solves,
+for one reason that holds on both of its two lookup paths:
+
+- The successor-prediction path tests a candidate whose `raw_len` is
+  already known in advance (from the successor table itself), via
+  `std::memcmp(region_bytes_ + candidate.raw_off, position,
+  candidate.raw_len) == 0`.
+- The hash-table lookup path computes the candidate's exact expected
+  length *before* any comparison, via a region-boundary scan
+  (`next_region()`), then also closes with a fixed-length
+  `std::memcmp(...) == 0` over that already-known length.
+
+Both are **known-length byte-equality** checks (true/false, no "how far
+did it get" answer needed). `extend_match_length()` solves a different
+problem: an **unknown-extent longest-common-run** search, returning how
+many elements matched before the first mismatch, which only
+`OnlineS1::build()`'s chain walk actually needs. Reusing the SIMD
+helper here would mean reimplementing a `memcmp`-equivalent for no
+behavioral gain — and `memcmp` is already AVX2-ifunc-dispatched by
+glibc on this host, so there is no measurable win available at this
+site. **No code change made to `cache/codec/p29_intern.h`.** This is a
+reasoned rejection, not an oversight: the two call sites look alike at
+the "hash chain + comparison" level but solve different comparison
+problems, and only one of them is the kind of problem the SIMD helper
+was built for.
+
+### Implementation: one-ahead prefetch of the next chain link (commit `c89e6d8e`)
+
+In `OnlineS1::build()`'s chain-walk loop (`cache/codec/p29_online_s1.h`),
+`predecessors_[candidate]` was read once per iteration already, but only
+at the *end* of the loop body, right before looping back — meaning the
+next iteration's two reads (`occurrences_[next]`, used by
+`extend_match_length()`, and `predecessors_[next]`, used by this same
+read the iteration after that) always started cold. The read is hoisted
+to the *top* of the loop body, into a `next_candidate` local, with two
+`__builtin_prefetch(ptr, /*rw=*/0, /*locality=*/1)` calls (guarded on
+`next_candidate != kNone`) issued immediately after it and before the
+(now cheap, SIMD'd) `extend_match_length()` call on the *current*
+candidate — giving the prefetch a window of real compute to overlap
+with instead of stalling on the pointer-chase cold. `next_candidate`'s
+value, and everything computed from it, is byte-for-byte identical to
+the trailing `candidate = predecessors_[candidate]` assignment it
+replaces; this is a pure latency hint with no semantic effect.
+
+### Verification
+
+- **Unit test**, run on H1 (`codec_intern`): both the pre-existing
+  `match_extend_simd` check and the corpus-intern pass remain green,
+  `EXIT=0` — no behavioral regression at the unit level.
+- **Build identity:** built plain (no instrumentation macros) via
+  `build_p50sim.sh` at commit `c89e6d8e`; the build receipt confirms
+  `source.head` matches and `tracked_clean: true`.
+- **Wire/output identity, full 60-TU corpus:** every field other than
+  the timing-only fields (`prepare_ns`, `simulator_execution_ns`,
+  `f_apply_materialize_ns`, `p29v1_codec_stage_ns`) compared row-for-row
+  against the `bd64a753` baseline — **zero mismatches across all 60/60
+  rows.** The prefetch does not move a single byte on the wire.
+- **Timing, 4 interleaved baseline/variant run pairs over the full
+  60-TU corpus, `ICECC_P50_PROFILE=P29V1`, `taskset -c 0-7`,**
+  `sum(prepare_ns)` over `tu_index` 1..59 (TU 0 broken out separately
+  since no prior convention excluding it was found in this report; the
+  full-60 figure is given alongside for transparency and agrees in both
+  direction and magnitude):
+
+  | Pair | Baseline `sum(prepare_ns)`, TUs 1-59 | Variant `sum(prepare_ns)`, TUs 1-59 | Delta | Delta, full 60 TUs |
+  |---|---|---|---|---|
+  | 1 | 2789.1 ms | 2764.6 ms | -0.88% | -0.76% |
+  | 2 | 2785.6 ms | 2730.6 ms | -1.98% | -1.93% |
+  | 3 | 2783.8 ms | 2765.4 ms | -0.66% | -0.64% |
+  | 4 | 2759.8 ms | 2731.4 ms | -1.03% | -0.91% |
+
+  The variant is faster than the `bd64a753` baseline in every one of
+  the 4 pairs, by a consistent but modest margin (mean **-1.14%** over
+  TUs 1-59, mean -1.06% over the full 60) — smaller than the SIMD
+  change's own ~10.6% win on the same stage, as expected given 91.9% of
+  positions have no second chain link to prefetch into at all; the win
+  is confined to the minority-of-positions, majority-of-compare-volume
+  deep-chain tail identified in the re-split above.
+
+**Verdict: accepted.** Small but consistent and reproducible — same
+direction on all 4 interleaved pairs, zero wire/digest mismatches on
+60/60 TUs, unit tests green, pure latency hint with no semantic path
+change. Committed as `c89e6d8e` on `perf-opt`.
+
+### Summary of this round
+
+| Item | Outcome |
+|---|---|
+| Stage re-split on SIMD build | `sender_match_prepare_ns` remains the largest sender-side sub-stage (32.4% of `prepare_ns`), ahead of `sender_intern_and_match_ns` (23.5%); chain-candidates-visited histogram is bimodal — 91.9% zero-hop, long deep tail dominating total compare volume. |
+| `SenderInternAndMatch` SIMD applicability | **Rejected** — different comparison problem (known-length `memcmp` equality vs. unknown-extent longest-run search); glibc's AVX2-ifunc `memcmp` already covers it; no code change. |
+| One-ahead chain-walk prefetch | **Accepted**, commit `c89e6d8e` — mean -1.14% on `prepare_ns` (TUs 1-59) across 4 interleaved pairs, 60/60 wire/digest identity, unit tests green. |
