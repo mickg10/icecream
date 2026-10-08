@@ -410,8 +410,6 @@ void test_long_lived_relationship_owner() {
     CHECK(third_result.committed_input->tu_seq.value == 2);
 
     // A bounded connection failure poisons only its own relationship owner.
-    // The exact retired F incarnation cannot be reset while its uncommitted
-    // preparation is live, and no later wrapper may reopen F through it.
     P50CRouteOwner failed_owner(config());
     const auto failed_route = relationship(111, 211, 1);
     context.restart();
@@ -468,7 +466,15 @@ void test_long_lived_relationship_owner() {
     context.run();
     CHECK(sticky.get().replacement_required);
     CHECK(poisoned_connections == 2);
-    CHECK(!failed_owner.reset_f_store_exact(Id128::from_u64(211), 1));
+    // failed_route's own transfer already reached a terminal, non-Committed
+    // result (RetryExhausted) and is not in flight, so its orphaned
+    // preparation is dead by construction: reset_f_store_exact may now
+    // force-discard it instead of refusing forever. other_failed_route (a
+    // different F store) is a different relationship and route key, and is
+    // untouched by resetting guid 211 -- only the one dead route goes cold.
+    CHECK(failed_owner.reset_f_store_exact(Id128::from_u64(211), 1));
+    CHECK(!failed_owner.owns(failed_route));
+    CHECK(failed_owner.owns(other_failed_route));
 
     // The healthy relationship is independent and advances normally to TU3.
     auto fourth_result = route_call(context, owner, server, acceptor, first_route,
@@ -613,7 +619,13 @@ void test_p29v1_retry_and_reset_owner() {
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
     CHECK(failed_result.replacement_required);
     CHECK(failed_connections == 2);
-    CHECK(!failed_owner.reset_f_store_exact(Id128::from_u64(251), 1));
+    // The orphaned preparation left by this terminal, non-in-flight
+    // RetryExhausted is dead by construction; reset_f_store_exact can now
+    // force-discard it instead of refusing forever (see the design note
+    // above P50CRouteOwner::reset_f_store_exact). The healthy `owner` above
+    // is a different P50CRouteOwner instance and stays untouched.
+    CHECK(failed_owner.reset_f_store_exact(Id128::from_u64(251), 1));
+    CHECK(!failed_owner.owns(failed_route));
     auto third = route_call(context, owner, server, acceptor, route, {7101, 3}, repeated);
     CHECK(third.status == ZstdSourceTransferStatus::Committed);
     CHECK(third.committed_input->tu_seq.value == 2);
@@ -1020,6 +1032,152 @@ void test_lane_guid_never_reaches_ensure_authority() {
     CHECK(owner.owner_count() == 1);
 }
 
+// Dedicated coverage for reset_f_store_exact's force-discard of a provably
+// superseded F incarnation (see the design note above its definition in
+// client/p50_route_owner.cpp). Mirrors
+// SidecarRuntime::bind_route_endpoint_identity observing a new (guid,
+// generation) at the same host:port after a RetryExhausted transfer: the
+// predecessor's orphaned preparation is dead by construction, so the reset
+// now succeeds instead of refusing forever, and only that one route goes
+// cold -- an unrelated relationship on the same owner, and the fresh route
+// to the new incarnation, are both unaffected.
+void test_reset_f_store_exact_discards_orphaned_superseded_incarnation() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    P50ServerEndpoint server(Id128::from_u64(520), server_caps, nullptr, nullptr,
+                             P50ServerEndpointConfig{
+                                 .input_job_state = [](CStoreGuid, const TxBegin&,
+                                                       const TxCommit&,
+                                                       std::span<const uint8_t>) {
+                                     return InputJobState::Open;
+                                 }});
+    P50CRouteOwner owner(config());
+    const std::vector<uint8_t> payload{'t', 'u', 'a'};
+
+    // An unrelated, healthy relationship on the same owner: its state must
+    // stay untouched by the reset below, which targets a different F store.
+    const auto other_route = relationship(301, 601, 1);
+    server.reset_store(Id128::from_u64(601));
+    auto other_before = route_call(context, owner, server, acceptor, other_route,
+                                   {8001, 1}, payload);
+    CHECK(other_before.status == ZstdSourceTransferStatus::Committed);
+    CHECK(other_before.committed_input->tu_seq.value == 0);
+
+    // F generation 1 at guid 701 fails closed; once this completes the
+    // sender's own transfer is no longer in flight, so its preparation is
+    // orphaned (terminal, non-Committed, never released).
+    const auto route_v1 = relationship(301, 701, 1);
+    context.restart();
+    unsigned connections = 0;
+    auto failed = asio::co_spawn(
+        context,
+        owner.transfer(
+            route_v1, {8002, 1},
+            ConnectedFdFactory{[&connections](auto) {
+                ++connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            std::span<const uint8_t>(payload)),
+        asio::use_future);
+    context.run();
+    const auto failed_result = failed.get();
+    CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_result.replacement_required);
+    CHECK(connections == 2);
+    CHECK(owner.owns(route_v1));
+    CHECK(owner.owns(other_route) && owner.owner_count() == 2);
+
+    // bind_route_endpoint_identity observes generation 2 at the same
+    // host:port and retires the dead generation-1 identity. The owner is
+    // not marked for whole-sidecar replacement by this.
+    CHECK(owner.reset_f_store_exact(Id128::from_u64(701), 1));
+    CHECK(!owner.owns(route_v1));
+    CHECK(owner.owns(other_route));
+
+    // The fresh route to the new incarnation succeeds normally; TU_SEQ keeps
+    // allocating from the shared C authority, not from a rewound base.
+    const auto route_v2 = relationship(301, 701, 2);
+    server.reset_store(Id128::from_u64(701));
+    auto replacement = route_call(context, owner, server, acceptor, route_v2,
+                                  {8003, 1}, payload);
+    CHECK(replacement.status == ZstdSourceTransferStatus::Committed);
+    CHECK(replacement.committed_input->tu_seq.value == 1);
+    CHECK(owner.owns(route_v2));
+
+    // other_route's own history is undisturbed: its next transfer continues
+    // normally and still commits -- proving route_replacement_required_
+    // never tripped and no other route went cold.
+    auto other_after = route_call(context, owner, server, acceptor, other_route,
+                                  {8001, 2}, payload);
+    CHECK(other_after.status == ZstdSourceTransferStatus::Committed);
+    CHECK(other_after.committed_input->tu_seq.value == 2);
+    CHECK(owner.owner_count() == 2);
+}
+
+// Dedicated coverage for the in-flight guard: a transfer actually in flight
+// must block the force-discard and preserve today's whole-sidecar
+// replacement behavior. before_prepare_for_route_for_test fires
+// synchronously from inside transfer_bytes, after its InFlightGuard (the
+// function's first statement) has already set transfer_in_flight() true and
+// before any preparation entry exists -- a deterministic seam to reenter
+// reset_f_store_exact on the very relationship mid-transfer, without any
+// real stalled network I/O.
+void test_reset_f_store_exact_refuses_while_transfer_in_flight() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    P50ServerEndpoint server(Id128::from_u64(521), server_caps, nullptr, nullptr,
+                             P50ServerEndpointConfig{
+                                 .input_job_state = [](CStoreGuid, const TxBegin&,
+                                                       const TxCommit&,
+                                                       std::span<const uint8_t>) {
+                                     return InputJobState::Open;
+                                 }});
+    const auto route_v1 = relationship(302, 801, 1);
+    P50CRouteOwner* owner_ptr = nullptr;
+    bool hook_ran = false;
+    bool reset_result_during_flight = true;
+    P50RouteOwnerConfig in_flight_config = config();
+    in_flight_config.before_prepare_for_route_for_test = [&]() {
+        hook_ran = true;
+        // Reentrant, synchronous call on the very relationship whose
+        // transfer_bytes() is currently running this hook.
+        reset_result_during_flight =
+            owner_ptr->reset_f_store_exact(Id128::from_u64(801), 1);
+    };
+    P50CRouteOwner owner(in_flight_config);
+    owner_ptr = &owner;
+    const std::vector<uint8_t> payload{'t', 'u', 'b'};
+
+    server.reset_store(Id128::from_u64(801));
+    auto committed = route_call(context, owner, server, acceptor, route_v1,
+                                {8101, 1}, payload);
+    CHECK(hook_ran);
+    // transfer_in_flight() was observably true at the reentrant call site,
+    // so the reset refuses instead of force-discarding the sender out from
+    // under its own still-running coroutine.
+    CHECK(!reset_result_during_flight);
+    CHECK(committed.status == ZstdSourceTransferStatus::Committed);
+    CHECK(owner.owns(route_v1));
+
+    // A refused reset marks the owner for whole-sidecar replacement, exactly
+    // like any other reset_f_store_exact failure -- today's behavior.
+    context.restart();
+    auto blocked = asio::co_spawn(
+        context,
+        owner.transfer(relationship(302, 802, 1), {8102, 1},
+                       acceptor.local_endpoint(),
+                       std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                       payload),
+        asio::use_future);
+    context.run();
+    CHECK(blocked.get().replacement_required);
+}
+
 }  // namespace
 
 int main() {
@@ -1038,4 +1196,6 @@ int main() {
     test_interned_tu_after_interner_fault_is_typed();
     test_consecutive_history_resets_of_one_successor();
     test_lane_guid_never_reaches_ensure_authority();
+    test_reset_f_store_exact_discards_orphaned_superseded_incarnation();
+    test_reset_f_store_exact_refuses_while_transfer_in_flight();
 }
