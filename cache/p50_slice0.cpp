@@ -1856,10 +1856,12 @@ struct CRoute::P29V1State {
 };
 
 CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
-               HistoryNonce history_nonce, ActionTrace* trace)
+               HistoryNonce history_nonce, ActionTrace* trace,
+               size_t max_active_tx)
     : authority_(authority), f_store_guid_(f_store_guid),
       history_nonce_(history_nonce),
       state_digest_(initial_route_digest(authority.guid(), history_nonce)),
+      max_active_tx_(max_active_tx == 0 ? 1 : max_active_tx),
       trace_(trace) {}
 
 CRoute::~CRoute() = default;
@@ -1876,9 +1878,12 @@ const CActiveTx& CRoute::begin_v1(
     const PreparedTUPtr& prepared, uint64_t max_route_state_bytes) {
     if (!prepared)
         throw std::invalid_argument("cannot route a null P29V1 PreparedTU");
-    if (active_)
-        throw std::logic_error("C route already has one ACTIVE_TX");
-    if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())
+    if (active_queue_.size() >= max_active_tx_)
+        throw std::logic_error("C route already has its full ACTIVE_TX pipeline");
+    if (!active_queue_.empty() && !active_queue_.back().predicted_post_digest)
+        throw std::logic_error(
+            "C route's newest ACTIVE_TX was not predict-committed yet");
+    if (predicted_cursor_.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("REL_SEQ space exhausted");
     if (!authority_.p29v1_runnable())
         throw std::logic_error("P29V1 is not runnable until daemon restart");
@@ -1901,10 +1906,12 @@ const CActiveTx& CRoute::begin_v1(
         }
         active.region_count = prepared->dense_regions.size();
         active.begin.history_nonce = history_nonce_;
-        active.begin.rel_seq = next_rel_seq_;
+        active.begin.rel_seq = predicted_cursor_;
         active.begin.tu_seq = prepared->tu_seq;
         active.begin.profile = ProfileId::P29V1;
-        active.begin.pre_state_digest = state_digest_;
+        active.begin.pre_state_digest =
+            active_queue_.empty() ? state_digest_
+                                   : *active_queue_.back().predicted_post_digest;
         active.begin.body = describe_component(
             static_cast<uint16_t>(ProfileId::P29V1), active.body,
             p29v1_->serializer.root_reference_count());
@@ -1912,11 +1919,11 @@ const CActiveTx& CRoute::begin_v1(
         active.begin.raw_digest = prepared->raw_digest;
         active.begin.transaction_digest = compute_transaction_digest(
             active.begin, active.body);
-        active_ = std::move(active);
+        active_queue_.push_back(std::move(active));
         p29v1_->answered_need.clear();
         p29v1_->fill_answered = false;
-        record(ActionType::TX_BEGIN, *active_);
-        return *active_;
+        record(ActionType::TX_BEGIN, active_queue_.back());
+        return active_queue_.back();
     } catch (const std::exception& error) {
         if (p29v1_->serializer.has_pending()) {
             try {
@@ -1925,7 +1932,7 @@ const CActiveTx& CRoute::begin_v1(
             }
         }
         p29v1_->terminal = true;
-        active_.reset();
+        active_queue_.clear();
         throw P50RoutePoisoned(error.what());
     } catch (...) {
         if (p29v1_->serializer.has_pending()) {
@@ -1935,7 +1942,7 @@ const CActiveTx& CRoute::begin_v1(
             }
         }
         p29v1_->terminal = true;
-        active_.reset();
+        active_queue_.clear();
         throw P50RoutePoisoned("P29V1 route failed while beginning a TU");
     }
 }
@@ -1964,7 +1971,8 @@ static void require_need_tu_end(std::span<const uint8_t> inner_need) {
 
 std::span<const uint8_t> CRoute::build_fill_v1(
     std::span<const uint8_t> inner_need) {
-    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+    if (active_queue_.empty() ||
+        active_queue_.back().begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal)
         throw std::logic_error("C route has no runnable P29V1 ACTIVE_TX");
     try {
@@ -1998,7 +2006,8 @@ std::span<const uint8_t> CRoute::build_fill_v1(
 
 std::optional<std::span<const uint8_t>> CRoute::fill_v1_before_need(
     size_t max_need_regions) {
-    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+    if (active_queue_.empty() ||
+        active_queue_.back().begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal || p29v1_->fill_answered)
         throw std::logic_error("C route has no fresh P29V1 ACTIVE_TX");
     if (p29v1_->serializer.pending_missing_regions() > max_need_regions)
@@ -2021,7 +2030,8 @@ std::optional<std::span<const uint8_t>> CRoute::fill_v1_before_need(
 }
 
 void CRoute::confirm_need_v1(std::span<const uint8_t> inner_need) {
-    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+    if (active_queue_.empty() ||
+        active_queue_.back().begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal || !p29v1_->fill_answered ||
         !p29v1_->answered_need.empty())
         throw std::logic_error("C route has no early P29V1 FILL to confirm");
@@ -2035,6 +2045,32 @@ void CRoute::confirm_need_v1(std::span<const uint8_t> inner_need) {
     }
 }
 
+const CActiveTx& CRoute::commit_predicted_v1() {
+    if (active_queue_.empty())
+        throw std::logic_error("C route has no ACTIVE_TX to predict-commit");
+    CActiveTx& active = active_queue_.back();
+    if (active.predicted_post_digest)
+        throw std::logic_error(
+            "C route's newest ACTIVE_TX was already predict-committed");
+    if (active.begin.profile != ProfileId::P29V1 || !p29v1_ || p29v1_->terminal)
+        throw std::logic_error("P29V1 route cannot predict-commit");
+    try {
+        p29v1_->serializer.commit();
+        if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
+            throw std::logic_error(
+                "P29V1 committed route state exceeded its preflight");
+    } catch (...) {
+        p29v1_->terminal = true;
+        throw;
+    }
+    active.predicted_post_digest = compute_post_state_digest(
+        active.begin.pre_state_digest, active.begin.history_nonce,
+        active.begin.rel_seq, active.begin.tu_seq,
+        active.begin.transaction_digest);
+    predicted_cursor_.value = active.begin.rel_seq.value + 1;
+    return active;
+}
+
 void CRoute::poison_v1() noexcept {
     if (p29v1_->serializer.has_pending()) {
         try {
@@ -2043,22 +2079,24 @@ void CRoute::poison_v1() noexcept {
         }
     }
     p29v1_->terminal = true;
-    active_.reset();
+    active_queue_.clear();
 }
 
 void CRoute::restart_v1_for_transport_retry() {
-    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+    if (active_queue_.empty() ||
+        active_queue_.back().begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal)
         throw std::logic_error(
             "C route has no runnable P29V1 transaction to retry");
+    CActiveTx& active = active_queue_.back();
     try {
         if (p29v1_->serializer.has_pending())
             p29v1_->serializer.abandon();
         const std::vector<uint8_t> body =
-            p29v1_->serializer.begin_tu(active_->prepared->dense_regions);
-        if (body != active_->body ||
+            p29v1_->serializer.begin_tu(active.prepared->dense_regions);
+        if (body != active.body ||
             p29v1_->serializer.root_reference_count() !=
-                active_->begin.body.decoded_bytes)
+                active.begin.body.decoded_bytes)
             throw std::logic_error(
                 "P29V1 transport retry changed the frozen BODY");
         p29v1_->answered_need.clear();
@@ -2071,14 +2109,15 @@ void CRoute::restart_v1_for_transport_retry() {
             }
         }
         p29v1_->terminal = true;
-        active_.reset();
+        active_queue_.clear();
         throw;
     }
 }
 
 void CRoute::reset_v1_route(FStoreGuid f_store_guid,
                             HistoryNonce history_nonce) {
-    if (!active_ || active_->begin.profile != ProfileId::P29V1)
+    if (active_queue_.empty() ||
+        active_queue_.back().begin.profile != ProfileId::P29V1)
         throw std::logic_error(
             "C route has no active P29V1 transaction to reset");
     reset_history(f_store_guid, history_nonce);
@@ -2109,37 +2148,70 @@ void CRoute::record(ActionType action, const CActiveTx& active) {
     trace_->record(std::move(record));
 }
 
+void CRoute::retire_locked_commits() {
+    // Drains active_queue_ from the front while a buffered TX_COMMIT exists
+    // for the head entry, retiring strictly in rel_seq order (touch-up (b)).
+    // The head's own serializer.commit() only runs here when it was never
+    // eagerly predict-committed (predicted_post_digest unset) -- i.e. the
+    // unmodified K=1 path. At K>1 that work already happened in
+    // commit_predicted_v1(), and same_commit()'s post_state_digest check
+    // (via compute_post_state_digest) already proves the predicted and
+    // confirmed digests agree, so no further digest comparison is needed
+    // here.
+    while (!active_queue_.empty()) {
+        CActiveTx& head = active_queue_.front();
+        const auto it = std::find_if(
+            reorder_buffer_.begin(), reorder_buffer_.end(),
+            [&](const auto& entry) { return same_commit(entry.first, head); });
+        if (it == reorder_buffer_.end()) break;
+        const TxCommit head_commit = it->first;
+        const ActionType head_action = it->second;
+        reorder_buffer_.erase(it);
+
+        if (!head.predicted_post_digest) {
+            try {
+                p29v1_->serializer.commit();
+                if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
+                    throw std::logic_error(
+                        "P29V1 committed route state exceeded its preflight");
+            } catch (...) {
+                p29v1_->terminal = true;
+                throw;
+            }
+        }
+        state_digest_ = head_commit.post_state_digest;
+        confirmed_cursor_.value = head.begin.rel_seq.value + 1;
+        record(head_action, head);
+        active_queue_.pop_front();
+    }
+}
+
 void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
-    if (!active_) throw std::logic_error("C route has no ACTIVE_TX to commit");
+    if (active_queue_.empty())
+        throw std::logic_error("C route has no ACTIVE_TX to commit");
     if (action != ActionType::COMMIT_ACCEPTED &&
         action != ActionType::LOST_COMMIT_ACCEPTED)
         throw std::invalid_argument("invalid commit action");
-    if (!same_commit(committed, *active_))
-        throw std::logic_error("TX_COMMIT does not close C's ACTIVE_TX");
-    if (active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+    const bool matches_any = std::any_of(
+        active_queue_.begin(), active_queue_.end(),
+        [&](const CActiveTx& entry) { return same_commit(committed, entry); });
+    if (!matches_any)
+        throw std::logic_error("TX_COMMIT does not close any of C's ACTIVE_TX");
+    if (active_queue_.front().begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal)
         throw std::logic_error("P29V1 route cannot accept a commit");
-    try {
-        p29v1_->serializer.commit();
-        if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
-            throw std::logic_error(
-                "P29V1 committed route state exceeded its preflight");
-    } catch (...) {
-        p29v1_->terminal = true;
-        throw;
-    }
-    state_digest_ = committed.post_state_digest;
-    record(action, *active_);
-    ++next_rel_seq_.value;
-    active_.reset();
+    reorder_buffer_.emplace_back(committed, action);
+    retire_locked_commits();
 }
 
 void CRoute::abandon_active() {
-    if (!active_) return;
-    record(ActionType::TX_ABORTED, *active_);
+    if (active_queue_.empty()) return;
+    for (const CActiveTx& active : active_queue_)
+        record(ActionType::TX_ABORTED, active);
     if (p29v1_ && p29v1_->serializer.has_pending())
         p29v1_->serializer.abandon();
-    active_.reset();
+    active_queue_.clear();
+    reorder_buffer_.clear();
 }
 
 void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) {
@@ -2148,7 +2220,8 @@ void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) 
     abandon_active();
     f_store_guid_ = f_store_guid;
     history_nonce_ = history_nonce;
-    next_rel_seq_ = RelSeq{0};
+    confirmed_cursor_ = RelSeq{0};
+    predicted_cursor_ = RelSeq{0};
     state_digest_ = initial_route_digest(authority_.guid(), history_nonce_);
     p29v1_.reset();
 }

@@ -303,6 +303,46 @@ void test_f_store_routes_are_isolated_by_profile() {
         "an active F session accepted a different profile identity");
 }
 
+// Step 3 (route pipelining, C side) regression gate: FStore::begin's
+// occupied-slot admission (cache/p50_slice0.cpp, FStore::begin) is explicitly
+// *not* touched by route pipelining -- the F-side admission widening for
+// K>1 lives entirely in the new F-side sequencer (a later step), never in
+// FStore itself (design doc §1.2 / §2 invariant 8). Prove FStore::begin
+// called twice in a row without an intervening commit_input still rejects
+// the second call exactly as it does today.
+void test_f_store_begin_rejects_second_active_tx_without_commit() {
+    const CStoreGuid c_guid = CStoreGuid::from_u64(70);
+    FStore store(FStoreGuid::from_u64(71));
+
+    const SessionHandle session = store.connect(c_guid);
+    const HistoryNonce nonce{72};
+    store.start_route(session, nonce, initial_route_digest(c_guid, nonce));
+    const SessionState established = store.resume(session);
+
+    TxBegin begin;
+    begin.history_nonce = nonce;
+    begin.rel_seq = established.next_rel_seq;
+    begin.tu_seq = TuSeq{0};
+    begin.profile = ProfileId::P29V1;
+    begin.pre_state_digest = established.state_digest;
+    begin.body.encoding = static_cast<uint16_t>(ProfileId::P29V1);
+    store.begin(session, begin);
+
+    // Same ACTIVE_TX replayed verbatim (no commit_input in between) is the
+    // one case FStore::begin tolerates: it is idempotent, not a second slot.
+    store.begin(session, begin);
+
+    // A genuinely different TX_BEGIN for the same still-pending slot -- same
+    // route cursor (history_nonce/rel_seq/pre_state_digest), different
+    // tu_seq -- must still be rejected exactly as today: FStore has not
+    // grown a second slot.
+    TxBegin different = begin;
+    different.tu_seq = TuSeq{1};
+    require_throws<std::logic_error>(
+        [&] { store.begin(session, different); },
+        "F route admitted a second ACTIVE_TX without an intervening commit");
+}
+
 void test_authority_and_route_fail_closed_before_enablement() {
     CAuthority authority(CStoreGuid::from_u64(50));
     require(authority.guid() == CStoreGuid::from_u64(50) &&
@@ -315,12 +355,29 @@ void test_authority_and_route_fail_closed_before_enablement() {
                 route.state_digest() ==
                     initial_route_digest(authority.guid(), HistoryNonce{52}),
             "new C route did not use the canonical cursor");
+    require(route.confirmed_rel_seq() == route.next_rel_seq() &&
+                route.active_count() == 0 && route.max_active_tx() == 1,
+            "default-depth C route did not reproduce the legacy K=1 cursor");
     require_throws<std::invalid_argument>(
         [&] { (void)route.begin_v1({}, 4096); },
         "C route accepted a null PreparedTU");
     require_throws<std::logic_error>(
         [&] { route.pin_v1_system_source_reuse(true); },
         "C route pinned reuse before its P29V1 codec existed");
+
+    // max_active_tx is the route-pipelining FIFO depth (§1.1 point 2); 0 is
+    // nonsensical and clamps to the K=1 legacy depth rather than leaving the
+    // route unable to ever hold an ACTIVE_TX.
+    const CRoute zero_clamped(authority, FStoreGuid::from_u64(53),
+                              HistoryNonce{54}, nullptr, 0);
+    require(zero_clamped.max_active_tx() == 1,
+            "C route did not clamp a zero pipeline depth to 1");
+
+    const CRoute deep(authority, FStoreGuid::from_u64(55), HistoryNonce{56},
+                      nullptr, 3);
+    require(deep.max_active_tx() == 3 && deep.active_count() == 0 &&
+                deep.confirmed_rel_seq() == deep.next_rel_seq(),
+            "K>1 C route did not report its configured pipeline depth");
 }
 
 void test_terminal_session_serial() {
@@ -347,6 +404,7 @@ int main() {
     test_global_reverse_invariants_catch_mutants();
     test_f_store_session_and_route_fencing();
     test_f_store_routes_are_isolated_by_profile();
+    test_f_store_begin_rejects_second_active_tx_without_commit();
     test_authority_and_route_fail_closed_before_enablement();
     test_terminal_session_serial();
     return 0;
