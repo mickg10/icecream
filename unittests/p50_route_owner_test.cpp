@@ -1097,14 +1097,17 @@ void test_reset_f_store_exact_discards_orphaned_superseded_incarnation() {
     CHECK(!owner.owns(route_v1));
     CHECK(owner.owns(other_route));
 
-    // The fresh route to the new incarnation succeeds normally; TU_SEQ keeps
-    // allocating from the shared C authority, not from a rewound base.
+    // The fresh route to the new incarnation succeeds normally. TU_SEQ keeps
+    // allocating from the shared C authority, not from a rewound base: seq 1
+    // was already spent on route_v1's own prepare_for_route (it runs once,
+    // before the connection retry loop that then exhausts and discards it),
+    // so the next allocation here is seq 2, not seq 1.
     const auto route_v2 = relationship(301, 701, 2);
     server.reset_store(Id128::from_u64(701));
     auto replacement = route_call(context, owner, server, acceptor, route_v2,
                                   {8003, 1}, payload);
     CHECK(replacement.status == ZstdSourceTransferStatus::Committed);
-    CHECK(replacement.committed_input->tu_seq.value == 1);
+    CHECK(replacement.committed_input->tu_seq.value == 2);
     CHECK(owner.owns(route_v2));
 
     // other_route's own history is undisturbed: its next transfer continues
@@ -1113,7 +1116,7 @@ void test_reset_f_store_exact_discards_orphaned_superseded_incarnation() {
     auto other_after = route_call(context, owner, server, acceptor, other_route,
                                   {8001, 2}, payload);
     CHECK(other_after.status == ZstdSourceTransferStatus::Committed);
-    CHECK(other_after.committed_input->tu_seq.value == 2);
+    CHECK(other_after.committed_input->tu_seq.value == 3);
     CHECK(owner.owner_count() == 2);
 }
 
