@@ -187,3 +187,48 @@ just here.
   single-process runs x 60 TUs) rows respectively; all three shapes agree
   in direction and rough magnitude, so only the range across shapes is
   quoted in the headline table rather than each shape individually.
+
+## C-side candidate: per-TU dense-region reserve (Decision 4)
+
+Scope: investigate whether C's per-TU heap allocation for its dense-region
+scratch buffer (the mirror, on the sender/encode side, of the F-side
+materialize-buffer work above) is worth pooling or recycling across TUs.
+
+To answer this with data rather than guesswork, the single `reserve()`
+call for that buffer was given its own dedicated stage-timer and
+allocation-counter scope, isolated from the surrounding intern/match work
+it used to be lumped into untimed. This required no behavior change at
+all — the call site, its argument, and its effect on the wire are
+byte-identical before and after; only measurement granularity changed.
+
+Measured over the full 60-TU corpus, single pass, `--count-allocations`:
+
+| Metric | p50 | p99 | mean |
+|---|---|---|---|
+| reserve-call time | 4.1 us | 13.2 us | 4.3 us |
+| surrounding intern/match stage time | 5.53 ms | 22.6 ms | 6.15 ms |
+| total per-TU prepare time | 21.5 ms | 57.1 ms | 23.0 ms |
+| reserve-call allocation count | 1 | 1 | 1.00 |
+| total per-TU allocation-scope count (all stages) | 12,630 | - | 23,843 |
+
+The reserve call's share of total per-TU prepare time is **~0.02%**
+(mean 0.022%, p50 0.018%); its share of the surrounding intern/match
+stage alone is **~0.08%**. Minor-fault counts for the reserve call are
+effectively zero (p50 0, mean 0.12, p99 1) — consistent with a single
+small arena allocation, not a page-faulting large/aligned one, so there
+is no hidden fault cost analogous to the F-side opt-4 copy-back trap.
+It accounts for exactly one allocation-scope entry per TU, out of a
+total that averages in the tens of thousands.
+
+**Verdict: not worth optimizing. Rejected without a code candidate.**
+Unlike the F-side materialize buffer (which dominated its own stage and
+had a real, measurable alternative), this allocation is already three to
+four orders of magnitude smaller than the stage that contains it and than
+the per-TU prepare budget as a whole. Pooling or recycling it could not
+plausibly move total prepare time by more than noise, and would add a
+lifetime-management surface (recycled-buffer staleness, thread-safety of
+a shared pool) for no measurable return. No pooling/arena candidate was
+prototyped as a result; the instrumentation added to make this
+determination is kept (see Candidate ledger context above) since it is
+zero-cost when its macros are off and may be useful for future
+measurement rounds.
