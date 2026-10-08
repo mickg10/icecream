@@ -47,7 +47,7 @@
  license to do so in the implementation brief.
 ***************************************************************************)
 
-EXTENDS Naturals, Sequences, FiniteSets, TLC
+EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS PipelineDepth, MaxRelSeq
 
