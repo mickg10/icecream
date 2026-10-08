@@ -141,6 +141,63 @@ static uint64_t monotonic_msec()
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+static uint64_t wall_clock_ns_now() noexcept
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
+}
+
+// Diagnostic-only. Every rejection path in handle_p50_source_arm() funnels
+// through its one reject() lambda; this is called from there so an F-side
+// arm refusal always leaves a trace instead of silently falling back to a
+// plain EndMsg()/handle_end(). Capped at kP50FArmRefusedPerSecondCap lines
+// per wall-clock second so a refusal storm (e.g. a replaying/misbehaving C
+// peer) cannot turn into unbounded log volume: anything beyond the cap for
+// a given second is counted instead of printed, and the count is flushed
+// as a single P50_F_ARM_REFUSED_SUPPRESSED line as soon as the window
+// rolls over. This never changes what the caller returns or does, and the
+// state below is plain (not atomic/locked) because client activity on this
+// daemon is dispatched from a single thread.
+static constexpr unsigned kP50FArmRefusedPerSecondCap = 20;
+
+static void note_p50_f_arm_refused(const P50SourceArmFields *identity,
+                                    int exitcode) noexcept
+{
+    static uint64_t window_start_sec = 0;
+    static unsigned emitted_this_window = 0;
+    static uint64_t suppressed_this_window = 0;
+
+    const uint64_t wall_ns = wall_clock_ns_now();
+    const uint64_t now_sec = wall_ns / 1000000000ull;
+
+    if (now_sec != window_start_sec) {
+        if (suppressed_this_window > 0) {
+            fprintf(stderr,
+                    "P50_F_ARM_REFUSED_SUPPRESSED count=%llu window_sec=%llu\n",
+                    (unsigned long long)suppressed_this_window,
+                    (unsigned long long)window_start_sec);
+        }
+        window_start_sec = now_sec;
+        emitted_this_window = 0;
+        suppressed_this_window = 0;
+    }
+
+    if (emitted_this_window < kP50FArmRefusedPerSecondCap) {
+        ++emitted_this_window;
+        fprintf(stderr,
+                "P50_F_ARM_REFUSED wire_job_id=%llu exitcode=%d wall_clock_ns=%llu\n",
+                (unsigned long long)(identity != nullptr ? identity->wire_job_id : 0),
+                exitcode,
+                (unsigned long long)wall_ns);
+    } else {
+        ++suppressed_this_window;
+    }
+}
+
 // The wire carries only this bounded relative budget.  Each F client retains
 // an absolute steady-clock deadline; ordinary traffic, replay, and a renewed
 // sidecar lease never extend it.
@@ -10061,6 +10118,7 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
        untrusted input; if this is a later malformed/replayed frame, the
        already-retained owner supplies the exact token. */
     auto reject = [&](const P50SourceArmFields *identity, int exitcode) {
+        note_p50_f_arm_refused(identity, exitcode);
         const P50SourceArmFields *settlement_identity = identity;
         // Once this wrapper owns a live arm, every later rejection belongs to
         // that immutable token.  Do not let a malformed/replayed frame name a
