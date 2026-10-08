@@ -15,12 +15,13 @@
 #include <utility>
 
 // SYS_close_range's old-headers fallback is shared with
-// cache/p50_daemon_sidecar_adapter.cpp -- see services/sys_close_range.h for
-// why this must be the one place that supplies the syscall number.  (Builds
-// against old distro headers -- Fedora 28-era glibc, the build0xx node
-// images -- used to leave close_range_sweep() compiled OUT and the unbounded
-// proc_fallback backend running on every job child: the production fd bug.)
-#include "services/sys_close_range.h"
+// cache/p50_daemon_sidecar_adapter.cpp -- see services/sys_syscall_numbers.h
+// for why this must be the one place that supplies the syscall number.
+// (Builds against old distro headers -- Fedora 28-era glibc, the build0xx
+// node images -- used to leave close_range_sweep() compiled OUT and the
+// unbounded proc_fallback backend running on every job child: the
+// production fd bug.)
+#include "services/sys_syscall_numbers.h"
 
 namespace icecc::p50::forkfd {
 

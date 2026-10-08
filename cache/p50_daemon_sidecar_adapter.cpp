@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 #include "services/digest128.h"
-#include "services/sys_close_range.h"
+#include "services/sys_syscall_numbers.h"
 
 extern char **environ;
 
@@ -1916,8 +1916,8 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             }
 #else
             // Old headers never defined SYS_close_range and
-            // services/sys_close_range.h could not supply it either (non-
-            // x86_64): go straight to the fallback.
+            // services/sys_syscall_numbers.h could not supply it either
+            // (non-x86_64): go straight to the fallback.
             cloexec_ok = sidecar_cloexec_sweep_proc_fallback(test_force_proc_open_failure_);
 #endif
             if (!cloexec_ok)
