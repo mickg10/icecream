@@ -267,15 +267,30 @@ void InputRecordStore::close_job(InputRecordKey key) {
     position->second.logical_job_open = false;
 }
 
-void InputRecordStore::collect_garbage() {
+uint64_t input_backing_batch_bytes(const InputBackingBatch& batch) {
+    uint64_t total = 0;
+    for (const auto& backing : batch) {
+        if (backing)
+            total += backing->size();
+    }
+    return total;
+}
+
+void InputRecordStore::collect_garbage(InputBackingBatch* graveyard) {
     for (auto position = records_.begin(); position != records_.end();) {
-        const Entry& entry = position->second;
+        Entry& entry = position->second;
         if (!entry.logical_job_open && entry.backing &&
             entry.backing.use_count() == 1) {
             if (entry.raw_bytes > retained_bytes_)
                 throw std::logic_error(
                     "InputRecordStore retained-byte accounting underflow");
             retained_bytes_ -= entry.raw_bytes;
+            // Move the backing out before erasing the node so that, when a
+            // graveyard is supplied, the erase() below drops a null
+            // shared_ptr (free) and the actual multi-MB deallocation happens
+            // only when `*graveyard` is later destroyed/reaped -- never here.
+            if (graveyard != nullptr)
+                graveyard->push_back(std::move(entry.backing));
             position = records_.erase(position);
         } else {
             ++position;
@@ -283,12 +298,20 @@ void InputRecordStore::collect_garbage() {
     }
 }
 
-void InputRecordStore::clear() {
+void InputRecordStore::clear(InputBackingBatch* graveyard) {
+    if (graveyard != nullptr) {
+        for (auto& [key, entry] : records_) {
+            (void)key;
+            if (entry.backing)
+                graveyard->push_back(std::move(entry.backing));
+        }
+    }
     records_.clear();
     retained_bytes_ = 0;
 }
 
-void InputRecordStore::rollback_new_record(InputRecordKey key) {
+void InputRecordStore::rollback_new_record(InputRecordKey key,
+                                           InputBackingBatch* graveyard) {
     const auto position = records_.find(key);
     if (position == records_.end())
         throw std::logic_error("transactional InputRecord rollback lost key");
@@ -299,6 +322,8 @@ void InputRecordStore::rollback_new_record(InputRecordKey key) {
     if (entry.raw_bytes > retained_bytes_)
         throw std::logic_error("InputRecord rollback accounting underflow");
     retained_bytes_ -= entry.raw_bytes;
+    if (graveyard != nullptr)
+        graveyard->push_back(std::move(entry.backing));
     records_.erase(position);
 }
 
@@ -357,7 +382,8 @@ bool InputRecordStore::namespace_evictable(CStoreGuid c_store_guid) const {
     return true;
 }
 
-void InputRecordStore::evict_namespace(CStoreGuid c_store_guid) {
+void InputRecordStore::evict_namespace(CStoreGuid c_store_guid,
+                                       InputBackingBatch* graveyard) {
     if (!namespace_evictable(c_store_guid))
         throw std::logic_error(
             "InputRecord namespace still owns a job lease or cursor");
@@ -366,10 +392,16 @@ void InputRecordStore::evict_namespace(CStoreGuid c_store_guid) {
         throw std::logic_error(
             "InputRecord namespace eviction accounting underflow");
     for (auto position = records_.begin(); position != records_.end();) {
-        if (position->first.c_store_guid == c_store_guid)
+        if (position->first.c_store_guid == c_store_guid) {
+            // Same graveyard deferral contract as collect_garbage(): move the
+            // backing out before erase() so the actual free happens only when
+            // `*graveyard` is later destroyed/reaped, never here.
+            if (graveyard != nullptr && position->second.backing)
+                graveyard->push_back(std::move(position->second.backing));
             position = records_.erase(position);
-        else
+        } else {
             ++position;
+        }
     }
     retained_bytes_ -= bytes;
 }

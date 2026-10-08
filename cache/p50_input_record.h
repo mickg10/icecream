@@ -67,6 +67,20 @@ enum class InputPublishResult {
     NotRetainedJobClosed,
 };
 
+// A batch of released input backings whose last reference just dropped. The
+// store hands these out instead of destroying them in place so a caller that
+// owns a single-threaded context (the F sidecar's OWNER thread) can move the
+// multi-MB-to-GB frees off that thread. Destroying this vector (dropping each
+// shared_ptr to use_count 0) is where the actual free happens; nothing about
+// the store's bookkeeping (retained_bytes_, record counts) depends on when
+// that destruction occurs.
+using InputBackingBatch =
+    std::vector<std::shared_ptr<const std::vector<uint8_t>>>;
+
+// Sum of the byte sizes of every backing still held in `batch`. Safe to call
+// before the batch is destroyed/handed to a reaper; used only for diagnostics.
+uint64_t input_backing_batch_bytes(const InputBackingBatch& batch);
+
 // This store owns the logical-job retention lease for exact committed input.
 // Route reconciliation remains a separate owner: closing a job/input lease must
 // never erase an unresolved C/F commit witness or permit REL_SEQ reuse.
@@ -163,12 +177,20 @@ public:
     void close_job(InputRecordKey key);
 
     // Release closed records only after every outstanding cursor is gone.
-    void collect_garbage();
+    //
+    // If `graveyard` is non-null, every released backing is moved into it
+    // instead of being destroyed here, so the bytes are freed only when the
+    // caller lets `*graveyard` go out of scope (or hands it to a reaper).
+    // If `graveyard` is null, released backings are freed inline, exactly as
+    // before this parameter existed.
+    void collect_garbage(InputBackingBatch* graveyard = nullptr);
 
     // Drop the store-owned lease for every record during an explicit F-store
     // incarnation replacement. Already-authorized cursors keep their shared
     // immutable bytes and remain readable.
-    void clear();
+    //
+    // Same `graveyard` deferral contract as collect_garbage().
+    void clear(InputBackingBatch* graveyard = nullptr);
 
     [[nodiscard]] bool contains(InputRecordKey key) const;
     [[nodiscard]] bool job_open(InputRecordKey key) const;
@@ -179,7 +201,9 @@ public:
     // Whole-namespace eviction is legal only after every logical-job lease is
     // closed and every issued cursor has released its immutable backing.
     [[nodiscard]] bool namespace_evictable(CStoreGuid c_store_guid) const;
-    void evict_namespace(CStoreGuid c_store_guid);
+    // Same `graveyard` deferral contract as collect_garbage().
+    void evict_namespace(CStoreGuid c_store_guid,
+                          InputBackingBatch* graveyard = nullptr);
     [[nodiscard]] size_t record_count() const { return records_.size(); }
     [[nodiscard]] uint64_t retained_bytes() const { return retained_bytes_; }
     [[nodiscard]] size_t max_records() const { return max_records_; }
@@ -193,7 +217,10 @@ private:
     // Roll back the one record just published by a transactional caller
     // before any cursor can escape.  This is intentionally private to the
     // attachment core rather than a general deletion API.
-    void rollback_new_record(InputRecordKey key);
+    //
+    // Same `graveyard` deferral contract as collect_garbage().
+    void rollback_new_record(InputRecordKey key,
+                              InputBackingBatch* graveyard = nullptr);
 
     struct Entry {
         uint64_t raw_bytes = 0;
