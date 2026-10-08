@@ -82,6 +82,7 @@
 
 #include <archive.h>
 
+#include <array>
 #include <chrono>
 #include <deque>
 #include <map>
@@ -95,6 +96,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <time.h>
 
 #include "ncpus.h"
 #include "exitcode.h"
@@ -10429,6 +10431,158 @@ void Daemon::service_pending_client_admissions_now()
             icecc::daemon_poll::PollReadiness(pollfds));
 }
 
+// --- Diagnostic-only daemon main-loop turn-latency trace --------------------
+//
+// Gated on the same ICECC_P50_DAEMON_LIFECYCLE_TRACE=<path> env var as the
+// lifecycle RPC trace in cache/p50_daemon_sidecar_adapter.cpp; absent/empty
+// leaves every function below a cheap no-op and this file's main loop
+// completely unmodified in behavior or timing. When set, once per wall-clock
+// second (measured on the turn boundaries themselves -- no extra wakeup is
+// added), appends one JSONL line ("icecream-p50-daemon-turn-v1") to the same
+// file summarizing that second's "answer_client_requests()" turns: how many
+// occurred, the max and p99 turn duration (steady-clock delta from one
+// poll() call returning to the next poll() call returning, i.e. the
+// non-blocking dispatch work done per turn), the max delta from a poll()
+// return to the start of that turn's cache-adapter lifecycle dispatch (the
+// cache_adapter->outer_advance_turn() call below), and the daemon's current
+// active-job count. Seconds with no turns are not reported.
+struct DaemonTurnTraceState {
+    bool have_last_poll_return = false;
+    std::chrono::steady_clock::time_point last_poll_return{};
+    int64_t bucket_second = -1;
+    uint64_t turns_in_bucket = 0;
+    int64_t max_turn_duration_ns = 0;
+    int64_t max_poll_return_to_dispatch_ns = 0;
+    // Bounded reservoir for an approximate p99: the first kMaxSamples turn
+    // durations observed within the current second. If a second sees more
+    // turns than this (a tight zero-timeout spin), later turns still count
+    // toward turns_in_bucket/max_turn_duration_ns but are not added to the
+    // p99 sample set -- an acceptable approximation for a diagnostic trace
+    // that must never grow unbounded.
+    static constexpr size_t kMaxSamples = 4096;
+    std::array<int32_t, kMaxSamples> turn_duration_us_samples{};
+    size_t sample_count = 0;
+};
+static DaemonTurnTraceState g_daemon_turn_trace_state;
+
+static void append_daemon_turn_trace(const char *path, uint64_t turns_in_second,
+                                      int64_t max_turn_duration_ns,
+                                      int64_t p99_turn_duration_ns,
+                                      int64_t max_poll_return_to_dispatch_ns,
+                                      unsigned active_job_count) noexcept
+{
+    struct timespec wall {};
+    clock_gettime(CLOCK_REALTIME, &wall);
+    const uint64_t wall_clock_ns =
+        static_cast<uint64_t>(wall.tv_sec) * 1000000000ULL +
+        static_cast<uint64_t>(wall.tv_nsec);
+    char buffer[384];
+    const int length = snprintf(
+        buffer, sizeof(buffer),
+        "{\"schema\":\"icecream-p50-daemon-turn-v1\","
+        "\"wall_clock_ns\":%llu,\"turns_in_second\":%llu,"
+        "\"max_turn_duration_ns\":%lld,\"p99_turn_duration_ns\":%lld,"
+        "\"max_poll_return_to_dispatch_ns\":%lld,"
+        "\"active_job_count\":%u}\n",
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<unsigned long long>(turns_in_second),
+        static_cast<long long>(max_turn_duration_ns),
+        static_cast<long long>(p99_turn_duration_ns),
+        static_cast<long long>(max_poll_return_to_dispatch_ns),
+        active_job_count);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(buffer))
+        return;
+    const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return;
+    size_t written = 0;
+    while (written < static_cast<size_t>(length)) {
+        const ssize_t result = write(fd, buffer + written, static_cast<size_t>(length) - written);
+        if (result > 0) {
+            written += static_cast<size_t>(result);
+            continue;
+        }
+        if (result < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    close(fd);
+}
+
+static void flush_daemon_turn_trace_if_due(const char *path, int64_t now_second,
+                                            unsigned active_job_count) noexcept
+{
+    DaemonTurnTraceState &state = g_daemon_turn_trace_state;
+    if (state.bucket_second < 0) {
+        state.bucket_second = now_second;
+        return;
+    }
+    if (now_second == state.bucket_second)
+        return;
+    if (state.turns_in_bucket > 0) {
+        int64_t p99_ns = state.max_turn_duration_ns;
+        if (state.sample_count > 0) {
+            std::array<int32_t, DaemonTurnTraceState::kMaxSamples> sorted =
+                state.turn_duration_us_samples;
+            std::sort(sorted.begin(), sorted.begin() + state.sample_count);
+            size_t index = (state.sample_count * 99) / 100;
+            if (index >= state.sample_count)
+                index = state.sample_count - 1;
+            p99_ns = static_cast<int64_t>(sorted[index]) * 1000;
+        }
+        append_daemon_turn_trace(path, state.turns_in_bucket, state.max_turn_duration_ns,
+                                  p99_ns, state.max_poll_return_to_dispatch_ns,
+                                  active_job_count);
+    }
+    state.bucket_second = now_second;
+    state.turns_in_bucket = 0;
+    state.max_turn_duration_ns = 0;
+    state.max_poll_return_to_dispatch_ns = 0;
+    state.sample_count = 0;
+}
+
+// Call exactly once, immediately after each turn's poll() call returns.
+static void daemon_turn_trace_record_poll_return(
+    const char *path, std::chrono::steady_clock::time_point now,
+    unsigned active_job_count) noexcept
+{
+    DaemonTurnTraceState &state = g_daemon_turn_trace_state;
+    const int64_t now_second =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    flush_daemon_turn_trace_if_due(path, now_second, active_job_count);
+
+    if (state.have_last_poll_return) {
+        const int64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - state.last_poll_return).count();
+        ++state.turns_in_bucket;
+        if (duration_ns > state.max_turn_duration_ns)
+            state.max_turn_duration_ns = duration_ns;
+        if (state.sample_count < DaemonTurnTraceState::kMaxSamples) {
+            const int64_t duration_us = duration_ns / 1000;
+            state.turn_duration_us_samples[state.sample_count++] =
+                static_cast<int32_t>(std::min<int64_t>(
+                    duration_us, std::numeric_limits<int32_t>::max()));
+        }
+    }
+    state.last_poll_return = now;
+    state.have_last_poll_return = true;
+}
+
+// Call at most once per turn, immediately before the cache-adapter lifecycle
+// dispatch (outer_advance_turn()) that follows this turn's poll() call.
+static void daemon_turn_trace_record_dispatch_start(
+    std::chrono::steady_clock::time_point now) noexcept
+{
+    DaemonTurnTraceState &state = g_daemon_turn_trace_state;
+    if (!state.have_last_poll_return)
+        return;
+    const int64_t delta_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now - state.last_poll_return).count();
+    if (delta_ns > state.max_poll_return_to_dispatch_ns)
+        state.max_poll_return_to_dispatch_ns = delta_ns;
+}
+// --- end diagnostic-only daemon main-loop turn-latency trace ----------------
+
 void Daemon::answer_client_requests()
 {
     if (expire_scheduler_output())
@@ -10874,6 +11028,16 @@ void Daemon::answer_client_requests()
 
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
+    // Diagnostic-only turn-latency trace (ICECC_P50_DAEMON_LIFECYCLE_TRACE);
+    // see daemon_turn_trace_record_poll_return() above. A no-op when unset.
+    {
+        const char *turn_trace_path = getenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE");
+        if (turn_trace_path != nullptr && *turn_trace_path != '\0') {
+            daemon_turn_trace_record_poll_return(
+                turn_trace_path, std::chrono::steady_clock::now(), current_kids);
+        }
+    }
+
     if (expire_scheduler_output())
         return;
     if (ret < 0 && errno != EINTR) {
@@ -10905,6 +11069,10 @@ void Daemon::answer_client_requests()
     }
     if (cache_adapter != nullptr && cache_adapter_start_attempted &&
         !cache_adapter->outer_action_taken()) {
+        // Diagnostic-only turn-latency trace (ICECC_P50_DAEMON_LIFECYCLE_TRACE);
+        // see daemon_turn_trace_record_dispatch_start() above. A no-op when
+        // the env var is unset (have_last_poll_return stays false).
+        daemon_turn_trace_record_dispatch_start(std::chrono::steady_clock::now());
         icecc::p50::advertisement::Update lifecycle_update;
         (void)cache_adapter->outer_advance_turn(
             std::chrono::steady_clock::now(), pollfds, &lifecycle_update);
