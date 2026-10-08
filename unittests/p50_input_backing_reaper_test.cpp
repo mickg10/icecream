@@ -145,7 +145,17 @@ void test_destructor_drains_everything() {
 }
 
 void test_full_queue_falls_back_to_inline() {
+    // The accepted (busy/queued) batches and the rejected (overflow) batch
+    // get separate logs. Both batches race against the reaper's worker
+    // thread on real wall-clock timing, so there is no way to assert
+    // anything about `log`'s contents at a specific moment without a
+    // flaky dependency on how far the 400ms/50ms async frees have
+    // progressed. `fallback_log` is only ever touched by this thread's own
+    // inline overflow_batch.clear(), so it is race-free and gives an exact,
+    // deterministic check that the fallback ran synchronously, here, on
+    // the caller thread.
     auto log = std::make_shared<DeleteLog>();
+    auto fallback_log = std::make_shared<DeleteLog>();
     const std::thread::id caller = std::this_thread::get_id();
     InputBackingReaper reaper(/*max_queued_batches=*/1);
 
@@ -168,7 +178,7 @@ void test_full_queue_falls_back_to_inline() {
 
     InputBackingBatch overflow_batch;
     overflow_batch.push_back(make_slow_backing(
-        1u << 16, log, std::chrono::milliseconds(10)));
+        1u << 16, fallback_log, std::chrono::milliseconds(10)));
     require(!reaper.submit(std::move(overflow_batch)),
             "reaper accepted a batch past its queue cap");
     require(!overflow_batch.empty(),
@@ -177,22 +187,28 @@ void test_full_queue_falls_back_to_inline() {
 
     // Inline fallback: the caller frees it right here, synchronously, on
     // this (the test) thread -- exactly what collect_input_garbage() does
-    // when InputBackingReaper::submit() returns false.
+    // when InputBackingReaper::submit() returns false. Checked against its
+    // own dedicated log, so this assertion cannot race the worker thread's
+    // unrelated frees of busy_batch/queued_batch on `log`.
     const Clock::time_point start = Clock::now();
     overflow_batch.clear();
     (void)elapsed_ms_since(start);  // informational only; inline is allowed to block.
-    require(log->saw_only_thread(caller) == false,
-            "sanity: earlier async deleters should not all be the caller");
     {
-        std::lock_guard<std::mutex> lock(log->mutex);
-        require(!log->deleter_threads.empty() &&
-                    log->deleter_threads.back() == caller,
+        std::lock_guard<std::mutex> lock(fallback_log->mutex);
+        require(fallback_log->deleter_threads.size() == 1 &&
+                    fallback_log->deleter_threads.back() == caller,
                 "fallback free did not run synchronously on the caller "
                 "thread after a full-queue rejection");
     }
 
-    require(wait_for_count(*log, 3, std::chrono::seconds(2)),
+    require(wait_for_count(*log, 2, std::chrono::seconds(2)),
             "reaper never finished draining the batches that were accepted");
+    // Now that both accepted batches are confirmed freed, the sanity check
+    // that at least one of those frees ran off the caller thread is
+    // deterministic rather than a race against the worker.
+    require(log->saw_only_thread(caller) == false,
+            "sanity: the accepted batches should have been freed by the "
+            "reaper's worker thread, not the caller");
 }
 
 // --- InputRecordStore graveyard-deferral tests ----------------------------
