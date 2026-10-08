@@ -215,13 +215,18 @@ FRejectStaleBegin ==
 ***************************************************************************)
 FCommit ==
     /\ fActive # NoTx
-    /\ ~NetHasCurrent("ACK")
     /\ LET committed == fActive.relSeq
            releaseCandidate == {p \in fParked : p.relSeq = committed + 1}
            victim == IF releaseCandidate # {}
                      THEN CHOOSE p \in releaseCandidate : TRUE
                      ELSE NoTx
        IN
+           \* Scoped to this commit's own relSeq (not NetHasCurrent's
+           \* kind+epoch-only check): otherwise at most one ack can ever be
+           \* outstanding for the current epoch, forcing C's retirement to
+           \* always be of the queue head and making out-of-order retirement
+           \* (M5) structurally unreachable.
+           /\ ~(\E m \in net : m.kind = "ACK" /\ m.relSeq = committed /\ m.epoch = epoch)
            /\ appliedLog' = Append(appliedLog, <<epoch, committed>>)
            /\ fRouteCursor' = committed + 1
            /\ fActive' = victim
@@ -456,9 +461,11 @@ SpecM1 == Init /\ [][NextM1]_vars /\ WF_vars(NextM1)
 FCommitMutantEarlyRelease(victim) ==
     /\ fActive # NoTx
     /\ victim \in (fParked \cup {NoTx})
-    /\ ~NetHasCurrent("ACK")
     /\ LET committed == fActive.relSeq
        IN
+           \* See FCommit: scoped to this commit's own relSeq, not just
+           \* kind+epoch, so acks for distinct relSeqs can coexist in net.
+           /\ ~(\E m \in net : m.kind = "ACK" /\ m.relSeq = committed /\ m.epoch = epoch)
            /\ appliedLog' = Append(appliedLog, <<epoch, committed>>)
            /\ fRouteCursor' = committed + 1
            /\ fActive' = victim
