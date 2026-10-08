@@ -1186,7 +1186,10 @@ def parse_host_path_arg(value: str) -> Tuple[str, str]:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("trace_dir", help="directory containing *.jsonl stage_trace output")
+    parser.add_argument("trace_dir", nargs="?", default=None,
+                         help="directory containing *.jsonl stage_trace output; "
+                              "optional when only --owner-lag, --c-result-trace, "
+                              "and/or --f-result-trace are given")
     parser.add_argument("--job", type=parse_job_arg, default=None,
                          help="print only this job's timeline, as EPOCH:WIREID")
     parser.add_argument("--summary", action="store_true",
@@ -1246,86 +1249,95 @@ def main(argv: Optional[List[str]] = None) -> int:
                               "the C or the F sidecar's file")
     args = parser.parse_args(argv)
 
-    records = load_records(args.trace_dir)
-    if not records:
-        print("error: no stage_trace records loaded", file=sys.stderr)
+    flag_only = args.owner_lag or args.c_result_trace or args.f_result_trace
+    if args.trace_dir is None and not flag_only:
+        print("error: trace_dir is required unless --owner-lag, "
+              "--c-result-trace, or --f-result-trace is given",
+              file=sys.stderr)
         return 1
 
     offsets = load_offsets(args.offsets)
-    jobs = group_by_job(records)
-    if not jobs:
-        print("warning: no records carried a wire identity "
-              "(epoch,wire_id) -- is ICECC_STAGE_TRACE_DIR set tree-wide?",
-              file=sys.stderr)
 
-    ninja_edges: List[NinjaEdge] = []
-    ninja_epoch_ns: Optional[int] = None
-    job_to_edge: Dict[Tuple[int, int], NinjaEdge] = {}
-    if args.ninja_log:
-        ninja_edges = parse_ninja_log(args.ninja_log)
-        ninja_epoch_ns = compute_ninja_epoch(ninja_edges, jobs, offsets)
-        if ninja_epoch_ns is None:
-            print("warning: --ninja-log given but no edge matched any "
-                  "output_path_mapped job -- is item (c) enabled in this trace?",
-                  file=sys.stderr)
-        else:
-            hash_to_job = _hash_to_job(jobs)
-            for edge in ninja_edges:
-                job_key = hash_to_job.get(edge.output_hash)
-                if job_key is not None:
-                    job_to_edge[job_key] = edge
-        mtime_epoch_ns = compute_ninja_epoch_mtime(ninja_edges)
-        print(f"  ninja epoch anchor (join via output_path_mapped): "
-              f"{'n/a' if ninja_epoch_ns is None else ninja_epoch_ns}")
-        print(f"  ninja epoch anchor (restat mtime, join-free): "
-              f"{'n/a' if mtime_epoch_ns is None else mtime_epoch_ns}")
-        if ninja_epoch_ns is not None and mtime_epoch_ns is not None:
-            disagreement_ns = abs(ninja_epoch_ns - mtime_epoch_ns)
-            if disagreement_ns > NINJA_EPOCH_DISAGREEMENT_WARN_NS:
-                print(f"  WARNING: the two ninja epoch anchors disagree by "
-                      f"{fmt_ms(disagreement_ns)} (> "
-                      f"{fmt_ms(NINJA_EPOCH_DISAGREEMENT_WARN_NS)}) -- check "
-                      f"that --ninja-log matches this trace dir and host",
-                      file=sys.stderr)
-        print_ninja_summary(ninja_edges, jobs)
-
-    def ninja_edge_for(job_key: Tuple[int, int]) -> Optional[NinjaEdge]:
-        return job_to_edge.get(job_key)
-
-    if args.job is not None:
-        recs = jobs.get(args.job)
-        if not recs:
-            print(f"error: no records for job {args.job}", file=sys.stderr)
+    if args.trace_dir is not None:
+        records = load_records(args.trace_dir)
+        if not records:
+            print("error: no stage_trace records loaded", file=sys.stderr)
             return 1
-        print_job_timeline(args.job, recs, offsets,
-                            ninja_edge_for(args.job), ninja_epoch_ns)
-        if args.top_gaps:
-            print_top_gaps(args.job, recs, offsets, args.top_gaps)
-    elif args.summary:
-        summarize(jobs, offsets)
-    else:
-        for job_key, recs in sorted(jobs.items()):
-            print_job_timeline(job_key, recs, offsets,
-                                ninja_edge_for(job_key), ninja_epoch_ns)
+
+        jobs = group_by_job(records)
+        if not jobs:
+            print("warning: no records carried a wire identity "
+                  "(epoch,wire_id) -- is ICECC_STAGE_TRACE_DIR set tree-wide?",
+                  file=sys.stderr)
+
+        ninja_edges: List[NinjaEdge] = []
+        ninja_epoch_ns: Optional[int] = None
+        job_to_edge: Dict[Tuple[int, int], NinjaEdge] = {}
+        if args.ninja_log:
+            ninja_edges = parse_ninja_log(args.ninja_log)
+            ninja_epoch_ns = compute_ninja_epoch(ninja_edges, jobs, offsets)
+            if ninja_epoch_ns is None:
+                print("warning: --ninja-log given but no edge matched any "
+                      "output_path_mapped job -- is item (c) enabled in this trace?",
+                      file=sys.stderr)
+            else:
+                hash_to_job = _hash_to_job(jobs)
+                for edge in ninja_edges:
+                    job_key = hash_to_job.get(edge.output_hash)
+                    if job_key is not None:
+                        job_to_edge[job_key] = edge
+            mtime_epoch_ns = compute_ninja_epoch_mtime(ninja_edges)
+            print(f"  ninja epoch anchor (join via output_path_mapped): "
+                  f"{'n/a' if ninja_epoch_ns is None else ninja_epoch_ns}")
+            print(f"  ninja epoch anchor (restat mtime, join-free): "
+                  f"{'n/a' if mtime_epoch_ns is None else mtime_epoch_ns}")
+            if ninja_epoch_ns is not None and mtime_epoch_ns is not None:
+                disagreement_ns = abs(ninja_epoch_ns - mtime_epoch_ns)
+                if disagreement_ns > NINJA_EPOCH_DISAGREEMENT_WARN_NS:
+                    print(f"  WARNING: the two ninja epoch anchors disagree by "
+                          f"{fmt_ms(disagreement_ns)} (> "
+                          f"{fmt_ms(NINJA_EPOCH_DISAGREEMENT_WARN_NS)}) -- check "
+                          f"that --ninja-log matches this trace dir and host",
+                          file=sys.stderr)
+            print_ninja_summary(ninja_edges, jobs)
+
+        def ninja_edge_for(job_key: Tuple[int, int]) -> Optional[NinjaEdge]:
+            return job_to_edge.get(job_key)
+
+        if args.job is not None:
+            recs = jobs.get(args.job)
+            if not recs:
+                print(f"error: no records for job {args.job}", file=sys.stderr)
+                return 1
+            print_job_timeline(args.job, recs, offsets,
+                                ninja_edge_for(args.job), ninja_epoch_ns)
             if args.top_gaps:
-                print_top_gaps(job_key, recs, offsets, args.top_gaps)
-
-    if args.occupancy:
-        print_occupancy(jobs, offsets, args.occupancy_bucket_ms)
-
-    if args.check_clocks:
-        warnings = check_clock_sanity(jobs, offsets)
-        if warnings:
-            print(f"\n=== clock sanity: {len(warnings)} causal-order "
-                  f"violation(s) found ===")
-            for w in warnings:
-                print(f"  WARNING: {w}")
+                print_top_gaps(args.job, recs, offsets, args.top_gaps)
+        elif args.summary:
+            summarize(jobs, offsets)
         else:
-            print("\n=== clock sanity: no causal-order violations "
-                  "found across hosts ===")
+            for job_key, recs in sorted(jobs.items()):
+                print_job_timeline(job_key, recs, offsets,
+                                    ninja_edge_for(job_key), ninja_epoch_ns)
+                if args.top_gaps:
+                    print_top_gaps(job_key, recs, offsets, args.top_gaps)
 
-    if not args.no_uncorrelated:
-        print_uncorrelated(records, args.tu_seq, args.limit)
+        if args.occupancy:
+            print_occupancy(jobs, offsets, args.occupancy_bucket_ms)
+
+        if args.check_clocks:
+            warnings = check_clock_sanity(jobs, offsets)
+            if warnings:
+                print(f"\n=== clock sanity: {len(warnings)} causal-order "
+                      f"violation(s) found ===")
+                for w in warnings:
+                    print(f"  WARNING: {w}")
+            else:
+                print("\n=== clock sanity: no causal-order violations "
+                      "found across hosts ===")
+
+        if not args.no_uncorrelated:
+            print_uncorrelated(records, args.tu_seq, args.limit)
 
     if args.c_result_trace and args.f_result_trace:
         c_v5_records = load_v5_source_results(args.c_result_trace)

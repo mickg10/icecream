@@ -464,6 +464,41 @@ public:
         return record->lease;
     }
 
+    // Robustness fix: capture() above has no matching release, so records_
+    // grows by one Record (and, on the Native backend, one held pidfd) per
+    // sidecar incarnation forever; only the destructor ever closes those
+    // fds.  Call this once an incarnation's teardown proof is complete --
+    // i.e. from the RetryEligible and EnterDegradedLegacy action handlers,
+    // right next to the existing outer_close_fds() call for that same
+    // incarnation, and NEVER from the FailedClosed handler, which
+    // deliberately retains everything (pidfd, registration, pid/pgid) for
+    // the external cleanup authority, exactly like outer_pidfd_ itself.
+    //
+    // Safe to fully erase (not just close) at both call sites: by the time
+    // the lifecycle reducer emits RetryEligible or EnterDegradedLegacy for
+    // this (pid, pgid), its own proves_absent() proof for that exact lease
+    // has already run and been consumed inside advance(); RetryEligible
+    // immediately resets the adapter's pid/pgid to -1 (so outer_group_
+    // observation() can never look this record up again), and
+    // EnterDegradedLegacy is terminal (outer_begin_turn() short-circuits on
+    // it), so neither proves_absent() nor lease_for() can read this record
+    // again afterward.  Erasing (rather than leaving a closed-marked
+    // Record behind) also avoids a stale record aliasing a later capture()
+    // for a reused pid/pgid, which std::find_if's first-match semantics
+    // would otherwise silently prefer over the fresh one.
+    void release(pid_t pid, pid_t pgid) noexcept
+    {
+        const auto record = std::find_if(
+            records_.begin(), records_.end(), [&](const Record& candidate) {
+                return candidate.pid == pid && candidate.pgid == pgid;
+            });
+        if (record == records_.end())
+            return;
+        if (record->pidfd >= 0)
+            (void)::close(record->pidfd);
+        records_.erase(record);
+    }
+
 private:
     struct Record {
         sidecar::KillDomainLease lease;
@@ -2970,6 +3005,20 @@ void DaemonSidecarAdapter::outer_apply_action(
             outer_listener_device_ = outer_listener_inode_ = 0;
         }
         outer_close_fds();
+        // Robustness fix: this incarnation's teardown proof is complete (the
+        // reducer already consumed proves_absent() for it to reach
+        // RetryEligible), and outer_pid_/outer_pgid_ are about to be reset
+        // to -1 below, after which outer_group_observation() can never look
+        // this (pid, pgid) up again.  Release the per-incarnation kill-domain
+        // Record (and its held pidfd, on the Native backend) now, next to
+        // outer_close_fds(), instead of leaking it until the adapter itself
+        // is destroyed.
+        if (outer_kill_domain_ != nullptr) {
+            auto verifier =
+                std::dynamic_pointer_cast<OuterKillDomainVerifier>(outer_kill_domain_);
+            if (verifier != nullptr)
+                verifier->release(outer_pid_, outer_pgid_);
+        }
         outer_disarm_registration();
         outer_group_domain_.reset();
         outer_group_gone_observed_ = false;
@@ -3004,6 +3053,18 @@ void DaemonSidecarAdapter::outer_apply_action(
         close_owned(outer_auth_fd_);
         outer_auth_phase_ = 0;
         outer_close_fds();
+        // Robustness fix: same release as the RetryEligible handler above --
+        // DegradedLegacy is terminal (outer_begin_turn() short-circuits once
+        // latched, see the FailedClosed/DegradedLegacy check further down),
+        // so no later proves_absent()/lease_for() lookup can read this
+        // incarnation's Record again.  Release it here, next to
+        // outer_close_fds(), rather than leaking it.
+        if (outer_kill_domain_ != nullptr) {
+            auto verifier =
+                std::dynamic_pointer_cast<OuterKillDomainVerifier>(outer_kill_domain_);
+            if (verifier != nullptr)
+                verifier->release(outer_pid_, outer_pgid_);
+        }
         outer_disarm_registration();
         outer_pid_ = outer_pgid_ = -1;
         outer_input_operation_.reset();
@@ -3107,7 +3168,19 @@ void DaemonSidecarAdapter::outer_append_pollfds(
     };
     append(outer_exec_fd_, POLLIN | POLLERR | POLLHUP);
     append(outer_ready_fd_, POLLIN | POLLERR | POLLHUP);
-    append(outer_pidfd_, POLLIN | POLLERR | POLLHUP);
+    // FailedClosed is a diagnostic terminal state that deliberately keeps
+    // the exact pidfd open and retained (see outer_shutdown_complete()) --
+    // it is not a license to keep polling it.  A pidfd whose process has
+    // already exited reports POLLHUP immediately on every poll(), so once
+    // the lifecycle has latched FailedClosed, continuing to append it here
+    // busy-spins the daemon's event loop at ~98% CPU for no observable
+    // benefit: nothing reads this fd's readiness while FailedClosed (see the
+    // matching central-reaper dispatch gate in the daemon's request-answering
+    // loop).  Robustness fix only -- the fd itself, its ownership, and every
+    // other poll source are unchanged.
+    if (outer_lifecycle_ == nullptr ||
+        outer_lifecycle_->state() != sidecar::LifecycleState::FailedClosed)
+        append(outer_pidfd_, POLLIN | POLLERR | POLLHUP);
     append(outer_auth_fd_,
            (outer_auth_phase_ == kAuthConnectPending || outer_auth_phase_ == 1 ||
             outer_auth_phase_ == 2 ||

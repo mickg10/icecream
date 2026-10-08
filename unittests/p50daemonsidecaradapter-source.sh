@@ -37,6 +37,39 @@ grep -F 'outer_commit_attempt_replacement' "$header" >/dev/null
 grep -F 'outer_close_logical_input_lease' "$header" >/dev/null
 grep -F 'AttemptLeafRetirementJoin' "$header" >/dev/null
 
+# Robustness fix (1): outer_append_pollfds() must stop polling the exact
+# pidfd once the lifecycle has latched FailedClosed -- a pidfd whose process
+# already exited reports POLLHUP on every poll(), busy-spinning the daemon's
+# event loop -- while leaving the fd itself open and retained.
+grep -F 'outer_lifecycle_->state() != sidecar::LifecycleState::FailedClosed' "$src" >/dev/null
+
+# Robustness fix (3): OuterKillDomainVerifier::release() must exist, and the
+# RetryEligible and EnterDegradedLegacy action handlers must each call it
+# (via outer_kill_domain_) once that incarnation's teardown proof is
+# complete, to stop leaking one Record -- and, on the Native pidfd backend,
+# one open pidfd -- per sidecar incarnation. The terminal FailedClosed
+# handler must NOT call it: that record is deliberately retained for the
+# external cleanup authority, exactly like outer_pidfd_ itself.
+grep -F 'void release(pid_t pid, pid_t pgid) noexcept' "$src" >/dev/null
+
+action_block() {
+    sed -n "/case sidecar::LifecycleAction::$1:/,/case sidecar::LifecycleAction::$2:/p" "$src"
+}
+if ! action_block RetryEligible EnterDegradedLegacy \
+        | grep -F 'verifier->release(outer_pid_, outer_pgid_)' >/dev/null; then
+    echo 'FAIL: RetryEligible handler must release the retiring kill-domain record' >&2
+    exit 1
+fi
+if ! action_block EnterDegradedLegacy FailedClosed \
+        | grep -F 'verifier->release(outer_pid_, outer_pgid_)' >/dev/null; then
+    echo 'FAIL: EnterDegradedLegacy handler must release the retiring kill-domain record' >&2
+    exit 1
+fi
+if action_block FailedClosed None | grep -F 'verifier->release(' >/dev/null; then
+    echo 'FAIL: FailedClosed handler must not release the kill-domain record it is required to retain for the external cleanup authority' >&2
+    exit 1
+fi
+
 if grep -E 'daemon/main\.cpp|signal\(|sigaction\(|listen_unix\(' "$src" "$header" >/dev/null; then
     echo 'FAIL: adapter acquired daemon-main, signal-handler, or public-listener ownership' >&2
     exit 1

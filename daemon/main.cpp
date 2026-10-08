@@ -5347,7 +5347,13 @@ bool Daemon::configure_cache_adapter() noexcept
         config.handoff_timeout = std::chrono::milliseconds(250);
         config.input_attachment_timeout = std::chrono::milliseconds(5000);
         config.input_lifecycle_timeout = std::chrono::milliseconds(5000);
-        config.shutdown_timeout = std::chrono::milliseconds(1000);
+        // Robustness fix: 1000ms gave the sidecar only 2s total to tear down
+        // (this value feeds both grace_timeout and kill_timeout, see
+        // DaemonSidecarAdapter's constructor in cache/p50_daemon_sidecar_adapter.cpp
+        // ~526-527). 5000ms gives it 10s, matching the other sidecar timeouts
+        // configured just above/below.  Not a protocol change -- purely a
+        // local teardown budget.
+        config.shutdown_timeout = std::chrono::milliseconds(5000);
         config.restart_window = std::chrono::milliseconds(10000);
         config.max_restarts = 3;
         // One attempt per event-loop turn keeps every recovery bounded while
@@ -10981,7 +10987,15 @@ void Daemon::answer_client_requests()
     // one daemon turn from combining WNOWAIT/consume with another fallible
     // lifecycle action.
     if (cache_adapter != nullptr && cache_adapter_start_attempted &&
-        cache_adapter->outer_pidfd() >= 0 && cache_adapter->outer_child_pid() > 1) {
+        cache_adapter->outer_pidfd() >= 0 && cache_adapter->outer_child_pid() > 1 &&
+        // Robustness fix, belt-and-suspenders with the pollfd gate in
+        // outer_append_pollfds(): once FailedClosed has latched, the pidfd
+        // is retained open but is no longer polled, so pidfd_ready below
+        // would already always be false; skip the dispatch block entirely
+        // rather than paying for a reap_one()/publish_pending() call every
+        // turn against a terminal, diagnostic-only state.
+        cache_adapter->outer_lifecycle_state() !=
+            icecc::p50::sidecar::LifecycleState::FailedClosed) {
         const int sidecar_pidfd = cache_adapter->outer_pidfd();
         const bool pidfd_ready = (poll_ready.any(sidecar_pidfd) &
                                   (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0;

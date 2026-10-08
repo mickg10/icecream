@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <initializer_list>
 #include <poll.h>
@@ -368,6 +369,83 @@ bool run_close_range_dispatch_tests(
 }
 #endif // defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
 
+// Robustness-fix regression for OuterKillDomainVerifier::capture(): before
+// release() existed, every crash/relaunch cycle appended one Record to
+// records_ (and, on the Native pidfd backend, opened one real pidfd) and
+// nothing ever removed it until the whole adapter was destroyed. This test
+// does several real kill-and-relaunch cycles through the public adapter API
+// -- the exact same crash/relaunch path already exercised once in main()
+// below -- and confirms this process's own open pidfd count settles into a
+// steady state instead of growing by one every cycle.
+int open_pidfd_count()
+{
+    int count = 0;
+    char target[256];
+    for (int fd = 0; fd < 4096; ++fd) {
+        if (::fcntl(fd, F_GETFD) < 0)
+            continue;
+        char path[32];
+        std::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        const ssize_t n = ::readlink(path, target, sizeof(target) - 1);
+        if (n > 0) {
+            target[static_cast<size_t>(n)] = '\0';
+            if (std::strncmp(target, "anon_inode:[pidfd]", 18) == 0)
+                ++count;
+        }
+    }
+    return count;
+}
+
+bool run_kill_domain_release_bound_test(
+    const std::string& temp_root, CentralChildReaperRegistry& reaper,
+    const DaemonSidecarAdapter::Config& base_config)
+{
+    const std::string pattern = temp_root + "/p50kd-XXXXXX";
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (::mkdtemp(buffer.data()) == nullptr || ::chmod(buffer.data(), 0700) != 0)
+        return false;
+    const std::string root(buffer.data());
+
+    auto config = base_config;
+    config.runtime_directory = root;
+    DaemonSidecarAdapter adapter(config);
+    adapter.observe_public_listener(true, config.public_listener_port);
+    adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update update;
+
+    bool ok = drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
+        return adapter.authenticated() && adapter.advertisement_snapshot().present();
+    });
+
+    constexpr int kCycles = 6;
+    int steady_state_count = -1;
+    for (int cycle = 0; ok && cycle < kCycles; ++cycle) {
+        const pid_t dying_pid = adapter.outer_child_pid();
+        ok = dying_pid > 1 && ::kill(dying_pid, SIGKILL) == 0;
+        ok = ok && drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
+            return adapter.authenticated() && adapter.outer_child_pid() > 1 &&
+                   adapter.outer_child_pid() != dying_pid;
+        });
+        if (!ok)
+            break;
+        const int count = open_pidfd_count();
+        if (cycle == 1) {
+            steady_state_count = count;
+        } else if (cycle > 1 && count > steady_state_count) {
+            std::fprintf(stderr,
+                         "kill-domain release regression: open pidfd count"
+                         " grew from %d to %d after relaunch cycle %d\n",
+                         steady_state_count, count, cycle);
+            ok = false;
+        }
+    }
+
+    ok = ok && drive_shutdown(adapter, reaper, update);
+    ok = ok && remove_p29_fingerprint_cache(root);
+    return ok && ::rmdir(root.c_str()) == 0;
+}
+
 } // namespace
 
 int main()
@@ -555,6 +633,14 @@ int main()
         return 29;
     if (!run_close_range_dispatch_tests(temp_root, reaper, config))
         return 30;
+
+    // Robustness fix: OuterKillDomainVerifier::release() must keep the
+    // per-incarnation kill-domain record (and its pidfd, on the Native
+    // backend) bounded across repeated crash/relaunch cycles instead of
+    // leaking one per incarnation forever.
+    if (!run_kill_domain_release_bound_test(std::string(temp_root), reaper,
+                                            config))
+        return 31;
 
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
