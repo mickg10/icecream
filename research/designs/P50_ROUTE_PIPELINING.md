@@ -590,19 +590,175 @@ field on the existing action-log plumbing.
 
 ### 5.1 Unit tests
 
-(TODO)
+The existing `unittests/` tree already has targeted coverage for every layer
+this design touches; the plan is to extend each in place (parameterize by
+`K`), not add a parallel test tree:
 
-### 5.2 Sim (cache/sim/p50sim.cpp)
+- **`p50_slice0_test.cpp`** (covers `CRoute`/`FStore` directly, §1.1 point 2 /
+  §1.2 "today's single-slot enforcement"): add cases that drive `FStore::begin`
+  through `K` admissions before any commit, assert the generalized occupied-
+  slot check (§1.2 (a)) accepts exactly `rel_seq ∈
+  [nextExpected, nextExpected+K-1]` and rejects outside it; assert
+  `commit_input` releases the sequencer's park signal for the immediate
+  successor only (not all parked successors at once).
+- **`p50_route_owner_test.cpp`** / **`p50_role_owner_test.cpp`**: extend to
+  drive `K`-deep `outstanding`/`active_queue_` FIFOs (§1.1 point 1-2) through
+  normal advancement and through every row of the §3 failure matrix — in
+  particular P3/P5 (verify the *entire* FIFO is invalidated, not just the
+  head) and P6 (verify successors are invalidated even though the triggering
+  TX's digest was in fact correct, per the conservative §0 mandate).
+- **`p50_profile_test.cpp`**: extend `P29V1LiveDialogue` tests to confirm the
+  single shared `state_`/`store_` instance (§1.2 (c)) is only ever driven in
+  strict `rel_seq` order by the new sequencer, including a test that
+  attempting to call `begin()` out of order (bypassing the sequencer) still
+  hits the existing "P29V1 TX_BEGIN arrived while dialogue is active" guard —
+  i.e. the sequencer is additive, not a replacement for the existing
+  single-dialogue guard, which remains the last line of defense.
+- **`p50_endpoint_test.cpp`** / **`p50_endpoint_run_cancel_test.cpp`**: extend
+  `run_connected` tests (both `P50ClientEndpoint` and `P50ServerEndpoint`
+  sides) to open `K` connections per route and assert: (a) `K=1` byte-for-byte
+  reproduces every existing assertion in these files unchanged (the primary
+  regression gate, §2 invariant 12); (b) lock hold time (§1.1 point 5 / §4) is
+  bounded to prepare+encode+write and does not include the STATE/COMMIT wait,
+  measured directly rather than inferred.
+- **`p50_source_arm_wait_test.cpp`** / **`p50_source_arm_live_wait_test.cpp`**
+  / **`p50_source_arm_wire_test.cpp`**: extend to assert the §4 clamp — `K`
+  must not exceed `armed_window_slots()` for a lane — including a negative
+  test that an out-of-range `ICECC_P50_ROUTE_PIPELINE_DEPTH` is clamped with a
+  warning, mirroring the existing `P50_ROUTE_LANES_CLAMPED` pattern.
+- **`p50_sidecar_lifecycle_test.cpp`** / **`p50_daemon_sidecar_adapter_test.cpp`**:
+  add the §3 P8 regression directly here — drive a parked connection that
+  intentionally delays its read-drain and assert `input_lifecycle_timeout` is
+  **not** affected (lifecycle RPC latency unchanged versus a `K=1` baseline
+  run in the same test binary) — this is the single highest-value new test in
+  the whole plan, since it is the one failure mode genuinely novel to this
+  design (§3 summary).
+- **`p50_s2_restart_replay_test.cpp`**: extend to drive a sidecar restart
+  (§3 P7) while `K>1` TXs are outstanding on one route and confirm every other
+  route on that sidecar also cold-reconnects, matching the unchanged blast-
+  radius argument in §3's P7 row.
+- **New test file** (only new file proposed in this plan):
+  `p50_route_pipeline_depth_test.cpp` — a focused test owning the cross-cutting
+  assertions that don't naturally belong to one existing file: `K=1`
+  byte-identical wire capture diffed against a pre-pipelining capture; `K`
+  env-var parsing/validation; the full §3 failure matrix driven end-to-end
+  against a fake F (reusing the existing fake-sidecar test harnesses,
+  e.g. `p50_fake_sidecar_eof.cpp`'s pattern) rather than against each
+  individual component test.
 
-(TODO)
+`cache/formal/check_trace.py` and its C++ counterpart `cache/p50_actions.cpp`
+both need the §2 invariant 8/9 generalization (scalar `pending`/`active` →
+queue-membership, reconciliation witness "ahead by exactly 1" → "ahead by at
+most `K`") and the §4 `parked`/`stage` field support — these are code changes
+to the *checkers*, reviewed and tested the same as production code (their own
+existing self-tests, e.g. driven via `p50_trace_check.sh` and
+`p50statejsonl-warn.sh`, are extended with `K>1` fixture traces).
+
+### 5.2 Sim (`cache/sim/p50sim.cpp`)
+
+Today's sim (`run_codec`, `run_batch`, loopback TCP, `cache/sim/p50sim.cpp:674`/`1212`)
+is fully serialized — one TX's `run_one`-equivalent lambda completes before the
+next begins — and has **no fault-injection mechanism** (confirmed by direct
+reading; there is no hook analogous to the mutant-config-driven fault
+injection the TLA+ side has). Two changes are needed, both additive:
+
+1. **Pipelined batch mode**: extend `run_batch` (or add a sibling entry point
+   selected by a new `Arguments` field, e.g. `--pipeline-depth K`) to open `K`
+   connections ahead and let their BEGIN/BODY/FILL writes and STATE/COMMIT
+   reads interleave on the existing loopback transport, rather than fully
+   serializing. This is the only way to exercise the actual *overlap*
+   (as opposed to just the bookkeeping) outside a real two-host farm run.
+2. **Fault injection hook**: a minimal one — the sim does not need the TLA+
+   model's full mutant taxonomy, only enough to drive each §3 row at least
+   once: inject a digest mismatch on a chosen `rel_seq` (drives P3/P5),
+   inject a connection drop before/after a chosen write (drives P2/P6), and
+   inject an artificial read-drain stall on a parked connection specifically
+   to validate the P8 non-interaction property from §5.1's highest-value
+   test, this time measured against real (loopback) socket backpressure
+   rather than a mocked timeout.
+
+Given the sim's existing single-file, lambda-heavy structure, both additions
+are scoped as new code paths gated behind the new CLI flag, not a rewrite of
+`run_batch`'s existing serialized path (which remains the `K=1` default and
+thus the regression baseline).
 
 ### 5.3 TLA+
 
-(TODO)
+Core model to extend: **`Protocol50ZstdRoute.tla`**
+(`cache/formal/`, 108 KB) — generalize `SingleUnresolvedTU`
+(lines 2602-2604) and `OutstandingCodecJobsBlockReuse` (lines 2584-2593) from
+scalar to bounded-by-`K` collections, per §2 invariants 1-2, as a new model
+constant (e.g. `PipelineDepth`) rather than a hardcoded `2`/`3` — the model
+should be checked at `PipelineDepth = 1` (must be isomorphic to today's
+checked model — the TLA+-level analogue of §2 invariant 12) and at small `K>1`
+(2-3; full state-space checking at the farm's real `K` is expected to be
+infeasible, so this is a representative-small-`K` check, not an exhaustive
+one).
+
+The two previously-unexamined files are directly relevant and now confirmed
+by inspection:
+
+- **`Protocol50ZstdRouteFInputComposition.tla`** (50 KB) composes the core
+  per-route model (`core`, instantiating `Protocol50ZstdRoute`) with an
+  **owner-side input-interface model** (`owner`, instantiating
+  `Protocol50ZstdRouteFInputInterface`) via actions named
+  `ObservePreparedSync`, `CancelAfterTouchSync`, `SelectCommitSync`,
+  `FCommitAndPublish`, `OwnerLateClose`/`OwnerNormalClose`,
+  `ResetCommitAfterOwnerCancel`, `ResetCommitWithoutOwner`, and
+  `RejectStaleOwnerEvent` (names read directly from the file). This is the
+  exact composition surface §1.2's parking design must be reflected in: a
+  parked TX is precisely "input has been touched/received by the owner side
+  but not yet synced/selected into the core route's committed state" — a state
+  this file's `TerminalResidualCore`/`CoreIndependent`/`ContextLossWithoutPreparedOwner`
+  predicates already partially describe for `K=1`'s single-slot case. The
+  concrete TLA+ work: widen the `owner` instance's prepared/touched state to a
+  bounded sequence of up to `K` pending syncs, and re-derive
+  `ContextLossAfterPreparedSync`/`RejectStaleOwnerEvent` for "which of the `K`
+  pending syncs does a given owner event apply to" — directly analogous to the
+  C++ sequencer's per-`rel_seq` park map (§1.2).
+- **`Protocol50ZstdRouteFInputInterface.tla`** (12.6 KB) is the smaller model
+  `FInputComposition` instantiates as `owner`; it is the one to extend first
+  (narrower surface) before propagating the generalization up into the
+  composition file.
+
+Mutant coverage: `s6_mutation_manifest.jsonl` (65 KB) is the master list of
+named mutants exercised against these models; new mutants specific to this
+design (e.g. "sequencer releases a parked TX before its predecessor commits,"
+"parking map entry not cleared on cold reset" — directly the P3/P5 new
+mechanics from §3) should be added here following the file's existing naming
+convention, run through the existing `run_formal_aggregate.py` harness
+unchanged.
 
 ### 5.4 Farm A/B plan
 
-(TODO)
+- **Baseline**: current `perf-combo` build (`a348414e`) at `K=1`, unchanged
+  wire behavior, as the control.
+- **Treatment**: same build plus this design, `K` swept over a small range
+  (2, 3, 4) via `ICECC_P50_ROUTE_PIPELINE_DEPTH`, on the existing subfarm
+  topology (H1/H2 only, per standing constraints — no H4).
+- **Primary metric**: per-route TX/s and farm-wide TU/s, compared against the
+  §0 baseline figures (~13-15 TX/s/route, ~41 TU/s farm-wide) and target
+  (~1/max(C local, F local) per route — ~51 TX/s on the slower host at
+  saturation).
+- **Guardrail metrics** (regressions here fail the A/B regardless of
+  throughput gain): `input_lifecycle_timeout` miss rate (§3 P8, §4) must be
+  statistically indistinguishable from the `K=1` baseline; sidecar
+  `fail_stop`/retirement rate must not increase; `EndpointCodecPool`
+  (`kWorkerCount=2`, `kMaxOutstanding=8`, §1.2) queue-full rate
+  ("endpoint codec queue is full") must not increase disproportionately to
+  the TX-rate increase (a proportional increase is expected and acceptable;
+  a *super*-proportional increase indicates the pool, not the route lock, is
+  now the bottleneck and `K` tuning guidance needs to account for it).
+- **Fault-injection leg**: repeat the above with the sim's new fault-injection
+  hooks (§5.2) replayed against the real farm topology at small scale (a
+  handful of routes, not the full farm) to validate the §3 failure matrix
+  under real network conditions, not just loopback — specifically the P6
+  (`LostFinalAcknowledgement`-triggers-full-chain-invalidation) and P8
+  (parking-does-not-stall-owner-thread) rows, which are the two rows this
+  design's correctness most hinges on.
+- **Rollback plan**: `K=1` via env var is the kill switch at every layer (§0,
+  §2 invariant 12) — no code rollback needed, only a config change, if the A/B
+  surfaces a regression.
 
 ## 6. LOC estimate and implementation order
 
