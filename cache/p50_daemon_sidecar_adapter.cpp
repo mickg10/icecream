@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
@@ -48,6 +49,17 @@ constexpr uint8_t kAuthClosePending = 7;
 // name is carried across turns; no cleanup syscall is hidden in the minting
 // operation and a failed allocation simply leaves the phase fail-closed.
 std::atomic<uint64_t> g_cleanup_sequence{1};
+
+// Shared by every diagnostic-only stderr/JSON line in this file: a
+// CLOCK_REALTIME wall-clock timestamp in nanoseconds since the epoch. This
+// exists purely for post-hoc cross-host log correlation; nothing in this
+// file ever reads it back to make a scheduling or control-flow decision.
+uint64_t wall_clock_ns_now() noexcept {
+    struct timespec wall {};
+    ::clock_gettime(CLOCK_REALTIME, &wall);
+    return static_cast<uint64_t>(wall.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(wall.tv_nsec);
+}
 
 // --- Diagnostic-only daemon-side lifecycle RPC trace -----------------------
 //
@@ -166,6 +178,71 @@ void append_daemon_lifecycle_trace(
     ::close(fd);
 }
 // --- end diagnostic-only daemon-side lifecycle RPC trace --------------------
+
+// --- Diagnostic-only daemon-side sidecar-exit trace -------------------------
+//
+// Gated on ICECC_P50_DAEMON_LIFECYCLE_TRACE=<path> (the same env var and the
+// same opt-in discipline as append_daemon_lifecycle_trace() above: absent or
+// empty leaves this a cheap no-op). Emitted once per reaped sidecar child,
+// alongside (never instead of) the always-on "cache sidecar exited" stderr
+// line in outer_observe_child_reaped() below.
+const char* reap_kernel_code_name(int kernel_code) noexcept {
+    switch (kernel_code) {
+    case CLD_EXITED: return "exited";
+    case CLD_KILLED: return "killed";
+    case CLD_DUMPED: return "dumped";
+    default: return "unknown";
+    }
+}
+
+// `status` here is the classic wait()-style encoded status produced by
+// wait_status_from_siginfo() in cache/p50_sidecar_lifecycle.cpp: for
+// CLD_EXITED it is WEXITSTATUS-decodable; for CLD_KILLED/CLD_DUMPED it is
+// WTERMSIG-decodable. This mirrors that decoding to report one small
+// human-meaningful integer rather than the packed raw status.
+int reap_status_detail(int kernel_code, int status) noexcept {
+    if (kernel_code == CLD_KILLED || kernel_code == CLD_DUMPED)
+        return WIFSIGNALED(status) ? WTERMSIG(status) : status;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : status;
+}
+
+void append_daemon_sidecar_exit_trace(
+    const char* path, pid_t pid, int kernel_code, int status_detail,
+    bool solicited, sidecar::LifecycleState state, const char* reason,
+    uint64_t wall_clock_ns) noexcept {
+    char buffer[768];
+    const int length = std::snprintf(
+        buffer, sizeof(buffer),
+        "{\"schema\":\"icecream-p50-daemon-sidecar-exit-v1\","
+        "\"wall_clock_ns\":%llu,\"pid\":%ld,\"code\":\"%s\","
+        "\"status\":%d,\"solicited\":%d,\"state\":\"%s\","
+        "\"reason\":\"%s\"}\n",
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<long>(pid),
+        reap_kernel_code_name(kernel_code),
+        status_detail,
+        solicited ? 1 : 0,
+        sidecar::lifecycle_state_name(state),
+        reason);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(buffer))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return;
+    size_t written = 0;
+    while (written < static_cast<size_t>(length)) {
+        const ssize_t result = ::write(fd, buffer + written, static_cast<size_t>(length) - written);
+        if (result > 0) {
+            written += static_cast<size_t>(result);
+            continue;
+        }
+        if (result < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    ::close(fd);
+}
+// --- end diagnostic-only daemon-side sidecar-exit trace ---------------------
 
 // The launch plan is intentionally a finite sequence rather than a helper
 // which performs setup in one call.  Each nonzero phase consumes one outer
@@ -1371,14 +1448,15 @@ void DaemonSidecarAdapter::retire_input_lifecycle_relationship(
     }
     std::fprintf(stderr,
                  "cache sidecar input-lifecycle retirement"
-                 " (reason=%s action=%d status=%d)\n",
+                 " (reason=%s action=%d status=%d) wall_clock_ns=%llu\n",
                  reason,
                  outer_last_input_lifecycle_result_.has_value()
                      ? static_cast<int>(outer_last_input_lifecycle_result_->request.action)
                      : -1,
                  outer_last_input_lifecycle_result_.has_value()
                      ? static_cast<int>(outer_last_input_lifecycle_result_->status)
-                     : -1);
+                     : -1,
+                 static_cast<unsigned long long>(wall_clock_ns_now()));
     fail(error);
     outer_input_failure_ = true;
     // Route the failure through the same A-retirement reducer used by
@@ -3065,10 +3143,11 @@ void DaemonSidecarAdapter::outer_apply_action(
             std::fprintf(stderr,
                          "cache sidecar launch preparation refused"
                          " (identity_valid=%d started=%d phase=%d pid=%ld"
-                         " reaper=%d)\n",
+                         " reaper=%d) wall_clock_ns=%llu\n",
                          int(action.identity.valid()),
                          int(outer_launch_started_), int(outer_launch_phase_),
-                         long(outer_pid_), int(outer_reaper_ != nullptr));
+                         long(outer_pid_), int(outer_reaper_ != nullptr),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
             outer_launch_failed_ = true;
             // A failed setup may have created only the attempt directory, or
             // may have failed before owning any pathname at all.  Never arm
@@ -3278,13 +3357,14 @@ void DaemonSidecarAdapter::outer_apply_action(
     case sidecar::LifecycleAction::EnterDegradedLegacy:
         std::fprintf(stderr,
                      "cache sidecar degraded to legacy"
-                     " (attempts=%u max=%llu owner_gen=%llu)\n",
+                     " (attempts=%u max=%llu owner_gen=%llu) wall_clock_ns=%llu\n",
                      outer_lifecycle_->attempts(),
                      static_cast<unsigned long long>(
                          std::min<uint64_t>(100000,
                              static_cast<uint64_t>(config_.max_restarts) +
                                  static_cast<uint64_t>(config_.max_attempts_per_recovery))),
-                     static_cast<unsigned long long>(outer_lifecycle_->owner_key().generation));
+                     static_cast<unsigned long long>(outer_lifecycle_->owner_key().generation),
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
         outer_authenticated_ = false;
         outer_ready_lease_.reset();
         disable_relationship();
@@ -3740,6 +3820,43 @@ bool DaemonSidecarAdapter::outer_observe_child_reaped(
         !outer_registration_.valid() ||
         event.registry_generation != outer_registration_.registry_generation())
         return false;
+    // Diagnostic-only: this is the one place in the adapter that ever sees
+    // the kernel-reaped pid/status/kernel_code triple for this sidecar (see
+    // cache/p50_sidecar_lifecycle.cpp's CentralChildReaperRegistry::reap_one(),
+    // which performs the actual two-phase pidfd/compat waitid observation and
+    // hands the already-decoded, already-identity-verified ReapEvent in
+    // here). `solicited` and `reason` are sampled now, before anything below
+    // mutates adapter state, so they reflect whether THIS daemon had already
+    // asked for teardown/replacement at the moment the exit was observed --
+    // not any flag this event's own processing might set afterward. Always
+    // on (unlike the JSON trace below): the farm harness greps this exact
+    // text, and an unsolicited exit with reason=none is precisely the
+    // "silent death" signature this instrumentation exists to catch.
+    {
+        const bool solicited = outer_shutdown_requested_ || outer_replacement_requested_;
+        const char* reason = "none";
+        if (outer_shutdown_requested_)
+            reason = "shutdown";
+        else if (outer_replacement_requested_)
+            reason = "replacement";
+        const uint64_t now_wall_clock_ns = wall_clock_ns_now();
+        std::fprintf(stderr,
+                     "cache sidecar exited pid=%ld code=%s status=%d"
+                     " solicited=%d state=%s reason=%s wall_clock_ns=%llu\n",
+                     static_cast<long>(event.pid),
+                     reap_kernel_code_name(event.kernel_code),
+                     reap_status_detail(event.kernel_code, event.status),
+                     solicited ? 1 : 0,
+                     sidecar::lifecycle_state_name(outer_lifecycle_->state()),
+                     reason,
+                     static_cast<unsigned long long>(now_wall_clock_ns));
+        const char* trace_path = std::getenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE");
+        if (trace_path != nullptr && *trace_path != '\0')
+            append_daemon_sidecar_exit_trace(
+                trace_path, event.pid, event.kernel_code,
+                reap_status_detail(event.kernel_code, event.status), solicited,
+                outer_lifecycle_->state(), reason, now_wall_clock_ns);
+    }
     // The registry has already enqueued this immutable value event.  Record
     // the readiness classification for advertisement counters and let the
     // reducer consume the mailbox on its next bounded advance.
@@ -4043,9 +4160,10 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             std::fprintf(stderr,
                          "cache sidecar auth socket closed"
-                         " (events=0x%x authenticated=%d)\n",
+                         " (events=0x%x authenticated=%d) wall_clock_ns=%llu\n",
                          static_cast<int>(events),
-                         static_cast<int>(outer_authenticated_));
+                         static_cast<int>(outer_authenticated_),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
             close_owned(outer_auth_fd_);
             outer_authenticated_ = false;
             outer_auth_failure_ = true;
@@ -4094,9 +4212,10 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         if (!reserve_outer_restart()) {
             std::fprintf(stderr,
                          "cache sidecar restart budget exhausted"
-                         " (restarts=%zu window=%lldms)\n",
+                         " (restarts=%zu window=%lldms) wall_clock_ns=%llu\n",
                          restart_times_.size(),
-                         (long long)config_.restart_window.count());
+                         (long long)config_.restart_window.count(),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
             outer_shutdown_requested_ = true;
             fail(AdapterError::AttemptExhausted);
             outer_observe(update);
@@ -4106,9 +4225,10 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         }
         std::fprintf(stderr,
                      "cache sidecar replacement launched"
-                     " (attempt=%u restarts=%zu)\n",
+                     " (attempt=%u restarts=%zu) wall_clock_ns=%llu\n",
                      outer_lifecycle_->attempts() + 1,
-                     restart_times_.size());
+                     restart_times_.size(),
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
         outer_replacement_requested_ = false;
         const sidecar::LifecycleActionResult replacement =
             outer_lifecycle_->begin(now);
