@@ -29,6 +29,12 @@
 #include <sys/mman.h>
 #endif
 
+#if defined(ICECC_P29V1_ALIGNED_HUGEPAGE_MATERIALIZED)
+#include <cstdlib>
+#include <new>
+#include <sys/mman.h>
+#endif
+
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
 extern "C" unsigned
 icecc_p50sim_p29_allocation_scope_enter(unsigned entry) noexcept;
@@ -811,6 +817,66 @@ inline void reserve_geometric(std::vector<T, Allocator> &values,
           : std::max<std::size_t>(1, capacity * 2);
   values.reserve(std::max(required, doubled));
 }
+
+#if defined(ICECC_P29V1_ALIGNED_HUGEPAGE_MATERIALIZED)
+// Opt-4 candidate (wire-neutral): allocator that always hands back memory
+// aligned to, and padded up to, a 2 MiB boundary, and advises the kernel
+// (MADV_HUGEPAGE) that the whole region should be backed by transparent huge
+// pages. Unlike plain reserve()+madvise() on the default allocator, this
+// guarantees every allocation this type ever makes is huge-page-aligned, so
+// a single up-front reserve() to the final known size produces one
+// allocation that is both the right size and the right alignment -- there is
+// no later incremental insert()-driven regrowth onto a fresh, un-advised
+// block. allocate()/deallocate() only choose and release raw storage; they
+// never read or write the bytes a caller stores there, so this cannot alter
+// anything derived from those bytes (contents, digests, CacheWire/P29 wire
+// bytes). Used only for a benching-gated opt-in buffer type; never affects
+// the default build.
+template <class T> struct Aligned2MiBAllocator {
+  using value_type = T;
+  static constexpr std::size_t kHugePageBytes = std::size_t{2} * 1024 * 1024;
+
+  Aligned2MiBAllocator() noexcept = default;
+  template <class U>
+  explicit Aligned2MiBAllocator(const Aligned2MiBAllocator<U> &) noexcept {}
+
+  [[nodiscard]] T *allocate(std::size_t count) {
+    if (count == 0)
+      return nullptr;
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
+      throw std::bad_alloc();
+    const std::size_t requested_bytes = count * sizeof(T);
+    const std::size_t rounded_bytes =
+        ((requested_bytes + kHugePageBytes - 1) / kHugePageBytes) *
+        kHugePageBytes;
+    void *pointer = nullptr;
+    if (::posix_memalign(&pointer, kHugePageBytes, rounded_bytes) != 0)
+      throw std::bad_alloc();
+    ::madvise(pointer, rounded_bytes, MADV_HUGEPAGE);
+    return static_cast<T *>(pointer);
+  }
+
+  void deallocate(T *pointer, std::size_t) noexcept { std::free(pointer); }
+
+  template <class U> struct rebind {
+    using other = Aligned2MiBAllocator<U>;
+  };
+
+  friend bool operator==(const Aligned2MiBAllocator &,
+                          const Aligned2MiBAllocator &) noexcept {
+    return true;
+  }
+  friend bool operator!=(const Aligned2MiBAllocator &,
+                          const Aligned2MiBAllocator &) noexcept {
+    return false;
+  }
+};
+
+using MaterializedBuffer =
+    std::vector<std::uint8_t, Aligned2MiBAllocator<std::uint8_t>>;
+#else
+using MaterializedBuffer = std::vector<std::uint8_t>;
+#endif
 
 } // namespace p29_wire_detail
 
@@ -1613,7 +1679,7 @@ public:
     return pending_.materialized;
   }
 
-  [[nodiscard]] std::vector<std::uint8_t> take_materialized() {
+  [[nodiscard]] p29_wire_detail::MaterializedBuffer take_materialized() {
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
     p29_wire_detail::P29AllocationScope allocation_scope(
         p29_wire_detail::P29AllocationEntry::ReceiverTakeMaterialized);
@@ -1859,7 +1925,7 @@ private:
     std::vector<std::uint32_t> occurrences;
     std::vector<std::uint8_t> need;
     std::vector<std::uint8_t> close;
-    std::vector<std::uint8_t> materialized;
+    p29_wire_detail::MaterializedBuffer materialized;
   };
 
   [[noreturn]] static void fail(const char *reason) {
@@ -2391,8 +2457,8 @@ private:
 
   void materialize() {
     const P29WireLimits limits = provider_.wire_limits();
-    auto append_region = [&](std::vector<std::uint8_t> &output,
-                             bool record_occurrence, std::uint32_t id) {
+    auto append_region = [&](auto &output, bool record_occurrence,
+                             std::uint32_t id) {
       const auto bytes = region_bytes(id);
       if (output.size() > limits.max_tu_bytes ||
           bytes.size() > limits.max_tu_bytes - output.size() ||
@@ -2409,8 +2475,7 @@ private:
         pending_.occurrences.push_back(id);
       }
     };
-    const auto assemble = [&](std::vector<std::uint8_t> &output,
-                              bool record_occurrences) {
+    const auto assemble = [&](auto &output, bool record_occurrences) {
       for (const RootReference &reference : pending_.root) {
         if (!reference.block) {
           append_region(output, record_occurrences, reference.id);

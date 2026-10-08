@@ -977,6 +977,34 @@ std::string bounded_context(std::string_view value) {
     return std::string(value.substr(0, kContextLimit)) + "...";
 }
 
+#if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
+// Opt-4 verification helper (sim-only, diagnostic): reads the AnonHugePages
+// field from this process's own /proc/self/smaps_rollup. This is read-only
+// introspection of the process's own page tables -- it never touches, nor
+// can it influence, any CacheWire/P29 wire bytes, materialized bytes, or
+// digests. Used only to confirm whether a candidate allocator actually
+// causes the kernel to back materialize buffers with transparent huge
+// pages; returns std::nullopt if the kernel/build doesn't expose the field
+// (e.g. no smaps_rollup support).
+std::optional<int64_t> read_anon_hugepages_kb() {
+    std::ifstream rollup("/proc/self/smaps_rollup");
+    if (!rollup)
+        return std::nullopt;
+    std::string line;
+    while (std::getline(rollup, line)) {
+        constexpr std::string_view kPrefix = "AnonHugePages:";
+        if (line.rfind(kPrefix, 0) == 0) {
+            std::istringstream fields(line.substr(kPrefix.size()));
+            int64_t kilobytes = 0;
+            if (fields >> kilobytes)
+                return kilobytes;
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+#endif
+
 void write_batch_row(std::ostream& output, std::string_view segment,
                      std::string_view relation_id, size_t index,
                      size_t expected_tu_seq,
@@ -1001,6 +1029,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                          p29v1_codec_stage_ns,
                      std::optional<std::array<int64_t, 7>>
                          p29v1_codec_stage_minflt,
+                     std::optional<int64_t> anon_hugepages_delta_kb,
                      const std::optional<std::string>& c_to_f_sha256,
                      const std::optional<std::string>& f_to_c_sha256) {
     Digest128 tx_digest{};
@@ -1160,6 +1189,8 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         }
         output << '}';
     }
+    if (anon_hugepages_delta_kb)
+        output << ",\"anon_hugepages_delta_kb\":" << *anon_hugepages_delta_kb;
     if (c_to_f_sha256)
         output << ",\"c_to_f_sha256\":\"" << *c_to_f_sha256 << '"';
     if (f_to_c_sha256)
@@ -1308,6 +1339,10 @@ void run_batch(const Arguments& arguments) {
                     p50sim_p29_stage_minflt[entry].load(
                         std::memory_order_relaxed);
 #endif
+#if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
+            const std::optional<int64_t> anon_hugepages_kb_before =
+                read_anon_hugepages_kb();
+#endif
             const auto prepare_started = std::chrono::steady_clock::now();
             auto prepared = authority->prepare_for_route(
                 relation.route,
@@ -1423,6 +1458,18 @@ void run_batch(const Arguments& arguments) {
 #else
             std::optional<std::array<int64_t, 7>> p29v1_codec_stage_minflt;
 #endif
+#if defined(ICECC_P50SIM_ANON_HUGEPAGES_ROLLUP)
+            std::optional<int64_t> anon_hugepages_delta_kb;
+            if (anon_hugepages_kb_before) {
+                const std::optional<int64_t> anon_hugepages_kb_after =
+                    read_anon_hugepages_kb();
+                if (anon_hugepages_kb_after)
+                    anon_hugepages_delta_kb =
+                        *anon_hugepages_kb_after - *anon_hugepages_kb_before;
+            }
+#else
+            std::optional<int64_t> anon_hugepages_delta_kb;
+#endif
 #if defined(ICECC_P50SIM_FRAME_SHA)
             // Both hashers are finalized here regardless of outcome: if the
             // TU didn't commit cleanly below, write_batch_row() is never
@@ -1481,6 +1528,7 @@ void run_batch(const Arguments& arguments) {
                             p29v1_codec_allocation_entries,
                             p29v1_codec_stage_ns,
                             p29v1_codec_stage_minflt,
+                            anon_hugepages_delta_kb,
                             c_to_f_sha256, f_to_c_sha256);
             output.flush();
             if (!output)

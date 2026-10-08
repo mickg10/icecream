@@ -2478,8 +2478,7 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
             throw std::logic_error(
                 "P29V1 mutant rematerialization does not match TX_BEGIN");
 #endif
-        std::vector<uint8_t> result =
-            route.p29v1->deserializer.take_materialized();
+        auto result = route.p29v1->deserializer.take_materialized();
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
         // Sim-only: time the two hash computations below individually
         // instead of letting them run unattributed inside the surrounding
@@ -2533,7 +2532,22 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
         }
         pending.p29v1_materialized = true;
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+#if defined(ICECC_P29V1_ALIGNED_HUGEPAGE_MATERIALIZED)
+        // Opt-4: result's underlying storage may use a custom 2-MiB-aligned
+        // allocator so the kernel can back it with transparent huge pages
+        // from the first write. This function's return type is a fixed
+        // public signature (std::vector<uint8_t>) that must not change, so
+        // this is one explicit, benching-only copy back to the plain
+        // allocator, performed here at the very end -- after all 5 timed
+        // Receiver* stages above have already run directly against
+        // `result`. The copy is pure overhead this diagnostic variant adds
+        // outside every measured stage; it does not read, write, or alter
+        // any byte already checked above, so it cannot change the wire
+        // bytes, the digests, or anything on the CacheWire/P29 wire.
+        return std::vector<uint8_t>(result.begin(), result.end());
+#else
         return result;
+#endif
     } catch (...) {
         route.p29v1->terminal = true;
         if (route.p29v1->deserializer.has_pending()) {
