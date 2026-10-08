@@ -475,6 +475,185 @@ bool run_kill_domain_release_bound_test(
     return ok && ::rmdir(root.c_str()) == 0;
 }
 
+// Diagnostic coverage for the daemon-side input-lifecycle RPC trace
+// (append_daemon_lifecycle_trace(), gated on
+// ICECC_P50_DAEMON_LIFECYCLE_TRACE). Production bug being diagnosed: on farm
+// workers, CloseAcceptedJob input-lifecycle RPCs are sometimes retired
+// (reason=protocol action=2 status=Timeout|Disconnected) before the request
+// is ever delivered to the sidecar; this trace is the only direct evidence
+// of where the configured input_lifecycle_timeout budget is actually spent
+// on the daemon side. Two invariants must hold:
+//   (a) with the env var unset, the trace file must never be created at
+//       all (zero behavior change by default);
+//   (b) with the env var set to a path, every input-lifecycle RPC that
+//       reaches a terminal result must append one compact-JSON record
+//       there, with exactly the field names the trace format documents.
+// This is also the first test in this file to drive the input-lifecycle
+// RPC path (apply_input_lifecycle() / CloseAcceptedJob) at all. The
+// specific terminal InputLifecycleStatus returned is deliberately not
+// asserted: no InputRecord is ever published for the probe key, so the
+// realistic outcome is a rejection such as UnknownRecord, which is exactly
+// as valid for exercising the trace as a success would be -- only the
+// trace's presence/absence and schema are under test here.
+bool run_daemon_lifecycle_trace_test(
+    const std::string& temp_root, CentralChildReaperRegistry& reaper,
+    const DaemonSidecarAdapter::Config& base_config)
+{
+    const std::string pattern = temp_root + "/p50lt-XXXXXX";
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (::mkdtemp(buffer.data()) == nullptr || ::chmod(buffer.data(), 0700) != 0)
+        return false;
+    const std::string root(buffer.data());
+
+    auto config = base_config;
+    config.runtime_directory = root;
+    DaemonSidecarAdapter adapter(config);
+    adapter.observe_public_listener(true, config.public_listener_port);
+    adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update update;
+
+    bool ok = drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
+        return adapter.authenticated() && adapter.advertisement_snapshot().present();
+    });
+
+    // One request_id counter shared by both sub-tests below; the actual
+    // replay key is operation_id (minted internally by
+    // next_input_lifecycle_operation()), not request_id, so reusing the
+    // counter across sub-tests cannot collide with anything.
+    uint64_t next_request_id = 1;
+    const auto issue_close_accepted_job = [&]() {
+        const icecc::p50::local::Identity identity{config.generation, adapter.attempt()};
+        const icecc::p50::InputRecordKey key{
+            icecc::p50::Id128::from_u64(0x7261636554ULL), icecc::p50::TuSeq{1}};
+        const icecc::p50::InputLeaseOwner owner{101, 1, 1};
+        const icecc::p50::InputFdRequest lease{identity, key, owner, next_request_id++};
+        const auto immediate = adapter.apply_input_lifecycle(
+            lease, icecc::p50::InputLifecycleAction::CloseAcceptedJob);
+        if (immediate.status == icecc::p50::InputLifecycleStatus::InvalidArgument ||
+            immediate.status == icecc::p50::InputLifecycleStatus::StoreReplaced) {
+            std::fprintf(stderr,
+                         "daemon lifecycle trace test: apply_input_lifecycle"
+                         " rejected immediately (status=%u), scenario moot\n",
+                         static_cast<unsigned>(immediate.status));
+            return false;
+        }
+        if (!drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
+                return adapter.pending_input_lifecycle_count() == 0;
+            })) {
+            std::fprintf(stderr,
+                         "daemon lifecycle trace test: CloseAcceptedJob never"
+                         " reached a terminal result within 5s\n");
+            return false;
+        }
+        if (!adapter.take_outer_input_lifecycle_result().has_value()) {
+            std::fprintf(stderr,
+                         "daemon lifecycle trace test: no terminal result"
+                         " available even though pending count reached 0\n");
+            return false;
+        }
+        return true;
+    };
+
+    // One shared candidate path for both sub-tests below, deliberately
+    // reused: sub-test A proves nothing appears at this exact path while
+    // the env var is unset, then sub-test B points the env var at this
+    // same path and proves content now appears there. Reusing one path
+    // (rather than two unrelated ones) directly ties the "absent" and
+    // "present" claims to the same env-var transition instead of merely
+    // probing two unconnected locations.
+    std::string trace_path;
+    {
+        const std::string trace_pattern = root + "/trace-XXXXXX";
+        std::vector<char> trace_buffer(trace_pattern.begin(), trace_pattern.end());
+        trace_buffer.push_back('\0');
+        const int fd = ::mkstemp(trace_buffer.data());
+        if (fd < 0) {
+            ok = false;
+        } else {
+            ::close(fd);
+            trace_path = trace_buffer.data();
+            ::unlink(trace_path.c_str());
+        }
+    }
+
+    // Sub-test A: env unset -> the trace file must never be created.
+    ::unsetenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE");
+    ok = ok && issue_close_accepted_job();
+    if (ok) {
+        struct stat info{};
+        if (::stat(trace_path.c_str(), &info) == 0 || errno != ENOENT) {
+            std::fprintf(stderr,
+                         "daemon lifecycle trace regression: a file exists at"
+                         " the probe path (or stat failed with errno=%d, not"
+                         " ENOENT) even though ICECC_P50_DAEMON_LIFECYCLE_TRACE"
+                         " was unset\n", errno);
+            ok = false;
+        }
+    }
+
+    // Sub-test B: env set to that same path -> exactly the documented
+    // compact-JSON schema must now appear there.
+    ok = ok && ::setenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE", trace_path.c_str(), 1) == 0;
+    ok = ok && issue_close_accepted_job();
+    ::unsetenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE");
+
+    if (ok) {
+        const int fd = ::open(trace_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            std::fprintf(stderr,
+                         "daemon lifecycle trace regression: trace file was"
+                         " never created even though"
+                         " ICECC_P50_DAEMON_LIFECYCLE_TRACE was set (errno=%d)\n",
+                         errno);
+            ok = false;
+        } else {
+            char contents[4096] = {0};
+            const ssize_t n = ::read(fd, contents, sizeof(contents) - 1);
+            ::close(fd);
+            if (n <= 0) {
+                std::fprintf(stderr,
+                             "daemon lifecycle trace regression: trace file"
+                             " was created but is empty\n");
+                ok = false;
+            } else {
+                const std::string text(contents, static_cast<size_t>(n));
+                static const char* const kNeedles[] = {
+                    "\"schema\":\"icecream-p50-daemon-lifecycle-v1\"",
+                    "\"wall_clock_ns\":",
+                    "\"operation_id\":",
+                    "\"action\":2,",
+                    "\"status\":",
+                    "\"job_identity_hash\":\"",
+                    "\"pending_depth_at_enqueue\":",
+                    "\"turns_before_first_attempt\":",
+                    "\"enqueue_to_first_attempt_ns\":",
+                    "\"enqueue_to_connect_done_ns\":",
+                    "\"enqueue_to_request_sent_ns\":",
+                    "\"enqueue_to_response_received_ns\":",
+                    "\"enqueue_to_ack_sent_ns\":",
+                    "\"enqueue_to_terminal_ns\":",
+                };
+                for (const char* needle : kNeedles) {
+                    if (text.find(needle) == std::string::npos) {
+                        std::fprintf(stderr,
+                                     "daemon lifecycle trace regression:"
+                                     " missing expected field '%s' in"
+                                     " recorded trace: %s\n",
+                                     needle, text.c_str());
+                        ok = false;
+                    }
+                }
+            }
+        }
+        ::unlink(trace_path.c_str());
+    }
+
+    ok = ok && drive_shutdown(adapter, reaper, update);
+    ok = ok && remove_p29_fingerprint_cache(root);
+    return ok && ::rmdir(root.c_str()) == 0;
+}
+
 } // namespace
 
 int main()
@@ -670,6 +849,13 @@ int main()
     if (!run_kill_domain_release_bound_test(std::string(temp_root), reaper,
                                             config))
         return 31;
+
+    // Diagnostic trace coverage for the farm input-lifecycle retirement
+    // investigation: see run_daemon_lifecycle_trace_test()'s comment for the
+    // production bug this is diagnosing and exactly what it proves.
+    if (!run_daemon_lifecycle_trace_test(std::string(temp_root), reaper,
+                                         config))
+        return 32;
 
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
