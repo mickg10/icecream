@@ -910,7 +910,15 @@ public:
       }
       const std::vector<std::uint32_t> current(regions.begin(), regions.end());
       pending_.plan = &matcher_.prepare(current);
+#if defined(ICECC_P29V1_SENDER_BODY_RESERVE_HINT)
+      if (body_capacity_hint_ > pending_.body.capacity())
+        pending_.body.reserve(body_capacity_hint_);
+#endif
       build_body();
+#if defined(ICECC_P29V1_SENDER_BODY_RESERVE_HINT)
+      if (pending_.body.size() > body_capacity_hint_)
+        body_capacity_hint_ = pending_.body.size();
+#endif
       return pending_.body;
     } catch (...) {
       if (matcher_.has_pending())
@@ -1501,6 +1509,18 @@ private:
   std::vector<std::uint32_t> block_stamps_;
   std::uint32_t requirement_stamp_ = 0;
   Pending pending_;
+#if defined(ICECC_P29V1_SENDER_BODY_RESERVE_HINT)
+  // Opt-3 candidate (wire-neutral): sticky high-water-mark reservation hint
+  // for pending_.body. clear_pending() only clear()s the vector (capacity is
+  // retained by the standard), so within one serializer instance later TUs
+  // already benefit from whatever capacity earlier TUs grew it to; this hint
+  // only helps the first TU(s) that set a new maximum, by pre-reserving to
+  // the previous maximum before build_body() runs instead of letting
+  // append_frame's incremental inserts grow it one reallocation at a time.
+  // reserve() never writes/zero-fills, so it cannot alter pending_.body's
+  // contents, length, or anything derived from it (digests, wire bytes).
+  std::size_t body_capacity_hint_ = 0;
+#endif
 };
 
 template <P29ReceiverProvider Provider> class P29Deserializer {
