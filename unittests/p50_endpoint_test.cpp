@@ -1036,6 +1036,91 @@ void test_p29v1_pipelined_begin() {
         fail("pipelined abort trace: " + *error);
 }
 
+// P50 route pipelining (research/designs/P50_ROUTE_PIPELINING.md), step 5a.
+//
+// F has no awareness of K (ICECC_P50_ROUTE_PIPELINE_DEPTH) at all: the
+// per-route sequencer added in step 5c only ever parks a TX_BEGIN that
+// arrives strictly ahead of route.next_rel, which is structurally
+// impossible at K=1 (one outstanding TX per route means every BEGIN F ever
+// observes is already at-cursor). This test pins the K=1 observable shape
+// -- route.next_rel advancing by exactly one per committed TX, and F never
+// deferring its first write past its first read on any session -- for both
+// an ordinary client and a client with the pre-existing
+// enable_pipelined_begin() feature enabled (which can legitimately make C
+// write BEGIN/BODY/FILL before reading F's STATE even at K=1, exercising
+// the same "something is already in the socket buffer" condition the
+// step-5c peek relies on, without ever requiring F to park). It must stay
+// green, byte-for-byte in these observable terms, across every later
+// step-5b/5c/5d change.
+std::vector<uint64_t> run_route_pipeline_k1_sequence(bool use_pipelined_begin) {
+    const P5coStoreGuids guids = p5co_store_guids(use_pipelined_begin ? 701 : 700);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    CompletionLog completions;
+    P50ServerEndpoint server(guids.f, caps, &completions, &actions);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, &completions, &actions,
+                      authority_limits);
+    if (use_pipelined_begin)
+        client.endpoint.enable_pipelined_begin();
+    for (int run = 0; run != 3; ++run) {
+        const std::vector<uint8_t> input = bytes(
+            "# 1 \"/tmp/p50-pipeline-k1.cc\"\nsame-line\nsame-line\nrun-" +
+            std::to_string(run) + "\n");
+        const PairResult pair = run_pair(client, server, admit(client, input));
+        require(pair.client.status == ClientRunStatus::Committed &&
+                    pair.server.status == ServerRunStatus::Completed &&
+                    copy_input(server, guids.c) == input,
+                "k1 identity: TU did not commit exact bytes");
+    }
+    if (const auto error = check_action_trace(actions.records()))
+        fail("k1 identity: " + *error);
+
+    // route.next_rel must advance 0, 1, 2 in strict order: no gap, repeat,
+    // or reorder, i.e. nothing was ever held back waiting on a successor
+    // that cannot exist at K=1.
+    std::vector<uint64_t> f_begin_rel_seq;
+    for (const ActionRecord& record : actions.records()) {
+        if (record.actor == ActorSide::F && record.c_store_guid == guids.c &&
+            (record.action == ActionType::TX_BEGIN ||
+             record.action == ActionType::ACTIVE_REPLAYED))
+            f_begin_rel_seq.push_back(record.rel_seq.value);
+    }
+    require(f_begin_rel_seq == std::vector<uint64_t>{0, 1, 2},
+            "k1 identity: F route cursor did not advance 0,1,2 in order");
+
+    // F's first write on a session is never recorded ahead of its first
+    // read on that same session (SESSION_HELLO always precedes SESSION_STATE).
+    std::set<uint64_t> f_sessions_seen;
+    std::set<uint64_t> f_read_before_first_write;
+    for (const AsyncCompletion& completion : completions.completions()) {
+        if (completion.stamp.actor != ActorSide::F)
+            continue;
+        const uint64_t serial = completion.stamp.session_serial;
+        if (completion.stamp.operation == AsyncOperationKind::ReadHeader)
+            f_sessions_seen.insert(serial);
+        else if (completion.stamp.operation == AsyncOperationKind::WriteFragment &&
+                 f_sessions_seen.contains(serial))
+            f_read_before_first_write.insert(serial);
+    }
+    require(f_sessions_seen.size() == 3 &&
+                f_read_before_first_write == f_sessions_seen,
+            "k1 identity: F wrote on a session before reading on it");
+    return f_begin_rel_seq;
+}
+
+void test_route_pipeline_k1_identity() {
+    const std::vector<uint64_t> plain = run_route_pipeline_k1_sequence(false);
+    const std::vector<uint64_t> pipelined = run_route_pipeline_k1_sequence(true);
+    require(plain == pipelined,
+            "k1 identity: plain and pipelined_begin clients diverged on F's "
+            "route cursor progression");
+}
+
 void test_profile_materialized_result_digest_gates() {
     uint64_t identity = 19000;
     for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
@@ -6340,6 +6425,11 @@ int main(int argc, char** argv) {
         test_p29v1_endpoint_route_dialogue_lifetime();
         test_p29v1_pipelined_begin();
         std::cout << "p50_endpoint_test: focused P29V1 dialogue PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_ROUTE_PIPELINE_FOCUS") != nullptr) {
+        test_route_pipeline_k1_identity();
+        std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
     }
     if (std::getenv("ICECC_P50_PROFILE_DIGEST_MUTANT_FOCUS") != nullptr) {
