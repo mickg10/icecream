@@ -1211,9 +1211,9 @@ void run_wire_controls(const Corpus &corpus,
     const std::vector<std::uint8_t> pending_need =
         deserializer.receive_body(pending_body);
     const std::vector<std::uint8_t> pending_fill =
-        serializer.answer_need(pending_need, true);
+        serializer.answer_need(pending_need, false);
     const std::span<const std::uint8_t> materialized =
-        deserializer.receive_fill(pending_fill, true);
+        deserializer.receive_fill(pending_fill, false);
     require(materialized.size() == expected_region.size() &&
                 std::equal(materialized.begin(), materialized.end(),
                            expected_region.begin()),
@@ -1261,9 +1261,9 @@ void run_wire_controls(const Corpus &corpus,
             const std::vector<std::uint8_t> tu_need =
                 seq_deserializer.receive_body(tu_body);
             const std::vector<std::uint8_t> tu_fill =
-                seq_serializer.answer_need(tu_need, true);
+                seq_serializer.answer_need(tu_need, false);
             const std::span<const std::uint8_t> tu_materialized =
-                seq_deserializer.receive_fill(tu_fill, true);
+                seq_deserializer.receive_fill(tu_fill, false);
             trace.insert(trace.end(), tu_body.begin(), tu_body.end());
             trace.insert(trace.end(), tu_need.begin(), tu_need.end());
             trace.insert(trace.end(), tu_fill.begin(), tu_fill.end());
