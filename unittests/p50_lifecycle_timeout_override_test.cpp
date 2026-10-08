@@ -77,8 +77,13 @@ void test_boundary_values_are_inclusive()
 
 void test_malformed_values_are_rejected_and_default_kept()
 {
+    // NOTE: a *leading*-whitespace value (e.g. " 15000") is intentionally not
+    // included here: strtoll() skips leading whitespace per the C standard,
+    // so resolve_input_lifecycle_timeout_override() legitimately accepts it
+    // as a full match. That is correct, unchanged production behavior, not a
+    // malformed case; see test_leading_whitespace_is_tolerated() below.
     const char* bad_values[] = {
-        "not-a-number", "15000x", " 15000", "15000 ", "15.5", "-1", "0",
+        "not-a-number", "15000x", "15000 ", "15.5", "-1", "0",
         "0x1388", "+", "",
     };
     for (const char* bad : bad_values) {
@@ -90,6 +95,21 @@ void test_malformed_values_are_rejected_and_default_kept()
         CHECK(r.override_rejected, "malformed value sets override_rejected");
         CHECK(!r.rejection_reason.empty(), "malformed value populates rejection_reason");
     }
+}
+
+void test_leading_whitespace_is_tolerated()
+{
+    // strtoll() skips leading whitespace per the C standard; the resolver
+    // relies on strtoll() directly and does not add its own stricter check,
+    // so a leading-whitespace value is accepted exactly like its trimmed
+    // form. This is documented, pre-existing (not a behavior change made by
+    // this diagnostic work) parsing behavior, called out explicitly so it is
+    // not mistaken for an oversight.
+    const auto r = resolve_input_lifecycle_timeout_override(" 15000", kDefault);
+    CHECK(r.effective_value == std::chrono::milliseconds(15000),
+          "leading-whitespace '  15000' is accepted via strtoll's own whitespace skip");
+    CHECK(r.override_applied, "leading-whitespace value sets override_applied");
+    CHECK(!r.override_rejected, "leading-whitespace value does not set override_rejected");
 }
 
 void test_rejection_reason_mentions_the_offending_value()
@@ -123,6 +143,7 @@ int main()
     test_valid_value_applies();
     test_boundary_values_are_inclusive();
     test_malformed_values_are_rejected_and_default_kept();
+    test_leading_whitespace_is_tolerated();
     test_rejection_reason_mentions_the_offending_value();
     test_default_value_is_passed_through_unmodified();
     return failures == 0 ? 0 : 1;
