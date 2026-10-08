@@ -25,6 +25,10 @@
 #include <cstdlib>
 
 #include "services/digest128.h"
+// SYS_pidfd_open/SYS_close_range old-headers fallback: see
+// services/sys_syscall_numbers.h, the one shared definition every caller
+// must use.
+#include "services/sys_syscall_numbers.h"
 
 extern char** environ;
 

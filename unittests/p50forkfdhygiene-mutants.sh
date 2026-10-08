@@ -5,16 +5,16 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 source=$src/daemon/p50_fork_fd_hygiene.cpp
 test=$src/unittests/p50_fork_fd_hygiene_test.cpp
 header=$src/daemon/p50_fork_fd_hygiene.h
-services_header=$src/services/sys_close_range.h
+services_header=$src/services/sys_syscall_numbers.h
 test -s "$source" -a -s "$test" -a -s "$header" -a -s "$services_header"
 
-# p50_fork_fd_hygiene.cpp includes "services/sys_close_range.h"; every
+# p50_fork_fd_hygiene.cpp includes "services/sys_syscall_numbers.h"; every
 # scratch tree below that compiles a (possibly mutated) copy of that .cpp
 # needs the header staged alongside it, or the compile fails before the
 # mutant can be observed at all.
 stage_services_header() { # <dir>
     mkdir -p "$1/services"
-    cp "$services_header" "$1/services/sys_close_range.h"
+    cp "$services_header" "$1/services/sys_syscall_numbers.h"
 }
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50forkfdhygiene.XXXXXX")

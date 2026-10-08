@@ -23,6 +23,15 @@
 #  include <time.h>
 #endif
 
+// SYS_pidfd_open is absent from the VFOS5 rpm leg's build headers
+// (Fedora 28, kernel-headers-4.16); without this include probe_pidfd_child()
+// below compiles its ENOSYS fallback unconditionally and the daemon selects
+// the compat child backend even on a runtime kernel (5.15+) that actually
+// supports pidfd_open -- the cache sidecar then never arms. See
+// services/sys_syscall_numbers.h for the one shared definition every caller
+// of SYS_pidfd_open/SYS_close_range must use.
+#include "services/sys_syscall_numbers.h"
+
 namespace icecc::p50::platform {
 
 namespace {
