@@ -192,9 +192,18 @@ Fault ==
     /\ epoch' = epoch + 1
     /\ cQueue' = <<>>
     /\ cPredictedCursor' = fRouteCursor
+    \* cConfirmedCursor must resync to fRouteCursor, not stay put: fRouteCursor
+    \* (durable ground truth) can already be ahead of cConfirmedCursor if F
+    \* committed a relSeq that CRetireCommit had not yet retired out of cQueue
+    \* before the fault wiped it.  Leaving cConfirmedCursor stale would anchor
+    \* the rebuilt cQueue at a relSeq that can never appear in it again,
+    \* permanently violating QueueAnchoredAtConfirmed.  This is a forward-only
+    \* catch-up to confirmed ground truth, not the "erase already-applied
+    \* ground truth" the module header rules out.
+    /\ cConfirmedCursor' = fRouteCursor
     /\ fParked' = {}
     /\ fActive' = NoTx
-    /\ UNCHANGED <<cConfirmedCursor, fRouteCursor, fStateSent, appliedLog>>
+    /\ UNCHANGED <<fRouteCursor, fStateSent, appliedLog>>
 
 Next ==
     \/ CBegin
@@ -349,9 +358,13 @@ FaultMutantNoBulkRelease ==
     /\ epoch' = epoch + 1
     /\ cQueue' = <<>>
     /\ cPredictedCursor' = fRouteCursor
+    \* Same cConfirmedCursor catch-up as the real Fault (see its comment) --
+    \* this mutant only deliberately breaks the parked-set bulk release, not
+    \* this unrelated piece of resync bookkeeping.
+    /\ cConfirmedCursor' = fRouteCursor
     /\ fParked' = fParked
     /\ fActive' = NoTx
-    /\ UNCHANGED <<cConfirmedCursor, fRouteCursor, fStateSent, appliedLog>>
+    /\ UNCHANGED <<fRouteCursor, fStateSent, appliedLog>>
 
 NextM3 ==
     \/ CBegin
