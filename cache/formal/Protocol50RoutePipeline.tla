@@ -75,7 +75,10 @@ VARIABLES
     fActive,           \* F's single ACTIVE_TX slot: NoTx or [relSeq,epoch]
     fParked,           \* F's parked-successor set (size <= K-1)
     fRouteCursor,       \* F's next-expected rel_seq ("next_rel")
-    fStateSent,        \* relSeqs for which F has ever issued STATE/BEGIN
+    fStateSent,        \* {relSeq,epoch} pairs for which F has issued STATE/BEGIN
+                       \* (epoch-tagged so a stale pre-fault send of a
+                       \* relSeq that gets legitimately reused after the
+                       \* fault isn't mistaken for still being open)
     epoch,             \* shared fault-epoch counter
     appliedLog         \* ground truth: relSeqs F has actually applied, in order
 
@@ -118,7 +121,7 @@ FArriveProceed(relSeq) ==
     /\ fActive = NoTx
     /\ relSeq = fRouteCursor
     /\ fActive' = [relSeq |-> relSeq, epoch |-> epoch]
-    /\ fStateSent' = fStateSent \cup {relSeq}
+    /\ fStateSent' = fStateSent \cup {[relSeq |-> relSeq, epoch |-> epoch]}
     /\ UNCHANGED <<cQueue, cConfirmedCursor, cPredictedCursor, fParked,
                    fRouteCursor, epoch, appliedLog>>
 
@@ -156,7 +159,7 @@ FCommit ==
            /\ fParked' = IF victim = NoTx THEN fParked ELSE fParked \ {victim}
            /\ fStateSent' = IF victim = NoTx
                              THEN fStateSent
-                             ELSE fStateSent \cup {victim.relSeq}
+                             ELSE fStateSent \cup {[relSeq |-> victim.relSeq, epoch |-> epoch]}
     /\ UNCHANGED <<cQueue, cConfirmedCursor, cPredictedCursor, epoch>>
 
 (***************************************************************************
@@ -215,13 +218,18 @@ TypeOK ==
     /\ \A p \in fParked : p.relSeq \in RelSeqs /\ p.epoch \in Nat
     /\ Cardinality(fParked) <= PipelineDepth - 1
     /\ fRouteCursor \in Nat
-    /\ fStateSent \subseteq RelSeqs
+    /\ \A s \in fStateSent : s.relSeq \in RelSeqs /\ s.epoch \in Nat
     /\ epoch \in Nat
     /\ appliedLog \in Seq(RelSeqs)
 
-\* relSeqs whose STATE/BEGIN has been sent but not yet applied -- F's
-\* notion of "currently open."
-OpenOnF == {r \in RelSeqs : r \in fStateSent /\
+\* relSeqs whose STATE/BEGIN has been sent *in the current epoch* but not
+\* yet applied -- F's notion of "currently open."  Must be scoped to the
+\* current epoch: a Fault bumps epoch without erasing fStateSent (that
+\* history is durable ground truth per the module header), and the same
+\* numeric relSeq can legitimately be re-begun after a fault once its
+\* aborted predecessor never reached FCommit, so an unscoped membership
+\* test would wrongly see the stale pre-fault send as still open.
+OpenOnF == {r \in RelSeqs : (\E s \in fStateSent : s.relSeq = r /\ s.epoch = epoch) /\
                               ~(\E k \in 1..Len(appliedLog) : appliedLog[k] = r)}
 
 SingleActiveTxOnF ==
@@ -250,7 +258,7 @@ QueueCurrentEpochOnly == \A k \in 1..Len(cQueue) : cQueue[k].epoch = epoch
 
 \* No STATE/BEGIN is ever issued for a relSeq ahead of what F currently
 \* expects (catches "STATE sent at park time").
-StateSentNeverAheadOfCursor == \A r \in fStateSent : r <= fRouteCursor
+StateSentNeverAheadOfCursor == \A s \in fStateSent : s.relSeq <= fRouteCursor
 
 \* Symmetric to QueueCurrentEpochOnly, for F's parking map (catches a
 \* missing bulk release on fault).
@@ -287,7 +295,7 @@ FArriveParkMutantEarlyActivate(relSeq) ==
     /\ relSeq > fRouteCursor
     /\ relSeq <= fRouteCursor + PipelineDepth - 1
     /\ fActive' = [relSeq |-> relSeq, epoch |-> epoch]
-    /\ fStateSent' = fStateSent \cup {relSeq}
+    /\ fStateSent' = fStateSent \cup {[relSeq |-> relSeq, epoch |-> epoch]}
     /\ UNCHANGED <<cQueue, cConfirmedCursor, cPredictedCursor, fParked,
                    fRouteCursor, epoch, appliedLog>>
 
@@ -319,7 +327,7 @@ FCommitMutantEarlyRelease(victim) ==
            /\ fParked' = IF victim = NoTx THEN fParked ELSE fParked \ {victim}
            /\ fStateSent' = IF victim = NoTx
                              THEN fStateSent
-                             ELSE fStateSent \cup {victim.relSeq}
+                             ELSE fStateSent \cup {[relSeq |-> victim.relSeq, epoch |-> epoch]}
     /\ UNCHANGED <<cQueue, cConfirmedCursor, cPredictedCursor, epoch>>
 
 NextM2 ==
@@ -363,7 +371,7 @@ FArriveParkMutantStateAtParkTime(relSeq) ==
     /\ relSeq <= fRouteCursor + PipelineDepth - 1
     /\ ~(\E p \in fParked : p.relSeq = relSeq)
     /\ fParked' = fParked \cup {[relSeq |-> relSeq, epoch |-> epoch]}
-    /\ fStateSent' = fStateSent \cup {relSeq}
+    /\ fStateSent' = fStateSent \cup {[relSeq |-> relSeq, epoch |-> epoch]}
     /\ UNCHANGED <<cQueue, cConfirmedCursor, cPredictedCursor, fActive,
                    fRouteCursor, epoch, appliedLog>>
 
