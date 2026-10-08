@@ -326,6 +326,13 @@ void test_f_store_begin_rejects_second_active_tx_without_commit() {
     begin.profile = ProfileId::P29V1;
     begin.pre_state_digest = established.state_digest;
     begin.body.encoding = static_cast<uint16_t>(ProfileId::P29V1);
+    // encoded_bytes == 0 would make FStore::begin auto-complete the body via
+    // append_component(session, {}), which runs the full P29V1 deserializer
+    // -- out of scope for this admission-only regression gate (and not a
+    // live P29V1 cycle, per this test's own doc comment). A nonzero
+    // encoded_bytes with no matching append_component() call leaves the
+    // ACTIVE_TX genuinely pending, which is all this test needs.
+    begin.body.encoded_bytes = 1;
     store.begin(session, begin);
 
     // Same ACTIVE_TX replayed verbatim (no commit_input in between) is the
