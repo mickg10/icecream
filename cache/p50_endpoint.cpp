@@ -3523,6 +3523,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                          impl_->route_limits.max_frame_payload,
                                          impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                          impl_->completions, control, verify);
+            if (control.stall_stage)
+                control.stall_stage->store(ClientStallStage::BeginWritten,
+                                           std::memory_order_relaxed);
             trace_last_write_done = std::chrono::steady_clock::now();
             co_await async_write_component<BodyMessage>(
                 socket, impl_->active->prepared->body, impl_->route_limits.max_frame_payload,
@@ -3558,6 +3561,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         Frame state_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+        if (control.stall_stage)
+            control.stall_stage->store(ClientStallStage::StateRead,
+                                       std::memory_order_relaxed);
         trace_state_read_done = std::chrono::steady_clock::now();
         result.c_state_wait_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3785,6 +3791,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 socket, impl_->active->prepared->body, frame_cap,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment),
                 impl_->completions, control, verify);
+            if (control.stall_stage)
+                control.stall_stage->store(ClientStallStage::BeginWritten,
+                                           std::memory_order_relaxed);
         }
 
         if (sent_profile == ProfileId::P29V1) {
@@ -3826,6 +3835,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         Frame commit_frame = co_await async_read_frame(
             socket, frame_cap, impl_->stamp(session, AsyncOperationKind::ReadHeader),
             impl_->completions, verify);
+        if (control.stall_stage)
+            control.stall_stage->store(ClientStallStage::CommitRead,
+                                       std::memory_order_relaxed);
         trace_commit_read_done = std::chrono::steady_clock::now();
         {
             struct timespec wall_ts{};

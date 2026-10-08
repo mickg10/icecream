@@ -191,12 +191,16 @@ public:
         std::chrono::steady_clock::time_point deadline,
         std::span<const uint8_t> source);
 
-    // raw_digest, when known, is digest128(*source).
+    // raw_digest, when known, is digest128(*source). stall_stage, when
+    // non-null (only under ICECC_P50_OWNER_LAG_TRACE), receives relaxed
+    // atomic stores of the last stage this transfer reached; see
+    // ClientStallStage in cache/p50_endpoint.h.
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
         ConnectedFdFactory connection, PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
         std::shared_ptr<const std::vector<uint8_t>> source,
-        std::optional<Digest128> raw_digest = std::nullopt);
+        std::optional<Digest128> raw_digest = std::nullopt,
+        std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr);
 
 private:
     using ConnectionTarget =
@@ -208,7 +212,8 @@ private:
         std::chrono::steady_clock::time_point deadline,
         bool explicit_route,
         std::shared_ptr<const std::vector<uint8_t>> source,
-        std::optional<Digest128> raw_digest = std::nullopt);
+        std::optional<Digest128> raw_digest = std::nullopt,
+        std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

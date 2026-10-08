@@ -15,6 +15,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/system/error_code.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -150,10 +151,32 @@ private:
     std::vector<AsyncCompletion> completions_;
 };
 
+// Coarse last-reached stage on a single client-side route transfer, tracked so
+// that if the owner coroutine ever stops making progress and the blocking
+// caller in P50CacheServiceImpl::transfer_source hits its wait_limit and
+// retires the sidecar (see fail_stop()/std::_Exit(125) there), the
+// ICECC_P50_OWNER_LAG_TRACE probe can report which step the stuck coroutine
+// last completed. Written only via relaxed atomic stores from the owner
+// executor; read (also relaxed) from the blocking caller's thread only in
+// that already-fatal shutdown path, so a torn/stale read changes nothing
+// about product behavior -- this is diagnostic-only, same as the rest of the
+// owner-lag probe.
+enum class ClientStallStage {
+    Connecting,
+    Armed,
+    SessionReady,
+    BeginWritten,
+    StateRead,
+    CommitRead,
+};
+
 // This control is a deterministic test seam around message boundaries and write
 // fragmentation. Normal product callers use the default value.
 struct EndpointIoControl {
     size_t max_write_fragment = std::numeric_limits<size_t>::max();
+    // Diagnostic-only, non-null only when ICECC_P50_OWNER_LAG_TRACE is set.
+    // See ClientStallStage above. Never read on any non-fail-stop path.
+    std::atomic<ClientStallStage>* stall_stage = nullptr;
     std::optional<MessageType> close_before_write;
     std::optional<MessageType> close_after_write;
     std::optional<AsyncOperationKind> wrong_digest_completion;

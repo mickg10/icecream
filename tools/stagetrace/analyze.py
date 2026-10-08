@@ -317,7 +317,13 @@ class OwnerLagSecondSample:
     steady_timer, on both C and F sidecars (same SidecarRuntime class
     handles both roles). max_lag_ns/p99_lag_ns summarize that second's
     (actual_fire - scheduled_fire) samples; owner_cpu_ns is that second's
-    CLOCK_THREAD_CPUTIME_ID delta on endpoint_owner_thread_. Diagnostic
+    CLOCK_THREAD_CPUTIME_ID delta on endpoint_owner_thread_.
+    trace_write_max_ns/trace_write_total_ns self-validate the probe: the
+    max and sum, over the *previous* reporting window, of the time this
+    trace writer itself spent in its own open+write+close calls on the
+    owner thread (see owner_lag_trace_write_max_ns_/
+    owner_lag_trace_write_total_ns_ in cache/p50_cache_service.h) -- if the
+    instrument itself were the stall, it would show up here. Diagnostic
     only -- see cache/p50_cache_service.cpp.
     """
     pid: int
@@ -326,6 +332,52 @@ class OwnerLagSecondSample:
     max_lag_ns: int
     p99_lag_ns: int
     owner_cpu_ns: int
+    trace_write_max_ns: int
+    trace_write_total_ns: int
+
+
+# Mirrors cache/p50_endpoint.h's ClientStallStage enum exactly (ordinal
+# order, not alphabetical) -- used only to render
+# OwnerLagStallSample.last_stage as a name instead of a bare int below.
+CLIENT_STALL_STAGE_NAMES = [
+    "connecting", "armed", "session_ready", "begin_written",
+    "state_read", "commit_read",
+]
+
+
+def client_stall_stage_name(value: int) -> str:
+    if 0 <= value < len(CLIENT_STALL_STAGE_NAMES):
+        return CLIENT_STALL_STAGE_NAMES[value]
+    return f"unknown({value})"
+
+
+@dataclass
+class OwnerLagStallSample:
+    """One parsed icecream-p50-owner-lag-stall-v1 record (same env var/file
+    as OwnerLagSecondSample/OwnerLagOpSample above).
+
+    Emitted once, right before SidecarRuntime::transfer_source's own
+    fail_stop()/std::_Exit(125), when a route-owner coroutine never
+    published a result before wait_limit (transfer_deadline +
+    configured_grace_ns) -- the hypothesized root cause of mid-leg client
+    sidecar restarts. route_identity_hash identifies the (c_store_guid,
+    f_store_guid, f_store_generation, profile) relationship (see
+    fnv1a_route_relationship in cache/p50_cache_service.cpp); last_stage is
+    the coarse ClientStallStage the stuck coroutine last completed before
+    the process gave up. tu_seq/rel_seq are always 0 here (not captured): a
+    transfer that never reached fail_stop's wait_limit has by definition
+    never seen F's STATE/COMMIT reply, so neither was ever assigned.
+    Diagnostic only -- see cache/p50_cache_service.cpp.
+    """
+    pid: int
+    wall_clock_ns: int
+    route_identity_hash: int
+    transfer_age_ns: int
+    configured_deadline_ns: int
+    configured_grace_ns: int
+    last_stage: int
+    tu_seq: int
+    rel_seq: int
 
 
 @dataclass
@@ -356,17 +408,20 @@ class OwnerLagOpSample:
 
 def load_owner_lag_trace(
         path: str,
-) -> Tuple[List[OwnerLagSecondSample], List[OwnerLagOpSample]]:
+) -> Tuple[List[OwnerLagSecondSample], List[OwnerLagOpSample],
+           List[OwnerLagStallSample]]:
     """Load ICECC_P50_OWNER_LAG_TRACE.
 
-    Both the per-second (icecream-p50-owner-lag-v1) and per-op
-    (icecream-p50-owner-lag-op-v1) schemas are appended to the same file by
-    the C++ side, interleaved in emission order, so this reads it once and
-    splits by the "schema" field. Diagnostic-only; never touches source
-    bytes or paths.
+    The per-second (icecream-p50-owner-lag-v1), per-op
+    (icecream-p50-owner-lag-op-v1), and per-stall
+    (icecream-p50-owner-lag-stall-v1) schemas are all appended to the same
+    file by the C++ side, interleaved in emission order, so this reads it
+    once and splits by the "schema" field. Diagnostic-only; never touches
+    source bytes or paths.
     """
     seconds: List[OwnerLagSecondSample] = []
     ops: List[OwnerLagOpSample] = []
+    stalls: List[OwnerLagStallSample] = []
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, start=1):
             line = line.strip()
@@ -388,6 +443,8 @@ def load_owner_lag_trace(
                         max_lag_ns=int(obj["max_lag_ns"]),
                         p99_lag_ns=int(obj["p99_lag_ns"]),
                         owner_cpu_ns=int(obj["owner_cpu_ns"]),
+                        trace_write_max_ns=int(obj.get("trace_write_max_ns", 0)),
+                        trace_write_total_ns=int(obj.get("trace_write_total_ns", 0)),
                     ))
                 elif schema == "icecream-p50-owner-lag-op-v1":
                     ops.append(OwnerLagOpSample(
@@ -401,18 +458,32 @@ def load_owner_lag_trace(
                         in_flight_tx=bool(obj["in_flight_tx"]),
                         in_flight_tx_age_ns=int(obj["in_flight_tx_age_ns"]),
                     ))
+                elif schema == "icecream-p50-owner-lag-stall-v1":
+                    stalls.append(OwnerLagStallSample(
+                        pid=int(obj["pid"]),
+                        wall_clock_ns=int(obj["wall_clock_ns"]),
+                        route_identity_hash=int(obj["route_identity_hash"]),
+                        transfer_age_ns=int(obj["transfer_age_ns"]),
+                        configured_deadline_ns=int(obj["configured_deadline_ns"]),
+                        configured_grace_ns=int(obj["configured_grace_ns"]),
+                        last_stage=int(obj["last_stage"]),
+                        tu_seq=int(obj["tu_seq"]),
+                        rel_seq=int(obj["rel_seq"]),
+                    ))
             except (KeyError, TypeError, ValueError) as exc:
                 print(f"warning: {path}:{lineno}: skipping owner-lag record "
                       f"({exc})", file=sys.stderr)
-    return seconds, ops
+    return seconds, ops, stalls
 
 
 def print_owner_lag_summary(seconds: List[OwnerLagSecondSample],
-                             ops: List[OwnerLagOpSample]) -> None:
+                             ops: List[OwnerLagOpSample],
+                             stalls: List[OwnerLagStallSample]) -> None:
     """--owner-lag summary: lag distribution plus seconds with max_lag > 1s,
     then per-op scheduling-lag vs. execution-time vs. in-flight-tx
-    breakdowns -- see the owner-lag probe design notes in
-    cache/p50_cache_service.h/.cpp for what each field settles."""
+    breakdowns, then any fail_stop stall-diagnosis records -- see the
+    owner-lag probe design notes in cache/p50_cache_service.h/.cpp for what
+    each field settles."""
     def pct(data: List[int], p: float) -> float:
         if not data:
             return float("nan")
@@ -422,7 +493,7 @@ def print_owner_lag_summary(seconds: List[OwnerLagSecondSample],
         return data[f] + (data[c] - data[f]) * (k - f)
 
     print(f"\n=== owner-lag summary ({len(seconds)} per-second samples, "
-          f"{len(ops)} per-op samples) ===")
+          f"{len(ops)} per-op samples, {len(stalls)} stall samples) ===")
     if not seconds:
         print("  no icecream-p50-owner-lag-v1 records found")
     else:
@@ -431,6 +502,8 @@ def print_owner_lag_summary(seconds: List[OwnerLagSecondSample],
             max_lags = [s.max_lag_ns for s in pid_seconds]
             p99_lags = [s.p99_lag_ns for s in pid_seconds]
             cpu_ns = [s.owner_cpu_ns for s in pid_seconds]
+            trace_write_max = [s.trace_write_max_ns for s in pid_seconds]
+            trace_write_total = [s.trace_write_total_ns for s in pid_seconds]
             print(f"  pid={pid} n_seconds={len(pid_seconds)}")
             print(f"    max_lag_ns: p50={pct(max_lags,0.5):.0f} "
                   f"p90={pct(max_lags,0.9):.0f} p99={pct(max_lags,0.99):.0f} "
@@ -440,15 +513,42 @@ def print_owner_lag_summary(seconds: List[OwnerLagSecondSample],
             mean_cpu_pct = (sum(cpu_ns) / len(cpu_ns)) / 1e9 * 100.0
             print(f"    owner_cpu_ns: mean={mean_cpu_pct:.1f}% of 1 core "
                   f"(per-second CLOCK_THREAD_CPUTIME_ID delta)")
-            stalls = [s for s in pid_seconds if s.max_lag_ns > 1_000_000_000]
-            if stalls:
-                print(f"    seconds with max_lag_ns > 1s: {len(stalls)}")
-                for s in stalls:
+            # Self-validation: time this trace writer itself spent in its
+            # own open+write+close calls on the owner thread, over the same
+            # previous-second windows as max_lag_ns above. If this were
+            # comparable to max_lag_ns, the probe would be suspect as its
+            # own stall; in practice it should sit orders of magnitude below.
+            print(f"    trace_write_max_ns (probe's own cost): "
+                  f"p50={pct(trace_write_max,0.5):.0f} "
+                  f"p99={pct(trace_write_max,0.99):.0f} "
+                  f"max={max(trace_write_max):.0f}")
+            print(f"    trace_write_total_ns (probe's own cost, summed "
+                  f"per second): p50={pct(trace_write_total,0.5):.0f} "
+                  f"max={max(trace_write_total):.0f}")
+            stall_seconds = [s for s in pid_seconds if s.max_lag_ns > 1_000_000_000]
+            if stall_seconds:
+                print(f"    seconds with max_lag_ns > 1s: {len(stall_seconds)}")
+                for s in stall_seconds:
                     print(f"      wall_clock_ns={s.wall_clock_ns} "
                           f"max_lag_ns={s.max_lag_ns} n={s.n} "
                           f"owner_cpu_ns={s.owner_cpu_ns}")
             else:
                 print("    seconds with max_lag_ns > 1s: none")
+
+    if stalls:
+        print(f"\n  fail_stop stall-diagnosis records "
+              f"(icecream-p50-owner-lag-stall-v1): {len(stalls)}")
+        for s in stalls:
+            print(f"    pid={s.pid} wall_clock_ns={s.wall_clock_ns} "
+                  f"route_identity_hash={s.route_identity_hash} "
+                  f"transfer_age_ns={s.transfer_age_ns} "
+                  f"configured_deadline_ns={s.configured_deadline_ns} "
+                  f"configured_grace_ns={s.configured_grace_ns} "
+                  f"last_stage={client_stall_stage_name(s.last_stage)} "
+                  f"tu_seq={s.tu_seq} rel_seq={s.rel_seq}")
+    else:
+        print("\n  no icecream-p50-owner-lag-stall-v1 records found "
+              "(no observed fail_stop stall)")
 
     if not ops:
         print("  no icecream-p50-owner-lag-op-v1 records found")
@@ -1135,12 +1235,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                          help="path to an ICECC_P50_OWNER_LAG_TRACE JSONL "
                               "file (icecream-p50-owner-lag-v1 per-second "
                               "records interleaved with "
-                              "icecream-p50-owner-lag-op-v1 per-op "
-                              "records); prints a lag distribution, "
-                              "flags seconds with max_lag_ns > 1s, and "
-                              "breaks down post_to_start_ns/owner_exec_ns/"
-                              "in_flight_tx per lifecycle op -- works for "
-                              "either the C or the F sidecar's file")
+                              "icecream-p50-owner-lag-op-v1 per-op records "
+                              "and any icecream-p50-owner-lag-stall-v1 "
+                              "fail_stop records); prints a lag "
+                              "distribution, flags seconds with "
+                              "max_lag_ns > 1s, breaks down "
+                              "post_to_start_ns/owner_exec_ns/in_flight_tx "
+                              "per lifecycle op, and lists any fail_stop "
+                              "stall-diagnosis record -- works for either "
+                              "the C or the F sidecar's file")
     args = parser.parse_args(argv)
 
     records = load_records(args.trace_dir)
@@ -1237,8 +1340,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               "skipping NTP offset derivation", file=sys.stderr)
 
     if args.owner_lag:
-        lag_seconds, lag_ops = load_owner_lag_trace(args.owner_lag)
-        print_owner_lag_summary(lag_seconds, lag_ops)
+        lag_seconds, lag_ops, lag_stalls = load_owner_lag_trace(args.owner_lag)
+        print_owner_lag_summary(lag_seconds, lag_ops, lag_stalls)
 
     return 0
 

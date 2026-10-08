@@ -512,11 +512,13 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                                     PrepareRequestKey request,
                                     Clock::time_point deadline,
                                     std::shared_ptr<const std::vector<uint8_t>> source,
-                                    std::optional<Digest128> raw_digest) {
+                                    std::optional<Digest128> raw_digest,
+                                    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
     if (source && source->size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
         source.reset();
     return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
-                          deadline, true, std::move(source), raw_digest);
+                          deadline, true, std::move(source), raw_digest,
+                          std::move(stall_stage));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -526,7 +528,8 @@ P50ZstdSourceSender::transfer_bytes(
     Clock::time_point deadline,
     bool explicit_route,
     std::shared_ptr<const std::vector<uint8_t>> source,
-    std::optional<Digest128> known_digest) {
+    std::optional<Digest128> known_digest,
+    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||
@@ -610,10 +613,12 @@ P50ZstdSourceSender::transfer_bytes(
         }
         ClientRunResult run;
         try {
+            EndpointIoControl io_control;
+            io_control.stall_stage = stall_stage.get();
             if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
                 run = co_await impl_->endpoint->run(
-                    std::get<boost::asio::ip::tcp::endpoint>(target), prepared, {},
-                    deadline);
+                    std::get<boost::asio::ip::tcp::endpoint>(target), prepared,
+                    io_control, deadline);
             } else {
                 int connected_fd = -1;
                 // BUSY is capacity only: this attempt has not started and no
@@ -651,7 +656,7 @@ P50ZstdSourceSender::transfer_bytes(
                                      : ClientRunStatus::Disconnected;
                 } else {
                     run = co_await impl_->endpoint->run_adopted_fd(
-                        connected_fd, prepared, {}, deadline);
+                        connected_fd, prepared, io_control, deadline);
                 }
             }
         } catch (const P29V1CapabilityUnavailable&) {

@@ -452,15 +452,51 @@ uint64_t fnv1a_input_record_key(const InputRecordKey& key) noexcept {
     return hash;
 }
 
+// Same FNV-1a convention as fnv1a_input_record_key above, but over a route
+// relationship's identity (c_store_guid, f_store_guid, f_store_generation,
+// profile) rather than one input's (c_store_guid, tu_seq). Used only by the
+// stall-diagnosis probe below (append_owner_lag_stall_trace): a short,
+// stable, non-reversible identity for the one relationship a stuck transfer
+// belongs to.
+uint64_t fnv1a_route_relationship(
+    const P50RouteRelationship& relationship) noexcept {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    const auto mix_byte = [&hash](uint8_t byte) noexcept {
+        hash ^= byte;
+        hash *= 0x100000001b3ULL;
+    };
+    for (const uint8_t byte : relationship.c_store_guid.bytes)
+        mix_byte(byte);
+    for (const uint8_t byte : relationship.f_store_guid.bytes)
+        mix_byte(byte);
+    uint64_t generation = relationship.f_store_generation;
+    for (int i = 0; i < 8; ++i) {
+        mix_byte(static_cast<uint8_t>(generation & 0xff));
+        generation >>= 8;
+    }
+    uint16_t profile = static_cast<uint16_t>(relationship.profile);
+    mix_byte(static_cast<uint8_t>(profile & 0xff));
+    mix_byte(static_cast<uint8_t>((profile >> 8) & 0xff));
+    return hash;
+}
+
 // One record per second while ICECC_P50_OWNER_LAG_TRACE is set, fed by
 // SidecarRuntime::arm_owner_lag_timer's 20 ms steady_timer. max_lag_ns /
 // p99_lag_ns summarize that second's (actual_fire - scheduled_fire)
 // samples; owner_cpu_ns is that second's CLOCK_THREAD_CPUTIME_ID delta on
-// endpoint_owner_thread_. Companion to append_owner_lag_op_trace below;
-// wall_clock_ns on both lines lets them be correlated offline.
+// endpoint_owner_thread_. trace_write_max_ns / trace_write_total_ns
+// self-validate the probe: they are the max and sum, over the *previous*
+// reporting window, of the time this trace writer itself spent in its own
+// open+write+close calls on the owner thread (see
+// owner_lag_trace_write_max_ns_ / owner_lag_trace_write_total_ns_) -- if
+// the instrument were the stall, it would show up here. Companion to
+// append_owner_lag_op_trace below; wall_clock_ns on both lines lets them
+// be correlated offline.
 void append_owner_lag_second_trace(uint64_t wall_clock_ns, uint64_t n,
                                     int64_t max_lag_ns, int64_t p99_lag_ns,
-                                    int64_t owner_cpu_ns) noexcept {
+                                    int64_t owner_cpu_ns,
+                                    int64_t trace_write_max_ns,
+                                    int64_t trace_write_total_ns) noexcept {
     const char* path = ::getenv("ICECC_P50_OWNER_LAG_TRACE");
     if (path == nullptr || *path == '\0')
         return;
@@ -470,13 +506,16 @@ void append_owner_lag_second_trace(uint64_t wall_clock_ns, uint64_t n,
         "{\"schema\":\"icecream-p50-owner-lag-v1\","
         "\"pid\":%lld,\"wall_clock_ns\":%llu,\"n\":%llu,"
         "\"max_lag_ns\":%lld,\"p99_lag_ns\":%lld,"
-        "\"owner_cpu_ns\":%lld}\n",
+        "\"owner_cpu_ns\":%lld,"
+        "\"trace_write_max_ns\":%lld,\"trace_write_total_ns\":%lld}\n",
         static_cast<long long>(::getpid()),
         static_cast<unsigned long long>(wall_clock_ns),
         static_cast<unsigned long long>(n),
         static_cast<long long>(max_lag_ns),
         static_cast<long long>(p99_lag_ns),
-        static_cast<long long>(owner_cpu_ns));
+        static_cast<long long>(owner_cpu_ns),
+        static_cast<long long>(trace_write_max_ns),
+        static_cast<long long>(trace_write_total_ns));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
@@ -542,6 +581,80 @@ void append_owner_lag_op_trace(std::string_view op, const InputRecordKey& key,
         static_cast<long long>(owner_exec_ns), result_status,
         in_flight_tx ? "true" : "false",
         static_cast<long long>(in_flight_tx_age_ns));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
+// One record, emitted once right before SidecarRuntime::transfer_source's
+// own fail_stop()/std::_Exit(125) when a route owner coroutine never
+// published a result before wait_limit (transfer_deadline +
+// config_.cancellation_grace) -- the hypothesized root cause of mid-leg
+// client sidecar restarts this probe exists to confirm or rule out.
+// route_identity_hash identifies the relationship (see
+// fnv1a_route_relationship); last_stage is the coarse ClientStallStage the
+// stuck coroutine last completed (see cache/p50_endpoint.h), read with one
+// relaxed atomic load. This runs on the control worker that is about to
+// _Exit the whole process, not the owner thread, so it must not allocate:
+// every value here is plain arithmetic, a single atomic load, or (below) a
+// stack-buffer snprintf, same as every other owner-lag record above.
+// tu_seq / rel_seq are reported as 0 (not captured), matching this probe's
+// existing "0 means not captured" convention elsewhere: a transfer that
+// never reached fail_stop's wait_limit has by definition never seen F's
+// STATE/COMMIT reply, so neither TU identity nor F's replay sequence was
+// ever assigned to it.
+void append_owner_lag_stall_trace(uint64_t route_identity_hash,
+                                   int64_t transfer_age_ns,
+                                   int64_t configured_deadline_ns,
+                                   int64_t configured_grace_ns,
+                                   ClientStallStage last_stage,
+                                   uint64_t tu_seq, uint64_t rel_seq) noexcept {
+    const char* path = ::getenv("ICECC_P50_OWNER_LAG_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    uint64_t wall_clock_ns = 0;
+    {
+        struct timespec wall_ts{};
+        if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
+            wall_clock_ns = static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
+                            static_cast<uint64_t>(wall_ts.tv_nsec);
+    }
+    char line[512];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-owner-lag-stall-v1\","
+        "\"pid\":%lld,\"wall_clock_ns\":%llu,"
+        "\"route_identity_hash\":%llu,"
+        "\"transfer_age_ns\":%lld,"
+        "\"configured_deadline_ns\":%lld,\"configured_grace_ns\":%lld,"
+        "\"last_stage\":%u,"
+        "\"tu_seq\":%llu,\"rel_seq\":%llu}\n",
+        static_cast<long long>(::getpid()),
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<unsigned long long>(route_identity_hash),
+        static_cast<long long>(transfer_age_ns),
+        static_cast<long long>(configured_deadline_ns),
+        static_cast<long long>(configured_grace_ns),
+        static_cast<unsigned>(last_stage),
+        static_cast<unsigned long long>(tu_seq),
+        static_cast<unsigned long long>(rel_seq));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
@@ -1864,9 +1977,25 @@ void SidecarRuntime::arm_owner_lag_timer() noexcept {
             if (::clock_gettime(CLOCK_REALTIME, &wall_ts) == 0)
                 wall_clock_ns = static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
                                 static_cast<uint64_t>(wall_ts.tv_nsec);
+            // Snapshot and reset the trace-write self-validation accumulators
+            // before this flush's own write, so that write's duration lands
+            // in the *next* window's report rather than retroactively
+            // inflating the line it would be reported on.
+            const int64_t trace_write_max_ns = owner_lag_trace_write_max_ns_;
+            const int64_t trace_write_total_ns = owner_lag_trace_write_total_ns_;
+            owner_lag_trace_write_max_ns_ = 0;
+            owner_lag_trace_write_total_ns_ = 0;
+            const auto write_start = std::chrono::steady_clock::now();
             append_owner_lag_second_trace(wall_clock_ns, owner_lag_second_n_,
                                            owner_lag_second_max_ns_, p99_lag_ns,
-                                           owner_cpu_ns);
+                                           owner_cpu_ns, trace_write_max_ns,
+                                           trace_write_total_ns);
+            const int64_t this_write_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - write_start).count();
+            owner_lag_trace_write_total_ns_ += this_write_ns;
+            if (this_write_ns > owner_lag_trace_write_max_ns_)
+                owner_lag_trace_write_max_ns_ = this_write_ns;
             owner_lag_second_started_ = fire_time;
             owner_lag_second_n_ = 0;
             owner_lag_second_max_ns_ = 0;
@@ -2060,6 +2189,16 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         }
     }
     auto source_read_ns = std::make_shared<uint64_t>(0);
+    // Diagnostic-only, non-null only when ICECC_P50_OWNER_LAG_TRACE is set.
+    // Tracks the last stage this transfer's owner coroutine reached, so a
+    // fail_stop at this call's wait_limit (see below) can report where
+    // progress stopped without touching behavior on any other path. See
+    // ClientStallStage in cache/p50_endpoint.h.
+    const std::shared_ptr<std::atomic<ClientStallStage>> stall_stage =
+        owner_lag_trace_enabled_
+            ? std::make_shared<std::atomic<ClientStallStage>>(
+                  ClientStallStage::Connecting)
+            : nullptr;
 
     struct PendingFd {
         int fd = -1;
@@ -2067,7 +2206,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     };
     // open_armed's result when F answered BUSY instead of READY.
     constexpr int kFSessionBusy = -2;
-    auto open_armed = [arm, source_read_ns,
+    auto open_armed = [arm, source_read_ns, stall_stage,
                        open_arm_timeout = config_.source_open_arm_timeout](
                           std::chrono::steady_clock::time_point outer_limit,
                           FStoreGuid& remote_guid,
@@ -2121,6 +2260,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             icecc::stagetrace::stage_trace("csidecar", "f_connect_done",
                 (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
                 (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+            if (stall_stage)
+                stall_stage->store(ClientStallStage::Connecting,
+                                   std::memory_order_relaxed);
             stage_start = std::chrono::steady_clock::now();
             const P50SourceArmMsg request_message(arm);
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
@@ -2137,6 +2279,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             icecc::stagetrace::stage_trace("csidecar", "arm_ack_received",
                 (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
                 (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+            if (stall_stage)
+                stall_stage->store(ClientStallStage::Armed,
+                                   std::memory_order_relaxed);
             if (std::chrono::steady_clock::now() >= limit)
                 return refused("f-arm-deadline");
             stage_start = std::chrono::steady_clock::now();
@@ -2158,6 +2303,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             icecc::stagetrace::stage_trace("csidecar", "cache_session_ready",
                 (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
                 (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+            if (stall_stage)
+                stall_stage->store(ClientStallStage::SessionReady,
+                                   std::memory_order_relaxed);
             return ready_fd;
         } catch (...) {
             return refused("f-open-exception");
@@ -2389,7 +2537,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
              source_bytes = *source_bytes, source_digest, completion, route_request,
              prepared_source, selected_lane, gate_wait_ns,
              expected_c_guid = relationship.c_store_guid, source_mutex_wait_ns,
-             source_mutex_service_start, transfer_start_mono_ns]() mutable
+             source_mutex_service_start, transfer_start_mono_ns,
+             stall_stage]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
                 ZstdSourceTransferResult observed;
@@ -2420,7 +2569,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     } else {
                         observed = co_await route_owner_->transfer(
                             relationship, route_request, connection,
-                            transfer_deadline, source_bytes, source_digest);
+                            transfer_deadline, source_bytes, source_digest,
+                            stall_stage);
                     }
                     if (observed.replacement_required && !observed.route_local_failure)
                         route_replacement_required_.store(
@@ -2476,6 +2626,41 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         // release this route's gate and admit a successor concurrently with
         // that live operation, recreating the overlap the gate forbids.
         // Retire the supervised sidecar instead of exposing ambiguous state.
+        //
+        // Diagnostic-only, same ICECC_P50_OWNER_LAG_TRACE probe as above:
+        // this is the one place a stuck owner coroutine is observed from
+        // outside the owner thread, right before the process exits, so it
+        // is the only chance to record which stage it last reached. No
+        // allocation: route_identity_hash/last_stage/both durations below
+        // are plain arithmetic or a single relaxed atomic load, and
+        // append_owner_lag_stall_trace writes through the same stack-buffer
+        // snprintf + direct ::write as every other owner-lag record.
+        int64_t stall_now_mono_ns = 0;
+        {
+            struct timespec stall_now_ts{};
+            if (::clock_gettime(CLOCK_MONOTONIC, &stall_now_ts) == 0)
+                stall_now_mono_ns =
+                    static_cast<int64_t>(stall_now_ts.tv_sec) * 1000000000LL +
+                    stall_now_ts.tv_nsec;
+        }
+        const int64_t transfer_deadline_mono_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                transfer_deadline.time_since_epoch())
+                .count();
+        append_owner_lag_stall_trace(
+            fnv1a_route_relationship(relationship),
+            transfer_start_mono_ns > 0
+                ? stall_now_mono_ns - transfer_start_mono_ns
+                : 0,
+            transfer_start_mono_ns > 0
+                ? transfer_deadline_mono_ns - transfer_start_mono_ns
+                : 0,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                config_.cancellation_grace)
+                .count(),
+            stall_stage ? stall_stage->load(std::memory_order_relaxed)
+                        : ClientStallStage::Connecting,
+            /*tu_seq=*/0, /*rel_seq=*/0);
         if (config_.fail_stop)
             config_.fail_stop();
         std::_Exit(125);
@@ -2957,6 +3142,7 @@ std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
                 const auto now = std::chrono::steady_clock::now();
                 if (result_status == 3)
                     owner_lag_tx_inflight_[request.key] = owner_start;
+                const auto write_start = std::chrono::steady_clock::now();
                 append_owner_lag_op_trace(
                     "attach", request.key,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2964,6 +3150,12 @@ std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         now - owner_start).count(),
                     result_status, false, 0);
+                const int64_t write_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - write_start).count();
+                owner_lag_trace_write_total_ns_ += write_ns;
+                if (write_ns > owner_lag_trace_write_max_ns_)
+                    owner_lag_trace_write_max_ns_ = write_ns;
             }
         });
     } catch (...) {
@@ -3006,6 +3198,7 @@ void SidecarRuntime::finish_input_attachment_on_owner(
                     owner_lag_tx_inflight_.erase(inflight_it);
                 }
                 const auto now = std::chrono::steady_clock::now();
+                const auto write_start = std::chrono::steady_clock::now();
                 append_owner_lag_op_trace(
                     "finish_attach", request.key,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3013,6 +3206,12 @@ void SidecarRuntime::finish_input_attachment_on_owner(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         now - owner_start).count(),
                     authorized ? 1u : 0u, in_flight, in_flight_age_ns);
+                const int64_t write_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - write_start).count();
+                owner_lag_trace_write_total_ns_ += write_ns;
+                if (write_ns > owner_lag_trace_write_max_ns_)
+                    owner_lag_trace_write_max_ns_ = write_ns;
             }
             completion->set_value();
         });
@@ -3054,6 +3253,7 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
                         owner_start - inflight_it->second).count();
                 }
                 const auto now = std::chrono::steady_clock::now();
+                const auto write_start = std::chrono::steady_clock::now();
                 append_owner_lag_op_trace(
                     "apply_lifecycle", request.key,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3061,6 +3261,12 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         now - owner_start).count(),
                     static_cast<uint32_t>(status), in_flight, in_flight_age_ns);
+                const int64_t write_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - write_start).count();
+                owner_lag_trace_write_total_ns_ += write_ns;
+                if (write_ns > owner_lag_trace_write_max_ns_)
+                    owner_lag_trace_write_max_ns_ = write_ns;
             };
             const P50ServerOwnerUsage before = endpoint_->owner_usage();
             InputLifecycleApplyResult decision =

@@ -373,6 +373,16 @@ private:
     int64_t owner_lag_second_max_ns_ = 0;
     std::vector<int64_t> owner_lag_second_samples_;
     int64_t owner_lag_prev_cpu_ns_ = 0;
+    // Self-validation: the probe must not become the stall it measures.
+    // Every append_owner_lag_op_trace / append_owner_lag_second_trace call
+    // on the owner thread times its own open+write+close and folds the
+    // duration in here; the per-second flush reports (and resets) these two
+    // accumulators, so a slow trace write shows up in trace_write_max_ns /
+    // trace_write_total_ns on the *next* line (the in-flight flush's own
+    // write duration is folded into the following second's window rather
+    // than its own, to avoid timing a write before it has happened).
+    int64_t owner_lag_trace_write_max_ns_ = 0;
+    int64_t owner_lag_trace_write_total_ns_ = 0;
     void arm_owner_lag_timer() noexcept;
     // Local proxy for "this retained input has an in-flight attachment right
     // now": present between a successful attach_input_on_owner and its
