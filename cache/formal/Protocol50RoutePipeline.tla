@@ -200,7 +200,7 @@ TypeOK ==
     /\ Len(cQueue) <= PipelineDepth
     /\ cConfirmedCursor \in Nat
     /\ cPredictedCursor \in Nat
-    /\ fActive = NoTx \/ fActive \in [relSeq: RelSeqs, epoch: Nat]
+    /\ IF fActive = NoTx THEN TRUE ELSE fActive \in [relSeq: RelSeqs, epoch: Nat]
     /\ fParked \subseteq [relSeq: RelSeqs, epoch: Nat]
     /\ Cardinality(fParked) <= PipelineDepth - 1
     /\ fRouteCursor \in Nat
