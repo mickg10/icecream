@@ -10,6 +10,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#define ICECC_P29_MATCH_SIMD_X86 1
+#include <immintrin.h>
+#endif
+
 // Sim-only diagnostic histograms for the hash-chain match search in
 // OnlineS1::build() (below). Compiled out of production and out of every
 // build that does not define ICECC_P50SIM_MATCH_HISTOGRAM; used once, ahead
@@ -108,6 +113,112 @@ private:
     std::vector<Block> blocks_;
     std::unordered_map<uint64_t, std::vector<uint32_t>> index_;
 };
+
+// extend_match_length() vectorizes the hash-chain match-extension compare in OnlineS1::build()
+// below. Measurement (a sim-only histogram, gated behind ICECC_P50SIM_MATCH_HISTOGRAM, taken
+// against the real corpus and discarded once this decision was made) showed the scalar
+// per-element compare this replaces almost never stops within the first 1-2 elements: true
+// hash-bucket collisions fail at element 0 (checked by the "0" bucket), but any genuine chain
+// hit already shares its first min_match (3) elements by construction of the anchor hash, so
+// the compare routinely runs for tens to hundreds of elements (and sometimes over a thousand)
+// before the first mismatch. That is squarely the regime where a wider per-step compare wins:
+// fewer loop iterations/branches for the same total element count, not a chain-walk/cache-miss
+// bound case where SIMD would be wasted motion. Every variant below returns EXACTLY the same
+// length an element-at-a-time scalar scan of [a, a+maximum) vs [b, b+maximum) would -- same
+// value at every maximum, including maxima that are not a multiple of the vector width; the
+// SSE2/AVX2 steps only ever run on whole vectors fully inside [0, maximum), with a scalar tail
+// for the remainder, so there is no over-read past `maximum` and no over/under-count at a
+// vector boundary.
+namespace match_detail {
+
+inline uint32_t extend_match_scalar(const uint32_t* a, const uint32_t* b,
+                                     uint32_t maximum) noexcept {
+    uint32_t length = 0;
+    while (length < maximum && a[length] == b[length]) {
+        ++length;
+    }
+    return length;
+}
+
+#if defined(ICECC_P29_MATCH_SIMD_X86)
+
+// SSE2 is part of the x86-64 baseline ABI: always available, no target attribute or runtime
+// check needed. 4 uint32 lanes per step.
+inline uint32_t extend_match_sse2(const uint32_t* a, const uint32_t* b,
+                                   uint32_t maximum) noexcept {
+    uint32_t length = 0;
+    while (length + 4 <= maximum) {
+        const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + length));
+        const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + length));
+        const unsigned mask =
+            static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi32(va, vb))) & 0xFFFFu;
+        if (mask != 0xFFFFu) {
+            // One compare bit per BYTE, 4 bytes per lane: the lowest zero (mismatch) bit's
+            // index, divided by 4, is the first mismatching uint32 lane.
+            const unsigned mismatch_bit = static_cast<unsigned>(__builtin_ctz(~mask & 0xFFFFu));
+            return length + mismatch_bit / 4;
+        }
+        length += 4;
+    }
+    for (; length < maximum && a[length] == b[length]; ++length) {
+    }
+    return length;
+}
+
+// AVX2 needs its own target attribute so this translation unit can use it even though the
+// rest of the build is not compiled with -mavx2; gated behind a runtime cpuid check
+// (avx2_available(), below) rather than a compile-time one, since this binary still has to
+// run correctly on an older host that only has the SSE2 baseline.
+__attribute__((target("avx2"))) inline uint32_t extend_match_avx2(const uint32_t* a,
+                                                                    const uint32_t* b,
+                                                                    uint32_t maximum) noexcept {
+    uint32_t length = 0;
+    while (length + 8 <= maximum) {
+        const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + length));
+        const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + length));
+        const unsigned mask =
+            static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi32(va, vb)));
+        if (mask != 0xFFFFFFFFu) {
+            const unsigned mismatch_bit = static_cast<unsigned>(__builtin_ctz(~mask));
+            return length + mismatch_bit / 4;
+        }
+        length += 8;
+    }
+    while (length + 4 <= maximum) {
+        const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + length));
+        const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + length));
+        const unsigned mask =
+            static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi32(va, vb))) & 0xFFFFu;
+        if (mask != 0xFFFFu) {
+            const unsigned mismatch_bit = static_cast<unsigned>(__builtin_ctz(~mask & 0xFFFFu));
+            return length + mismatch_bit / 4;
+        }
+        length += 4;
+    }
+    for (; length < maximum && a[length] == b[length]; ++length) {
+    }
+    return length;
+}
+
+inline bool avx2_available() noexcept {
+    static const bool available = __builtin_cpu_supports("avx2") != 0;
+    return available;
+}
+#endif  // ICECC_P29_MATCH_SIMD_X86
+
+inline uint32_t extend_match_length(const uint32_t* a, const uint32_t* b,
+                                     uint32_t maximum) noexcept {
+#if defined(ICECC_P29_MATCH_SIMD_X86)
+    if (avx2_available()) {
+        return extend_match_avx2(a, b, maximum);
+    }
+    return extend_match_sse2(a, b, maximum);
+#else
+    return extend_match_scalar(a, b, maximum);
+#endif
+}
+
+}  // namespace match_detail
 
 // Online S1 longest-previous-factor state.
 //
@@ -232,12 +343,10 @@ private:
                 uint32_t chain = 0;
                 while (candidate != kNone && chain < config_.max_chain) {
                     if (candidate < position) {
-                        uint32_t length = 0;
                         const uint32_t maximum = end - position;
-                        while (length < maximum &&
-                               occurrences_[candidate + length] == occurrences_[position + length]) {
-                            ++length;
-                        }
+                        const uint32_t length = match_detail::extend_match_length(
+                            occurrences_.data() + candidate, occurrences_.data() + position,
+                            maximum);
 #if defined(ICECC_P50SIM_MATCH_HISTOGRAM)
                         icecc_p50sim_p29_match_extend_sample(length);
 #endif

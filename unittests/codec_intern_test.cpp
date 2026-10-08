@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,102 @@ using icecc::codec::P29InternLayout;
 void require(bool condition, const std::string &reason) {
     if (!condition)
         die(reason);
+}
+
+// Regression/correctness check for the AVX2/SSE2 extend_match_length() helper in
+// p29_online_s1.h (the vectorized replacement for OnlineS1::build()'s inner hash-chain
+// match-extension compare). The scalar implementation (extend_match_scalar()) is the
+// specification: it is a one-element-at-a-time scan, trivially correct by inspection, so
+// every SIMD variant must agree with it EXACTLY for every input, including every boundary
+// right at a vector width (4 for SSE2, 8 for AVX2) and every maximum that is not a multiple
+// of either width. The dispatcher (extend_match_length()) picks AVX2 or SSE2 depending on
+// what the current CPU supports, so this test calls both concrete variants directly (not
+// just the dispatcher) to make sure whichever one the bench host lacks is still exercised
+// here on whatever host runs this unit test.
+void check_match_extend_simd() {
+    std::mt19937 rng(0xA5A5u);
+    std::uniform_int_distribution<std::uint32_t> value_dist(0, 7);  // small alphabet: frequent
+                                                                     // equal runs, like real
+                                                                     // region-id occurrences.
+
+    const auto reference_matches = [](const std::vector<std::uint32_t> &a,
+                                       const std::vector<std::uint32_t> &b,
+                                       std::uint32_t maximum) {
+        return p29::match_detail::extend_match_scalar(a.data(), b.data(), maximum);
+    };
+
+    // Fixed boundary cases: mismatch at every offset from 0 through well past 2x the AVX2
+    // width (8), at totals that are shorter than one vector, exactly one vector, several
+    // vectors, and with a remainder -- plus the all-equal (maximum reached) case for each
+    // total.
+    const std::vector<std::uint32_t> totals = {0, 1, 2, 3, 4, 5, 6, 7,
+                                                 8, 9, 15, 16, 17, 23,
+                                                 24, 31, 32, 33, 64, 100};
+    for (std::uint32_t total : totals) {
+        for (std::uint32_t mismatch_at = 0; mismatch_at <= total + 2; ++mismatch_at) {
+            std::vector<std::uint32_t> a(total + 8, 1);
+            std::vector<std::uint32_t> b(total + 8, 1);
+            if (mismatch_at < total) {
+                b[mismatch_at] = 2;  // forces a's and b's leading run to end at mismatch_at
+            }
+            const std::uint32_t expect = reference_matches(a, b, total);
+            require(expect == std::min(mismatch_at, total),
+                    "extend_match_scalar reference disagrees with its own construction");
+            const std::uint32_t got_sse2 =
+                p29::match_detail::extend_match_sse2(a.data(), b.data(), total);
+            require(got_sse2 == expect,
+                    "extend_match_sse2 length differs from scalar reference at total=" +
+                        std::to_string(total) +
+                        " mismatch_at=" + std::to_string(mismatch_at) + ": got " +
+                        std::to_string(got_sse2) + " expected " + std::to_string(expect));
+            if (p29::match_detail::avx2_available()) {
+                const std::uint32_t got_avx2 =
+                    p29::match_detail::extend_match_avx2(a.data(), b.data(), total);
+                require(got_avx2 == expect,
+                        "extend_match_avx2 length differs from scalar reference at total=" +
+                            std::to_string(total) +
+                            " mismatch_at=" + std::to_string(mismatch_at) + ": got " +
+                            std::to_string(got_avx2) + " expected " + std::to_string(expect));
+            }
+        }
+    }
+
+    // Randomized/adversarial inputs: fully independent random content on both sides (so
+    // mismatches land at every possible lane within every vector step), across many random
+    // lengths, run many trials.
+    std::uniform_int_distribution<std::uint32_t> length_dist(0, 257);
+    for (int trial = 0; trial != 20000; ++trial) {
+        const std::uint32_t total = length_dist(rng);
+        std::vector<std::uint32_t> a(total);
+        std::vector<std::uint32_t> b(total);
+        for (std::uint32_t index = 0; index != total; ++index) {
+            a[index] = value_dist(rng);
+            b[index] = value_dist(rng);
+        }
+        const std::uint32_t expect = reference_matches(a, b, total);
+        const std::uint32_t got_sse2 =
+            p29::match_detail::extend_match_sse2(a.data(), b.data(), total);
+        require(got_sse2 == expect,
+                "extend_match_sse2 length differs from scalar reference on random trial " +
+                    std::to_string(trial) + " total=" + std::to_string(total));
+        if (p29::match_detail::avx2_available()) {
+            const std::uint32_t got_avx2 =
+                p29::match_detail::extend_match_avx2(a.data(), b.data(), total);
+            require(got_avx2 == expect,
+                    "extend_match_avx2 length differs from scalar reference on random trial " +
+                        std::to_string(trial) + " total=" + std::to_string(total));
+        }
+        const std::uint32_t got_dispatch =
+            p29::match_detail::extend_match_length(a.data(), b.data(), total);
+        require(got_dispatch == expect,
+                "extend_match_length dispatcher differs from scalar reference on random "
+                "trial " +
+                    std::to_string(trial) + " total=" + std::to_string(total));
+    }
+
+    std::cout << "codec_intern: match_extend_simd check PASS (20000 random trials + "
+              << totals.size() << " boundary totals, avx2="
+              << (p29::match_detail::avx2_available() ? "yes" : "no") << ")\n";
 }
 
 class MmapProvider {
@@ -583,6 +680,7 @@ CorpusResult intern_corpus(P29Interner<MmapProvider> &interner,
 
 int main(int argc, char **argv) {
     try {
+        check_match_extend_simd();
         allocation_controls();
         const std::size_t committed_first = accounting_control_once();
         const std::size_t committed_second = accounting_control_once();
