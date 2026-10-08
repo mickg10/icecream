@@ -30,7 +30,16 @@
 #  include <sys/syscall.h>
 #  include <sys/types.h>
 #  if defined(SYS_close_range)
-#    include <linux/close_range.h>
+/* glibc's generated syscall-number table can define SYS_close_range (it is
+   just a numeric ABI slot) well before the matching UAPI header exists: the
+   VFOS5 rpm's build image (Fedora 28, kernel-headers-4.16.13) defines the
+   number but ships no linux/close_range.h (that header postdates the
+   4.16-era headers; close_range(2) itself is 5.9+). Only include it when it
+   is actually there -- the CLOSE_RANGE_CLOEXEC fallback below supplies the
+   one flag bit callers need when it is not. */
+#    if __has_include(<linux/close_range.h>)
+#      include <linux/close_range.h>
+#    endif
 #  elif defined(__x86_64__)
 /* close_range(2) is x86_64 syscall 436.  Supply the number the way
    pidfd-uapi-style shims do; see the file comment above for the ENOSYS vs
