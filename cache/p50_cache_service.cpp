@@ -1906,6 +1906,18 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
                                          kReopenLimit};
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
+    // Step 4 (research/designs/P50_ROUTE_PIPELINING.md): a process-lifetime
+    // constant, sourced once here rather than per-request, mirroring the
+    // one-time route_lane_count() env-var read. Stays clamped to 1 (today's
+    // behavior) until ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE is set, per
+    // RouteGate::route_pipeline_depth()'s own no-F-sequencer safety gate.
+    route_config.authority_limits.route_pipeline_depth =
+        RouteGate::route_pipeline_depth(
+            config_.endpoint_caps.profile == ProfileId::P29V1
+                ? CACHE_PROFILE_P29V1
+                : config_.endpoint_caps.profile == ProfileId::ZSTD_ROUTE
+                      ? CACHE_PROFILE_ZSTD_ROUTE
+                      : CACHE_PROFILE_ZSTD_TU);
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
         std::move(config_.before_route_prepare_for_test);

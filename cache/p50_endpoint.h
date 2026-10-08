@@ -241,6 +241,15 @@ struct PreparationAuthorityLimits {
     // it fits under this, else probe(); its hash tables grow into the rest.
     uint64_t max_interner_reserved_bytes = uint64_t{24} << 30;
     uint64_t max_route_state_bytes = uint64_t{1} << 30;
+    // How many successive TUs on one route may have an uncommitted
+    // successor prepared at once (research/designs/P50_ROUTE_PIPELINING.md,
+    // "Step 4"). 1 reproduces every pre-pipelining call site byte-for-byte:
+    // a route may not begin TU n+1 until TU n commits. The production value
+    // is sourced once at sidecar construction from
+    // SidecarRuntime::RouteGate::route_pipeline_depth(), which itself stays
+    // clamped to 1 outside this step's own tests until the F-side sequencer
+    // (design doc Step 5) exists.
+    uint32_t route_pipeline_depth = 1;
     auto operator<=>(const PreparationAuthorityLimits&) const = default;
 };
 

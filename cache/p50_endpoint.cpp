@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <deque>
 #include <fcntl.h>
 #include <limits>
 #include <map>
@@ -902,7 +903,14 @@ struct P50PreparationAuthority::Impl {
         ProfileId profile = ProfileId::ZSTD_TU;
         std::vector<uint8_t> committed_route_history;
         Digest128 committed_route_history_digest = digest128(std::span<const uint8_t>{});
-        std::optional<uint64_t> uncommitted_route_entry;
+        // Bounded by authority_limits.route_pipeline_depth (default 1,
+        // reproducing the old single-optional behavior exactly). FIFO:
+        // commit() only ever retires the front entry. A non-tail release
+        // conservatively clears the whole deque (mirroring
+        // CRoute::abandon_active()'s own uniform invalidation of its
+        // active_queue_) per P50_ROUTE_PIPELINING.md Step 4's settled
+        // "invalidate all outstanding successors uniformly" decision.
+        std::deque<uint64_t> uncommitted_route_entries;
         std::unique_ptr<CRoute> p29_route;
         Digest128 p29v1_system_source_fingerprint{};
     };
@@ -1001,7 +1009,8 @@ struct P50PreparationAuthority::Impl {
         }
         if (key.profile == ProfileId::P29V1)
             state->p29_route = std::make_unique<CRoute>(
-                *p29_authority, key.f_store_guid, HistoryNonce{1});
+                *p29_authority, key.f_store_guid, HistoryNonce{1}, nullptr,
+                authority_limits.route_pipeline_depth);
         RouteState& result = *state;
         routes.emplace(key, std::move(state));
         return result;
@@ -1095,9 +1104,10 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
 
     if ((route.profile == ProfileId::ZSTD_ROUTE ||
          route.profile == ProfileId::P29V1) &&
-        route.uncommitted_route_entry.has_value())
+        route.uncommitted_route_entries.size() >=
+            std::max<uint32_t>(1, impl_->authority_limits.route_pipeline_depth))
         throw std::logic_error(
-            "selected route profile requires its predecessor to commit before preparing the next TU");
+            "selected route profile already has its full pipeline of successors outstanding");
 
     if (impl_->entries.size() >= impl_->authority_limits.max_live_entries)
         throw std::length_error("C preparation authority reached its live-entry bound");
@@ -1211,7 +1221,7 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         retained_added = true;
         if (route.profile == ProfileId::ZSTD_ROUTE ||
             route.profile == ProfileId::P29V1)
-            route.uncommitted_route_entry = entry_id;
+            route.uncommitted_route_entries.push_back(entry_id);
         impl_->consume_entry();
         if (reserved_tu_seq)
             impl_->p29_authority->commit_tu_seq(*reserved_tu_seq);
@@ -1228,8 +1238,9 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             impl_->entries.erase(entry_id);
         if ((route.profile == ProfileId::ZSTD_ROUTE ||
              route.profile == ProfileId::P29V1) &&
-            route.uncommitted_route_entry == entry_id)
-            route.uncommitted_route_entry.reset();
+            !route.uncommitted_route_entries.empty() &&
+            route.uncommitted_route_entries.back() == entry_id)
+            route.uncommitted_route_entries.pop_back();
         throw;
     }
 }
@@ -1290,7 +1301,9 @@ CRoute& P50PreparationAuthority::p29v1_successor(PreparedTuHandle handle) {
         throw std::invalid_argument("prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(entry.route);
     if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_)
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) == route.uncommitted_route_entries.end())
         throw std::logic_error("P29V1 NEED does not identify the route successor");
     return *route.p29_route;
 }
@@ -1358,7 +1371,9 @@ void P50PreparationAuthority::pin_p29v1_system_source_reuse(
         throw std::invalid_argument("prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(position->second.route);
     if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_)
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) == route.uncommitted_route_entries.end())
         throw std::logic_error(
             "P29V1 fingerprint does not identify the route successor");
     const Digest128 c_fingerprint = route.p29v1_system_source_fingerprint;
@@ -1381,7 +1396,9 @@ void P50PreparationAuthority::restart_p29v1_transport_retry(
             "prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(entry.route);
     if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_)
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) == route.uncommitted_route_entries.end())
         throw std::logic_error(
             "P29V1 retry does not identify the route successor");
     route.p29_route->restart_v1_for_transport_retry();
@@ -1404,7 +1421,9 @@ PreparedInputPtr P50PreparationAuthority::reset_p29v1_route(
             "P29V1 route reset identity is invalid");
     Impl::RouteState& route = impl_->route_state(entry.route);
     if (!route.p29_route ||
-        route.uncommitted_route_entry != handle.entry_id_ ||
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) == route.uncommitted_route_entries.end() ||
         !entry.shared->p29_source)
         throw std::logic_error(
             "P29V1 route reset does not identify its prepared successor");
@@ -1460,9 +1479,16 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     if ((entry.route.profile == ProfileId::ZSTD_ROUTE ||
          entry.route.profile == ProfileId::P29V1) &&
         !entry.committed &&
-        route.uncommitted_route_entry == handle.entry_id_)
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) != route.uncommitted_route_entries.end())
     {
-        route.uncommitted_route_entry.reset();
+        // Conservative by design (P50_ROUTE_PIPELINING.md Step 4): releasing
+        // any uncommitted successor before it commits invalidates every
+        // other outstanding successor on this route too, not just this one.
+        // CRoute::abandon_active() already clears its whole active_queue_
+        // uniformly; mirror that here so the two structures never diverge.
+        route.uncommitted_route_entries.clear();
         if (entry.route.profile == ProfileId::P29V1 && route.p29_route)
             route.p29_route->abandon_active();
     }
@@ -1487,7 +1513,8 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
     auto& entry = position->second;
     Impl::RouteState& route = impl_->route_state(entry.route);
     if (entry.route.profile == ProfileId::ZSTD_ROUTE && !entry.committed) {
-        if (route.uncommitted_route_entry != handle.entry_id_)
+        if (route.uncommitted_route_entries.empty() ||
+            route.uncommitted_route_entries.front() != handle.entry_id_)
             throw std::logic_error("ZSTD_ROUTE commit is not its prepared successor");
         const size_t limit = static_cast<size_t>(std::min<uint64_t>(
             impl_->zstd_limits.max_history_bytes,
@@ -1510,10 +1537,11 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         route.committed_route_history_digest = digest128(
             std::span<const uint8_t>(route.committed_route_history));
         entry.committed = true;
-        route.uncommitted_route_entry.reset();
+        route.uncommitted_route_entries.pop_front();
     }
     if (entry.route.profile == ProfileId::P29V1 && !entry.committed) {
-        if (route.uncommitted_route_entry != handle.entry_id_)
+        if (route.uncommitted_route_entries.empty() ||
+            route.uncommitted_route_entries.front() != handle.entry_id_)
             throw std::logic_error("P29V1 commit is not its prepared successor");
         const auto commit = TxCommit{entry.prepared->begin.history_nonce,
                                      entry.prepared->begin.rel_seq,
@@ -1528,7 +1556,7 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
                                          entry.prepared->begin.transaction_digest)};
         route.p29_route->accept_commit(commit);
         entry.committed = true;
-        route.uncommitted_route_entry.reset();
+        route.uncommitted_route_entries.pop_front();
     }
 }
 
