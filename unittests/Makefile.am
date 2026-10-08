@@ -145,7 +145,8 @@ p50inputrecordreopen_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(XXHASH_LIBS)
 p50inputattachment_LDADD = libp50reference.a ../cache/libprotocol50.a ../services/libicecc.la
 p50endpoint_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_ENDPOINT_TEST_HOOKS
-p50endpoint_LDFLAGS = $(BOOST_LDFLAGS)
+p50endpoint_CXXFLAGS = -pthread
+p50endpoint_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50endpoint_LDADD = libp50reference.a ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a \
@@ -281,7 +282,8 @@ s3persistence_LDFLAGS = -pthread
 s3persistence_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50s3realprocess_SOURCES = p50_s3_real_process.cpp
 p50s3realprocess_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
-p50s3realprocess_LDFLAGS = $(BOOST_LDFLAGS)
+p50s3realprocess_CXXFLAGS = -pthread
+p50s3realprocess_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50s3realprocess_LDADD = ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la \

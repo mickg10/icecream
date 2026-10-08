@@ -1,4 +1,5 @@
 #include "p50_endpoint.h"
+#include "p50_input_backing_reaper.h"
 #include "p50_slice0.h"
 
 #include "p50_adopted_outcome_writer.h"
@@ -2255,6 +2256,16 @@ struct P50ServerEndpoint::Impl {
         return result;
     }
 
+    // Hands a batch of just-released input backings to input_backing_reaper.
+    // Best effort: if the reaper's bounded queue is full or it has been torn
+    // down, submit() leaves `graveyard` untouched and it is freed right
+    // here, inline, when this function returns -- exactly the pre-reaper
+    // behavior for that one batch, never worse. Callers never need to know
+    // which case happened.
+    void submit_backing_graveyard(InputBackingBatch&& graveyard) {
+        (void)input_backing_reaper.submit(std::move(graveyard));
+    }
+
     void evict_namespace_inputs(CStoreGuid c_guid) {
         if (!namespace_is_evictable(c_guid))
             throw std::logic_error(
@@ -2262,7 +2273,9 @@ struct P50ServerEndpoint::Impl {
         for (const InputRecordKey key : input_records.namespace_keys(c_guid))
             global_resources->release(c_guid, global_key(key.tu_seq));
         Namespace& space = namespaces.at(c_guid);
-        input_records.evict_namespace(c_guid);
+        InputBackingBatch graveyard;
+        input_records.evict_namespace(c_guid, &graveyard);
+        submit_backing_graveyard(std::move(graveyard));
         space.last_input.reset();
         // Input payload eviction never destroys the authenticated outer
         // Protocol-50 cursor. P29V1's receiver dictionary does depend on its
@@ -2284,12 +2297,15 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error(
                 "F endpoint selected a live namespace for whole-namespace eviction");
         global_resources->evict(c_guid);
-        input_records.evict_namespace(c_guid);
+        InputBackingBatch graveyard;
+        input_records.evict_namespace(c_guid, &graveyard);
+        submit_backing_graveyard(std::move(graveyard));
         if (namespaces.erase(c_guid) != 1)
             throw std::logic_error(
                 "F endpoint lost its whole-namespace eviction target");
         revisions.erase(c_guid);
     }
+
 
     void ensure_input_capacity(CStoreGuid incoming, uint64_t raw_bytes) {
         const size_t record_limit = input_records.max_records();
@@ -3208,6 +3224,13 @@ struct P50ServerEndpoint::Impl {
     std::unique_ptr<ActionTrace> owned_actions;
     ActionTrace* actions = nullptr;
     InputRecordStore input_records;
+    // Drains the multi-MB-to-GB backing buffers that collect_input_garbage()
+    // and the namespace/whole-store eviction paths below detach from
+    // input_records, off this struct's single OWNER thread. See
+    // p50_input_backing_reaper.h; falls back to an inline (synchronous) free
+    // whenever its bounded queue is full or it has been torn down, which
+    // cannot happen here since it is destroyed along with the rest of Impl.
+    InputBackingReaper input_backing_reaper;
     std::unique_ptr<GlobalResourceModel> global_resources;
     P50ServerEndpointConfig config{};
     EndpointRunRegistry endpoint_runs;
@@ -4622,7 +4645,16 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
     impl_->live_sessions.clear();
     impl_->namespaces.clear();
     impl_->revisions.clear();
-    impl_->input_records.clear();
+    {
+        // reset_store drops every retained input in one call -- structurally
+        // the same bulk-free risk collect_input_garbage() has, just triggered
+        // by an F-store incarnation replacement instead of routine GC. Route
+        // it through the same reaper rather than freeing on this owner-thread
+        // call.
+        InputBackingBatch graveyard;
+        impl_->input_records.clear(&graveyard);
+        impl_->submit_backing_graveyard(std::move(graveyard));
+    }
     impl_->next_namespace_touch = 1;
     impl_->namespace_touch_exhausted = false;
     impl_->f_guid = new_guid;
@@ -4666,16 +4698,37 @@ void P50ServerEndpoint::collect_input_garbage() {
         (void)space;
         before.emplace(c_guid, impl_->input_records.namespace_keys(c_guid));
     }
-    impl_->input_records.collect_garbage();
+    InputBackingBatch graveyard;
+    impl_->input_records.collect_garbage(&graveyard);
     impl_->release_collected_global_inputs(before);
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start).count();
+    // Measured before the submit()/fallback below so it reflects what was
+    // released either way, regardless of whether the reaper or this thread
+    // ends up actually freeing it.
+    const uint64_t freed_bytes = input_backing_batch_bytes(graveyard);
+    const bool deferred = impl_->input_backing_reaper.submit(std::move(graveyard));
+    if (!deferred) {
+        // Reaper queue full or stopped: submit() left `graveyard` untouched,
+        // so destroying it now frees the backings synchronously, right here
+        // -- same as collect_garbage() behaved before the reaper existed.
+        // Correctness over speed. Still inside the timed region below, so a
+        // fallback free is visible in elapsed_ms/wall_clock_ns.
+        graveyard.clear();
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
     if (elapsed_ms > 50) {
+        const auto elapsed_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
         std::fprintf(stderr,
                      "cache sidecar collect_input_garbage took %lldms"
-                     " (retained_input_records=%zu)\n",
+                     " (retained_input_records=%zu) wall_clock_ns=%lld"
+                     " freed_bytes=%llu deferred=%d\n",
                      static_cast<long long>(elapsed_ms),
-                     impl_->input_records.record_count());
+                     impl_->input_records.record_count(),
+                     static_cast<long long>(elapsed_ns),
+                     static_cast<unsigned long long>(freed_bytes),
+                     deferred ? 1 : 0);
     }
 }
 
