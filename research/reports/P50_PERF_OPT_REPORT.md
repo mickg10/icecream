@@ -439,3 +439,139 @@ all-zero — verified to correctly fail on the broken form of the fix and
 correctly pass on the corrected form. This class of silent,
 round-specific, hand-redone fix cannot recur unnoticed for any future
 round.
+
+## SIMD vectorization of the hash-chain match-extension compare (2026-10-08)
+
+Scope: this round follows up on the candidate proposed, but explicitly
+not implemented or measured, at the end of the "C-side candidate:
+SenderEncode sub-stage split (Decision 5)" section above — vectorizing
+the longest-common-run comparison loop inside `OnlineS1::build()`'s
+hash-chain candidate walk (`cache/codec/p29_online_s1.h`). That loop
+compares `uint32_t` region/occurrence IDs one element at a time to
+extend a tentative match until a mismatch or the TU's end, and was
+identified as the dominant share (~85-90%) of the `SenderEncode`
+sub-stage split. Per that section's own rule, any candidate here must
+compute exactly the same best-length/best-source winner at every tie, so
+the resulting plan — and every byte this call puts on the wire — is
+unchanged by construction, not just by re-verification after the fact.
+
+### Measurement-first gate (commit `32d73020f0b91879258eecd17307d619171c684c`)
+
+Before writing any SIMD, two sim-only histograms (gated behind
+`ICECC_P50SIM_MATCH_HISTOGRAM`, same discipline as the other
+instrumentation macros in this report; never compiled into production)
+were added to measure, over the real 60-TU corpus: (1) how long each
+successful match-extension actually runs once started, and (2) how many
+chain candidates get walked per hash-table position before a match (or
+no match) is found. The decision gate from the governing methodology:
+if most extensions end within the first 1-2 elements, the compare itself
+cannot be the bottleneck and SIMD cannot win — the cost would be the
+chain walk's pointer-chasing cache misses, pointing at a prefetch
+candidate instead.
+
+**Result: the "SIMD can't win" trigger does not fire.** The
+extend-length histogram's buckets 1 and 2 are structurally empty — any
+genuine chain hit already shares its first `min_match = 3` elements by
+construction of the anchor hash, so a real match can only ever be
+measured starting at 3+ elements, never 1 or 2. The bulk of the mass
+sits at 9 through 128+ elements per candidate compared, with a long tail
+past 1024. True hash collisions (content that hashed alike but isn't
+actually a match) fail at element 0 essentially always, since a
+collision scrambles content and gives no reason to agree past the first
+element — this bucket carries roughly 8.8% of all extension attempts.
+This is the regime where a wider per-step compare wins outright, not a
+chain-walk/cache-miss-bound case; the SIMD path was selected over the
+prefetch fallback on this data, not by default.
+
+### Implementation (commit `bd64a753cf7b7ad05c9075ca4ecb4e019fe5c797`)
+
+Added `p29::match_detail::extend_match_length()` in
+`cache/codec/p29_online_s1.h`:
+
+- **AVX2** path: 8 `uint32_t` lanes per step via `_mm256_cmpeq_epi32` +
+  `movemask_epi8`, compiled under a function-level
+  `__attribute__((target("avx2")))` and selected only at runtime via
+  `__builtin_cpu_supports("avx2")` (cached once in a `static const
+  bool`) — this keeps the rest of the translation unit on the default
+  baseline instruction set and requires no build-flag change anywhere
+  else in the project, preserving portability to hosts without AVX2.
+- **SSE2** fallback: 4 lanes, unconditionally available on the x86-64
+  baseline ABI, no runtime gating needed.
+- **Scalar** fallback for non-x86 targets.
+
+Both vector paths find the first mismatching lane as `ctz(~mask) / 4`
+from the byte-granularity comparison mask, exactly the technique
+specified by the governing methodology. Each loop only runs full-width
+vector steps strictly inside `[0, maximum)`, with a scalar tail for any
+remainder, so the returned length matches the scalar reference exactly
+at every boundary — including a `maximum` that is not an exact multiple
+of the vector width. `OnlineS1::build()`'s inner extend-match loop was
+rewired to call this dispatcher in place of the prior one-element-at-a-
+time scan; the pre-existing histogram sample call immediately after it
+is unchanged.
+
+A dedicated correctness test, `check_match_extend_simd()`, was added to
+`unittests/codec_intern_test.cpp`: fixed boundary cases (mismatch at
+every offset through past twice the AVX2 width, at totals shorter than,
+equal to, and several multiples of a vector width plus a remainder) plus
+20000 randomized trials, each comparing `extend_match_sse2`/
+`extend_match_avx2`/`extend_match_length` against the scalar reference
+for exact equality.
+
+### Verification this round
+
+- **Unit test, run on H1 (AVX2 present):**
+  `codec_intern: match_extend_simd check PASS (20000 random trials + 20
+  boundary totals, avx2=yes)`, followed by the pre-existing
+  `codec_intern` corpus-intern pass (`PASS tus=11 ... seconds=0.112962`)
+  — both green, `EXIT=0` for the whole binary.
+- **Build identity:** both arms were built from this branch with
+  `build_p50sim.sh` itself (no manual flag overrides beyond `CXX=g++`),
+  one at commit `1a1172dacd9ec09d700f63351cc373b8a0243846` (last commit
+  before the SIMD change — the "baseline" arm) and one at `bd64a753`
+  (the "variant" arm). Each build's own receipt
+  (`.p50sim-build.json`) confirms `source.head` matches the intended
+  commit and `tracked_clean: true` for that build.
+- **Wire/output identity, full 60-TU corpus, run 1:** every field other
+  than the three timing-only fields (`prepare_ns`,
+  `simulator_execution_ns`, `f_apply_materialize_ns`) compared
+  row-for-row between baseline and variant — including `raw_digest`,
+  `state_before_digest`, `state_digest`, `transaction_digest`,
+  `c_to_f_bytes`, `f_to_c_bytes`, `encoded_source_bytes`, and
+  `negotiated_profile_mask` — with **zero mismatches across all 60/60
+  rows**. The SIMD change does not move a single byte on the wire, as
+  required.
+- **Timing, 4 interleaved baseline/variant run pairs over the full
+  60-TU corpus, `ICECC_P50_PROFILE=P29V1`, `taskset -c 0-7`:**
+
+  | Run | Baseline wall | Variant wall |
+  |---|---|---|
+  | 1 | 9.19 s | 8.93 s |
+  | 2 | 9.36 s | 9.01 s |
+  | 3 | 9.23 s | 9.02 s |
+  | 4 | 9.26 s | 9.10 s |
+
+  The variant is faster than the baseline in every one of the 4 pairs
+  (mean 9.26 s vs 9.02 s, ~2.6% faster end to end). Isolating the
+  specific stage this change touches (`prepare_ns`, summed across all
+  60 TUs per run) shows a cleaner and larger signal, since it excludes
+  I/O and other unrelated per-run overhead:
+
+  | Run | Baseline `sum(prepare_ns)` | Variant `sum(prepare_ns)` |
+  |---|---|---|
+  | 1 | 3204.1 ms | 2862.0 ms |
+  | 2 | 3278.7 ms | 2877.6 ms |
+  | 3 | 3206.9 ms | 2892.2 ms |
+  | 4 | 3196.1 ms | 2889.0 ms |
+
+  Mean 3221.5 ms vs 2880.2 ms — a consistent **~10.6% reduction** in the
+  stage containing the vectorized loop, agreeing in direction across
+  all 4 runs.
+
+**Verdict: accepted.** The decision gate's data-driven call to pursue
+SIMD over prefetch is borne out: `bd64a753` is wire/digest-identical to
+the pre-SIMD baseline on 60/60 TUs with zero exceptions, passes a
+dedicated 20020-case correctness test, and delivers a consistent,
+repeatable win — ~10.6% on the targeted `prepare_ns` stage and ~2.6% on
+end-to-end wall time, in the same direction on every one of 4 interleaved
+run pairs. No prefetch fallback was needed.
