@@ -23,6 +23,7 @@
 #include <optional>
 #include <poll.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <sys/types.h>
 
@@ -425,6 +426,56 @@ private:
     void append_pending_advertisement_update(
         advertisement::Update& destination) noexcept;
     void fail(AdapterError error) noexcept;
+
+    // Diagnostic-only lifecycle trace hooks (ICECC_P50_DAEMON_LIFECYCLE_TRACE).
+    // Each is a cheap no-op (map lookup against an empty/absent-entry table)
+    // when the env var is unset; none of them influence any lifecycle
+    // decision or return value. See p50_daemon_sidecar_adapter.cpp for the
+    // JSONL schema ("icecream-p50-daemon-lifecycle-v1") written by the last
+    // of these, trace_lifecycle_emit_terminal().
+    void trace_lifecycle_mark_enqueued(uint64_t operation_id) noexcept;
+    void trace_lifecycle_mark_first_attempt(uint64_t operation_id) noexcept;
+    void trace_lifecycle_update_milestones(uint64_t operation_id,
+                                           uint8_t phase_before,
+                                           uint8_t phase_after,
+                                           bool control_complete) noexcept;
+    void trace_lifecycle_emit_terminal(
+        const InputLifecycleResult& result) noexcept;
+
+    // Diagnostic-only per-operation progress capture for the daemon-side
+    // lifecycle RPC trace (ICECC_P50_DAEMON_LIFECYCLE_TRACE). Populated only
+    // when that env var names a path; otherwise this table stays empty, and
+    // its upkeep is the same handful of cheap getenv()-gated branches as the
+    // existing ICECC_P50_SOURCE_RESULT_TRACE convention in
+    // cache/p50_cache_service.cpp. None of these fields participate in any
+    // lifecycle decision -- they are read back only by the trace writer.
+    struct InputLifecycleTraceState {
+        std::chrono::steady_clock::time_point enqueue_mono{};
+        uint64_t enqueue_turn = 0;
+        size_t pending_depth_at_enqueue = 0;
+        bool first_attempt_recorded = false;
+        std::chrono::steady_clock::time_point first_attempt_mono{};
+        uint64_t turns_before_first_attempt = 0;
+        bool connect_done_recorded = false;
+        std::chrono::steady_clock::time_point connect_done_mono{};
+        bool request_sent_recorded = false;
+        std::chrono::steady_clock::time_point request_sent_mono{};
+        bool response_received_recorded = false;
+        std::chrono::steady_clock::time_point response_received_mono{};
+        bool ack_sent_recorded = false;
+        std::chrono::steady_clock::time_point ack_sent_mono{};
+    };
+    // Keyed by InputLifecycleRequest::operation_id. Entries are created at
+    // enqueue (queue_outer_input_request) only when the trace env var is set,
+    // updated as the in-flight dialogue's Phase advances, and erased when the
+    // terminal trace record for that operation_id is written.
+    std::unordered_map<uint64_t, InputLifecycleTraceState> trace_lifecycle_state_;
+    // Incremented unconditionally, once per daemon iteration, at the top of
+    // outer_begin_turn() -- the documented once-per-iteration entry point.
+    // Cheap bookkeeping with no behavioral effect; used by the lifecycle
+    // trace to report how many daemon turns elapsed between a request's
+    // enqueue and its first dequeue/attempt.
+    uint64_t outer_turn_number_ = 0;
 
     Config config_;
     AdapterState state_ = AdapterState::Stopped;

@@ -120,6 +120,14 @@ public:
     lifecycle_result() const noexcept { return lifecycle_result_; }
     [[nodiscard]] const std::optional<P50SourceTransferResult>&
     source_transfer_result() const noexcept { return source_transfer_result_; }
+    // Diagnostic-only Phase snapshot for the daemon-side lifecycle RPC trace
+    // (ICECC_P50_DAEMON_LIFECYCLE_TRACE). The ordinal has no meaning outside
+    // this translation unit beyond "has it increased since the last check";
+    // callers must not interpret specific values and must not use this to
+    // make any protocol decision.
+    [[nodiscard]] uint8_t phase_ordinal() const noexcept {
+        return static_cast<uint8_t>(phase_);
+    }
 
 private:
     enum class Phase : uint8_t { None, ConnectPending, Connecting, WriteHello, ReadHelloAck,

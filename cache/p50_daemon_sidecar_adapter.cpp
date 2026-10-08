@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "services/digest128.h"
@@ -47,6 +48,124 @@ constexpr uint8_t kAuthClosePending = 7;
 // name is carried across turns; no cleanup syscall is hidden in the minting
 // operation and a failed allocation simply leaves the phase fail-closed.
 std::atomic<uint64_t> g_cleanup_sequence{1};
+
+// --- Diagnostic-only daemon-side lifecycle RPC trace -----------------------
+//
+// Gated on ICECC_P50_DAEMON_LIFECYCLE_TRACE=<path>; absent/empty env var is
+// the only opt-in and leaves every call below a cheap no-op, matching the
+// ICECC_P50_SOURCE_RESULT_TRACE convention in cache/p50_cache_service.cpp
+// (same fire-and-forget raw-fd append, same truncate-and-drop-on-overflow
+// snprintf discipline). Never writes a raw guid: job identity is folded into
+// a single FNV-1a 64-bit hash so trace lines can be correlated across hosts
+// without exposing cache content identifiers.
+constexpr uint64_t kFnv1a64OffsetBasis = 0xcbf29ce484222325ULL;
+constexpr uint64_t kFnv1a64Prime = 0x100000001b3ULL;
+
+uint64_t fnv1a64_bytes(uint64_t hash, const uint8_t* data, size_t length) noexcept {
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= data[i];
+        hash *= kFnv1a64Prime;
+    }
+    return hash;
+}
+
+uint64_t fnv1a64_u64(uint64_t hash, uint64_t value) noexcept {
+    for (int i = 0; i < 8; ++i) {
+        hash ^= (value >> (i * 8)) & 0xffULL;
+        hash *= kFnv1a64Prime;
+    }
+    return hash;
+}
+
+uint64_t daemon_lifecycle_job_identity_hash(const InputLifecycleRequest& request) noexcept {
+    uint64_t hash = kFnv1a64OffsetBasis;
+    hash = fnv1a64_u64(hash, request.identity.generation);
+    hash = fnv1a64_u64(hash, request.identity.attempt);
+    hash = fnv1a64_bytes(hash, request.key.c_store_guid.bytes.data(),
+                         request.key.c_store_guid.bytes.size());
+    hash = fnv1a64_u64(hash, request.key.tu_seq.value);
+    hash = fnv1a64_u64(hash, request.owner.logical_job);
+    hash = fnv1a64_u64(hash, request.owner.assignment_epoch);
+    hash = fnv1a64_u64(hash, request.owner.assignment_nonce);
+    hash = fnv1a64_u64(hash, request.operation_id);
+    return hash;
+}
+
+// -1 is the "milestone never reached" sentinel for every signed delta field;
+// it is never a valid elapsed-nanoseconds value because enqueue is always
+// chronologically first. The terminal delta has no sentinel: this function
+// is only ever called once a terminal state is known.
+constexpr int64_t kDaemonLifecycleTraceUnset = -1;
+
+int64_t daemon_lifecycle_delta_ns(
+    std::chrono::steady_clock::time_point enqueue_mono, bool recorded,
+    std::chrono::steady_clock::time_point milestone_mono) noexcept {
+    if (!recorded)
+        return kDaemonLifecycleTraceUnset;
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            milestone_mono - enqueue_mono).count());
+}
+
+void append_daemon_lifecycle_trace(
+    const char* path, const InputLifecycleRequest& request,
+    InputLifecycleStatus status,
+    uint64_t pending_depth_at_enqueue, uint64_t turns_before_first_attempt,
+    int64_t enqueue_to_first_attempt_ns, int64_t enqueue_to_connect_done_ns,
+    int64_t enqueue_to_request_sent_ns, int64_t enqueue_to_response_received_ns,
+    int64_t enqueue_to_ack_sent_ns, int64_t enqueue_to_terminal_ns) noexcept {
+    struct timespec wall {};
+    ::clock_gettime(CLOCK_REALTIME, &wall);
+    const uint64_t wall_clock_ns =
+        static_cast<uint64_t>(wall.tv_sec) * 1000000000ULL +
+        static_cast<uint64_t>(wall.tv_nsec);
+    const uint64_t job_hash = daemon_lifecycle_job_identity_hash(request);
+    char buffer[768];
+    const int length = std::snprintf(
+        buffer, sizeof(buffer),
+        "{\"schema\":\"icecream-p50-daemon-lifecycle-v1\","
+        "\"wall_clock_ns\":%llu,\"operation_id\":%llu,\"action\":%u,"
+        "\"status\":%u,\"job_identity_hash\":\"%016llx\","
+        "\"pending_depth_at_enqueue\":%llu,"
+        "\"turns_before_first_attempt\":%llu,"
+        "\"enqueue_to_first_attempt_ns\":%lld,"
+        "\"enqueue_to_connect_done_ns\":%lld,"
+        "\"enqueue_to_request_sent_ns\":%lld,"
+        "\"enqueue_to_response_received_ns\":%lld,"
+        "\"enqueue_to_ack_sent_ns\":%lld,"
+        "\"enqueue_to_terminal_ns\":%lld}\n",
+        static_cast<unsigned long long>(wall_clock_ns),
+        static_cast<unsigned long long>(request.operation_id),
+        static_cast<unsigned>(request.action),
+        static_cast<unsigned>(status),
+        static_cast<unsigned long long>(job_hash),
+        static_cast<unsigned long long>(pending_depth_at_enqueue),
+        static_cast<unsigned long long>(turns_before_first_attempt),
+        static_cast<long long>(enqueue_to_first_attempt_ns),
+        static_cast<long long>(enqueue_to_connect_done_ns),
+        static_cast<long long>(enqueue_to_request_sent_ns),
+        static_cast<long long>(enqueue_to_response_received_ns),
+        static_cast<long long>(enqueue_to_ack_sent_ns),
+        static_cast<long long>(enqueue_to_terminal_ns));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(buffer))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return;
+    size_t written = 0;
+    while (written < static_cast<size_t>(length)) {
+        const ssize_t result = ::write(fd, buffer + written, static_cast<size_t>(length) - written);
+        if (result > 0) {
+            written += static_cast<size_t>(result);
+            continue;
+        }
+        if (result < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    ::close(fd);
+}
+// --- end diagnostic-only daemon-side lifecycle RPC trace --------------------
 
 // The launch plan is intentionally a finite sequence rather than a helper
 // which performs setup in one call.  Each nonzero phase consumes one outer
@@ -904,6 +1023,123 @@ InputLifecycleResult DaemonSidecarAdapter::apply_input_lifecycle(
     return queue_outer_input_request(std::move(request));
 }
 
+// --- Diagnostic-only lifecycle trace hooks (ICECC_P50_DAEMON_LIFECYCLE_TRACE) --
+//
+// Each hook re-reads the env var directly rather than caching it: the trace
+// is a diagnostic opt-in a daemon operator can enable without a restart in
+// test rigs, and getenv() is cheap relative to the syscalls these turns
+// already perform. When unset, trace_lifecycle_state_ never gains entries
+// and every hook below returns after a single branch.
+
+void DaemonSidecarAdapter::trace_lifecycle_mark_enqueued(
+    uint64_t operation_id) noexcept {
+    const char* path = std::getenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    InputLifecycleTraceState state;
+    state.enqueue_mono = std::chrono::steady_clock::now();
+    state.enqueue_turn = outer_turn_number_;
+    state.pending_depth_at_enqueue = pending_input_lifecycle_.size();
+    try {
+        trace_lifecycle_state_[operation_id] = state;
+    } catch (...) {
+        // A diagnostic table allocation failure must never surface as a
+        // lifecycle error; simply skip tracing this operation.
+    }
+}
+
+void DaemonSidecarAdapter::trace_lifecycle_mark_first_attempt(
+    uint64_t operation_id) noexcept {
+    const auto it = trace_lifecycle_state_.find(operation_id);
+    if (it == trace_lifecycle_state_.end() || it->second.first_attempt_recorded)
+        return;
+    it->second.first_attempt_recorded = true;
+    it->second.first_attempt_mono = std::chrono::steady_clock::now();
+    it->second.turns_before_first_attempt =
+        outer_turn_number_ - it->second.enqueue_turn;
+}
+
+void DaemonSidecarAdapter::trace_lifecycle_update_milestones(
+    uint64_t operation_id, uint8_t phase_before, uint8_t phase_after,
+    bool control_complete) noexcept {
+    const auto it = trace_lifecycle_state_.find(operation_id);
+    if (it == trace_lifecycle_state_.end())
+        return;
+    InputLifecycleTraceState& state = it->second;
+    const auto now = std::chrono::steady_clock::now();
+    // Phase ordinals are monotonically increasing along the lifecycle-mode
+    // path (see local::DaemonControlOperation::Phase); a one-sided ">="
+    // threshold on the post-advance value is therefore sufficient to detect
+    // a crossing even when several phases are chained within one turn
+    // (DaemonControlLimits::chain_ready_phases). phase_before is kept only
+    // so a future caller could narrow the exact crossing turn if needed.
+    (void)phase_before;
+    if (!state.connect_done_recorded &&
+        phase_after >= static_cast<uint8_t>(3) /* WriteHello */) {
+        state.connect_done_recorded = true;
+        state.connect_done_mono = now;
+    }
+    if (!state.request_sent_recorded &&
+        phase_after >= static_cast<uint8_t>(10) /* ReadLifecycleReply */) {
+        state.request_sent_recorded = true;
+        state.request_sent_mono = now;
+    }
+    if (!state.response_received_recorded &&
+        phase_after >= static_cast<uint8_t>(11) /* CheckLifecycleReplyTrailing */) {
+        state.response_received_recorded = true;
+        state.response_received_mono = now;
+    }
+    // "ack sent" cannot be derived from a phase threshold: the terminal
+    // WriteLifecycleGoodbye handler sets DaemonControlStatus::Complete
+    // without a further phase transition. Complete is reached only once
+    // the goodbye frame is fully written, so it is the correct signal that
+    // the protocol ran all the way through (as opposed to Timeout,
+    // Disconnected, or any other terminal status, for which no ack was
+    // ever sent and this field is deliberately left unset).
+    if (!state.ack_sent_recorded && control_complete) {
+        state.ack_sent_recorded = true;
+        state.ack_sent_mono = now;
+    }
+}
+
+void DaemonSidecarAdapter::trace_lifecycle_emit_terminal(
+    const InputLifecycleResult& result) noexcept {
+    const char* path = std::getenv("ICECC_P50_DAEMON_LIFECYCLE_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    const uint64_t operation_id = result.request.operation_id;
+    const auto it = trace_lifecycle_state_.find(operation_id);
+    if (it == trace_lifecycle_state_.end()) {
+        // No enqueue record (e.g. trace was enabled mid-flight for an
+        // operation that was already pending). Emit nothing rather than a
+        // record with a meaningless zero-length enqueue baseline.
+        return;
+    }
+    const InputLifecycleTraceState& state = it->second;
+    const auto now = std::chrono::steady_clock::now();
+    const int64_t to_first_attempt = daemon_lifecycle_delta_ns(
+        state.enqueue_mono, state.first_attempt_recorded, state.first_attempt_mono);
+    const int64_t to_connect_done = daemon_lifecycle_delta_ns(
+        state.enqueue_mono, state.connect_done_recorded, state.connect_done_mono);
+    const int64_t to_request_sent = daemon_lifecycle_delta_ns(
+        state.enqueue_mono, state.request_sent_recorded, state.request_sent_mono);
+    const int64_t to_response_received = daemon_lifecycle_delta_ns(
+        state.enqueue_mono, state.response_received_recorded,
+        state.response_received_mono);
+    const int64_t to_ack_sent = daemon_lifecycle_delta_ns(
+        state.enqueue_mono, state.ack_sent_recorded, state.ack_sent_mono);
+    const int64_t to_terminal = daemon_lifecycle_delta_ns(
+        state.enqueue_mono, true, now);
+    const uint64_t pending_depth_at_enqueue = state.pending_depth_at_enqueue;
+    const uint64_t turns_before_first_attempt = state.turns_before_first_attempt;
+    trace_lifecycle_state_.erase(it);
+    append_daemon_lifecycle_trace(
+        path, result.request, result.status, pending_depth_at_enqueue,
+        turns_before_first_attempt, to_first_attempt, to_connect_done,
+        to_request_sent, to_response_received, to_ack_sent, to_terminal);
+}
+// --- end diagnostic-only lifecycle trace hooks ------------------------------
+
 InputLifecycleResult DaemonSidecarAdapter::queue_outer_input_request(
     InputLifecycleRequest request) noexcept {
     const InputLifecycleResult invalid{InputLifecycleStatus::InvalidArgument, request};
@@ -989,7 +1225,9 @@ InputLifecycleResult DaemonSidecarAdapter::queue_outer_input_request(
         return InputLifecycleResult{InputLifecycleStatus::StoreReplaced, request};
     }
     try {
+        const uint64_t operation_id_for_trace = request.operation_id;
         pending_input_lifecycle_.push_back(std::move(request));
+        trace_lifecycle_mark_enqueued(operation_id_for_trace);
     } catch (...) {
         retire_input_lifecycle_relationship(AdapterError::InputLifecycleCapacity);
         return InputLifecycleResult{InputLifecycleStatus::StoreReplaced, request};
@@ -3276,6 +3514,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             !runtime_nodes_valid())
             return false;
         const InputLifecycleRequest request = pending_input_lifecycle_.front();
+        trace_lifecycle_mark_first_attempt(request.operation_id);
         const auto request_deadline =
             request.deadline == std::chrono::steady_clock::time_point{}
                 ? now + config_.input_lifecycle_timeout
@@ -3284,6 +3523,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
             outer_last_input_lifecycle_result_ = InputLifecycleResult{
                 InputLifecycleStatus::Timeout, request};
+            trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
             retire_input_lifecycle_relationship(AdapterError::InputLifecycleProtocol);
             outer_action_taken_ = true;
             return true;
@@ -3293,6 +3533,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
             outer_last_input_lifecycle_result_ = InputLifecycleResult{
                 InputLifecycleStatus::StoreReplaced, request};
+            trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
             outer_action_taken_ = true;
             return true;
         }
@@ -3331,6 +3572,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             if (status != local::DaemonControlStatus::InProgress) {
                 outer_last_input_lifecycle_result_ = InputLifecycleResult{
                     map_input_control_status(status), request};
+                trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
                 outer_input_operation_.reset();
                 outer_input_request_.reset();
                 outer_input_cancel_lease_.reset();
@@ -3365,9 +3607,15 @@ bool DaemonSidecarAdapter::outer_advance_input(
             revents = descriptor.revents;
             break;
         }
+    const uint8_t phase_before = outer_input_operation_->phase_ordinal();
     const local::DaemonControlStatus status =
         outer_input_operation_->advance(now, revents);
     outer_action_taken_ = true;
+    if (outer_input_request_.has_value())
+        trace_lifecycle_update_milestones(
+            outer_input_request_->operation_id, phase_before,
+            outer_input_operation_->phase_ordinal(),
+            status == local::DaemonControlStatus::Complete);
     if (!outer_input_operation_->done())
         return true;
 
@@ -3427,6 +3675,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
         }
     }
     outer_last_input_lifecycle_result_ = InputLifecycleResult{result_status, request};
+    trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
     const bool success =
         result_status == InputLifecycleStatus::Applied ||
         result_status == InputLifecycleStatus::AlreadyApplied ||
@@ -3516,6 +3765,12 @@ bool DaemonSidecarAdapter::outer_begin_turn(
     advertisement::Update update;
     append_pending_advertisement_update(update);
     outer_action_taken_ = false;
+    // Diagnostic-only turn counter (ICECC_P50_DAEMON_LIFECYCLE_TRACE). Always
+    // incremented, regardless of any early return below, because this is the
+    // one documented once-per-daemon-iteration entry point; it has no
+    // behavioral effect and is read back only by the lifecycle trace to
+    // report how many daemon turns elapsed before a request's first attempt.
+    ++outer_turn_number_;
     if (outer_lifecycle_ == nullptr || !outer_config_valid_ ||
         outer_reaper_ == nullptr) {
         fail(AdapterError::InvalidConfiguration);
@@ -3660,6 +3915,7 @@ bool DaemonSidecarAdapter::outer_advance_turn(
             outer_input_request_.reset();
             outer_last_input_lifecycle_result_ = InputLifecycleResult{
                 InputLifecycleStatus::Disconnected, request};
+            trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
             outer_input_cancel_lease_.reset();
             // Explicit cancellation is an input-lifecycle failure and enters
             // the same A withdrawal/teardown reducer as timeout, EOF, and
