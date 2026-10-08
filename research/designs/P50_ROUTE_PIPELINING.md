@@ -1,11 +1,16 @@
 # P50 Route Pipelining — Design Doc (DRAFT, WIP)
 
-Status: REVISED DRAFT — addressing sorbet-main's correctness review of
-`cacae856`. §1.2 (F-side parking) is rewritten end-to-end (raw frame buffer +
-peek-only `rel_seq` + per-route sequencer, parking before any semantic
-processing); §2/§3/§4/§5/§6/§7 updated for consistency. Not re-marked
-"complete" until this revision itself is reviewed. No implementation code in
-this tree change; this document only.
+Status: COMPLETE — addresses sorbet-main's correctness review of `cacae856`
+in full. §1.2 (F-side parking) is rewritten end-to-end (raw frame buffer +
+peek-only `rel_seq` peek + per-route sequencer, parking before any semantic
+processing); §2 (invariant 8 corrected to C-side-only queue generalization),
+§3 (failure matrix simplified for the new parking model), §4 (ARM window
+corrected to the farm's real value, K-forces-lanes=1 clamp, write-complete
+signal split, owner-thread CPU budget), §5 (test plan rebuilt around the raw
+buffer/sequencer design), §6 (LOC table rebuilt, ~1400 LOC / 11 steps), and §7
+(all six open questions converted to settled decisions, plus a new §8 citation
+note) are all updated and now mutually consistent with the revised §1.2. No
+implementation code in this tree change; this document only.
 
 Branch: `perf-pipe`, off `a348414e` ("services/sys_close_range.h: guard the UAPI
 include with `__has_include`"), the current farm "perf-combo" build
@@ -795,12 +800,35 @@ this design touches; the plan is to extend each in place (parameterize by
 `K`), not add a parallel test tree:
 
 - **`p50_slice0_test.cpp`** (covers `CRoute`/`FStore` directly, §1.1 point 2 /
-  §1.2 "today's single-slot enforcement"): add cases that drive `FStore::begin`
-  through `K` admissions before any commit, assert the generalized occupied-
-  slot check (§1.2 (a)) accepts exactly `rel_seq ∈
-  [nextExpected, nextExpected+K-1]` and rejects outside it; assert
-  `commit_input` releases the sequencer's park signal for the immediate
-  successor only (not all parked successors at once).
+  §1.2 "today's single-slot enforcement"): this file's job under the revised
+  §1.2 design is now a **regression** gate, not a widening gate — assert
+  `FStore::begin`'s occupied-slot check (`cache/p50_slice0.cpp:2324-2326`) and
+  `Namespace::Route.pending` stay exactly the `K=1` scalar logic, byte-for-byte
+  unchanged, at every `K`, since the admission widening lives entirely in the
+  new F-side sequencer (below), not in `FStore`/`CRoute`'s F half (§2
+  invariant 8). Add one explicit test that calls `FStore::begin` twice in a
+  row without an intervening `commit_input` and asserts it still rejects the
+  second call exactly as it does today — i.e. prove the sequencer is doing
+  100% of the new admission work and `FStore` was not touched.
+- **New: F-side raw-frame-buffer and sequencer tests** (these belong in
+  `p50_endpoint_test.cpp`'s server-side (`P50ServerEndpoint`) cases, since the
+  sequencer lives in `run_connected`, not in `p50_slice0.cpp` — see §1.2):
+  assert that frames for `rel_seq+1 .. rel_seq+K-1` arriving before the
+  predecessor's `commit_input` are drained into the raw per-connection buffer
+  with **zero** semantic decode beyond the peek-only `decode_as<TxBegin>` for
+  `rel_seq` — no STATE write, no `stage()` call, verified via an
+  instrumentation counter rather than by absence of an observable side effect;
+  assert release-on-predecessor-commit replays the buffered frames through the
+  unchanged STATE → BEGIN → BODY/NEED/FILL → materialize → COMMIT path and
+  produces byte-for-byte the same wire trace as an unparked `K=1` arrival
+  (this is the correctness crux of the revised §1.2 and the single
+  highest-value test added by this revision); assert bulk release
+  (`HISTORY_RESET`, cold-store, sidecar-stop, abort/disconnect) drains *every*
+  parked connection through that same unchanged path, each self-resolving via
+  the existing mismatch handling with no special-cased success/failure variant
+  on the release signal itself (§1.2 point 5); assert deadline-based release
+  (reusing `transfer_deadline`/`cancellation_grace` — no new timeout concept)
+  fires when a predecessor never commits.
 - **`p50_route_owner_test.cpp`** / **`p50_role_owner_test.cpp`**: extend to
   drive `K`-deep `outstanding`/`active_queue_` FIFOs (§1.1 point 1-2) through
   normal advancement and through every row of the §3 failure matrix — in
@@ -847,12 +875,20 @@ this design touches; the plan is to extend each in place (parameterize by
   individual component test.
 
 `cache/formal/check_trace.py` and its C++ counterpart `cache/p50_actions.cpp`
-both need the §2 invariant 8/9 generalization (scalar `pending`/`active` →
-queue-membership, reconciliation witness "ahead by exactly 1" → "ahead by at
-most `K`") and the §4 `parked`/`stage` field support — these are code changes
-to the *checkers*, reviewed and tested the same as production code (their own
-existing self-tests, e.g. driven via `p50_trace_check.sh` and
-`p50statejsonl-warn.sh`, are extended with `K>1` fixture traces).
+need the §2 invariant 8/9 generalization **on the C side only** — `c["active"]
+== tx` generalizes to "head-of-queue member of `active_queue_`," and the
+reconciliation witness generalizes from "ahead by exactly 1" to "ahead by at
+most `K`." F's half of the checker (`f["pending"] == tx`) is **not** touched —
+it stays the exact `K=1` assertion, since F's `install_begin`/
+`materialize_and_verify`/`commit_input` sequence still runs one TX at a time
+against the unchanged scalar `Namespace::Route.pending` (§2 invariant 8). The
+checkers also pick up the new §4 C-side-only additive queue-position/depth
+trace field (no F-side `parked`/`stage` field — F's `TX_BEGIN` is now emitted
+in order at release time, so it is indistinguishable from a `K=1` trace and
+needs no disambiguation field). These are code changes to the *checkers*,
+reviewed and tested the same as production code (their own existing
+self-tests, e.g. driven via `p50_trace_check.sh` and `p50statejsonl-warn.sh`,
+are extended with `K>1` fixture traces).
 
 ### 5.2 Sim (`cache/sim/p50sim.cpp`)
 
@@ -860,7 +896,7 @@ Today's sim (`run_codec`, `run_batch`, loopback TCP, `cache/sim/p50sim.cpp:674`/
 is fully serialized — one TX's `run_one`-equivalent lambda completes before the
 next begins — and has **no fault-injection mechanism** (confirmed by direct
 reading; there is no hook analogous to the mutant-config-driven fault
-injection the TLA+ side has). Two changes are needed, both additive:
+injection the TLA+ side has). Three changes are needed, all additive:
 
 1. **Pipelined batch mode**: extend `run_batch` (or add a sibling entry point
    selected by a new `Arguments` field, e.g. `--pipeline-depth K`) to open `K`
@@ -876,11 +912,22 @@ injection the TLA+ side has). Two changes are needed, both additive:
    to validate the P8 non-interaction property from §5.1's highest-value
    test, this time measured against real (loopback) socket backpressure
    rather than a mocked timeout.
+3. **Owner-context CPU-per-TX measurement at `K=2`** (new — review point 3 /
+   §4's "C-side owner-thread CPU budget" subsection): instrument the sim's
+   loopback C-side owner `context_` to report busy-time per committed TX,
+   separating the on-owner-context work (FILL write dispatch, both the
+   write-complete and final-result completion signals, STATE/COMMIT handling)
+   from the off-owner-context worker-thread work (`handle_connection`/
+   `prepare_source`/OnlineS1/encode). This is the sim-side half of the action
+   item §4 flags against the farm's own ~47%-busy-at-41-TX/s pidstat
+   measurement — it is cheap to add here (the sim already runs loopback on
+   one host) and gives a repeatable, farm-independent number to check the
+   §5.4 A/B's owner-thread guardrail against before spending real farm time.
 
-Given the sim's existing single-file, lambda-heavy structure, both additions
-are scoped as new code paths gated behind the new CLI flag, not a rewrite of
-`run_batch`'s existing serialized path (which remains the `K=1` default and
-thus the regression baseline).
+Given the sim's existing single-file, lambda-heavy structure, all three
+additions are scoped as new code paths gated behind the new CLI flag, not a
+rewrite of `run_batch`'s existing serialized path (which remains the `K=1`
+default and thus the regression baseline).
 
 ### 5.3 TLA+
 
@@ -933,9 +980,11 @@ unchanged.
 
 - **Baseline**: current `perf-combo` build (`a348414e`) at `K=1`, unchanged
   wire behavior, as the control.
-- **Treatment**: same build plus this design, `K` swept over a small range
-  (2, 3, 4) via `ICECC_P50_ROUTE_PIPELINE_DEPTH`, on the existing subfarm
-  topology (H1/H2 only, per standing constraints — no H4).
+- **Treatment**: same build plus this design, `K` swept over **2 and 4**
+  (the settled A/B points per §7(2) — not a continuous sweep; `K=4` doubles as
+  the hard max clamp enforced at admission, §6 step 1) via
+  `ICECC_P50_ROUTE_PIPELINE_DEPTH`, on the existing subfarm topology (H1/H2
+  only, per standing constraints — no H4).
 - **Primary metric**: per-route TX/s and farm-wide TU/s, compared against the
   §0 baseline figures (~13-15 TX/s/route, ~41 TU/s farm-wide) and target
   (~1/max(C local, F local) per route — ~51 TX/s on the slower host at
@@ -948,7 +997,14 @@ unchanged.
   ("endpoint codec queue is full") must not increase disproportionately to
   the TX-rate increase (a proportional increase is expected and acceptable;
   a *super*-proportional increase indicates the pool, not the route lock, is
-  now the bottleneck and `K` tuning guidance needs to account for it).
+  now the bottleneck and `K` tuning guidance needs to account for it); C-side
+  owner-thread busy-time per TX (§4's "C-side owner-thread CPU budget"
+  subsection, review point 3) must not exceed the farm's existing
+  ~47%-busy-at-41-TX/s baseline by more than the TX-rate increase alone would
+  predict — a disproportionate rise means the owner-context work (FILL write +
+  completion signals + STATE/COMMIT handling) is the new bottleneck and the
+  worker-pool mitigation (§4) needs to be pulled forward from "flagged" to
+  "scheduled."
 - **Fault-injection leg**: repeat the above with the sim's new fault-injection
   hooks (§5.2) replayed against the real farm topology at small scale (a
   handful of routes, not the full farm) to validate the §3 failure matrix
@@ -973,77 +1029,87 @@ working, `K=1`-identical system.
 
 | Step | Files | Est. LOC | What lands |
 |---|---|---|---|
-| 1 | `cache/p50_cache_service.h`/`.cpp` | ~40 | `ICECC_P50_ROUTE_PIPELINE_DEPTH` env parsing (mirrors existing `ICECC_P50_ARMED_WINDOW`/`ICECC_P50_ROUTE_LANES` pattern exactly), `K` clamp against `armed_window_slots()` with a `P50_ROUTE_PIPELINE_DEPTH_CLAMPED`-style warning (§4). No behavioral change yet — `K` is parsed but nothing consumes it. Pure plumbing, trivially reviewable. |
+| 1 | `cache/p50_cache_service.h`/`.cpp` | ~50 | `ICECC_P50_ROUTE_PIPELINE_DEPTH` env parsing (mirrors the existing `ICECC_P50_ARMED_WINDOW`/`ICECC_P50_ROUTE_LANES` pattern exactly). Three clamps land here, all `*_CLAMPED`-style warnings mirroring `route_lane_count()`'s pattern (`cache/p50_cache_service.cpp:2019-2032`): (a) `K <= armed_window_slots()` — the farm's actual runtime value is `ICECC_P50_ARMED_WINDOW=16`, not the compiled-in default of 8 (§4); (b) hard max clamp `K <= 4` regardless of (a) (§7(2)); (c) profile-scoped clamp — `K>1` is only honored when the route's negotiated profile is `P29V1`, every other profile is forced to `K=1` (§7(1)). `K>1` also forces `lanes=1` with its own clamp-with-warning (§4, §7(4)). No behavioral change yet — `K` is parsed and clamped but nothing consumes it. Pure plumbing, trivially reviewable. |
 | 2 | `cache/codec/p29_wire.h` | ~60 | `P29Serializer::Pending` scalar → ring buffer of depth `K` (§1.1 point 3). `K=1` ring behaves identically to the scalar. Unit-testable in isolation via existing `p50_wire_test.cpp`. |
-| 3 | `cache/p50_slice0.h`/`.cpp` | ~180 | `CRoute::active_` → `active_queue_` FIFO with `confirmed_cursor_`/`predicted_cursor_` split (§1.1 point 2); `FStore::Namespace::Route.pending` scalar → bounded map (§1.2 (a)); `FStore::begin`'s occupied-slot check generalized. **No sequencer yet** — this step only widens the data structures and their admission checks; `materialize_and_verify` is still called synchronously in arrival order (safe at this step because nothing upstream yet produces out-of-order arrivals). Largest single-file change; covered by extending `p50_slice0_test.cpp` per §5.1. |
-| 4 | `cache/p50_endpoint.h`/`.cpp` | ~260 | `Impl::RouteState::uncommitted_route_entry` → bounded FIFO (§1.1 point 1); `P50ClientEndpoint::Impl`'s scalar `active_session`/`active`/`queued` → ordered map keyed by `rel_seq`, each with its own `ClientIoState`/socket (§1.1 point 4); extend the `pipelined_begin` code path (§1.1 point 5) to fire for TX `n+1` once `predicted_cursor_` is valid, releasing the route lock at the FILL write rather than the STATE read. This is the step that actually changes **C-side wire behavior** for the first time — gated end-to-end behind `K>1` (at `K=1` the new map/FIFO code paths degenerate to exactly the old scalar logic, verified by the `p50_endpoint_test.cpp` `K=1`-identity regression from §5.1). Largest and highest-risk step; budget the most review time here. |
-| 5 | `cache/p50_slice0.cpp`, `cache/p50_profile.cpp` | ~150 | The F-side **sequencer**: per-route `map<rel_seq, park-signal>` that defers handing a parked TX's staged input to the shared `P29FRouteCodec`/`P29V1LiveDialogue` until the predecessor's `commit_input` (§1.2 (b)); park-signal gets a success/failure variant (§3 P5). This is the step that makes F-side parking real — before this step, step 3's wider admission structures exist but nothing yet defers materialization, so `K>1` would be unsafe to enable; this step is what makes it safe. |
-| 6 | `cache/p50_endpoint.cpp` (server side) | ~80 | Server-side `run_connected` reads/drains BODY/NEED/FILL unchanged, but routes `begin_materialization` through the new sequencer (§1.2) instead of calling it directly; cold-reset/`HISTORY_RESET` handling extended to clear the whole parking map, not one scalar (§3 P3). |
-| 7 | `cache/p50_actions.h`/`.cpp`, `cache/formal/check_trace.py` | ~120 | `ActionRecord` gets the `parked`/`stage` field (§4); both checkers' scalar `pending`/`active` equality assertions generalize to queue-membership; reconciliation witness generalizes to "ahead by at most `K`" (§2 invariants 8-9). Can and should land *before* step 8's farm testing needs real traces to validate against — but logically depends on steps 3-6 existing to produce K>1 traces to test the new checker logic against, so it is ordered after them. |
-| 8 | `cache/sim/p50sim.cpp` | ~150 | `--pipeline-depth` flag plus the three fault-injection hooks (§5.2). |
-| 9 | `cache/formal/Protocol50ZstdRouteFInputInterface.tla`, `Protocol50ZstdRouteFInputComposition.tla`, `Protocol50ZstdRoute.tla`, `s6_mutation_manifest.jsonl` | ~250 (TLA+ is verbose) | `PipelineDepth` constant generalization (§5.3), new mutants. Can proceed in parallel with steps 2-8 once this design doc is approved — the TLA+ model is a *specification* of the intended design, not a derivation from the C++, so it does not need to wait on implementation; in practice landing it alongside/slightly behind the C++ gives the model concrete behavior to cross-check against. |
-| 10 | `unittests/p50_route_pipeline_depth_test.cpp` (new) | ~200 | Cross-cutting `K=1` identity capture, env-var validation, failure-matrix-driven fake-F test (§5.1). |
-| 11 | farm A/B (§5.4) | 0 (no code; config + measurement) | `K` sweep, guardrail metrics, fault-injection leg, go/no-go. |
+| 3 | `cache/p50_slice0.h`/`.cpp` | ~130 | **C side only**: `CRoute::active_` → `active_queue_` FIFO (§1.1 point 2); `accept_commit` generalized to retire strictly in `rel_seq` order via a reorder buffer in front of the FIFO head (review point 2b) — a commit that arrives out of order waits in the reorder buffer rather than retiring early. `FStore`/`Namespace::Route.pending` (the F side) is explicitly **not** touched in this step or any other — it stays the exact `K=1` scalar, per the revised §1.2 and §2 invariant 8. Covered by extending `p50_slice0_test.cpp` per §5.1 (including the new regression case proving `FStore::begin` is unchanged). |
+| 4 | `cache/p50_endpoint.h`/`.cpp`, `cache/p50_cache_service.cpp` | ~300 | Client-side (`P50ClientEndpoint`) changes: `Impl::RouteState::uncommitted_route_entry` → bounded FIFO (§1.1 point 1); scalar `active_session`/`active`/`queued` → ordered map keyed by `rel_seq`, each with its own `ClientIoState`/socket (§1.1 point 4); extend `pipelined_begin` (§1.1 point 5) to fire for TX `n+1` once `predicted_cursor_` is valid. The **write-complete signal split** (review point 2c): inside `transfer_source_on_owner`'s `co_spawn(context_, ...)` lambda (`cache/p50_cache_service.cpp:~2534`), add a second promise/signal set immediately after the FILL write completes (`~2570-2574`), decoupled from the existing final-result signal (`completion->set_value(value)`, `~2611-2612`); the route lock releases on the **write-complete** signal, not the final result — this is the mechanism that actually lets TX `n+1`'s FILL write start before TX `n`'s STATE/COMMIT confirms. This is the step that changes **C-side wire behavior** for the first time, gated end-to-end behind `K>1` (at `K=1` the new map/FIFO/signal-split code degenerates to exactly the old scalar/single-signal logic, verified by the `p50_endpoint_test.cpp` `K=1`-identity regression from §5.1). Largest and highest-risk step; budget the most review time here, including a direct check against the existing `wait_until`/`fail_stop`/`_Exit(125)` watchdog (`cache/p50_cache_service.cpp:~2624-2668`) to confirm it still fires per *outstanding* TX rather than per route (review point 2c). |
+| 5 | `cache/p50_endpoint.cpp` (server side, `run_connected`) | ~170 | The F-side **raw frame buffer + sequencer**, parking before any semantic processing (revised §1.2): per-connection raw buffer bound to frame boundaries via the existing `FrameParser`; a peek-only `decode_as<TxBegin>` to read `rel_seq` without touching STATE or calling `stage()`; a per-route sequencer that holds the buffered frames until release; the three release triggers (predecessor `commit_input`, bulk release on abort/disconnect/route-terminal/`HISTORY_RESET`/cold-store/sidecar-stop, and park-deadline reuse of `transfer_deadline`/`cancellation_grace`); on release, replay the buffered frames through the **completely unchanged** STATE → [HISTORY_RESET] → BEGIN → BODY/NEED/FILL → materialize → COMMIT path. This is the step that makes F-side parking real and safe to enable at `K>1` — steps 1-4 are inert without it. |
+| 6 | — | 0 | Folded into step 5: the bulk-release trigger (abort/disconnect/route-terminal/`HISTORY_RESET`/cold-store/sidecar-stop) already drains every parked connection through the unchanged mismatch path with no separate success/failure variant needed (§3 P3/P5) — confirmed by the §5.1 bulk-release test, no additional production code. |
+| 7 | `cache/p50_actions.h`/`.cpp`, `cache/formal/check_trace.py` | ~60 | **C-side-only** trace additions: a new additive queue-position/depth field on C's action records (not an F-side `parked`/`stage` field — F's `TX_BEGIN` is now emitted in order at release time and is indistinguishable from a `K=1` trace, §4); both checkers' `c["active"] == tx` assertion generalizes to "head-of-queue member of `active_queue_`," reconciliation witness generalizes to "ahead by at most `K`" (§2 invariant 9); `f["pending"] == tx` is **not** touched (§2 invariant 8). Per review point 4(6), this step is largely moot in practice for the initial rollout since §7(1) clamps every non-`P29V1` profile to `K=1` and only `P29V1` routes ever produce a `K>1` trace to check against. Logically depends on steps 3-5 existing to produce real `K>1` traces to validate the new checker logic against. |
+| 8 | `cache/sim/p50sim.cpp` | ~180 | `--pipeline-depth` flag; the digest-mismatch and connection-drop fault-injection hooks (§5.2); **new** — owner-context CPU-per-TX instrumentation at `K=2`, separating on-owner-context work (FILL write + both completion signals + STATE/COMMIT handling) from off-owner-context worker-thread work, feeding the §6 budget question directly (review point 3) rather than waiting for a farm-only answer. |
+| 9 | `cache/formal/Protocol50ZstdRouteFInputInterface.tla`, `Protocol50ZstdRouteFInputComposition.tla`, `Protocol50ZstdRoute.tla`, `s6_mutation_manifest.jsonl` | ~250 (TLA+ is verbose) | `PipelineDepth` constant generalization (§5.3), new mutants reflecting the revised §1.2 (sequencer releases a parked TX before its predecessor commits; parking buffer not cleared on cold reset). Can proceed in parallel with steps 2-8 once this design doc is approved — the TLA+ model is a *specification* of the intended design, not a derivation from the C++, so it does not need to wait on implementation. |
+| 10 | `unittests/p50_endpoint_test.cpp` additions, `unittests/p50_route_pipeline_depth_test.cpp` (new) | ~200 | Cross-cutting `K=1` identity capture, env-var/clamp validation (window, max-4, profile-scoped, lanes-forced-to-1), the raw-buffer/peek/sequencer tests from §5.1, and the full §3 failure matrix driven end-to-end against a fake F (reusing the existing fake-sidecar test harnesses, e.g. `p50_fake_sidecar_eof.cpp`'s pattern). |
+| 11 | farm A/B (§5.4) | 0 (no code; config + measurement) | `K` sweep at 2 and 4, guardrail metrics including the new owner-thread-CPU guardrail, fault-injection leg, go/no-go. |
 
-**Total estimate: ~1490 LOC** across 9 production/test files plus 4 TLA+
-files, in 10 code steps + 1 measurement step. No step touches
-`daemon/main.cpp`/`p50_daemon_sidecar_adapter.*` directly — the lifecycle-RPC
-timeout constants are *reused* unchanged (§1.2, §4), not modified, so those
-files are read-only references throughout, which is itself a useful
-confirmation that this design does not touch sidecar-lifecycle policy, only
-route-level transfer mechanics.
+**Total estimate: ~1400 LOC** across roughly 12 production/test files plus 4
+TLA+ files, in 10 code steps + 1 measurement step (down from the first
+draft's ~1490 LOC / 10-step estimate — the net reduction comes from step 6
+dropping to 0 LOC now that bulk release is confirmed to require no new
+production code, offset by the larger step 4 needed for the write-complete
+signal split). No step touches `daemon/main.cpp`/`p50_daemon_sidecar_adapter.*`
+directly — the lifecycle-RPC timeout constants are *reused* unchanged (§1.2,
+§4), not modified, so those files are read-only references throughout, which
+is itself a useful confirmation that this design does not touch
+sidecar-lifecycle policy, only route-level transfer mechanics.
 
-## 7. Open questions for sorbet-main
+## 7. Decisions settled by sorbet-main's review
 
-1. **Scope to `P29V1LiveDialogue` only, or all three dialogue classes?**
-   `cache/p50_profile.cpp` dispatches `P29V1LiveDialogue`, `ZstdRouteDialogue`,
-   and `ZstdTuDialogue` via function-pointer vtables. Everything in §1-§6 is
-   written against `P29V1LiveDialogue` (and `FStore`, which it owns) because
-   that is the dialogue the farm's current bottleneck analysis (§0) is about.
-   `ZstdRouteDialogue`/`ZstdTuDialogue` were not audited for this doc at all —
-   it is unknown whether they share enough structure (single shared `state_`,
-   same `materialize_and_verify`-style shared-deserializer constraint) for the
-   §1.2 sequencer design to transfer directly, or whether they'd need their
-   own analysis. **Recommendation**: implement and farm-validate P29V1 first
-   (§6 steps 1-6 as scoped), treat the other two dialogues as a follow-up
-   design note rather than blocking this one — but sorbet-main should confirm
-   this scoping is acceptable before step 4 (the first wire-behavior-changing
-   step) lands.
-2. **`K` default and max.** This doc assumes small `K` (2-4) throughout
-   (§5.4's sweep range) and shows `K` is naturally bounded by
-   `armed_window_slots()` (8 by default, §4). Should the shipped default stay
-   `K=1` indefinitely (opt-in only, per-deployment), or should sorbet-main set
-   a target default once the A/B (§5.4) is green? Not resolved here since it's
-   a rollout decision, not a design one.
-3. **`LostFinalAcknowledgement` chain-invalidation conservatism (§3 P6).** The
-   current design invalidates all outstanding successors even when the
-   triggering TX's commit is later confirmed correct via reconnect — per the
-   §0 mandate ("any reconnect outcome other than `ExactMatch` invalidates all
-   outstanding successors"), applied uniformly for simplicity. Is it worth a
-   future, more surgical relaxation that re-validates successors against the
-   now-confirmed cursor instead of discarding them, given `LostFinalAcknowledgement`
-   is the one outcome where F's state is actually unambiguous? Flagged, not
-   designed — would need its own invariant/failure-matrix review if pursued.
-4. **Joint `K` × `lanes` tuning (§4).** If a future tuning wants both `K` and
-   `RouteGate::route_lane_count()`'s lane count to grow independently beyond
-   what one shared `armed_window_slots()` budget comfortably allows, the
-   clamp formula needs to become two-dimensional (`lanes * armed_window_slots()
-   <= max_live_sessions` **and** `K <= armed_window_slots()`, independently,
-   rather than one subsuming the other). Out of scope for an initial `K` in
-   the 2-4 range per step 1's clamp, but worth sorbet-main flagging now if
-   there's an appetite to push `K` closer to 8 later.
-5. **`EndpointCodecPool` capacity (§5.4 guardrail).** `kWorkerCount=2`/
-   `kMaxOutstanding=8` is an existing, separate ceiling this design does not
-   propose changing, but K>1 on even a few routes could plausibly make it the
-   new bottleneck sooner than expected. Should raising `kWorkerCount`/
-   `kMaxOutstanding` be pre-authorized as part of this project if the A/B
-   shows it's the limiting factor, or should that be a strictly separate
-   follow-up decision/design?
-6. **Trace-format compatibility.** §4/§5.1 proposes a new `parked`/`stage`
-   field on `ActionRecord`/the JSONL trace format. Is this an additive,
-   backward-compatible field (old consumers ignore it, §2 invariant 12-style
-   compatibility) across every current consumer of this trace format, or are
-   there other tools/dashboards outside `cache/formal/` and this repo that
-   parse the JSONL trace positionally/strictly and would need their own
-   update? Not auditable from inside this worktree — needs sorbet-main's or
-   another owner's confirmation.
+The six items below were open questions in the first draft; sorbet-main's
+review settled all of them. Each is now a decision this design implements,
+not a question — cross-referenced to where it lands in §4/§6.
+
+1. **Scope: `P29V1LiveDialogue` only.** `ZstdRouteDialogue`/`ZstdTuDialogue`
+   are not in scope for this project. Every route negotiated on either of
+   those two profiles is clamped to `K=1` unconditionally — this is an
+   explicit profile-scoped clamp (§6 step 1), not just an absence of
+   implementation work, so a future profile addition cannot silently inherit
+   `K>1` behavior it was never designed or tested for. `ZstdRouteDialogue`/
+   `ZstdTuDialogue` pipelining, if ever wanted, is a follow-up design, not an
+   extension of this one.
+2. **`K` default and max.** Shipped default is `K=1` (opt-in only). The A/B
+   (§5.4) is run at exactly two treatment points, `K=2` and `K=4` — not a
+   continuous sweep. `K=4` doubles as the hard ceiling: every layer clamps
+   `K <= 4` regardless of `armed_window_slots()` (§6 step 1), so `K` can never
+   be tuned past 4 without a follow-up design change to this clamp itself.
+3. **`LostFinalAcknowledgement` chain-invalidation conservatism (§3 P6).**
+   Accepted as designed — invalidate all outstanding successors uniformly,
+   including the case where the triggering TX's commit later turns out to
+   have been correct. The more surgical "re-validate successors against the
+   now-confirmed cursor" relaxation is explicitly not pursued; §3 P6 is final
+   for this project.
+4. **Joint `K` × `lanes` tuning (§4).** Not pursued. Decision: `K>1`
+   unconditionally forces `lanes=1`, clamped with a warning (mirroring the
+   `P50_ROUTE_LANES_CLAMPED` pattern at `cache/p50_cache_service.cpp:2019-2032`,
+   §4, §6 step 1) — reflecting the standing rejection of multi-lane RAM
+   duplication as a tuning axis. The two-dimensional clamp formula from the
+   first draft's open question is dropped; there is no path to `K>1` and
+   `lanes>1` simultaneously in this design.
+5. **`EndpointCodecPool` capacity (§5.4 guardrail).** No change to
+   `kWorkerCount=2`/`kMaxOutstanding=8` as part of this project. The pool's
+   queue-full rate is a guardrail metric (§5.4) only — if the A/B shows a
+   super-proportional rise in "endpoint codec queue is full," that becomes its
+   own, strictly separate follow-up decision/design, not something
+   pre-authorized here.
+6. **Trace-format compatibility.** Moot in practice, as a consequence of
+   decision 1: the F-side `parked`/`stage` field proposed in the first draft
+   was dropped during the §1.2 revision (F's `TX_BEGIN` is now emitted in
+   order at release time and is indistinguishable from a `K=1` trace, §4), so
+   the only new field is a C-side-only additive queue-position/depth field on
+   C's action records (§6 step 7). Its only consumers are in-repo:
+   `cache/p50_actions.cpp`, `cache/formal/check_trace.py`, and `analyze.py`.
+   No external dashboard/tool outside this repo parses `ActionRecord` JSONL,
+   so there is no backward-compatibility exposure to audit further.
+
+## 8. Citation discrepancy with the review (minor)
+
+One citation in sorbet-main's review does not match the code as read in this
+worktree: the review places the `wait_until`/`fail_stop`/`_Exit(125)` watchdog
+around line "~2147" of `cache/p50_cache_service.cpp`. Direct reading in this
+worktree places it at **`~2624-2668`** instead (see §4's "C-side route-lock
+release point" subsection, which cites the same span). Line 2147 in this
+worktree's copy of the file falls inside unrelated code well before
+`transfer_source_on_owner`. This is flagged as a citation-only disagreement —
+it does not change any conclusion in the review or this document, since the
+design was written against the grounded `~2624-2668` location throughout; it
+is noted here only because sorbet-main's review explicitly asked to be told
+"anything in this review you think is wrong."
