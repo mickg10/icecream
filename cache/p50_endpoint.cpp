@@ -4321,6 +4321,46 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         const SessionSelection selection =
             negotiate_session(hello, kP50WireRevision,
                               impl_->caps.supported_profiles, impl_->caps.wire);
+        // Step 5b (route pipelining, F side): a kernel-level MSG_PEEK of
+        // whatever bytes have already arrived on this connection, taken
+        // immediately before stage()/the SESSION_STATE write per
+        // research/designs/P50_ROUTE_PIPELINING.md §2/§5.1. A client using
+        // the pre-existing enable_pipelined_begin() pattern (or, in the
+        // future, any outstanding leg of a K>1 route) may have written
+        // TX_BEGIN (and more) immediately after SESSION_HELLO without
+        // waiting for SESSION_STATE, so those bytes can already be sitting
+        // in the socket's receive buffer here. MSG_PEEK does not remove
+        // anything from that buffer, so every later read on this connection
+        // (the HISTORY_RESET branch, the direct-BEGIN branch, and the main
+        // dialogue loop below) observes exactly the same wire bytes it
+        // would have observed without this block: no behavior change at
+        // K=1, where this is always nullopt or an at-cursor rel_seq that
+        // step 5c's sequencer will let fall straight through. The decoded
+        // value is recorded only in the diagnostic, non-wire
+        // ServerRunResult field below; step 5c is what makes an admission
+        // decision from it.
+        {
+            boost::system::error_code peek_avail_error;
+            const std::size_t peek_available = socket.available(peek_avail_error);
+            if (!peek_avail_error && peek_available > 0) {
+                std::vector<uint8_t> peek_buffer(peek_available);
+                boost::system::error_code peek_recv_error;
+                const std::size_t peeked_bytes = socket.receive(
+                    asio::buffer(peek_buffer), tcp::socket::message_peek, peek_recv_error);
+                if (!peek_recv_error) {
+                    FrameParser peek_parser(selection.limits.max_frame_payload);
+                    const std::vector<Frame> peeked_frames = peek_parser.feed(
+                        std::span<const uint8_t>(peek_buffer.data(), peeked_bytes));
+                    for (const Frame& peeked_frame : peeked_frames) {
+                        if (peeked_frame.type == MessageType::TX_BEGIN) {
+                            result.f_hello_time_peeked_begin_rel_seq =
+                                decode_as<TxBegin>(peeked_frame).rel_seq;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         SessionState state = impl_->stage(session, hello, selection);
         co_await async_write_message(socket, state, selection.limits.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
