@@ -32,7 +32,7 @@
  the entire P29V1 F-side codec view is destroyed and rebuilt from
  scratch.  On the C/F-endpoint side, Impl::reset_history
  (cache/p50_endpoint.cpp) replaces the whole Route entry via
- space.routes.insert_or_assign(*session.profile, Route{...}) with
+ space.routes.insert_or_assign(session.profile deref, Route{...}) with
  .dialogue = nullptr -- the shared dialogue pointer is dropped, not
  resynchronized in place.  C never adopts F's durable cursor; both sides
  simply restart at rel_seq 0 under a new epoch.  Concretely, Fault here:
