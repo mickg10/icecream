@@ -342,6 +342,22 @@ private:
                 uint32_t candidate = heads_[bucket(position)];
                 uint32_t chain = 0;
                 while (candidate != kNone && chain < config_.max_chain) {
+                    // One-ahead software prefetch: predecessors_[candidate] is itself an
+                    // unpredictable pointer-chase (the whole reason this is a "chain" walk), so
+                    // the hardware prefetcher cannot anticipate it. Reading it here -- before
+                    // spending time in extend_match_length() below on the CURRENT candidate --
+                    // starts the next hop's two cache-line fetches (its occurrences_ entry, read
+                    // by extend_match_length() next iteration, and its own predecessors_ entry,
+                    // read by this same line the iteration after that) while that compare is
+                    // in flight, instead of stalling on them cold at the top of the next
+                    // iteration. Purely a latency hint: next_candidate's value, and everything
+                    // computed from it, is byte-for-byte identical to the original "candidate =
+                    // predecessors_[candidate]" trailing assignment it replaces.
+                    const uint32_t next_candidate = predecessors_[candidate];
+                    if (next_candidate != kNone) {
+                        __builtin_prefetch(occurrences_.data() + next_candidate, 0, 1);
+                        __builtin_prefetch(predecessors_.data() + next_candidate, 0, 1);
+                    }
                     if (candidate < position) {
                         const uint32_t maximum = end - position;
                         const uint32_t length = match_detail::extend_match_length(
@@ -356,7 +372,7 @@ private:
                             if (length == maximum) break;
                         }
                     }
-                    candidate = predecessors_[candidate];
+                    candidate = next_candidate;
                     ++chain;
                 }
 #if defined(ICECC_P50SIM_MATCH_HISTOGRAM)
