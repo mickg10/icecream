@@ -44,20 +44,46 @@ fi
 # than replacing it, so extra -D macro defines must be delivered via
 # CPPFLAGS (also plainly assigned as "CPPFLAGS = " i.e. empty, so it must
 # still be a command-line arg, not just an env var -- but being empty by
-# default, overriding it is additive, not destructive). CXXFLAGS itself is
-# therefore left to the Makefile's own default in the two make invocations
-# below; only CPPFLAGS carries $cxxflags into them.
-make_force=
-if [ -n "$cxxflags" ]; then
-    make_force=-B
-fi
+# default, overriding it is additive, not destructive).
+#
+# KNOWN TRAP (part 3): CXXFLAGS itself cannot simply be "left alone" either.
+# autoconf substitutes whatever CXXFLAGS the TREE WAS LAST CONFIGURED WITH
+# directly into "CXXFLAGS = ..." in the generated Makefile, and that baked
+# value persists untouched across every later invocation of this script --
+# including any ICECC_P50SIM_* macro a PRIOR round passed at ./configure
+# time. Observed: a tree last configured for ICECC_P50SIM_STAGE_TIMERS kept
+# "-DICECC_P50SIM_STAGE_TIMERS" baked into cache/Makefile's own CXXFLAGS;
+# a later run of this script requesting a DIFFERENT macro (CPPFLAGS alone)
+# still compiled p50_slice0.o with the stage-timer class fully instantiated
+# (it is gated on that same macro in cache/codec/p29_wire.h), while this
+# run's p50sim.cpp -- built for the different macro -- never defined the
+# stage-timer's required icecc_p50sim_p29_stage_timer_add symbol, so the
+# final link failed with an undefined reference. Fix: strip any
+# ICECC_P50SIM_* token out of the Makefile's own baked CXXFLAGS and pass
+# that sanitized string back explicitly on the make command line (which
+# overrides the Makefile's plain "VAR = ..." assignment, same precedence
+# rule as CXX above) -- this always yields a clean baseline, whether or not
+# this run requests any instrumentation macro itself, since only our own
+# $cxxflags (via CPPFLAGS) should determine what gets compiled in.
+sanitize_cxxflags() {
+    sed -n 's/^CXXFLAGS = //p' "$1" | head -n 1 | sed -E 's/-DICECC_P50SIM_[A-Za-z0-9_]*//g'
+}
+
+# Rebuild is forced unconditionally: sanitize_cxxflags can change the
+# effective CXXFLAGS even when $cxxflags is empty (stripping a stale macro
+# baked in by an earlier round), and make only tracks file mtimes, not
+# compiler flags, so a flags-only change would otherwise be silently
+# skipped against a previously-built, now-stale .a/.o.
+make_force=-B
 
 if [ -f "$build_root/cache/Makefile" ] && [ -f "$build_root/services/Makefile" ]; then
+    cache_cxxflags=$(sanitize_cxxflags "$build_root/cache/Makefile")
+    services_cxxflags=$(sanitize_cxxflags "$build_root/services/Makefile")
     make -C "$build_root/cache" $make_force \
-        CXX="$cxx" CPPFLAGS="$cxxflags" \
+        CXX="$cxx" CXXFLAGS="$cache_cxxflags" CPPFLAGS="$cxxflags" \
         libprotocol50.a libp50endpoint.a libp50adoptedoutcomewriter.a
     make -C "$build_root/services" $make_force \
-        CXX="$cxx" CPPFLAGS="$cxxflags" \
+        CXX="$cxx" CXXFLAGS="$services_cxxflags" CPPFLAGS="$cxxflags" \
         libicecc.la
     "$cxx" -std=c++23 -O2 -DBOOST_ERROR_CODE_HEADER_ONLY $cxxflags \
         -I"$root" -I"$build_root" -I"$dep_root/include" $config_cppflags \
