@@ -575,3 +575,160 @@ dedicated 20020-case correctness test, and delivers a consistent,
 repeatable win — ~10.6% on the targeted `prepare_ns` stage and ~2.6% on
 end-to-end wall time, in the same direction on every one of 4 interleaved
 run pairs. No prefetch fallback was needed.
+
+## Follow-up round on the SIMD change (2026-10-08): stage re-split, a second-site rejection, and a one-ahead prefetch
+
+Scope: re-measure the per-stage split on top of the now-accepted SIMD
+build (`bd64a753`), decide whether the hash-chain *walk* itself (as
+opposed to the per-step compare, already handled above) is now the
+dominant cost, and — conditional on that — try a software-prefetch
+variant. Also checked whether the same SIMD helper applies to the
+*other* hash-chain search in this path, `sender_intern_and_match_ns`.
+
+### Stage re-split on the SIMD build
+
+`bd64a753` was rebuilt with both sim-only instrumentation macros
+(`ICECC_P50SIM_STAGE_TIMERS`, `ICECC_P50SIM_MATCH_HISTOGRAM`) and run
+over the full 60-TU corpus. Restricting to the sender-side sub-stages
+that fall inside the `prepare_ns` window (the receiver-side stages are
+timed across a wider span that also includes `context.run()`, so their
+raw `ns` figures are not comparable as a share of `prepare_ns` — this
+matches the pre-existing scope note on the stage-timer instrumentation):
+
+| Sub-stage | Sum over 60 TUs | Share of `prepare_ns` |
+|---|---|---|
+| `sender_encode_ns` (parent of the four Decision-5 sub-stages) | 1257.3 ms | 44.2% |
+| `sender_match_prepare_ns` | 920.7 ms | **32.4%** |
+| `sender_intern_and_match_ns` | 667.9 ms | 23.5% |
+| `sender_build_root_ns` | 121.0 ms | 4.3% |
+| `sender_encode_blocks_ns` | 44.9 ms | 1.6% |
+| `sender_encode_root_ns` | 3.2 ms | 0.1% |
+| `sender_prepare_reserve_ns` | 0.2 ms | ~0.0% |
+
+`sender_match_prepare_ns` is now the single largest named sub-stage,
+ahead of `sender_intern_and_match_ns` — unchanged in relative rank from
+before the SIMD change, consistent with the SIMD win landing inside this
+stage without displacing it from the top spot.
+
+The two match-histograms, pooled over the full corpus (112,563 total
+match-attempted positions, 1,310,452 total chain-candidate compares):
+
+- **Chain-candidates-visited per position** is sharply skewed: **91.9%**
+  of positions visit **zero** additional candidates beyond the first
+  (i.e. resolve immediately), but a long tail walks much deeper chains
+  — candidate counts past 1024 account for the remainder, with the
+  per-bucket mass thinning gradually rather than cutting off (0.97% of
+  positions alone fall in the 513-1024 bucket).
+- **Extend-length per candidate compared** (i.e. per step of that chain
+  walk) stays dominated by the same 9-128-element mass identified in the
+  SIMD gate above (16.6% + 14.3% + 19.6% + 17.1% ≈ 67.6% of all 1.31M
+  compares), so the SIMD win from the prior round is still being
+  exercised at full volume — the chain walk did not get shorter, each
+  step just got cheaper.
+
+**Decision: the chain walk is now the governing cost pattern worth a
+prefetch try.** 91.9% of positions already terminate in one step (no
+win possible there, nothing to prefetch into), but the ~8% tail that
+walks deep chains is exactly where `predecessors_[candidate]` is an
+unpredictable pointer-chase the hardware prefetcher cannot anticipate —
+and this tail now dominates the 1.31M-compare aggregate even though it
+is a minority of positions, per the coordinator's conditional for
+trying the one-ahead prefetch variant.
+
+### Second-site check: does the SIMD helper apply to `SenderInternAndMatch`?
+
+`sender_intern_and_match_ns` (667.9 ms / 23.5% of `prepare_ns`) wraps
+`P29Interner::process()` — a region-level interning/dedup loop against
+a shared catalogue, called once per TU from the authority's prepare
+path. It is structurally a hash-chain search like `OnlineS1::build()`,
+but **not the same comparison problem** `extend_match_length()` solves,
+for one reason that holds on both of its two lookup paths:
+
+- The successor-prediction path tests a candidate whose `raw_len` is
+  already known in advance (from the successor table itself), via
+  `std::memcmp(region_bytes_ + candidate.raw_off, position,
+  candidate.raw_len) == 0`.
+- The hash-table lookup path computes the candidate's exact expected
+  length *before* any comparison, via a region-boundary scan
+  (`next_region()`), then also closes with a fixed-length
+  `std::memcmp(...) == 0` over that already-known length.
+
+Both are **known-length byte-equality** checks (true/false, no "how far
+did it get" answer needed). `extend_match_length()` solves a different
+problem: an **unknown-extent longest-common-run** search, returning how
+many elements matched before the first mismatch, which only
+`OnlineS1::build()`'s chain walk actually needs. Reusing the SIMD
+helper here would mean reimplementing a `memcmp`-equivalent for no
+behavioral gain — and `memcmp` is already AVX2-ifunc-dispatched by
+glibc on this host, so there is no measurable win available at this
+site. **No code change made to `cache/codec/p29_intern.h`.** This is a
+reasoned rejection, not an oversight: the two call sites look alike at
+the "hash chain + comparison" level but solve different comparison
+problems, and only one of them is the kind of problem the SIMD helper
+was built for.
+
+### Implementation: one-ahead prefetch of the next chain link (commit `c89e6d8e`)
+
+In `OnlineS1::build()`'s chain-walk loop (`cache/codec/p29_online_s1.h`),
+`predecessors_[candidate]` was read once per iteration already, but only
+at the *end* of the loop body, right before looping back — meaning the
+next iteration's two reads (`occurrences_[next]`, used by
+`extend_match_length()`, and `predecessors_[next]`, used by this same
+read the iteration after that) always started cold. The read is hoisted
+to the *top* of the loop body, into a `next_candidate` local, with two
+`__builtin_prefetch(ptr, /*rw=*/0, /*locality=*/1)` calls (guarded on
+`next_candidate != kNone`) issued immediately after it and before the
+(now cheap, SIMD'd) `extend_match_length()` call on the *current*
+candidate — giving the prefetch a window of real compute to overlap
+with instead of stalling on the pointer-chase cold. `next_candidate`'s
+value, and everything computed from it, is byte-for-byte identical to
+the trailing `candidate = predecessors_[candidate]` assignment it
+replaces; this is a pure latency hint with no semantic effect.
+
+### Verification
+
+- **Unit test**, run on H1 (`codec_intern`): both the pre-existing
+  `match_extend_simd` check and the corpus-intern pass remain green,
+  `EXIT=0` — no behavioral regression at the unit level.
+- **Build identity:** built plain (no instrumentation macros) via
+  `build_p50sim.sh` at commit `c89e6d8e`; the build receipt confirms
+  `source.head` matches and `tracked_clean: true`.
+- **Wire/output identity, full 60-TU corpus:** every field other than
+  the timing-only fields (`prepare_ns`, `simulator_execution_ns`,
+  `f_apply_materialize_ns`, `p29v1_codec_stage_ns`) compared row-for-row
+  against the `bd64a753` baseline — **zero mismatches across all 60/60
+  rows.** The prefetch does not move a single byte on the wire.
+- **Timing, 4 interleaved baseline/variant run pairs over the full
+  60-TU corpus, `ICECC_P50_PROFILE=P29V1`, `taskset -c 0-7`,**
+  `sum(prepare_ns)` over `tu_index` 1..59 (TU 0 broken out separately
+  since no prior convention excluding it was found in this report; the
+  full-60 figure is given alongside for transparency and agrees in both
+  direction and magnitude):
+
+  | Pair | Baseline `sum(prepare_ns)`, TUs 1-59 | Variant `sum(prepare_ns)`, TUs 1-59 | Delta | Delta, full 60 TUs |
+  |---|---|---|---|---|
+  | 1 | 2789.1 ms | 2764.6 ms | -0.88% | -0.76% |
+  | 2 | 2785.6 ms | 2730.6 ms | -1.98% | -1.93% |
+  | 3 | 2783.8 ms | 2765.4 ms | -0.66% | -0.64% |
+  | 4 | 2759.8 ms | 2731.4 ms | -1.03% | -0.91% |
+
+  The variant is faster than the `bd64a753` baseline in every one of
+  the 4 pairs, by a consistent but modest margin (mean **-1.14%** over
+  TUs 1-59, mean -1.06% over the full 60) — smaller than the SIMD
+  change's own ~10.6% win on the same stage, as expected given 91.9% of
+  positions have no second chain link to prefetch into at all; the win
+  is confined to the minority-of-positions, majority-of-compare-volume
+  deep-chain tail identified in the re-split above.
+
+**Verdict: accepted.** Small but consistent and reproducible — same
+direction on all 4 interleaved pairs, zero wire/digest mismatches on
+60/60 TUs, unit tests green, pure latency hint with no semantic path
+change. Committed as `c89e6d8e` on `perf-opt`.
+
+### Summary of this round
+
+| Item | Outcome |
+|---|---|
+| Stage re-split on SIMD build | `sender_match_prepare_ns` remains the largest sender-side sub-stage (32.4% of `prepare_ns`), ahead of `sender_intern_and_match_ns` (23.5%); chain-candidates-visited histogram is bimodal — 91.9% zero-hop, long deep tail dominating total compare volume. |
+| `SenderInternAndMatch` SIMD applicability | **Rejected** — different comparison problem (known-length `memcmp` equality vs. unknown-extent longest-run search); glibc's AVX2-ifunc `memcmp` already covers it; no code change. |
+| One-ahead chain-walk prefetch | **Accepted**, commit `c89e6d8e` — mean -1.14% on `prepare_ns` (TUs 1-59) across 4 interleaved pairs, 60/60 wire/digest identity, unit tests green. |
