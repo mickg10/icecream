@@ -1036,6 +1036,98 @@ void test_p29v1_pipelined_begin() {
         fail("pipelined abort trace: " + *error);
 }
 
+
+// Step 4 sub-step 4a (research/designs/P50_ROUTE_PIPELINING.md, "Step 4"):
+// K=1 identity capture. This records the exact client+server wire bytes
+// (via EndpointIoControl::outbound_message_observer, the existing
+// production-safe test seam -- no new plumbing) plus the C-side action
+// trace for a sequential multi-TX K=1 dialogue on one P29V1 route, folds
+// everything into a single Digest128, and freezes it against a golden
+// value captured from pre-Step-4 code. Every later Step 4 sub-step (4b-4e)
+// must keep this test green: with K=1 (one TX fully committed before the
+// next begins), observable wire bytes and action-trace content must stay
+// byte-identical even once K>1 pipelining lands for K>=2.
+void test_p29v1_k1_pipeline_wire_identity() {
+    const P5coStoreGuids guids = p5co_store_guids(237);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, &actions,
+                      authority_limits);
+
+    icecc::Digest128Builder builder;
+    const auto observe = [&builder](ActorSide actor, const Message& message) {
+        builder.append_u8(static_cast<uint8_t>(actor));
+        const std::vector<uint8_t> frame = encode_frame(message);
+        builder.append_u32(static_cast<uint32_t>(frame.size()));
+        builder.append(std::span<const uint8_t>(frame));
+    };
+    EndpointIoControl client_control;
+    client_control.outbound_message_observer = observe;
+    EndpointIoControl server_control;
+    server_control.outbound_message_observer = observe;
+
+    const std::vector<uint8_t> tu1 =
+        bytes("# 1 \"/tmp/k1-fixture.cc\"\nfirst-tu\n");
+    const std::vector<uint8_t> tu2 =
+        bytes("# 1 \"/tmp/k1-fixture.cc\"\nsecond-tu\n");
+    const std::vector<uint8_t> tu3 =
+        bytes("# 1 \"/tmp/k1-fixture.cc\"\nthird-tu\n");
+
+    const PairResult first = run_pair(client, server, admit(client, tu1),
+                                       client_control, server_control);
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed &&
+                first.server.committed_input.has_value(),
+            "K1 identity: first TU did not commit");
+    server.close_input_job(*first.server.committed_input);
+
+    const PairResult second = run_pair(client, server, admit(client, tu2),
+                                        client_control, server_control);
+    require(second.client.status == ClientRunStatus::Committed &&
+                second.server.status == ServerRunStatus::Completed &&
+                second.server.committed_input.has_value(),
+            "K1 identity: second TU did not commit");
+    server.close_input_job(*second.server.committed_input);
+
+    const PairResult third = run_pair(client, server, admit(client, tu3),
+                                       client_control, server_control);
+    require(third.client.status == ClientRunStatus::Committed &&
+                third.server.status == ServerRunStatus::Completed &&
+                third.server.committed_input.has_value(),
+            "K1 identity: third TU did not commit");
+    server.close_input_job(*third.server.committed_input);
+
+    require(client.endpoint.next_rel_seq().value == 3,
+            "K1 identity: route rel_seq did not advance 1,2,3 across "
+            "sequential K=1 TUs");
+
+    if (const auto error = check_action_trace(actions.records()))
+        fail("K1 identity action trace: " + *error);
+    for (const ActionRecord& record : actions.records())
+        builder.append(action_jsonl(record));
+
+    // Golden value captured from pre-Step-4 code (today's base). Any Step 4
+    // sub-step that changes this value for a K=1 dialogue has broken the
+    // "K=1 stays byte-identical" invariant and must be investigated, not
+    // silently re-baselined.
+    const icecc::Digest128 golden{{
+        0x86, 0x88, 0x34, 0x20, 0xa6, 0x4c, 0x8c, 0xc5,
+        0xc1, 0x42, 0xaf, 0x51, 0xa6, 0x6d, 0xcf, 0xc3,
+    }};
+    const icecc::Digest128 actual = builder.finish();
+    require(actual == golden,
+            "K1 wire+action identity drifted from the pre-Step-4 golden "
+            "capture (actual_hex=" + icecc::digest128_hex(actual) +
+            "); every Step 4 sub-step must keep K=1 byte-identical per "
+            "P50_ROUTE_PIPELINING.md Step 4");
+}
+
 void test_profile_materialized_result_digest_gates() {
     uint64_t identity = 19000;
     for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
@@ -6339,6 +6431,7 @@ int main(int argc, char** argv) {
     if (std::getenv("ICECC_P50_P29_DIALOGUE_FOCUS") != nullptr) {
         test_p29v1_endpoint_route_dialogue_lifetime();
         test_p29v1_pipelined_begin();
+        test_p29v1_k1_pipeline_wire_identity();
         std::cout << "p50_endpoint_test: focused P29V1 dialogue PASS\n";
         return 0;
     }
@@ -6389,6 +6482,7 @@ int main(int argc, char** argv) {
     test_server_routes_are_isolated_by_profile();
     test_p29v1_endpoint_route_dialogue_lifetime();
     test_p29v1_pipelined_begin();
+    test_p29v1_k1_pipeline_wire_identity();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())
