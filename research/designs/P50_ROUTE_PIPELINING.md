@@ -427,7 +427,41 @@ that already encodes it) that it continues to hold.
 
 ## 3. Failure matrix
 
-(TODO)
+Successor state at the moment a predecessor fails is one of:
+
+- **S1 — not yet prepared**: C has not called `begin_tu()`/encoded it; cannot
+  exist until its immediate predecessor's *local* `P29Serializer::commit()`
+  has produced a `predicted_post_digest` to seed it (prepare order is still
+  strictly sequential — only the *wait* is pipelined, not local preparation).
+- **S2 — prepared locally only**: in C's `outstanding`/`active_queue_` FIFO
+  (§1.1), nothing written to a connection yet (the route lock still serializes
+  writes to connections one at a time, in `rel_seq` order — invariant 11).
+- **S3 — parked at F**: TX's connection is open, BEGIN/BODY/FILL fully sent and
+  drained by F, staged in F's per-connection buffer, waiting on the §1.2
+  sequencer's per-`rel_seq` signal.
+
+There is no S4 ("already independently progressed past its predecessor") by
+construction — invariant 4 (§2) guarantees the sequencer never hands a
+successor's bytes to the shared deserializer out of order.
+
+| # | Predecessor failure | Trigger / where | Effect on this TX | Effect on successors (S2/S3) | New mechanics needed |
+|---|---|---|---|---|---|
+| P1 | C-local prepare/encode fails | exception in `prepare_for_route`/`begin_tu()`/`commit()`, before any wire write | existing error path, unchanged | **none exist** — S1 only, nothing to unwind, because successor prepare is gated on this TX's local commit output | none — identical to today |
+| P2 | C's wire write of BEGIN/BODY/FILL fails (connection error, partial write) | socket error during §1.1 point 5's write | existing error path for this connection | successors can only be in **S2** (writes are serialized by the lock in order) — simply dropped from the FIFOs, their connections are **never opened** | none — F never saw them, nothing to clean up on F |
+| P3 | F rejects BEGIN at the cursor/digest-match check (`cache/p50_slice0.cpp:2324-2326`) — C's prediction was wrong | race/desync or genuine bug; under K>1 this becomes a reachable *expected-under-fault* path, not only a bug signal, because C now writes BEGIN before confirming STATE | reconnect outcome worse than `ExactMatch` (`RouteHistoryReset`/`ColdFStore`) for this TX | successors in **S2**: dropped by C, connections never opened. Successors in **S3**: F's cold-reset/HISTORY_RESET handling must also **erase the parking map's entries** for those `rel_seq`s — new mechanic; today's reset only clears a scalar `pending` | **F's reset path must clear the whole parking map, not one scalar** |
+| P4 | Predecessor is itself a parked successor whose own predecessor already failed (cascading) | recursive case of invariant 6 | n/a — resolved as whichever concrete mode (P1-P8) actually originated the chain | all queued behind it, transitively | none — parking adds no *new* failure mode here, only widens the blast radius of an existing one |
+| P5 | `materialize_and_verify` fails (digest/content mismatch, corrupt input) → `route.p29v1->terminal = true` (`cache/p50_slice0.cpp:2573-2582`) | F-side verify, same as today at K=1 | route marked terminal, exactly as today | successors in **S3**: the sequencer must refuse to hand their staged bytes to the now-terminal deserializer and instead fail them with the same terminal/cold-reset outcome. **Requires the per-`rel_seq` park signal to carry a success/failure variant**, not just a single "go" — new mechanic. Successors in **S2**: dropped by C once it observes the non-`ExactMatch` outcome for this TX | **park signal needs a failure variant, propagated to every still-parked successor** |
+| P6 | F commits TX, writes COMMIT, but C's connection drops before C reads STATE back — `LostFinalAcknowledgement` | ambiguous-ack case; F's cursor genuinely *did* advance correctly | today: C reconnects, gets `LostFinalAcknowledgement`, re-syncs via STATE, treats TX as committed | **per the §0 mandate, successors are invalidated too — uniformly, even though this TX's prediction was actually correct.** Flagged as a candidate relaxation in §7, not implemented here | none required for the conservative behavior; a future optimization is out of scope |
+| P7 | Sidecar `fail_stop()`/`_Exit(125)` while this TX was active anywhere in the pipeline | deliberate hard-crash to avoid releasing a route gate on ambiguous state | whole process exits, supervisor restarts it | **every route on that sidecar** reconnects cold — already true at K=1 for every *other* route; K>1 only means *this* route loses more unsent, locally-queued work than it would at K=1. Blast radius shape is unchanged | none — mechanism identical, just more work discarded per incident |
+| P8 | Lifecycle retirement: missed `input_lifecycle_timeout` → `retire_input_lifecycle_relationship` via `CloseAcceptedJob`/`Timeout` | owner-thread-wide, not route-local | whole relationship retired, same category as P7 | same as P7 | **new risk this design must guard against**: if §1.2's "F must keep draining parked connections at full speed, never block the owner thread" property is violated by a bug, a stalled parked-connection write could itself *cause* a P8 retirement that would not have happened at K=1 — i.e. parking is the one mechanism in this design that could turn a route-local slowdown into a sidecar-wide outage. Mitigated by: no blocking calls on the owner thread's path for a parked connection (reads continue on the existing async loop exactly as for an unparked one), and explicitly probed in §5.2/§5.4 (backpressure injection) |
+
+Summary of the one truly new failure *mode* introduced by this design (as
+opposed to existing modes whose blast radius widens): **P8's parking-induced
+owner-thread stall.** Every other row is either unchanged from today (P1, P2,
+P6's mechanism, P7) or an existing mode whose cleanup now has to reach a
+multi-entry structure instead of a scalar (P3, P5). This narrows what §5 needs
+to stress-test beyond ordinary regression: specifically, backpressure on a
+parked connection's socket must never be allowed to block the owner thread.
 
 ## 4. Interactions (ARM admission, route lock, deadlines, lifecycle RPCs, telemetry)
 
