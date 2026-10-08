@@ -299,7 +299,131 @@ timeout concept, the existing per-op deadline doubles as the park timeout.
 
 ## 2. Invariants that must still hold under K>1
 
-(TODO)
+Each invariant below is stated as it holds **today** (`K=1`, implicit), then
+restated for general `K`, with the evidence (code + the formal/trace tooling
+that already encodes it) that it continues to hold.
+
+1. **`rel_seq` is monotonic, contiguous, per-route, no gaps.** Today: enforced
+   by `FStore::begin`'s cursor-match check (`cache/p50_slice0.cpp:2324-2326`)
+   and `CRoute`'s own `active_`/cursor bookkeeping. Under K>1: unchanged in
+   substance — the §1.2 generalization of `FStore::begin` only widens *how many*
+   `rel_seq` values may be simultaneously staged (`nextExpected ..
+   nextExpected+K-1`), it does not relax the requirement that each individual
+   `rel_seq` arriving at F must be exactly the next unseen value in that
+   window; a `rel_seq` outside the window is still rejected exactly as "does
+   not match F's route cursor" is today. The TLA+ model's
+   `SingleUnresolvedTU` invariant (`cache/formal/Protocol50ZstdRoute.tla:2602-2604`)
+   generalizes from "at most one unresolved TU" to "at most `K` unresolved TUs,
+   each with a distinct, consecutive `rel_seq`" — same shape of invariant, wider
+   bound.
+2. **At most one ACTIVE_TX per route, redundantly enforced at 4 layers.**
+   Generalizes to **at most `K` outstanding (uncommitted) TXs per route**, with
+   the same 4 layers (§1.1 points 1-4, §1.2 "`FStore::begin`'s occupied-slot
+   check") each independently capping at `K` rather than `1`. `K=1` makes every
+   one of these checks byte-for-byte identical to today's (`size() >= 1` is
+   exactly today's `has_value()`/non-null check). This is the central
+   backward-compatibility argument for the whole design: no enforcement site is
+   *removed*, each is only parameterized by `K`.
+3. **Digest chain integrity**: TX `n+1`'s `pre_digest` must equal TX `n`'s
+   resulting digest. Today this is only checked once, synchronously, because
+   TX `n+1` cannot even be prepared until TX `n` commits. Under K>1 it becomes a
+   *chain* of `K` predicted digests (§1.1's `predicted_cursor_`), each still
+   checked the same way — F's cursor-match check at commit time
+   (`cache/p50_slice0.cpp:2324-2326`, run once per TX, strictly in order via
+   the §1.2 sequencer) is unchanged; what changes is only *when* C computed the
+   value it is asserting (ahead of time, locally, via
+   `P29Serializer::commit()`, rather of necessity synchronously). If any
+   predicted digest in the chain turns out wrong (predecessor aborted/mismatched),
+   invariant 6 below is what discards the rest of the chain — the digest-chain
+   invariant itself never has to tolerate "being wrong," it is instead backed by
+   universal invalidation.
+4. **Exactly-once, in-order apply on F.** Today trivially true (one TX at a
+   time). Under K>1: guaranteed by the §1.2 sequencer, which hands TX `n+1`'s
+   staged bytes to the *shared* `P29FRouteCodec`/`P29V1LiveDialogue` only after
+   TX `n`'s `commit_input` (`cache/p50_slice0.cpp:2609-2613`) completes —
+   i.e. F never has two TXs "in" `materialize_and_verify` concurrently for one
+   route, by construction, because the shared deserializer object is single-
+   threaded-use and the sequencer is the only caller. This is the one invariant
+   where "fewer changes" (§1.2 Option A) was explicitly chosen *because* it lets
+   this invariant hold by sharing the existing single-instance object rather
+   than needing a new concurrency-safe multi-instance redesign.
+5. **One connection carries exactly one TX; nothing may arrive on a connection
+   after its COMMIT.** Unchanged, verbatim, under K>1 — `async_wait_peer_close`
+   (`cache/p50_endpoint.cpp:788-802`) is not touched by this design at all; it
+   is in fact the reason (§1.1 point 4, §1.2 "today's single-slot enforcement")
+   that each outstanding TX *must* open its own fresh connection, which is
+   already a fixed constraint from §0, not a new one.
+6. **Universal invalidation on fault.** New framing of an old mechanism: today,
+   a faulted TX already invalidates "the route" wholesale via
+   `RouteHistoryReset`/`ColdFStore` reconnect outcomes — there is nothing *else*
+   outstanding to invalidate because `K=1`. Under K>1, the *same* reconnect
+   outcomes fire from the *same* trigger conditions (digest mismatch, timeout,
+   abort), but now there is a queue of successors behind the faulted TX; the
+   invariant is that **all** of them are discarded together with the faulted
+   TX, never selectively kept. Concretely: the §1.1 `outstanding`/`active_queue_`
+   FIFOs and the §1.2 parked-connection map are *cleared in their entirety*
+   (not just popped at the front) whenever a non-`ExactMatch` outcome is
+   produced for any member of the chain — because every successor's
+   `pre_digest` was predicted against a chain rooted at the faulted TX, so every
+   successor's prediction is simultaneously invalid. See §3 for the full matrix
+   of which stage-combinations trigger this.
+7. **Session continuity (`f["connected"] != replacing"`, one live logical F
+   session per relationship at a time)** — from `check_trace.py`'s
+   `current_f_session()`/session-replacement bookkeeping. This invariant is
+   about the **logical session** (identified by `history_nonce` plus the
+   route's established/not-established state), not about TCP connections — and
+   it was already true that a session's *connections* are transient and
+   per-TX (invariant 5), so a session having `K` simultaneously-open
+   connections for its `K` outstanding TXs is not a new kind of multiplicity;
+   it is still exactly one *session*. No change to session-replacement
+   semantics (`RouteHistoryReset`, cold-store adoption) is proposed anywhere in
+   this design.
+8. **Scalar "pending"/"active" slot checks in the trace checker.**
+   `check_trace.py`'s `f["pending"] == tx` (checked on `INPUT_MATERIALIZED`/
+   `INPUT_COMMITTED`) and `c["active"] == tx` (checked on `COMMIT_ACCEPTED`/
+   `LOST_COMMIT_ACCEPTED`) are literally scalar-equality assertions today and
+   **must change** to "`tx` is a/the head-of-queue member of a bounded ordered
+   set" — this is the one invariant class that cannot be preserved as "the same
+   check with a wider bound" purely in code; the *trace checker itself* needs
+   new logic (§5.1) because today's assertions are written assuming `K=1`.
+   The underlying semantic invariant they encode — "F only materializes/commits
+   a TX that C still considers outstanding, and C only accepts a commit for a
+   TX it has not already retired" — is unchanged; only its *representation*
+   (scalar vs. queue-membership) changes.
+9. **Reconciliation witness** (F-ahead-of-C-by-exactly-one-`rel_seq` during the
+   window between F's commit and C's acceptance, enforced by
+   `check_reconciliation_witness()` in `check_trace.py`). Generalizes from
+   "ahead by exactly 1" to "ahead by at most `K`, and never behind" — F may have
+   committed up to `K-1` TXs that C has locally predicted but not yet had
+   confirmed via STATE/COMMIT read-back. At `K=1` this generalized statement
+   collapses to exactly the original "ahead by exactly 1" (since the only
+   non-zero value ≤ `K-1=0`... — more precisely: at `K=1` there is only ever at
+   most one outstanding TX, so "ahead by at most 1" degenerates to today's
+   statement exactly). This witness needs updating in `check_trace.py` (§5.1).
+10. **Per-TX ARM claim stays job-bound.** Unchanged by construction (§0 fixed
+    constraint) — each outstanding TX still claims exactly one ARM slot for
+    exactly its own lifetime; `K` outstanding TXs on one route now hold up to
+    `K` simultaneous ARM claims instead of ≤1, which is purely a capacity/
+    admission question for §4, not a change to the claim-is-job-bound
+    invariant's *shape*.
+11. **Route-lock mutual exclusion.** Today the lock serializes the *entire*
+    per-TX operation, so "lock held" and "TX outstanding" are the same interval.
+    Under K>1 these intervals split: the lock still provides strict mutual
+    exclusion over the *local* prepare+encode+write stage (so two TXs on one
+    route never interleave their writes on the wire — connections are still
+    opened and written to one at a time, in `rel_seq` order), but "TX
+    outstanding" now extends well past lock release, through the STATE/COMMIT
+    wait. The invariant that changes shape (not disappears) is: "the route
+    lock orders TX *admission/write* across the route" rather than "the route
+    lock orders the TX end-to-end" — end-to-end ordering is now carried by
+    `rel_seq` plus the §1.2 sequencer instead of by lock scope.
+12. **`K=1` is byte-identical to today.** The umbrella invariant tying all the
+    above together, and the primary regression-safety argument for §5: every
+    structural change above is a parameterization by `K`, not a behavioral
+    fork; setting `K=1` must make every new bounded-FIFO/queue/map degenerate to
+    exactly one slot with exactly today's check sequence and exactly today's
+    wire bytes. §5.1 includes an explicit "K=1 produces an identical trace to
+    pre-pipelining code" regression test as the first-line defense for this.
 
 ## 3. Failure matrix
 
