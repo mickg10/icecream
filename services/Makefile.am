@@ -28,7 +28,7 @@ noinst_HEADERS = \
 	digest128.h \
 	ncpus.h \
 	pipes.h \
-	sys_close_range.h \
+	sys_syscall_numbers.h \
 	tempfile.h \
 	platform.h \
 	utf8.h \
