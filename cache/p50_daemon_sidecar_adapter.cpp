@@ -3523,7 +3523,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
             outer_last_input_lifecycle_result_ = InputLifecycleResult{
                 InputLifecycleStatus::Timeout, request};
-            trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
+            trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
             retire_input_lifecycle_relationship(AdapterError::InputLifecycleProtocol);
             outer_action_taken_ = true;
             return true;
@@ -3533,7 +3533,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
             outer_last_input_lifecycle_result_ = InputLifecycleResult{
                 InputLifecycleStatus::StoreReplaced, request};
-            trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
+            trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
             outer_action_taken_ = true;
             return true;
         }
@@ -3572,7 +3572,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
             if (status != local::DaemonControlStatus::InProgress) {
                 outer_last_input_lifecycle_result_ = InputLifecycleResult{
                     map_input_control_status(status), request};
-                trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
+                trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
                 outer_input_operation_.reset();
                 outer_input_request_.reset();
                 outer_input_cancel_lease_.reset();
@@ -3675,7 +3675,7 @@ bool DaemonSidecarAdapter::outer_advance_input(
         }
     }
     outer_last_input_lifecycle_result_ = InputLifecycleResult{result_status, request};
-    trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
+    trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
     const bool success =
         result_status == InputLifecycleStatus::Applied ||
         result_status == InputLifecycleStatus::AlreadyApplied ||
@@ -3915,7 +3915,7 @@ bool DaemonSidecarAdapter::outer_advance_turn(
             outer_input_request_.reset();
             outer_last_input_lifecycle_result_ = InputLifecycleResult{
                 InputLifecycleStatus::Disconnected, request};
-            trace_lifecycle_emit_terminal(outer_last_input_lifecycle_result_);
+            trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
             outer_input_cancel_lease_.reset();
             // Explicit cancellation is an input-lifecycle failure and enters
             // the same A withdrawal/teardown reducer as timeout, EOF, and
