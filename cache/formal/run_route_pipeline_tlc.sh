@@ -120,3 +120,5 @@ run_expected_failure route-pipeline-retire-any-order-mutant Protocol50RoutePipel
 run_expected_failure route-pipeline-successor-survives-fault-mutant \
     Protocol50RoutePipeline.tla \
     Protocol50RoutePipelineM6.cfg QueueCurrentEpochOnly
+run_expected_failure route-pipeline-stale-ack-mutant Protocol50RoutePipeline.tla \
+    Protocol50RoutePipelineM7.cfg NoCrossEpochRetire
