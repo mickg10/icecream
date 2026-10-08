@@ -1,8 +1,11 @@
 # P50 Route Pipelining — Design Doc (DRAFT, WIP)
 
-Status: COMPLETE DRAFT — all 7 sections (plus §0) written, ready for
-sorbet-main review. No implementation code in this tree change; this
-document only.
+Status: REVISED DRAFT — addressing sorbet-main's correctness review of
+`cacae856`. §1.2 (F-side parking) is rewritten end-to-end (raw frame buffer +
+peek-only `rel_seq` + per-route sequencer, parking before any semantic
+processing); §2/§3/§4/§5/§6/§7 updated for consistency. Not re-marked
+"complete" until this revision itself is reviewed. No implementation code in
+this tree change; this document only.
 
 Branch: `perf-pipe`, off `a348414e` ("services/sys_close_range.h: guard the UAPI
 include with `__has_include`"), the current farm "perf-combo" build
@@ -167,19 +170,55 @@ to the same outcome enum on mismatch — no new fallback vocabulary needed.
    reconnect — see §1.2 for why this requires *zero* further change on the C side
    under the recommended design.
 
-### 1.2 F side: parking
+**C-side touch-ups required by sorbet-main's review (additive; §1.1 above is
+otherwise accepted unchanged):**
+
+(a) *No partial rollback is ever needed.* Every fault takes the route through
+a full history reset, discarding whichever uncommitted `n, n+1, …` state
+existed, wholesale, never via a partial unwind — this remains exactly true
+under K>1, confirmed on both sides of the wire:
+  - F side: `CRoute::reset_history` (`cache/p50_slice0.cpp:2145-2154`) calls
+    `abandon_active()` and then `p29v1_.reset()` — the entire P29V1 F-side
+    codec view is destroyed and rebuilt, not patched.
+  - C/F-endpoint side: `Impl::reset_history`
+    (`cache/p50_endpoint.cpp:2803-2830`) replaces the whole `Route` entry via
+    `space.routes.insert_or_assign(*session.profile, Route{...})`, with
+    `.dialogue = nullptr` as part of the fresh struct — the shared
+    `P29V1LiveDialogue` pointer is dropped, not reset in place.
+  Under K>1 this is unchanged: §2 invariant 6's "any mismatch invalidates all
+  outstanding successors" always discards the *whole* outstanding chain via
+  one `reset_history`/cold-store call, exactly the all-or-nothing reset
+  already in place at `K=1`.
+
+(b) *`accept_commit` must retire strictly in `rel_seq` order.*
+`CRoute::accept_commit` (`cache/p50_slice0.cpp:2112-2132`) has no reordering
+logic today — it validates against the single `active_` slot and
+unconditionally does `++next_rel_seq_.value; active_.reset();`. Under K>1,
+COMMITs for `n` and `n+1` arrive on two different sockets and can be observed
+out of order by C's coroutines (no ordering guarantee between two
+independent connections' read-ready callbacks). Fix: a small reorder stage in
+front of today's `accept_commit` body, keyed by `rel_seq` — an early-arriving
+`n+1` ack is buffered (not applied) until `n`'s ack has retired
+(`next_rel_seq_` advanced past `n`); only then is the buffered `n+1` ack
+replayed through the existing, unchanged `accept_commit` body. This reuses
+the same `rel_seq` keying as `active_queue_` (§1.1 point 2), so it is a
+small addition to the same data structure, not a new concept.
+
+### 1.2 F side: parking (revised per sorbet-main review of commit `cacae856`)
 
 **Today's server-side flow** (`P50ServerEndpoint::run_connected`, server-side span
 `cache/p50_endpoint.cpp:4136-4557`, one TX per connection): accept
-(4301-4305) → HELLO (4306-4314) → STATE exchange (4321-4327) → optional
-HISTORY_RESET (4332-4343) → BEGIN (4356-4373) → BODY/NEED/FILL loop (4382-4421) →
-`begin_materialization` (4430) → `async_materialize` (4433, def 508-596) →
-`finish_materialization` (4439, def 3018) → `select_materialized_job_state`
-(4444, def 3084) → `commit_materialized` (4453, def 3103) → COMMIT write
-(4463-4466) → wait-peer-close (4485-4487, def 788-802) → disconnect+close
-(4492/4494) → `co_return` (4499).
+(4301-4305) → HELLO (4306-4314) → `stage()` + STATE write (~4321-4324) →
+optional HISTORY_RESET (4332-4343) → BEGIN (4356-4373) → BODY/NEED/FILL loop
+(4382-4421) → `begin_materialization` (4430) → `async_materialize` (4433, def
+508-596) → `finish_materialization` (4439, def 3018) →
+`select_materialized_job_state` (4444, def 3084) → `commit_materialized`
+(4453, def 3103) → COMMIT write (4463-4466) → wait-peer-close (4485-4487, def
+788-802) → disconnect+close (4492/4494) → `co_return` (4499).
 
-**Today's single-slot enforcement:**
+**Today's single-slot enforcement (unchanged by this design — restated for
+reference, since the sequencer below sits strictly *in front of* all of
+this, never inside it):**
 
 - `FStore::begin` (`cache/p50_slice0.cpp:2318-2358`): cursor-match check
   (2324-2326, "TX_BEGIN does not match F's route cursor"), route-established
@@ -193,10 +232,7 @@ HISTORY_RESET (4332-4343) → BEGIN (4356-4373) → BODY/NEED/FILL loop (4382-44
   `P29FRouteCodec` deserializer in place; on failure it sets
   `route.p29v1->terminal = true` (2573-2582), poisoning the *whole route*. It does
   not touch cursor/`pending` lifetime — only `commit_input` (2585-2615,
-  specifically 2609-2613) does that. **Consequence: `materialize_and_verify` is
-  not safely callable for TX n+1 while TX n has not yet committed** — the shared
-  deserializer's internal state assumes strictly sequential application. Parking
-  must defer this call, not just the wire-visible COMMIT.
+  specifically 2609-2613) does that.
 - `P29V1LiveDialogue` (`cache/p50_profile.cpp`): single `state_` field (default
   `State::Idle`, line 16/273) and a single `FStore store_` member (line 264,
   one dialogue+codec view per *route*, not per TX). `begin()` (32-64) guard at
@@ -205,98 +241,179 @@ HISTORY_RESET (4332-4343) → BEGIN (4356-4373) → BODY/NEED/FILL loop (4382-44
   (139-140, def 238-245).
 - `async_wait_peer_close` (**788-802**): throws "message arrived after final
   TX_COMMIT" (line 799) if any byte arrives after COMMIT on the same connection —
-  this is the exact code that structurally forbids reusing one connection for two
+  the exact code that structurally forbids reusing one connection for two
   TXs, confirming §1.1 point 4's "new connection per outstanding TX" requirement
   from the F side too.
 - Separate, pre-existing bound worth flagging: `EndpointCodecPool`
   (**462-490**), `kWorkerCount = 2` (464), `kMaxOutstanding = 8` (465),
-  `try_acquire()` (467-476, throws "endpoint codec queue is full" at 539) — the
-  pool used by `async_materialize`'s worker call to `dialogue->materialize_verified()`
-  (558). This is an *existing*, separate concurrency ceiling (2 worker threads,
-  8 outstanding) that already tolerates more than 1 outstanding materialize call
-  across *different routes*; K>1 on one route adds load to this same pool and
-  must be checked against it (§4), but does not require changing it.
+  `try_acquire()` (467-476, throws "endpoint codec queue is full" at 539) — an
+  *existing*, separate concurrency ceiling (2 worker threads, 8 outstanding)
+  that already tolerates more than 1 outstanding materialize call across
+  *different* routes; K>1 on one route adds load to this same pool and is
+  checked against it (§4, §7(5)), but does not require changing it.
 
-**Design choice — "F delays STATE for a parked TX" vs "C accepts a STATE cursor
-within its outstanding window":**
+**What the first pass of this document got wrong.** The original §1.2 had F
+run TX `n+1` through the whole BODY/NEED/FILL loop (4356-4421) "exactly as
+today" and park only in front of `begin_materialization` (4430). That is
+unsound: two things *earlier* in that span already read the shared, scalar
+per-route cursor, which is only correct once TX `n` has committed —
 
-The task asks to evaluate both and pick the one needing fewer changes.
+- The STATE write itself: `impl_->stage(session, hello, selection)`
+  (`cache/p50_endpoint.cpp:2593-2618`), called unconditionally right after
+  HELLO (~4322) and written to the wire immediately
+  (`co_await async_write_message(socket, state, ...)`, ~4324), computes
+  `state = snapshot(hello, selection)` — TX `n`'s *pre*-commit cursor, if a
+  successor arrives before `n` commits. Under the first draft this stale
+  STATE would already be on the wire by the time F "decided" to park, out of
+  order with its own later processing.
+- `Impl::prepare_begin` (`cache/p50_endpoint.cpp:2835-2879`), reached via
+  `prepare_begin_candidate`/`install_begin` (2879-2924) off the BEGIN frame,
+  has the three-way cursor check at **2842-2844**:
+  ```cpp
+  if (begin.history_nonce != route.nonce || begin.rel_seq != route.next_rel ||
+      begin.pre_state_digest != route.state)
+      throw std::logic_error("TX_BEGIN differs from the F route cursor");
+  ```
+  `route.nonce`/`route.next_rel`/`route.state` are exactly the shared,
+  synchronous cursor fields that only become correct after TX `n` commits —
+  TX `n+1`'s own `pre_state_digest` is checked against TX `n`'s *pre*-commit
+  value if this runs before `n` commits, so it fails 2842-2844 (the
+  endpoint-level twin of `FStore::begin`'s 2324-2326 check one layer down).
+- The NEED computation inside the BODY/NEED/FILL loop
+  (`cache/p50_endpoint.cpp:~4382-4392`): `pending.dialogue->need_messages(...)`
+  reads `pending.dialogue`, which for P29V1 *is* `route.dialogue` — the same
+  shared, per-route object reused across TXs (`prepare_begin` wires it up via
+  `if ((begin.profile == ProfileId::P29V1 ...) && route.dialogue)
+  result.pending.dialogue = route.dialogue;`). Computing NEED against it
+  before TX `n`'s regions are applied produces a NEED list that will not
+  match the FILL C builds against its own *post-n* prediction — `validate_need`
+  is exact, so this mismatches.
 
-- **Option A (recommended): F parks.** After accepting TX `n+1`'s connection and
-  reading HELLO, F reads and drains TX_BEGIN/BODY/NEED-reply/FILL
-  (4356-4421) **exactly as today, with no delay** — this is important: it means
-  C's write phase under the per-route lock (§1.1 point 5) always completes
-  promptly regardless of ordering, because F is still actively reading. What F
-  defers is only the "become visible" tail: `begin_materialization` through the
-  COMMIT write (4430-4466). Concretely: F stages TX `n+1`'s fully-received input
-  in a **new per-connection staging buffer** (not the shared
-  `FStore::Namespace::Route.pending`/`p29v1`), and parks that connection's
-  coroutine on a per-route sequencer keyed by expected `rel_seq` (e.g. a small
-  `map<rel_seq, promise/channel>`, signaled by the predecessor's `commit_input`
-  at `cache/p50_slice0.cpp:2609-2613`). Once signaled, F hands the staged input to
-  the shared deserializer and proceeds through `materialize_and_verify` →
-  `commit_materialized` → COMMIT write exactly as today.
+That is why the original design had to widen `FStore::begin` into a bounded
+occupied-slot window, split `Namespace::Route.pending` into a per-`rel_seq`
+map, add a per-connection staging buffer, and add a parking map with a
+success/failure variant on the park signal. All of that machinery existed
+only to let the *shared-state-reading* parts of the pipeline still run
+early, for a parked TX. The fix below removes the need for any of it by
+never running those parts early in the first place.
 
-  *Why fewer changes*: C's STATE-read path (3561-3566) and exact-match logic
-  (3601-3604) need **zero** changes — C already blocks on
-  `co_await async_read_frame` for STATE, and it is already correct, today, for F
-  to take an arbitrary amount of time before writing that frame. All new
-  machinery (the parking map, the staging buffer, the generalized occupied-slot
-  check) lives entirely on F, which already owns the authoritative route cursor
-  and is the natural place to decide "whose turn is it."
+**Revised design: raw frame buffer, peek-only `rel_seq`, park before any
+semantic processing.**
 
-  *Changes needed*: (a) `FStore::begin`'s occupied-slot check (2334-2338)
-  generalizes from "reject if ACTIVE_TX already set" to "accept iff this
-  `rel_seq` is exactly `nextExpected .. nextExpected+K-1`", i.e. extends a bounded
-  FIFO instead of filling one scalar; `Namespace::Route.pending` becomes a small
-  `map<rel_seq, FPending>` bounded by `K`. (b) a new per-route commit sequencer
-  that parks out-of-turn connections' coroutines until their immediate
-  predecessor's `commit_input` fires, then releases them strictly in `rel_seq`
-  order. (c) `P29V1LiveDialogue`'s single `state_`/`store_` do **not** need to
-  become `K` parallel instances — the cheaper option is to keep one shared
-  dialogue instance and let (b)'s sequencer be the only thing that ever calls
-  `begin()`/`commit_visible()` on it, strictly in order. TX `n+1`'s own
-  `begin()` call against the shared dialogue is itself deferred until TX `n`'s
-  `commit_visible()`'s `clear_per_tu()` → `Idle` transition has happened — a
-  direct consequence of (b), not a separate change. This confines the
-  generalization to "one more layer of queueing in front of an unchanged
-  single-shared-dialogue state machine."
+1. **Drain into a raw buffer, no decoding.** `run_connected` reads and
+   decodes `SessionHello` exactly as today (4306-4314 — HELLO carries no
+   route-cursor-dependent field, so nothing to defer here). It then drains
+   the socket into a per-connection **raw frame buffer** — frame-boundary-
+   aware (reusing `FrameParser`/`decode_frame_header`,
+   `cache/protocol50.h:287-301`, so frame headers are parsed but payloads are
+   not interpreted), with *no* call into `impl_->stage`,
+   `prepare_begin_candidate`, `install_begin`, `append_body`, or
+   `need_messages` — none of the functions that read shared route state run
+   yet. The buffer is bounded by the TX's own self-declared wire size: once
+   the first `TX_BEGIN` frame (step 2) has been peeked, its
+   `raw_bytes`/`body.encoded_bytes` fields (`cache/protocol50.h:229-240`,
+   plus the frame-header/NEED-frame overhead already accounted for by
+   `kMandatoryControlFramePayload`, `protocol50.h:113`) give an exact,
+   protocol-native ceiling for everything that follows in this TX; exceeding
+   it fails the connection closed — the same severity class as today's
+   existing decoder bounds (e.g. `FillStreamDecoder::max_record_bytes`,
+   `protocol50.h:364-374`). This drain is driven by the *same* async read
+   loop as an unparked connection, never a blocking read — see point 7 (P8).
+2. **Peek, don't decode-and-act.** The first `TX_BEGIN` frame in the buffer
+   (immediately, or after a leading `HISTORY_RESET` frame — a connection
+   that opens with HISTORY_RESET is always rooted at `rel_seq=0` and so never
+   needs to park, by construction) is read with the same pure
+   `decode_as<TxBegin>` the live path already uses, purely to extract
+   `rel_seq`. This reads bytes already in the buffer, has no side effects,
+   and does **not** call `prepare_begin`/`install_begin`.
+3. **Admission decision.** Read `route.next_rel`/whether the route already
+   has an active (released, mid-processing) TX — a cheap, side-effect-free
+   peek at the existing scalar `Namespace::Route` fields, **not** the full
+   `stage()`/`snapshot()` call:
+   - If `rel_seq == route.next_rel` and no TX is currently active for the
+     route, proceed now — byte-for-byte today's path, and what `K=1` always
+     does.
+   - If `rel_seq ∈ (route.next_rel, route.next_rel + K − 1]`, park: register
+     this connection on a per-route sequencer keyed by `rel_seq` and return
+     control to the async read loop (the raw-buffer drain from step 1
+     continues in the background).
+   - Otherwise (outside the window, or a genuine desync), proceed now and let
+     the existing, unchanged mismatch path handle it — `FStore::begin`
+     (`cache/p50_slice0.cpp:2324-2326`) or `Impl::prepare_begin`
+     (`cache/p50_endpoint.cpp:2842-2844`) rejects it, producing the ordinary
+     `RouteHistoryReset`/`ColdFStore` outcome. No new rejection path: parking
+     is purely an *additional* gate in front of the existing one, never a
+     replacement for it.
+4. **Deferred STATE, then replay through the unchanged path.** For a parked
+   connection, `impl_->stage(...)` and its STATE write (~4321-4324) are
+   **not** called at accept time — deferred wholesale until release, not
+   split. Once the sequencer releases this `rel_seq`: F calls `stage()` now
+   (`snapshot()` now reads TX `n`'s *post*-commit cursor — exactly C's
+   prediction for TX `n+1`'s `pre_state_digest`), writes STATE, and replays
+   the already-buffered frames through the completely **unchanged** path:
+   STATE → [HISTORY_RESET] → BEGIN (hitting the same 2842-2844 check, which
+   now passes, because the cursor is current) → BODY/NEED/FILL (now
+   computing NEED against the post-`n`-commit shared dialogue, matching C's
+   FILL) → `materialize_and_verify` → COMMIT. The only new plumbing is a thin
+   "read from the buffer first, then fall through to the live socket"
+   wrapper around the handful of `co_await async_read_frame(...)` call sites
+   in this span — mechanically the same function, fed from a different
+   source for frames that already arrived while parked.
+5. **Release triggers**, all posted on the owner `context_` (so none of this
+   introduces a new thread or a blocking call):
+   - The predecessor's `commit_input` (`cache/p50_slice0.cpp:2609-2613`)
+     releases exactly `rel_seq+1` — the ordinary, single-successor case.
+   - Predecessor abort/disconnect, route terminal (e.g. after
+     `materialize_and_verify` sets `p29v1->terminal = true`,
+     `cache/p50_slice0.cpp:2573-2582`), `HISTORY_RESET`, cold-store adoption,
+     or sidecar stop releases **all** currently-parked connections for that
+     route at once. Each then proceeds through the *same* unchanged live path
+     as step 4 — it calls `stage()`, gets the real (post-reset/post-failure)
+     cursor, and the existing mismatch logic sends it down the ordinary
+     reconnect-outcome path exactly as an unparked TX hitting a genuine
+     desync would today. **No failure variant is needed on the release
+     signal itself** — releasing always means "go run the unchanged live path
+     now and let it decide," never "go run it and tell it to fail."
+   - The park deadline itself, reusing the same `transfer_deadline` +
+     `cancellation_grace` that already bounds `transfer_source_on_owner`
+     (`cache/p50_cache_service.cpp:~2461-2464` acquire /
+     `~2624-2668` watchdog) — no new timeout concept. If the predecessor does
+     not commit before this deadline, the park is abandoned and the
+     connection proceeds through the existing deadline-exceeded path
+     (`ClientRunStatus::DeadlineExceeded`, `cache/p50_endpoint.cpp:3328-3330`).
+6. **What stays unchanged.** `FStore::begin`
+   (`cache/p50_slice0.cpp:2318-2358`), `Namespace::Route.pending` (scalar
+   `optional<FPending>`), `P29V1LiveDialogue`'s single `state_`/`store_`, and
+   F's trace records are all **scalar and untouched** by this design — the
+   sequencer's only job is deciding *when* a connection may start the
+   existing single-TX-at-a-time machinery, never running two TXs through it
+   concurrently or splitting it into multiple instances. F's `TX_BEGIN` trace
+   record (`record(ActionType::TX_BEGIN, ...)` inside `install_begin`) is
+   emitted at the point `install_begin` actually runs — i.e. at
+   release/processing time, in order — exactly as for an unparked TX today.
+   No `parked`/`stage` field is needed on the F-side trace (contrast with the
+   first draft's §4 proposal, dropped — see the revised §4 below).
+7. **Drain-while-parked is retained (P8).** The raw buffer in step 1 must be
+   filled by the *same* async read loop used for an unparked connection,
+   never by a blocking read — the one requirement carried over unchanged from
+   the first draft, because it is still what prevents a parked connection's
+   TCP backpressure from stalling the single owner thread shared by every
+   route and lifecycle RPC on that endpoint (`endpoint_owner_loop` is
+   `context_.run()` on one dedicated thread,
+   `cache/p50_cache_service.cpp:1926`; lifecycle RPCs share the same
+   `context_`, `:3241`, and must complete inside `input_lifecycle_timeout`
+   or the sidecar is retired, `cache/p50_daemon_sidecar_adapter.cpp:3265-3287`).
 
-- **Option B (rejected): C accepts a windowed STATE cursor.** This requires
-  generalizing C's exact-match comparison (3601-3604) to accept a *range* of
-  valid `(rel_seq, digest)` pairs, and requires F to answer STATE immediately,
-  with a cursor value that is only correct "once TX n commits" — i.e. F would
-  have to do its own prediction of a not-yet-committed cursor, duplicating the
-  job C already does. It also requires relaxing `FStore::begin`'s cursor-match
-  check (2324-2326) to a window, but F *still* needs the same ordering/staging
-  machinery as Option A to decide when it's actually safe to run
-  `materialize_and_verify` relative to the predecessor. Option B therefore pays
-  the full cost of Option A's F-side machinery *plus* extra C-side
-  generalization, for no additional benefit — rejected.
-
-**Fate of TCP-buffered bytes while parked:** not left in the kernel socket
-buffer. F's read loop for a parked connection runs unchanged through
-BODY/NEED/FILL (4382-4421); every byte is drained into F's normal per-connection
-decode path exactly as fast as for an unparked TX. Only `materialize_and_verify`
-and everything after it are deferred. This matters structurally: if F stopped
-reading while parked, C's async write under the route lock could block
-indefinitely on TCP backpressure, stalling the lock for a reason unrelated to the
-route itself — unacceptable given the owner thread is single-threaded and shared
-by *all* routes and lifecycle RPCs on that endpoint (confirmed: `endpoint_owner_loop`
-is `context_.run()` on one dedicated thread, `cache/p50_cache_service.cpp:2709-2722`
-/ `:1926`; lifecycle RPCs are posted onto the *same* `context_`,
-`cache/p50_cache_service.cpp:3241`, and must complete inside
-`input_lifecycle_timeout`, 250 ms default / 5000 ms in production
-(`cache/p50_daemon_sidecar_adapter.h:118`, `daemon/main.cpp:5349`) or the whole
-sidecar is retired on `Timeout`, `cache/p50_daemon_sidecar_adapter.cpp:3265-3287`).
-
-**Timeout for a parked TX:** bounded by the same `transfer_deadline` +
-`cancellation_grace` that already bounds `transfer_source_on_owner`
-(`cache/p50_cache_service.cpp:2083`/`2623-2626`). If the predecessor does not
-commit before the successor's own deadline, the successor's park is abandoned and
-it aborts through the existing deadline-exceeded path
-(`ClientRunStatus::DeadlineExceeded`, `cache/p50_endpoint.cpp:3328-3330`) — no new
-timeout concept, the existing per-op deadline doubles as the park timeout.
+**Option B (rejected, unchanged conclusion): C accepts a windowed STATE
+cursor.** Requires generalizing C's exact-match comparison (3601-3604) to
+accept a *range* of valid `(rel_seq, digest)` pairs, and requires F to answer
+STATE immediately with a cursor value that is only correct "once TX n
+commits" — i.e. F would have to do its own prediction of a not-yet-committed
+cursor, duplicating the job C already does — while *still* needing the same
+park/release machinery as the revised design above to decide when it is safe
+to run `materialize_and_verify` relative to the predecessor. Option B pays
+the full cost of the chosen design's F-side machinery *plus* extra C-side
+generalization, for no additional benefit — rejected.
 
 ## 2. Invariants that must still hold under K>1
 
@@ -382,15 +499,19 @@ that already encodes it) that it continues to hold.
 8. **Scalar "pending"/"active" slot checks in the trace checker.**
    `check_trace.py`'s `f["pending"] == tx` (checked on `INPUT_MATERIALIZED`/
    `INPUT_COMMITTED`) and `c["active"] == tx` (checked on `COMMIT_ACCEPTED`/
-   `LOST_COMMIT_ACCEPTED`) are literally scalar-equality assertions today and
-   **must change** to "`tx` is a/the head-of-queue member of a bounded ordered
-   set" — this is the one invariant class that cannot be preserved as "the same
-   check with a wider bound" purely in code; the *trace checker itself* needs
-   new logic (§5.1) because today's assertions are written assuming `K=1`.
-   The underlying semantic invariant they encode — "F only materializes/commits
-   a TX that C still considers outstanding, and C only accepts a commit for a
-   TX it has not already retired" — is unchanged; only its *representation*
-   (scalar vs. queue-membership) changes.
+   `LOST_COMMIT_ACCEPTED`) are literally scalar-equality assertions today.
+   Per the §1.2 revision, **the F half needs no change at all**: F's
+   `install_begin`/`materialize_and_verify`/`commit_input` sequence still runs
+   exactly one TX at a time, strictly in order, against the scalar
+   `Namespace::Route.pending` — the sequencer only gates *when* that unchanged
+   machinery starts, so `f["pending"] == tx` continues to hold exactly as
+   written, unmodified. Only the **C half** generalizes — `c["active"] == tx`
+   must change to "`tx` is a/the head-of-queue member of a bounded ordered set"
+   (`active_queue_`, §1.1 point 2), since C now has up to `K` TXs it considers
+   outstanding simultaneously. The underlying semantic invariant — "F only
+   materializes/commits a TX that C still considers outstanding, and C only
+   accepts a commit for a TX it has not already retired" — is unchanged; only
+   the C-side *representation* (scalar vs. queue-membership) changes.
 9. **Reconciliation witness** (F-ahead-of-C-by-exactly-one-`rel_seq` during the
    window between F's commit and C's acceptance, enforced by
    `check_reconciliation_witness()` in `check_trace.py`). Generalizes from
@@ -437,9 +558,10 @@ Successor state at the moment a predecessor fails is one of:
 - **S2 — prepared locally only**: in C's `outstanding`/`active_queue_` FIFO
   (§1.1), nothing written to a connection yet (the route lock still serializes
   writes to connections one at a time, in `rel_seq` order — invariant 11).
-- **S3 — parked at F**: TX's connection is open, BEGIN/BODY/FILL fully sent and
-  drained by F, staged in F's per-connection buffer, waiting on the §1.2
-  sequencer's per-`rel_seq` signal.
+- **S3 — parked at F**: TX's connection is open; raw bytes have been drained
+  into F's per-connection **raw** buffer (§1.2) — frame-boundary-aware but with
+  *no* semantic decode yet: no STATE write, no cursor check, no touch of the
+  shared dialogue — waiting on the §1.2 sequencer's per-`rel_seq` release.
 
 There is no S4 ("already independently progressed past its predecessor") by
 construction — invariant 4 (§2) guarantees the sequencer never hands a
@@ -449,9 +571,9 @@ successor's bytes to the shared deserializer out of order.
 |---|---|---|---|---|---|
 | P1 | C-local prepare/encode fails | exception in `prepare_for_route`/`begin_tu()`/`commit()`, before any wire write | existing error path, unchanged | **none exist** — S1 only, nothing to unwind, because successor prepare is gated on this TX's local commit output | none — identical to today |
 | P2 | C's wire write of BEGIN/BODY/FILL fails (connection error, partial write) | socket error during §1.1 point 5's write | existing error path for this connection | successors can only be in **S2** (writes are serialized by the lock in order) — simply dropped from the FIFOs, their connections are **never opened** | none — F never saw them, nothing to clean up on F |
-| P3 | F rejects BEGIN at the cursor/digest-match check (`cache/p50_slice0.cpp:2324-2326`) — C's prediction was wrong | race/desync or genuine bug; under K>1 this becomes a reachable *expected-under-fault* path, not only a bug signal, because C now writes BEGIN before confirming STATE | reconnect outcome worse than `ExactMatch` (`RouteHistoryReset`/`ColdFStore`) for this TX | successors in **S2**: dropped by C, connections never opened. Successors in **S3**: F's cold-reset/HISTORY_RESET handling must also **erase the parking map's entries** for those `rel_seq`s — new mechanic; today's reset only clears a scalar `pending` | **F's reset path must clear the whole parking map, not one scalar** |
+| P3 | F rejects BEGIN at the cursor/digest-match check (`cache/p50_slice0.cpp:2324-2326`) — C's prediction was wrong | race/desync or genuine bug; under K>1 this becomes a reachable *expected-under-fault* path, not only a bug signal, because C now writes BEGIN before confirming STATE | reconnect outcome worse than `ExactMatch` (`RouteHistoryReset`/`ColdFStore`) for this TX | successors in **S2**: dropped by C, connections never opened. Successors in **S3**: this is one of §1.2's bulk-release triggers (route goes through `RouteHistoryReset`/`ColdFStore`) — **there is nothing to clear except waking the parked waiters**, since no semantic state was ever touched for them. Each released connection runs `stage()` fresh, gets the real (post-reset) cursor, and hits the *same* 2324-2326/2842-2844 check itself, landing on the ordinary non-`ExactMatch` outcome on its own — no special-casing needed | **none** — the existing bulk-release trigger (§1.2 point 5) already covers this; released successors self-resolve via the unchanged mismatch path |
 | P4 | Predecessor is itself a parked successor whose own predecessor already failed (cascading) | recursive case of invariant 6 | n/a — resolved as whichever concrete mode (P1-P8) actually originated the chain | all queued behind it, transitively | none — parking adds no *new* failure mode here, only widens the blast radius of an existing one |
-| P5 | `materialize_and_verify` fails (digest/content mismatch, corrupt input) → `route.p29v1->terminal = true` (`cache/p50_slice0.cpp:2573-2582`) | F-side verify, same as today at K=1 | route marked terminal, exactly as today | successors in **S3**: the sequencer must refuse to hand their staged bytes to the now-terminal deserializer and instead fail them with the same terminal/cold-reset outcome. **Requires the per-`rel_seq` park signal to carry a success/failure variant**, not just a single "go" — new mechanic. Successors in **S2**: dropped by C once it observes the non-`ExactMatch` outcome for this TX | **park signal needs a failure variant, propagated to every still-parked successor** |
+| P5 | `materialize_and_verify` fails (digest/content mismatch, corrupt input) → `route.p29v1->terminal = true` (`cache/p50_slice0.cpp:2573-2582`) | F-side verify, same as today at K=1 | route marked terminal, exactly as today | successors in **S3**: setting `terminal = true` is itself one of §1.2's bulk-release triggers ("route terminal") — the sequencer wakes every parked waiter for the route, each of which proceeds through the *unchanged* live path (step 4) exactly as in P3 above: it calls `stage()`, observes the terminal/reset state, and resolves to the ordinary terminal/cold-reset outcome on its own. **No success/failure variant on the release signal is needed** — release always means "go run the unchanged path and let it decide." Successors in **S2**: dropped by C once it observes the non-`ExactMatch` outcome for this TX | **none** — same bulk-release trigger as P3; no new variant on the wake signal |
 | P6 | F commits TX, writes COMMIT, but C's connection drops before C reads STATE back — `LostFinalAcknowledgement` | ambiguous-ack case; F's cursor genuinely *did* advance correctly | today: C reconnects, gets `LostFinalAcknowledgement`, re-syncs via STATE, treats TX as committed | **per the §0 mandate, successors are invalidated too — uniformly, even though this TX's prediction was actually correct.** Flagged as a candidate relaxation in §7, not implemented here | none required for the conservative behavior; a future optimization is out of scope |
 | P7 | Sidecar `fail_stop()`/`_Exit(125)` while this TX was active anywhere in the pipeline | deliberate hard-crash to avoid releasing a route gate on ambiguous state | whole process exits, supervisor restarts it | **every route on that sidecar** reconnects cold — already true at K=1 for every *other* route; K>1 only means *this* route loses more unsent, locally-queued work than it would at K=1. Blast radius shape is unchanged | none — mechanism identical, just more work discarded per incident |
 | P8 | Lifecycle retirement: missed `input_lifecycle_timeout` → `retire_input_lifecycle_relationship` via `CloseAcceptedJob`/`Timeout` | owner-thread-wide, not route-local | whole relationship retired, same category as P7 | same as P7 | **new risk this design must guard against**: if §1.2's "F must keep draining parked connections at full speed, never block the owner thread" property is violated by a bug, a stalled parked-connection write could itself *cause* a P8 retirement that would not have happened at K=1 — i.e. parking is the one mechanism in this design that could turn a route-local slowdown into a sidecar-wide outage. Mitigated by: no blocking calls on the owner thread's path for a parked connection (reads continue on the existing async loop exactly as for an unparked one), and explicitly probed in §5.2/§5.4 (backpressure injection) |
@@ -459,10 +581,14 @@ successor's bytes to the shared deserializer out of order.
 Summary of the one truly new failure *mode* introduced by this design (as
 opposed to existing modes whose blast radius widens): **P8's parking-induced
 owner-thread stall.** Every other row is either unchanged from today (P1, P2,
-P6's mechanism, P7) or an existing mode whose cleanup now has to reach a
-multi-entry structure instead of a scalar (P3, P5). This narrows what §5 needs
-to stress-test beyond ordinary regression: specifically, backpressure on a
-parked connection's socket must never be allowed to block the owner thread.
+P6's mechanism, P7) or an existing mode whose cleanup, after the §1.2 revision,
+reduces to **"wake the parked waiters and let the unchanged live path resolve
+each of them"** — P3 and P5 need no new success/failure variant on the release
+signal and no multi-entry structure to clear beyond the sequencer's own
+wait-list, because no semantic state was ever applied to a parked connection
+before release. This narrows what §5 needs to stress-test beyond ordinary
+regression to just one thing: backpressure on a parked connection's socket
+must never be allowed to block the owner thread.
 
 ## 4. Interactions (ARM admission, route lock, deadlines, lifecycle RPCs, telemetry)
 
@@ -473,8 +599,11 @@ overridable via `ICECC_P50_ARMED_WINDOW` (`armed_window_slots()`,
 brief cited "16" for this window; that figure is a *different*, unrelated
 constant — `kMaxBacklog = 16` (`cache/p50_cache_service.cpp:93`), which only
 bounds the `--backlog` CLI argument (TCP listen backlog) validated at
-`cache/p50_cache_service.cpp:3698-3702`. **The correct, authoritative ARM
-window default is 8**, and this document uses that figure throughout.
+`cache/p50_cache_service.cpp:3698-3702`. **The compiled-in default is 8; the
+farm's actual runtime value is 16** (`ICECC_P50_ARMED_WINDOW=16` is how the
+farm is run today, per sorbet-main). This document uses **16** — the farm's
+real operating value — wherever it reasons about admission budget below, and
+calls out the compiled-in default of 8 only where the distinction matters.
 
 **What "ARM admission window" actually does today, precisely, and how K
 interacts with it.** It is easy to conflate with this design's `K`, but it is
@@ -500,20 +629,23 @@ just idle-connected) rather than strictly serialized one-at-a-time through the
 gate. The key resource-budget consequence: **every outstanding TX under this
 design still needs its own live F session**, exactly as an armed-but-idle one
 does today — so `K` consumes from the *same* `armed_window_slots()` budget a
-lane already has, rather than requiring a new, additional budget. The natural
-and simplest admission rule is therefore: **`K` must not exceed
-`armed_window_slots()` for the lane** (default 8 ≫ default `K=1`, so there is
-no practical pressure at today's defaults, but this must be an explicit
-validation/clamp — analogous to `route_lane_count()`'s existing
-`P50_ROUTE_LANES_CLAMPED` warning pattern — rather than an unenforced
-assumption). No change to `route_lane_count()`'s formula is required *if* `K`
-is clamped to fit inside the existing per-lane window; if a future tuning
-wants `K` and `lanes` to both grow independently beyond what one shared
-`armed_window_slots()` budget allows, the clamp formula would need to become
-`lanes * armed_window_slots() <= max_live_sessions` **and** `K <=
-armed_window_slots()` jointly — flagged as a §7 open question only if `K`
-default/tuning is ever expected to approach 8; out of scope for an initial
-`K` in the 2-4 range.
+lane already has, rather than requiring a new, additional budget.
+
+**`K>1` forces `lanes=1` (per sorbet-main review 4(4) — the user has already
+rejected multi-lane RAM duplication as a tuning axis).** Rather than letting
+`K` and `lanes` tune jointly against the shared `armed_window_slots()` budget,
+this design simply does not pursue that combination: whenever `K>1` is
+configured for a route, `lanes` is clamped to `1` with a warning, mirroring
+`route_lane_count()`'s existing `P50_ROUTE_LANES_CLAMPED` pattern
+(`cache/p50_cache_service.cpp:2019-2032`). With `lanes` fixed at `1`, the
+admission rule collapses to the simple case: **`K` must not exceed
+`armed_window_slots()`** for that one lane — at the farm's actual runtime
+value of 16 this gives ample headroom over the §7-settled default (`K=1`) and
+A/B ceiling (`K≤4`). The joint formula
+(`lanes * armed_window_slots() <= max_live_sessions` **and**
+`K <= armed_window_slots()`) is explicitly *not* pursued; it would only matter
+if a future tuning wanted `K` and `lanes` to grow independently, which the
+user has ruled out.
 
 **Per-route lock.** Already covered in depth in §1.1/§1.2/§2 invariant 11:
 `Lane::transfer` narrows from guarding prepare+encode+write+wait end-to-end to
@@ -534,6 +666,67 @@ lane instead of ≤1 — this is a quantitative increase in timer-wheel load
 proportional to `K`, not a new mechanism, and should be included in the farm
 A/B's resource-overhead checks (§5.4) rather than treated as a correctness
 risk.
+
+**C-side route-lock release point — the "write complete" signal (review point
+2c).** In `transfer_source_on_owner`
+(`cache/p50_cache_service.cpp`), the per-route lock is acquired around
+`~2461-2464` and, as written today, held until the `co_spawn(context_, ...)`
+lambda started at `~2534` fully completes — that lambda contains both
+`route_owner_->transfer(...)` (the actual FILL wire-write, `~2570-2574`) and
+the eventual `completion->set_value(value); co_return;` that signals the
+*whole* operation's result. Under K>1 this is too coarse: holding the lock
+until the *final result* is known (which includes waiting on STATE/COMMIT
+round-trip confirmation) would re-serialize exactly the latency this design
+is trying to pipeline away. The fix: split the single `completion` signal
+into two —
+  1. a **"write complete"** signal (a separate promise/flag), set the instant
+     the FILL write itself finishes (right after `~2570-2574`), which is what
+     the route lock actually waits on before releasing — this is the
+     "guarding prepare+encode+write only" scope already stated above;
+  2. the existing **final result** signal (`completion->set_value(value)`,
+     `~2611-2612`), set later, once STATE/COMMIT confirmation completes —
+     this is what the TX's own outstanding-ness (invariants 2/11, the
+     `active_queue_` membership) still waits on, independent of the lock.
+The existing `wait_until` + `fail_stop()`/`_Exit(125)` watchdog
+(`cache/p50_cache_service.cpp:~2624-2668`) continues to apply per outstanding
+TX, unchanged in mechanism: under K>1 there are simply up to `K` concurrently
+armed watchdog timers per lane instead of ≤1 (the same quantitative-not-
+structural increase already noted above for `transfer_deadline`), each
+independently guarding its own TX's confirmation deadline — a watchdog firing
+for TX `n` still triggers the same whole-process `fail_stop()`, which (§2
+invariant 6) is exactly the "discard the whole outstanding chain" case,
+unchanged by `K`.
+
+**C-side owner-thread CPU budget (review point 3).** sorbet-main's own
+measurement: the C sidecar's owner thread runs at ~47% CPU busy at 41 TX/s
+(`pidstat`); doubling the per-route TX rate at `K=2` would approach
+saturation — this is the C-side analogue of failure-matrix row P8's
+owner-thread-stall risk, not an F-side one. Classifying per-TX work by which
+thread it runs on:
+  - **Off the owner context, on a per-connection worker thread**:
+    `handle_connection` (def `cache/p50_cache_service.cpp:1291`, spawned per
+    connection at `:4008-4012`) — `prepare_source`, the OnlineS1 digest pass,
+    and encode all run here, each on its own connection's worker thread, not
+    serialized against other routes' work.
+  - **On the shared owner `context_`/`endpoint_owner_thread_` budget**: the
+    `asio::co_spawn(context_, ...)` lambda at `~2534` — i.e. exactly the FILL
+    wire-write (`route_owner_->transfer(...)`, `~2570-2574`) and both halves
+    of the split completion signal above (`~2611-2612`) — plus STATE/COMMIT
+    handling for the route, since both touch the same shared `Route`/`Lane`
+    object and must be serialized through the owner context to stay
+    consistent with the lock-scope statement above.
+  Doubling `K` doubles the TX rate specifically on this second,
+  owner-context-bound subset of work — the first (worker-thread) subset scales
+  independently per connection and is not the bottleneck sorbet-main
+  identified. **Action item, folded into §6's implementation order**: measure
+  owner-context CPU per TX at `K=2` in the sim (new §6 step, see below) before
+  shipping any default above `K=1`. If the measurement shows the owner
+  context is over budget, the mitigation is to move the FILL-write dispatch
+  itself off the owner context onto a small worker pool mirroring
+  `EndpointCodecPool` (`cache/p50_endpoint.cpp:462-490`, 2 workers / 8
+  outstanding) — tracked as a **separate commit**, not part of this design's
+  first landing, since §7(5) (unchanged pool policy) already says no pool
+  change ships with the initial `K` rollout.
 
 **Lifecycle RPCs.** `apply_input_lifecycle_on_owner` and friends are posted
 onto the *same* single `endpoint_owner_thread_`/`context_` that services every
@@ -568,24 +761,30 @@ ACTIVE_REPLAYED, LOST_COMMIT_ACCEPTED, F_STORE_INCAR_REPLACED` — a superset of
 (and, confirmed, identical in spirit to) `check_trace.py`'s 14-action
 vocabulary (that file lacks `F_STORE_INCAR_REPLACED`, a C++-side-only action).
 No new `ActionType` is required by this design — every lifecycle event under
-K>1 is still exactly one of these 15 (a parked TX still eventually emits
-`TX_BEGIN`, then either `INPUT_MATERIALIZED`→`INPUT_COMMITTED`→`COMMIT_ACCEPTED`
-or `TX_ABORTED`, just later than it would at K=1). What **does** need a new
-field is `ActionRecord` itself (`cache/p50_actions.h:37+`): today's checkers
-assume at most one outstanding `rel_seq` per side and infer ordering purely
-from arrival order on one shared stream per connection; under K>1, trace
-consumers need an explicit way to tell "TX n+1's `TX_BEGIN` arrived while
-parked, before n's `COMMIT_ACCEPTED`" apart from a same-shaped trace at K=1
-(where that interleaving cannot occur) — otherwise `check_trace.py`'s
-generalized queue-membership checks (§2 invariant 8, §5.1) cannot distinguish
-"successor admitted" from "successor already active," which they must, since
-only one of those states is allowed per TX to touch `materialize_and_verify`.
-The minimal addition: a boolean or small enum `parked: bool` (or
-`stage: {PARKED, SEQUENCED}`) alongside each F-side `TX_BEGIN` record,
-set at the exact point `FStore::begin`'s generalized admission check (§1.2)
-places it in the staging map rather than handing it directly to the shared
-deserializer. No digest/codec/frame change — purely an added observability
-field on the existing action-log plumbing.
+K>1 is still exactly one of these 15. **Per the §1.2 revision, the F side
+needs no new trace field at all**: F's `TX_BEGIN` record is now emitted at
+the point `install_begin` actually runs — i.e. at release/processing time, in
+order, exactly as at `K=1` — so a trace replayed at K>1 is, from F's side,
+indistinguishable in *shape* from a K=1 trace one TX at a time; there is no
+"arrived while parked" interleaving to disambiguate on this side, because
+parking happens strictly *before* any semantic record is emitted (the
+first draft's proposed `parked`/`stage` field on F's `TX_BEGIN` record is
+dropped entirely).
+
+The one place a small additive field is still useful is the **C side**: with
+`active_queue_` (§1.1 point 2) now potentially holding up to `K` members
+instead of a scalar, `check_trace.py`'s generalized queue-membership check
+(§2 invariant 8) is simplest if C's own action records (at TX-write time and
+at `COMMIT_ACCEPTED`) carry an explicit queue-position/depth field, rather
+than requiring the checker to reconstruct queue order purely from
+multi-connection arrival interleaving in the merged trace. This is a single
+additive JSON field on existing C-side records — no digest/codec/wire change,
+no new `ActionType` — and per sorbet-main review point 4(6), moot in practice
+for the initial rollout (§7(1): P29V1-only, other profiles clamped to `K=1`,
+so most traces will show the field at its degenerate `K=1` value). Its only
+consumers are the in-repo checkers (`cache/p50_actions.cpp`,
+`cache/formal/check_trace.py`) and this project's own `analyze.py` — nothing
+wire-visible, nothing F-side.
 
 ## 5. Test plan
 
