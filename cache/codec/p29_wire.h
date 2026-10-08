@@ -262,6 +262,12 @@ enum class P29AllocationEntry : unsigned {
   ReceiverTakeMaterialized,
   ReceiverCommit,
   ReceiverAbandon,
+  // Appended, not inserted among the above: existing indices must stay
+  // stable so prior batch-output rows remain comparable by position.
+  // Isolates CAuthority::prepare_p29v1_at_seq()'s dense_regions.reserve()
+  // call (cache/p50_slice0.cpp) from the SenderInternAndMatch stage it
+  // used to be lumped into, for the Decision 4 measurement.
+  SenderPrepareReserve,
 };
 
 class P29AllocationScope {
@@ -306,6 +312,14 @@ enum class P29StageTimerEntry : unsigned {
   SenderInternAndMatch,
   SenderEncode,
   ReceiverMaterializeCopyback,
+  // Appended, not inserted among the above, for the same stable-index
+  // reason as P29AllocationEntry::SenderPrepareReserve. Times only the
+  // dense_regions.reserve() call in CAuthority::prepare_p29v1_at_seq()
+  // (previously unmeasured; SenderInternAndMatch wraps only the
+  // following interner.process() call), to drive a measurement-first
+  // Decision 4 verdict rather than guessing at reserve()'s share of
+  // prepare_ns.
+  SenderPrepareReserve,
 };
 
 class P29StageTimerScope {
