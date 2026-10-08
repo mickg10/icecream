@@ -1644,6 +1644,47 @@ bool P50PreparationAuthority::reset_route(PreparationRouteKey route_key) noexcep
     }
 }
 
+// See the design-note comment above P50CRouteOwner::reset_f_store_exact in
+// client/p50_route_owner.cpp for the full safety argument. In short: a route
+// key only reaches this function after its caller has proven the key's F
+// incarnation is dead, so every Entry still filed under it is orphaned
+// (its sender already reached a terminal, non-Committed result and simply
+// never released the handle) rather than actively owned. This mirrors
+// release()'s uncommitted/retained-bytes bookkeeping above, but erases
+// unconditionally instead of requiring the caller to hold the handle.
+bool P50PreparationAuthority::discard_route(PreparationRouteKey route_key) noexcept {
+    try {
+        impl_->owner.require();
+        const auto route_position = impl_->routes.find(route_key);
+        Impl::RouteState* route =
+            route_position != impl_->routes.end() ? route_position->second.get() : nullptr;
+        for (auto position = impl_->entries.begin(); position != impl_->entries.end();) {
+            if (position->second.route != route_key) {
+                ++position;
+                continue;
+            }
+            Impl::Entry& entry = position->second;
+            if (route && !entry.committed &&
+                route->uncommitted_route_entry == position->first) {
+                route->uncommitted_route_entry.reset();
+                if (route_key.profile == ProfileId::P29V1 && route->p29_route)
+                    route->p29_route->abandon_active();
+            }
+            impl_->retained_bytes -= entry.retained_bytes;
+            const PrepareRequestKey request = entry.request;
+            const std::shared_ptr<Impl::Shared> shared = entry.shared;
+            position = impl_->entries.erase(position);
+            shared->entries.erase(route_key);
+            if (shared->entries.empty())
+                impl_->requests.erase(request);
+        }
+        impl_->routes.erase(route_key);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 ProfileId P50PreparationAuthority::profile() const {
     impl_->owner.check();
     return impl_->profile;

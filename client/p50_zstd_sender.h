@@ -202,6 +202,13 @@ public:
         std::optional<Digest128> raw_digest = std::nullopt,
         std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr);
 
+    // True from the moment transfer_bytes begins running until it reaches a
+    // terminal result (including by exception). Only meaningful for a
+    // route-bound sender; see P50CRouteOwner::reset_f_store_exact, which uses
+    // this to decide whether an orphaned preparation entry may be
+    // force-discarded for a provably superseded F incarnation.
+    [[nodiscard]] bool transfer_in_flight() const noexcept;
+
 private:
     using ConnectionTarget =
         std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory>;

@@ -99,9 +99,12 @@ public:
     // same-C-store check is byte-identical to the pre-lanes behavior.
     void register_lane(CStoreGuid lane_guid);
 
-    // Drops every profile view for one exact retired F incarnation.  False
-    // means at least one route still owns an uncommitted preparation; callers
-    // must replace the whole C sidecar and must not admit the successor.
+    // Drops every profile view for one exact retired F incarnation. An
+    // orphaned preparation left behind by a sender's own terminal,
+    // non-Committed transfer result is force-discarded here (see the design
+    // note above reset_f_store_exact's definition). False means some route's
+    // sender still has a transfer actually in flight; callers must replace
+    // the whole C sidecar and must not admit the successor.
     [[nodiscard]] bool reset_f_store_exact(
         FStoreGuid old_f_store_guid,
         uint64_t old_f_store_generation) noexcept;
