@@ -1317,6 +1317,47 @@ void run_materialize_thp_switch_controls() {
   }
 }
 
+// Regression test for a decode-side bug found while building the THP
+// switch test above (see research/reports/P50_PERF_OPT_REPORT.md): a
+// payload whose decoded size is an exact multiple of the decoder's
+// internal zstd output buffer (ZSTD_DStreamOutSize()) can finish its
+// frame (remaining == 0) on the very ZSTD_decompressStream() call that
+// also fills that buffer completely. ContinuingDecoder::decode()'s loop
+// used to continue solely on output.pos == output.size, so it spun one
+// extra iteration past an already-finished frame with no input left;
+// zstd then reported a nonzero byte count for a nonexistent next frame,
+// which read as "P29 zstd stream did not close". This test is deliberately
+// minimal and decoupled from the THP-switch feature: it drives
+// ContinuingEncoder/ContinuingDecoder directly with a single-chunk
+// payload, independent of any materialize/FILL/THP machinery, so a
+// regression here cannot be masked by -- or confused with -- unrelated
+// feature changes.
+void run_continuing_decoder_exact_multiple_regression() {
+  const std::size_t chunk_bytes = ZSTD_DStreamOutSize();
+  require(chunk_bytes > 0,
+          "exact-multiple regression: ZSTD_DStreamOutSize() returned 0");
+  // Highly compressible content keeps the whole payload inside a single
+  // zstd block, so a one-shot decode() call is the one that both finishes
+  // the frame and fills the output buffer -- the exact edge case.
+  const std::vector<std::uint8_t> raw(chunk_bytes, std::uint8_t{0x5a});
+
+  wire::ContinuingEncoder encoder;
+  const std::vector<std::uint8_t> encoded = encoder.encode(raw, /*close=*/true);
+
+  wire::ContinuingDecoder decoder;
+  const std::vector<std::uint8_t> decoded =
+      decoder.decode(encoded, /*close=*/true);
+
+  require(decoded.size() == raw.size(),
+          "exact-multiple regression: decoded size differs from the "
+          "exact-multiple payload");
+  require(decoded == raw,
+          "exact-multiple regression: decoded bytes differ from the "
+          "exact-multiple payload");
+  std::cout << "continuing decoder exact-multiple regression: OK ("
+            << chunk_bytes << " bytes)\n";
+}
+
 struct Options {
   std::vector<fs::path> inputs = phase0_inputs();
   P29InternLayout layout = P29InternLayout::probe();
@@ -1408,6 +1449,7 @@ int main(int argc, char **argv) {
     run_wire_controls(corpus, interner);
     run_golden_comparison_controls();
     run_materialize_thp_switch_controls();
+    run_continuing_decoder_exact_multiple_regression();
 
     const auto total_start = Clock::now();
     auto research =

@@ -134,6 +134,32 @@ host configuration is designed to honor fastest. Recorded here for
 completeness; the farm-leg validation itself lives outside this
 repository's history.
 
+## Latent decode bug found this round: virtu2 fix-list candidate
+
+Building the THP-switch unit test above surfaced a real, pre-existing
+production bug in `ContinuingDecoder::decode()` (`p29_wire.h`), unrelated
+to opt-5 itself: a transfer whose decoded size lands on an exact multiple
+of the decoder's internal zstd output buffer size can finish its frame on
+the very call that also fills that buffer completely, and the old
+loop-exit test (`output.pos == output.size` alone) would spin one extra
+iteration past the already-finished frame, which zstd reports as a
+nonzero byte count for a nonexistent next frame -- surfacing as "P29 zstd
+stream did not close" and failing the transfer outright. The fix (already
+in `aff53d4a`) adds a `remaining != 0` guard to that condition and changes
+nothing else; it only affects how many times the decode loop iterates in
+this one edge case, so it cannot and does not change a single byte on the
+wire. A dedicated, minimal regression test now exists
+(`run_continuing_decoder_exact_multiple_regression`, in
+`unittests/codec_wire_test.cpp`), decoupled from the THP-switch feature
+test whose 8 MiB payload had incidentally also been an exact multiple of
+that buffer size: it drives `ContinuingEncoder`/`ContinuingDecoder`
+directly with a single-chunk payload sized to `ZSTD_DStreamOutSize()`,
+confirmed via a scratch revert of the guard to fail with exactly that
+error before the fix and pass cleanly with it. Because this bug is in
+shared decode-path code rather than anything specific to this branch's
+opt-5 work, it belongs on the virtu2 fix list for consideration there, not
+just here.
+
 ## Methodology notes
 
 - All measurements use the 60-TU real-corpus bench described in
