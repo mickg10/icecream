@@ -1233,7 +1233,7 @@ void test_s3_resource_storm_product_path() {
                                         blocked_prepared);
     require(blocked.client.status == ClientRunStatus::TerminalError &&
                 blocked.server.status == ServerRunStatus::TerminalError &&
-                blocked_client->has_active_transaction() &&
+                blocked_client.has_active_transaction() &&
                 storm_server.owner_usage().retained_input_records == 8 &&
                 storm_server.owner_usage().retained_input_bytes == 8 * 64,
             "cursor-pinned product capacity failure changed retained state");
@@ -1245,7 +1245,7 @@ void test_s3_resource_storm_product_path() {
                 recovered.server.status == ServerRunStatus::Completed &&
                 recovered.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
                 recovered.server.committed_input.has_value() &&
-                copy_input(storm_server, blocked_client->c_store_guid()) == blocked_input,
+                copy_input(storm_server, blocked_client.c_store_guid()) == blocked_input,
             "failed product install did not retry exact bytes after cursor release");
     storm_server.close_input_job(*recovered.server.committed_input);
     report_resource_checkpoint("storm-recovered", storm_server.owner_usage());
@@ -1514,7 +1514,7 @@ void test_complete_p5co_endpoint_handoff() {
         context, server.run_adopted(std::move(handoff)), asio::use_future);
     std::future<ClientRunResult> client_result = asio::co_spawn(
         context,
-        client->endpoint.run(std::move(*client_socket), prepared, {},
+        client.endpoint.run(std::move(*client_socket), prepared, {},
                             deadline.as_steady_time_point()),
         asio::use_future);
     context.run();
@@ -1685,7 +1685,7 @@ void test_p5co_endpoint_absolute_deadline_and_binding() {
             context, server.run_adopted(std::move(handoff)), asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
             context,
-            wrong_client->endpoint.run(std::move(*client_socket), prepared, {},
+            wrong_client.endpoint.run(std::move(*client_socket), prepared, {},
                                       deadline.as_steady_time_point()),
             asio::use_future);
         context.run();
@@ -1742,7 +1742,7 @@ void test_p5co_endpoint_absolute_deadline_and_binding() {
             asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
             context,
-            client->endpoint.run(std::move(*client_socket), prepared, {},
+            client.endpoint.run(std::move(*client_socket), prepared, {},
                                 deadline.as_steady_time_point()),
             asio::use_future);
         context.run();
@@ -1811,7 +1811,7 @@ void test_server_completion_rechecks_after_live_callback() {
             asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
             context,
-            client->endpoint.run(std::move(*client_socket), prepared, {},
+            client.endpoint.run(std::move(*client_socket), prepared, {},
                                 deadline.as_steady_time_point()),
             asio::use_future);
         context.run();
@@ -2014,7 +2014,7 @@ void test_p5co_worker_completion_is_stale_after_deadline_or_cancel() {
                 asio::use_future);
             std::future<ClientRunResult> client_result = asio::co_spawn(
                 context,
-                client->endpoint.run(std::move(*client_socket), prepared, {},
+                client.endpoint.run(std::move(*client_socket), prepared, {},
                                     deadline.as_steady_time_point()),
                 asio::use_future);
             context.run();
@@ -2100,7 +2100,7 @@ void test_p5co_worker_completion_is_stale_after_deadline_or_cancel() {
             asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
             context,
-            client->endpoint.run(std::move(*client_socket), prepared, {},
+            client.endpoint.run(std::move(*client_socket), prepared, {},
                                 deadline.as_steady_time_point()),
             asio::use_future);
         context.run();
@@ -2274,7 +2274,7 @@ void test_p5co_codec_queue_is_bounded() {
         asio::use_future);
     std::future<ClientRunResult> recovery_client_result = asio::co_spawn(
         context,
-        recovery_client->endpoint.run(
+        recovery_client.endpoint.run(
             std::move(*recovery_client_socket), recovery_prepared, {},
             recovery_deadline.as_steady_time_point()),
         asio::use_future);
@@ -2327,7 +2327,7 @@ void test_p5co_deadline_wins_after_owner_job_selector() {
             context, server.run_adopted(std::move(handoff)), asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
             context,
-            client->endpoint.run(std::move(*client_socket), prepared, {},
+            client.endpoint.run(std::move(*client_socket), prepared, {},
                                 deadline.as_steady_time_point()),
             asio::use_future);
         context.run();
@@ -2377,7 +2377,7 @@ void test_p5co_deadline_wins_after_owner_job_selector() {
             context, server.run_adopted(std::move(handoff)), asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
             context,
-            client->endpoint.run(std::move(*client_socket), prepared, {},
+            client.endpoint.run(std::move(*client_socket), prepared, {},
                                 deadline.as_steady_time_point()),
             asio::use_future);
         context.run();
@@ -2430,7 +2430,7 @@ void test_client_deadline_and_direct_socket_ownership() {
         asio::io_context context;
         std::future<ClientRunResult> future = asio::co_spawn(
             context,
-            client->endpoint.run(tcp::endpoint{asio::ip::address_v4::loopback(), 1}, prepared,
+            client.endpoint.run(tcp::endpoint{asio::ip::address_v4::loopback(), 1}, prepared,
                                  {}, std::chrono::steady_clock::now() - std::chrono::seconds(1)),
             asio::use_future);
         context.run();
@@ -2450,7 +2450,7 @@ void test_client_deadline_and_direct_socket_ownership() {
     const auto started = std::chrono::steady_clock::now();
     std::future<ClientRunResult> future = asio::co_spawn(
         context,
-        client->endpoint.run(acceptor.local_endpoint(), prepared, {},
+        client.endpoint.run(acceptor.local_endpoint(), prepared, {},
                              std::chrono::steady_clock::now() + std::chrono::milliseconds(100)),
         asio::use_future);
     context.run();
@@ -2486,7 +2486,7 @@ void test_client_deadline_and_direct_socket_ownership() {
             const auto executor = co_await asio::this_coro::executor;
             tcp::socket connected(executor);
             co_await connected.async_connect(adopted_acceptor.local_endpoint(), asio::use_awaitable);
-            co_return co_await adopted_client->endpoint.run(std::move(connected),
+            co_return co_await adopted_client.endpoint.run(std::move(connected),
                                                            adopted_prepared);
         },
         asio::use_future);
@@ -2527,7 +2527,7 @@ void test_client_completion_deadline_is_fresh_before_first_write() {
 
     std::future<ClientRunResult> run = asio::co_spawn(
         context,
-        client->endpoint.run(
+        client.endpoint.run(
             acceptor.local_endpoint(), prepared, std::move(control),
             std::chrono::steady_clock::now() + std::chrono::milliseconds(50)),
         asio::use_future);
@@ -4421,7 +4421,7 @@ void test_input_record_owner_and_aggregate_limits() {
         std::future<ServerRunResult> excess =
             asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
         std::future<ClientRunResult> client_result = asio::co_spawn(
-            context, client->endpoint.run(acceptor.local_endpoint(), prepared),
+            context, client.endpoint.run(acceptor.local_endpoint(), prepared),
             asio::use_future);
         context.run();
         require(client_result.get().status == ClientRunStatus::Committed &&
@@ -5693,7 +5693,7 @@ void test_client_operation_scoped_cancellation() {
                                {asio::ip::address_v4::loopback(), 0});
         std::future<ClientRunResult> run = asio::co_spawn(
             context,
-            client->endpoint.run(acceptor.local_endpoint(),
+            client.endpoint.run(acceptor.local_endpoint(),
                                 admit(client, input), control),
             asio::use_future);
         context.run();
@@ -5717,7 +5717,7 @@ void test_client_operation_scoped_cancellation() {
             asio::use_future);
         std::future<ClientRunResult> run = asio::co_spawn(
             context,
-            client->endpoint.run(acceptor.local_endpoint(), prepared, {}),
+            client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
             asio::use_future);
         context.run();
         peer.get();
@@ -6110,7 +6110,7 @@ void test_commit_identity_negative_matrix() {
                                    CommitMismatchField::None, baseline_begin),
             asio::use_future);
         std::future<ClientRunResult> run = asio::co_spawn(
-            context, client->endpoint.run(acceptor.local_endpoint(), prepared, {}),
+            context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
             asio::use_future);
         context.run();
         fake.get();
@@ -6138,7 +6138,7 @@ void test_commit_identity_negative_matrix() {
                                            &observed_body),
                     asio::use_future);
                 std::future<ClientRunResult> run = asio::co_spawn(
-                    context, client->endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                    context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
                     asio::use_future);
                 context.run();
                 fake.get();
@@ -6161,7 +6161,7 @@ void test_commit_identity_negative_matrix() {
                     raw_f_exact_retry(acceptor, fake_f, observed_begin, observed_body),
                     asio::use_future);
                 std::future<ClientRunResult> run = asio::co_spawn(
-                    context, client->endpoint.run(acceptor.local_endpoint(), {}, {}),
+                    context, client.endpoint.run(acceptor.local_endpoint(), {}, {}),
                     asio::use_future);
                 context.run();
                 fake.get();
@@ -6188,7 +6188,7 @@ void test_commit_identity_negative_matrix() {
                 raw_f_serve_and_commit(acceptor, fake_f, field, observed_begin),
                 asio::use_future);
             std::future<ClientRunResult> run = asio::co_spawn(
-                context, client->endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
                 asio::use_future);
             context.run();
             fake.get();
@@ -6568,9 +6568,7 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
     // The next TX runs K=1-cold: a fresh full dance (STATE first, then
     // HISTORY_RESET) on a new history nonce, exactly the K=1 cold path.
     const std::vector<uint8_t> third =
-        bytes("# 1 "/tmp/k2-fixture.cc"
-cold-tx
-");
+        bytes("# 1 \"/tmp/k2-fixture.cc\"\ncold-tx\n");
     const PreparedTuHandle third_handle = admit(*run.client, third);
     const P5coStoreGuids guids = p5co_store_guids(scenario.seed);
     P50ServerEndpoint real_server(guids.f, EndpointCaps{});
@@ -6944,7 +6942,7 @@ void test_lost_final_commit_identity_negative_matrix() {
             std::future<void> fake = asio::co_spawn(
                 context, raw_f_receive_then_drop(acceptor, f_guid, begin), asio::use_future);
             std::future<ClientRunResult> run = asio::co_spawn(
-                context, client->endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
                 asio::use_future);
             context.run();
             fake.get();
@@ -6960,7 +6958,7 @@ void test_lost_final_commit_identity_negative_matrix() {
             raw_f_present_last_commit(acceptor, f_guid, begin, CommitMismatchField::None),
             asio::use_future);
         std::future<ClientRunResult> run = asio::co_spawn(
-            context, client->endpoint.run(acceptor.local_endpoint(), {}, {}), asio::use_future);
+            context, client.endpoint.run(acceptor.local_endpoint(), {}, {}), asio::use_future);
         context.run();
         fake.get();
         const ClientRunResult accepted = run.get();
@@ -6982,7 +6980,7 @@ void test_lost_final_commit_identity_negative_matrix() {
             std::future<void> fake = asio::co_spawn(
                 context, raw_f_receive_then_drop(acceptor, f_guid, begin), asio::use_future);
             std::future<ClientRunResult> run = asio::co_spawn(
-                context, client->endpoint.run(acceptor.local_endpoint(), prepared, {}),
+                context, client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
                 asio::use_future);
             context.run();
             fake.get();
@@ -6998,7 +6996,7 @@ void test_lost_final_commit_identity_negative_matrix() {
                 context, raw_f_present_last_commit(acceptor, f_guid, begin, field),
                 asio::use_future);
             std::future<ClientRunResult> run = asio::co_spawn(
-                context, client->endpoint.run(acceptor.local_endpoint(), {}, {}),
+                context, client.endpoint.run(acceptor.local_endpoint(), {}, {}),
                 asio::use_future);
             context.run();
             fake.get();
@@ -7024,7 +7022,7 @@ void test_lost_final_commit_identity_negative_matrix() {
                 raw_f_present_last_commit(acceptor, f_guid, begin, CommitMismatchField::None),
                 asio::use_future);
             std::future<ClientRunResult> run = asio::co_spawn(
-                context, client->endpoint.run(acceptor.local_endpoint(), {}, {}),
+                context, client.endpoint.run(acceptor.local_endpoint(), {}, {}),
                 asio::use_future);
             context.run();
             fake.get();
