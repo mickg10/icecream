@@ -367,6 +367,17 @@ public:
     // C-wide immutable catalogue or TU allocator.
     [[nodiscard]] bool reset_route(PreparationRouteKey route) noexcept;
 
+    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): a pipelined
+    // successor's own uncommitted P29V1 route state must be retired when the
+    // client endpoint observes its predecessor deviated from the predicted
+    // witness, before the handle itself is released. Unlike reset_route(),
+    // this acts on one still-live handle, not a whole relationship; the
+    // caller must not use `handle` again afterward. Throws
+    // std::invalid_argument if `handle` does not belong to this authority,
+    // has already been released, or is not an active P29V1 successor; throws
+    // std::logic_error if `handle` is not the route's identified successor.
+    void abandon_route(PreparedTuHandle handle);
+
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
     void validate_begin(const TxBegin& begin) const;
@@ -624,6 +635,24 @@ public:
     [[nodiscard]] bool has_reconciliation_work() const;
     [[nodiscard]] RelSeq next_rel_seq() const;
     [[nodiscard]] Digest128 state_digest() const;
+
+    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): true from the
+    // moment a pipelined successor observes its predecessor deviate from the
+    // predicted witness until reset_after_pipeline_poison() clears it. The
+    // predicted-cursor/pipeline-member bookkeeping that is meant to set this
+    // flag is the remaining Step 4d/5 work and does not exist yet, so this
+    // is always false today; the accessor and its paired reset below are
+    // being landed first as the cross-layer bridge the sender side already
+    // calls.
+    [[nodiscard]] bool has_pipeline_poison() const noexcept;
+
+    // Cold local reset for the route this endpoint owns, performed by the
+    // caller while the poisoning transfer still counts as in flight. Leaves
+    // f_guid untouched so the next head dialogue's same_f check stays true
+    // and takes the existing, unmodified RouteHistoryReset wire branch.
+    // Throws std::logic_error if called without an outstanding pipeline
+    // poison.
+    void reset_after_pipeline_poison();
 
 private:
     boost::asio::awaitable<ClientRunResult> run_connected(

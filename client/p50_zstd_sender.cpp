@@ -622,6 +622,14 @@ P50ZstdSourceSender::transfer_bytes(
                 run = co_await impl_->endpoint->run(
                     std::get<boost::asio::ip::tcp::endpoint>(target), prepared,
                     io_control, deadline);
+                if (impl_->endpoint->has_pipeline_poison()) {
+                    // Step 4d: retire this handle's own uncommitted P29V1
+                    // route state before anything below treats this attempt
+                    // as terminal, while the transfer still counts as in
+                    // flight.
+                    impl_->authority->abandon_route(prepared);
+                    impl_->endpoint->reset_after_pipeline_poison();
+                }
             } else {
                 int connected_fd = -1;
                 // BUSY is capacity only: this attempt has not started and no
@@ -660,6 +668,11 @@ P50ZstdSourceSender::transfer_bytes(
                 } else {
                     run = co_await impl_->endpoint->run_adopted_fd(
                         connected_fd, prepared, io_control, deadline);
+                    if (impl_->endpoint->has_pipeline_poison()) {
+                        // Step 4d: same retirement as the other branch above.
+                        impl_->authority->abandon_route(prepared);
+                        impl_->endpoint->reset_after_pipeline_poison();
+                    }
                 }
             }
         } catch (const P29V1CapabilityUnavailable&) {

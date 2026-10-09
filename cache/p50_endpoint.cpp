@@ -1672,6 +1672,28 @@ bool P50PreparationAuthority::reset_route(PreparationRouteKey route_key) noexcep
     }
 }
 
+void P50PreparationAuthority::abandon_route(PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed)
+        throw std::invalid_argument(
+            "prepared-TU handle is not active P29V1");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route ||
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) == route.uncommitted_route_entries.end())
+        throw std::logic_error(
+            "abandon_route does not identify the route successor");
+    route.p29_route->abandon_active();
+}
+
 ProfileId P50PreparationAuthority::profile() const {
     impl_->owner.check();
     return impl_->profile;
@@ -1926,6 +1948,12 @@ struct P50ClientEndpoint::Impl {
     RelSeq next_rel{};
     Digest128 state{};
     bool pipelined_begin = false;
+    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): set by the
+    // not-yet-implemented predicted-cursor bookkeeping when a pipelined
+    // successor observes its predecessor deviate from the predicted
+    // witness; cleared by reset_after_pipeline_poison(). Always false until
+    // that bookkeeping lands (Step 4d/5).
+    bool poisoned = false;
     // F's fingerprint and limits from the STATE that last admitted a TX_BEGIN.
     std::optional<Digest128> route_f_fingerprint;
     SessionLimits route_limits{};
@@ -4028,6 +4056,30 @@ RelSeq P50ClientEndpoint::next_rel_seq() const {
 Digest128 P50ClientEndpoint::state_digest() const {
     impl_->owner.check();
     return impl_->state;
+}
+
+bool P50ClientEndpoint::has_pipeline_poison() const noexcept {
+    impl_->owner.check();
+    return impl_->poisoned;
+}
+
+void P50ClientEndpoint::reset_after_pipeline_poison() {
+    impl_->owner.require();
+    if (!impl_->poisoned)
+        throw std::logic_error(
+            "reset_after_pipeline_poison() called without an outstanding "
+            "pipeline poison");
+    // Cold local reset: fresh history/rel-seq/state, deliberately leaving
+    // f_guid untouched so the next head dialogue's same_f check still takes
+    // the existing RouteHistoryReset wire branch unmodified.
+    impl_->history_nonce = impl_->allocate_nonce();
+    impl_->next_rel = RelSeq{0};
+    impl_->state = Digest128{};
+    impl_->active.reset();
+    impl_->queued.reset();
+    impl_->queued_handle = {};
+    impl_->route_f_fingerprint.reset();
+    impl_->poisoned = false;
 }
 
 P50ServerEndpoint::P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps,
