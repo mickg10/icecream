@@ -3707,6 +3707,21 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     storm.after_storm = transfer(identity_base + 100);
     storm.after_storm_ran = true;
     front.stop();
+    for (size_t index = 0; index != kStormTransfers; ++index)
+        std::fprintf(stderr,
+                     "p50cacheservice: storm[%zu] id=%llu code=%u error=%u "
+                     "attempts=%u tu=%llu\n",
+                     index, static_cast<unsigned long long>(identity_base + 10 * index),
+                     static_cast<unsigned>(storm.results[index].code),
+                     static_cast<unsigned>(storm.results[index].error_code),
+                     static_cast<unsigned>(storm.results[index].attempts),
+                     static_cast<unsigned long long>(storm.results[index].tu_seq));
+    std::fprintf(stderr,
+                 "p50cacheservice: storm-after id=%llu code=%u error=%u attempts=%u\n",
+                 static_cast<unsigned long long>(identity_base + 100),
+                 static_cast<unsigned>(storm.after_storm.code),
+                 static_cast<unsigned>(storm.after_storm.error_code),
+                 static_cast<unsigned>(storm.after_storm.attempts));
 
     CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
     CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
