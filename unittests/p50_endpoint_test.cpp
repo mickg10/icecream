@@ -6403,6 +6403,13 @@ asio::awaitable<void> raw_parked_f_serve_connection(
             }
         }
     }
+    if (state->head_never_commits.load() && !park) {
+        // T5: the head never writes its COMMIT; C's own transfer deadline
+        // must be the thing that fails it. Sit in the peer-close wait until
+        // C gives up and closes.
+        co_await raw_wait_for_close(socket);
+        co_return;
+    }
     co_await raw_write(socket, Message{commit});
     co_await raw_wait_for_close(socket);
 }
@@ -6455,6 +6462,15 @@ void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
     auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
     out.client = client;
     out.fake = state;
+    if (scenario.head_outcome ==
+        K2PipelineScenario::HeadOutcome::DropAfterNeed)
+        state->head_drop_after_need.store(true);
+    if (scenario.head_outcome ==
+        K2PipelineScenario::HeadOutcome::NeverCommit)
+        state->head_never_commits.store(true);
+    if (scenario.successor_outcome ==
+        K2PipelineScenario::SuccessorOutcome::CorruptStateDigest)
+        state->corrupt_successor_state.store(true);
 
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -6511,8 +6527,7 @@ void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
                                       scenario.force_successor_commit_first,
                                       head_begin_capture, head_body_capture),
         asio::use_future);
-    if (scenario.successor_outcome == K2PipelineScenario::SuccessorOutcome::CorruptStateDigest)
-        state->corrupt_successor_state.store(true);
+
 
     TxBegin succ_begin_wire;
     std::vector<uint8_t> succ_body_wire;
