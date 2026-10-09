@@ -7182,6 +7182,884 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
 }
 
 
+// raw_commit_one_tu is defined further down (step-5d recovery fixture).
+asio::awaitable<void> raw_commit_one_tu(tcp::endpoint remote, CStoreGuid c_guid,
+                                        const ZstdTuEnvelope& tu, HistoryNonce nonce,
+                                        RelSeq rel);
+
+// ===== Admission-race fixes (2026-10-09): Fix F pre-park + Fix C dispatch =====
+//
+// Fix F (F side): the step-5b MSG_PEEK is instantaneous. A successor that
+// writes SESSION_HELLO and then TX_BEGIN as two separate writes (BEGIN
+// delayed) defeats it: when F has consumed HELLO the successor's BEGIN has
+// not landed yet, so the old fall-through ran stage() -- a SESSION_STATE
+// built from the still-outstanding head's cursor, which the C successor's
+// exact-witness check rejects -- and then activate() REPLACED the live head
+// session, dropping the head's pending TX. The level-triggered pre-park
+// (cache/p50_endpoint.cpp step 5c) parks the session instead. Both tests
+// below drive the REAL P50ServerEndpoint with a raw successor socket whose
+// HELLO/BEGIN split is test-controlled, and the head's materialization
+// gated on F's codec worker (the one blocking gate that is not the
+// io_context thread) so route->pending is deterministically set.
+
+// T-F (Fix F): successor HELLO, then a delayed BEGIN (100 ms) -- the exact
+// missed-peek shape. F must pre-park: no SESSION_STATE byte may reach the
+// successor socket while the head is still gated (a stage() would have
+// written one immediately), and after the head commits the successor's STATE
+// must carry its OWN predicted witness (cursor 1 + the offline-derived
+// pre-state), never the head's cursor.
+struct PreparkRace {
+    // Set by the head's F-side materialize gate
+    // (before_materialize_on_worker): the deterministic proof that the
+    // head's TX is INSTALLED and pending on the route. The successor must
+    // not write HELLO before this -- F's successor session would then
+    // process HELLO with no pending TX on the route and (correctly, per
+    // the design) fall through to stage() instead of pre-parking.
+    std::atomic<bool>* head_pending = nullptr;
+    std::atomic<bool> begin_written{false};
+    // Set by the successor coroutine after its no-stage probe loop: the
+    // gate releaser waits for it, so the head stays gated (its TX pending)
+    // through the whole probe window -- deterministic ordering, no
+    // sleep-based handoff.
+    std::atomic<bool> probe_done{false};
+};
+
+asio::awaitable<void> raw_prepark_successor(tcp::endpoint remote, CStoreGuid c_guid,
+                                            const ZstdTuEnvelope& successor_tu,
+                                            HistoryNonce nonce,
+                                            PreparkRace& race) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    // Do not write HELLO until the head's TX is installed and pending on
+    // the route at F (the gate-entered flag is that deterministic signal):
+    // the pre-park condition is route->pending owned by another serial.
+    asio::steady_timer pending_wait(executor);
+    while (!race.head_pending->load(std::memory_order_acquire)) {
+        pending_wait.expires_after(std::chrono::milliseconds(1));
+        boost::system::error_code ignored;
+        co_await pending_wait.async_wait(
+            asio::redirect_error(asio::use_awaitable, ignored));
+    }
+    SessionHello hello;
+    hello.c_store_guid = c_guid;
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    hello.limits = {};
+    co_await raw_write(socket, hello);
+    // The hook-controlled delay: BEGIN (and BODY) land only after F has
+    // certainly consumed HELLO -- beyond the peek's reach.
+    asio::steady_timer delay(executor);
+    delay.expires_after(std::chrono::milliseconds(100));
+    co_await delay.async_wait(asio::use_awaitable);
+    co_await raw_write(socket, successor_tu.begin);
+    Message body_message = BodyMessage{successor_tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    race.begin_written.store(true);
+    // Park proof: while the head's materialization is still gated (its TX
+    // pending on the route), no byte may arrive on this socket. A
+    // fall-through stage() would have written SESSION_STATE immediately
+    // (microseconds after the missed peek), so a short level-triggered
+    // probe window on available() is a complete refutation; the gate is
+    // held through this whole window (probe_done gates the releaser).
+    asio::steady_timer probe(executor);
+    for (int iteration = 0; iteration != 20; ++iteration) {
+        probe.expires_after(std::chrono::milliseconds(10));
+        boost::system::error_code ignored;
+        co_await probe.async_wait(
+            asio::redirect_error(asio::use_awaitable, ignored));
+        boost::system::error_code available_error;
+        const std::size_t available = socket.available(available_error);
+        require(!available_error && available == 0,
+                "pre-park successor received bytes while its predecessor "
+                "was still pending (stage() ran early)");
+    }
+    race.probe_done.store(true);
+    // The gate released (the test's watcher frees it once begin_written);
+    // the STATE read completes only through the head's commit release, and
+    // it must carry this successor's OWN predicted cursor.
+    const SessionState state = raw_decode<SessionState>(
+        co_await raw_read(socket, hello.limits.max_frame_payload));
+    require(state.route_present && state.history_nonce == nonce &&
+                state.next_rel_seq.value == 1 &&
+                state.state_digest == successor_tu.begin.pre_state_digest,
+            "pre-park successor observed a route cursor that never advanced "
+            "to its own predicted witness");
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, state.limits.max_frame_payload));
+    require(commit.transaction_digest == successor_tu.begin.transaction_digest &&
+                commit.raw_digest == successor_tu.begin.raw_digest,
+            "pre-park successor received a different TX_COMMIT");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+// The gated raw head: HELLO + fresh-route reset + BEGIN + BODY, then the
+// test holds its materialization on F's codec worker until the successor has
+// landed its whole batch, then it commits and closes.
+asio::awaitable<void> raw_prepark_head(tcp::endpoint remote, CStoreGuid c_guid,
+                                       const ZstdTuEnvelope& head_tu,
+                                       HistoryNonce nonce, PreparkRace& race) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    const SessionState reset_ack =
+        co_await raw_reset(socket, open, nonce);
+    require(reset_ack.route_present && reset_ack.history_nonce == nonce &&
+                reset_ack.state_digest == initial_route_digest(c_guid, nonce) &&
+                reset_ack.next_rel_seq.value == 0,
+            "pre-park head did not establish its fresh route");
+    const TxBegin begin =
+        make_begin(head_tu, nonce, reset_ack.state_digest,
+                   reset_ack.next_rel_seq);
+    co_await raw_write(socket, begin);
+    Message body_message = BodyMessage{head_tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    // Deterministic level-triggered flag wait (no sleep-based
+    // synchronisation): the head's commit read happens only after the
+    // successor's batch is on the wire and the gate released.
+    asio::steady_timer wait(executor);
+    while (!race.begin_written.load()) {
+        wait.expires_after(std::chrono::milliseconds(1));
+        boost::system::error_code ignored;
+        co_await wait.async_wait(asio::redirect_error(asio::use_awaitable, ignored));
+    }
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, reset_ack.limits.max_frame_payload));
+    require(commit.transaction_digest == begin.transaction_digest &&
+                commit.raw_digest == begin.raw_digest,
+            "pre-park head received a different TX_COMMIT");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+void test_route_pipeline_prepark_when_begin_lands_after_hello() {
+    const P5coStoreGuids guids = p5co_store_guids(48);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    const HistoryNonce nonce{481};
+    const ZstdTuEnvelope head_tu =
+        encode_zstd_tu(nonce, RelSeq{0}, TuSeq{4810},
+                        initial_route_digest(guids.c, nonce),
+                        bytes("pre-park: head TU\n"));
+    // The successor's pre-state is derived entirely offline from the head's
+    // own begin fields -- the route-pipelining argument pattern.
+    const Digest128 successor_pre_state = compute_post_state_digest(
+        head_tu.begin.pre_state_digest, head_tu.begin.history_nonce,
+        head_tu.begin.rel_seq, head_tu.begin.tu_seq,
+        head_tu.begin.transaction_digest);
+    const ZstdTuEnvelope successor_tu =
+        encode_zstd_tu(nonce, RelSeq{1}, TuSeq{4811}, successor_pre_state,
+                       bytes("pre-park: successor TU\n"));
+
+    std::promise<void> release_head;
+    std::future<void> head_gate = release_head.get_future();
+    std::atomic<bool> head_materialize_entered{false};
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&]() {
+        if (!head_materialize_entered.exchange(true))
+            head_gate.wait();
+    };
+    PreparkRace race;
+    race.head_pending = &head_materialize_entered;
+    asio::io_context context;
+    // Separate acceptors per leg: no accept-order race between head and
+    // successor.
+    tcp::acceptor head_acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::acceptor successor_acceptor(
+        context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(head_acceptor, head_server_control),
+        asio::use_future);
+    std::future<ServerRunResult> successor_server = asio::co_spawn(
+        context, server.accept_one(successor_acceptor), asio::use_future);
+    std::future<void> head_client = asio::co_spawn(
+        context,
+        raw_prepark_head(head_acceptor.local_endpoint(), guids.c, head_tu,
+                         nonce, race),
+        asio::use_future);
+    std::future<void> successor_client = asio::co_spawn(
+        context,
+        raw_prepark_successor(successor_acceptor.local_endpoint(), guids.c,
+                              successor_tu, nonce, race),
+        asio::use_future);
+    // Release the head's materialization once the successor has landed its
+    // full batch: the head commits, release_parked_at wakes the pre-parked
+    // successor, and both dialogues complete.
+    std::future<void> releaser = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!race.begin_written.load() || !race.probe_done.load()) {
+                timer.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            release_head.set_value();
+            co_return;
+        },
+        asio::use_future);
+    context.run_for(std::chrono::seconds(10));
+    require(head_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                head_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "test_route_pipeline_prepark_when_begin_lands_after_hello: "
+            "hung (pre-park regression?)");
+    head_client.get();
+    successor_client.get();
+    const ServerRunResult head_run = head_server.get();
+    const ServerRunResult successor_run = successor_server.get();
+    require(head_run.status == ServerRunStatus::Completed &&
+                successor_run.status == ServerRunStatus::Completed,
+            "pre-park pair did not complete both sessions");
+    require(head_run.f_rel_seq.value == 0 &&
+                successor_run.f_rel_seq.value == 1,
+            "pre-park pair did not run at its declared rel_seq");
+    // The successor's HELLO-time peek must NOT have seen its own BEGIN: the
+    // 100 ms delay is the whole fixture (the head's own session never peeks
+    // a TX_BEGIN on its own connection).
+    require(!successor_run.f_hello_time_peeked_begin_rel_seq.has_value(),
+            "pre-park fixture broke: the successor's delayed BEGIN was "
+            "peekable at HELLO time");
+    (void)releaser;
+    // Commit order and exact bytes on the F route.
+    std::vector<uint64_t> f_commit_order;
+    for (const ActionRecord& record : actions.records()) {
+        if (record.actor != ActorSide::F || record.c_store_guid != guids.c)
+            continue;
+        if (record.action == ActionType::INPUT_COMMITTED)
+            f_commit_order.push_back(record.rel_seq.value);
+    }
+    require(f_commit_order == std::vector<uint64_t>{0, 1},
+            "pre-park pair committed its TUs out of route order");
+    require(copy_input(server, guids.c) ==
+                std::optional<std::vector<uint8_t>>(
+                    bytes("pre-park: successor TU\n")),
+            "pre-park successor did not materialize exact bytes");
+}
+
+// T-F grace leg (Fix F): HELLO with no further bytes while the head's TX is
+// pending. The pre-park holds (nothing to fall through on), and when the
+// head commits, release_parked_at -- level-triggered -- wakes it; the
+// fall-through runs the unchanged stage()/STATE path against the advanced
+// cursor. The successor then closes without a BEGIN, so its session ends in
+// the ordinary mid-dialogue EOF: never a hang, never a terminal latch on
+// the route (the next TU commits through the unchanged path).
+void test_route_pipeline_prepark_grace_falls_through_after_head_commit() {
+    const P5coStoreGuids guids = p5co_store_guids(49);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpoint server(guids.f, caps);
+    const HistoryNonce nonce{491};
+    const ZstdTuEnvelope head_tu =
+        encode_zstd_tu(nonce, RelSeq{0}, TuSeq{4910},
+                        initial_route_digest(guids.c, nonce),
+                        bytes("pre-park grace: head TU\n"));
+
+    std::promise<void> release_head;
+    std::future<void> head_gate = release_head.get_future();
+    std::atomic<bool> head_materialize_entered{false};
+    std::atomic<bool> successor_hello_written{false};
+    std::atomic<bool> successor_probe_done{false};
+    std::atomic<bool> head_released{false};
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&]() {
+        if (!head_materialize_entered.exchange(true))
+            head_gate.wait();
+    };
+    asio::io_context context;
+    tcp::acceptor head_acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::acceptor successor_acceptor(
+        context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(head_acceptor, head_server_control),
+        asio::use_future);
+    std::future<ServerRunResult> successor_server = asio::co_spawn(
+        context, server.accept_one(successor_acceptor), asio::use_future);
+    std::future<void> head_client = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket socket(executor);
+            const tcp::endpoint remote = head_acceptor.local_endpoint();
+            co_await socket.async_connect(remote, asio::use_awaitable);
+            SessionHello hello;
+            hello.c_store_guid = guids.c;
+            hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+            hello.limits = {};
+            const RawRoute open = co_await raw_open(socket, remote, guids.c);
+            const SessionState reset_ack =
+                co_await raw_reset(socket, open, nonce);
+            require(reset_ack.route_present &&
+                        reset_ack.history_nonce == nonce,
+                    "grace head did not establish its route");
+            const TxBegin begin = make_begin(
+                head_tu, nonce, reset_ack.state_digest,
+                reset_ack.next_rel_seq);
+            co_await raw_write(socket, begin);
+            Message body_message = BodyMessage{head_tu.body};
+            co_await raw_write(socket, std::move(body_message));
+            const TxCommit commit = raw_decode<TxCommit>(
+                co_await raw_read(socket, reset_ack.limits.max_frame_payload));
+            require(commit.transaction_digest == begin.transaction_digest,
+                    "grace head received a different TX_COMMIT");
+            boost::system::error_code ignored;
+            socket.close(ignored);
+            co_return;
+        },
+        asio::use_future);
+    // The HELLO-only successor: writes HELLO, probes that nothing is staged
+    // while the head is gated (the pre-park must hold, not fall through:
+    // falling through would stage() a SESSION_STATE onto this socket), then
+    // closes -- surfacing the pre-park's readable-but-empty EOF path.
+    std::future<void> successor_client = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket socket(executor);
+            const tcp::endpoint remote =
+                successor_acceptor.local_endpoint();
+            co_await socket.async_connect(remote, asio::use_awaitable);
+            // Same deterministic ordering as the park test: HELLO only
+            // after the head's TX is pending on the route at F.
+            asio::steady_timer pending_wait(executor);
+            while (!head_materialize_entered.load(std::memory_order_acquire)) {
+                pending_wait.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await pending_wait.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            SessionHello hello;
+            hello.c_store_guid = guids.c;
+            hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+            hello.limits = {};
+            co_await raw_write(socket, hello);
+            successor_hello_written.store(true);
+            // Park proof while gated: no SESSION_STATE byte may arrive.
+            asio::steady_timer probe(executor);
+            for (int iteration = 0; iteration != 20; ++iteration) {
+                probe.expires_after(std::chrono::milliseconds(10));
+                boost::system::error_code ignored;
+                co_await probe.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+                boost::system::error_code available_error;
+                const std::size_t available =
+                    socket.available(available_error);
+                require(!available_error && available == 0,
+                        "grace successor received bytes while the head was "
+                        "still pending (stage() ran early)");
+            }
+            successor_probe_done.store(true);
+            // Stay connected through the release: the head commits, the
+            // pre-park wakes through release_parked_at, falls through, and
+            // stage() writes the post-commit STATE onto THIS socket (the
+            // grace fall-through). Only then close -- never sending a
+            // BEGIN -- so F ends in the ordinary mid-dialogue EOF.
+            asio::steady_timer wait_release(executor);
+            while (!head_released.load()) {
+                wait_release.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await wait_release.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            // The released fall-through stages STATE here; drain it so the
+            // session proceeds to the BEGIN wait, then close: EOF.
+            boost::system::error_code ignored;
+            const SessionState staged = raw_decode<SessionState>(
+                co_await raw_read(socket, hello.limits.max_frame_payload));
+            require(staged.route_present && staged.next_rel_seq.value == 1,
+                    "grace successor's fall-through STATE did not carry the "
+                    "post-commit cursor");
+            socket.close(ignored);
+            co_return;
+        },
+        asio::use_future);
+    // Release the head's materialization only after the successor's whole
+    // probe window has run (level-triggered flags, the same deterministic
+    // handoff as the park test): the head then commits, release_parked_at
+    // wakes the pre-parked successor, the fall-through stages the
+    // post-commit STATE onto its socket, and its close ends the session in
+    // the ordinary EOF.
+    std::future<void> releaser = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!successor_hello_written.load() ||
+                   !successor_probe_done.load()) {
+                timer.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            release_head.set_value();
+            head_released.store(true);
+            co_return;
+        },
+        asio::use_future);
+    context.run_for(std::chrono::seconds(10));
+    require(head_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                head_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "test_route_pipeline_prepark_grace_falls_through_after_head_"
+            "commit: hung (pre-park grace regression?)");
+    head_client.get();
+    successor_client.get();
+    const ServerRunResult head_run = head_server.get();
+    const ServerRunResult successor_run = successor_server.get();
+    require(head_run.status == ServerRunStatus::Completed,
+            "grace pair: the gated head did not commit");
+    require(successor_run.status == ServerRunStatus::Disconnected,
+            "grace pair: the HELLO-only successor did not end in the "
+            "ordinary disconnect");
+    require(head_run.f_rel_seq.value == 0,
+            "grace pair: the head did not run at rel 0");
+    require(copy_input(server, guids.c) ==
+                std::optional<std::vector<uint8_t>>(
+                    bytes("pre-park grace: head TU\n")),
+            "grace pair: the head did not materialize exact bytes");
+    // The route stays fully usable through the unchanged path.
+    const std::vector<uint8_t> recovery_input =
+        bytes("pre-park grace: recovery TU\n");
+    const ZstdTuEnvelope recovery_tu =
+        encode_zstd_tu(nonce, RelSeq{1}, TuSeq{4911},
+                       compute_post_state_digest(
+                           head_tu.begin.pre_state_digest,
+                           head_tu.begin.history_nonce,
+                           head_tu.begin.rel_seq, head_tu.begin.tu_seq,
+                           head_tu.begin.transaction_digest),
+                       recovery_input);
+    asio::io_context recovery;
+    tcp::acceptor recovery_acceptor(
+        recovery, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> recovery_server = asio::co_spawn(
+        recovery, server.accept_one(recovery_acceptor), asio::use_future);
+    std::future<void> recovery_client = asio::co_spawn(
+        recovery,
+        raw_commit_one_tu(recovery_acceptor.local_endpoint(), guids.c,
+                          recovery_tu, nonce, RelSeq{1}),
+        asio::use_future);
+    recovery.run_for(std::chrono::seconds(5));
+    require(recovery_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                recovery_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "grace pair: the recovery leg hung");
+    recovery_client.get();
+    const ServerRunResult recovery_run = recovery_server.get();
+    require(recovery_run.status == ServerRunStatus::Completed &&
+                recovery_run.f_rel_seq.value == 1,
+            "grace pair: the route was not usable after the pre-park "
+            "grace fall-through");
+    require(copy_input(server, guids.c) ==
+                std::optional<std::vector<uint8_t>>(recovery_input),
+            "grace pair: the recovery TU did not materialize exact bytes");
+    (void)releaser;
+}
+
+// T-F grace-expiry leg (Fix F fixup, sorbet-main review): the pre-park's
+// bounded grace must FALL THROUGH when it expires -- not throw. The timer
+// handler cancels the socket wait; without the grace-expired flag the loop
+// would see operation_aborted, released == false, and throw system_error,
+// killing the session before stage() ever ran. Here the grace bound is
+// shortened through the endpoint config (the test-only override; production
+// keeps 2000 ms), the head stays gated (its TX pending) for longer than the
+// grace, and the successor sends HELLO and nothing else. F must fall
+// through at the expiry, run the unchanged stage(), and write a SESSION_STATE
+// carrying the HEAD's cursor (the head never committed) onto the successor
+// socket -- the session then ends in the ordinary mid-dialogue EOF, never a
+// pre-park error, and the head's pending TX is untouched (no activate() ran:
+// the successor sent no BEGIN), so the head still commits once released.
+void test_route_pipeline_prepark_grace_expiry_falls_through_not_throws() {
+    const P5coStoreGuids guids = p5co_store_guids(50);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpointConfig server_config;
+    server_config.prepark_grace_bound_ms = 150;
+    P50ServerEndpoint server(guids.f, caps, nullptr, nullptr, server_config);
+    const HistoryNonce nonce{501};
+    const ZstdTuEnvelope head_tu =
+        encode_zstd_tu(nonce, RelSeq{0}, TuSeq{5010},
+                        initial_route_digest(guids.c, nonce),
+                        bytes("pre-park expiry: head TU\n"));
+
+    std::promise<void> release_head;
+    std::future<void> head_gate = release_head.get_future();
+    std::atomic<bool> head_materialize_entered{false};
+    std::atomic<bool> successor_state_read{false};
+    std::atomic<bool> successor_closed{false};
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&]() {
+        if (!head_materialize_entered.exchange(true))
+            head_gate.wait();
+    };
+
+    asio::io_context context;
+    tcp::acceptor head_acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::acceptor successor_acceptor(
+        context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(head_acceptor, head_server_control),
+        asio::use_future);
+    std::future<ServerRunResult> successor_server = asio::co_spawn(
+        context, server.accept_one(successor_acceptor), asio::use_future);
+    // The gated raw head: HELLO + route reset + BEGIN + BODY, then held.
+    std::future<void> head_client = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket socket(executor);
+            const RawRoute open =
+                co_await raw_open(socket, head_acceptor.local_endpoint(),
+                                  guids.c);
+            const SessionState reset_ack =
+                co_await raw_reset(socket, open, nonce);
+            const TxBegin begin =
+                make_begin(head_tu, nonce, reset_ack.state_digest,
+                           reset_ack.next_rel_seq);
+            co_await raw_write(socket, begin);
+            Message body_message = BodyMessage{head_tu.body};
+            co_await raw_write(socket, std::move(body_message));
+            // The commit read completes only after the test releases the
+            // gate (the successor has then observed the grace fall-through).
+            const TxCommit commit = raw_decode<TxCommit>(
+                co_await raw_read(socket, reset_ack.limits.max_frame_payload));
+            require(commit.transaction_digest == begin.transaction_digest,
+                    "pre-park expiry head received a different TX_COMMIT");
+            boost::system::error_code ignored;
+            socket.close(ignored);
+            co_return;
+        },
+        asio::use_future);
+    // The HELLO-only successor: HELLO after the head's TX is pending, then
+    // nothing. The 150 ms grace expires (the head stays gated far longer);
+    // the fall-through stages a STATE with the HEAD's cursor onto this
+    // socket. Read it, then close: the ordinary EOF.
+    std::future<void> successor_client = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            const auto executor = co_await asio::this_coro::executor;
+            tcp::socket socket(executor);
+            const tcp::endpoint remote =
+                successor_acceptor.local_endpoint();
+            co_await socket.async_connect(remote, asio::use_awaitable);
+            asio::steady_timer pending_wait(executor);
+            while (!head_materialize_entered.load(std::memory_order_acquire)) {
+                pending_wait.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await pending_wait.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            SessionHello hello;
+            hello.c_store_guid = guids.c;
+            hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+            hello.limits = {};
+            co_await raw_write(socket, hello);
+            // The grace expiry falls through: the staged STATE arrives
+            // WITHOUT any release (the head is still gated). A regression
+            // that throws on the grace instead would leave this read
+            // pending forever (the future-readiness assertion below then
+            // fails instead of hanging the leg).
+            const SessionState staged = raw_decode<SessionState>(
+                co_await raw_read(socket, hello.limits.max_frame_payload));
+            successor_state_read.store(true);
+            // Today's fall-through semantics: the head never committed, so
+            // the staged cursor is still the HEAD's (rel 0) -- NOT the
+            // successor's.
+            require(staged.route_present && staged.history_nonce == nonce &&
+                        staged.next_rel_seq.value == 0,
+                    "pre-park expiry fall-through staged a cursor it must "
+                    "not have (the head never committed)");
+            boost::system::error_code ignored;
+            socket.close(ignored);
+            successor_closed.store(true);
+            co_return;
+        },
+        asio::use_future);
+    // Release the head's materialization only after the successor observed
+    // the grace fall-through STATE and closed: the head then commits
+    // (proving its pending TX survived the fall-through untouched).
+    std::future<void> releaser = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!successor_state_read.load() ||
+                   !successor_closed.load()) {
+                timer.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            release_head.set_value();
+            co_return;
+        },
+        asio::use_future);
+    context.run_for(std::chrono::seconds(10));
+    require(head_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                head_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "test_route_pipeline_prepark_grace_expiry_falls_through_not_"
+            "throws: hung (grace-expiry threw instead of falling through?)");
+    head_client.get();
+    successor_client.get();
+    const ServerRunResult head_run = head_server.get();
+    const ServerRunResult successor_run = successor_server.get();
+    // The head committed exactly (its pending TX was never replaced: the
+    // fall-through's stage() ran, but no BEGIN was read from the successor,
+    // so activate()/install never ran).
+    require(head_run.status == ServerRunStatus::Completed &&
+                head_run.f_rel_seq.value == 0,
+            "pre-park expiry: the head did not commit after the grace "
+            "fall-through (its pending TX must be untouched)");
+    // The successor session ended in the ordinary mid-dialogue EOF -- never
+    // a pre-park error (a grace-expiry throw would have surfaced as a
+    // TerminalError before any STATE was staged, and the successor's STATE
+    // read above would never have completed).
+    require(successor_run.status == ServerRunStatus::Disconnected,
+            "pre-park expiry: the successor session did not end in the "
+            "ordinary disconnect");
+    require(copy_input(server, guids.c) ==
+                std::optional<std::vector<uint8_t>>(
+                    bytes("pre-park expiry: head TU\n")),
+            "pre-park expiry: the head did not materialize exact bytes");
+    (void)releaser;
+}
+
+// T-C (Fix C): three same-route TXs at depth 2, the third dispatched while
+// the second is a NOT-YET-PROMOTED successor -- the commit-to-promotion
+// gap. The head commits (Impl::accept resets `active`, wakes the slot
+// waiters) and returns (active_session 0), but TX2 is promoted only when
+// its own coroutine resumes. TX3's dispatch (after its production-shaped
+// wait_for_window_slot) lands in the gap or just after TX2's promotion --
+// in either order the entry dispatch must take the pipelined branch
+// (Impl::outstanding: the successors deque / active head) and admit TX3 as
+// the next successor. The old dispatch chose the HEAD path from
+// active_session == 0 (then TX2's promotion threw "promoted over a live
+// head dialogue") or the full-window throw, both poisoning the route.
+//
+// Determinism: the head's materialization is gated on F's codec worker, so
+// TX2's admission (posted from the head's write_complete) happens strictly
+// while the head is outstanding, and TX3 is posted from TX2's write_complete
+// -- TX2 is then in the successors deque, suspended at its STATE read (F
+// parks it), unpromoted. TX3 arms a registered window-slot wait before the
+// gate releases (the test waits on the waiter-count test hook, not a
+// sleep), so the head's accept is what wakes it.
+void test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap() {
+    const P5coStoreGuids guids = p5co_store_guids(253);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    P50ServerEndpoint server(guids.f, caps);
+
+    std::promise<void> release_head;
+    std::future<void> head_gate = release_head.get_future();
+    std::atomic<bool> head_materialize_entered{false};
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&]() {
+        if (!head_materialize_entered.exchange(true))
+            head_gate.wait();
+    };
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(acceptor, head_server_control),
+        asio::use_future);
+    std::future<ServerRunResult> tx2_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+    std::future<ServerRunResult> tx3_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+
+    const std::vector<uint8_t> head_input =
+        bytes("# 1 \"/tmp/k2-real-d.cc\"\nshared-d-head\nhead-line\n");
+    const std::vector<uint8_t> tx2_input =
+        bytes("# 1 \"/tmp/k2-real-d.cc\"\nshared-d-head\ntx2-line\n");
+    const std::vector<uint8_t> tx3_input =
+        bytes("# 1 \"/tmp/k2-real-d.cc\"\nshared-d-head\ntx3-line\n");
+    const PreparedTuHandle head_handle = admit(client, head_input);
+
+    std::atomic<bool> tx2_dispatched{false};
+    std::atomic<bool> tx3_dispatched{false};
+    std::atomic<bool> tx3_observed_active{false};
+    std::atomic<bool> tx3_observed_gap{false};
+    std::optional<std::future<ClientRunResult>> tx2_result;
+    std::optional<std::future<ClientRunResult>> tx3_result;
+    std::optional<PreparedTuHandle> tx2_handle;
+    std::optional<PreparedTuHandle> tx3_handle;
+
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        if (tx2_dispatched.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            tx2_handle = admit(client, tx2_input);
+            EndpointIoControl tx2_control;
+            // TX2's own write_complete posts TX3: at that point TX2 is an
+            // admitted-but-unpromoted successor (in the deque, suspended at
+            // its STATE read, parked on F) and the head is still gated.
+            tx2_control.write_complete = [&]() {
+                if (tx3_dispatched.exchange(true))
+                    return;
+                asio::post(context, [&]() {
+                    tx3_result.emplace(asio::co_spawn(
+                        context,
+                        [&]() -> asio::awaitable<ClientRunResult> {
+                            // The production sender shape: wait for a free
+                            // window slot BEFORE prepare_for_route and the
+                            // run -- the authority's own uncommitted-successor
+                            // bound (prepare_for_route's admission) is only
+                            // reachable once the head's accept freed its
+                            // entry, which is exactly what the slot wait
+                            // gates on. A bounded wait so the waiter
+                            // registers (wait_for_window_slot only
+                            // registers its timer under a deadline), and so
+                            // a regression that loses the wake fails
+                            // instead of hanging.
+                            const bool slot =
+                                co_await client.endpoint.wait_for_window_slot(
+                                    std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(10));
+                            require(slot,
+                                    "T-C: TX3 window slot wait failed");
+                            tx3_handle = admit(client, tx3_input);
+                            // Built inside the coroutine: this body resumes
+                            // after the slot-wait suspension, by which time
+                            // the posting lambda's frame is gone, so the
+                            // control must not dangle from it.
+                            EndpointIoControl tx3_control;
+                            tx3_control.outbound_message_observer =
+                                [&](ActorSide actor, const Message&) {
+                                    if (actor != ActorSide::C)
+                                        return;
+                                    // Which dispatch order happened: TX3
+                                    // admitted while TX2 was already
+                                    // promoted (active), or while TX2 was
+                                    // still unpromoted (the gap). Both are
+                                    // valid post-fix; both must commit.
+                                    if (client.endpoint.has_active_transaction())
+                                        tx3_observed_active.store(true);
+                                    else
+                                        tx3_observed_gap.store(true);
+                                };
+                            co_return co_await client.endpoint.run(
+                                remote, *tx3_handle, tx3_control,
+                                std::nullopt);
+                        },
+                        asio::use_future));
+                });
+            };
+            tx2_result.emplace(asio::co_spawn(
+                context,
+                client.endpoint.run(remote, *tx2_handle, tx2_control),
+                asio::use_future));
+        });
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.endpoint.run(remote, head_handle, head_control),
+                asio::use_future);
+    // Release the head's materialization only once TX3 is posted AND its
+    // window-slot wait is armed (the waiter-count test hook -- deterministic
+    // release point, no sleep): the head then commits, its accept wakes
+    // TX3's slot wait, and TX3 dispatches across the gap.
+    std::future<void> releaser = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!tx3_dispatched.load() ||
+                   client.endpoint
+                           .pipeline_window_slot_waiter_count_for_test() ==
+                       0) {
+                timer.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            release_head.set_value();
+            co_return;
+        },
+        asio::use_future);
+    context.run();
+
+    const ClientRunResult head = head_result.get();
+    require(tx2_result.has_value() && tx3_result.has_value(),
+            "T-C: TX2 or TX3 were never posted");
+    const ClientRunResult tx2 = tx2_result->get();
+    const ClientRunResult tx3 = tx3_result->get();
+    (void)head_server;
+    (void)tx2_server;
+    (void)tx3_server;
+    (void)releaser;
+    const auto describe = [](const ClientRunResult& result) {
+        return std::string("status=") +
+               std::to_string(static_cast<uint8_t>(result.status)) +
+               " terminal=" +
+               (result.terminal_error.has_value() ? result.terminal_error->detail
+                                                  : std::string("<none>"));
+    };
+    require(head.status == ClientRunStatus::Committed,
+            "T-C: the head TX did not commit (" + describe(head) + ")");
+    require(tx2.status == ClientRunStatus::Committed,
+            "T-C: TX2 did not commit (" + describe(tx2) + ")");
+    require(tx3.status == ClientRunStatus::Committed,
+            "T-C: TX3 did not commit (" + describe(tx3) + ")");
+    // All three committed with an unbroken digest chain in rel order, and
+    // no poison / epoch change ever latched.
+    require(head.committed_commit.has_value() &&
+                tx2.committed_commit.has_value() &&
+                tx3.committed_commit.has_value(),
+            "T-C: commit witnesses missing");
+    require(tx2.committed_commit->tu_seq.value >
+                head.committed_commit->tu_seq.value &&
+                tx3.committed_commit->tu_seq.value >
+                    tx2.committed_commit->tu_seq.value,
+            "T-C: TUs did not commit in order");
+    require(client.endpoint.next_rel_seq().value == 3,
+            "T-C: the confirmed rel_seq did not advance past all three TXs");
+    require(!client.endpoint.has_pipeline_poison() &&
+                client.endpoint.pipeline_epoch_for_test() == 0,
+            "T-C: the dispatch gap poisoned the route (it must not)");
+    require(tx3_observed_active.load() || tx3_observed_gap.load(),
+            "T-C: TX3's dispatch-order observation never fired");
+    std::fprintf(stderr,
+                 "p50_endpoint_test: T-C dispatch order: %s\n",
+                 tx3_observed_gap.load() ? "gap (TX2 unpromoted)"
+                                         : "promoted-first (TX2 active)");
+    // F applied all three in route order: the final route input is TX3's.
+    require(copy_input(server, guids.c) == tx3_input,
+            "T-C: F did not apply the three TUs in order (final input "
+            "differs)");
+}
+
 // ===== K=2 integration: real C <-> real F, no fake (P50_ROUTE_PIPELINING.md) =====
 //
 // The four tests below drive the merged step-4 (C-side window) and step-5
@@ -8287,6 +9165,10 @@ int main(int argc, char** argv) {
         test_p29v1_k2_real_successor_closed_while_parked();
         test_p29v1_k2_real_head_killed_after_fill();
         test_p29v1_k2_real_no_eager_fill_all_commit();
+        test_route_pipeline_prepark_when_begin_lands_after_hello();
+        test_route_pipeline_prepark_grace_falls_through_after_head_commit();
+        test_route_pipeline_prepark_grace_expiry_falls_through_not_throws();
+        test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
     }
@@ -8353,6 +9235,10 @@ int main(int argc, char** argv) {
     test_p29v1_k2_real_successor_closed_while_parked();
     test_p29v1_k2_real_head_killed_after_fill();
     test_p29v1_k2_real_no_eager_fill_all_commit();
+    test_route_pipeline_prepark_when_begin_lands_after_hello();
+    test_route_pipeline_prepark_grace_falls_through_after_head_commit();
+    test_route_pipeline_prepark_grace_expiry_falls_through_not_throws();
+    test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())
