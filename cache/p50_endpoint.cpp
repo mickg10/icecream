@@ -1728,6 +1728,13 @@ void P50PreparationAuthority::abandon_route(PreparedTuHandle handle) {
         throw std::logic_error(
             "abandon_route does not identify the route successor");
     route.p29_route->abandon_active();
+    // Step 4d core (P50_ROUTE_PIPELINING.md section 1.1 errata): a pipeline
+    // poison invalidates the WHOLE outstanding chain uniformly --
+    // CRoute::abandon_active() clears its active_queue_, and the authority's
+    // own uncommitted-successor deque must not survive either, or the next
+    // TX's commit() finds a stale front ("is not its prepared successor")
+    // and the route is stranded. Same uniform clear the release path applies.
+    route.uncommitted_route_entries.clear();
 }
 
 ProfileId P50PreparationAuthority::profile() const {
