@@ -6690,8 +6690,6 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
         asio::use_future);
     third_context.run();
     const ClientRunResult cold = third_result.get();
-    std::cerr << "K2DBG: cold TX stall="
-              << static_cast<uint8_t>(third_stage.load()) << std::endl;
     require(cold.status == ClientRunStatus::Committed,
             std::string("K2 successor-deviation: the post-reset TX did not "
                         "run cold and commit (status=") +
