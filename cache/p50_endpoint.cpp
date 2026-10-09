@@ -1923,6 +1923,15 @@ struct P50ServerEndpoint::Impl {
     struct Pending {
         TxBegin begin;
         std::shared_ptr<ProfileDialogue> dialogue;
+        // step 5c (route pipelining): session that installed this active TX.
+        // A route may now have other live sessions on it at the same time --
+        // a committed predecessor lingering in its post-commit EOF wait while
+        // a released successor runs, or a second released connection whose
+        // own install_begin lost the single-slot race -- and only the
+        // installing session's disconnect may clear the active TX (and wake
+        // the connections parked behind it); anyone else's disconnect must
+        // leave both alone.
+        uint64_t owner_serial = 0;
         bool materializing = false;
         bool global_tu_started = false;
         bool global_staged = false;
@@ -2077,6 +2086,14 @@ struct P50ServerEndpoint::Impl {
         bool activated = false;
         // Wrote TX_COMMIT and only waits for C's EOF.
         bool committed = false;
+        // step 5c (route pipelining): this session's OWN final commit, set
+        // together with `committed` right before the TX_COMMIT write. A
+        // committed session lingers in its post-commit write/EOF wait while
+        // a released successor may already be running the next TX on the same
+        // route, so post-commit completion checks must bind to this
+        // session-local identity -- the route's `pending`/`last_commit` now
+        // belong to the successor and would (spuriously) go stale.
+        std::optional<TxCommit> final_commit;
     };
 
     struct Session {
@@ -2560,6 +2577,20 @@ struct P50ServerEndpoint::Impl {
             !session.profile || session.profile != current.profile ||
             !session.activated)
             throw StaleCompletion();
+        // step 5c: a committed session binds its OWN final commit and touches
+        // no route-shared state at all. At K=1 this is byte-identical to the
+        // route-bound branches below (this session's begin/commit ARE the
+        // route's pending/last, and its serial IS the namespace's
+        // active_session); under route pipelining the released successor
+        // takes the namespace's active_session (require_route's guard would
+        // throw here) and the route's pending / last_commit as soon as it
+        // stages, which would otherwise rebind this finished session's
+        // post-commit completion checks to the successor's TX and spuriously
+        // stale it long after its own commit landed.
+        if (current.final_commit) {
+            bind_live_identity(result, *current.final_commit);
+            return result;
+        }
         const Route& route = require_route(session);
         result.history_nonce = route.nonce;
         result.rel_seq = route.next_rel;
@@ -2809,7 +2840,17 @@ struct P50ServerEndpoint::Impl {
             return;
         Namespace& space = position->second;
         Route* const route = find_route(space, *session.profile);
-        if (route != nullptr && route->pending) {
+        // step 5c: only the session that installed the route's active TX
+        // may clear it. At K=1 this is always the disconnecting session itself
+        // (only one session is ever live on a route), so the check is
+        // byte-identical; under route pipelining other live sessions exist --
+        // a committed predecessor lingering in its EOF wait, or a released
+        // connection whose install lost the single-slot race -- and their
+        // disconnect must not abort someone else's active transaction.
+        const bool owns_active_tx =
+            route != nullptr && route->pending &&
+            route->pending->owner_serial == session.serial;
+        if (owns_active_tx) {
             if (retain_interrupted)
                 route->interrupted = route->pending->begin;
             else
@@ -2824,8 +2865,15 @@ struct P50ServerEndpoint::Impl {
         // commit is never coming, so every connection parked behind it must
         // wake and re-run the live path against the real outcome
         // (interrupted/pending cleared above) instead of waiting on a
-        // commit that will never arrive.
-        if (route != nullptr)
+        // commit that will never arrive. A session that did NOT own the
+        // active TX (committed predecessor, or a released connection that
+        // never installed) has no effect on the cursor's future: its
+        // disconnect must leave parked successors asleep -- their release
+        // comes from the real predecessor commit (release_parked_at) or from
+        // the genuine bulk triggers (HISTORY_RESET/cold adoption/eviction),
+        // and a premature wake here would push them through the ordinary
+        // mismatch rejection instead of their intended commit.
+        if (owns_active_tx)
             release_all_parked(*route);
         if (route != nullptr && *session.profile == ProfileId::P29V1 &&
             route->dialogue_profile == ProfileId::P29V1 &&
@@ -3040,6 +3088,7 @@ struct P50ServerEndpoint::Impl {
         }
         route.interrupted.reset();
         route.pending = std::move(prepared.pending);
+        route.pending->owner_serial = session.serial;
         record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN, session, &begin);
         return replay;
     }
@@ -4776,6 +4825,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                 commit_done - commit_start)
                 .count());
         impl_->live_sessions.at(session.serial).committed = true;
+        impl_->live_sessions.at(session.serial).final_commit = commit;
         co_await async_write_message(
             socket, commit, selection.limits.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::WriteFragment, &committed_begin),
