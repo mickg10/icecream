@@ -6656,7 +6656,7 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
     std::vector<uint8_t> third_body_wire;
     std::future<void> third_fake = asio::co_spawn(
         third_context,
-        raw_parked_f_serve_connection(third_acceptor, run.fake.get(), false,
+        raw_parked_f_serve_connection(third_acceptor, run.fake, false,
                                       false, third_begin_wire,
                                       third_body_wire),
         asio::use_future);
@@ -6666,16 +6666,16 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
                                  third_handle, EndpointIoControl{}),
         asio::use_future);
     third_context.run();
-    const ClientRunResult third = third_result.get();
-    require(third.status == ClientRunStatus::Committed,
+    const ClientRunResult cold = third_result.get();
+    require(cold.status == ClientRunStatus::Committed,
             std::string("K2 successor-deviation: the post-reset TX did not "
                         "run cold and commit (status=") +
-                std::to_string(static_cast<uint8_t>(third.status)) +
+                std::to_string(static_cast<uint8_t>(cold.status)) +
                 " reconnect=" +
-                std::to_string(static_cast<uint8_t>(third.reconnect)) +
+                std::to_string(static_cast<uint8_t>(cold.reconnect)) +
                 " terminal=" +
-                (third.terminal_error.has_value()
-                     ? third.terminal_error->detail
+                (cold.terminal_error.has_value()
+                     ? cold.terminal_error->detail
                      : std::string("<none>")) +
                 ")");
     require(third_begin_wire.rel_seq.value == 0 &&
