@@ -314,6 +314,7 @@ TESTS += p50inputbufferpool
 p50inputattachment_SOURCES = p50_input_attachment_test.cpp
 p50inputfd_SOURCES = p50_input_fd_attachment_test.cpp ../cache/p50_control_operation.cpp \
 	../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
+	../cache/p50_input_buffer_pool.cpp \
 	../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/protocol50.cpp
 p50inputfd_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS
@@ -324,6 +325,7 @@ check_PROGRAMS += p50inputattachasync
 TESTS += p50inputattachasync
 p50inputattachasync_SOURCES = p50inputattachasync.cpp ../cache/p50_control_operation.cpp \
     ../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
+    ../cache/p50_input_buffer_pool.cpp \
     ../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
     ../cache/protocol50.cpp
 p50inputattachasync_CXXFLAGS = -pthread
