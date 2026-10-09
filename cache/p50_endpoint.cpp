@@ -5946,15 +5946,17 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                                      prepark_drained_now)))
                             buffered_frames.push_back(
                                 std::move(prepark_frame));
-                        if (prepark_drained_total > prepark_ceiling) {
-                            prepark_ceiling_exceeded = true;
-                            break;
-                        }
-                        if (!prepark_first_frame_done) {
-                            // Decide from the FIRST fully drained post-HELLO
-                            // frame only.
-                            if (buffered_frames.empty())
-                                continue;
+                        // Decide from the FIRST fully drained post-HELLO
+                        // frame BEFORE applying the drain ceiling: on a
+                        // real (high-BDP) route one drain routinely carries
+                        // the successor's BEGIN plus megabytes of its BODY,
+                        // so checking the 1 MiB pre-BEGIN ceiling first
+                        // would reject the very successor whose BEGIN
+                        // declares that size (K2-2 farm leg, 2026-10-09:
+                        // F TerminalError code 1 on the first cold-route
+                        // successor of every sidecar incarnation).
+                        if (!prepark_first_frame_done &&
+                            !buffered_frames.empty()) {
                             const Frame& prepark_first =
                                 buffered_frames.front();
                             prepark_first_frame_done = true;
@@ -5986,12 +5988,16 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                                         Impl::park(*prepark_route, prepark_key,
                                                    io);
                                 }
-                                continue;
+                            } else {
+                                // BEGIN at or behind the cursor,
+                                // HISTORY_RESET, anything else: fall through
+                                // immediately with the frame buffered; the
+                                // unchanged code below handles it.
+                                break;
                             }
-                            // BEGIN at or behind the cursor, HISTORY_RESET,
-                            // anything else: fall through immediately with
-                            // the frame buffered; the unchanged code below
-                            // handles it.
+                        }
+                        if (prepark_drained_total > prepark_ceiling) {
+                            prepark_ceiling_exceeded = true;
                             break;
                         }
                     }
