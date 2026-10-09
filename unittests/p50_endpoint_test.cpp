@@ -7181,6 +7181,480 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     (void)head_fake;
 }
 
+
+// ===== K=2 integration: real C <-> real F, no fake (P50_ROUTE_PIPELINING.md) =====
+//
+// The four tests below drive the merged step-4 (C-side window) and step-5
+// (F-side park/release sequencer) halves against each other through the
+// REAL P50ServerEndpoint, which now parks a successor TX_BEGIN that arrives
+// ahead of the route cursor and releases it exactly at the predecessor's
+// commit (release_parked_at). No raw-socket fake is involved anywhere.
+//
+// The driver mirrors production (client/p50_zstd_sender.cpp + step 4c):
+// the head's EndpointIoControl::write_complete only POSTS the successor
+// transfer onto the io_context -- never admits, prepares, or runs anything
+// inline (the write_complete contract in cache/p50_endpoint.h).
+
+namespace {
+
+// One K=2 pair against a real P50ServerEndpoint: TU `head_index` runs as
+// the head dialogue, TU `head_index + 1` is posted from the head's
+// write_complete and runs as the pipelined successor on its own real
+// connection. Both must commit. `observe_pipelining` records whether the
+// successor was actually dispatched while the head was still outstanding
+// (window_size() >= 2 at the successor's first outbound message).
+struct K2RealPairResult {
+    ClientRunResult head;
+    ClientRunResult successor;
+    bool successor_dispatched_while_head_outstanding = false;
+    uint64_t c_to_f_bytes = 0;
+};
+
+K2RealPairResult k2_real_pair(TestClient& client,
+                              P50ServerEndpoint& server,
+                              const std::vector<uint8_t>& head_input,
+                              const std::vector<uint8_t>& successor_input) {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+    std::future<ServerRunResult> successor_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+
+    const PreparedTuHandle head_handle = admit(client, head_input);
+    std::atomic<bool> dispatched{false};
+    std::atomic<bool> pipelining_observed{false};
+    std::atomic<uint64_t> c_to_f_bytes{0};
+    std::optional<std::future<ClientRunResult>> successor_result;
+
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        // Post, never inline: production releases the route transfer lock
+        // here and TX n+1's transfer runs in its own coroutine.
+        if (dispatched.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            const PreparedTuHandle successor_handle = admit(client, successor_input);
+            EndpointIoControl successor_control;
+            successor_control.outbound_message_observer =
+                [&](ActorSide actor, const Message& message) {
+                    if (actor != ActorSide::C)
+                        return;
+                    // The successor is writing while the head is still
+                    // outstanding: the pipeline window holds both.
+                    if (client.pipeline_window_size_for_test() >= 2)
+                        pipelining_observed.store(true);
+                    const std::vector<uint8_t> frame = encode_frame(message);
+                    c_to_f_bytes.fetch_add(frame.size());
+                };
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.run(remote, successor_handle, successor_control),
+                asio::use_future));
+        });
+    };
+    head_control.outbound_message_observer =
+        [&](ActorSide actor, const Message& message) {
+            if (actor != ActorSide::C)
+                return;
+            const std::vector<uint8_t> frame = encode_frame(message);
+            c_to_f_bytes.fetch_add(frame.size());
+        };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.run(remote, head_handle, head_control), asio::use_future);
+    context.run();
+    K2RealPairResult out;
+    out.head = head_result.get();
+    require(successor_result.has_value(),
+            "K2 real pair: write_complete never posted the successor");
+    out.successor = successor_result->get();
+    out.successor_dispatched_while_head_outstanding = pipelining_observed.load();
+    out.c_to_f_bytes = c_to_f_bytes.load();
+    (void)head_server;
+    (void)successor_server;
+    return out;
+}
+
+std::vector<std::vector<uint8_t>> k2_real_tu_inputs(size_t count, uint8_t seed) {
+    // Mixed shared/novel lines: every TU repeats the same prologue lines
+    // (shared) plus one unique novel line, so P29V1 interning sees both
+    // hit and novel regions across the run.
+    std::vector<std::vector<uint8_t>> inputs;
+    inputs.reserve(count);
+    for (size_t index = 0; index != count; ++index) {
+        std::string text = "# 1 \"/tmp/k2-real.cc\"\nshared-alpha\nshared-beta\nshared-gamma\n";
+        text += "novel-" + std::to_string(static_cast<unsigned>(seed)) + "-" +
+                std::to_string(index) + "\n";
+        inputs.push_back(bytes(text));
+    }
+    return inputs;
+}
+
+void require_real_pair_committed(const K2RealPairResult& pair, size_t head_index,
+                                 const std::vector<uint8_t>& head_input,
+                                 const std::vector<uint8_t>& successor_input,
+                                 P50ServerEndpoint& server, CStoreGuid c_guid) {
+    const std::string prefix =
+        "K2 real pair " + std::to_string(head_index) + ": ";
+    require(pair.head.status == ClientRunStatus::Committed &&
+                pair.successor.status == ClientRunStatus::Committed,
+            prefix + "head/successor did not both commit (head=" +
+                std::to_string(static_cast<uint8_t>(pair.head.status)) +
+                " successor=" +
+                std::to_string(static_cast<uint8_t>(pair.successor.status)) +
+                ")");
+    require(copy_input(server, c_guid) == successor_input,
+            prefix + "F's last committed input is not the successor TU");
+    (void)head_input;
+}
+
+}  // namespace
+
+// (a) Straight line: 30 TUs on one route at K=2, mixed shared/novel lines.
+// Every TU commits, F's route cursor advances 0..29 in order, pipelining
+// observably HAPPENED (a successor dispatched while its head was
+// outstanding), and the C->F wire byte total stays within +-5% of the same
+// 30 TUs driven sequentially at K=1.
+void test_p29v1_k2_real_straight_line_30tu() {
+    const P5coStoreGuids guids = p5co_store_guids(250);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+
+    const std::vector<std::vector<uint8_t>> inputs = k2_real_tu_inputs(30, 7);
+
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, &actions, limits);
+
+    size_t pipelined_pairs = 0;
+    uint64_t k2_wire_bytes = 0;
+    for (size_t pair_index = 0; pair_index != 15; ++pair_index) {
+        const K2RealPairResult pair =
+            k2_real_pair(client, server, inputs[2 * pair_index],
+                         inputs[2 * pair_index + 1]);
+        require_real_pair_committed(pair, pair_index, inputs[2 * pair_index],
+                                   inputs[2 * pair_index + 1], server,
+                                   guids.c);
+        require(pair.successor.committed_commit.has_value() &&
+                    pair.head.committed_commit.has_value(),
+                "K2 real pair: commit witnesses missing");
+        require(pair.successor.committed_commit->rel_seq.value ==
+                    pair.head.committed_commit->rel_seq.value + 1,
+                "K2 real pair: successor rel_seq was not head+1");
+        pipelined_pairs += pair.successor_dispatched_while_head_outstanding ? 1 : 0;
+        k2_wire_bytes += pair.c_to_f_bytes;
+    }
+    require(client.endpoint.next_rel_seq().value == 30,
+            "K2 real straight line: confirmed cursor did not advance past "
+            "all 30 TUs");
+    require(pipelined_pairs != 0,
+            "K2 real straight line: pipelining never observably happened "
+            "(no successor was dispatched while a head was outstanding)");
+    require(!client.endpoint.has_pipeline_poison(),
+            "K2 real straight line: route was poisoned on the happy path");
+
+    // F's route cursor must have advanced strictly 0..29 in order.
+    std::vector<uint64_t> f_begin_rel_seq;
+    for (const ActionRecord& record : actions.records()) {
+        if (record.actor == ActorSide::F && record.c_store_guid == guids.c &&
+            (record.action == ActionType::TX_BEGIN ||
+             record.action == ActionType::ACTIVE_REPLAYED))
+            f_begin_rel_seq.push_back(record.rel_seq.value);
+    }
+    std::vector<uint64_t> expected;
+    for (uint64_t index = 0; index != 30; ++index)
+        expected.push_back(index);
+    require(f_begin_rel_seq == expected,
+            "K2 real straight line: F route cursor did not advance 0..29 "
+            "in order");
+
+    // Wire-budget comparison: the same 30 TUs at K=1.
+    ActionTrace k1_actions;
+    P50ServerEndpoint k1_server(guids.f, caps, nullptr, &k1_actions);
+    TestClient k1_client(guids.c, caps, HistoryNonce{1}, nullptr, &k1_actions);
+    uint64_t k1_wire_bytes = 0;
+    for (const std::vector<uint8_t>& input : inputs) {
+        EndpointIoControl control;
+        control.outbound_message_observer =
+            [&](ActorSide actor, const Message& message) {
+                if (actor != ActorSide::C)
+                    return;
+                const std::vector<uint8_t> frame = encode_frame(message);
+                k1_wire_bytes += frame.size();
+            };
+        const PairResult sequential =
+            run_pair(k1_client, k1_server, admit(k1_client, input), control);
+        require(sequential.client.status == ClientRunStatus::Committed &&
+                    copy_input(k1_server, guids.c) == input,
+                "K1 wire-budget leg: TU did not commit exact bytes");
+    }
+    require(k1_wire_bytes != 0, "K1 wire-budget leg measured no bytes");
+    const double drift =
+        100.0 * static_cast<double>(k2_wire_bytes < k1_wire_bytes
+                                        ? k1_wire_bytes - k2_wire_bytes
+                                        : k2_wire_bytes - k1_wire_bytes) /
+        static_cast<double>(k1_wire_bytes);
+    require(drift <= 5.0,
+            "K2 real straight line: C->F wire bytes drifted more than 5% "
+            "vs the same TUs at K=1 (k2=" + std::to_string(k2_wire_bytes) +
+            " k1=" + std::to_string(k1_wire_bytes) + " drift=" +
+            std::to_string(drift) + "%)");
+}
+
+// (b) Successor socket closed by C while parked on F (poison): F must not
+// touch route state; the next TX after the route reset commits.
+void test_p29v1_k2_real_successor_closed_while_parked() {
+    const P5coStoreGuids guids = p5co_store_guids(251);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    P50ServerEndpoint server(guids.f, caps);
+
+    // Hold the head's materialization on F's codec worker so the successor
+    // parks (F defers stage()+STATE until the predecessor commits).
+    std::promise<void> release_materialize;
+    std::future<void> materialize_gate = release_materialize.get_future();
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&materialize_gate]() {
+        materialize_gate.wait();
+    };
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(acceptor, head_server_control),
+        asio::use_future);
+    std::future<ServerRunResult> successor_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+
+    const std::vector<uint8_t> head_input =
+        bytes("# 1 \"/tmp/k2-real-b.cc\"\nshared-head\nhead-line\n");
+    const std::vector<uint8_t> successor_input =
+        bytes("# 1 \"/tmp/k2-real-b.cc\"\nshared-head\nsuccessor-line\n");
+    const PreparedTuHandle head_handle = admit(client, head_input);
+
+    std::atomic<bool> dispatched{false};
+    std::optional<std::future<ClientRunResult>> successor_result;
+    std::optional<PreparedTuHandle> successor_handle;
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        if (dispatched.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            successor_handle = admit(client, successor_input);
+            // Short deadline: while parked on F (no STATE until the
+            // predecessor commits), this deadline closes C's successor
+            // socket -- the C-side io death this test drives.
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.run(remote, *successor_handle, EndpointIoControl{},
+                           std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(400)),
+                asio::use_future));
+        });
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.run(remote, head_handle, head_control), asio::use_future);
+    // Release F's materialization once the successor has died, from inside
+    // the io_context so the head then commits normally.
+    std::future<void> successor_watcher = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            // Poll (level-triggered) until the successor run finished.
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!successor_result.has_value() ||
+                   successor_result->wait_for(std::chrono::seconds(0)) !=
+                       std::future_status::ready) {
+                timer.expires_after(std::chrono::milliseconds(5));
+                boost::system::error_code ignored;
+                co_await timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            release_materialize.set_value();
+            co_return;
+        },
+        asio::use_future);
+    context.run();
+
+    const ClientRunResult head = head_result.get();
+    const ClientRunResult successor = successor_result->get();
+    (void)successor_watcher;
+    (void)head_server;
+    (void)successor_server;
+    require(head.status == ClientRunStatus::Committed,
+            "K2 real parked-close: the healthy head did not commit while "
+            "its parked successor was closed");
+    require(successor.status != ClientRunStatus::Committed,
+            "K2 real parked-close: the closed successor committed");
+    require(client.endpoint.has_pipeline_poison(),
+            "K2 real parked-close: route was not poisoned by the "
+            "successor-side io death");
+    // F never applied the successor: the last committed input is still the
+    // head's.
+    require(copy_input(server, guids.c) == head_input,
+            "K2 real parked-close: F applied route state for the closed "
+            "successor (route state must be untouched)");
+    // Bridge teardown, exactly the production order: retire the
+    // successor's own uncommitted route state (abandon_route clears the
+    // CRoute serializer queue and the authority's successor deque), then
+    // the cold endpoint reset.
+    require(successor_handle.has_value(),
+            "K2 real parked-close: successor handle missing");
+    client.authority->abandon_route(*successor_handle);
+    client.endpoint.reset_after_pipeline_poison();
+    require(!client.endpoint.has_pipeline_poison() &&
+                client.endpoint.pipeline_epoch_for_test() == 1 &&
+                client.endpoint.next_rel_seq().value == 0,
+            "K2 real parked-close: cold reset did not land");
+
+    // The next TX after the reset commits through the cold dance.
+    const std::vector<uint8_t> next_input =
+        bytes("# 1 \"/tmp/k2-real-b.cc\"\nshared-head\npost-reset-line\n");
+    const PairResult next_pair =
+        run_pair(client, server, admit(client, next_input));
+    require(next_pair.client.status == ClientRunStatus::Committed &&
+                next_pair.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == next_input,
+            "K2 real parked-close: the next TX after the route reset did "
+            "not commit");
+}
+
+// (c) Head connection killed after its FILL write while the successor is
+// parked: route poison, cold reset, recovery, next TX commits.
+void test_p29v1_k2_real_head_killed_after_fill() {
+    const P5coStoreGuids guids = p5co_store_guids(252);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    P50ServerEndpoint server(guids.f, caps);
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+    std::future<ServerRunResult> successor_server = asio::co_spawn(
+        context, server.accept_one(acceptor), asio::use_future);
+
+    const std::vector<uint8_t> head_input =
+        bytes("# 1 \"/tmp/k2-real-c.cc\"\nshared-c-head\nhead-line\n");
+    const std::vector<uint8_t> successor_input =
+        bytes("# 1 \"/tmp/k2-real-c.cc\"\nshared-c-head\nsuccessor-line\n");
+    const PreparedTuHandle head_handle = admit(client, head_input);
+
+    std::atomic<bool> dispatched{false};
+    std::atomic<bool> killed{false};
+    std::optional<std::future<ClientRunResult>> successor_result;
+    std::optional<PreparedTuHandle> successor_handle;
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        if (dispatched.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            successor_handle = admit(client, successor_input);
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.run(remote, *successor_handle, EndpointIoControl{}),
+                asio::use_future));
+            // Kill the head's own connection right after its FILL write:
+            // the successor is now outstanding (parked on F).
+            killed.store(true);
+            client.endpoint.request_cancel_for_test();
+        });
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.run(remote, head_handle, head_control), asio::use_future);
+    context.run();
+    require(killed.load(), "K2 real head-kill: the kill never fired");
+
+    const ClientRunResult head = head_result.get();
+    const ClientRunResult successor = successor_result->get();
+    (void)head_server;
+    (void)successor_server;
+    require(head.status == ClientRunStatus::Disconnected,
+            "K2 real head-kill: the killed head did not surface its "
+            "disconnect");
+    require(successor.status != ClientRunStatus::Committed,
+            "K2 real head-kill: the parked successor committed despite the "
+            "head's death");
+    require(client.endpoint.has_pipeline_poison(),
+            "K2 real head-kill: route was not poisoned by the head death "
+            "with a successor outstanding");
+    require(successor_handle.has_value(),
+            "K2 real head-kill: successor handle missing");
+    client.authority->abandon_route(*successor_handle);
+    client.endpoint.reset_after_pipeline_poison();
+    require(!client.endpoint.has_pipeline_poison() &&
+                client.endpoint.pipeline_epoch_for_test() == 1,
+            "K2 real head-kill: cold reset did not land");
+
+    // Recovery: the next TX commits through the cold HISTORY_RESET path.
+    const std::vector<uint8_t> next_input =
+        bytes("# 1 \"/tmp/k2-real-c.cc\"\nshared-c-head\nrecovered-line\n");
+    const PairResult next_pair =
+        run_pair(client, server, admit(client, next_input));
+    require(next_pair.client.status == ClientRunStatus::Committed &&
+                copy_input(server, guids.c) == next_input,
+            "K2 real head-kill: the next TX after the cold reset did not "
+            "commit");
+}
+
+// (d) A K=2 run whose TUs are large enough that fill_before_need is
+// impossible for some TX (the nullopt fallback path). All commit.
+void test_p29v1_k2_real_no_eager_fill_all_commit() {
+    require(::setenv("ICECC_P50_EARLY_NEED_REGION_BOUND", "0", 1) == 0,
+            "K2 real no-eager-fill: could not lower the early-FILL bound");
+    const struct BoundRestore {
+        ~BoundRestore() { ::unsetenv("ICECC_P50_EARLY_NEED_REGION_BOUND"); }
+    } bound_restore;
+
+    const P5coStoreGuids guids = p5co_store_guids(253);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    P50ServerEndpoint server(guids.f, caps);
+
+    for (int pair_index = 0; pair_index != 3; ++pair_index) {
+        const std::vector<uint8_t> head_input =
+            bytes("# 1 \"/tmp/k2-real-d.cc\"\nshared-d\nhead-" +
+                  std::to_string(pair_index) + "\n");
+        const std::vector<uint8_t> successor_input =
+            bytes("# 1 \"/tmp/k2-real-d.cc\"\nshared-d\nsuccessor-" +
+                  std::to_string(pair_index) + "\n");
+        const K2RealPairResult pair =
+            k2_real_pair(client, server, head_input, successor_input);
+        require_real_pair_committed(pair, static_cast<size_t>(pair_index),
+                                    head_input, successor_input, server,
+                                    guids.c);
+        require(!client.endpoint.has_pipeline_poison(),
+                "K2 real no-eager-fill: fallback poisoned the route");
+        require(client.endpoint.pipeline_epoch_for_test() == 0,
+                "K2 real no-eager-fill: fallback bumped the pipeline epoch");
+    }
+}
+
 // ===== same_commit negative coverage: lost-final reconnect path =====
 // Ruling part 2: after a lost final commit, a fake F presenting a well-formed
 // SessionState.last_commit differing from the active TxBegin in any identity field must be
@@ -7804,6 +8278,10 @@ int main(int argc, char** argv) {
         test_p29v1_k2_pipeline_successor_io_death_poisons_route();
         test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head();
         test_p29v1_k1_pipeline_wire_identity();
+        test_p29v1_k2_real_straight_line_30tu();
+        test_p29v1_k2_real_successor_closed_while_parked();
+        test_p29v1_k2_real_head_killed_after_fill();
+        test_p29v1_k2_real_no_eager_fill_all_commit();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
     }
@@ -7866,6 +8344,10 @@ int main(int argc, char** argv) {
     test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable();
     test_p29v1_k2_pipeline_successor_io_death_poisons_route();
     test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head();
+    test_p29v1_k2_real_straight_line_30tu();
+    test_p29v1_k2_real_successor_closed_while_parked();
+    test_p29v1_k2_real_head_killed_after_fill();
+    test_p29v1_k2_real_no_eager_fill_all_commit();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())
