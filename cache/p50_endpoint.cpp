@@ -5613,6 +5613,247 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                 }
             }
         }
+        // step 5c pre-park (route pipelining, F side; 2026-10-09): the
+        // level-triggered companion of the instantaneous peek above. C
+        // writes SESSION_HELLO and TX_BEGIN as two separate async writes, so
+        // a pipelined successor's BEGIN routinely lands in this socket's
+        // receive buffer a moment AFTER this coroutine has already read
+        // HELLO -- the step-5b peek then records nothing and the
+        // fall-through below would run stage() (writing a SESSION_STATE that
+        // carries the still-outstanding head's cursor, which the C
+        // successor's exact-witness check rejects) and then activate()
+        // (whose replacement branch drops the live head's pending TX).
+        // Pre-park instead whenever the peek saw no TX_BEGIN and no
+        // HISTORY_RESET frame, an established route exists, and the route's
+        // active TX belongs to another live session: register as parked at
+        // next_rel + 1 -- the head's commit releases exactly that key
+        // synchronously with its ++next_rel (release_parked_at), and every
+        // abort/disconnect/HISTORY_RESET/eviction path bulk-releases
+        // (release_all_parked) -- then wait, suspending on nothing but the
+        // socket itself, until the in-flight TX resolves (released: fall
+        // through with whatever is buffered), or this connection's first
+        // post-HELLO frame completes (a TX_BEGIN ahead of the cursor is a
+        // parked successor: re-key and keep waiting, bounded by that BEGIN's
+        // own declared wire size; anything else -- BEGIN at or behind the
+        // cursor, HISTORY_RESET -- falls through immediately with the frame
+        // buffered and lets the unchanged dispatch below decide), or a
+        // bounded grace expires (min(this run's own absolute operation
+        // deadline, 2000 ms), implemented as a timer whose expiry cancels
+        // the socket wait; falling through then reproduces exactly today's
+        // behavior). Waking on the socket wait is the only suspension
+        // point.
+        //
+        // K=1 visibility: this block only runs while ANOTHER session's TX is
+        // in flight on the route (route->pending owned by a different
+        // serial), which at depth 1 can only happen as a failure-recovery
+        // reconnect racing the live head's tail. There F now waits up to the
+        // grace bound for that TX to resolve (or for the new session's first
+        // frame) instead of replacing the live head's pending TX at once.
+        // No K=1 wire bytes change: a fall-through runs the identical
+        // stage()/HISTORY_RESET/BEGIN dispatch below, reading the drained
+        // buffer first through next_frame() exactly as the parked path does.
+        {
+            boost::system::error_code prepark_avail_error;
+            const std::size_t prepark_available =
+                socket.available(prepark_avail_error);
+            bool prepark_saw_history_reset = false;
+            if (!prepark_avail_error && prepark_available > 0) {
+                std::vector<uint8_t> prepark_buffer(prepark_available);
+                boost::system::error_code prepark_recv_error;
+                const std::size_t prepark_peeked = socket.receive(
+                    asio::buffer(prepark_buffer), tcp::socket::message_peek,
+                    prepark_recv_error);
+                if (!prepark_recv_error) {
+                    FrameParser prepark_parser(
+                        selection.limits.max_frame_payload);
+                    for (const Frame& prepark_frame : prepark_parser.feed(
+                             std::span<const uint8_t>(prepark_buffer.data(),
+                                                      prepark_peeked))) {
+                        // The first post-HELLO frame is the only one that
+                        // matters: BEGIN-at-cursor / HISTORY_RESET /
+                        // anything else all fall through unchanged, so just
+                        // note which shape it is.
+                        if (prepark_frame.type == MessageType::TX_BEGIN) {
+                            break;
+                        }
+                        if (prepark_frame.type == MessageType::HISTORY_RESET) {
+                            prepark_saw_history_reset = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!result.f_hello_time_peeked_begin_rel_seq &&
+                !prepark_saw_history_reset) {
+                const auto prepark_namespace =
+                    impl_->namespaces.find(hello.c_store_guid);
+                Impl::Route* prepark_route = nullptr;
+                if (prepark_namespace != impl_->namespaces.end()) {
+                    const ProfileId prepark_profile =
+                        require_single_route_profile(
+                            selection.negotiated_profiles);
+                    prepark_route = Impl::find_route(prepark_namespace->second,
+                                                    prepark_profile);
+                }
+                if (prepark_route != nullptr && prepark_route->pending &&
+                    prepark_route->pending->owner_serial != session.serial) {
+                    // Level-triggered key: one past the current cursor. The
+                    // head's commit bumps next_rel and releases exactly this
+                    // key; any other resolution bulk-releases. prepark_key
+                    // always names the rel_seq the CURRENT waiter is
+                    // registered under, so every forget_parked below (loop
+                    // exits and error paths alike) stays symmetric with its
+                    // park() call even after a re-key.
+                    RelSeq prepark_key{prepark_route->next_rel.value + 1};
+                    std::shared_ptr<Impl::ParkedWaiter> prepark_waiter =
+                        Impl::park(*prepark_route, prepark_key, io);
+                    FrameParser prepark_drain_parser(
+                        selection.limits.max_frame_payload);
+                    std::size_t prepark_drained_total = 0;
+                    std::size_t prepark_ceiling = 1u << 20;
+                    bool prepark_ceiling_exceeded = false;
+                    bool prepark_first_frame_done = false;
+                    // Bounded grace: cap at the earlier of this run's own
+                    // absolute operation deadline (if any) and 2000 ms. The
+                    // absolute deadline is sampled on this process's
+                    // CLOCK_MONOTONIC -- the same clock asio::steady_timer
+                    // arms from -- so the conversion is exact; an invalid or
+                    // missing deadline keeps the 2000 ms bound.
+                    auto prepark_grace =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(2000);
+                    if (deadline && deadline->valid()) {
+                        const auto absolute =
+                            deadline->as_steady_time_point();
+                        if (absolute < prepark_grace)
+                            prepark_grace = absolute;
+                    }
+                    asio::steady_timer prepark_timer(
+                        socket.get_executor(), prepark_grace);
+                    prepark_timer.async_wait(
+                        [io](const boost::system::error_code&) {
+                            // Grace expiry cancels the socket wait; the
+                            // park loop below observes the wait completing
+                            // without a release and falls through.
+                            boost::system::error_code ignored;
+                            io->socket.cancel(ignored);
+                        });
+                    for (;;) {
+                        if (prepark_waiter->released)
+                            break;
+                        boost::system::error_code prepark_wait_error;
+                        co_await socket.async_wait(
+                            tcp::socket::wait_read,
+                            asio::redirect_error(asio::use_awaitable,
+                                                 prepark_wait_error));
+                        require_operation();
+                        if (prepark_waiter->released)
+                            break;
+                        if (prepark_wait_error) {
+                            Impl::forget_parked(*prepark_route, prepark_key,
+                                                prepark_waiter);
+                            cancel_quietly(prepark_timer);
+                            throw boost::system::system_error(
+                                prepark_wait_error);
+                        }
+                        boost::system::error_code prepark_eof_error;
+                        const std::size_t prepark_available_now =
+                            socket.available(prepark_eof_error);
+                        if (prepark_eof_error) {
+                            Impl::forget_parked(*prepark_route, prepark_key,
+                                                prepark_waiter);
+                            cancel_quietly(prepark_timer);
+                            throw boost::system::system_error(
+                                prepark_eof_error);
+                        }
+                        if (prepark_available_now == 0) {
+                            // Readable-but-empty is a graceful close while
+                            // pre-parked: exactly the parked loop's EOF.
+                            Impl::forget_parked(*prepark_route, prepark_key,
+                                                prepark_waiter);
+                            cancel_quietly(prepark_timer);
+                            throw boost::system::system_error(
+                                asio::error::eof);
+                        }
+                        std::vector<uint8_t> prepark_drain_buffer(
+                            prepark_available_now);
+                        boost::system::error_code prepark_recv_error;
+                        const std::size_t prepark_drained_now = socket.receive(
+                            asio::buffer(prepark_drain_buffer), 0,
+                            prepark_recv_error);
+                        if (prepark_recv_error) {
+                            Impl::forget_parked(*prepark_route, prepark_key,
+                                                prepark_waiter);
+                            cancel_quietly(prepark_timer);
+                            throw boost::system::system_error(
+                                prepark_recv_error);
+                        }
+                        prepark_drained_total += prepark_drained_now;
+                        for (Frame& prepark_frame : prepark_drain_parser.feed(
+                                 std::span<const uint8_t>(
+                                     prepark_drain_buffer.data(),
+                                     prepark_drained_now)))
+                            buffered_frames.push_back(
+                                std::move(prepark_frame));
+                        if (prepark_drained_total > prepark_ceiling) {
+                            prepark_ceiling_exceeded = true;
+                            break;
+                        }
+                        if (!prepark_first_frame_done) {
+                            // Decide from the FIRST fully drained post-HELLO
+                            // frame only.
+                            if (buffered_frames.empty())
+                                continue;
+                            const Frame& prepark_first =
+                                buffered_frames.front();
+                            prepark_first_frame_done = true;
+                            if (prepark_first.type ==
+                                    MessageType::TX_BEGIN &&
+                                decode_as<TxBegin>(prepark_first).rel_seq
+                                        .value >
+                                    prepark_route->next_rel.value) {
+                                // A successor BEGIN ahead of the cursor:
+                                // re-key the park onto its own rel_seq (the
+                                // head's commit releases exactly that) and
+                                // keep waiting, with that BEGIN's declared
+                                // wire size as the drain ceiling -- exactly
+                                // the parked path's bound arithmetic.
+                                const TxBegin prepark_begin =
+                                    decode_as<TxBegin>(prepark_first);
+                                prepark_ceiling =
+                                    static_cast<std::size_t>(
+                                        prepark_begin.raw_bytes +
+                                        prepark_begin.body.encoded_bytes) *
+                                        2 +
+                                    (1u << 20);
+                                if (prepark_begin.rel_seq != prepark_key) {
+                                    Impl::forget_parked(
+                                        *prepark_route, prepark_key,
+                                        prepark_waiter);
+                                    prepark_key = prepark_begin.rel_seq;
+                                    prepark_waiter =
+                                        Impl::park(*prepark_route, prepark_key,
+                                                   io);
+                                }
+                                continue;
+                            }
+                            // BEGIN at or behind the cursor, HISTORY_RESET,
+                            // anything else: fall through immediately with
+                            // the frame buffered; the unchanged code below
+                            // handles it.
+                            break;
+                        }
+                    }
+                    Impl::forget_parked(*prepark_route, prepark_key,
+                                        prepark_waiter);
+                    cancel_quietly(prepark_timer);
+                    if (prepark_ceiling_exceeded)
+                        throw std::length_error(
+                            "F endpoint pre-parked connection exceeded its "
+                            "declared TX size");
+                }
+            }
+        }
         // step 5c: serve already-drained frames (buffered while parked)
         // before falling through to the live socket. Mechanically the same
         // async_read_frame() every other profile/path on this connection
