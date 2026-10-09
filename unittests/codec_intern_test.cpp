@@ -6,7 +6,11 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -917,6 +921,113 @@ void check_process_planned_differential() {
     std::cout << "codec_intern: process_planned differential check PASS\n";
 }
 
+
+// Concurrency stress for the two-phase intern: the plan phase is lock-free
+// and runs concurrently with the single writer's process_planned under an
+// explicit mutex (exactly the production shape: plan outside the lock,
+// write inside it).  N threads (>= 8) process distinct and OVERLAPPING TUs
+// concurrently; every produced region id must materialize the exact input
+// bytes through region_bytes() (the concurrent-read-safe accessor), and
+// the whole run must leave the interner in a state whose region count is
+// exactly the distinct regions of the corpus (same as a single-threaded
+// process() of the same TUs, which the second interner computes).
+void check_process_planned_concurrent() {
+    const P29InternLayout layout = P29InternLayout::probe();
+    MmapProvider provider(independent_reservation(layout));
+    P29Interner<MmapProvider> interner(provider, layout);
+    MmapProvider reference_provider(independent_reservation(layout));
+    P29Interner<MmapProvider> reference_interner(reference_provider, layout);
+
+    // Overlapping corpus: TUs 0..7 are distinct, and every thread ALSO
+    // processes the SHARED TU (tus[0] reused per thread) plus its own
+    // distinct TU, so plans overlap and the lock-free probes race with
+    // adds of the very same content.
+    std::vector<std::vector<std::uint8_t>> inputs;
+    for (int index = 0; index != 12; ++index) {
+        const std::string name = std::to_string(index);
+        // Linemarker-heavy: two "# <n> \"x\"" boundaries per TU, with
+        // per-TU region content so plans overlap across workers while
+        // each TU still adds its own new regions.
+        const std::string text =
+            "# " + name + " \"r\"\nregion-" + name + "-aaaaaaaa\n" +
+            "# " + name + " \"s\"\nshared-" + name + "\n";
+        inputs.push_back(std::vector<uint8_t>(text.begin(), text.end()));
+    }
+    // Every thread also re-processes TU 0 (the overlap).
+    inputs.push_back(inputs[0]);
+
+    constexpr int kThreads = 8;
+    std::mutex write_mutex;
+    std::vector<std::thread> workers;
+    std::atomic<int> failures{0};
+    for (int worker = 0; worker != kThreads; ++worker) {
+        workers.emplace_back([&, worker] {
+            try {
+                for (int round = 0; round != 8; ++round) {
+                    const std::vector<std::uint8_t> &input =
+                        inputs[(worker + round) % inputs.size()];
+                    // Plan OUTSIDE the lock (concurrent with every other
+                    // thread's writer phase).
+                    const std::vector<icecc::codec::P29RegionPlanEntry> plan =
+                        interner.plan_regions(input);
+                    std::vector<std::uint32_t> regions;
+                    {
+                        std::lock_guard<std::mutex> lock(write_mutex);
+                        interner.process_planned(input, plan, regions);
+                    }
+                    // Every produced TU must materialize exactly, through
+                    // the concurrent-read-safe accessor, while other
+                    // threads keep interning.
+                    size_t offset = 0;
+                    for (const std::uint32_t id : regions) {
+                        const std::span<const std::uint8_t> region =
+                            interner.region_bytes(id);
+                        if (region.size() > input.size() - offset ||
+                            std::memcmp(region.data(), input.data() + offset,
+                                        region.size()) != 0)
+                            throw std::runtime_error(
+                                "concurrent region does not materialize");
+                        offset += region.size();
+                    }
+                    if (offset != input.size())
+                        throw std::runtime_error(
+                            "concurrent materialization length differs");
+                }
+            } catch (const std::exception&) {
+                ++failures;
+            }
+        });
+    }
+
+    // The single-threaded reference over the same corpus.
+    std::vector<std::uint32_t> reference_regions;
+    {
+        std::vector<std::uint32_t> unused;
+        for (const std::vector<std::uint8_t> &input : inputs)
+            reference_interner.process(input, unused);
+        (void)unused;
+    }
+
+    for (std::thread &worker : workers)
+        worker.join();
+    require(failures.load() == 0, "concurrent workers reported failures");
+    require(interner.distinct_regions() > 0 &&
+                interner.distinct_regions() ==
+                    reference_interner.distinct_regions(),
+            "concurrent interner region count differs from the "
+            "single-threaded reference: " +
+                std::to_string(interner.distinct_regions()) + " vs " +
+                std::to_string(reference_interner.distinct_regions()));
+    require(interner.distinct_lines() ==
+                reference_interner.distinct_lines(),
+            "concurrent interner line count differs from the "
+            "single-threaded reference");
+    std::cout << "codec_intern: process_planned concurrent check PASS ("
+              << kThreads << " threads, " << inputs.size()
+              << " overlapping TUs x 8 rounds)\n";
+}
+
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -925,6 +1036,7 @@ int main(int argc, char **argv) {
         allocation_controls();
         check_next_region_differential();
         check_process_planned_differential();
+        check_process_planned_concurrent();
         const std::size_t committed_first = accounting_control_once();
         const std::size_t committed_second = accounting_control_once();
         require(committed_first == committed_second,

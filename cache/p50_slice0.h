@@ -262,6 +262,16 @@ struct PreparedTU {
     Digest128 raw_digest{};
 
 private:
+public:
+    // Read-only view of the interned region ids, for verification callers
+    // (the endpoint's split prepare and the concurrency stress test): the
+    // ids are final once the intern call returned, and materializing them
+    // through the authority's interner must reproduce the exact input.
+    [[nodiscard]] std::span<const uint32_t> dense_region_ids() const {
+        return dense_regions;
+    }
+
+private:
     friend class CAuthority;
     friend class CRoute;
     // prepare_source()'s split path: the interning runs under the C-wide
