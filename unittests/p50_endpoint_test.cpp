@@ -1233,7 +1233,7 @@ void test_s3_resource_storm_product_path() {
                                         blocked_prepared);
     require(blocked.client.status == ClientRunStatus::TerminalError &&
                 blocked.server.status == ServerRunStatus::TerminalError &&
-                blocked_client.has_active_transaction() &&
+                blocked_client->has_active_transaction() &&
                 storm_server.owner_usage().retained_input_records == 8 &&
                 storm_server.owner_usage().retained_input_bytes == 8 * 64,
             "cursor-pinned product capacity failure changed retained state");
@@ -1245,7 +1245,7 @@ void test_s3_resource_storm_product_path() {
                 recovered.server.status == ServerRunStatus::Completed &&
                 recovered.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
                 recovered.server.committed_input.has_value() &&
-                copy_input(storm_server, blocked_client.c_store_guid()) == blocked_input,
+                copy_input(storm_server, blocked_client->c_store_guid()) == blocked_input,
             "failed product install did not retry exact bytes after cursor release");
     storm_server.close_input_job(*recovered.server.committed_input);
     report_resource_checkpoint("storm-recovered", storm_server.owner_usage());
@@ -6508,7 +6508,7 @@ void test_p29v1_k2_pipeline_straight_line() {
                 run.successor.committed_commit.has_value(),
             "K2 straight line: commit witnesses missing");
     require(run.successor.committed_commit->post_state_digest ==
-                run.successor.begin.pre_state_digest,
+                run.successor_begin.pre_state_digest,
             "K2 straight line: confirmed state is not the successor's "
             "predicted pre-state");
 }
@@ -6526,7 +6526,7 @@ void test_p29v1_k2_pipeline_successor_commit_dispatched_first() {
                 run.successor.status == ClientRunStatus::Committed,
             "K2 commit-order: both TXs did not commit");
     require(run.successor.committed_commit->post_state_digest ==
-                run.successor.begin.pre_state_digest,
+                run.successor_begin.pre_state_digest,
             "K2 commit-order: confirmed state did not follow rel_seq order");
 }
 
@@ -6776,8 +6776,10 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     // (4096): the successor's NEED could outgrow a socket buffer, so the
     // dispatch must keep it on the head path.
     std::vector<uint8_t> huge;
-    for (uint32_t index = 0; index < 6000; ++index)
-        huge += std::string("u" + std::to_string(index) + "\n");
+    for (uint32_t index = 0; index < 6000; ++index) {
+        const std::string line = "u" + std::to_string(index) + "\n";
+        huge.insert(huge.end(), line.begin(), line.end());
+    }
     const std::vector<uint8_t> small = bytes("# 1 \"/tmp/k2-t7.cc\"\nsmall\n");
     const PreparedTuHandle head_handle = admit(client, small);
 
