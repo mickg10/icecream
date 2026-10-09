@@ -7243,14 +7243,14 @@ K2RealPairResult k2_real_pair(TestClient& client,
                         return;
                     // The successor is writing while the head is still
                     // outstanding: the pipeline window holds both.
-                    if (client.pipeline_window_size_for_test() >= 2)
+                    if (client.endpoint.pipeline_window_size_for_test() >= 2)
                         pipelining_observed.store(true);
                     const std::vector<uint8_t> frame = encode_frame(message);
                     c_to_f_bytes.fetch_add(frame.size());
                 };
             successor_result.emplace(asio::co_spawn(
                 context,
-                client.run(remote, successor_handle, successor_control),
+                client.endpoint.run(remote, successor_handle, successor_control),
                 asio::use_future));
         });
     };
@@ -7262,7 +7262,8 @@ K2RealPairResult k2_real_pair(TestClient& client,
             c_to_f_bytes.fetch_add(frame.size());
         };
     std::future<ClientRunResult> head_result = asio::co_spawn(
-        context, client.run(remote, head_handle, head_control), asio::use_future);
+        context, client.endpoint.run(remote, head_handle, head_control),
+                asio::use_future);
     context.run();
     K2RealPairResult out;
     out.head = head_result.get();
@@ -7459,14 +7460,16 @@ void test_p29v1_k2_real_successor_closed_while_parked() {
             // socket -- the C-side io death this test drives.
             successor_result.emplace(asio::co_spawn(
                 context,
-                client.run(remote, *successor_handle, EndpointIoControl{},
-                           std::chrono::steady_clock::now() +
-                               std::chrono::milliseconds(400)),
+                client.endpoint.run(remote, *successor_handle,
+                                    EndpointIoControl{},
+                                    std::chrono::steady_clock::now() +
+                                        std::chrono::milliseconds(400)),
                 asio::use_future));
         });
     };
     std::future<ClientRunResult> head_result = asio::co_spawn(
-        context, client.run(remote, head_handle, head_control), asio::use_future);
+        context, client.endpoint.run(remote, head_handle, head_control),
+                asio::use_future);
     // Release F's materialization once the successor has died, from inside
     // the io_context so the head then commits normally.
     std::future<void> successor_watcher = asio::co_spawn(
@@ -7571,7 +7574,8 @@ void test_p29v1_k2_real_head_killed_after_fill() {
             successor_handle = admit(client, successor_input);
             successor_result.emplace(asio::co_spawn(
                 context,
-                client.run(remote, *successor_handle, EndpointIoControl{}),
+                client.endpoint.run(remote, *successor_handle,
+                                    EndpointIoControl{}),
                 asio::use_future));
             // Kill the head's own connection right after its FILL write:
             // the successor is now outstanding (parked on F).
@@ -7580,7 +7584,8 @@ void test_p29v1_k2_real_head_killed_after_fill() {
         });
     };
     std::future<ClientRunResult> head_result = asio::co_spawn(
-        context, client.run(remote, head_handle, head_control), asio::use_future);
+        context, client.endpoint.run(remote, head_handle, head_control),
+                asio::use_future);
     context.run();
     require(killed.load(), "K2 real head-kill: the kill never fired");
 
